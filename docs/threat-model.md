@@ -1,5 +1,14 @@
 # TWO Bot Next: internal actions and Worker threat model
 
+Reviewed 2026-10-10 against `f2e154c1ba06bae319a65030fdf377cfe690f41d`.
+The private receiver (#343) and the staging-only ingress (#370) are merged on
+main; `event.read` (#583) and the moderation, settings, membership, event and
+channel-moderation executors (#663, #678, #679, #680, #686, #687) are wired
+through the signed receiver. The website-action ingress is staging-only and
+dark by default (see Scope). Production flag state is not verifiable from the
+repository; it is recorded on the deployment receipt. This refresh changes no
+code and asserts neither on nor off for any live environment.
+
 Reviewed 2026-10-01 against baseline `5ddab2dfec52853a0c87cc6e555baf6575eae77e`
 (delta `44338b28..5ddab2d` assessed; prior review 2026-09-30 against
 `44338b28a7feac0093cbd72dc9cecc45ab33a15d`). The F7 redirect caller-map and
@@ -14,38 +23,54 @@ designed in [internal-action signing v2](internal-action-signing-v2.md); no
 code changed.
 This is a source-based STRIDE assessment, **not deployment approval**. No live
 credentials, Discord mutations, database probes or key rotation were performed.
-The private durable HTTP receiver (PR #114,
-`feat/private-internal-actions-http` at `5210a0b`) remains open and unmerged;
-the async durable-burn seam and receiver/executor integration remain unwired
-on main.
+The private HTTP receiver (`crates/bot/src/internal_action_http.rs:1180`)
+is merged on main with a body cap (`MAX_BODY_BYTES`,
+`crates/core/src/internal_actions.rs:76`), a header cap
+(`crates/bot/src/internal_action_http.rs:78-82`, enforced at `:2551`) and a
+body timeout (`:81`, enforced at `:1260`); the receiver/executor integration
+is wired for the verbs listed in Scope. The Worker ingress comment calls that
+ingress "staging-only, dark by default" (`wrangler/src/index.ts:882-883`).
 
 ## Scope and current exposure
 
 The historical contract has **18 actions**. The current core allowlist has
-**19**: those 18 plus `event.read`
-(`crates/core/src/internal_actions.rs:626`; nine moderation verbs at `:676`,
-14 idempotency-bound at `:653`). All 19 are assessed below. Note drift:
-`docs/parity.md:197` still describes the website→bot row as 18 actions and
+**19** (rechecked 2026-10-10): those 18 plus `event.read`
+(`crates/core/src/internal_actions.rs:653`; nine moderation verbs at `:703`,
+14 idempotency-bound at `:680`). All 19 are assessed below. Note drift:
+`docs/parity.md:221` still describes the website→bot row as 18 actions and
 omits `event.read` and settings compare-and-set; the core constants above are
 authoritative. The legacy `docs/INTERNAL_ACTIONS.md` is not in this checkout;
 the ported core, [parity inventory](parity.md) and
 [durable-store contract](internal-action-store.md) are the source evidence here.
 
-**Implemented libraries are not deployed receiver controls.** Executor additions
-since the prior review are libraries: announcement execution
+**Wired receiver executors (merged since the 2026-10-01 baseline).** The
+announcement receiver (#343), the staging-only ingress (#370), `event.read`
+(#583), moderation timeout (#663), moderation ban/tempban/kick/warn (#678),
+settings get/set (#679), event upsert/cancel (#680), membership (#686) and
+channel moderation (#687) are wired through the signed receiver
+(`crates/bot/src/internal_action_http.rs:1180`): announcement execution
 (`crates/discord/src/internal_actions.rs:115`), member join/role assignment
-(`crates/discord/src/internal_exec/member.rs`), guild settings CAS (via #81),
+(`crates/discord/src/internal_exec/member.rs`), guild settings CAS,
 channel-moderation wiring
 (`crates/discord/src/internal_channel_moderation.rs:67`) and the ticket runtime
-(`crates/bot/src/ticket_runtime.rs`, integrated via #155).
+(`crates/bot/src/ticket_runtime.rs`) now execute behind that route when the
+ingress gate below admits them.
 
-- The Worker routes exact `/health` and `/readyz` to the singleton Container;
-  other paths enter the invite redirect handler (`wrangler/src/index.ts:313`).
-  Reserved internal paths (`/metrics`, `/metrics/*`, canonicalized aliases)
-  return 404 for every method before lookup (`wrangler/src/index.ts:321`,
-  `wrangler/src/redirect.ts:177`, `:211`); other non-GET/HEAD paths return 405,
-  so current `POST /internal/actions` returns 405 rather than reaching an
-  action receiver (`wrangler/src/redirect.ts:216`).
+- The ingress gate is code, and it is dark by default. The Worker routes exact
+  `POST /internal/actions` (`ACTIONS_PATH`,
+  `wrangler/src/internal-actions.ts:21`) to the Container only when
+  `ingressEnabled(env)` is true (`wrangler/src/index.ts:883`), where
+  `ingressEnabled` returns true only when `INTERNAL_ACTIONS_INGRESS` and
+  `TWO_INTERNAL_ACTIONS` are both `"1"`
+  (`wrangler/src/internal-actions.ts:62-63`; `receiverEnabled` at `:58-59`).
+  In every other state the route does not exist: the caller sees current
+  redirect/probe behavior and the Container is never contacted. Other paths
+  keep current behavior: exact `/health` and `/readyz` go to the singleton
+  Container and remaining paths enter the invite redirect handler. Reserved
+  internal paths (`/metrics`, `/metrics/*`, canonicalized aliases) return 404
+  for every method before lookup; other non-GET/HEAD probe paths return 405.
+  Production flag state is not verifiable from the repository; it is recorded
+  on the deployment receipt.
 - The Container router serves GET `/health`, GET `/healthz`, and GET
   `/readyz` (`crates/bot/src/server.rs:29-31`) and merges an internal
   `/metrics` scrape on the same listener (`:34`,
@@ -60,17 +85,22 @@ channel-moderation wiring
   forwards only those two (`:123-128`), and at the Worker level `/healthz` is
   answered statically by the redirect handler (`wrangler/src/redirect.ts:219`),
   never proxied.
-- The Container DO independently refuses forwarding paths other than the two
-  probes (`wrangler/src/index.ts:123-128`). Neither that forwarding policy nor
-  the Worker secret whitelist currently admits internal actions.
+- The Container DO admits internal actions only through the same gate: the
+  `internalActions` handler refuses unless `ingressEnabled` and the request is
+  an exact actions request (`wrangler/src/index.ts:538`), then forwards the
+  exact bytes to the fixed receiver port (`:544`). Other forwarding paths still
+  refuse non-probe paths, and the ingress never starts the Container on an
+  unauthenticated flood.
 - HMAC authorization, private-bind validation, field validators, durable replay
-  and execution claims exist as libraries. Signing secrets and the nonce decoy
-  are now `Secret`-wrapped (`crates/core/src/internal_actions.rs:150-152`,
-  `:213-234`). The async durable-burn seam and receiver/executor integration
-  remain unwired (`docs/internal-action-store.md:86-89`). Implementing that
-  route is outside this assessment, assigned to
-  [TOG-10603](/TOG/issues/TOG-10603); this document does not lift its holds.
-  Receiver PR #114 is open, not merged.
+  and execution claims are enforced in the merged receiver, not libraries.
+  Signing secrets and the nonce decoy are `Secret`-wrapped
+  (`crates/core/src/internal_actions.rs:150-152`, `:213-234`). The receiver
+  serves `POST /internal/actions` with single-header extraction, a 2 MiB body
+  cap, a 5-second body timeout and a 20-second request timeout
+  (`crates/bot/src/internal_action_http.rs:78-82`, `:1180`, `:1214`, `:1260`,
+  `:2551`). This document does not lift deployment holds; residual receiver
+  and deployment items stay open under F1, F2 and F6 with the named owner
+  roles below.
 - Gateway traffic is received over the bot's outbound Discord connection, not
   an additional inbound HTTP webhook. The runtime commits funnel effects and
   gateway checkpoints; detached dispatch now fans MessageCreate/
@@ -118,13 +148,15 @@ was verified here.
    role and object-level authorization belong to the website; never put the
    service HMAC key in the browser. The website sends one authorized action,
    fresh timestamp/nonce, and a stable idempotency key for one intent.
-2. **Website → Worker → Container (future actions flow):** Internet traffic crosses
-   the Worker routing/authentication boundary, then a separate DO forwarding
-   boundary. Both currently exclude actions (reserved-internal 404s land before
-   campaign lookup). Adding a route must be explicit, default-deny and reviewed;
-   merely forwarding all paths would expose the bot's remote control. Preserve
-   signed body bytes across every hop and require TLS.
-3. **Private receiver → core/store → Discord REST (future):** service signature,
+2. **Website → Worker → Container (actions flow, dark by default):** Internet
+   traffic crosses the Worker routing/authentication boundary, then a separate
+   DO forwarding boundary. Both admit actions only when `INTERNAL_ACTIONS_INGRESS`
+   and `TWO_INTERNAL_ACTIONS` are both `"1"`
+   (`wrangler/src/internal-actions.ts:62-63`); otherwise the route does not
+   exist and callers see current redirect/probe behavior. The route is explicit
+   and default-deny; merely forwarding all paths would expose the bot's remote
+   control. Preserve signed body bytes across every hop and require TLS.
+3. **Private receiver → core/store → Discord REST (present):** service signature,
    freshness and durable replay refusal precede parsing, authorization and an
    atomic execution claim. Only a committed new claim may cause a side effect;
    the executor assumes policy adjudication happened elsewhere. New since the
@@ -134,8 +166,8 @@ was verified here.
    (`crates/core/src/internal_action_store.rs:92`, `:328`), moderation channel
    reads are guild-fenced (`crates/discord/src/executor.rs:887`), and ticket
    close/reservation runs under row-lock fences with atomic transcript commits
-   (`crates/cutover/src/tickets.rs:34`, `:180-199`). None of this wires the
-   receiver; it raises the F2 acceptance bar instead.
+   (`crates/cutover/src/tickets.rs:34`, `:180-199`). This now runs behind the
+   merged receiver; it raises the F2 acceptance bar for the wired verbs.
 4. **Discord gateway → Container:** authenticated upstream does not make members'
    payloads trusted. DMs are dropped from message processing; foreign-guild
    event/activity batches are refused at persistence, and effects/checkpoints
@@ -165,8 +197,12 @@ was verified here.
 
 ## STRIDE analysis
 
-Severity is the credible blast radius **if the future receiver is enabled**, not
-an assertion of a currently exploitable action route. P1 items below are release
+Severity is the credible blast radius **when the receiver ingress is admitted**,
+that is only when `INTERNAL_ACTIONS_INGRESS` and `TWO_INTERNAL_ACTIONS` are both
+`"1"` (`wrangler/src/internal-actions.ts:62-63`); otherwise the route does not
+exist and callers see current redirect/probe behavior. This is not an assertion
+about any live environment: production flag state is not verifiable from the
+repository and is recorded on the deployment receipt. P1 items below are release
 gates for that integration. Current-public-surface findings are marked explicitly.
 
 | STRIDE | Concrete threat / boundary | Existing control | Residual risk / required evidence |
@@ -175,7 +211,7 @@ gates for that integration. Current-public-surface findings are marked explicitl
 | Spoofing | Replay a capture on another environment, under a rotating identity, or after clock rollback | Timestamp/skew and global nonce burn; durable identity contract requires a stable logical caller; monotonic high-water guards refuse regressed freshness clocks fail-closed on both paths (`ClockGuard` in `crates/core/src/clock_guard.rs`, memory pipeline in `crates/core/src/internal_actions.rs:1575`, durable mark in `crates/core/src/internal_action_store.rs:270` + `0353_internal_clock_high_water.sql`) | Canonical MAC has no host, environment or caller ID (v2 binds audience and caller: [spec](internal-action-signing-v2.md), implementation pending); never reuse secrets across environments or aliases. Within one ring `parse_keys` refuses a repeated key ID or two IDs sharing a secret, naming IDs only; cross-environment reuse remains a custody check. Preserve ledgers during rotation. TTL alone is not a clock policy: the guards (not the TTL) close the expiry-then-rollback reopen. F2/F3/F8. |
 | Tampering | Change body/action or exploit different HTTP/JSON parsers | MAC signs raw-body SHA256, not parsed/reencoded JSON; validators and allowlists refuse bad fields | `Idempotency-Key` is not signed (v2 signs it: [spec](internal-action-signing-v2.md), implementation pending); trusted transport is required. A signed body repeating a JSON object key at any depth (compared after unescaping) refuses as `Malformed`/`duplicate_json_key` before dispatch; the nonce stays burned and the key is never echoed. Bound collection before hashing and test proxy/path/method semantics. F1/F3. |
 | Tampering | Bypass role/channel maps, foreign-guild fence or protected-target policy | Symbolic role/channel keys, catalog-only settings, moderation adjudication and guild-fenced persistence exist in libraries. Moderation permission/targets now resolve from one `command_permissions` source (`crates/core/src/moderation.rs:103-112`); website moderation channels are guild/type-checked (`crates/discord/src/executor.rs:887`); role assignment pins `resolved_role_id` at claim time (`crates/core/src/internal_action_store.rs:92`) | Receiver must call every relevant validator and obtain trusted live permission/hierarchy facts; `authorize` alone does not validate action fields. Settings CAS conflicts (`VersionConflict`/409 at `crates/core/src/internal_actions.rs:507`) must refresh, never blind-retry. P1 F2. |
-| Repudiation | Retry a destructive action after an ambiguous outcome, or lose audit linkage | Store commits scalar intent and audit atomically; only `Claimed` allows execution; stale/unknown claims require reconciliation. Ticket close commits transcript atomically under row-lock fences (`crates/cutover/src/tickets.rs:180-199`); later audits copy the original role pin, never a re-evaluated map | Async store seam is not wired. Request/actor IDs need trusted derivation; no arbitrary provider JSON in terminal records. Transcript purge and CAS-token retention are new deletion/conflict surfaces; cleanup must not reopen duplication. P1 F2, F5. |
+| Repudiation | Retry a destructive action after an ambiguous outcome, or lose audit linkage | Store commits scalar intent and audit atomically; only `Claimed` allows execution; stale/unknown claims require reconciliation. Ticket close commits transcript atomically under row-lock fences (`crates/cutover/src/tickets.rs:180-199`); later audits copy the original role pin, never a re-evaluated map | Durable burn/claim path is wired in the merged receiver (`crates/bot/src/internal_action_http.rs:1300`). Open (Receiver owner): request/actor IDs still need trusted derivation; no arbitrary provider JSON in terminal records. Transcript purge and CAS-token retention remain open deletion/conflict surfaces; cleanup must not reopen duplication. P1 F2, F5. |
 | Information disclosure | Leak OAuth/bot/signing/DB credentials via errors, tracing or settings | Redacted key/decision Debug, catalog denies environment-only/unknown settings, typed store errors/results. Since the prior review: `Secret`-wrapped signing keys/decoy, redacted transport/Debug (`crates/discord/src/executor.rs`), `RawResponse` shape-only Debug, `database_url` query allowlist plus passfile-target silencing, and generic DB connection/migration errors | HTTP rejection logger is not implemented. Logging full headers/body/error chains would undo minimization. Staging and production log head sampling 1 (`wrangler/wrangler.toml:84-86`, `:118-120`) raises log stakes in both. Source does not prove runtime TLS/custody. F4/F6. |
 | Denial of service | Public probes wake/pin singleton Container or consume pool/crypto/memory | DO path allowlist, six-second readiness probe, pool/timeouts. Public `/health` and `/readyz` return 405 for non-GET/HEAD, then spend a per-caller **60 burst, 1/second** `healthBuckets` budget (429 with `Retry-After`) before the Container is touched, and forward a sanitized probe (`wrangler/src/index.ts:84-88`, `:410-444`; TOG-12245, #259). Redirects spend a separate `clickBuckets` map (`:65-67`, `:496`). Both are `TokenBuckets` with idle expiry no shorter than full refill, a 10,000-key fail-closed cap and a 64-entry sweep budget (`wrangler/src/redirect.ts:126-254`). Reserved-internal `/metrics*` 404s land before the bucket and DB lookup (`wrangler/src/index.ts:459`, `wrangler/src/redirect.ts:344-346`); readiness webhook failures stay generic and never log the secret URL (`wrangler/src/index.ts:382`) | Probe and redirect buckets are per isolate, not a global edge limit: a recycled or different isolate starts every caller full. The cap bounds memory but refuses every new caller while 10,000 keys are live; a new key at the cap first reaps idle entries, so a map of one-time callers drains on new-key traffic alone (fixed, TOG-12387). Probes have no application auth. Action body cap runs after HMAC and nonce burn; authenticated nonce flood precedes key bucket. Gateway fan-out is detached per event, so a hostile event burst spawns bounded runtime work (ticket lane 10 s, cumulative 120 s) rather than stalling heartbeats — bound it anyway. F1/F7. |
 | Denial of service | Spend the same clock interval twice in an action bucket | This change keeps a last-seen clock high-water mark | New regression covers both bucket specs; restart/multi-instance buckets are still local. Future receiver needs bounded ingress/concurrency. F7. |
@@ -578,17 +614,17 @@ Remaining proposals are intentionally **not implemented** here:
 
 | ID / priority | Next owner / proposal | Concrete acceptance test before activation |
 | --- | --- | --- |
-| F1 / P1 receiver gate | Receiver implementer ([TOG-10603](/TOG/issues/TOG-10603); PR #114 open, unmerged): default-deny Worker/DO routes, separate guarded bind policy, bounded byte collection/time/concurrency, exact method/path/content-type and single-header extraction | Through Worker and direct receiver: alternate paths/methods (including `/metrics*` canonicalization aliases), duplicate mixed-case headers, comma-joined values, oversized/chunked/encoded bodies refuse before unbounded allocation or mutation; valid exact bytes authenticate; public/wildcard bind cannot enable actions. |
-| F2 / P1 receiver gate | Receiver implementer with Security review: wire durable pre-parse burn, stable principal mapping, committed claims, trusted user/guild/channel/event and permission/hierarchy facts, all action validators — now including ticket reservation/recovery fences, guild-fenced channel reads, `resolved_role_id` pinning and settings CAS conflict handling | Every verb (plus ticket/member/channel/settings-CAS paths): foreign guild/object and unauthorized/protected actor/target refuse; stale CAS writes conflict instead of reverting; restart/parallel/rejected/timeout requests cannot double-execute; DB failures never fall back to memory-only guards. Review the exact integration head. |
+| F1 / P1 receiver gate | Receiver owner (merged #343, #370; prior draft #114 superseded): default-deny Worker/DO routes, separate guarded bind policy, bounded byte collection/time/concurrency, exact method/path/content-type and single-header extraction are merged (`crates/bot/src/internal_action_http.rs:78-82`, `:1180`, `:2551`; `wrangler/src/index.ts:883`; `wrangler/src/internal-actions.ts:62-63`). Open: Worker owner proves per-isolate in-flight/concurrency caps under flood; Deployment owner records bind/marker receipts on the deployment receipt | Through Worker and direct receiver: alternate paths/methods (including `/metrics*` canonicalization aliases), duplicate mixed-case headers, comma-joined values, oversized/chunked/encoded bodies refuse before unbounded allocation or mutation; valid exact bytes authenticate only when both ingress flags are `"1"`; public/wildcard bind cannot enable actions without the Worker-set marker. |
+| F2 / P1 receiver gate | Receiver owner with Security review (merged #583, #663, #678, #679, #680, #686, #687): durable pre-parse burn, stable principal mapping, committed claims, trusted user/guild/channel/event and permission/hierarchy facts, all action validators — including ticket reservation/recovery fences, guild-fenced channel reads, `resolved_role_id` pinning and settings CAS conflict handling — are wired for the 19 verbs. Open: Receiver owner proves every verb refuses foreign guild/object and unauthorized/protected actor/target on the exact integration head | Every verb (plus ticket/member/channel/settings-CAS paths): foreign guild/object and unauthorized/protected actor/target refuse; stale CAS writes conflict instead of reverting; restart/parallel/rejected/timeout requests cannot double-execute; DB failures never fall back to memory-only guards. Review the exact integration head. |
 | F3 / P2 signing hardening | Website and receiver owners: versioned MAC binding audience, caller and idempotency identity — designed ([spec](internal-action-signing-v2.md), [TOG-12752](/TOG/issues/TOG-12752)); implementation pending (six slices listed in the spec). Landed ([TOG-12243](/TOG/issues/TOG-12243)): `parse_keys` refuses duplicate key IDs/reused-secret aliases; signed bodies with a repeated JSON key refuse at any depth | Alter audience/intent/header representation or send ambiguous JSON/key specs: refuse; frozen legacy vectors remain compatible until an explicitly approved version transition. CAS tokens stay opaque equality metadata, never new signed fields without a version. No silent canonical-format change. Activation evidence: the spec's acceptance list (single-field tamper, cross-audience/caller refusal, v1-under-v2-only refusal, inclusive lifetime/skew edges, rotation retry dedupe, log-marker fixtures). |
 | F4 / P2 rejection telemetry | Receiver implementer: scalar structured logger with bounded labels/suppression | Capture every rejection class with token/body/SQL marker fixtures; no marker or full input escapes and rejection flood stays bounded. `Secret`/redaction and `database_url` allowlist work has landed; staging and production log head-sampling 1 make log proof load-bearing in both. |
 | F5 / P2 action-specific safety | Action owners: mapped event ownership, automation import schema/cardinality/overwrite transaction, key-specific setting validation, tempban recovery and lockdown/unlock overwrite serialization | Unmapped events, excessive imports, protected roles, invalid setting types, conflicting channel intents and unknown outcomes fail closed; legitimate operation/reconciliation has scalar evidence. Moderation duration caps and settings CAS have landed as narrowing, not closure. |
 | F6 / P1 deployment gate | Deployment owner with CISO: verify secret custody, per-environment guild/DB/key bindings, least-privilege DB role and mandatory authenticated TLS for Neon | Record non-secret binding/TLS/role receipts on the deployment card; test only fixtures/CI or explicitly authorized staging. Least-privilege roles/verifier/DML-only gateway/operator-migrates-first (via #102) and the `database_url` allowlist are procedure progress, not isolation proof; staging observability is telemetry, not a fence. Source URL-prefix validation is not TLS or isolation proof. |
-| F7 / P2 current-public-surface and future ingress | Worker/receiver owners: global edge/guild/caller quotas, bounded nonce/intent growth (redirect caller map, per-isolate probe limits, canonical caller identity, unknown budget and terminal 429 hold landed), the shared per-bot-token/channel cooldown governor fed by every `AnnouncementExecutor` 429 (landed; receiver must share one per token, TOG-11045), and total REST deadlines; preserve gateway resources | Landed for the Worker: bounded redirect caller map and public probe gate (TOG-12245, #259). `TokenBuckets` (`wrangler/src/redirect.ts:171-372`) idle-expires only fully refilled buckets, caps at 10,000 keys fail-closed and sweeps at most 64 per call; `/health`/`/readyz` take a separate `healthBuckets` budget before the Container (`wrangler/src/index.ts:99`, `:548-572`). Fixtures `wrangler/test/redirect.test.ts:589-766` prove idle reclamation, a fixed ceiling, churn that cannot reset a depleted caller, bounded sweep work and reap-before-refuse at the cap; `wrangler/test/health-probes.test.ts:122-147` proves the probe 429. **Landed (TOG-12469, #290):** canonical caller identity, so case, whitespace, IPv6 zone-id and `::ffff:` aliases share one bucket (`canonicalCallerKey`, `wrangler/src/redirect.ts:143-169`); one bounded `unknown` budget for callers with no edge signal, which cannot mint entries or starve valid callers; and a terminal hold after 25 straight denials (60 s) that retries can neither shorten nor extend (`take`, `:277-355`). **Landed (TOG-12533):** the redirect 429 forwards the bucket's own `Retry-After` (whole seconds, at least 1), so a held caller is told the remaining hold instead of a one-second retry loop (`:506-516`, wired at `wrangler/src/index.ts:643`). Refill accrues across a hold, capped at capacity, by design: the hold bounds the denial streak, not admissions, and a caller that honors the wait gets what an idle caller would (review sim, 100 rps for 600 s: 600 admits with the hold, 659 without). Fixtures `wrangler/test/redirect.test.ts:768-986` and `wrangler/test/redirect-worker.test.ts:102-132` prove alias folding, the unknown budget, the hold and refill across it, and a counting-down hold `Retry-After` through the handler and the Worker entry with no store lookup during the hold, while a refill denial still gets 1. Reserved-internal 404s and ticket/dispatch budgets have also landed. Residual (open): buckets are per isolate, not global, so quota does not survive other instances or restarts (a recycled or different isolate starts every caller full); 10,000 live keys in one isolate refuse new callers there, and one IPv6 prefix can still mint distinct keys; a map of idle keys drains on new-key traffic alone (fixed, TOG-12387). Still open: prove bounded collection/concurrency. The executor-level 429 governor is proven locally: the first intent returns `RateLimited(Global/Channel, retry_after_ms)`; a second genuinely new intent before that cooldown elapses is refused as `NoEffect(CoolingDown)` without a Discord send while other channels proceed, and a new intent proceeds only after the cooldown closes; the original key stays terminal throughout. Receiver wiring of one governor per token remains open (TOG-11045). No destructive live load tests. |
+| F7 / P2 current-public-surface and staging-only ingress (merged #370) | Worker/receiver owners: global edge/guild/caller quotas, bounded nonce/intent growth (redirect caller map, per-isolate probe limits, canonical caller identity, unknown budget and terminal 429 hold landed), the shared per-bot-token/channel cooldown governor fed by every `AnnouncementExecutor` 429 (landed; receiver must share one per token, TOG-11045), and total REST deadlines; preserve gateway resources | Landed for the Worker: bounded redirect caller map and public probe gate (TOG-12245, #259). `TokenBuckets` (`wrangler/src/redirect.ts:171-372`) idle-expires only fully refilled buckets, caps at 10,000 keys fail-closed and sweeps at most 64 per call; `/health`/`/readyz` take a separate `healthBuckets` budget before the Container (`wrangler/src/index.ts:99`, `:548-572`). Fixtures `wrangler/test/redirect.test.ts:589-766` prove idle reclamation, a fixed ceiling, churn that cannot reset a depleted caller, bounded sweep work and reap-before-refuse at the cap; `wrangler/test/health-probes.test.ts:122-147` proves the probe 429. **Landed (TOG-12469, #290):** canonical caller identity, so case, whitespace, IPv6 zone-id and `::ffff:` aliases share one bucket (`canonicalCallerKey`, `wrangler/src/redirect.ts:143-169`); one bounded `unknown` budget for callers with no edge signal, which cannot mint entries or starve valid callers; and a terminal hold after 25 straight denials (60 s) that retries can neither shorten nor extend (`take`, `:277-355`). **Landed (TOG-12533):** the redirect 429 forwards the bucket's own `Retry-After` (whole seconds, at least 1), so a held caller is told the remaining hold instead of a one-second retry loop (`:506-516`, wired at `wrangler/src/index.ts:643`). Refill accrues across a hold, capped at capacity, by design: the hold bounds the denial streak, not admissions, and a caller that honors the wait gets what an idle caller would (review sim, 100 rps for 600 s: 600 admits with the hold, 659 without). Fixtures `wrangler/test/redirect.test.ts:768-986` and `wrangler/test/redirect-worker.test.ts:102-132` prove alias folding, the unknown budget, the hold and refill across it, and a counting-down hold `Retry-After` through the handler and the Worker entry with no store lookup during the hold, while a refill denial still gets 1. Reserved-internal 404s and ticket/dispatch budgets have also landed. Residual (open): buckets are per isolate, not global, so quota does not survive other instances or restarts (a recycled or different isolate starts every caller full); 10,000 live keys in one isolate refuse new callers there, and one IPv6 prefix can still mint distinct keys; a map of idle keys drains on new-key traffic alone (fixed, TOG-12387). Byte/time collection is bounded in the merged path (2 MiB cap, 5 s body and 20 s request timeouts). Still open (Worker owner): prove bounded per-isolate concurrency under flood. The executor-level 429 governor is proven locally: the first intent returns `RateLimited(Global/Channel, retry_after_ms)`; a second genuinely new intent before that cooldown elapses is refused as `NoEffect(CoolingDown)` without a Discord send while other channels proceed, and a new intent proceeds only after the cooldown closes; the original key stays terminal throughout. Receiver wiring of one governor per token remains open (TOG-11045). No destructive live load tests. |
 | F8 / P1 receiver clock-policy gate | Landed: `ClockGuard` high-water policy (`crates/core/src/clock_guard.rs`, 5 s tolerance) enforced on the memory pipeline (`crates/core/src/internal_actions.rs:1540`) and the durable burn (`crates/core/src/internal_action_store.rs:270` + `0353_internal_clock_high_water.sql`); restart/failover restores `nonce_high_water_ms`; bounded state (mark only, no per-nonce history) | Accept a capture, expire/sweep/replace its nonce, then roll time back into its signed window: memory and durable paths refuse, including across instance restart/failover and lock waits — pinned by `pipeline_clock_rollback_after_nonce_expiry_refuses_capture` and `nonce_db_rollback_after_expiry_refuses_capture`. Cleanup (including transcript/intent retention) must not erase replay protection. Legitimate traffic resumes only under that verified policy. |
 
-F1/F2/F8 are requirements for the existing receiver slice, not new route work in
-this PR. F6 is evidence required at deployment, not authorization to touch secrets.
+F1/F2/F8 are requirements for the merged receiver above, not closed by this
+refresh. F6 is evidence required at deployment, not authorization to touch secrets.
 The other rows are follow-up proposals, not granted resources, new holds on
 unrelated staging work or claims of completed remediation. None of the prior
 follow-ups are closed by this refresh; owners above are re-affirmed. Update this
