@@ -2377,7 +2377,6 @@ mod tests {
     /// message-lane work proves a Bypassed create never reaches `on_message`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn gateway_worker_trigger_gate_posts_no_sticky_for_bypassed_while_accept_dispatches() {
-        use std::future::Future;
         use two_bot_core::automod_runtime::{
             AutomodClaimLedger, AutomodMatch, AutomodRuntime, AutomodScope, DeliveryKey,
             FunnelDisposition, LedgerClaim, MessageDelivery, MessageDeliveryKind, MessageSubject,
@@ -2397,64 +2396,50 @@ mod tests {
         impl AutomodClaimLedger for AcceptLedger {
             type Claim = UnitClaim;
             type Error = String;
-            fn ledger_claim(
+            async fn ledger_claim(
                 &self,
                 _: &DeliveryKey,
-            ) -> impl Future<Output = Result<LedgerClaim<UnitClaim>, String>> + Send {
-                async { Ok(LedgerClaim::Acquired(UnitClaim)) }
+            ) -> Result<LedgerClaim<UnitClaim>, String> {
+                Ok(LedgerClaim::Acquired(UnitClaim))
             }
-            fn ledger_preserve(
+            async fn ledger_preserve(
                 &self,
                 _: &UnitClaim,
                 _: &AutomodMatch,
-            ) -> impl Future<Output = Result<bool, String>> + Send {
-                async { Ok(false) }
+            ) -> Result<bool, String> {
+                Ok(false)
             }
-            fn ledger_mark_started(
-                &self,
-                _: &UnitClaim,
-            ) -> impl Future<Output = Result<bool, String>> + Send {
-                async { Ok(true) }
+            async fn ledger_mark_started(&self, _: &UnitClaim) -> Result<bool, String> {
+                Ok(true)
             }
-            fn ledger_complete(
+            async fn ledger_complete(
                 &self,
                 _: &UnitClaim,
                 _: &StoredOutcome,
-            ) -> impl Future<Output = Result<bool, String>> + Send {
-                async { Ok(true) }
+            ) -> Result<bool, String> {
+                Ok(true)
             }
-            fn ledger_release(
-                &self,
-                _: &UnitClaim,
-            ) -> impl Future<Output = Result<bool, String>> + Send {
-                async { Ok(true) }
+            async fn ledger_release(&self, _: &UnitClaim) -> Result<bool, String> {
+                Ok(true)
             }
-            fn ledger_record(
+            async fn ledger_record(
                 &self,
                 _: &UnitClaim,
                 _: &MessageSubject,
                 _: AutomodFilter,
                 _: &str,
-            ) -> impl Future<Output = Result<ViolationRecord, String>> + Send {
-                async { Err("unused".to_owned()) }
+            ) -> Result<ViolationRecord, String> {
+                Err("unused".to_owned())
             }
         }
 
         struct NeverFacts;
         impl AutomodFacts for NeverFacts {
-            fn fetch_message(
-                &self,
-                _: &str,
-                _: &str,
-                _: &str,
-            ) -> impl Future<Output = Option<FetchedMessage>> + Send {
-                async { None }
+            async fn fetch_message(&self, _: &str, _: &str, _: &str) -> Option<FetchedMessage> {
+                None
             }
-            fn target_facts(
-                &self,
-                _: &MessageSubject,
-            ) -> impl Future<Output = Option<TargetFacts>> + Send {
-                async { None }
+            async fn target_facts(&self, _: &MessageSubject) -> Option<TargetFacts> {
+                None
             }
         }
 
@@ -2526,19 +2511,11 @@ mod tests {
         };
         struct NeverFactsAgain;
         impl AutomodFacts for NeverFactsAgain {
-            fn fetch_message(
-                &self,
-                _: &str,
-                _: &str,
-                _: &str,
-            ) -> impl Future<Output = Option<FetchedMessage>> + Send {
-                async { None }
+            async fn fetch_message(&self, _: &str, _: &str, _: &str) -> Option<FetchedMessage> {
+                None
             }
-            fn target_facts(
-                &self,
-                _: &MessageSubject,
-            ) -> impl Future<Output = Option<TargetFacts>> + Send {
-                async { None }
+            async fn target_facts(&self, _: &MessageSubject) -> Option<TargetFacts> {
+                None
             }
         }
         let accept_activation = AutomodActivation::new(
