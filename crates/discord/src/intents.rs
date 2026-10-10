@@ -41,6 +41,26 @@ pub fn gateway_intents(message_content: bool) -> Intents {
     }
 }
 
+/// Privileged `GUILD_PRESENCES` for voice-room names: requested only when
+/// voice rooms are on (`TWO_VOICE=1`) and the deployment opts in with
+/// `TWO_VOICE_PRESENCE=1` (both exact). The Developer Portal "Presence Intent"
+/// switch must be on first, or Discord closes the gateway with 4014; keeping
+/// the flag off by default means a bot without that grant always starts.
+#[must_use]
+pub fn needs_voice_presences(env_voice: &str, env_voice_presence: &str) -> bool {
+    env_voice == "1" && env_voice_presence == "1"
+}
+
+/// `intents` plus `GUILD_PRESENCES` when `presences` is true.
+#[must_use]
+pub fn with_presences(intents: Intents, presences: bool) -> Intents {
+    if presences {
+        intents | Intents::GUILD_PRESENCES
+    } else {
+        intents
+    }
+}
+
 /// Whether privileged `MESSAGE_CONTENT` is justified, mirroring legacy
 /// `needsMessageContent`: enabled automod (`TWO_AUTOMOD === '1'`, exact
 /// match) or configured tickets (all three of
@@ -77,6 +97,21 @@ pub fn cache_resource_types() -> ResourceType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presences_need_voice_and_the_explicit_flag() {
+        assert!(needs_voice_presences("1", "1"));
+        for (voice, presence) in [("1", ""), ("1", "0"), ("1", "true"), ("", "1"), ("0", "1")] {
+            assert!(
+                !needs_voice_presences(voice, presence),
+                "{voice:?} {presence:?}"
+            );
+        }
+        let base = gateway_intents(false);
+        assert!(!base.contains(Intents::GUILD_PRESENCES));
+        assert_eq!(with_presences(base, false), base);
+        assert_eq!(with_presences(base, true), base | Intents::GUILD_PRESENCES);
+    }
 
     #[test]
     fn guild_members_always_requested() {

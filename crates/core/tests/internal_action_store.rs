@@ -5,8 +5,9 @@
 use sqlx::{PgPool, Row};
 use two_bot_core::clock_guard::ClockGuard;
 use two_bot_core::internal_action_store::{
-    AuditSubject, DiscordId, ExecutionClaim, InternalActionStore, InternalClaim,
+    AuditSubject, DiscordId, EventOutcome, ExecutionClaim, InternalActionStore, InternalClaim,
     InternalStoreError, ReconciliationEvidence, RequestIdentity, TerminalFailure, TerminalResponse,
+    UnknownEventIntent,
 };
 use two_bot_core::secret::Secret;
 use two_bot_core::{body_hash, CLAIM_STALE_SECONDS, NONCE_TTL_SECONDS, SKEW_SECONDS};
@@ -600,6 +601,7 @@ fn success() -> TerminalResponse {
     TerminalResponse::Success {
         resource_id: Some(DiscordId::new("345678901234567890").unwrap()),
         affected: 2,
+        outcome: None,
     }
 }
 
@@ -1020,6 +1022,90 @@ async fn stale_and_unknown_claims_never_reexecute_and_reconciliation_is_terminal
 }
 
 #[tokio::test]
+async fn event_outcome_persists_and_replays_the_recorded_response() {
+    let db = TestDb::new().await;
+    let store = db.store();
+    for (key, outcome) in [
+        ("outcome-create:123", EventOutcome::Created),
+        ("outcome-update:123", EventOutcome::Updated),
+        ("outcome-cancel:123", EventOutcome::Cancelled),
+    ] {
+        let id = identity(key, "event.upsert", b"{\"event_key\":\"launch\"}");
+        let claim = claimed(store.claim(&id, &subject()).await.unwrap());
+        let receipt = TerminalResponse::Success {
+            resource_id: Some(DiscordId::new("345678901234567890").unwrap()),
+            affected: 1,
+            outcome: Some(outcome),
+        };
+        store.finish(&claim, &receipt).await.unwrap();
+        assert!(
+            matches!(store.claim(&id, &subject()).await.unwrap(), InternalClaim::Replay(r) if r == receipt),
+            "replay must return the recorded outcome, never a re-derived one"
+        );
+    }
+    // Announcement receipts carry no outcome: NULL persists and replays as None.
+    let legacy = identity("outcome-legacy:123", "announcement.post", b"{}");
+    let claim = claimed(store.claim(&legacy, &subject()).await.unwrap());
+    store.finish(&claim, &success()).await.unwrap();
+    assert!(
+        matches!(store.claim(&legacy, &subject()).await.unwrap(), InternalClaim::Replay(r) if r == success())
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn terminal_audit_names_receipt_resource_and_outcome() {
+    let db = TestDb::new().await;
+    let store = db.store();
+    // An event.upsert create claims with the guild alone as its subject, so
+    // the intent audit names no target: the terminal audit must still name
+    // the Discord event and the result word from the completed receipt.
+    let created = AuditSubject {
+        guild_id: Some(DiscordId::new("123456789012345678").unwrap()),
+        ..AuditSubject::default()
+    };
+    let id = identity(
+        "audit-create:123",
+        "event.upsert",
+        b"{\"event_key\":\"launch\"}",
+    );
+    let claim = claimed(store.claim(&id, &created).await.unwrap());
+    let intent_id = claim.intent_id();
+    let receipt = TerminalResponse::Success {
+        resource_id: Some(DiscordId::new("345678901234567890").unwrap()),
+        affected: 1,
+        outcome: Some(EventOutcome::Created),
+    };
+    store.finish(&claim, &receipt).await.unwrap();
+    let intent: (Option<String>, Option<i64>, Option<String>) = sqlx::query_as(
+        "SELECT resource_id, affected, outcome FROM internal_action_log \
+         WHERE intent_id = $1 AND phase = 'intent'",
+    )
+    .bind(intent_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(intent, (None, None, None));
+    let terminal: (Option<String>, Option<i64>, Option<String>) = sqlx::query_as(
+        "SELECT resource_id, affected, outcome FROM internal_action_log \
+         WHERE intent_id = $1 AND phase = 'terminal'",
+    )
+    .bind(intent_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        terminal,
+        (
+            Some("345678901234567890".to_owned()),
+            Some(1),
+            Some("created".to_owned())
+        )
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn audit_failures_roll_back_claim_and_terminal_without_leaking_details() {
     let db = TestDb::new().await;
     let store = db.store();
@@ -1251,5 +1337,361 @@ async fn event_key_map_refuses_misshapen_inputs() {
             "{guild}/{key}"
         );
     }
+    db.cleanup().await;
+}
+
+fn event_subject(guild: &str) -> AuditSubject {
+    AuditSubject {
+        guild_id: Some(DiscordId::new(guild).unwrap()),
+        actor_id: None,
+        target_id: None,
+        resolved_role_id: None,
+    }
+}
+
+async fn unknown_event(
+    store: &InternalActionStore,
+    key: &str,
+    action: &str,
+    guild: &str,
+) -> ExecutionClaim {
+    let id = identity(key, action, b"{\"event_key\":\"launch\"}");
+    let claim = claimed(store.claim(&id, &event_subject(guild)).await.unwrap());
+    store.mark_unknown(&claim).await.unwrap();
+    claim
+}
+
+fn created_receipt(event_id: &str) -> TerminalResponse {
+    TerminalResponse::Success {
+        resource_id: Some(DiscordId::new(event_id).unwrap()),
+        affected: 1,
+        outcome: Some(EventOutcome::Created),
+    }
+}
+
+#[tokio::test]
+async fn unknown_event_list_names_only_guild_unknown_events_oldest_first() {
+    let db = TestDb::new().await;
+    let store = db.store();
+    // Non-event unknowns and completed event intents are never listed.
+    let member = unknown_event(
+        &store,
+        "unknown-list-member:1",
+        "guild.add_member",
+        EVENT_GUILD,
+    )
+    .await;
+    let done = claimed(
+        store
+            .claim(
+                &identity(
+                    "unknown-list-done:1",
+                    "event.upsert",
+                    b"{\"event_key\":\"launch\"}",
+                ),
+                &event_subject(EVENT_GUILD),
+            )
+            .await
+            .unwrap(),
+    );
+    store
+        .finish(&done, &created_receipt(MAPPED_EVENT))
+        .await
+        .unwrap();
+    let first = unknown_event(&store, "unknown-list-first:1", "event.upsert", EVENT_GUILD).await;
+    let second = unknown_event(&store, "unknown-list-second:1", "event.cancel", EVENT_GUILD).await;
+    let other = unknown_event(&store, "unknown-list-other:1", "event.upsert", OTHER_GUILD).await;
+    assert!(member.intent_id() > 0 && other.intent_id() > 0);
+    let rows: Vec<UnknownEventIntent> =
+        store.list_unknown_event_intents(EVENT_GUILD).await.unwrap();
+    assert_eq!(
+        rows.iter().map(|row| row.intent_id).collect::<Vec<_>>(),
+        vec![first.intent_id(), second.intent_id()]
+    );
+    assert_eq!(rows[0].action, "event.upsert");
+    assert_eq!(rows[1].action, "event.cancel");
+    for row in &rows {
+        assert_eq!(row.created_at_utc.len(), 19, "UTC YYYY-MM-DD HH:MM:SS");
+    }
+    let other_rows = store.list_unknown_event_intents(OTHER_GUILD).await.unwrap();
+    assert_eq!(
+        other_rows
+            .iter()
+            .map(|row| row.intent_id)
+            .collect::<Vec<_>>(),
+        vec![other.intent_id()]
+    );
+    assert_eq!(
+        store.list_unknown_event_intents("not-a-snowflake").await,
+        Err(InternalStoreError::InvalidInput)
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn resolve_event_create_heals_mapping_and_replays_created() {
+    let db = TestDb::new().await;
+    let store = db.store();
+    // A create whose mapping write failed: Discord holds the event, the key
+    // resolves to nothing.
+    let claim = unknown_event(&store, "unknown-heal-create:1", "event.upsert", EVENT_GUILD).await;
+    assert_eq!(
+        store.event_id_for_key(EVENT_GUILD, "launch").await.unwrap(),
+        None
+    );
+    let receipt = created_receipt(MAPPED_EVENT);
+    store
+        .resolve_event_intent(
+            claim.intent_id(),
+            "event.upsert",
+            EVENT_GUILD,
+            Some(("launch", MAPPED_EVENT)),
+            &receipt,
+            ReconciliationEvidence::DiscordConfirmedEffect,
+        )
+        .await
+        .unwrap();
+    // Mapping and terminal receipt commit together: replay serves the healed
+    // create, never a second effect.
+    assert_eq!(
+        store.event_id_for_key(EVENT_GUILD, "launch").await.unwrap(),
+        Some(MAPPED_EVENT.to_owned())
+    );
+    assert!(
+        matches!(store.claim(&identity("unknown-heal-create:1", "event.upsert", b"{\"event_key\":\"launch\"}"), &event_subject(EVENT_GUILD)).await.unwrap(), InternalClaim::Replay(r) if r == receipt)
+    );
+    let evidence: String = sqlx::query_scalar(
+        "SELECT evidence_code FROM internal_action_log WHERE intent_id = $1 AND phase = 'terminal'",
+    )
+    .bind(claim.intent_id())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(evidence, "discord_confirmed_effect");
+    // A resolved intent is terminal: resolving again refuses.
+    assert_eq!(
+        store
+            .resolve_event_intent(
+                claim.intent_id(),
+                "event.upsert",
+                EVENT_GUILD,
+                Some(("launch", MAPPED_EVENT)),
+                &receipt,
+                ReconciliationEvidence::DiscordConfirmedEffect,
+            )
+            .await,
+        Err(InternalStoreError::TransitionRefused)
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn resolve_event_cancel_retains_mapping_and_replays_cancelled() {
+    let db = TestDb::new().await;
+    let store = db.store();
+    store
+        .put_event_key(EVENT_GUILD, "launch", MAPPED_EVENT)
+        .await
+        .unwrap();
+    let claim = unknown_event(&store, "unknown-heal-cancel:1", "event.cancel", EVENT_GUILD).await;
+    let receipt = TerminalResponse::Success {
+        resource_id: Some(DiscordId::new(MAPPED_EVENT).unwrap()),
+        affected: 1,
+        outcome: Some(EventOutcome::Cancelled),
+    };
+    store
+        .resolve_event_intent(
+            claim.intent_id(),
+            "event.cancel",
+            EVENT_GUILD,
+            None,
+            &receipt,
+            ReconciliationEvidence::DiscordConfirmedEffect,
+        )
+        .await
+        .unwrap();
+    // Cancel resolutions never rewrite mappings: the retained row survives so
+    // a later edit cannot silently recreate the event.
+    assert_eq!(
+        store.event_id_for_key(EVENT_GUILD, "launch").await.unwrap(),
+        Some(MAPPED_EVENT.to_owned())
+    );
+    assert!(
+        matches!(store.claim(&identity("unknown-heal-cancel:1", "event.cancel", b"{\"event_key\":\"launch\"}"), &event_subject(EVENT_GUILD)).await.unwrap(), InternalClaim::Replay(r) if r == receipt)
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn resolve_event_no_effect_records_failure_without_mapping() {
+    let db = TestDb::new().await;
+    let store = db.store();
+    let claim = unknown_event(&store, "unknown-no-effect:1", "event.upsert", EVENT_GUILD).await;
+    let failure = TerminalResponse::Failure(TerminalFailure::NoEffect);
+    store
+        .resolve_event_intent(
+            claim.intent_id(),
+            "event.upsert",
+            EVENT_GUILD,
+            None,
+            &failure,
+            ReconciliationEvidence::DiscordConfirmedNoEffect,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.event_id_for_key(EVENT_GUILD, "launch").await.unwrap(),
+        None
+    );
+    assert!(
+        matches!(store.claim(&identity("unknown-no-effect:1", "event.upsert", b"{\"event_key\":\"launch\"}"), &event_subject(EVENT_GUILD)).await.unwrap(), InternalClaim::Replay(r) if r == failure)
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn resolve_event_intent_refuses_mismatched_rows_and_shapes() {
+    let db = TestDb::new().await;
+    let store = db.store();
+    let claim = unknown_event(&store, "unknown-refuse:1", "event.upsert", EVENT_GUILD).await;
+    let id = claim.intent_id();
+    let created = created_receipt(MAPPED_EVENT);
+    let cancelled = TerminalResponse::Success {
+        resource_id: Some(DiscordId::new(MAPPED_EVENT).unwrap()),
+        affected: 1,
+        outcome: Some(EventOutcome::Cancelled),
+    };
+    let effect = ReconciliationEvidence::DiscordConfirmedEffect;
+    // Wrong guild, wrong action, and unknown intent ids never resolve.
+    // Each case uses a shape-valid mapping/response for its action so the
+    // row-mismatch refusal (not the shape refusal) is what fires: cancels
+    // carry no mapping, upserts do.
+    for (intent, action, guild, mapping, response) in [
+        (
+            id,
+            "event.upsert",
+            OTHER_GUILD,
+            Some(("launch", MAPPED_EVENT)),
+            &created,
+        ),
+        (id, "event.cancel", EVENT_GUILD, None, &cancelled),
+        (
+            id + 10_000,
+            "event.upsert",
+            EVENT_GUILD,
+            Some(("launch", MAPPED_EVENT)),
+            &created,
+        ),
+    ] {
+        assert_eq!(
+            store
+                .resolve_event_intent(intent, action, guild, mapping, response, effect)
+                .await,
+            Err(InternalStoreError::TransitionRefused),
+            "{action}/{guild}"
+        );
+    }
+    // Still fenced: the exact resolution still lands afterwards.
+    store
+        .resolve_event_intent(
+            id,
+            "event.upsert",
+            EVENT_GUILD,
+            Some(("launch", MAPPED_EVENT)),
+            &created,
+            effect,
+        )
+        .await
+        .unwrap();
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn resolve_event_intent_refuses_invalid_evidence_and_mappings() {
+    let db = TestDb::new().await;
+    let store = db.store();
+    let claim = unknown_event(&store, "unknown-shape:1", "event.upsert", EVENT_GUILD).await;
+    let id = claim.intent_id();
+    let created = created_receipt(MAPPED_EVENT);
+    let no_effect = TerminalResponse::Failure(TerminalFailure::NoEffect);
+    let malformed = TerminalResponse::Failure(TerminalFailure::Malformed);
+    let effect = ReconciliationEvidence::DiscordConfirmedEffect;
+    let no_effect_evidence = ReconciliationEvidence::DiscordConfirmedNoEffect;
+    // Evidence must support the response; only success/no-effect responses
+    // are operator evidence; mapping shape must match the resolution kind.
+    for (action, guild, mapping, response, evidence) in [
+        (
+            "event.upsert",
+            EVENT_GUILD,
+            Some(("launch", MAPPED_EVENT)),
+            &created,
+            ReconciliationEvidence::ProvenNotSent,
+        ),
+        (
+            "event.upsert",
+            EVENT_GUILD,
+            Some(("launch", MAPPED_EVENT)),
+            &malformed,
+            effect,
+        ),
+        ("event.upsert", EVENT_GUILD, None, &created, effect),
+        (
+            "event.upsert",
+            EVENT_GUILD,
+            Some(("launch", MAPPED_EVENT)),
+            &no_effect,
+            no_effect_evidence,
+        ),
+        (
+            "event.upsert",
+            EVENT_GUILD,
+            Some(("launch", "100000000000000007")),
+            &created,
+            effect,
+        ),
+        (
+            "event.cancel",
+            EVENT_GUILD,
+            Some(("launch", MAPPED_EVENT)),
+            &created,
+            effect,
+        ),
+        (
+            "role.assign",
+            EVENT_GUILD,
+            None,
+            &no_effect,
+            no_effect_evidence,
+        ),
+        (
+            "event.upsert",
+            "not-a-snowflake",
+            None,
+            &no_effect,
+            no_effect_evidence,
+        ),
+    ] {
+        assert_eq!(
+            store
+                .resolve_event_intent(id, action, guild, mapping, response, evidence)
+                .await,
+            Err(InternalStoreError::InvalidInput),
+            "{action}/{guild}"
+        );
+    }
+    // Non-positive intent ids refuse before any row lock.
+    assert_eq!(
+        store
+            .resolve_event_intent(
+                0,
+                "event.upsert",
+                EVENT_GUILD,
+                None,
+                &no_effect,
+                no_effect_evidence
+            )
+            .await,
+        Err(InternalStoreError::InvalidInput)
+    );
     db.cleanup().await;
 }
