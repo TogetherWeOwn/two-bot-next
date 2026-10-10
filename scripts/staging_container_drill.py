@@ -548,7 +548,8 @@ class Drill:
             deployed, deploy_elapsed, expect_rollout = fenced, 0.0, False
         leg["deployed"] = iso(deployed)
         leg["deploy_elapsed_seconds"] = deploy_elapsed
-        self.control("deployment-takeover", release_fence=True)
+        self.control("deployment-takeover", release_fence=True,
+                     expected_deployment=pin["worker_version"])
         taken = self.stamp(f"{name}: ownership taken")
         leg["takeover"] = iso(taken)
         target_worker = serving_version(self.client)
