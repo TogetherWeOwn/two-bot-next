@@ -745,13 +745,14 @@ fn apply_dispatch<I: InviteSource>(
                 dispatch_error = Some(leveling_dispatch_failure());
             }
         }
-        // Community facts: drain buffered message_created and rules_accepted
-        // writes on every dispatch, even when no XP award queued — bots,
-        // webhooks and staff automation capture facts but never awards, so
-        // gating on `requests` would leak the buffer. A failed write never
-        // stalls the worker
-        // (audit precedent): warn and continue; the scorecard fails closed
-        // on missing coverage.
+        // Community facts: drain buffered voice_session_started/ended,
+        // message_created and rules_accepted writes on every dispatch, even
+        // when no XP award queued — bots, webhooks and staff automation
+        // capture facts but never awards, and a move's end+start pair
+        // buffers two rows for one frame, so gating on `requests` would leak
+        // the buffer. A failed write never stalls the worker (audit
+        // precedent): warn and continue; the scorecard fails closed on
+        // missing coverage.
         let drained = handle.block_on(tokio::time::timeout(deadline, pipeline.drain_facts()));
         count_community_facts_drain_failure(two_bot_core::metrics::global(), &drained);
         match drained {
