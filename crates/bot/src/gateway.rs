@@ -2455,10 +2455,11 @@ mod tests {
                 &two_bot_core::now_iso(),
                 two_bot_discord::MessageEligibility::default(),
             );
-            assert_eq!(
-                scratch.drain_facts().await.expect("scratch drain"),
-                1,
-                "fixture join must buffer one community fact"
+            // A join buffers its member fact plus the member_joined fact
+            // (#683); the precondition is only that the drain is non-empty.
+            assert!(
+                scratch.drain_facts().await.expect("scratch drain") >= 1,
+                "fixture join must buffer at least one community fact"
             );
         }
         #[derive(Clone)]
