@@ -14,8 +14,8 @@ import uuid
 
 MIB = 1024 * 1024
 IMAGE_MAX_BYTES = 112 * MIB
-# Recalibrated for the linked S4 self-role runtime (TOG-10292): PR head
-# measured 10,805,344 bytes (10.30 MiB) on the ephemeral runner vs main
+# Recalibrated for the linked S4 self-role runtime: PR head measured
+# 10,805,344 bytes (10.30 MiB) on the ephemeral runner vs main
 # baseline 10,377,112 bytes (9.90 MiB) at ec49663. Growth is linked
 # runtime/handlers/REST + previously-dead domain/store code, no new
 # dependencies; release profile already minimal (opt-level=z, lto, strip).
