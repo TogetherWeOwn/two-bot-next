@@ -439,6 +439,65 @@ class CadenceTest(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn("PASS jobs-map:", out)
 
+    def test_degraded_503_with_failing_jobs_stays_green(self):
+        # Truthful 503 (database down) without --expect-ready grades
+        # truthfulness, not scheduler progress: failing jobs stay green.
+        now_ms = int(time.time() * 1000)
+        body = (503, json.dumps({
+            "components": [["process", "ready"], ["gateway", "ready"],
+                           ["database", "down"]],
+            "jobs": {"counter": {"parked": False, "running": True,
+                                 "consecutive_failures": 3,
+                                 "last_error_class": "database",
+                                 "last_start": now_ms - 5_000}},
+            "build_revision": "r", "build_id": "b",
+        }).encode())
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+        self.assertIn("freshness not graded", out)
+
+    def test_degraded_503_with_failing_jobs_fails_expect_ready(self):
+        # The strict gate grades freshness too: the same degraded report
+        # fails jobs-map once --expect-ready is set.
+        now_ms = int(time.time() * 1000)
+        body = (503, json.dumps({
+            "components": [["process", "ready"], ["gateway", "ready"],
+                           ["database", "down"]],
+            "jobs": {"counter": {"parked": False, "running": True,
+                                 "consecutive_failures": 3,
+                                 "last_error_class": "database",
+                                 "last_start": now_ms - 5_000}},
+            "build_revision": "r", "build_id": "b",
+        }).encode())
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/", "--expect-ready")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL jobs-map:", out)
+        self.assertIn("counter", out)
+
+    def test_mixed_report_counts_are_honest(self):
+        # Only jobs graded against a fresh last_success count as fresh;
+        # ungraded (feeds/unknown) and not-yet-run jobs are reported
+        # separately, and the receipt must not overstate verification.
+        body = readyz_with_jobs({
+            "feeds": (False, 10 ** 6),
+            "brand_new_job": (False, 10 ** 6),
+            "counter": (False, None),
+            "rank": (False, 10),
+            "inactivity": (True, 10 ** 6),
+        })
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+        self.assertIn("1 jobs fresh within cadence", out)
+        self.assertIn("2 ungraded (brand_new_job, feeds)", out)
+        self.assertIn("1 not yet run", out)
+        self.assertIn("1 parked", out)
+        self.assertNotIn("4 jobs fresh", out)
+
 
 if __name__ == "__main__":
     unittest.main()

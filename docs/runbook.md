@@ -64,7 +64,8 @@ origin as `--base-url` (or `QA_PROBE_BASE_URL`); add `--expect-ready` only when
 the gate needs the service itself ready. A parked preview (truthful 503) stays
 green without the flag. Each probe line cites the code path it checks. The five
 probes cover liveness, the readyz breakdown shape, gateway truthfulness, the
-informational jobs map, and that the body is the container's breakdown rather
+jobs map (freshness-graded when ready or with --expect-ready, otherwise
+informational), and that the body is the container's breakdown rather
 than an ownership-fence refusal.
 
 The container listens on `LISTEN_ADDR` (default `0.0.0.0:8080`). The Worker

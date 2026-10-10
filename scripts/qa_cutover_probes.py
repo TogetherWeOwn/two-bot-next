@@ -28,12 +28,15 @@ Probes and the code path each one checks:
                    crates/bot/src/server.rs readiness_after_ping.
   jobs-map         /readyz carries the informational jobs map (each entry
                    with boolean parked/running). Jobs never flip readiness,
-                   but every unparked job with a known code-constant cadence
-                   must show a recent last_success: a job older than its
-                   max_last_success_age_seconds (2x cadence + timeout) fails
-                   and is named; a job with no success but failed attempts
-                   (consecutive_failures > 0, or a last_start older than the
-                   fail line) fails and is named. feeds is ungraded (its
+                   but when the service reports ready (200) or --expect-ready
+                   is set, every unparked job with a known code-constant
+                   cadence must show a recent last_success: a job older than
+                   its max_last_success_age_seconds (2x cadence + timeout)
+                   fails and is named; a job with no success but failed
+                   attempts (consecutive_failures > 0, or a last_start older
+                   than the fail line) fails and is named. While degraded
+                   without --expect-ready the jobs map stays informational so
+                   a truthful parked 503 stays green. feeds is ungraded (its
                    cadence is env-configured), as is any unknown job name.
                    Source: crates/bot/src/jobs.rs statuses,
                    crates/bot/src/server.rs failing_jobs test.
@@ -43,9 +46,11 @@ Probes and the code path each one checks:
                    Source: wrangler/src/ownership.ts, wrangler/src/index.ts.
 
 A parked preview (503, gateway down, database down) is a PASS: the probe
-grades truthfulness, not service readiness. Pass --expect-ready when the
-cutover gate needs the service itself ready (200, gateway ready); then a
-parked-but-truthful server fails gateway-state.
+grades truthfulness, not service readiness, and the jobs map is not graded
+for freshness while degraded. Pass --expect-ready when the cutover gate
+needs the service itself ready (200, gateway ready); then a
+parked-but-truthful server fails gateway-state and stale/failing jobs fail
+jobs-map.
 
 Usage:
   python3 scripts/qa_cutover_probes.py --base-url URL [--expect-ready]
@@ -286,7 +291,7 @@ def consecutive_failures(entry):
     return max(0, int(failures))
 
 
-def check_jobs(report, now_ms=None):
+def check_jobs(report, now_ms=None, enforce_freshness=True):
     jobs = report.get("jobs")
     if not isinstance(jobs, dict) or not jobs:
         raise ProbeError("/readyz carries no informational jobs map")
@@ -299,7 +304,17 @@ def check_jobs(report, now_ms=None):
         raise ProbeError(f"/readyz jobs map has malformed entries: {shown}")
     if now_ms is None:
         now_ms = int(time.time() * 1000)
-    stale, warns, parked = [], [], 0
+    parked_while_degraded = sum(1 for entry in jobs.values()
+                                if entry.get("parked"))
+    if not enforce_freshness:
+        # Degraded without --expect-ready: the probe grades truthfulness, not
+        # scheduler progress, so a truthful parked 503 stays green.
+        return (f"{len(jobs)} jobs reported while degraded: freshness not "
+                f"graded ({parked_while_degraded} parked; informational, "
+                f"never gates readiness)")
+    stale, warns = [], []
+    parked, fresh, not_yet = 0, 0, 0
+    ungraded = []
     for name in sorted(jobs):
         entry = jobs[name]
         if entry.get("parked"):
@@ -307,7 +322,10 @@ def check_jobs(report, now_ms=None):
             continue
         limit = MAX_LAST_SUCCESS_AGE_SECONDS.get(name)
         if limit is None:
-            continue  # unknown job: a newer build's cadence is not ours to grade
+            # feeds (env-configured cadence) or a newer build's unknown job:
+            # not ours to grade, and never counted as verified fresh.
+            ungraded.append(name)
+            continue
         age = job_age_seconds(entry, now_ms)
         if age is None:
             # No success recorded yet. A fresh boot (no attempts yet) is not
@@ -326,18 +344,26 @@ def check_jobs(report, now_ms=None):
             if started is not None and started > limit:
                 stale.append(f"{name}=last_start {started}s ago with no "
                              f"success (>{limit}s)")
+                continue
+            not_yet += 1
             continue  # never ran yet; not evidence of stuck
         if age > limit:
             stale.append(f"{name}={age}s > {limit}s")
-        elif age > WARN_LAST_SUCCESS_AGE_SECONDS[name]:
-            warns.append(f"{name}={age}s")
+        else:
+            fresh += 1
+            if age > WARN_LAST_SUCCESS_AGE_SECONDS[name]:
+                warns.append(f"{name}={age}s")
     if stale:
         shown = ", ".join(stale)
         raise ProbeError(f"stale jobs past max_last_success_age_seconds or "
                          f"failing with no success: {shown}")
-    fresh = len(jobs) - parked
-    reason = (f"{fresh} jobs fresh within cadence, {parked} parked "
-              f"(informational; never gates readiness)")
+    parts = [f"{fresh} jobs fresh within cadence"]
+    if ungraded:
+        parts.append(f"{len(ungraded)} ungraded ({', '.join(sorted(ungraded))})")
+    if not_yet:
+        parts.append(f"{not_yet} not yet run")
+    parts.append(f"{parked} parked")
+    reason = ", ".join(parts) + " (informational; never gates readiness)"
     if warns:
         reason += f" [warn: {', '.join(warns)}]"
     return reason
@@ -395,7 +421,9 @@ def run(args, fetch_fn=None):
                           f"{SRC_SERVER}, {SRC_HEALTH}"))
     record("gateway-state", SRC_GATEWAY, check_gateway, state,
            readyz_status, args.expect_ready)
-    record("jobs-map", SRC_JOBS, check_jobs, report)
+    enforce = readyz_status == 200 or bool(args.expect_ready)
+    record("jobs-map", SRC_JOBS,
+           lambda rep: check_jobs(rep, enforce_freshness=enforce), report)
     if isinstance(report, dict) and report.get("error"):
         results.append(Result("fence-watch", False,
                               f"container breakdown carries error {report.get('error')!r:.40}",
