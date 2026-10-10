@@ -5,7 +5,9 @@
 The container source integrates an opt-in private `POST /internal/actions`
 listener with the durable store, nonce-commit authentication capability and
 strict receiver configuration. It wires only `announcement.post`, the keyless
-`event.read`, `moderation.timeout` and the membership pair (`role.assign`
+`event.read`, the restrictive member verbs `moderation.ban`,
+`moderation.tempban`, `moderation.kick`, `moderation.warn` and
+`moderation.timeout`, and the membership pair (`role.assign`
 through the allowlisted role-key map, `guild.add_member` behind its own
 allowlist flag with a transient OAuth token), regardless of the core action
 catalogue's broader defaults. Every other verb stays refused by the per-effect
