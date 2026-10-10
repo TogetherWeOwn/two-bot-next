@@ -51,6 +51,14 @@ rejection (typically 400). A 404 is also `discord_rejected`, not a fabricated
 successful cancellation. Same-key idempotency is durable replay of the first
 result. No 429, 5xx or uncertain mutation is automatically retried here.
 
+Status classification shares one helper with the announcement transport:
+`two_bot_discord::executor::is_definitive_rejection` (400/401/403/404/405 plus
+413/415/422). 404 proves absence, 413/415/422 prove Discord validated before
+mutating, so all four are terminal `discord_rejected` on every event call
+(create/update/cancel/read), release the send-admission lane on receipt, and
+never retain the execution fence. 408, redirects, 409, 425 and 5xx stay
+uncertain (`needs_reconciliation` on the mutation path).
+
 An upsert whose mapped event was deleted in Discord fails the same way: its PATCH
 404 is `discord_rejected`, and the mapping is kept. That key needs an operator to
 clear the mapping before a new create. Classifying that 404 as absence is a

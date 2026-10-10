@@ -348,10 +348,12 @@ impl AnnouncementExecutor {
         if let Some(ready) = &self.response_received {
             ready.notify_one();
         }
-        match response.status().as_u16() {
-            // Narrow confirmed-rejection allowlist. 408, other statuses,
+        let status = response.status().as_u16();
+        match status {
+            // Shared confirmed-rejection allowlist (see
+            // `crate::executor::is_definitive_rejection`). 408, other statuses,
             // redirects and 5xx are NOT proof of no message being created.
-            400 | 401 | 403 | 404 | 405 | 413 | 415 | 422 => {
+            status if crate::executor::is_definitive_rejection(status) => {
                 return ExecutionOutcome::NoEffect(Refusal::DiscordRejected);
             }
             429 => {

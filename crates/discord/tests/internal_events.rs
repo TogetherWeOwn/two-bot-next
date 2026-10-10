@@ -15,8 +15,8 @@ use two_bot_core::internal_actions::{validate_event_input, EventInput, EventPlac
 use two_bot_core::{EventStatus, ScheduledEvent, ScheduledEventMirror};
 use two_bot_discord::ratelimit_guard::GuardError;
 use two_bot_discord::{
-    event_status_name, scheduled_event_body, ActionExecutor, DiscordError, EventActionError,
-    EventCall,
+    event_status_name, is_definitive_rejection, scheduled_event_body, ActionExecutor, DiscordError,
+    EventActionError, EventCall,
 };
 
 const GUILD: &str = "100000000000000001";
@@ -300,10 +300,15 @@ async fn read_external_location_and_all_four_statuses() {
 async fn already_cancelled_404_and_other_failures_do_not_retry_or_refresh() {
     // Fresh-key cancellation of an already-cancelled event is a Discord 400,
     // not a fabricated success. Same-key replay is the durable store's job.
+    // 404/413/415/422 share the announcement classifier: Discord validates
+    // before mutating, so all four are terminal rejections, never fences.
     for (status, code) in [
         (400, "discord_rejected"),
         (403, "discord_rejected"),
         (404, "discord_rejected"),
+        (413, "discord_rejected"),
+        (415, "discord_rejected"),
+        (422, "discord_rejected"),
         (429, "rate_limited"),
         (503, "discord_unavailable"),
     ] {
@@ -339,7 +344,7 @@ async fn already_cancelled_404_and_other_failures_do_not_retry_or_refresh() {
         assert_eq!(error.action_error().code.as_str(), code);
         assert_eq!(
             error.is_safe_pre_mutation(),
-            matches!(status, 400 | 403 | 404)
+            is_definitive_rejection(status)
         );
         assert_eq!(mirror.row().unwrap().0, old);
         assert_eq!(rest.requests().len(), 1);
@@ -349,30 +354,35 @@ async fn already_cancelled_404_and_other_failures_do_not_retry_or_refresh() {
         );
         rest.shutdown().await;
     }
-    for call in [
-        EventCall::Read {
-            event_id: EVENT.to_owned(),
-        },
-        EventCall::Upsert {
-            event_id: Some(EVENT.to_owned()),
-            input: input(false),
-        },
-    ] {
-        let rest = MockRest::start(
-            vec![ScriptedResponse::status(404)],
-            ScriptedResponse::status(500),
-        )
-        .await;
-        let mirror = MemoryMirror::default();
-        let error = executor(&rest)
-            .execute_event(GUILD, &call, &mirror, OBSERVED)
-            .await
-            .unwrap_err();
-        assert_eq!(error.action_error().code.as_str(), "discord_rejected");
-        assert!(error.is_safe_pre_mutation());
-        assert!(mirror.row().is_none());
-        assert_eq!(rest.requests().len(), 1);
-        rest.shutdown().await;
+    // The shared classifier covers every call shape: a mapped event deleted
+    // in Discord (PATCH 404) and oversized/unsupported/invalid bodies
+    // (413/415/422) are terminal on read and upsert alike, never a fence.
+    for status in [404, 413, 415, 422] {
+        for call in [
+            EventCall::Read {
+                event_id: EVENT.to_owned(),
+            },
+            EventCall::Upsert {
+                event_id: Some(EVENT.to_owned()),
+                input: input(false),
+            },
+        ] {
+            let rest = MockRest::start(
+                vec![ScriptedResponse::status(status)],
+                ScriptedResponse::status(500),
+            )
+            .await;
+            let mirror = MemoryMirror::default();
+            let error = executor(&rest)
+                .execute_event(GUILD, &call, &mirror, OBSERVED)
+                .await
+                .unwrap_err();
+            assert_eq!(error.action_error().code.as_str(), "discord_rejected");
+            assert!(error.is_safe_pre_mutation(), "status {status}");
+            assert!(mirror.row().is_none());
+            assert_eq!(rest.requests().len(), 1);
+            rest.shutdown().await;
+        }
     }
 }
 
