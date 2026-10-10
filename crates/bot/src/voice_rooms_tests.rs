@@ -63,6 +63,13 @@ fn snapshot(extra: &[u64], members: Vec<VoiceMember>) -> GuildSnapshot {
         channel(CATEGORY, 4, None),
     ];
     channels.extend(extra.iter().map(|id| channel(*id, 2, Some(CATEGORY))));
+    // Ordinary members by default: every voice member carries an (empty) guild
+    // role list so target-authority resolution yields Some(false). Tests for
+    // privilege/unavailable override this map.
+    let member_roles = members
+        .iter()
+        .map(|member| (member.member_id, Vec::new()))
+        .collect();
     GuildSnapshot {
         channels,
         members,
@@ -73,6 +80,7 @@ fn snapshot(extra: &[u64], members: Vec<VoiceMember>) -> GuildSnapshot {
             member_roles: vec![],
             roles: vec![role(permissions())],
         },
+        member_roles,
     }
 }
 
@@ -7421,6 +7429,7 @@ fn health_guild(
             member_roles: vec![],
             roles: vec![role(base)],
         },
+        member_roles: HashMap::new(),
     });
     live
 }
@@ -8083,6 +8092,7 @@ fn health_check_dedups_a_shared_category_override() {
             member_roles: vec![],
             roles: vec![role(permissions())],
         },
+        member_roles: HashMap::new(),
     });
     assert_eq!(live.permission_findings(&[CREATOR, 201]).len(), 1);
 }
