@@ -232,6 +232,10 @@ controller's bounded cache pool was missing at implementation time.
 
 - Core unit tests: cumulative histogram, unique series, finite label sets,
   hostile labels, saturating job counters, status groups and missing latency.
+- Docs conformance (`crates/core/tests/metrics_docs.rs`): every counter row
+  in the table above renders in the exposition with its allowlisted labels,
+  and every exposition counter has a row here; deliberate-drift fixtures
+  prove both directions fail by name.
 - Supervisor fixtures (paused Tokio time, local `Metrics` registries): first
   success for every website/community registration, seconds conversion, returned
   failures, preserved success timestamps, streak reset, timeout/future/factory
