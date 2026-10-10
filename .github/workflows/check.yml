@@ -22,13 +22,11 @@ on:
   # SBOM/vulnerability scan runs on dependency-affecting PRs, every push to
   # main, and here weekly. Non-PR events fail closed to full jobs in the
   # selectors below, so this run covers the whole matrix. Off the hour to
-  # avoid the busiest scheduled-run window (UTC); Mondays to sit apart from
-  # the release workflow's own weekly schedule.
+  # avoid the busiest scheduled-run window (UTC).
   schedule:
     - cron: '9 4 * * 1'
-  # Dispatched by the release workflow (TOG-10035) on release-please branches:
-  # PRs opened with GITHUB_TOKEN trigger no workflows, so the required `check`
-  # / `worker check` would never run on the release PR without this path.
+  # Manual runs (e.g. single-core flake validation). Releases no longer
+  # dispatch it: there is no release PR (docs/releases.md).
   workflow_dispatch:
     inputs:
       single_core_tests:
@@ -1580,9 +1578,6 @@ jobs:
       - name: Verify production deploy guards
         if: needs.job-inputs.outputs.worker != 'false'
         run: python3 ../scripts/test-deploy-production.py
-      - name: Verify release reconciliation retries
-        if: needs.job-inputs.outputs.worker != 'false'
-        run: python3 ../scripts/test-release-retry.py
       # Always runs, even on docs/asset-only fast-pass: the offline suite
       # pins this step with no `if:` (test_required_worker_ci_runs_this_offline_suite).
       - name: Verify staging rollout provenance (offline fixtures)
@@ -1619,14 +1614,17 @@ jobs:
       - name: Verify runner routing for every workflow job
         if: needs.job-inputs.outputs.worker != 'false'
         run: python3 ../scripts/test-runner-routing.py
-      - name: Verify offline release lifecycle
+      - name: Verify offline release on promote
         if: needs.job-inputs.outputs.worker != 'false'
-        # Match the library bundled by the pinned release action, in an isolated
-        # API-double fixture with lifecycle scripts disabled and no write token.
-        run: | # zizmor: ignore[adhoc-packages] pinned offline release fixture only
+        # Version bumps, notes, rollback guard and off-main refusal against a
+        # throwaway git repository (no network, no token).
+        run: node ../scripts/test-release-on-promote.cjs
+      - name: Verify the commit-parse guard
+        if: needs.job-inputs.outputs.worker != 'false'
+        # The PR-side guard uses release-please's pinned conventional-commit
+        # parser, in an isolated install with lifecycle scripts disabled.
+        run: | # zizmor: ignore[adhoc-packages] pinned commit parser fixture only
           npm install --prefix "$RUNNER_TEMP/release-fixture" --ignore-scripts --no-audit --no-fund release-please@17.6.0
-          NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release.cjs
-          NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release-publication.cjs
           NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-commit-parse-guard.cjs
 
   # Single always-run aggregator for the path-filtered matrix. GitHub counts
