@@ -62,13 +62,20 @@ After the reviewer approves (or the automated approval passes), the job:
 4. gates on `/health` 200 and on `/readyz` reporting this SHA (see
    [Build identity and the `/readyz` gate](#build-identity-and-the-readyz-gate)).
 
-**Roll back.** Dispatch again with `rollback` set to the previous version ID
+**Roll back.** This dispatch is the single production rollback method.
+Dispatch again with `rollback` set to the previous version ID
 from the failed run's summary. Set `sha` to the commit that version was built
 from. It is recorded as the rollback message, and the `/readyz` gate after the
 rollback must report that revision, or a pre-stamp version (see below). The
 rollback passes the same guard and the same Environment approval. It then runs
 `wrangler rollback <version-id> --message <sha> --yes` and fails unless that
-version serves 100% of traffic.
+version serves 100% of traffic. When the Rust image itself is the fault,
+dispatch in deploy mode with the prior good SHA instead; a standalone full
+redeploy outside this workflow is superseded as a production rollback path.
+Drill record: the rehearsal log in
+[cutover-rollback-runbook.md](cutover-rollback-runbook.md#7-staging-rehearsal-log)
+and the staging rollback drill
+([ci-security.md](ci-security.md#staging-rollback-drill-manual)).
 
 ## Build identity and the `/readyz` gate
 
