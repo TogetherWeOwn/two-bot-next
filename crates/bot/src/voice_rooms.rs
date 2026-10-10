@@ -2110,6 +2110,11 @@ pub struct GuildRoomWorker<S, H> {
     /// Who started each vote this session, by vote ID. The vote core binds the
     /// target but not the initiator, and every audit row names both.
     vote_initiators: HashMap<Snowflake, Snowflake>,
+    /// Evicted votes whose initiator is fenced: retained because their
+    /// enforcement is still queued. Retried on every drain; a released fence
+    /// drops here, so this stays proportional to the pending-enforcement
+    /// backlog, never history.
+    fenced_initiators: HashSet<Snowflake>,
     /// V4 audit rows not yet appended, oldest first. Appended off the actor's
     /// synchronous vote path by [`GuildRoomWorker::flush_kick_audit`]; a failed
     /// flush keeps them (the append is idempotent) up to
@@ -2330,6 +2335,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             vote_refs: HashMap::new(),
             active_votes: Vec::new(),
             vote_initiators: HashMap::new(),
+            fenced_initiators: HashSet::new(),
             kick_audit: VecDeque::new(),
             kick_audit_retry_ms: 0,
             name_policy: Arc::new(AutomodPolicy::default()),
@@ -3136,9 +3142,58 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     }
 
     /// Who started a vote this session. Every vote the core knows began in
-    /// [`Self::kick_start`], so the fallback is unreachable.
+    /// [`Self::kick_start`], and the initiator stays fenced while the vote is
+    /// still in [`Self::active_votes`] or its enforcement is still queued, so
+    /// the fallback is unreachable.
     fn vote_initiator(&self, vote_id: Snowflake) -> Snowflake {
         self.vote_initiators.get(&vote_id).copied().unwrap_or(0)
+    }
+
+    /// Forget this worker's per-vote maps for one core-evicted vote. The ref
+    /// always goes: a later ballot for an evicted vote is unknown either way.
+    /// The initiator stays while its enforcement is still queued, so the
+    /// enforcement audit still names who started the vote (VK-03 fence); the
+    /// queued action is the ground truth, and every terminal dispatch path
+    /// releases it in the same arm that audits, so the fence cannot leak. It
+    /// also stays while the vote is still in [`Self::active_votes`]: a command
+    /// landing between reconnect and the first ready tick can reap a vote the
+    /// tick has not settled yet, and the tick's UnknownVote expiry backstop
+    /// audits the result row with this initiator.
+    fn forget_vote_maps(&mut self, vote_id: Snowflake) {
+        self.vote_refs.remove(&vote_id);
+        if self.queue.has_queued_kick(vote_id)
+            || self.active_votes.iter().any(|vote| vote.id == vote_id)
+        {
+            self.fenced_initiators.insert(vote_id);
+        } else {
+            self.vote_initiators.remove(&vote_id);
+        }
+    }
+
+    /// Drop this worker's per-vote maps for every vote the core has evicted
+    /// since the last drain. Call after every core call: `start`/`cast`/
+    /// `refresh` reap on their own pass and only report through the drain
+    /// buffer, so waiting for the timer would leak these maps without bound.
+    /// Fenced initiators are retried first: a fence released since the last
+    /// pass (its enforcement dispatched and audited, and the vote settled out
+    /// of [`Self::active_votes`]) drops now.
+    fn drop_evicted_vote_maps(&mut self) {
+        let released: Vec<Snowflake> = self
+            .fenced_initiators
+            .iter()
+            .copied()
+            .filter(|vote_id| {
+                !self.queue.has_queued_kick(*vote_id)
+                    && !self.active_votes.iter().any(|vote| vote.id == *vote_id)
+            })
+            .collect();
+        for vote_id in released {
+            self.fenced_initiators.remove(&vote_id);
+            self.vote_initiators.remove(&vote_id);
+        }
+        for evicted in self.votes.drain_evicted() {
+            self.forget_vote_maps(evicted);
+        }
     }
 
     /// Queue one audit row for the next flush. A full buffer drops its oldest
@@ -3273,10 +3328,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             occupants: &occupants,
             target_privileged,
         };
-        let update = self
-            .votes
-            .start(vote_id, facts, initiator_id, target_id, &ActorClock(now_ms))
-            .map_err(KickRefusal::Vote)?;
+        let started =
+            self.votes
+                .start(vote_id, facts, initiator_id, target_id, &ActorClock(now_ms));
+        // The start's own pass may have reaped other votes: drop their maps
+        // before inserting the new vote's, so a reused interaction ID (legal
+        // past the horizon) never loses its fresh entries to the drain.
+        self.drop_evicted_vote_maps();
+        let update = started.map_err(KickRefusal::Vote)?;
         self.vote_refs.insert(vote_id, update.vote);
         self.vote_initiators.insert(vote_id, initiator_id);
         self.active_votes.push(update.vote);
@@ -3306,20 +3365,41 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             occupants: &occupants,
             target_privileged,
         };
-        let update = self
+        let cast = self
             .votes
-            .cast(reference, facts, voter_id, ballot, &ActorClock(now_ms))
-            .map_err(KickRefusal::Vote)?;
+            .cast(reference, facts, voter_id, ballot, &ActorClock(now_ms));
+        // The ballot's own pass may have reaped other votes; the current vote
+        // is untouched on success (it was just acted on), so draining first is
+        // safe for the settle below, which still needs its initiator.
+        self.drop_evicted_vote_maps();
+        let update = match cast {
+            Err(VoteKickError::UnknownVote) => {
+                // The core reaped this vote past its retention horizon (or it
+                // never existed here): drop the worker's maps so they stay
+                // bounded too, keeping the enforcement fence intact.
+                self.forget_vote_maps(vote_id);
+                return Err(KickRefusal::Vote(VoteKickError::UnknownVote));
+            }
+            result => result.map_err(KickRefusal::Vote)?,
+        };
         Ok(self.settle_vote(update))
     }
 
     /// Timer entry: expire votes and react to roster, ownership and room-delete
     /// changes. Returns the updates that finished a vote. Skipped while live
     /// evidence is not authoritative: a stale roster must not cancel a vote.
+    ///
+    /// Retention is bounded last (VK-03), never first: while disconnected or
+    /// halted the worker can neither settle votes (a stale roster must not
+    /// cancel one) nor reap them (an unaudited terminal must not be evicted,
+    /// and a queued enforcement still needs its initiator). Nothing new can
+    /// arrive meanwhile — [`Self::kick_start`] and [`Self::kick_cast`] refuse
+    /// while not ready or halted — so retention stays bounded by the outage,
+    /// and the first ready tick settles every live vote before reaping. A vote
+    /// the core already reaped inside this same pass (its lazy expiry backdates
+    /// the deadline past the horizon) audits as expired through the UnknownVote
+    /// backstop in the loop, so no expiry loses its result row.
     pub fn kick_refresh(&mut self, now_ms: u64) -> Vec<VoteKickUpdate> {
-        if self.active_votes.is_empty() {
-            return Vec::new();
-        }
         let ready = self.live.read_state().ready;
         if !ready || self.halted {
             return Vec::new();
@@ -3343,15 +3423,56 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 target_privileged,
             };
             // A room that is gone has no occupants, so the core cancels the vote.
-            let Ok(update) = self.votes.refresh(reference, facts, &ActorClock(now_ms)) else {
-                self.active_votes.retain(|vote| vote.id != reference.id);
-                continue;
+            // A vote this worker never settled can still come back unknown: the
+            // core's lazy sweep expires elapsed votes with a backdated deadline,
+            // so a sibling refreshed earlier in this same pass can push a vote
+            // past the horizon before its own turn (or a command's pass reaped
+            // it between ticks). That vote expired — every other terminal path
+            // settles through the worker first — so audit the expiry instead of
+            // silently dropping the result row. Progress is best-effort from
+            // current facts: the ballots were reaped with the vote.
+            let update = match self.votes.refresh(reference, facts, &ActorClock(now_ms)) {
+                Ok(update) => update,
+                Err(VoteKickError::UnknownVote)
+                    if self.active_votes.iter().any(|vote| vote.id == reference.id) =>
+                {
+                    let eligible = facts
+                        .occupants
+                        .iter()
+                        .filter(|id| **id != reference.target_id)
+                        .count();
+                    VoteKickUpdate {
+                        vote: reference,
+                        status: VoteKickStatus::Expired,
+                        progress: VoteProgress {
+                            yes: 0,
+                            required: eligible / 2 + 1,
+                            total: eligible,
+                        },
+                        kick: None,
+                    }
+                }
+                Err(_) => {
+                    self.active_votes.retain(|vote| vote.id != reference.id);
+                    continue;
+                }
             };
             let update = self.settle_vote(update);
             if update.status != VoteKickStatus::Active {
                 finished.push(update);
             }
         }
+        // Reap only after every live vote had the chance to settle above: at
+        // this point every evictable vote is worker-settled — directly, or
+        // through the UnknownVote expiry backstop in the loop — so eviction
+        // drops no unaudited terminal. The initiator still survives while its
+        // enforcement is queued.
+        for evicted in self.votes.prune(&ActorClock(now_ms)) {
+            self.forget_vote_maps(evicted);
+        }
+        // The settle loop's own refreshes buffer through the same drain; the
+        // timer prune already collected them, so this is normally a no-op.
+        self.drop_evicted_vote_maps();
         finished
     }
 

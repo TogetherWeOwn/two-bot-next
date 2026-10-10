@@ -555,6 +555,11 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
         "vote-kick outcome family grew; update the cardinality budget and the guard doc"
     );
     assert_eq!(
+        metrics::CHECKPOINT_FAILURE_STAGES.len(),
+        2,
+        "checkpoint-failure family grew; update the cardinality budget and the guard doc"
+    );
+    assert_eq!(
         metrics::INTERNAL_ACTION_FAMILIES.len(),
         6,
         "internal-action family grew; update the cardinality budget and the guard doc"
@@ -609,9 +614,9 @@ fn exposition_series_count_matches_the_cardinality_budget() {
     let text = metrics::Metrics::default().render(None);
     let series = text.lines().filter(|line| !line.starts_with('#')).count();
     assert_eq!(
-        series, 386,
-        "exposition grew past the 386-sample budget (21 events + 4 scalars + 1 latency \
-         + 11 histogram + 156 rest + 48 jobs + 31 voice + 26 vote-kick + 2 db-errors + 4 send-admissions + 6 dispatch-drops + 72 internal-actions + 4 pool); \
+        series, 388,
+        "exposition grew past the 388-sample budget (21 events + 4 scalars + 1 latency \
+         + 11 histogram + 156 rest + 48 jobs + 31 voice + 26 vote-kick + 2 db-errors + 4 send-admissions + 6 dispatch-drops + 2 checkpoint-failures + 72 internal-actions + 4 pool); \
          update docs/log-volume-guard.md with the new series"
     );
 }

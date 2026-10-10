@@ -1,6 +1,6 @@
 use super::*;
 use two_bot_core::voice_vote_kick::{
-    VoteBallot, VoteCancellation, VoteKickError, VOTE_KICK_TTL_MS,
+    VoteBallot, VoteCancellation, VoteKickError, VOTE_KICK_COOLDOWN_MS, VOTE_KICK_TTL_MS,
 };
 
 const OWNER: u64 = MEMBER;
@@ -123,6 +123,219 @@ async fn not_voting_counts_as_no() {
     assert!(worker.kick_refresh(4).is_empty());
     assert!(!worker.dispatch_one(5).await);
     assert!(trace.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn timer_prune_reaps_evicted_vote_refs_past_the_cooldown_horizon() {
+    let (mut worker, _) = setup().await;
+    start(&mut worker, VOTER_A, TARGET).unwrap();
+    worker.kick_cast(VOTE, VOTER_A, VoteBallot::Yes, 1).unwrap();
+    worker.kick_cast(VOTE, VOTER_B, VoteBallot::Yes, 2).unwrap();
+    let passed = worker.kick_cast(VOTE, VOTER_C, VoteBallot::Yes, 3).unwrap();
+    assert_eq!(passed.status, VoteKickStatus::Passed);
+    // Through the horizon inclusive a stale button still replays terminal.
+    let horizon_end = 3 + VOTE_KICK_COOLDOWN_MS;
+    let replay = worker
+        .kick_cast(VOTE, VOTER_C, VoteBallot::Yes, horizon_end)
+        .unwrap();
+    assert_eq!(replay.status, VoteKickStatus::Passed);
+    // Strictly past the horizon the timer reaps the core vote and this
+    // worker's ref maps: the stale button is unknown and the target is
+    // votable again with a fresh interaction ID.
+    let after = horizon_end + 1;
+    assert!(worker.kick_refresh(after).is_empty());
+    assert!(!worker.vote_refs.contains_key(&VOTE));
+    assert_eq!(
+        worker
+            .kick_cast(VOTE, VOTER_A, VoteBallot::Yes, after)
+            .unwrap_err(),
+        KickRefusal::Vote(VoteKickError::UnknownVote)
+    );
+    worker
+        .kick_start(VOTE + 1, ROOM, VOTER_A, TARGET, after)
+        .unwrap();
+}
+
+#[tokio::test]
+async fn command_path_eviction_reports_to_the_worker_maps() {
+    // VK-03 finding 1: a start whose own pass reaps an older vote must drop
+    // the worker's ref in the same call, without waiting for the timer.
+    let (mut worker, _) = setup().await;
+    pass_vote(&mut worker);
+    let after = 2 + VOTE_KICK_COOLDOWN_MS + 1;
+    worker
+        .kick_start(VOTE + 1, ROOM, VOTER_B, VOTER_C, after)
+        .unwrap();
+    assert!(!worker.vote_refs.contains_key(&VOTE));
+    // The initiator stays fenced: its enforcement is still queued.
+    assert_eq!(worker.vote_initiators.get(&VOTE), Some(&VOTER_A));
+    // Two timer passes change nothing: the maps were already reaped.
+    assert!(worker.kick_refresh(after).is_empty());
+    assert!(worker.kick_refresh(after + 1).is_empty());
+    assert!(!worker.vote_refs.contains_key(&VOTE));
+}
+
+#[tokio::test]
+async fn queued_enforcement_keeps_its_initiator_past_the_horizon() {
+    // VK-03 finding 2 (fence): a passed vote reaped while its enforcement is
+    // still queued keeps its initiator, so the enforcement audit names who
+    // started the vote instead of recording 0.
+    let (mut worker, _) = setup().await;
+    pass_vote(&mut worker);
+    let after = 2 + VOTE_KICK_COOLDOWN_MS + 1;
+    assert!(worker.kick_refresh(after).is_empty());
+    assert!(!worker.vote_refs.contains_key(&VOTE));
+    assert_eq!(worker.vote_initiators.get(&VOTE), Some(&VOTER_A));
+    dispatch(&mut worker, after + 1).await;
+    assert!(worker.flush_kick_audit(after + 2).await);
+    let rows = worker.store.kick_audit.lock().unwrap().clone();
+    let enforcement = rows
+        .iter()
+        .find(|row| row.event == KickAuditEvent::Enforcement)
+        .expect("enforcement row");
+    assert_eq!(enforcement.initiator_id, VOTER_A);
+    // With the fence released, the next reap drops the initiator too: no leak.
+    assert!(worker.kick_refresh(after + 3).is_empty());
+    assert!(!worker.vote_initiators.contains_key(&VOTE));
+}
+
+#[tokio::test]
+async fn outage_gates_reaping_and_reconnect_settles_before_it_reaps() {
+    // VK-03 finding 2 (gate): while evidence is not authoritative the timer
+    // neither settles nor reaps, and the first ready tick settles the elapsed
+    // vote (audited) before the reap drops it.
+    let (mut worker, _) = setup().await;
+    start(&mut worker, VOTER_A, TARGET).unwrap();
+    worker.live.disconnect();
+    assert!(worker.kick_refresh(VOTE_KICK_TTL_MS).is_empty());
+    let past_horizon = VOTE_KICK_TTL_MS + VOTE_KICK_COOLDOWN_MS + 1;
+    assert!(worker.kick_refresh(past_horizon).is_empty());
+    assert!(worker.vote_refs.contains_key(&VOTE));
+    assert!(worker.vote_initiators.contains_key(&VOTE));
+    worker.live.publish(snapshot(&[ROOM], roster()));
+    let finished = worker.kick_refresh(past_horizon + 1);
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].status, VoteKickStatus::Expired);
+    assert!(worker.flush_kick_audit(past_horizon + 2).await);
+    assert_eq!(
+        audit_trail(&worker),
+        [
+            (KickAuditEvent::VoteStarted, "started"),
+            (KickAuditEvent::VoteResult, "expired"),
+        ]
+    );
+    let rows = worker.store.kick_audit.lock().unwrap().clone();
+    assert_eq!(rows[1].initiator_id, VOTER_A);
+}
+
+#[tokio::test]
+async fn long_outage_audits_every_expired_vote_not_just_the_first() {
+    // VK-03 review warning: after an outage past TTL + cooldown, the first
+    // ready tick used to audit only the first refreshed vote. The core's lazy
+    // sweep expires elapsed votes with a backdated deadline, so a sibling
+    // refreshed later in the same pass was already past the horizon: its
+    // refresh hit UnknownVote and the vote was dropped with no result row.
+    let (mut worker, _) = setup().await;
+    worker.kick_start(VOTE, ROOM, VOTER_A, TARGET, 0).unwrap();
+    worker
+        .kick_start(VOTE + 1, ROOM, VOTER_B, VOTER_C, 0)
+        .unwrap();
+    worker.live.disconnect();
+    let past_horizon = VOTE_KICK_TTL_MS + VOTE_KICK_COOLDOWN_MS + 1;
+    assert!(worker.kick_refresh(past_horizon).is_empty());
+    worker.live.publish(snapshot(&[ROOM], roster()));
+    let finished = worker.kick_refresh(past_horizon + 1);
+    assert_eq!(finished.len(), 2);
+    assert!(finished
+        .iter()
+        .all(|update| update.status == VoteKickStatus::Expired));
+    assert!(worker.flush_kick_audit(past_horizon + 2).await);
+    assert_eq!(
+        audit_trail(&worker),
+        [
+            (KickAuditEvent::VoteStarted, "started"),
+            (KickAuditEvent::VoteStarted, "started"),
+            (KickAuditEvent::VoteResult, "expired"),
+            (KickAuditEvent::VoteResult, "expired"),
+        ]
+    );
+    // Each result row names its own initiator and target.
+    let rows = worker.store.kick_audit.lock().unwrap().clone();
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.event == KickAuditEvent::VoteResult)
+            .map(|row| (row.vote_id, row.initiator_id, row.target_id))
+            .collect::<Vec<_>>(),
+        [(VOTE, VOTER_A, TARGET), (VOTE + 1, VOTER_B, VOTER_C)]
+    );
+}
+
+#[tokio::test]
+async fn start_before_first_ready_tick_does_not_swallow_the_expiry_audit() {
+    // Same backstop through the command path: a start that lands between
+    // reconnect and the first ready tick settles (but cannot evict) the
+    // elapsed vote, and the tick's own pass would otherwise reap it before
+    // its refresh turn.
+    let (mut worker, _) = setup().await;
+    worker.kick_start(VOTE, ROOM, VOTER_A, TARGET, 0).unwrap();
+    worker.live.disconnect();
+    let past_horizon = VOTE_KICK_TTL_MS + VOTE_KICK_COOLDOWN_MS + 1;
+    assert!(worker.kick_refresh(past_horizon).is_empty());
+    worker.live.publish(snapshot(&[ROOM], roster()));
+    worker
+        .kick_start(VOTE + 1, ROOM, VOTER_B, VOTER_C, past_horizon + 1)
+        .unwrap();
+    let finished = worker.kick_refresh(past_horizon + 2);
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].vote.id, VOTE);
+    assert_eq!(finished[0].status, VoteKickStatus::Expired);
+    assert!(worker.flush_kick_audit(past_horizon + 3).await);
+    assert_eq!(
+        audit_trail(&worker),
+        [
+            (KickAuditEvent::VoteStarted, "started"),
+            (KickAuditEvent::VoteStarted, "started"),
+            (KickAuditEvent::VoteResult, "expired"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn two_commands_before_first_ready_tick_keep_the_expiry_initiator() {
+    // VK-03 review warning: two commands landing between reconnect and the
+    // first ready tick used to audit the reaped vote's expiry with initiator
+    // 0. The first command's pass lazily expires the vote with a backdated
+    // deadline; the second command's pass evicts it and dropped the worker's
+    // initiator while the vote was still in `active_votes`, so the tick's
+    // UnknownVote backstop synthesized the row with the fallback. The ballot
+    // path shares the same drain (`drop_evicted_vote_maps`), so two starts
+    // pin the fence for both.
+    let (mut worker, _) = setup().await;
+    worker.kick_start(VOTE, ROOM, VOTER_A, TARGET, 0).unwrap();
+    worker.live.disconnect();
+    let past_horizon = VOTE_KICK_TTL_MS + VOTE_KICK_COOLDOWN_MS + 1;
+    assert!(worker.kick_refresh(past_horizon).is_empty());
+    worker.live.publish(snapshot(&[ROOM], roster()));
+    worker
+        .kick_start(VOTE + 1, ROOM, VOTER_B, VOTER_C, past_horizon + 1)
+        .unwrap();
+    worker
+        .kick_start(VOTE + 2, ROOM, VOTER_C, VOTER_B, past_horizon + 1)
+        .unwrap();
+    let finished = worker.kick_refresh(past_horizon + 2);
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].vote.id, VOTE);
+    assert_eq!(finished[0].status, VoteKickStatus::Expired);
+    assert!(worker.flush_kick_audit(past_horizon + 3).await);
+    let rows = worker.store.kick_audit.lock().unwrap().clone();
+    let result = rows
+        .iter()
+        .find(|row| row.event == KickAuditEvent::VoteResult && row.vote_id == VOTE)
+        .expect("expiry row for the reaped vote");
+    assert_eq!(result.initiator_id, VOTER_A);
+    assert_eq!(result.target_id, TARGET);
+    // The fence releases once the tick settles the vote: no leak.
+    assert!(!worker.vote_initiators.contains_key(&VOTE));
 }
 
 #[tokio::test]
