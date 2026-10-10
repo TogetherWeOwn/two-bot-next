@@ -8,6 +8,7 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 use tokio::sync::{watch, Mutex, OnceCell};
 use two_bot_core::{
+    activation::LiveCapability,
     build_community_snapshot, build_counter_reading,
     database_tls::{self, TlsPolicy},
     match_rank_roles, normalize_events, now_iso, plan_rank_heal, read_raid_windows, replace_events,
@@ -213,6 +214,13 @@ pub async fn serve(
                     guild: guild.to_string(),
                     observation: Mutex::new(()),
                 });
+                // The rank tick is the only website job with a Discord write
+                // path: the ladder self-heal grants roles under the bot
+                // identity. It obeys the same live-identity fence as the other
+                // posting jobs, resolved once at boot (the token never changes
+                // at runtime). A refused identity keeps the old non-nested
+                // refusal and never grants.
+                let rank_heal = activation.permitted(LiveCapability::RankHeal);
                 for (name, kind) in NAMES
                     .into_iter()
                     .zip([Kind::Counter, Kind::Rank, Kind::Events])
@@ -220,6 +228,7 @@ pub async fn serve(
                     let context = context.clone();
                     let shutdown = shutdown.subscribe();
                     let cadence = cadence(kind);
+                    let rank_heal = rank_heal && matches!(kind, Kind::Rank);
                     registered.push(Job {
                         name,
                         cadence,
@@ -244,6 +253,7 @@ pub async fn serve(
                                             &context.guild,
                                             &context.observation,
                                             &shutdown,
+                                            rank_heal,
                                         ).await
                                     } => result,
                                 }
@@ -650,6 +660,10 @@ async fn heal_rank_ladder(
 /// supervisor to abort us. Biased selection discards a simultaneously-ready REST
 /// result; publication fences also cover shutdown arriving during that poll.
 /// This cannot undo a database commit already submitted before shutdown.
+///
+/// `rank_heal` is the boot-resolved live-identity fence for the rank ladder
+/// self-heal: only the rank tick consults it, and only a permitted identity
+/// may grant roles. Every other kind ignores it.
 pub async fn run_once(
     kind: Kind,
     pool: &PgPool,
@@ -657,11 +671,12 @@ pub async fn run_once(
     guild: &str,
     observation: &Mutex<()>,
     shutdown: &watch::Receiver<bool>,
+    rank_heal: bool,
 ) -> Result<(), ErrorClass> {
     tokio::select! {
         biased;
         _ = server::shutdown_requested(shutdown.clone()) => Ok(()),
-        result = snapshot_once(kind, pool, rest, guild, observation, shutdown) => result,
+        result = snapshot_once(kind, pool, rest, guild, observation, shutdown, rank_heal) => result,
     }
 }
 
@@ -676,6 +691,7 @@ async fn snapshot_once(
     guild: &str,
     observation: &Mutex<()>,
     shutdown: &watch::Receiver<bool>,
+    rank_heal: bool,
 ) -> Result<(), ErrorClass> {
     if matches!(kind, Kind::Events) {
         let response = get(
@@ -755,7 +771,16 @@ async fn snapshot_once(
     if !snapshot.nested {
         // Non-cumulative members (hand-granted higher rank without the lower
         // rungs) self-heal: grant the missing rungs with an audit reason,
-        // bounded and hierarchy-fenced, then rebuild and re-verify.
+        // bounded and hierarchy-fenced, then rebuild and re-verify. The heal
+        // grants roles under the bot identity, so a refused identity keeps
+        // the old refusal and never touches the wire.
+        if !rank_heal {
+            tracing::warn!(
+                job = "rank",
+                "rank ladder not nested; self-heal refused for this identity; publication skipped"
+            );
+            return Err(ErrorClass::Configuration);
+        }
         let plan = plan_rank_heal(&members, &ladder, &windows);
         if !heal_rank_ladder(rest, guild, &guild_object["roles"], &plan, shutdown).await? {
             return Ok(());

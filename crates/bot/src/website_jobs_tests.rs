@@ -1,6 +1,6 @@
 use super::*;
 use serde_json::json;
-use two_bot_core::{apply_web_contract, RankKey};
+use two_bot_core::{activation::LiveCapability, apply_web_contract, RankKey};
 use two_bot_testsupport::TestDatabase;
 
 use crate::{
@@ -124,8 +124,39 @@ async fn tick(
     guild: &str,
     observation: &Mutex<()>,
 ) -> Result<(), ErrorClass> {
+    // Tests exercise the permitted path by default; the refused-identity path
+    // goes through `tick_gated` with the real fence decision.
+    tick_gated(kind, pool, rest, guild, observation, true).await
+}
+
+async fn tick_gated(
+    kind: Kind,
+    pool: &PgPool,
+    rest: &ActionExecutor,
+    guild: &str,
+    observation: &Mutex<()>,
+    rank_heal: bool,
+) -> Result<(), ErrorClass> {
     let (_stop, shutdown) = watch::channel(false);
-    run_once(kind, pool, rest, guild, observation, &shutdown).await
+    run_once(kind, pool, rest, guild, observation, &shutdown, rank_heal).await
+}
+
+/// Twilight percent-encodes `X-Audit-Log-Reason` on the wire (`-` arrives as
+/// `%2D`, spaces as `%20`), so assertions decode the captured header first.
+fn decode_reason(header: &str) -> String {
+    let mut bytes = Vec::new();
+    let input = header.as_bytes();
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'%' {
+            bytes.push(u8::from_str_radix(&header[i + 1..i + 3], 16).unwrap());
+            i += 3;
+        } else {
+            bytes.push(input[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(bytes).unwrap()
 }
 
 fn executor(mock: &MockRest) -> ActionExecutor {
@@ -489,7 +520,8 @@ async fn three_website_ticks_publish_rows_and_fail_closed() {
             &guarded,
             guild,
             &observation,
-            &shutdown
+            &shutdown,
+            false
         )
         .await,
         Err(ErrorClass::Rest)
@@ -596,7 +628,7 @@ async fn rank_heal_grants_missing_rungs_with_audit_reason() {
     let reason = put
         .header("x-audit-log-reason")
         .expect("audit reason header");
-    assert!(reason.contains("self-heal"), "{reason}");
+    assert!(decode_reason(reason).contains("self-heal"), "{reason}");
     mock.shutdown().await;
 }
 
@@ -802,7 +834,7 @@ fn rank_tick_self_heals_non_cumulative_ladder_and_publishes() {
             assert_eq!(put.path, "/api/v10/guilds/2222/members/1001/roles/11");
             assert!(
                 put.header("x-audit-log-reason")
-                    .is_some_and(|reason| reason.contains("self-heal")),
+                    .is_some_and(|reason| decode_reason(reason).contains("self-heal")),
                 "heal grant carries the audit reason"
             );
             let rank: Option<String> =
@@ -863,6 +895,103 @@ fn rank_tick_self_heals_non_cumulative_ladder_and_publishes() {
             assert!(
                 text.contains("Prospect"),
                 "repair alert names the role: {text}"
+            );
+        });
+    });
+}
+
+/// A refused identity never grants: the live pair is not cleared for the
+/// rank-heal capability, so a non-cumulative ladder keeps the old
+/// `Configuration` refusal with no PUT and nothing published.
+#[test]
+fn rank_tick_refused_identity_sends_no_put() {
+    assert!(
+        fixtures::staging().permitted(LiveCapability::RankHeal),
+        "staging pair heals rank ladders"
+    );
+    for (label, activation) in fixtures::refused() {
+        assert!(
+            !activation.permitted(LiveCapability::RankHeal),
+            "{label} must not heal rank ladders"
+        );
+    }
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+                assert!(
+                    std::env::var("GITHUB_ACTIONS").is_err(),
+                    "CI must supply the guarded test database"
+                );
+                eprintln!("SKIP refused rank-heal integration: TWO_TEST_DATABASE_URL is not set");
+                return;
+            };
+            let fixture = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+                .await
+                .expect("create migrated agent-testdb fixture");
+            let pool = fixture.pool().clone();
+            apply_web_contract(&pool).await.unwrap();
+            let guild = "2222";
+            for (index, anomaly) in two_bot_core::RAID_ANOMALIES.iter().enumerate() {
+                let (start, _) =
+                    two_bot_core::window_bounds(anomaly.start, anomaly.end).unwrap();
+                sqlx::query("INSERT INTO members (guild_id, member_id, joined_at, is_bot) VALUES ($1,$2,$3::timestamptz,FALSE)")
+                    .bind(guild).bind((9000 + index).to_string()).bind(start).execute(&pool).await.unwrap();
+            }
+            // Member 1001 holds Member ("12") without Prospect ("11"): the
+            // same non-cumulative ladder the permitted path heals.
+            let roster = json!([
+                member(1001, false, &["12"]),
+                member(9000, false, &[]),
+                member(9001, false, &[]),
+                member(9002, false, &[]),
+            ]);
+            let roles = json!({"roles": [
+                {"id":"10","name":"Bot","position":99},
+                {"id":"11","name":"Prospect","position":1},
+                {"id":"12","name":"Member","position":2},
+                {"id":"13","name":"Soldier","position":3},
+                {"id":"14","name":"Veteran","position":4},
+                {"id":"15","name":"Legend","position":5},
+            ]});
+            let mock = MockRest::start(
+                vec![
+                    ScriptedResponse::json(200, roster),
+                    ScriptedResponse::json(200, roles),
+                ],
+                ScriptedResponse::status(500),
+            )
+            .await;
+            let observation = Arc::new(Mutex::new(()));
+            assert_eq!(
+                tick_gated(Kind::Rank, &pool, &executor(&mock), guild, &observation, false).await,
+                Err(ErrorClass::Configuration)
+            );
+            let requests = mock.requests();
+            assert_eq!(requests.len(), 2, "{requests:?}");
+            assert!(
+                requests.iter().all(|request| request.method != "PUT"),
+                "refused heal must not mutate"
+            );
+            let published: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM rank_snapshots WHERE guild_id=$1")
+                    .bind(guild)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(published, 0, "refused heal publishes nothing");
+            mock.shutdown().await;
+            fixture
+                .close()
+                .await
+                .expect("drop disposable test database");
+            assert!(
+                capture.text().contains("self-heal refused for this identity"),
+                "refusal names the fence"
             );
         });
     });

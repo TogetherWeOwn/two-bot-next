@@ -24,39 +24,66 @@ fn executor(mock: &MockRest) -> ActionExecutor {
 /// they call) gains a Discord write verb: bind that job to a `LiveCapability`
 /// in `activation::BootActivation` before it ships, as the ticker and the feed
 /// poller are.
+const WRITE_VERBS: [&str; 17] = [
+    ".post_",
+    ".delete_",
+    ".put_",
+    ".edit_",
+    ".execute_",
+    ".set_",
+    ".ban(",
+    ".unban(",
+    ".kick",
+    ".timeout_",
+    ".purge",
+    ".finish_interaction",
+    ".sync_guild_commands",
+    ".send_request",
+    ".call_once_raw",
+    ".recover_message",
+    ".member_role_ids",
+];
+
 #[test]
 fn community_jobs_have_no_discord_write_path() {
-    const WRITE_VERBS: [&str; 17] = [
-        ".post_",
-        ".delete_",
-        ".put_",
-        ".edit_",
-        ".execute_",
-        ".set_",
-        ".ban(",
-        ".unban(",
-        ".kick",
-        ".timeout_",
-        ".purge",
-        ".finish_interaction",
-        ".sync_guild_commands",
-        ".send_request",
-        ".call_once_raw",
-        ".recover_message",
-        ".member_role_ids",
-    ];
-    for (file, source) in [
-        ("community_jobs.rs", include_str!("community_jobs.rs")),
-        ("website_jobs.rs", include_str!("website_jobs.rs")),
-    ] {
-        for verb in WRITE_VERBS {
-            assert!(
-                !source.contains(verb),
-                "{file} calls `{verb}`: a community job with a Discord write path must be \
-                 bound to a LiveCapability before it ships"
-            );
-        }
+    let source = include_str!("community_jobs.rs");
+    for verb in WRITE_VERBS {
+        assert!(
+            !source.contains(verb),
+            "community_jobs.rs calls `{verb}`: a community job with a Discord write path must be \
+             bound to a LiveCapability before it ships"
+        );
     }
+}
+
+/// TOG-20441 exception to the pin above: the rank tick is the one website job
+/// with a Discord write path (the ladder self-heal grants missing lower rungs
+/// and reads the bot hierarchy first). This pins the exception instead: exactly
+/// the two heal verbs, nothing else, and the heal sits behind the
+/// live-identity fence.
+#[test]
+fn rank_heal_is_the_only_fenced_discord_write_path() {
+    const HEAL_VERBS: [&str; 2] = [".set_", ".member_role_ids"];
+    let source = include_str!("website_jobs.rs");
+    for verb in WRITE_VERBS {
+        if HEAL_VERBS.contains(&verb) {
+            continue;
+        }
+        assert!(
+            !source.contains(verb),
+            "website_jobs.rs calls `{verb}`: only the fenced rank self-heal may write to Discord"
+        );
+    }
+    for verb in HEAL_VERBS {
+        assert!(
+            source.contains(verb),
+            "website_jobs.rs lost `{verb}`: the heal exception changed shape"
+        );
+    }
+    assert!(
+        source.contains("LiveCapability::RankHeal"),
+        "rank self-heal grants must sit behind the live-identity fence"
+    );
 }
 
 fn member(id: u64, bot: bool) -> Value {
