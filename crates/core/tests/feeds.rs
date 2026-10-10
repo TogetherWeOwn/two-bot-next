@@ -106,6 +106,7 @@ fn sources_reject_credentials_and_canonicalized_private_literals() {
         "http://example.org/",
         "file:///etc/passwd",
         "https://user:pass@example.org/",
+        "https://example.org:8443/",
         "https://localhost/",
         "https://LOCALHOST./",
         "https://127.1/",
@@ -117,6 +118,7 @@ fn sources_reject_credentials_and_canonicalized_private_literals() {
     ] {
         assert!(validate_source(source).is_err(), "accepted {source}");
     }
+    assert!(validate_source("https://example.org:443/feed").is_ok());
     assert_eq!(
         normalize_source(FeedKind::Youtube, "UCabcdefghijklmnopqrstuv").unwrap(),
         "https://www.youtube.com/feeds/videos.xml?channel_id=UCabcdefghijklmnopqrstuv"
@@ -126,18 +128,20 @@ fn sources_reject_credentials_and_canonicalized_private_literals() {
 }
 
 #[test]
-fn source_length_bound_matches_published_utf16_limit_before_trimming() {
+fn source_length_bound_matches_published_byte_limit_before_trimming() {
     let base = "https://example.org/";
-    let at_limit = format!("{base}{}", "x".repeat(MAX_FEED_SOURCE_CHARS - base.len()));
-    assert_eq!(at_limit.encode_utf16().count(), MAX_FEED_SOURCE_CHARS);
+    let at_limit = format!("{base}{}", "x".repeat(MAX_FEED_SOURCE_BYTES - base.len()));
+    assert_eq!(at_limit.len(), MAX_FEED_SOURCE_BYTES);
     assert!(validate_source(&at_limit).is_ok());
     assert!(normalize_source(FeedKind::Twitch, &at_limit).is_ok());
 
+    // Multibyte input counts bytes, not characters: this path is exactly
+    // 2048 UTF-16 units but over the byte ceiling, so it is refused.
     let unicode_path = format!(
         "{base}{}",
-        "😀".repeat((MAX_FEED_SOURCE_CHARS - base.encode_utf16().count()) / 2)
+        "😀".repeat((MAX_FEED_SOURCE_BYTES - base.len()) / 2)
     );
-    assert_eq!(unicode_path.encode_utf16().count(), MAX_FEED_SOURCE_CHARS);
+    assert!(unicode_path.len() > MAX_FEED_SOURCE_BYTES);
     assert!(matches!(
         validate_source(&unicode_path),
         Err(FetchError::InvalidSource)
@@ -145,7 +149,7 @@ fn source_length_bound_matches_published_utf16_limit_before_trimming() {
 
     let over_limit = format!(
         "{base}{}",
-        "x".repeat(MAX_FEED_SOURCE_CHARS - base.len() + 1)
+        "x".repeat(MAX_FEED_SOURCE_BYTES - base.len() + 1)
     );
     assert!(matches!(
         normalize_source(FeedKind::Twitch, &format!(" {over_limit} ")),
@@ -169,14 +173,14 @@ fn dns_results_are_all_or_nothing_and_socket_targets_are_pinned() {
     // A new DNS lookup at a redirect/request boundary refuses a rebound host.
     assert!(PublicRequest::prepare(url, &[ip("127.0.0.1")]).is_err());
     assert_eq!(plan.addresses()[0].ip(), ip("8.8.8.8"));
-    let literal = validate_source("https://8.8.8.8:8443/feed").unwrap();
+    let literal = validate_source("https://8.8.8.8/feed").unwrap();
     assert!(PublicRequest::prepare(literal.clone(), &[ip("1.1.1.1")]).is_err());
     assert_eq!(
         PublicRequest::prepare(literal, &[ip("8.8.8.8")])
             .unwrap()
             .addresses()[0]
             .port(),
-        8443
+        443
     );
 }
 
@@ -853,6 +857,241 @@ fn rejects_xml_entities_malformed_size_and_item_explosion() {
     assert!(matches!(parse_xml_feed(&xml), Err(FeedError::TooManyItems)));
     let xml = "<rss><channel><item><guid>1</guid><link>javascript:alert(1)</link></item><item><guid>2</guid><link>https://user:pass@example.org</link></item></channel></rss>";
     assert!(parse_xml_feed(xml).unwrap().is_empty());
+    let xml = format!(
+        "<rss><channel><item><guid>long</guid><link>https://example.org/{}</link></item></channel></rss>",
+        "a".repeat(2000)
+    );
+    assert!(parse_xml_feed(&xml).unwrap().is_empty());
+}
+
+#[test]
+fn item_url_budget_matches_each_feed_kind() {
+    const URL_PREFIX: &str = "https://example.org/";
+    let url_with_units =
+        |units: usize| format!("{URL_PREFIX}{}", "a".repeat(units - URL_PREFIX.len()));
+
+    for (kind, prefix) in [
+        (FeedKind::Rss, "New feed item"),
+        (FeedKind::Youtube, "New YouTube upload"),
+        (FeedKind::Twitch, "Twitch update"),
+    ] {
+        let max_url_units = 2000 - format!("{prefix}: ****\n").encode_utf16().count() - 1;
+        let xml_for_url = |url: &str| {
+            match kind {
+            FeedKind::Youtube => format!(
+                "<feed><entry><id>key</id><title>x</title><link href=\"{url}\"/></entry></feed>"
+            ),
+            FeedKind::Rss | FeedKind::Twitch => format!(
+                "<rss><channel><item><guid>key</guid><title>x</title><link>{url}</link></item></channel></rss>"
+            ),
+        }
+        };
+
+        let accepted_url = url_with_units(max_url_units);
+        let parsed = parse_xml_feed_for_kind(&xml_for_url(&accepted_url), kind).unwrap();
+        assert_eq!(parsed.len(), 1, "kind: {kind:?}");
+        let post = plan_post(&relay(kind), &parsed[0]).unwrap();
+        assert_eq!(post.content.encode_utf16().count(), 2000, "kind: {kind:?}");
+
+        let over_budget_url = url_with_units(max_url_units + 1);
+        assert!(
+            parse_xml_feed_for_kind(&xml_for_url(&over_budget_url), kind)
+                .unwrap()
+                .is_empty()
+        );
+        let kind_agnostic = parse_xml_feed(&xml_for_url(&over_budget_url)).unwrap();
+        if kind == FeedKind::Youtube {
+            assert_eq!(
+                kind_agnostic.len(),
+                1,
+                "kind-agnostic parser uses the widest feed URL budget"
+            );
+        } else {
+            assert!(kind_agnostic.is_empty(), "kind-agnostic parser: {kind:?}");
+        }
+        let direct_item = FeedItem {
+            title: "x".into(),
+            url: over_budget_url,
+            ..item("over-budget")
+        };
+        assert!(matches!(
+            plan_post(&relay(kind), &direct_item),
+            Err(FeedError::InvalidItemUrl)
+        ));
+    }
+}
+
+#[test]
+fn message_safe_item_urls_preserve_unrelated_at_signs() {
+    let feed = relay(FeedKind::Rss);
+    let feed_item = FeedItem {
+        title: "Post".into(),
+        url: "https://example.org/@alice/post?next=%40everyone&also=%40here".into(),
+        ..item("mention-url")
+    };
+    let post = plan_post(&feed, &feed_item).unwrap();
+    let item_url = "https://example.org/@alice/post?next=%40everyone&also=%40here";
+
+    assert!(post.content.ends_with(item_url));
+    assert_eq!(
+        two_bot_core::message_safety::content(&post.content),
+        post.content
+    );
+}
+
+#[test]
+fn feed_posts_escape_untrusted_titles_and_preserve_item_url_previews() {
+    let feed = relay(FeedKind::Rss);
+    let feed_item = FeedItem {
+        title: "x** [Claim](https://evil.example) **y\r\n@everyone".into(),
+        url: "https://example.org/post?x=1&y=2".into(),
+        ..item("rss-1")
+    };
+    let content = plan_post(&feed, &feed_item).unwrap().content;
+
+    assert!(!content.contains("]("));
+    assert!(content.contains(r"\[Claim\]\(https\:\/\/evil\.example\)"));
+    assert_eq!(content.lines().count(), 2);
+    assert!(content.ends_with("https://example.org/post?x=1&y=2"));
+    assert_eq!(two_bot_core::message_safety::content(&content), content);
+
+    let long_title = FeedItem {
+        title: "*".repeat(1200),
+        url: "https://example.org/post?x=1&y=2".into(),
+        ..item("rss-long")
+    };
+    let long_content = plan_post(&feed, &long_title).unwrap().content;
+    assert!(long_content.encode_utf16().count() <= 2000);
+    assert!(long_content.contains("…**\nhttps://example.org/post?x=1&y=2"));
+    assert!(long_content.ends_with("https://example.org/post?x=1&y=2"));
+    assert_eq!(
+        two_bot_core::message_safety::content(&long_content),
+        long_content
+    );
+
+    let url = format!(
+        "https://example.org/{}",
+        "a".repeat(1970 - "https://example.org/".len())
+    );
+    let near_limit_mention = FeedItem {
+        title: "@everyone".into(),
+        url: url.clone(),
+        ..item("rss-mention-boundary")
+    };
+    let near_limit_post = plan_post(&feed, &near_limit_mention).unwrap();
+    assert_eq!(near_limit_post.content.encode_utf16().count(), 2000);
+    assert!(near_limit_post.content.ends_with(&url));
+    assert!(near_limit_post.content.contains("…**\n"));
+    assert_eq!(
+        two_bot_core::message_safety::content(&near_limit_post.content),
+        near_limit_post.content
+    );
+
+    let long_url = FeedItem {
+        url: format!("https://example.org/{}", "a".repeat(2000)),
+        ..item("rss-long-url")
+    };
+    assert!(matches!(
+        plan_post(&feed, &long_url),
+        Err(FeedError::InvalidItemUrl)
+    ));
+
+    assert!(matches!(
+        plan_post(
+            &feed,
+            &FeedItem {
+                url: "https://user@example.org/post".into(),
+                ..feed_item
+            }
+        ),
+        Err(FeedError::InvalidItemUrl)
+    ));
+}
+
+#[test]
+fn unsafe_item_urls_are_filtered_before_delivery() {
+    let feed = relay(FeedKind::Rss);
+    for url in [
+        "https://example.org/@everyone",
+        "https://example.org/notice?search=@here",
+        "https://example.org/x](https://evil.example)",
+    ] {
+        let xml = format!(
+            "<rss><channel><item><guid>key</guid><title>x</title><link>{url}</link></item></channel></rss>"
+        );
+        assert!(parse_xml_feed_for_kind(&xml, FeedKind::Rss)
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            plan_post(
+                &feed,
+                &FeedItem {
+                    url: url.into(),
+                    ..item("unsafe-url")
+                }
+            ),
+            Err(FeedError::InvalidItemUrl)
+        ));
+    }
+
+    for url in [
+        "https://example.org/%40everyone",
+        "https://en.wikipedia.org/wiki/Foo_(bar)",
+    ] {
+        let xml = format!(
+            "<rss><channel><item><guid>key</guid><title>x</title><link>{url}</link></item></channel></rss>"
+        );
+        let items = parse_xml_feed_for_kind(&xml, FeedKind::Rss).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].url, url);
+
+        let post = plan_post(
+            &feed,
+            &FeedItem {
+                url: url.into(),
+                ..item("kept-url")
+            },
+        )
+        .unwrap();
+        assert!(post.content.ends_with(url));
+        assert_eq!(
+            two_bot_core::message_safety::content(&post.content),
+            post.content
+        );
+    }
+}
+
+#[test]
+fn parse_report_counts_only_items_filtered_for_unsafe_urls() {
+    let entry = |key: &str, url: &str| {
+        format!("<item><guid>{key}</guid><title>x</title><link>{url}</link></item>")
+    };
+    // Literal mentions, handles that merely start with `here`/`everyone` and
+    // `](` masked links are filtered and counted; a plain handle, a path with
+    // parentheses, an invalid URL and a credentialed URL are kept or dropped
+    // without touching the count.
+    let xml = format!(
+        "<rss><channel>{}{}{}{}{}{}{}</channel></rss>",
+        entry("a", "https://example.org/@everyone"),
+        entry("b", "https://mastodon.social/@heresy/1"),
+        entry("c", "https://mastodon.social/@alice/1"),
+        entry("d", "not a url"),
+        entry("e", "https://user@example.org/@here"),
+        entry("f", "https://example.org/x](https://evil.example)"),
+        entry("g", "https://en.wikipedia.org/wiki/Foo_(bar)"),
+    );
+    let parsed = parse_xml_feed_report(&xml, FeedKind::Rss).unwrap();
+    assert_eq!(parsed.unsafe_urls_filtered, 3);
+    assert_eq!(parsed.items.len(), 2);
+    assert_eq!(parsed.items[0].url, "https://mastodon.social/@alice/1");
+    assert_eq!(
+        parsed.items[1].url,
+        "https://en.wikipedia.org/wiki/Foo_(bar)"
+    );
+    assert_eq!(
+        parse_xml_feed_for_kind(&xml, FeedKind::Rss).unwrap(),
+        parsed.items
+    );
 }
 
 #[test]
@@ -944,4 +1183,58 @@ fn commands_require_enabled_configured_guild_and_manage_guild() {
         feed_list_text(&[feed]),
         "`feed-1` rss → <#channel-1> https://example.org/feed.xml"
     );
+}
+
+#[test]
+fn feed_list_truncates_each_source_before_combining_rows() {
+    let first = FeedRelay {
+        source: format!("https://example.org/{}", "a".repeat(5000)),
+        ..relay(FeedKind::Rss)
+    };
+    let second = FeedRelay {
+        id: "second".into(),
+        source: "https://example.org/second".into(),
+        ..relay(FeedKind::Rss)
+    };
+    let text = feed_list_text(&[first, second]);
+
+    assert!(text.contains("…\n`second`"));
+    assert!(text.encode_utf16().count() <= 2000);
+}
+
+#[test]
+fn feed_add_rejects_long_sources_and_nonstandard_ports() {
+    let context = FeedCommandContext {
+        enabled: true,
+        configured_guild_id: "guild-1",
+        guild_id: "guild-1",
+        channel_id: "channel-1",
+        actor_id: "actor",
+        can_manage_guild: true,
+        now_ms: 1234,
+    };
+    let expanded_source = format!("https://example.org/{}", "é".repeat(400));
+    assert!(expanded_source.len() < MAX_FEED_SOURCE_BYTES);
+    let sources = [
+        format!("https://example.org/{}", "a".repeat(MAX_FEED_SOURCE_BYTES)),
+        "https://example.org:8443/feed".into(),
+        expanded_source,
+    ];
+
+    for source in sources {
+        assert!(
+            matches!(
+                plan_command(
+                    &context,
+                    FeedCommand::Add {
+                        id: "feed-1".into(),
+                        kind: FeedKind::Rss,
+                        source: source.clone(),
+                    }
+                ),
+                Err(FeedError::Fetch(FetchError::InvalidSource))
+            ),
+            "accepted {source}"
+        );
+    }
 }

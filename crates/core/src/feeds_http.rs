@@ -6,15 +6,14 @@ use thiserror::Error;
 use url::{Host, Url};
 
 pub const MAX_FEED_BYTES: usize = 2_000_000;
-/// Bound feed URLs before parsing or advertising them in command metadata.
-pub const MAX_FEED_SOURCE_CHARS: usize = 2048;
+pub const MAX_FEED_SOURCE_BYTES: usize = 2048;
 pub const MAX_REDIRECT_HOPS: usize = 3;
 pub const FEED_READ_TIMEOUT_MS: u64 = 15_000;
 pub const FEED_USER_AGENT: &str = "Owen/1.0 (+https://two.gg)";
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum FetchError {
-    #[error("Feed source must be an HTTPS URL without embedded credentials.")]
+    #[error("Feed source must be an HTTPS URL on port 443, without credentials, and at most 2048 bytes.")]
     InvalidSource,
     #[error("Feed source must resolve only to public IP addresses.")]
     NonPublicAddress,
@@ -29,28 +28,16 @@ pub enum FetchError {
 }
 
 pub fn validate_source(source: &str) -> Result<Url, FetchError> {
-    if source
-        .encode_utf16()
-        .take(MAX_FEED_SOURCE_CHARS + 1)
-        .count()
-        > MAX_FEED_SOURCE_CHARS
-    {
+    if source.len() > MAX_FEED_SOURCE_BYTES {
         return Err(FetchError::InvalidSource);
     }
     let url = Url::parse(source.trim()).map_err(|_| FetchError::InvalidSource)?;
-    if url
-        .as_str()
-        .encode_utf16()
-        .take(MAX_FEED_SOURCE_CHARS + 1)
-        .count()
-        > MAX_FEED_SOURCE_CHARS
-    {
-        return Err(FetchError::InvalidSource);
-    }
     if url.scheme() != "https"
         || !url.username().is_empty()
         || url.password().is_some()
         || url.host().is_none()
+        || url.port_or_known_default() != Some(443)
+        || url.as_str().len() > MAX_FEED_SOURCE_BYTES
     {
         return Err(FetchError::InvalidSource);
     }

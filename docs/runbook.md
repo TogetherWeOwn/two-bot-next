@@ -119,11 +119,15 @@ for the dashboard procedure.
 
 Rust uses JSON `tracing` logs, configured by `RUST_LOG`, fallback
 `error,two_bot={LOG_LEVEL:-info}` (dependency crates stay ERROR-only unless
-`RUST_LOG` opts in); `/readyz` 503s log at DEBUG, not ERROR. This wrapper currently
-forwards **only** `DISCORD_TOKEN`, `DATABASE_URL`, `GUILD_ID` and its computed
-`LISTEN_ADDR`, not `RUST_LOG` or arbitrary `TWO_*` flags. Adding a Worker var
-alone will not configure the container. Do not dump env or HTTP headers to
-troubleshoot; redact tokens, connection strings, and member data from evidence.
+`RUST_LOG` opts in); `/readyz` 503s log at DEBUG, not ERROR. This wrapper forwards
+`DISCORD_TOKEN`, `DATABASE_URL`, `GUILD_ID`, its computed `LISTEN_ADDR`, the reviewed
+`TWO_*` flags (`FORWARDED_FLAGS` in `wrangler/src/container-env.ts`), the validated
+`DISCORD_APPLICATION_ID`, and the 12 validated non-secret `DISCORD_*` IDs
+(`FORWARDED_DISCORD_IDS` there: audit/voice/moderation log channels, staff alert
+channel, ticket category/panel/staff role, landing/goodbye/anchor-welcome channels,
+session lobby/looking-to-play) — not `RUST_LOG`, secrets, or arbitrary vars. Adding
+a Worker var alone will not configure the container. Do not dump env or HTTP headers
+to troubleshoot; redact tokens, connection strings, and member data from evidence.
 
 Look for these literal messages:
 
@@ -146,7 +150,8 @@ The DO renews activity and probes `/readyz` every `KEEPALIVE_SECONDS` (default
 60); `sleepAfter` is 30 minutes. Outbound gateway traffic alone does not keep
 an idle container awake. Do not disable the keepalive or increase capacity
 without measured evidence. `lite`, `max_instances=1` is the declared placement,
-not evidence of the measured RSS budget. See [staging soak](staging-soak.md).
+not a measurement or B2 acceptance criterion. B2 requires flat memory and has
+no accepted numeric RSS threshold; see [staging soak](staging-soak.md).
 
 ### Sustained-unready alerts
 
@@ -166,6 +171,15 @@ transition (fire, resolve). It posts to `OPS_ALERT_WEBHOOK_URL` only when
 retains the credential and monitoring. See
 [metrics](metrics.md#off-container-scrape-and-alert-rules). Fetch the live data
 with `curl -H "Authorization: Bearer $METRICS_SCRAPE_TOKEN" "$WORKER_URL/ops/metrics"`.
+`METRICS_SCRAPE_TOKEN` must be at least 32 characters; a shorter value leaves
+the route at `404` and a short staging token must be reissued (none is
+provisioned today). Every scrape attempt takes one token synchronously
+before the secret comparison, so concurrent guesses cannot share a token;
+an exhausted caller is refused without any comparison (`429` +
+`retry-after`). Buckets are per caller, so someone else's failures cannot
+throttle a correct bearer elsewhere; a caller shed only because the
+10,000-entry table is full is still compared, so a scanner flood cannot
+lock out the authenticated scraper.
 
 #### Alert: job stale
 
@@ -339,6 +353,14 @@ or unconfirmed shutdown leaves denial; do not assume a 503 stopped the old
 process. Preserve maintenance until teardown is confirmed. 401/auth failure is
 a stop, 409 requires state reconciliation, and 503 is never permission to clear
 storage/alarms. No operation clears SDK state or changes guild/database bindings.
+The deployment-takeover client re-reads the fresh epoch on every retry, so reads
+answered by converging versions never block the post. The transfer step pins the
+client to the receipt-validated Worker version (`OWNERSHIP_EXPECTED_DEPLOYMENT`).
+When its posted epoch shows up owned by a deployment other than the one
+answering the read, the client re-posts only if the answering version is the
+deployed one (old-to-new handover); an answer from any other version is stale,
+so it stops without posting rather than handing that version a further commit.
+Without the pin the client fails closed and always stops on such a mismatch.
 
 The workflow preflight stops **before deploy** if control configuration is absent.
 After deployment it explicitly transfers only a previously active owner. First
@@ -531,7 +553,8 @@ both Worker version and running image. Unlike CI's explicit handoff step, the
 bare deploy command does **not** transfer ownership: read control state, confirm
 old-process teardown, and perform the authorized takeover with its current epoch
 before any startup-capable probe. Then check `/health`, `/readyz` and startup
-logs; record finish-to-first-ready gap (soak target under 60 seconds). A container
+logs; record finish-to-first-ready as a separate deployment/workflow interval.
+It is not the B2 outage-start-to-verified-recovery measure. A container
 replacement can restart the shard; there is no promise of zero downtime.
 
 ### Worker-version rollback
@@ -578,7 +601,9 @@ Pick the target from the deployment list: a version that already served staging
 traffic, not the serving one, compatible with the current schema (the script
 refuses an unknown or never-deployed id). The job summary and evidence file hold
 the fence, rollback, takeover and first-ready times, the time-to-ready against
-the 60 s budget, probe counts, the container image digest and instance counts.
+the workflow's 60 s budget, probe counts, the container image digest and
+instance counts. This workflow interval is not an outage-start recovery
+measurement and cannot prove B2's under-60-second recovery criterion.
 Gateway-session count is not observable from probes; read the Worker logs for it.
 If the run stops on a 401/403 it skips the restore: recover with a
 `deploy-staging` dispatch with `release_fence=true` after the binding is fixed.
@@ -749,6 +774,32 @@ Source: [`automod.rs`](../crates/core/src/automod.rs),
 Do not enable new writes until runtime wiring, environment propagation,
 containment, authorization and staging evidence exist.
 
+### Automation definition quotas
+
+Ordinary store-backed creation permits **25 schedules**, **25 feed relays** and
+**20 open LFG posts per guild**. Disabled feeds and disabled/completed schedules
+still count toward their definition limits. Remove an unused definition with
+`/feed-remove` or `/schedule-remove`; close an open post with `/lfg-close`.
+The command replies name the exhausted limit and the command that frees a slot.
+No Discord post is attempted for a quota-refused LFG creation.
+
+Capacity checks and writes share a short transaction-scoped guild/resource lock.
+Schedule replacements and open LFG updates do not consume another slot;
+reopening a closed LFG post does. Feed creation remains insert-only. Existing
+rows above a limit are preserved, and existing schedule/LFG definitions can
+still be updated. These are application CRUD limits, not schema constraints:
+operator backup/restore preserves historical rows and is not quota-truncated.
+
+This change does not add retention, trigger/signup cooldowns or feed-poll
+fairness. Audit replay markers and uncertain delivery state must remain durable
+when implementing those separately. No automatic purge or live-data cleanup is
+authorized by these limits.
+
+Source: [`automation_quota.rs`](../crates/core/src/automation_quota.rs),
+[`scheduled_store.rs`](../crates/core/src/scheduled_store.rs),
+[`feeds_store.rs`](../crates/core/src/feeds_store.rs),
+[`lfg_store.rs`](../crates/core/src/lfg_store.rs).
+
 ## Backup, restore and drill commands
 
 [Backup procedures and formats](backup.md) are the detailed contract. These
@@ -849,6 +900,7 @@ or existing operator handoff; see [backup.md](backup.md) for unit contracts.
 | HTTP 200 health but persistent 503 ready | Listener works; inspect `gateway`, `database` and `token_invalid` state and sanitized logs. A database failure or rejected-token latch need not be a gateway transport outage. Never soften readiness or count the scaffold-era deploy gate as recovery. |
 | Reconnect / RESUME refused | Follow [restart semantics](#restart-semantics-durable-resume-not-full-state-recovery); 4007/4009 force fresh IDENTIFY. Preserve the durable checkpoint, don't hand-edit sequence or start another shard. |
 | Discord REST 429 / suspected breaker | Separate token-wide durable admission, executor-local pacing, process-wide global pause/invalid-request breaker, and the private announcement governor. Refusal can precede HTTP; retry bounds vary by action. There is no manual reset endpoint. Do not hammer Discord, replay uncertain moderation writes or restart/delete state to clear a hold. Identify the actual writer and use verified containment; see the [Discord playbook](#discord-gateway-or-api-outage). |
+| Channel moderation lane stuck `in_progress` after an ambiguous write | No automatic retry/expiry. Quiesce original workers, establish old REST settlement, and read actual Discord overwrites/slowmode before using the inspection-first, explicitly confirmed operator CLI. It preserves recovery and audits the prior claim. See [channel lane reconciliation](channel-lane-reconciliation.md); never release a lane while a delayed unlock can still write. |
 | `POST /internal/actions` 404 on staging | The route is dark unless the Worker var `INTERNAL_ACTIONS_INGRESS` (staging env) **and** the secret `TWO_INTERNAL_ACTIONS` are both exactly `1`. Wrong method, a trailing slash or any query string is also 404 by design. Production is always 404. |
 | `POST /internal/actions` 503 `unavailable` | The container is not running (public ingress never starts it; wait for the probe or keepalive), the ownership fence refused this deployment, or the receiver answered something other than its JSON envelope. Check `/readyz` and ownership status; do not retry-loop a signed request with a new nonce. |
 | Ready but feature inactive | Gateway readiness says nothing about library-only commands/jobs/kill switches. Check [runtime boundaries](#containment-kill-switches-and-feature-flags), not extra environment guesses. |

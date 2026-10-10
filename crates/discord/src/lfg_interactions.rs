@@ -1,6 +1,6 @@
 //! LFG interaction handlers using the shared router, store and REST executor.
 
-use crate::{ActionExecutor, DiscordError};
+use crate::{automation_admission::ActorCooldowns, ActionExecutor, DiscordError};
 use serde_json::{json, Value};
 use two_bot_core::commands::MAX_RESOURCE_ID_CHARS;
 use two_bot_core::lfg::{self, LfgPost, LfgRole, LfgSelectAction, LfgSignup, LfgStatus};
@@ -30,10 +30,14 @@ pub enum LfgError {
     Audit(#[from] rsvp_store::RsvpStoreError),
     #[error("LFG Discord operation failed")]
     Discord(#[from] DiscordError),
+    #[error(transparent)]
+    Definition(#[from] two_bot_core::automation_quota::QuotaWriteError),
     #[error("LFG acceptance is uncertain; durable state retained for nonce recovery")]
     Uncertain,
     #[error("LFG is busy right now; try again in a few seconds.")]
     Busy,
+    #[error("Wait 5 seconds before joining or changing another LFG role.")]
+    CoolingDown,
 }
 
 /// LFG executions allowed to hold a pool connection at once, per process.
@@ -60,6 +64,7 @@ pub struct LfgInteractions {
     in_flight: tokio::sync::Semaphore,
     /// Executions that are running or queued for the permit.
     admitted: std::sync::atomic::AtomicUsize,
+    signup_cooldowns: tokio::sync::Mutex<ActorCooldowns>,
 }
 
 /// One admitted execution; releases its place in the queue on drop, including
@@ -78,6 +83,7 @@ impl LfgInteractions {
             pool,
             in_flight: tokio::sync::Semaphore::new(LFG_MAX_IN_FLIGHT),
             admitted: std::sync::atomic::AtomicUsize::new(0),
+            signup_cooldowns: tokio::sync::Mutex::new(ActorCooldowns::default()),
         }
     }
 
@@ -98,6 +104,34 @@ impl LfgInteractions {
         Ok((admission, permit))
     }
 
+    /// Also used by routing before its deferred callback. Direct service callers
+    /// still pass this gate in execute; the same event does not extend a window.
+    pub(crate) async fn admit_signup(
+        &self,
+        request: &LfgRequest,
+        guild_id: &str,
+        actor_id: &str,
+        interaction_id: u64,
+    ) -> Result<(), LfgError> {
+        if !matches!(request, LfgRequest::Select(LfgSelectAction::Signup { .. })) {
+            return Ok(());
+        }
+        let guild = guild_id.parse::<u64>().ok().filter(|id| *id != 0);
+        let actor = actor_id.parse::<u64>().ok().filter(|id| *id != 0);
+        let (Some(guild), Some(actor)) = (guild, actor) else {
+            return Err(LfgError::Invalid("Invalid LFG actor or server.".into()));
+        };
+        if !self.signup_cooldowns.lock().await.admit(
+            guild,
+            actor,
+            interaction_id,
+            tokio::time::Instant::now(),
+        ) {
+            return Err(LfgError::CoolingDown);
+        }
+        Ok(())
+    }
+
     pub async fn execute(
         &self,
         executor: &ActionExecutor,
@@ -107,6 +141,11 @@ impl LfgInteractions {
         interaction_id: u64,
         bot_user_id: u64,
     ) -> Result<String, LfgError> {
+        // Apply only to signup/move, before queue admission, SQL, audit or
+        // channel refresh. Leave and close must remain usable for recovery.
+        let signup = matches!(&request, LfgRequest::Select(LfgSelectAction::Signup { .. }));
+        self.admit_signup(&request, guild_id, actor_id, interaction_id)
+            .await?;
         let now = time::OffsetDateTime::now_utc();
         let at = lfg::iso_millis_utc(now);
         let id = match &request {
@@ -140,6 +179,24 @@ impl LfgInteractions {
             .bind(format!("lfg-runtime:{guild_id}:{id}"))
             .execute(&mut *guard)
             .await?;
+        // An admitted redelivery may retry refresh, but must not append another
+        // signup audit or reapply a signup after the actor has left. The same
+        // per-post lock serializes this lookup with the original execution.
+        let replay_outcome: Option<String> = if signup {
+            sqlx::query_scalar(
+                "SELECT outcome FROM announcements_audit_log
+                 WHERE id = $1 AND guild_id = $2 AND actor_id = $3
+                   AND target_key = $4 AND action = 'lfg.signup'",
+            )
+            .bind(format!("lfg:signup:{interaction_id}"))
+            .bind(guild_id)
+            .bind(actor_id)
+            .bind(&id)
+            .fetch_optional(&self.pool)
+            .await?
+        } else {
+            None
+        };
         let (action, outcome, reply, refresh) = match request {
             LfgRequest::Create {
                 title,
@@ -274,14 +331,15 @@ impl LfgInteractions {
                 )
             }
             LfgRequest::Select(LfgSelectAction::Signup { role_key, .. }) => {
-                let outcome =
-                    store::signup_lfg(&self.pool, guild_id, &id, &role_key, actor_id, &at).await?;
-                (
-                    "lfg.signup",
-                    outcome.as_str().into(),
-                    lfg::signup_reply(outcome),
-                    true,
-                )
+                let outcome = match replay_outcome.as_ref() {
+                    Some(outcome) => outcome.clone(),
+                    None => store::signup_lfg(&self.pool, guild_id, &id, &role_key, actor_id, &at)
+                        .await?
+                        .as_str()
+                        .to_owned(),
+                };
+                let reply = format!("LFG {outcome}.");
+                ("lfg.signup", outcome, reply, true)
             }
             LfgRequest::Select(LfgSelectAction::Leave { .. }) => {
                 // leave_lfg is id-only: establish the guild fence before invoking it.
@@ -295,16 +353,18 @@ impl LfgInteractions {
                 )
             }
         };
-        self.audit(
-            guild_id,
-            actor_id,
-            interaction_id,
-            &id,
-            action,
-            &outcome,
-            &at,
-        )
-        .await?;
+        if replay_outcome.is_none() {
+            self.audit(
+                guild_id,
+                actor_id,
+                interaction_id,
+                &id,
+                action,
+                &outcome,
+                &at,
+            )
+            .await?;
+        }
         let result = if refresh {
             match self.refresh(executor, guild_id, &id).await {
                 Ok(()) => reply,
@@ -357,10 +417,14 @@ impl LfgInteractions {
         rsvp_store::write_audit(
             &self.pool,
             &RsvpAudit {
-                id: format!(
-                    "lfg:{interaction}:{}",
-                    time::OffsetDateTime::now_utc().unix_timestamp_nanos()
-                ),
+                id: if action == "lfg.signup" {
+                    format!("lfg:signup:{interaction}")
+                } else {
+                    format!(
+                        "lfg:{interaction}:{}",
+                        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+                    )
+                },
                 guild_id: guild.into(),
                 actor_id: Some(actor.into()),
                 action: action.into(),
@@ -420,6 +484,51 @@ mod tests {
     async fn admitted(service: Arc<LfgInteractions>) -> bool {
         let result = service.admit().await;
         result.is_ok()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn signup_refusal_precedes_queue_and_pool_and_exempts_recovery() {
+        let service = service();
+        service.pool.close().await;
+        let executor = ActionExecutor::with_proxy(
+            "lfg-admission-fixture".into(),
+            Some("http://127.0.0.1:1".into()),
+        )
+        .unwrap();
+        let request = || {
+            LfgRequest::Select(LfgSelectAction::Signup {
+                post_id: "post".into(),
+                role_key: "tank".into(),
+            })
+        };
+        service.admit_signup(&request(), "1", "2", 3).await.unwrap();
+        let running = service.admit().await.unwrap();
+        for id in 4..1004 {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                service.execute(&executor, request(), "1", "2", id, 0),
+            )
+            .await
+            .expect("refusal cannot queue or access the closed pool");
+            assert!(matches!(result, Err(LfgError::CoolingDown)));
+        }
+        assert_eq!(service.admitted.load(Ordering::Acquire), 1);
+        assert!(service.admit_signup(&request(), "1", "2", 3).await.is_ok());
+        assert!(service.admit_signup(&request(), "1", "4", 5).await.is_ok());
+        assert!(service.admit_signup(&request(), "6", "2", 5).await.is_ok());
+        for request in [
+            LfgRequest::Select(LfgSelectAction::Leave {
+                post_id: "post".into(),
+            }),
+            LfgRequest::Close {
+                post_id: "post".into(),
+            },
+        ] {
+            assert!(service.admit_signup(&request, "1", "2", 4).await.is_ok());
+        }
+        tokio::time::advance(crate::automation_admission::COOLDOWN).await;
+        assert!(service.admit_signup(&request(), "1", "2", 4).await.is_ok());
+        drop(running);
     }
 
     #[tokio::test]

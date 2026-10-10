@@ -78,6 +78,13 @@ fn message(id: u64, content: &str) -> Message {
     .expect("valid Twilight message fixture")
 }
 
+async fn expire_actor_window() {
+    // Pause only between calls: a paused clock auto-advances during socket I/O.
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+    tokio::time::resume();
+}
+
 async fn seed_text_command(pool: &sqlx::PgPool, template: &str) {
     two_bot_core::custom_command_service::put(
         pool,
@@ -237,6 +244,7 @@ async fn explicitly_accepted_prefixes_render_audit_and_suppress_mentions() {
     let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id": "9000"}))).await;
     let runtime = runtime(pool.clone(), &mock, true);
     for (id, acceptance) in [(51, AutomodDisabled), (52, Unmatched), (53, Exempt)] {
+        expire_actor_window().await;
         assert_eq!(
             runtime
                 .handle_message(
@@ -250,6 +258,7 @@ async fn explicitly_accepted_prefixes_render_audit_and_suppress_mentions() {
             TextCommandOutcome::Delivered
         );
     }
+    expire_actor_window().await;
     assert_eq!(
         runtime
             .handle_message(
@@ -262,6 +271,7 @@ async fn explicitly_accepted_prefixes_render_audit_and_suppress_mentions() {
             .unwrap(),
         TextCommandOutcome::Ignored
     );
+    expire_actor_window().await;
     sqlx::query("UPDATE automation_commands SET enabled = FALSE WHERE name = 'faq'")
         .execute(&pool)
         .await
@@ -329,6 +339,7 @@ async fn prefix_attempt_survives_concurrency_restart_and_unknown_outcomes() {
         TextCommandOutcome::AlreadyAttempted
     );
     // Crash/cancellation after committing the attempt, before recording a result.
+    expire_actor_window().await;
     assert!(
         store::claim_text_attempt(&pool, "2222", "3333", "faq", 61, &two_bot_core::now_iso())
             .await
@@ -360,6 +371,7 @@ async fn prefix_delivery_and_render_failures_are_audited_without_retry() {
         (63, None, "context_unavailable"),
         (64, Some(oversized.as_str()), "render_failed"),
     ] {
+        expire_actor_window().await;
         assert!(runtime
             .handle_message(&message(id, "!faq"), Unmatched, true, server)
             .await
@@ -459,6 +471,7 @@ async fn prefix_storage_failure_never_permits_an_untracked_or_repeated_post() {
         .execute(&pool)
         .await
         .unwrap();
+    expire_actor_window().await;
     sqlx::query("ALTER TABLE automation_audit_log ADD CONSTRAINT refuse_result CHECK (action <> 'command.run')")
         .execute(&pool).await.unwrap();
     assert!(runtime

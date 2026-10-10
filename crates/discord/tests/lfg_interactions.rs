@@ -190,6 +190,12 @@ impl TestDb {
     }
 }
 
+async fn expire_actor_window() {
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+    tokio::time::resume();
+}
+
 fn body(request: &common::RestRequest) -> Value {
     serde_json::from_slice(&request.body).expect("JSON body")
 }
@@ -235,6 +241,7 @@ async fn router_runs_create_signup_full_switch_leave_close_with_audit() {
     let joined_at = store::list_lfg_signups(&db.pool, post).await.unwrap()[0]
         .joined_at
         .clone();
+    expire_actor_window().await;
     rt.handle(&select(7003, post, 3333, "tank")).await.unwrap();
     assert_eq!(
         store::list_lfg_signups(&db.pool, post).await.unwrap()[0].joined_at,
@@ -242,9 +249,11 @@ async fn router_runs_create_signup_full_switch_leave_close_with_audit() {
     );
     rt.handle(&select(7004, post, 3334, "tank")).await.unwrap();
     assert_eq!(last_reply(&mock), "LFG full.");
+    expire_actor_window().await;
     rt.handle(&select(7005, post, 3333, "dps")).await.unwrap();
     assert_eq!(last_reply(&mock), "LFG moved.");
     rt.handle(&select(7006, post, 3334, "tank")).await.unwrap();
+    expire_actor_window().await;
     rt.handle(&select(7007, post, 3334, "dps")).await.unwrap();
     assert_eq!(last_reply(&mock), "LFG full.");
     assert_eq!(
@@ -326,6 +335,58 @@ async fn router_runs_create_signup_full_switch_leave_close_with_audit() {
     assert!(!content.contains("@everyone"));
     assert_eq!(reply["allowed_mentions"]["parse"], json!([]));
 
+    mock.shutdown().await;
+    drop(rt);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "needs agent-testdb or the CI service container"]
+async fn router_refuses_lfg_capacity_before_posting_and_names_the_close_command() {
+    let db = TestDb::new().await;
+    for n in 0..20 {
+        let post = lfg::LfgPost {
+            id: format!("quota-{n}"),
+            guild_id: GUILD.into(),
+            channel_id: CHANNEL.into(),
+            message_id: None,
+            title: "Stored title".into(),
+            starts_at: "2099-09-11T20:00:00Z".into(),
+            status: lfg::LfgStatus::Open,
+            created_by: "3333".into(),
+            created_at: "2026-09-30T00:00:00.000Z".into(),
+            closed_at: None,
+        };
+        store::put_lfg(&db.pool, &post, &[], true).await.unwrap();
+    }
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(204)],
+        ScriptedResponse::json(200, json!({"id": "5900"})),
+    )
+    .await;
+    let rt = runtime(db.pool.clone(), &mock, true);
+    rt.handle(&create(7199, PERM_MANAGE_EVENTS)).await.unwrap();
+    assert_eq!(
+        last_reply(&mock),
+        two_bot_core::automation_quota::AutomationQuota::OpenLfgPosts.to_string()
+    );
+    assert!(store::get_lfg(&db.pool, GUILD, "lfg-7199")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store::list_lfg_roles(&db.pool, "lfg-7199")
+        .await
+        .unwrap()
+        .is_empty());
+    let audits: i64 = sqlx::query_scalar("SELECT count(*) FROM announcements_audit_log")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(audits, 0);
+    assert!(!mock
+        .requests()
+        .iter()
+        .any(|request| request.path.starts_with("/api/v10/channels/")));
     mock.shutdown().await;
     drop(rt);
     db.cleanup().await;

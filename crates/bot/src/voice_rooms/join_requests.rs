@@ -308,7 +308,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
         let mut entrants = Vec::new();
         {
-            let live = self.live.inner.read().expect("live voice lock");
+            let live = self.live.read_state();
             if !live.ready {
                 return;
             }
@@ -354,9 +354,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         };
         let occupants: Vec<MemberId> = self
             .live
-            .inner
-            .read()
-            .expect("live voice lock")
+            .read_state()
             .occupants(room)
             .into_iter()
             .map(MemberId)
@@ -389,7 +387,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             return JoinReply::Refused(PAUSED.to_owned());
         }
         let bot_permissions = {
-            let live = self.live.inner.read().expect("live voice lock");
+            let live = self.live.read_state();
             if !live.ready {
                 return JoinReply::Refused(WARMING.to_owned());
             }
@@ -824,9 +822,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         };
         let in_join = self
             .live
-            .inner
-            .read()
-            .expect("live voice lock")
+            .read_state()
             .members
             .get(&member)
             .is_some_and(|state| state.channel_id == Some(join));
@@ -1000,7 +996,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// Drop a deleted overwrite from the live snapshot, so the next decision
     /// reads what Discord now holds without waiting for the gateway echo.
     fn forget_overwrite(&self, room: Snowflake, member: Snowflake) {
-        let mut live = self.live.inner.write().expect("live voice lock");
+        let mut live = self.live.write_state();
         if let Some(channel) = live.channels.get_mut(&room) {
             if let Some(overwrites) = channel.permission_overwrites.as_mut() {
                 overwrites.retain(|entry| {

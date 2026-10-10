@@ -133,16 +133,17 @@ above for exact seconds on a new head.
 | `/readyz` parked answer | 503 with process ready and gateway down (6-job parked map at the trial head; 10-job map on current heads) | Smoke contract | Truthful parked, never acceptance |
 | Docker HEALTHCHECK | Healthy within 30 s of start | Smoke contract | Same deadline as `/health` |
 | SIGTERM shutdown | Exit 0 in 0.236 s (trial); 0.095 s historical default image | Trial log; baseline doc | Inside the 10 s smoke and 35 s drain budgets |
-| Parked-mode RSS peak | Not sampled by smoke. Proxies: synthetic pipeline peak ≈ 24 MiB (debug, mock workload); B1 floor ≈ 140 MiB; `lite` gate signal ≈ 200 MiB on the shipped `basic` placement; no OOM at the 256 MiB cap | Baseline and benchmark docs | Placement unchanged; loaded-guild RSS still needs the staging soak |
-| Gateway-connected first 200 | Never measured on the trial (no secrets by design) | Staging soak acceptance | 60 s budget stands |
+| Parked-mode RSS peak | Not sampled by smoke. Proxies: synthetic pipeline peak ≈ 24 MiB (debug, mock workload); B1 floor ≈ 140 MiB; `lite` gate signal ≈ 200 MiB on the shipped `basic` placement; no OOM at the 256 MiB cap | Baseline and benchmark docs | Placement unchanged; loaded-guild RSS is a separate placement question, not a numeric B2 acceptance criterion or authority to change placement |
+| Gateway-connected first 200 | Never measured on the trial (no secrets by design) | Staging readiness workflow | The 60 s restart/deploy-to-first-200 budget is a readiness interval, not B2 outage-start-to-verified-recovery |
 
 ### SLO thresholds
 
-No threshold changes. The existing budgets already bound this runtime: first
-200 within 60 s of a restart or deploy event, SIGTERM drain inside 35 s, RSS
-against the B1 floor on the shipped placement, and the image/binary size
-ceilings. The cutover guard keeps reading those values; this section is the
-distroless evidence behind them.
+No threshold changes. The existing operational budgets already bound this runtime:
+first 200 within 60 s of a restart or deploy event (a readiness workflow
+interval, not B2 outage recovery), SIGTERM drain inside 35 s, RSS observations
+against the B1 floor for separate placement review (not B2 pass/fail), and the
+image/binary size ceilings. The cutover guard keeps reading those values; this
+section is the distroless evidence behind them.
 
 Not claimed here: a live Discord TLS handshake, backup/guild-config upload-hook
 paths, or loaded-guild RSS — those stay on the cutover preconditions above.

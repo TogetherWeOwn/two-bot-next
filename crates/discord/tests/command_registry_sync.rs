@@ -210,6 +210,140 @@ async fn dry_run_renders_add_remove_options_permissions_and_descriptions_without
     mock.shutdown().await;
 }
 
+fn identity_interaction(
+    id: u64,
+    name: &str,
+) -> twilight_model::application::interaction::Interaction {
+    serde_json::from_value(json!({
+        "id": "7000", "application_id": APP_ID.to_string(), "type": 2,
+        "token": "registry-identity-fixture", "authorizing_integration_owners": {},
+        "entitlements": [], "guild_id": GUILD_ID.to_string(),
+        "data": {"id": id.to_string(), "name": name, "type": 1, "guild_id": GUILD_ID.to_string()}
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn identity_snapshot_uses_matching_get_and_then_the_new_put_receipt() {
+    let commands = desired();
+    let mut replaced = fetched_registry(&commands);
+    for command in replaced.as_array_mut().unwrap() {
+        let old: u64 = command["id"].as_str().unwrap().parse().unwrap();
+        command["id"] = json!((old + 10000).to_string());
+    }
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, fetched_registry(&commands)),
+            ScriptedResponse::json(200, drifted_registry(&commands)),
+            ScriptedResponse::json(200, replaced),
+        ],
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let executor = executor(&mock);
+    let identities = executor.command_identities();
+    executor
+        .sync_guild_commands(APP_ID, GUILD_ID, &commands, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        identities
+            .slash_name(&identity_interaction(9000, "wrong-name"))
+            .as_deref(),
+        Some("inspect")
+    );
+    assert_eq!(mock.requests().len(), 1, "hash match sends no PUT");
+    executor
+        .sync_guild_commands(APP_ID, GUILD_ID, &commands, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        identities
+            .slash_name(&identity_interaction(19000, "wrong-name"))
+            .as_deref(),
+        Some("inspect")
+    );
+    assert_eq!(
+        identities.slash_name(&identity_interaction(9000, "inspect")),
+        None
+    );
+    assert_eq!(mock.requests().len(), 3);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_publish_does_not_install_the_pre_write_get_or_bad_receipt() {
+    for receipt in [
+        ScriptedResponse::status(403),
+        ScriptedResponse::json(200, json!([])),
+    ] {
+        let commands = desired();
+        let mut drift = drifted_registry(&commands);
+        let inspect = drift
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|command| command["name"] == "inspect")
+            .unwrap();
+        inspect["id"] = json!("19000");
+        let mock = MockRest::start(
+            vec![
+                ScriptedResponse::json(200, fetched_registry(&commands)),
+                ScriptedResponse::json(200, drift),
+                receipt,
+            ],
+            ScriptedResponse::status(403),
+        )
+        .await;
+        let executor = executor(&mock);
+        executor
+            .sync_guild_commands(APP_ID, GUILD_ID, &commands, true)
+            .await
+            .unwrap();
+        assert!(executor
+            .sync_guild_commands(APP_ID, GUILD_ID, &commands, true)
+            .await
+            .is_err());
+        let identities = executor.command_identities();
+        assert_eq!(
+            identities
+                .slash_name(&identity_interaction(9000, "wrong-name"))
+                .as_deref(),
+            Some("inspect")
+        );
+        assert_eq!(
+            identities.slash_name(&identity_interaction(19000, "inspect")),
+            None
+        );
+        mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn direct_publication_records_ids_for_dynamic_republish_callers() {
+    let commands = desired();
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(200, fetched_registry(&commands))],
+        ScriptedResponse::status(403),
+    )
+    .await;
+    let executor = executor(&mock);
+    executor
+        .publish_guild_commands(APP_ID, GUILD_ID, &commands)
+        .await
+        .unwrap();
+    assert_eq!(
+        executor
+            .command_identities()
+            .slash_name(&identity_interaction(9000, "wrong-name"))
+            .as_deref(),
+        Some("inspect")
+    );
+    assert_eq!(mock.requests().len(), 1);
+    assert_full_put(&mock.requests()[0], &commands);
+    mock.shutdown().await;
+}
+
 #[tokio::test]
 async fn apply_bulk_overwrites_full_registry_then_fresh_executor_skips_matching_registry() {
     let commands = desired();

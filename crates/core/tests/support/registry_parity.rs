@@ -1,7 +1,15 @@
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
-use two_bot_core::commands::{CommandDefinition, HELP_DESCRIPTION, OCCURRENCE_ID_MAX_CHARS};
+use two_bot_core::commands::{
+    CommandDefinition, HELP_DESCRIPTION, MAX_RESOURCE_ID_CHARS, OCCURRENCE_ID_MAX_CHARS,
+};
+use two_bot_core::custom_commands::{
+    MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_CHARS, MAX_TEXT_TRIGGER_CHARS,
+};
+use two_bot_core::feeds_http::MAX_FEED_SOURCE_BYTES;
+use two_bot_core::lfg::{MAX_ROLE_SPEC_CHARS, MAX_TITLE_CHARS};
 use two_bot_core::router::{InteractionRouter, RouterGates};
+use two_bot_core::scheduled::MAX_BODY_CHARS;
 
 pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("rsvp-attendance", "docs/parity.md §1 #12 / #25"),
@@ -15,15 +23,15 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("rsvp-attendance", "docs/parity.md §1 #25 copy"),
     ("lfg", "docs/parity.md §1 #26 copy"),
     ("lfg-close", "docs/parity.md §1 #27 copy"),
-    ("command", "docs/parity.md §1 #14 input bounds"),
-    ("command-remove", "docs/parity.md §1 #15 input bounds"),
-    ("schedule", "docs/parity.md §1 #17 input bounds"),
-    ("schedule-remove", "docs/parity.md §1 #18 input bounds"),
-    ("sticky", "docs/parity.md §1 #20 input bounds"),
-    ("lfg", "docs/parity.md §1 #26 input bounds"),
-    ("lfg-close", "docs/parity.md §1 #27 input bounds"),
-    ("feed-add", "docs/parity.md §1 #28 input bounds"),
-    ("feed-remove", "docs/parity.md §1 #29 input bounds"),
+    ("command", "docs/parity.md §1 #14 caps"),
+    ("command-remove", "docs/parity.md §1 #15 caps"),
+    ("schedule", "docs/parity.md §1 #17 caps"),
+    ("schedule-remove", "docs/parity.md §1 #18 caps"),
+    ("sticky", "docs/parity.md §1 #20 caps"),
+    ("lfg", "docs/parity.md §1 #26 caps"),
+    ("lfg-close", "docs/parity.md §1 #27 caps"),
+    ("feed-add", "docs/parity.md §1 #28 caps"),
+    ("feed-remove", "docs/parity.md §1 #29 caps"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -99,6 +107,56 @@ pub fn expected_registry() -> Value {
         assert!(duration["max_value"].is_null());
         duration["max_value"] = json!(max);
     }
+    // Custom-command caps: advertise ONLY max_length matching the runtime
+    // validators; every other field stays legacy-identical.
+    for (name, option_name, max, reference) in [
+        (
+            "command",
+            "name",
+            MAX_COMMAND_NAME_CHARS,
+            "docs/parity.md §1 #14 caps",
+        ),
+        (
+            "command",
+            "template",
+            MAX_TEMPLATE_CHARS,
+            "docs/parity.md §1 #14 caps",
+        ),
+        (
+            "command",
+            "description",
+            MAX_DESCRIPTION_CHARS,
+            "docs/parity.md §1 #14 caps",
+        ),
+        (
+            "command",
+            "text-trigger",
+            MAX_TEXT_TRIGGER_CHARS,
+            "docs/parity.md §1 #14 caps",
+        ),
+        (
+            "command-remove",
+            "name",
+            MAX_COMMAND_NAME_CHARS,
+            "docs/parity.md §1 #15 caps",
+        ),
+    ] {
+        let command = commands
+            .iter_mut()
+            .find(|c| c["name"] == name)
+            .expect(reference);
+        let opt = command["options"]
+            .as_array_mut()
+            .expect("legacy options array")
+            .iter_mut()
+            .find(|o| o["name"] == option_name)
+            .expect(reference);
+        assert!(
+            opt.get("max_length").is_none(),
+            "legacy has no max_length on {name} {option_name}"
+        );
+        opt["max_length"] = json!(max);
+    }
     let rota = commands
         .iter()
         .position(|c| c["name"] == INTENTIONAL_DIFFERENCES[1].0)
@@ -161,28 +219,63 @@ pub fn expected_registry() -> Value {
             .expect("copy exception names a published command");
         *command.pointer_mut(pointer).expect("copy field exists") = json!(value);
     }
-    // New application-side input bounds add only `max_length`; the frozen
-    // legacy registry fixture remains untouched.
-    for (name, option_name, max_length) in [
-        ("command", "name", 32),
-        ("command", "template", 2000),
-        ("command", "description", 100),
-        ("command", "text-trigger", 33),
-        ("command-remove", "name", 32),
-        ("schedule", "body", 2000),
-        ("schedule-remove", "id", 128),
-        ("sticky", "body", 2000),
-        ("lfg", "title", 100),
-        ("lfg", "roles", 2339),
-        ("lfg-close", "id", 128),
-        ("feed-add", "source", 2048),
-        ("feed-remove", "id", 128),
+    // Further caps from the input-bound fix: advertise ONLY max_length
+    // matching the runtime validators; the frozen legacy registry fixture
+    // remains untouched. Custom-command caps are covered by the loop above.
+    for (name, option_name, max_length, reference) in [
+        (
+            "schedule",
+            "body",
+            MAX_BODY_CHARS,
+            "docs/parity.md §1 #17 caps",
+        ),
+        (
+            "schedule-remove",
+            "id",
+            MAX_RESOURCE_ID_CHARS,
+            "docs/parity.md §1 #18 caps",
+        ),
+        (
+            "sticky",
+            "body",
+            MAX_BODY_CHARS,
+            "docs/parity.md §1 #20 caps",
+        ),
+        (
+            "lfg",
+            "title",
+            MAX_TITLE_CHARS,
+            "docs/parity.md §1 #26 caps",
+        ),
+        (
+            "lfg",
+            "roles",
+            MAX_ROLE_SPEC_CHARS,
+            "docs/parity.md §1 #26 caps",
+        ),
+        (
+            "lfg-close",
+            "id",
+            MAX_RESOURCE_ID_CHARS,
+            "docs/parity.md §1 #27 caps",
+        ),
+        (
+            "feed-add",
+            "source",
+            MAX_FEED_SOURCE_BYTES,
+            "docs/parity.md §1 #28 caps",
+        ),
+        (
+            "feed-remove",
+            "id",
+            MAX_RESOURCE_ID_CHARS,
+            "docs/parity.md §1 #29 caps",
+        ),
     ] {
-        let reference = INTENTIONAL_DIFFERENCES
+        let _ = INTENTIONAL_DIFFERENCES
             .iter()
             .find(|(command, _)| *command == name)
-            .expect("input bound has a documented command exception")
-            .1;
+            .expect("cap has a documented command exception");
         let command = commands
             .iter_mut()
             .find(|command| command["name"] == name)

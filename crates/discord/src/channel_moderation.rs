@@ -258,8 +258,9 @@ impl ChannelModerationRuntime {
             }
             ChannelClaim::InFlight => return Ok(Some(ChannelReply::uncertain())),
             ChannelClaim::Mismatch => {
-                let reply =
-                    ChannelReply::refused("This request id was used for different action content.");
+                let reply = ChannelReply::refused(
+                    "This request id is already used or retired; use a new request id.",
+                );
                 self.audit_refusal(&mut request, &reply).await?;
                 return Ok(Some(reply));
             }

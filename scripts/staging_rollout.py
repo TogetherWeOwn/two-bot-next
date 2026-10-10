@@ -46,6 +46,22 @@ APPLICATION_IMAGE_STALE_POLLS = 24
 # drift diagnostic, including when an in-flight poll read reaches the deadline.
 # It cannot accept a rollout; it only labels the failure.
 IMAGE_DRIFT_DIAGNOSTIC_SECONDS = 15
+# Fence and unavailability reasons /readyz can actually return
+# (wrangler/src/ownership.ts OwnershipRefused reasons surfaced as the 503
+# `reason`, plus the container probe's 500 `error_class`). `deployment_id_missing`
+# is the outer Worker version-identity fence (index.ts /readyz forward);
+# `operation_failed` is refused()'s fallback for non-OwnershipRefused errors.
+# `epoch_conflict` is defensive only: the fence answers it with 409 on the
+# control path, and Client.request keeps only /readyz JSON 500/503 bodies, so a
+# live 409 arrives bodyless and carries no token. The parser still recognises
+# it wherever a report reaches it, per this slice's fixed set.
+READINESS_TOKENS = frozenset({
+    "ownership_fenced", "not_owner", "container_unavailable", "epoch_conflict",
+    "shutdown_unconfirmed", "storage_unavailable", "storage_invalid",
+    "deployment_id_missing", "operation_failed",
+})
+VERIFY_TIMEOUT_SECONDS = 300
+MAX_TIMEOUT_DIAGNOSTIC_SECONDS = 3600
 TOKEN = re.compile(r"[a-z0-9_]{1,32}")
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 IMAGE = rf"registry\.cloudflare\.com/[^/@\s]+/{APPLICATION}@sha256:[0-9a-f]{{64}}"
@@ -113,6 +129,9 @@ class Client:
         self.deadline = deadline
         # Last allowlisted state seen by verify; printed only on rollout_timeout.
         self.observation = None
+        self.zero_instance_polls = 0
+        self.zero_instance_first = None
+        self.zero_instance_last = None
         self.opener = build_opener(NoRedirect())
 
     def request(self, url, authenticated=False):
@@ -130,12 +149,11 @@ class Client:
             # Even Cloudflare's error envelope may include configuration values.
             if authenticated:
                 raise GateError("api_http_failure") from None
-            # Only the bot's own parked-readiness answer (JSON 503, the Worker's
-            # probe allowlist) keeps its body: the gate echoes strict tokens from
-            # it. Every other error body is discarded (TOG-13044).
+            # Readiness diagnostics may inspect only JSON 500/503 bodies; the
+            # allowlisted token parser below prevents upstream text from logging.
             headers = error.headers if error.headers is not None else {}
             media = (headers.get("content-type") or "").split(";")[0].strip().lower()
-            if error.code == 503 and media == "application/json":
+            if url.endswith("/readyz") and error.code in (500, 503) and media == "application/json":
                 try:
                     body = error.read(MAX_BODY + 1)
                 except (OSError, ValueError):
@@ -432,6 +450,16 @@ def rollout_observation(row):
     return " ".join(parts)
 
 
+def completed_zero_instance_rollout(row):
+    if not isinstance(row, dict) or row.get("status") != "completed":
+        return False
+    health = row.get("health")
+    instances = health.get("instances") if isinstance(health, dict) else None
+    keys = ("active", "healthy", "failed", "starting", "scheduling")
+    return (isinstance(instances, dict)
+            and all(type(instances.get(key)) is int and instances[key] == 0 for key in keys))
+
+
 def gateway_failure(report):
     # The bot's fixed phase/class for a failed gateway task, as `phase:class`;
     # anything that is not two strict tokens is dropped, never echoed.
@@ -450,34 +478,122 @@ def runtime_observation(status, headers, body, version, revision, build_id):
     parts = [f"readyz={status}"]
     try:
         report = mapping(decode(body))
-        components = [f"{part[0]}:{part[1]}" for part in sequence(report.get("components"))
+    except GateError:
+        parts.append("body=unreadable")
+        return " ".join(parts)
+    try:
+        raw = sequence(report.get("components"))
+        components = [f"{part[0]}:{part[1]}" for part in raw
                       if isinstance(part, list) and len(part) == 2
                       and all(isinstance(item, str) and TOKEN.fullmatch(item) for item in part)]
         parts.append("components=" + ",".join(components))
-        parts.append("identity=" + ("match" if headers.get("x-two-worker-version") == version
-                                    and report.get("build_revision") == revision
-                                    and report.get("build_id") == build_id else "mismatch"))
-        failure = gateway_failure(report)
-        if failure:
-            parts.append("gateway_failure=" + failure)
     except GateError:
-        parts.append("body=unreadable")
+        pass
+    parts.append("identity=" + readiness_identity(headers, report, version, revision, build_id))
+    token = readiness_token(report)
+    if token:
+        parts.append(f"token={token}")
+    failure = gateway_failure(report)
+    if failure:
+        parts.append("gateway_failure=" + failure)
     return " ".join(parts)
 
 
-def unconverged_failure(client, url, version, revision, build_id):
-    # Best effort while the rollout has not converged, so the timeout log can
-    # name why the gateway never became ready: the failure of THIS build only.
-    # An older Worker or image (identity mismatch) never contributes.
-    _, headers, body = client.request(url + "/readyz")
+def readiness_identity(headers, report, version, revision, build_id):
+    worker = headers.get("x-two-worker-version")
+    if not isinstance(report, dict):
+        return "mismatch" if worker is not None and worker != version else "absent"
+    observed = (worker, report.get("build_revision"), report.get("build_id"))
+    expected = (version, revision, build_id)
+    if any(value is not None and value != target for value, target in zip(observed, expected)):
+        return "mismatch"
+    if any(value is None for value in observed):
+        return "absent"
+    return "match"
+
+
+def readiness_token(report):
+    if not isinstance(report, dict):
+        return None
+    candidates = [report.get("reason"), report.get("error_class"), report.get("error")]
+    fenced = report.get("ownership_fenced")
+    if isinstance(fenced, dict):
+        candidates.extend((fenced.get("reason"), fenced.get("error")))
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate in READINESS_TOKENS:
+            return candidate
+    return None
+
+
+def zero_instance_readiness_observation(status, headers, report, version, revision, build_id):
+    if readiness_identity(headers, report, version, revision, build_id) != "match":
+        return None
+    components = report.get("components")
+    if not isinstance(components, list):
+        return None
+    names = ("process", "gateway", "database", "token_invalid")
+    states = ("ready", "starting", "down")
+    state_rank = {"ready": 0, "starting": 1, "down": 2}
+    observed = {}
+    for component in components:
+        if (isinstance(component, list) and len(component) == 2
+                and component[0] in names and component[1] in states):
+            previous = observed.get(component[0])
+            if previous is None or state_rank[component[1]] > state_rank[previous]:
+                observed[component[0]] = component[1]
+    if not observed:
+        return None
+    status_code = status if type(status) is int and 0 <= status <= 599 else "unknown"
+    safe_components = ",".join(f"{name}:{observed[name]}" for name in names if name in observed)
+    parts = [f"readyz={status_code}", "identity=match", "components=" + safe_components]
+    failure = gateway_failure(report)
+    if failure:
+        parts.append("gateway_failure=" + failure)
+    return " ".join(parts)
+
+
+def summary_observation(diagnostic):
+    # The first/last summary keeps status, identity, components and token; the
+    # per-poll gateway_failure stays on the live observation only, so a failure
+    # seen on an early poll cannot look current after a later poll cleared it.
+    return " ".join(part for part in (diagnostic or "").split(" ")
+                    if not part.startswith("gateway_failure="))
+
+
+def record_zero_instance_timeout(client, row, verification_started):
+    if (not completed_zero_instance_rollout(row) or not client.observation
+            or " reason=zero_instances" in client.observation):
+        return
+    elapsed = min(MAX_TIMEOUT_DIAGNOSTIC_SECONDS,
+                  max(0, int(time.monotonic() - verification_started)))
+    details = ""
+    if client.zero_instance_polls:
+        first = summary_observation(client.zero_instance_first).replace(" ", ",")
+        last = summary_observation(client.zero_instance_last).replace(" ", ",")
+        details = (f" polls={client.zero_instance_polls} first={first} last={last}")
+    client.observation += f" phase=rollout reason=zero_instances elapsed_s={elapsed}{details}"
+
+
+def unconverged_readiness(client, url, version, revision, build_id, zero_instances):
+    # Best effort from the existing readiness probe; logs contain only status,
+    # identity class and fixed tokens, never upstream text or identifiers.
+    status, headers, body = client.request(url + "/readyz")
+    status_code = status if type(status) is int and 0 <= status <= 599 else "unknown"
     try:
         report = mapping(decode(body))
     except GateError:
-        return None
-    if (headers.get("x-two-worker-version") != version or report.get("build_revision") != revision
-            or report.get("build_id") != build_id):
-        return None
-    return gateway_failure(report)
+        report = None
+    identity = readiness_identity(headers, report, version, revision, build_id)
+    parts = [f"readyz={status_code}", f"identity={identity}"]
+    token = readiness_token(report)
+    if token:
+        parts.append(f"token={token}")
+    if identity != "match":
+        return None, " ".join(parts)
+    failure = gateway_failure(report)
+    diagnostic = (zero_instance_readiness_observation(
+        status, headers, report, version, revision, build_id) if zero_instances else None)
+    return failure, diagnostic or " ".join(parts)
 
 
 def staging_url():
@@ -580,13 +696,15 @@ def image_drift_detail(client, app, row, image):
     return " ".join(parts) or None
 
 
-def deadline_aware_read(client, read, app, row, image, drift_candidate):
-    """Classify only expired poll reads backed by an observed stale rollout."""
+def deadline_aware_read(client, read, app, row, image, drift_candidate, verification_started):
+    """Classify stale-image drift and annotate an expired zero-instance poll."""
     try:
         return read()
     except GateError as error:
         if str(error) not in ("api_transport_failure", "rollout_timeout"):
             raise
+        if time.monotonic() >= client.deadline:
+            record_zero_instance_timeout(client, row, verification_started)
         if (time.monotonic() < client.deadline or not drift_candidate or app is None or row is None
                 or mapping(app.get("configuration")).get("image") == image):
             raise
@@ -597,6 +715,7 @@ def deadline_aware_read(client, read, app, row, image, drift_candidate):
 
 
 def verify(args, client):
+    verification_started = time.monotonic()
     baseline = mapping(decode(Path(args.receipt).read_bytes()))
     version = deploy_version(read_records(args.output), baseline["started"])
     image = docker_image(version, baseline["revision"], baseline["build_id"])
@@ -611,7 +730,7 @@ def verify(args, client):
         probed = False
         passed = False
         app = deadline_aware_read(
-            client, lambda: application(client), app, row, image, drift_candidate)
+            client, lambda: application(client), app, row, image, drift_candidate, verification_started)
         require(app["id"] == baseline["application_id"]
                 and app["durable_objects"]["namespace_id"] == baseline["namespace_id"], "application_identity_drift")
         if pinned is None:
@@ -620,7 +739,7 @@ def verify(args, client):
         if pinned is not None:
             path = f"/containers/applications/{app['id']}/rollouts/{identifier(pinned['id'])}"
             row = mapping(deadline_aware_read(
-                client, lambda: client.api(path), app, row, image, drift_candidate))
+                client, lambda: client.api(path), app, row, image, drift_candidate, verification_started))
             require(row.get("id") == pinned["id"], "rollout_identity_drift")
             complete = converged(row, image, number(pinned.get("target_version")))
             lag = False if complete else active_lag(row, image, number(pinned.get("target_version")))
@@ -630,7 +749,9 @@ def verify(args, client):
                 # An out-of-band Worker version (secret put outside the deploy)
                 # invalidates the ownership record, so this rollout can never
                 # converge: fail fast instead of burning the verify budget.
-                active_worker(client, version)
+                deadline_aware_read(
+                    client, lambda: active_worker(client, version), app, row, image,
+                    drift_candidate, verification_started)
             stale = (complete or lag) and mapping(app.get("configuration")).get("image") != image
             drift_candidate = stale
             if stale:
@@ -685,15 +806,26 @@ def verify(args, client):
                         passed = True
         # Warming is allowed, but never acceptance evidence; discard the body.
         deadline_aware_read(
-            client, lambda: client.request(url + "/health"), app, row, image, drift_candidate)
+            client, lambda: client.request(url + "/health"), app, row, image, drift_candidate,
+            verification_started)
         # Only once this build's rollout exists: before that nothing of ours runs.
         if pinned is not None and not probed:
-            failure = deadline_aware_read(
-                client, lambda: unconverged_failure(
-                    client, url, version, baseline["revision"], baseline["build_id"]),
-                app, row, image, drift_candidate)
-            if failure:
-                client.observation += " gateway_failure=" + failure
+            readiness = deadline_aware_read(
+                client, lambda: unconverged_readiness(
+                    client, url, version, baseline["revision"], baseline["build_id"],
+                    completed_zero_instance_rollout(row)),
+                app, row, image, drift_candidate, verification_started)
+            if readiness:
+                failure, diagnostic = readiness
+                if diagnostic:
+                    client.observation += " " + diagnostic
+                    if completed_zero_instance_rollout(row):
+                        client.zero_instance_polls += 1
+                        if client.zero_instance_first is None:
+                            client.zero_instance_first = diagnostic
+                        client.zero_instance_last = diagnostic
+                if failure and "gateway_failure=" not in client.observation:
+                    client.observation += " gateway_failure=" + failure
         if not passed:
             lag_streak = 0
         time.sleep(max(0, min(5, client.deadline - time.monotonic())))
@@ -704,6 +836,7 @@ def verify(args, client):
     if image_stale and "gateway_failure=" not in (client.observation or ""):
         client.deadline = time.monotonic() + IMAGE_DRIFT_DIAGNOSTIC_SECONDS
         raise GateError("application_image_drift", image_drift_detail(client, app, row, image))
+    record_zero_instance_timeout(client, row, verification_started)
     raise GateError("rollout_timeout")
 
 
@@ -718,7 +851,7 @@ def main():
     args = parser.parse_args()
     client = None
     try:
-        deadline = time.monotonic() + 300 if args.mode == "verify" else None
+        deadline = time.monotonic() + VERIFY_TIMEOUT_SECONDS if args.mode == "verify" else None
         # `receipt` only reads the local Wrangler NDJSON; it needs no Cloudflare credentials.
         client = None if args.mode == "receipt" else Client(
             os.environ.get("CLOUDFLARE_ACCOUNT_ID"), os.environ.get("CLOUDFLARE_API_TOKEN"), deadline)

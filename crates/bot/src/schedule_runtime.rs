@@ -19,6 +19,7 @@ use twilight_model::application::interaction::{
     application_command::CommandOptionValue, Interaction, InteractionData,
 };
 use two_bot_core::{
+    automation_quota::QuotaWriteError,
     commands::MAX_RESOURCE_ID_CHARS,
     funnel::now_millis_for_test,
     message_safety,
@@ -168,6 +169,9 @@ pub(crate) async fn schedule_create(
                 "Scheduled message id belongs to another guild.",
             )
             .await;
+        }
+        Err(QuotaWriteError::Capacity(quota)) => {
+            finish(executor, interaction, quota.to_string()).await;
         }
         Err(err) => {
             tracing::warn!(error = %err, "schedule put failed");

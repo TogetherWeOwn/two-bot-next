@@ -27,7 +27,8 @@ pub const MAX_RENDERED_CHARS: usize = 2000;
 pub const MAX_DESCRIPTION_CHARS: usize = 100;
 /// Command-name bound, characters (legacy `NAME_PATTERN` `{1,32}`).
 pub const MAX_COMMAND_NAME_CHARS: usize = 32;
-/// Optional text trigger: `!` plus a maximum-length command name.
+/// Text-trigger bound, characters including the leading `!` (legacy
+/// `TRIGGER_PATTERN` `^![a-z0-9_-]{1,32}$`: one `!` plus a command name).
 pub const MAX_TEXT_TRIGGER_CHARS: usize = MAX_COMMAND_NAME_CHARS + 1;
 
 /// Said to anybody who reaches a custom command while automations are off

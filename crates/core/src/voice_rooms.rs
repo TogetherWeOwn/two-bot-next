@@ -46,6 +46,10 @@ pub const RENAME_MIN_INTERVAL_MS: u64 = 300_000;
 /// A queued action is dead-lettered after this many failed attempts; the
 /// `/setup` panel surfaces dead letters as recent failures (V10).
 pub const QUEUE_MAX_ATTEMPTS: u32 = 10;
+/// Newest dead letters kept per queue; older entries drop and count toward
+/// [`ActionQueue::failed_dropped`]. Bounds `/setup` recent-failures memory
+/// when a guild-wide outage dead-letters every write.
+pub const MAX_FAILED_ACTIONS: usize = 100;
 
 // --- creator channels -------------------------------------------------------
 
@@ -972,6 +976,9 @@ struct QueueInner {
     /// (guild, channel) pairs with lost access: actions touching them wait.
     suspended: HashSet<(Snowflake, Snowflake)>,
     failed: Vec<FailedAction>,
+    /// Dead letters evicted by the [`MAX_FAILED_ACTIONS`] cap (oldest first).
+    /// Monotonic; `clear_failed` leaves it set.
+    failed_dropped: u64,
 }
 
 impl QueueInner {
@@ -1167,6 +1174,11 @@ impl ActionQueue {
                 reason,
                 failed_at_ms: now_ms,
             });
+            if inner.failed.len() > MAX_FAILED_ACTIONS {
+                let excess = inner.failed.len() - MAX_FAILED_ACTIONS;
+                inner.failed.drain(..excess);
+                inner.failed_dropped = inner.failed_dropped.saturating_add(excess as u64);
+            }
             return true;
         }
         inner.requeue(QueuedAction {
@@ -1248,13 +1260,22 @@ impl ActionQueue {
         (len(&inner.urgent), len(&inner.deferred))
     }
 
-    /// Dead-lettered writes for `/setup` recent failures (V10).
+    /// Dead-lettered writes for `/setup` recent failures (V10): the newest
+    /// [`MAX_FAILED_ACTIONS`] entries, oldest dropped (see
+    /// [`Self::failed_dropped`]).
     #[must_use]
     pub fn failed(&self) -> Vec<FailedAction> {
         self.inner.lock().expect("queue lock").failed.clone()
     }
 
-    /// Clear dead letters (after `/setup` shows them, V10).
+    /// Dead letters evicted by the cap so far; `clear_failed` does not reset it.
+    #[must_use]
+    pub fn failed_dropped(&self) -> u64 {
+        self.inner.lock().expect("queue lock").failed_dropped
+    }
+
+    /// Clear dead letters (after `/setup` shows them, V10). Keeps
+    /// [`Self::failed_dropped`] so the eviction total survives the clear.
     pub fn clear_failed(&self) {
         self.inner.lock().expect("queue lock").failed.clear();
     }
@@ -2068,6 +2089,63 @@ mod tests {
         assert_eq!(fail_backoff_ms(100), 60_000);
         q.clear_failed();
         assert!(q.failed().is_empty());
+    }
+
+    #[test]
+    fn dead_letter_list_caps_at_10k_oldest_drop() {
+        const TOTAL: u64 = 10_000;
+        let q = ActionQueue::new();
+        for i in 0..TOTAL {
+            q.enqueue(
+                GUILD,
+                RoomAction::DeleteRoom {
+                    channel_id: 1_000_000 + i,
+                },
+            );
+            let mut action = q.pop_due(GUILD, u64::MAX).expect("due");
+            for step in 1..=QUEUE_MAX_ATTEMPTS {
+                if step < QUEUE_MAX_ATTEMPTS {
+                    let now = action.not_before_ms;
+                    assert!(q.mark_failed(action.clone(), format!("boom-{i}"), now));
+                    let due = now.saturating_add(fail_backoff_ms(step));
+                    action = q.pop_due(GUILD, due).expect("retry exactly when due");
+                    assert_eq!(action.attempts, step);
+                } else {
+                    assert!(q.mark_failed(action.clone(), format!("boom-{i}"), i));
+                }
+            }
+        }
+        let failed = q.failed();
+        assert_eq!(failed.len(), MAX_FAILED_ACTIONS, "cap holds at 10k entries");
+        let dropped = TOTAL - MAX_FAILED_ACTIONS as u64;
+        assert_eq!(q.failed_dropped(), dropped);
+        assert!(
+            failed
+                .windows(2)
+                .all(|w| w[0].failed_at_ms < w[1].failed_at_ms),
+            "newest entries retained in order"
+        );
+        assert_eq!(
+            failed.first().expect("capped").reason,
+            format!("boom-{dropped}")
+        );
+        assert_eq!(
+            failed.last().expect("capped").reason,
+            format!("boom-{}", TOTAL - 1)
+        );
+        assert!(
+            failed
+                .iter()
+                .all(|f| f.action.attempts == QUEUE_MAX_ATTEMPTS),
+            "only exhausted writes are dead-lettered"
+        );
+        q.clear_failed();
+        assert!(q.failed().is_empty());
+        assert_eq!(
+            q.failed_dropped(),
+            dropped,
+            "clear keeps the eviction total"
+        );
     }
 
     #[test]

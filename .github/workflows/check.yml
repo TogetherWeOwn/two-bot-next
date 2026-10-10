@@ -1025,6 +1025,11 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot --locked --test restore_drill -- --ignored --nocapture
 
+      - name: Community scorecard captured-stream coverage (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot --locked --bin two-bot scorecard_marks_only_captured_streams -- --ignored
+
   moderation-db:
     name: moderation db
     permissions:
@@ -1568,6 +1573,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_edge_cases.py -v
       - name: Verify staging smoke run (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_smoke_run.py -v
+      - name: Verify staging events read (offline fixtures, no database)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_events_read.py -v
       - name: Verify cutover acceptance probes (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_qa_cutover_probes.py -v
       - name: Verify runner routing for every workflow job

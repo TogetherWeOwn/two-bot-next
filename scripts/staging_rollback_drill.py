@@ -48,6 +48,8 @@ SAFE_CONTROL_LINE = re.compile(r"(Ownership control failed \(HTTP [0-9]{3}\)|"
                                r"OWNERSHIP_CONTROL_TOKEN is missing or invalid|"
                                r"Expected the approved two-bot-next-staging workers\.dev origin)")
 AUTH_STATUSES = ("401", "403")
+# Above the client's takeover window plus one attempt of two 15 s requests, so a takeover POST is never killed mid-flight.
+OWNERSHIP_CONTROL_TIMEOUT_SECONDS = 420
 
 
 class DrillClient(rollout.Client):
@@ -252,7 +254,7 @@ class Drill:
         else:
             rolled = fenced  # restore after a refused rollback: the original Worker still serves
         leg["rolled_back"] = iso(rolled)
-        self.control("deployment-takeover", release_fence=True)
+        self.control("deployment-takeover", release_fence=True, expected_deployment=version)
         taken = self.stamp(f"{name}: ownership taken")
         leg["takeover"] = iso(taken)
         first_ready, counts = self.wait_ready(version, rolled)
@@ -298,11 +300,11 @@ class Drill:
         return f"{phase}:{code}"
 
 
-def ownership_control(token, url, actor, root=None):
+def ownership_control(token, url, actor, root=None, expected_deployment=None):
     """Run the reviewed control client; the token only ever travels in the child's environment."""
     root = Path(root or Path(__file__).resolve().parents[1])
 
-    def control(action, epoch=None, release_fence=False):
+    def control(action, epoch=None, release_fence=False, expected_deployment=expected_deployment):
         command = ["node", str(root / "wrangler/scripts/ownership-control.mjs"), action]
         if epoch is not None:
             command.append(str(epoch))
@@ -311,8 +313,12 @@ def ownership_control(token, url, actor, root=None):
         env = {"PATH": os.environ.get("PATH", os.defpath), "STAGING_WORKER_URL": url,
                "OWNERSHIP_CONTROL_TOKEN": token, "OWNERSHIP_ACTOR": actor,
                "OWNERSHIP_RELEASE_FENCE": "true" if release_fence else "false"}
+        # Pin the takeover client to the deployed Worker version when known, so a
+        # retry answered by a stale version refuses instead of re-posting to it.
+        if expected_deployment is not None:
+            env["OWNERSHIP_EXPECTED_DEPLOYMENT"] = expected_deployment
         try:
-            result = subprocess.run(command, env=env, capture_output=True, timeout=90, text=True)
+            result = subprocess.run(command, env=env, capture_output=True, timeout=OWNERSHIP_CONTROL_TIMEOUT_SECONDS, text=True)
         except (OSError, subprocess.SubprocessError):
             raise GateError("ownership_control_unavailable") from None
         if result.returncode != 0:
