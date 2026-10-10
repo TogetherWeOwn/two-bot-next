@@ -2385,12 +2385,12 @@ mod tests {
     async fn gateway_worker_trigger_gate_posts_no_sticky_for_bypassed_while_accept_dispatches() {
         use std::future::Future;
         use two_bot_core::automod_runtime::{
-            AutomodClaimLedger, AutomodConfig, AutomodMatch, AutomodRuntime, AutomodScope,
-            DeliveryKey, FunnelDisposition, LedgerClaim, MessageDelivery, MessageDeliveryKind,
-            MessageSubject, StoredOutcome, TargetFacts, ViolationRecord, STAGING_GUILD_ID,
+            AutomodClaimLedger, AutomodMatch, AutomodRuntime, AutomodScope, DeliveryKey,
+            FunnelDisposition, LedgerClaim, MessageDelivery, MessageDeliveryKind, MessageSubject,
+            StoredOutcome, TargetFacts, ViolationRecord, STAGING_GUILD_ID,
         };
         use two_bot_core::router::RouterGates;
-        use two_bot_core::AutomodFilter;
+        use two_bot_core::{AutomodConfig, AutomodFilter};
         use two_bot_discord::automod_activation::{
             AutomodActivation, AutomodFacts, FetchedMessage,
         };
