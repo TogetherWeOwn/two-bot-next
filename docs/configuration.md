@@ -67,7 +67,7 @@ When voice is enabled, `build_production_runtime` also reads
 `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID`, `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID`,
 `TWO_TEMP_VOICE_CATEGORY_ID` and `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS` solely
 for delete protection, not creator provisioning. Its empty grace is fixed at
-60 seconds; `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` remains unwired.
+60 seconds unless `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` (0 to 600) sets it.
 Onboarding, automod, scorecard and classifier typed loaders exist but are not
 called during boot; their defaults below come from empty-map calls. The separate
 `preflight` operator CLI validates further catalog keys from the environment

@@ -44,8 +44,9 @@ library code with no Discord dependency and can start immediately.
   `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID`, `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID`,
   `TWO_TEMP_VOICE_CATEGORY_ID` and comma-separated `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS`
   supply additional protection; malformed IDs disable the voice runtime. Stored
-  settings remain unwired. `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` is not consumed:
-  this safety grace is fixed at 60 seconds.
+  settings remain unwired. `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` (0 to 600, read
+  at boot) sets the empty grace; unset keeps 60 seconds. `0` deletes a room on
+  the next tick after its last human leaves, matching the interim voice bot.
 - If the member can't be moved in (missing Move Members, or they left first), the
   bot deletes the room immediately.
 - If the bot loses access to a room (View Channel, Connect, Manage Channels or Move
