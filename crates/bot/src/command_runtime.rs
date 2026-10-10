@@ -151,7 +151,7 @@ pub(crate) const LANE_MESSAGES: usize = 0;
 const LANE_INTERACTIONS: usize = 1;
 const LANE_REGISTRY: usize = 2;
 const LANE_PRIVILEGED: usize = 3;
-const LANE_BUSY: usize = 4;
+pub(crate) const LANE_BUSY: usize = 4;
 pub(crate) const LANE_REACTIONS: usize = 5;
 
 /// Seconds between saturation `warn!` lines per runtime (TOG-19878). The
