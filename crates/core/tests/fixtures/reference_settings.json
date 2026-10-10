@@ -56,7 +56,7 @@
   "TWO_COMMUNITY_HUMAN_CHANNEL_IDS": "Channels considered for human community activity.",
   "TWO_COMMUNITY_RAID_ACTOR_IDS": "Known raid actors excluded from human activity classification.",
   "TWO_COMMUNITY_RECOMMENDATIONS": "Permit scorecard recommendations unless explicitly disabled with 0.",
-  "TWO_COMMUNITY_SCORECARD": "Enable the weekly scorecard job. Live fact capture is event attendance and rules acceptance only.",
+  "TWO_COMMUNITY_SCORECARD": "Enable the weekly scorecard job. Live fact capture is event attendance, message creation and rules acceptance only.",
   "TWO_COMMUNITY_STAGING_ACTOR_IDS": "Staging actors excluded from human community activity.",
   "TWO_COMMUNITY_STAGING_GUILD_IDS": "Staging guilds excluded from human community activity.",
   "TWO_COMMUNITY_TEST_ACTOR_IDS": "Test actors excluded from human community activity.",
