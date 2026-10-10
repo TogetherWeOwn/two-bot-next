@@ -1973,6 +1973,7 @@ fn moderation_resolve_app(pool: sqlx::PgPool, mock: &MockMembers) -> Router {
         effect,
         Arc::new(MockEventRead::default()),
         moderation,
+        Arc::new(MockChannel::default()),
     )))
 }
 
