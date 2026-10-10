@@ -206,6 +206,35 @@ const DISPATCH_LANE_CAPS: [&str; 6] = [
     "busy",
     "reactions",
 ];
+/// One row per `metrics::INTERNAL_ACTION_FAMILIES` entry, in the same order.
+/// A new receiver family fails here until it gets a budget row in the guard
+/// doc. Unknown verbs collapse to the trailing `other`.
+const INTERNAL_ACTION_CAP_FAMILIES: [&str; 6] = [
+    "announcement",
+    "event",
+    "settings",
+    "moderation",
+    "membership",
+    "other",
+];
+/// One row per `metrics::INTERNAL_ACTION_OUTCOMES` entry, in the same order.
+/// A new receiver outcome fails here until it gets a budget row in the guard
+/// doc. Unknown outcomes collapse to the trailing `internal`, never to a
+/// dynamic label or secret.
+const INTERNAL_ACTION_CAP_OUTCOMES: [&str; 12] = [
+    "executed",
+    "auth_failure",
+    "unknown_key",
+    "clock_skew",
+    "nonce_replay",
+    "rate_limit",
+    "unknown_action",
+    "action_disabled",
+    "malformed_body",
+    "conflict",
+    "upstream",
+    "internal",
+];
 
 #[test]
 fn storage_and_send_gate_labels_match_their_caps() {
@@ -223,6 +252,16 @@ fn storage_and_send_gate_labels_match_their_caps() {
         metrics::DISPATCH_LANES,
         &DISPATCH_LANE_CAPS[..],
         "DISPATCH_LANES grew without a budget row; update docs/log-volume-guard.md"
+    );
+    assert_eq!(
+        metrics::INTERNAL_ACTION_FAMILIES,
+        &INTERNAL_ACTION_CAP_FAMILIES[..],
+        "INTERNAL_ACTION_FAMILIES grew without a budget row; update docs/log-volume-guard.md"
+    );
+    assert_eq!(
+        metrics::INTERNAL_ACTION_OUTCOMES,
+        &INTERNAL_ACTION_CAP_OUTCOMES[..],
+        "INTERNAL_ACTION_OUTCOMES grew without a budget row; update docs/log-volume-guard.md"
     );
 }
 
@@ -474,6 +513,16 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
         2,
         "checkpoint-failure family grew; update the cardinality budget and the guard doc"
     );
+    assert_eq!(
+        metrics::INTERNAL_ACTION_FAMILIES.len(),
+        6,
+        "internal-action family grew; update the cardinality budget and the guard doc"
+    );
+    assert_eq!(
+        metrics::INTERNAL_ACTION_OUTCOMES.len(),
+        12,
+        "internal-action outcome family grew; update the cardinality budget and the guard doc"
+    );
     for (allowlist, name) in [
         (metrics::EVENTS, "EVENTS"),
         (metrics::REST_ROUTES, "routes"),
@@ -481,6 +530,10 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
         (metrics::VOICE_DEAD_ACTIONS, "dead-letter"),
         (metrics::DB_ERROR_OPS, "db-errors"),
         (metrics::SEND_ADMISSION_OUTCOMES, "send-admissions"),
+        (
+            metrics::INTERNAL_ACTION_FAMILIES,
+            "internal-action families",
+        ),
     ] {
         assert_eq!(
             allowlist.last(),
@@ -488,6 +541,11 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
             "{name} lost its `other` collapse trapdoor; unknowns must never become series"
         );
     }
+    assert_eq!(
+        metrics::INTERNAL_ACTION_OUTCOMES.last(),
+        Some(&"internal"),
+        "internal-action outcomes lost its `internal` collapse trapdoor; unknowns must never become series"
+    );
 }
 
 /// Any new series anywhere in the exposition fails here until the
@@ -509,9 +567,9 @@ fn exposition_series_count_matches_the_cardinality_budget() {
     let text = metrics::Metrics::default().render(None);
     let series = text.lines().filter(|line| !line.starts_with('#')).count();
     assert_eq!(
-        series, 289,
-        "exposition grew past the 289-sample budget (20 events + 4 scalars + 1 latency \
-         + 11 histogram + 156 rest + 48 jobs + 31 voice + 2 db-errors + 4 send-admissions + 6 dispatch-drops + 2 checkpoint-failures + 4 pool); \
+        series, 361,
+        "exposition grew past the 361-sample budget (20 events + 4 scalars + 1 latency \
+         + 11 histogram + 156 rest + 48 jobs + 31 voice + 2 db-errors + 4 send-admissions + 6 dispatch-drops + 2 checkpoint-failures + 72 internal-actions + 4 pool); \
          update docs/log-volume-guard.md with the new series"
     );
 }

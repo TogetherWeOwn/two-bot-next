@@ -183,6 +183,7 @@ async fn refused_identity_parks_the_posting_jobs_in_the_readyz_status_map() {
             gates,
             activation,
             action.clone(),
+            String::new(),
         ));
         registered
     };

@@ -239,6 +239,20 @@ test('deployment-takeover never retries any non-5xx failure', async () => {
   }
 });
 
+test('explicit takeover refuses a no-op echo at the posted epoch after one POST', async () => {
+  const f = fixture([ok(80), ok(80)]);
+  await assert.rejects(f.invoke({ action: 'takeover', expectedEpoch: 80 }), /Ownership transition not confirmed/);
+  assert.deepEqual(f.calls, ['GET', 'POST']);
+  assert.deepEqual(f.waits, []);
+});
+
+test('deployment-takeover refuses a no-op echo at the posted epoch without posting again', async () => {
+  const f = fixture([ok(80), ok(80)]);
+  await assert.rejects(f.invoke({ action: 'deployment-takeover' }), /Ownership transition not confirmed/);
+  assert.deepEqual(f.calls, ['GET', 'POST']);
+  assert.deepEqual(f.waits, []);
+});
+
 test('explicit takeover never retries', async () => {
   const f = fixture([ok(80), http(503)]);
   await assert.rejects(f.invoke({ action: 'takeover', expectedEpoch: 80 }), /HTTP 503/);
