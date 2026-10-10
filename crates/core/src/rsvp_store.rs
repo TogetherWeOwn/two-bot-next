@@ -602,7 +602,16 @@ mod tests {
             eprintln!("skipping rsvp_store test: TWO_TEST_DATABASE_URL not set");
             return;
         };
-        let going = rsvp(RsvpStatus::Going, &schema, "2026-09-10T10:00:00.000Z");
+        // Use a dedicated (guild, event) pair for this test. The event
+        // admission lock is database-wide, not per-schema, so sharing the
+        // fixture key with the other store tests lets their writers queue
+        // behind the guard below in parallel runs and the waiter count never
+        // reaches exactly two.
+        let going = RsvpRecord {
+            guild_id: "1545644954272137333".to_owned(),
+            event_id: "1546451670500643333".to_owned(),
+            ..rsvp(RsvpStatus::Going, &schema, "2026-09-10T10:00:00.000Z")
+        };
         let interested = RsvpRecord {
             status: RsvpStatus::Interested,
             ..going.clone()
@@ -630,13 +639,12 @@ mod tests {
         let first = tokio::spawn(async move { put_rsvp(&first_pool, &going).await });
         let second_pool = pool.clone();
         let second = tokio::spawn(async move { put_rsvp(&second_pool, &interested).await });
-        // The queue wait is scheduling-sensitive on loaded CI runners: both
-        // spawned writers must be polled onto the advisory lock before the
-        // timeout. Attempt 1 of the PR's `rust tests` job elapsed the old 5 s
-        // budget here (`both concurrent writers queued on empty key:
-        // Elapsed(())`) with neither writer finished, so allow 30 s. The
-        // bypass panic below still catches a writer that never queues.
-        let waiting = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        // Both spawned writers must be polled onto the advisory lock before
+        // the timeout. The guard above holds this test's dedicated
+        // (guild, event) key, so only these two writers can queue here and a
+        // short budget suffices. The bypass panic below still catches a
+        // writer that never queues.
+        let waiting = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let count: i64 = sqlx::query_scalar(
                     "SELECT COUNT(*) FROM pg_locks waiter
@@ -677,7 +685,7 @@ mod tests {
         assert!(new.is_new());
         assert_eq!(changed.previous, Some(new.current));
         assert!(changed.changed());
-        let rows = list_rsvps(&pool, "1545644954272137297", "1546451670500642999")
+        let rows = list_rsvps(&pool, &going.guild_id, &going.event_id)
             .await
             .expect("final RSVP");
         assert_eq!(rows.len(), 1);
