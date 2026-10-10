@@ -13,7 +13,12 @@ included in that request and never patched afterwards.
   `(position, id)` order. Existing channels are never moved. The index becomes
   Discord's create-time `position` via `position_for_index`. A category that
   cannot be planned leaves the position to Discord (append) instead of blocking
-  the join. `/group` is not wired yet (see below).
+  the join. `/group` is wired: when the creator's `group_by_category` is set, the
+  worker reads it (`crates/bot/src/voice_rooms.rs:3427-3444`) and forwards
+  `grouped`/`group_room_ids` into `plan_placement`
+  (`crates/bot/src/voice_room_plan.rs:206-212`). Re-checked at `86a6668a7`;
+  name-display numbering still ranks per creator, not per category
+  (`crates/bot/src/voice_name_panel.rs:394-401).
 - **Permission inheritance.** The creator's stored source (creator channel,
   category, or a chosen channel) supplies the overrides. Every emitted allow
   excludes Manage Roles, including inherited role/member, owner and bot
@@ -46,5 +51,8 @@ room lands next to its creator; if not, only that function changes.
 
 The per-creator settings commands (`/position`, `/group`,
 `/inheritpermissions`, `/defaultlimit`, `/alwaysprivate`) are wired as
-admin-gated slash commands with single-field writes; the required-role
-setting is not. Until that lands, role gating stays on the V11 import.
+admin-gated slash commands with single-field writes, and the required-role
+setting is wired too: `/access role` parses (`crates/bot/src/voice_rooms.rs:6980`),
+applies `AccessAction::RequiredRole` (`:7599`), and the gate refuses callers
+without the role (`:7224-7227`; core check
+`crates/core/src/voice_access.rs:127-162`). Re-checked at `86a6668a7`.
