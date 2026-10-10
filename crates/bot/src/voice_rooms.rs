@@ -2525,7 +2525,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 return false;
             }
         };
-        let seed = self.fresh_name_seed(ticket.creator_id, ticket.member_id, seed);
+        // Create the room under its template name: the later name pass then
+        // finds it unchanged, so most rooms never spend a rename.
+        let (seed, template_name) = self.first_room_name(ticket.creator_id, ticket.member_id, seed);
+        let name = match template_name {
+            Some(template_name) => {
+                metrics::global().voice_name("created_with_template");
+                template_name
+            }
+            None => name,
+        };
         let id = self.queue.enqueue(
             self.live.guild_id,
             RoomAction::CreateRoom {
@@ -4759,23 +4768,37 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 self.dispatch_join(action, now_ms, started).await;
             }
             RoomAction::RenameRoom { channel_id, name } => {
-                let valid = {
+                let skip = {
                     let live = self.live.read_state();
-                    self.rooms.contains_key(&channel_id)
-                        && self.desired_names.get(&channel_id) == Some(&name)
-                        && live
-                            .channels
-                            .get(&channel_id)
-                            .is_some_and(|c| c.name.as_deref() != Some(&name))
-                        && can_manage_room(live.permissions(self.live.guild_id, channel_id))
+                    match live.channels.get(&channel_id) {
+                        _ if !self.rooms.contains_key(&channel_id)
+                            || self.desired_names.get(&channel_id) != Some(&name) =>
+                        {
+                            Some("rename_stale")
+                        }
+                        None => Some("rename_unseen"),
+                        Some(channel) if channel.name.as_deref() == Some(&name) => {
+                            Some("rename_stale")
+                        }
+                        Some(_)
+                            if !can_manage_room(
+                                live.permissions(self.live.guild_id, channel_id),
+                            ) =>
+                        {
+                            Some("rename_no_access")
+                        }
+                        Some(_) => None,
+                    }
                 };
-                if !valid {
+                if let Some(reason) = skip {
+                    metrics::global().voice_name(reason);
                     self.queue.mark_succeeded(&action);
                     return true;
                 }
                 // One rename per channel at a time: a newer name waits for
                 // the outcome of the one still running.
                 if self.renames_in_flight.contains_key(&channel_id) {
+                    metrics::global().voice_name("rename_held");
                     self.queue.mark_succeeded(&action);
                     self.rename_retries.insert(
                         channel_id,
@@ -4783,6 +4806,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     );
                     return true;
                 }
+                metrics::global().voice_name("rename_sent");
                 let result = match self.http.detached_rename(channel_id, &name) {
                     Some(request) => {
                         let mut task = tokio::spawn(request);
@@ -8486,6 +8510,8 @@ async fn execute_create<S: RoomPersistence, H: RoomWrites>(
         nsfw: false,
         user_limit: 0,
         position: None,
+        respace: Vec::new(),
+        fallback_position: None,
         overwrites: Vec::new(),
     };
     let always: WriteGuard = Arc::new(|| true);

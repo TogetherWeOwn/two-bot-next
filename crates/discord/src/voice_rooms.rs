@@ -137,6 +137,11 @@ pub struct RoomChannelAttributes {
     pub user_limit: u16,
     /// Create-time sorting position (V8 placement); `None` lets Discord append.
     pub position: Option<u64>,
+    /// Bulk reorder of the category's channels to apply first, opening a free
+    /// `position` (empty when it is free already).
+    pub respace: Vec<(Snowflake, u64)>,
+    /// Position used instead of `position` when that reorder fails.
+    pub fallback_position: Option<u64>,
     /// Empty means "include no overrides": the room syncs to its category.
     pub overwrites: Vec<PermissionOverwrite>,
 }
@@ -171,6 +176,8 @@ impl RoomChannelAttributes {
             nsfw: channel.nsfw.unwrap_or(false),
             user_limit,
             position: None,
+            respace: Vec::new(),
+            fallback_position: None,
             overwrites,
         })
     }
@@ -552,6 +559,17 @@ impl RoomHttp {
         if guild_id == 0 || attributes.parent_id == Some(0) || attributes.user_limit > 99 {
             return Err(RoomHttpError::InvalidRequest);
         }
+        // A re-space that fails leaves the room tied with the channel above
+        // its slot rather than failing the create over placement.
+        let mut position = attributes.position;
+        if !attributes.respace.is_empty()
+            && self
+                .reorder_channels(guild_id, &attributes.respace)
+                .await
+                .is_err()
+        {
+            position = attributes.fallback_position.or(position);
+        }
         let mut request = self
             .http
             .create_guild_channel(Id::new(guild_id), name)
@@ -563,7 +581,7 @@ impl RoomHttp {
         if !attributes.overwrites.is_empty() {
             request = request.permission_overwrites(&attributes.overwrites);
         }
-        if let Some(position) = attributes.position {
+        if let Some(position) = position {
             request = request.position(position);
         }
         if let Some(parent_id) = attributes.parent_id {
@@ -581,6 +599,31 @@ impl RoomHttp {
         let request = request.try_into_request().map_err(classify_http_error)?;
         let body = self.send(request, still_in_creator).await?;
         serde_json::from_slice(&body).map_err(|_| RoomHttpError::UnknownOutcome)
+    }
+
+    /// Discord's bulk `PATCH /guilds/{guild.id}/channels`: set each listed
+    /// channel's position in one request (Manage Channels).
+    pub async fn reorder_channels(
+        &self,
+        guild_id: Snowflake,
+        positions: &[(Snowflake, u64)],
+    ) -> Result<(), RoomHttpError> {
+        if guild_id == 0 || positions.iter().any(|(id, _)| *id == 0) {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let body: Vec<serde_json::Value> = positions
+            .iter()
+            .map(|(id, position)| serde_json::json!({ "id": id.to_string(), "position": position }))
+            .collect();
+        let request = twilight_http::request::RequestBuilder::raw(
+            twilight_http::request::Method::Patch,
+            format!("guilds/{guild_id}/channels"),
+        )
+        .json(&body)
+        .build()
+        .map_err(|_| RoomHttpError::InvalidRequest)?;
+        self.send(request, || true).await?;
+        Ok(())
     }
 
     // Source: https://docs.rs/twilight-http/0.17.1/twilight_http/request/guild/member/struct.UpdateGuildMember.html
@@ -1183,6 +1226,8 @@ mod tests {
                 nsfw: true,
                 user_limit: 8,
                 position: None,
+                respace: Vec::new(),
+                fallback_position: None,
                 overwrites: overrides,
             }
         );

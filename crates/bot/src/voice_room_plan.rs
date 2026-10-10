@@ -23,8 +23,8 @@ use two_bot_core::{
         RoomPermissionPlan,
     },
     voice_placement::{
-        plan_placement, position_for_index, resolve_initial_state, CategoryChannel,
-        CategoryEntryKind, PlacementRequest,
+        create_slot, plan_placement, resolve_initial_state, CategoryChannel, CategoryEntryKind,
+        CreateSlot, PlacementRequest,
     },
     voice_rooms::{CreatorChannel, PermissionSource, RoomPosition, VoiceRoom},
     PermissionFinding, Snowflake, VoicePermissionScope,
@@ -178,12 +178,20 @@ fn bot_can_manage(
 /// Placement is best effort: a category whose order cannot be planned leaves
 /// the position to Discord (the room is appended) rather than blocking the
 /// join.
-fn placement(input: &RoomPlanInput<'_>) -> Option<u64> {
+fn placement(input: &RoomPlanInput<'_>) -> Option<CreateSlot> {
     let parent = input.creator.parent_id;
+    // Voice and stage channels sort among themselves (text channels always
+    // render above them), so only they decide where a room lands.
     let order: Vec<CategoryChannel> = input
         .channels
         .values()
-        .filter(|channel| channel.parent_id == parent && channel.kind != ChannelType::GuildCategory)
+        .filter(|channel| {
+            channel.parent_id == parent
+                && matches!(
+                    channel.kind,
+                    ChannelType::GuildVoice | ChannelType::GuildStageVoice
+                )
+        })
         .map(|channel| {
             let id = channel.id.get();
             CategoryChannel {
@@ -203,15 +211,32 @@ fn placement(input: &RoomPlanInput<'_>) -> Option<u64> {
         RoomPosition::Above => PlacementSide::Above,
         RoomPosition::Below => PlacementSide::Below,
     };
+    // Ungrouped, each creator keeps its own block (creator, then its rooms
+    // oldest first): a new room joins the end of that block.
+    let creator_id = input.creator.id.get();
+    let own_rooms: Vec<Snowflake> = input
+        .rooms
+        .values()
+        .filter(|room| {
+            room.creator_channel_id == creator_id
+                && order.iter().any(|entry| entry.id == room.channel_id)
+        })
+        .map(|room| room.channel_id)
+        .collect();
+    let (grouped, group_room_ids) = if input.grouped {
+        (true, input.group_room_ids)
+    } else {
+        (!own_rooms.is_empty(), own_rooms.as_slice())
+    };
     let index = plan_placement(PlacementRequest {
-        creator_id: input.creator.id.get(),
+        creator_id,
         side,
-        grouped: input.grouped,
-        group_room_ids: input.group_room_ids,
+        grouped,
+        group_room_ids,
         category_order: &order,
     })
     .ok()?;
-    Some(position_for_index(&order, index))
+    Some(create_slot(&order, index))
 }
 
 fn permission_error(
@@ -384,7 +409,11 @@ pub(crate) fn plan_room_diagnosed(
 
     let mut attributes = RoomChannelAttributes::from_creator(settings, input.creator, overwrites)?;
     attributes.user_limit = u16::from(initial.user_limit);
-    attributes.position = placement(input);
+    if let Some(slot) = placement(input) {
+        attributes.position = Some(slot.position);
+        attributes.fallback_position = Some(slot.fallback);
+        attributes.respace = slot.respace;
+    }
     Ok(attributes)
 }
 

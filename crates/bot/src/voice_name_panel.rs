@@ -435,24 +435,27 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
     }
 
-    /// Pick the new room's seed so its first template name repeats neither
-    /// a live voice channel nor the guild's last [`RECENT_NAME_MEMORY`] first
-    /// names. The first name is rendered as the room will see it: the joiner
-    /// alone with their presence, still in the creator channel. When no tried
-    /// seed is fresh (a tiny pool), the drawn seed is kept.
-    pub(super) fn fresh_name_seed(
+    /// The new room's seed and first template name, so the room is created
+    /// with its template name and needs no rename. The seed is picked so the
+    /// name repeats neither a live voice channel nor the guild's last
+    /// [`RECENT_NAME_MEMORY`] first names. The name is rendered as the room
+    /// will first see it: the joiner with their presence, still in the
+    /// creator channel. When no tried seed is fresh (a tiny pool), the drawn
+    /// seed and its name are kept. `None` for a blank template or a render
+    /// the name filter blocks: the room is created with its V1 name.
+    pub(super) fn first_room_name(
         &mut self,
         creator_id: Snowflake,
         owner_id: Snowflake,
         seed: u64,
-    ) -> u64 {
+    ) -> (u64, Option<String>) {
         let Some(template) = self
             .creators
             .get(&creator_id)
             .map(|creator| creator.name_template.clone())
             .filter(|template| !template.trim().is_empty())
         else {
-            return seed;
+            return (seed, None);
         };
         let command = NameCommand {
             actor_id: owner_id,
@@ -491,7 +494,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 fallback_name: &facts.fallback,
             };
             let Ok(name) = decide_template_name(&template, &render, &checks) else {
-                return seed;
+                return (seed, None);
             };
             let key = name.to_lowercase();
             let taken = self.recent_names.iter().any(|recent| *recent == key)
@@ -501,14 +504,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     .any(|other| other.to_lowercase() == key);
             if !taken {
                 self.remember_name(key);
-                return probe.name_seed;
+                return (probe.name_seed, Some(name));
             }
-            first.get_or_insert(key);
+            first.get_or_insert(name);
         }
-        if let Some(key) = first {
-            self.remember_name(key);
+        if let Some(name) = &first {
+            self.remember_name(name.to_lowercase());
         }
-        seed
+        (seed, first)
     }
 
     fn remember_name(&mut self, key: String) {
@@ -589,6 +592,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             let unknown = !self.name_directory.knows(room.owner_id)
                 || (uses_original_creator && !self.name_directory.knows(room.original_creator_id));
             if unknown {
+                if !self.name_waits.contains_key(&room_id) {
+                    metrics::global().voice_name("waiting_for_name");
+                }
                 let since = *self.name_waits.entry(room_id).or_insert(now_ms);
                 if now_ms.saturating_sub(since) < NAME_WAIT_MS {
                     self.name_inputs = None;
@@ -619,13 +625,22 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 Ok(name) => {
                     // A channel the live snapshot cannot see yet is retried
                     // on a later pass.
-                    if self.propose_name(room_id, &name, now_ms).is_some() {
-                        self.name_signatures.insert(room_id, signature);
-                    } else {
-                        self.name_inputs = None;
+                    match self.propose_name(room_id, &name, now_ms) {
+                        Some(outcome) => {
+                            metrics::global().voice_name(match outcome {
+                                ProposeOutcome::Unchanged => "unchanged",
+                                ProposeOutcome::Queued { .. } => "proposed",
+                            });
+                            self.name_signatures.insert(room_id, signature);
+                        }
+                        None => {
+                            metrics::global().voice_name("channel_unseen");
+                            self.name_inputs = None;
+                        }
                     }
                 }
                 Err(_) => {
+                    metrics::global().voice_name("blocked");
                     self.name_signatures.insert(room_id, signature);
                 }
             }

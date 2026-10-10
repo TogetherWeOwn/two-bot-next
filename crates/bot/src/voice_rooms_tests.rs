@@ -785,6 +785,7 @@ impl RoomWrites for Http {
             .unwrap()
             .push(attributes.clone());
         let mut result = channel(id, 2, attributes.parent_id);
+        result.name = Some(name.to_owned());
         result.permission_overwrites = Some(attributes.overwrites.clone());
         if let Some(hook) = &self.after_create {
             hook();
@@ -3551,6 +3552,21 @@ fn fixture_policy(words: &[&str]) -> AutomodPolicy {
     AutomodPolicy {
         bad_words: words.iter().map(ToString::to_string).collect(),
         ..AutomodPolicy::default()
+    }
+}
+
+#[test]
+fn possessive_matches_auto_voice_for_names_ending_in_s() {
+    // Auto-Voice renders a literal `'s` (`@@owner@@'s room`) whatever the
+    // name ends with, so "PisnRzrs" is "PisnRzrs's room" there too.
+    let policy = AutomodPolicy::default();
+    for (display, expected) in [("PisnRzrs", "PisnRzrs's room"), ("JAMES", "JAMES's room")] {
+        assert_eq!(
+            resolve_room_name(display, &policy, &name_context())
+                .unwrap()
+                .name,
+            expected
+        );
     }
 }
 
@@ -9916,23 +9932,37 @@ async fn failed_create_compensation_orphan_is_counted_without_a_channel_id() {
 }
 
 #[tokio::test]
-async fn a_new_room_is_renamed_from_its_creator_template() {
+async fn a_new_room_is_created_with_its_template_name_and_never_renamed() {
     let (live, store, http, trace) = fixture();
-    store.creators.lock().unwrap()[0].name_template = "@@owner@@'s den ##".to_owned();
+    store.creators.lock().unwrap()[0].name_template = "@@owner@@'s den".to_owned();
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     join(&mut worker, MEMBER);
     dispatch(&mut worker, 0).await;
     dispatch(&mut worker, 1).await;
-    worker.refresh_template_names(2);
-    dispatch(&mut worker, 3).await;
+    worker.live.voice_update(MEMBER, Some(500), Some(false));
+    for now in 2..6 {
+        worker.refresh_template_names(now);
+        worker.dispatch_one(now).await;
+    }
+    assert_eq!(
+        *worker.http.created_names.lock().unwrap(),
+        ["new room's den"]
+    );
     assert_eq!(
         *trace.lock().unwrap(),
-        [
-            "create",
-            "persist:500",
-            "move:300:500",
-            "rename:500:new room's den #1"
-        ]
+        ["create", "persist:500", "move:300:500"]
+    );
+}
+
+#[tokio::test]
+async fn a_blank_template_creates_the_room_with_its_v1_name() {
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(
+        *worker.http.created_names.lock().unwrap(),
+        ["new room's room"]
     );
 }
 
