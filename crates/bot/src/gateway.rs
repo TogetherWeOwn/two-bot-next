@@ -69,6 +69,28 @@ pub(crate) fn worker_prefix_trigger(
     }
 }
 
+/// Dispatch accepted creates, while recording only telemetry for candidates
+/// refused by the worker's capture-only gate. The refusal path never spawns
+/// text-automation work.
+fn dispatch_or_record_prefix_trigger(
+    command_runtime: Option<&Arc<crate::command_runtime::CommandRuntime>>,
+    disposition: Option<crate::automod_gateway::WorkerVerdict>,
+    event: &Event,
+    automod_enabled: bool,
+) -> bool {
+    if let Some(trigger) = worker_prefix_trigger(disposition, event, automod_enabled) {
+        command_runtime.is_some_and(|runtime| runtime.dispatch_with_verdict(event, trigger))
+    } else {
+        if !automod_enabled || !matches!(event, Event::MessageCreate(_)) {
+            return false;
+        }
+        if let Some(runtime) = command_runtime {
+            runtime.record_refused_prefix_trigger(event);
+        }
+        false
+    }
+}
+
 /// Supervisor-visible gateway state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatewayState {
@@ -694,16 +716,15 @@ fn apply_dispatch<I: InviteSource>(
                 voice.disconnect();
             }
         }
-        if let Some(trigger) = worker_prefix_trigger(disposition, &dispatch.event, automod_enabled)
-        {
-            if let Some(runtime) = command_runtime.as_ref() {
-                // Detached spawn from the blocking worker needs the runtime.
-                // The verdict travels with the event; a missing
-                // verdict fails closed inside the trigger handler.
-                let _guard = handle.enter();
-                runtime.dispatch_with_verdict(&dispatch.event, trigger);
-            }
-        }
+        // Detached spawn from the blocking worker needs the runtime. A create
+        // refused by the trigger gate records only prefix-candidate telemetry.
+        let _guard = handle.enter();
+        dispatch_or_record_prefix_trigger(
+            command_runtime.as_ref(),
+            disposition,
+            &dispatch.event,
+            automod_enabled,
+        );
         if !requests.is_empty() {
             let drain_outcome =
                 handle.block_on(checkpoint_io(worker_state, generation, deadline, async {
@@ -2529,6 +2550,25 @@ mod tests {
         use two_bot_discord::ActionExecutor;
 
         ensure_crypto_provider();
+        let _series_guard = crate::gateway_commands::PREFIX_REFUSED_SERIES_GUARD
+            .lock()
+            .await;
+        fn refused_verdict_total() -> u64 {
+            two_bot_core::metrics::global()
+                .render(None)
+                .lines()
+                .find(|line| {
+                    line.starts_with(
+                        "two_bot_gateway_prefix_trigger_refused_total{reason=\"verdict\"} ",
+                    )
+                })
+                .expect("refused series")
+                .rsplit_once(' ')
+                .expect("sample")
+                .1
+                .parse()
+                .expect("counter value")
+        }
 
         struct AcceptLedger;
         struct UnitClaim;
@@ -2710,7 +2750,7 @@ mod tests {
         )
         .expect("test executor");
         let gates = RouterGates {
-            configured_guild: Some(22),
+            configured_guild: Some(42),
             scorecard: false,
             automations: true,
             announcements: false,
@@ -2726,9 +2766,18 @@ mod tests {
             pool,
             runtime_executor,
             crate::command_runtime::router_with_commands(gates),
-            22,
+            42,
             true,
         );
+        let command_vars = HashMap::from([
+            ("TWO_AUTOMATIONS".to_owned(), "1".to_owned()),
+            ("TWO_TEXT_COMMANDS".to_owned(), "1".to_owned()),
+            ("TWO_AUTOMOD".to_owned(), "1".to_owned()),
+        ]);
+        let command_config =
+            crate::gateway_commands::GatewayCommandConfig::from_map(42, &command_vars)
+                .expect("test command config");
+        runtime.initialize_custom_commands_for_test(command_config);
         let handle = tokio::runtime::Handle::current();
         let message_event = |id: &str, guild: &str| {
             Event::MessageCreate(Box::new(
@@ -2737,7 +2786,7 @@ mod tests {
                     "guild_id": guild,
                     "channel_id": "66",
                     "author": {"id": "44", "username": "member", "discriminator": "0", "bot": false},
-                    "content": "hello",
+                    "content": "!faq",
                     "timestamp": "2026-09-28T00:00:00.000000+00:00",
                     "edited_timestamp": null,
                     "tts": false,
@@ -2753,34 +2802,48 @@ mod tests {
                 .unwrap(),
             ))
         };
-        // The exact worker call site (`worker_prefix_trigger` decision plus the
-        // detached `dispatch_with_verdict` effect): Bypassed never dispatches
-        // (so `on_message` never runs and no sticky post is possible) while an
-        // inspected Accept through the same path still dispatches.
+        // The exact worker path: Bypassed records an in-scope prefix candidate
+        // without dispatching; inspected Accept still dispatches as before.
         let bypassed_event = message_event("4000000000000000001", "42");
         assert!(
-            crate::gateway::worker_prefix_trigger(Some(bypassed_verdict), &bypassed_event, true)
-                .is_none(),
+            worker_prefix_trigger(Some(bypassed_verdict), &bypassed_event, true).is_none(),
             "Bypassed create must not dispatch text automations"
+        );
+        let before = refused_verdict_total();
+        let _guard = handle.enter();
+        assert!(
+            !dispatch_or_record_prefix_trigger(
+                Some(&runtime),
+                Some(bypassed_verdict),
+                &bypassed_event,
+                true,
+            ),
+            "CaptureOnly is recorded without dispatch"
+        );
+        assert_eq!(
+            refused_verdict_total(),
+            before + 1,
+            "CaptureOnly prefix candidate is counted by the worker path"
         );
         assert_eq!(
             runtime.lane_in_flight(crate::command_runtime::LANE_MESSAGES),
             0,
-            "no message-lane work means no sticky side effect for Bypassed"
+            "refused prefix telemetry starts no message-lane work"
         );
         let accept_event = message_event("4000000000000000002", STAGING_GUILD_ID);
-        let trigger =
-            crate::gateway::worker_prefix_trigger(Some(accept_verdict), &accept_event, true)
-                .expect("inspected Accept still dispatches text automations");
         assert_eq!(
-            trigger,
-            Some(FunnelDisposition::Accept),
+            worker_prefix_trigger(Some(accept_verdict), &accept_event, true),
+            Some(Some(FunnelDisposition::Accept)),
             "the worker forwards the trigger verdict, not the funnel"
         );
-        let _guard = handle.enter();
         assert!(
-            runtime.dispatch_with_verdict(&accept_event, trigger),
-            "inspected Accept dispatches through the worker call site"
+            dispatch_or_record_prefix_trigger(
+                Some(&runtime),
+                Some(accept_verdict),
+                &accept_event,
+                true,
+            ),
+            "inspected Accept still dispatches through the worker path"
         );
     }
 

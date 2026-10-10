@@ -28,6 +28,10 @@ use two_bot_discord::{
     ActionExecutor,
 };
 
+#[cfg(test)]
+pub(crate) static PREFIX_REFUSED_SERIES_GUARD: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 pub struct GatewayCommandConfig {
     gates: RouterGates,
     text_commands: bool,
@@ -119,6 +123,28 @@ pub struct GatewayCommands {
 }
 
 impl GatewayCommands {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        pool: PgPool,
+        executor: ActionExecutor,
+        config: GatewayCommandConfig,
+        router: Arc<InteractionRouter>,
+    ) -> Self {
+        let guild_id = config
+            .gates
+            .configured_guild
+            .and_then(Id::new_checked)
+            .expect("test command config has a valid guild");
+        Self {
+            runtime: CustomCommandRuntime::new(pool, router, executor, 1111),
+            application_id: 1111,
+            guild_id,
+            guild_name: RwLock::new("Test guild".to_owned()),
+            text_commands: config.text_commands,
+            acceptance: config.acceptance,
+        }
+    }
+
     #[cfg(test)]
     pub async fn bootstrap(
         pool: PgPool,
@@ -233,6 +259,13 @@ impl GatewayCommands {
                 true
             }
         }
+    }
+
+    /// Record a refused candidate before the worker's trigger gate skips
+    /// detached dispatch. No command lookup or automation work is started.
+    pub(crate) fn record_refused_prefix_trigger(&self, message: &Message) {
+        self.runtime
+            .record_refused_prefix_trigger(message, self.text_commands);
     }
 
     /// Detached prefix-trigger dispatch with the automod verdict for this
@@ -366,7 +399,7 @@ mod tests {
     /// gate stays on the trigger verdict, the forwarded value is the
     /// trigger verdict) and the verdict-to-acceptance mapping, then proves
     /// both directions through the real trigger handler: the denied path
-    /// early-returns `Ignored` (no POST, no DB), the accepted path passes the
+    /// early-returns `Refused` (no POST, no DB), the accepted path passes the
     /// gate and reaches the store lookup (`Storage` on the row-less lazy
     /// pool), and the reply itself is proven via the in-memory row plus the
     /// real render and the real POST.
@@ -382,7 +415,6 @@ mod tests {
     #[tokio::test]
     async fn worker_prefix_trigger_decision_is_verdict_sensitive() {
         use std::time::Duration;
-
         use twilight_gateway::Event;
         use twilight_model::gateway::payload::incoming::MessageCreate;
         use two_bot_core::automod_runtime::{
@@ -396,6 +428,8 @@ mod tests {
 
         use crate::automod_gateway::{runs_text_automations, verdict_of, WorkerVerdict};
         use crate::gateway::worker_prefix_trigger;
+
+        let _series_guard = PREFIX_REFUSED_SERIES_GUARD.lock().await;
 
         // Mock activation: a settled clean create hands `Accept` to triggers,
         // while an uninspected create keeps funnel `Accept` but hands triggers
@@ -589,7 +623,7 @@ mod tests {
         rest.shutdown().await;
 
         // Denied create never reaches the store or the wire: the real trigger
-        // handler early-returns `Ignored` before any DB lookup or POST, even
+        // handler early-returns `Refused` before any DB lookup or POST, even
         // with a lazy pool that could never serve one.
         let denied_rest = crate::discord_test_common::MockRest::start(
             Vec::new(),
@@ -642,7 +676,7 @@ mod tests {
             .expect("denied trigger returns");
         assert_eq!(
             denied_outcome,
-            two_bot_discord::custom_commands::TextCommandOutcome::Ignored
+            two_bot_discord::custom_commands::TextCommandOutcome::Refused
         );
         assert!(
             denied_rest.requests().is_empty(),
@@ -651,7 +685,7 @@ mod tests {
         denied_rest.shutdown().await;
 
         // Accepted verdict passes the same real gate: with a lazy pool it
-        // reaches the store lookup and reports `Storage` instead of `Ignored`,
+        // reaches the store lookup and reports `Storage` instead of `Refused`,
         // proving it was not refused before the in-memory row above would reply.
         let accepted_rest = crate::discord_test_common::MockRest::start(
             Vec::new(),
