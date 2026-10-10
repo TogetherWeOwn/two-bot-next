@@ -11,12 +11,23 @@ use two_bot_core::scheduled::{resolve_scheduled_id, IdResolution};
 const MAX_ROLE_KEY_ERROR_CHARS: usize = 128;
 
 /// Fixed synthetic schedule-id inventory. Twelve hex chars, like the
-/// production generator emits; no real id, token or secret appears here.
-const SCHEDULE_IDS: [&str; 4] = [
+/// production generator emits, plus two overlong entries that pin the
+/// refusal-before-resolution guard: a 130-char hex id and a 65-emoji id
+/// (65 chars but 130 UTF-16 units). No real id, token or secret appears here.
+const LONG_HEX_ID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdefab";
+/// 65 emoji = 65 chars, 130 UTF-16 units (overlong); exact match must refuse.
+const LONG_EMOJI_ID: &str = "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀";
+/// 64 emoji = 64 chars, 128 UTF-16 units (at the bound, not overlong).
+const BOUNDARY_EMOJI_PREFIX: &str = "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀";
+/// 129 ASCII chars = 129 UTF-16 units (overlong) and a prefix of LONG_HEX_ID.
+const LONG_HEX_PREFIX_129: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdefa";
+const SCHEDULE_IDS: [&str; 6] = [
     "01f3a9c4d2e5",
     "01f3a9c4d2e6",
     "9b7e2a10cc44",
     "deadbeef0042",
+    LONG_HEX_ID,
+    LONG_EMOJI_ID,
 ];
 
 fuzz_target!(|data: &[u8]| {
@@ -37,6 +48,24 @@ fuzz_target!(|data: &[u8]| {
     assert!(matches!(
         resolve_scheduled_id(SCHEDULE_IDS.iter().copied(), &overlong_prefix),
         IdResolution::Missing
+    ));
+    // Pin the overlong guard against a matching inventory id: without the
+    // guard these would resolve Unique. Also pins the UTF-16 measure: the
+    // emoji id is only 65 chars but 130 UTF-16 units, so a `.chars()` count
+    // would wrongly accept it.
+    assert!(matches!(
+        resolve_scheduled_id(SCHEDULE_IDS.iter().copied(), LONG_HEX_PREFIX_129),
+        IdResolution::Missing
+    ));
+    assert!(matches!(
+        resolve_scheduled_id(SCHEDULE_IDS.iter().copied(), LONG_EMOJI_ID),
+        IdResolution::Missing
+    ));
+    // Boundary pin: 128 UTF-16 units is allowed, so the 64-emoji prefix of
+    // the long emoji id still resolves Unique.
+    assert!(matches!(
+        resolve_scheduled_id(SCHEDULE_IDS.iter().copied(), BOUNDARY_EMOJI_PREFIX),
+        IdResolution::Unique(id) if id == LONG_EMOJI_ID
     ));
     assert_eq!(
         AuditRecord::put("guild", "actor", "", true)
