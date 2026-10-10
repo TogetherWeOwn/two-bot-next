@@ -43,8 +43,9 @@ only, never staging/production), and restart counts. See the query pack.
 
 - Liveness: `GET /health` on the Worker (200 `{"status":"ok"}` means the
   process answers HTTP; not proof of gateway, database or delivery).
-- Readiness: `GET /readyz` (200 ready / 503 with component breakdown;
-  only `process` and `gateway` are wired). Suggested poll cadence 60 s;
+- Readiness: `GET /readyz` (200 when every component is `ready` / 503 with the
+  component breakdown: `process`, `gateway`, `database`, `token_invalid`; only
+  a `gateway` at `down` or `starting` is parked). Suggested poll cadence 60 s;
   record findings, not every healthy poll.
 - Metrics: `GET /ops/metrics` on the Worker with the already-provisioned
   scrape token (never in a PR or log). Container-internal `/metrics` is
