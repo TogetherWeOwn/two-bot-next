@@ -114,6 +114,14 @@ free lane slots), so `reactions` growth points at a hot member before an
 undersized lane; the M2.1 alert rule should treat `reactions` drops as
 member-hot until lane saturation is confirmed.
 
+Fatal-runner reasons are class `session` and O(1) bytes: both dispatch-join
+`map_err` sites in `crates/bot/src/gateway.rs` pass the surfaced reason
+through `bounded_runner_reason`, capped at `RUNNER_REASON_MAX_CHARS`
+(512 chars, char-boundary). Today every reason is one of six `&'static str`
+literals from `dispatch_bounded` (the `JoinError` payload is discarded
+there), so the type already bounds the output; the cap is a fence that holds
+even if a future supervisor returns a larger payload.
+
 Subscription facts that bound the top of the funnel: the bot never requests
 `GUILD_PRESENCES`, so presence arrives only through the hourly
 `presence_probe` job, never as gateway events; `MESSAGE_CONTENT` is requested
