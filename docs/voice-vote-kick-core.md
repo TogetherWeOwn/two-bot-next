@@ -7,11 +7,18 @@ persistence, timer task or room-lifecycle runtime are introduced.
 ## Domain contract
 
 - Supply authoritative `VoteRoomFacts` for the managed room, including its
-  guild, owner, original creator and current occupant IDs. Duplicate IDs count
-  once. The V4 electorate is the occupants other than the target; no extra
-  role, administrator override or bot-specific moderation rule is added here.
+  guild, owner, original creator and current occupant IDs, plus the target's
+  guild-scoped privilege (`target_privileged`): `Some(true)` when the target
+  holds effective Kick Members or Administrator in that guild, `Some(false)`
+  for an ordinary target, and `None` when the guild-authority lookup is
+  unavailable. Duplicate IDs count once. The V4 electorate is the occupants
+  other than the target; no extra role, administrator override or bot-specific
+  moderation rule is added here.
 - `start` accepts any occupant, rejects self-targeting, absent targets, the owner
-  and original creator, and permits only one active vote per guild/target. Use
+  and original creator (`ProtectedTarget`), privileged Kick Members /
+  Administrator holders (`PrivilegedTarget`), and unavailable authority lookups
+  (`AuthorityUnavailable`, fail closed with no vote, ballot, or enforcement
+  effect), and permits only one active vote per guild/target. Use
   the unique initiating interaction ID as the vote ID. Starting is not a Yes
   ballot: V4 says votes are cast with buttons.
 - `cast` accepts one Yes or No ballot per current eligible occupant. Neither a
@@ -26,9 +33,16 @@ persistence, timer task or room-lifecycle runtime are introduced.
 - Supply processing time through `VoteClock`, not a client-provided time. The
   deadline is fixed at start + 120,000 ms; at or after the deadline, even a
   threshold-reaching ballot expires without a passing decision.
-- `refresh` must run on every member/ownership change and at the deadline.
+- `refresh` must run on every member/ownership/role change and at the deadline.
   Target departure cancels permanently, even if the target later rejoins.
   Becoming the owner or original creator also prevents a pending vote passing.
+  A mid-vote grant of Kick Members / Administrator, or a lost authority lookup
+  (`None`), cancels as `TargetProtected` with no kick decision: the recheck
+  runs on every `cast`/`refresh` transition immediately before a pass, so a
+  promotion granted mid-vote cannot be bypassed. The runtime rechecks guild
+  authority a final time immediately before the Discord deny/disconnect writes
+  and writes nothing when the target is privileged or the lookup is
+  unavailable.
 - Carry the complete `VoteKickRef` through buttons, deriving the actual guild
   and room from trusted routing context. A changed ID/guild/room/target or
   mismatched facts cannot mutate another vote. A terminal vote never reopens.
@@ -63,7 +77,8 @@ cargo test -p two-bot-core voice_vote_kick --locked
 ```
 
 The unit fixture uses a manually advanced clock and supplied ID lists. It pins
-initiation/voter refusals, owner/creator protection, guild/room/target binding,
+initiation/voter refusals, owner/creator/privileged/unavailable protection,
+guild/room/target binding,
 roster and ballot deduplication, strict-majority thresholds for odd/even totals,
 abstention/No, current-membership changes, exact expiry boundaries, target
 leave/rejoin cancellation, one room-scoped passing decision and terminal replay.

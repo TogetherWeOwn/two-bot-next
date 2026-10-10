@@ -542,6 +542,12 @@ impl<S: FunnelStore, L: LevelingHook, F: FactsSink> FunnelHandlers<S, L, F> {
         &self.store
     }
 
+    /// Access the facts sink (async runtimes drain deferred buffers).
+    #[must_use]
+    pub fn facts(&self) -> Option<&F> {
+        self.facts.as_ref()
+    }
+
     /// Member arrival. Bots are captured in facts but never write funnel rows.
     pub fn on_join(&self, i: JoinInput) -> HandlerOutcome {
         if i.is_bot {
