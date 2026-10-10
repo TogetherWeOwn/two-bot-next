@@ -32,6 +32,22 @@ export const JOB_INTERVAL_SECONDS: Record<string, number> = {
 };
 
 export const STALE_INTERVALS = 2;
+/**
+ * Staleness window in seconds for the 15 s tickers (`scheduled_messages`,
+ * `settings`). Ten minutes is 40 missed ticks: far above the keepalive scrape
+ * cadence (~60 s, so ~10 consecutive missed scrapes must agree), the
+ * supervisor startup jitter (up to 5 s), and the per-attempt timeouts
+ * (`scheduled_messages` 120 s, `settings` 10 s), so one slow scrape or a
+ * single timed-out tick never pages; yet a truly wedged ticker (skipped busy
+ * deadlines count neither as success nor failure, so neither `job_stale` nor
+ * `job_consecutive_failures` can see it) still pages well within the 48 h
+ * watch. A zero success timestamp suppresses both boot (never succeeded) and
+ * parked (never registered: `DATABASE_URL` unset, or the automations gate
+ * off) since those stay zero; see `docs/metrics.md`.
+ */
+export const TICKER_STALE_SECONDS = 600;
+/** Jobs covered by `ticker_stale` instead of `job_stale`. */
+export const TICKER_STALE_JOBS: readonly string[] = ["scheduled_messages", "settings"];
 export const FAILURE_THRESHOLD = 3;
 /** 429s must exceed this share of REST requests between two samples... */
 export const REST_429_RATIO = 0.1;
@@ -56,6 +72,8 @@ export const RULES: readonly RuleDef[] = [
   { id: "db_errors", summary: `database errors reached ${DB_ERROR_MIN_ERRORS}+ between samples`, runbook: "runbook.md#alert-db-errors" },
   { id: "send_admission_blocked", summary: `Discord sends refused admission for ${SEND_BLOCKED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-send-admission-blocked" },
   { id: "voice_failures", summary: `voice room lifecycle failures exceed ${VOICE_FAILURE_RATIO * 100}% of operations (min ${VOICE_FAILURE_MIN_OPS} ops), or new dead-letters/orphans`, runbook: "runbook.md#alert-voice-failures" },
+  { id: "gateway_missed_events", summary: `gateway missed events increased between samples`, runbook: "runbook.md#alert-gateway-missed-events" },
+  { id: "ticker_stale", summary: `15 s ticker has no success for more than ${TICKER_STALE_SECONDS / 60} minutes`, runbook: "runbook.md#alert-ticker-stale" },
 ];
 
 /**
@@ -83,9 +101,12 @@ export interface MetricsAlertState {
   voiceFailures: number;
   voiceDeadLetters: number;
   voiceOrphans: number;
+  gatewayMissed: number;
+  /** False until the first evaluation stores a baseline: the first sample never fires. */
+  gatewayMissedSeen: boolean;
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0 };
+export const EMPTY_STATE: MetricsAlertState = { firing: [], rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false };
 
 export function parseExposition(text: string): Sample[] {
   const samples: Sample[] = [];
@@ -122,6 +143,16 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   }
   for (const s of gauge("two_bot_job_consecutive_failures")) {
     if (s.value >= FAILURE_THRESHOLD) firing.push(`job_consecutive_failures:${s.labels["job"] ?? "other"}`);
+  }
+  for (const s of gauge("two_bot_job_last_success_timestamp_seconds")) {
+    const job = s.labels["job"] ?? "";
+    // 15 s tickers wedge silently: skipped busy deadlines are neither success
+    // nor failure, so neither job_stale nor job_consecutive_failures sees
+    // them. Zero means never succeeded since start (boot) or never registered
+    // (parked: DATABASE_URL unset, or the automations gate off): not stale.
+    if (TICKER_STALE_JOBS.includes(job) && s.value > 0 && nowSeconds - s.value > TICKER_STALE_SECONDS) {
+      firing.push(`ticker_stale:${job}`);
+    }
   }
 
   let rest429 = 0;
@@ -197,7 +228,19 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     firing.push("voice_failures");
   }
 
-  return { firing, state: { firing, rest429, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans } };
+  // Gateway missed events (sequence gaps inside one session): any increase
+  // between two samples fails the zero-missed-events acceptance. The first
+  // sample only stores the baseline and never fires; a counter that went
+  // backwards means the process restarted: no window.
+  // `??` covers DO storage written before these fields existed.
+  let gatewayMissed = 0;
+  for (const s of gauge("two_bot_gateway_missed_events_total")) gatewayMissed += s.value;
+  const prevGatewayMissed = prev.gatewayMissed ?? 0;
+  const gatewaySeen = prev.gatewayMissedSeen ?? false;
+  const gatewayReset = gatewayMissed < prevGatewayMissed;
+  if (gatewaySeen && !gatewayReset && gatewayMissed > prevGatewayMissed) firing.push("gateway_missed_events");
+
+  return { firing, state: { firing, rest429, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true } };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {

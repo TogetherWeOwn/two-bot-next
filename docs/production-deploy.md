@@ -90,7 +90,9 @@ the head of `main`, which can be newer than the commit being deployed.
 Production renders its own config instead of calling `staging_rollout.py
 prepare`. That path also snapshots the staging Cloudflare application and
 checks the staging ownership receipt, which production does not use. Ownership
-takeover is roadmap item M1.5 and out of scope here. `scripts/production_deploy.py
+takeover runs as the P2–P4 steps in
+[Production ownership takeover](#production-ownership-takeover-p2p4) below.
+`scripts/production_deploy.py
 render` reads the checked-in `wrangler/wrangler.toml`, makes its paths absolute
 because the rendered file lives outside `wrangler/`, and sets `image_vars` on the
 single production container. Nothing else changes, and
@@ -129,6 +131,70 @@ In rollback mode the same gate reads the revision that the rolled-back version
 reports, so `sha` must be that version's commit. A version built before this
 change reports `unknown` for both fields. The gate records that as a pre-stamp
 version and does not fail the rollback. Any other revision fails it.
+
+## Production ownership takeover (P2–P4)
+
+Implements P2–P4 of the approved design
+([cutover-production-takeover-design.md](cutover-production-takeover-design.md)).
+Staging keeps its own client and behavior; nothing here renames, repoints, or
+relaxes the staging gate. This step never activates production: GO stays the
+cutover lead's separate decision on the B4 execution card
+([cutover-sequence.md](cutover-sequence.md) §§4–5).
+
+**Requesting it.** Dispatch with `takeover: true` (default `false`). The guard
+validates the flag and records `Takeover: requested/not requested` in the run
+summary. With `false` the job deploys and stops: the fence stays held, fenced
+answers carry no build fields, and the gate fails without being a rollback
+signal.
+
+**Order inside the `production` job** (same Environment approval as the deploy):
+
+1. `Require production ownership-control configuration`: `preflight` through
+   `wrangler/scripts/production-ownership-control.mjs` before anything is
+   replaced. It refuses a missing/short control token or a non-production
+   origin before the deploy.
+2. Deploy (or rollback) runs as before. `Record the Worker version and SHA`
+   exports the single Worker version serving 100% as `NEW_VERSION`, and
+   refuses the takeover when traffic is split or unreadable.
+3. P2 `Read production ownership state without starting`: authenticated GET
+   against the production Worker URL. It confirms the serving deployment is
+   the recorded `NEW_VERSION` with `running=false`; any mismatch is NO-GO
+   and the run stops before any POST. The full response is tee'd to the run
+   log as the P2 receipt.
+4. P3 `Take over production ownership at the read epoch`: one POST with
+   exactly `{"action":"takeover","expectedEpoch":<P2 epoch>,"actor":...}`.
+   The actor is `github-actions:<run id>:<guarded SHA>` (audit label only;
+   authentication is the bearer token). The explicit release (`true` only in
+   these steps) authorizes unparking; a routine deploy never unparks. Only
+   5xx POSTs retry inside a bounded window with the epoch re-read first; a
+   5xx after a committed takeover is confirmed by GET, never re-posted.
+   401, 400, 405 and 409 never retry. Every refused state answers with the
+   design's documented code (401/400/405 outside the fence vocabulary, 409
+   on epoch conflict, otherwise 503 `ownership_fenced` with `no-store`).
+5. P4: the `/health` + `/readyz` gate above runs the first owned probes
+   (one container start, revision/build-ID match, single gateway session),
+   then `Re-read the active production version after takeover` plus
+   `Confirm the taken-over version still serves` prove the taken-over
+   version still serves 100%.
+
+**Secrets.** GitHub `production` Environment only — no host-held secrets, no
+new secret surface. `PRODUCTION_OWNERSHIP_CONTROL_TOKEN` (Environment
+secret, ≥32 chars; provisioning/rotation is a separate governed step, never
+part of takeover) is read only inside the `production`-gated job and never
+forwarded into the container. `PRODUCTION_WORKER_URL` (Environment variable,
+non-secret) must be `https://` and differ from `STAGING_WORKER_URL`; the job
+and the client both refuse otherwise, and the client never follows redirects.
+Receipts, logs and cards name only bindings, version IDs and fixed refusal
+words — never secret values.
+
+**Rollback.** On any failed gate, follow the ordered checklist in
+[cutover-rollback-runbook.md §4](cutover-rollback-runbook.md#4-ordered-rollback-steps)
+and the full procedure in [cutover.md §Rollback](cutover.md#rollback-preserve-next-window-writes-before-reopening-legacy):
+fence the singleton first (`fence` action of the same client, with the
+current readback epoch and the explicit release), reconcile before
+reopening, then revert traffic with a `rollback=<previous version-id>`
+dispatch from the watch header. The same guard, Environment approval and
+takeover order apply to the revert.
 
 ## `PRODUCTION_AUTO_APPROVE`
 
