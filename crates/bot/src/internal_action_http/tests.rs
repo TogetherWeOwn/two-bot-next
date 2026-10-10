@@ -15,6 +15,34 @@ use two_bot_testsupport::TestDatabase;
 mod adapter;
 mod settings;
 
+/// Stored `internal_idempotency` receipt row: action, state, response code,
+/// status, resource, affected count, guild, actor, target, resolved role.
+type StoredReceiptRow = (
+    String,
+    String,
+    Option<String>,
+    Option<i32>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Terminal `internal_action_log` row: action, phase, response code, evidence
+/// code, status, guild, target, resolved role.
+type TerminalAuditRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<i32>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 fn secret(index: usize) -> String {
     let fixture: Value = serde_json::from_str(include_str!(
         "../../../core/tests/fixtures/internal-action-signing.json"
@@ -1012,18 +1040,7 @@ async fn authenticated_membership_actions_succeed_and_refusals_stay_redacted() {
     // without echoing request bytes: `guild.add_member` sorts before
     // `role.assign`. Only scalar linkage columns are selected; no hashes,
     // tokens or raw bytes enter the assertion output.
-    let rows: Vec<(
-        String,
-        String,
-        Option<String>,
-        Option<i32>,
-        Option<String>,
-        Option<i64>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    )> = sqlx::query_as(
+    let rows: Vec<StoredReceiptRow> = sqlx::query_as(
         "SELECT action, state, response_code, http_status, resource_id, affected, \
          guild_id, actor_id, target_id, resolved_role_id \
          FROM internal_idempotency ORDER BY action",
@@ -1089,16 +1106,7 @@ async fn authenticated_membership_actions_succeed_and_refusals_stay_redacted() {
     assert_eq!(add_replay["result"], json!({"outcome": "added"}));
     // Terminal audit rows mirror the same outcome linkage with executor
     // evidence, proving `store.finish` carried it to the ledger as well.
-    let logs: Vec<(
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<i32>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    )> = sqlx::query_as(
+    let logs: Vec<TerminalAuditRow> = sqlx::query_as(
         "SELECT action, phase, response_code, evidence_code, http_status, \
          guild_id, target_id, resolved_role_id \
          FROM internal_action_log WHERE phase = 'terminal' ORDER BY action",
