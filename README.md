@@ -6,15 +6,15 @@ The Together We Own Discord bot (Owen), rewritten in Rust to run in a single alw
 Cloudflare Container. It replaces [two-bot](https://github.com/TogetherWeOwn/two-bot)
 (TypeScript/discord.js), which is now in maintenance mode: fixes only, no new features.
 
-Status: Rust gateway and durable recovery implemented; feature/core and storage
-ports are in place, with runtime integration still incomplete. Twilight is the
-Discord framework — see [ADR 0001](docs/adr/0001-discord-framework.md). The
-`two-bot` binary exposes health/readiness, persists gateway sessions and funnel
-effects, and provides backup/restore operator commands. The `wrangler/` wrapper
-targets one Cloudflare Container; this is not a production-cutover or soak claim.
-Command publication metadata is not proof that every feature is wired into the
-runtime: remaining seams and drop decisions are tracked in the
-[parity matrix](docs/parity.md).
+Status: the bot has been live in production on one Cloudflare Container since
+2026-10-10. A subset of commands is published; see the
+[command publication guide](docs/command-publish.md) for the enabled registry
+and its gates. Publication metadata is not proof that every feature is wired
+into the runtime: remaining seams and drop decisions are tracked in the
+[parity matrix](docs/parity.md). Twilight is the Discord framework — see
+[ADR 0001](docs/adr/0001-discord-framework.md). The `two-bot` binary exposes
+health/readiness, persists gateway sessions and funnel effects, and provides
+backup/restore operator commands.
 
 On-call: [operations runbook](docs/runbook.md) — health/logs, redeploy/rollback,
 RESUME semantics, kill-switch/feature wiring boundaries, backups and common
@@ -43,7 +43,8 @@ failures. See also [backup procedures](docs/backup.md) and
 The `lite` design target remains one gateway session and less than 256 MiB RSS.
 This placement/deployment reference is not B2 soak acceptance: B2 requires flat
 memory and defines no numeric RSS threshold. This README makes no measurement
-claim. Staging deploys from `main`; production is a separate manual gate.
+claim. Staging deploys from `main`; production deploys through the manual
+[`deploy-production` gate](docs/production-deploy.md).
 
 ## Operator references
 
