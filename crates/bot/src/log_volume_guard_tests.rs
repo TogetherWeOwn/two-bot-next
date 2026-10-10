@@ -186,6 +186,16 @@ const JOB_CAPS: [JobCap; 12] = [
 /// refused admits are counted, never silently dropped.
 const DB_ERROR_CAP_OPS: [&str; 2] = ["admission", "other"];
 const SEND_ADMISSION_CAP_OUTCOMES: [&str; 4] = ["admitted", "blocked", "storage_error", "other"];
+/// One row per `metrics::DISPATCH_LANES` entry, in the same order. A new
+/// dispatch lane fails here until it gets a budget row in the guard doc.
+const DISPATCH_LANE_CAPS: [&str; 6] = [
+    "messages",
+    "interactions",
+    "registry",
+    "privileged",
+    "busy",
+    "reactions",
+];
 
 #[test]
 fn storage_and_send_gate_labels_match_their_caps() {
@@ -198,6 +208,11 @@ fn storage_and_send_gate_labels_match_their_caps() {
         metrics::SEND_ADMISSION_OUTCOMES,
         &SEND_ADMISSION_CAP_OUTCOMES[..],
         "SEND_ADMISSION_OUTCOMES grew without a budget row; update docs/log-volume-guard.md"
+    );
+    assert_eq!(
+        metrics::DISPATCH_LANES,
+        &DISPATCH_LANE_CAPS[..],
+        "DISPATCH_LANES grew without a budget row; update docs/log-volume-guard.md"
     );
 }
 
@@ -439,6 +454,11 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
         4,
         "send-admission family grew; update the cardinality budget and the guard doc"
     );
+    assert_eq!(
+        metrics::DISPATCH_LANES.len(),
+        6,
+        "dispatch-lane family grew; update the cardinality budget and the guard doc"
+    );
     for (allowlist, name) in [
         (metrics::EVENTS, "EVENTS"),
         (metrics::REST_ROUTES, "routes"),
@@ -466,12 +486,17 @@ fn exposition_series_count_matches_the_cardinality_budget() {
         "route family changed the budget"
     );
     assert_eq!(metrics::JOBS.len(), 12, "job family changed the budget");
+    assert_eq!(
+        metrics::DISPATCH_LANES.len(),
+        6,
+        "dispatch-lane family changed the budget"
+    );
     let text = metrics::Metrics::default().render(None);
     let series = text.lines().filter(|line| !line.starts_with('#')).count();
     assert_eq!(
-        series, 279,
-        "exposition grew past the 279-sample budget (18 events + 4 scalars + 1 latency \
-         + 11 histogram + 156 rest + 48 jobs + 31 voice + 2 db-errors + 4 send-admissions + 4 pool); \
+        series, 285,
+        "exposition grew past the 285-sample budget (18 events + 4 scalars + 1 latency \
+         + 11 histogram + 156 rest + 48 jobs + 31 voice + 2 db-errors + 4 send-admissions + 6 dispatch-drops + 4 pool); \
          update docs/log-volume-guard.md with the new series"
     );
 }
