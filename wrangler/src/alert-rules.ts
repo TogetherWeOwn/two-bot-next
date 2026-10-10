@@ -74,6 +74,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "voice_failures", summary: `voice room lifecycle failures exceed ${VOICE_FAILURE_RATIO * 100}% of operations (min ${VOICE_FAILURE_MIN_OPS} ops), or new dead-letters/orphans`, runbook: "runbook.md#alert-voice-failures" },
   { id: "gateway_missed_events", summary: `gateway missed events increased between samples`, runbook: "runbook.md#alert-gateway-missed-events" },
   { id: "ticker_stale", summary: `15 s ticker has no success for more than ${TICKER_STALE_SECONDS / 60} minutes`, runbook: "runbook.md#alert-ticker-stale" },
+  { id: "receiver_refusals", summary: `website-action receiver refusals increased between samples`, runbook: "runbook.md#alert-receiver-refusals" },
 ];
 
 /**
@@ -104,9 +105,13 @@ export interface MetricsAlertState {
   gatewayMissed: number;
   /** False until the first evaluation stores a baseline: the first sample never fires. */
   gatewayMissedSeen: boolean;
+  /** Refused `two_bot_internal_actions_total` outcomes summed by family. */
+  receiverRefusals: Record<string, number>;
+  /** False until the first evaluation stores a baseline: the first sample never fires. */
+  receiverRefusalsSeen: boolean;
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false };
+export const EMPTY_STATE: MetricsAlertState = { firing: [], rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false };
 
 export function parseExposition(text: string): Sample[] {
   const samples: Sample[] = [];
@@ -240,7 +245,31 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   const gatewayReset = gatewayMissed < prevGatewayMissed;
   if (gatewaySeen && !gatewayReset && gatewayMissed > prevGatewayMissed) firing.push("gateway_missed_events");
 
-  return { firing, state: { firing, rest429, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true } };
+  // Website-action receiver refusals by family: any per-family increase of
+  // refused `two_bot_internal_actions_total` outcomes (every outcome other
+  // than `executed`) between two samples pages, so a receiver-abuse or
+  // refusal storm names its family. The first sample only stores the
+  // baseline and never fires; a per-family counter that went backwards
+  // means the process restarted: no window for that family.
+  // `??` covers DO storage written before these fields existed.
+  const receiverRefusals: Record<string, number> = {};
+  for (const s of gauge("two_bot_internal_actions_total")) {
+    if (s.labels["outcome"] !== "executed") {
+      const family = s.labels["family"] ?? "other";
+      receiverRefusals[family] = (receiverRefusals[family] ?? 0) + s.value;
+    }
+  }
+  const prevReceiverRefusals = prev.receiverRefusals ?? {};
+  const receiverSeen = prev.receiverRefusalsSeen ?? false;
+  if (receiverSeen) {
+    for (const [family, count] of Object.entries(receiverRefusals)) {
+      const prevCount = prevReceiverRefusals[family] ?? 0;
+      // A counter that went backwards means the process restarted: no window.
+      if (count > prevCount) firing.push(`receiver_refusals:${family}`);
+    }
+  }
+
+  return { firing, state: { firing, rest429, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, receiverRefusals, receiverRefusalsSeen: true } };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {

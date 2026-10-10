@@ -135,6 +135,45 @@ test("gateway missed events fire on any increase, never on the first sample or a
   assert.deepEqual(ev([`two_bot_gateway_missed_events_total 2`], restart.state).firing, ["gateway_missed_events"]);
 });
 
+test("receiver refusals fire on any per-family increase, never on the first sample or a reset", () => {
+  const refused = (family: string, outcome: string, n: number) =>
+    `two_bot_internal_actions_total{family="${family}",outcome="${outcome}"} ${n}`;
+  const executed = (family: string, n: number) =>
+    `two_bot_internal_actions_total{family="${family}",outcome="executed"} ${n}`;
+  // First sample only stores the baseline, even with nonzero refusals.
+  const first = ev([
+    refused("moderation", "auth_failure", 5),
+    refused("moderation", "rate_limit", 2),
+    executed("moderation", 10),
+  ]);
+  assert.deepEqual(first.firing, []);
+  // A per-family increase fires with the family subject; executed growth alone stays silent.
+  const fire = ev([
+    refused("moderation", "auth_failure", 6),
+    refused("moderation", "rate_limit", 2),
+    executed("moderation", 100),
+  ], first.state);
+  assert.deepEqual(fire.firing, ["receiver_refusals:moderation"]);
+  // A flat window recovers (no increase, no fire).
+  assert.deepEqual(ev([
+    refused("moderation", "auth_failure", 6),
+    refused("moderation", "rate_limit", 2),
+    executed("moderation", 101),
+  ], fire.state).firing, []);
+  // Other families fire independently.
+  const mixed = ev([
+    refused("moderation", "auth_failure", 6),
+    refused("membership", "unknown_key", 1),
+    executed("membership", 3),
+  ], fire.state);
+  assert.deepEqual(mixed.firing, ["receiver_refusals:membership"]);
+  // A counter that went backwards means the process restarted: no window.
+  const restart = ev([refused("moderation", "auth_failure", 1)], fire.state);
+  assert.deepEqual(restart.firing, []);
+  // The post-restart baseline fires again on the next increase.
+  assert.deepEqual(ev([refused("moderation", "auth_failure", 2)], restart.state).firing, ["receiver_refusals:moderation"]);
+});
+
 test("ticker stale fires past 10 minutes, ignores boot, parked and fresh tickers", () => {
   // Boot (never succeeded) and parked (never registered) stay zero: silent.
   assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="scheduled_messages"} 0`]).firing, []);
@@ -154,7 +193,7 @@ test("ticker stale fires past 10 minutes, ignores boot, parked and fresh tickers
 test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   const window = "2026-10-09T20-11-06Z";
   // Single shared spelling with the Rust canonical list (ALERT_RULE_IDS in
-  // crates/core/src/evidence.rs); both sides pin all nine here and there.
+  // crates/core/src/evidence.rs); both sides pin all ten here and there.
   assert.deepEqual(RULES.map((r) => r.id), [
     "job_stale",
     "job_consecutive_failures",
@@ -165,6 +204,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "voice_failures",
     "gateway_missed_events",
     "ticker_stale",
+    "receiver_refusals",
   ]);
   assert.equal(packetFilename("job_stale:rank", window), `evidence-job_stale-${window}.json`);
   assert.equal(packetFilename("job_consecutive_failures:counter", window), `evidence-job_consecutive_failures-${window}.json`);
@@ -175,6 +215,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("voice_failures", window), `evidence-voice_failures-${window}.json`);
   assert.equal(packetFilename("gateway_missed_events", window), `evidence-gateway_missed_events-${window}.json`);
   assert.equal(packetFilename("ticker_stale:scheduled_messages", window), `evidence-ticker_stale-${window}.json`);
+  assert.equal(packetFilename("receiver_refusals:moderation", window), `evidence-receiver_refusals-${window}.json`);
   // Unknown keys get no filename rather than a misleading one; hostile
   // window stamps stay filename-safe.
   assert.equal(packetFilename("no_such_rule", window), undefined);
@@ -231,6 +272,12 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   );
   firing.push(
     ...ev([`two_bot_job_last_success_timestamp_seconds{job="scheduled_messages"} ${NOW - 601}`]).firing,
+  );
+  firing.push(
+    ...ev(
+      [`two_bot_internal_actions_total{family="moderation",outcome="auth_failure"} 1`],
+      ev([`two_bot_internal_actions_total{family="moderation",outcome="auth_failure"} 0`]).state,
+    ).firing,
   );
   assert.equal(firing.length, RULES.length, `expected one firing key per rule, got: ${firing.join(", ")}`);
   const packets = transitionMessages([], firing);

@@ -362,6 +362,36 @@ when a due schedule row or settings change stays unapplied past the
 window — the fix then belongs to the on-call engineer, not another
 redeploy.
 
+#### Alert: receiver refusals
+
+Refused `two_bot_internal_actions_total` outcomes increased for one family
+between two keepalive samples. Every outcome other than `executed`
+(`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`,
+`rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`,
+`conflict`, `upstream`, `internal`) counts as a refusal: the signed
+website-action receiver saw the request and refused it. Any per-family
+increase pages at once (zero threshold), because a receiver-abuse or
+refusal storm stays quiet through the burn math. The firing key names its
+family (`receiver_refusals:moderation`). The first sample after monitoring
+arms only stores the baseline and never fires, and a counter reset
+(process restart) skips the window rather than firing.
+
+First response: scope the refusing family from the `family`/`outcome`
+labels on `two_bot_internal_actions_total` via the authorized
+`/ops/metrics` scrape; confirm no deploy is in progress (a fresh deploy
+restarts the process and resets the counter); then read the container logs
+for the matching `internal action refused` warn lines (sampled summaries
+with `kind`/`class`/`key`/`action`). A single historic refusal with no
+growth never re-pages. Do not retry-loop a signed request with a new
+nonce, rotate keys, or restart the container to "clear" the counter; a
+replacement resets the baseline without stopping the abusive caller.
+
+Escalate when refusals persist across windows after the suspect deploy or
+caller is identified, when they coincide with 429 or DB-error alerts, or
+when `executed` traffic for the same family collapses while refusals rise
+— the receiver may be refusing legitimate work and the fix belongs to the
+on-call engineer, not another redeploy.
+
 ## Persisted ownership control
 
 The Worker/DO fence is implemented, not implicitly released by deployment.

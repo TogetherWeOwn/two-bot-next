@@ -146,9 +146,9 @@ pub const DISPATCH_LANES: &[&str] = &[
 /// verbs) collapses to `other`. No key id, token, body or request bytes ever
 /// become a family label.
 ///
-/// Alert-threshold hook for M2.1: alert when refused outcomes increase
-/// across consecutive scrapes (exact rule lands with M2.1 once TOG-18943
-/// unblocks); a single refusal inside one burst is not paging.
+/// Alert rule `receiver_refusals:<family>` in `wrangler/src/alert-rules.ts`:
+/// any per-family increase of refused outcomes across consecutive scrapes
+/// pages; the first sample and restarts skip the window.
 pub const INTERNAL_ACTION_FAMILIES: &[&str] = &[
     "announcement",
     "event",
