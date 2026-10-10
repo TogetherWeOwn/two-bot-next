@@ -401,12 +401,18 @@ Invocation (secret-free; each URL comes only from its existing binding):
 
 ```text
 staging-migrate --plan --source-sha <40hex> --staging-host <host> \
-  --staging-database <db> --recovery-evidence-ref <ref> --acl-plan-ref <ref> \
+  --staging-database <db> [--staging-branch-id <branch>] \
+  --recovery-evidence-ref <ref> --acl-plan-ref <ref> \
   [--expected-pending <ascending,comma-separated versions>]
 staging-migrate --apply <same flags> --expected-pending <list> \
   --plan-manifest-sha256 <64hex> --plan-run-id <run id> \
   --plan-manifest-path <producing run's downloaded manifest>
 ```
+
+`--staging-branch-id` pins the PlanetScale branch id (non-secret). It is
+required when `--staging-host` ends in `.psdb.cloud` (PlanetScale routes
+branches by the binding username's `{role}.{branch_id}` suffix); other hosts
+leave it empty.
 
 Reconcile is set-based: pending is every source version absent from the
 ledger, in source order, so a ledger may lag the source by any subset. `--plan`
@@ -449,8 +455,11 @@ string instead of failing the plan.
 
 It refuses (exit 2, before any DDL) when the binding is absent, the target does
 not equal the pinned staging host/database inputs, either pin is empty or looks
-like production, either host pin or the binding host is a pooler endpoint
-(session `SET ROLE` and the migrator lock need the direct endpoint), the login
+like production, either host pin or the binding host is a pooler endpoint,
+the binding uses a pooled port (anything but 5432) or a pooler-style `|` username
+(session `SET ROLE` and the migrator lock need the direct 5432 endpoint),
+a `*.psdb.cloud` pin has no `--staging-branch-id`, the pin is malformed, or the
+binding username's branch suffix does not match the pinned branch, the login
 cannot assume `two_bot_migrator` (apply) or `two_bot_migrator_ro` (plan), the
 plan login also holds `two_bot_migrator`, a reference is missing, `--apply` has no
 `--expected-pending` or it mismatches, `--apply` has no `plan_manifest_sha256`/

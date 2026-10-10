@@ -1380,7 +1380,19 @@ mod tests {
                 "verify must refuse pooled/branch-mismatched binding {pooled}"
             );
         }
-        // A malformed branch pin refuses before any DDL.
+        // A malformed branch pin refuses before any DDL. The no-binding
+        // case proves the pin-format check itself refuses: without a URL the
+        // username-suffix match cannot run, so only `branch_id_valid` can
+        // refuse here.
+        let bad_branch_no_url = Request {
+            url: None,
+            expected_branch_id: "not a branch!".to_owned(),
+            ..planetscale_pin.clone()
+        };
+        assert!(matches!(
+            validate_request(&bad_branch_no_url),
+            Err(RunError::Refused(_))
+        ));
         let bad_branch = Request {
             expected_branch_id: "not a branch!".to_owned(),
             ..planetscale_pin.clone()
