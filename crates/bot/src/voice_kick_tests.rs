@@ -1094,7 +1094,7 @@ async fn hostile_reasons_never_echo_in_refusals_errors_or_logs() {
                 !row.outcome.contains(hostile),
                 "{hostile:?} echoed in audit outcome: {row:?}"
             );
-            assert_no_reason_echo(hostile, &row.outcome, "audit outcome");
+            assert_no_reason_echo(hostile, row.outcome, "audit outcome");
             assert!(
                 row.outcome
                     .bytes()
