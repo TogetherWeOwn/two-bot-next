@@ -292,10 +292,10 @@ fn vote_kick_starts_refusals_and_enforcements_render_every_series() {
     assert!(text.contains("two_bot_voice_vote_kick_total{outcome=\"other\"} 0\n"));
 }
 
-/// Docs-claims-subset conformance (M4.3/M4.23 pattern): every vote-kick
-/// outcome `docs/metrics.md` names must exist in exposition. The doc beside
-/// the voice rows claims the allowlist; this test fails when the doc invents
-/// a series or the code ships one the doc does not name.
+/// Docs-claims-subset conformance (M4.3/M4.23 pattern): `docs/metrics.md`
+/// names exactly the vote-kick outcomes exposition renders. The allowlist
+/// bullet beside the voice rows claims the set; this test fails when the doc
+/// invents a series or the code ships one the doc does not name.
 #[test]
 fn vote_kick_docs_claims_are_a_subset_of_exposition() {
     let docs = include_str!("../../../docs/metrics.md");
@@ -318,4 +318,29 @@ fn vote_kick_docs_claims_are_a_subset_of_exposition() {
             "exposition must render allowlisted vote-kick outcome `{outcome}` at zero"
         );
     }
+    // Reverse direction: the allowlist bullet (up to its source citation)
+    // must not invent an outcome. Every backticked code it names is the
+    // series, the label, or an allowlisted outcome — nothing else.
+    let anchor = "- `two_bot_voice_vote_kick_total{outcome}`";
+    let start = docs
+        .find(anchor)
+        .expect("docs must carry the vote-kick allowlist bullet");
+    let tail = &docs[start..];
+    let end = tail
+        .find("`crates/core/src/metrics.rs`")
+        .expect("vote-kick allowlist bullet must cite its source");
+    let mut claimed: Vec<&str> = tail[..end]
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|token| !token.contains('{') && *token != "outcome")
+        .collect();
+    claimed.sort_unstable();
+    claimed.dedup();
+    let mut expected = VOICE_VOTE_KICK_OUTCOMES.to_vec();
+    expected.sort_unstable();
+    assert_eq!(
+        claimed, expected,
+        "vote-kick allowlist bullet must name exactly the exposition outcomes"
+    );
 }
