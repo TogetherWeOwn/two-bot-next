@@ -1806,39 +1806,35 @@ async fn moderation_channel_happy_paths_emit_planner_outcomes() {
         // persisted `store.finish` receipt carries it as the stored
         // `affected` count plus the request linkage: moderated channel as both
         // `resource_id` and `target_id`, actor and staging guild scalars.
-        let row: (
-            String,
-            String,
-            i32,
-            Option<String>,
-            Option<i64>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ) = sqlx::query_as(
-            "SELECT state, response_code, http_status, resource_id, affected, \
-             guild_id, actor_id, target_id FROM internal_idempotency WHERE action = $1",
+        // Reuses the canonical `StoredReceiptRow` shape so clippy's
+        // `type_complexity` stays quiet.
+        let row: StoredReceiptRow = sqlx::query_as(
+            "SELECT action, state, response_code, http_status, resource_id, affected, \
+             guild_id, actor_id, target_id, resolved_role_id FROM internal_idempotency \
+             WHERE action = $1",
         )
         .bind(action)
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(row.0, "completed", "{action}");
-        assert_eq!(row.1, "success", "{action}");
-        assert_eq!(row.2, 200, "{action}");
+        assert_eq!(row.0, action, "{action}");
+        assert_eq!(row.1, "completed", "{action}");
+        assert_eq!(row.2.as_deref(), Some("success"), "{action}");
+        assert_eq!(row.3, Some(200), "{action}");
         assert_eq!(
-            row.3.as_deref(),
+            row.4.as_deref(),
             Some("222222222222222222"),
             "{action}: stored channel linkage"
         );
         assert_eq!(
-            row.4,
+            row.5,
             Some(expected_affected),
             "{action}: stored planner count"
         );
-        assert_eq!(row.5.as_deref(), Some(staging_guild()), "{action}");
-        assert_eq!(row.6.as_deref(), Some("111111111111111111"), "{action}");
-        assert_eq!(row.7.as_deref(), Some("222222222222222222"), "{action}");
+        assert_eq!(row.6.as_deref(), Some(staging_guild()), "{action}");
+        assert_eq!(row.7.as_deref(), Some("111111111111111111"), "{action}");
+        assert_eq!(row.8.as_deref(), Some("222222222222222222"), "{action}");
+        assert_eq!(row.9, None, "{action}: no resolved role");
     }
     set_moderation_flags(false);
     assert_eq!(channel.calls(), 4);
@@ -1977,33 +1973,24 @@ async fn moderation_channel_success_replays_and_mismatches_like_announcements() 
     );
     // The stored receipt keeps the planner linkage: completed success for the
     // lockdown verb, moderated channel as resource and target, actor and guild.
-    let row: (
-        String,
-        String,
-        i32,
-        Option<String>,
-        Option<i64>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        String,
-    ) = sqlx::query_as(
-        "SELECT state, response_code, http_status, resource_id, affected, \
-         guild_id, actor_id, target_id, action FROM internal_idempotency \
+    let row: StoredReceiptRow = sqlx::query_as(
+        "SELECT action, state, response_code, http_status, resource_id, affected, \
+         guild_id, actor_id, target_id, resolved_role_id FROM internal_idempotency \
          WHERE state = 'completed'",
     )
     .fetch_one(db.pool())
     .await
     .unwrap();
-    assert_eq!(row.0, "completed");
-    assert_eq!(row.1, "success");
-    assert_eq!(row.2, 200);
-    assert_eq!(row.3.as_deref(), Some("222222222222222222"));
-    assert_eq!(row.4, Some(1));
-    assert_eq!(row.5.as_deref(), Some(staging_guild()));
-    assert_eq!(row.6.as_deref(), Some("111111111111111111"));
-    assert_eq!(row.7.as_deref(), Some("222222222222222222"));
-    assert_eq!(row.8, "moderation.lockdown");
+    assert_eq!(row.0, "moderation.lockdown");
+    assert_eq!(row.1, "completed");
+    assert_eq!(row.2.as_deref(), Some("success"));
+    assert_eq!(row.3, Some(200));
+    assert_eq!(row.4.as_deref(), Some("222222222222222222"));
+    assert_eq!(row.5, Some(1));
+    assert_eq!(row.6.as_deref(), Some(staging_guild()));
+    assert_eq!(row.7.as_deref(), Some("111111111111111111"));
+    assert_eq!(row.8.as_deref(), Some("222222222222222222"));
+    assert_eq!(row.9, None, "lockdown receipt has no resolved role");
     let changed = format!("{raw} ");
     let (status, _, mismatch) =
         answer(restarted, signed(&changed, "new", "intent-channel-fixture")).await;
