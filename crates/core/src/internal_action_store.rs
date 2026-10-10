@@ -705,9 +705,9 @@ impl InternalActionStore {
         sqlx::query(
             "INSERT INTO internal_action_log \
              (intent_id, phase, caller_hash, action, guild_id, actor_id, target_id, resolved_role_id, \
-              response_code, http_status, evidence_code) \
+              response_code, http_status, evidence_code, resource_id, affected, outcome) \
              SELECT intent_id, $2, caller_hash, action, guild_id, actor_id, target_id, resolved_role_id, \
-                    response_code, http_status, $3 \
+                    response_code, http_status, $3, resource_id, affected, outcome \
              FROM internal_idempotency WHERE intent_id = $1 \
              ON CONFLICT (intent_id, phase) DO NOTHING",
         )

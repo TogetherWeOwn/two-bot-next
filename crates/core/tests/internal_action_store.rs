@@ -1053,6 +1053,58 @@ async fn event_outcome_persists_and_replays_the_recorded_response() {
 }
 
 #[tokio::test]
+async fn terminal_audit_names_receipt_resource_and_outcome() {
+    let db = TestDb::new().await;
+    let store = db.store();
+    // An event.upsert create claims with the guild alone as its subject, so
+    // the intent audit names no target: the terminal audit must still name
+    // the Discord event and the result word from the completed receipt.
+    let created = AuditSubject {
+        guild_id: Some(DiscordId::new("123456789012345678").unwrap()),
+        ..AuditSubject::default()
+    };
+    let id = identity(
+        "audit-create:123",
+        "event.upsert",
+        b"{\"event_key\":\"launch\"}",
+    );
+    let claim = claimed(store.claim(&id, &created).await.unwrap());
+    let intent_id = claim.intent_id();
+    let receipt = TerminalResponse::Success {
+        resource_id: Some(DiscordId::new("345678901234567890").unwrap()),
+        affected: 1,
+        outcome: Some(EventOutcome::Created),
+    };
+    store.finish(&claim, &receipt).await.unwrap();
+    let intent: (Option<String>, Option<i64>, Option<String>) = sqlx::query_as(
+        "SELECT resource_id, affected, outcome FROM internal_action_log \
+         WHERE intent_id = $1 AND phase = 'intent'",
+    )
+    .bind(intent_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(intent, (None, None, None));
+    let terminal: (Option<String>, Option<i64>, Option<String>) = sqlx::query_as(
+        "SELECT resource_id, affected, outcome FROM internal_action_log \
+         WHERE intent_id = $1 AND phase = 'terminal'",
+    )
+    .bind(intent_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        terminal,
+        (
+            Some("345678901234567890".to_owned()),
+            Some(1),
+            Some("created".to_owned())
+        )
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn audit_failures_roll_back_claim_and_terminal_without_leaking_details() {
     let db = TestDb::new().await;
     let store = db.store();

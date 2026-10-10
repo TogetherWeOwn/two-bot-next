@@ -87,6 +87,11 @@ result word (`created`/`updated`/`cancelled`, migration `0424`): event intents
 always record one so replay returns the first result byte-identically, while
 announcement receipts stay `None` and render `message_id`. Failure is
 definitive; timeout/transport uncertainty must use `mark_unknown`.
+The terminal audit copies the receipt's `resource_id`, `affected` and
+`outcome` (migration `0425`), so an `event.upsert` create — claimed with the
+guild alone as its subject — still names its Discord event and result word in
+the audit trail. Intent-phase audits keep those columns NULL, exactly like the
+uncompleted receipt they mirror.
 The adapter persists the whole typed response. It intentionally accepts neither
 `serde_json::Value` nor `ActionError` (which contains free-text log details).
 Receiver/executor follow-ups must map these typed scalars to their wire envelopes
