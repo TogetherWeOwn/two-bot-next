@@ -250,6 +250,20 @@ fn uninspected_create_keeps_funnel_accept_with_capture_only_trigger() {
 }
 
 #[test]
+fn bypassed_trigger_refuses_text_automations_while_funnel_would_allow() {
+    // M2.19: the worker gates text automations on the trigger verdict, so a
+    // Bypassed (uninspected) create posts no sticky automation even though its
+    // funnel disposition stays Accept for the ordinary funnel path.
+    let bypassed = Activation {
+        disposition: FunnelDisposition::Accept,
+        outcome: ActivationOutcome::Bypassed,
+    };
+    let verdict = verdict_of(&bypassed, MessageDeliveryKind::Create);
+    assert!(runs_text_automations(Some(verdict.funnel)));
+    assert!(!runs_text_automations(Some(verdict.trigger)));
+}
+
+#[test]
 fn settled_clean_create_hands_its_accept_to_triggers() {
     let clean = Activation {
         disposition: FunnelDisposition::CaptureOnly,
