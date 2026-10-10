@@ -126,8 +126,11 @@ F6 stays open until the deployment card records a non-secret TLS receipt.
   `backup_cli::tls_admission_guard_redacts_dependency_logs`,
   `secret_redaction::channel_store_tls_refusals_never_echo_urls_or_reach_logs`,
   `rest::admission_tls_fence_refuses_plaintext_and_wrong_hosts` plus the
-  `from_env` entry proof
-  `admission_configuration::admission_bootstrap_tls_refusal_redacts_dependency_logs`).
+  `from_env` entry proofs
+  (`admission_configuration::admission_bootstrap_tls_refusal_redacts_dependency_logs`
+  for a realistic remote URL, and the dial-discriminating
+  `admission_bootstrap_tls_spy_refuses_before_any_socket`, which fails when
+  the fence is reverted to raw `connect_options`).
 - DB suites and CLIs pass `LocalOnly` explicitly (`connect_with_tls` /
   `connect_pool_with_tls` / `open_pool_with_tls`, or
   `TWO_DATABASE_TLS=local-only` on `env_clear()` subprocesses). The CI `check`
