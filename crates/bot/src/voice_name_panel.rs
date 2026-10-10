@@ -28,7 +28,7 @@ use twilight_model::{
     channel::message::component::{Label, TextInput, TextInputStyle},
 };
 use two_bot_core::{
-    voice_alias::AliasTable,
+    voice_alias::{resolve_game, AliasTable},
     voice_conditions::ConditionFacts,
     voice_custom_id::{name_custom_custom_id, name_modal_custom_id, name_restore_custom_id},
     voice_name_filter::{
@@ -258,6 +258,10 @@ const NAME_SETTINGS_RELOAD_MS: u64 = 300_000;
 /// template renders with the "member" fallback.
 pub(super) const NAME_WAIT_MS: u64 = 60_000;
 const NAME_SETTINGS_RETRY_MS: u64 = 60_000;
+/// How many of the guild's latest first names a new room avoids.
+pub(super) const RECENT_NAME_MEMORY: usize = 3;
+/// Seeds tried for a fresh first name before keeping the drawn one.
+const FRESH_SEED_TRIES: u64 = 8;
 
 /// Least time between two voice status writes for one room.
 pub(super) const STATUS_MIN_INTERVAL_MS: u64 = 10_000;
@@ -344,6 +348,8 @@ struct NameFacts {
     fallback: String,
     filter: NameFilterContext,
     other_names: Vec<String>,
+    /// Occupants playing one of the selected (alias-resolved) games.
+    game_players: u32,
 }
 
 impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
@@ -439,6 +445,89 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
     }
 
+    /// Pick the new room's seed so its first template name repeats neither
+    /// a live voice channel nor the guild's last [`RECENT_NAME_MEMORY`] first
+    /// names. The first name is rendered as the room will see it: the joiner
+    /// alone with their presence, still in the creator channel. When no tried
+    /// seed is fresh (a tiny pool), the drawn seed is kept.
+    pub(super) fn fresh_name_seed(
+        &mut self,
+        creator_id: Snowflake,
+        owner_id: Snowflake,
+        seed: u64,
+    ) -> u64 {
+        let Some(template) = self
+            .creators
+            .get(&creator_id)
+            .map(|creator| creator.name_template.clone())
+            .filter(|template| !template.trim().is_empty())
+        else {
+            return seed;
+        };
+        let command = NameCommand {
+            actor_id: owner_id,
+            is_admin: true,
+            request: NameInteraction::Panel,
+            settings: self.name_settings.clone(),
+            directory: self.name_directory.clone(),
+            policy: Arc::clone(&self.name_policy),
+        };
+        let mut probe = VoiceRoom {
+            guild_id: self.live.guild_id,
+            channel_id: creator_id,
+            creator_channel_id: creator_id,
+            owner_id,
+            original_creator_id: owner_id,
+            name_seed: seed,
+            created_at: String::new(),
+        };
+        let mut first = None;
+        for attempt in 0..FRESH_SEED_TRIES {
+            probe.name_seed = if attempt == 0 {
+                seed
+            } else {
+                reseed(seed, attempt)
+            };
+            let facts = self.name_facts(&probe, &command);
+            let checks = NameChecks {
+                policy: &command.policy,
+                filter: &facts.filter,
+                unique_names: false,
+                other_voice_names: &facts.other_names,
+            };
+            let render = RenderFacts {
+                context: &facts.context,
+                conditions: &facts.conditions,
+                fallback_name: &facts.fallback,
+            };
+            let Ok(name) = decide_template_name(&template, &render, &checks) else {
+                return seed;
+            };
+            let key = name.to_lowercase();
+            let taken = self.recent_names.iter().any(|recent| *recent == key)
+                || facts
+                    .other_names
+                    .iter()
+                    .any(|other| other.to_lowercase() == key);
+            if !taken {
+                self.remember_name(key);
+                return probe.name_seed;
+            }
+            first.get_or_insert(key);
+        }
+        if let Some(key) = first {
+            self.remember_name(key);
+        }
+        seed
+    }
+
+    fn remember_name(&mut self, key: String) {
+        self.recent_names.push_back(key);
+        while self.recent_names.len() > RECENT_NAME_MEMORY {
+            self.recent_names.pop_front();
+        }
+    }
+
     /// V5 automatic naming: render each tracked room's creator template
     /// whenever the facts it depends on change (creation, joins and leaves,
     /// owner handoff, limit) and propose the result on the rename lane, which
@@ -446,8 +535,21 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// budget. Rooms with a `/name` override keep it; a blank template keeps
     /// the room's current name; a render the name filter blocks is skipped.
     pub(super) fn refresh_template_names(&mut self, now_ms: u64) {
-        if self.halted || !self.live.read_state().ready {
-            return;
+        let (ready, generation) = {
+            let live = self.live.read_state();
+            (live.ready, live.generation)
+        };
+        if self.halted || !ready || self.playtime_generation != Some(generation) {
+            // Presence is not authoritative across a pause or gateway gap,
+            // even if the reconnect completed between naming passes.
+            for playtime in self.playtime.values_mut() {
+                playtime.suspend();
+            }
+            self.playtime_generation = Some(generation);
+            self.name_inputs = None;
+            if self.halted || !ready {
+                return;
+            }
         }
         // Skip the whole pass while nothing automatic names read has moved:
         // voice transitions, room owners and limits, display names, settings,
@@ -485,6 +587,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             let room_id = room.channel_id;
             command.actor_id = room.owner_id;
             command.request = NameInteraction::Restore { room_id };
+            // Playtime follows live presence, not automatic-name eligibility.
+            let facts = self.name_facts(&room, &command);
+            self.playtime.entry(room_id).or_default().observe(
+                shown_game(&facts),
+                facts.game_players,
+                (self.wall_clock)(),
+            );
             // The status line follows the room whatever its name does: a
             // `/name` override, a blank name template or a name wait.
             self.refresh_voice_status(&room, &command);
@@ -518,14 +627,6 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             } else {
                 self.name_waits.remove(&room_id);
             }
-            command.actor_id = room.owner_id;
-            command.request = NameInteraction::Restore { room_id };
-            let facts = self.name_facts(&room, &command);
-            self.playtime.entry(room_id).or_default().observe(
-                shown_game(&facts),
-                facts.context.members_playing,
-                (self.wall_clock)(),
-            );
             let signature = NameSignature::of(&facts);
             if self.name_signatures.get(&room_id) == Some(&signature) {
                 continue;
@@ -897,6 +998,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             },
             fallback,
             filter,
+            game_players: 0,
             other_names: live
                 .channels
                 .values()
@@ -944,6 +1046,21 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             &aliases,
             &options,
         );
+        facts.game_players = u32::try_from(
+            occupants
+                .iter()
+                .filter_map(|occupant| occupant.presence?.game.as_deref())
+                .filter(|game| {
+                    let resolved = resolve_game(game, &aliases);
+                    facts
+                        .conditions
+                        .games
+                        .iter()
+                        .any(|selected| selected == resolved)
+                })
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
         facts.context.game_minutes = shown_game(&facts).map_or(0, |game| {
             self.playtime
                 .get(&room.channel_id)
@@ -1214,6 +1331,12 @@ impl RoomPlaytime {
         self.players = players;
     }
 
+    /// Stop the running stretch without crediting unobserved time.
+    fn suspend(&mut self) {
+        self.game = None;
+        self.players = 0;
+    }
+
     fn running_ms(&self, wall_ms: u64) -> u64 {
         wall_ms
             .saturating_sub(self.since_ms)
@@ -1234,4 +1357,13 @@ fn minutes_since(created_at: &str, wall_ms: u64) -> u32 {
         .map_or(0, |created| {
             u32::try_from(wall_ms.saturating_sub(created) / 60_000).unwrap_or(u32::MAX)
         })
+}
+
+/// A further seed derived from the drawn one (SplitMix64 finalizer), so
+/// re-rolls stay spread over the whole range.
+fn reseed(seed: u64, attempt: u64) -> u64 {
+    let mut z = seed.wrapping_add(attempt.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }

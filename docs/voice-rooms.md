@@ -228,13 +228,22 @@ library code with no Discord dependency and can start immediately.
 - `@@room_minutes@@`: whole minutes since the room was created. `@@room_tier@@`:
   0 to 5 at 0, 15, 45, 90, 180 and 360 minutes.
 - `@@game_minutes@@`: combined member-minutes the room has played the game it
-  shows now (two players for ten minutes count twenty), kept in memory for the
-  live room only and reset by a restart. `@@game_tier@@`: the same tiers.
+  shows now (two players for ten minutes count twenty). Only members playing a
+  selected, alias-resolved game count; a two-game name combines both groups.
+  Tracking continues under a custom name, a blank template or a display-name
+  wait. A paused worker or gateway reconnect discards the unobserved stretch,
+  retaining previously settled time. Totals live in memory for the room only
+  and reset by a restart. `@@game_tier@@`: the same tiers.
 - Time facts re-render a name only when a tier, the local hour or another fact
   changes, so a raw minute count shown in a name moves at those points, not every
   minute. The rename budget still applies.
 - `@@random_emoji@@`, `[[a/b/c]]` and `[[list:name]]` (named lists from guild
   settings) are rolled from a per-room seed stored at creation and never re-rolled.
+  The seed is chosen so a new room's first name (rendered for the joiner alone,
+  with their presence) differs from every live voice channel name and from the
+  guild's last three first names, case-insensitively. Up to eight seeds are tried;
+  a pool too small to vary keeps the drawn seed. The memory is per guild and
+  in-process: a restart starts it empty.
 
 **Resting / in-use names**
 

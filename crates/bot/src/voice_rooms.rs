@@ -2153,8 +2153,13 @@ pub struct GuildRoomWorker<S, H> {
     name_waits: HashMap<Snowflake, u64>,
     /// Combined playtime per live room (time-aware names); memory only.
     playtime: HashMap<Snowflake, RoomPlaytime>,
+    /// Gateway generation last observed, fencing stretches across reconnects.
+    playtime_generation: Option<u64>,
     /// Wall clock (Unix milliseconds) for the time-aware name facts.
     wall_clock: fn() -> u64,
+    /// The guild's most recent first names, newest last; a new room's seed
+    /// is chosen so its first name repeats none of them.
+    recent_names: VecDeque<String>,
     creations: HashMap<u64, Creation>,
     accepted: HashMap<Snowflake, (u64, u64)>,
     moves: HashMap<Snowflake, JoinTicket>,
@@ -2436,7 +2441,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             status_outcomes: mpsc::unbounded_channel(),
             name_waits: HashMap::new(),
             playtime: HashMap::new(),
+            playtime_generation: None,
             wall_clock: unix_now_ms,
+            recent_names: VecDeque::new(),
             creations: HashMap::new(),
             accepted: HashMap::new(),
             moves: HashMap::new(),
@@ -2527,6 +2534,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 return false;
             }
         };
+        let seed = self.fresh_name_seed(ticket.creator_id, ticket.member_id, seed);
         let id = self.queue.enqueue(
             self.live.guild_id,
             RoomAction::CreateRoom {

@@ -9949,10 +9949,169 @@ fn room_playtime_adds_up_member_minutes_per_game() {
     assert_eq!(playtime.minutes("Valorant", 70 * minute), 0);
 }
 
-static TEST_WALL_MS: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    static TEST_WALL_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 fn test_wall_clock() -> u64 {
-    TEST_WALL_MS.load(Ordering::SeqCst)
+    TEST_WALL_MS.get()
+}
+
+async fn playtime_worker(template: &str, games: &[&str]) -> GuildRoomWorker<Store, Http> {
+    TEST_WALL_MS.set(0);
+    let (live, store, http, _) = fixture();
+    store.creators.lock().unwrap()[0].name_template = template.to_owned();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    for (index, game) in games.iter().enumerate() {
+        let member = MEMBER + index as u64;
+        live.voice_update(member, Some(500), Some(false));
+        live.set_presence(
+            member,
+            MemberPresence {
+                game: Some((*game).to_owned()),
+                ..Default::default()
+            },
+        );
+    }
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.wall_clock = test_wall_clock;
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    worker
+}
+
+#[tokio::test]
+async fn room_playtime_counts_only_players_of_the_selected_games() {
+    let template = "@@game_name@@ @@game_minutes@@ @@game_tier@@";
+    for (games, alias, force_single, shown, expected) in [
+        (vec!["Apex", "Apex", "Valorant"], false, false, "Apex", 20),
+        (
+            vec!["Apex Legends", "apex legends", "Valorant"],
+            true,
+            false,
+            "Apex",
+            20,
+        ),
+        (
+            vec!["Apex", "Apex", "Valorant", "Valorant", "Chess"],
+            false,
+            false,
+            "Apex & Valorant",
+            40,
+        ),
+        (
+            vec!["Apex", "Valorant", "Valorant"],
+            false,
+            true,
+            "Apex",
+            10,
+        ),
+    ] {
+        let mut worker = playtime_worker(template, &games).await;
+        if alias {
+            worker
+                .name_settings
+                .aliases
+                .push(("Apex Legends".to_owned(), "Apex".to_owned()));
+        }
+        worker.name_settings.force_single_game = force_single;
+        worker.refresh_template_names(0);
+        TEST_WALL_MS.set(10 * 60_000);
+        worker.refresh_template_names(1);
+        assert_eq!(
+            worker.playtime[&500].minutes(shown, test_wall_clock()),
+            expected
+        );
+        if !force_single {
+            let tier = two_bot_core::voice_naming::minutes_tier(expected);
+            assert_eq!(
+                worker.desired_names[&500],
+                format!("{shown} {expected} {tier}")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn room_playtime_keeps_tracking_when_automatic_names_are_skipped() {
+    let template = "@@game_name@@ @@game_minutes@@ @@game_tier@@";
+    for skip in ["override", "blank", "name wait"] {
+        let mut worker = playtime_worker(template, &["Apex", "Apex"]).await;
+        worker.refresh_template_names(0);
+        TEST_WALL_MS.set(3 * 60_000);
+        worker.refresh_template_names(1);
+        match skip {
+            "override" => {
+                worker.custom_names.insert(500, "custom".to_owned());
+            }
+            "blank" => worker
+                .creators
+                .get_mut(&CREATOR)
+                .unwrap()
+                .name_template
+                .clear(),
+            _ => worker.name_directory = NameDirectory::default(),
+        }
+        TEST_WALL_MS.set(4 * 60_000);
+        worker.live.set_presence(MEMBER, MemberPresence::default());
+        worker
+            .live
+            .set_presence(MEMBER + 1, MemberPresence::default());
+        worker.refresh_template_names(2);
+        TEST_WALL_MS.set(124 * 60_000);
+        worker.refresh_template_names(3);
+        assert_eq!(
+            worker.playtime[&500].minutes("Apex", test_wall_clock()),
+            8,
+            "{skip}"
+        );
+        worker.custom_names.remove(&500);
+        worker.creators.get_mut(&CREATOR).unwrap().name_template = template.to_owned();
+        worker.name_directory.insert(MEMBER, "Alex".to_owned());
+        worker.live.set_presence(
+            MEMBER,
+            MemberPresence {
+                game: Some("Apex".to_owned()),
+                ..Default::default()
+            },
+        );
+        worker.refresh_template_names(4);
+        TEST_WALL_MS.set(127 * 60_000);
+        worker.refresh_template_names(5);
+        assert_eq!(
+            worker.playtime[&500].minutes("Apex", test_wall_clock()),
+            11,
+            "{skip}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn room_playtime_discards_unobserved_gateway_and_halt_gaps() {
+    for gap in ["halt", "gateway", "reconnect between passes"] {
+        let mut worker = playtime_worker("@@game_minutes@@ @@game_tier@@", &["Apex"]).await;
+        worker.refresh_template_names(0);
+        TEST_WALL_MS.set(10 * 60_000);
+        worker.refresh_template_names(1);
+        TEST_WALL_MS.set(11 * 60_000);
+        if gap == "halt" {
+            worker.halted = true;
+        } else {
+            worker.live.disconnect();
+        }
+        if gap != "reconnect between passes" {
+            worker.refresh_template_names(2);
+        }
+        TEST_WALL_MS.set(131 * 60_000);
+        worker.halted = false;
+        worker.live.write_state().ready = true;
+        worker.refresh_template_names(3);
+        assert_eq!(worker.playtime[&500].minutes("Apex", test_wall_clock()), 10);
+        TEST_WALL_MS.set(137 * 60_000);
+        worker.refresh_template_names(4);
+        assert_eq!(worker.desired_names[&500], "16 1");
+        assert_eq!(worker.playtime[&500].minutes("Apex", test_wall_clock()), 16);
+    }
 }
 
 #[tokio::test]
@@ -9968,14 +10127,14 @@ async fn a_room_tier_change_renames_the_room_once() {
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     worker.wall_clock = test_wall_clock;
     worker.name_directory.insert(MEMBER, "Alex".to_owned());
-    TEST_WALL_MS.store(created + minute, Ordering::SeqCst);
+    TEST_WALL_MS.set(created + minute);
     worker.refresh_template_names(0);
     dispatch(&mut worker, 0).await;
     // Minutes pass inside the tier: no new name.
-    TEST_WALL_MS.store(created + 10 * minute, Ordering::SeqCst);
+    TEST_WALL_MS.set(created + 10 * minute);
     worker.refresh_template_names(1);
     assert!(!worker.dispatch_one(1).await);
-    TEST_WALL_MS.store(created + 16 * minute, Ordering::SeqCst);
+    TEST_WALL_MS.set(created + 16 * minute);
     worker.refresh_template_names(2);
     assert_eq!(worker.desired_names[&500], "veterans");
     dispatch(&mut worker, 600_000).await;
@@ -9983,6 +10142,51 @@ async fn a_room_tier_change_renames_the_room_once() {
         *trace.lock().unwrap(),
         ["rename:500:fresh", "rename:500:veterans"]
     );
+}
+
+fn first_names(worker: &GuildRoomWorker<Store, Http>, template: &str) -> Vec<String> {
+    let mut creations: Vec<_> = worker.creations.iter().collect();
+    creations.sort_unstable_by_key(|(id, _)| **id);
+    creations
+        .into_iter()
+        .map(|(_, creation)| {
+            let context = two_bot_core::voice_naming::RoomContext {
+                seed: creation.spec.seed,
+                ..Default::default()
+            };
+            two_bot_core::voice_naming::render_str(template, &context)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn consecutive_rooms_never_repeat_a_recent_first_name() {
+    let template = "[[a/b/c/d/e/f]]";
+    let (live, store, http, _) = fixture();
+    store.creators.lock().unwrap()[0].name_template = template.to_owned();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // Every join draws the same seed, so only the fresh-name pick can
+    // tell these rooms apart.
+    for member in 0..12 {
+        join(&mut worker, MEMBER + member);
+    }
+    let names = first_names(&worker, template);
+    assert_eq!(names.len(), 12);
+    for (index, name) in names.iter().enumerate() {
+        let recent = &names[index.saturating_sub(name_panel::RECENT_NAME_MEMORY)..index];
+        assert!(!recent.contains(name), "{index}: {name} repeats {recent:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_pool_too_small_to_vary_keeps_the_drawn_seed() {
+    let (live, store, http, _) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "[[only]]".to_owned();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    join(&mut worker, MEMBER + 1);
+    let seeds: Vec<u64> = worker.creations.values().map(|c| c.spec.seed).collect();
+    assert_eq!(seeds, [7, 7]);
 }
 
 #[tokio::test]
