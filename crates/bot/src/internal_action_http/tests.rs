@@ -1770,26 +1770,30 @@ async fn moderation_channel_happy_paths_emit_planner_outcomes() {
     ));
     let _flag = MODERATION_FLAG_LOCK.lock().await;
     set_moderation_flags(true);
-    for (action, intent, expected) in [
+    for (action, intent, expected, expected_affected) in [
         (
             "moderation.purge",
             "intent-channel-purge",
             serde_json::json!({"outcome": "purged", "affected": 3}),
+            3_i64,
         ),
         (
             "moderation.slowmode",
             "intent-channel-slowmode",
             serde_json::json!({"outcome": "slowmode_updated"}),
+            1_i64,
         ),
         (
             "moderation.lockdown",
             "intent-channel-lockdown",
             serde_json::json!({"outcome": "locked_down"}),
+            1_i64,
         ),
         (
             "moderation.unlock",
             "intent-channel-unlock",
             serde_json::json!({"outcome": "unlocked"}),
+            1_i64,
         ),
     ] {
         let (status, headers, body) =
@@ -1798,6 +1802,39 @@ async fn moderation_channel_happy_paths_emit_planner_outcomes() {
         assert!(!headers.contains_key("idempotent-replay"), "{action}");
         assert_eq!(body["result"], expected, "{action}");
         assert_eq!(body["request_id"].as_str().unwrap().len(), 26, "{action}");
+        // The planner outcome renders on the wire (asserted above) while the
+        // persisted `store.finish` receipt carries it as the stored
+        // `affected` count plus the request linkage: moderated channel as both
+        // `resource_id` and `target_id`, actor and staging guild scalars.
+        // Reuses the canonical `StoredReceiptRow` shape so clippy's
+        // `type_complexity` stays quiet.
+        let row: StoredReceiptRow = sqlx::query_as(
+            "SELECT action, state, response_code, http_status, resource_id, affected, \
+             guild_id, actor_id, target_id, resolved_role_id FROM internal_idempotency \
+             WHERE action = $1",
+        )
+        .bind(action)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(row.0, action, "{action}");
+        assert_eq!(row.1, "completed", "{action}");
+        assert_eq!(row.2.as_deref(), Some("success"), "{action}");
+        assert_eq!(row.3, Some(200), "{action}");
+        assert_eq!(
+            row.4.as_deref(),
+            Some("222222222222222222"),
+            "{action}: stored channel linkage"
+        );
+        assert_eq!(
+            row.5,
+            Some(expected_affected),
+            "{action}: stored planner count"
+        );
+        assert_eq!(row.6.as_deref(), Some(staging_guild()), "{action}");
+        assert_eq!(row.7.as_deref(), Some("111111111111111111"), "{action}");
+        assert_eq!(row.8.as_deref(), Some("222222222222222222"), "{action}");
+        assert_eq!(row.9, None, "{action}: no resolved role");
     }
     set_moderation_flags(false);
     assert_eq!(channel.calls(), 4);
@@ -1909,6 +1946,11 @@ async fn moderation_channel_success_replays_and_mismatches_like_announcements() 
         first["result"],
         serde_json::json!({"outcome": "locked_down"})
     );
+    assert_eq!(
+        channel.calls(),
+        1,
+        "first lockdown reaches the channel effect once"
+    );
     let restarted = router(state_full_with_channel(
         db.independent_pool().await.unwrap(),
         effect.clone(),
@@ -1924,13 +1966,42 @@ async fn moderation_channel_success_replays_and_mismatches_like_announcements() 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers["idempotent-replay"], "true");
     assert_eq!(first["result"], replay["result"]);
+    assert_eq!(
+        channel.calls(),
+        1,
+        "idempotent replay returns the stored record without a second Discord call"
+    );
+    // The stored receipt keeps the planner linkage: completed success for the
+    // lockdown verb, moderated channel as resource and target, actor and guild.
+    let row: StoredReceiptRow = sqlx::query_as(
+        "SELECT action, state, response_code, http_status, resource_id, affected, \
+         guild_id, actor_id, target_id, resolved_role_id FROM internal_idempotency \
+         WHERE state = 'completed'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(row.0, "moderation.lockdown");
+    assert_eq!(row.1, "completed");
+    assert_eq!(row.2.as_deref(), Some("success"));
+    assert_eq!(row.3, Some(200));
+    assert_eq!(row.4.as_deref(), Some("222222222222222222"));
+    assert_eq!(row.5, Some(1));
+    assert_eq!(row.6.as_deref(), Some(staging_guild()));
+    assert_eq!(row.7.as_deref(), Some("111111111111111111"));
+    assert_eq!(row.8.as_deref(), Some("222222222222222222"));
+    assert_eq!(row.9, None, "lockdown receipt has no resolved role");
     let changed = format!("{raw} ");
     let (status, _, mismatch) =
         answer(restarted, signed(&changed, "new", "intent-channel-fixture")).await;
     set_moderation_flags(false);
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(mismatch["error"]["retryable"], false);
-    assert_eq!(channel.calls(), 1);
+    assert_eq!(
+        channel.calls(),
+        1,
+        "payload mismatch still performs no second Discord call"
+    );
     assert_eq!(effect.calls(), 0);
     assert_eq!(moderation.calls(), 0);
     db.close().await.unwrap();
