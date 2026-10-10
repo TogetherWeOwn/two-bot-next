@@ -131,17 +131,27 @@ come from [cutover.md](cutover.md) §§Registry swap and Rollback.
   and container images. The checked-in Worker configuration declares no
   custom routes or domains; the invite-redirect snapshot is Worker
   configuration, not DNS.
-- Revert by dispatching the production workflow with the previous Worker
-  version ID recorded in the watch header. The guard requires a full
-  commit on the main branch with green checks and a successful staging
-  run, plus reviewer approval; the workflow fails unless the target
-  version serves 100% of traffic, then re-runs the `/health` 200 and
-  truthful-`/readyz` gate.
+- The production workflow dispatch below is the single production
+  rollback method. Revert by dispatching the production workflow with
+  the previous Worker version ID recorded in the watch header. The
+  guard requires a full commit on the main branch with green checks
+  and a successful staging run, plus reviewer approval; the workflow
+  fails unless the target version serves 100% of traffic, then re-runs
+  the `/health` 200 and the build-identity `/readyz` gate, which proves
+  the rolled-back revision serves. Drill record: the rehearsal log in
+  §7 below and the staging rollback drill
+  ([ci-security.md](ci-security.md#staging-rollback-drill-manual),
+  [runbook.md](runbook.md#worker-version-rollback)).
 - A Worker-version rollback does **not** rebuild the container image or
-  rewind data. When the Rust image is the fault, redeploy the
-  known-good reviewed source and image pair with the full deploy path,
-  only after confirming it supports the current schema and bindings,
-  then confirm the running image separately.
+  rewind data. A standalone full redeploy of a known-good pair is
+  **superseded as a production rollback path**: when the Rust image is
+  the fault, dispatch the same production workflow in deploy mode with
+  the prior good SHA (guard and `/readyz` build-identity gate apply
+  unchanged), only after confirming it supports the current schema and
+  bindings, then confirm the running image separately. The
+  digest-pinned container backout exists only as the staging drill in
+  [runbook.md](runbook.md#worker-version-rollback); it has no
+  production dispatch and no production drill record.
 - Never roll back to a pre-fence wrapper version: it ignores the
   persisted ownership record and can restart an unauthorized gateway.
   Keep a reviewed fence-capable known-good pair recorded before rollout.
