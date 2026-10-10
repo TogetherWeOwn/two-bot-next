@@ -9865,3 +9865,89 @@ async fn failed_create_compensation_orphan_is_counted_without_a_channel_id() {
         "untracked orphan must advance the counter"
     );
 }
+
+#[tokio::test]
+async fn a_new_room_is_renamed_from_its_creator_template() {
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "@@owner@@'s den ##".to_owned();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    worker.refresh_template_names(2);
+    dispatch(&mut worker, 3).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        [
+            "create",
+            "persist:500",
+            "move:300:500",
+            "rename:500:new room's den #1"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn template_names_rerender_only_when_their_facts_change() {
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "@@owner@@ · @@num@@".to_owned();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER, Some(500), Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    // Nothing changed: no new proposal, nothing to dispatch.
+    worker.refresh_template_names(1);
+    assert!(!worker.dispatch_one(1).await);
+    worker.live.voice_update(MEMBER + 1, Some(500), Some(false));
+    worker.refresh_template_names(2);
+    assert_eq!(worker.desired_names[&500], "Alex · 2");
+    // The rename lane paces the second rename within Discord's budget.
+    dispatch(&mut worker, 600_000).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["rename:500:Alex · 1", "rename:500:Alex · 2"]
+    );
+}
+
+#[tokio::test]
+async fn a_name_override_or_a_blank_template_is_never_replaced() {
+    let (live, store, http, trace) = fixture();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER, Some(500), Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // The fixture creator has a blank template: the room keeps its name.
+    worker.refresh_template_names(0);
+    assert!(!worker.dispatch_one(0).await);
+    let mut creator = worker.creators[&CREATOR].clone();
+    creator.name_template = "@@owner@@'s den".to_owned();
+    worker.creators.insert(CREATOR, creator);
+    worker.custom_names.insert(500, "my room".to_owned());
+    worker.refresh_template_names(1);
+    assert!(!worker.dispatch_one(1).await);
+    assert!(trace.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_voice_display_update_reaches_the_owner_token() {
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "@@owner@@".to_owned();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER, Some(500), Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    apply_command(
+        &mut worker,
+        ActorCommand::Display {
+            member_id: MEMBER,
+            display: "Sam".to_owned(),
+        },
+        0,
+    );
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(*trace.lock().unwrap(), ["rename:500:Sam"]);
+}

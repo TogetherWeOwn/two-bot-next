@@ -118,7 +118,7 @@ mod name_panel;
 pub use name_panel::NameDirectory;
 use name_panel::{
     handle_name_interaction, name_component_action, name_directory_from_cache, NameCommand,
-    NameInteraction, NameReply,
+    NameInteraction, NameReply, NameSettings, NameSignature,
 };
 
 pub type WriteGuard = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -1982,6 +1982,12 @@ pub struct GuildRoomWorker<S, H> {
     /// V3 `/name` overrides by room: the owner's text as typed, template
     /// tokens intact. A room without an entry uses its template name.
     custom_names: HashMap<Snowflake, String>,
+    /// V5 automatic naming: display names seen for members in voice, the
+    /// guild's naming settings, and the facts each room's template name was
+    /// last rendered from (a room re-renders only when they change).
+    name_directory: NameDirectory,
+    name_settings: NameSettings,
+    name_signatures: HashMap<Snowflake, NameSignature>,
     creations: HashMap<u64, Creation>,
     accepted: HashMap<Snowflake, (u64, u64)>,
     moves: HashMap<Snowflake, JoinTicket>,
@@ -2184,6 +2190,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .await?
             .into_iter()
             .collect();
+        // Unreadable settings keep the defaults: automatic names then render
+        // without named lists or a custom "no game" label, never block rooms.
+        let name_settings = store
+            .config_snapshot(live.guild_id)
+            .await
+            .map(|config| NameSettings::from_config(&config))
+            .unwrap_or_default();
         let guild_id = live.guild_id;
         let worker = Self {
             live,
@@ -2204,6 +2217,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             desired_names: HashMap::new(),
             limit_acks: HashMap::new(),
             custom_names,
+            name_directory: NameDirectory::default(),
+            name_settings,
+            name_signatures: HashMap::new(),
             creations: HashMap::new(),
             accepted: HashMap::new(),
             moves: HashMap::new(),
@@ -2272,6 +2288,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
         self.accepted
             .insert(ticket.member_id, (ticket.generation, ticket.transition));
+        self.name_directory
+            .insert(ticket.member_id, display.to_owned());
         let context = NameFilterContext {
             guild_id: self.live.guild_id.to_string(),
             channel_id: ticket.creator_id.to_string(),
@@ -4802,6 +4820,12 @@ struct GuildActor {
 
 enum ActorCommand {
     Reconcile,
+    /// A member's current display name from a voice event, for `@@owner@@`
+    /// in automatic room names.
+    Display {
+        member_id: Snowflake,
+        display: String,
+    },
     Join {
         ticket: JoinTicket,
         /// The joiner's display name; the worker renders and filters the room
@@ -5130,7 +5154,15 @@ where
                 seed: self.seeds.fetch_add(1, Ordering::Relaxed),
                 created_at: now_iso(),
             },
-            None => ActorCommand::Reconcile,
+            None => {
+                if channel.is_some() {
+                    let _ = actor.tx.send(ActorCommand::Display {
+                        member_id: member,
+                        display,
+                    });
+                }
+                ActorCommand::Reconcile
+            }
         };
         actor.tx.send(command).is_ok()
     }
@@ -5571,6 +5603,9 @@ async fn run_actor<S: RoomPersistence, H: RoomWrites>(
                 // Expire votes and react to roster changes before the queue
                 // drains, so a passed vote's enforcement is dispatchable now.
                 worker.kick_refresh(now_ms);
+                // V5: re-render template names whose facts changed (create,
+                // join/leave, owner handoff); the rename lane paces them.
+                worker.refresh_template_names(now_ms);
                 // Return to the inbox after each await. Evidence is already
                 // live, but creator configuration/status commands must not sit
                 // behind a 64-write burst either.
@@ -5592,6 +5627,9 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
 ) {
     match command {
         ActorCommand::Reconcile => worker.reconcile(),
+        ActorCommand::Display { member_id, display } => {
+            worker.name_directory.insert(member_id, display);
+        }
         ActorCommand::Join {
             ticket,
             display,

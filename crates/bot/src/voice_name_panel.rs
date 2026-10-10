@@ -160,7 +160,7 @@ pub(super) struct NameSettings {
 }
 
 impl NameSettings {
-    fn from_config(config: &VoiceConfiguration) -> Self {
+    pub(super) fn from_config(config: &VoiceConfiguration) -> Self {
         Self {
             unique_names: config.settings.unique_names,
             no_game_label: config.settings.no_game_label.clone(),
@@ -209,6 +209,20 @@ const NOT_OWNER: &str = "Only the room's owner (or a server admin) can rename it
 const CHANNEL_UNSEEN: &str = "I can't see that channel right now. Try again in a moment.";
 const RENAME_NOTE: &str =
     "Discord limits renames to about two every ten minutes, so it may take a moment to show.";
+
+/// The facts an automatic template name was rendered from: the room is
+/// re-rendered only when one of them changes, so an idle room costs nothing
+/// and Discord's rename budget is spent on real changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NameSignature {
+    owner_name: String,
+    original_creator_name: String,
+    member_count: u32,
+    owner_present: bool,
+    user_limit: u32,
+    room_number: u32,
+    members: Vec<String>,
+}
 
 /// Everything one name decision needs from the live guild.
 struct NameFacts {
@@ -310,6 +324,80 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 }
             }
         }
+    }
+
+    /// V5 automatic naming: render each tracked room's creator template
+    /// whenever the facts it depends on change (creation, joins and leaves,
+    /// owner handoff, limit) and propose the result on the rename lane, which
+    /// coalesces to one pending name per channel within Discord's rename
+    /// budget. Rooms with a `/name` override keep it; a blank template keeps
+    /// the room's current name; a render the name filter blocks is skipped.
+    pub(super) fn refresh_template_names(&mut self, now_ms: u64) {
+        if self.halted || !self.live.read_state().ready {
+            return;
+        }
+        let rooms: Vec<VoiceRoom> = self.rooms.values().cloned().collect();
+        for room in rooms {
+            let room_id = room.channel_id;
+            if self.custom_names.contains_key(&room_id) {
+                continue;
+            }
+            let Some(template) = self
+                .creators
+                .get(&room.creator_channel_id)
+                .map(|creator| creator.name_template.clone())
+                .filter(|template| !template.trim().is_empty())
+            else {
+                continue;
+            };
+            let command = NameCommand {
+                actor_id: room.owner_id,
+                is_admin: true,
+                request: NameInteraction::Restore { room_id },
+                settings: self.name_settings.clone(),
+                directory: self.name_directory.clone(),
+                policy: Arc::clone(&self.name_policy),
+            };
+            let facts = self.name_facts(&room, &command);
+            let signature = NameSignature {
+                owner_name: facts.context.owner_name.clone(),
+                original_creator_name: facts.context.original_creator_name.clone(),
+                member_count: facts.context.member_count,
+                owner_present: facts.context.owner_present,
+                user_limit: facts.context.user_limit,
+                room_number: facts.context.room_number,
+                members: facts.conditions.member_ids.clone(),
+            };
+            if self.name_signatures.get(&room_id) == Some(&signature) {
+                continue;
+            }
+            let checks = NameChecks {
+                policy: &command.policy,
+                filter: &facts.filter,
+                unique_names: false,
+                other_voice_names: &facts.other_names,
+            };
+            let render = RenderFacts {
+                context: &facts.context,
+                conditions: &facts.conditions,
+                fallback_name: &facts.fallback,
+            };
+            match decide_template_name(&template, &render, &checks) {
+                Ok(name) => {
+                    // A channel the live snapshot cannot see yet is retried
+                    // on a later tick.
+                    if self.propose_name(room_id, &name, now_ms).is_some() {
+                        self.name_signatures.insert(room_id, signature);
+                    }
+                }
+                Err(_) => {
+                    self.name_signatures.insert(room_id, signature);
+                }
+            }
+        }
+        let rooms = &self.rooms;
+        self.name_signatures
+            .retain(|room_id, _| rooms.contains_key(room_id));
     }
 
     /// Propose the new channel name first: a channel the live snapshot cannot
