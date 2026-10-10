@@ -61,6 +61,10 @@ come from the guild object's `roles` array. Domain/store semantics are unchanged
   be grounded in imported funnel history. A deliberate skip is a successful
   attempt, not evidence that a fresh snapshot was written.
 - Missing/ambiguous ladder roles or nonnested ranks refuse rank publication.
+  A ladder refusal logs one `rank ladder unusable` warn naming each failing
+  rung by its fixed label plus the outcome and capped match count
+  (for example `Legend missing matches=0`); it never logs a Discord role
+  name or id and still fails closed with `configuration`.
 - Failed or malformed scheduled-event reads keep the previous mirror. Only a
   valid empty event array clears it.
 

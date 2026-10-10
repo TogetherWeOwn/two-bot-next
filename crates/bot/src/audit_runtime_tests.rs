@@ -577,22 +577,11 @@ async fn unreachable_dependencies_fail_the_job_and_retry_next_sweep() {
     );
 }
 
-/// Process-wide sweep-log capture. The test binary runs sibling sweeps on
-/// other threads with no subscriber installed, and tracing-core resolves a
-/// callsite's first registration against the registering thread's default
-/// while only one dispatcher is live: `audit_retry_swept` then caches
-/// "never" and a per-test `set_default` capture is never consulted. A global
-/// install is part of every interest computation (same hazard as
-/// `crates/core/tests/reply_lifecycle.rs`). One install per process; each
+/// Process-wide sweep-log capture shared with every log-hygiene test in this
+/// binary (see `tracing_capture::global`): one install per process, each
 /// reader keeps only the text appended after its own start offset.
 fn sweep_log_capture() -> &'static crate::tracing_capture::Capture {
-    static CAPTURE: OnceLock<crate::tracing_capture::Capture> = OnceLock::new();
-    CAPTURE.get_or_init(|| {
-        let capture = crate::tracing_capture::Capture::default();
-        tracing::subscriber::set_global_default(capture.clone())
-            .expect("install global sweep-log capture");
-        capture
-    })
+    crate::tracing_capture::global()
 }
 
 #[tokio::test(flavor = "current_thread")]

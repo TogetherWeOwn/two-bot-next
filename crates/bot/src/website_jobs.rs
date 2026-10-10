@@ -10,9 +10,10 @@ use tokio::sync::{watch, Mutex, OnceCell};
 use two_bot_core::{
     build_community_snapshot, build_counter_reading,
     database_tls::{self, TlsPolicy},
-    match_rank_roles, normalize_events, now_iso, read_raid_windows, replace_events, write_counter,
-    write_rank_snapshot, Config, RawScheduledEvent, RosterMember, WebsiteStoreError,
-    LIVE_COUNTER_INTERVAL_MS, RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
+    diagnose_rank_roles, match_rank_roles, normalize_events, now_iso, read_raid_windows,
+    replace_events, write_counter, write_rank_snapshot, Config, RankRungProblem, RawScheduledEvent,
+    RosterMember, WebsiteStoreError, LIVE_COUNTER_INTERVAL_MS, RANK_SNAPSHOT_INTERVAL_MS,
+    SCHEDULED_EVENTS_INTERVAL_MS,
 };
 use two_bot_discord::executor::ActionExecutor;
 
@@ -479,6 +480,11 @@ pub(crate) async fn roster(
 /// Legacy BOT_FLOOR_MAX_PAGES: ten full pages plus one termination probe.
 pub(crate) const BOT_FLOOR_MAX_PAGES: usize = 11;
 
+/// Upper bound for the per-rung match count in the rank-ladder refusal log.
+/// The diagnostic reports the raw count; only the log line is capped so one
+/// misconfigured guild cannot bloat a warn line.
+pub(crate) const RANK_LADDER_MATCH_LOG_CAP: usize = 99;
+
 /// A daily floor scan is bounded independently of the website roster. A full
 /// final page cannot prove completion, so discard the partial count. Exactly
 /// 10,000 members completes via an empty eleventh page.
@@ -630,7 +636,34 @@ async fn snapshot_once(
             Ok((id.to_string(), name.to_owned()))
         })
         .collect::<Result<Vec<_>, ErrorClass>>()?;
-    let ladder = match_rank_roles(&roles).ok_or(ErrorClass::Configuration)?;
+    let ladder = match match_rank_roles(&roles) {
+        Some(ladder) => ladder,
+        None => {
+            // Fail closed, but name each failing rung by its fixed label plus
+            // the outcome and the capped match count. Never logs a Discord
+            // role name or id: the diagnostic carries only rung labels.
+            let failures = diagnose_rank_roles(&roles);
+            let detail = failures
+                .iter()
+                .map(|failure| {
+                    let (outcome, count) = match failure.problem {
+                        RankRungProblem::Missing => ("missing", 0),
+                        RankRungProblem::Ambiguous { matches } => {
+                            ("ambiguous", matches.min(RANK_LADDER_MATCH_LOG_CAP))
+                        }
+                    };
+                    format!("{} {outcome} matches={count}", failure.key.label())
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            tracing::warn!(
+                job = "rank",
+                failures = %if detail.is_empty() { "unknown".to_owned() } else { detail },
+                "rank ladder unusable; publication skipped"
+            );
+            return Err(ErrorClass::Configuration);
+        }
+    };
     let snapshot = build_community_snapshot(&members, &ladder, &windows).ok_or(ErrorClass::Rest)?;
     if publication_stopped(shutdown) {
         return Ok(());
