@@ -21,7 +21,11 @@ IMAGE_MAX_BYTES = 112 * MIB
 # dependencies; release profile already minimal (opt-level=z, lto, strip).
 # Per b1-baseline calibration (measured * 1.4 rounded up to the next MiB):
 # 10.30 * 1.4 = 14.42 -> 15 MiB. Image still within budget (101.61/112).
-BINARY_MAX_BYTES = 15 * MIB
+# Recalibrated 2026-10-10: PR head measured 15,739,344 bytes (15.01 MiB) on
+# the CI runner, 10,704 bytes over the 15 MiB ceiling. Growth is the cutover
+# admission TLS fence plus pool timeouts, no new dependencies; release
+# profile already minimal (opt-level=z, lto, strip).
+BINARY_MAX_BYTES = 16 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.
 BINARY = "/home/nonroot/two-bot"
