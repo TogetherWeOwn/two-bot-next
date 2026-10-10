@@ -714,8 +714,13 @@ def shared_pool_retain(pool, inventory, proc_root='/proc', now=None, max_age=60,
                     results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
                                      'reason': 'unexpected slot contents; skipped, lease kept'}
                     continue
-                target = real_directory(slot / 'target')
-                scratch = real_directory(slot / 'scratch')
+                try:
+                    target = real_directory(slot / 'target')
+                    scratch = real_directory(slot / 'scratch')
+                except Refusal as error:
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': f'not a real slot directory ({error}); skipped, lease kept'}
+                    continue
                 try:
                     before_bytes = usage(slot)
                 except Refusal as error:

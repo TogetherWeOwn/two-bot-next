@@ -1105,6 +1105,20 @@ class SharedPoolRetainTests(unittest.TestCase):
         self.assertFalse(row['eligible'])
         self.assertIn('incomplete slot scan', row['reason'])
         self.assertTrue((slot / 'lease.json').exists())
+        (slot / 'target' / 'debug' / 'link').unlink()
+        # A symlinked target directory itself must skip only that slot (with
+        # a receipt for the healthy slot), never refuse the whole run: the
+        # name check above passes while real_directory raises Refusal.
+        shutil.rmtree(slot / 'target')
+        (slot / 'target').symlink_to(self.root, target_is_directory=True)
+        receipt = self.retain()
+        by_slot = self.by_slot(receipt)
+        self.assertFalse(by_slot['slot-0']['eligible'])
+        self.assertIn('real slot directory', by_slot['slot-0']['reason'])
+        self.assertTrue((slot / 'lease.json').exists())
+        # The healthy slot is still processed (earlier retains in this test
+        # already emptied it, so bytes need not move here).
+        self.assertTrue(by_slot['slot-1']['eligible'])
 
     def test_external_tmp_is_never_touched(self):
         scratch = self.root / 'container-tmp'
