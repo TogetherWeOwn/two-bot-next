@@ -859,6 +859,13 @@ async fn authenticated_membership_actions_succeed_and_refusals_stay_redacted() {
     assert_eq!(effect.calls(), 1);
 
     let add_ok = r#"{"action":"guild.add_member","discord_id":"111111111111111111","access_token":"fixture-oauth"}"#;
+    // Non-vacuous control: the raw signed bytes DO carry the token pre-persist,
+    // so the stored-state scan below would catch a leak instead of passing
+    // on empty input.
+    assert!(
+        add_ok.contains("fixture-oauth"),
+        "control: raw guild.add_member bytes must carry the token"
+    );
     let (status, _, add_first) = answer(app.clone(), signed(add_ok, "old", "intent-add-ok")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(add_first["result"], json!({"outcome": "added"}));
@@ -869,6 +876,92 @@ async fn authenticated_membership_actions_succeed_and_refusals_stay_redacted() {
     assert_eq!(headers["idempotent-replay"], "true");
     assert_eq!(add_replay["result"], json!({"outcome": "added"}));
     assert_eq!(effect.calls(), 2);
+    // Wire responses never echo the transient token, including the replay.
+    assert!(
+        !add_first.to_string().contains("fixture-oauth"),
+        "first guild.add_member response must not echo the token"
+    );
+    assert!(
+        !add_replay.to_string().contains("fixture-oauth"),
+        "replayed guild.add_member response must not echo the token"
+    );
+    // Stored-state evidence: the OAuth token is absent from every persisted
+    // record for the happy path — the idempotency claim plus its
+    // `store.finish` receipt (same row, now completed) and the audit rows.
+    let claim_rows: Vec<String> = sqlx::query_scalar(
+        "SELECT row_to_json(i)::text FROM internal_idempotency i \
+         WHERE action = 'guild.add_member'",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(claim_rows.len(), 1, "exactly one guild.add_member claim");
+    for row in &claim_rows {
+        assert!(
+            !row.contains("fixture-oauth"),
+            "OAuth token persisted in idempotency claim/receipt"
+        );
+    }
+    // The receipt is durable: completed success with the stored-member
+    // `affected = 1`, no resource, and still no token bytes.
+    let state: String = sqlx::query_scalar(
+        "SELECT state FROM internal_idempotency WHERE action = 'guild.add_member'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(state, "completed");
+    let response_code: String = sqlx::query_scalar(
+        "SELECT response_code FROM internal_idempotency WHERE action = 'guild.add_member'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(response_code, "success");
+    let affected: i64 = sqlx::query_scalar(
+        "SELECT affected FROM internal_idempotency WHERE action = 'guild.add_member'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(affected, 1);
+    let resource_id: Option<String> = sqlx::query_scalar(
+        "SELECT resource_id FROM internal_idempotency WHERE action = 'guild.add_member'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(resource_id, None);
+    let audit_rows: Vec<String> = sqlx::query_scalar(
+        "SELECT row_to_json(a)::text FROM internal_action_log a \
+         WHERE intent_id IN (SELECT intent_id FROM internal_idempotency \
+         WHERE action = 'guild.add_member') ORDER BY audit_id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(audit_rows.len(), 2, "intent + terminal audit rows");
+    for row in &audit_rows {
+        assert!(
+            !row.contains("fixture-oauth"),
+            "OAuth token persisted in audit row"
+        );
+    }
+    // Sweep every persisted internal-action record so a cross-row leak
+    // cannot hide outside the happy-path intent.
+    let persisted: Vec<String> = sqlx::query_scalar(
+        "SELECT row_to_json(i)::text FROM internal_idempotency i \
+         UNION ALL SELECT row_to_json(a)::text FROM internal_action_log a",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    for row in &persisted {
+        assert!(
+            !row.contains("fixture-oauth"),
+            "OAuth token persisted in stored internal-action record"
+        );
+    }
 
     // Refusal-before-effect: malformed shapes and unknown keys refuse cleanly
     // with no secret echo and no Discord call. Each uses a fresh intent so a
