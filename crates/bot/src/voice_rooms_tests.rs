@@ -10087,3 +10087,24 @@ async fn a_game_or_stream_change_rerenders_the_room_name() {
         ["rename:500:Hangout", "rename:500:Apex Legends 🔴"]
     );
 }
+
+#[tokio::test]
+async fn a_rename_that_timed_out_retries_within_seconds_not_minutes() {
+    let (live, store, http, trace) = fixture();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER, Some(500), Some(false));
+    http.rename_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::RenameDeferred);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.propose_name(500, "templated", 0);
+    dispatch(&mut worker, 0).await;
+    assert!(!worker.dispatch_one(RENAME_DEFERRED_RETRY_MS - 1).await);
+    dispatch(&mut worker, RENAME_DEFERRED_RETRY_MS).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["rename:500:templated", "rename:500:templated"]
+    );
+}

@@ -2194,6 +2194,9 @@ const KICK_AUDIT_BUFFER_MAX: usize = 256;
 /// Rows appended per flush (one transaction).
 const KICK_AUDIT_BATCH: usize = 32;
 
+/// Retry delay for a rename that timed out before Discord answered.
+const RENAME_DEFERRED_RETRY_MS: u64 = 15_000;
+
 /// Pause after a failed flush before the next attempt.
 const KICK_AUDIT_RETRY_MS: u64 = 5_000;
 
@@ -4637,7 +4640,20 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             action,
                         );
                     }
-                    Err(RoomHttpError::RenameDeferred | RoomHttpError::UnknownOutcome) => {
+                    // A rename that timed out before an outcome retries soon:
+                    // a short-lived room would otherwise be deleted before a
+                    // five-minute retry. If it did land, the gateway's channel
+                    // update makes the retry a no-op; a Discord limit answers
+                    // with its own retry-after.
+                    Err(RoomHttpError::RenameDeferred) => {
+                        self.queue.mark_rate_limited(
+                            self.live.guild_id,
+                            RENAME_DEFERRED_RETRY_MS,
+                            elapsed_ms(now_ms, started),
+                            action,
+                        );
+                    }
+                    Err(RoomHttpError::UnknownOutcome) => {
                         self.queue.mark_rate_limited(
                             self.live.guild_id,
                             RENAME_MIN_INTERVAL_MS,
