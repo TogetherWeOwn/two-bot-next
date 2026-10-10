@@ -48,7 +48,7 @@ function assertExcludedConsumers(snapshot, version) {
   const fuzz = parseCargoManifest(snapshot['fuzz/Cargo.toml']);
   assert.equal(fuzz.package.version, '0.0.0', 'The unpublished fuzz harness keeps its own version');
   const original = parseCargoManifest(bootstrapSnapshot['fuzz/Cargo.toml']);
-  assert.equal(fuzz.bin.length, 8, 'Retain all eight fuzz targets');
+  assert.equal(fuzz.bin.length, 10, 'Retain all ten fuzz targets');
   assert.deepEqual(fuzz.bin, original.bin, 'Release updates must preserve the fuzz target definitions');
   for (const [name, dependency] of Object.entries(original.dependencies)) {
     if (dependency.path) {
@@ -92,7 +92,7 @@ for (const name of ['two-bot-core', 'two-bot-cutover']) {
 const staleExample = bootstrapSnapshot['CONTRIBUTING.md'].replace(
   /^(two-bot-testsupport = .*version = ")[^"]+/m, (_, prefix) => `${prefix}0.0.0`);
 assert.throws(() => assertExcludedConsumers({...bootstrapSnapshot, 'CONTRIBUTING.md': staleExample}, seedVersion), /Unsynchronized testsupport dependency example/);
-console.log('PASS 3 excluded-consumer drift guards: both fuzz dependencies and the contributor example');
+console.log('PASS 3 excluded-consumer drift guards: all fuzz dependencies and the contributor example');
 
 async function simulate(snapshot, {message, file, tagged, bootstrap}) {
   // Everything, including the prior version/tag, is derived from this snapshot.

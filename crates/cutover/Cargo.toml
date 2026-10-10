@@ -79,6 +79,10 @@ name = "legacy_copy"
 path = "src/bin/legacy_copy.rs"
 
 [[bin]]
+name = "voice-config-apply"
+path = "src/bin/voice_config_apply.rs"
+
+[[bin]]
 name = "staging-migrate"
 path = "src/bin/staging_migrate.rs"
 
