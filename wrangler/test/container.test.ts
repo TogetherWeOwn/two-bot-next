@@ -880,6 +880,62 @@ for (const path of ["/INTERNAL/OWNERSHIP", "/internal/%6fwnership", "//internal/
   });
 }
 
+test("DO /ops/metrics: hung container fetch aborts within the bound (504, generic body)", async (t) => {
+  const h = await harness(t);
+  // Prove the 6 s bound without sleeping through it: the runner cancels
+  // live waits near ~5 s, so shrink only the timer and assert the production
+  // code requested the full bound. The SDK resolves aborts as a 500
+  // Response (never a rejection), so the fixture mirrors that shape.
+  const realTimeout = AbortSignal.timeout;
+  const timeout = t.mock.method(AbortSignal, "timeout", (ms: number) =>
+    realTimeout(ms === 6000 ? 50 : ms));
+  t.mock.method(h.bot, "containerFetch", (...args: Parameters<TwoBotContainer["containerFetch"]>) => {
+    const init = args[1] as RequestInit | undefined;
+    return new Promise<Response>((resolve) => {
+      const sdkAbortBody = (message: string) =>
+        resolve(new Response(`Error proxying request to container: ${message}`, { status: 500 }));
+      if (init?.signal?.aborted) sdkAbortBody("fixture already aborted");
+      else init?.signal?.addEventListener("abort", () => sdkAbortBody("The operation was aborted due to timeout"));
+    });
+  });
+  const started = Date.now();
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/ops/metrics"));
+  const elapsed = Date.now() - started;
+  assert.equal(response.status, 504);
+  assert.equal(await response.text(), "metrics unavailable\n");
+  assert.ok(
+    timeout.mock.calls.some((call) => call.arguments[0] === 6000),
+    "container fetch must request the 6 s abort bound",
+  );
+  assert.ok(elapsed < 5000, `hung fetch must return well within the bound, took ${elapsed}ms`);
+});
+
+test("DO /ops/metrics: rejected container fetch still returns 504 with a generic body", async (t) => {
+  const h = await harness(t);
+  t.mock.method(h.bot, "containerFetch", async () => { throw new Error("fixture transport failure"); });
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/ops/metrics"));
+  assert.equal(response.status, 504);
+  assert.equal(await response.text(), "metrics unavailable\n");
+});
+
+test("DO /ops/metrics: oversized body returns 502 with a generic body", async (t) => {
+  const h = await harness(t);
+  t.mock.method(h.bot, "containerFetch", async () => new Response("m 1\n".repeat(20000)));
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/ops/metrics"));
+  assert.equal(response.status, 502);
+  assert.equal(await response.text(), "metrics unavailable\n");
+});
+
+test("DO /ops/metrics: small body proxies status with the exposition content type", async (t) => {
+  const h = await harness(t);
+  t.mock.method(h.bot, "containerFetch", async () => new Response("# HELP x\n", { status: 200 }));
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/ops/metrics"));
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "text/plain; version=0.0.4; charset=utf-8");
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.equal(await response.text(), "# HELP x\n");
+});
+
 // Readiness monitoring uses synthetic responses only. Global fetch is stubbed
 // in every alert test: no configured webhook, Worker or database is contacted.
 async function alertHarness(t: TestContext, env: Partial<Env> = {}, values?: Map<string, unknown>) {

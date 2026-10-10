@@ -119,11 +119,15 @@ for the dashboard procedure.
 
 Rust uses JSON `tracing` logs, configured by `RUST_LOG`, fallback
 `error,two_bot={LOG_LEVEL:-info}` (dependency crates stay ERROR-only unless
-`RUST_LOG` opts in); `/readyz` 503s log at DEBUG, not ERROR. This wrapper currently
-forwards **only** `DISCORD_TOKEN`, `DATABASE_URL`, `GUILD_ID` and its computed
-`LISTEN_ADDR`, not `RUST_LOG` or arbitrary `TWO_*` flags. Adding a Worker var
-alone will not configure the container. Do not dump env or HTTP headers to
-troubleshoot; redact tokens, connection strings, and member data from evidence.
+`RUST_LOG` opts in); `/readyz` 503s log at DEBUG, not ERROR. This wrapper forwards
+`DISCORD_TOKEN`, `DATABASE_URL`, `GUILD_ID`, its computed `LISTEN_ADDR`, the reviewed
+`TWO_*` flags (`FORWARDED_FLAGS` in `wrangler/src/container-env.ts`), the validated
+`DISCORD_APPLICATION_ID`, and the 12 validated non-secret `DISCORD_*` IDs
+(`FORWARDED_DISCORD_IDS` there: audit/voice/moderation log channels, staff alert
+channel, ticket category/panel/staff role, landing/goodbye/anchor-welcome channels,
+session lobby/looking-to-play) — not `RUST_LOG`, secrets, or arbitrary vars. Adding
+a Worker var alone will not configure the container. Do not dump env or HTTP headers
+to troubleshoot; redact tokens, connection strings, and member data from evidence.
 
 Look for these literal messages:
 
@@ -167,6 +171,15 @@ transition (fire, resolve). It posts to `OPS_ALERT_WEBHOOK_URL` only when
 retains the credential and monitoring. See
 [metrics](metrics.md#off-container-scrape-and-alert-rules). Fetch the live data
 with `curl -H "Authorization: Bearer $METRICS_SCRAPE_TOKEN" "$WORKER_URL/ops/metrics"`.
+`METRICS_SCRAPE_TOKEN` must be at least 32 characters; a shorter value leaves
+the route at `404` and a short staging token must be reissued (none is
+provisioned today). Every scrape attempt takes one token synchronously
+before the secret comparison, so concurrent guesses cannot share a token;
+an exhausted caller is refused without any comparison (`429` +
+`retry-after`). Buckets are per caller, so someone else's failures cannot
+throttle a correct bearer elsewhere; a caller shed only because the
+10,000-entry table is full is still compared, so a scanner flood cannot
+lock out the authenticated scraper.
 
 #### Alert: job stale
 
