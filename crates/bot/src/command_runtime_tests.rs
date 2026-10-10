@@ -5120,3 +5120,81 @@ async fn self_role_reactions_enforce_per_member_fairness() {
         mock.shutdown().await;
     }
 }
+
+/// Saturation drops count per lane while the log stays quiet (TOG-19878): a
+/// burst of N drops on one lane increments only that lane's counter and
+/// emits O(1) log lines. The busy lane is covered through the same
+/// `spawn_first` path.
+#[tokio::test]
+async fn saturated_lane_counts_drops_per_lane_and_quiets_logs() {
+    use crate::command_runtime::{DISPATCH_LIMITS, LANE_BUSY, LANE_MESSAGES};
+    use crate::tracing_capture;
+
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(false, false), false, origin);
+    let _guard = runtime.dispatch_guard();
+
+    // Fill the message lane without database or REST work.
+    for _ in 0..DISPATCH_LIMITS[LANE_MESSAGES] {
+        assert!(runtime.hold_lane_for_test(LANE_MESSAGES, Duration::from_secs(30)));
+    }
+    assert_eq!(
+        runtime.lane_in_flight(LANE_MESSAGES),
+        DISPATCH_LIMITS[LANE_MESSAGES]
+    );
+
+    const MESSAGE_DROPS: usize = 20;
+    const BUSY_DROPS: usize = 3;
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || {
+        for _ in 0..MESSAGE_DROPS {
+            assert!(
+                !runtime.hold_lane_for_test(LANE_MESSAGES, Duration::from_secs(30)),
+                "a full lane admits no waiters"
+            );
+        }
+        // The busy lane drops through the same path with its own counter.
+        for _ in 0..DISPATCH_LIMITS[LANE_BUSY] {
+            assert!(runtime.hold_lane_for_test(LANE_BUSY, Duration::from_secs(30)));
+        }
+        for _ in 0..BUSY_DROPS {
+            assert!(
+                !runtime.hold_lane_for_test(LANE_BUSY, Duration::from_secs(30)),
+                "a full busy lane admits no waiters"
+            );
+        }
+    });
+
+    assert_eq!(
+        runtime.dispatch_drops_total(LANE_MESSAGES),
+        MESSAGE_DROPS as u64,
+        "every message-lane drop counts"
+    );
+    assert_eq!(
+        runtime.dispatch_drops_total(LANE_BUSY),
+        BUSY_DROPS as u64,
+        "every busy-lane drop counts on its own lane"
+    );
+    for lane in 0..DISPATCH_LIMITS.len() {
+        if lane != LANE_MESSAGES && lane != LANE_BUSY {
+            assert_eq!(
+                runtime.dispatch_drops_total(lane),
+                0,
+                "lane {lane} must not count another lane's drops"
+            );
+        }
+    }
+    let saturated_lines = capture
+        .text()
+        .lines()
+        .filter(|line| line.contains("command dispatch saturated"))
+        .count();
+    assert_eq!(
+        saturated_lines,
+        1,
+        "a burst of {} drops emits one sampled line, got {saturated_lines}",
+        MESSAGE_DROPS + BUSY_DROPS
+    );
+    assert!(mock.requests().is_empty(), "dropped work sends no REST");
+    mock.shutdown().await;
+}
