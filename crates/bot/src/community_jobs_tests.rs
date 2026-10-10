@@ -925,7 +925,8 @@ async fn scorecard_marks_only_captured_streams() {
     let errors = scorecard["ingestionErrors"]
         .as_array()
         .expect("ingestion errors array");
-    for stream in ["member_joined"] {
+    {
+        let stream = "member_joined";
         assert!(
             errors
                 .iter()
