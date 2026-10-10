@@ -63,9 +63,9 @@ requires on every roster change.
 
 ## Not provided by the core (not parity evidence)
 
-- Coordinated retention bounding of all vote state (VK-03), staff-permission
-  protected targets (VK-01) and mention-safe reason rendering (VK-04) remain
-  separate cards.
+- Coordinated retention bounding of all vote state (VK-03) remains a separate
+  card. Staff-permission protected targets (VK-01) and mention-safe reason
+  rendering (VK-04) have landed on main and compose with this slice.
 - Slash/button routing, ephemeral reply text, durable replay retention across
   restarts and permission-bearing delivery remain parent obligations, as
   listed in [the core document](voice-vote-kick-core.md#residual-parent-integration-not-parity-evidence).

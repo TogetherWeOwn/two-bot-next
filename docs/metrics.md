@@ -100,6 +100,7 @@ as dynamic labels.
   `RESUMED`, `GUILD_CREATE`, `GUILD_DELETE`, `GUILD_UPDATE`,
   `GUILD_MEMBER_ADD`, `GUILD_MEMBER_REMOVE`, `GUILD_MEMBER_UPDATE`,
   `MESSAGE_CREATE`, `MESSAGE_UPDATE`, `MESSAGE_DELETE`,
+  `MESSAGE_REACTION_ADD`, `MESSAGE_REACTION_REMOVE`,
   `VOICE_STATE_UPDATE`, `INVITE_CREATE`, `INVITE_DELETE`,
   `INTERACTION_CREATE`, `HEARTBEAT_ACK`, `GATEWAY_CLOSE`, `other`.
 - `two_bot_rest_requests_total{route,result}` — `result` is one of `2xx`,
@@ -280,11 +281,19 @@ No Prometheus server, no new infrastructure.
 | `db_errors` | 3+ storage failures between samples (restarts skip the window) | [DB errors](runbook.md#alert-db-errors) |
 | `send_admission_blocked` | new admission refusals in 3 consecutive samples | [send admission blocked](runbook.md#alert-send-admission-blocked) |
 | `voice_failures` | room-op failures > 5% of >= 10 ops between samples, or any new dead-letter/orphan (restarts skip the window) | [voice failures](runbook.md#alert-voice-failures) |
+| `gateway_missed_events` | any increase of `two_bot_gateway_missed_events_total` between samples (first sample and restarts skip the window) | [gateway missed events](runbook.md#alert-gateway-missed-events) |
+| `ticker_stale:<job>` | 15 s ticker with no success for more than 10 minutes (never-succeeded is ignored) | [ticker stale](runbook.md#alert-ticker-stale) |
 
 `job_stale` uses `JOB_INTERVAL_SECONDS`, which must equal each scheduled job's
-Rust `*_INTERVAL_MS / 1000`. `invite_snapshot`, `session_checkpoint` and `other`
-have no cadence and are exempt. `wrangler/test/alert-job-catalog.test.ts` fails
-when a `JOBS` label has neither a matching cadence nor a reasoned exemption.
+Rust `*_INTERVAL_MS / 1000`. The 15 s tickers (`scheduled_messages`,
+`settings`) use `ticker_stale` with the explicit `TICKER_STALE_SECONDS` (600)
+window instead: at two intervals a 15 s cadence would flap on a single slow
+scrape, and skipped busy deadlines are neither success nor failure, so
+`job_stale` and `job_consecutive_failures` cannot see a wedged ticker.
+`invite_snapshot`, `session_checkpoint` and `other` have no cadence and are
+exempt; `audit_retry` stays exempt with its parked/halt reason.
+`wrangler/test/alert-job-catalog.test.ts` fails when a `JOBS` label has
+neither a matching cadence, ticker_stale coverage, nor a reasoned exemption.
 
 Packet identity (TOG-12100): rule ids above are the single shared spelling
 used on both sides of the B2 soak evidence seam. The Rust canonical list is
@@ -293,7 +302,7 @@ used on both sides of the B2 soak evidence seam. The Rust canonical list is
 is named `evidence-{ruleId}-{window}.json` (soak-ledger packets stamp the
 `soak_expected_committed` ledger identity), so the QA evidence table can
 attribute packets when several rules fire in one window. Both sides pin all
-seven spellings with tests; the payload shape is unchanged.
+nine spellings with tests; the payload shape is unchanged.
 
 Known gaps: the DB error counter currently records only send-admission SQL,
 so non-admission stores still surface only through the pool proxy and the

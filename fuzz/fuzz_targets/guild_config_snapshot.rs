@@ -23,7 +23,10 @@ fuzz_target!(|data: &[u8]| {
     let _ = config_hash(&canonical);
     let _ = snapshot_counts(&snapshot);
     let sealed = seal_snapshot(snapshot.clone());
-    assert_eq!(verify_snapshot_integrity(&sealed).unwrap(), SealState::Sealed);
+    assert_eq!(
+        verify_snapshot_integrity(&sealed).unwrap(),
+        SealState::Sealed
+    );
 
     // A fixed in-memory current guild drives references/diff decoding. Match
     // only the identity, not the uploaded roles/channels or its integrity seal.

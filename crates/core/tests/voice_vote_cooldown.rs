@@ -48,6 +48,7 @@ fn room_a(occupants: &[u64]) -> VoteRoomFacts<'_> {
         owner_id: 2,
         original_creator_id: 3,
         occupants,
+        target_privileged: Some(false),
     }
 }
 
@@ -59,6 +60,7 @@ fn room_b(occupants: &[u64]) -> VoteRoomFacts<'_> {
         owner_id: 20,
         original_creator_id: 21,
         occupants,
+        target_privileged: Some(false),
     }
 }
 
@@ -570,6 +572,7 @@ fn room_b_with_initiator(occupants: &[u64]) -> VoteRoomFacts<'_> {
         owner_id: 20,
         original_creator_id: 21,
         occupants,
+        target_privileged: Some(false),
     }
 }
 
