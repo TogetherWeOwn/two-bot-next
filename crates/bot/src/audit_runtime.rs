@@ -311,6 +311,14 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
                     *current = next;
                 }
             }
+            Err("disabled") => {
+                let next = AuditChannelIds::default();
+                let mut current = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+                if *current != next {
+                    tracing::info!(job = JOB, "audit destinations disabled live");
+                    *current = next;
+                }
+            }
             Err(reason) => {
                 tracing::warn!(
                     job = JOB,

@@ -49,7 +49,8 @@ the feed poller applies `TWO_FEED_POLL_SECONDS` from the snapshot before
 every tick (`crates/bot/src/feed_jobs.rs:232-259`); the audit mirror applies
 `DISCORD_AUDIT_LOG_CHANNEL_ID`, `DISCORD_VOICE_LOG_CHANNEL_ID` and
 `DISCORD_MODERATION_LOG_CHANNEL_ID` from the snapshot on every record and
-sweep (`crates/bot/src/audit_runtime.rs`); ticket operations apply
+sweep (`crates/bot/src/audit_runtime.rs`), where blanking all three parks the
+mirror live and a malformed row keeps the last good destinations; ticket operations apply
 `DISCORD_TICKET_CATEGORY_ID`, `DISCORD_TICKET_PANEL_CHANNEL_ID` and
 `DISCORD_TICKET_STAFF_ROLE_ID` from the snapshot on every execute, recovery
 and purge (`crates/bot/src/ticket_runtime.rs`). Three boot-only edges

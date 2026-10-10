@@ -194,7 +194,7 @@ pub(crate) fn layered_vars(
     vars
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TicketConfig {
     pub guild_id: String,
     pub category_id: String,

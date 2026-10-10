@@ -164,6 +164,42 @@ fn malformed_stored_destination_keeps_the_last_good() {
     );
 }
 
+#[test]
+fn blank_stored_destinations_disable_the_live_mirror() {
+    let (mut writer, live) = live_channel();
+    let runtime = unconnected_runtime(all_vars());
+
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![
+            SettingRow {
+                guild_id: GUILD.to_owned(),
+                key: "DISCORD_AUDIT_LOG_CHANNEL_ID".to_owned(),
+                value: json!(""),
+                version: 1,
+            },
+            SettingRow {
+                guild_id: GUILD.to_owned(),
+                key: "DISCORD_VOICE_LOG_CHANNEL_ID".to_owned(),
+                value: json!(""),
+                version: 1,
+            },
+            SettingRow {
+                guild_id: GUILD.to_owned(),
+                key: "DISCORD_MODERATION_LOG_CHANNEL_ID".to_owned(),
+                value: json!(""),
+                version: 1,
+            },
+        ],
+    });
+    runtime.refresh_channels_with(Some(&live));
+    assert_eq!(
+        runtime.channels_for_test(),
+        AuditChannelIds::default(),
+        "blanking all three destinations must park the live mirror"
+    );
+}
+
 // ---------------------------------------------------------- mirror double --
 
 type PostResult = Result<String, MirrorError>;
@@ -345,7 +381,9 @@ async fn record(runtime: &AuditRuntime<ScriptMirror>, entry: &str) {
     );
 }
 
-async fn drained<M: AuditMirror>(runtime: &AuditRuntime<M>) -> Vec<(String, DeliverOutcome)> {
+async fn drained<M: AuditMirror + Clone>(
+    runtime: &AuditRuntime<M>,
+) -> Vec<(String, DeliverOutcome)> {
     match runtime.sweep().await.unwrap() {
         Sweep::Drained(report) => {
             assert!(
