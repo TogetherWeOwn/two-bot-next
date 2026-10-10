@@ -454,6 +454,18 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertIn("Promoting the latest successful staging deploy", stdout)
         self.assertEqual(calls[0][0], f"repos/{REPO}/actions/workflows/deploy-staging.yml/runs")
 
+    def test_rollback_with_empty_sha_is_refused_never_promoted(self):
+        # During an incident the latest staged SHA is usually the faulty build:
+        # a rollback must always name its commit explicitly.
+        result = self.guard(sha="", rollback=VERSION)
+        self.assertRefused(result, "40-character hex")
+        self.assertEqual(result[3], [])
+
+    def test_runbook_documents_promotion_and_explicit_sha_for_recovery(self):
+        runbook = (ROOT / "docs/production-deploy.md").read_text()
+        self.assertIn("Leave `sha` empty to promote", runbook)
+        self.assertIn("always set `sha` explicitly", runbook)
+
     def test_empty_sha_without_any_staging_success_is_refused(self):
         self.assertRefused(
             self.guard(sha="", **{"staging-latest": {"total_count": 0, "workflow_runs": []}}),
