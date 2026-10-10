@@ -18,7 +18,7 @@ included in that request and never patched afterwards.
   `grouped`/`group_room_ids` into `plan_placement`
   (`crates/bot/src/voice_room_plan.rs:206-212`). Re-checked at `86a6668a7`;
   name-display numbering still ranks per creator, not per category
-  (`crates/bot/src/voice_name_panel.rs:394-401).
+  (`crates/bot/src/voice_name_panel.rs:394-401`).
 - **Permission inheritance.** The creator's stored source (creator channel,
   category, or a chosen channel) supplies the overrides. Every emitted allow
   excludes Manage Roles, including inherited role/member, owner and bot
