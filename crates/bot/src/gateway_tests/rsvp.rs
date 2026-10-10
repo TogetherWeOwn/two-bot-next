@@ -493,7 +493,7 @@ async fn queued_commands(
     );
     let requests = rest.requests();
     assert_eq!(requests.len(), 10);
-    for (index, content) in [(8, "RSVP saved: going."), (9, "RSVP saved: interested.")] {
+    for (index, content) in [(6, "RSVP saved: going."), (9, "RSVP saved: interested.")] {
         assert_eq!(requests[index].method, "PATCH");
         assert_eq!(
             serde_json::from_slice::<Value>(&requests[index].body).unwrap()["content"],
