@@ -687,6 +687,14 @@ the Director of Engineering. **Never silently choose a 48-hour data loss** to
 restore availability. Any proposed loss/irreversible recovery requires its
 separate authority; the lead cannot waive this runbook's zero-loss gate.
 
+**Decision D5 (live cutover):** the production cutover is live. Production is
+the PlanetScale main database `two_bot`. Writes made during the Next window
+are accepted as lost on rollback, bounded by a 2-hour rollback decision
+window; after that window it is forward-fix only, never rollback. Mitigation
+is the pre-cutover PlanetScale backup plus the untouched Coolify `twobot`
+database. The zero-loss gate above describes the pre-cutover plan; once the
+2-hour window closes, this decision supersedes it.
+
 ## Communication template
 
 Use a private moderator channel for operational detail; public notice contains
