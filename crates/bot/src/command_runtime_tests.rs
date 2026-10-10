@@ -5353,7 +5353,8 @@ async fn worker_verdict_drives_prefix_trigger_from_call_site() {
     wait_for(
         || runtime.lane_in_flight(LANE_MESSAGES) == 0,
         "verdict prefix work settles",
-    );
+    )
+    .await;
 
     let posts = mock.posts_to("/channels/4444/messages").await;
     assert_eq!(
