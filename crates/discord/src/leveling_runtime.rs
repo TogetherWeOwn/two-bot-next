@@ -17,12 +17,15 @@ use twilight_model::{
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
 use two_bot_core::{
+    classify,
+    community_store::{message_fact, record_fact, CommunityStoreError, FactWrite},
     leveling::{
         leaderboard_reply, plan_reward_roles, rank_reply, XpAward, LEADERBOARD_DEFAULT_LIMIT,
     },
     leveling_store::{self, LevelingStoreError},
-    FunnelHandlers, FunnelStore, HandlerId, InviteSnapshotStore, LevelOutcome, LevelingHook,
-    NoopFacts, Snowflake,
+    ClassifierConfig, ClassifyInput, FactsSink, FunnelHandlers, FunnelStore, HandlerId,
+    InviteSnapshotStore, LevelOutcome, LevelingHook, MemberJoinFact, MessageFact,
+    RulesAcceptedFact, Snowflake, VoiceEndedFact, VoiceStartedFact,
 };
 
 use two_bot_core::automod_runtime::FunnelDisposition;
@@ -105,6 +108,104 @@ impl DeferredLeveling {
     fn take(&self) -> Vec<AwardRequest> {
         std::mem::take(&mut *self.0.lock().expect("leveling buffer"))
     }
+}
+
+/// Failures propagate to the gateway supervisor; Display never includes SQL
+/// connection details, Discord tokens, response bodies or member content.
+#[derive(Debug, thiserror::Error)]
+pub enum CommunityFactsError {
+    #[error("community facts store operation failed")]
+    Store(#[from] CommunityStoreError),
+}
+
+#[derive(Debug, Default)]
+struct CommunityFactsState {
+    pool: Option<PgPool>,
+    config: ClassifierConfig,
+    pending: Vec<FactWrite>,
+}
+
+/// Buffered `message_created` capture (TOG-19603). The synchronous
+/// [`FactsSink`] hook only classifies and buffers; the serial checkpoint
+/// writer drains via [`OrderedLevelingPipeline::drain_facts`], which persists
+/// through `community_store::record_fact`. Mirrors [`DeferredLeveling`]: no
+/// `block_on`, no detached tasks, no mutex held over an await. Disabled
+/// (no pool) it drops every fact, exactly like [`two_bot_core::NoopFacts`].
+#[derive(Debug, Clone, Default)]
+pub struct DeferredCommunityFacts(Arc<Mutex<CommunityFactsState>>);
+
+impl DeferredCommunityFacts {
+    /// Arm Postgres capture with the scorecard classifier resolved once from
+    /// the process environment. Called once at boot when
+    /// `TWO_COMMUNITY_SCORECARD=1`; tests call it with their fixture pool.
+    pub fn enable(&self, pool: PgPool) {
+        let mut state = self.0.lock().expect("community facts lock");
+        state.pool = Some(pool);
+        state.config = ClassifierConfig::from_env();
+    }
+
+    /// Persist every buffered fact. Returns the inserted count; a duplicate
+    /// delivery returns `false` from the store and is not counted twice.
+    pub async fn drain(&self) -> Result<usize, CommunityFactsError> {
+        let (pool, pending) = {
+            let mut state = self.0.lock().expect("community facts lock");
+            (state.pool.clone(), std::mem::take(&mut state.pending))
+        };
+        let Some(pool) = pool else {
+            return Ok(0);
+        };
+        let mut inserted = 0;
+        for write in &pending {
+            if record_fact(&pool, write).await? {
+                inserted += 1;
+            }
+        }
+        Ok(inserted)
+    }
+}
+
+impl FactsSink for DeferredCommunityFacts {
+    fn record_member_join(&self, _fact: MemberJoinFact<'_>) {}
+
+    fn record_rules_accepted(&self, _fact: RulesAcceptedFact<'_>) {}
+
+    fn record_message(&self, fact: MessageFact<'_>) {
+        let mut state = self.0.lock().expect("community facts lock");
+        if state.pool.is_none() {
+            return;
+        }
+        // Content-minimized by construction: IDs plus the classifier verdict
+        // plus the channel class only, never message content. Bots, webhooks
+        // and staff automation are classified and captured here; the funnel
+        // gate in `on_message` already keeps them out of the XP/activity
+        // counts, so this sink never filters.
+        let input = ClassifyInput {
+            guild_id: fact.guild_id.to_string(),
+            actor_id: fact.member_id.to_string(),
+            is_bot: fact.is_bot,
+            webhook_id: fact.webhook_id.map(|w| w.to_string()),
+            is_staff_automation: fact.is_staff_automation,
+            is_raid: false,
+            is_staging: false,
+            is_test: false,
+        };
+        let verdict = classify(&state.config, &input);
+        state.pending.push(message_fact(
+            &input.guild_id,
+            fact.message_id,
+            &fact.channel_id.to_string(),
+            fact.channel_class.as_str(),
+            &input,
+            fact.occurred_at,
+            verdict,
+        ));
+    }
+
+    fn record_voice_started(&self, _fact: VoiceStartedFact<'_>) -> Option<String> {
+        None
+    }
+
+    fn record_voice_ended(&self, _fact: VoiceEndedFact<'_>) {}
 }
 
 /// Award/reply slice of the shared command runtime; no private router or client.
@@ -263,8 +364,9 @@ impl LevelingRuntime {
 /// persistent gateway runner seeds both from the store, while unit and
 /// database tests keep the in-memory defaults.
 pub struct OrderedLevelingPipeline<S, I = NoInvites, P = PipelineSnapshots> {
-    pipeline: Pipeline<S, DeferredLeveling, NoopFacts, I, NoClassification, P>,
+    pipeline: Pipeline<S, DeferredLeveling, DeferredCommunityFacts, I, NoClassification, P>,
     pending: DeferredLeveling,
+    facts: DeferredCommunityFacts,
     dispatch: tokio::sync::Mutex<()>,
     runtime: Option<LevelingRuntime>,
 }
@@ -272,15 +374,17 @@ pub struct OrderedLevelingPipeline<S, I = NoInvites, P = PipelineSnapshots> {
 impl<S: FunnelStore> OrderedLevelingPipeline<S> {
     pub fn new(store: S, runtime: Option<LevelingRuntime>) -> Self {
         let pending = DeferredLeveling::default();
+        let facts = DeferredCommunityFacts::default();
         Self {
             pipeline: Pipeline::new(
                 store,
                 Some(pending.clone()),
-                None,
+                Some(facts.clone()),
                 NoInvites,
                 NoClassification,
             ),
             pending,
+            facts,
             dispatch: tokio::sync::Mutex::new(()),
             runtime,
         }
@@ -295,23 +399,40 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
         snapshots: P,
     ) -> Self {
         let pending = DeferredLeveling::default();
+        let facts = DeferredCommunityFacts::default();
         Self {
             pipeline: Pipeline::with_snapshots(
                 store,
                 Some(pending.clone()),
-                None,
+                Some(facts.clone()),
                 invite_source,
                 NoClassification,
                 snapshots,
             ),
             pending,
+            facts,
             dispatch: tokio::sync::Mutex::new(()),
             runtime,
         }
     }
 
-    pub fn handlers(&self) -> &FunnelHandlers<S, DeferredLeveling, NoopFacts> {
+    pub fn handlers(&self) -> &FunnelHandlers<S, DeferredLeveling, DeferredCommunityFacts> {
         self.pipeline.handlers()
+    }
+
+    /// Arm Postgres `message_created` capture (TOG-19603). Called once at
+    /// boot when `TWO_COMMUNITY_SCORECARD=1`; without it the sink drops every
+    /// fact, exactly like the previous no-op seam.
+    pub fn enable_community_facts(&self, pool: PgPool) {
+        self.facts.enable(pool);
+    }
+
+    /// Persist buffered message facts without holding the async dispatch
+    /// lock. The caller owns ordering (the serial checkpoint writer); call on
+    /// every dispatch, even when no award queued — bots, webhooks and staff
+    /// automation capture facts but never awards.
+    pub async fn drain_facts(&self) -> Result<usize, CommunityFactsError> {
+        self.facts.drain().await
     }
 
     /// Access the cache (shard runner updates, tests seed).
