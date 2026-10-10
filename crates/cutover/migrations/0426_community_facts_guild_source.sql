@@ -1,4 +1,4 @@
--- 0424_community_facts_guild_source: index the RSVP check-in capacity count.
+-- 0426_community_facts_guild_source: index the RSVP check-in capacity count.
 --
 -- `record_checkin` (crates/core/src/rsvp_store.rs) counts the occurrence's
 -- facts with `SELECT COUNT(*) FROM community_facts WHERE guild_id = $1 AND

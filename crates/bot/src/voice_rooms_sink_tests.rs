@@ -627,3 +627,37 @@ async fn actor_load_failure_bumps_counter_and_arms_warn_throttle() {
         "first failure arms the warn throttle"
     );
 }
+
+#[tokio::test]
+async fn guild_create_seeds_display_names_for_restarted_rooms() {
+    let (store, http, _) = fixture();
+    let runtime = runtime(store, http);
+    let pipeline = MemPipeline::for_replay();
+    feed(&runtime, &pipeline, ready_event());
+    let mut guild: serde_json::Value =
+        serde_json::from_str(include_str!("../tests/fixtures/voice_guild.json")).unwrap();
+    guild["roles"][0]["permissions"] = json!(permissions().bits().to_string());
+    guild["members"].as_array_mut().unwrap().push(json!({
+        "user": {"id": MEMBER.to_string(), "username": "alex", "global_name": "Alex", "discriminator": "0"},
+        "roles": [], "deaf": false, "mute": false, "flags": 0, "joined_at": NOW
+    }));
+    // Without the presence intent Discord's GuildCreate carries the members
+    // in voice together with their voice states.
+    guild["voice_states"] = json!([{
+        "channel_id": CREATOR.to_string(), "user_id": MEMBER.to_string(), "session_id": "voice",
+        "deaf": false, "mute": false, "self_deaf": false, "self_mute": false,
+        "self_video": false, "suppress": false
+    }]);
+    feed(
+        &runtime,
+        &pipeline,
+        Event::GuildCreate(Box::new(GuildCreate::Available(
+            serde_json::from_value(guild).unwrap(),
+        ))),
+    );
+    let (_, directory) = tokio::time::timeout(Duration::from_secs(5), runtime.naming_probe(GUILD))
+        .await
+        .expect("probe deadline")
+        .expect("actor exists");
+    assert!(directory.knows(MEMBER));
+}
