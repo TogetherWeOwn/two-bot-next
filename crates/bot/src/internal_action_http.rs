@@ -100,6 +100,23 @@ fn internal_family(action: ActionLabel) -> &'static str {
     }
 }
 
+/// Bounded action label for an `authorize` refusal (TOG-20119). `authorize`
+/// runs after the signature verified and the nonce burned, so recovering the
+/// verb from the raw body is safe here — the same guarantee
+/// [`ActionLabel::from_body`] documents. Both `ActionNotAllowed` (disabled or
+/// unwired verb) and `RateLimited` (the per-key bucket fires before the body
+/// parses, the `guild.add_member` bucket after it parsed and allowed the verb)
+/// recover the verb, so a rate-limited `guild.add_member` counts as
+/// `membership`/`rate_limit` instead of collapsing to `other`. Every earlier
+/// refusal keeps [`ActionLabel::Unknown`].
+fn authorize_action_label(code: ErrorCode, raw: &[u8]) -> ActionLabel {
+    if code == ErrorCode::ActionNotAllowed || code == ErrorCode::RateLimited {
+        ActionLabel::from_body(raw)
+    } else {
+        ActionLabel::Unknown
+    }
+}
+
 /// The test seam is module-private: runtime effects can only use the admitted
 /// announcement adapter. It does not expose an origin override or a resend API.
 enum Effect {
@@ -1238,11 +1255,7 @@ async fn receive(state: &ReceiverState, request: Request, id: &str) -> Response 
     let decision = match decision {
         Ok(decision) => decision,
         Err(error) => {
-            let action = if error.code == ErrorCode::ActionNotAllowed {
-                ActionLabel::from_body(&raw)
-            } else {
-                ActionLabel::Unknown
-            };
+            let action = authorize_action_label(error.code, &raw);
             return reject(Failure::from_action(error), action);
         }
     };

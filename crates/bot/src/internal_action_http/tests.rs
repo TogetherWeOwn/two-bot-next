@@ -2356,6 +2356,55 @@ async fn event_read_replayed_nonce_is_refused_without_a_second_discord_call() {
     db.close().await.unwrap();
 }
 
+/// Authorize refusals recover the verb for both `ActionNotAllowed` and
+/// `RateLimited`: a rate-limited `guild.add_member` keeps the `membership`
+/// family instead of collapsing to `other`, so the counter series
+/// `membership`/`rate_limit` can increment. Earlier refusals stay unknown.
+#[test]
+fn authorize_refusals_recover_the_verb_for_disabled_and_rate_limited_actions() {
+    let member_body = br#"{"action":"guild.add_member"}"#;
+    let unknown_body = br#"{"action":"website.nonexistent"}"#;
+    let malformed_body = b"not json";
+    for (code, raw, expected) in [
+        (
+            ErrorCode::ActionNotAllowed,
+            member_body.as_slice(),
+            ActionLabel::Known("guild.add_member"),
+        ),
+        (
+            ErrorCode::RateLimited,
+            member_body.as_slice(),
+            ActionLabel::Known("guild.add_member"),
+        ),
+        (
+            ErrorCode::RateLimited,
+            unknown_body.as_slice(),
+            ActionLabel::Unknown,
+        ),
+        (
+            ErrorCode::RateLimited,
+            malformed_body.as_slice(),
+            ActionLabel::Unknown,
+        ),
+        (
+            ErrorCode::Malformed,
+            member_body.as_slice(),
+            ActionLabel::Unknown,
+        ),
+    ] {
+        let label = authorize_action_label(code, raw);
+        assert_eq!(label, expected, "code {code:?}");
+        assert_eq!(
+            internal_family(label),
+            match expected {
+                ActionLabel::Known("guild.add_member") => "membership",
+                _ => "other",
+            },
+            "code {code:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn listeners_fail_closed_and_drain_sibling_on_unexpected_exit() {
     let (shutdown, stopping) = tokio::sync::watch::channel(false);
