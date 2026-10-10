@@ -455,7 +455,8 @@ mod tests {
         }
         // Each privileged class is denied separately at start with no
         // vote, ballot, or enforcement effect.
-        for privileged in [privileged_room(&[2, 3, 4, 9])] {
+        {
+            let privileged = privileged_room(&[2, 3, 4, 9]);
             let mut core = VoteKickCore::new();
             assert_eq!(
                 core.start(100, privileged, 4, 9, &clock),
@@ -464,7 +465,8 @@ mod tests {
             assert!(core.start(100, facts, 4, 9, &clock).is_ok());
         }
         // An unavailable guild-authority lookup fails closed.
-        for unknown in [unknown_authority_room(&[2, 3, 4, 9])] {
+        {
+            let unknown = unknown_authority_room(&[2, 3, 4, 9]);
             let mut core = VoteKickCore::new();
             assert_eq!(
                 core.start(100, unknown, 4, 9, &clock),
