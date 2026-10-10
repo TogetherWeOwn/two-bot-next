@@ -21,7 +21,12 @@ IMAGE_MAX_BYTES = 112 * MIB
 # dependencies; release profile already minimal (opt-level=z, lto, strip).
 # Per b1-baseline calibration (measured * 1.4 rounded up to the next MiB):
 # 10.30 * 1.4 = 14.42 -> 15 MiB. Image still within budget (101.61/112).
-BINARY_MAX_BYTES = 15 * MIB
+# Rebumped for the internal-actions families (event executors plus the
+# channel-moderation union): CI measured 15,741,344 bytes (15.01 MiB) on the
+# event-executors head vs the 15 MiB budget — 12,704 bytes (0.08%) over, no
+# new dependencies. 16 MiB restores a working tripwire with room for the
+# queued reconcile tooling; revisit if the binary approaches it.
+BINARY_MAX_BYTES = 16 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.
 BINARY = "/home/nonroot/two-bot"

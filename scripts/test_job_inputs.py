@@ -120,7 +120,7 @@ class SelectionTests(unittest.TestCase):
         # Docs-only: skips Rust and supply, keeps worker (docs/ listing
         # assertion). `docs` is informational only and gates nothing.
         self.assertEqual(
-            jobs(["docs/metrics.md", "README.md"]),
+            jobs(["docs/gateway-recovery.md", "README.md"]),
             {RUST: False, WORKER: True, PARITY: False,
              SUPPLY: False, DOCS: True})
         # Asset-only: validator assets plus chrome select no job; the
@@ -136,7 +136,7 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(
             jobs(["tests/voice_templates/coverage.json",
                   "tests/voice_templates/README.md",
-                  "docs/metrics.md", "README.md"]),
+                  "docs/gateway-recovery.md", "README.md"]),
             {RUST: False, WORKER: True, PARITY: False,
              SUPPLY: False, DOCS: True})
         # Code: runs Rust, worker and supply (the scan inventories the
@@ -200,6 +200,17 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(inputs.classify("docs/parity-baseline.json"),
                          {PARITY})
 
+    def test_metrics_doc_selects_rust_and_worker(self):
+        # docs/metrics.md is read by both the Rust exposition-conformance
+        # test and the worker event/alert catalog tests, so its edits run
+        # the Rust matrix, the worker job and the supply scan (via rust).
+        self.assertEqual(inputs.classify("docs/metrics.md"),
+                         {RUST, WORKER})
+        self.assertEqual(
+            jobs(["docs/metrics.md"]),
+            {RUST: True, WORKER: True, PARITY: False,
+             SUPPLY: True, DOCS: True})
+
     def test_runbook_docs_select_worker_only(self):
         for path in ["docs/runbook.md", "docs/container-readiness.md"]:
             with self.subTest(path=path):
@@ -208,7 +219,7 @@ class SelectionTests(unittest.TestCase):
     def test_unrelated_docs_select_worker_only(self):
         # No file reader in PR-run code, but runbook.test.ts asserts on the
         # docs/ listing itself (case-collision + readiness links).
-        for path in ["docs/metrics.md", "docs/gateway-recovery.md",
+        for path in ["docs/gateway-recovery.md",
                      "docs/leveling-port.md", "docs/feeds-port.md",
                      "docs/distroless-evaluation.md", "docs/build-cache.md",
                      "docs/database-roles.md",
@@ -259,7 +270,7 @@ class SelectionTests(unittest.TestCase):
 
     def test_docs_only_pr_skips_rust_and_supply(self):
         self.assertEqual(
-            jobs(["docs/metrics.md", "docs/gateway-recovery.md",
+            jobs(["docs/leveling-port.md", "docs/gateway-recovery.md",
                   "README.md", ".github/CODEOWNERS"]),
             {RUST: False, WORKER: True, PARITY: False,
              SUPPLY: False, DOCS: True})
@@ -311,7 +322,8 @@ class SelectionTests(unittest.TestCase):
 
     def test_cli_job_flag_prints_single_value(self):
         with patch.object(inputs, "git_diff_names",
-                          side_effect=self.fake_diff(["docs/metrics.md"])):
+                          side_effect=self.fake_diff(
+                              ["docs/gateway-recovery.md"])):
             for job, want in ((RUST, "false"), (WORKER, "true"),
                               (PARITY, "false"), (SUPPLY, "false"),
                               (DOCS, "true")):
@@ -348,7 +360,8 @@ class ReaderCoverageTests(unittest.TestCase):
     """Every doc-literal reader must agree with the classifier.
 
     If a new docs/ read lands in Rust/scripts/wrangler code, this suite
-    forces the RUST_DOCS/WORKER_DOCS/PARITY_DOCS sets to follow it.
+    forces the RUST_DOCS/RUST_WORKER_DOCS/WORKER_DOCS/PARITY_DOCS sets to
+    follow it.
     """
 
     # Docs the preconditions binary checks by existence only (is_file, never

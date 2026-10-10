@@ -9865,3 +9865,225 @@ async fn failed_create_compensation_orphan_is_counted_without_a_channel_id() {
         "untracked orphan must advance the counter"
     );
 }
+
+#[tokio::test]
+async fn a_new_room_is_renamed_from_its_creator_template() {
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "@@owner@@'s den ##".to_owned();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    worker.refresh_template_names(2);
+    dispatch(&mut worker, 3).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        [
+            "create",
+            "persist:500",
+            "move:300:500",
+            "rename:500:new room's den #1"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn template_names_rerender_only_when_their_facts_change() {
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "@@owner@@ · @@num@@".to_owned();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER, Some(500), Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    // Nothing changed: no new proposal, nothing to dispatch.
+    worker.refresh_template_names(1);
+    assert!(!worker.dispatch_one(1).await);
+    worker.live.voice_update(MEMBER + 1, Some(500), Some(false));
+    worker.refresh_template_names(2);
+    assert_eq!(worker.desired_names[&500], "Alex · 2");
+    // The rename lane paces the second rename within Discord's budget.
+    dispatch(&mut worker, 600_000).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["rename:500:Alex · 1", "rename:500:Alex · 2"]
+    );
+}
+
+#[tokio::test]
+async fn a_name_override_or_a_blank_template_is_never_replaced() {
+    let (live, store, http, trace) = fixture();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER, Some(500), Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // The fixture creator has a blank template: the room keeps its name.
+    worker.refresh_template_names(0);
+    assert!(!worker.dispatch_one(0).await);
+    let mut creator = worker.creators[&CREATOR].clone();
+    creator.name_template = "@@owner@@'s den".to_owned();
+    worker.creators.insert(CREATOR, creator);
+    worker.custom_names.insert(500, "my room".to_owned());
+    worker.refresh_template_names(1);
+    assert!(!worker.dispatch_one(1).await);
+    assert!(trace.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_voice_display_update_reaches_the_owner_token() {
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "@@owner@@".to_owned();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER, Some(500), Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    apply_command(
+        &mut worker,
+        ActorCommand::Display {
+            member_id: MEMBER,
+            display: "Sam".to_owned(),
+        },
+        0,
+    );
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(*trace.lock().unwrap(), ["rename:500:Sam"]);
+}
+
+#[tokio::test]
+async fn a_restarted_worker_waits_for_the_owner_name_instead_of_renaming_to_member() {
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "@@owner@@'s den".to_owned();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER, Some(500), Some(false));
+    // A fresh worker has no display names yet.
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.refresh_template_names(0);
+    assert!(!worker.dispatch_one(0).await);
+    // The GuildCreate seeding (or the owner's next voice event) supplies it.
+    apply_command(
+        &mut worker,
+        ActorCommand::Display {
+            member_id: MEMBER,
+            display: "Alex".to_owned(),
+        },
+        1,
+    );
+    worker.refresh_template_names(1);
+    dispatch(&mut worker, 1).await;
+    assert_eq!(*trace.lock().unwrap(), ["rename:500:Alex's den"]);
+}
+
+#[tokio::test]
+async fn written_settings_reach_automatic_names() {
+    let (live, store, http, _trace) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut config = empty_config();
+    config.settings.no_game_label = "Hangout".to_owned();
+    apply_command(
+        &mut worker,
+        ActorCommand::NameSettingsChanged(NameSettings::from_config(&config)),
+        5,
+    );
+    assert_eq!(worker.name_settings.no_game_label, "Hangout");
+    assert!(worker.name_settings_loaded);
+    assert_eq!(worker.name_settings_read_ms, Some(5));
+}
+
+#[tokio::test]
+async fn an_unknown_original_creator_name_waits_instead_of_rendering_member() {
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template =
+        "@@owner@@ from @@ORIGINAL_CREATOR@@".to_owned();
+    let mut handed = room(500);
+    handed.owner_id = MEMBER + 1;
+    store.rooms.lock().unwrap().insert(500, handed);
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER + 1, Some(500), Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.name_directory.insert(MEMBER + 1, "Sam".to_owned());
+    worker.refresh_template_names(0);
+    assert!(!worker.dispatch_one(0).await);
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    worker.refresh_template_names(1);
+    dispatch(&mut worker, 1).await;
+    assert_eq!(*trace.lock().unwrap(), ["rename:500:Sam from Alex"]);
+}
+
+#[tokio::test]
+async fn a_confirmed_import_hands_its_settings_to_the_worker() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, _) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let (confirm_id, _) = preview_buttons(&preview.expect("preview"));
+    // The worker has loaded and done its first settings read before the
+    // write, so only the handoff can deliver the imported settings now (the
+    // periodic reload is minutes away).
+    let (before, _) = runtime.naming_probe(GUILD).await.expect("probe");
+    assert_eq!(before, NameSettings::from_config(&empty_config()));
+    let confirm = component_interaction(&confirm_id, manager(), UPLOADER);
+    let (_, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
+    let (settings, _) = runtime.naming_probe(GUILD).await.expect("probe");
+    assert_eq!(settings, NameSettings::from_config(&full_config()));
+}
+
+#[tokio::test]
+async fn an_unknown_owner_name_waits_only_a_bounded_time() {
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "@@owner@@'s den".to_owned();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER + 1, Some(500), Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.refresh_template_names(0);
+    assert!(!worker.dispatch_one(0).await);
+    worker.refresh_template_names(name_panel::NAME_WAIT_MS);
+    dispatch(&mut worker, name_panel::NAME_WAIT_MS).await;
+    assert_eq!(*trace.lock().unwrap(), ["rename:500:member's den"]);
+}
+
+#[tokio::test]
+async fn a_game_or_stream_change_rerenders_the_room_name() {
+    use two_bot_core::voice_presence::MemberPresence;
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template =
+        "{{PLAYING ?? @@game_name@@ // Hangout}}{{ANY_LIVE ?? 🔴}}".to_owned();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER, Some(500), Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    worker.name_settings.no_game_label = "Hangout".to_owned();
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    // The owner starts a game: the presence frame reports the room.
+    let room = worker.live.set_presence(
+        MEMBER,
+        MemberPresence {
+            game: Some("Apex Legends".to_owned()),
+            ..MemberPresence::default()
+        },
+    );
+    assert_eq!(room, Some(500));
+    worker.room_facts_changed(500, 1);
+    worker.refresh_template_names(1);
+    assert_eq!(worker.desired_names[&500], "Apex Legends");
+    // Going live through Discord adds the live marker on the next render.
+    assert_eq!(worker.live.set_self_stream(MEMBER, true), Some(500));
+    worker.room_facts_changed(500, 2);
+    worker.refresh_template_names(2);
+    assert_eq!(worker.desired_names[&500], "Apex Legends 🔴");
+    // The rename lane coalesces both changes into one paced rename.
+    dispatch(&mut worker, 600_000).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["rename:500:Hangout", "rename:500:Apex Legends 🔴"]
+    );
+}

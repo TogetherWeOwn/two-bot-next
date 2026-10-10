@@ -15,14 +15,20 @@ use two_bot_core::internal_actions::{validate_event_input, EventInput, EventPlac
 use two_bot_core::{EventStatus, ScheduledEvent, ScheduledEventMirror};
 use two_bot_discord::ratelimit_guard::GuardError;
 use two_bot_discord::{
-    event_status_name, scheduled_event_body, ActionExecutor, DiscordError, EventActionError,
-    EventCall,
+    event_status_name, is_definitive_rejection, scheduled_event_body, ActionExecutor, DiscordError,
+    EventActionError, EventCall,
 };
 
 const GUILD: &str = "100000000000000001";
 const EVENT: &str = "100000000000000002";
 const CHANNEL: &str = "100000000000000003";
 const OBSERVED: &str = "2026-09-01T18:00:00.000Z";
+
+/// Fixed clock for the executor's post-return stamp: offline tests assert
+/// exact mirror rows, while production passes `two_bot_core::now_iso`.
+fn stamp() -> String {
+    OBSERVED.to_owned()
+}
 
 fn input(voice: bool) -> EventInput {
     let mut body = json!({
@@ -168,7 +174,7 @@ async fn create_update_cancel_and_read_refresh_before_acknowledging() {
                 input: input(false),
             },
             &mirror,
-            OBSERVED,
+            stamp,
         )
         .await
         .unwrap();
@@ -187,7 +193,7 @@ async fn create_update_cancel_and_read_refresh_before_acknowledging() {
                 input: input(true),
             },
             &mirror,
-            OBSERVED,
+            stamp,
         )
         .await
         .unwrap();
@@ -204,7 +210,7 @@ async fn create_update_cancel_and_read_refresh_before_acknowledging() {
                 event_id: EVENT.to_owned(),
             },
             &mirror,
-            OBSERVED,
+            stamp,
         )
         .await
         .unwrap();
@@ -220,7 +226,7 @@ async fn create_update_cancel_and_read_refresh_before_acknowledging() {
                 event_id: EVENT.to_owned(),
             },
             &mirror,
-            OBSERVED,
+            stamp,
         )
         .await
         .unwrap();
@@ -281,7 +287,7 @@ async fn read_external_location_and_all_four_statuses() {
                     event_id: EVENT.to_owned(),
                 },
                 &mirror,
-                OBSERVED,
+                stamp,
             )
             .await
             .unwrap();
@@ -300,10 +306,15 @@ async fn read_external_location_and_all_four_statuses() {
 async fn already_cancelled_404_and_other_failures_do_not_retry_or_refresh() {
     // Fresh-key cancellation of an already-cancelled event is a Discord 400,
     // not a fabricated success. Same-key replay is the durable store's job.
+    // 404/413/415/422 share the announcement classifier: Discord validates
+    // before mutating, so all four are terminal rejections, never fences.
     for (status, code) in [
         (400, "discord_rejected"),
         (403, "discord_rejected"),
         (404, "discord_rejected"),
+        (413, "discord_rejected"),
+        (415, "discord_rejected"),
+        (422, "discord_rejected"),
         (429, "rate_limited"),
         (503, "discord_unavailable"),
     ] {
@@ -332,14 +343,14 @@ async fn already_cancelled_404_and_other_failures_do_not_retry_or_refresh() {
                     event_id: EVENT.to_owned(),
                 },
                 &mirror,
-                OBSERVED,
+                stamp,
             )
             .await
             .unwrap_err();
         assert_eq!(error.action_error().code.as_str(), code);
         assert_eq!(
             error.is_safe_pre_mutation(),
-            matches!(status, 400 | 403 | 404)
+            is_definitive_rejection(status)
         );
         assert_eq!(mirror.row().unwrap().0, old);
         assert_eq!(rest.requests().len(), 1);
@@ -349,30 +360,35 @@ async fn already_cancelled_404_and_other_failures_do_not_retry_or_refresh() {
         );
         rest.shutdown().await;
     }
-    for call in [
-        EventCall::Read {
-            event_id: EVENT.to_owned(),
-        },
-        EventCall::Upsert {
-            event_id: Some(EVENT.to_owned()),
-            input: input(false),
-        },
-    ] {
-        let rest = MockRest::start(
-            vec![ScriptedResponse::status(404)],
-            ScriptedResponse::status(500),
-        )
-        .await;
-        let mirror = MemoryMirror::default();
-        let error = executor(&rest)
-            .execute_event(GUILD, &call, &mirror, OBSERVED)
-            .await
-            .unwrap_err();
-        assert_eq!(error.action_error().code.as_str(), "discord_rejected");
-        assert!(error.is_safe_pre_mutation());
-        assert!(mirror.row().is_none());
-        assert_eq!(rest.requests().len(), 1);
-        rest.shutdown().await;
+    // The shared classifier covers every call shape: a mapped event deleted
+    // in Discord (PATCH 404) and oversized/unsupported/invalid bodies
+    // (413/415/422) are terminal on read and upsert alike, never a fence.
+    for status in [404, 413, 415, 422] {
+        for call in [
+            EventCall::Read {
+                event_id: EVENT.to_owned(),
+            },
+            EventCall::Upsert {
+                event_id: Some(EVENT.to_owned()),
+                input: input(false),
+            },
+        ] {
+            let rest = MockRest::start(
+                vec![ScriptedResponse::status(status)],
+                ScriptedResponse::status(500),
+            )
+            .await;
+            let mirror = MemoryMirror::default();
+            let error = executor(&rest)
+                .execute_event(GUILD, &call, &mirror, stamp)
+                .await
+                .unwrap_err();
+            assert_eq!(error.action_error().code.as_str(), "discord_rejected");
+            assert!(error.is_safe_pre_mutation(), "status {status}");
+            assert!(mirror.row().is_none());
+            assert_eq!(rest.requests().len(), 1);
+            rest.shutdown().await;
+        }
     }
 }
 
@@ -408,7 +424,7 @@ async fn malformed_or_mismatched_success_never_becomes_retry_safe() {
                     input: input(false),
                 },
                 &mirror,
-                OBSERVED,
+                stamp,
             )
             .await
             .unwrap_err();
@@ -440,7 +456,7 @@ async fn missing_create_identity_failed_write_and_bad_local_id_fail_closed() {
                     input: input(false),
                 },
                 &MemoryMirror::default(),
-                OBSERVED,
+                stamp,
             )
             .await
             .unwrap_err();
@@ -466,7 +482,7 @@ async fn missing_create_identity_failed_write_and_bad_local_id_fail_closed() {
                 input: input(false),
             },
             &mirror,
-            OBSERVED,
+            stamp,
         )
         .await
         .unwrap_err();
@@ -484,7 +500,7 @@ async fn missing_create_identity_failed_write_and_bad_local_id_fail_closed() {
                 input: bad_input,
             },
             &MemoryMirror::default(),
-            OBSERVED,
+            stamp,
         )
         .await
         .unwrap_err();
@@ -524,7 +540,7 @@ async fn acknowledgement_waits_for_the_mirror_write() {
                     input: input(false),
                 },
                 worker_mirror.as_ref(),
-                OBSERVED,
+                stamp,
             )
             .await
     });
@@ -733,7 +749,7 @@ mod database {
                     input: input(false),
                 },
                 &db.pool,
-                OBSERVED,
+                stamp,
             )
             .await
             .unwrap();
@@ -746,7 +762,7 @@ mod database {
                     input: input(true),
                 },
                 &db.pool,
-                OBSERVED,
+                stamp,
             )
             .await
             .unwrap();
@@ -760,7 +776,7 @@ mod database {
                     input: input(false),
                 },
                 &db.pool,
-                OBSERVED,
+                stamp,
             )
             .await
             .unwrap();
@@ -772,7 +788,7 @@ mod database {
                     event_id: EVENT.to_owned(),
                 },
                 &db.pool,
-                OBSERVED,
+                stamp,
             )
             .await
             .unwrap();
@@ -785,7 +801,7 @@ mod database {
                     event_id: EVENT.to_owned(),
                 },
                 &db.pool,
-                refreshed,
+                || refreshed.to_owned(),
             )
             .await
             .unwrap();
@@ -799,7 +815,7 @@ mod database {
             },
         ] {
             assert!(executor
-                .execute_event(GUILD, &call, &db.pool, OBSERVED)
+                .execute_event(GUILD, &call, &db.pool, stamp)
                 .await
                 .is_err());
             db.assert_row("cancelled", None, None, refreshed).await;

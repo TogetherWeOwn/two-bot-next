@@ -916,35 +916,92 @@ fn reason_line(content: &str) -> &str {
         .expect("a Reason line")
 }
 
+/// Gate VK-04 hostile-matrix echo probes, shared by the ballot render test and
+/// the refusal/error/log echo test so both prove the same inputs.
+const HOSTILE_ECHO_PROBES: &[&str] = &[
+    "@everyone",
+    "@here",
+    "<@",
+    "<#",
+    "<:",
+    "://",
+    "www.",
+    "discord.gg",
+    ".gg/",
+    ".com/",
+    "**",
+    "__",
+    "~~",
+    "||",
+];
+
+/// Hostile snowflakes from the matrix above; none equals a test ID (ROOM=500,
+/// VOTE=7000, members in the 300s).
+const HOSTILE_ECHO_IDS: &[&str] = &["7654321", "987654321", "123456789"];
+
+/// Reason-derived echo probes: only substrings actually present in this hostile
+/// input. Bare "<@" / "<#" / "<:" prefixes are deliberately NOT probed:
+/// `failure_line` legitimately renders "<#ROOM>" channel mentions for real IDs,
+/// so a bare prefix cannot distinguish an echo from the fixed ID format.
+/// Mention-pill inputs are instead pinned by their hostile-specific snowflake.
+fn assert_no_reason_echo(hostile: &str, rendered: &str, where_: &str) {
+    let folded_rendered = rendered.to_lowercase();
+    let folded_hostile = hostile.to_lowercase();
+    for probe in HOSTILE_ECHO_PROBES {
+        if matches!(*probe, "<@" | "<#" | "<:") {
+            continue;
+        }
+        if !folded_hostile.contains(*probe) {
+            continue;
+        }
+        assert!(
+            !folded_rendered.contains(*probe),
+            "{hostile:?} probe {probe:?} in {where_}: {rendered:?}"
+        );
+    }
+    for needle in HOSTILE_ECHO_IDS.iter().copied() {
+        if hostile.contains(needle) {
+            assert!(
+                !rendered.contains(needle),
+                "{hostile:?} id {needle:?} echoed in {where_}: {rendered:?}"
+            );
+        }
+    }
+}
+
+/// Gate VK-04 hostile matrix from #692, shared by the ballot render test and
+/// the refusal/error/log echo test so both prove the same inputs.
+const HOSTILE_VOTE_REASONS: &[&str] = &[
+    "@everyone get in here",
+    "@here vote yes",
+    "@\u{200b}everyone split obfuscation",
+    "@\u{200c}here split obfuscation",
+    "<@&7654321> role pill",
+    "<@987654321> user pill",
+    "<#123456789> channel pill",
+    "<:custom:123456789> emoji pill",
+    "<a:dance:123456789> animated emoji pill",
+    "see https://evil.example/phish for proof",
+    "see http://evil.example/phish for proof",
+    "see HTTPS://evil.example/phish for proof",
+    "[click here](https://evil.example/phish)",
+    "www.evil.example/phish",
+    "WWW.EVIL.EXAMPLE/PHISH",
+    "Www.evil.example/phish",
+    "join discord.gg/abc123 for backup",
+    "join DISCORD.GG/ABC123 for backup",
+    "visit evil.com/phish for proof",
+    "visit EVIL.COM/PHISH for proof",
+    "**BAN THEM** __now__ ~~please~~ `code` ||spoiler||",
+    "# heading\n> quote\n```fence```\n- list\nmultiline",
+];
+
 /// Gate VK-04 hostile matrix, asserted on the final Discord payload: no
 /// hostile reason may produce a ping, clickable link, embed or formatted bot
 /// endorsement in the wire text.
 #[test]
 fn hostile_reasons_render_as_mention_safe_plain_text() {
-    for hostile in [
-        "@everyone get in here",
-        "@here vote yes",
-        "@\u{200b}everyone split obfuscation",
-        "@\u{200c}here split obfuscation",
-        "<@&7654321> role pill",
-        "<@987654321> user pill",
-        "<#123456789> channel pill",
-        "<:custom:123456789> emoji pill",
-        "<a:dance:123456789> animated emoji pill",
-        "see https://evil.example/phish for proof",
-        "see http://evil.example/phish for proof",
-        "see HTTPS://evil.example/phish for proof",
-        "[click here](https://evil.example/phish)",
-        "www.evil.example/phish",
-        "WWW.EVIL.EXAMPLE/PHISH",
-        "Www.evil.example/phish",
-        "join discord.gg/abc123 for backup",
-        "join DISCORD.GG/ABC123 for backup",
-        "visit evil.com/phish for proof",
-        "visit EVIL.COM/PHISH for proof",
-        "**BAN THEM** __now__ ~~please~~ `code` ||spoiler||",
-        "# heading\n> quote\n```fence```\n- list\nmultiline",
-    ] {
+    for hostile in HOSTILE_VOTE_REASONS.iter().copied() {
         let (content, response) = start_payload(Some(hostile));
         let line = reason_line(&content);
         assert!(!line.contains("@everyone"), "{hostile:?} -> {line:?}");
@@ -1030,7 +1087,8 @@ fn ordinary_reasons_render_intact_and_absent_reason_renders_no_line() {
 
 /// Gate VK-04 refusal half: every vote-kick refusal is a fixed acknowledgement
 /// that never interpolates initiator text, so raw input cannot leak through an
-/// error path.
+/// error path. The length assertion pins full coverage: a new refusal variant
+/// breaks it until it is listed here too.
 #[test]
 fn kick_refusals_never_echo_initiator_text() {
     let refusals = [
@@ -1040,7 +1098,11 @@ fn kick_refusals_never_echo_initiator_text() {
         KickRefusal::Vote(VoteKickError::TargetNotOccupant),
         KickRefusal::Vote(VoteKickError::SelfTarget),
         KickRefusal::Vote(VoteKickError::ProtectedTarget),
+        KickRefusal::Vote(VoteKickError::PrivilegedTarget),
+        KickRefusal::Vote(VoteKickError::AuthorityUnavailable),
         KickRefusal::Vote(VoteKickError::ActiveVoteExists),
+        KickRefusal::Vote(VoteKickError::Cooldown),
+        KickRefusal::Vote(VoteKickError::InitiatorLimited),
         KickRefusal::Vote(VoteKickError::ReusedVoteId),
         KickRefusal::Vote(VoteKickError::UnknownVote),
         KickRefusal::Vote(VoteKickError::WrongVoteBoundary),
@@ -1048,13 +1110,189 @@ fn kick_refusals_never_echo_initiator_text() {
         KickRefusal::Vote(VoteKickError::RepeatedVote),
         KickRefusal::Vote(VoteKickError::InvalidTime),
     ];
-    assert_eq!(refusals.len(), 13, "every refusal variant is covered");
+    assert_eq!(refusals.len(), 17, "every refusal variant is covered");
     for refusal in refusals {
         let text = kick_refusal_text(&refusal);
         for probe in ["@everyone", "https://", "<@", "**"] {
             assert!(
                 !text.contains(probe),
                 "{refusal:?} must not echo initiator text: {text:?}"
+            );
+        }
+    }
+}
+
+/// Gate VK-04 echo tripwire: holds every hostile reason from the #692 matrix
+/// in scope while exercising the vote refusal/error/log renderers, pinning
+/// their fixed outputs. Those paths take no reason input by construction
+/// (`kick_start` has no reason parameter; refusals render only from the
+/// `KickRefusal` enum; audit rows carry fixed codes plus snowflakes), so this
+/// test guards the plumbing rather than proving absence on its own. Genuine
+/// refusal-text proof lives in `kick_refusals_never_echo_initiator_text` and
+/// ballot render proof in `hostile_reasons_render_as_mention_safe_plain_text`;
+/// ordinary text still passes through via
+/// `ordinary_reasons_render_intact_and_absent_reason_renders_no_line`.
+#[tokio::test]
+async fn hostile_reasons_never_echo_in_refusals_errors_or_logs() {
+    let admission = two_bot_core::voice_create_admission::CreateAdmissionConfig::default();
+    let admission_reasons = [
+        two_bot_core::voice_create_admission::RefusalReason::UserCap,
+        two_bot_core::voice_create_admission::RefusalReason::GuildCap,
+        two_bot_core::voice_create_admission::RefusalReason::Cooldown,
+        two_bot_core::voice_create_admission::RefusalReason::UserBurst,
+        two_bot_core::voice_create_admission::RefusalReason::GuildBurst,
+    ];
+    assert_eq!(
+        HOSTILE_VOTE_REASONS.len(),
+        22,
+        "the #692 matrix must stay pinned"
+    );
+    for hostile in HOSTILE_VOTE_REASONS.iter().copied() {
+        // The ballot fences for this input are asserted in
+        // `hostile_reasons_render_as_mention_safe_plain_text`; here the same
+        // input is in scope while the refusal/error/log paths run.
+        let (content, _) = start_payload(Some(hostile));
+        assert!(
+            content.contains("Reason: "),
+            "{hostile:?} must render a Reason line: {content:?}"
+        );
+        let (mut worker, _) = setup().await;
+        start(&mut worker, VOTER_A, TARGET).unwrap();
+        worker.kick_cast(VOTE, VOTER_A, VoteBallot::Yes, 1).unwrap();
+
+        // Repeat-vote refusal and second-vote-for-one-target refusal.
+        let repeat = worker
+            .kick_cast(VOTE, VOTER_A, VoteBallot::No, 2)
+            .unwrap_err();
+        assert_eq!(
+            repeat,
+            KickRefusal::Vote(VoteKickError::RepeatedVote),
+            "{hostile:?}"
+        );
+        let repeat_text = kick_refusal_text(&repeat);
+        assert!(
+            !repeat_text.contains(hostile),
+            "{hostile:?} echoed in repeat refusal: {repeat_text:?}"
+        );
+        let active = worker
+            .kick_start(VOTE + 1, ROOM, VOTER_B, TARGET, 3)
+            .unwrap_err();
+        assert_eq!(
+            active,
+            KickRefusal::Vote(VoteKickError::ActiveVoteExists),
+            "{hostile:?}"
+        );
+        let active_text = kick_refusal_text(&active);
+        assert!(
+            !active_text.contains(hostile),
+            "{hostile:?} echoed in active-vote refusal: {active_text:?}"
+        );
+        for text in [repeat_text, active_text] {
+            let folded = text.to_lowercase();
+            for probe in HOSTILE_ECHO_PROBES.iter().copied() {
+                assert!(
+                    !folded.contains(probe),
+                    "{hostile:?} probe {probe:?} in refusal: {text:?}"
+                );
+            }
+        }
+
+        // `failure_line`: `CreateRefused` carries only `reason.code()` plus IDs
+        // and fixed user text, never initiator free text.
+        for reason in admission_reasons {
+            let message = reason.user_message(&admission);
+            assert!(
+                !message.contains(hostile),
+                "{hostile:?} echoed in user_message for {reason:?}: {message:?}"
+            );
+            let failure = LifecycleFailure::CreateRefused {
+                creator_id: ROOM,
+                reason,
+                message,
+            };
+            let rendered = failure_line(&failure);
+            assert!(
+                rendered.contains(reason.code()),
+                "{hostile:?} must keep reason.code() for {reason:?}: {rendered:?}"
+            );
+            assert!(
+                rendered.contains(&ROOM.to_string()),
+                "{hostile:?} must keep IDs: {rendered:?}"
+            );
+            assert!(
+                !rendered.contains(hostile),
+                "{hostile:?} echoed in failure_line: {rendered:?}"
+            );
+            assert_no_reason_echo(hostile, &rendered, "failure_line");
+        }
+        // Other failure families carry IDs and typed errors only.
+        let others = [
+            LifecycleFailure::CategoryFull {
+                creator_id: ROOM,
+                message: "category is full".to_owned(),
+            },
+            LifecycleFailure::Discord {
+                channel_id: ROOM,
+                error: RoomHttpError::AccessDenied,
+            },
+            LifecycleFailure::Persistence {
+                channel_id: Some(ROOM),
+                error: StoreError::Unavailable,
+            },
+            LifecycleFailure::MissingPermission {
+                write: RefusedWrite::Create,
+                channel_id: ROOM,
+                findings: Vec::new(),
+            },
+            LifecycleFailure::NameBlocked {
+                creator_id: ROOM,
+                error: NameError::Empty,
+            },
+        ];
+        for failure in &others {
+            let rendered = failure_line(failure);
+            assert!(
+                !rendered.contains(hostile),
+                "{hostile:?} echoed in {failure:?}: {rendered:?}"
+            );
+            assert_no_reason_echo(hostile, &rendered, "failure_line");
+        }
+
+        // Vote log sites: audit rows carry snowflakes and fixed codes only, and
+        // follow-up ballot edits never interpolate the reason.
+        assert!(worker.flush_kick_audit(4).await, "{hostile:?}");
+        let rows = worker.store.kick_audit.lock().unwrap().clone();
+        for row in &rows {
+            assert!(
+                !row.outcome.contains(hostile),
+                "{hostile:?} echoed in audit outcome: {row:?}"
+            );
+            assert_no_reason_echo(hostile, row.outcome, "audit outcome");
+            assert!(
+                row.outcome
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b == b'_'),
+                "audit outcome must stay a fixed code: {row:?}"
+            );
+        }
+        let base = started_update();
+        for status in [
+            VoteKickStatus::Active,
+            VoteKickStatus::Passed,
+            VoteKickStatus::Expired,
+            VoteKickStatus::Cancelled(VoteCancellation::TargetLeft),
+            VoteKickStatus::Cancelled(VoteCancellation::TargetProtected),
+        ] {
+            let update = VoteKickUpdate { status, ..base };
+            let response = vote_update_message(&update);
+            let text = response
+                .data
+                .as_ref()
+                .and_then(|data| data.content.clone())
+                .unwrap_or_default();
+            assert!(
+                !text.contains(hostile),
+                "{hostile:?} echoed in vote update {status:?}: {text:?}"
             );
         }
     }

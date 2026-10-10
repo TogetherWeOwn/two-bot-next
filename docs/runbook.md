@@ -362,6 +362,40 @@ when a due schedule row or settings change stays unapplied past the
 window — the fix then belongs to the on-call engineer, not another
 redeploy.
 
+#### Alert: receiver refusals
+
+Refused `two_bot_internal_actions_total` outcomes rose for one family in
+3 consecutive keepalive samples. Every outcome other than `executed`
+(`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`,
+`rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`,
+`conflict`, `upstream`, `internal`) counts as a refusal: the signed
+website-action receiver saw the request and refused it. The streak (not
+a single window) pages, because a receiver-abuse or refusal storm stays
+quiet through the burn math while one forged probe must not. The firing
+key names its family (`receiver_refusals:moderation`). The first sample
+after monitoring arms only stores the baseline and never fires, and a
+counter reset (process restart) clears that family's streak rather than
+firing. Family `other` holds every pre-auth refusal (bad signature,
+unknown key, clock skew, nonce replay map through `ActionLabel::Unknown`),
+so a lone `receiver_refusals:other` streak points at forged traffic
+before a wired-family misconfiguration.
+
+First response: scope the refusing family from the `family`/`outcome`
+labels on `two_bot_internal_actions_total` via the authorized
+`/ops/metrics` scrape; confirm no deploy is in progress (a fresh deploy
+restarts the process and resets the counter); then read the container logs
+for the matching `internal action refused` warn lines (sampled summaries
+with `kind`/`class`/`key`/`action`). A single historic refusal with no
+growth never re-pages. Do not retry-loop a signed request with a new
+nonce, rotate keys, or restart the container to "clear" the counter; a
+replacement resets the baseline without stopping the abusive caller.
+
+Escalate when refusals persist across windows after the suspect deploy or
+caller is identified, when they coincide with 429 or DB-error alerts, or
+when `executed` traffic for the same family collapses while refusals rise
+— the receiver may be refusing legitimate work and the fix belongs to the
+on-call engineer, not another redeploy.
+
 ## Persisted ownership control
 
 The Worker/DO fence is implemented, not implicitly released by deployment.
@@ -823,7 +857,7 @@ tokens, or redeploy with an unreviewed wiring change during this docs procedure.
 | Automations/announcements/text | `TWO_AUTOMATIONS=1`, `TWO_ANNOUNCEMENTS=1`; text needs automations **and** `TWO_TEXT_COMMANDS=1`. | Per-feature gates, not operational containment. Verify the affected deployed handler; registry publishing or a periodic job alone does not prove a specific action is active. |
 | Onboarding | `TWO_ONBOARDING_MODE=legacy|session|anchor`, default legacy; `TWO_ONBOARDING_DRY_RUN=1`. | Mode/dry-run contracts are feature-scoped, not bot-wide stop controls. Verify the affected handler and staging evidence; a catalogue value alone is not a runtime activation or reload receipt. |
 | Community scorecard | `TWO_COMMUNITY_SCORECARD=1`; recommendations on unless `TWO_COMMUNITY_RECOMMENDATIONS=0`. | Conditionally registered supervised job; durable retry budget and completion rules apply. A successful/no-op tick is not fresh publication proof. See the [database playbook](#neon-or-hyperdrive-outage). |
-| Internal actions | Moderation requires `TWO_INTERNAL_ALLOW_MODERATION=1` **and** `TWO_MODERATION=1`; other verbs have allow flags. | Only the private `announcement.post` receiver exists, and only in staging: dark until the Operator sets the Worker secret `TWO_INTERNAL_ACTIONS` to `1` last; unset it to go dark again. Reachable solely through the staging Worker ingress for `POST /internal/actions`; production has none. The other allow flags still authorize nothing. See [staging ingress](internal-actions-receiver.md#staging-ingress-default-dark). |
+| Internal actions | `announcement.post`, `role.assign` and `event.upsert` are on whenever the receiver is; `event.cancel` needs `TWO_INTERNAL_ALLOW_EVENT_CANCEL=1`, `event.read` needs `TWO_INTERNAL_ALLOW_EVENT_READ=1`, `settings.get`/`settings.set` need `TWO_INTERNAL_ALLOW_SETTINGS=1`, `guild.add_member` needs `TWO_INTERNAL_ALLOW_ADD_MEMBER=1`, member and channel moderation need `TWO_INTERNAL_ALLOW_MODERATION=1` **and** `TWO_MODERATION=1`; remaining verbs stay refused. | Wired receivers are `announcement.post`, `role.assign` and `event.upsert` (no extra flag: contained only by the dark switch below), `event.cancel`, `event.read`, `settings.get`, `settings.set`, `guild.add_member`, `moderation.ban`, `moderation.tempban`, `moderation.kick`, `moderation.warn`, `moderation.timeout`, `moderation.purge`, `moderation.slowmode`, `moderation.lockdown`, `moderation.unlock`, staging only: dark until the Operator sets the Worker secret `TWO_INTERNAL_ACTIONS` to `1` last; unset it to go dark again. Reachable solely through the staging Worker ingress for `POST /internal/actions`; production has none. Unsetting an allow flag stops that verb. See [staging ingress](internal-actions-receiver.md#staging-ingress-default-dark) and the [receiver verb list](internal-actions-receiver.md). |
 | Settings hot reload | Typed catalogue/store with env-only secret/moderation keys. | Poller/runtime rebuilding remains follow-up; no promise of changes applying without restart. |
 
 Source: [`automod.rs`](../crates/core/src/automod.rs),
@@ -967,6 +1001,7 @@ or existing operator handoff; see [backup.md](backup.md) for unit contracts.
 | Reconnect / RESUME refused | Follow [restart semantics](#restart-semantics-durable-resume-not-full-state-recovery); 4007/4009 force fresh IDENTIFY. Preserve the durable checkpoint, don't hand-edit sequence or start another shard. |
 | Discord REST 429 / suspected breaker | Separate token-wide durable admission, executor-local pacing, process-wide global pause/invalid-request breaker, and the private announcement governor. Refusal can precede HTTP; retry bounds vary by action. There is no manual reset endpoint. Do not hammer Discord, replay uncertain moderation writes or restart/delete state to clear a hold. Identify the actual writer and use verified containment; see the [Discord playbook](#discord-gateway-or-api-outage). |
 | Channel moderation lane stuck `in_progress` after an ambiguous write | No automatic retry/expiry. Quiesce original workers, establish old REST settlement, and read actual Discord overwrites/slowmode before using the inspection-first, explicitly confirmed operator CLI. It preserves recovery and audits the prior claim. See [channel lane reconciliation](channel-lane-reconciliation.md); never release a lane while a delayed unlock can still write. |
+| Website event action stuck `needs_reconciliation` after an ambiguous create | No automatic retry: re-submitting under a new key can make a second event. Read the actual guild scheduled events in Discord, then resolve the exact intent with the inspection-first, explicitly confirmed `two-bot reconcile-event` CLI (`--list`, then `--created`/`--updated`/`--cancelled`/`--no-effect` with `--execute`). See [the receiver contract](internal-actions-receiver.md); never re-submit the operation under a new key before reconciling. |
 | `POST /internal/actions` 404 on staging | The route is dark unless the Worker var `INTERNAL_ACTIONS_INGRESS` (staging env) **and** the secret `TWO_INTERNAL_ACTIONS` are both exactly `1`. Wrong method, a trailing slash or any query string is also 404 by design. Production is always 404. |
 | `POST /internal/actions` 503 `unavailable` | The container is not running (public ingress never starts it; wait for the probe or keepalive), the ownership fence refused this deployment, or the receiver answered something other than its JSON envelope. Check `/readyz` and ownership status; do not retry-loop a signed request with a new nonce. |
 | Ready but feature inactive | Gateway readiness says nothing about library-only commands/jobs/kill switches. Check [runtime boundaries](#containment-kill-switches-and-feature-flags), not extra environment guesses. |

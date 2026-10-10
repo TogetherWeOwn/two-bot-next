@@ -66,11 +66,13 @@ export is required. The report names this coverage gate explicitly.
 1. `GET /users/@me`, then `GET /applications/@me`: proves the token is accepted
    and the application can be read. Any REST error stops further checks; no
    alternate credential is tried.
-2. Application approved **or limited** flags for Guild Members and Message
-   Content are compared to `gateway::intents_from_env()`. Members are always
-   requested. Content is requested for `TWO_AUTOMOD=1` **or** all three nonempty
-   ticket settings (category, staff role, panel channel). Missing a requested
-   portal flag is FAIL; an unused enabled flag is WARN.
+2. Application approved **or limited** flags for Guild Members, Message
+   Content and Presence are compared to `gateway::intents_from_env()`. Members
+   are always requested. Content is requested for `TWO_AUTOMOD=1` **or** all
+   three nonempty ticket settings (category, staff role, panel channel).
+   Presence is requested for `TWO_VOICE=1` with `TWO_VOICE_PRESENCE=1`
+   (`docs/voice-presence.md`). Missing a requested portal flag is FAIL; an
+   unused enabled flag is WARN.
 3. The bot's guild member and all guild roles are fetched. Permissions are the
    union of `@everyone` and the bot's held roles. The legacy funnel/internal-action
    grant is checked: Manage Server, View Channels, Create Instant Invite, Manage

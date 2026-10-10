@@ -333,14 +333,80 @@ python3 scripts/cargo_cache.py retain \
   --evidence /RUN-SCRATCH/two-pool-retain-receipt.json
 ```
 
-Output is JSON with `retain: true` and a per-slot record
-(`eligible`, `before_bytes`/`after_bytes`/`reclaimed_bytes`,
-`lock_held_through_mutation`). The Operator holds TWO build/dispatch
+Output is JSON with `retain: true`, an `excluded_deleted_references` count,
+and a per-slot record (`eligible`, `before_bytes`/`after_bytes`/
+`reclaimed_bytes`, `lock_held_through_mutation`). The Operator holds TWO build/dispatch
 admission, re-exports a fresh inventory immediately before running, and
 retains the evidence receipt. Scratch has no Cargo-defined top-level names
 (temp files are arbitrary), so only protected directory/file/suffix vetoes
 apply there — but the attested classification is still required. Never turn
 this command into unattended cron cleanup.
+
+### Deleted-reference evidence model (multi-tenant host)
+
+Per-slot checks veto on positive attribution only: a lexical path inside the
+slot's `target`/`scratch`, or a `(device, inode)` identity in that slot's
+output. The whole-run check refuses a deleted entry attributable to no held
+slot, with one provable exception: **different-filesystem exclusion**. One
+filesystem's unlinked inode can never be another filesystem's file, so a
+stat-backed (fd/cwd/exe) deleted entry whose device appears in no held slot
+output is provably unable to reference slot output. Such entries are excluded
+and counted in the receipt as `excluded_deleted_references` — never silently
+dropped. Maps entries are never device-excluded: the kernel prints the
+superblock device there, which need not equal the stat device for the same
+file (btrfs per-subvolume anon_dev, pre-6.8 overlayfs). The one maps exception
+is identity, not device: a deleted path that cannot be a regular file at all —
+a `/SYSV<key>` shared-memory segment or `/dev/zero` — cannot alias slot output
+and is excluded by identity (PostgreSQL backends map both, so without this
+rule those ubiquitous shared-host mappings refuse every run). Everything else
+stays fail-closed: same-filesystem unattributed entries (a deleted slot file
+held open is indistinguishable from an unrelated same-filesystem temp file),
+device-unknown entries, incomplete/denied scans, and any run where a held
+slot's output device is unreadable (then nothing is device-excluded).
+
+Limitations: unrelated deleted files on the *same* filesystem as slot output
+still refuse the whole run — as do all other maps deleted entries that
+attribute to no slot (including real tmpfs paths such as `/dev/shm` files,
+whose non-aliasing cannot be proven without mount-namespace analysis) —
+quiesce writers or supply an independently verified exact-path
+process-reference receipt instead. Exclusion assumes no filesystem topology
+change under held slots during the bounded run (all locks are held
+throughout). The read-only legacy `audit` keeps the strict global rule except
+for the same non-file identity exclusion; only `retain` partitions by device.
+
+### Bounded TWO-only build/dispatch admission hold (and undo)
+
+Existing supported controls only: slot `lock` flocks, `timeout(1)`,
+read-only `policy.json`, and a fresh inventory. No service stop, no mass
+cancellation, no environment/roster change. Running workers keep their slots:
+the holder below uses non-blocking locks and never steals or kills.
+
+1. Record pre-hold state: `sha256sum policy.json`, lock inodes (`stat`), and
+   lease hashes. If `run` admission already refuses (wedged pool, no idle
+   below-budget slot), record that refusal as the hold evidence and skip to
+   step 4 — no holder process is needed.
+2. Otherwise start a bounded holder (e.g. `timeout 300`) that non-blocking
+   flocks each *free* slot lock and sleeps; locks held by running workers
+   fail `LOCK_NB` and are reported as preserved, never touched.
+3. Validate scope and quiescence: the holder reports held vs worker-held
+   slots; a re-probe shows no idle slot for new `run` admission. Export a
+   fresh complete host-scope inventory (≤60s): every row terminal with
+   `live_run: false` and `referenced: false`.
+4. Release the holder (kill its PID; expiry is the `timeout`) and run `retain`
+   immediately in the same shell with the fresh inventory and an evidence
+   path. The residual release-to-acquire race stays fail-closed: a new writer
+   holds its slot lock (slot skips, lease kept) and inventory revalidation
+   refuses a stale run with no mutation.
+5. Release/expiry: the holder always ends via kill or timeout; `retain` ends
+   by exiting. Verify the post-run inventory and the evidence receipt.
+
+Undo (retain never ran or aborted before mutation): release the holder,
+verify `policy.json` hash, lock inodes and lease files match the pre-hold
+record, and re-probe admission behavior. No receipt means no mutation
+occurred; running workers were never touched. If `retain` mutated some slots
+and then must be rolled back, regenerable output rebuilds through the
+repaired bounded pool; source, secrets, services and archives have no
+rollback change here.
 
 ## /home available-byte alarm
 

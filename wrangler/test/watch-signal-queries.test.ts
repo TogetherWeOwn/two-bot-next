@@ -19,3 +19,14 @@ test("the ticker-staleness query drops zero success timestamps before subtractio
   assert.ok(query.includes("settings"), "query must cover the settings ticker");
   assert.ok(/>\s*0/.test(query), "query must filter `> 0` so boot/parked (zero-timestamp) series are absent, not stale");
 });
+
+test("the receiver-refusal query groups refused outcomes by family, matching the worker rule", () => {
+  const blocks = [...doc.matchAll(/```promql\n([\s\S]*?)```/g)].map((m) => m[1]!);
+  const query = blocks.find((b) => b.includes("two_bot_internal_actions_total"));
+  assert.ok(query, "receiver-refusal promql block with two_bot_internal_actions_total not found");
+  assert.ok(query.includes("family"), "query must group by family so the surge names its family");
+  assert.ok(query.includes("executed"), "query must separate executed from refused outcomes");
+  assert.ok(/!=\s*"?executed"?/.test(query), "query must filter refused outcomes (outcome != executed)");
+  assert.ok(doc.includes("receiver_refusals"), "doc must name the receiver_refusals alert rule");
+  assert.ok(doc.includes("runbook.md#alert-receiver-refusals"), "doc must link the receiver-refusals runbook anchor");
+});

@@ -32,6 +32,7 @@ mod database_roles_cli;
 mod discord_test_common;
 mod dispatch;
 mod erasure_cli;
+mod event_cli;
 mod feed_jobs;
 mod gateway;
 mod gateway_commands;
