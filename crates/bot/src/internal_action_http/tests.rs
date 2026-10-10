@@ -203,6 +203,24 @@ fn state_full(
     mutates: Arc<MockEventMutate>,
     moderation: Arc<MockModeration>,
 ) -> Arc<ReceiverState> {
+    state_full_with_channel(
+        pool,
+        effect,
+        reads,
+        mutates,
+        moderation,
+        Arc::new(MockChannel::default()),
+    )
+}
+
+fn state_full_with_channel(
+    pool: sqlx::PgPool,
+    effect: Arc<MockEffect>,
+    reads: Arc<MockEventRead>,
+    mutates: Arc<MockEventMutate>,
+    moderation: Arc<MockModeration>,
+    channel: Arc<MockChannel>,
+) -> Arc<ReceiverState> {
     // The announcement double also stands in as the membership double:
     // membership tests share the mock and assert its calls, while moderation
     // tests never reach the member effect.
@@ -214,6 +232,7 @@ fn state_full(
         reads,
         mutates,
         moderation,
+        channel,
     ))
 }
 
@@ -260,6 +279,53 @@ impl ModerationEffect for MockModeration {
                 resource_id: Some(target),
                 affected: 1,
                 outcome: None,
+            })
+        })
+    }
+}
+
+/// Offline channel-moderation double: the auth/key/flag fences must refuse
+/// before this is ever called, so deny-path tests assert `calls() == 0`.
+/// Success mirrors the planner outcomes (`purged` with its count,
+/// `slowmode_updated`, `locked_down`, `unlocked`) without touching Discord.
+#[derive(Default)]
+struct MockChannel {
+    calls: AtomicUsize,
+}
+
+impl MockChannel {
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl ChannelModerationEffect for MockChannel {
+    fn execute_channel<'a>(
+        &'a self,
+        request: &'a InternalChannelRequest,
+        _: &'a str,
+        _: &'a str,
+        _: &'a str,
+    ) -> BoxFuture<'a, Result<InternalChannelResult, ActionError>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let (outcome, affected) = match request.action().action_name() {
+                "moderation.purge" => ("purged".to_owned(), Some(3)),
+                "moderation.slowmode" => ("slowmode_updated".to_owned(), None),
+                "moderation.lockdown" => ("locked_down".to_owned(), None),
+                "moderation.unlock" => ("unlocked".to_owned(), None),
+                _ => {
+                    return Err(ActionError::new(
+                        ErrorCode::ActionNotAllowed,
+                        "not a channel moderation action",
+                        "moderation_action_mismatch",
+                    ));
+                }
+            };
+            Ok(InternalChannelResult {
+                outcome,
+                affected,
+                replayed: false,
             })
         })
     }
@@ -375,6 +441,29 @@ fn moderation_payload_with(action: &str, extra: Value) -> String {
     {
         body["duration_seconds"] = serde_json::json!(3600);
     }
+    for (key, value) in extra.as_object().unwrap() {
+        body[key] = value.clone();
+    }
+    body.to_string()
+}
+
+fn channel_payload(action: &str) -> String {
+    let mut body = serde_json::json!({
+        "action": action,
+        "actor_id": "111111111111111111",
+        "channel_id": "222222222222222222",
+        "reason": "spam",
+    });
+    match action {
+        "moderation.purge" => body["count"] = serde_json::json!(10),
+        "moderation.slowmode" => body["seconds"] = serde_json::json!(30),
+        _ => {}
+    }
+    body.to_string()
+}
+
+fn channel_payload_with(action: &str, extra: Value) -> String {
+    let mut body = serde_json::from_str::<Value>(&channel_payload(action)).unwrap();
     for (key, value) in extra.as_object().unwrap() {
         body[key] = value.clone();
     }
@@ -1110,6 +1199,7 @@ fn read_app(pool: sqlx::PgPool, api: &MockEventApi) -> Router {
         reads,
         Arc::new(MockEventMutate),
         Arc::new(MockModeration::default()),
+        Arc::new(MockChannel::default()),
     )))
 }
 
@@ -1129,6 +1219,7 @@ fn mutate_app(pool: sqlx::PgPool, api: &MockEventApi) -> Router {
         reads,
         mutates,
         Arc::new(MockModeration::default()),
+        Arc::new(MockChannel::default()),
     )))
 }
 
@@ -1480,6 +1571,326 @@ async fn moderation_success_replays_without_second_effect_but_changed_bytes_conf
     db.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn moderation_channel_flag_off_is_refused_before_any_effect() {
+    let Some(db) = database().await else { return };
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let moderation = Arc::new(MockModeration::default());
+    let channel = Arc::new(MockChannel::default());
+    let app = router(state_full_with_channel(
+        db.pool().clone(),
+        effect.clone(),
+        Arc::new(MockEventRead::default()),
+        moderation.clone(),
+        channel.clone(),
+    ));
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    set_moderation_flags(false);
+    for action in [
+        "moderation.purge",
+        "moderation.slowmode",
+        "moderation.lockdown",
+        "moderation.unlock",
+    ] {
+        let (status, _, body) = answer(
+            app.clone(),
+            signed(&channel_payload(action), "old", "intent-channel-flag-off"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{action}");
+        assert_eq!(body["error"]["code"], "action_not_allowed");
+        assert_eq!(body["error"]["retryable"], false);
+    }
+    assert_eq!(effect.calls(), 0);
+    assert_eq!(moderation.calls(), 0);
+    assert_eq!(channel.calls(), 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn moderation_channel_happy_paths_emit_planner_outcomes() {
+    let Some(db) = database().await else { return };
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let moderation = Arc::new(MockModeration::default());
+    let channel = Arc::new(MockChannel::default());
+    let app = router(state_full_with_channel(
+        db.pool().clone(),
+        effect.clone(),
+        Arc::new(MockEventRead::default()),
+        moderation.clone(),
+        channel.clone(),
+    ));
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    set_moderation_flags(true);
+    for (action, intent, expected) in [
+        (
+            "moderation.purge",
+            "intent-channel-purge",
+            serde_json::json!({"outcome": "purged", "affected": 3}),
+        ),
+        (
+            "moderation.slowmode",
+            "intent-channel-slowmode",
+            serde_json::json!({"outcome": "slowmode_updated"}),
+        ),
+        (
+            "moderation.lockdown",
+            "intent-channel-lockdown",
+            serde_json::json!({"outcome": "locked_down"}),
+        ),
+        (
+            "moderation.unlock",
+            "intent-channel-unlock",
+            serde_json::json!({"outcome": "unlocked"}),
+        ),
+    ] {
+        let (status, headers, body) =
+            answer(app.clone(), signed(&channel_payload(action), "old", intent)).await;
+        assert_eq!(status, StatusCode::OK, "{action}");
+        assert!(!headers.contains_key("idempotent-replay"), "{action}");
+        assert_eq!(body["result"], expected, "{action}");
+        assert_eq!(body["request_id"].as_str().unwrap().len(), 26, "{action}");
+    }
+    set_moderation_flags(false);
+    assert_eq!(channel.calls(), 4);
+    assert_eq!(effect.calls(), 0);
+    assert_eq!(moderation.calls(), 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn moderation_channel_bad_channel_keys_are_refused_before_any_effect() {
+    let Some(db) = database().await else { return };
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let moderation = Arc::new(MockModeration::default());
+    let channel = Arc::new(MockChannel::default());
+    let app = router(state_full_with_channel(
+        db.pool().clone(),
+        effect.clone(),
+        Arc::new(MockEventRead::default()),
+        moderation.clone(),
+        channel.clone(),
+    ));
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    set_moderation_flags(true);
+    // Malformed actor/channel identities, out-of-range numbers and missing
+    // fields must refuse before the channel executor runs: the mock counts
+    // every entry, so any call here is a refusal-before-effect failure.
+    for (action, extra) in [
+        (
+            "moderation.purge",
+            serde_json::json!({"channel_id": "not-a-snowflake"}),
+        ),
+        (
+            "moderation.slowmode",
+            serde_json::json!({"channel_id": "00000000000000000"}),
+        ),
+        (
+            "moderation.lockdown",
+            serde_json::json!({"channel_id": "99999999999999999999"}),
+        ),
+        (
+            "moderation.unlock",
+            serde_json::json!({"channel_id": "022222222222222222"}),
+        ),
+        (
+            "moderation.purge",
+            serde_json::json!({"actor_id": "not-a-snowflake"}),
+        ),
+        ("moderation.purge", serde_json::json!({"count": 0})),
+        ("moderation.purge", serde_json::json!({"count": 101})),
+        ("moderation.purge", serde_json::json!({"count": "10"})),
+        ("moderation.slowmode", serde_json::json!({"seconds": 21601})),
+        ("moderation.slowmode", serde_json::json!({"seconds": "30"})),
+        ("moderation.lockdown", serde_json::json!({"reason": ""})),
+        (
+            "moderation.unlock",
+            serde_json::json!({"reason": "x".repeat(513)}),
+        ),
+    ] {
+        let raw = channel_payload_with(action, extra);
+        let (status, _, body) =
+            answer(app.clone(), signed(&raw, "old", "intent-channel-bad-key")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{action}: {raw}");
+        assert_eq!(body["error"]["code"], "malformed", "{action}: {raw}");
+    }
+    // A well-formed purge without its required count is malformed, not a
+    // default: the existing 1–100 path requires the field.
+    let missing_count = serde_json::json!({
+        "action": "moderation.purge",
+        "actor_id": "111111111111111111",
+        "channel_id": "222222222222222222",
+        "reason": "spam",
+    })
+    .to_string();
+    let (status, _, body) = answer(
+        app.clone(),
+        signed(&missing_count, "old", "intent-channel-bad-key"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "malformed");
+    set_moderation_flags(false);
+    assert_eq!(channel.calls(), 0);
+    assert_eq!(effect.calls(), 0);
+    assert_eq!(moderation.calls(), 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn moderation_channel_success_replays_and_mismatches_like_announcements() {
+    let Some(db) = database().await else { return };
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let moderation = Arc::new(MockModeration::default());
+    let channel = Arc::new(MockChannel::default());
+    let app = router(state_full_with_channel(
+        db.pool().clone(),
+        effect.clone(),
+        Arc::new(MockEventRead::default()),
+        moderation.clone(),
+        channel.clone(),
+    ));
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    set_moderation_flags(true);
+    let raw = channel_payload("moderation.lockdown");
+    let (status, headers, first) =
+        answer(app.clone(), signed(&raw, "old", "intent-channel-fixture")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!headers.contains_key("idempotent-replay"));
+    assert_eq!(
+        first["result"],
+        serde_json::json!({"outcome": "locked_down"})
+    );
+    let restarted = router(state_full_with_channel(
+        db.independent_pool().await.unwrap(),
+        effect.clone(),
+        Arc::new(MockEventRead::default()),
+        moderation.clone(),
+        channel.clone(),
+    ));
+    let (status, headers, replay) = answer(
+        restarted.clone(),
+        signed(&raw, "new", "intent-channel-fixture"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["idempotent-replay"], "true");
+    assert_eq!(first["result"], replay["result"]);
+    let changed = format!("{raw} ");
+    let (status, _, mismatch) =
+        answer(restarted, signed(&changed, "new", "intent-channel-fixture")).await;
+    set_moderation_flags(false);
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(mismatch["error"]["retryable"], false);
+    assert_eq!(channel.calls(), 1);
+    assert_eq!(effect.calls(), 0);
+    assert_eq!(moderation.calls(), 0);
+    db.close().await.unwrap();
+}
+
+/// Channel permission gates pin the live-snapshot check itself: purge needs
+/// Manage Messages, slowmode/lockdown/unlock need Manage Channels. Deleting
+/// the per-verb check turns these refusals into resolution successes.
+#[test]
+fn channel_required_permission_covers_purge_and_manage_channels_verbs() {
+    assert_eq!(
+        channel_required_permission(ModerationAction::Purge),
+        PERM_MANAGE_MESSAGES
+    );
+    for action in [
+        ModerationAction::Slowmode,
+        ModerationAction::Lockdown,
+        ModerationAction::Unlock,
+    ] {
+        assert_eq!(
+            channel_required_permission(action),
+            PERM_MANAGE_CHANNELS,
+            "{}",
+            action.action_name()
+        );
+    }
+}
+
+/// A disabled channel executor must bind despite invalid moderation gates:
+/// a bad `TWO_MODERATION_PROTECTED_ROLE_IDS` (or a stray `TWO_MODERATION=1`
+/// without `TWO_OWEN_USER_ID`) must not stop the receiver from starting while
+/// the channel verbs are off. Enabled misconfiguration stays fatal (next test).
+#[tokio::test]
+async fn channel_executor_disabled_tolerates_invalid_gates() {
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    let prev_allow = std::env::var("TWO_INTERNAL_ALLOW_MODERATION").ok();
+    let prev_mod = std::env::var("TWO_MODERATION").ok();
+    let prev_owen = std::env::var("TWO_OWEN_USER_ID").ok();
+    let prev_protected = std::env::var("TWO_MODERATION_PROTECTED_ROLE_IDS").ok();
+    // Stray moderation publish gate without the internal allowlist: the
+    // channel verbs are off, with both invalid-gate shapes present at once.
+    std::env::remove_var("TWO_INTERNAL_ALLOW_MODERATION");
+    std::env::set_var("TWO_MODERATION", "1");
+    std::env::remove_var("TWO_OWEN_USER_ID");
+    std::env::set_var("TWO_MODERATION_PROTECTED_ROLE_IDS", "not-a-snowflake");
+    let api = MockEventApi::start().await;
+    let discord =
+        ActionExecutor::with_proxy("not-a-credential".to_owned(), Some(api.origin.clone()))
+            .unwrap();
+    let result = channel_executor_from_env(lazy_pool(), discord);
+    if let Some(value) = prev_allow {
+        std::env::set_var("TWO_INTERNAL_ALLOW_MODERATION", value);
+    } else {
+        std::env::remove_var("TWO_INTERNAL_ALLOW_MODERATION");
+    }
+    if let Some(value) = prev_mod {
+        std::env::set_var("TWO_MODERATION", value);
+    } else {
+        std::env::remove_var("TWO_MODERATION");
+    }
+    if let Some(value) = prev_owen {
+        std::env::set_var("TWO_OWEN_USER_ID", value);
+    } else {
+        std::env::remove_var("TWO_OWEN_USER_ID");
+    }
+    if let Some(value) = prev_protected {
+        std::env::set_var("TWO_MODERATION_PROTECTED_ROLE_IDS", value);
+    } else {
+        std::env::remove_var("TWO_MODERATION_PROTECTED_ROLE_IDS");
+    }
+    assert!(
+        result.is_ok(),
+        "disabled channel executor must bind despite invalid gates"
+    );
+}
+
+/// Enabled misconfiguration stays fatal: `TWO_MODERATION=1` with the channel
+/// verbs on but no valid `TWO_OWEN_USER_ID` must refuse the receiver bind.
+#[tokio::test]
+async fn channel_executor_enabled_rejects_invalid_gates() {
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    let prev_owen = std::env::var("TWO_OWEN_USER_ID").ok();
+    let prev_protected = std::env::var("TWO_MODERATION_PROTECTED_ROLE_IDS").ok();
+    set_moderation_flags(true);
+    std::env::remove_var("TWO_OWEN_USER_ID");
+    std::env::remove_var("TWO_MODERATION_PROTECTED_ROLE_IDS");
+    let api = MockEventApi::start().await;
+    let discord =
+        ActionExecutor::with_proxy("not-a-credential".to_owned(), Some(api.origin.clone()))
+            .unwrap();
+    let result = channel_executor_from_env(lazy_pool(), discord);
+    set_moderation_flags(false);
+    if let Some(value) = prev_owen {
+        std::env::set_var("TWO_OWEN_USER_ID", value);
+    } else {
+        std::env::remove_var("TWO_OWEN_USER_ID");
+    }
+    if let Some(value) = prev_protected {
+        std::env::set_var("TWO_MODERATION_PROTECTED_ROLE_IDS", value);
+    } else {
+        std::env::remove_var("TWO_MODERATION_PROTECTED_ROLE_IDS");
+    }
+    assert!(
+        result.is_err(),
+        "enabled channel executor must refuse invalid gates"
+    );
+}
+
 /// A disabled moderation executor must bind despite invalid moderation
 /// settings: the executor never parses gates or secrets while the website
 /// verbs are off, so malformed settings must not stop the receiver from
@@ -1561,38 +1972,68 @@ async fn moderation_executor_enabled_rejects_invalid_gates() {
 }
 
 #[tokio::test]
-async fn unwired_moderation_verbs_stay_refused_with_flags_on() {
+async fn all_nine_moderation_verbs_pass_admission_with_flags_on() {
     let Some(db) = database().await else { return };
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let moderation = Arc::new(MockModeration::default());
+    let channel = Arc::new(MockChannel::default());
+    let app = router(state_full_with_channel(
+        db.pool().clone(),
+        effect.clone(),
+        Arc::new(MockEventRead::default()),
+        moderation.clone(),
+        channel.clone(),
+    ));
     let _flag = MODERATION_FLAG_LOCK.lock().await;
     set_moderation_flags(true);
-    let moderation = Arc::new(MockModeration::default());
-    let app = moderation_app(db.pool().clone(), moderation.clone());
-    // The channel verbs belong to the channel family slice and stay refused.
-    for (verb, extra) in [
-        ("moderation.purge", serde_json::json!({"count": 10})),
-        ("moderation.slowmode", serde_json::json!({"seconds": 5})),
-        ("moderation.lockdown", serde_json::json!({})),
-        ("moderation.unlock", serde_json::json!({})),
+    // Both families are wired now: the five member verbs and the four
+    // channel verbs all pass the action_not_allowed gate. Per-verb outcomes
+    // live in the family happy-path tests; this pins the dispatch union so a
+    // future merge cannot silently drop a verb back to refused.
+    for action in [
+        "moderation.ban",
+        "moderation.tempban",
+        "moderation.kick",
+        "moderation.warn",
+        "moderation.timeout",
     ] {
         let (status, _, body) = answer(
             app.clone(),
             signed(
-                &moderation_payload_with(verb, extra),
+                &moderation_payload(action),
                 "old",
-                &format!("intent-unwired-{verb}"),
+                &format!("intent-all-wired-{action}"),
             ),
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{verb}");
-        assert_eq!(body["error"]["code"], "action_not_allowed", "{verb}");
-        assert_eq!(body["error"]["retryable"], false, "{verb}");
+        assert_eq!(status, StatusCode::OK, "{action}");
+        assert_ne!(body["error"]["code"], "action_not_allowed", "{action}");
+    }
+    for action in [
+        "moderation.purge",
+        "moderation.slowmode",
+        "moderation.lockdown",
+        "moderation.unlock",
+    ] {
+        let (status, _, body) = answer(
+            app.clone(),
+            signed(
+                &channel_payload(action),
+                "old",
+                &format!("intent-all-wired-{action}"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{action}");
+        assert_ne!(body["error"]["code"], "action_not_allowed", "{action}");
     }
     set_moderation_flags(false);
     assert_eq!(
         moderation.calls(),
-        0,
-        "unwired verbs never reach the effect"
+        5,
+        "member verbs reach the member effect"
     );
+    assert_eq!(channel.calls(), 4, "channel verbs reach the channel effect");
     db.close().await.unwrap();
 }
 
@@ -1841,6 +2282,7 @@ fn moderation_resolve_app(pool: sqlx::PgPool, mock: &MockMembers) -> Router {
         Arc::new(MockEventRead::default()),
         Arc::new(MockEventMutate),
         moderation,
+        Arc::new(MockChannel::default()),
     )))
 }
 
@@ -2501,6 +2943,7 @@ async fn event_create_admission_refusal_releases_claim_for_same_key_retry() {
         reads,
         mutates,
         Arc::new(MockModeration::default()),
+        Arc::new(MockChannel::default()),
     )));
     let raw = upsert_payload("lane");
     let (status, _, refused) = answer(app.clone(), signed(&raw, "old", "intent-lane")).await;
@@ -2551,6 +2994,7 @@ async fn event_cancel_admission_refusal_releases_claim_for_same_key_retry() {
         reads,
         mutates,
         Arc::new(MockModeration::default()),
+        Arc::new(MockChannel::default()),
     )));
     let raw = cancel_payload("launch");
     let (status, _, refused) = answer(app.clone(), signed(&raw, "old", "intent-cancel")).await;
@@ -2588,6 +3032,7 @@ async fn event_mutation_queued_behind_the_gate_is_refused_before_any_claim() {
         reads,
         mutates,
         Arc::new(MockModeration::default()),
+        Arc::new(MockChannel::default()),
     );
     receiver.event_gate_wait = Duration::from_millis(50);
     let state = Arc::new(receiver);
@@ -2636,6 +3081,7 @@ async fn event_create_mirror_failure_leaves_the_key_unmapped_and_unknown() {
         reads,
         mutates,
         Arc::new(MockModeration::default()),
+        Arc::new(MockChannel::default()),
     )));
     let raw = upsert_payload("mirror");
     let (status, _, first) = answer(app.clone(), signed(&raw, "old", "intent-mirror")).await;
@@ -2698,6 +3144,7 @@ async fn event_mutation_completes_its_receipt_after_the_client_is_dropped() {
         reads,
         mutates,
         Arc::new(MockModeration::default()),
+        Arc::new(MockChannel::default()),
     )));
     let raw = upsert_payload("dropped");
     let client = tokio::spawn(answer(app.clone(), signed(&raw, "old", "intent-dropped")));
@@ -2761,6 +3208,7 @@ async fn event_read_queued_behind_the_gate_is_refused_before_any_discord_call() 
         reads,
         mutates,
         Arc::new(MockModeration::default()),
+        Arc::new(MockChannel::default()),
     );
     receiver.event_gate_wait = Duration::from_millis(50);
     let state = Arc::new(receiver);
