@@ -39,7 +39,7 @@ Not in scope:
 
 ## v1 today (reference, unchanged by this document)
 
-- Code: `crates/core/src/internal_actions.rs` (re-checked at `bce86a791`).
+- Code: `crates/core/src/internal_actions.rs` (re-checked at `86a6668a7`).
   - Canonical string: `canonical_string` at `:115`, `POST\n/internal/actions\n{timestamp}\n{nonce}\n{sha256_hex(raw_body)}`.
   - Signature: `sign` at `:124`, HMAC-SHA256 under the raw secret, sent as `X-TWO-Signature: sha256=<hex>`.
 - Unsigned headers: `X-TWO-Key-Id` and `Idempotency-Key`.
@@ -60,7 +60,7 @@ Not in scope:
   9. Body parse, which refuses repeated JSON keys.
   10. Allowlist.
   11. `guild.add_member` bucket.
-- Dedupe: `RequestIdentity` (`crates/core/src/internal_action_store.rs:58`) keys a slot on `(sha256(caller), sha256(idempotency key))` and requires the same action and payload digest. Status re-checked at `bce86a791`: no `X-TWO-Audience` or `v2=` refs in `crates/`, so v2 remains designed, not implemented.
+- Dedupe: `RequestIdentity` (`crates/core/src/internal_action_store.rs:58`) keys a slot on `(sha256(caller), sha256(idempotency key))` and requires the same action and payload digest. Status re-checked at `86a6668a7`: no `X-TWO-Audience` or `v2=` refs in `crates/`, so v2 remains designed, not implemented.
 
 The frozen v1 vectors stay valid until an explicitly approved version
 transition (see Migration, step G). v2 is a new scheme next to v1, not an edit
