@@ -721,6 +721,174 @@ async fn a_failed_flush_keeps_the_rows_backs_off_and_never_halts_the_worker() {
     assert!(!worker.flush_kick_audit(KICK_AUDIT_RETRY_MS * 3).await);
 }
 
+/// A freshly started vote, for render-only tests: no worker needed.
+fn started_update() -> VoteKickUpdate {
+    VoteKickUpdate {
+        vote: VoteKickRef {
+            id: VOTE,
+            guild_id: GUILD,
+            room_id: ROOM,
+            target_id: TARGET,
+        },
+        status: VoteKickStatus::Active,
+        progress: VoteProgress {
+            yes: 0,
+            required: 3,
+            total: 4,
+        },
+        kick: None,
+    }
+}
+
+/// The final Discord payload for a vote start with `reason`, split into the
+/// public content and the full response for mention/flag assertions.
+fn start_payload(reason: Option<&str>) -> (String, InteractionResponse) {
+    let response = vote_message(&started_update(), VOTER_A, TARGET, reason);
+    let content = response
+        .data
+        .as_ref()
+        .and_then(|data| data.content.clone())
+        .unwrap_or_default();
+    (content, response)
+}
+
+/// The rendered `Reason:` line of a vote-start payload.
+fn reason_line(content: &str) -> &str {
+    content
+        .lines()
+        .find(|line| line.starts_with("Reason: "))
+        .expect("a Reason line")
+}
+
+/// Gate VK-04 hostile matrix, asserted on the final Discord payload: no
+/// hostile reason may produce a ping, clickable link, embed or formatted bot
+/// endorsement in the wire text.
+#[test]
+fn hostile_reasons_render_as_mention_safe_plain_text() {
+    for hostile in [
+        "@everyone get in here",
+        "@here vote yes",
+        "@\u{200b}everyone split obfuscation",
+        "@\u{200c}here split obfuscation",
+        "<@&7654321> role pill",
+        "<@987654321> user pill",
+        "<#123456789> channel pill",
+        "<:custom:123456789> emoji pill",
+        "see https://evil.example/phish for proof",
+        "see http://evil.example/phish for proof",
+        "see HTTPS://evil.example/phish for proof",
+        "[click here](https://evil.example/phish)",
+        "www.evil.example/phish",
+        "**BAN THEM** __now__ ~~please~~ `code` ||spoiler||",
+        "# heading\n> quote\n```fence```\n- list\nmultiline",
+    ] {
+        let (content, response) = start_payload(Some(hostile));
+        let line = reason_line(&content);
+        assert!(!line.contains("@everyone"), "{hostile:?} -> {line:?}");
+        assert!(!line.contains("@here"), "{hostile:?} -> {line:?}");
+        assert!(!line.contains("<@"), "{hostile:?} -> {line:?}");
+        assert!(!line.contains("<#"), "{hostile:?} -> {line:?}");
+        assert!(!line.contains("<:"), "{hostile:?} -> {line:?}");
+        assert!(!line.contains("://"), "{hostile:?} -> {line:?}");
+        assert!(!line.contains("www."), "{hostile:?} -> {line:?}");
+        for markup in ["**", "__", "~~", "||", "[click here]("] {
+            assert!(!line.contains(markup), "{hostile:?} -> {line:?}");
+        }
+        // The reason is one folded line: no block markup can start a line.
+        assert_eq!(content.lines().count(), 3, "{hostile:?} -> {content:?}");
+        // Payload fences hold for every hostile input: only the target may be
+        // pinged, embeds stay suppressed, and no embed object is attached.
+        let data = response.data.as_ref().expect("response data");
+        assert_eq!(
+            data.allowed_mentions
+                .as_ref()
+                .map(|mentions| mentions.users.clone())
+                .unwrap_or_default(),
+            [Id::<UserMarker>::new(TARGET)]
+        );
+        assert!(data
+            .allowed_mentions
+            .as_ref()
+            .is_some_and(|mentions| mentions.parse.is_empty() && mentions.roles.is_empty()));
+        assert!(data
+            .flags
+            .is_some_and(|flags| flags.contains(MessageFlags::SUPPRESS_EMBEDS)));
+        assert!(data.embeds.as_ref().is_none_or(Vec::is_empty));
+    }
+}
+
+#[test]
+fn overlong_reasons_are_cut_to_the_documented_bound_after_escaping() {
+    for hostile in ["x".repeat(600), format!("**{}**", "x".repeat(600))] {
+        let (content, _) = start_payload(Some(&hostile));
+        let rendered = reason_line(&content)
+            .strip_prefix("Reason: ")
+            .expect("reason text");
+        assert_eq!(
+            rendered.chars().count(),
+            VOTE_KICK_PUBLIC_REASON_LIMIT,
+            "overlong input must fill exactly the bound"
+        );
+    }
+    let long = "y".repeat(VOTE_KICK_PUBLIC_REASON_LIMIT + 1);
+    let options = vec![CommandDataOption {
+        name: "reason".to_owned(),
+        value: CommandOptionValue::String(long),
+    }];
+    assert_eq!(
+        parse_kick_reason(&options).map(|reason| reason.chars().count()),
+        Some(VOTE_KICK_PUBLIC_REASON_LIMIT),
+        "parse caps to the same documented bound"
+    );
+}
+
+#[test]
+fn ordinary_reasons_render_intact_and_absent_reason_renders_no_line() {
+    let plain = "Playing loud music after quiet hours";
+    let (content, _) = start_payload(Some(plain));
+    assert!(
+        content.contains(&format!("Reason: {plain}")),
+        "plain text must pass through byte-identical: {content:?}"
+    );
+    let (content, _) = start_payload(None);
+    assert!(
+        !content.lines().any(|line| line.starts_with("Reason:")),
+        "no reason means no Reason line: {content:?}"
+    );
+}
+
+/// Gate VK-04 refusal half: every vote-kick refusal is a fixed acknowledgement
+/// that never interpolates initiator text, so raw input cannot leak through an
+/// error path.
+#[test]
+fn kick_refusals_never_echo_initiator_text() {
+    let refusals = [
+        KickRefusal::Unavailable,
+        KickRefusal::NotARoom,
+        KickRefusal::Vote(VoteKickError::InitiatorNotOccupant),
+        KickRefusal::Vote(VoteKickError::TargetNotOccupant),
+        KickRefusal::Vote(VoteKickError::SelfTarget),
+        KickRefusal::Vote(VoteKickError::ProtectedTarget),
+        KickRefusal::Vote(VoteKickError::ActiveVoteExists),
+        KickRefusal::Vote(VoteKickError::ReusedVoteId),
+        KickRefusal::Vote(VoteKickError::UnknownVote),
+        KickRefusal::Vote(VoteKickError::WrongVoteBoundary),
+        KickRefusal::Vote(VoteKickError::IneligibleVoter),
+        KickRefusal::Vote(VoteKickError::RepeatedVote),
+        KickRefusal::Vote(VoteKickError::InvalidTime),
+    ];
+    assert_eq!(refusals.len(), 13, "every refusal variant is covered");
+    for refusal in refusals {
+        let text = kick_refusal_text(&refusal);
+        for probe in ["@everyone", "https://", "<@", "**"] {
+            assert!(
+                !text.contains(probe),
+                "{refusal:?} must not echo initiator text: {text:?}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn the_audit_buffer_is_bounded_and_drops_the_oldest_row() {
     let (mut worker, _trace) = setup().await;
