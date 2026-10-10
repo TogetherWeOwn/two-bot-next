@@ -361,21 +361,26 @@ mod tests {
         assert!(GatewayCommandConfig::from_map(1, &vars).is_err());
     }
 
-    /// Worker call-site coverage for the verdict-to-trigger plumbing: with
-    /// automod enabled, an `Accept` create sends the prefix reply while a
-    /// `CaptureOnly` create does not. Drives `dispatch_with_verdict` from the
-    /// worker decision (`gateway::worker_prefix_trigger`, which owns the
-    /// `disposition.map(|v| v.trigger)` plumbing) and proves the reply split.
+    /// Worker decision coverage for the verdict-to-trigger plumbing
+    /// (offline): pins `gateway::worker_prefix_trigger` (the text-automation
+    /// gate stays on the funnel disposition, the forwarded value is the
+    /// trigger verdict) and the verdict-to-acceptance mapping, then proves
+    /// both directions through the real trigger handler: the denied path
+    /// early-returns `Ignored` (no POST, no DB), the accepted path passes the
+    /// gate and reaches the store lookup (`Storage` on the row-less lazy
+    /// pool), and the reply itself is proven via the in-memory row plus the
+    /// real render and the real POST.
     ///
     /// Offline: mock activation (`verdict_of` with fake `Activation`),
     /// in-memory trigger store (`HashMap`, no live DB), loopback `MockRest`
-    /// for the reply POST, and a lazy pool that never connects. The denied
-    /// path proves early return via the real trigger handler (`Ignored`, no
-    /// POST, no DB); the accepted path proves it passes the gate via the real
-    /// handler (`Storage`, i.e. it reached the lookup) and proves the reply
-    /// via the in-memory row plus the real render and the real POST.
+    /// for the reply POST, and lazy pools that never connect. This harness
+    /// has no trigger row, so a `dispatch_with_verdict` drive can post no
+    /// reply for either verdict and cannot prove the reply split; that
+    /// end-to-end proof lives in
+    /// `command_runtime_tests::worker_verdict_drives_prefix_trigger_from_call_site`,
+    /// which seeds a `!faq` row on an isolated test database.
     #[tokio::test]
-    async fn worker_verdict_drives_prefix_trigger_from_call_site() {
+    async fn worker_prefix_trigger_decision_is_verdict_sensitive() {
         use std::time::Duration;
 
         use twilight_gateway::Event;
@@ -707,90 +712,5 @@ mod tests {
             "no reply without the row; the in-memory POST above proves the send"
         );
         accepted_rest.shutdown().await;
-
-        // The worker call site drives `dispatch_with_verdict` with the trigger
-        // verdict above installed: both verdicts admit on the message lane
-        // without panicking, and the installed trigger handler judges the
-        // verdict (capture-only refuses before any store or wire work; accept
-        // reaches the store lookup, which has no row in this offline harness).
-        let dispatch_rest = crate::discord_test_common::MockRest::start(
-            vec![
-                crate::discord_test_common::ScriptedResponse::json(
-                    200,
-                    serde_json::json!({"id": "1111"}),
-                ),
-                crate::discord_test_common::ScriptedResponse::json(
-                    200,
-                    serde_json::json!({"id": "2222", "name": "Test guild"}),
-                ),
-            ],
-            crate::discord_test_common::ScriptedResponse::status(500),
-        )
-        .await;
-        let dispatch_pool = sqlx::postgres::PgPoolOptions::new()
-            .acquire_timeout(Duration::from_secs(2))
-            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
-            .expect("lazy pool");
-        let dispatch_gates = two_bot_core::RouterGates {
-            configured_guild: Some(2222),
-            automations: true,
-            moderation: false,
-            voice: false,
-            voice_assistant: false,
-            scorecard: false,
-            announcements: false,
-            tickets: false,
-            self_roles: false,
-            onboarding_picker: false,
-            session_picker: false,
-        };
-        let dispatch_runtime = crate::command_runtime::CommandRuntime::new(
-            dispatch_pool,
-            two_bot_discord::ActionExecutor::with_proxy(
-                "test-token".to_owned(),
-                Some(dispatch_rest.origin()),
-            )
-            .expect("mock executor"),
-            crate::command_runtime::router_with_commands(dispatch_gates),
-            2222,
-            true,
-        );
-        let _guard = dispatch_runtime.dispatch_guard();
-        let init_config =
-            GatewayCommandConfig::from_map(2222, &vars).expect("dispatch command config");
-        dispatch_runtime
-            .initialize_custom_commands(init_config)
-            .await
-            .expect("offline custom-command init (loopback REST, no DB)");
-        assert!(
-            dispatch_runtime.dispatch_with_verdict(&accept_event, Some(FunnelDisposition::Accept)),
-            "accept admits on the message lane"
-        );
-        assert!(
-            dispatch_runtime
-                .dispatch_with_verdict(&split_event, Some(FunnelDisposition::CaptureOnly)),
-            "capture-only still admits; the trigger handler refuses it"
-        );
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while dispatch_runtime.lane_in_flight(crate::command_runtime::LANE_MESSAGES) != 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("dispatched prefix work settles");
-        let dispatch_posts: Vec<_> = dispatch_rest
-            .requests()
-            .into_iter()
-            .filter(|request| {
-                request.method == "POST" && request.path.ends_with("/channels/4444/messages")
-            })
-            .collect();
-        assert!(
-            dispatch_posts.is_empty(),
-            "offline harness has no trigger row, so no spawned reply posts; \
-             the accept POST is proven by the in-memory row above and the \
-             capture-only refusal by the real handler"
-        );
-        dispatch_rest.shutdown().await;
     }
 }

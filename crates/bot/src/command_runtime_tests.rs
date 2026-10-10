@@ -5010,3 +5010,165 @@ async fn saturated_lane_counts_drops_per_lane_and_quiets_logs() {
     assert!(mock.requests().is_empty(), "dropped work sends no REST");
     mock.shutdown().await;
 }
+
+/// Worker call-site proof for the verdict-to-prefix-trigger plumbing: with
+/// automod enabled, driving `dispatch_with_verdict` with the worker decision
+/// (`gateway::worker_prefix_trigger`, exactly as `apply_dispatch` wires it)
+/// posts exactly one prefix reply for an `Accept` create and none for a
+/// `CaptureOnly` or unscreened (`None`) create.
+///
+/// Seeded `!faq` row on the isolated `TestDb`, loopback `MockRest`, the real
+/// trigger handler and the real render. A dispatch path that drops the
+/// verdict (`None`), forces `Accept`, or ignores the verdict for the
+/// configured acceptance posts zero or two-plus replies and fails the count;
+/// a worker that forwards the funnel disposition instead of the trigger
+/// verdict upgrades the capture-only create to a reply and fails it too.
+/// Requires the disposable agent-testdb/CI Postgres service (same as the
+/// gateway suite — never the runtime DATABASE_URL).
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb or CI service"]
+async fn worker_verdict_drives_prefix_trigger_from_call_site() {
+    use std::collections::HashMap;
+
+    use twilight_model::gateway::payload::incoming::MessageCreate;
+    use two_bot_core::automod_runtime::FunnelDisposition;
+    use two_bot_core::custom_commands::PutCommandInput;
+
+    use crate::automod_gateway::WorkerVerdict;
+    use crate::command_runtime::LANE_MESSAGES;
+    use crate::gateway::worker_prefix_trigger;
+    use crate::gateway_commands::GatewayCommandConfig;
+
+    fn verdict_message(id: u64, author: &str) -> Message {
+        serde_json::from_value(serde_json::json!({
+            "id": id.to_string(), "guild_id": "2222", "channel_id": "4444", "type": 0,
+            "author": {"id": author, "username": "tester", "discriminator": "0000", "avatar": null},
+            "content": "!faq please", "timestamp": "2026-09-30T12:00:00.000000+00:00",
+            "edited_timestamp": null,
+            "tts": false, "mention_everyone": false, "mentions": [], "mention_roles": [],
+            "attachments": [], "embeds": [], "pinned": false
+        }))
+        .expect("valid Twilight message fixture")
+    }
+
+    fn verdict_event(message: Message) -> Event {
+        Event::MessageCreate(Box::new(MessageCreate(message)))
+    }
+
+    let db = TestDb::new().await;
+    two_bot_core::custom_command_service::put(
+        &db.pool,
+        true,
+        GUILD_S,
+        "3333",
+        &PutCommandInput {
+            name: "faq".to_owned(),
+            description: "FAQ".to_owned(),
+            template: "Hi {user} {username} in {server} {channel}".to_owned(),
+            text_trigger: Some("!faq".to_owned()),
+        },
+        "seed-faq",
+        &two_bot_core::now_iso(),
+    )
+    .await
+    .expect("seed custom command");
+
+    // Bootstrap reads first: the application id, then the guild name.
+    let (mock, origin) = MockRest::start_script(vec![
+        RestResponse {
+            status: 200,
+            body: Some(r#"{"id":"1111"}"#.to_owned()),
+            delay: Duration::ZERO,
+        },
+        RestResponse {
+            status: 200,
+            body: Some(r#"{"id":"2222","name":"Test guild"}"#.to_owned()),
+            delay: Duration::ZERO,
+        },
+    ])
+    .await;
+    let runtime = CommandRuntime::new(
+        db.pool.clone(),
+        executor_at(origin),
+        router_with_commands(gates(true, true)),
+        GUILD,
+        true,
+    );
+    let _guard = runtime.dispatch_guard();
+    let vars = HashMap::from([
+        ("TWO_AUTOMATIONS".to_owned(), "1".to_owned()),
+        ("TWO_TEXT_COMMANDS".to_owned(), "1".to_owned()),
+        ("TWO_AUTOMOD".to_owned(), "1".to_owned()),
+    ]);
+    runtime
+        .initialize_custom_commands(
+            GatewayCommandConfig::from_map(GUILD, &vars).expect("dispatch command config"),
+        )
+        .await
+        .expect("custom-command bootstrap (loopback REST, isolated DB)");
+
+    // The worker call site: the trigger verdict feeds `dispatch_with_verdict`.
+    let accept_event = verdict_event(verdict_message(61, "3333"));
+    let split_event = verdict_event(verdict_message(62, "3334"));
+    let unscreened_event = verdict_event(verdict_message(63, "3335"));
+    let accept = Some(WorkerVerdict {
+        funnel: FunnelDisposition::Accept,
+        trigger: FunnelDisposition::Accept,
+    });
+    let split = Some(WorkerVerdict {
+        funnel: FunnelDisposition::Accept,
+        trigger: FunnelDisposition::CaptureOnly,
+    });
+    let accept_trigger = worker_prefix_trigger(accept, &accept_event, true);
+    assert_eq!(
+        accept_trigger,
+        Some(Some(FunnelDisposition::Accept)),
+        "accepted create forwards its accept trigger"
+    );
+    let split_trigger = worker_prefix_trigger(split, &split_event, true);
+    assert_eq!(
+        split_trigger,
+        Some(Some(FunnelDisposition::CaptureOnly)),
+        "uninspected funnel-accept still forwards capture-only to triggers"
+    );
+    let unscreened_trigger = worker_prefix_trigger(None, &unscreened_event, true);
+    assert_eq!(
+        unscreened_trigger,
+        Some(None),
+        "unscreened create dispatches without a verdict and fails closed downstream"
+    );
+    assert!(
+        runtime.dispatch_with_verdict(&accept_event, accept_trigger.expect("accept dispatches")),
+        "accept admits on the message lane"
+    );
+    assert!(
+        runtime.dispatch_with_verdict(&split_event, split_trigger.expect("split dispatches")),
+        "capture-only still admits; the trigger handler refuses it"
+    );
+    assert!(
+        runtime.dispatch_with_verdict(
+            &unscreened_event,
+            unscreened_trigger.expect("unscreened dispatches")
+        ),
+        "unscreened create still admits; the missing verdict refuses it"
+    );
+    wait_for(
+        || runtime.lane_in_flight(LANE_MESSAGES) == 0,
+        "verdict prefix work settles",
+    );
+
+    let posts = mock.posts_to("/channels/4444/messages").await;
+    assert_eq!(
+        posts.len(),
+        1,
+        "only the accepted create posts a prefix reply, got {}",
+        posts.len()
+    );
+    let body: serde_json::Value = serde_json::from_slice(&posts[0].body).unwrap();
+    assert_eq!(
+        body["content"], "Hi <@3333> tester in Test guild <#4444>",
+        "accepted create renders and posts the seeded trigger reply"
+    );
+    mock.shutdown().await;
+    db.close().await;
+}
