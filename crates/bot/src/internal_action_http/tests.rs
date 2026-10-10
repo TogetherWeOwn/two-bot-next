@@ -3,7 +3,7 @@
 use super::*;
 use axum::body::Body;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::atomic::{AtomicUsize, Ordering},
 };
 use tower::ServiceExt;
@@ -1226,6 +1226,356 @@ async fn unwired_moderation_verbs_stay_refused_with_flags_on() {
         moderation.calls(),
         0,
         "unwired verbs never reach the effect"
+    );
+    db.close().await.unwrap();
+}
+
+#[test]
+fn moderation_permission_union_is_owner_admin_or_role_bits() {
+    let guild = staging_guild().to_owned();
+    let owner = "123456789012345678".to_owned();
+    let admin_role = "199999999999999999".to_owned();
+    let mod_role = "222222222222222222".to_owned();
+    let facts = ModerationGuildFacts {
+        guild_id: guild.clone(),
+        owner_id: owner.clone(),
+        positions: HashMap::from([
+            (guild.clone(), 0),
+            (mod_role.clone(), 5),
+            (admin_role.clone(), 9),
+        ]),
+        permissions: HashMap::from([
+            (guild.clone(), 0),
+            (mod_role.clone(), PERM_KICK_MEMBERS | PERM_MODERATE_MEMBERS),
+            (admin_role.clone(), ADMINISTRATOR_BIT),
+        ]),
+    };
+    // The guild owner passes everything, whatever they hold.
+    assert_eq!(moderation_permissions(&[], &facts, &owner), Some(u64::MAX));
+    // ADMINISTRATOR passes everything for non-owners.
+    assert_eq!(
+        moderation_permissions(
+            &[guild.clone(), admin_role.clone()],
+            &facts,
+            "111111111111111111"
+        ),
+        Some(u64::MAX)
+    );
+    // Ordinary members get the union of the held role bits plus @everyone.
+    assert_eq!(
+        moderation_permissions(
+            &[guild.clone(), mod_role.clone()],
+            &facts,
+            "111111111111111111"
+        ),
+        Some(PERM_KICK_MEMBERS | PERM_MODERATE_MEMBERS)
+    );
+    // An unknown held role fails closed: the snapshot is incomplete, never
+    // unprotected.
+    assert_eq!(
+        moderation_permissions(
+            &[guild.clone(), "299999999999999999".to_owned()],
+            &facts,
+            "111111111111111111"
+        ),
+        None
+    );
+    // @everyone membership is additive and idempotent.
+    assert_eq!(
+        moderation_with_everyone(vec![mod_role.clone()], &guild),
+        vec![mod_role.clone(), guild.clone()]
+    );
+    assert_eq!(
+        moderation_with_everyone(vec![mod_role.clone(), guild.clone()], &guild),
+        vec![mod_role.clone(), guild.clone()]
+    );
+    // Hierarchy resolves against the snapshot; unknown roles fail closed.
+    assert_eq!(
+        moderation_top_position(&[guild.clone(), mod_role.clone()], &facts),
+        Some(5)
+    );
+    assert_eq!(
+        moderation_top_position(&["299999999999999999".to_owned()], &facts),
+        None
+    );
+}
+
+/// Loopback Discord double routed by path for the resolve-path tests: guild
+/// snapshot, bot identity, member snapshots. The reply set is fixed per test
+/// so an unexpected extra Discord call is a visible path, not a shifted
+/// canned reply.
+struct MockMembers {
+    origin: String,
+    requests: Arc<Mutex<Vec<Value>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+const RESOLVE_OWNER_ID: &str = "123456789012345678";
+const RESOLVE_BOT_ID: &str = "999999999999999999";
+const RESOLVE_ACTOR_ID: &str = "111111111111111111";
+const RESOLVE_TARGET_ID: &str = "333333333333333333";
+const RESOLVE_MOD_ROLE: &str = "222222222222222222";
+const RESOLVE_TOP_ROLE: &str = "444444444444444444";
+
+impl MockMembers {
+    async fn start(guild_status: u16, target_present: bool) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let requests: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let guild_id = staging_guild().to_owned();
+        let task = tokio::spawn(async move {
+            // Non-move closure like the sibling doubles: the async block only
+            // borrows the shared log and copies the small config per request.
+            let app = Router::new().fallback(|request: Request| {
+                let guild_id = guild_id.clone();
+                async move {
+                    let (parts, _) = request.into_parts();
+                    let path = parts.uri.path().to_owned();
+                    let method = parts.method.clone();
+                    seen.lock().unwrap().push(json!({
+                        "method": method.as_str(),
+                        "path": path,
+                    }));
+                    let guild_path = format!("/api/v10/guilds/{guild_id}");
+                    if path == "/api/v10/users/@me" {
+                        return (
+                            StatusCode::OK,
+                            Json(json!({"id": RESOLVE_BOT_ID, "bot": true})),
+                        );
+                    }
+                    if path == guild_path {
+                        if guild_status == StatusCode::OK.as_u16() {
+                            return (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "id": guild_id,
+                                    "owner_id": RESOLVE_OWNER_ID,
+                                    "roles": [
+                                        {"id": guild_id, "position": 0, "permissions": "0"},
+                                        {"id": RESOLVE_MOD_ROLE, "position": 5,
+                                         "permissions": (PERM_KICK_MEMBERS | PERM_MODERATE_MEMBERS).to_string()},
+                                        {"id": RESOLVE_TOP_ROLE, "position": 50, "permissions": "0"},
+                                    ],
+                                })),
+                            );
+                        }
+                        return (
+                            StatusCode::from_u16(guild_status)
+                                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                            Json(Value::Null),
+                        );
+                    }
+                    let members_prefix = format!("{guild_path}/members/");
+                    if let Some(user_id) = path.strip_prefix(members_prefix.as_str()) {
+                        let member = |id: &str, roles: Vec<Value>, bot: bool| {
+                            json!({"user": {"id": id, "bot": bot}, "roles": roles})
+                        };
+                        if user_id == RESOLVE_BOT_ID {
+                            return (
+                                StatusCode::OK,
+                                Json(member(
+                                    RESOLVE_BOT_ID,
+                                    vec![json!(RESOLVE_TOP_ROLE)],
+                                    true,
+                                )),
+                            );
+                        }
+                        if user_id == RESOLVE_ACTOR_ID {
+                            return (
+                                StatusCode::OK,
+                                Json(member(
+                                    RESOLVE_ACTOR_ID,
+                                    vec![json!(RESOLVE_MOD_ROLE)],
+                                    false,
+                                )),
+                            );
+                        }
+                        if user_id == RESOLVE_TARGET_ID && target_present {
+                            return (
+                                StatusCode::OK,
+                                Json(member(RESOLVE_TARGET_ID, vec![], false)),
+                            );
+                        }
+                        return (StatusCode::NOT_FOUND, Json(Value::Null));
+                    }
+                    (StatusCode::NOT_FOUND, Json(Value::Null))
+                }
+            });
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self {
+            origin,
+            requests,
+            task,
+        }
+    }
+
+    fn paths(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|seen| seen.get("path").and_then(Value::as_str).map(str::to_owned))
+            .collect()
+    }
+
+    fn methods(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|seen| {
+                seen.get("method")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+}
+
+impl Drop for MockMembers {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// The real [`ModerationExecutor`] over loopback Discord: deny paths run the
+/// production resolver and error mapping, not the offline double.
+fn moderation_resolve_app(pool: sqlx::PgPool, mock: &MockMembers) -> Router {
+    let discord =
+        ActionExecutor::with_proxy("not-a-credential".to_owned(), Some(mock.origin.clone()))
+            .unwrap();
+    let store = PgMemberModerationStore::new(pool.clone(), staging_guild().to_owned());
+    let inner = InternalMemberExecutor::new(
+        store,
+        discord.clone(),
+        InternalMemberConfig {
+            guild_id: staging_guild().to_owned(),
+            enabled: true,
+            policy: ModerationPolicy {
+                owen_user_id: RESOLVE_OWNER_ID.to_owned(),
+                protected_role_ids: HashSet::new(),
+                bot_user_id: None,
+            },
+            audit_secret: None,
+        },
+    )
+    .unwrap();
+    let moderation: Arc<dyn ModerationEffect> = Arc::new(ModerationExecutor::new(inner, discord));
+    let effect: Arc<dyn ActionEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
+    router(Arc::new(ReceiverState::new(
+        config(),
+        pool,
+        effect,
+        Arc::new(MockEventRead::default()),
+        moderation,
+    )))
+}
+
+#[tokio::test]
+async fn moderation_resolve_refuses_actor_without_verb_permission() {
+    let Some(db) = database().await else { return };
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    set_moderation_flags(true);
+    // The fixture actor holds Kick + Moderate Members, never Ban Members.
+    let mock = MockMembers::start(200, true).await;
+    let app = moderation_resolve_app(db.pool().clone(), &mock);
+    let (status, _, body) = answer(
+        app,
+        signed(
+            &moderation_payload("moderation.ban"),
+            "old",
+            "intent-resolve-forbidden",
+        ),
+    )
+    .await;
+    set_moderation_flags(false);
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "action_not_allowed");
+    assert_eq!(body["error"]["retryable"], false);
+    let paths = mock.paths();
+    assert!(
+        paths
+            .iter()
+            .any(|path| path.ends_with(&format!("/guilds/{}", staging_guild()))),
+        "the resolver must read live guild facts: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|path| path.contains(RESOLVE_TARGET_ID)),
+        "the forbidden actor refuses before the target resolves: {paths:?}"
+    );
+    assert!(
+        !mock.methods().iter().any(|method| method != "GET"),
+        "a refusal performs no Discord mutation: {:?}",
+        mock.paths()
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn moderation_resolve_refuses_departed_kick_target() {
+    let Some(db) = database().await else { return };
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    set_moderation_flags(true);
+    let mock = MockMembers::start(200, false).await;
+    let app = moderation_resolve_app(db.pool().clone(), &mock);
+    let (status, _, body) = answer(
+        app,
+        signed(
+            &moderation_payload("moderation.kick"),
+            "old",
+            "intent-resolve-departed",
+        ),
+    )
+    .await;
+    set_moderation_flags(false);
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "action_not_allowed");
+    assert_eq!(body["error"]["retryable"], false);
+    let paths = mock.paths();
+    assert!(
+        paths.iter().any(|path| path.contains(RESOLVE_TARGET_ID)),
+        "the departed target must be observed, not synthesized: {paths:?}"
+    );
+    assert!(
+        !mock.methods().iter().any(|method| method != "GET"),
+        "a refusal performs no Discord mutation: {paths:?}"
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn moderation_snapshot_unavailable_stays_fenced_without_effect() {
+    let Some(db) = database().await else { return };
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    set_moderation_flags(true);
+    let mock = MockMembers::start(500, true).await;
+    let app = moderation_resolve_app(db.pool().clone(), &mock);
+    let raw = moderation_payload("moderation.ban");
+    let (status, _, refusal) = answer(
+        app.clone(),
+        signed(&raw, "old", "intent-resolve-unavailable"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(refusal["error"]["code"], "needs_reconciliation");
+    assert_eq!(refusal["error"]["retryable"], false);
+    let calls = mock.paths().len();
+    // Same intent, fresh nonce: the claim is retained for reconciliation, so
+    // the snapshot is not re-read and no effect runs.
+    let (status, _, replay) = answer(
+        app,
+        signed_with_nonce(&raw, "new", &nonce(), "intent-resolve-unavailable"),
+    )
+    .await;
+    set_moderation_flags(false);
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(replay["error"]["code"], "needs_reconciliation");
+    assert_eq!(
+        mock.paths().len(),
+        calls,
+        "reconciliation replays must not touch Discord again"
     );
     db.close().await.unwrap();
 }

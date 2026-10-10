@@ -610,6 +610,11 @@ impl ReceiverState {
 /// settings store. Invalid enabled moderation configuration is fatal, like
 /// the receiver bind itself; a disabled executor still constructs and refuses
 /// every moderation call with `action_not_allowed`.
+///
+/// The moderation settings (gates, audit secret) parse only when the website
+/// verbs are enabled: a disabled executor never touches policy or secrets, so
+/// malformed moderation settings must not fail the bind while every website
+/// verb stays refused.
 fn moderation_executor_from_env(
     pool: sqlx::PgPool,
     discord: ActionExecutor,
@@ -627,18 +632,32 @@ fn moderation_executor_from_env(
     ]
     .iter()
     .all(|verb| flags.is_enabled(verb));
-    let gates = ModerationGates::from_map(&vars).map_err(|e| e.to_string())?;
-    if enabled && !gates.enabled {
-        return Err("moderation flag without TWO_MODERATION".to_owned());
-    }
-    let policy = ModerationPolicy {
-        owen_user_id: gates.owen_user_id,
-        protected_role_ids: gates.protected_role_ids,
-        bot_user_id: None,
+    let (policy, audit_secret) = if enabled {
+        let gates = ModerationGates::from_map(&vars).map_err(|e| e.to_string())?;
+        if !gates.enabled {
+            return Err("moderation flag without TWO_MODERATION".to_owned());
+        }
+        let audit_secret = moderation_audit_secret(&vars, None)
+            .map_err(|e| e.to_string())?
+            .map(|s| s.expose().to_owned());
+        (
+            ModerationPolicy {
+                owen_user_id: gates.owen_user_id,
+                protected_role_ids: gates.protected_role_ids,
+                bot_user_id: None,
+            },
+            audit_secret,
+        )
+    } else {
+        (
+            ModerationPolicy {
+                owen_user_id: String::new(),
+                protected_role_ids: std::collections::HashSet::new(),
+                bot_user_id: None,
+            },
+            None,
+        )
     };
-    let audit_secret = moderation_audit_secret(&vars, None)
-        .map_err(|e| e.to_string())?
-        .map(|s| s.expose().to_owned());
     let store = PgMemberModerationStore::new(pool, guild_id.clone());
     let inner = InternalMemberExecutor::new(
         store,
