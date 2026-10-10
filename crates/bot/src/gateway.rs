@@ -1231,12 +1231,22 @@ pub async fn run_shard<I: InviteSource + 'static>(
                 return;
             }
             let operation = match work {
-                ReceivedWork::Clear(deadline) => handle.block_on(checkpoint_io(
-                    &worker_state,
-                    &generation,
-                    deadline,
-                    store.clear(),
-                )),
+                ReceivedWork::Clear(deadline) => {
+                    let cleared = handle.block_on(checkpoint_io(
+                        &worker_state,
+                        &generation,
+                        deadline,
+                        store.clear(),
+                    ));
+                    if cleared.is_err() {
+                        // A failed checkpoint clear stops the worker like any
+                        // other failed commit; count it for the M2.1 alert
+                        // hook under the `commit` stage (a durable store
+                        // write failing).
+                        two_bot_core::metrics::global().checkpoint_failure("commit");
+                    }
+                    cleared
+                }
                 ReceivedWork::Failed(error) => Err(error),
                 ReceivedWork::Dispatch {
                     dispatch,

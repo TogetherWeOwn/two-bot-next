@@ -41,7 +41,7 @@ table and the test are updated together.
 | `two_bot_dispatch_drops_total{lane}` | 6 | `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` |
 | `two_bot_gateway_checkpoint_failures_total{stage}` | 2 | `pre_commit`, `commit` |
 | `two_bot_internal_actions_total{family,outcome}` | 72 | 6 families x 12 outcomes (`announcement`, `event`, `settings`, `moderation`, `membership`, `other` x `executed` + 11 refusal classes) |
-| `# HELP` / `# TYPE` headers | 50 | 25 families x 2 |
+| `# HELP` / `# TYPE` headers | 52 | 26 families x 2 |
 
 ## Per-event caps (gateway metric labels)
 
