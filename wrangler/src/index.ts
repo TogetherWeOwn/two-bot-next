@@ -44,7 +44,13 @@ import {
   parseMappingsSnapshot,
 } from "./redirect-store.ts";
 import { connectPostgres } from "./redirect-db.ts";
-import { forwardedFlagVars, type ForwardedFlagEnv } from "./container-env.ts";
+import {
+  forwardedDiscordIdVars,
+  forwardedFlagVars,
+  isSnowflake,
+  type ForwardedDiscordIdEnv,
+  type ForwardedFlagEnv,
+} from "./container-env.ts";
 import {
   ACTIONS_PATH,
   CONTAINER_MARKER,
@@ -71,8 +77,11 @@ import {
   type MetricsAlertState,
 } from "./alert-rules.ts";
 
-/** Plus the optional reviewed TWO_* flags in container-env.ts (TOG-12020). */
-export interface Env extends ForwardedFlagEnv {
+/**
+ * Plus the optional reviewed TWO_* flags in container-env.ts (TOG-12020) and
+ * the optional reviewed DISCORD_* snowflake IDs there (TOG-19025, M3.6).
+ */
+export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   TWO_BOT: DurableObjectNamespace<TwoBotContainer>;
   /** Cloudflare version identity, never a client-supplied owner name. */
   CF_VERSION_METADATA?: { id: string };
@@ -84,9 +93,14 @@ export interface Env extends ForwardedFlagEnv {
   TWO_AUTOMATIONS?: string;
   TWO_TEXT_COMMANDS?: string;
   TWO_AUTOMOD?: string;
-  // Explicit: not a TWO_* flag, so outside the container-env allowlist.
+  // Explicit: not a TWO_* flag, so outside the flag allowlist. Validated as
+  // a snowflake before forwarding (see containerEnvVars below).
   DISCORD_APPLICATION_ID?: string;
-  /** Infrastructure ID protected from temporary-room deletion. */
+  /**
+   * Infrastructure ID protected from temporary-room deletion. Declared here
+   * for its doc comment; forwarded via FORWARDED_DISCORD_IDS like the other
+   * non-secret DISCORD_* IDs (TOG-19025).
+   */
   DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID?: string;
   BOT_PORT?: string;
   KEEPALIVE_SECONDS?: string;
@@ -151,6 +165,27 @@ function missCacheFor(env: Env): RedirectMissCache {
 // the Worker and is unaffected.
 const healthBuckets = new TokenBuckets();
 
+// Attempt cap for the authenticated /ops/metrics scrape. Every attempt takes
+// one token synchronously before the secret comparison, so a burst of
+// concurrent guesses cannot share a single token across many comparisons
+// (the comparison awaits digests, during which other in-flight requests would
+// otherwise all pass a read-only precheck). An exhausted caller is refused
+// without any comparison, so guessing cannot confirm a bearer while
+// throttled. Buckets are per caller (as with the probe cap), so another
+// caller's guessing cannot throttle a correct bearer — even a caller shed
+// only because the 10,000-entry table is full is still compared, so a scanner
+// flood cannot lock out the authenticated scraper; a correct bearer from
+// the same exhausted caller waits out the retry-after like any other request.
+// A correct bearer consumes one token per scrape, which the production
+// scraper (~1/15 s against a 10-burst/1-per-second bucket) never nears.
+// CONTROL_PATH deliberately shares nothing here: it is a separate ownership
+// gate whose token already requires 32 characters (see ownership.ts
+// authenticated()), and its lockout semantics belong to that fence.
+const metricsAuthBuckets = new TokenBuckets({ capacity: 10, refillPerSecond: 1 });
+// A short scrape token is an operator misconfiguration, not per-request
+// information: say so once per isolate so scanners cannot flood the logs.
+let metricsShortTokenLogged = false;
+
 // Store instances are request-scoped, but the lookup cache must survive
 // across requests to blunt repeated lookups — so it lives here beside the
 // miss cache, keyed (and reset) on the same configuration identity. A changed
@@ -198,6 +233,16 @@ const DEFAULT_UNREADY_SECONDS = 600;
 const READINESS_KEY = "two-bot:readiness";
 const METRICS_ALERT_KEY = "two-bot:metrics-alerts";
 const OPS_METRICS_PATH = "/ops/metrics";
+// The scrape token follows the ownership control token's floor: anything
+// shorter is treated as not configured. A short staging token must be
+// reissued, never padded (none is provisioned today).
+const MIN_SCRAPE_TOKEN_LENGTH = 32;
+// The DO serves the scrape from inside blockConcurrencyWhile, so the
+// container fetch must be bounded well below the 30s DO gate.
+const METRICS_FETCH_TIMEOUT_MS = 6000;
+// Prometheus exposition is small; cap the proxied body so a compromised or
+// wedged container cannot exhaust the isolate reading it.
+const MAX_METRICS_BODY_BYTES = 64 * 1024;
 
 /** Compare via digests so length/prefix timing does not leak the token. */
 async function tokenMatches(provided: string, expected: string): Promise<boolean> {
@@ -237,6 +282,32 @@ function isBotProbeResponse(response: Response): boolean {
 const FAILURE_TOKEN = /^[a-z0-9_]{1,32}$/;
 const MAX_PROBE_BODY_BYTES = 64 * 1024;
 
+/**
+ * Read at most `limit` bytes as text. Returns null when the body is larger
+ * (drained first so the SDK proxy pipe is not left hanging), so an oversized
+ * container response can be refused without buffering it.
+ */
+async function readBoundedText(response: Response, limit: number): Promise<string | null> {
+  const reader = response.body?.getReader();
+  if (!reader) return "";
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > limit) {
+      await reader.cancel().catch(() => {});
+      return null;
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return new TextDecoder().decode(bytes);
+}
+
 function gatewayFailure(body: ArrayBuffer): { phase: string; class: string } | null {
   if (body.byteLength > MAX_PROBE_BODY_BYTES) return null;
   try {
@@ -264,12 +335,16 @@ function containerPort(raw: string | undefined): number {
 }
 
 // Non-TWO_* container input: application ID for command registry sync.
-// The TWO_* publication flags ride the reviewed container-env allowlist.
+// The TWO_* publication flags ride the reviewed container-env flag allowlist;
+// the non-secret DISCORD_* IDs ride FORWARDED_DISCORD_IDS there (TOG-19025).
 const APPLICATION_ID_KEY = "DISCORD_APPLICATION_ID" as const;
 
 /** Readonly view of the secrets/vars the DO forwards into the container. */
 function containerEnvVars(env: Env, port: number): Record<string, string> {
-  const vars: Record<string, string> = forwardedFlagVars(env);
+  const vars: Record<string, string> = {
+    ...forwardedFlagVars(env),
+    ...forwardedDiscordIdVars(env),
+  };
   if (env.DISCORD_TOKEN) vars["DISCORD_TOKEN"] = env.DISCORD_TOKEN;
   if (env.DATABASE_URL) vars["DATABASE_URL"] = env.DATABASE_URL;
   if (env.GUILD_ID) vars["GUILD_ID"] = env.GUILD_ID;
@@ -284,10 +359,14 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
   if (env.TWO_AUTOMOD !== undefined) {
     vars["TWO_AUTOMOD"] = env.TWO_AUTOMOD;
   }
+  // Application ID is a public snowflake, not a secret: forward it only when
+  // it parses as one, so a typo cannot fail the command registry sync closed
+  // with a confusing error. The session lobby ID rides FORWARDED_DISCORD_IDS
+  // above (already merged and validated).
   const applicationId = env[APPLICATION_ID_KEY];
-  if (applicationId !== undefined) vars[APPLICATION_ID_KEY] = applicationId;
-  const lobbyId = env.DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID;
-  if (lobbyId !== undefined) vars["DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID"] = lobbyId;
+  if (typeof applicationId === "string" && isSnowflake(applicationId)) {
+    vars[APPLICATION_ID_KEY] = applicationId;
+  }
   vars["LISTEN_ADDR"] = `0.0.0.0:${port}`;
   // Private internal-actions receiver (TOG-12980, bind TOG-16851). Dark unless
   // the Operator sets TWO_INTERNAL_ACTIONS to exactly "1"; any other value
@@ -386,8 +465,46 @@ export class TwoBotContainer extends Container<Env> {
         // Reached only through the Worker's bearer-token gate (see default export).
         if (url.pathname === OPS_METRICS_PATH) {
           await this.armKeepalive();
-          const upstream = await this.containerFetch("http://c/metrics");
-          return new Response(await upstream.text(), {
+          // The SDK resolves fetch failures (including the abort timeout) as
+          // a 500/503/429 Response, so a catch alone never fires. Treat an
+          // aborted signal or any non-2xx upstream as a 504 with a generic
+          // body, and drain the SDK error text instead of proxying it.
+          const fetchSignal = AbortSignal.timeout(METRICS_FETCH_TIMEOUT_MS);
+          const metricsUnavailable = (status: number) =>
+            new Response("metrics unavailable\n", {
+              status,
+              headers: { "content-type": "text/plain", "cache-control": "no-store" },
+            });
+          let upstream: Response;
+          try {
+            upstream = await this.containerFetch("http://c/metrics", {
+              signal: fetchSignal,
+            });
+          } catch {
+            return metricsUnavailable(504);
+          }
+          if (fetchSignal.aborted || !upstream.ok) {
+            // Cancel without reading: a huge non-2xx body must not bypass
+            // the 64 KiB cap by being drained here.
+            await upstream.body?.cancel().catch(() => {});
+            return metricsUnavailable(504);
+          }
+          let body: string | null;
+          try {
+            body = await readBoundedText(upstream, MAX_METRICS_BODY_BYTES);
+          } catch {
+            return new Response("metrics unavailable\n", {
+              status: 504,
+              headers: { "content-type": "text/plain", "cache-control": "no-store" },
+            });
+          }
+          if (body === null) {
+            return new Response("metrics unavailable\n", {
+              status: 502,
+              headers: { "content-type": "text/plain", "cache-control": "no-store" },
+            });
+          }
+          return new Response(body, {
             status: upstream.status,
             headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8", "cache-control": "no-store" },
           });
@@ -831,12 +948,57 @@ export default {
       return result;
     }
 
-    // Authenticated off-container scrape path. No configured token → 404 (the
-    // route does not exist); missing/wrong bearer → 401. Exact path only.
+    // Authenticated off-container scrape path. No configured token (or one
+    // shorter than the 32-character floor — same bar as the ownership
+    // control token) → 404 (the route does not exist); missing/wrong
+    // bearer → 401, with per-caller throttling of attempts (429 +
+    // retry-after). Every attempt takes a token synchronously before the
+    // secret comparison, so concurrent guesses cannot share one token; a
+    // throttled caller is refused without any comparison, so guessing cannot
+    // confirm a bearer while exhausted. Buckets are per caller, so someone
+    // else's guessing cannot throttle a correct bearer — and a caller shed
+    // only because the caller table is full is still compared, so a scanner
+    // flood cannot lock out the authenticated scraper. Exact path only.
+    // CONTROL_PATH keeps its own gate (ownership.ts authenticated()): it
+    // shares neither this bucket nor its budget.
     if (url.pathname === OPS_METRICS_PATH) {
-      if (!env.METRICS_SCRAPE_TOKEN || request.method !== "GET") return new Response("not found", { status: 404 });
+      if (!env.METRICS_SCRAPE_TOKEN || env.METRICS_SCRAPE_TOKEN.length < MIN_SCRAPE_TOKEN_LENGTH
+        || request.method !== "GET") {
+        if (env.METRICS_SCRAPE_TOKEN && env.METRICS_SCRAPE_TOKEN.length < MIN_SCRAPE_TOKEN_LENGTH
+          && !metricsShortTokenLogged) {
+          metricsShortTokenLogged = true;
+          console.error(JSON.stringify({
+            event: "metrics_scrape_token_misconfigured",
+            reason: "token_below_minimum_length",
+            minimum_length: MIN_SCRAPE_TOKEN_LENGTH,
+          }));
+        }
+        return new Response("not found", { status: 404 });
+      }
+      const caller = request.headers.get("cf-connecting-ip") ?? "unknown";
+      // Take budget synchronously before the secret comparison: no guess —
+      // right or wrong — is evaluated while throttled, and concurrent
+      // guesses each consume their own token instead of sharing one across
+      // the awaited digest comparison below. A correct bearer on a fresh
+      // budget is unaffected (one token of a 10-burst).
+      const verdict = metricsAuthBuckets.take(caller);
+      if (!verdict.allowed && !metricsAuthBuckets.peek(caller).allowed) {
+        // Tracked caller out of budget (or in terminal hold): refuse without
+        // any comparison, so guessing cannot confirm a bearer while
+        // exhausted. peek is synchronous, so this cannot race the take above.
+        // An untracked caller denied only because the caller table is full
+        // falls through to the comparison below instead, so a flood of
+        // one-time scanners can never lock out the authenticated scraper.
+        return new Response("slow down\n", {
+          status: 429,
+          headers: {
+            "content-type": "text/plain",
+            "retry-after": String(verdict.retryAfter),
+          },
+        });
+      }
       const m = /^Bearer (.+)$/.exec(request.headers.get("authorization") ?? "");
-      if (!m || !(await tokenMatches(m[1]!, env.METRICS_SCRAPE_TOKEN))) {
+      if (!m || m[1]!.length > 4096 || !(await tokenMatches(m[1]!, env.METRICS_SCRAPE_TOKEN))) {
         return new Response("unauthorized", { status: 401, headers: { "www-authenticate": "Bearer" } });
       }
       try {
