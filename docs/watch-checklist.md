@@ -34,6 +34,7 @@ and the Worker (`packetFilename` in `wrangler/src/alert-rules.ts`).
 | `send_admission_blocked` | new send-admission refusals in 3 consecutive windows | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-send-admission-blocked) |
 | `voice_failures` | room-op failures > 5% of >= 10 ops between samples, or any new dead-letter/orphan | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-failures) |
 | `gateway_missed_events` | any increase of `two_bot_gateway_missed_events_total` between samples (first sample and restarts skip the window) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-gateway-missed-events) |
+| `gateway_unpaired_disconnect` | disconnects without a RESUMED or fresh READY for 3 consecutive samples (first sample and restarts re-baseline; clears at zero unpaired) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-gateway-unpaired-disconnect) |
 | `ticker_stale:<job>` | 15 s ticker with no success for more than 10 minutes (never-succeeded is ignored) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-ticker-stale) |
 | `receiver_refusals:<family>` | refused website-action outcomes rising in 3 consecutive samples per family (first sample and restarts clear the streak; `other` holds pre-auth refusals) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-receiver-refusals) |
 

@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import worker, { type Env } from "../src/index.ts";
 import {
   EMPTY_STATE, RULES, RUNBOOK_BASE_URL, evaluateMetrics, packetFilename, parseExposition, ruleFor, runbookUrl, transitionMessages,
+  type MetricsAlertState,
 } from "../src/alert-rules.ts";
 
 const NOW = 1_000_000;
@@ -135,6 +136,106 @@ test("gateway missed events fire on any increase, never on the first sample or a
   assert.deepEqual(ev([`two_bot_gateway_missed_events_total 2`], restart.state).firing, ["gateway_missed_events"]);
 });
 
+const gateway = (disconnects: number, recoveries: number, ready = 0) => [
+  `two_bot_gateway_disconnects_total ${disconnects}`,
+  `two_bot_gateway_resumes_total ${recoveries}`,
+  `two_bot_gateway_events_total{event="READY"} ${ready}`,
+];
+const UNPAIRED = "gateway_unpaired_disconnect";
+
+test("gateway unpaired: a reconnect that resumes within two samples never pages", () => {
+  const base = ev(gateway(0, 0));
+  const sameSample = ev(gateway(1, 1), base.state);
+  assert.deepEqual(sameSample.firing, []);
+  const nextSample = ev(gateway(2, 1), sameSample.state);
+  assert.deepEqual(nextSample.firing, []);
+  assert.deepEqual(ev(gateway(2, 2), nextSample.state).firing, []);
+  // A fresh READY pairs with a disconnect just like a RESUMED does.
+  const readyPaired = ev(gateway(3, 2, 1), ev(gateway(2, 2), nextSample.state).state);
+  assert.deepEqual(readyPaired.firing, []);
+  // Two samples without a recovery stay below the bound; the recovery lands on the second.
+  const late1 = ev(gateway(4, 2, 1), readyPaired.state);
+  const late2 = ev(gateway(4, 2, 1), late1.state);
+  assert.deepEqual([late1.firing, late2.firing], [[], []]);
+  assert.equal(late2.state.gatewayUnpairedStreak, 2);
+  assert.deepEqual(ev(gateway(4, 3, 1), late2.state).firing, []);
+});
+
+test("gateway unpaired pages on the third unpaired sample and resolves once recoveries catch up", () => {
+  const base = ev(gateway(0, 0));
+  const one = ev(gateway(1, 0), base.state);
+  const two = ev(gateway(1, 0), one.state);
+  assert.deepEqual([one.firing, two.firing], [[], []]);
+  const fire = ev(gateway(1, 0), two.state);
+  assert.deepEqual(fire.firing, [UNPAIRED]);
+  assert.deepEqual(ev(gateway(1, 0), fire.state).firing, [UNPAIRED]);
+  assert.deepEqual(ev(gateway(1, 1), fire.state).firing, []);
+});
+
+test("gateway unpaired: two disconnects against one recovery leave one unpaired, below the bound", () => {
+  const base = ev(gateway(0, 0));
+  const two = ev(gateway(2, 1), base.state);
+  assert.deepEqual(two.state.gatewayUnpaired, 1);
+  assert.deepEqual(two.firing, []);
+  assert.deepEqual(ev(gateway(2, 2), two.state).firing, []);
+});
+
+test("gateway unpaired never fires on the first sample, which only stores the baseline", () => {
+  const first = ev(gateway(5, 0));
+  assert.deepEqual(first.firing, []);
+  assert.equal(first.state.gatewayUnpaired, 0);
+  assert.deepEqual(ev(gateway(5, 0), first.state).firing, []);
+});
+
+test("gateway unpaired restart holds the firing key for one sample, then re-baselines", () => {
+  const base = ev(gateway(0, 0));
+  const fire = [1, 1, 1].reduce((s) => ev(gateway(1, 0), s.state), base);
+  assert.deepEqual(fire.firing, [UNPAIRED]);
+  // Counters went backwards: no window, so the sample neither pages nor clears.
+  const restart = ev(gateway(0, 1), fire.state);
+  assert.deepEqual(restart.firing, [UNPAIRED]);
+  assert.equal(restart.state.gatewayUnpaired, 0);
+  // Growth after the restart is measured from the new baseline and holds while unpaired.
+  const again = ev(gateway(1, 1), restart.state);
+  assert.deepEqual(again.firing, [UNPAIRED]);
+  assert.deepEqual(ev(gateway(1, 2), again.state).firing, []);
+});
+
+test("gateway unpaired restart never pages by itself", () => {
+  const base = ev(gateway(0, 0));
+  const pending = ev(gateway(1, 0), base.state);
+  const restart = ev(gateway(0, 0), pending.state);
+  assert.deepEqual(restart.firing, []);
+  const s1 = ev(gateway(1, 0), restart.state);
+  const s2 = ev(gateway(1, 0), s1.state);
+  assert.deepEqual([s1.firing, s2.firing], [[], []]);
+});
+
+test("gateway unpaired: missing, duplicated, or non-numeric samples never clear a firing state", () => {
+  let fired = ev(gateway(0, 0));
+  for (let i = 0; i < 3; i++) fired = ev(gateway(1, 0), fired.state);
+  assert.deepEqual(fired.firing, [UNPAIRED]);
+  const absent = ev([`two_bot_job_consecutive_failures{job="counter"} 0`], fired.state);
+  assert.deepEqual(absent.firing, [UNPAIRED]);
+  assert.deepEqual(absent.state.gatewayUnpaired, fired.state.gatewayUnpaired);
+  const nan = ev(["two_bot_gateway_disconnects_total NaN", "two_bot_gateway_resumes_total 0", `two_bot_gateway_events_total{event="READY"} 0`], fired.state);
+  assert.deepEqual(nan.firing, [UNPAIRED]);
+  const duplicated = ev([...gateway(1, 0), "two_bot_gateway_resumes_total 0"], fired.state);
+  assert.deepEqual(duplicated.firing, [UNPAIRED]);
+  assert.deepEqual(ev(gateway(1, 1), absent.state).firing, []);
+});
+
+test("gateway unpaired reads Durable Object state written before its fields existed", () => {
+  const legacy = {
+    firing: [] as string[], rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0,
+    voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false,
+    receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {},
+  } as MetricsAlertState;
+  const first = ev(gateway(7, 0), legacy);
+  assert.deepEqual(first.firing, []);
+  assert.deepEqual(ev(gateway(8, 0), first.state).firing, []);
+});
+
 test("receiver refusals need three consecutive windows with new refusals, never the first sample or a reset", () => {
   const refused = (family: string, outcome: string, n: number) =>
     `two_bot_internal_actions_total{family="${family}",outcome="${outcome}"} ${n}`;
@@ -206,7 +307,7 @@ test("ticker stale fires past 10 minutes, ignores boot, parked and fresh tickers
 test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   const window = "2026-10-09T20-11-06Z";
   // Single shared spelling with the Rust canonical list (ALERT_RULE_IDS in
-  // crates/core/src/evidence.rs); both sides pin all ten here and there.
+  // crates/core/src/evidence.rs); both sides pin all eleven here and there.
   assert.deepEqual(RULES.map((r) => r.id), [
     "job_stale",
     "job_consecutive_failures",
@@ -216,6 +317,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "send_admission_blocked",
     "voice_failures",
     "gateway_missed_events",
+    "gateway_unpaired_disconnect",
     "ticker_stale",
     "receiver_refusals",
   ]);
@@ -227,6 +329,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("send_admission_blocked", window), `evidence-send_admission_blocked-${window}.json`);
   assert.equal(packetFilename("voice_failures", window), `evidence-voice_failures-${window}.json`);
   assert.equal(packetFilename("gateway_missed_events", window), `evidence-gateway_missed_events-${window}.json`);
+  assert.equal(packetFilename("gateway_unpaired_disconnect", window), `evidence-gateway_unpaired_disconnect-${window}.json`);
   assert.equal(packetFilename("ticker_stale:scheduled_messages", window), `evidence-ticker_stale-${window}.json`);
   assert.equal(packetFilename("receiver_refusals:moderation", window), `evidence-receiver_refusals-${window}.json`);
   // Unknown keys get no filename rather than a misleading one; hostile
@@ -283,6 +386,9 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
       ev([`two_bot_gateway_missed_events_total 0`]).state,
     ).firing,
   );
+  let unpaired = ev(gateway(0, 0));
+  for (let i = 0; i < 3; i++) unpaired = ev(gateway(1, 0), unpaired.state);
+  firing.push(...unpaired.firing);
   firing.push(
     ...ev([`two_bot_job_last_success_timestamp_seconds{job="scheduled_messages"} ${NOW - 601}`]).firing,
   );

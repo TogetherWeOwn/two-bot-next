@@ -45,6 +45,15 @@ table only says what each tier means and how fast a human moves.
 | SEV-1 page | Budget-burning or safety-threatening now | Sustained error bleed both windows over burn rate; gateway session loss (unpaired disconnect, missed-event increase, session-start budget exhausted); pool pressure or job failures persisting across a checkpoint; irreconcilable data/registry drift; any rollback trigger from the runbook | Wake the owner role at once; freeze writers; work the runbook |
 | SEV-2 ticket | Degraded but bounded, watch closely | Single-window breach that the confirming window does not sustain; warn-level observation from the dashboard queries; one overdue sanction with a named disposition and a near-term due time; slow resource drift inside placement caps | Record a watch row and a ticket; triage within the shift; escalate to SEV-1 if half the watch error budget is spent or the signal persists across two consecutive long windows |
 
+The unpaired-disconnect case of the gateway session-loss row now has an
+automated rule: `gateway_unpaired_disconnect` fires when disconnects have no
+RESUMED or fresh READY for 3 consecutive keepalive samples (runbook:
+[gateway unpaired disconnect](runbook.md#alert-gateway-unpaired-disconnect)).
+It is evaluated on every keepalive scrape and posts to the ops alert webhook only when
+`OPS_ALERT_FORWARDING` is `"on"`; each transition is still logged as a
+`metrics_alert` event either way. Missed-event increases stay on
+`gateway_missed_events`. Both are SEV-1 when they fire.
+
 A missed budget at any tier is an incident, never permission to skip
 reconciliation. Silence a page only with a recorded decision on the
 execution card.
