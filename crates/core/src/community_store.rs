@@ -872,7 +872,7 @@ mod tests {
         let start_meta = start.metadata.expect("start metadata");
         assert!(
             start_meta.contains(&format!("\"sessionKey\":\"{key}\"")),
-            "start carries its session key: {start_meta}"
+            "start carries its session key"
         );
 
         // A supplied key survives (the gateway tracker's durable key), so a
@@ -908,7 +908,7 @@ mod tests {
             "\"durationSeconds\":330",
             "\"startKnown\":true",
         ] {
-            assert!(end_meta.contains(field), "end carries {field}: {end_meta}");
+            assert!(end_meta.contains(field), "end carries expected field");
         }
 
         // End without a seen start: honest unknown, never a fabricated start.
@@ -927,11 +927,11 @@ mod tests {
             orphan_meta.contains("\"startedAt\":null")
                 && orphan_meta.contains("\"durationSeconds\":null")
                 && orphan_meta.contains("\"startKnown\":false"),
-            "orphan end is honestly unknown: {orphan_meta}"
+            "orphan end is honestly unknown"
         );
         assert!(
             !orphan_meta.contains("2026-09-02T10:00:00.000Z"),
-            "no start is invented: {orphan_meta}"
+            "no start is invented"
         );
     }
 

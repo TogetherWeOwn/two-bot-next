@@ -472,15 +472,15 @@ async fn community_voice_fact_capture_round_trip() {
     .unwrap();
     assert!(
         session_key.starts_with(&format!("{GUILD}:{MEMBER}:")),
-        "session key binds guild and member: {session_key}"
+        "session key binds guild and member"
     );
     assert!(
         session_key.ends_with(&format!(":{VOICE_CHANNEL}")),
-        "session key binds channel: {session_key}"
+        "session key binds channel"
     );
     assert!(
         metadata.contains(&format!("\"sessionKey\":\"{session_key}\"")),
-        "start carries its session key: {metadata}"
+        "start carries its session key"
     );
 
     // Leave 330 s later: one measured end with honest duration math.
@@ -511,7 +511,7 @@ async fn community_voice_fact_capture_round_trip() {
         "\"durationSeconds\":330",
         "\"startKnown\":true",
     ] {
-        assert!(row.2.contains(field), "end carries {field}: {}", row.2);
+        assert!(row.2.contains(field), "end carries expected field");
     }
 
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM community_facts")

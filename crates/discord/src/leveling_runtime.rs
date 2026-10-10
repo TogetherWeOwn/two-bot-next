@@ -196,9 +196,7 @@ impl FactsSink for DeferredCommunityFacts {
 
     fn record_voice_started(&self, fact: VoiceStartedFact<'_>) -> Option<String> {
         let mut state = self.0.lock().expect("community facts lock");
-        if state.pool.is_none() {
-            return None;
-        }
+        state.pool.as_ref()?;
         // Bots are classified and captured here; the funnel gate in
         // `on_voice_join` already keeps them out of the XP/activity counts,
         // so this sink never filters. The durable session key is generated
