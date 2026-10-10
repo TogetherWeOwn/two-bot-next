@@ -2711,6 +2711,7 @@ async fn import_automations(
             let terminal = TerminalResponse::Success {
                 resource_id: None,
                 affected,
+                outcome: None,
             };
             if state.store.finish(&claim, &terminal).await.is_err() {
                 let _ = state.store.mark_unknown(&claim).await;
