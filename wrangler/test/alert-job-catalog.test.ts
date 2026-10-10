@@ -1,14 +1,16 @@
 /** Job-catalog drift guard (TOG-12376). `evaluateMetrics` silently skips the
- * `job_stale` rule for any job without an entry in `JOB_INTERVAL_SECONDS`, so
- * every label in the Rust `JOBS` allowlist (`crates/core/src/metrics.rs`) must
- * either have a cadence equal to its registered Rust `*_INTERVAL_MS / 1000` or
- * an explicit, reasoned exemption, and `docs/metrics.md` must list every label.
+ * `job_stale` rule for any job without an entry in `JOB_INTERVAL_SECONDS` and
+ * the `ticker_stale` rule for any job outside `TICKER_STALE_JOBS`, so every
+ * label in the Rust `JOBS` allowlist (`crates/core/src/metrics.rs`) must have
+ * a cadence equal to its registered Rust `*_INTERVAL_MS / 1000`, ticker_stale
+ * coverage with a reason, or an explicit, reasoned exemption, and
+ * `docs/metrics.md` must list every label.
  * Reads the Rust sources as text; never compiles or runs anything.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
-import { JOB_INTERVAL_SECONDS } from "../src/alert-rules.ts";
+import { JOB_INTERVAL_SECONDS, TICKER_STALE_JOBS, TICKER_STALE_SECONDS } from "../src/alert-rules.ts";
 
 const root = new URL("../../", import.meta.url);
 const read = (path: string) => readFileSync(new URL(path, root), "utf8");
@@ -17,14 +19,17 @@ const websiteJobsRs = read("crates/bot/src/website_jobs.rs");
 const communityJobsRs = read("crates/bot/src/community_jobs.rs");
 const metricsMd = read("docs/metrics.md");
 
-/** Labels with no fixed cadence, so `job_stale` cannot apply to them. */
+/** Labels with no fixed cadence, so neither `job_stale` nor `ticker_stale` applies. */
 const STALE_EXEMPT = new Map<string, string>([
   ["invite_snapshot", "no periodic caller; stays zero until a real caller records a completion"],
   ["session_checkpoint", "event-driven: one success per durable gateway commit, not a scheduled tick"],
   ["other", "catch-all for unknown job names; unrelated jobs share it, so no single cadence exists"],
-  ["audit_retry", "supervisor sweep with its own 30 s loop and parked/halt reporting in audit_runtime.rs; not registered through the website/community schedulers this catalog parses"],
-  ["scheduled_messages", "15 s ticker registered in scheduled_jobs.rs, not the website/community schedulers this catalog parses; at STALE_INTERVALS=2 a staleness rule would be noisy and needs its own threshold"],
-  ["settings", "DB-only 15 s version poll registered in settings_jobs.rs, not the website/community schedulers this catalog parses; parked without DATABASE_URL, so at STALE_INTERVALS=2 a staleness rule would be noisy and needs its own threshold"],
+  ["audit_retry", "stays exempt from ticker_stale: 30 s supervisor sweep with parked/halt reporting in audit_runtime.rs (parked when unconfigured, halt claims nothing); a wedged sweep that keeps failing surfaces via job_consecutive_failures, and a halted sweep is intentional, not a wedge; not registered through the website/community schedulers this catalog parses"],
+]);
+/** 15 s tickers covered by `ticker_stale` (TICKER_STALE_SECONDS window), not `job_stale`. */
+const TICKER_COVERED = new Map<string, string>([
+  ["scheduled_messages", "15 s ticker registered in scheduled_jobs.rs; covered by ticker_stale, not the website/community schedulers this catalog parses"],
+  ["settings", "DB-only 15 s version poll registered in settings_jobs.rs, parked without DATABASE_URL; covered by ticker_stale, not the website/community schedulers this catalog parses"],
 ]);
 
 function parseJobs(source: string): string[] {
@@ -95,11 +100,12 @@ interface Catalog {
   jobs: readonly string[];
   rust: ReadonlyMap<string, number>;
   worker: Readonly<Record<string, number>>;
+  ticker: ReadonlyMap<string, string>;
   exempt: ReadonlyMap<string, string>;
 }
 
-/** Every mismatch between the Rust allowlist/cadences and the Worker table. */
-function catalogGaps({ jobs, rust, worker, exempt }: Catalog): string[] {
+/** Every mismatch between the Rust allowlist/cadences and the Worker tables. */
+function catalogGaps({ jobs, rust, worker, ticker, exempt }: Catalog): string[] {
   const gaps: string[] = [];
   const cadence = new Map(Object.entries(worker));
   for (const job of jobs) {
@@ -107,15 +113,23 @@ function catalogGaps({ jobs, rust, worker, exempt }: Catalog): string[] {
     if (reason !== undefined) {
       if (reason.trim() === "") gaps.push(`${job}: exemption has no reason`);
       if (cadence.has(job)) gaps.push(`${job}: both exempt and in JOB_INTERVAL_SECONDS`);
+      if (ticker.has(job)) gaps.push(`${job}: both exempt and covered by ticker_stale`);
+      continue;
+    }
+    if (ticker.has(job)) {
+      const why = ticker.get(job)!;
+      if (why.trim() === "") gaps.push(`${job}: ticker coverage has no reason`);
+      if (cadence.has(job)) gaps.push(`${job}: both covered by ticker_stale and in JOB_INTERVAL_SECONDS`);
       continue;
     }
     const seconds = cadence.get(job);
     const expected = rust.get(job);
-    if (seconds === undefined) gaps.push(`${job}: no JOB_INTERVAL_SECONDS cadence and no exemption, so job_stale never fires`);
+    if (seconds === undefined) gaps.push(`${job}: no JOB_INTERVAL_SECONDS cadence, no ticker_stale coverage and no exemption, so no staleness rule ever fires`);
     else if (expected === undefined) gaps.push(`${job}: no Rust scheduler registration to take a cadence from`);
     else if (seconds !== expected) gaps.push(`${job}: JOB_INTERVAL_SECONDS ${seconds}s != Rust ${expected}s`);
   }
   for (const job of cadence.keys()) if (!jobs.includes(job)) gaps.push(`${job}: cadence for a label outside Rust JOBS`);
+  for (const job of ticker.keys()) if (!jobs.includes(job)) gaps.push(`${job}: ticker_stale coverage for a label outside Rust JOBS`);
   for (const job of exempt.keys()) if (!jobs.includes(job)) gaps.push(`${job}: exemption for a label outside Rust JOBS`);
   for (const job of rust.keys()) if (!jobs.includes(job)) gaps.push(`${job}: registered job missing from Rust JOBS`);
   return gaps;
@@ -123,7 +137,7 @@ function catalogGaps({ jobs, rust, worker, exempt }: Catalog): string[] {
 
 const JOBS = parseJobs(metricsRs);
 const RUST = rustCadenceSeconds();
-const real: Catalog = { jobs: JOBS, rust: RUST, worker: JOB_INTERVAL_SECONDS, exempt: STALE_EXEMPT };
+const real: Catalog = { jobs: JOBS, rust: RUST, worker: JOB_INTERVAL_SECONDS, ticker: TICKER_COVERED, exempt: STALE_EXEMPT };
 
 test("parses the full Rust job allowlist and every registered cadence", () => {
   assert.deepEqual(JOBS, [
@@ -138,8 +152,20 @@ test("parses the full Rust job allowlist and every registered cadence", () => {
   });
 });
 
-test("every Rust JOBS label has a matching job_stale cadence or a reasoned exemption", () => {
+test("every Rust JOBS label has a matching staleness cadence, ticker coverage or a reasoned exemption", () => {
   assert.deepEqual(catalogGaps(real), []);
+});
+
+test("the 15 s tickers are covered by ticker_stale with an explicit 10-minute window", () => {
+  assert.equal(TICKER_STALE_SECONDS, 600);
+  assert.deepEqual([...TICKER_STALE_JOBS].sort(), ["scheduled_messages", "settings"]);
+  assert.deepEqual([...TICKER_COVERED.keys()].sort(), [...TICKER_STALE_JOBS].sort());
+  for (const job of TICKER_STALE_JOBS) {
+    assert.ok(JOBS.includes(job), `${job}: ticker_stale covers a label outside Rust JOBS`);
+    assert.ok(!Object.hasOwn(JOB_INTERVAL_SECONDS, job), `${job}: covered by both ticker_stale and JOB_INTERVAL_SECONDS`);
+    assert.ok(!STALE_EXEMPT.has(job), `${job}: covered by both ticker_stale and an exemption`);
+  }
+  assert.ok(STALE_EXEMPT.has("audit_retry"), "audit_retry keeps its reasoned exemption");
 });
 
 test("a new Rust job without a cadence fails the catalog", () => {
@@ -147,7 +173,7 @@ test("a new Rust job without a cadence fails the catalog", () => {
   const jobs = parseJobs(metricsRs.replace(header, `${header}\n    "fake_job",`));
   assert.ok(jobs.includes("fake_job"), "fixture did not inject the fake job");
   assert.deepEqual(catalogGaps({ ...real, jobs }), [
-    "fake_job: no JOB_INTERVAL_SECONDS cadence and no exemption, so job_stale never fires",
+    "fake_job: no JOB_INTERVAL_SECONDS cadence, no ticker_stale coverage and no exemption, so no staleness rule ever fires",
   ]);
 });
 
@@ -160,11 +186,11 @@ test("a cadence drift on either side fails the catalog", () => {
   ]);
   const { counter: _, ...withoutCounter } = JOB_INTERVAL_SECONDS;
   assert.deepEqual(catalogGaps({ ...real, worker: withoutCounter }), [
-    "counter: no JOB_INTERVAL_SECONDS cadence and no exemption, so job_stale never fires",
+    "counter: no JOB_INTERVAL_SECONDS cadence, no ticker_stale coverage and no exemption, so no staleness rule ever fires",
   ]);
 });
 
-test("exemptions and cadences stay inside the Rust allowlist", () => {
+test("exemptions, ticker coverage and cadences stay inside the Rust allowlist", () => {
   assert.deepEqual(catalogGaps({ ...real, worker: { ...JOB_INTERVAL_SECONDS, other: 60 } }), [
     "other: both exempt and in JOB_INTERVAL_SECONDS",
   ]);
@@ -173,6 +199,15 @@ test("exemptions and cadences stay inside the Rust allowlist", () => {
   ]);
   assert.deepEqual(catalogGaps({ ...real, exempt: new Map([...STALE_EXEMPT, ["other", " "]]) }), [
     "other: exemption has no reason",
+  ]);
+  assert.deepEqual(catalogGaps({ ...real, ticker: new Map([...TICKER_COVERED, ["retired", "gone"]]) }), [
+    "retired: ticker_stale coverage for a label outside Rust JOBS",
+  ]);
+  assert.deepEqual(catalogGaps({ ...real, exempt: new Map([...STALE_EXEMPT, ["settings", "double-covered"]]) }), [
+    "settings: both exempt and covered by ticker_stale",
+  ]);
+  assert.deepEqual(catalogGaps({ ...real, worker: { ...JOB_INTERVAL_SECONDS, settings: 15 } }), [
+    "settings: both covered by ticker_stale and in JOB_INTERVAL_SECONDS",
   ]);
 });
 

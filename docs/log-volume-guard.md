@@ -20,7 +20,7 @@ high-rate event without a cap row fails the suite.
   guild/member/channel ID, token, query string, body or message content ever
   becomes a label or a log field.
 
-## Cardinality budget: 285 samples
+## Cardinality budget: 287 samples
 
 `GET /metrics` renders this many non-comment samples from process start,
 before any traffic. Adding any series fails the pinned count until this
@@ -28,7 +28,7 @@ table and the test are updated together.
 
 | Family | Series | How |
 | --- | --- | --- |
-| `two_bot_gateway_events_total{event}` | 18 | `EVENTS` allowlist |
+| `two_bot_gateway_events_total{event}` | 20 | `EVENTS` allowlist |
 | reconnects, resumes, disconnects, missed | 4 | scalar counters |
 | `two_bot_gateway_latency_seconds` | 1 | gauge, `NaN` until measured |
 | `two_bot_handler_duration_seconds` | 11 | 8 buckets + `+Inf` + sum + count |
@@ -58,17 +58,19 @@ thresholds document for paging.
 | `GUILD_UPDATE` | steady | rare | never |
 | `GUILD_MEMBER_ADD` | steady | join rate of the guild | never |
 | `GUILD_MEMBER_REMOVE` | steady | leave rate of the guild | never |
-| `GUILD_MEMBER_UPDATE` | hot | unbounded; member churn | 5 |
+| `GUILD_MEMBER_UPDATE` | hot | unbounded; member churn | 7 |
 | `MESSAGE_CREATE` | hot | unbounded; busiest dispatch | 1 |
 | `MESSAGE_UPDATE` | hot | unbounded | 2 |
 | `MESSAGE_DELETE` | hot | unbounded | 3 |
+| `MESSAGE_REACTION_ADD` | hot | unbounded; self-role bursts on their own lane | 5 |
+| `MESSAGE_REACTION_REMOVE` | hot | unbounded; self-role bursts on their own lane | 6 |
 | `VOICE_STATE_UPDATE` | hot | unbounded; voice churn | 4 |
 | `INVITE_CREATE` | steady | rare | never |
 | `INVITE_DELETE` | steady | rare | never |
 | `INTERACTION_CREATE` | steady | user-driven rate | never |
 | `HEARTBEAT_ACK` | steady | ~1 per 45 s; the latency signal | never |
 | `GATEWAY_CLOSE` | session | ~0/hr; pairs with reconnects | never |
-| `other` | hot | collapsed unknowns; growth means a new Discord type arrived | 6, last: shedding the catchall blinds us |
+| `other` | hot | collapsed unknowns; growth means a new Discord type arrived | 8, last: shedding the catchall blinds us |
 
 ## Log-line classes (catalog traced messages)
 
@@ -106,7 +108,11 @@ Dispatch-lane saturation (TOG-19878) follows the same shed-meter shape: every
 attempted lane, while the `warn!` samples the first drop per 60 s per runtime.
 A burst is O(1) log lines with N counter increments. The six lane labels are
 class steady and never shed; growth means a lane is undersized or a burst
-needs the M2.1 alert rule, not a new label.
+needs the M2.1 alert rule, not a new label. The `reactions` lane additionally
+counts per-member fairness refusals (member at `PER_USER_IN_FLIGHT` slots with
+free lane slots), so `reactions` growth points at a hot member before an
+undersized lane; the M2.1 alert rule should treat `reactions` drops as
+member-hot until lane saturation is confirmed.
 
 Subscription facts that bound the top of the funnel: the bot never requests
 `GUILD_PRESENCES`, so presence arrives only through the hourly

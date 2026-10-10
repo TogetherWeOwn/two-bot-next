@@ -244,6 +244,14 @@ async fn connect_governed(
 async fn lane_holding_rest(seen: Arc<AtomicBool>, hold: Duration) -> MockRest {
     let held = Arc::new(AtomicBool::new(false));
     MockRest::with_responder(move |request| {
+        // RA-01 live-membership gate precedes the live-event read: echo the
+        // requested user so the gate sees a current member and reaches the
+        // scheduled-events hold below.
+        if request.method == "GET" && request.path.contains("/members/") {
+            let user = request.path.rsplit('/').next().unwrap_or("77");
+            let user = user.split('?').next().unwrap_or("77");
+            return ScriptedResponse::json(200, json!({"user": {"id": user}, "roles": []}));
+        }
         if request.method == "GET" && request.path.contains("scheduled-events") {
             seen.store(true, Ordering::Release);
             if !held.swap(true, Ordering::AcqRel) {
@@ -314,11 +322,16 @@ async fn queued_commands(
         None
     };
     let event = ScriptedResponse::json(200, json!({"id":EVENT,"guild_id":GUILD,"status":1}));
+    // RA-01: each RSVP completion does a live-membership GET before the
+    // live-event GET, so the scripted queue carries a member echo before each
+    // event. Actor id 77 matches `interaction()` above.
+    let member = ScriptedResponse::json(200, json!({"user": {"id": "77"}, "roles": []}));
     let rest = MockRest::start(
         vec![
             ScriptedResponse::json(200, json!({"id":"1111"})),
             ScriptedResponse::status(200),
             ScriptedResponse::status(204),
+            member.clone(),
             event.clone().delayed(if slow_database {
                 Duration::ZERO
             } else {
@@ -327,6 +340,7 @@ async fn queued_commands(
             ScriptedResponse::status(204),
             // Deferred original edits require ID-bearing 200 receipts.
             ScriptedResponse::json(200, json!({"id": "99"})),
+            member,
             event,
             ScriptedResponse::json(200, json!({"id": "99"})),
         ],
@@ -338,7 +352,7 @@ async fn queued_commands(
     ws.send(Message::text(interaction(2, "going").to_string()))
         .await
         .unwrap();
-    wait_requests(&rest, 4).await; // First defer and live-event read are underway.
+    wait_requests(&rest, 5).await; // First defer, membership, and live-event read are underway.
     let delivered = tokio::time::Instant::now();
     ws.send(Message::text(interaction(3, "interested").to_string()))
         .await
@@ -359,14 +373,14 @@ async fn queued_commands(
             .await
             .unwrap();
     }
-    wait_requests(&rest, 5).await;
+    wait_requests(&rest, 6).await;
     let requests = rest.requests();
-    assert!(requests[4]
+    assert!(requests[5]
         .path
         .ends_with("/interactions/3/mock-rsvp-3/callback"));
-    assert!(requests[4].received_at.duration_since(delivered) < Duration::from_secs(3));
+    assert!(requests[5].received_at.duration_since(delivered) < Duration::from_secs(3));
     assert_eq!(
-        serde_json::from_slice::<Value>(&requests[4].body).unwrap()["type"],
+        serde_json::from_slice::<Value>(&requests[5].body).unwrap()["type"],
         5
     );
     assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 1);
@@ -478,8 +492,8 @@ async fn queued_commands(
         2
     );
     let requests = rest.requests();
-    assert_eq!(requests.len(), 8);
-    for (index, content) in [(5, "RSVP saved: going."), (7, "RSVP saved: interested.")] {
+    assert_eq!(requests.len(), 10);
+    for (index, content) in [(6, "RSVP saved: going."), (9, "RSVP saved: interested.")] {
         assert_eq!(requests[index].method, "PATCH");
         assert_eq!(
             serde_json::from_slice::<Value>(&requests[index].body).unwrap()["content"],
@@ -493,7 +507,7 @@ async fn queued_commands(
             .unwrap();
         ws.send(Message::text(leave(7).to_string())).await.unwrap();
         wait_sequence(&db.store, 7).await;
-        assert_eq!(rest.requests().len(), 8);
+        assert_eq!(rest.requests().len(), 10);
         shutdown.send_replace(true);
         runner.await.unwrap().unwrap();
     }
@@ -547,6 +561,8 @@ async fn sticky_and_feed_are_deferred_at_receipt_while_rsvp_is_pending() {
             ScriptedResponse::json(200, json!({"id":"1111"})),
             ScriptedResponse::status(200),
             ScriptedResponse::status(204),
+            // RA-01: the RSVP membership echo precedes its live-event read.
+            ScriptedResponse::json(200, json!({"user": {"id": "77"}, "roles": []})),
             ScriptedResponse::json(200, json!({"id":EVENT,"guild_id":GUILD,"status":1}))
                 .delayed(Duration::from_millis(3200)),
         ],
@@ -559,7 +575,7 @@ async fn sticky_and_feed_are_deferred_at_receipt_while_rsvp_is_pending() {
     ws.send(Message::text(interaction(2, "going").to_string()))
         .await
         .unwrap();
-    wait_requests(&rest, 4).await;
+    wait_requests(&rest, 5).await;
     let delivered = tokio::time::Instant::now();
     let commands: Vec<_> = [(3, "sticky"), (4, "feed-remove")]
         .into_iter()
@@ -576,7 +592,7 @@ async fn sticky_and_feed_are_deferred_at_receipt_while_rsvp_is_pending() {
     for command in &commands {
         ws.send(Message::text(command.to_string())).await.unwrap();
     }
-    wait_requests(&rest, 8).await;
+    wait_requests(&rest, 9).await;
     let requests = rest.requests();
     for sequence in [3, 4] {
         let suffix = format!("/interactions/{sequence}/mock-rsvp-{sequence}/callback");
@@ -601,7 +617,7 @@ async fn sticky_and_feed_are_deferred_at_receipt_while_rsvp_is_pending() {
     assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 1);
     ws.send(Message::text(leave(5).to_string())).await.unwrap();
     wait_sequence(&db.store, 5).await;
-    assert_eq!(rest.requests().len(), 9); // No second dispatch at queue consumption.
+    assert_eq!(rest.requests().len(), 10); // No second dispatch at queue consumption.
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM announcements_audit_log")
             .fetch_one(&db.pool)
@@ -614,7 +630,7 @@ async fn sticky_and_feed_are_deferred_at_receipt_while_rsvp_is_pending() {
     }
     ws.send(Message::text(leave(6).to_string())).await.unwrap();
     wait_sequence(&db.store, 6).await;
-    assert_eq!(rest.requests().len(), 9);
+    assert_eq!(rest.requests().len(), 10);
     runner.abort();
     let _ = runner.await;
     drop(ws);
@@ -1022,6 +1038,11 @@ async fn handoff_rest(seen: Arc<AtomicBool>) -> MockRest {
     use std::sync::atomic::AtomicUsize;
     let calls = Arc::new(AtomicUsize::new(0));
     MockRest::with_responder(move |request| {
+        if request.method == "GET" && request.path.contains("/members/") {
+            let user = request.path.rsplit('/').next().unwrap_or("77");
+            let user = user.split('?').next().unwrap_or("77");
+            return ScriptedResponse::json(200, json!({"user": {"id": user}, "roles": []}));
+        }
         if request.method == "GET" && request.path.contains("scheduled-events") {
             seen.store(true, Ordering::Release);
             let call = calls.fetch_add(1, Ordering::AcqRel);
@@ -1119,6 +1140,11 @@ async fn receipt_callback_total_stays_inside_absolute_budget() {
     let seen = Arc::new(AtomicBool::new(false));
     let seen_probe = Arc::clone(&seen);
     let rest = MockRest::with_responder(move |request| {
+        if request.method == "GET" && request.path.contains("/members/") {
+            let user = request.path.rsplit('/').next().unwrap_or("77");
+            let user = user.split('?').next().unwrap_or("77");
+            return ScriptedResponse::json(200, json!({"user": {"id": user}, "roles": []}));
+        }
         if request.method == "GET" && request.path.contains("scheduled-events") {
             seen_probe.store(true, Ordering::Release);
             // Occupancy ends 100 ms before the receipt budget does, but the

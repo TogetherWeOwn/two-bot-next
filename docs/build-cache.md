@@ -272,6 +272,76 @@ cannot be held or scans cannot be complete, **skip deletion**. Never turn this
 command into unattended cron cleanup. Never prune the shared cache through this
 legacy-worktree audit.
 
+## Shared-pool lock-through-mutation retention (`retain`)
+
+The legacy `audit` above covers worktree targets only and **must never prune
+the shared pool**. Over-budget shared slots with dead recorded holders need a
+separate, reviewed retention path that holds exclusivity through the mutation
+itself: `scripts/cargo_cache.py retain`. It mutates **exact slot paths only**
+(`slot-N/target`, `slot-N/scratch`, `slot-N/lease.json`, then recreates empty
+`target`+`scratch`) while holding the SAME slot `lock` flock fd/inode from
+re-verify through deletion and recreation. It never releases-then-deletes,
+never replaces the lock file, and never touches `policy.json`, budgets,
+quotas, registries, services, or `/tmp`.
+
+Supply a fresh, complete, **host-scope** slot inventory (distinct `slots` key,
+not `workspaces`):
+
+```json
+{
+  "version": 1,
+  "complete": true,
+  "process_scope": "host",
+  "captured_at_unix": 1790737200,
+  "slots": [
+    {
+      "path": "/paperclip/.cache/two-bot-next-bounded/slot-0",
+      "issue_id": "actual-issue-uuid",
+      "status": "done",
+      "live_run": false,
+      "referenced": false,
+      "target_provenance": "build_output_only"
+    }
+  ]
+}
+```
+
+`live_run` covers **running, queued and retry** runs; `referenced` covers
+**all execution/project/shared workspace refs** to that exact slot.
+`target_provenance: build_output_only` is an independently recorded,
+exact-slot Operator classification (unclassified/mixed/unknown or missing
+stays ineligible). `complete: true` only after accounting for the whole
+relevant control-plane set. The inventory must be at most 60 seconds old
+both before AND after the scan; missing/ambiguous rows fail closed.
+
+Run on the **host in its PID namespace** with read access to *all* process
+cwd, exe, fd, mmap **and cmdline** entries, including container processes.
+Device/inode identity is compared too, so container spellings need not match
+the host; lexical-only cmdline entries still veto by path. Deleted
+(unlinked/replaced) artifacts fail closed, and any denied/incomplete process
+or slot scan aborts the whole run (unresolved deleted references refuse with
+no mutation). Per-slot doubt (held lock, unexpected contents, unattributed
+or live/referenced row, missing attestation, provenance veto in target or
+scratch, actual process reference, replaced lock) skips that slot and keeps
+its lease.
+
+```sh
+python3 scripts/cargo_cache.py retain \
+  --pool /paperclip/.cache/two-bot-next-bounded \
+  --inventory /RUN-SCRATCH/two-pool-inventory.json \
+  --proc-root /proc \
+  --evidence /RUN-SCRATCH/two-pool-retain-receipt.json
+```
+
+Output is JSON with `retain: true` and a per-slot record
+(`eligible`, `before_bytes`/`after_bytes`/`reclaimed_bytes`,
+`lock_held_through_mutation`). The Operator holds TWO build/dispatch
+admission, re-exports a fresh inventory immediately before running, and
+retains the evidence receipt. Scratch has no Cargo-defined top-level names
+(temp files are arbitrary), so only protected directory/file/suffix vetoes
+apply there — but the attested classification is still required. Never turn
+this command into unattended cron cleanup.
+
 ## /home available-byte alarm
 
 Install/run on the **host**, not inside an agent container:
