@@ -17,6 +17,8 @@
 //! - rank-role matching ([`match_rank_roles`]) and its per-rung diagnostic
 //!   ([`diagnose_rank_roles`])
 //! - one-pass snapshot arithmetic ([`build_community_snapshot`])
+//! - the non-cumulative self-heal plan ([`plan_rank_heal`]): missing lower
+//!   rungs per member, granted by the rank tick before it publishes
 //! - the counter-only reading ([`build_counter_reading`])
 //! - skip outcomes ([`CounterSkip`], [`RankSkip`])
 //! - the single-flight primitive ([`JobGate`])
@@ -269,6 +271,68 @@ pub fn match_rank_roles(roles: &[(String, String)]) -> Option<Vec<RankRole>> {
         out.push(RankRole { key, role_id });
     }
     Some(out)
+}
+
+/// One missing lower rung to restore (rank self-heal plan entry): the member
+/// already holds a higher rank, so granting this lower rung never escalates
+/// anyone — it only completes the cumulative ladder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RankHeal {
+    pub member_id: String,
+    pub key: RankKey,
+    pub role_id: String,
+}
+
+/// Missing lower rungs for every included human whose highest rank is not
+/// cumulative (moderators hand-granting a higher rank without the lower rungs
+/// used to fail the whole rank tick; the tick now grants these instead).
+/// Bots and raid-window accounts are excluded exactly like
+/// [`build_community_snapshot`]; unranked and already-nested members
+/// contribute nothing. Output is in roster order, ladder order within a
+/// member, so the bounded grant loop and the repair alert are deterministic.
+/// Empty on malformed input (the tick fails closed upstream instead).
+#[must_use]
+pub fn plan_rank_heal(
+    members: &[RosterMember],
+    rank_roles: &[RankRole],
+    raid_windows: &[RaidWindow],
+) -> Vec<RankHeal> {
+    if members.is_empty()
+        || rank_roles.len() != RankKey::ALL.len()
+        || !rank_roles.iter().map(|r| r.key).eq(RankKey::ALL)
+    {
+        return Vec::new();
+    }
+    let raid_accounts: HashSet<&str> = raid_windows
+        .iter()
+        .flat_map(|w| w.excluded_member_ids.iter().map(String::as_str))
+        .collect();
+    let role_ids: Vec<&str> = rank_roles.iter().map(|r| r.role_id.as_str()).collect();
+    let mut out = Vec::new();
+    for member in members.iter().filter(|m| {
+        !m.user_id.is_empty() && !m.is_bot && !raid_accounts.contains(m.user_id.as_str())
+    }) {
+        let held: HashSet<&str> = member.roles.iter().map(String::as_str).collect();
+        let Some(highest_index) = role_ids
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| held.contains(*id))
+            .map(|(i, _)| i)
+            .max()
+        else {
+            continue;
+        };
+        for (index, role_id) in role_ids.iter().enumerate().take(highest_index) {
+            if !held.contains(role_id) {
+                out.push(RankHeal {
+                    member_id: member.user_id.clone(),
+                    key: rank_roles[index].key,
+                    role_id: (*role_id).to_owned(),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// One rank aggregate row (legacy `rankRows`).
@@ -765,6 +829,96 @@ mod tests {
         )
         .expect("snapshot");
         assert!(!snapshot.nested);
+    }
+
+    #[test]
+    fn rank_heal_plan_lists_missing_lower_rungs_in_order() {
+        let plan = plan_rank_heal(
+            &[
+                member("broken", &[RankKey::Prospect, RankKey::Soldier], false),
+                member("legend", &[RankKey::Prospect, RankKey::Legend], false),
+                member(
+                    "nested",
+                    &[RankKey::Prospect, RankKey::Member, RankKey::Soldier],
+                    false,
+                ),
+                member("unranked", &[], false),
+            ],
+            &ladder(),
+            &[],
+        );
+        let ids = role_ids();
+        assert_eq!(
+            plan,
+            vec![
+                RankHeal {
+                    member_id: "broken".to_owned(),
+                    key: RankKey::Member,
+                    role_id: ids[&RankKey::Member].clone(),
+                },
+                RankHeal {
+                    member_id: "legend".to_owned(),
+                    key: RankKey::Member,
+                    role_id: ids[&RankKey::Member].clone(),
+                },
+                RankHeal {
+                    member_id: "legend".to_owned(),
+                    key: RankKey::Soldier,
+                    role_id: ids[&RankKey::Soldier].clone(),
+                },
+                RankHeal {
+                    member_id: "legend".to_owned(),
+                    key: RankKey::Veteran,
+                    role_id: ids[&RankKey::Veteran].clone(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rank_heal_plan_skips_bots_raid_blank_and_unranked() {
+        // A fully non-cumulative roster still yields nothing for members the
+        // snapshot itself excludes: healing a raid account or a bot would
+        // touch members outside the published denominator. `raid_window()`
+        // excludes only "raid".
+        let plan = plan_rank_heal(
+            &[
+                member("bot", &[RankKey::Legend], true),
+                member("raid", &[RankKey::Legend], false),
+                member("unranked", &[], false),
+                RosterMember {
+                    user_id: String::new(),
+                    is_bot: false,
+                    roles: vec![role_ids()[&RankKey::Legend].clone()],
+                },
+                member("human", &[RankKey::Legend], false),
+            ],
+            &ladder(),
+            &[raid_window()],
+        );
+        assert!(
+            plan.iter().all(|grant| grant.member_id == "human"),
+            "{plan:?}"
+        );
+        assert_eq!(plan.len(), 4, "{plan:?}");
+        // A roster of only excluded members leaves nothing healable.
+        let excluded = plan_rank_heal(
+            &[member("raid", &[RankKey::Legend], false)],
+            &ladder(),
+            &[RaidWindow {
+                id: "raid".to_owned(),
+                excluded_member_ids: HashSet::from(["raid".to_owned()]),
+            }],
+        );
+        assert!(excluded.is_empty());
+    }
+
+    #[test]
+    fn rank_heal_plan_is_empty_on_malformed_input() {
+        let humans = vec![member("human", &[RankKey::Legend], false)];
+        assert!(plan_rank_heal(&[], &ladder(), &[]).is_empty());
+        assert!(plan_rank_heal(&humans, &ladder()[..4], &[]).is_empty());
+        assert!(plan_rank_heal(&humans, &[], &[]).is_empty());
     }
 
     #[test]
