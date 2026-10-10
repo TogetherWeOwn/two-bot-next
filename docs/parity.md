@@ -84,6 +84,8 @@ golden exception or a claim of whole-baseline registry parity.
 | `rsvp-attendance` | docs/parity.md §1 #25 copy | Picker copy only: description drops the legacy bot name, and `event-id` says where to find the id with an example. Options, bounds and permissions stay legacy-identical. |
 | `lfg` | docs/parity.md §1 #26 copy | Picker copy only: `starts-at` shows an ISO-8601 example and `roles` documents the `role:Label:count` format with an example. Options, bounds and permissions stay legacy-identical. |
 | `lfg-close` | docs/parity.md §1 #27 copy | Picker copy only: `id` says it comes from the posted signup. Options, bounds and permissions stay legacy-identical. |
+| `command` | docs/parity.md §1 #14 caps | Advertise only `max_length` matching the runtime caps (`name` 32, `template` 2000, `description` 100, `text-trigger` 33); every other field stays legacy-identical. |
+| `command-remove` | docs/parity.md §1 #15 caps | Advertise only `max_length` 32 on `name`, matching the runtime cap; every other field stays legacy-identical. |
 
 These are the complete behavioural exceptions, mirrored by the test allowlist.
 Only equivalent guild-API representation defaults are canonicalized: omitted

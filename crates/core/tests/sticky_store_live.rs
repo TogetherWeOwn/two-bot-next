@@ -132,7 +132,7 @@ async fn cleanup(pool: PgPool, options: PgConnectOptions, schema: String) {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires reachable agent-testdb (STICKY_TEST_DATABASE_URL override); CI runs --ignored in ignored-db-stores"]
 async fn sticky_live_round_trip() {
     let (pool, options, schema) = scratch_pool("fresh").await;
 
@@ -326,7 +326,7 @@ async fn sticky_live_round_trip() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires reachable agent-testdb (STICKY_TEST_DATABASE_URL override); CI runs --ignored in ignored-db-stores"]
 async fn sticky_live_legacy_upgrade() {
     let (pool, options, schema) = scratch_pool("legacy").await;
     sqlx::raw_sql(include_str!("fixtures/legacy_sticky.sql"))

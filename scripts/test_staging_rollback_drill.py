@@ -124,10 +124,10 @@ class WorldOpener:
 
 
 def make_control(world):
-    def control(action, epoch=None, release_fence=False):
+    def control(action, epoch=None, release_fence=False, expected_deployment=None):
         world.tick(1)
         count = sum(1 for call in world.calls if call[0] == action) + 1
-        world.calls.append((action, epoch, release_fence))
+        world.calls.append((action, epoch, release_fence, expected_deployment))
         world.events.append(("control", action))
         failure = world.fail_control.get((action, count))
         if failure:
@@ -362,9 +362,9 @@ class EvidenceTests(unittest.TestCase):
         world = World()
         control = make_control(world)
 
-        def hostile(action, epoch=None, release_fence=False):
-            state = control(action, epoch, release_fence)
-            if action == "status" and world.calls.count(("status", None, False)) >= 2:
+        def hostile(action, epoch=None, release_fence=False, expected_deployment=None):
+            state = control(action, epoch, release_fence, expected_deployment)
+            if action == "status" and world.calls.count(("status", None, False, None)) >= 2:
                 state["owner"]["phase"] = f"weird {SENTINEL}"
             return state
 
@@ -519,6 +519,24 @@ class ClientAndControlTests(unittest.TestCase):
         with patch.object(drill.subprocess, "run", return_value=done) as run:
             control("deployment-takeover", release_fence=True)
         self.assertEqual(run.call_args.kwargs["env"]["OWNERSHIP_RELEASE_FENCE"], "true")
+        self.assertNotIn("OWNERSHIP_EXPECTED_DEPLOYMENT", run.call_args.kwargs["env"])
+
+    def test_expected_deployment_travels_only_in_the_child_environment(self):
+        done = subprocess.CompletedProcess([], 0, stdout=json.dumps({"owner": {"phase": "active", "epoch": 1}}),
+                                           stderr="")
+        control = drill.ownership_control(SENTINEL, URL, "github-actions:1:rollback-drill", root="/repo")
+        with patch.object(drill.subprocess, "run", return_value=done) as run:
+            control("deployment-takeover", release_fence=True, expected_deployment=TARGET)
+        env = run.call_args.kwargs["env"]
+        self.assertEqual(env["OWNERSHIP_EXPECTED_DEPLOYMENT"], TARGET)
+        self.assertNotIn(TARGET, " ".join(run.call_args.args[0]))
+
+    def test_takeover_legs_pin_the_target_and_restore_versions(self):
+        world = World()
+        instance, failures, logs = run_drill(world)
+        self.assertEqual(failures, [])
+        takeovers = [call for call in world.calls if call[0] == "deployment-takeover"]
+        self.assertEqual([call[3] for call in takeovers], [TARGET, PRE])
 
     def test_child_environment_keeps_only_path_and_explicit_ownership_inputs(self):
         inherited = {"PATH": "/runtime/bin:/usr/bin", "CLOUDFLARE_API_TOKEN": SENTINEL,

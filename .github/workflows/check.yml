@@ -206,6 +206,7 @@ jobs:
       - name: soak evidence parser (offline, fixtures only)
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_evidence.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_gate5_outage.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_sanitize_evidence_rows.py' -v
 
       - name: staging E2E run-record template (offline)
@@ -711,6 +712,16 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot-discord --features db --locked --test leveling_runtime -- --ignored --test-threads=1
 
+      - name: community message fact capture (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-discord --features db --locked --test leveling_runtime community_message_fact_capture_round_trip -- --ignored --test-threads=1
+
+      - name: community message fact round trip (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-core --features db --locked --lib community_store::tests::message_created_fact_round_trip_is_idempotent -- --ignored
+
       - name: onboarding prompt store regressions (CI service only)
         run: cargo test -p two-bot-core --features db --test onboarding_store --locked -- --ignored
 
@@ -1024,6 +1035,11 @@ jobs:
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot --locked --test restore_drill -- --ignored --nocapture
+
+      - name: Community scorecard captured-stream coverage (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot --locked --bin two-bot scorecard_marks_only_captured_streams -- --ignored
 
   moderation-db:
     name: moderation db

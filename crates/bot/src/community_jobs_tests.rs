@@ -726,7 +726,8 @@ async fn community_ticks_write_rows_and_stay_gated() {
     .unwrap();
     assert_eq!(rows, vec![(42, Some(2)), (43, None)]);
 
-    // Monday 06:15 UTC: six stream heartbeats then one run row. Completion
+    // Monday 06:15 UTC: two stream heartbeats (the captured `event_attended`
+    // and `message_created` streams are marked) then one run row. Completion
     // suppresses later ticks, including with a fresh process State.
     let monday = parse_iso_millis("2026-09-28T06:15:00.000Z").unwrap();
     run_once(Kind::Scorecard, &pool, &rest, guild, &state, monday)
@@ -766,7 +767,7 @@ async fn community_ticks_write_rows_and_stay_gated() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(beats, 6, "coverage marked for every fact stream");
+    assert_eq!(beats, 2, "coverage marked only for the captured streams");
     run_once(
         Kind::Scorecard,
         &pool,
@@ -829,6 +830,124 @@ async fn community_ticks_write_rows_and_stay_gated() {
     .await
     .unwrap();
     assert_eq!(flagged.as_deref(), Some("2026-09-28T01:00:00.000Z"));
+
+    mock.shutdown().await;
+    fixture
+        .close()
+        .await
+        .expect("drop disposable test database");
+}
+
+/// Only streams with a live writer are marked: one Monday tick with
+/// `event_attended` and `message_created` captured leaves two heartbeats, and
+/// the run fails closed — `incomplete`, never `complete` — naming the four
+/// uncaptured streams. Under production defaults the degraded run records one
+/// `INGESTION_INCOMPLETE` alert, and the retry tick does not duplicate it.
+#[tokio::test]
+#[ignore = "needs a disposable test database; routed to a check.yml step"]
+async fn scorecard_marks_only_captured_streams() {
+    let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+        assert!(
+            std::env::var("GITHUB_ACTIONS").is_err(),
+            "CI must supply the guarded test database"
+        );
+        eprintln!("SKIP community job integration: TWO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let fixture = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("create migrated agent-testdb fixture");
+    let pool = fixture.pool().clone();
+    let guild = "3333";
+    // The scorecard path makes no Discord calls; the double stays silent.
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let rest = executor(&mock);
+    let gates = ScorecardGates {
+        recommendations_enabled: true,
+        ..enabled_gates()
+    };
+    let state = fresh_state(gates, 14);
+
+    let monday = parse_iso_millis("2026-09-28T06:15:00.000Z").unwrap();
+    run_once(Kind::Scorecard, &pool, &rest, guild, &state, monday)
+        .await
+        .unwrap();
+    // A retry tick completes without a second run: the degraded output is a
+    // successful persisted result, not a failure to retry.
+    run_once(
+        Kind::Scorecard,
+        &pool,
+        &rest,
+        guild,
+        &state,
+        monday + 60_000,
+    )
+    .await
+    .unwrap();
+
+    let beats: Vec<String> = sqlx::query_scalar(
+        "SELECT stream FROM community_stream_heartbeats WHERE guild_id=$1 ORDER BY stream",
+    )
+    .bind(guild)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(beats, ["event_attended", "message_created"]);
+    let runs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM community_scorecard_runs WHERE guild_id=$1")
+            .bind(guild)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(runs, 1, "one degraded run across the retry tick");
+    let (coverage_state, scorecard_json): (String, String) = sqlx::query_as(
+        "SELECT coverage_state, scorecard_json FROM community_scorecard_runs WHERE guild_id=$1",
+    )
+    .bind(guild)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(coverage_state, "incomplete");
+    let scorecard: Value = serde_json::from_str(&scorecard_json).expect("valid JSON");
+    assert_eq!(scorecard["coverageState"], "incomplete");
+    assert!(scorecard["weeklyActiveHumans"].is_null());
+    let errors = scorecard["ingestionErrors"]
+        .as_array()
+        .expect("ingestion errors array");
+    for stream in [
+        "voice_session_started",
+        "voice_session_ended",
+        "member_joined",
+        "rules_accepted",
+    ] {
+        assert!(
+            errors
+                .iter()
+                .any(|e| e == &json!(format!("missing_stream_coverage:{stream}"))),
+            "uncaptured {stream} is named"
+        );
+    }
+    for stream in ["event_attended", "message_created"] {
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e == &json!(format!("missing_stream_coverage:{stream}"))),
+            "the captured {stream} stream is not flagged"
+        );
+    }
+    assert_eq!(scorecard["intervention"]["code"], "INGESTION_INCOMPLETE");
+    let alert_keys: Vec<String> =
+        sqlx::query_scalar("SELECT alert_key FROM community_scorecard_alerts WHERE guild_id=$1")
+            .bind(guild)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let week = &scorecard["weekStart"].as_str().expect("week start")[..10];
+    assert_eq!(
+        alert_keys,
+        [format!("INGESTION_INCOMPLETE:{week}:contract")],
+        "one deduplicated alert across the retry tick"
+    );
 
     mock.shutdown().await;
     fixture

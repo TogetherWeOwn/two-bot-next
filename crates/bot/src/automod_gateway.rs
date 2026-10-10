@@ -1,7 +1,7 @@
-//! Gateway wiring for the shared automod activation (TOG-12354).
+//! Gateway wiring for the shared automod activation.
 //!
 //! The serial dispatch worker calls [`process`] once per translated delivery,
-//! in gateway order and before the funnel, then hands the returned disposition
+//! in gateway order and before the funnel, then hands the funnel disposition
 //! to `OrderedLevelingPipeline::collect_at_with_message_disposition` exactly once. There is no
 //! private client, router or timer: Discord reads and mutations go through the
 //! command runtime's [`ActionExecutor`], and repeat history expires on the
@@ -22,12 +22,15 @@ use sqlx::PgPool;
 use tracing::warn;
 use two_bot_core::automod_runtime::{
     AutomodClaimLedger, AutomodRuntime, AutomodScope, FunnelDisposition, MessageDelivery,
+    MessageDeliveryKind,
 };
 use two_bot_core::automod_store::AutomodStore;
 use two_bot_core::moderation::ModerationGates;
 use two_bot_core::AutomodConfig;
 use two_bot_discord::automod::{partial_edit_delivery, PartialEdit};
-use two_bot_discord::automod_activation::{AutomodActivation, AutomodFacts, RestAutomodFacts};
+use two_bot_discord::automod_activation::{
+    Activation, ActivationOutcome, AutomodActivation, AutomodFacts, RestAutomodFacts,
+};
 use two_bot_discord::ActionExecutor;
 
 use crate::jobs::{self, Job};
@@ -239,21 +242,45 @@ pub(crate) fn partial_edit(text: &str, receipt_ms: u64) -> Option<MessageDeliver
     Some(partial_edit_delivery(&edit, receipt_ms))
 }
 
-/// Run one delivery through the activation and return the disposition for the
-/// funnel's single call. A timeout never becomes acceptance: a create keeps raw
-/// capture only.
+/// What one delivery decided: `funnel` is its single call into the funnel and
+/// `trigger` is the verdict prefix triggers act on. A delivery automod did not
+/// inspect, or whose completion was not recorded, keeps its funnel disposition
+/// but its trigger verdict is capture-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WorkerVerdict {
+    pub(crate) funnel: FunnelDisposition,
+    pub(crate) trigger: FunnelDisposition,
+}
+
+fn verdict_of(activation: &Activation, kind: MessageDeliveryKind) -> WorkerVerdict {
+    let funnel = activation.uncommitted_disposition(kind);
+    let trigger = match activation.outcome {
+        ActivationOutcome::Bypassed | ActivationOutcome::Retained(_) => {
+            FunnelDisposition::CaptureOnly
+        }
+        _ => funnel,
+    };
+    WorkerVerdict { funnel, trigger }
+}
+
+/// Run one delivery through the activation. A timeout never becomes acceptance:
+/// a create keeps raw capture only.
 pub(crate) async fn process<L: AutomodClaimLedger, F: AutomodFacts>(
     activation: &AutomodActivation<L, F>,
     delivery: MessageDelivery,
     at_iso: &str,
-) -> FunnelDisposition {
+) -> WorkerVerdict {
     refresh_from_poller(activation, delivery.guild_id.as_deref());
     let kind = delivery.kind;
     match tokio::time::timeout(PROCESS_MAX, activation.process(delivery, at_iso)).await {
-        Ok(result) => result.uncommitted_disposition(kind),
+        Ok(result) => verdict_of(&result, kind),
         Err(_) => {
             warn!("automod delivery timed out; claim left for reconciliation");
-            kind.funnel(true)
+            let capture = kind.funnel(true);
+            WorkerVerdict {
+                funnel: capture,
+                trigger: capture,
+            }
         }
     }
 }

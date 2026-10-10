@@ -190,8 +190,8 @@ pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryErr
 pub use community::{
     build_scorecard, classify, is_scorecard_run_time, previous_closed_week, scorecard_tick,
     week_start_ms, Classification, ClassifierConfig, ClassifyInput, FactRow, ScorecardGates,
-    ScorecardInputs, ScorecardOutcome, StreamCoverage, COMMUNITY_CLASSIFICATIONS,
-    COMMUNITY_FACT_TYPES, SCORECARD_TICK_INTERVAL_MS,
+    ScorecardInputs, ScorecardOutcome, StreamCoverage, CAPTURED_STREAMS, COMMUNITY_CLASSIFICATIONS,
+    COMMUNITY_FACT_TYPES, SCORECARD_TICK_INTERVAL_MS, STREAM_WRITERS,
 };
 pub use community_snapshots::{
     build_community_snapshot, build_counter_reading, match_rank_roles, window_bounds,
@@ -221,7 +221,7 @@ pub use custom_commands::{
     validate_put_input, validate_template, AuditRecord, CommandError, DeleteDecision,
     PutCommandInput, PutDecision, RunOutcome, StoredCommand, TemplateContext, TemplateError,
     MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_RENDERED_CHARS, MAX_TEMPLATE_CHARS,
-    TEMPLATE_PLACEHOLDERS,
+    MAX_TEXT_TRIGGER_CHARS, TEMPLATE_PLACEHOLDERS,
 };
 pub use events::{CoreEvent, VoiceSessionDelta};
 pub use evidence::{
@@ -355,10 +355,11 @@ pub use router::{
 pub use rsvp::{
     attendance_totals_text, checkin_classification, checkin_duplicate_text,
     checkin_idempotency_key, checkin_metadata_json, checkin_recorded_text, checkin_source,
-    checkin_source_event_id, is_snowflake, partition_rsvps, require_manage_events, rsvp_saved_text,
-    validate_event_id, validate_occurrence_id, AttendanceClassification, AttendanceProof,
-    CheckinError, RsvpAudit, RsvpError, RsvpRecord, RsvpStatus, RsvpTotals, RsvpTransition,
-    ATTENDANCE_EVENT_TYPE, RSVP_AUDIT_ACTION,
+    checkin_source_event_id, is_snowflake, parse_attendance_occurrence, partition_rsvps,
+    require_manage_events, rsvp_saved_text, validate_event_id, validate_occurrence_id,
+    AttendanceClassification, AttendanceOccurrence, AttendanceProof, CheckinError, RsvpAudit,
+    RsvpError, RsvpRecord, RsvpStatus, RsvpTotals, RsvpTransition, ATTENDANCE_EVENT_TYPE,
+    RSVP_AUDIT_ACTION,
 };
 #[cfg(feature = "db")]
 pub use rsvp_store::{
@@ -437,7 +438,8 @@ pub use voice_rooms::{
     PermissionSource, ProposeOutcome, QueuedAction, ReconcilePlan, RenameCoalescer, RoomAction,
     RoomJoinDecision, RoomJoinRequest, RoomLeaveDecision, RoomLeaveReport, RoomPosition, RoomStore,
     SeenChannel, TextCompanion, VoiceGates, VoiceRoom, MAX_CHANNELS_PER_CATEGORY,
-    MAX_CHANNEL_NAME_LEN, MAX_USER_LIMIT, QUEUE_MAX_ATTEMPTS, RENAME_MIN_INTERVAL_MS,
+    MAX_CHANNEL_NAME_LEN, MAX_FAILED_ACTIONS, MAX_USER_LIMIT, QUEUE_MAX_ATTEMPTS,
+    RENAME_MIN_INTERVAL_MS,
 };
 pub use voice_vote_kick::{
     RoomKickDecision, VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError,

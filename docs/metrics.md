@@ -40,6 +40,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_voice_tracked_rooms` | Rooms tracked in memory; compare with live Discord channels for ghosts |
 | `two_bot_voice_compensation_pending` | Tracked rooms awaiting compensating delete after a failed write |
 | `two_bot_voice_orphans_total` | Untracked creator-channel orphans needing manual deletion after failed `/create` compensation |
+| `two_bot_dispatch_drops_total{lane}` | Dispatch-lane saturation drops: every event refused because every attempted lane was full. `lane` is one of `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` (see label allowlists below). A single-lane refusal counts its lane once; a privileged spill refused by both lanes counts both. Logs sample the first drop per 60 s per runtime, so bursts are O(1) lines with N counter increments. Alert-threshold hook for M2.1 (lands once TOG-18943 unblocks): alert when any lane's drops increase across consecutive keepalive samples; a single drop inside one burst is not paging |
 
 ## Job coverage and outcomes
 
@@ -142,13 +143,18 @@ as dynamic labels.
 - `two_bot_voice_dead_letters_total{action}` — `action` is `create`, `move`,
   `delete`, `companion`, `ownership`, `kick`, `rename`, `limit` or `other`.
 - `two_bot_db_errors_total{op}` — `op` is `admission` or `other`. Recorded
-  by `Metrics::db_error`; currently only send-admission SQL
-  (admit/extend/complete storage failures) reports, so `other` stays zero
-  until another store's op joins the allowlist.
+  by `Metrics::db_error`; send-admission SQL (admit/extend/complete storage
+  failures) reports as `admission`, and failed voice actor store loads
+  report as `other`.
 - `two_bot_send_admissions_total{outcome}` — `outcome` is `admitted`,
   `blocked`, `storage_error` or `other`. Recorded once per `admit()`
   decision by the Postgres admission gate; failed `complete()`/`extend()`
   storage writes count only in `two_bot_db_errors_total`.
+- `two_bot_dispatch_drops_total{lane}` — `lane` is one of `messages`,
+  `interactions`, `registry`, `privileged`, `busy` or `reactions`, in the
+  bot's `DISPATCH_LIMITS` order (`crates/core/src/metrics.rs`
+  `DISPATCH_LANES`). Recorded on every `spawn_first` saturation refusal,
+  including the busy-lane path; scope-shutdown refusals are not drops.
 - Log fields (coordinated with blocked structured-log work, which owns JSON
   formatting): `voice_event="voice_operation"` with `op`/`outcome`,
   `voice_event="voice_reconcile"` with plan counts,
@@ -241,9 +247,27 @@ No Prometheus server, no new infrastructure.
 
 - Authenticated pull: `GET /ops/metrics` on the Worker with
   `Authorization: Bearer <METRICS_SCRAPE_TOKEN>`. The token is an optional
-  Worker secret (never a plain var). Unset → `404`; missing or wrong bearer →
-  `401` (compared via SHA-256 digests); non-GET → `404`. Unauthenticated
-  requests never reach the container. `/metrics` itself stays `404`.
+  Worker secret (never a plain var) and must be at least 32 characters —
+  the same floor as the ownership control token. Unset or shorter → `404`
+  (plus one redacted log line naming the requirement); a short staging
+  token must be reissued, never padded (none is provisioned today).
+  Missing or wrong bearer → `401` (compared via SHA-256 digests);
+  every attempt takes one token synchronously before the comparison, so
+  concurrent guesses cannot share a token and a throttled caller is
+  refused without any comparison — guessing cannot confirm a bearer
+  while exhausted (`429` + `retry-after` via the existing per-caller
+  bucket, 10 burst, 1/sec). Buckets are per caller, so another caller's
+  guessing cannot throttle a correct bearer elsewhere; a caller shed only
+  because the 10,000-entry table is full is still compared, so a scanner
+  flood cannot lock out the authenticated scraper. The scraper
+  (~1/15 s) never nears the budget. Non-GET →
+  `404`. Unauthenticated requests never reach the container. `/metrics`
+  itself stays `404`. The ownership control path (`/internal/ownership`)
+  keeps its own gate and shares neither this bucket nor its budget.
+  The DO container fetch aborts after 6 s (`504`, generic body — the SDK
+  resolves aborts as a 500 Response, which is mapped to 504 without
+  proxying its text) and the upstream body is capped at 64 KiB
+  (larger → `502`, generic body).
 - Rules live in `wrangler/src/alert-rules.ts`; each links to a
   [runbook](runbook.md#metrics-alerts) section (a test enforces the anchors):
 

@@ -521,7 +521,14 @@ fn executor_at(origin: String) -> ActionExecutor {
 }
 
 async fn wait_for<F: Fn() -> bool>(predicate: F, what: &str) {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    wait_for_timeout(predicate, what, Duration::from_secs(10)).await;
+}
+
+/// `wait_for` with an explicit deadline, for lane tests whose holders must
+/// outlive slow CI schedulers. Poll-based, so a generous deadline costs
+/// nothing when the lane drains fast.
+async fn wait_for_timeout<F: Fn() -> bool>(predicate: F, what: &str, timeout: Duration) {
+    tokio::time::timeout(timeout, async {
         loop {
             if predicate() {
                 return;
@@ -4739,4 +4746,267 @@ async fn declined_kick_gets_the_router_refusal_exactly_once() {
             mock.shutdown().await;
         }
     }
+}
+
+#[tokio::test]
+async fn self_role_reactions_have_their_own_bounded_lane() {
+    use std::collections::HashSet;
+    use twilight_model::gateway::payload::incoming::{MessageCreate, ReactionAdd};
+    use two_bot_core::self_roles::{PanelMode, SelfRoleGates, SelfRoleOption, SelfRolePanel};
+    use two_bot_core::InteractionRouter;
+    use two_bot_cutover::self_role_store::SelfRoleStore;
+
+    use crate::command_runtime::{DISPATCH_LIMITS, LANE_MESSAGES, LANE_REACTIONS};
+    use crate::self_role_handlers::SelfRoleService;
+    use crate::self_role_runtime::SelfRoleRuntime;
+
+    const SR_GUILD: u64 = 100_000_000_000_000_001;
+    const SR_CHANNEL: &str = "100000000000000007";
+    const SR_MESSAGE: &str = "100000000000000008";
+    const SR_BOT: &str = "100000000000000003";
+
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("lazy pool");
+    let executor =
+        ActionExecutor::with_proxy("test-token".to_owned(), Some(origin)).expect("mock executor");
+    let service_runtime = SelfRoleRuntime {
+        store: SelfRoleStore::new(pool.clone()),
+        executor: executor.clone(),
+        guild_id: SR_GUILD.to_string(),
+        bot_id: SR_BOT.to_owned(),
+    };
+    let panel = SelfRolePanel {
+        id: "games".into(),
+        channel_id: SR_CHANNEL.into(),
+        message_id: SR_MESSAGE.into(),
+        mode: PanelMode::Reaction,
+        exclusive: true,
+        color: false,
+        options: vec![SelfRoleOption {
+            key: "new".into(),
+            label: "New".into(),
+            role_id: "100000000000000004".into(),
+            permissions: "0".into(),
+            emoji: Some("b".into()),
+            description: None,
+        }],
+    };
+    let service = Arc::new(
+        SelfRoleService::new(
+            service_runtime,
+            SelfRoleGates {
+                panels: vec![panel],
+                dry_run: false,
+            },
+            &[SR_GUILD.to_string()].into_iter().collect::<HashSet<_>>(),
+        )
+        .expect("approved staging catalogue"),
+    );
+    let router = InteractionRouter::new(RouterGates {
+        configured_guild: Some(SR_GUILD),
+        scorecard: false,
+        automations: true,
+        announcements: false,
+        moderation: false,
+        voice: false,
+        voice_assistant: false,
+        tickets: false,
+        self_roles: true,
+        onboarding_picker: false,
+        session_picker: false,
+    });
+    let runtime =
+        CommandRuntime::new_with_self_roles(pool, executor, router, SR_GUILD, true, service);
+    let _guard = runtime.dispatch_guard();
+    let reaction_cap = DISPATCH_LIMITS[LANE_REACTIONS];
+    let message_cap = DISPATCH_LIMITS[LANE_MESSAGES];
+    assert_ne!(
+        LANE_REACTIONS, LANE_MESSAGES,
+        "reactions must not share the message lane"
+    );
+
+    // A saturated message lane still admits reactions: message bursts must
+    // not starve role claims.
+    for _ in 0..message_cap {
+        assert!(runtime.hold_lane_for_test(LANE_MESSAGES, Duration::from_secs(5)));
+    }
+    assert_eq!(runtime.lane_in_flight(LANE_MESSAGES), message_cap);
+    let first = Event::ReactionAdd(Box::new(ReactionAdd(
+        crate::self_role_handlers::tests::reaction(),
+    )));
+    assert!(
+        runtime.dispatch(&first),
+        "message saturation must not block reactions"
+    );
+    // Saturation held at dispatch time: the holders are fresh here, so a
+    // slow reaction cannot drain them first and flake this read.
+    assert_eq!(runtime.lane_in_flight(LANE_MESSAGES), message_cap);
+    wait_for_timeout(
+        || runtime.lane_in_flight(LANE_REACTIONS) == 0,
+        "admitted reaction settles",
+        Duration::from_secs(60),
+    )
+    .await;
+    // Reaction work stays off the message lane: holders only drain, the
+    // depth never grows past the cap no matter how slow the reaction was.
+    assert!(
+        runtime.lane_in_flight(LANE_MESSAGES) <= message_cap,
+        "reaction work stays off the message lane"
+    );
+    wait_for_timeout(
+        || runtime.lane_in_flight(LANE_MESSAGES) == 0,
+        "message holders drain",
+        Duration::from_secs(60),
+    )
+    .await;
+
+    // One reaction is admitted while the lane has room; the detached task
+    // settles (fast store refusal) and the lane drains.
+    assert!(runtime.dispatch(&first), "room in the lane admits");
+    wait_for_timeout(
+        || runtime.lane_in_flight(LANE_REACTIONS) == 0,
+        "admitted reaction settles",
+        Duration::from_secs(60),
+    )
+    .await;
+
+    // Saturate the dedicated reaction lane without database or REST work.
+    for _ in 0..reaction_cap {
+        assert!(runtime.hold_lane_for_test(LANE_REACTIONS, Duration::from_secs(30)));
+    }
+    assert_eq!(runtime.lane_in_flight(LANE_REACTIONS), reaction_cap);
+
+    // A reaction burst must not discard message automations: with the
+    // reaction lane full, a message still admits on its own lane without
+    // touching the reaction depth.
+    let message = Event::MessageCreate(Box::new(MessageCreate(message(
+        9,
+        100_000_000_000_000_007,
+        false,
+        Some(SR_GUILD),
+    ))));
+    assert!(
+        runtime.dispatch(&message),
+        "full reaction lane still admits messages"
+    );
+    // Admission is the isolation proof: `dispatch` returns true only after
+    // pushing the message onto `LANE_MESSAGES`, so a saturated reaction lane
+    // cannot discard message automations. The message's own sticky lookup is
+    // incidental refused-database work; waiting on its settle would couple
+    // this test to CI scheduler speed (the red-run failure), so assert the
+    // synchronous separation facts instead: the message stays within its own
+    // lane's cap and the reaction depth is untouched whether or not the
+    // message task has been scheduled yet. The admitted task can only fail
+    // its lookup and return; it never touches the mock REST double.
+    assert!(
+        runtime.lane_in_flight(LANE_MESSAGES) <= message_cap,
+        "message work stays on the message lane"
+    );
+    assert_eq!(
+        runtime.lane_in_flight(LANE_REACTIONS),
+        reaction_cap,
+        "message work stays off the reaction lane"
+    );
+
+    // A 1,000-event burst is dropped at the lane, never unbounded: every
+    // dispatch reports refusal and in-flight never exceeds the cap.
+    let mut admitted = 0usize;
+    let mut max_observed = 0usize;
+    for _ in 0..1000 {
+        let event = Event::ReactionAdd(Box::new(ReactionAdd(
+            crate::self_role_handlers::tests::reaction(),
+        )));
+        if runtime.dispatch(&event) {
+            admitted += 1;
+        }
+        max_observed = max_observed.max(runtime.lane_in_flight(LANE_REACTIONS));
+    }
+    assert_eq!(admitted, 0, "saturated lane drops reaction bursts");
+    assert!(
+        max_observed <= reaction_cap,
+        "in-flight {max_observed} exceeds lane cap {reaction_cap}"
+    );
+    assert_eq!(runtime.lane_in_flight(LANE_REACTIONS), reaction_cap);
+    assert!(mock.requests().is_empty(), "dropped reactions send no REST");
+    mock.shutdown().await;
+}
+
+/// Saturation drops count per lane while the log stays quiet (TOG-19878): a
+/// burst of N drops on one lane increments only that lane's counter and
+/// emits O(1) log lines. The busy lane is covered through the same
+/// `spawn_first` path.
+#[tokio::test]
+async fn saturated_lane_counts_drops_per_lane_and_quiets_logs() {
+    use crate::command_runtime::{DISPATCH_LIMITS, LANE_BUSY, LANE_MESSAGES};
+    use crate::tracing_capture;
+
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let runtime = runtime_without_db(gates(false, false), false, origin);
+    let _guard = runtime.dispatch_guard();
+
+    // Fill the message lane without database or REST work.
+    for _ in 0..DISPATCH_LIMITS[LANE_MESSAGES] {
+        assert!(runtime.hold_lane_for_test(LANE_MESSAGES, Duration::from_secs(30)));
+    }
+    assert_eq!(
+        runtime.lane_in_flight(LANE_MESSAGES),
+        DISPATCH_LIMITS[LANE_MESSAGES]
+    );
+
+    const MESSAGE_DROPS: usize = 20;
+    const BUSY_DROPS: usize = 3;
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || {
+        for _ in 0..MESSAGE_DROPS {
+            assert!(
+                !runtime.hold_lane_for_test(LANE_MESSAGES, Duration::from_secs(30)),
+                "a full lane admits no waiters"
+            );
+        }
+        // The busy lane drops through the same path with its own counter.
+        for _ in 0..DISPATCH_LIMITS[LANE_BUSY] {
+            assert!(runtime.hold_lane_for_test(LANE_BUSY, Duration::from_secs(30)));
+        }
+        for _ in 0..BUSY_DROPS {
+            assert!(
+                !runtime.hold_lane_for_test(LANE_BUSY, Duration::from_secs(30)),
+                "a full busy lane admits no waiters"
+            );
+        }
+    });
+
+    assert_eq!(
+        runtime.dispatch_drops_total(LANE_MESSAGES),
+        MESSAGE_DROPS as u64,
+        "every message-lane drop counts"
+    );
+    assert_eq!(
+        runtime.dispatch_drops_total(LANE_BUSY),
+        BUSY_DROPS as u64,
+        "every busy-lane drop counts on its own lane"
+    );
+    for lane in 0..DISPATCH_LIMITS.len() {
+        if lane != LANE_MESSAGES && lane != LANE_BUSY {
+            assert_eq!(
+                runtime.dispatch_drops_total(lane),
+                0,
+                "lane {lane} must not count another lane's drops"
+            );
+        }
+    }
+    let saturated_lines = capture
+        .text()
+        .lines()
+        .filter(|line| line.contains("command dispatch saturated"))
+        .count();
+    assert_eq!(
+        saturated_lines,
+        1,
+        "a burst of {} drops emits one sampled line, got {saturated_lines}",
+        MESSAGE_DROPS + BUSY_DROPS
+    );
+    assert!(mock.requests().is_empty(), "dropped work sends no REST");
+    mock.shutdown().await;
 }

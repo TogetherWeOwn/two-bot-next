@@ -27,6 +27,9 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `cold resume committed; requesting voice snapshot via identify` | `crates/bot/src/gateway.rs:362` | Cold voice RESUME committed; reception IDENTIFies for a fresh voice snapshot |
 | `gateway ready; checkpoint committed` | `crates/bot/src/gateway.rs:671` | Dispatch committed and shard marked Connected |
 | `gateway leveling dispatch failed` | `crates/bot/src/gateway.rs:609` | Leveling funnel drain failed inside the checkpoint deadline |
+| `gateway community facts dispatch failed` | `crates/bot/src/gateway.rs:957` | Community facts drain failed; worker continues and the scorecard fails closed on missing coverage |
+| `gateway community facts dispatch timed out` | `crates/bot/src/gateway.rs:960` | Community facts drain missed the checkpoint deadline; worker continues and the scorecard fails closed on missing coverage |
+| `gateway onboarding job invalid` | `crates/bot/src/gateway.rs:1066` | Dispatch-worker durable onboarding payload failed to serialize; recorded as a typed error, checkpoint unchanged |
 | `onboarding interaction interrupted; member must reselect` | `crates/bot/src/gateway.rs:791` | Durable onboarding job recovered without callback credentials; kept as interruption receipt |
 | `invite counter read unavailable; retaining snapshot` | `crates/bot/src/gateway.rs:899` | REST invite read failed; persisted baseline kept instead of an empty listing |
 | `interaction acknowledgement blocked; advancing past lost callback` | `crates/bot/src/gateway.rs:287` | Ordered RSVP acknowledgement hit send-admission Blocked; checkpoint advances past the lost callback without replaying uncertain effects |
@@ -131,6 +134,16 @@ sink attaches to the gateway writer on the cutover path.
 | `voice_event="voice_reconcile"` | `crates/bot/src/voice_rooms.rs:1470` (`voice_reconcile planned`) | One reconcile pass plan size with per-action counts |
 | `voice_event="voice_dead_letter"` | `crates/bot/src/voice_rooms.rs:2002` (`voice action dead-lettered`) | Queue write exhausted retries with bounded `action` and attempts |
 | `voice_event="voice_creator_orphan"` | `crates/bot/src/voice_rooms.rs:4904` (`voice creator orphan needs manual deletion`) | Untracked creator-channel orphan needing manual deletion |
+
+Adjacent actor message without a `voice_event` field:
+`voice actor load failed; actor respawns on the next guild snapshot`
+(`observe_voice_actor_load_failure` in `crates/bot/src/voice_rooms.rs`):
+the guild actor's store load failed. Every failure bumps
+`two_bot_db_errors_total{op="other"}`; the warn is throttled process-wide to
+one line per 5 minutes, so a burst across guilds names only the first. The
+actor respawns on the next guild snapshot (`publish_snapshot` on
+`GuildCreate`/resumed replay); voice, channel and role events for the guild
+are dropped until then.
 
 ## Unknowns (TBD)
 

@@ -1,6 +1,17 @@
-//! Private announcement receiver. Never merge this router into the health socket.
-//! Authentication and a committed nonce precede JSON; a committed intent precedes
-//! the effect. Cancellation leaves durable ownership, never a new execution lease.
+//! Private internal-action receiver (announcement, event read, settings, moderation).
+//! Never merge this router into the health socket. Authentication and a
+//! committed nonce precede JSON; a committed intent precedes the effect (except
+//! keyless reads). Cancellation leaves durable ownership, never a new execution
+//! lease.
+//!
+//! Wired effects: `announcement.post` (single-attempt send), `event.read`
+//! (keyless mapped GET), `settings.get`/`settings.set` (settings executors),
+//! the restrictive member verbs `moderation.ban`, `moderation.tempban`,
+//! `moderation.kick`, `moderation.warn` and `moderation.timeout` (member
+//! moderation through the shared moderation service), `role.assign`
+//! (allowlisted role-key assignment) and `guild.add_member` (OAuth-backed
+//! join with a transient token). Every other verb stays refused by the
+//! per-effect fences below, even when the env-only flag gate authorizes it.
 
 use std::{
     future::IntoFuture,
@@ -21,6 +32,7 @@ use serde_json::{json, Map, Value};
 use tokio::{net::TcpListener, sync::Semaphore};
 use two_bot_core::{
     clock_guard::ClockGuard,
+    commands::{PERM_BAN_MEMBERS, PERM_KICK_MEMBERS, PERM_MODERATE_MEMBERS},
     format_iso_millis,
     internal_action_config::InternalActionConfig,
     internal_action_store::{
@@ -28,13 +40,22 @@ use two_bot_core::{
         TerminalFailure, TerminalResponse,
     },
     internal_actions::{
-        new_request_id, unmapped_event_key, validate_announcement, validate_event_key,
-        validate_idempotency_key, ActionError, AuthDecision, AuthHeaders, AuthenticatedRequest,
-        ErrorCode, InternalFlags, TokenBuckets, ACTIONS_PATH, MAX_BODY_BYTES, SKEW_SECONDS,
+        new_request_id, require_field_str, unmapped_event_key, validate_announcement,
+        validate_event_key, validate_idempotency_key, ActionError, AuthDecision, AuthHeaders,
+        AuthenticatedRequest, ErrorCode, GuildAddMemberRequest, InternalFlags, RoleAssignRequest,
+        TokenBuckets, ACTIONS_PATH, MAX_BODY_BYTES, SKEW_SECONDS,
     },
+    internal_settings::SettingsCommand,
+    member_moderation_store::PgMemberModerationStore,
     rejection_telemetry::{ActionLabel, KeyLabel, Rejection, RejectionRecord, RejectionTelemetry},
+    ModerationAction, ModerationActor, ModerationGates, ModerationPolicy, ModerationTarget,
 };
+use two_bot_cutover::{internal_settings::execute_settings, settings::SettingsStore};
+use two_bot_discord::executor::member::MemberOutcome;
 use two_bot_discord::internal_actions::{AnnouncementExecutor, ExecutionOutcome, Refusal};
+use two_bot_discord::internal_member_moderation::{
+    InternalMemberConfig, InternalMemberExecutor, InternalMemberRequest,
+};
 use two_bot_discord::{ActionExecutor, EventActionError, EventCall};
 
 const MAX_HEADER_BYTES: usize = 8192;
@@ -88,6 +109,441 @@ impl ActionEffect for AnnouncementExecutor {
     }
 }
 
+/// Membership mutations: `role.assign` (allowlisted key, hierarchy-checked)
+/// and `guild.add_member` (OAuth token, transient only). The receiver owns the
+/// durable claim; this trait owns only the Discord calls after the claim. The
+/// OAuth token is a per-call argument only: it never enters a struct, an audit
+/// row, a stored receipt, a log, or a `Debug` impl.
+trait MemberEffect: Send + Sync {
+    fn execute_assign<'a>(
+        &'a self,
+        guild_id: &'a str,
+        bot_user_id: &'a str,
+        request: &'a RoleAssignRequest<'a>,
+    ) -> BoxFuture<'a, Result<MemberOutcome, ActionError>>;
+    fn execute_add<'a>(
+        &'a self,
+        guild_id: &'a str,
+        request: &'a GuildAddMemberRequest<'a>,
+        access_token: &'a str,
+    ) -> BoxFuture<'a, Result<MemberOutcome, ActionError>>;
+    fn resolve_bot<'a>(&'a self) -> BoxFuture<'a, Result<String, ActionError>>;
+}
+
+impl MemberEffect for ActionExecutor {
+    fn execute_assign<'a>(
+        &'a self,
+        guild_id: &'a str,
+        bot_user_id: &'a str,
+        request: &'a RoleAssignRequest<'a>,
+    ) -> BoxFuture<'a, Result<MemberOutcome, ActionError>> {
+        Box::pin(async move {
+            self.assign_internal_role(guild_id, bot_user_id, request)
+                .await
+        })
+    }
+
+    fn execute_add<'a>(
+        &'a self,
+        guild_id: &'a str,
+        request: &'a GuildAddMemberRequest<'a>,
+        access_token: &'a str,
+    ) -> BoxFuture<'a, Result<MemberOutcome, ActionError>> {
+        Box::pin(async move {
+            self.add_internal_member(guild_id, request, access_token)
+                .await
+        })
+    }
+
+    fn resolve_bot<'a>(&'a self) -> BoxFuture<'a, Result<String, ActionError>> {
+        Box::pin(async move {
+            self.current_bot_user_id()
+                .await
+                .map(|id| id.to_string())
+                .map_err(|detail| {
+                    ActionError::new(
+                        ErrorCode::DiscordUnavailable,
+                        "Discord bot identity is unavailable",
+                        format!("bot_identity_unavailable: {}", detail.cause()),
+                    )
+                })
+        })
+    }
+}
+
+/// Restrictive-moderation effect: `moderation.ban`, `moderation.tempban`,
+/// `moderation.kick`, `moderation.warn` and `moderation.timeout` through the
+/// shared moderation service. The test seam is module-private like
+/// [`ActionEffect`]: the
+/// production effect resolves actor/target from the configured staging guild
+/// using live member roles, positions, permissions and bot/owner flags — never
+/// from body-supplied roles or permissions. Mocks skip Discord and return a
+/// canned receipt, so HTTP-layer allow/deny/key-reuse tests stay offline.
+trait ModerationEffect: Send + Sync {
+    fn execute_moderation<'a>(
+        &'a self,
+        request: &'a InternalMemberRequest,
+        request_id: &'a str,
+        idempotency_key: &'a str,
+        now_ms: i64,
+    ) -> BoxFuture<'a, Result<TerminalResponse, ActionError>>;
+}
+
+/// Production moderation effect over the shared [`InternalMemberExecutor`].
+/// Resolution (guild facts, actor/target/bot snapshots) runs inside the
+/// effect so the HTTP handler stays a thin validate-claim-finish fence.
+/// Definitive service failures become terminal receipts; transport, rate-limit,
+/// store and in-flight uncertainty stays [`Effect::Unknown`] so the outer
+/// idempotency claim is retained for reconciliation, never re-executed.
+struct ModerationExecutor {
+    inner: InternalMemberExecutor<PgMemberModerationStore>,
+    discord: ActionExecutor,
+}
+
+impl ModerationExecutor {
+    fn new(
+        inner: InternalMemberExecutor<PgMemberModerationStore>,
+        discord: ActionExecutor,
+    ) -> Self {
+        Self { inner, discord }
+    }
+}
+
+impl ModerationEffect for ModerationExecutor {
+    fn execute_moderation<'a>(
+        &'a self,
+        request: &'a InternalMemberRequest,
+        request_id: &'a str,
+        idempotency_key: &'a str,
+        now_ms: i64,
+    ) -> BoxFuture<'a, Result<TerminalResponse, ActionError>> {
+        Box::pin(async move {
+            let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+            let facts = moderation_guild_facts(&self.discord, guild_id).await?;
+            let bot_id = self
+                .discord
+                .current_bot_user_id()
+                .await
+                .map(|id| id.to_string())
+                .map_err(|_| {
+                    ActionError::new(
+                        ErrorCode::DiscordUnavailable,
+                        "Discord member snapshot unavailable; do not retry this key",
+                        "moderation_snapshot_unavailable",
+                    )
+                })?;
+            let (bot_roles, _) = moderation_fetched_member(&self.discord, guild_id, &bot_id)
+                .await?
+                .ok_or_else(|| {
+                    ActionError::new(
+                        ErrorCode::DiscordUnavailable,
+                        "Discord member snapshot unavailable; do not retry this key",
+                        "moderation_snapshot_unavailable",
+                    )
+                })?;
+            let bot_with_everyone = moderation_with_everyone(bot_roles, guild_id);
+            let bot_position =
+                moderation_top_position(&bot_with_everyone, &facts).ok_or_else(|| {
+                    ActionError::new(
+                        ErrorCode::DiscordUnavailable,
+                        "Discord member snapshot unavailable; do not retry this key",
+                        "moderation_snapshot_unavailable",
+                    )
+                })?;
+            let (actor, target, bot_position) =
+                moderation_resolve(&self.discord, request, &facts, bot_position).await?;
+            match self
+                .inner
+                .execute(
+                    request,
+                    &actor,
+                    &target,
+                    bot_position,
+                    request_id,
+                    idempotency_key,
+                    now_ms,
+                )
+                .await
+            {
+                Ok(result) => {
+                    let target_id = DiscordId::new(request.target_id()).map_err(|_| {
+                        ActionError::new(
+                            ErrorCode::Internal,
+                            "Internal action storage unavailable",
+                            "moderation_receipt_invalid",
+                        )
+                    })?;
+                    let _ = result.outcome;
+                    Ok(TerminalResponse::Success {
+                        resource_id: Some(target_id),
+                        affected: 1,
+                    })
+                }
+                Err(error) => match error.code {
+                    ErrorCode::Malformed
+                    | ErrorCode::ActionNotAllowed
+                    | ErrorCode::DiscordRejected => {
+                        let failure = match error.code {
+                            ErrorCode::Malformed => TerminalFailure::Malformed,
+                            ErrorCode::ActionNotAllowed => TerminalFailure::ActionNotAllowed,
+                            _ => TerminalFailure::DiscordRejected,
+                        };
+                        Ok(TerminalResponse::Failure(failure))
+                    }
+                    _ => Err(error),
+                },
+            }
+        })
+    }
+}
+
+/// Discord `ADMINISTRATOR` bit (1 << 3): holders pass every permission check.
+const ADMINISTRATOR_BIT: u64 = 1 << 3;
+
+/// The five website-wired restrictive verbs. Channel verbs belong to the
+/// channel family slice: none of them may reach this resolver.
+fn is_wired_moderation_verb(action: ModerationAction) -> bool {
+    matches!(
+        action,
+        ModerationAction::Ban
+            | ModerationAction::TempBan
+            | ModerationAction::Kick
+            | ModerationAction::Warn
+            | ModerationAction::Timeout
+    )
+}
+
+/// Per-verb actor gate (legacy `permissionFor`): bans check Ban Members,
+/// kicks check Kick Members, warns and timeouts check Moderate Members. The
+/// resolver refuses verbs outside [`is_wired_moderation_verb`] before this
+/// runs; the shared service re-checks the same gate from its own table.
+fn moderation_required_permission(action: ModerationAction) -> u64 {
+    match action {
+        ModerationAction::Ban | ModerationAction::TempBan => PERM_BAN_MEMBERS,
+        ModerationAction::Kick => PERM_KICK_MEMBERS,
+        _ => PERM_MODERATE_MEMBERS,
+    }
+}
+
+/// Bans address users, not just members: Discord bans a departed or
+/// never-joined user id outright. Kicks, warns and timeouts act on a guild
+/// member, so they refuse a departed target instead of synthesizing one.
+fn moderation_tolerates_departed_target(action: ModerationAction) -> bool {
+    matches!(action, ModerationAction::Ban | ModerationAction::TempBan)
+}
+
+/// Live guild snapshot for hierarchy and permission resolution. Read per
+/// website moderation call: hierarchy never runs on a partial or cached
+/// snapshot.
+struct ModerationGuildFacts {
+    guild_id: String,
+    owner_id: String,
+    positions: std::collections::HashMap<String, i64>,
+    permissions: std::collections::HashMap<String, u64>,
+}
+
+fn moderation_text(value: &Value, key: &str) -> Option<String> {
+    value.get(key)?.as_str().map(str::to_owned)
+}
+
+async fn moderation_guild_facts(
+    executor: &ActionExecutor,
+    guild_id: &str,
+) -> Result<ModerationGuildFacts, ActionError> {
+    let refuse = || {
+        ActionError::new(
+            ErrorCode::DiscordUnavailable,
+            "Discord member snapshot unavailable; do not retry this key",
+            "moderation_snapshot_unavailable",
+        )
+    };
+    let guild = executor
+        .get_json_strict(&format!("/guilds/{guild_id}"))
+        .await
+        .map_err(|_| refuse())?
+        .ok_or_else(refuse)?;
+    let owner_id = moderation_text(&guild, "owner_id").ok_or_else(refuse)?;
+    let mut positions = std::collections::HashMap::new();
+    let mut permissions = std::collections::HashMap::new();
+    for role in guild
+        .get("roles")
+        .and_then(Value::as_array)
+        .ok_or_else(refuse)?
+    {
+        let id = moderation_text(role, "id").ok_or_else(refuse)?;
+        let position = role
+            .get("position")
+            .and_then(Value::as_i64)
+            .ok_or_else(refuse)?;
+        let perm = role
+            .get("permissions")
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or_else(refuse)?;
+        positions.insert(id.clone(), position);
+        permissions.insert(id, perm);
+    }
+    if !positions.contains_key(guild_id) {
+        return Err(refuse());
+    }
+    Ok(ModerationGuildFacts {
+        guild_id: guild_id.to_owned(),
+        owner_id,
+        positions,
+        permissions,
+    })
+}
+
+fn moderation_top_position(held: &[String], facts: &ModerationGuildFacts) -> Option<i64> {
+    let mut top = *facts.positions.get(&facts.guild_id)?;
+    for role in held {
+        top = top.max(*facts.positions.get(role)?);
+    }
+    Some(top)
+}
+
+fn moderation_with_everyone(mut roles: Vec<String>, guild_id: &str) -> Vec<String> {
+    if !roles.iter().any(|r| r == guild_id) {
+        roles.push(guild_id.to_owned());
+    }
+    roles
+}
+
+/// Guild-level permission union for the held roles plus `@everyone`.
+/// Unknown held roles fail closed; the snapshot is incomplete, never
+/// unprotected. The guild owner and `ADMINISTRATOR` holders pass everything.
+fn moderation_permissions(
+    held: &[String],
+    facts: &ModerationGuildFacts,
+    user_id: &str,
+) -> Option<u64> {
+    if user_id == facts.owner_id {
+        return Some(u64::MAX);
+    }
+    let mut bits = *facts.permissions.get(&facts.guild_id)?;
+    for role in held {
+        bits |= *facts.permissions.get(role)?;
+    }
+    if bits & ADMINISTRATOR_BIT != 0 {
+        return Some(u64::MAX);
+    }
+    Some(bits)
+}
+
+/// Membership plus bot flag from `GET /guilds/{g}/members/{u}`. `None` is a
+/// departed or never-joined user: bans tolerate it (Discord bans bare user
+/// ids), kicks and warns refuse. An id mismatch or malformed body fails
+/// closed into fenced uncertainty.
+async fn moderation_fetched_member(
+    executor: &ActionExecutor,
+    guild_id: &str,
+    user_id: &str,
+) -> Result<Option<(Vec<String>, bool)>, ActionError> {
+    let refuse = || {
+        ActionError::new(
+            ErrorCode::DiscordUnavailable,
+            "Discord member snapshot unavailable; do not retry this key",
+            "moderation_snapshot_unavailable",
+        )
+    };
+    let member = executor
+        .get_json_strict(&format!("/guilds/{guild_id}/members/{user_id}"))
+        .await
+        .map_err(|_| refuse())?;
+    let Some(member) = member else {
+        return Ok(None);
+    };
+    let user = member.get("user").ok_or_else(refuse)?;
+    if moderation_text(user, "id").as_deref() != Some(user_id) {
+        return Err(refuse());
+    }
+    let mut roles = Vec::new();
+    for role in member
+        .get("roles")
+        .and_then(Value::as_array)
+        .ok_or_else(refuse)?
+    {
+        roles.push(role.as_str().ok_or_else(refuse)?.to_owned());
+    }
+    let is_bot = user.get("bot").and_then(Value::as_bool).unwrap_or(false);
+    Ok(Some((roles, is_bot)))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn moderation_resolve(
+    executor: &ActionExecutor,
+    request: &InternalMemberRequest,
+    facts: &ModerationGuildFacts,
+    bot_highest_role_position: i64,
+) -> Result<(ModerationActor, ModerationTarget, i64), ActionError> {
+    if !is_wired_moderation_verb(request.action()) {
+        return Err(ActionError::new(
+            ErrorCode::ActionNotAllowed,
+            "not a wired moderation action",
+            "moderation_action_mismatch",
+        ));
+    }
+    let guild_id = &facts.guild_id;
+    let refuse_unavailable = || {
+        ActionError::new(
+            ErrorCode::DiscordUnavailable,
+            "Discord member snapshot unavailable; do not retry this key",
+            "moderation_snapshot_unavailable",
+        )
+    };
+    let (actor_roles, _) = moderation_fetched_member(executor, guild_id, request.actor_id())
+        .await?
+        .ok_or_else(|| {
+            ActionError::new(
+                ErrorCode::ActionNotAllowed,
+                "moderation actor is not a guild member",
+                "moderation_actor_not_member",
+            )
+        })?;
+    let actor_with_everyone = moderation_with_everyone(actor_roles, guild_id);
+    let actor = ModerationActor {
+        user_id: request.actor_id().to_owned(),
+        highest_role_position: moderation_top_position(&actor_with_everyone, facts)
+            .ok_or_else(refuse_unavailable)?,
+        role_ids: actor_with_everyone.clone(),
+        permissions: moderation_permissions(&actor_with_everyone, facts, request.actor_id())
+            .ok_or_else(refuse_unavailable)?,
+    };
+    let required = moderation_required_permission(request.action());
+    if actor.permissions & required != required && actor.user_id != facts.owner_id {
+        return Err(ActionError::new(
+            ErrorCode::ActionNotAllowed,
+            "moderation actor lacks the permission for this action",
+            "moderation_actor_forbidden",
+        ));
+    }
+    // A departed target bans at `@everyone` standing: hierarchy still applies
+    // against the actor and the bot. The bot flag is unknowable off-guild, so
+    // the shared service's any-bot guard cannot fire for departed users; the
+    // owner-id and hierarchy guards still can.
+    let (target_roles, is_bot) =
+        match moderation_fetched_member(executor, guild_id, request.target_id()).await? {
+            Some(found) => found,
+            None if moderation_tolerates_departed_target(request.action()) => (Vec::new(), false),
+            None => {
+                return Err(ActionError::new(
+                    ErrorCode::ActionNotAllowed,
+                    "moderation target is not a guild member",
+                    "moderation_target_not_member",
+                ));
+            }
+        };
+    let target_with_everyone = moderation_with_everyone(target_roles, guild_id);
+    let target = ModerationTarget {
+        user_id: request.target_id().to_owned(),
+        highest_role_position: moderation_top_position(&target_with_everyone, facts)
+            .ok_or_else(refuse_unavailable)?,
+        role_ids: target_with_everyone,
+        is_bot,
+        is_guild_owner: request.target_id() == facts.owner_id,
+    };
+    Ok((actor, target, bot_highest_role_position))
+}
 /// Keyless read-only effect: a resolved `event.read` performs one Discord GET
 /// through [`ActionExecutor::execute_event`] and refreshes the Postgres mirror.
 /// Reads carry no `Idempotency-Key` and take no durable idempotency claim; the
@@ -142,7 +598,9 @@ struct ReceiverState {
     config: InternalActionConfig,
     store: InternalActionStore,
     effect: Arc<dyn ActionEffect>,
+    member: Arc<dyn MemberEffect>,
     event_read: Arc<dyn EventReadEffect>,
+    moderation: Arc<dyn ModerationEffect>,
     clock: Mutex<ClockGuard>,
     buckets: Mutex<TokenBuckets>,
     telemetry: Mutex<RejectionTelemetry>,
@@ -154,13 +612,17 @@ impl ReceiverState {
         config: InternalActionConfig,
         pool: sqlx::PgPool,
         effect: Arc<dyn ActionEffect>,
+        member: Arc<dyn MemberEffect>,
         event_read: Arc<dyn EventReadEffect>,
+        moderation: Arc<dyn ModerationEffect>,
     ) -> Self {
         Self {
             config,
             store: InternalActionStore::new(pool),
             effect,
+            member,
             event_read,
+            moderation,
             clock: Mutex::new(ClockGuard::new()),
             buckets: Mutex::new(TokenBuckets::new()),
             telemetry: Mutex::new(RejectionTelemetry::default()),
@@ -192,6 +654,7 @@ impl ReceiverState {
                 TerminalFailure::ActionNotAllowed => ErrorCode::ActionNotAllowed,
                 TerminalFailure::DiscordRejected => ErrorCode::DiscordRejected,
                 TerminalFailure::NoEffect => ErrorCode::DiscordUnavailable,
+                TerminalFailure::VersionConflict => ErrorCode::VersionConflict,
             };
             log_records(
                 self.telemetry
@@ -200,7 +663,7 @@ impl ReceiverState {
                     .record(Rejection::new(code, key, action), now_ms()),
             );
         }
-        terminal_response(response, replayed, id)
+        terminal_response(response, action, replayed, id)
     }
 
     fn flush(&self, shutdown: bool) {
@@ -212,6 +675,77 @@ impl ReceiverState {
         };
         log_records(records);
     }
+}
+
+/// Build the production moderation executor from the process environment.
+/// `enabled` requires every wired restrictive verb's flag, which all derive
+/// from BOTH `TWO_MODERATION` and `TWO_INTERNAL_ALLOW_MODERATION` (see
+/// [`InternalFlags`]): the website must never grant itself verbs through the
+/// settings store. Invalid enabled moderation configuration is fatal, like
+/// the receiver bind itself; a disabled executor still constructs and refuses
+/// every moderation call with `action_not_allowed`.
+///
+/// The moderation settings (gates, audit secret) parse only when the website
+/// verbs are enabled: a disabled executor never touches policy or secrets, so
+/// malformed moderation settings must not fail the bind while every website
+/// verb stays refused.
+fn moderation_executor_from_env(
+    pool: sqlx::PgPool,
+    discord: ActionExecutor,
+) -> Result<ModerationExecutor, String> {
+    use two_bot_core::mac::moderation_audit_secret;
+
+    let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID.to_owned();
+    let vars: std::collections::HashMap<String, String> = std::env::vars().collect();
+    let flags = InternalFlags::from_map(&vars);
+    let enabled = [
+        "moderation.ban",
+        "moderation.tempban",
+        "moderation.kick",
+        "moderation.warn",
+        "moderation.timeout",
+    ]
+    .iter()
+    .all(|verb| flags.is_enabled(verb));
+    let (policy, audit_secret) = if enabled {
+        let gates = ModerationGates::from_map(&vars).map_err(|e| e.to_string())?;
+        if !gates.enabled {
+            return Err("moderation flag without TWO_MODERATION".to_owned());
+        }
+        let audit_secret = moderation_audit_secret(&vars, None)
+            .map_err(|e| e.to_string())?
+            .map(|s| s.expose().to_owned());
+        (
+            ModerationPolicy {
+                owen_user_id: gates.owen_user_id,
+                protected_role_ids: gates.protected_role_ids,
+                bot_user_id: None,
+            },
+            audit_secret,
+        )
+    } else {
+        (
+            ModerationPolicy {
+                owen_user_id: String::new(),
+                protected_role_ids: std::collections::HashSet::new(),
+                bot_user_id: None,
+            },
+            None,
+        )
+    };
+    let store = PgMemberModerationStore::new(pool, guild_id.clone());
+    let inner = InternalMemberExecutor::new(
+        store,
+        discord.clone(),
+        InternalMemberConfig {
+            guild_id,
+            enabled,
+            policy,
+            audit_secret,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(ModerationExecutor::new(inner, discord))
 }
 
 /// Binding completes before any gateway/job task starts. Invalid enabled
@@ -229,9 +763,10 @@ pub async fn bind(
     use two_bot_core::send_admission::{PgSendAdmission, SendAdmission};
     use two_bot_discord::internal_actions::CooldownGovernor;
 
-    // One shared send-admission lane for both executors: every Discord send,
-    // announcement or event read, holds the same token-wide lane. Bound as the
-    // trait object so both executor constructors coerce without re-wrapping.
+    // One shared send-admission lane for every executor: announcement sends,
+    // event reads and moderation calls all hold the same token-wide lane.
+    // Bound as the trait object so every executor constructor coerces without
+    // re-wrapping.
     let admission: Arc<dyn SendAdmission> =
         Arc::new(PgSendAdmission::new(pool.clone(), token).map_err(|_| {
             std::io::Error::other("internal-action admission configuration invalid")
@@ -243,9 +778,21 @@ pub async fn bind(
         Arc::clone(&admission),
     )
     .map_err(|_| std::io::Error::other("internal-action executor configuration invalid"))?;
-    let events =
-        ActionExecutor::with_admission(token.to_owned(), None, admission).map_err(|_| {
+    let events = ActionExecutor::with_admission(token.to_owned(), None, Arc::clone(&admission))
+        .map_err(|_| {
             std::io::Error::other("internal-action event executor configuration invalid")
+        })?;
+    // Membership shares the same admitted transport as event reads: one
+    // token-wide lane for every Discord send. Cloned before the read wrapper
+    // takes ownership; role hierarchy and add-member PUTs hold the same lane.
+    let member = events.clone();
+    let moderation_discord = ActionExecutor::with_admission(token.to_owned(), None, admission)
+        .map_err(|_| {
+            std::io::Error::other("internal-action moderation executor configuration invalid")
+        })?;
+    let moderation =
+        moderation_executor_from_env(pool.clone(), moderation_discord).map_err(|_| {
+            std::io::Error::other("internal-action moderation executor configuration invalid")
         })?;
     let listener = TcpListener::bind(config.listen_addr()).await?;
     Ok(BoundReceiver {
@@ -254,7 +801,9 @@ pub async fn bind(
             config,
             pool.clone(),
             Arc::new(executor),
+            Arc::new(member),
             Arc::new(EventReadExecutor::new(events, pool)),
+            Arc::new(moderation),
         )),
     })
 }
@@ -412,7 +961,7 @@ async fn receive(state: &ReceiverState, request: Request, id: &str) -> Response 
     let flags = InternalFlags::from_env();
     let decision = {
         let mut buckets = state.buckets.lock().expect("buckets lock");
-        burned.authorize(&flags, true, false, &mut buckets)
+        burned.authorize(&flags, true, true, &mut buckets)
     };
     let decision = match decision {
         Ok(decision) => decision,
@@ -430,6 +979,34 @@ async fn receive(state: &ReceiverState, request: Request, id: &str) -> Response 
     // idempotency claim. The committed nonce above is their replay guard.
     if decision.action == "event.read" {
         return read_event(state, &decision, id, key, action).await;
+    }
+    if decision.action == "settings.get" {
+        return read_setting(state, &decision, id, key, action).await;
+    }
+    if decision.action == "settings.set" {
+        return write_setting(state, &decision, headers.idempotency, &raw, id, key, action).await;
+    }
+    // Family 1 (settings, M3.10) plus the five wired restrictive-moderation
+    // verbs. Every other verb without an adapter stays refused below, even
+    // when the flag gate authorizes it — shipping an implementation must
+    // never widen the allowlist by itself.
+    if matches!(
+        decision.action.as_str(),
+        "moderation.ban"
+            | "moderation.tempban"
+            | "moderation.kick"
+            | "moderation.warn"
+            | "moderation.timeout"
+    ) {
+        return moderation_member(state, &decision, &raw, headers.idempotency, id, key, action)
+            .await;
+    }
+    // Membership family (M3.10 fam5): validated role-key assignment and
+    // OAuth-backed guild joins share the same nonce/bucket fences above. The
+    // durable claim below is the same store the announcement path uses, so
+    // audit (`intent`/`terminal`) and replay semantics match.
+    if decision.action == "role.assign" || decision.action == "guild.add_member" {
+        return execute_member(state, &decision, headers.idempotency, &raw, id, key, action).await;
     }
     // This second fence is explicit: core phase-1 defaults are not capabilities.
     if !AnnouncementExecutor::supports(&decision.action) {
@@ -522,6 +1099,421 @@ async fn read_event(
     }
 }
 
+/// Membership family: `role.assign` resolves a caller-supplied key through the
+/// configured role map (never a raw snowflake), `guild.add_member` carries a
+/// transient OAuth token that never enters audit rows, stored receipts, logs,
+/// or `Debug`. Field validation runs before the durable claim, so malformed
+/// keys and shapes refuse with no Discord call and no idempotency row. The
+/// claim, terminal receipt (`Success{None,0/1}` matching the stored-member
+/// executor), and replay mapping match the announcement path and the
+/// `execute_stored_member` contract: `1` is the applied effect (`assigned` /
+/// `added`), `0` the idempotent no-op (`already_held` / `already_member`).
+/// Only a definitive Discord rejection finishes as `discord_rejected`; every
+/// other post-claim failure (rate-limit, timeout, transport, identity read)
+/// retains the claim as `unknown` (`needs_reconciliation`), never releasing or
+/// retrying the mutation. This is deliberately conservative: local admission
+/// refusals also retain rather than release, so a held lane never grants a
+/// second dispatch under the same intent.
+async fn execute_member(
+    state: &ReceiverState,
+    decision: &AuthDecision,
+    idempotency_header: Option<&str>,
+    raw: &[u8],
+    id: &str,
+    key: KeyLabel,
+    action: ActionLabel,
+) -> Response {
+    let reject = |failure| state.reject(failure, key.clone(), action, id);
+    let idempotency = match validate_idempotency_key(idempotency_header, &decision.action) {
+        Ok(key) => key,
+        Err(error) => return reject(Failure::from_action(error)),
+    };
+    let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+    // Validate before the claim: no Discord call, no idempotency row on bad input.
+    // The `Failure` envelope drops validator text, so untrusted keys and the
+    // OAuth token never reach the wire; `AuthDecision`'s `Debug` already hides
+    // the body.
+    enum Validated {
+        Assign { discord_id: String, role_id: String },
+        Add { discord_id: String },
+    }
+    let validated = match decision.action.as_str() {
+        "role.assign" => {
+            match RoleAssignRequest::validate(&decision.body, state.config.role_keys()) {
+                Ok(request) => Validated::Assign {
+                    discord_id: request.discord_id().to_owned(),
+                    role_id: request.role_id().to_owned(),
+                },
+                Err(error) => return reject(Failure::from_action(error)),
+            }
+        }
+        "guild.add_member" => match GuildAddMemberRequest::validate(&decision.body) {
+            Ok(request) => {
+                // Presence only; the value stays transient for the Discord call
+                // below and is never stored or logged.
+                if require_field_str(&decision.body, "access_token").is_err() {
+                    return reject(Failure::code(ErrorCode::Internal));
+                }
+                Validated::Add {
+                    discord_id: request.discord_id().to_owned(),
+                }
+            }
+            Err(error) => return reject(Failure::from_action(error)),
+        },
+        _ => return reject(Failure::code(ErrorCode::ActionNotAllowed)),
+    };
+    let (target_id, resolved_role_id) = match &validated {
+        Validated::Assign {
+            discord_id,
+            role_id,
+        } => (discord_id.as_str(), Some(role_id.as_str())),
+        Validated::Add { discord_id } => (discord_id.as_str(), None),
+    };
+    let subject = {
+        let guild = match DiscordId::new(guild_id) {
+            Ok(id) => id,
+            Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+        };
+        let target = match DiscordId::new(target_id) {
+            Ok(id) => id,
+            Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+        };
+        let role = match resolved_role_id {
+            Some(role) => match DiscordId::new(role) {
+                Ok(id) => Some(id),
+                Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+            },
+            None => None,
+        };
+        AuditSubject {
+            guild_id: Some(guild),
+            target_id: Some(target),
+            actor_id: None,
+            resolved_role_id: role,
+        }
+    };
+    let Some(caller) = state.config.caller_for(&decision.key_id) else {
+        return reject(Failure::code(ErrorCode::Internal));
+    };
+    let identity = match RequestIdentity::new(caller, idempotency, &decision.action, raw) {
+        Ok(identity) => identity,
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    let claim = match state.store.claim(&identity, &subject).await {
+        Ok(InternalClaim::Claimed(claim)) => claim,
+        Ok(InternalClaim::Replay(response)) => {
+            return state.terminal(response, true, id, key.clone(), action);
+        }
+        Ok(InternalClaim::Mismatch) => {
+            return reject(Failure::code(ErrorCode::VersionConflict));
+        }
+        Ok(InternalClaim::InFlight) => return reject(Failure::code(ErrorCode::InProgress)),
+        Ok(InternalClaim::NeedsReconciliation) => return reject(Failure::reconciliation()),
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    // The claim is committed: every Discord call below runs after it, including
+    // the bot-identity read for the hierarchy check.
+    let outcome = match validated {
+        Validated::Assign { .. } => {
+            let bot_user_id = match state.member.resolve_bot().await {
+                Ok(id) => id,
+                Err(_) => {
+                    let _ = state.store.mark_unknown(&claim).await;
+                    return reject(Failure::reconciliation());
+                }
+            };
+            // Revalidate against the same map the pre-claim check used, so the
+            // request reaching Discord is the pinned allowlist entry, not a
+            // retargeted mid-request edit.
+            let request =
+                match RoleAssignRequest::validate(&decision.body, state.config.role_keys()) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        let _ = state
+                            .store
+                            .finish(
+                                &claim,
+                                &TerminalResponse::Failure(TerminalFailure::Malformed),
+                            )
+                            .await;
+                        return state.terminal(
+                            TerminalResponse::Failure(TerminalFailure::Malformed),
+                            false,
+                            id,
+                            key.clone(),
+                            action,
+                        );
+                    }
+                };
+            state
+                .member
+                .execute_assign(guild_id, &bot_user_id, &request)
+                .await
+        }
+        Validated::Add { .. } => {
+            let request = match GuildAddMemberRequest::validate(&decision.body) {
+                Ok(request) => request,
+                Err(_) => {
+                    let _ = state
+                        .store
+                        .finish(
+                            &claim,
+                            &TerminalResponse::Failure(TerminalFailure::Malformed),
+                        )
+                        .await;
+                    return state.terminal(
+                        TerminalResponse::Failure(TerminalFailure::Malformed),
+                        false,
+                        id,
+                        key.clone(),
+                        action,
+                    );
+                }
+            };
+            // Transient only: cloned for the single Discord PUT, never stored.
+            let token = match require_field_str(&decision.body, "access_token") {
+                Ok(token) => token.to_owned(),
+                Err(_) => {
+                    let _ = state
+                        .store
+                        .finish(
+                            &claim,
+                            &TerminalResponse::Failure(TerminalFailure::Malformed),
+                        )
+                        .await;
+                    return state.terminal(
+                        TerminalResponse::Failure(TerminalFailure::Malformed),
+                        false,
+                        id,
+                        key.clone(),
+                        action,
+                    );
+                }
+            };
+            let result = state.member.execute_add(guild_id, &request, &token).await;
+            // Drop the secret at once; the `String` lives only for this call.
+            drop(token);
+            result
+        }
+    };
+    match outcome {
+        Ok(member_outcome) => {
+            let affected = u32::from(matches!(
+                member_outcome,
+                MemberOutcome::Added | MemberOutcome::Assigned
+            ));
+            let response = TerminalResponse::Success {
+                resource_id: None,
+                affected,
+            };
+            if state.store.finish(&claim, &response).await.is_err() {
+                let _ = state.store.mark_unknown(&claim).await;
+                return reject(Failure::reconciliation());
+            }
+            state.terminal(response, false, id, key.clone(), action)
+        }
+        Err(error) if error.code == ErrorCode::DiscordRejected => {
+            let response = TerminalResponse::Failure(TerminalFailure::DiscordRejected);
+            if state.store.finish(&claim, &response).await.is_err() {
+                let _ = state.store.mark_unknown(&claim).await;
+                return reject(Failure::reconciliation());
+            }
+            state.terminal(response, false, id, key.clone(), action)
+        }
+        Err(_) => {
+            let _ = state.store.mark_unknown(&claim).await;
+            reject(Failure::reconciliation())
+        }
+    }
+}
+
+/// Website restrictive moderation (`moderation.ban`, `moderation.tempban`,
+/// `moderation.kick`, `moderation.warn`, `moderation.timeout`):
+/// idempotency-key validation and the durable claim match the announcement
+/// path. The body parses via [`InternalMemberRequest::from_body`]
+/// (actor/target snowflakes, trimmed reason, tempban `duration_seconds`
+/// 60–365d, timeout `duration_seconds` 60–28d); actor and target resolve from
+/// the configured staging guild using live member roles, positions,
+/// permissions and bot/owner flags — never from body-supplied roles. The outer
+/// [`InternalActionStore`] claim guards the exact signed bytes (replay,
+/// mismatch, in-flight); the inner [`InternalMemberExecutor`] guards the
+/// moderation content and writes the shared `moderation_audit` ledger, so rows
+/// are identical to the slash-command path. Only the five wired verbs reach
+/// here; every other verb stays refused by the fences in [`receive`].
+#[allow(clippy::too_many_arguments)]
+async fn moderation_member(
+    state: &ReceiverState,
+    decision: &AuthDecision,
+    raw: &[u8],
+    idempotency_header: Option<&str>,
+    id: &str,
+    key: KeyLabel,
+    action: ActionLabel,
+) -> Response {
+    let reject = |failure| state.reject(failure, key.clone(), action, id);
+    let idempotency = match validate_idempotency_key(idempotency_header, &decision.action) {
+        Ok(key) => key.to_owned(),
+        Err(error) => return reject(Failure::from_action(error)),
+    };
+    let request = match InternalMemberRequest::from_body(&decision.action, &decision.body) {
+        Ok(request) => request,
+        Err(error) => return reject(Failure::from_action(error)),
+    };
+    if !is_wired_moderation_verb(request.action()) {
+        return reject(Failure::code(ErrorCode::ActionNotAllowed));
+    }
+    let subject = match (
+        DiscordId::new(two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID),
+        DiscordId::new(request.actor_id()),
+        DiscordId::new(request.target_id()),
+    ) {
+        (Ok(guild_id), Ok(actor_id), Ok(target_id)) => AuditSubject {
+            guild_id: Some(guild_id),
+            actor_id: Some(actor_id),
+            target_id: Some(target_id),
+            ..AuditSubject::default()
+        },
+        _ => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    let Some(caller) = state.config.caller_for(&decision.key_id) else {
+        return reject(Failure::code(ErrorCode::Internal));
+    };
+    let caller = caller.to_owned();
+    let identity = match RequestIdentity::new(&caller, &idempotency, &decision.action, raw) {
+        Ok(identity) => identity,
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    let claim = match state.store.claim(&identity, &subject).await {
+        Ok(InternalClaim::Claimed(claim)) => claim,
+        Ok(InternalClaim::Replay(response)) => {
+            return moderation_terminal(
+                state,
+                &decision.action,
+                response,
+                true,
+                id,
+                key.clone(),
+                action,
+            );
+        }
+        Ok(InternalClaim::Mismatch) => {
+            return reject(Failure::code(ErrorCode::VersionConflict));
+        }
+        Ok(InternalClaim::InFlight) => {
+            return reject(Failure::code(ErrorCode::InProgress));
+        }
+        Ok(InternalClaim::NeedsReconciliation) => {
+            return reject(Failure::reconciliation());
+        }
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    // Resolution (guild facts, actor/target/bot snapshots) and the shared
+    // moderation service run inside the effect. Definitive refusals become
+    // terminal receipts; snapshot/transport uncertainty stays fenced.
+    let now = now_ms() as i64;
+    match state
+        .moderation
+        .execute_moderation(&request, id, &idempotency, now)
+        .await
+    {
+        Ok(response) => {
+            if state.store.finish(&claim, &response).await.is_err() {
+                let _ = state.store.mark_unknown(&claim).await;
+                return reject(Failure::reconciliation());
+            }
+            moderation_terminal(
+                state,
+                &decision.action,
+                response,
+                false,
+                id,
+                key.clone(),
+                action,
+            )
+        }
+        Err(error)
+            if matches!(
+                error.code,
+                ErrorCode::Malformed | ErrorCode::ActionNotAllowed | ErrorCode::DiscordRejected
+            ) =>
+        {
+            let failure = match error.code {
+                ErrorCode::Malformed => TerminalFailure::Malformed,
+                ErrorCode::ActionNotAllowed => TerminalFailure::ActionNotAllowed,
+                _ => TerminalFailure::DiscordRejected,
+            };
+            let response = TerminalResponse::Failure(failure);
+            if state.store.finish(&claim, &response).await.is_err() {
+                let _ = state.store.mark_unknown(&claim).await;
+                return reject(Failure::reconciliation());
+            }
+            moderation_terminal(
+                state,
+                &decision.action,
+                response,
+                false,
+                id,
+                key.clone(),
+                action,
+            )
+        }
+        Err(_) => {
+            let _ = state.store.mark_unknown(&claim).await;
+            reject(Failure::reconciliation())
+        }
+    }
+}
+
+/// Legacy outcome string per wired verb (`MemberOutcome::as_str`): `banned`,
+/// `temporarily_banned`, `kicked`, `warned`, `timed_out`. The stored receipt
+/// carries only the affected target, so the wire renders the outcome from the
+/// action — the first and every replayed response are identical.
+fn moderation_outcome(action: &str) -> Option<&'static str> {
+    match action {
+        "moderation.ban" => Some("banned"),
+        "moderation.tempban" => Some("temporarily_banned"),
+        "moderation.kick" => Some("kicked"),
+        "moderation.warn" => Some("warned"),
+        "moderation.timeout" => Some("timed_out"),
+        _ => None,
+    }
+}
+
+/// Render a moderation terminal receipt. Success carries the acted-on target
+/// as the stored `resource_id` (audit) and reports the verb's outcome on the
+/// wire; failures share the announcement failure codes. Replays set the same
+/// `idempotent-replay` header as the announcement path.
+#[allow(clippy::too_many_arguments)]
+fn moderation_terminal(
+    state: &ReceiverState,
+    action: &str,
+    response: TerminalResponse,
+    replayed: bool,
+    id: &str,
+    key: KeyLabel,
+    action_label: ActionLabel,
+) -> Response {
+    match response {
+        TerminalResponse::Success { .. } => {
+            let Some(outcome) = moderation_outcome(action) else {
+                return state.reject(Failure::code(ErrorCode::Internal), key, action_label, id);
+            };
+            let mut wire = (
+                StatusCode::OK,
+                Json(json!({"ok": true, "result": {"outcome": outcome}, "request_id": id})),
+            )
+                .into_response();
+            if replayed {
+                wire.headers_mut()
+                    .insert("idempotent-replay", HeaderValue::from_static("true"));
+            }
+            wire.headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            wire
+        }
+        TerminalResponse::Failure(_) => state.terminal(response, replayed, id, key, action_label),
+    }
+}
 /// The 7-field read result (`outcome`, `event_id`, `name`, `starts_at`,
 /// `location`, `status`, `observed_at`) is the response, not a stored
 /// idempotency receipt: reads take no claim, so there is nothing to replay.
@@ -531,6 +1523,194 @@ fn event_read_response(result: Value, id: &str) -> Response {
         Json(json!({"ok": true, "result": result, "request_id": id})),
     )
         .into_response();
+    wire.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    wire
+}
+
+/// Keyless `settings.get`: read the guild's stored override only, never the
+/// process environment. The flag gate already ran in `authorize`; the committed
+/// nonce above is the replay guard, so no idempotency claim is taken.
+async fn read_setting(
+    state: &ReceiverState,
+    decision: &AuthDecision,
+    id: &str,
+    key: KeyLabel,
+    action: ActionLabel,
+) -> Response {
+    let reject = |failure| state.reject(failure, key.clone(), action, id);
+    let command = match SettingsCommand::parse("settings.get", &decision.body) {
+        Ok(command) => command,
+        Err(error) => return reject(Failure::from_action(error)),
+    };
+    let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+    let store = SettingsStore::new(state.store.pool());
+    match execute_settings(&store, guild_id, &command).await {
+        Ok(outcome) => settings_read_response(outcome.result, outcome.observed_version, id),
+        Err(error) => reject(Failure::from_action(error)),
+    }
+}
+
+/// `settings.set`: validated writes claim the outer durable idempotency key
+/// before executing. Replaying the stored terminal returns the first
+/// value-free `{key,outcome}` result without a second write, audit row or
+/// version bump. A stale `expected_version` is a non-retryable 409
+/// `version_conflict`: the save that landed in between is never silently
+/// reverted.
+#[allow(clippy::too_many_arguments)]
+async fn write_setting(
+    state: &ReceiverState,
+    decision: &AuthDecision,
+    idempotency_header: Option<&str>,
+    raw: &[u8],
+    id: &str,
+    key: KeyLabel,
+    action: ActionLabel,
+) -> Response {
+    let reject = |failure| state.reject(failure, key.clone(), action, id);
+    let idempotency = match validate_idempotency_key(idempotency_header, &decision.action) {
+        Ok(key) => key,
+        Err(error) => return reject(Failure::from_action(error)),
+    };
+    let command = match SettingsCommand::parse("settings.set", &decision.body) {
+        Ok(command) => command,
+        Err(error) => return reject(Failure::from_action(error)),
+    };
+    let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+    let (_, actor, _) = command.write().expect("set parses as a write");
+    let subject = AuditSubject {
+        guild_id: Some(DiscordId::new(guild_id).expect("staging guild ID")),
+        actor_id: Some(DiscordId::new(actor).expect("validated actor ID")),
+        ..AuditSubject::default()
+    };
+    let Some(caller) = state.config.caller_for(&decision.key_id) else {
+        return reject(Failure::code(ErrorCode::Internal));
+    };
+    let identity = match RequestIdentity::new(caller, idempotency, &decision.action, raw) {
+        Ok(identity) => identity,
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    let claim = match state.store.claim(&identity, &subject).await {
+        Ok(InternalClaim::Claimed(claim)) => claim,
+        Ok(InternalClaim::Replay(response)) => {
+            return replay_setting(state, &decision.body, response, id, key, action).await;
+        }
+        Ok(InternalClaim::Mismatch) => return reject(Failure::code(ErrorCode::VersionConflict)),
+        Ok(InternalClaim::InFlight) => return reject(Failure::code(ErrorCode::InProgress)),
+        Ok(InternalClaim::NeedsReconciliation) => return reject(Failure::reconciliation()),
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    let store = SettingsStore::new(state.store.pool());
+    match execute_settings(&store, guild_id, &command).await {
+        Ok(outcome) => {
+            let deleted = command.write().expect("set parses as a write").0.is_none();
+            let terminal = TerminalResponse::Success {
+                resource_id: None,
+                affected: u32::from(!deleted),
+            };
+            if state.store.finish(&claim, &terminal).await.is_err() {
+                let _ = state.store.mark_unknown(&claim).await;
+                return reject(Failure::reconciliation());
+            }
+            settings_write_response(outcome.result, outcome.observed_version, id, false)
+        }
+        Err(error) => {
+            let terminal = match error.code {
+                ErrorCode::VersionConflict => {
+                    Some(TerminalResponse::Failure(TerminalFailure::VersionConflict))
+                }
+                ErrorCode::ActionNotAllowed => {
+                    Some(TerminalResponse::Failure(TerminalFailure::ActionNotAllowed))
+                }
+                ErrorCode::Malformed => Some(TerminalResponse::Failure(TerminalFailure::Malformed)),
+                _ => None,
+            };
+            if let Some(terminal) = terminal {
+                if state.store.finish(&claim, &terminal).await.is_err() {
+                    let _ = state.store.mark_unknown(&claim).await;
+                    return reject(Failure::reconciliation());
+                }
+                return reject(Failure::from_action(error));
+            }
+            let _ = state.store.mark_unknown(&claim).await;
+            reject(Failure::reconciliation())
+        }
+    }
+}
+
+/// Replay a stored `settings.set` terminal without re-executing the write.
+/// Success rebuilds the value-free `{key,outcome}` result from the claimed
+/// body (the payload hash guarantees it matches the first execution); failures
+/// reuse the generic terminal envelope with the replay marker.
+async fn replay_setting(
+    state: &ReceiverState,
+    body: &Map<String, Value>,
+    response: TerminalResponse,
+    id: &str,
+    key: KeyLabel,
+    action: ActionLabel,
+) -> Response {
+    match response {
+        TerminalResponse::Success { .. } => {
+            let rebuilt = SettingsCommand::parse("settings.set", body)
+                .map(|command| {
+                    let deleted = command.write().expect("claimed set is a write").0.is_none();
+                    let outcome = if deleted { "unset" } else { "saved" };
+                    json!({"key": command.key(), "outcome": outcome})
+                })
+                .unwrap_or_else(|_| json!({"key": "", "outcome": "saved"}));
+            let version = current_setting_version(state, body).await;
+            settings_write_response(rebuilt, version, id, true)
+        }
+        TerminalResponse::Failure(_) => state.terminal(response, true, id, key, action),
+    }
+}
+
+/// CAS token the replayed save committed. The claim stores no version, so
+/// report the key's current token: identical absent a later save, and a later
+/// save's token otherwise, which a blind retry must see rather than revert.
+async fn current_setting_version(state: &ReceiverState, body: &Map<String, Value>) -> i64 {
+    let Ok(command) = SettingsCommand::parse("settings.set", body) else {
+        return 0;
+    };
+    let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+    let store = SettingsStore::new(state.store.pool());
+    store
+        .get(guild_id, command.key())
+        .await
+        .ok()
+        .and_then(|stored| stored.map(|(_, version)| version))
+        .unwrap_or(0)
+}
+
+/// Legacy `result` (`key`/`value`/`source`) plus the CAS `version` as envelope
+/// metadata, never an extra field inside `result`. Zero means absent; otherwise
+/// feed it back as `expected_version` for the next save.
+fn settings_read_response(result: Value, version: i64, id: &str) -> Response {
+    let mut wire = (
+        StatusCode::OK,
+        Json(json!({"ok": true, "result": result, "version": version, "request_id": id})),
+    )
+        .into_response();
+    wire.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    wire
+}
+
+/// Successful saves carry the committed CAS `version` beside `result`, like
+/// reads: the website feeds it back as `expected_version` instead of
+/// re-reading first, so a save that landed in between cannot be silently
+/// reverted by a blind retry.
+fn settings_write_response(result: Value, version: i64, id: &str, replayed: bool) -> Response {
+    let mut wire = (
+        StatusCode::OK,
+        Json(json!({"ok": true, "result": result, "version": version, "request_id": id})),
+    )
+        .into_response();
+    if replayed {
+        wire.headers_mut()
+            .insert("idempotent-replay", HeaderValue::from_static("true"));
+    }
     wire.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     wire
@@ -691,7 +1871,12 @@ impl Failure {
     }
 }
 
-fn terminal_response(response: TerminalResponse, replayed: bool, id: &str) -> Response {
+fn terminal_response(
+    response: TerminalResponse,
+    action: ActionLabel,
+    replayed: bool,
+    id: &str,
+) -> Response {
     let mut wire = match response {
         TerminalResponse::Success {
             resource_id: Some(message_id),
@@ -700,11 +1885,26 @@ fn terminal_response(response: TerminalResponse, replayed: bool, id: &str) -> Re
             "ok": true, "result": {"message_id": message_id.as_str()}, "request_id": id,
         }))
         .into_response(),
+        // Membership receipts: `None` + `0/1` is the stored-member contract.
+        // `1` applied the effect, `0` is the idempotent no-op. Anything else
+        // (including a message-shaped receipt for a membership action) is a
+        // store inconsistency, never a success.
+        TerminalResponse::Success {
+            resource_id: None,
+            affected,
+        } => match (action.as_str(), affected) {
+            ("role.assign", 1) => member_success("assigned", id),
+            ("role.assign", 0) => member_success("already_held", id),
+            ("guild.add_member", 1) => member_success("added", id),
+            ("guild.add_member", 0) => member_success("already_member", id),
+            _ => Failure::reconciliation().response(id),
+        },
         TerminalResponse::Success { .. } => Failure::reconciliation().response(id),
         TerminalResponse::Failure(failure) => match failure {
             TerminalFailure::Malformed => Failure::code(ErrorCode::Malformed),
             TerminalFailure::ActionNotAllowed => Failure::code(ErrorCode::ActionNotAllowed),
             TerminalFailure::DiscordRejected => Failure::code(ErrorCode::DiscordRejected),
+            TerminalFailure::VersionConflict => Failure::code(ErrorCode::VersionConflict),
             TerminalFailure::NoEffect => Failure::http(
                 StatusCode::BAD_GATEWAY,
                 "no_effect",
@@ -721,6 +1921,16 @@ fn terminal_response(response: TerminalResponse, replayed: bool, id: &str) -> Re
     wire.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     wire
+}
+
+/// Membership success envelope: the legacy `{"outcome": ...}` result object.
+/// Insertion order (`ok`, `result`, `request_id`) matches the stored-member
+/// `success_body` wire contract.
+fn member_success(outcome: &str, id: &str) -> Response {
+    Json(json!({
+        "ok": true, "result": {"outcome": outcome}, "request_id": id,
+    }))
+    .into_response()
 }
 
 fn log_records(records: Vec<RejectionRecord>) {
