@@ -4245,13 +4245,20 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 member_id,
                 vote_id,
             } => {
-                let live = self.live.read_state();
-                let permissions = live.permissions(self.live.guild_id, channel_id);
+                let permissions = self
+                    .live
+                    .read_state()
+                    .permissions(self.live.guild_id, channel_id);
                 // Recheck guild authority immediately before enforcement (VK-01):
                 // a promotion granted after the vote passed, or an unavailable
                 // guild-authority lookup, must produce no Discord write.
-                let privileged = live.target_privileged(self.live.guild_id, member_id);
-                drop(live);
+                // Statement-temporary guards: no named `RwLockReadGuard`
+                // (`!Send`) is held across the Discord awaits below, so this
+                // future stays `Send` for the actor spawn.
+                let privileged = self
+                    .live
+                    .read_state()
+                    .target_privileged(self.live.guild_id, member_id);
                 // What a clean `Ok` below means; each skip or partial write
                 // overrides it so the audit row says what Discord was asked.
                 let mut applied = EnforcementOutcome::ConnectDeniedAndDisconnected;
