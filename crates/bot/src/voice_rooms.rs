@@ -1996,6 +1996,8 @@ pub struct GuildRoomWorker<S, H> {
     /// Cheap fingerprint of every input automatic names depend on; an idle
     /// guild skips the per-room work entirely.
     name_inputs: Option<u64>,
+    /// When each room started waiting for an unknown display name.
+    name_waits: HashMap<Snowflake, u64>,
     creations: HashMap<u64, Creation>,
     accepted: HashMap<Snowflake, (u64, u64)>,
     moves: HashMap<Snowflake, JoinTicket>,
@@ -2231,6 +2233,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             name_settings_loaded,
             name_settings_read_ms: None,
             name_inputs: None,
+            name_waits: HashMap::new(),
             creations: HashMap::new(),
             accepted: HashMap::new(),
             moves: HashMap::new(),
@@ -5925,9 +5928,11 @@ pub fn inventory_from_cache(
     })
 }
 
-/// Display names for every cached guild member and everyone in voice: room
-/// owners and original creators who left voice still render by name after a
-/// restart. The worker prunes the names it cannot use.
+/// Display names for everyone in voice plus any member the cache holds.
+/// Without the presence intent Discord's GuildCreate carries only the bot and
+/// members in voice, so a person who left voice before a restart can stay
+/// unknown; the worker then waits a bounded time before rendering the
+/// fallback. The worker prunes the names it cannot use.
 fn cached_display_names(
     cache: &DefaultInMemoryCache,
     guild_id: Snowflake,

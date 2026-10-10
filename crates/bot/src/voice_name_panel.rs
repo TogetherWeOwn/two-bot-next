@@ -228,6 +228,9 @@ const RENAME_NOTE: &str =
     "Discord limits renames to about two every ten minutes, so it may take a moment to show.";
 
 const NAME_SETTINGS_RELOAD_MS: u64 = 300_000;
+/// Longest wait for an unknown owner or original creator name before the
+/// template renders with the "member" fallback.
+pub(super) const NAME_WAIT_MS: u64 = 60_000;
 const NAME_SETTINGS_RETRY_MS: u64 = 60_000;
 
 /// The facts an automatic template name was rendered from: the room is
@@ -402,12 +405,23 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 continue;
             };
             // A person whose display name is unknown would render as
-            // "member": wait for the name instead of spending a rename.
-            if !self.name_directory.knows(room.owner_id)
-                || (template.contains("@@original_creator@@")
-                    && !self.name_directory.knows(room.original_creator_id))
-            {
-                continue;
+            // "member": wait briefly for the name (the GuildCreate seed and
+            // voice events supply it) instead of spending a rename, but never
+            // longer than NAME_WAIT_MS, so a room whose owner or original
+            // creator left voice before a restart still follows its template.
+            let uses_original_creator = template
+                .to_ascii_lowercase()
+                .contains("@@original_creator@@");
+            let unknown = !self.name_directory.knows(room.owner_id)
+                || (uses_original_creator && !self.name_directory.knows(room.original_creator_id));
+            if unknown {
+                let since = *self.name_waits.entry(room_id).or_insert(now_ms);
+                if now_ms.saturating_sub(since) < NAME_WAIT_MS {
+                    self.name_inputs = None;
+                    continue;
+                }
+            } else {
+                self.name_waits.remove(&room_id);
             }
             command.actor_id = room.owner_id;
             command.request = NameInteraction::Restore { room_id };
@@ -452,6 +466,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
         let rooms = &self.rooms;
         self.name_signatures
+            .retain(|room_id, _| rooms.contains_key(room_id));
+        self.name_waits
             .retain(|room_id, _| rooms.contains_key(room_id));
     }
 

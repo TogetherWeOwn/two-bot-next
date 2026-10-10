@@ -641,6 +641,13 @@ async fn guild_create_seeds_display_names_for_restarted_rooms() {
         "user": {"id": MEMBER.to_string(), "username": "alex", "global_name": "Alex", "discriminator": "0"},
         "roles": [], "deaf": false, "mute": false, "flags": 0, "joined_at": NOW
     }));
+    // Without the presence intent Discord's GuildCreate carries the members
+    // in voice together with their voice states.
+    guild["voice_states"] = json!([{
+        "channel_id": CREATOR.to_string(), "user_id": MEMBER.to_string(), "session_id": "voice",
+        "deaf": false, "mute": false, "self_deaf": false, "self_mute": false,
+        "self_video": false, "suppress": false
+    }]);
     feed(
         &runtime,
         &pipeline,

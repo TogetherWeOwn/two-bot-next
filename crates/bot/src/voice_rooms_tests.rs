@@ -9997,7 +9997,7 @@ async fn written_settings_reach_automatic_names() {
 async fn an_unknown_original_creator_name_waits_instead_of_rendering_member() {
     let (live, store, http, trace) = fixture();
     store.creators.lock().unwrap()[0].name_template =
-        "@@owner@@ from @@original_creator@@".to_owned();
+        "@@owner@@ from @@ORIGINAL_CREATOR@@".to_owned();
     let mut handed = room(500);
     handed.owner_id = MEMBER + 1;
     store.rooms.lock().unwrap().insert(500, handed);
@@ -10022,9 +10022,29 @@ async fn a_confirmed_import_hands_its_settings_to_the_worker() {
     let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
     let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
     let (confirm_id, _) = preview_buttons(&preview.expect("preview"));
+    // The worker has loaded and done its first settings read before the
+    // write, so only the handoff can deliver the imported settings now (the
+    // periodic reload is minutes away).
+    let (before, _) = runtime.naming_probe(GUILD).await.expect("probe");
+    assert_eq!(before, NameSettings::from_config(&empty_config()));
     let confirm = component_interaction(&confirm_id, manager(), UPLOADER);
     let (_, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
     assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
     let (settings, _) = runtime.naming_probe(GUILD).await.expect("probe");
     assert_eq!(settings, NameSettings::from_config(&full_config()));
+}
+
+#[tokio::test]
+async fn an_unknown_owner_name_waits_only_a_bounded_time() {
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "@@owner@@'s den".to_owned();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER + 1, Some(500), Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.refresh_template_names(0);
+    assert!(!worker.dispatch_one(0).await);
+    worker.refresh_template_names(name_panel::NAME_WAIT_MS);
+    dispatch(&mut worker, name_panel::NAME_WAIT_MS).await;
+    assert_eq!(*trace.lock().unwrap(), ["rename:500:member's den"]);
 }
