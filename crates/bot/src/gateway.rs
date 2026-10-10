@@ -2396,8 +2396,8 @@ mod tests {
             .expect("lazy pool");
         let pipeline = build_pipeline(vec![], None);
         pipeline.enable_community_facts(broken);
-        // Gate-clearing join: `pending: false` buffers one `member_join`
-        // fact via `on_join` plus one `rules_accepted` fact via
+        // Gate-clearing join: `pending: false` buffers two facts, one
+        // `member_joined` via `on_join` plus one `rules_accepted` via
         // `on_gate_cleared`, so the drain has work to fail on. A
         // `RESUMED` event would drain nothing and prove nothing.
         let join = || {
@@ -2445,9 +2445,10 @@ mod tests {
                 },
             ))
         };
-        // Pin the fixture precondition explicitly: the gate-clearing join
-        // must buffer both facts, or this test would exercise the
-        // empty-drain path instead of the failure site.
+        // Pin the fixture precondition explicitly: the join must buffer both
+        // facts (`member_joined` via `on_join` plus `rules_accepted` via
+        // `on_gate_cleared`), or this test would exercise the empty-drain
+        // path instead of the failure site.
         {
             let scratch = build_pipeline(vec![], None);
             scratch.enable_community_facts(pool.clone());
@@ -2459,7 +2460,7 @@ mod tests {
             assert_eq!(
                 scratch.drain_facts().await.expect("scratch drain"),
                 2,
-                "fixture join must buffer join + rules_accepted facts"
+                "fixture join must buffer member_joined plus rules_accepted"
             );
         }
         #[derive(Clone)]

@@ -128,6 +128,40 @@ fn sources_reject_credentials_and_canonicalized_private_literals() {
 }
 
 #[test]
+fn source_length_bound_matches_published_byte_limit_before_trimming() {
+    let base = "https://example.org/";
+    let at_limit = format!("{base}{}", "x".repeat(MAX_FEED_SOURCE_BYTES - base.len()));
+    assert_eq!(at_limit.len(), MAX_FEED_SOURCE_BYTES);
+    assert!(validate_source(&at_limit).is_ok());
+    assert!(normalize_source(FeedKind::Twitch, &at_limit).is_ok());
+
+    // Multibyte input counts bytes, not characters: this path is exactly
+    // 2048 UTF-16 units but over the byte ceiling, so it is refused.
+    let unicode_path = format!(
+        "{base}{}",
+        "😀".repeat((MAX_FEED_SOURCE_BYTES - base.len()) / 2)
+    );
+    assert!(unicode_path.len() > MAX_FEED_SOURCE_BYTES);
+    assert!(matches!(
+        validate_source(&unicode_path),
+        Err(FetchError::InvalidSource)
+    ));
+
+    let over_limit = format!(
+        "{base}{}",
+        "x".repeat(MAX_FEED_SOURCE_BYTES - base.len() + 1)
+    );
+    assert!(matches!(
+        normalize_source(FeedKind::Twitch, &format!(" {over_limit} ")),
+        Err(FeedError::Fetch(FetchError::InvalidSource))
+    ));
+    assert!(matches!(
+        validate_source(&over_limit),
+        Err(FetchError::InvalidSource)
+    ));
+}
+
+#[test]
 fn dns_results_are_all_or_nothing_and_socket_targets_are_pinned() {
     let url = validate_source("https://example.org/feed").unwrap();
     let plan = PublicRequest::prepare(url.clone(), &[ip("8.8.8.8"), ip("1.1.1.1")]).unwrap();
