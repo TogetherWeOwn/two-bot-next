@@ -47,6 +47,28 @@ pub fn ensure_crypto_provider() {
     }
 }
 
+/// Worker decision for prefix triggers: `Some(trigger)` means the serial
+/// dispatch worker must call `dispatch_with_verdict(event, trigger)`, `None`
+/// means it must not. `trigger` is `disposition.map(|verdict| verdict.trigger)`;
+/// the text-automation gate stays on the trigger verdict, not the funnel: an
+/// uninspected create keeps funnel `Accept` but its trigger is capture-only
+/// and must not run sticky or prefix triggers (fail-closed).
+pub(crate) fn worker_prefix_trigger(
+    disposition: Option<crate::automod_gateway::WorkerVerdict>,
+    event: &Event,
+    automod_enabled: bool,
+) -> Option<Option<two_bot_core::automod_runtime::FunnelDisposition>> {
+    let trigger = disposition.map(|verdict| verdict.trigger);
+    if automod_enabled
+        && matches!(event, Event::MessageCreate(_))
+        && crate::automod_gateway::runs_text_automations(trigger)
+    {
+        Some(trigger)
+    } else {
+        None
+    }
+}
+
 /// Supervisor-visible gateway state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatewayState {
@@ -635,14 +657,7 @@ fn apply_dispatch<I: InviteSource>(
                 voice.disconnect();
             }
         }
-        let trigger = disposition.map(|verdict| verdict.trigger);
-        // Text automations gate on the trigger verdict, not
-        // the funnel: a Bypassed create keeps funnel-Accept
-        // but its trigger is capture-only and must not run
-        // sticky (fail-closed; M2.19).
-        if automod_enabled
-            && matches!(dispatch.event, Event::MessageCreate(_))
-            && crate::automod_gateway::runs_text_automations(trigger)
+        if let Some(trigger) = worker_prefix_trigger(disposition, &dispatch.event, automod_enabled)
         {
             if let Some(runtime) = command_runtime.as_ref() {
                 // Detached spawn from the blocking worker needs the runtime.
@@ -1241,6 +1256,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                     committed,
                 ),
             };
+
             if let Err(error) = operation {
                 // Retain the original error without panicking away accepted
                 // commands or allowing a later checkpoint to leap past failure.
