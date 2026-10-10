@@ -40,12 +40,13 @@ pub const COMMUNITY_FACT_TYPES: [&str; 6] = [
 ];
 
 /// Streams with a live production writer: the only streams `scorecard_once`
-/// may mark covered. Today that is just `event_attended` (host check-in via
-/// `rsvp_store::record_checkin`); message, voice, join and rules capture land
-/// in later slices, one per stream. This must always equal the `Some` rows of
-/// [`STREAM_WRITERS`]; the `captured_streams_match_live_writers` guard fails
-/// otherwise.
-pub const CAPTURED_STREAMS: [&str; 1] = ["event_attended"];
+/// may mark covered. That is `event_attended` (host check-in via
+/// `rsvp_store::record_checkin`) and `message_created` (gateway
+/// `MessageCreate` via `community_store::record_message_fact`); voice, join
+/// and rules capture land in later slices, one per stream. This must always
+/// equal the `Some` rows of [`STREAM_WRITERS`]; the
+/// `captured_streams_match_live_writers` guard fails otherwise.
+pub const CAPTURED_STREAMS: [&str; 2] = ["event_attended", "message_created"];
 
 /// Capture registry: every fact stream with the production writer that appends
 /// it, or `None` while no live path writes it. Single source of truth for both
@@ -54,7 +55,10 @@ pub const CAPTURED_STREAMS: [&str; 1] = ["event_attended"];
 /// is a writer the scorecard does not claim. Landing a writer flips its row
 /// and grows [`CAPTURED_STREAMS`] in the same PR.
 pub const STREAM_WRITERS: [(&str, Option<&str>); 6] = [
-    ("message_created", None),
+    (
+        "message_created",
+        Some("community_store::record_message_fact"),
+    ),
     ("voice_session_started", None),
     ("voice_session_ended", None),
     ("member_joined", None),
