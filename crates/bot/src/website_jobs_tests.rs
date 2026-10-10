@@ -631,7 +631,9 @@ async fn rank_tick_missing_rung_names_the_rung_and_writes_nothing() {
             .bind(guild).bind((9100 + index).to_string()).bind(start).execute(&pool).await.unwrap();
     }
     // Distinctive fixture ids plus injection text: none may reach the log.
-    let probe_id = "973111222333444555";
+    // Note: the probe id is deliberately not a 17-20 digit snowflake so the
+    // snowflake gate (scripts/ci/check-src-snowflakes.py) stays clean.
+    let probe_id = "probe-9999";
     let probe_name = "ladder-probe-evil-<script>alert(1)</script>";
     let members = json!([member(1000, false, &["11"])]);
     let roles = json!({"roles": [
@@ -678,7 +680,7 @@ async fn rank_tick_missing_rung_names_the_rung_and_writes_nothing() {
     for expected in ["Legend", "missing", "matches=0"] {
         assert!(logs.contains(expected), "missing {expected:?} in logs");
     }
-    for leaked in [probe_id, probe_name, "973111222333444555"] {
+    for leaked in [probe_id, probe_name] {
         assert!(!logs.contains(leaked), "logs leaked {leaked:?}");
     }
 }

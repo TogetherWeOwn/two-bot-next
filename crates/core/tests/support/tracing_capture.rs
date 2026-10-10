@@ -21,6 +21,9 @@ impl Capture {
 /// process; each reader keeps only the text appended after its own start
 /// offset) keeps callsite interest stable. All log-assertion tests in one
 /// binary must share this helper instead of installing their own global.
+// The support file is `#[path]`-included in several test binaries and not
+// every binary uses `global()`; allow dead code so `-D warnings` stays green.
+#[allow(dead_code)]
 pub fn global() -> &'static Capture {
     static GLOBAL: std::sync::OnceLock<Capture> = std::sync::OnceLock::new();
     GLOBAL.get_or_init(|| {
