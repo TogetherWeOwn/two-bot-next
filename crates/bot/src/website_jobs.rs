@@ -556,6 +556,11 @@ async fn snapshot_once(
     shutdown: &watch::Receiver<bool>,
 ) -> Result<(), ErrorClass> {
     if matches!(kind, Kind::Events) {
+        // Stamp the snapshot before the GET, not after: the mirror's
+        // last-observed-wins `updated_at` must describe when the observation
+        // began, so a mutation that lands while the GET is in flight keeps
+        // its newer row instead of being overwritten by this older fetch.
+        let fetched_at = now_iso();
         let response = get(
             rest,
             &format!("/guilds/{guild}/scheduled-events?with_user_count=true"),
@@ -571,7 +576,7 @@ async fn snapshot_once(
         if publication_stopped(shutdown) {
             return Ok(());
         }
-        return replace_events(pool, guild, &now_iso(), &events)
+        return replace_events(pool, guild, &fetched_at, &events)
             .await
             .map_err(|_| ErrorClass::Database);
     }
