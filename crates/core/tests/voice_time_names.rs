@@ -33,14 +33,38 @@ fn minute_tiers_start_at_their_bounds() {
 #[test]
 fn every_hour_has_one_daypart() {
     let expected = [
-        "night", "night", "late night", "late night", "late night", "morning", "morning",
-        "morning", "morning", "morning", "morning", "morning", "afternoon", "afternoon",
-        "afternoon", "afternoon", "afternoon", "evening", "evening", "evening", "evening",
-        "evening", "night", "night",
+        "night",
+        "night",
+        "late night",
+        "late night",
+        "late night",
+        "morning",
+        "morning",
+        "morning",
+        "morning",
+        "morning",
+        "morning",
+        "morning",
+        "afternoon",
+        "afternoon",
+        "afternoon",
+        "afternoon",
+        "afternoon",
+        "evening",
+        "evening",
+        "evening",
+        "evening",
+        "evening",
+        "night",
+        "night",
     ];
     for (hour, part) in expected.iter().enumerate() {
         assert_eq!(daypart(hour as u32), *part, "{hour}");
-        assert_eq!(render("@@daypart@@", &at_hour(hour as i64)), *part, "{hour}");
+        assert_eq!(
+            render("@@daypart@@", &at_hour(hour as i64)),
+            *part,
+            "{hour}"
+        );
     }
 }
 
@@ -52,14 +76,18 @@ fn time_tokens_render_minutes_and_tiers() {
         ..RoomContext::default()
     };
     assert_eq!(
-        render("@@room_minutes@@ @@room_tier@@ @@game_minutes@@ @@game_tier@@", &ctx),
+        render(
+            "@@room_minutes@@ @@room_tier@@ @@game_minutes@@ @@game_tier@@",
+            &ctx
+        ),
         "50 2 200 4"
     );
 }
 
 #[test]
 fn tiers_and_dayparts_drive_conditions() {
-    let template = "{{@@room_tier@@ >= 3 ?? marathon // {{@@game_minutes@@ > 60 ?? grinding // fresh}}}}";
+    let template =
+        "{{@@room_tier@@ >= 3 ?? marathon // {{@@game_minutes@@ > 60 ?? grinding // fresh}}}}";
     let mut ctx = RoomContext::default();
     assert_eq!(render(template, &ctx), "fresh");
     ctx.game_minutes = 61;
@@ -68,7 +96,14 @@ fn tiers_and_dayparts_drive_conditions() {
     assert_eq!(render(template, &ctx), "marathon");
 
     let parts = "{{MORNING ?? m // {{AFTERNOON ?? a // {{EVENING ?? e // {{NIGHT ?? n // {{LATE_NIGHT ?? l // none}}}}}}}}}}";
-    for (hour, letter) in [(6, "m"), (13, "a"), (19, "e"), (23, "n"), (0, "n"), (3, "l")] {
+    for (hour, letter) in [
+        (6, "m"),
+        (13, "a"),
+        (19, "e"),
+        (23, "n"),
+        (0, "n"),
+        (3, "l"),
+    ] {
         assert_eq!(render(parts, &at_hour(hour)), letter, "{hour}");
     }
     // The guild offset moves the daypart with the local clock.

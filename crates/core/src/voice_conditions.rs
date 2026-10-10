@@ -17,8 +17,8 @@
 use std::cell::Cell;
 
 use crate::voice_naming::{
-    daypart, local_hour, parse, ChannelKind, Evaluation, Extension, ExtensionPolicy, PartyInfo, PassthroughExtensions,
-    RoomContext, Segment, Template,
+    daypart, local_hour, parse, ChannelKind, Evaluation, Extension, ExtensionPolicy, PartyInfo,
+    PassthroughExtensions, RoomContext, Segment, Template,
 };
 
 /// Deepest conditional nesting evaluated, counting conditionals inside
