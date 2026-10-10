@@ -624,7 +624,10 @@ the `prod`-substring refusal (the production host and `two_bot` database are
 production-like by construction) and instead refuses any staging host pin
 (fixture hosts, any `staging` label, any Neon endpoint) at both validation and
 the binding-host check, so a mistaken production pin aimed at staging still
-fails closed before any DDL. The manifest carries `migration_target`
+fails closed before any DDL. The binding-host check additionally refuses any
+non-`5432` port and any pooled (`|…`) login on production, so a binding
+copied from the app's pooled connection string still fails closed (pooler
+`SET ROLE` and the migrator lock need the direct endpoint). The manifest carries `migration_target`
 (`staging` or `production`); the claim publisher requires the matching value.
 
 The workflow mirrors the staging shape with the `production-migrate-` prefix:

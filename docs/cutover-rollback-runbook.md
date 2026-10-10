@@ -178,15 +178,20 @@ come from [cutover.md](cutover.md) §§Registry swap and Rollback.
   completion or claim state, including Next-created records with no
   legacy counterpart. An unsupported mapping blocks reopening; it never
   permits dropping those records.
-- **Maximum accepted loss: zero acknowledged committed writes** over the
-  whole Next window. Restoring to the freeze baseline alone loses that
-  window and is not an acceptable rollback.
-- **Decision D5 (live cutover):** the production cutover is live. Production
+- **Maximum accepted loss (pre-cutover rule): zero acknowledged committed
+  writes** over the whole Next window. Restoring to the freeze baseline
+  alone loses that window and is not an acceptable rollback. Once the
+  cutover lead declares production live, Decision D5 below supersedes this
+  gate for rollback inside the 2-hour window.
+- **Decision D5 (live cutover, declared by the cutover lead in the
+  live-cutover declaration with its recorded reason and loss statement —
+  see §1 Decider):** the production cutover is live. Production
   is the PlanetScale main database `two_bot`. Writes made during the Next
   window are accepted as lost on rollback, bounded by a 2-hour rollback
-  decision window; after that window it is forward-fix only, never rollback.
-  Mitigation is the pre-cutover PlanetScale backup plus the untouched Coolify
-  `twobot` database. See [cutover.md](cutover.md#rollback-preserve-next-window-writes-before-reopening-legacy).
+  decision window; during that window this decision supersedes the
+  zero-loss gate above. After that window it is forward-fix only, never
+  rollback. Mitigation is the pre-cutover PlanetScale backup plus the
+  untouched Coolify `twobot` database. See [cutover.md](cutover.md#rollback-preserve-next-window-writes-before-reopening-legacy).
 - **Allocator gate:** reconcile every imported generated-key allocator,
   including high-water marks, deleted IDs and sequence semantics, and
   prove the next allocation cannot collide before releasing any writer.
