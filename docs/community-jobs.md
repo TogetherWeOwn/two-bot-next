@@ -166,7 +166,8 @@ write verb; bind that job to a capability in `BootActivation` before it ships.
   watermark/classifier changed or the completion write was lost. A successfully
   persisted incomplete scorecard is terminal, not a transient failure.
   Before scoring, mark honest stream coverage for the captured streams only
-  (`CAPTURED_STREAMS`, today just `event_attended`) from capture start through
+  (`CAPTURED_STREAMS`, today `event_attended` and `rules_accepted`) from
+  capture start through
   the closed week end; a mid-week start fails closed (`INGESTION_INCOMPLETE`,
   human numerators null). A Monday boot cannot claim closed-week coverage:
   leave missing heartbeats missing rather than inserting an inverted interval.
@@ -176,9 +177,13 @@ write verb; bind that job to a capability in `BootActivation` before it ships.
   `run_sweep`. Never DM, ping, or message from this outcome — any outbound
   contact needs CEO sign-off first.
 - Implement fact writes on the gateway handlers through the `FactsSink` seam,
-  classifying via `classify`. Keep `TWO_COMMUNITY_SCORECARD` off by default
-  and `TWO_PRESENCE_PROBE` on (legacy default); restrict enabling to staging.
-  No production guild or token was used to verify this slice.
+  classifying via `classify`: the pipeline buffers gate-clearings in
+  `DeferredCommunityFacts` and the serial worker drains them through
+  `CommunityFactsRuntime` after the funnel rows (a failed drain only warns;
+  the scorecard fails closed on the missing fact). Keep
+  `TWO_COMMUNITY_SCORECARD` off by default and `TWO_PRESENCE_PROBE` on
+  (legacy default); restrict enabling to staging. No production guild or
+  token was used to verify this slice.
 - The presence series is never published: no `web_v1` view may read
   `presence_probe`. The only reader is an operator trend report over
   `read_series` + `evaluate_trigger`.

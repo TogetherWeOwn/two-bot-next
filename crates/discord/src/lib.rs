@@ -16,6 +16,7 @@ pub mod channel_access;
 pub mod channel_moderation;
 pub mod command_identity;
 pub mod command_registry;
+pub mod community_facts;
 #[cfg(feature = "db")]
 pub mod custom_commands;
 pub mod executor;
@@ -57,6 +58,9 @@ pub mod voice_rooms;
 pub use leveling_runtime::{LevelingRuntime, OrderedLevelingPipeline};
 
 pub use adapter::event_to_core;
+#[cfg(feature = "db")]
+pub use community_facts::{CommunityDrainOutcome, CommunityFactsRuntime};
+pub use community_facts::{DeferredCommunityFacts, RulesAcceptedWrite};
 pub use executor::{
     lockdown_masks, pace_delay_ms, paced_step, throw_for_status, timeout_until_iso, unlock_masks,
     ActionExecutor, ChannelCall, ChannelCallOutcome, DiscordCall, DiscordError, EveryoneOverwrite,

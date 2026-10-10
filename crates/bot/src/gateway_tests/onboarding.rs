@@ -343,6 +343,7 @@ async fn spawn_onboarding_with_store(
         None,
         None,
         None,
+        None,
         async move {
             match shutdown {
                 Some(receiver) => crate::server::shutdown_requested(receiver).await,

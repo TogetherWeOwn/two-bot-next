@@ -254,6 +254,7 @@ async fn registered_voice_id_with_rsvp_payload_has_one_voice_callback() {
         Some(commands),
         None,
         Some(voice),
+        None,
         crate::server::shutdown_requested(receiver),
     ));
     let (socket, _) = listener.accept().await.unwrap();
@@ -479,6 +480,7 @@ async fn cold_voice_resume_commits_replay_before_identify_and_reconciles_stored_
         None,
         None,
         Some(voice.clone()),
+        None,
         std::future::pending(),
     ));
     let resume = mock.authentication().await;

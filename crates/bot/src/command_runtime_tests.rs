@@ -3399,6 +3399,7 @@ async fn gateway_keeps_checkpointing_and_heartbeating_during_channel_rest_work()
         Some(Arc::clone(&runtime)),
         None,
         None,
+        None,
         std::future::pending::<()>(),
     ));
     wait_for(|| mock.requests().len() == 1, "READY publication").await;

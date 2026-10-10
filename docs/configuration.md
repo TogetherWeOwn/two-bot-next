@@ -138,7 +138,7 @@ Catalog entries: 122.
 | `TWO_COMMUNITY_HUMAN_CHANNEL_IDS` | hot | Not specified in Next | stored unwired | Channels considered for human community activity. |
 | `TWO_COMMUNITY_RAID_ACTOR_IDS` | hot | `[]` | stored unwired | Known raid actors excluded from human activity classification. |
 | `TWO_COMMUNITY_RECOMMENDATIONS` | cold | `true` | stored unwired | Permit scorecard recommendations unless explicitly disabled with 0. |
-| `TWO_COMMUNITY_SCORECARD` | cold | `false` | stored unwired | Enable the weekly scorecard job. Live fact capture is event attendance only. |
+| `TWO_COMMUNITY_SCORECARD` | cold | `false` | stored unwired | Enable the weekly scorecard job. Live fact capture is event attendance and rules acceptance only. |
 | `TWO_COMMUNITY_STAGING_ACTOR_IDS` | hot | `[]` | stored unwired | Staging actors excluded from human community activity. |
 | `TWO_COMMUNITY_STAGING_GUILD_IDS` | hot | `[]` | stored unwired | Staging guilds excluded from human community activity. |
 | `TWO_COMMUNITY_TEST_ACTOR_IDS` | hot | `[]` | stored unwired | Test actors excluded from human community activity. |

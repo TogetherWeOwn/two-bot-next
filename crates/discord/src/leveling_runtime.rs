@@ -21,15 +21,17 @@ use two_bot_core::{
         leaderboard_reply, plan_reward_roles, rank_reply, XpAward, LEADERBOARD_DEFAULT_LIMIT,
     },
     leveling_store::{self, LevelingStoreError},
-    FunnelHandlers, FunnelStore, HandlerId, InviteSnapshotStore, LevelOutcome, LevelingHook,
-    NoopFacts, Snowflake,
+    FactsSink, FunnelHandlers, FunnelStore, HandlerId, InviteSnapshotStore, LevelOutcome,
+    LevelingHook, NoopFacts, Snowflake,
 };
 
 use two_bot_core::automod_runtime::FunnelDisposition;
 
 use crate::{
-    pipeline::MessageEligibility, ActionExecutor, DiscordError, InviteSource, NoClassification,
-    NoInvites, Pipeline, PipelineSnapshots,
+    community_facts::{DeferredCommunityFacts, RulesAcceptedWrite},
+    pipeline::MessageEligibility,
+    ActionExecutor, DiscordError, InviteSource, NoClassification, NoInvites, Pipeline,
+    PipelineSnapshots,
 };
 
 /// Failures propagate to the gateway supervisor; Display never includes SQL
@@ -262,8 +264,8 @@ impl LevelingRuntime {
 /// `I` serves invite counters and `P` persists invite snapshots; the
 /// persistent gateway runner seeds both from the store, while unit and
 /// database tests keep the in-memory defaults.
-pub struct OrderedLevelingPipeline<S, I = NoInvites, P = PipelineSnapshots> {
-    pipeline: Pipeline<S, DeferredLeveling, NoopFacts, I, NoClassification, P>,
+pub struct OrderedLevelingPipeline<S, I = NoInvites, P = PipelineSnapshots, F = NoopFacts> {
+    pipeline: Pipeline<S, DeferredLeveling, F, I, NoClassification, P>,
     pending: DeferredLeveling,
     dispatch: tokio::sync::Mutex<()>,
     runtime: Option<LevelingRuntime>,
@@ -276,7 +278,7 @@ impl<S: FunnelStore> OrderedLevelingPipeline<S> {
             pipeline: Pipeline::new(
                 store,
                 Some(pending.clone()),
-                None,
+                Some(NoopFacts),
                 NoInvites,
                 NoClassification,
             ),
@@ -287,7 +289,9 @@ impl<S: FunnelStore> OrderedLevelingPipeline<S> {
     }
 }
 
-impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPipeline<S, I, P> {
+impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore, F: FactsSink + Default>
+    OrderedLevelingPipeline<S, I, P, F>
+{
     pub fn with_snapshots(
         store: S,
         runtime: Option<LevelingRuntime>,
@@ -299,7 +303,7 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
             pipeline: Pipeline::with_snapshots(
                 store,
                 Some(pending.clone()),
-                None,
+                Some(F::default()),
                 invite_source,
                 NoClassification,
                 snapshots,
@@ -310,7 +314,7 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
         }
     }
 
-    pub fn handlers(&self) -> &FunnelHandlers<S, DeferredLeveling, NoopFacts> {
+    pub fn handlers(&self) -> &FunnelHandlers<S, DeferredLeveling, F> {
         self.pipeline.handlers()
     }
 
@@ -397,5 +401,19 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
         self.pipeline
             .handle_at_with_message_disposition(event, at, disposition);
         self.pending.take()
+    }
+}
+
+impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore>
+    OrderedLevelingPipeline<S, I, P, DeferredCommunityFacts>
+{
+    /// Take the buffered gate-clear facts for the community drain. Empty when
+    /// the dispatch carried no gate-clearing; the caller drains only then.
+    pub fn take_community_facts(&self) -> Vec<RulesAcceptedWrite> {
+        self.pipeline
+            .handlers()
+            .facts()
+            .map(DeferredCommunityFacts::take)
+            .unwrap_or_default()
     }
 }

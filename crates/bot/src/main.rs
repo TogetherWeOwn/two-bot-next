@@ -460,6 +460,11 @@ async fn run(cli_args: &[String]) {
                         }
                     };
                     let leveling = runtime.as_ref().map(|runtime| runtime.leveling());
+                    // Community facts capture rides the gateway dispatch: the
+                    // pipeline buffers gate-clearings, the worker drains them
+                    // below. Parked unless TWO_COMMUNITY_SCORECARD=1, the same
+                    // gate that arms the Monday job.
+                    let community = two_bot_discord::CommunityFactsRuntime::from_env(pool.clone());
                     let pipeline = Arc::new(
                         build_persistent_pipeline(&store, guild_id, token.clone(), leveling)
                             .await
@@ -587,6 +592,7 @@ async fn run(cli_args: &[String]) {
                         runtime,
                         automod,
                         voice,
+                        community,
                         async move {
                             server::shutdown_requested(stopping).await;
                         },

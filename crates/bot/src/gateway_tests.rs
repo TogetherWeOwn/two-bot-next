@@ -531,6 +531,7 @@ async fn spawn_runner_until_shutdown(
         commands,
         None,
         None,
+        None,
         shutdown,
     ));
     (task, state)

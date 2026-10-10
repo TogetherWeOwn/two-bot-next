@@ -33,7 +33,8 @@ use two_bot_core::{AutomodPolicy, ComponentStatus, Config, InviteState, Snowflak
 use two_bot_cutover::gateway_session::{GatewayJob, GatewaySessionStore};
 use two_bot_cutover::{connect, DB_POOL_MAX_DEFAULT};
 use two_bot_discord::{
-    gateway_intents, needs_message_content, InviteSource, LevelingRuntime, OrderedLevelingPipeline,
+    gateway_intents, needs_message_content, CommunityFactsRuntime, DeferredCommunityFacts,
+    InviteSource, LevelingRuntime, OrderedLevelingPipeline,
 };
 
 /// Install the process-wide rustls crypto provider (ring) unless one is set.
@@ -153,7 +154,7 @@ fn intents_for_settings(
 /// buffer. `I` serves invite counters (HTTP at runtime, none in tests); the
 /// funnel buffer doubles as the invite snapshot store, seeded at boot.
 pub type GatewayPipeline<I = two_bot_discord::NoInvites> =
-    OrderedLevelingPipeline<GatewayFunnelBuffer, I, GatewayFunnelBuffer>;
+    OrderedLevelingPipeline<GatewayFunnelBuffer, I, GatewayFunnelBuffer, DeferredCommunityFacts>;
 
 pub async fn load_boot_session(
     store: &GatewaySessionStore,
@@ -470,6 +471,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
     runtime: Option<Arc<crate::command_runtime::CommandRuntime>>,
     automod: Option<Arc<crate::automod_gateway::ProductionAutomod>>,
     voice: Option<Arc<dyn VoiceEventSink>>,
+    community: Option<CommunityFactsRuntime>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), sqlx::Error> {
     let _dispatch_guard = runtime.as_ref().map(|runtime| runtime.dispatch_guard());
@@ -777,6 +779,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
     let handle = tokio::runtime::Handle::current();
     let worker_state = Arc::clone(&state);
     let worker_voice = voice;
+    let worker_community = community;
     let stop_state = Arc::clone(&state);
     let live_interactions: LiveInteractions = Arc::default();
     let queue_signal = Arc::new(tokio::sync::Notify::new());
@@ -939,6 +942,23 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             .unwrap_or_else(|_| {
                                 panic!("gateway leveling dispatch failed; checkpoint unchanged")
                             });
+                            }
+                            // Community facts ride the same dispatch: classify
+                            // and persist gate-clearings after the funnel rows.
+                            // A failed drain only warns — a lost fact fails the
+                            // scorecard closed, while stalling the cursor would
+                            // lose the funnel row too. Without the community
+                            // runtime the buffer is dropped, never retained.
+                            let community_writes = pipeline.take_community_facts();
+                            if !community_writes.is_empty() {
+                                if let Some(community) = worker_community.as_ref() {
+                                    if handle
+                                        .block_on(community.drain_writes(community_writes))
+                                        .is_err()
+                                    {
+                                        tracing::warn!("gateway community facts drain failed");
+                                    }
+                                }
                             }
                             // A Blocked receipt-callback exhaustion leaves the command
                             // never-acknowledged: hold the cursor instead of
