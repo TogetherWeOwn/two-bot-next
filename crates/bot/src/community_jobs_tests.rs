@@ -768,7 +768,7 @@ async fn community_ticks_write_rows_and_stay_gated() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(beats, 2, "coverage marked only for the captured streams");
+    assert_eq!(beats, 3, "coverage marked only for the captured streams");
     run_once(
         Kind::Scorecard,
         &pool,

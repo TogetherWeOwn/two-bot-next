@@ -141,7 +141,7 @@ pub struct RulesAcceptedWrite {
     pub source: String,
 }
 
-/// Buffered `message_created` (TOG-19603) and `rules_accepted` capture. The
+/// Buffered `message_created` and `rules_accepted` capture. The
 /// synchronous [`FactsSink`] hook only classifies and buffers; the serial
 /// checkpoint writer drains via [`OrderedLevelingPipeline::drain_facts`],
 /// which persists through `community_store::record_fact`. Mirrors
@@ -511,8 +511,7 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
         self.pipeline.handlers()
     }
 
-    /// Arm Postgres community-facts capture (message TOG-19603, rules this
-    /// slice). Called once at boot when `TWO_COMMUNITY_SCORECARD=1`; without
+    /// Arm Postgres community-facts capture for both streams. Called once at boot when `TWO_COMMUNITY_SCORECARD=1`; without
     /// it the sink drops every fact, exactly like the previous no-op seam.
     pub fn enable_community_facts(&self, pool: PgPool) {
         self.facts.enable(pool);

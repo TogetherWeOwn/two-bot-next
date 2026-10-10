@@ -944,8 +944,8 @@ pub async fn run_shard<I: InviteSource + 'static>(
                                 panic!("gateway leveling dispatch failed; checkpoint unchanged")
                             });
                             }
-                            // Community facts (message TOG-19603, rules this
-                            // slice): drain buffered writes on every dispatch,
+                            // Community facts (message_created and rules_accepted):
+                            // drain buffered writes on every dispatch,
                             // even when no XP award queued — bots, webhooks
                             // and staff automation capture facts but never
                             // awards, so gating on `requests` would leak the
