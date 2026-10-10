@@ -314,6 +314,19 @@ fn ingress_capacity_failure() -> sqlx::Error {
     sqlx::Error::InvalidArgument("gateway ingress capacity exhausted".into())
 }
 
+/// Fatal-runner reason bound: at most 512 chars of the dispatch-supervisor
+/// reason reach the surfaced runner error (logs + `operation`). Class
+/// `session` per `docs/log-volume-guard.md`: the runner fails at most a
+/// handful of times per process lifetime, so the output is O(1) bytes even
+/// when a join-error payload is arbitrarily large. Char-boundary truncation
+/// keeps the surfaced string valid UTF-8.
+const RUNNER_REASON_MAX_CHARS: usize = 512;
+
+fn bounded_runner_reason(reason: &str) -> sqlx::Error {
+    let bounded: String = reason.chars().take(RUNNER_REASON_MAX_CHARS).collect();
+    sqlx::Error::InvalidArgument(bounded)
+}
+
 /// Await one RSVP completion ticket on the dispatch worker. A dropped sender
 /// becomes [`interaction_drain_failure`] — a recorded error that holds the
 /// cursor — instead of a worker panic that would discard accepted commands.
@@ -1245,7 +1258,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
             futures_util::pin_mut!(queue_worker);
             tokio::select! {
                 result = dispatch => {
-                    let result = result.map_err(|reason| sqlx::Error::InvalidArgument(reason.into()));
+                    let result = result.map_err(|reason| bounded_runner_reason(reason));
                     if result.is_ok() && error.lock().expect("gateway error lock").is_none() {
                         // Cooperative end with a healthy writer: the last
                         // commit may have raced the drain return before the
@@ -1280,7 +1293,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
         }
         None => dispatch
             .await
-            .map_err(|reason| sqlx::Error::InvalidArgument(reason.into())),
+            .map_err(|reason| bounded_runner_reason(reason)),
     };
     // Reception does not restart in this runner. Keep Draining sticky through
     // both successful shutdown and fatal exit, including any remaining writer.
@@ -2513,5 +2526,34 @@ mod tests {
                 "onboarding interaction missing ingress ticket; checkpoint committed",
             ]
         );
+    }
+
+    /// Fatal-runner reasons stay O(1) bytes: an oversized join-error payload
+    /// is truncated to `RUNNER_REASON_MAX_CHARS`, while short reasons pass
+    /// through unchanged so the #659 typed errors keep their exact text.
+    #[test]
+    fn gateway_runner_reason_is_bounded() {
+        match bounded_runner_reason("dispatch backlog full") {
+            sqlx::Error::InvalidArgument(message) => {
+                assert_eq!(message, "dispatch backlog full");
+            }
+            error => panic!("runner reason must stay typed, got {error:?}"),
+        }
+        let oversized = "x".repeat(RUNNER_REASON_MAX_CHARS + 10_000);
+        match bounded_runner_reason(&oversized) {
+            sqlx::Error::InvalidArgument(message) => {
+                assert_eq!(message.len(), RUNNER_REASON_MAX_CHARS);
+                assert_eq!(message, "x".repeat(RUNNER_REASON_MAX_CHARS));
+            }
+            error => panic!("oversized reason must stay typed, got {error:?}"),
+        }
+        // Multi-byte chars truncate on a char boundary, never mid-codepoint.
+        let emoji = "🦀".repeat(RUNNER_REASON_MAX_CHARS + 10);
+        match bounded_runner_reason(&emoji) {
+            sqlx::Error::InvalidArgument(message) => {
+                assert_eq!(message.chars().count(), RUNNER_REASON_MAX_CHARS);
+            }
+            error => panic!("oversized reason must stay typed, got {error:?}"),
+        }
     }
 }

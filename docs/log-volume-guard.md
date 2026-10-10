@@ -108,6 +108,13 @@ A burst is O(1) log lines with N counter increments. The six lane labels are
 class steady and never shed; growth means a lane is undersized or a burst
 needs the M2.1 alert rule, not a new label.
 
+Fatal-runner reasons are class `session` and O(1) bytes: both dispatch-join
+`map_err` sites in `crates/bot/src/gateway.rs` truncate the surfaced reason
+to `RUNNER_REASON_MAX_CHARS` (512 chars, char-boundary) via
+`bounded_runner_reason`. A join-error payload of any size yields at most one
+512-char `InvalidArgument` line; short supervisor reasons pass through
+unchanged.
+
 Subscription facts that bound the top of the funnel: the bot never requests
 `GUILD_PRESENCES`, so presence arrives only through the hourly
 `presence_probe` job, never as gateway events; `MESSAGE_CONTENT` is requested
