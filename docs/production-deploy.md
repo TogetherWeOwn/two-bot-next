@@ -32,8 +32,12 @@ names a missing Environment makes GitHub create it with no protection, so the
 guard checks before the deploy job can run. This repository is public, so
 required reviewers work on every plan; no Enterprise plan is needed.
 
-**Deploy.** Dispatch with `sha` set to a full 40-character commit that is on
-`main`. That commit needs successful, completed `ci-ok` and `worker check`
+**Deploy.** Leave `sha` empty to promote the commit of the latest successful
+`deploy-staging` run on `main` (the normal case: merges keep superseding pending
+staging runs, so the newest `main` commit is often not staged). The guard then
+applies every rule below to that commit and refuses it if its `ci-ok` or
+`worker check` has not finished green. To deploy a specific commit, dispatch
+with `sha` set to a full 40-character commit that is on `main`. That commit needs successful, completed `ci-ok` and `worker check`
 runs from GitHub Actions and a successful `deploy-staging` run. `ci-ok` is the
 full verdict over lint, worker checks and every selected Rust/DB test lane;
 a green lint-only `check` job is not enough. The guard enumerates `check.yml`
@@ -47,7 +51,7 @@ pagination and a run/attempt change during validation fail closed. If a partial
 rerun omits a required job from the current attempt, rerun **all jobs**; do not
 reuse the earlier attempt's receipt. The summary records the admitted run/attempt.
 Staging runs queue in a single concurrency group, so an intermediate commit may
-never stage. Pick one that did. A push to `main` that touches only docs, root
+never stage; the empty-`sha` promotion picks the latest one that did. A push to `main` that touches only docs, root
 markdown or repository chrome (the `paths-ignore` list in `deploy-staging.yml`)
 starts no staging run either, so the newest `main` commit may have no
 `deploy-staging` run: pin the latest commit that changes runtime inputs, or
@@ -62,13 +66,30 @@ After the reviewer approves (or the automated approval passes), the job:
 4. gates on `/health` 200 and on `/readyz` reporting this SHA (see
    [Build identity and the `/readyz` gate](#build-identity-and-the-readyz-gate)).
 
-**Roll back.** Dispatch again with `rollback` set to the previous version ID
-from the failed run's summary. Set `sha` to the commit that version was built
+**Roll back.** This dispatch is the single production rollback method. A rollback,
+and a redeploy of a prior good commit, must always set `sha` explicitly: an empty
+`sha` promotes the latest staged commit, which during an incident is usually the
+build that just broke production (the guard refuses a rollback without `sha`).
+Dispatch again with `rollback` set to the previous version ID
+from the failed run's summary and `takeover: true`. Set `sha` to the commit that version was built
 from. It is recorded as the rollback message, and the `/readyz` gate after the
 rollback must report that revision, or a pre-stamp version (see below). The
 rollback passes the same guard and the same Environment approval. It then runs
 `wrangler rollback <version-id> --message <sha> --yes` and fails unless that
-version serves 100% of traffic.
+version serves 100% of traffic. Without the takeover the fence stays held,
+fenced answers carry no build fields, and the gate fails without being a
+rollback signal. When the Rust image itself is the fault,
+dispatch in deploy mode with `takeover: true` and the prior good SHA instead; a standalone full
+redeploy outside this workflow is superseded as a production rollback path.
+Coverage: the rehearsal log in
+[cutover-rollback-runbook.md](cutover-rollback-runbook.md#7-staging-rehearsal-log)
+is a dry-walk that checked this route without executing a rollback or deploy;
+the staging rollback drill
+([ci-security.md](ci-security.md#staging-rollback-drill-manual)) rehearses
+fence, unforced deployment with immediate Durable Object update, takeover and
+restore, which differs from this dispatch's `rollback --yes` with deferred
+Durable Object default. The deploy-mode path with a prior good SHA has no
+production drill record.
 
 ## Build identity and the `/readyz` gate
 
@@ -212,13 +233,29 @@ Read the variable and the Environment's reviewers again before each dispatch.
 
 ## 48-hour watch log (TOG-9699)
 
-The cutover executor copies this template onto the execution card at `T_0`
-(first `/readyz` 200 on the production revision) and fills it in through the
-watch deadline `T_0 + 48 h`. Watch checkpoints at +15 min, +1 h, +6 h, +24 h
-and +48 h follow [cutover.md](cutover.md) §48-hour watch. Poll read-only on a
-short cadence (suggested 60 s); record findings, not every healthy poll.
+The cutover executor records each checkpoint with
+`scripts/cutover_watch_checkpoint.py` — one checkpoint per call — and pastes
+the emitted row onto the execution card at `T_0` (first `/readyz` 200 on the
+production revision) through the watch deadline `T_0 + 48 h`:
 
-### Watch header (fill once at T_0)
+```sh
+python3 scripts/cutover_watch_checkpoint.py --checkpoint +15m \
+    --expected-sha <40-hex> --expected-build-id <run-id>-<attempt> \
+    --production-url https://<production-worker>/
+```
+
+`--checkpoint` is one of the five labels `+15m`, `+1h`, `+6h`, `+24h`,
+`+48h`, matching the five checkpoint rows below; `--expected-sha` is the
+deployed commit from the watch header and `--expected-build-id` is that
+deploy run's `<run id>-<attempt>` from the run summary. The script is
+read-only: one GET to `/readyz`, no writes, migrates, or DB connections. It
+emits GO only on a 200 with every component ready and an exact
+revision/build-ID match; anything short of a full match is EXTEND, never
+GO, and a ROLLBACK decision stays human. Checkpoints follow
+[cutover.md](cutover.md) §48-hour watch. Poll read-only on a short cadence
+(suggested 60 s); record findings, not every healthy poll.
+
+### Watch header (record once at T_0)
 
 | Field | Value |
 |---|---|

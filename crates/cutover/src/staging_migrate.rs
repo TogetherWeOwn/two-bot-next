@@ -1,4 +1,4 @@
-//! Staging-only SQLx migration runner (TOG-11572).
+//! SQLx migration runner with an explicit staging/production target.
 //!
 //! Applies this crate's embedded migrations through the same SQLx migrator the
 //! gateway used before it went DML-only, with ledger `public._sqlx_migrations`.
@@ -10,8 +10,9 @@
 //!
 //! Fail-closed: every refusal happens before any DDL. The runner never resets,
 //! reverts, restores, creates roles, grants privileges or reads other
-//! credentials. The database URL arrives only through the mode's fixed
-//! environment binding ([`PLAN_URL_ENV`] for plan, [`URL_ENV`] for apply) and
+//! credentials. The database URL arrives only through the target and mode's fixed
+//! environment binding (staging: [`PLAN_URL_ENV`] for plan, [`URL_ENV`] for apply;
+//! production: [`PROD_PLAN_URL_ENV`] for plan, [`PROD_URL_ENV`] for apply) and
 //! is never printed. Plan refuses when the RO binding is absent, even when a
 //! migrator URL is set elsewhere, and refuses before reading the ledger when
 //! its login also holds [`MIGRATOR_ROLE`] (the plan credential is RO only).
@@ -31,8 +32,14 @@ use sqlx::{
 
 /// Fixed binding names; each value is a secret and is never echoed.
 /// Plan reads only the RO binding; apply reads only the migrator binding.
+/// Staging keeps its names; production reads only its own pair.
 pub const URL_ENV: &str = "TWO_BOT_STAGING_MIGRATOR_DATABASE_URL";
 pub const PLAN_URL_ENV: &str = "TWO_BOT_STAGING_PLAN_DATABASE_URL";
+/// Production bindings (PlanetScale `two_bot`): plan reads only the read-only
+/// binding, apply reads only the migrator binding. A mode never borrows the
+/// other target's credential.
+pub const PROD_URL_ENV: &str = "TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL";
+pub const PROD_PLAN_URL_ENV: &str = "TWO_BOT_PRODUCTION_PLAN_DATABASE_URL";
 pub const MIGRATOR_ROLE: &str = "two_bot_migrator";
 /// Read-only migration-plan identity: SELECT on bot tables, the admission
 /// lane and the ledger; no DML, DDL, sequence, function or web-view access
@@ -69,6 +76,50 @@ const AUDIT_MEMBERSHIP_SQL: &str = "SELECT e.login, (r.oid IS NOT NULL) AS login
 
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
+/// Explicit migration target. The CLI requires `--target staging|production`;
+/// there is no default. Staging keeps its bindings and production-substring
+/// refusal; production reads only its own bindings, allows the production
+/// substring, and additionally refuses any staging host pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    Staging,
+    Production,
+}
+
+impl Target {
+    /// Parse the CLI `--target` value. Accepts only the two lowercase names.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "staging" => Some(Self::Staging),
+            "production" => Some(Self::Production),
+            _ => None,
+        }
+    }
+
+    /// Canonical name echoed in the manifest (`migration_target`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Staging => "staging",
+            Self::Production => "production",
+        }
+    }
+}
+
+/// Staging host pins the production target must never touch.
+///
+/// Staging runs on shared Neon (plus the `agent-testdb` / loopback fixtures),
+/// while production runs on PlanetScale. Any binding host that is a fixture
+/// host, carries a `staging` label, or points at Neon is a staging pin: the
+/// production target refuses it even when the dispatch pins match it, so a
+/// mistaken production pin aimed at staging still fails closed before any DDL.
+fn is_staging_host(host_lower: &str) -> bool {
+    host_lower == "agent-testdb"
+        || host_lower == "127.0.0.1"
+        || host_lower == "localhost"
+        || host_lower.contains("staging")
+        || host_lower.contains("neon.tech")
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
     /// A prerequisite is missing or unsafe; no DDL was attempted.
@@ -86,9 +137,16 @@ fn refuse<T>(message: impl Into<String>) -> Result<T, RunError> {
 #[derive(Debug, Clone)]
 pub struct Request {
     pub url: Option<String>,
+    pub target: Target,
     pub source_sha: String,
     pub expected_host: String,
     pub expected_database: String,
+    /// Pinned PlanetScale branch id (non-secret workflow input). Empty means
+    /// no pin (Neon and test hosts). Required when the pinned host is a
+    /// `*.psdb.cloud` endpoint: PlanetScale routes by the username's
+    /// `{role}.{branch_id}` suffix while every branch shares `postgres` as
+    /// the database name, so host+database alone cannot fix the branch.
+    pub expected_branch_id: String,
     pub recovery_evidence_ref: String,
     pub acl_plan_ref: String,
     pub apply: bool,
@@ -124,6 +182,57 @@ fn is_ref(value: &str) -> bool {
         && !value.contains("://")
         && !value.contains('@')
         && !value.chars().any(char::is_whitespace)
+}
+
+/// True for PlanetScale Postgres endpoints (`*.pg.psdb.cloud`,
+/// `*.horizon.psdb.cloud`). Both serve direct Postgres on 5432 and
+/// transaction-mode PgBouncer on 6432 of the same host.
+fn is_planetscale_host(host: &str) -> bool {
+    host.to_ascii_lowercase().ends_with(".psdb.cloud")
+}
+
+/// Bare branch-id shape: PlanetScale branch ids are short alphanumeric
+/// strings (e.g. `cnlmx96ec5kw`). Allow alphanumerics, dash and underscore
+/// up to 63 chars; anything else is not a bare pin.
+fn branch_id_valid(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 63
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Binding-shape refusal shared by `validate_request` (pre-connect) and
+/// `verify_target` (binding match): pooled ports, pooler-style usernames and
+/// branch mismatches all refuse before any DDL.
+fn check_binding_shape(
+    req: &Request,
+    options: &sqlx::postgres::PgConnectOptions,
+) -> Result<(), RunError> {
+    // Transaction pooling (PgBouncer, transaction mode) is unsound for the
+    // per-connection SET ROLE and the SQLx advisory lock: only direct 5432.
+    if options.get_port() != 5432 {
+        return refuse("pooled ports are refused; use the direct 5432 endpoint");
+    }
+    let username = options.get_username();
+    // Dedicated and replica bouncers append `|name` to the username and
+    // share the pinned host: the host pin alone cannot exclude them.
+    if username.contains('|') {
+        return refuse("pooler-style usernames are refused; use the direct role login");
+    }
+    let want = req.expected_branch_id.trim();
+    if !want.is_empty() {
+        // PlanetScale routes by `{role}.{branch_id}`: the username's final
+        // dot-suffix must equal the pinned branch id.
+        let matches = username
+            .rsplit('.')
+            .next()
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(want));
+        if !matches {
+            return refuse("binding branch does not match the pinned staging branch");
+        }
+    }
+    Ok(())
 }
 
 /// Parse the `expected_pending` workflow input: ascending, comma-separated
@@ -265,36 +374,84 @@ pub fn check_plan_provenance(req: &Request, computed_hash: &str) -> Result<(), R
 
 /// Pure prerequisite checks; nothing here touches the network.
 ///
-/// Pinned-identity model: the workflow pins the exact non-secret staging
-/// endpoint host and database name per dispatch, and `verify_target`
-/// refuses before any DDL unless the secret migrator binding points at
-/// exactly that pinned identity. A `staging` substring in the database name
-/// remains accepted but is no longer required, so the verified shared-Neon
-/// staging database (which cannot carry `staging` in its name) can be
-/// targeted. Production exclusion is fail-closed: any `prod`-like host or
-/// database pin is refused, and no production Neon endpoint is recorded in
-/// `docs/cutover.md` or `docs/production-deploy.md` as of this change.
+/// Pinned-identity model: the workflow pins the exact non-secret endpoint host
+/// and database name per dispatch, and `verify_target` refuses before any DDL
+/// unless the secret binding points at exactly that pinned identity. A
+/// `staging` substring in the database name remains accepted but is no longer
+/// required, so the verified shared-Neon staging database (which cannot carry
+/// `staging` in its name) can be targeted.
+///
+/// Staging keeps the production exclusion: any `prod`-like host or database pin
+/// is refused. Production drops that substring refusal (the production host and
+/// the `two_bot` database are production-like by construction) and instead
+/// refuses any staging host pin: a fixture host, a `staging` label, or a Neon
+/// endpoint. The binding-host check in `verify_target` enforces the same fence
+/// on the secret URL itself.
 pub fn validate_request(req: &Request) -> Result<(), RunError> {
     let sha = &req.source_sha;
     if sha.len() != 40 || !sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
         return refuse("source SHA must be a full 40-char lowercase hex commit");
     }
-    for (label, value) in [
-        ("expected host", &req.expected_host),
-        ("expected database", &req.expected_database),
-    ] {
-        let lower = value.to_ascii_lowercase();
-        if lower.is_empty() || lower.contains("prod") || lower.contains('@') || lower.contains('/')
-        {
-            return refuse(format!(
-                "{label} is empty, production-like or not a bare name"
-            ));
+    let host_lower = req.expected_host.to_ascii_lowercase();
+    let db_lower = req.expected_database.to_ascii_lowercase();
+    match req.target {
+        Target::Staging => {
+            for (label, lower) in [
+                ("expected host", &host_lower),
+                ("expected database", &db_lower),
+            ] {
+                if lower.is_empty()
+                    || lower.contains("prod")
+                    || lower.contains('@')
+                    || lower.contains('/')
+                {
+                    return refuse(format!(
+                        "{label} is empty, production-like or not a bare name"
+                    ));
+                }
+            }
+        }
+        Target::Production => {
+            for (label, lower) in [
+                ("expected host", &host_lower),
+                ("expected database", &db_lower),
+            ] {
+                if lower.is_empty() || lower.contains('@') || lower.contains('/') {
+                    return refuse(format!("{label} is empty or not a bare name"));
+                }
+            }
+            // Production never targets staging: the host pin itself is fenced
+            // here, and the secret binding host is fenced again in
+            // `verify_target`, so a mistaken pin aimed at staging still refuses.
+            if is_staging_host(&host_lower) {
+                return refuse(
+                    "production target refuses a staging host pin; use the production host",
+                );
+            }
         }
     }
     // Session SET ROLE and the SQLx advisory lock are unsound behind
     // transaction pooling: only the direct endpoint may be targeted.
+    // PlanetScale serves PgBouncer on port 6432 of the same host (never a
+    // `-pooler` hostname), so the hostname check alone cannot exclude it:
+    // the port and username checks in `check_binding_shape` own the rest.
     if req.expected_host.to_ascii_lowercase().contains("-pooler") {
         return refuse("pooler endpoints are refused; use the direct endpoint");
+    }
+    // PlanetScale branch pin: every branch shares `postgres` as the database
+    // name and routes by the username's `{role}.{branch_id}` suffix, so the
+    // host+database pin alone cannot fix the branch. A `*.psdb.cloud` pin
+    // requires the non-secret branch id; other hosts accept an empty pin.
+    // (Production takes no branch pin yet; its fail-closed refusal lives
+    // after the pooled-shape check below so pooled bindings keep the pooled
+    // refusal in both gates, mirroring `verify_target`.)
+    let branch = req.expected_branch_id.trim();
+    if !branch.is_empty() && !branch_id_valid(branch) {
+        return refuse("staging branch id is not a bare branch pin");
+    }
+    if branch.is_empty() && req.target == Target::Staging && is_planetscale_host(&req.expected_host)
+    {
+        return refuse("PlanetScale hosts require --staging-branch-id");
     }
     match &req.expected_pending {
         Some(raw) => {
@@ -359,19 +516,44 @@ pub fn validate_request(req: &Request) -> Result<(), RunError> {
             binding_env(req),
         ));
     }
+    // Pre-connect pooled/branch refusal: the same shape check `verify_target`
+    // runs is parsed here so a pooled `:6432`, `|bouncer` or wrong-branch
+    // binding refuses in `validate_request` too. An unparseable URL is left
+    // for `verify_target`, which owns the invalid-URL refusal.
+    if let Some(url) = req.url.as_deref().filter(|u| !u.is_empty()) {
+        if let Ok(options) = two_bot_core::database_url::connect_options(url) {
+            check_binding_shape(req, &options)?;
+        }
+    }
+    // The production target takes no branch pin yet, so a production dispatch
+    // aimed at a `*.psdb.cloud` host fails closed here until the production
+    // branch-pin follow-up lands. After the pooled-shape check so pooled
+    // bindings keep the pooled refusal, mirroring `verify_target`; the
+    // message must not name `--staging-branch-id`, which production rejects.
+    if req.target == Target::Production
+        && req.expected_branch_id.trim().is_empty()
+        && is_planetscale_host(&req.expected_host)
+    {
+        return refuse(
+            "production PlanetScale dispatch needs a production branch pin, \
+             which is not supported yet; refusing",
+        );
+    }
     Ok(())
 }
 
-/// The fixed environment binding for this mode: plan reads only the
+/// The fixed environment binding for this target and mode: plan reads only the
 /// read-only binding, apply reads only the migrator binding. The CLI sets
 /// `Request.url` from exactly this binding, so a mode can never borrow the
-/// other mode's credential; `validate_request` refuses an absent binding
-/// before any connection is attempted.
+/// other mode's credential nor the other target's credential;
+/// `validate_request` refuses an absent binding before any connection is
+/// attempted.
 fn binding_env(req: &Request) -> &'static str {
-    if req.apply {
-        URL_ENV
-    } else {
-        PLAN_URL_ENV
+    match (req.target, req.apply) {
+        (Target::Staging, true) => URL_ENV,
+        (Target::Staging, false) => PLAN_URL_ENV,
+        (Target::Production, true) => PROD_URL_ENV,
+        (Target::Production, false) => PROD_PLAN_URL_ENV,
     }
 }
 
@@ -399,11 +581,51 @@ fn verify_target(req: &Request) -> Result<sqlx::postgres::PgConnectOptions, RunE
     if host.contains("-pooler") {
         return refuse("pooler endpoints are refused; use the direct endpoint");
     }
+    // PlanetScale serves PgBouncer on the same host at port 6432 (with a
+    // `|name` username suffix for dedicated poolers), so the `-pooler`
+    // host check above cannot see it: a production binding copied from the
+    // app's pooled connection string passes every host fence. Session
+    // `SET ROLE` and the SQLx advisory lock are unsound behind transaction
+    // pooling, so production targets only the direct endpoint: port 5432
+    // with a bare login. SQLx percent-decodes the username, so one `|`
+    // check covers both the raw and `%7C` forms (a raw `|` never parses).
+    if req.target == Target::Production {
+        if options.get_port() != 5432 {
+            return refuse("production refuses a non-5432 binding port; use the direct endpoint");
+        }
+        if options.get_username().contains('|') {
+            return refuse("production refuses a pooled binding login; use the direct login");
+        }
+    }
+    // Production never touches a staging host, even when the dispatch pins
+    // match it: the binding itself is fenced before the pin comparison.
+    if req.target == Target::Production && is_staging_host(&host) {
+        return refuse(
+            "production target refuses a staging binding host; use the production binding",
+        );
+    }
     if host != req.expected_host.to_ascii_lowercase() || database != req.expected_database {
         return refuse(format!(
-            "{binding} target does not match the verified staging identity"
+            "{binding} target does not match the verified {} identity",
+            req.target.as_str(),
         ));
     }
+    // Fail-closed PlanetScale pin: a `*.psdb.cloud` binding without a pinned
+    // branch id refuses even when host+database match, so a dispatch that
+    // forgets the branch pin cannot reach an unpinned branch. Production
+    // takes no branch pin yet and fails closed here until the production
+    // branch-pin follow-up lands; its refusal must not name
+    // `--staging-branch-id`, which the production target rejects.
+    if req.expected_branch_id.trim().is_empty() && is_planetscale_host(&host) {
+        if req.target == Target::Production {
+            return refuse(
+                "production PlanetScale dispatch needs a production branch pin, \
+                 which is not supported yet; refusing",
+            );
+        }
+        return refuse("PlanetScale hosts require --staging-branch-id");
+    }
+    check_binding_shape(req, &options)?;
     Ok(options)
 }
 
@@ -740,10 +962,12 @@ async fn run_on_pool(
     Ok(json!({
         "runner_version": RUNNER_VERSION,
         "tool": {"name": "two-bot-cutover staging_migrate", "crate_version": env!("CARGO_PKG_VERSION"),
-                 "sqlx": SQLX_VERSION, "invocation": "staging-migrate --plan|--apply"},
+                 "sqlx": SQLX_VERSION, "invocation": "staging-migrate --target staging|production --plan|--apply"},
         "mode": if req.apply { "apply" } else { "plan" },
+        "migration_target": req.target.as_str(),
         "source_sha": req.source_sha,
-        "target": {"host": req.expected_host, "database": req.expected_database},
+        "target": {"host": req.expected_host, "database": req.expected_database,
+                   "branch_id": req.expected_branch_id.trim()},
         "recovery_evidence_ref": req.recovery_evidence_ref,
         "acl_plan_ref": req.acl_plan_ref,
         "role": expected_role(req),
@@ -974,9 +1198,11 @@ mod tests {
         let hash = manifest_hash(source_sha, pending, &MIGRATOR);
         Request {
             url: Some("postgres://u@agent-testdb:5432/two_staging".to_owned()),
+            target: Target::Staging,
             source_sha: source_sha.to_owned(),
             expected_host: "agent-testdb".to_owned(),
             expected_database: "two_staging".to_owned(),
+            expected_branch_id: String::new(),
             recovery_evidence_ref: "TOG-1#doc".to_owned(),
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: true,
@@ -993,6 +1219,70 @@ mod tests {
             // `check_plan_provenance` reads the file. Provenance tests below
             // point this at real temp manifests.
             plan_manifest_path: Some("producing-plan/staging-migrate-manifest.json".to_owned()),
+        }
+    }
+
+    /// Production apply carrying the exact hash for its own source SHA. Uses a
+    /// non-staging fixture host so the staging-pin fence does not fire; the
+    /// binding-host fence is covered separately.
+    fn bound_production_apply(pending: &[i64], source_sha: &str) -> Request {
+        let hash = manifest_hash(source_sha, pending, &MIGRATOR);
+        Request {
+            url: Some("postgres://u@prod-host.invalid:5432/two_bot".to_owned()),
+            target: Target::Production,
+            source_sha: source_sha.to_owned(),
+            expected_host: "prod-host.invalid".to_owned(),
+            expected_database: "two_bot".to_owned(),
+            expected_branch_id: String::new(),
+            recovery_evidence_ref: "TOG-1#doc".to_owned(),
+            acl_plan_ref: "TOG-2#doc".to_owned(),
+            apply: true,
+            expected_pending: Some(
+                pending
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            plan_manifest_sha256: Some(hash),
+            plan_run_id: Some("123456789".to_owned()),
+            plan_manifest_path: Some("producing-plan/production-migrate-manifest.json".to_owned()),
+        }
+    }
+
+    fn staging_plan() -> Request {
+        Request {
+            url: Some("postgres://u@agent-testdb:5432/two_staging".to_owned()),
+            target: Target::Staging,
+            source_sha: "a".repeat(40),
+            expected_host: "agent-testdb".to_owned(),
+            expected_database: "two_staging".to_owned(),
+            expected_branch_id: String::new(),
+            recovery_evidence_ref: "TOG-1#doc".to_owned(),
+            acl_plan_ref: "TOG-2#doc".to_owned(),
+            apply: false,
+            expected_pending: None,
+            plan_manifest_sha256: None,
+            plan_run_id: None,
+            plan_manifest_path: None,
+        }
+    }
+
+    fn production_plan() -> Request {
+        Request {
+            url: Some("postgres://u@prod-host.invalid:5432/two_bot".to_owned()),
+            target: Target::Production,
+            source_sha: "a".repeat(40),
+            expected_host: "prod-host.invalid".to_owned(),
+            expected_database: "two_bot".to_owned(),
+            expected_branch_id: String::new(),
+            recovery_evidence_ref: "TOG-1#doc".to_owned(),
+            acl_plan_ref: "TOG-2#doc".to_owned(),
+            apply: false,
+            expected_pending: None,
+            plan_manifest_sha256: None,
+            plan_run_id: None,
+            plan_manifest_path: None,
         }
     }
 
@@ -1201,9 +1491,11 @@ mod tests {
     fn validation_refuses_before_connecting() {
         let ok = Request {
             url: Some("postgres://u@agent-testdb:5432/two_staging".to_owned()),
+            target: Target::Staging,
             source_sha: "a".repeat(40),
             expected_host: "agent-testdb".to_owned(),
             expected_database: "two_staging".to_owned(),
+            expected_branch_id: String::new(),
             recovery_evidence_ref: "TOG-1#doc".to_owned(),
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
@@ -1226,6 +1518,91 @@ mod tests {
             ..ok.clone()
         };
         assert!(validate_request(&neon_pin).is_ok());
+        // PlanetScale staging uses the same pinned-host model plus a branch
+        // pin: a direct `*.pg.psdb.cloud:5432` host with the matching
+        // `{role}.{branch_id}` username validates, while a `-pooler` host,
+        // a pooled `:6432` port, a `|bouncer` username, a wrong branch or a
+        // missing branch pin refuses. PgBouncer serves pooling on 6432 of
+        // the same host in transaction mode, never a `-pooler` hostname.
+        let planetscale_pin = Request {
+            url: Some(
+                "postgresql://migrator.cnfixture01@psdb-fixture-1.pg.psdb.cloud:5432/postgres?sslmode=require"
+                    .to_owned(),
+            ),
+            expected_host: "psdb-fixture-1.pg.psdb.cloud".to_owned(),
+            expected_database: "postgres".to_owned(),
+            expected_branch_id: "cnfixture01".to_owned(),
+            ..ok.clone()
+        };
+        assert!(validate_request(&planetscale_pin).is_ok());
+        assert!(verify_target(&planetscale_pin).is_ok());
+        // A PlanetScale pin without the branch id refuses: every branch
+        // shares `postgres` as the database name, so host+database alone
+        // cannot fix the branch.
+        let ps_missing_branch = Request {
+            url: Some(
+                "postgresql://migrator.cnfixture01@psdb-fixture-1.pg.psdb.cloud:5432/postgres?sslmode=require"
+                    .to_owned(),
+            ),
+            expected_host: "psdb-fixture-1.pg.psdb.cloud".to_owned(),
+            expected_database: "postgres".to_owned(),
+            expected_branch_id: String::new(),
+            ..ok.clone()
+        };
+        assert!(matches!(
+            validate_request(&ps_missing_branch),
+            Err(RunError::Refused(_))
+        ));
+        assert!(matches!(
+            verify_target(&ps_missing_branch),
+            Err(RunError::Refused(_))
+        ));
+        // Pooled shapes refuse in both gates even when the pins match them.
+        for pooled in [
+            // Default PgBouncer on the same host.
+            "postgresql://migrator.cnfixture01@psdb-fixture-1.pg.psdb.cloud:6432/postgres?sslmode=require",
+            // Dedicated/replica bouncer usernames share the pinned host.
+            "postgresql://migrator.cnfixture01%7Cread-bouncer@psdb-fixture-1.pg.psdb.cloud:6432/postgres?sslmode=require",
+            // Wrong branch credential on the pinned host.
+            "postgresql://migrator.otherbranch@psdb-fixture-1.pg.psdb.cloud:5432/postgres?sslmode=require",
+        ] {
+            let req = Request {
+                url: Some(pooled.to_owned()),
+                expected_host: "psdb-fixture-1.pg.psdb.cloud".to_owned(),
+                expected_database: "postgres".to_owned(),
+                expected_branch_id: "cnfixture01".to_owned(),
+                ..ok.clone()
+            };
+            assert!(
+                matches!(validate_request(&req), Err(RunError::Refused(_))),
+                "validate must refuse pooled/branch-mismatched binding {pooled}"
+            );
+            assert!(
+                matches!(verify_target(&req), Err(RunError::Refused(_))),
+                "verify must refuse pooled/branch-mismatched binding {pooled}"
+            );
+        }
+        // A malformed branch pin refuses before any DDL. The no-binding
+        // case proves the pin-format check itself refuses: without a URL the
+        // username-suffix match cannot run, so only `branch_id_valid` can
+        // refuse here.
+        let bad_branch_no_url = Request {
+            url: None,
+            expected_branch_id: "not a branch!".to_owned(),
+            ..planetscale_pin.clone()
+        };
+        assert!(matches!(
+            validate_request(&bad_branch_no_url),
+            Err(RunError::Refused(_))
+        ));
+        let bad_branch = Request {
+            expected_branch_id: "not a branch!".to_owned(),
+            ..planetscale_pin.clone()
+        };
+        assert!(matches!(
+            validate_request(&bad_branch),
+            Err(RunError::Refused(_))
+        ));
         let bad = [
             Request {
                 url: None,
@@ -1261,6 +1638,10 @@ mod tests {
             },
             Request {
                 expected_host: "ep-test-pooler.us-east-2.aws.neon.tech".to_owned(),
+                ..ok.clone()
+            },
+            Request {
+                expected_host: "psdb-fixture-1-pooler.pg.psdb.cloud".to_owned(),
                 ..ok.clone()
             },
             Request {
@@ -1321,9 +1702,11 @@ mod tests {
         let sha = "a".repeat(40);
         let plan = Request {
             url: Some("postgres://u@agent-testdb:5432/two_staging".to_owned()),
+            target: Target::Staging,
             source_sha: sha.clone(),
             expected_host: "agent-testdb".to_owned(),
             expected_database: "two_staging".to_owned(),
+            expected_branch_id: String::new(),
             recovery_evidence_ref: "TOG-1#doc".to_owned(),
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
@@ -1346,9 +1729,11 @@ mod tests {
     fn plan_refuses_a_missing_ro_binding_by_name() {
         let ok = Request {
             url: Some("postgres://u@agent-testdb:5432/two_staging".to_owned()),
+            target: Target::Staging,
             source_sha: "a".repeat(40),
             expected_host: "agent-testdb".to_owned(),
             expected_database: "two_staging".to_owned(),
+            expected_branch_id: String::new(),
             recovery_evidence_ref: "TOG-1#doc".to_owned(),
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
@@ -1392,9 +1777,11 @@ mod tests {
     fn binding_must_match_pinned_identity() {
         let base = Request {
             url: Some("postgres://u@agent-testdb:5432/two_bot?sslmode=disable".to_owned()),
+            target: Target::Staging,
             source_sha: "a".repeat(40),
             expected_host: "agent-testdb".to_owned(),
             expected_database: "two_bot".to_owned(),
+            expected_branch_id: String::new(),
             recovery_evidence_ref: "TOG-1#doc".to_owned(),
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
@@ -1431,6 +1818,356 @@ mod tests {
             Err(RunError::Refused(_))
         ));
         assert!(matches!(verify_target(&pooler), Err(RunError::Refused(_))));
+        // A PlanetScale pooler binding is refused even when the pins match it.
+        let ps_pooler = Request {
+            url: Some(
+                "postgresql://migrator.cnfixture01@psdb-fixture-1-pooler.pg.psdb.cloud:5432/postgres?sslmode=require"
+                    .to_owned(),
+            ),
+            expected_host: "psdb-fixture-1-pooler.pg.psdb.cloud".to_owned(),
+            expected_database: "postgres".to_owned(),
+            expected_branch_id: "cnfixture01".to_owned(),
+            ..base.clone()
+        };
+        assert!(matches!(
+            validate_request(&ps_pooler),
+            Err(RunError::Refused(_))
+        ));
+        assert!(matches!(
+            verify_target(&ps_pooler),
+            Err(RunError::Refused(_))
+        ));
+        // A direct PlanetScale binding with the matching branch pin passes
+        // both gates.
+        let ps_direct = Request {
+            url: Some(
+                "postgresql://migrator.cnfixture01@psdb-fixture-1.pg.psdb.cloud:5432/postgres?sslmode=require"
+                    .to_owned(),
+            ),
+            expected_host: "psdb-fixture-1.pg.psdb.cloud".to_owned(),
+            expected_database: "postgres".to_owned(),
+            expected_branch_id: "cnfixture01".to_owned(),
+            ..base.clone()
+        };
+        assert!(validate_request(&ps_direct).is_ok());
+        assert!(verify_target(&ps_direct).is_ok());
+        // Pooled and wrong-branch shapes refuse in both gates.
+        for (url, branch) in [
+            (
+                "postgresql://migrator.cnfixture01@psdb-fixture-1.pg.psdb.cloud:6432/postgres?sslmode=require",
+                "cnfixture01",
+            ),
+            (
+                "postgresql://migrator.cnfixture01%7Cread-bouncer@psdb-fixture-1.pg.psdb.cloud:6432/postgres?sslmode=require",
+                "cnfixture01",
+            ),
+            (
+                "postgresql://migrator.otherbranch@psdb-fixture-1.pg.psdb.cloud:5432/postgres?sslmode=require",
+                "cnfixture01",
+            ),
+        ] {
+            let req = Request {
+                url: Some(url.to_owned()),
+                expected_host: "psdb-fixture-1.pg.psdb.cloud".to_owned(),
+                expected_database: "postgres".to_owned(),
+                expected_branch_id: branch.to_owned(),
+                ..base.clone()
+            };
+            assert!(
+                matches!(validate_request(&req), Err(RunError::Refused(_))),
+                "validate must refuse {url}"
+            );
+            assert!(
+                matches!(verify_target(&req), Err(RunError::Refused(_))),
+                "verify must refuse {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn target_parses_only_the_two_names() {
+        assert_eq!(Target::parse("staging"), Some(Target::Staging));
+        assert_eq!(Target::parse("production"), Some(Target::Production));
+        for raw in ["", "Staging", "STAGING", "prod", "production ", " staging"] {
+            assert_eq!(Target::parse(raw), None, "must refuse {raw:?}");
+        }
+        assert_eq!(Target::Staging.as_str(), "staging");
+        assert_eq!(Target::Production.as_str(), "production");
+    }
+
+    #[test]
+    fn production_bindings_are_target_specific() {
+        let staging_plan = staging_plan();
+        let staging_apply = bound_apply(&pending_versions(), &"a".repeat(40));
+        let prod_plan = production_plan();
+        let prod_apply = bound_production_apply(&pending_versions(), &"a".repeat(40));
+        assert_eq!(binding_env(&staging_plan), PLAN_URL_ENV);
+        assert_eq!(binding_env(&staging_apply), URL_ENV);
+        assert_eq!(binding_env(&prod_plan), PROD_PLAN_URL_ENV);
+        assert_eq!(binding_env(&prod_apply), PROD_URL_ENV);
+        assert_ne!(PLAN_URL_ENV, PROD_PLAN_URL_ENV);
+        assert_ne!(URL_ENV, PROD_URL_ENV);
+        assert_eq!(expected_role(&prod_plan), READ_ONLY_ROLE);
+        assert_eq!(expected_role(&prod_apply), MIGRATOR_ROLE);
+        assert!(validate_request(&staging_plan).is_ok());
+        assert!(validate_request(&prod_plan).is_ok());
+        assert!(validate_request(&staging_apply).is_ok());
+        assert!(validate_request(&prod_apply).is_ok());
+    }
+
+    #[test]
+    fn production_allows_prod_pins_but_refuses_staging_pins() {
+        // Production drops the `prod` substring refusal: the production host
+        // and database are production-like by construction.
+        let mut prod = production_plan();
+        prod.expected_host = "ep-prod-example.pscale.example".to_owned();
+        prod.url = Some("postgres://u@ep-prod-example.pscale.example:5432/two_bot".to_owned());
+        assert!(validate_request(&prod).is_ok());
+        let mut prod_db = production_plan();
+        prod_db.expected_database = "two_prod".to_owned();
+        assert!(validate_request(&prod_db).is_ok());
+        // Staging keeps the refusal on both pins.
+        let mut staging = staging_plan();
+        staging.expected_host = "ep-prod-example.us-east-2.aws.neon.tech".to_owned();
+        assert!(matches!(
+            validate_request(&staging),
+            Err(RunError::Refused(_))
+        ));
+        let mut staging_db = staging_plan();
+        staging_db.expected_database = "two_prod".to_owned();
+        assert!(matches!(
+            validate_request(&staging_db),
+            Err(RunError::Refused(_))
+        ));
+        // Production refuses every staging host pin before any DDL.
+        for host in [
+            "agent-testdb",
+            "127.0.0.1",
+            "localhost",
+            "ep-staging-example.us-east-2.aws.neon.tech",
+            "ep-test-pooler.us-east-2.aws.neon.tech",
+            "staging-host.invalid",
+        ] {
+            let mut req = production_plan();
+            req.expected_host = host.to_owned();
+            req.url = Some(format!("postgres://u@{host}:5432/two_bot"));
+            let err = validate_request(&req).unwrap_err().to_string();
+            assert!(
+                err.contains("staging"),
+                "production must name the staging fence, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_refuses_a_staging_binding_host() {
+        // Even when the pins match, a staging binding host refuses: the secret
+        // URL itself is fenced, not just the pin text. The pins below name the
+        // production host while the binding URL points at staging, so only the
+        // binding fence can fire.
+        let mut req = production_plan();
+        req.expected_host = "prod-host.invalid".to_owned();
+        req.url = Some("postgres://u@agent-testdb:5432/two_bot".to_owned());
+        assert!(matches!(verify_target(&req), Err(RunError::Refused(_))));
+        let err = verify_target(&req).unwrap_err().to_string();
+        assert!(
+            err.contains("staging"),
+            "binding fence must name staging: {err}"
+        );
+        // A Neon binding refuses the same way.
+        let mut neon = production_plan();
+        neon.expected_host = "prod-host.invalid".to_owned();
+        neon.url = Some(
+            "postgres://u@ep-staging-example.us-east-2.aws.neon.tech:5432/two_bot?sslmode=require"
+                .to_owned(),
+        );
+        assert!(matches!(verify_target(&neon), Err(RunError::Refused(_))));
+    }
+
+    #[test]
+    fn production_refuses_pooled_bindings() {
+        // Pooled bindings refuse pre-connect in `validate_request` (shared
+        // `check_binding_shape`) and again in `verify_target` before any DDL.
+        // Use a non-PlanetScale host so the `*.psdb.cloud` branch-pin fence
+        // stays out of this test; PlanetScale pin coverage lives in
+        // `validation_refuses_before_connecting`.
+        let mut pooled_port = production_plan();
+        pooled_port.expected_host = "prod-host.invalid".to_owned();
+        pooled_port.url =
+            Some("postgres://u@prod-host.invalid:6432/two_bot?sslmode=require".to_owned());
+        let err = validate_request(&pooled_port).unwrap_err().to_string();
+        assert!(
+            err.contains("direct"),
+            "pooled port must name the direct endpoint, got: {err}"
+        );
+        let err = verify_target(&pooled_port).unwrap_err().to_string();
+        assert!(
+            err.contains("direct endpoint"),
+            "pooled port must name the direct endpoint, got: {err}"
+        );
+        // Dedicated-PgBouncer logins carry a `|name` suffix on the username;
+        // SQLx percent-decodes it, so the encoded form refuses the same way.
+        let mut pooled_login = production_plan();
+        pooled_login.expected_host = "prod-host.invalid".to_owned();
+        pooled_login.url = Some(
+            "postgres://u%7Cpgbouncer@prod-host.invalid:5432/two_bot?sslmode=require".to_owned(),
+        );
+        let err = validate_request(&pooled_login).unwrap_err().to_string();
+        assert!(
+            err.contains("direct"),
+            "pooled login must name the direct login, got: {err}"
+        );
+        let err = verify_target(&pooled_login).unwrap_err().to_string();
+        assert!(
+            err.contains("direct login"),
+            "pooled login must name the direct login, got: {err}"
+        );
+        // The exact probe from review: a production binding copied from the
+        // app's pooled PlanetScale string (same host, port 6432, no `-pooler`
+        // hostname) refuses in both gates.
+        for pooled in [
+            "postgresql://u@abc-useast1-1.horizon.psdb.cloud:6432/two_bot?sslmode=require",
+            "postgresql://u%7Cpool@abc-useast1-1.horizon.psdb.cloud:6432/two_bot?sslmode=require",
+        ] {
+            let mut req = production_plan();
+            req.expected_host = "abc-useast1-1.horizon.psdb.cloud".to_owned();
+            req.url = Some(pooled.to_owned());
+            assert!(
+                matches!(validate_request(&req), Err(RunError::Refused(_))),
+                "production validate must refuse pooled PlanetScale binding {pooled}"
+            );
+            assert!(
+                matches!(verify_target(&req), Err(RunError::Refused(_))),
+                "production verify must refuse pooled PlanetScale binding {pooled}"
+            );
+        }
+        // The direct endpoint on the same host still verifies.
+        let mut direct = production_plan();
+        direct.expected_host = "prod-host.invalid".to_owned();
+        direct.url = Some("postgres://u@prod-host.invalid:5432/two_bot?sslmode=require".to_owned());
+        assert!(validate_request(&direct).is_ok());
+        assert!(verify_target(&direct).is_ok());
+    }
+
+    #[test]
+    fn production_planetscale_refuses_without_a_production_pin() {
+        // Production takes no branch pin yet: even the direct PlanetScale
+        // endpoint refuses in both gates until the production branch-pin
+        // follow-up lands. The refusal must name the missing production
+        // pin and never `--staging-branch-id`, which production rejects.
+        let mut req = production_plan();
+        req.expected_host = "abc-useast1-1.horizon.psdb.cloud".to_owned();
+        req.url = Some(
+            "postgresql://migrator@abc-useast1-1.horizon.psdb.cloud:5432/two_bot?sslmode=require"
+                .to_owned(),
+        );
+        for gate in [validate_request(&req), verify_target(&req).map(|_| ())] {
+            let err = gate.unwrap_err().to_string();
+            assert!(
+                err.contains("production branch pin"),
+                "production PlanetScale refusal must name the production pin, got: {err}"
+            );
+            assert!(
+                !err.contains("--staging-branch-id"),
+                "production refusal must not name the staging pin, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_keeps_every_other_refusal() {
+        let prod_plan = production_plan();
+        // Bad source SHA refuses on both targets.
+        for sha in [
+            "main".to_owned(),
+            "ABCDEF".repeat(10),
+            "a".repeat(39),
+            "g".repeat(40),
+        ] {
+            let mut req = prod_plan.clone();
+            req.source_sha = sha.to_owned();
+            assert!(matches!(validate_request(&req), Err(RunError::Refused(_))));
+            let mut staging = staging_plan();
+            staging.source_sha = sha.to_owned();
+            assert!(matches!(
+                validate_request(&staging),
+                Err(RunError::Refused(_))
+            ));
+        }
+        // Empty / non-bare pins refuse on both targets.
+        for (host, db) in [
+            ("", "two_bot"),
+            ("prod-host.invalid", ""),
+            ("a@b", "two_bot"),
+            ("prod-host.invalid", "a/b"),
+        ] {
+            for mut req in [prod_plan.clone(), staging_plan()] {
+                req.expected_host = host.to_owned();
+                req.expected_database = db.to_owned();
+                assert!(matches!(validate_request(&req), Err(RunError::Refused(_))));
+            }
+        }
+        // Pooler pins refuse on both targets.
+        for mut req in [prod_plan.clone(), staging_plan()] {
+            req.expected_host = "ep-test-pooler.us-east-2.aws.neon.tech".to_owned();
+            assert!(matches!(validate_request(&req), Err(RunError::Refused(_))));
+        }
+        // Missing bindings name the target's own env on both targets and modes.
+        for (req, want) in [
+            (
+                Request {
+                    url: None,
+                    ..prod_plan.clone()
+                },
+                PROD_PLAN_URL_ENV,
+            ),
+            (
+                Request {
+                    url: None,
+                    ..bound_production_apply(&pending_versions(), &"a".repeat(40))
+                },
+                PROD_URL_ENV,
+            ),
+            (
+                Request {
+                    url: None,
+                    ..staging_plan()
+                },
+                PLAN_URL_ENV,
+            ),
+        ] {
+            let err = validate_request(&req).unwrap_err().to_string();
+            assert!(err.contains(want), "must name {want}, got: {err}");
+        }
+        // Apply without the reviewed pending list or the plan binding refuses.
+        for good in [
+            bound_production_apply(&pending_versions(), &"a".repeat(40)),
+            bound_apply(&pending_versions(), &"a".repeat(40)),
+        ] {
+            for mutate in [
+                |r: &mut Request| r.expected_pending = None,
+                |r: &mut Request| r.plan_manifest_sha256 = None,
+                |r: &mut Request| r.plan_run_id = None,
+                |r: &mut Request| r.plan_manifest_path = None,
+            ] {
+                let mut req = good.clone();
+                mutate(&mut req);
+                assert!(matches!(validate_request(&req), Err(RunError::Refused(_))));
+            }
+        }
+        // Binding mismatch refuses on both targets.
+        let mut prod_mismatch = prod_plan.clone();
+        prod_mismatch.url = Some("postgres://u@other.invalid:5432/two_bot".to_owned());
+        assert!(matches!(
+            verify_target(&prod_mismatch),
+            Err(RunError::Refused(_))
+        ));
+        let mut staging_mismatch = staging_plan();
+        staging_mismatch.url = Some("postgres://u@other.invalid:5432/two_staging".to_owned());
+        assert!(matches!(
+            verify_target(&staging_mismatch),
+            Err(RunError::Refused(_))
+        ));
     }
 
     #[test]

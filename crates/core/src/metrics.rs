@@ -23,6 +23,7 @@ pub const EVENTS: &[&str] = &[
     "MESSAGE_REACTION_ADD",
     "MESSAGE_REACTION_REMOVE",
     "VOICE_STATE_UPDATE",
+    "PRESENCE_UPDATE",
     "INVITE_CREATE",
     "INVITE_DELETE",
     "INTERACTION_CREATE",
@@ -58,7 +59,7 @@ pub const REST_ROUTES: &[&str] = &[
     "DELETE /channels/:channel",
     "other",
 ];
-const RESULTS: &[&str] = &["2xx", "3xx", "4xx", "429", "5xx", "transport"];
+pub const RESULTS: &[&str] = &["2xx", "3xx", "4xx", "429", "5xx", "transport"];
 pub const JOBS: &[&str] = &[
     "invite_snapshot",
     "session_checkpoint",
@@ -73,11 +74,11 @@ pub const JOBS: &[&str] = &[
     "scheduled_messages",
     "other",
 ];
-const JOB_OUTCOMES: &[&str] = &["success", "failure"];
+pub const JOB_OUTCOMES: &[&str] = &["success", "failure"];
 /// Room lifecycle operations (TOG-13543): creator-channel create/move/delete
 /// outcomes only. Retries (429/backoff) are not outcomes.
 pub const VOICE_OPERATIONS: &[&str] = &["create", "move", "delete"];
-const VOICE_OUTCOMES: &[&str] = &[
+pub const VOICE_OUTCOMES: &[&str] = &[
     "success",
     "category_full",
     "discord",
@@ -115,6 +116,47 @@ pub const DB_ERROR_OPS: &[&str] = &["admission", "other"];
 /// `other`. Failed `complete()`/`extend()` storage writes count only in
 /// db_errors: the admit decision was already recorded.
 pub const SEND_ADMISSION_OUTCOMES: &[&str] = &["admitted", "blocked", "storage_error", "other"];
+/// Verdict-refused prefix triggers (TOG-19932): a prefix candidate refused by
+/// the automod verdict before any trigger lookup. `verdict` is the only
+/// production reason today; unknown reasons collapse to `other`. Unmatched
+/// content (no trigger) never increments this family.
+pub const PREFIX_TRIGGER_REFUSED_REASONS: &[&str] = &["verdict", "other"];
+/// Vote-kick outcomes for `two_bot_voice_vote_kick_total{outcome}` (M4.30):
+/// one `started` per successful `kick_start`, one refusal code per refused
+/// `kick_start` (the worker-level `evidence_unavailable` / `not_a_room` plus
+/// every `voice_vote_kick_audit::refusal_outcome` code, including `cooldown`
+/// and `initiator_limited`), and one enforcement code per terminal
+/// `KickMember` dispatch (`EnforcementOutcome::as_str`). Unknown outcomes
+/// collapse to the trailing `other`, never to a dynamic label. No IDs,
+/// tokens or bodies are retained.
+pub const VOICE_VOTE_KICK_OUTCOMES: &[&str] = &[
+    "started",
+    "evidence_unavailable",
+    "not_a_room",
+    "initiator_not_occupant",
+    "target_not_occupant",
+    "self_target",
+    "protected_target",
+    "privileged_target",
+    "authority_unavailable",
+    "active_vote_exists",
+    "cooldown",
+    "initiator_limited",
+    "reused_vote_id",
+    "unknown_vote",
+    "wrong_vote_boundary",
+    "ineligible_voter",
+    "repeated_vote",
+    "invalid_time",
+    "connect_denied_and_disconnected",
+    "connect_denied_target_absent",
+    "skipped_room_gone",
+    "skipped_target_protected",
+    "permission_missing",
+    "discord_error",
+    "gave_up",
+    "other",
+];
 /// Dispatch-lane names for `two_bot_dispatch_drops_total{lane}`, in the bot's
 /// `DISPATCH_LIMITS` order (messages, interactions, registry, privileged,
 /// busy, reactions). Length must equal the lane count; unknown names collapse
@@ -135,6 +177,63 @@ pub const DISPATCH_LANES: &[&str] = &[
     "privileged",
     "busy",
     "reactions",
+];
+/// Checkpoint-failure stages for `two_bot_gateway_checkpoint_failures_total{stage}`.
+/// `pre_commit` is a commit skipped after a funnel/leveling/acknowledgement
+/// failure held in `dispatch_error` or `acknowledgement_held`; `commit` is the
+/// durable store write itself failing. Every failure stops the dispatch worker
+/// and is recorded on `operation`; the counter is the alertable signal.
+/// Failure causes are never labels (no reason strings); unknown stages collapse
+/// to the trailing `commit` slot only when the allowlist grows.
+///
+/// Alert-threshold hook for M2.1: alert on any increase across consecutive
+/// scrapes (exact rule lands with M2.1); unlike bursty dispatch drops, a
+/// single checkpoint failure stops the worker, so there is no
+/// benign-singleton case.
+pub const CHECKPOINT_FAILURE_STAGES: &[&str] = &["pre_commit", "commit"];
+/// Website-action receiver families for
+/// `two_bot_internal_actions_total{family,outcome}` (TOG-20119, roadmap
+/// M4.23). The signed receiver (`crates/bot/src/internal_action_http.rs`)
+/// maps each bounded `action` verb to one family: `announcement.post` to
+/// `announcement`, `event.*` to `event`, `settings.*` to `settings`,
+/// `moderation.*` to `moderation`, `role.assign`/`guild.add_member` to
+/// `membership`; anything else (including unwired catalog verbs and unknown
+/// verbs) collapses to `other`. No key id, token, body or request bytes ever
+/// become a family label.
+///
+/// Alert rule `receiver_refusals:<family>` in `wrangler/src/alert-rules.ts`:
+/// refused outcomes rising in 3 consecutive scrapes per family pages; the
+/// first sample and restarts clear the streak, and one forged pre-auth
+/// probe (family `other`) stays silent.
+pub const INTERNAL_ACTION_FAMILIES: &[&str] = &[
+    "announcement",
+    "event",
+    "settings",
+    "moderation",
+    "membership",
+    "other",
+];
+/// Receiver outcomes for `two_bot_internal_actions_total{family,outcome}`:
+/// `executed` for every terminal success envelope (including idempotent
+/// replays served without a second effect), otherwise the bounded refusal
+/// class matching `RejectionClass::as_str` (`auth_failure`, `unknown_key`,
+/// `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`,
+/// `action_disabled`, `malformed_body`, `conflict`, `upstream`, `internal`).
+/// Each request counts exactly once. No secret, token, key id or raw request
+/// bytes ever become an outcome label.
+pub const INTERNAL_ACTION_OUTCOMES: &[&str] = &[
+    "executed",
+    "auth_failure",
+    "unknown_key",
+    "clock_skew",
+    "nonce_replay",
+    "rate_limit",
+    "unknown_action",
+    "action_disabled",
+    "malformed_body",
+    "conflict",
+    "upstream",
+    "internal",
 ];
 const BUCKETS_MICROS: &[u64] = &[
     1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
@@ -206,9 +305,13 @@ struct Values {
     voice_tracked: u64,
     voice_compensation: u64,
     voice_orphans: u64,
+    voice_vote_kick: [u64; VOICE_VOTE_KICK_OUTCOMES.len()],
     db_errors: [u64; DB_ERROR_OPS.len()],
     send_admissions: [u64; SEND_ADMISSION_OUTCOMES.len()],
+    prefix_trigger_refused: [u64; PREFIX_TRIGGER_REFUSED_REASONS.len()],
     dispatch_drops: [u64; DISPATCH_LANES.len()],
+    checkpoint_failures: [u64; CHECKPOINT_FAILURE_STAGES.len()],
+    internal_actions: [[u64; INTERNAL_ACTION_OUTCOMES.len()]; INTERNAL_ACTION_FAMILIES.len()],
 }
 
 /// All storage is fixed-size. Unknown labels collapse to `other`, including hostile input.
@@ -378,6 +481,20 @@ impl Metrics {
         values.voice_compensation = compensation;
     }
 
+    /// One vote-kick start, refusal or enforcement (M4.30). Call once per
+    /// `kick_start` decision (`started` or the refusal code) and once per
+    /// terminal `KickMember` enforcement (`EnforcementOutcome::as_str`).
+    /// `vote_result` rows (passed/expired/cancelled) are not outcomes here.
+    /// Unknown outcomes collapse to `other`.
+    pub fn voice_vote_kick(&self, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.voice_vote_kick[bounded_index(outcome, VOICE_VOTE_KICK_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
     /// One untracked creator-channel orphan needing manual deletion after
     /// failed `/create` compensation (TOG-13543). No channel ID is retained.
     pub fn voice_orphan(&self) {
@@ -411,6 +528,20 @@ impl Metrics {
         *counter = counter.saturating_add(1);
     }
 
+    /// One verdict-refused prefix trigger (TOG-19932). Call once on the
+    /// refusal arm only: the automod verdict refused the create before any
+    /// trigger lookup. Unmatched content (no trigger) never calls this.
+    /// Unknown reasons collapse to `other`.
+    pub fn prefix_trigger_refused(&self, reason: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.prefix_trigger_refused
+            [bounded_index(reason, PREFIX_TRIGGER_REFUSED_REASONS)];
+        *counter = counter.saturating_add(1);
+    }
+
     /// One dispatch-lane saturation drop (TOG-19878). Call once per saturated
     /// lane per dropped event from `spawn_first`: a single-lane drop increments
     /// that lane; a multi-lane attempt whose every lane is full increments each
@@ -423,6 +554,39 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let counter = &mut values.dispatch_drops[bounded_index(lane, DISPATCH_LANES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One failed gateway checkpoint commit from `apply_dispatch`: `pre_commit`
+    /// when the commit was skipped after a funnel/leveling/acknowledgement
+    /// failure, `commit` when the durable store write itself failed. Call once
+    /// per Err arm entry. Unknown stages collapse to `commit` only when the
+    /// allowlist grows; failure causes are never labels. No IDs, tokens or
+    /// bodies are retained.
+    pub fn checkpoint_failure(&self, stage: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter =
+            &mut values.checkpoint_failures[bounded_index(stage, CHECKPOINT_FAILURE_STAGES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One signed website-action receiver execution (TOG-20119). Call exactly
+    /// once per request from the receiver: `executed` for every terminal
+    /// success envelope (including idempotent replays), otherwise the bounded
+    /// refusal class. Unknown families and outcomes collapse to `other` and
+    /// `internal` respectively only when the allowlists grow; today every
+    /// caller passes a member, so those slots stay zero unless hostile input
+    /// arrives. No IDs, tokens, key ids or bodies are retained.
+    pub fn internal_action(&self, family: &str, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.internal_actions[bounded_index(family, INTERNAL_ACTION_FAMILIES)]
+            [bounded_index(outcome, INTERNAL_ACTION_OUTCOMES)];
         *counter = counter.saturating_add(1);
     }
 
@@ -614,6 +778,19 @@ impl Metrics {
         );
         header(
             &mut out,
+            "two_bot_voice_vote_kick_total",
+            "counter",
+            "Vote-kick starts, refusals by refusal code and terminal enforcements by enforcement code; vote results are audit-only.",
+        );
+        for (outcome, count) in VOICE_VOTE_KICK_OUTCOMES.iter().zip(values.voice_vote_kick) {
+            writeln!(
+                out,
+                "two_bot_voice_vote_kick_total{{outcome=\"{outcome}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
             "two_bot_db_errors_total",
             "counter",
             "Storage-layer failures by bounded operation; pool gauges are pressure, this is errors.",
@@ -636,6 +813,22 @@ impl Metrics {
         }
         header(
             &mut out,
+            "two_bot_gateway_prefix_trigger_refused_total",
+            "counter",
+            "Prefix candidates refused by the automod verdict before any trigger lookup, by bounded reason.",
+        );
+        for (reason, count) in PREFIX_TRIGGER_REFUSED_REASONS
+            .iter()
+            .zip(values.prefix_trigger_refused)
+        {
+            writeln!(
+                out,
+                "two_bot_gateway_prefix_trigger_refused_total{{reason=\"{reason}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
             "two_bot_dispatch_drops_total",
             "counter",
             "Dispatch-lane saturation drops by bounded lane (reactions lane also counts per-member fairness refusals); logs sample one warn per 60 s per runtime.",
@@ -646,6 +839,37 @@ impl Metrics {
                 "two_bot_dispatch_drops_total{{lane=\"{lane}\"}} {count}"
             )
             .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_gateway_checkpoint_failures_total",
+            "counter",
+            "Failed gateway checkpoint commits by bounded stage; every failure stops the dispatch worker.",
+        );
+        for (stage, count) in CHECKPOINT_FAILURE_STAGES
+            .iter()
+            .zip(values.checkpoint_failures)
+        {
+            writeln!(
+                out,
+                "two_bot_gateway_checkpoint_failures_total{{stage=\"{stage}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_internal_actions_total",
+            "counter",
+            "Signed website-action receiver executions by bounded family and outcome; refusals share the warn-summary classes.",
+        );
+        for (family, outcomes) in INTERNAL_ACTION_FAMILIES.iter().zip(values.internal_actions) {
+            for (outcome, count) in INTERNAL_ACTION_OUTCOMES.iter().zip(outcomes) {
+                writeln!(
+                    out,
+                    "two_bot_internal_actions_total{{family=\"{family}\",outcome=\"{outcome}\"}} {count}"
+                )
+                .unwrap();
+            }
         }
         let (size, idle, max) = pool.unwrap_or_default();
         scalar(
@@ -728,7 +952,11 @@ mod tests {
             metrics.job_failure(&hostile);
             metrics.db_error(&hostile);
             metrics.send_admission(&hostile);
+            metrics.prefix_trigger_refused(&hostile);
             metrics.dispatch_drop(&hostile);
+            metrics.voice_vote_kick(&hostile);
+            metrics.checkpoint_failure(&hostile);
+            metrics.internal_action(&hostile, &hostile);
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
@@ -820,10 +1048,57 @@ mod tests {
             metrics.voice_operation(&hostile, &hostile);
             metrics.voice_reconcile(&hostile, 1);
             metrics.voice_dead_letter(&hostile);
+            metrics.voice_vote_kick(&hostile);
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
         assert!(!text.contains("secret"));
+    }
+
+    #[test]
+    fn vote_kick_starts_refusals_and_enforcements_stay_bounded() {
+        let metrics = Metrics::default();
+        metrics.voice_vote_kick("started");
+        metrics.voice_vote_kick("started");
+        metrics.voice_vote_kick("cooldown");
+        metrics.voice_vote_kick("initiator_limited");
+        metrics.voice_vote_kick("connect_denied_and_disconnected");
+        metrics.voice_vote_kick("gave_up");
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_vote_kick_total{outcome=\"started\"} 2\n"));
+        assert!(text.contains("two_bot_voice_vote_kick_total{outcome=\"cooldown\"} 1\n"));
+        assert!(text.contains("two_bot_voice_vote_kick_total{outcome=\"initiator_limited\"} 1\n"));
+        assert!(text.contains(
+            "two_bot_voice_vote_kick_total{outcome=\"connect_denied_and_disconnected\"} 1\n"
+        ));
+        assert!(text.contains("two_bot_voice_vote_kick_total{outcome=\"gave_up\"} 1\n"));
+        assert!(text.contains("two_bot_voice_vote_kick_total{outcome=\"other\"} 0\n"));
+        // Fixed cardinality: every allowlisted outcome renders exactly once.
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("two_bot_voice_vote_kick_total{"))
+            .collect();
+        assert_eq!(series.len(), VOICE_VOTE_KICK_OUTCOMES.len());
+        let mut unique = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, value) = line.rsplit_once(' ').unwrap();
+            assert!(unique.insert(key), "duplicate series: {key}");
+            assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
+    }
+
+    #[test]
+    fn vote_kick_counters_saturate_without_wrapping() {
+        let metrics = Metrics::default();
+        {
+            let mut values = metrics.0.lock().unwrap();
+            values.voice_vote_kick[bounded_index("started", VOICE_VOTE_KICK_OUTCOMES)] = u64::MAX;
+        }
+        metrics.voice_vote_kick("started");
+        assert!(metrics.render(None).contains(&format!(
+            "two_bot_voice_vote_kick_total{{outcome=\"started\"}} {}\n",
+            u64::MAX
+        )));
     }
 
     #[test]
@@ -842,6 +1117,47 @@ mod tests {
         assert!(text.contains("two_bot_send_admissions_total{outcome=\"storage_error\"} 1\n"));
         assert!(text.contains("two_bot_send_admissions_total{outcome=\"other\"} 0\n"));
         // Fixed cardinality: 2 db-error ops + 4 admission outcomes.
+        let mut series = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, value) = line.rsplit_once(' ').unwrap();
+            assert!(series.insert(key), "duplicate series: {key}");
+            assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
+    }
+
+    #[test]
+    fn prefix_trigger_refusals_stay_bounded_and_saturate() {
+        // TOG-19932: verdict refusals count separately from unmatched content.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(
+            text.contains("two_bot_gateway_prefix_trigger_refused_total{reason=\"verdict\"} 0\n")
+        );
+        assert!(text.contains("two_bot_gateway_prefix_trigger_refused_total{reason=\"other\"} 0\n"));
+        metrics.prefix_trigger_refused("verdict");
+        metrics.prefix_trigger_refused("verdict");
+        metrics.prefix_trigger_refused("hostile\"\\\nlabel");
+        let text = metrics.render(None);
+        assert!(
+            text.contains("two_bot_gateway_prefix_trigger_refused_total{reason=\"verdict\"} 2\n")
+        );
+        assert!(text.contains("two_bot_gateway_prefix_trigger_refused_total{reason=\"other\"} 1\n"));
+        assert!(!text.contains("hostile"));
+        {
+            let mut values = metrics.0.lock().unwrap();
+            values.prefix_trigger_refused = [u64::MAX, u64::MAX];
+        }
+        metrics.prefix_trigger_refused("verdict");
+        metrics.prefix_trigger_refused("other");
+        let text = metrics.render(None);
+        assert!(text.contains(&format!(
+            "two_bot_gateway_prefix_trigger_refused_total{{reason=\"verdict\"}} {}\n",
+            u64::MAX
+        )));
+        assert!(text.contains(&format!(
+            "two_bot_gateway_prefix_trigger_refused_total{{reason=\"other\"}} {}\n",
+            u64::MAX
+        )));
         let mut series = std::collections::HashSet::new();
         for line in text.lines().filter(|line| !line.starts_with('#')) {
             let (key, value) = line.rsplit_once(' ').unwrap();
@@ -872,12 +1188,89 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_failures_stay_bounded_and_saturate() {
+        let metrics = Metrics::default();
+        metrics.checkpoint_failure("pre_commit");
+        metrics.checkpoint_failure("commit");
+        metrics.checkpoint_failure("commit");
+        let text = metrics.render(None);
+        assert!(
+            text.contains("two_bot_gateway_checkpoint_failures_total{stage=\"pre_commit\"} 1\n")
+        );
+        assert!(text.contains("two_bot_gateway_checkpoint_failures_total{stage=\"commit\"} 2\n"));
+        // Fixed cardinality: two stages.
+        let mut series = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, value) = line.rsplit_once(' ').unwrap();
+            assert!(series.insert(key), "duplicate series: {key}");
+            assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
+    }
+
+    #[test]
+    fn checkpoint_hostile_labels_collapse_without_new_series() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.checkpoint_failure(&hostile);
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        assert!(!text.contains("secret"));
+        assert!(text.contains("two_bot_gateway_checkpoint_failures_total{stage=\"commit\"} 100\n"));
+    }
+
+    #[test]
     fn dispatch_hostile_labels_collapse_without_new_series() {
         let metrics = Metrics::default();
         let before = metrics.render(None).lines().count();
         for id in 0..100 {
             let hostile = format!("{id}\"\\\nsecret=value");
             metrics.dispatch_drop(&hostile);
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        assert!(!text.contains("secret"));
+    }
+
+    #[test]
+    fn internal_actions_count_executed_and_refused_per_family() {
+        let metrics = Metrics::default();
+        // Executed membership action (role.assign served through the signed
+        // receiver) and a refused unknown verb (other family, unknown_action).
+        metrics.internal_action("membership", "executed");
+        metrics.internal_action("membership", "executed");
+        metrics.internal_action("other", "unknown_action");
+        metrics.internal_action("announcement", "executed");
+        let text = metrics.render(None);
+        assert!(text.contains(
+            "two_bot_internal_actions_total{family=\"membership\",outcome=\"executed\"} 2\n"
+        ));
+        assert!(text.contains(
+            "two_bot_internal_actions_total{family=\"other\",outcome=\"unknown_action\"} 1\n"
+        ));
+        assert!(text.contains(
+            "two_bot_internal_actions_total{family=\"announcement\",outcome=\"executed\"} 1\n"
+        ));
+        assert!(text
+            .contains("two_bot_internal_actions_total{family=\"event\",outcome=\"executed\"} 0\n"));
+        // Fixed cardinality: six families by twelve outcomes.
+        let mut series = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, value) = line.rsplit_once(' ').unwrap();
+            assert!(series.insert(key), "duplicate series: {key}");
+            assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
+    }
+
+    #[test]
+    fn internal_action_hostile_labels_collapse_without_new_series() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.internal_action(&hostile, &hostile);
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);

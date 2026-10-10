@@ -4,11 +4,13 @@ Threat-model [F6](threat-model.md) requires authenticated TLS for Neon. The
 `two_bot_core::database_tls` module fences the database URL before SQLx parses
 it. `two_bot_cutover::connect` (cutover CLIs, `two-bot db roles verify` and the
 bot's website/community job pool) calls it after the `database_url` key
-allowlist and before `connect_options`. The three send-admission pools share
-one helper (`website_jobs::admission_pool_with_tls`, used by the website jobs,
-the preflight `admission_transport` and the commands CLI `executor`) that does
-the same: `database_url::validate`, `database_tls::enforce`, `connect_options`,
-`database_tls::apply`, plus the statement timeout and the acquire timeout.
+allowlist and before `connect_options`. The three bot-side send-admission pools
+share one helper
+(`website_jobs::admission_pool_with_tls`, used by the website jobs, the preflight
+`admission_transport` and the commands CLI `executor`). The cutover tools' fourth
+pool (`RestClient::from_env`) uses its own `admission_connect_options` helper.
+Both paths validate before enforcing TLS, then parse and apply the effective TLS
+mode; each configures the statement and acquire timeouts.
 
 ## Setting
 
@@ -93,15 +95,15 @@ Fenced: every caller of `two_bot_cutover::connect`, the gateway store pool
 (`two_bot_store::connect_pool`, via `connect_pool_with_tls`), both
 `two-bot backup` URL parses (`backup_cli::open_pool`, via
 `open_pool_with_tls`, and `governed_guild_config_api`),
-`channel_moderation_store::connect` (via `connect_with_tls`), and three of the
+`channel_moderation_store::connect` (via `connect_with_tls`), and all four
 send-admission pools (`website_jobs::admission_pool_with_tls` for the website
-jobs, the preflight `admission_transport` and the commands CLI `executor`).
+jobs, the preflight `admission_transport`, the commands CLI `executor`, and
+`two_bot_cutover::rest::RestClient::from_env` via `admission_connect_options`
+(with `from_url_with_tls` as a public explicit URL/policy constructor used by
+tests) for the `report`, `ghost_cleanup`, `backfill_messages`, `backfill`,
+`capture` and `voice_config_apply` operator tools).
 
-Known gaps (not yet fenced): `two_bot_cutover::rest::RestClient::from_env`
-(`crates/cutover/src/rest.rs`) builds a send-admission pool from
-`TWO_DATABASE_URL` with raw `connect_options` for the `report`,
-`ghost_cleanup` and `backfill_messages` operator tools, so the TLS policy is
-not enforced there; `staging_migrate::verify_target` plus `connect`
+Known gaps (not yet fenced): `staging_migrate::verify_target` plus `connect`
 (`crates/cutover/src/staging_migrate.rs`) pins the expected host and database
 but never calls `database_tls::enforce`/`apply` and sets no timeouts; the
 `legacy_copy` binary (`crates/cutover/src/bin/legacy_copy.rs`) builds its
@@ -126,7 +128,13 @@ F6 stays open until the deployment card records a non-secret TLS receipt.
   (`crates/store/tests/tls_refusal.rs`,
   `backup_cli::open_pool_with_tls_refusals_never_echo_urls_or_reach_logs`,
   `backup_cli::tls_admission_guard_redacts_dependency_logs`,
-  `secret_redaction::channel_store_tls_refusals_never_echo_urls_or_reach_logs`).
+  `secret_redaction::channel_store_tls_refusals_never_echo_urls_or_reach_logs`,
+  `rest::admission_tls_fence_refuses_plaintext_and_wrong_hosts` plus the
+  `from_env` entry proofs
+  (`admission_configuration::admission_bootstrap_tls_refusal_redacts_dependency_logs`
+  for a realistic remote URL, and the dial-discriminating
+  `admission_bootstrap_tls_spy_refuses_before_any_socket`, which fails when
+  the fence is reverted to raw `connect_options`).
 - DB suites and CLIs pass `LocalOnly` explicitly (`connect_with_tls` /
   `connect_pool_with_tls` / `open_pool_with_tls`, or
   `TWO_DATABASE_TLS=local-only` on `env_clear()` subprocesses). The CI `check`

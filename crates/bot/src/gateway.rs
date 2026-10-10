@@ -47,6 +47,50 @@ pub fn ensure_crypto_provider() {
     }
 }
 
+/// Worker decision for prefix triggers: `Some(trigger)` means the serial
+/// dispatch worker must call `dispatch_with_verdict(event, trigger)`, `None`
+/// means it must not. `trigger` is `disposition.map(|verdict| verdict.trigger)`;
+/// the text-automation gate stays on the trigger verdict, not the funnel: an
+/// uninspected create keeps funnel `Accept` but its trigger is capture-only
+/// and must not run sticky or prefix triggers (fail-closed).
+pub(crate) fn worker_prefix_trigger(
+    disposition: Option<crate::automod_gateway::WorkerVerdict>,
+    event: &Event,
+    automod_enabled: bool,
+) -> Option<Option<two_bot_core::automod_runtime::FunnelDisposition>> {
+    let trigger = disposition.map(|verdict| verdict.trigger);
+    if automod_enabled
+        && matches!(event, Event::MessageCreate(_))
+        && crate::automod_gateway::runs_text_automations(trigger)
+    {
+        Some(trigger)
+    } else {
+        None
+    }
+}
+
+/// Dispatch accepted creates, while recording only telemetry for candidates
+/// refused by the worker's capture-only gate. The refusal path never spawns
+/// text-automation work.
+fn dispatch_or_record_prefix_trigger(
+    command_runtime: Option<&Arc<crate::command_runtime::CommandRuntime>>,
+    disposition: Option<crate::automod_gateway::WorkerVerdict>,
+    event: &Event,
+    automod_enabled: bool,
+) -> bool {
+    if let Some(trigger) = worker_prefix_trigger(disposition, event, automod_enabled) {
+        command_runtime.is_some_and(|runtime| runtime.dispatch_with_verdict(event, trigger))
+    } else {
+        if !automod_enabled || !matches!(event, Event::MessageCreate(_)) {
+            return false;
+        }
+        if let Some(runtime) = command_runtime {
+            runtime.record_refused_prefix_trigger(event);
+        }
+        false
+    }
+}
+
 /// Supervisor-visible gateway state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatewayState {
@@ -125,7 +169,14 @@ pub fn intents_from_env(activation: &crate::activation::BootActivation) -> Inten
             &var("TWO_AUTOMATIONS"),
             &var("TWO_TEXT_COMMANDS"),
         );
-    base | gateway_intents(text_commands)
+    // Voice-room presence facts (game/stream tokens) need privileged
+    // GUILD_PRESENCES; off unless explicitly enabled, so a bot whose app lacks
+    // the Presence Intent grant never closes with 4014.
+    let presences = two_bot_discord::intents::needs_voice_presences(
+        &var("TWO_VOICE"),
+        &var("TWO_VOICE_PRESENCE"),
+    );
+    two_bot_discord::intents::with_presences(base | gateway_intents(text_commands), presences)
 }
 
 fn intents_for_settings(
@@ -312,6 +363,21 @@ fn missing_ingress_ticket_failure() -> sqlx::Error {
 /// instead of queueing unbounded acknowledgement work.
 fn ingress_capacity_failure() -> sqlx::Error {
     sqlx::Error::InvalidArgument("gateway ingress capacity exhausted".into())
+}
+
+/// Fatal-runner reason fence: at most 512 chars of the dispatch-supervisor
+/// reason reach the surfaced runner error (logs + `operation`). Class
+/// `session` per `docs/log-volume-guard.md`: the runner fails at most a
+/// handful of times per process lifetime. Today every reason is one of six
+/// `&'static str` literals from `dispatch_bounded` (the `JoinError` payload
+/// is discarded there), so the bound is defense in depth: it holds even if a
+/// future supervisor returns a larger payload. Char-boundary truncation keeps
+/// the surfaced string valid UTF-8.
+const RUNNER_REASON_MAX_CHARS: usize = 512;
+
+fn bounded_runner_reason(reason: &str) -> sqlx::Error {
+    let bounded: String = reason.chars().take(RUNNER_REASON_MAX_CHARS).collect();
+    sqlx::Error::InvalidArgument(bounded)
 }
 
 /// Await one RSVP completion ticket on the dispatch worker. A dropped sender
@@ -514,33 +580,6 @@ fn voice_disconnected(voice: Option<&Arc<dyn VoiceEventSink>>) {
     }
 }
 
-/// Trigger-gated text-automation dispatch for the serial worker: only an
-/// inspected `Accept` trigger verdict dispatches (fail-closed). Extracted from
-/// `apply_dispatch` so worker-level tests drive the exact call-site gate
-/// (`gateway.rs` trigger path, M2.22): a Bypassed create keeps funnel-Accept
-/// but its trigger is capture-only and must not run sticky.
-fn dispatch_text_automations(
-    handle: &tokio::runtime::Handle,
-    command_runtime: Option<&Arc<crate::command_runtime::CommandRuntime>>,
-    automod_enabled: bool,
-    event: &Event,
-    trigger: Option<two_bot_core::automod_runtime::FunnelDisposition>,
-) -> bool {
-    if automod_enabled
-        && matches!(event, Event::MessageCreate(_))
-        && crate::automod_gateway::runs_text_automations(trigger)
-    {
-        if let Some(runtime) = command_runtime {
-            // Detached spawn from the blocking worker needs the runtime.
-            // The verdict travels with the event; a missing
-            // verdict fails closed inside the trigger handler.
-            let _guard = handle.enter();
-            return runtime.dispatch_with_verdict(event, trigger);
-        }
-    }
-    false
-}
-
 /// One blocking-worker dispatch step: run the funnel/leveling drain, await the
 /// interaction completion, serialize any onboarding job and commit the
 /// checkpoint — or record the first failure as a typed error and skip the
@@ -571,6 +610,22 @@ fn apply_dispatch<I: InviteSource>(
     acknowledgement: Option<tokio::sync::oneshot::Receiver<bool>>,
     committed: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), sqlx::Error> {
+    // Presence updates (TWO_VOICE_PRESENCE) only feed in-memory voice-room
+    // name facts: no funnel, audit or durable effect. They stay in gateway
+    // order with GUILD_CREATE (whose presence snapshot this worker applies)
+    // but skip the checkpoint commit, one Postgres transaction per dispatch.
+    // The next committed dispatch carries the cursor past them, and a RESUME
+    // replays them idempotently; reception already advanced, so no gap.
+    if let Some(ReceivedDispatch {
+        event: Event::PresenceUpdate(update),
+        ..
+    }) = dispatch.as_deref()
+    {
+        if let Some(voice) = worker_voice.as_ref() {
+            voice.presence(update);
+        }
+        return Ok(());
+    }
     let timer = crate::gateway_metrics::DispatchTimer::start();
     let mut connected: Option<&str> = None;
     let mut onboarding_job = None;
@@ -647,17 +702,14 @@ fn apply_dispatch<I: InviteSource>(
                 voice.disconnect();
             }
         }
-        let trigger = disposition.map(|verdict| verdict.trigger);
-        // Text automations gate on the trigger verdict, not
-        // the funnel: a Bypassed create keeps funnel-Accept
-        // but its trigger is capture-only and must not run
-        // sticky (fail-closed; M2.19, M2.22).
-        let _ = dispatch_text_automations(
-            handle,
+        // Detached spawn from the blocking worker needs the runtime. A create
+        // refused by the trigger gate records only prefix-candidate telemetry.
+        let _guard = handle.enter();
+        dispatch_or_record_prefix_trigger(
             command_runtime.as_ref(),
-            automod_enabled,
+            disposition,
             &dispatch.event,
-            trigger,
+            automod_enabled,
         );
         if !requests.is_empty() {
             let drain_outcome =
@@ -679,13 +731,14 @@ fn apply_dispatch<I: InviteSource>(
                 dispatch_error = Some(leveling_dispatch_failure());
             }
         }
-        // Community facts: drain buffered message_created and rules_accepted
-        // writes on every dispatch, even when no XP award queued — bots,
-        // webhooks and staff automation capture facts but never awards, so
-        // gating on `requests` would leak the buffer. A failed write never
-        // stalls the worker
-        // (audit precedent): warn and continue; the scorecard fails closed
-        // on missing coverage.
+        // Community facts: drain buffered voice_session_started/ended,
+        // message_created and rules_accepted writes on every dispatch, even
+        // when no XP award queued — bots, webhooks and staff automation
+        // capture facts but never awards, and a move's end+start pair
+        // buffers two rows for one frame, so gating on `requests` would leak
+        // the buffer. A failed write never stalls the worker (audit
+        // precedent): warn and continue; the scorecard fails closed on
+        // missing coverage.
         match handle.block_on(tokio::time::timeout(deadline, pipeline.drain_facts())) {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => tracing::warn!(
@@ -743,23 +796,29 @@ fn apply_dispatch<I: InviteSource>(
             None
         }
     };
-    let checkpoint_result = if let Some(error) = dispatch_error {
-        Err(error)
+    let (checkpoint_result, checkpoint_stage) = if let Some(error) = dispatch_error {
+        (Err(error), "pre_commit")
     } else if acknowledgement_held {
-        Err(sqlx::Error::InvalidArgument(
-            "interaction acknowledgement failed; checkpoint unchanged".into(),
-        ))
+        (
+            Err(sqlx::Error::InvalidArgument(
+                "interaction acknowledgement failed; checkpoint unchanged".into(),
+            )),
+            "pre_commit",
+        )
     } else {
-        handle.block_on(checkpoint_io(
-            worker_state,
-            generation,
-            deadline,
-            store.commit_dispatch_with_job(
-                &checkpoint,
-                pipeline.handlers().store().take_batch(),
-                durable_job,
-            ),
-        ))
+        (
+            handle.block_on(checkpoint_io(
+                worker_state,
+                generation,
+                deadline,
+                store.commit_dispatch_with_job(
+                    &checkpoint,
+                    pipeline.handlers().store().take_batch(),
+                    durable_job,
+                ),
+            )),
+            "commit",
+        )
     };
     // A failed checkpoint is recorded on `operation` (the
     // worker stops and accepted RSVP drains) instead of
@@ -821,6 +880,11 @@ fn apply_dispatch<I: InviteSource>(
             }
         }
         Err(error) => {
+            // Every failed checkpoint stops the worker; count it for the M2.1
+            // alert hook alongside the sibling failure surfaces. The stage is
+            // bounded (`pre_commit` when the commit was skipped, `commit` when
+            // the store write failed); causes are never labels.
+            two_bot_core::metrics::global().checkpoint_failure(checkpoint_stage);
             if let Some(committed) = committed {
                 let _ = committed.send(());
             }
@@ -1212,12 +1276,22 @@ pub async fn run_shard<I: InviteSource + 'static>(
                 return;
             }
             let operation = match work {
-                ReceivedWork::Clear(deadline) => handle.block_on(checkpoint_io(
-                    &worker_state,
-                    &generation,
-                    deadline,
-                    store.clear(),
-                )),
+                ReceivedWork::Clear(deadline) => {
+                    let cleared = handle.block_on(checkpoint_io(
+                        &worker_state,
+                        &generation,
+                        deadline,
+                        store.clear(),
+                    ));
+                    if cleared.is_err() {
+                        // A failed checkpoint clear stops the worker like any
+                        // other failed commit; count it for the M2.1 alert
+                        // hook under the `commit` stage (a durable store
+                        // write failing).
+                        two_bot_core::metrics::global().checkpoint_failure("commit");
+                    }
+                    cleared
+                }
                 ReceivedWork::Failed(error) => Err(error),
                 ReceivedWork::Dispatch {
                     dispatch,
@@ -1248,6 +1322,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                     committed,
                 ),
             };
+
             if let Err(error) = operation {
                 // Retain the original error without panicking away accepted
                 // commands or allowing a later checkpoint to leap past failure.
@@ -1271,7 +1346,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
             futures_util::pin_mut!(queue_worker);
             tokio::select! {
                 result = dispatch => {
-                    let result = result.map_err(|reason| sqlx::Error::InvalidArgument(reason.into()));
+                    let result = result.map_err(bounded_runner_reason);
                     if result.is_ok() && error.lock().expect("gateway error lock").is_none() {
                         // Cooperative end with a healthy writer: the last
                         // commit may have raced the drain return before the
@@ -1304,9 +1379,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                 }
             }
         }
-        None => dispatch
-            .await
-            .map_err(|reason| sqlx::Error::InvalidArgument(reason.into())),
+        None => dispatch.await.map_err(bounded_runner_reason),
     };
     // Reception does not restart in this runner. Keep Draining sticky through
     // both successful shutdown and fatal exit, including any remaining writer.
@@ -2241,6 +2314,85 @@ mod tests {
         );
     }
 
+    /// `PRESENCE_UPDATE` reaches the voice sink in gateway order on the
+    /// dispatch worker and never commits: the lazy pool below can never
+    /// connect, so any checkpoint attempt would surface as an error here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_worker_applies_presence_without_a_checkpoint_commit() {
+        struct Presences(std::sync::Mutex<Vec<u64>>);
+        impl VoiceEventSink for Presences {
+            fn handle(&self, _: &Event, _: &twilight_cache_inmemory::DefaultInMemoryCache) {
+                panic!("presence must not take the full voice handler path");
+            }
+            fn presence(
+                &self,
+                update: &twilight_model::gateway::payload::incoming::PresenceUpdate,
+            ) {
+                let id = match &update.0.user {
+                    twilight_model::gateway::presence::UserOrId::User(user) => user.id.get(),
+                    twilight_model::gateway::presence::UserOrId::UserId { id } => id.get(),
+                };
+                self.0.lock().unwrap().push(id);
+            }
+            fn disconnect(&self) {}
+            fn needs_bootstrap(&self, _: &twilight_cache_inmemory::DefaultInMemoryCache) -> bool {
+                false
+            }
+        }
+        let pipeline = build_pipeline(vec![], None);
+        let state = RwLock::new(GatewayState::Armed);
+        let generation = AtomicU64::new(0);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        let store = GatewaySessionStore::new(pool, "test-guild".to_owned(), 1);
+        let sink = Arc::new(Presences(std::sync::Mutex::new(Vec::new())));
+        let update: twilight_model::gateway::payload::incoming::PresenceUpdate =
+            serde_json::from_value(serde_json::json!({
+                "user": {"id": "42"},
+                "guild_id": "22",
+                "status": "online",
+                "activities": [{"type": 0, "name": "Apex Legends"}],
+                "client_status": {"desktop": "online"}
+            }))
+            .expect("presence");
+        let dispatch = ReceivedDispatch::new(Event::PresenceUpdate(Box::new(update)));
+        let checkpoint = GatewaySession {
+            session_id: "test-session".to_owned(),
+            sequence: 8,
+            resume_url: "ws://127.0.0.1:1".to_owned(),
+            updated_at_ms: two_bot_core::funnel::now_millis_for_test(),
+        };
+        let voice: Arc<dyn VoiceEventSink> = sink.clone();
+        let outcome = tokio::task::block_in_place(|| {
+            apply_dispatch(
+                &tokio::runtime::Handle::current(),
+                &state,
+                &generation,
+                &pipeline,
+                &store,
+                None,
+                None,
+                Some(voice),
+                None,
+                LiveInteractions::default(),
+                Arc::new(tokio::sync::Notify::new()),
+                Some(Box::new(dispatch)),
+                None,
+                checkpoint,
+                CHECKPOINT_IO_MAX,
+                0,
+                None,
+                None,
+            )
+        });
+        assert!(
+            outcome.is_ok(),
+            "presence must not attempt a commit: {outcome:?}"
+        );
+        assert_eq!(*sink.0.lock().unwrap(), [42]);
+    }
+
     /// The worker itself — not just the error constructor — records a failed
     /// leveling drain as a typed error and skips the checkpoint commit. A
     /// message that queues a leveling award drains through a runtime whose
@@ -2355,7 +2507,7 @@ mod tests {
         );
     }
 
-    /// M2.22: the worker's trigger gate (the exact `dispatch_text_automations`
+    /// M2.22: the worker's trigger gate (the exact `worker_prefix_trigger`
     /// call site above) posts no sticky automation for a Bypassed create while
     /// an inspected Accept through the same path still dispatches. Both verdicts
     /// come from the real worker function `automod_gateway::process` (not
@@ -2370,84 +2522,88 @@ mod tests {
     /// message-lane work proves a Bypassed create never reaches `on_message`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn gateway_worker_trigger_gate_posts_no_sticky_for_bypassed_while_accept_dispatches() {
-        use std::future::Future;
         use two_bot_core::automod_runtime::{
-            AutomodClaimLedger, AutomodConfig, AutomodMatch, AutomodRuntime, AutomodScope,
-            DeliveryKey, FunnelDisposition, LedgerClaim, MessageDelivery, MessageDeliveryKind,
-            MessageSubject, StoredOutcome, TargetFacts, ViolationRecord, STAGING_GUILD_ID,
+            AutomodClaimLedger, AutomodMatch, AutomodRuntime, AutomodScope, DeliveryKey,
+            FunnelDisposition, LedgerClaim, MessageDelivery, MessageDeliveryKind, MessageSubject,
+            StoredOutcome, TargetFacts, ViolationRecord, STAGING_GUILD_ID,
         };
         use two_bot_core::router::RouterGates;
-        use two_bot_core::AutomodFilter;
+        use two_bot_core::{AutomodConfig, AutomodFilter};
         use two_bot_discord::automod_activation::{
             AutomodActivation, AutomodFacts, FetchedMessage,
         };
         use two_bot_discord::ActionExecutor;
 
         ensure_crypto_provider();
+        let _series_guard = crate::gateway_commands::PREFIX_REFUSED_SERIES_GUARD
+            .lock()
+            .await;
+        fn refused_verdict_total() -> u64 {
+            two_bot_core::metrics::global()
+                .render(None)
+                .lines()
+                .find(|line| {
+                    line.starts_with(
+                        "two_bot_gateway_prefix_trigger_refused_total{reason=\"verdict\"} ",
+                    )
+                })
+                .expect("refused series")
+                .rsplit_once(' ')
+                .expect("sample")
+                .1
+                .parse()
+                .expect("counter value")
+        }
 
         struct AcceptLedger;
         struct UnitClaim;
         impl AutomodClaimLedger for AcceptLedger {
             type Claim = UnitClaim;
             type Error = String;
-            fn ledger_claim(
+            async fn ledger_claim(
                 &self,
                 _: &DeliveryKey,
-            ) -> impl Future<Output = Result<LedgerClaim<UnitClaim>, String>> + Send {
-                async { Ok(LedgerClaim::Acquired(UnitClaim)) }
+            ) -> Result<LedgerClaim<UnitClaim>, String> {
+                Ok(LedgerClaim::Acquired(UnitClaim))
             }
-            fn ledger_preserve(
+            async fn ledger_preserve(
                 &self,
                 _: &UnitClaim,
                 _: &AutomodMatch,
-            ) -> impl Future<Output = Result<bool, String>> + Send {
-                async { Ok(false) }
+            ) -> Result<bool, String> {
+                Ok(false)
             }
-            fn ledger_mark_started(
-                &self,
-                _: &UnitClaim,
-            ) -> impl Future<Output = Result<bool, String>> + Send {
-                async { Ok(true) }
+            async fn ledger_mark_started(&self, _: &UnitClaim) -> Result<bool, String> {
+                Ok(true)
             }
-            fn ledger_complete(
+            async fn ledger_complete(
                 &self,
                 _: &UnitClaim,
                 _: &StoredOutcome,
-            ) -> impl Future<Output = Result<bool, String>> + Send {
-                async { Ok(true) }
+            ) -> Result<bool, String> {
+                Ok(true)
             }
-            fn ledger_release(
-                &self,
-                _: &UnitClaim,
-            ) -> impl Future<Output = Result<bool, String>> + Send {
-                async { Ok(true) }
+            async fn ledger_release(&self, _: &UnitClaim) -> Result<bool, String> {
+                Ok(true)
             }
-            fn ledger_record(
+            async fn ledger_record(
                 &self,
                 _: &UnitClaim,
                 _: &MessageSubject,
                 _: AutomodFilter,
                 _: &str,
-            ) -> impl Future<Output = Result<ViolationRecord, String>> + Send {
-                async { Err("unused".to_owned()) }
+            ) -> Result<ViolationRecord, String> {
+                Err("unused".to_owned())
             }
         }
 
         struct NeverFacts;
         impl AutomodFacts for NeverFacts {
-            fn fetch_message(
-                &self,
-                _: &str,
-                _: &str,
-                _: &str,
-            ) -> impl Future<Output = Option<FetchedMessage>> + Send {
-                async { None }
+            async fn fetch_message(&self, _: &str, _: &str, _: &str) -> Option<FetchedMessage> {
+                None
             }
-            fn target_facts(
-                &self,
-                _: &MessageSubject,
-            ) -> impl Future<Output = Option<TargetFacts>> + Send {
-                async { None }
+            async fn target_facts(&self, _: &MessageSubject) -> Option<TargetFacts> {
+                None
             }
         }
 
@@ -2519,19 +2675,11 @@ mod tests {
         };
         struct NeverFactsAgain;
         impl AutomodFacts for NeverFactsAgain {
-            fn fetch_message(
-                &self,
-                _: &str,
-                _: &str,
-                _: &str,
-            ) -> impl Future<Output = Option<FetchedMessage>> + Send {
-                async { None }
+            async fn fetch_message(&self, _: &str, _: &str, _: &str) -> Option<FetchedMessage> {
+                None
             }
-            fn target_facts(
-                &self,
-                _: &MessageSubject,
-            ) -> impl Future<Output = Option<TargetFacts>> + Send {
-                async { None }
+            async fn target_facts(&self, _: &MessageSubject) -> Option<TargetFacts> {
+                None
             }
         }
         let accept_activation = AutomodActivation::new(
@@ -2587,7 +2735,7 @@ mod tests {
         )
         .expect("test executor");
         let gates = RouterGates {
-            configured_guild: Some(22),
+            configured_guild: Some(42),
             scorecard: false,
             automations: true,
             announcements: false,
@@ -2603,9 +2751,18 @@ mod tests {
             pool,
             runtime_executor,
             crate::command_runtime::router_with_commands(gates),
-            22,
+            42,
             true,
         );
+        let command_vars = HashMap::from([
+            ("TWO_AUTOMATIONS".to_owned(), "1".to_owned()),
+            ("TWO_TEXT_COMMANDS".to_owned(), "1".to_owned()),
+            ("TWO_AUTOMOD".to_owned(), "1".to_owned()),
+        ]);
+        let command_config =
+            crate::gateway_commands::GatewayCommandConfig::from_map(42, &command_vars)
+                .expect("test command config");
+        runtime.initialize_custom_commands_for_test(command_config);
         let handle = tokio::runtime::Handle::current();
         let message_event = |id: &str, guild: &str| {
             Event::MessageCreate(Box::new(
@@ -2614,7 +2771,7 @@ mod tests {
                     "guild_id": guild,
                     "channel_id": "66",
                     "author": {"id": "44", "username": "member", "discriminator": "0", "bot": false},
-                    "content": "hello",
+                    "content": "!faq",
                     "timestamp": "2026-09-28T00:00:00.000000+00:00",
                     "edited_timestamp": null,
                     "tts": false,
@@ -2630,30 +2787,217 @@ mod tests {
                 .unwrap(),
             ))
         };
+        // The exact worker path: Bypassed records an in-scope prefix candidate
+        // without dispatching; inspected Accept still dispatches as before.
+        let bypassed_event = message_event("4000000000000000001", "42");
         assert!(
-            !dispatch_text_automations(
-                &handle,
-                Some(&runtime),
-                true,
-                &message_event("4000000000000000001", "42"),
-                Some(bypassed_verdict.trigger),
-            ),
+            worker_prefix_trigger(Some(bypassed_verdict), &bypassed_event, true).is_none(),
             "Bypassed create must not dispatch text automations"
+        );
+        let before = refused_verdict_total();
+        let _guard = handle.enter();
+        assert!(
+            !dispatch_or_record_prefix_trigger(
+                Some(&runtime),
+                Some(bypassed_verdict),
+                &bypassed_event,
+                true,
+            ),
+            "CaptureOnly is recorded without dispatch"
+        );
+        assert_eq!(
+            refused_verdict_total(),
+            before + 1,
+            "CaptureOnly prefix candidate is counted by the worker path"
         );
         assert_eq!(
             runtime.lane_in_flight(crate::command_runtime::LANE_MESSAGES),
             0,
-            "no message-lane work means no sticky side effect for Bypassed"
+            "refused prefix telemetry starts no message-lane work"
+        );
+        let accept_event = message_event("4000000000000000002", STAGING_GUILD_ID);
+        assert_eq!(
+            worker_prefix_trigger(Some(accept_verdict), &accept_event, true),
+            Some(Some(FunnelDisposition::Accept)),
+            "the worker forwards the trigger verdict, not the funnel"
         );
         assert!(
-            dispatch_text_automations(
-                &handle,
+            dispatch_or_record_prefix_trigger(
                 Some(&runtime),
+                Some(accept_verdict),
+                &accept_event,
                 true,
-                &message_event("4000000000000000002", STAGING_GUILD_ID),
-                Some(accept_verdict.trigger),
             ),
-            "inspected Accept still dispatches text automations"
+            "inspected Accept still dispatches through the worker path"
+        );
+    }
+
+    /// A failed community-facts drain never stalls serial dispatch: the worker
+    /// warns and still commits the cursor. The facts writer is broken here
+    /// with an unconnectable pool (short acquire timeout) while the session
+    /// store stays healthy, so a gate-clearing dispatch must return `Ok` with
+    /// the checkpoint committed and a `gateway community facts dispatch
+    /// failed` warn — no panic and no held cursor. Needs a migrated test
+    /// database; skips without one (CI supplies `TWO_TEST_DATABASE_URL`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_worker_community_facts_drain_failure_warns_and_commits() {
+        let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+            assert!(
+                std::env::var("GITHUB_ACTIONS").is_err(),
+                "CI must supply the guarded test database"
+            );
+            eprintln!("SKIP gateway_worker_community_facts_drain_failure_warns_and_commits: TWO_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let db = two_bot_testsupport::TestDatabase::create(
+            &url,
+            &sqlx::migrate!("../cutover/migrations"),
+        )
+        .await
+        .expect("create migrated agent-testdb fixture");
+        let pool = db.pool().clone();
+        // Facts writer only: unconnectable with a short acquire timeout so
+        // the drain hits the write-failure arm (`dispatch failed`) inside
+        // the dispatch deadline instead of the timeout arm, without
+        // touching the healthy session store below.
+        let broken = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        let pipeline = build_pipeline(vec![], None);
+        pipeline.enable_community_facts(broken);
+        // Gate-clearing join: `pending: false` buffers two facts, one
+        // `member_joined` via `on_join` plus one `rules_accepted` via
+        // `on_gate_cleared`, so the drain has work to fail on. A
+        // `RESUMED` event would drain nothing and prove nothing.
+        let join = || {
+            use std::str::FromStr as _;
+            let stamp = twilight_model::util::Timestamp::from_str("2026-09-28T00:00:00.000+00:00")
+                .expect("fixture stamp");
+            Event::MemberAdd(Box::new(
+                twilight_model::gateway::payload::incoming::MemberAdd {
+                    guild_id: twilight_model::id::Id::new(22),
+                    member: twilight_model::guild::Member {
+                        avatar: None,
+                        avatar_decoration_data: None,
+                        banner: None,
+                        communication_disabled_until: None,
+                        deaf: false,
+                        flags: twilight_model::guild::MemberFlags::empty(),
+                        joined_at: Some(stamp),
+                        mute: false,
+                        nick: None,
+                        pending: false,
+                        premium_since: None,
+                        roles: vec![],
+                        user: twilight_model::user::User {
+                            accent_color: None,
+                            avatar: None,
+                            avatar_decoration: None,
+                            avatar_decoration_data: None,
+                            banner: None,
+                            bot: false,
+                            discriminator: 0,
+                            email: None,
+                            flags: None,
+                            global_name: None,
+                            id: twilight_model::id::Id::new(44),
+                            locale: None,
+                            mfa_enabled: None,
+                            name: "member".to_owned(),
+                            premium_type: None,
+                            primary_guild: None,
+                            public_flags: None,
+                            system: None,
+                            verified: None,
+                        },
+                    },
+                },
+            ))
+        };
+        // Pin the fixture precondition explicitly: the join must buffer both
+        // facts (`member_joined` via `on_join` plus `rules_accepted` via
+        // `on_gate_cleared`), or this test would exercise the empty-drain
+        // path instead of the failure site.
+        {
+            let scratch = build_pipeline(vec![], None);
+            scratch.enable_community_facts(pool.clone());
+            scratch.collect_at(
+                &join(),
+                &two_bot_core::now_iso(),
+                two_bot_discord::MessageEligibility::default(),
+            );
+            assert_eq!(
+                scratch.drain_facts().await.expect("scratch drain"),
+                2,
+                "fixture join must buffer member_joined plus rules_accepted"
+            );
+        }
+        #[derive(Clone)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let capture = Capture(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let state = RwLock::new(GatewayState::Armed);
+        let generation = AtomicU64::new(0);
+        let store = GatewaySessionStore::new(pool, "22".to_owned(), 1);
+        let checkpoint = GatewaySession {
+            session_id: "test-session".to_owned(),
+            sequence: 7,
+            resume_url: "ws://127.0.0.1:1".to_owned(),
+            updated_at_ms: two_bot_core::funnel::now_millis_for_test(),
+        };
+        // The worker step blocks on the drain: run it the way the dispatch
+        // worker does, on a blocking thread.
+        let outcome = tokio::task::block_in_place(|| {
+            apply_dispatch(
+                &tokio::runtime::Handle::current(),
+                &state,
+                &generation,
+                &pipeline,
+                &store,
+                None,
+                None,
+                None,
+                None,
+                LiveInteractions::default(),
+                Arc::new(tokio::sync::Notify::new()),
+                Some(Box::new(ReceivedDispatch::new(join()))),
+                None,
+                checkpoint,
+                CHECKPOINT_IO_MAX,
+                0,
+                None,
+                None,
+            )
+        });
+        assert!(
+            outcome.is_ok(),
+            "facts drain failure must warn and continue, got {outcome:?}"
+        );
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("gateway community facts dispatch failed"),
+            "failed facts drain must warn, got: {output}"
+        );
+        assert_eq!(
+            store.load().await.expect("load").expect("session").sequence,
+            7,
+            "failed facts drain must still commit the cursor"
         );
     }
 
@@ -2841,5 +3185,34 @@ mod tests {
                 "onboarding interaction missing ingress ticket; checkpoint committed",
             ]
         );
+    }
+
+    /// Fatal-runner reason fence: an oversized payload is truncated to
+    /// `RUNNER_REASON_MAX_CHARS`, while short reasons pass through unchanged
+    /// so the #659 typed errors keep their exact text.
+    #[test]
+    fn gateway_runner_reason_is_bounded() {
+        match bounded_runner_reason("dispatch backlog full") {
+            sqlx::Error::InvalidArgument(message) => {
+                assert_eq!(message, "dispatch backlog full");
+            }
+            error => panic!("runner reason must stay typed, got {error:?}"),
+        }
+        let oversized = "x".repeat(RUNNER_REASON_MAX_CHARS + 10_000);
+        match bounded_runner_reason(&oversized) {
+            sqlx::Error::InvalidArgument(message) => {
+                assert_eq!(message.len(), RUNNER_REASON_MAX_CHARS);
+                assert_eq!(message, "x".repeat(RUNNER_REASON_MAX_CHARS));
+            }
+            error => panic!("oversized reason must stay typed, got {error:?}"),
+        }
+        // Multi-byte chars truncate on a char boundary, never mid-codepoint.
+        let emoji = "🦀".repeat(RUNNER_REASON_MAX_CHARS + 10);
+        match bounded_runner_reason(&emoji) {
+            sqlx::Error::InvalidArgument(message) => {
+                assert_eq!(message.chars().count(), RUNNER_REASON_MAX_CHARS);
+            }
+            error => panic!("oversized reason must stay typed, got {error:?}"),
+        }
     }
 }

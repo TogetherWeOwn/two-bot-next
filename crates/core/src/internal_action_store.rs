@@ -4,6 +4,7 @@
 //! terminal outcome, not a new execution lease. See `docs/internal-action-store.md`.
 
 use sqlx::{PgPool, Row};
+use std::str::FromStr as _;
 
 use crate::clock_guard::CLOCK_SKEW_TOLERANCE_MS;
 use crate::internal_actions::{
@@ -111,12 +112,50 @@ pub enum TerminalFailure {
     VersionConflict,
 }
 
+/// Durable website-event outcome: the closed legacy result word for one intent.
+/// `None` on success is the announcement shape (its envelope carries
+/// `message_id`, never an outcome). Event intents always record one: replay
+/// must return the first result byte-identically, and a create replayed after
+/// its key was registered must still read `created`, never a re-derived
+/// `updated`. Never free text: this column feeds the wire envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventOutcome {
+    Created,
+    Updated,
+    Cancelled,
+}
+
+impl EventOutcome {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Updated => "updated",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl std::str::FromStr for EventOutcome {
+    type Err = InternalStoreError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "created" => Ok(Self::Created),
+            "updated" => Ok(Self::Updated),
+            "cancelled" => Ok(Self::Cancelled),
+            _ => Err(InternalStoreError::Unavailable),
+        }
+    }
+}
+
 /// Minimal replayable response contract. Extend with typed scalars, never raw JSON.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalResponse {
     Success {
         resource_id: Option<DiscordId>,
         affected: u32,
+        outcome: Option<EventOutcome>,
     },
     Failure(TerminalFailure),
 }
@@ -160,6 +199,13 @@ impl TerminalResponse {
         }
     }
 
+    fn outcome(&self) -> Option<&'static str> {
+        match self {
+            Self::Success { outcome, .. } => outcome.map(EventOutcome::as_str),
+            Self::Failure(_) => None,
+        }
+    }
+
     fn from_row(row: &sqlx::postgres::PgRow) -> Result<Self, InternalStoreError> {
         let code: &str = row.try_get("response_code")?;
         let response = match code {
@@ -171,6 +217,10 @@ impl TerminalResponse {
                     .map_err(|_| InternalStoreError::Unavailable)?,
                 affected: u32::try_from(row.try_get::<i64, _>("affected")?)
                     .map_err(|_| InternalStoreError::Unavailable)?,
+                outcome: row
+                    .try_get::<Option<&str>, _>("outcome")?
+                    .map(EventOutcome::from_str)
+                    .transpose()?,
             },
             "malformed" => Self::Failure(TerminalFailure::Malformed),
             "action_not_allowed" => Self::Failure(TerminalFailure::ActionNotAllowed),
@@ -238,6 +288,16 @@ impl ReconciliationEvidence {
             )
         )
     }
+}
+
+/// One unknown website event intent awaiting operator reconciliation.
+/// Hashes never leave the database: the operator names the exact intent id,
+/// exactly like the member-moderation reconcile tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownEventIntent {
+    pub intent_id: i64,
+    pub action: String,
+    pub created_at_utc: String,
 }
 
 /// Reuses the runtime pool. Methods never migrate or contact Discord.
@@ -587,23 +647,166 @@ impl InternalActionStore {
         }
         sqlx::query(
             "UPDATE internal_idempotency SET state = 'completed', response_code = $2, \
-             http_status = $3, resource_id = $4, affected = $5, updated_at = clock_timestamp() \
-             WHERE intent_id = $1",
+             http_status = $3, resource_id = $4, affected = $5, outcome = $6, \
+             updated_at = clock_timestamp() WHERE intent_id = $1",
         )
         .bind(intent_id)
         .bind(response.code())
         .bind(i32::from(response.status()))
         .bind(response.resource_id())
         .bind(response.affected())
+        .bind(response.outcome())
         .execute(&mut *tx)
         .await?;
+        Self::complete_locked(&mut tx, intent_id, response, evidence).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Shared completion write: mark one locked intent completed with its
+    /// terminal response and evidence audit. Callers own all transition
+    /// checks; this helper checks nothing.
+    async fn complete_locked(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        intent_id: i64,
+        response: &TerminalResponse,
+        evidence: Option<ReconciliationEvidence>,
+    ) -> Result<(), InternalStoreError> {
+        sqlx::query(
+            "UPDATE internal_idempotency SET state = 'completed', response_code = $2, \
+             http_status = $3, resource_id = $4, affected = $5, outcome = $6, \
+             updated_at = clock_timestamp() WHERE intent_id = $1",
+        )
+        .bind(intent_id)
+        .bind(response.code())
+        .bind(i32::from(response.status()))
+        .bind(response.resource_id())
+        .bind(response.affected())
+        .bind(response.outcome())
+        .execute(&mut **tx)
+        .await?;
         Self::audit(
-            &mut tx,
+            tx,
             intent_id,
             "terminal",
             Some(evidence.map_or("executor", ReconciliationEvidence::as_str)),
         )
         .await?;
+        Ok(())
+    }
+
+    /// Read-only listing of `unknown` event intents for one guild, oldest
+    /// first. Never migrates, never writes, never contacts Discord.
+    pub async fn list_unknown_event_intents(
+        &self,
+        guild_id: &str,
+    ) -> Result<Vec<UnknownEventIntent>, InternalStoreError> {
+        if !is_snowflake(guild_id) {
+            return Err(InternalStoreError::InvalidInput);
+        }
+        Ok(sqlx::query(
+            "SELECT intent_id, action, \
+             to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at_utc \
+             FROM internal_idempotency \
+             WHERE state = 'unknown' AND action IN ('event.upsert', 'event.cancel') \
+             AND guild_id = $1 ORDER BY intent_id",
+        )
+        .bind(guild_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| UnknownEventIntent {
+            intent_id: row.try_get("intent_id").unwrap_or_default(),
+            action: row.try_get("action").unwrap_or_default(),
+            created_at_utc: row.try_get("created_at_utc").unwrap_or_default(),
+        })
+        .collect())
+    }
+
+    /// Operator resolution of one exact unknown event intent, in a single
+    /// transaction. `reconcile()` needs the caller's exact raw payload bytes,
+    /// which an operator never has; this path addresses the intent by id and
+    /// refuses anything but an `unknown` event row in the named guild.
+    ///
+    /// A confirmed `event.upsert` effect registers (or re-points) its key
+    /// mapping in the same transaction, before the terminal receipt commits:
+    /// a create whose mapping write failed heals here, and replay can never
+    /// report success for a key with no mapping. Cancels retain the mapping
+    /// the receiver kept, so an effect resolution for `event.cancel` carries
+    /// no mapping. A proven no-effect records a terminal `no_effect` failure
+    /// without touching mappings; retrying then needs a new idempotency key.
+    /// Only `Success` and `NoEffect` responses are accepted: malformed and
+    /// admission refusals are receiver-side, never operator evidence.
+    pub async fn resolve_event_intent(
+        &self,
+        intent_id: i64,
+        expected_action: &str,
+        guild_id: &str,
+        key_mapping: Option<(&str, &str)>,
+        response: &TerminalResponse,
+        evidence: ReconciliationEvidence,
+    ) -> Result<(), InternalStoreError> {
+        if intent_id <= 0
+            || !matches!(expected_action, "event.upsert" | "event.cancel")
+            || !is_snowflake(guild_id)
+            || !evidence.supports(response)
+            || !matches!(
+                response,
+                TerminalResponse::Success { .. }
+                    | TerminalResponse::Failure(TerminalFailure::NoEffect)
+            )
+        {
+            return Err(InternalStoreError::InvalidInput);
+        }
+        let upsert_success = matches!(response, TerminalResponse::Success { .. })
+            && expected_action == "event.upsert";
+        match (upsert_success, key_mapping) {
+            // Upsert effects (re)point the key; every other resolution must
+            // not rewrite mappings.
+            (true, Some(_)) | (false, None) => {}
+            (true, None) | (false, Some(_)) => return Err(InternalStoreError::InvalidInput),
+        }
+        if let (Some((event_key, event_id)), TerminalResponse::Success { resource_id, .. }) =
+            (key_mapping, response)
+        {
+            Self::check_event_key_shape(guild_id, event_key)?;
+            if !is_snowflake(event_id)
+                || resource_id
+                    .as_ref()
+                    .is_none_or(|id| id.as_str() != event_id)
+            {
+                return Err(InternalStoreError::InvalidInput);
+            }
+        }
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT state, action, guild_id FROM internal_idempotency \
+             WHERE intent_id = $1 FOR UPDATE",
+        )
+        .bind(intent_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(InternalStoreError::TransitionRefused)?;
+        let state: &str = row.try_get("state")?;
+        let action: &str = row.try_get("action")?;
+        let row_guild: Option<&str> = row.try_get("guild_id")?;
+        if state != "unknown" || action != expected_action || row_guild != Some(guild_id) {
+            return Err(InternalStoreError::TransitionRefused);
+        }
+        if let Some((event_key, event_id)) = key_mapping {
+            sqlx::query(
+                "INSERT INTO internal_event_keys (guild_id, event_key, event_id) \
+                 VALUES ($1, $2, $3) \
+                 ON CONFLICT (guild_id, event_key) DO UPDATE \
+                 SET event_id = EXCLUDED.event_id, updated_at = clock_timestamp()",
+            )
+            .bind(guild_id)
+            .bind(event_key)
+            .bind(event_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        Self::complete_locked(&mut tx, intent_id, response, Some(evidence)).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -654,9 +857,9 @@ impl InternalActionStore {
         sqlx::query(
             "INSERT INTO internal_action_log \
              (intent_id, phase, caller_hash, action, guild_id, actor_id, target_id, resolved_role_id, \
-              response_code, http_status, evidence_code) \
+              response_code, http_status, evidence_code, resource_id, affected, outcome) \
              SELECT intent_id, $2, caller_hash, action, guild_id, actor_id, target_id, resolved_role_id, \
-                    response_code, http_status, $3 \
+                    response_code, http_status, $3, resource_id, affected, outcome \
              FROM internal_idempotency WHERE intent_id = $1 \
              ON CONFLICT (intent_id, phase) DO NOTHING",
         )
@@ -781,10 +984,25 @@ mod tests {
     }
 
     #[test]
+    fn event_outcome_round_trips_the_closed_legacy_words() {
+        for (word, outcome) in [
+            ("created", EventOutcome::Created),
+            ("updated", EventOutcome::Updated),
+            ("cancelled", EventOutcome::Cancelled),
+        ] {
+            assert_eq!(outcome.as_str(), word);
+            assert_eq!(EventOutcome::from_str(word).unwrap(), outcome);
+        }
+        assert!(EventOutcome::from_str("posted").is_err());
+        assert!(EventOutcome::from_str("").is_err());
+    }
+
+    #[test]
     fn reconciliation_evidence_cannot_authorize_execution() {
         let success = TerminalResponse::Success {
             resource_id: None,
             affected: 1,
+            outcome: None,
         };
         let failure = TerminalResponse::Failure(TerminalFailure::NoEffect);
         assert!(ReconciliationEvidence::DiscordConfirmedEffect.supports(&success));

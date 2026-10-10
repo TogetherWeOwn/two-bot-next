@@ -28,6 +28,10 @@ use two_bot_discord::{
     ActionExecutor,
 };
 
+#[cfg(test)]
+pub(crate) static PREFIX_REFUSED_SERIES_GUARD: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 pub struct GatewayCommandConfig {
     gates: RouterGates,
     text_commands: bool,
@@ -119,6 +123,28 @@ pub struct GatewayCommands {
 }
 
 impl GatewayCommands {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        pool: PgPool,
+        executor: ActionExecutor,
+        config: GatewayCommandConfig,
+        router: Arc<InteractionRouter>,
+    ) -> Self {
+        let guild_id = config
+            .gates
+            .configured_guild
+            .and_then(Id::new_checked)
+            .expect("test command config has a valid guild");
+        Self {
+            runtime: CustomCommandRuntime::new(pool, router, executor, 1111),
+            application_id: 1111,
+            guild_id,
+            guild_name: RwLock::new("Test guild".to_owned()),
+            text_commands: config.text_commands,
+            acceptance: config.acceptance,
+        }
+    }
+
     #[cfg(test)]
     pub async fn bootstrap(
         pool: PgPool,
@@ -233,6 +259,13 @@ impl GatewayCommands {
                 true
             }
         }
+    }
+
+    /// Record a refused candidate before the worker's trigger gate skips
+    /// detached dispatch. No command lookup or automation work is started.
+    pub(crate) fn record_refused_prefix_trigger(&self, message: &Message) {
+        self.runtime
+            .record_refused_prefix_trigger(message, self.text_commands);
     }
 
     /// Detached prefix-trigger dispatch with the automod verdict for this
@@ -359,5 +392,359 @@ mod tests {
         assert!(config.acceptance.permits_automations());
         vars.insert("TWO_MODERATION".into(), "1".into());
         assert!(GatewayCommandConfig::from_map(1, &vars).is_err());
+    }
+
+    /// Worker decision coverage for the verdict-to-trigger plumbing
+    /// (offline): pins `gateway::worker_prefix_trigger` (the text-automation
+    /// gate stays on the trigger verdict, the forwarded value is the
+    /// trigger verdict) and the verdict-to-acceptance mapping, then proves
+    /// both directions through the real trigger handler: the denied path
+    /// early-returns `Refused` (no POST, no DB), the accepted path passes the
+    /// gate and reaches the store lookup (`Storage` on the row-less lazy
+    /// pool), and the reply itself is proven via the in-memory row plus the
+    /// real render and the real POST.
+    ///
+    /// Offline: mock activation (`verdict_of` with fake `Activation`),
+    /// in-memory trigger store (`HashMap`, no live DB), loopback `MockRest`
+    /// for the reply POST, and lazy pools that never connect. This harness
+    /// has no trigger row, so a `dispatch_with_verdict` drive can post no
+    /// reply for either verdict and cannot prove the reply split; that
+    /// end-to-end proof lives in
+    /// `command_runtime_tests::worker_verdict_drives_prefix_trigger_from_call_site`,
+    /// which seeds a `!faq` row on an isolated test database.
+    #[tokio::test]
+    async fn worker_prefix_trigger_decision_is_verdict_sensitive() {
+        use std::time::Duration;
+        use twilight_gateway::Event;
+        use twilight_model::gateway::payload::incoming::MessageCreate;
+        use two_bot_core::automod_runtime::{
+            CompletionKind, FunnelDisposition, MessageDeliveryKind, StoredOutcome,
+        };
+        use two_bot_core::custom_commands::{
+            accepted_text_trigger, builtin_command_names, render_template, StoredCommand,
+            TemplateContext,
+        };
+        use two_bot_discord::automod_activation::{Activation, ActivationOutcome, RetainReason};
+
+        use crate::automod_gateway::{runs_text_automations, verdict_of, WorkerVerdict};
+        use crate::gateway::worker_prefix_trigger;
+
+        let _series_guard = PREFIX_REFUSED_SERIES_GUARD.lock().await;
+
+        // Mock activation: a settled clean create hands `Accept` to triggers,
+        // while an uninspected create keeps funnel `Accept` but hands triggers
+        // `CaptureOnly` (the split the `trigger` plumbing must preserve).
+        let clean = Activation {
+            disposition: FunnelDisposition::CaptureOnly,
+            outcome: ActivationOutcome::Duplicate(Some(StoredOutcome {
+                matched: false,
+                deleted: false,
+                outcome: CompletionKind::Accepted,
+            })),
+        };
+        assert_eq!(
+            verdict_of(&clean, MessageDeliveryKind::Create),
+            WorkerVerdict {
+                funnel: FunnelDisposition::Accept,
+                trigger: FunnelDisposition::Accept,
+            }
+        );
+        let bypassed = Activation {
+            disposition: FunnelDisposition::Accept,
+            outcome: ActivationOutcome::Bypassed,
+        };
+        assert_eq!(
+            verdict_of(&bypassed, MessageDeliveryKind::Create),
+            WorkerVerdict {
+                funnel: FunnelDisposition::Accept,
+                trigger: FunnelDisposition::CaptureOnly,
+            }
+        );
+        let retained = Activation {
+            disposition: FunnelDisposition::Accept,
+            outcome: ActivationOutcome::Retained(RetainReason::CompletionRefused),
+        };
+        assert_eq!(
+            verdict_of(&retained, MessageDeliveryKind::Create),
+            WorkerVerdict {
+                funnel: FunnelDisposition::Accept,
+                trigger: FunnelDisposition::CaptureOnly,
+            }
+        );
+
+        fn message(id: u64, author: &str, content: &str) -> twilight_model::channel::Message {
+            serde_json::from_value(serde_json::json!({
+                "id": id.to_string(), "guild_id": "2222", "channel_id": "4444", "type": 0,
+                "author": {"id": author, "username": "tester", "discriminator": "0000", "avatar": null},
+                "content": content, "timestamp": "2026-09-30T12:00:00.000000+00:00", "edited_timestamp": null,
+                "tts": false, "mention_everyone": false, "mentions": [], "mention_roles": [],
+                "attachments": [], "embeds": [], "pinned": false
+            }))
+            .expect("valid Twilight message fixture")
+        }
+
+        fn event(message: twilight_model::channel::Message) -> Event {
+            Event::MessageCreate(Box::new(MessageCreate(message)))
+        }
+
+        // Automod enabled (not the `TWO_AUTOMOD=0` fast path): bootstrap
+        // acceptance fails closed without a verdict; the worker verdict decides.
+        let vars = HashMap::from([
+            ("TWO_AUTOMATIONS".to_owned(), "1".to_owned()),
+            ("TWO_TEXT_COMMANDS".to_owned(), "1".to_owned()),
+            ("TWO_AUTOMOD".to_owned(), "1".to_owned()),
+        ]);
+        let config = GatewayCommandConfig::from_map(2222, &vars).expect("command config");
+        assert_eq!(config.acceptance, AutomationMessageAcceptance::Unavailable);
+        assert!(!config.acceptance.permits_automations());
+
+        // Worker plumbing on the real helper: the gate stays on `trigger`
+        // (fail-closed, so an uninspected funnel-accept never dispatches),
+        // the forwarded value is the trigger verdict (not `funnel`).
+        let accept_disposition = Some(WorkerVerdict {
+            funnel: FunnelDisposition::Accept,
+            trigger: FunnelDisposition::Accept,
+        });
+        let split_disposition = Some(WorkerVerdict {
+            funnel: FunnelDisposition::Accept,
+            trigger: FunnelDisposition::CaptureOnly,
+        });
+        let contained_disposition = Some(WorkerVerdict {
+            funnel: FunnelDisposition::CaptureOnly,
+            trigger: FunnelDisposition::CaptureOnly,
+        });
+        let accept_event = event(message(51, "3333", "!faq please"));
+        let split_event = event(message(52, "3334", "!faq please"));
+        assert_eq!(
+            worker_prefix_trigger(accept_disposition, &accept_event, true),
+            Some(Some(FunnelDisposition::Accept)),
+            "accepted create forwards its accept trigger"
+        );
+        assert!(
+            worker_prefix_trigger(split_disposition, &split_event, true).is_none(),
+            "uninspected funnel-accept never dispatches prefix triggers"
+        );
+        assert!(
+            worker_prefix_trigger(contained_disposition, &split_event, true).is_none(),
+            "contained trigger never dispatches prefix triggers"
+        );
+        assert!(
+            worker_prefix_trigger(accept_disposition, &accept_event, false).is_none(),
+            "disabled automod never dispatches from the worker"
+        );
+        // A missing verdict fails closed downstream even when the gate lets an
+        // unscreened create through.
+        assert!(runs_text_automations(None));
+        assert_eq!(
+            acceptance_for_verdict(None),
+            AutomationMessageAcceptance::Unavailable
+        );
+        assert!(!acceptance_for_verdict(None).permits_automations());
+
+        // Verdict-to-acceptance: `Accept` permits, `CaptureOnly` refuses.
+        assert!(acceptance_for_verdict(Some(FunnelDisposition::Accept)).permits_automations());
+        assert!(
+            !acceptance_for_verdict(Some(FunnelDisposition::CaptureOnly)).permits_automations()
+        );
+        assert_eq!(
+            effective_acceptance(
+                AutomationMessageAcceptance::Unavailable,
+                Some(FunnelDisposition::Accept)
+            ),
+            AutomationMessageAcceptance::Unmatched
+        );
+        assert_eq!(
+            effective_acceptance(
+                AutomationMessageAcceptance::Unavailable,
+                Some(FunnelDisposition::CaptureOnly)
+            ),
+            AutomationMessageAcceptance::CaptureOnly
+        );
+
+        // In-memory trigger store (no live DB): the `!faq` row the reply renders.
+        let mut triggers: HashMap<String, StoredCommand> = HashMap::new();
+        triggers.insert(
+            "!faq".to_owned(),
+            StoredCommand {
+                guild_id: "2222".to_owned(),
+                name: "faq".to_owned(),
+                description: "FAQ".to_owned(),
+                template: "Hi {user} {username} in {server} {channel}".to_owned(),
+                text_trigger: Some("!faq".to_owned()),
+                enabled: true,
+            },
+        );
+        let builtins = builtin_command_names();
+        let trigger = accepted_text_trigger(true, true, false, "!faq please", &builtins);
+        assert_eq!(trigger.as_deref(), Some("!faq"));
+        let row = triggers
+            .get(trigger.as_deref().unwrap())
+            .expect("seeded trigger");
+        let rendered = render_template(
+            &row.template,
+            &TemplateContext {
+                user: "<@3333>".to_owned(),
+                username: "tester".to_owned(),
+                server: "Test guild".to_owned(),
+                channel: "<#4444>".to_owned(),
+            },
+        )
+        .expect("template renders");
+        assert_eq!(rendered, "Hi <@3333> tester in Test guild <#4444>");
+
+        // Accepted create sends the prefix reply over loopback REST.
+        let rest = crate::discord_test_common::MockRest::start(
+            vec![crate::discord_test_common::ScriptedResponse::json(
+                200,
+                serde_json::json!({"id": "9000"}),
+            )],
+            crate::discord_test_common::ScriptedResponse::status(500),
+        )
+        .await;
+        let executor = two_bot_discord::ActionExecutor::with_proxy(
+            "test-token".to_owned(),
+            Some(rest.origin()),
+        )
+        .expect("mock executor");
+        executor
+            .post_message("4444", &rendered, Some(51))
+            .await
+            .expect("loopback reply posts");
+        let posts: Vec<_> = rest
+            .requests()
+            .into_iter()
+            .filter(|request| {
+                request.method == "POST" && request.path.ends_with("/channels/4444/messages")
+            })
+            .collect();
+        assert_eq!(posts.len(), 1, "accept posts exactly one prefix reply");
+        let body: serde_json::Value = serde_json::from_slice(&posts[0].body).unwrap();
+        assert_eq!(body["content"], rendered);
+        rest.shutdown().await;
+
+        // Denied create never reaches the store or the wire: the real trigger
+        // handler early-returns `Refused` before any DB lookup or POST, even
+        // with a lazy pool that could never serve one.
+        let denied_rest = crate::discord_test_common::MockRest::start(
+            Vec::new(),
+            crate::discord_test_common::ScriptedResponse::status(500),
+        )
+        .await;
+        // Offline harness: the closed loopback port may drop SYNs on hosted CI,
+        // so the default 30 s acquire would outlive the settle window below.
+        // Fail fast instead (same for the accepted/dispatch pools).
+        let denied_pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_secs(2))
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        let denied_router = std::sync::Arc::new(two_bot_core::InteractionRouter::new(
+            two_bot_core::RouterGates {
+                configured_guild: Some(2222),
+                automations: true,
+                moderation: false,
+                voice: false,
+                voice_assistant: false,
+                scorecard: false,
+                announcements: false,
+                tickets: false,
+                self_roles: false,
+                onboarding_picker: false,
+                session_picker: false,
+            },
+        ));
+        // Authoritative empty custom-command fixture, like the runtime tests.
+        let mut router_with_custom = two_bot_core::InteractionRouter::new(denied_router.gates());
+        two_bot_discord::custom_commands::CustomCommandRuntime::register(&mut router_with_custom);
+        let denied_runtime = two_bot_discord::custom_commands::CustomCommandRuntime::new(
+            denied_pool,
+            std::sync::Arc::new(router_with_custom),
+            two_bot_discord::ActionExecutor::with_proxy(
+                "test-token".to_owned(),
+                Some(denied_rest.origin()),
+            )
+            .expect("mock executor"),
+            1111,
+        );
+        let denied_outcome = denied_runtime
+            .handle_message(
+                &message(52, "3334", "!faq please"),
+                acceptance_for_verdict(Some(FunnelDisposition::CaptureOnly)),
+                true,
+                Some("Test guild"),
+            )
+            .await
+            .expect("denied trigger returns");
+        assert_eq!(
+            denied_outcome,
+            two_bot_discord::custom_commands::TextCommandOutcome::Refused
+        );
+        assert!(
+            denied_rest.requests().is_empty(),
+            "capture-only sends no prefix reply and needs no DB"
+        );
+        denied_rest.shutdown().await;
+
+        // Accepted verdict passes the same real gate: with a lazy pool it
+        // reaches the store lookup and reports `Storage` instead of `Refused`,
+        // proving it was not refused before the in-memory row above would reply.
+        let accepted_rest = crate::discord_test_common::MockRest::start(
+            Vec::new(),
+            crate::discord_test_common::ScriptedResponse::status(500),
+        )
+        .await;
+        let accepted_pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_secs(2))
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        let accepted_router = std::sync::Arc::new(two_bot_core::InteractionRouter::new(
+            two_bot_core::RouterGates {
+                configured_guild: Some(2222),
+                automations: true,
+                moderation: false,
+                voice: false,
+                voice_assistant: false,
+                scorecard: false,
+                announcements: false,
+                tickets: false,
+                self_roles: false,
+                onboarding_picker: false,
+                session_picker: false,
+            },
+        ));
+        let mut accepted_router_with_custom =
+            two_bot_core::InteractionRouter::new(accepted_router.gates());
+        two_bot_discord::custom_commands::CustomCommandRuntime::register(
+            &mut accepted_router_with_custom,
+        );
+        let accepted_runtime = two_bot_discord::custom_commands::CustomCommandRuntime::new(
+            accepted_pool,
+            std::sync::Arc::new(accepted_router_with_custom),
+            two_bot_discord::ActionExecutor::with_proxy(
+                "test-token".to_owned(),
+                Some(accepted_rest.origin()),
+            )
+            .expect("mock executor"),
+            1111,
+        );
+        let accepted_result = accepted_runtime
+            .handle_message(
+                &message(53, "3335", "!faq please"),
+                acceptance_for_verdict(Some(FunnelDisposition::Accept)),
+                true,
+                Some("Test guild"),
+            )
+            .await;
+        assert!(
+            matches!(
+                accepted_result,
+                Err(two_bot_discord::custom_commands::CustomCommandError::Storage)
+            ),
+            "accept reaches the store lookup (in-memory row above would reply), got {accepted_result:?}"
+        );
+        assert!(
+            accepted_rest.requests().is_empty(),
+            "no reply without the row; the in-memory POST above proves the send"
+        );
+        accepted_rest.shutdown().await;
     }
 }

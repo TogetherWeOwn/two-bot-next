@@ -30,6 +30,8 @@ use crate::funnel::Snowflake;
 pub const MAX_CHANNEL_NAME_LEN: u32 = 100;
 /// Largest voice user limit (`/limit`, 0 = unlimited, max 99).
 pub const MAX_USER_LIMIT: i64 = 99;
+/// Longest `/inheritpermissions` source choice (`category`).
+pub const MAX_PERMISSION_SOURCE_CHARS: u32 = 8;
 /// Largest first room number (`/position first-number`): the V11 export codec
 /// stores it as `u32`, so anything above `u32::MAX` breaks `/export` and
 /// `/import` with "Could not read the voice configuration" and can overflow
@@ -1187,6 +1189,28 @@ impl ActionQueue {
         true
     }
 
+    /// True while a room-scoped kick enforcement for this vote is still queued
+    /// (either lane, including backed-off, suspended or not-yet-due entries).
+    /// The worker keeps the vote's initiator until the enforcement audit runs,
+    /// so pruning past the retention horizon never drops an unresolved
+    /// enforcement fence (VK-03). An action being dispatched cannot coincide
+    /// with this read: the single-threaded actor holds the worker mutably
+    /// across the whole dispatch, so in-flight needs no fence of its own.
+    #[must_use]
+    pub fn has_queued_kick(&self, vote_id: Snowflake) -> bool {
+        let inner = self.inner.lock().expect("queue lock");
+        [&inner.urgent, &inner.deferred].iter().any(|lanes| {
+            lanes.values().any(|queue| {
+                queue.iter().any(|queued| {
+                    matches!(
+                        queued.action,
+                        RoomAction::KickMember { vote_id: id, .. } if id == vote_id
+                    )
+                })
+            })
+        })
+    }
+
     /// Access lost on a room (spec V1): its actions wait, nothing retries.
     pub fn suspend(&self, guild_id: Snowflake, channel_id: Snowflake) {
         self.inner
@@ -1246,6 +1270,17 @@ impl ActionQueue {
     /// or forgotten by reconcile). Returns the dropped count.
     pub fn drop_for_channel(&self, guild_id: Snowflake, channel_id: Snowflake) -> usize {
         self.drain_for_channel(guild_id, channel_id).len()
+    }
+
+    /// Whether the guild is waiting out a Discord rate limit.
+    #[must_use]
+    pub fn backed_off(&self, guild_id: Snowflake, now_ms: u64) -> bool {
+        self.inner
+            .lock()
+            .expect("queue lock")
+            .guild_not_before_ms
+            .get(&guild_id)
+            .is_some_and(|t| now_ms < *t)
     }
 
     /// Pending (urgent, deferred) counts for the guild. Diagnostics/tests.
@@ -1558,6 +1593,7 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
                 CommandOptionType::String,
             )
             .required()
+            .max_length(MAX_PERMISSION_SOURCE_CHARS)
             .choices(vec![
                 CommandChoice {
                     name: "Creator".to_owned(),
@@ -2826,6 +2862,7 @@ mod tests {
             ["channel", "source", "source-channel"]
         );
         assert!(inherit.options[1].required == Some(true));
+        assert_eq!(inherit.options[1].max_length, Some(8));
         // `/defaultlimit` bounds match the import validation (0-99).
         let limit = defs.iter().find(|def| def.name == "defaultlimit").unwrap();
         assert_eq!(limit.options[1].min_value, Some(0));

@@ -341,6 +341,10 @@ pub struct AuditRecord {
     pub reason: Option<String>,
 }
 
+fn bounded_audit_name(name: &str) -> String {
+    name.chars().take(MAX_COMMAND_NAME_CHARS).collect()
+}
+
 impl AuditRecord {
     #[must_use]
     pub fn put(guild_id: &str, actor_id: &str, name: &str, created: bool) -> Self {
@@ -353,7 +357,7 @@ impl AuditRecord {
                 "command.update"
             })
             .to_owned(),
-            target_key: Some(name.to_owned()),
+            target_key: Some(bounded_audit_name(name)),
             outcome: "ok".to_owned(),
             reason: None,
         }
@@ -376,7 +380,7 @@ impl AuditRecord {
                 "command.create"
             })
             .to_owned(),
-            target_key: Some(name.to_owned()),
+            target_key: Some(bounded_audit_name(name)),
             outcome: "rejected".to_owned(),
             reason: Some(error_code(err).to_owned()),
         }
@@ -388,7 +392,7 @@ impl AuditRecord {
             guild_id: guild_id.to_owned(),
             actor_id: Some(actor_id.to_owned()),
             action: "command.delete".to_owned(),
-            target_key: Some(name.to_owned()),
+            target_key: Some(bounded_audit_name(name)),
             outcome: (if deleted { "ok" } else { "absent" }).to_owned(),
             reason: None,
         }
@@ -400,7 +404,7 @@ impl AuditRecord {
             guild_id: guild_id.to_owned(),
             actor_id: Some(actor_id.to_owned()),
             action: "command.run".to_owned(),
-            target_key: Some(name.to_owned()),
+            target_key: Some(bounded_audit_name(name)),
             outcome: (if ok { "ok" } else { "failed" }).to_owned(),
             reason: reason.map(str::to_owned),
         }
@@ -1065,6 +1069,21 @@ mod tests {
         let d = adjudicate_delete(GUILD, ACTOR, "faq", false);
         assert!(!d.deleted && !d.resync_registry);
         assert_eq!(d.audit.outcome, "absent");
+    }
+
+    #[test]
+    fn rejected_and_absent_audits_bound_untrusted_names() {
+        let name = "😀".repeat(MAX_COMMAND_NAME_CHARS + 17);
+        let expected = "😀".repeat(MAX_COMMAND_NAME_CHARS);
+        let err = CommandError::ReservedName("ban".to_owned());
+
+        let rejected = AuditRecord::put_rejected(GUILD, ACTOR, &name, false, &err);
+        assert_eq!(rejected.outcome, "rejected");
+        assert_eq!(rejected.target_key.as_deref(), Some(expected.as_str()));
+
+        let absent = adjudicate_delete(GUILD, ACTOR, &name, false);
+        assert_eq!(absent.audit.outcome, "absent");
+        assert_eq!(absent.audit.target_key.as_deref(), Some(expected.as_str()));
     }
 
     #[test]

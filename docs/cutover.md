@@ -123,7 +123,10 @@ that can mutate the copied data can be paused and resumed without duplication.
 **T−15 min:** run read-only command diff and preflight with the production
 application/guild through the authorized REST executor (no gateway startup).
 Capture token-valid/application identity, intent flags, role/channel results and
-session-start budget; FAIL is NO-GO, WARN needs a recorded disposition. Snapshot
+the `session start budget` check (`GET /gateway/bot`: `remaining`, `total`,
+`reset_after_ms`, `max_concurrency`); FAIL is NO-GO (exit 1), including
+`remaining` below 10 or an unreadable budget, while WARN (`remaining` below
+100) needs a recorded disposition but keeps exit 0. Snapshot
 legacy configuration, command definitions **and separate guild permissions**
 *before* any overwrite. Confirm the legacy restart path does not auto-register a
 different registry or resume a stale session. Verify the persisted Worker/DO
@@ -284,8 +287,11 @@ version; there is no client-supplied target deployment. `expectedEpoch` is 0 onl
 for a never-initialized record; a stale/replayed epoch returns 409. It is not safe
 to invent 0 or retry a conflict without reading and reconciling the new state.
 
-Each accepted change increments the epoch, atomically persists a **fenced**
+Each accepted change commits exactly one epoch higher, atomically persists a **fenced**
 owner and audit receipt, then awaits native destruction and checks `running=false`.
+The single exception is an idempotent repeat: a same-owner exact-epoch takeover
+over an `active` record with no recovery pending returns the stored record
+unchanged, with no write, no audit row, no destroy and no epoch increment.
 Only a successful takeover writes `phase=active`; it does **not** start the new
 container. A stop/crash/final-write failure leaves persisted denial and must be
 reconciled with a fresh authenticated epoch change. The independent audit keys
@@ -686,6 +692,18 @@ writes in maintenance, preserve both data sets, and escalate a decision brief to
 the Director of Engineering. **Never silently choose a 48-hour data loss** to
 restore availability. Any proposed loss/irreversible recovery requires its
 separate authority; the lead cannot waive this runbook's zero-loss gate.
+
+**Decision D5 (live cutover, declared by the cutover lead — see
+[cutover-rollback-runbook.md](cutover-rollback-runbook.md) §1 Decider):**
+the production cutover is live. Production is
+the PlanetScale main database `two_bot`. Writes made during the Next window
+are accepted as lost on rollback, bounded by a 2-hour rollback decision
+window; after that window it is forward-fix only, never rollback. Mitigation
+is the pre-cutover PlanetScale backup plus the untouched Coolify `twobot`
+database. The zero-loss gate above describes the pre-cutover plan; during
+the 2-hour rollback decision window this decision supersedes it for
+rollback. After the window closes it is forward-fix only, never rollback,
+so no rollback supersession applies there.
 
 ## Communication template
 

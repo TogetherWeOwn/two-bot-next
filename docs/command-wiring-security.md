@@ -24,7 +24,7 @@ majority and one-ballot-per-member rules in
 | VK-01 | Protect targets with effective **Kick Members** or **Administrator** permission, as well as the room owner and original creator. Resolve target authority in the interaction's guild, fail closed when it is unavailable, and recheck before enforcement so a promotion during a vote cannot be bypassed. | Deny each protected target separately at start and after a mid-vote promotion; an unavailable authority lookup causes no disconnect or permission edit. An ordinary target can still be voted on. |
 | VK-02 | Ship a finite post-terminal cooldown and a per-initiator limit across targets. Pin the duration, limit, keys and pass/defeat/expiry/cancel behavior in the implementation and tests; a two-minute active-vote window alone is not a post-terminal cooldown. | Repeated attempts, fresh interaction IDs and target/room changes cannot evade the chosen limits. Test just before and exactly at the deadline and show refused attempts create no vote or enforcement effect. |
 | VK-03 | Bound all retained vote state: `VoteKickCore::votes`, including terminal votes and their ballots, active-vote tracking, `vote_refs` and `vote_initiators`. Define coordinated retention across these stores. Pruning must not reopen a replay or drop an unresolved enforcement fence. If safe capacity cannot be recovered, refuse new admissions rather than grow without limit or forget an accepted interaction. | At-capacity and high-churn tests assert finite counts of active/terminal votes, retained ballots and both runtime maps; replay after pruning/restart is refused for the documented replay horizon, and pending enforcement remains fenced. |
-| VK-04 | Render the public reason as bounded, mention-safe plain text without clickable links, markdown formatting or embeds under the bot's name. Do not echo raw input in errors or logs. | Everyone/role/user mentions, disguised links, bare URLs, markdown and overlong reasons cannot create a ping, link, embed or formatted bot endorsement in the final Discord payload. |
+| VK-04 | Render the public reason as bounded, mention-safe plain text without clickable links, markdown formatting or embeds under the bot's name. Do not echo raw input in errors or logs. | Everyone/role/user mentions, disguised links, bare URLs, markdown and overlong reasons cannot create a ping, link, embed or formatted bot endorsement in the final Discord payload. Proved by `hostile_reasons_render_as_mention_safe_plain_text` (ballot payload) in `crates/bot/src/voice_kick_tests.rs`; ordinary text passes through via `ordinary_reasons_render_intact_and_absent_reason_renders_no_line`. Refusal, error and log paths are reason-free by construction: `kick_start` takes no reason parameter, refusals render only from the `KickRefusal` enum via `kick_refusal_text` (fixed `&'static str` per variant, all 17 pinned by `kick_refusals_never_echo_initiator_text`), audit rows carry fixed outcome codes plus snowflakes, and follow-up ballot edits never take the reason; `hostile_reasons_never_echo_in_refusals_errors_or_logs` holds the hostile matrix in scope over those paths as a regression tripwire. |
 
 The [cooldown checklist](voice-vote-kick-cooldown-checklist.md) records the
 existing active-vote window and the intentional **no post-terminal cooldown**
@@ -61,15 +61,25 @@ totals after event cancellation or deletion, without requiring a live-event look
 | RA-02 | Resolve the supplied occurrence through a trusted, guild-scoped event/occurrence binding, not arbitrary caller text. Preserve runtime **Manage Events** authority for every `/attendance` host check-in, including when the actor selects themself, and verify the selected target's current guild membership. Selecting oneself must not create an unprivileged self-check-in path or downgrade `AttendanceProof::HostCheckin`. | Unknown/cross-event occurrences, forged user IDs, cross-guild targets and unauthorized host check-ins create no attendance or audit rows. Explicitly test unauthorized self and on-behalf refusals, and authorized self and on-behalf paths that retain HostCheckin proof. |
 | RA-03 | Bound admissions and storage growth even for valid events: pin per-user rate/cap limits and occurrence bounds, deduplicate retries, and define retention for RSVP and audit rows without deleting required recovery/audit evidence. Keep validation and writes race-safe. | Burst, duplicate and concurrent requests have bounded row counts. Event/occurrence removal or membership loss between lookup and write is refused under the chosen consistency contract; lookup/store errors do not become successful check-ins. |
 
-The current [`event-occurrence` command contract](commands.md#attendance) accepts
-a scheduled-event ID or a free-text occurrence ID. The
-[parity contract](parity.md) permits only the documented length bound and picker
-copy changes, not removal of those accepted formats. RA-02 therefore requires a
-hardening PR to define and test trusted event/occurrence resolution for both
-formats. Restricting input to Discord-derived IDs instead requires an explicit
-parity decision, a recorded intentional difference and coordinated command
-reference, fixture and regression updates. This checklist grants no such waiver
-and does not change the accepted formats.
+The current [`event-occurrence` command contract](commands.md#attendance) states
+the trusted rule: a bare scheduled-event id binds the event itself, any other
+text must anchor as `{event_id}:{label}`, and bare slugs refuse. The
+[parity contract](parity.md) records the bare-slug refusal as an intentional
+security difference; the anchored free-text format is preserved, not removed.
+Trusted resolution is defined and tested by the RA-02 hardening change, pinned
+by `crates/core/src/rsvp.rs::tests::attendance_occurrence_binds_every_format_to_a_live_event_anchor`
+(shape, refusal classes, no-echo refusal) and the
+`crates/discord/tests/rsvp_runtime.rs` acceptance battery
+(`unknown_and_cross_guild_occurrences_refuse_without_writes`,
+`host_checkin_authorized_self_and_on_behalf_retain_host_checkin_proof`,
+`permissions_gates_and_guild_fence_precede_store_access`,
+`malformed_inputs_and_failed_ack_do_not_write`,
+`non_member_and_unverifiable_targets_refuse_without_writes`), which assert zero
+attendance/audit writes on every refusal. Restricting input further to
+Discord-derived IDs alone would still require an explicit parity decision, a
+recorded intentional difference and coordinated command reference, fixture and
+regression updates. This checklist grants no such waiver and does not change
+the accepted formats.
 
 The store functions above are persistence primitives, not permission checks.
 Exercise the actual interaction-to-store path with a disposable test database;

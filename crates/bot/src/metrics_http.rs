@@ -153,6 +153,13 @@ mod tests {
             "two_bot_send_admissions_total{outcome=\"blocked\"} ",
             "two_bot_dispatch_drops_total{lane=\"messages\"} ",
             "two_bot_dispatch_drops_total{lane=\"reactions\"} ",
+            "two_bot_voice_vote_kick_total{outcome=\"started\"} ",
+            "two_bot_voice_vote_kick_total{outcome=\"cooldown\"} ",
+            "two_bot_voice_vote_kick_total{outcome=\"initiator_limited\"} ",
+            "two_bot_voice_vote_kick_total{outcome=\"connect_denied_and_disconnected\"} ",
+            "two_bot_voice_vote_kick_total{outcome=\"other\"} ",
+            "two_bot_gateway_checkpoint_failures_total{stage=\"pre_commit\"} ",
+            "two_bot_gateway_checkpoint_failures_total{stage=\"commit\"} ",
         ] {
             assert!(text.contains(sample), "missing sample {sample}");
         }

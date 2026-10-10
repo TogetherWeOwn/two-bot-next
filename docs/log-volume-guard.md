@@ -20,7 +20,7 @@ high-rate event without a cap row fails the suite.
   guild/member/channel ID, token, query string, body or message content ever
   becomes a label or a log field.
 
-## Cardinality budget: 287 samples
+## Cardinality budget: 390 samples
 
 `GET /metrics` renders this many non-comment samples from process start,
 before any traffic. Adding any series fails the pinned count until this
@@ -28,7 +28,7 @@ table and the test are updated together.
 
 | Family | Series | How |
 | --- | --- | --- |
-| `two_bot_gateway_events_total{event}` | 20 | `EVENTS` allowlist |
+| `two_bot_gateway_events_total{event}` | 21 | `EVENTS` allowlist |
 | reconnects, resumes, disconnects, missed | 4 | scalar counters |
 | `two_bot_gateway_latency_seconds` | 1 | gauge, `NaN` until measured |
 | `two_bot_handler_duration_seconds` | 11 | 8 buckets + `+Inf` + sum + count |
@@ -38,8 +38,12 @@ table and the test are updated together.
 | pool gauges | 4 | configured, size, idle, max |
 | `two_bot_db_errors_total{op}` | 2 | `admission`, `other` |
 | `two_bot_send_admissions_total{outcome}` | 4 | `admitted`, `blocked`, `storage_error`, `other` |
+| `two_bot_gateway_prefix_trigger_refused_total{reason}` | 2 | `verdict`, `other` |
 | `two_bot_dispatch_drops_total{lane}` | 6 | `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` |
-| `# HELP` / `# TYPE` headers | 48 | 24 families x 2 |
+| `two_bot_voice_vote_kick_total{outcome}` | 26 | `started` + 2 worker refusals + 15 vote-core refusals (including `cooldown`, `initiator_limited`) + 7 enforcements + `other` |
+| `two_bot_gateway_checkpoint_failures_total{stage}` | 2 | `pre_commit`, `commit` |
+| `two_bot_internal_actions_total{family,outcome}` | 72 | 6 families x 12 outcomes (`announcement`, `event`, `settings`, `moderation`, `membership`, `other` x `executed` + 11 refusal classes) |
+| `# HELP` / `# TYPE` headers | 56 | 28 families x 2 |
 
 ## Per-event caps (gateway metric labels)
 
@@ -65,12 +69,13 @@ thresholds document for paging.
 | `MESSAGE_REACTION_ADD` | hot | unbounded; self-role bursts on their own lane | 5 |
 | `MESSAGE_REACTION_REMOVE` | hot | unbounded; self-role bursts on their own lane | 6 |
 | `VOICE_STATE_UPDATE` | hot | unbounded; voice churn | 4 |
+| `PRESENCE_UPDATE` | hot | unbounded; only with `TWO_VOICE_PRESENCE=1`; in-memory only, ordered, never checkpointed | 8 |
 | `INVITE_CREATE` | steady | rare | never |
 | `INVITE_DELETE` | steady | rare | never |
 | `INTERACTION_CREATE` | steady | user-driven rate | never |
 | `HEARTBEAT_ACK` | steady | ~1 per 45 s; the latency signal | never |
 | `GATEWAY_CLOSE` | session | ~0/hr; pairs with reconnects | never |
-| `other` | hot | collapsed unknowns; growth means a new Discord type arrived | 8, last: shedding the catchall blinds us |
+| `other` | hot | collapsed unknowns; growth means a new Discord type arrived | 9, last: shedding the catchall blinds us |
 
 ## Log-line classes (catalog traced messages)
 
@@ -114,10 +119,30 @@ free lane slots), so `reactions` growth points at a hot member before an
 undersized lane; the M2.1 alert rule should treat `reactions` drops as
 member-hot until lane saturation is confirmed.
 
-Subscription facts that bound the top of the funnel: the bot never requests
-`GUILD_PRESENCES`, so presence arrives only through the hourly
-`presence_probe` job, never as gateway events; `MESSAGE_CONTENT` is requested
-only when automod, tickets or text commands justify it.
+Website-action receiver executions (TOG-20119, roadmap M4.23) follow the same
+shape: every signed-receiver request increments
+`two_bot_internal_actions_total{family,outcome}` exactly once, while refusal
+`warn!` summaries stay sampled. A burst is O(1) log lines with N counter
+increments. The six families and twelve outcomes are class steady and never
+shed; unknown verbs collapse to `other` and unknown outcomes to `internal`,
+so growth means a real family or refusal class arrived and needs the M2.1
+alert rule, not a new label.
+
+Fatal-runner reasons are class `session` and O(1) bytes: both dispatch-join
+`map_err` sites in `crates/bot/src/gateway.rs` pass the surfaced reason
+through `bounded_runner_reason`, capped at `RUNNER_REASON_MAX_CHARS`
+(512 chars, char-boundary). Today every reason is one of six `&'static str`
+literals from `dispatch_bounded` (the `JoinError` payload is discarded
+there), so the type already bounds the output; the cap is a fence that holds
+even if a future supervisor returns a larger payload.
+
+Subscription facts that bound the top of the funnel: the bot requests
+`GUILD_PRESENCES` only with `TWO_VOICE=1` and `TWO_VOICE_PRESENCE=1`
+(`docs/voice-presence.md`). Those `PRESENCE_UPDATE` dispatches stay in
+gateway order on the dispatch worker but only update in-memory voice-room
+facts: no funnel, audit or checkpoint commit. Without the flag, presence
+arrives only through the hourly `presence_probe` job. `MESSAGE_CONTENT` is requested only when
+automod, tickets or text commands justify it.
 
 ## Maintenance
 
@@ -125,5 +150,7 @@ The catalog, this guard, the conformance test and the guard test move
 together. Add a dispatch label: add its cap row here and in `EVENT_CAPS`.
 Add a job or voice family: same for `JOB_CAPS` and the cardinality table.
 Add a dispatch lane: add its label row here and in `DISPATCH_LANE_CAPS`.
+Add a receiver family or outcome: add its label row here and in
+`INTERNAL_ACTION_CAP_FAMILIES` / `INTERNAL_ACTION_CAP_OUTCOMES`.
 Add a log line on the session path: record it in the catalog and in
 `SESSION_LOG_CAPS`. Unknowns fail closed on purpose.

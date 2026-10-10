@@ -14,6 +14,7 @@ use twilight_http::{
 };
 use twilight_model::{
     channel::{Channel, ChannelType},
+    gateway::connection_info::BotConnectionInfo,
     guild::{invite::Invite, Member, Permissions, Role},
     id::Id,
     oauth::{Application, ApplicationFlags},
@@ -39,6 +40,14 @@ pub const USAGE: &str = "\
       Exit 0: PASS/WARN only; 1: FAIL; 2: invalid CLI/configuration.
       See docs/preflight.md for coverage and interpretation.
 ";
+
+// A cutover spends at least one session start on the forced IDENTIFY, plus
+// more on reconnect retries if the first connect fails. Discord's
+// session-start budget is a hard daily limit, so preflight fails closed with
+// margin above a single start and warns earlier at 10% of Discord's usual
+// 1000-start daily budget.
+const SESSION_START_FAIL_FLOOR: u32 = 10;
+const SESSION_START_WARN_THRESHOLD: u32 = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -364,6 +373,54 @@ async fn read_discord<T: serde::de::DeserializeOwned>(
         .map_err(|_| Check::fail(check, "invalid Discord response"))
 }
 
+/// Privileged-intent rows: a requested intent the portal has not granted
+/// fails (Discord would close the gateway with 4014); a granted intent the
+/// runtime does not request warns.
+fn intent_checks(intents: Intents, flags: ApplicationFlags) -> Vec<(Status, &'static str, String)> {
+    // Source: https://docs.discord.com/developers/resources/application#application-object-application-flags
+    [
+        (
+            "Guild Members intent",
+            intents.contains(Intents::GUILD_MEMBERS),
+            flags.intersects(
+                ApplicationFlags::GATEWAY_GUILD_MEMBERS
+                    | ApplicationFlags::GATEWAY_GUILD_MEMBERS_LIMITED,
+            ),
+        ),
+        (
+            "Message Content intent",
+            intents.contains(Intents::MESSAGE_CONTENT),
+            flags.intersects(
+                ApplicationFlags::GATEWAY_MESSAGE_CONTENT
+                    | ApplicationFlags::GATEWAY_MESSAGE_CONTENT_LIMITED,
+            ),
+        ),
+        (
+            "Presence intent",
+            intents.contains(Intents::GUILD_PRESENCES),
+            flags.intersects(
+                ApplicationFlags::GATEWAY_PRESENCE | ApplicationFlags::GATEWAY_PRESENCE_LIMITED,
+            ),
+        ),
+    ]
+    .into_iter()
+    .map(|(name, requested, enabled)| {
+        let status = if requested && !enabled {
+            Status::Fail
+        } else if !requested && enabled {
+            Status::Warn
+        } else {
+            Status::Pass
+        };
+        (
+            status,
+            name,
+            format!("runtime requested={requested}, portal enabled={enabled}"),
+        )
+    })
+    .collect()
+}
+
 async fn check_discord(
     client: &Client,
     transport: &HyperTransport,
@@ -386,38 +443,36 @@ async fn check_discord(
         format!("application ID {}", app.id),
     );
     let flags = app.flags.unwrap_or_else(ApplicationFlags::empty);
-    // Source: https://docs.discord.com/developers/resources/application#application-object-application-flags
-    for (name, requested, enabled) in [
-        (
-            "Guild Members intent",
-            intents.contains(Intents::GUILD_MEMBERS),
-            flags.intersects(
-                ApplicationFlags::GATEWAY_GUILD_MEMBERS
-                    | ApplicationFlags::GATEWAY_GUILD_MEMBERS_LIMITED,
-            ),
-        ),
-        (
-            "Message Content intent",
-            intents.contains(Intents::MESSAGE_CONTENT),
-            flags.intersects(
-                ApplicationFlags::GATEWAY_MESSAGE_CONTENT
-                    | ApplicationFlags::GATEWAY_MESSAGE_CONTENT_LIMITED,
-            ),
-        ),
-    ] {
-        let status = if requested && !enabled {
-            Status::Fail
-        } else if !requested && enabled {
-            Status::Warn
-        } else {
-            Status::Pass
-        };
-        report.add(
-            status,
-            name,
-            format!("runtime requested={requested}, portal enabled={enabled}"),
-        );
+    for (status, name, detail) in intent_checks(intents, flags) {
+        report.add(status, name, detail);
     }
+    // The cutover's forced IDENTIFY spends one session start against a hard
+    // Discord daily limit, so the budget is read here through the same
+    // governed GET path: lane held, no retry, and any failed, timed-out or
+    // malformed read fails closed like every other check. Counts only; the
+    // token is never part of the detail.
+    let budget: BotConnectionInfo = read_discord(
+        transport,
+        "session start budget",
+        client.gateway().authed().try_into_request(),
+    )
+    .await?;
+    let limit = &budget.session_start_limit;
+    let status = if limit.remaining < SESSION_START_FAIL_FLOOR {
+        Status::Fail
+    } else if limit.remaining < SESSION_START_WARN_THRESHOLD {
+        Status::Warn
+    } else {
+        Status::Pass
+    };
+    report.add(
+        status,
+        "session start budget",
+        format!(
+            "remaining={} total={} reset_after_ms={} max_concurrency={}",
+            limit.remaining, limit.total, limit.reset_after, limit.max_concurrency
+        ),
+    );
     let guild_id = Id::new(targets.guild_id);
     let member: Member = read_discord(
         transport,
@@ -698,6 +753,39 @@ pub async fn dispatch(args: &[String]) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn presence_intent_needs_the_portal_grant() {
+        use twilight_model::oauth::ApplicationFlags;
+        let row = |intents, flags| {
+            super::intent_checks(intents, flags)
+                .into_iter()
+                .find(|(_, name, _)| *name == "Presence intent")
+                .map(|(status, _, _)| status)
+                .expect("presence row")
+        };
+        let presences = Intents::GUILD_PRESENCES;
+        assert!(matches!(
+            row(presences, ApplicationFlags::empty()),
+            super::Status::Fail
+        ));
+        assert!(matches!(
+            row(presences, ApplicationFlags::GATEWAY_PRESENCE_LIMITED),
+            super::Status::Pass
+        ));
+        assert!(matches!(
+            row(presences, ApplicationFlags::GATEWAY_PRESENCE),
+            super::Status::Pass
+        ));
+        assert!(matches!(
+            row(Intents::empty(), ApplicationFlags::GATEWAY_PRESENCE_LIMITED),
+            super::Status::Warn
+        ));
+        assert!(matches!(
+            row(Intents::empty(), ApplicationFlags::empty()),
+            super::Status::Pass
+        ));
+    }
+
     use super::*;
 
     #[test]

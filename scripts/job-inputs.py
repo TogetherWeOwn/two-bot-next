@@ -147,6 +147,14 @@ PARITY_DOCS = frozenset({
     "docs/parity.md",
     "docs/parity-baseline.json",
 })
+# Docs read by both Rust tests and the worker suite: docs/metrics.md is
+# pinned by the Rust exposition-conformance test
+# (crates/core/tests/metrics_docs.rs) and by the worker event/alert catalog
+# tests (wrangler/test/event-catalog.test.ts,
+# wrangler/test/alert-job-catalog.test.ts), so its edits select both jobs.
+RUST_WORKER_DOCS = frozenset({
+    "docs/metrics.md",
+})
 WORKER_DOCS = frozenset({
     "docs/runbook.md",
     "docs/container-readiness.md",
@@ -257,6 +265,8 @@ def classify(path):
         return frozenset(jobs)
     if path.startswith(WORKER_PREFIX):
         return frozenset({WORKER})
+    if path in RUST_WORKER_DOCS:
+        return frozenset({RUST, WORKER})
     if path in RUST_DOCS:
         jobs = {RUST}
         if path in PARITY_DOCS:

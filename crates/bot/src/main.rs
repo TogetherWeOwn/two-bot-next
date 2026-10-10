@@ -32,6 +32,7 @@ mod database_roles_cli;
 mod discord_test_common;
 mod dispatch;
 mod erasure_cli;
+mod event_cli;
 mod feed_jobs;
 mod gateway;
 mod gateway_commands;
@@ -467,7 +468,7 @@ async fn run(cli_args: &[String]) {
                                 step_failure(FailureClass::MilestonesLoadFailed, error)
                             })?,
                     );
-                    // Community message capture (TOG-19603): arm the Postgres
+                    // Community voice + message capture: arm the Postgres
                     // facts sink only when the scorecard job is enabled, so a
                     // staging-gated rollout captures exactly while it scores.
                     if std::env::var("TWO_COMMUNITY_SCORECARD").is_ok_and(|v| v == "1") {

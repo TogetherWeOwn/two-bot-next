@@ -55,12 +55,16 @@ cutover migrations, `web_v1` and the reviewed role plan before runtime starts;
 jobs never execute migration/view DDL using the DML-only runtime credential.
 Admission refusal sends no HTTP. Initialization errors are retried on the next attempt, never
 logged with a database URL. Guild members are fully paginated; rank-role names
-come from the guild object's `roles` array. Domain/store semantics are unchanged:
+come from the guild object's `roles` array. Domain/store semantics are unchanged
+except for the rank self-heal below, the one tick that writes to Discord:
 
 - Counter and rank ticks publish nothing when historical raid windows cannot
   be grounded in imported funnel history. A deliberate skip is a successful
   attempt, not evidence that a fresh snapshot was written.
-- Missing/ambiguous ladder roles or nonnested ranks refuse rank publication.
+- Missing/ambiguous ladder roles refuse rank publication. Non-nested ranks
+  self-heal when the live-identity fence permits the `rank_heal` capability:
+  the tick grants the missing lower rungs (bounded, hierarchy-fenced, with an
+  audit reason) and republishes; a refused identity keeps the old refusal.
 - Failed or malformed scheduled-event reads keep the previous mirror. Only a
   valid empty event array clears it.
 
@@ -166,8 +170,9 @@ write verb; bind that job to a capability in `BootActivation` before it ships.
   watermark/classifier changed or the completion write was lost. A successfully
   persisted incomplete scorecard is terminal, not a transient failure.
   Before scoring, mark honest stream coverage for the captured streams only
-  (`CAPTURED_STREAMS`, today `event_attended`, `message_created` and
-  `rules_accepted`) from capture start through
+  (`CAPTURED_STREAMS`, today all six streams: `event_attended`,
+  `voice_session_started`, `voice_session_ended`, `message_created`,
+  `rules_accepted` and `member_joined`) from capture start through
   the closed week end; a mid-week start fails closed (`INGESTION_INCOMPLETE`,
   human numerators null). A Monday boot cannot claim closed-week coverage:
   leave missing heartbeats missing rather than inserting an inverted interval.
@@ -177,8 +182,16 @@ write verb; bind that job to a capability in `BootActivation` before it ships.
   `run_sweep`. Never DM, ping, or message from this outcome — any outbound
   contact needs CEO sign-off first.
 - Implement fact writes on the gateway handlers through the `FactsSink` seam,
-  classifying via `classify`. The `message_created` writer is live
+  classifying via `classify`. The voice writers are live
   (`DeferredCommunityFacts`, armed only when `TWO_COMMUNITY_SCORECARD=1`):
+  voice join/leave/move frames land via `voice_started_fact` /
+  `voice_ended_fact` + `record_fact`, keyed `voice-start:{session_key}` /
+  `voice-end:{session_key}` so duplicate delivery returns `false`; a move
+  stays one atomic end+start pair on the per-member chain and
+  mute/deafen/camera-only frames (no channel change) write nothing. End rows
+  carry `sessionKey`, `startedAt`, `durationSeconds`, `startKnown`; an end
+  without a seen start records `startKnown:false` with nulls, never a
+  fabricated start. The `message_created` writer is live on the same seam:
   gateway `MessageCreate` events land via `message_fact` + `record_fact`,
   keyed `discord-message:{message_id}` so duplicate delivery returns `false`;
   DMs never reach the sink (dropped in the pipeline) and bots, webhooks and
@@ -187,6 +200,11 @@ write verb; bind that job to a capability in `BootActivation` before it ships.
   drain through `rules_accepted_fact` + `record_fact` on the serial worker,
   keyed `rules-accepted:{guild}:{member}` so repeat clears return `false`; a
   failed drain only warns and the scorecard fails closed on the missing fact.
+  The `member_joined` writer shares the same sink: gateway joins buffer raw
+  with their invite attribution (`source` + `inviterId` metadata) and drain
+  through `member_join_fact` + `record_fact` on the serial worker, keyed
+  `member-join:{guild}:{actor}:{occurred_at}` so a redelivered burst returns
+  `false`; bots are captured but never funnel-counted.
   Keep `TWO_COMMUNITY_SCORECARD` off by default and `TWO_PRESENCE_PROBE` on
   (legacy default); restrict enabling to staging. No production guild or
   token was used to verify this slice.
