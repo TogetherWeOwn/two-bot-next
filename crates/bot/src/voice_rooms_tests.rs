@@ -10048,3 +10048,42 @@ async fn an_unknown_owner_name_waits_only_a_bounded_time() {
     dispatch(&mut worker, name_panel::NAME_WAIT_MS).await;
     assert_eq!(*trace.lock().unwrap(), ["rename:500:member's den"]);
 }
+
+#[tokio::test]
+async fn a_game_or_stream_change_rerenders_the_room_name() {
+    use two_bot_core::voice_presence::MemberPresence;
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template =
+        "{{PLAYING ?? @@game_name@@ // Hangout}}{{ANY_LIVE ?? 🔴}}".to_owned();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER, Some(500), Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    worker.name_settings.no_game_label = "Hangout".to_owned();
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    // The owner starts a game: the presence frame reports the room.
+    let room = worker.live.set_presence(
+        MEMBER,
+        MemberPresence {
+            game: Some("Apex Legends".to_owned()),
+            ..MemberPresence::default()
+        },
+    );
+    assert_eq!(room, Some(500));
+    worker.room_facts_changed(500, 1);
+    worker.refresh_template_names(1);
+    assert_eq!(worker.desired_names[&500], "Apex Legends");
+    // Going live through Discord adds the live marker on the next render.
+    assert_eq!(worker.live.set_self_stream(MEMBER, true), Some(500));
+    worker.room_facts_changed(500, 2);
+    worker.refresh_template_names(2);
+    assert_eq!(worker.desired_names[&500], "Apex Legends 🔴");
+    // The rename lane coalesces both changes into one paced rename.
+    dispatch(&mut worker, 600_000).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["rename:500:Hangout", "rename:500:Apex Legends 🔴"]
+    );
+}

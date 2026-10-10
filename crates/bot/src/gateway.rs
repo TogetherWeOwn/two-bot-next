@@ -147,7 +147,14 @@ pub fn intents_from_env(activation: &crate::activation::BootActivation) -> Inten
             &var("TWO_AUTOMATIONS"),
             &var("TWO_TEXT_COMMANDS"),
         );
-    base | gateway_intents(text_commands)
+    // Voice-room presence facts (game/stream tokens) need privileged
+    // GUILD_PRESENCES; off unless explicitly enabled, so a bot whose app lacks
+    // the Presence Intent grant never closes with 4014.
+    let presences = two_bot_discord::intents::needs_voice_presences(
+        &var("TWO_VOICE"),
+        &var("TWO_VOICE_PRESENCE"),
+    );
+    two_bot_discord::intents::with_presences(base | gateway_intents(text_commands), presences)
 }
 
 fn intents_for_settings(
