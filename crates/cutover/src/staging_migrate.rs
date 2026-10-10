@@ -1995,6 +1995,25 @@ mod tests {
             err.contains("direct login"),
             "pooled login must name the direct login, got: {err}"
         );
+        // The exact probe from review: a production binding copied from the
+        // app's pooled PlanetScale string (same host, port 6432, no `-pooler`
+        // hostname) refuses in both gates.
+        for pooled in [
+            "postgresql://u@abc-useast1-1.horizon.psdb.cloud:6432/two_bot?sslmode=require",
+            "postgresql://u%7Cpool@abc-useast1-1.horizon.psdb.cloud:6432/two_bot?sslmode=require",
+        ] {
+            let mut req = production_plan();
+            req.expected_host = "abc-useast1-1.horizon.psdb.cloud".to_owned();
+            req.url = Some(pooled.to_owned());
+            assert!(
+                matches!(validate_request(&req), Err(RunError::Refused(_))),
+                "production validate must refuse pooled PlanetScale binding {pooled}"
+            );
+            assert!(
+                matches!(verify_target(&req), Err(RunError::Refused(_))),
+                "production verify must refuse pooled PlanetScale binding {pooled}"
+            );
+        }
         // The direct endpoint on the same host still verifies.
         let mut direct = production_plan();
         direct.expected_host = "prod-host.invalid".to_owned();
