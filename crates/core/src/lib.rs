@@ -355,10 +355,11 @@ pub use router::{
 pub use rsvp::{
     attendance_totals_text, checkin_classification, checkin_duplicate_text,
     checkin_idempotency_key, checkin_metadata_json, checkin_recorded_text, checkin_source,
-    checkin_source_event_id, is_snowflake, partition_rsvps, require_manage_events, rsvp_saved_text,
-    validate_event_id, validate_occurrence_id, AttendanceClassification, AttendanceProof,
-    CheckinError, RsvpAudit, RsvpError, RsvpRecord, RsvpStatus, RsvpTotals, RsvpTransition,
-    ATTENDANCE_EVENT_TYPE, RSVP_AUDIT_ACTION,
+    checkin_source_event_id, is_snowflake, parse_attendance_occurrence, partition_rsvps,
+    require_manage_events, rsvp_saved_text, validate_event_id, validate_occurrence_id,
+    AttendanceClassification, AttendanceOccurrence, AttendanceProof, CheckinError, RsvpAudit,
+    RsvpError, RsvpRecord, RsvpStatus, RsvpTotals, RsvpTransition, ATTENDANCE_EVENT_TYPE,
+    RSVP_AUDIT_ACTION,
 };
 #[cfg(feature = "db")]
 pub use rsvp_store::{
