@@ -40,6 +40,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_voice_tracked_rooms` | Rooms tracked in memory; compare with live Discord channels for ghosts |
 | `two_bot_voice_compensation_pending` | Tracked rooms awaiting compensating delete after a failed write |
 | `two_bot_voice_orphans_total` | Untracked creator-channel orphans needing manual deletion after failed `/create` compensation |
+| `two_bot_voice_vote_kick_total{outcome}` | Vote-kick starts, refusals and terminal enforcements; `outcome` is `started`, a refusal code (`evidence_unavailable`, `not_a_room`, `initiator_not_occupant`, `target_not_occupant`, `self_target`, `protected_target`, `privileged_target`, `authority_unavailable`, `active_vote_exists`, `cooldown`, `initiator_limited`, `reused_vote_id`, `unknown_vote`, `wrong_vote_boundary`, `ineligible_voter`, `repeated_vote`, `invalid_time`), an enforcement code (`connect_denied_and_disconnected`, `connect_denied_target_absent`, `skipped_room_gone`, `skipped_target_protected`, `permission_missing`, `discord_error`, `gave_up`) or `other`; vote results (`passed`/`expired`/`cancelled`) are audit-only and never counted |
 | `two_bot_dispatch_drops_total{lane}` | Dispatch-lane saturation drops: every event refused because every attempted lane was full. `lane` is one of `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` (see label allowlists below). The `reactions` lane additionally counts per-member fairness refusals: a reaction refused because its member already holds `PER_USER_IN_FLIGHT` reaction slots, even while the lane has free slots. A single-lane refusal counts its lane once; a privileged spill refused by both lanes counts both. Logs sample the first drop per 60 s per runtime, so bursts are O(1) lines with N counter increments. Alert-threshold hook for M2.1 (lands once TOG-18943 unblocks): alert when any lane's drops increase across consecutive keepalive samples; a single drop inside one burst is not paging. `reactions`-lane growth points at a hot member before an undersized lane |
 
 ## Job coverage and outcomes
@@ -143,6 +144,20 @@ as dynamic labels.
   `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued`.
 - `two_bot_voice_dead_letters_total{action}` — `action` is `create`, `move`,
   `delete`, `companion`, `ownership`, `kick`, `rename`, `limit` or `other`.
+- `two_bot_voice_vote_kick_total{outcome}` — `outcome` is `started`,
+  `evidence_unavailable`, `not_a_room`, `initiator_not_occupant`,
+  `target_not_occupant`, `self_target`, `protected_target`,
+  `privileged_target`, `authority_unavailable`, `active_vote_exists`,
+  `cooldown`, `initiator_limited`, `reused_vote_id`, `unknown_vote`,
+  `wrong_vote_boundary`, `ineligible_voter`, `repeated_vote`, `invalid_time`,
+  `connect_denied_and_disconnected`, `connect_denied_target_absent`,
+  `skipped_room_gone`, `skipped_target_protected`, `permission_missing`,
+  `discord_error`, `gave_up` or `other` (`crates/core/src/metrics.rs`
+  `VOICE_VOTE_KICK_OUTCOMES`). Recorded once per `kick_start` decision
+  (`started` or the refusal code from `kick_refusal_outcome`) and once per
+  terminal `KickMember` enforcement (`EnforcementOutcome::as_str`); vote
+  results are audit-only. Refusal codes never become free-form text; unknown
+  outcomes collapse to `other`.
 - `two_bot_db_errors_total{op}` — `op` is `admission` or `other`. Recorded
   by `Metrics::db_error`; send-admission SQL (admit/extend/complete storage
   failures) reports as `admission`, and failed voice actor store loads

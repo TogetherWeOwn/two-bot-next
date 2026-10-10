@@ -3067,6 +3067,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             outcome.as_str(),
             None,
         ));
+        metrics::global().voice_vote_kick(outcome.as_str());
     }
 
     /// Append buffered audit rows, one batch per call. Driven by the actor's
@@ -3113,28 +3114,35 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         now_ms: u64,
     ) -> Result<VoteKickUpdate, KickRefusal> {
         let started = self.begin_vote(vote_id, room_id, initiator_id, target_id, now_ms);
-        let row = match &started {
-            Ok(update) => kick_audit_row(
-                KickAuditEvent::VoteStarted,
-                update.vote,
-                initiator_id,
+        let (row, outcome) = match &started {
+            Ok(update) => (
+                kick_audit_row(
+                    KickAuditEvent::VoteStarted,
+                    update.vote,
+                    initiator_id,
+                    OUTCOME_STARTED,
+                    Some(update.progress),
+                ),
                 OUTCOME_STARTED,
-                Some(update.progress),
             ),
-            Err(refusal) => kick_audit_row(
-                KickAuditEvent::VoteRefused,
-                VoteKickRef {
-                    id: vote_id,
-                    guild_id: self.live.guild_id,
-                    room_id,
-                    target_id,
-                },
-                initiator_id,
+            Err(refusal) => (
+                kick_audit_row(
+                    KickAuditEvent::VoteRefused,
+                    VoteKickRef {
+                        id: vote_id,
+                        guild_id: self.live.guild_id,
+                        room_id,
+                        target_id,
+                    },
+                    initiator_id,
+                    kick_refusal_outcome(*refusal),
+                    None,
+                ),
                 kick_refusal_outcome(*refusal),
-                None,
             ),
         };
         self.push_kick_audit(row);
+        metrics::global().voice_vote_kick(outcome);
         started
     }
 

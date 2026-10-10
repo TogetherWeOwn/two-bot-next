@@ -206,6 +206,37 @@ const DISPATCH_LANE_CAPS: [&str; 6] = [
     "busy",
     "reactions",
 ];
+/// One row per `metrics::VOICE_VOTE_KICK_OUTCOMES` entry, in the same order.
+/// A new vote-kick outcome fails here until it gets a budget row in the guard
+/// doc.
+const VOTE_KICK_CAP_OUTCOMES: [&str; 26] = [
+    "started",
+    "evidence_unavailable",
+    "not_a_room",
+    "initiator_not_occupant",
+    "target_not_occupant",
+    "self_target",
+    "protected_target",
+    "privileged_target",
+    "authority_unavailable",
+    "active_vote_exists",
+    "cooldown",
+    "initiator_limited",
+    "reused_vote_id",
+    "unknown_vote",
+    "wrong_vote_boundary",
+    "ineligible_voter",
+    "repeated_vote",
+    "invalid_time",
+    "connect_denied_and_disconnected",
+    "connect_denied_target_absent",
+    "skipped_room_gone",
+    "skipped_target_protected",
+    "permission_missing",
+    "discord_error",
+    "gave_up",
+    "other",
+];
 
 #[test]
 fn storage_and_send_gate_labels_match_their_caps() {
@@ -223,6 +254,11 @@ fn storage_and_send_gate_labels_match_their_caps() {
         metrics::DISPATCH_LANES,
         &DISPATCH_LANE_CAPS[..],
         "DISPATCH_LANES grew without a budget row; update docs/log-volume-guard.md"
+    );
+    assert_eq!(
+        metrics::VOICE_VOTE_KICK_OUTCOMES,
+        &VOTE_KICK_CAP_OUTCOMES[..],
+        "VOICE_VOTE_KICK_OUTCOMES grew without a budget row; update docs/log-volume-guard.md"
     );
 }
 
@@ -469,6 +505,11 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
         6,
         "dispatch-lane family grew; update the cardinality budget and the guard doc"
     );
+    assert_eq!(
+        metrics::VOICE_VOTE_KICK_OUTCOMES.len(),
+        26,
+        "vote-kick outcome family grew; update the cardinality budget and the guard doc"
+    );
     for (allowlist, name) in [
         (metrics::EVENTS, "EVENTS"),
         (metrics::REST_ROUTES, "routes"),
@@ -476,6 +517,7 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
         (metrics::VOICE_DEAD_ACTIONS, "dead-letter"),
         (metrics::DB_ERROR_OPS, "db-errors"),
         (metrics::SEND_ADMISSION_OUTCOMES, "send-admissions"),
+        (metrics::VOICE_VOTE_KICK_OUTCOMES, "vote-kick"),
     ] {
         assert_eq!(
             allowlist.last(),
@@ -504,9 +546,9 @@ fn exposition_series_count_matches_the_cardinality_budget() {
     let text = metrics::Metrics::default().render(None);
     let series = text.lines().filter(|line| !line.starts_with('#')).count();
     assert_eq!(
-        series, 287,
-        "exposition grew past the 287-sample budget (20 events + 4 scalars + 1 latency \
-         + 11 histogram + 156 rest + 48 jobs + 31 voice + 2 db-errors + 4 send-admissions + 6 dispatch-drops + 4 pool); \
+        series, 313,
+        "exposition grew past the 313-sample budget (20 events + 4 scalars + 1 latency \
+         + 11 histogram + 156 rest + 48 jobs + 31 voice + 26 vote-kick + 2 db-errors + 4 send-admissions + 6 dispatch-drops + 4 pool); \
          update docs/log-volume-guard.md with the new series"
     );
 }

@@ -1092,3 +1092,60 @@ async fn the_audit_buffer_is_bounded_and_drops_the_oldest_row() {
         KICK_AUDIT_BUFFER_MAX
     );
 }
+
+/// M4.30: every counted vote-kick path emits an audit outcome the metric
+/// allowlist covers, so an initiator-spam wave (`cooldown` /
+/// `initiator_limited`) and every terminal enforcement land on their own
+/// series. Vote results stay audit-only and are excluded here.
+#[tokio::test]
+async fn counted_vote_kick_paths_emit_metric_covered_outcomes() {
+    use two_bot_core::metrics::{Metrics, VOICE_VOTE_KICK_OUTCOMES};
+
+    let (mut worker, _trace) = setup().await;
+    // A start, a same-target refusal, and a terminal enforcement.
+    start(&mut worker, VOTER_A, TARGET).unwrap();
+    assert!(worker
+        .kick_start(VOTE + 1, ROOM, VOTER_B, TARGET, 1)
+        .is_err());
+    for voter in [VOTER_A, VOTER_B] {
+        worker.kick_cast(VOTE, voter, VoteBallot::Yes, 1).unwrap();
+    }
+    let passed = worker.kick_cast(VOTE, VOTER_C, VoteBallot::Yes, 2).unwrap();
+    assert_eq!(passed.status, VoteKickStatus::Passed);
+    dispatch(&mut worker, 3).await;
+    assert!(worker.flush_kick_audit(4).await);
+    let counted: Vec<&'static str> = worker
+        .store
+        .kick_audit
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|row| {
+            row.event == KickAuditEvent::VoteStarted
+                || row.event == KickAuditEvent::VoteRefused
+                || row.event == KickAuditEvent::Enforcement
+        })
+        .map(|row| row.outcome)
+        .collect();
+    assert!(counted.contains(&"started"));
+    assert!(counted.contains(&"active_vote_exists"));
+    assert!(counted.contains(&"connect_denied_and_disconnected"));
+    // Every counted outcome renders on a fresh registry without new series.
+    let metrics = Metrics::default();
+    for outcome in &counted {
+        assert!(
+            VOICE_VOTE_KICK_OUTCOMES.contains(outcome),
+            "counted vote-kick outcome missing from metric allowlist: {outcome}"
+        );
+        metrics.voice_vote_kick(outcome);
+    }
+    let text = metrics.render(None);
+    for outcome in &counted {
+        assert!(
+            text.contains(&format!(
+                "two_bot_voice_vote_kick_total{{outcome=\"{outcome}\"}} "
+            )),
+            "counted outcome missing from exposition: {outcome}"
+        );
+    }
+}

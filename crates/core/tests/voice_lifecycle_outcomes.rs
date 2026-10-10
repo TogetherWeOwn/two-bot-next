@@ -10,6 +10,12 @@
 
 use two_bot_core::metrics::{
     Metrics, REST_ROUTES, VOICE_DEAD_ACTIONS, VOICE_OPERATIONS, VOICE_RECONCILE_ACTIONS,
+    VOICE_VOTE_KICK_OUTCOMES,
+};
+use two_bot_core::voice_vote_kick::VoteKickError;
+use two_bot_core::voice_vote_kick_audit::{
+    refusal_outcome, EnforcementOutcome, OUTCOME_EVIDENCE_UNAVAILABLE, OUTCOME_NOT_A_ROOM,
+    OUTCOME_STARTED,
 };
 
 /// Every series line for one metric family, in render order.
@@ -201,5 +207,115 @@ fn voice_rest_outcomes_land_under_allowlisted_templates() {
         assert!(text.contains(&format!(
             "two_bot_rest_requests_total{{route=\"{route}\",result=\"{result}\"}} 1\n"
         )));
+    }
+}
+
+// ---- (6) vote-kick starts, refusals and enforcements (M4.30) ----
+
+const VOTE_KICK_REFUSALS: [VoteKickError; 15] = [
+    VoteKickError::InitiatorNotOccupant,
+    VoteKickError::TargetNotOccupant,
+    VoteKickError::SelfTarget,
+    VoteKickError::ProtectedTarget,
+    VoteKickError::PrivilegedTarget,
+    VoteKickError::AuthorityUnavailable,
+    VoteKickError::ActiveVoteExists,
+    VoteKickError::Cooldown,
+    VoteKickError::InitiatorLimited,
+    VoteKickError::ReusedVoteId,
+    VoteKickError::UnknownVote,
+    VoteKickError::WrongVoteBoundary,
+    VoteKickError::IneligibleVoter,
+    VoteKickError::RepeatedVote,
+    VoteKickError::InvalidTime,
+];
+
+/// Every audit outcome the voice-kick paths count must be an allowlisted
+/// metric outcome: one `started`, every refusal code (including `cooldown`
+/// and `initiator_limited` plus the two worker-level refusals) and every
+/// terminal enforcement code. Vote results stay audit-only.
+#[test]
+fn vote_kick_audit_outcomes_are_all_metric_covered() {
+    let mut expected = vec![
+        OUTCOME_STARTED,
+        OUTCOME_EVIDENCE_UNAVAILABLE,
+        OUTCOME_NOT_A_ROOM,
+    ];
+    expected.extend(VOTE_KICK_REFUSALS.map(refusal_outcome));
+    expected.extend(EnforcementOutcome::ALL.map(|outcome| outcome.as_str()));
+    for outcome in &expected {
+        assert!(
+            VOICE_VOTE_KICK_OUTCOMES.contains(outcome),
+            "vote-kick outcome missing from metric allowlist: {outcome}"
+        );
+    }
+    assert_eq!(
+        VOICE_VOTE_KICK_OUTCOMES.last(),
+        Some(&"other"),
+        "vote-kick family lost its `other` collapse trapdoor"
+    );
+    // No audit code smuggles a guild-kick/ban word into a label.
+    for outcome in &expected {
+        for banned in ["kick", "ban", "token"] {
+            assert!(
+                !outcome.contains(banned),
+                "{outcome} names {banned}; enforcement vocabulary stays room-scoped"
+            );
+        }
+    }
+}
+
+/// The full vote-kick outcome grid renders one series per allowlisted
+/// outcome, with an initiator-spam wave (`cooldown` / `initiator_limited`)
+/// landing on its own series.
+#[test]
+fn vote_kick_starts_refusals_and_enforcements_render_every_series() {
+    let metrics = Metrics::default();
+    for outcome in VOICE_VOTE_KICK_OUTCOMES {
+        if *outcome != "other" {
+            metrics.voice_vote_kick(outcome);
+        }
+    }
+    // An initiator-spam wave is two more refusals, not new series.
+    metrics.voice_vote_kick("cooldown");
+    metrics.voice_vote_kick("initiator_limited");
+    let text = metrics.render(None);
+    let series = series_for(&text, "two_bot_voice_vote_kick_total{");
+    assert_eq!(series.len(), VOICE_VOTE_KICK_OUTCOMES.len());
+    assert!(text.contains("two_bot_voice_vote_kick_total{outcome=\"started\"} 1\n"));
+    assert!(text.contains("two_bot_voice_vote_kick_total{outcome=\"cooldown\"} 2\n"));
+    assert!(text.contains("two_bot_voice_vote_kick_total{outcome=\"initiator_limited\"} 2\n"));
+    assert!(text.contains(
+        "two_bot_voice_vote_kick_total{outcome=\"connect_denied_and_disconnected\"} 1\n"
+    ));
+    assert!(text.contains("two_bot_voice_vote_kick_total{outcome=\"gave_up\"} 1\n"));
+    assert!(text.contains("two_bot_voice_vote_kick_total{outcome=\"other\"} 0\n"));
+}
+
+/// Docs-claims-subset conformance (M4.3/M4.23 pattern): every vote-kick
+/// outcome `docs/metrics.md` names must exist in exposition. The doc beside
+/// the voice rows claims the allowlist; this test fails when the doc invents
+/// a series or the code ships one the doc does not name.
+#[test]
+fn vote_kick_docs_claims_are_a_subset_of_exposition() {
+    let docs = include_str!("../../../docs/metrics.md");
+    assert!(
+        docs.contains("two_bot_voice_vote_kick_total{outcome}"),
+        "docs/metrics.md must document the vote-kick counter beside the voice rows"
+    );
+    for outcome in VOICE_VOTE_KICK_OUTCOMES {
+        assert!(
+            docs.contains(outcome),
+            "docs/metrics.md must name vote-kick outcome `{outcome}` in the row or allowlist"
+        );
+    }
+    let text = Metrics::default().render(None);
+    for outcome in VOICE_VOTE_KICK_OUTCOMES {
+        assert!(
+            text.contains(&format!(
+                "two_bot_voice_vote_kick_total{{outcome=\"{outcome}\"}} 0\n"
+            )),
+            "exposition must render allowlisted vote-kick outcome `{outcome}` at zero"
+        );
     }
 }
