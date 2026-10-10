@@ -207,6 +207,32 @@ otherwise the loop is unchanged.
   reception for creates while automod is active; the worker fires it only for an
   accepted create (`Accept`). Matched, unavailable and timed-out creates are
   rejected for automations as well as for XP/activity.
+- **Funnel-vs-trigger verdicts.** Each delivery gets one `WorkerVerdict`
+  (`crates/bot/src/automod_gateway.rs:138-141`): `funnel` is its single call
+  into the funnel and `trigger` is the verdict prefix triggers act on. A
+  delivery automod did not inspect, or whose completion was not recorded, keeps
+  its funnel disposition but its trigger verdict is capture-only (`:133-136`).
+  `verdict_of` (`:143-152`) forces the trigger to `CaptureOnly` when the
+  outcome is `Bypassed` or `Retained(_)`, and otherwise copies the funnel. A
+  `process` timeout keeps raw capture only for both (`:162-172`). The worker
+  hands the funnel disposition to
+  `handle_at_with_message_disposition` exactly once and fires the message hook
+  only when `runs_text_automations` passes — `None` (automod inactive) or
+  `Accept` (`:175-179`, `crates/bot/src/gateway.rs:623-636`). The hook carries
+  the trigger verdict into the trigger handler, where a missing verdict fails
+  closed (`crates/bot/src/command_runtime.rs:845-869`). Per outcome class
+  (`ActivationOutcome` in `crates/discord/src/automod_activation.rs:74-86`):
+
+  | Outcome | `funnel` | `trigger` | Text automations run? |
+  | --- | --- | --- | --- |
+  | `Bypassed` (outside the fence) | ordinary disposition: clean create → `Accept` (`automod_activation.rs:151`) | `CaptureOnly` | yes for a clean create (`Accept` passes the gate) |
+  | `Completed` (incl. enforce, dry-run, accepted) | activation disposition | = `funnel` | iff `Accept` |
+  | `Retained(_)` (needs recorded reconciliation) | disposition | `CaptureOnly` | iff `funnel` is `Accept` |
+  | `Duplicate(Some(receipt))` (settled replay) | from the receipt: matched → capture-only, clean → accept (`automod_activation.rs:107-113`) | = `funnel` | iff the receipt was clean (`Accept`) |
+  | `Duplicate(None)` (in-flight replay) | capture-only for a create, `None` for an update | = `funnel` | no for a create |
+  | `Unavailable` (enrichment/claim/target failed) | `CaptureOnly` for a create, `None` for an update (`automod_activation.rs:154`) | = `funnel` | no |
+  | `process` timeout | `kind.funnel(true)`: capture-only for a create, `None` for an update | same | no |
+  | automod inactive (no verdict) | — | — | yes (`None` passes the gate) |
 - **Funnel once-per-message.** The funnel's writes commit with the gateway
   checkpoint, so a dispatch reaching `process` is not yet in the funnel. A
   replay after a crash between the claim write and the checkpoint finds a
