@@ -551,6 +551,20 @@ fn voice_disconnected(voice: Option<&Arc<dyn VoiceEventSink>>) {
     }
 }
 
+/// Counts one warn-and-continue community-facts drain failure: a facts-writer
+/// error or a missed dispatch deadline. A committed drain counts nothing.
+fn count_community_facts_drain_failure<T, E>(
+    metrics: &two_bot_core::metrics::Metrics,
+    drained: &Result<Result<T, E>, tokio::time::error::Elapsed>,
+) {
+    let reason = match drained {
+        Ok(Ok(_)) => return,
+        Ok(Err(_)) => "error",
+        Err(_) => "timeout",
+    };
+    metrics.community_facts_drain_failure(reason);
+}
+
 /// One blocking-worker dispatch step: run the funnel/leveling drain, await the
 /// interaction completion, serialize any onboarding job and commit the
 /// checkpoint — or record the first failure as a typed error and skip the
@@ -694,7 +708,9 @@ fn apply_dispatch<I: InviteSource>(
         // stalls the worker
         // (audit precedent): warn and continue; the scorecard fails closed
         // on missing coverage.
-        match handle.block_on(tokio::time::timeout(deadline, pipeline.drain_facts())) {
+        let drained = handle.block_on(tokio::time::timeout(deadline, pipeline.drain_facts()));
+        count_community_facts_drain_failure(two_bot_core::metrics::global(), &drained);
+        match drained {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => tracing::warn!(
                 error = %error,
@@ -2645,6 +2661,42 @@ mod tests {
         );
     }
 
+    fn community_facts_drain_failures(reason: &str) -> u64 {
+        let prefix =
+            format!("two_bot_community_facts_drain_failures_total{{reason=\"{reason}\"}} ");
+        two_bot_core::metrics::global()
+            .render(None)
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix.as_str()))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn community_facts_drain_counts_failures_and_stays_silent_on_success() {
+        let metrics = two_bot_core::metrics::Metrics::default();
+        let committed: Result<Result<usize, ()>, tokio::time::error::Elapsed> = Ok(Ok(2));
+        let failed: Result<Result<usize, ()>, tokio::time::error::Elapsed> = Ok(Err(()));
+        let timed_out = tokio::time::timeout(
+            std::time::Duration::ZERO,
+            std::future::pending::<Result<usize, ()>>(),
+        )
+        .await;
+        count_community_facts_drain_failure(&metrics, &committed);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_community_facts_drain_failures_total{reason=\"error\"} 0\n"));
+        assert!(
+            text.contains("two_bot_community_facts_drain_failures_total{reason=\"timeout\"} 0\n")
+        );
+        count_community_facts_drain_failure(&metrics, &failed);
+        count_community_facts_drain_failure(&metrics, &timed_out);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_community_facts_drain_failures_total{reason=\"error\"} 1\n"));
+        assert!(
+            text.contains("two_bot_community_facts_drain_failures_total{reason=\"timeout\"} 1\n")
+        );
+    }
+
     /// A failed community-facts drain never stalls serial dispatch: the worker
     /// warns and still commits the cursor. The facts writer is broken here
     /// with an unconnectable pool (short acquire timeout) while the session
@@ -2765,6 +2817,7 @@ mod tests {
             .with_writer(move || writer.clone())
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
+        let failures_before = community_facts_drain_failures("error");
         let state = RwLock::new(GatewayState::Armed);
         let generation = AtomicU64::new(0);
         let store = GatewaySessionStore::new(pool, "22".to_owned(), 1);
@@ -2806,6 +2859,10 @@ mod tests {
         assert!(
             output.contains("gateway community facts dispatch failed"),
             "failed facts drain must warn, got: {output}"
+        );
+        assert!(
+            community_facts_drain_failures("error") > failures_before,
+            "failed facts drain must increment the drain-failure counter"
         );
         assert_eq!(
             store.load().await.expect("load").expect("session").sequence,

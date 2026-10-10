@@ -42,6 +42,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_voice_orphans_total` | Untracked creator-channel orphans needing manual deletion after failed `/create` compensation |
 | `two_bot_dispatch_drops_total{lane}` | Dispatch-lane saturation drops: every event refused because every attempted lane was full. `lane` is one of `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` (see label allowlists below). The `reactions` lane additionally counts per-member fairness refusals: a reaction refused because its member already holds `PER_USER_IN_FLIGHT` reaction slots, even while the lane has free slots. A single-lane refusal counts its lane once; a privileged spill refused by both lanes counts both. Logs sample the first drop per 60 s per runtime, so bursts are O(1) lines with N counter increments. Alert-threshold hook for M2.1 (lands once TOG-18943 unblocks): alert when any lane's drops increase across consecutive keepalive samples; a single drop inside one burst is not paging. `reactions`-lane growth points at a hot member before an undersized lane |
 | `two_bot_internal_actions_total{family,outcome}` | Signed website-action receiver executions by bounded family and outcome. `family` is one of `announcement`, `event`, `settings`, `moderation`, `membership` or `other` (see label allowlists below). `outcome` is `executed` or the refusal class (`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`, `conflict`, `upstream` or `internal`). Every request counts once; replays count on each serve. Refusal warn-summaries stay sampled; this counter is the alertable signal. Alert-threshold hook for M2.1 (lands once TOG-18943 unblocks): alert when refused outcomes increase across consecutive keepalive samples; a single refusal inside one burst is not paging |
+| `two_bot_community_facts_drain_failures_total{reason}` | Warn-and-continue community-facts drain failures in the gateway dispatch worker. `reason` is `error` (the facts writer returned an error) or `timeout` (the drain missed the dispatch deadline), or `other` (see label allowlists below). Each failed dispatch counts once; a committed drain counts nothing. The worker never stalls on this, and the scorecard fails closed on missing coverage. Alert-threshold hook for M2.1 (lands once TOG-18943 unblocks): alert when the counter increases across consecutive scrapes; a single failed drain is not paging |
 
 ## Job coverage and outcomes
 
@@ -174,6 +175,11 @@ as dynamic labels.
   `ReceiverState::terminal` plus the keyless-read and settings/moderation
   success envelopes for executions); no key id, token, body or request bytes
   ever become labels.
+- `two_bot_community_facts_drain_failures_total{reason}` — `reason` is `error`,
+  `timeout` or `other`. Recorded once per failed community-facts drain in
+  `crates/bot/src/gateway.rs` (`apply_dispatch`), in both warn-and-continue
+  arms; the existing warn log lines are unchanged. No error text, SQL or
+  identifier becomes a label.
 - Log fields (coordinated with blocked structured-log work, which owns JSON
   formatting): `voice_event="voice_operation"` with `op`/`outcome`,
   `voice_event="voice_reconcile"` with plan counts,
