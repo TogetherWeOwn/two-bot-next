@@ -80,6 +80,7 @@ class Result:
     name: str
     ok: bool
     reason: str
+    checkpoint_read_failed: bool = False
 
     def line(self):
         return f"{'PASS' if self.ok else 'FAIL'} {self.name}: {self.reason}"
@@ -235,7 +236,8 @@ def run(args, fetch_fn=fetch):
                                       "readyz 503: checkpoint read failed "
                                       f"(gateway_failure durable_gateway:{CHECKPOINT_READ_CLASS}); "
                                       "root cause unverified; require separate reviewed "
-                                      "schema/ACL/connectivity evidence"))
+                                      "schema/ACL/connectivity evidence",
+                                      checkpoint_read_failed=True))
             else:
                 results.append(Result("readyz", False,
                                       f"readyz 503: parked ({', '.join(down)} not ready); "
@@ -255,7 +257,8 @@ def evidence_shape(results, report, expected_sha):
             "build_id": (report or {}).get("build_id"),
             "gateway_failure_class": failure.get("class"),
             "gateway_failure_root_cause": ("unverified"
-                                           if failure.get("class") == CHECKPOINT_READ_CLASS
+                                           if any(result.checkpoint_read_failed
+                                                  for result in results)
                                            else None),
             "expected_sha": expected_sha}
 

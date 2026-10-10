@@ -162,10 +162,9 @@ def health_rows(args, origin, run, fetch_fn):
         "build": ("readyz build identity", "build_revision is the tested revision",
                   "readyz", SIGNATURE_BUILD),
     }
-    failure = (report or {}).get("gateway_failure") or {}
     for result in results:
         name, expected, timing_key, signature = meta[result.name]
-        if result.name == "readyz" and failure.get("class") == health_probe.CHECKPOINT_READ_CLASS:
+        if result.checkpoint_read_failed:
             signature = SIGNATURE_CHECKPOINT_READ
         run.rows.append(Row(name, "pass" if result.ok else "fail", expected, result.reason,
                             started, run.durations.get(timing_key, 0),

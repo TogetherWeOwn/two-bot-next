@@ -271,6 +271,44 @@ class SmokeRunTests(unittest.TestCase):
             self.assertNotIn("SMOKE-READYZ-DB-BEHIND", text)
             self.assertNotIn("migrate before", text)
 
+    def test_contradictory_checkpoint_class_keeps_the_generic_signature(self):
+        for status, gateway, expected in ((200, "down", 503), (503, "ready", 200)):
+            with self.subTest(status=status, gateway=gateway):
+                contradictory = dict(
+                    READY, components=[["process", "ready"], ["gateway", gateway],
+                                       ["database", "ready"], ["token_invalid", "ready"]],
+                    gateway_failure={"phase": "durable_gateway",
+                                     "class": "checkpoint_load_failed",
+                                     "detail": "sensitive-fixture-detail"})
+                code, out = self.drive(health=self.health_fetch(
+                    readyz=(status, {}, json.dumps(contradictory).encode())))
+                self.assertEqual(code, 1)
+                record = self.written()
+                row = self.rows(record)["GET /readyz"]
+                self.assertEqual(record["verdict"]["disposition"], "NEEDS WORK")
+                self.assertEqual(row["result"], "fail")
+                self.assertEqual(row["failure_signature"], smoke.SIGNATURE_READYZ)
+                self.assertIn(f"contradicts the component breakdown (expected {expected})",
+                              row["actual"])
+                self.assertEqual(self.rows(record)["readyz build identity"]["result"], "pass")
+                for text in (out, json.dumps(record)):
+                    self.assertNotIn(smoke.SIGNATURE_CHECKPOINT_READ, text)
+                    self.assertNotIn("checkpoint read failed", text)
+                    self.assertNotIn("root cause unverified", text)
+                    self.assertNotIn("sensitive-fixture-detail", text)
+
+    def test_ready_checkpoint_class_does_not_create_a_failure_signature(self):
+        ready = dict(READY, gateway_failure={"phase": "durable_gateway",
+                                            "class": "checkpoint_load_failed"})
+        code, _ = self.drive(health=self.health_fetch(
+            readyz=(200, {}, json.dumps(ready).encode())))
+        self.assertEqual(code, 0)
+        record = self.written()
+        self.assertEqual(record["verdict"]["disposition"], "PASS")
+        row = self.rows(record)["GET /readyz"]
+        self.assertEqual(row["result"], "pass")
+        self.assertNotIn("failure_signature", row)
+
     def test_build_revision_mismatch_fails(self):
         code, _ = self.drive(extra=("--expected-sha", OTHER_SHA, "--deploy-run-id", "42"))
         self.assertEqual(code, 1)

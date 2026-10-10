@@ -2151,6 +2151,9 @@ pub struct GuildRoomWorker<S, H> {
     ),
     /// When each room started waiting for an unknown display name.
     name_waits: HashMap<Snowflake, u64>,
+    /// The guild's most recent first names, newest last; a new room's seed
+    /// is chosen so its first name repeats none of them.
+    recent_names: VecDeque<String>,
     creations: HashMap<u64, Creation>,
     accepted: HashMap<Snowflake, (u64, u64)>,
     moves: HashMap<Snowflake, JoinTicket>,
@@ -2431,6 +2434,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             status_refusal_logged: false,
             status_outcomes: mpsc::unbounded_channel(),
             name_waits: HashMap::new(),
+            recent_names: VecDeque::new(),
             creations: HashMap::new(),
             accepted: HashMap::new(),
             moves: HashMap::new(),
@@ -2521,6 +2525,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 return false;
             }
         };
+        let seed = self.fresh_name_seed(ticket.creator_id, ticket.member_id, seed);
         let id = self.queue.enqueue(
             self.live.guild_id,
             RoomAction::CreateRoom {

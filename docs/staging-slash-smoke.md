@@ -126,6 +126,10 @@ this proves the build answers readiness and the guild publishes the surface.
 step, not migration drift: a root-cause claim requires separate reviewed
 schema/ACL/connectivity evidence and an independent receipt, as described in
 [the health-contract probe](staging-health-contract-probe.md#checkpoint-read-assertion-not-a-root-cause-diagnosis).
+Only a status-consistent 503 classified by the health probe as a failed
+checkpoint read gets this signature. A contradictory status/breakdown
+keeps `SMOKE-READYZ-NOT-READY` even when the response carries the class;
+an all-ready 200 has no failure signature.
 No probe is allowed to apply a migration or test production.
 
 The record's deploy run id defaults to the `readyz` `build_id` prefix (the build
@@ -159,6 +163,7 @@ on every deploy by the `deploy-staging` gate.
 
 Offline coverage: `scripts/test_staging_smoke_run.py` (live-guild refusal before
 any request, container down, parked, checkpoint-read failure without a root-cause
-claim, mismatched builds, missing
-core surface, foreign or rejected token, token never in output, record schema,
+claim, contradictory status/breakdown with the checkpoint class keeping the
+generic signature, all-ready with the class and no failure signature,
+mismatched builds, missing core surface, foreign or rejected token, token never in output, record schema,
 drift against the command matrix).

@@ -36,9 +36,13 @@ solely from this failure class. See
 
 The allowlisted JSON evidence retains `gateway_failure_class` and the
 failing `readyz` check's observed-step reason. Its additive
-`gateway_failure_root_cause` field is `"unverified"` for this class and
-`null` otherwise; it is never copied from remote cause/error details.
-The probe cannot create the independent root-cause receipt.
+`gateway_failure_root_cause` field is `"unverified"` only when the probe
+classifies a status-consistent 503 with this class as a checkpoint-read
+failure. It is `null` otherwise, including a contradictory status/breakdown
+or an all-ready 200 carrying the class. The class remains an observed
+allowlisted token, not the classified verdict. The cause field is never
+copied from remote cause/error details. The probe cannot create the
+independent root-cause receipt.
 
 **No probe is allowed to apply a migration or test production.** Migration
 execution remains a separate reviewed, governed staging operation, not
@@ -70,8 +74,10 @@ before any request; the all-ready pass with build identity and evidence;
 `--expected-sha` match and mismatch; parked gateway as truthful-not-approval;
 checkpoint-read failure without a root-cause assertion or migration advice;
 unreviewed remote causes/details dropped from output and evidence; unknown
-failure classes refused without echoing details; a 200 that contradicts its
-breakdown; ownership refusals, short breakdowns and non-JSON bodies as
+failure classes refused without echoing details; both contradictory
+status/breakdown directions carrying the checkpoint class without a failed-read
+classification; an all-ready 200 with that class and no cause assertion;
+ownership refusals, short breakdowns and non-JSON bodies as
 not-the-bot; health 503 as not-liveness; transport failures by class;
 redirects observed, never followed.
 
