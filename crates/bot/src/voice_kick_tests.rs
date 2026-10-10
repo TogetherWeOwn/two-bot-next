@@ -1016,13 +1016,7 @@ async fn hostile_reasons_never_echo_in_refusals_errors_or_logs() {
             "{hostile:?} echoed in active-vote refusal: {active_text:?}"
         );
         for text in [repeat_text, active_text] {
-            let folded = text.to_lowercase();
-            for probe in PROBES {
-                assert!(
-                    !folded.contains(&probe.to_lowercase()),
-                    "{hostile:?} probe {probe:?} in refusal: {text:?}"
-                );
-            }
+            assert_no_reason_echo(hostile, &text, "refusal");
         }
     }
 }
