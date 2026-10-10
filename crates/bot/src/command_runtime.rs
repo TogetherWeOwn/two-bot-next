@@ -154,11 +154,24 @@ const LANE_PRIVILEGED: usize = 3;
 const LANE_BUSY: usize = 4;
 pub(crate) const LANE_REACTIONS: usize = 5;
 
+/// Seconds between saturation `warn!` lines per runtime (TOG-19878). The
+/// drop counter increments on every event; the log samples the first drop in
+/// each window so a burst is O(1) lines.
+const SATURATION_LOG_WINDOW_SECS: u64 = 60;
+
 #[derive(Default)]
 struct DispatchTasks {
     stopped: bool,
     lanes: [Vec<tokio::task::AbortHandle>; DISPATCH_LIMITS.len()],
+    /// Per-lane saturation drops (test-visible mirror of the global
+    /// `two_bot_dispatch_drops_total{lane}` counter, which `spawn_first`
+    /// increments alongside).
+    drops: [u64; DISPATCH_LIMITS.len()],
+    last_drop_log: Option<std::time::Instant>,
 }
+
+// Lane labels stay in `DISPATCH_LIMITS` order with the global metric allowlist.
+const _: () = assert!(two_bot_core::metrics::DISPATCH_LANES.len() == DISPATCH_LIMITS.len());
 
 /// Cancels admitted work on gateway exit, including supervisor cancellation.
 /// Interrupted channel effects retain their durable claims for reconciliation.
@@ -641,7 +654,10 @@ impl CommandRuntime {
         self.spawn_first(&[lane], work)
     }
 
-    /// Admit `work` into the first of `lanes` that has room.
+    /// Admit `work` into the first of `lanes` that has room. A drop with
+    /// every attempted lane full increments each attempted lane's saturation
+    /// counter (single-lane calls stay 1:1; the privileged spill pair counts
+    /// both lanes) and emits at most one `warn!` per 60 s per runtime.
     fn spawn_first(
         &self,
         lanes: &[usize],
@@ -660,7 +676,22 @@ impl CommandRuntime {
                 return true;
             }
         }
-        warn!(?lanes, "command dispatch saturated; event not admitted");
+        for &lane in lanes {
+            tasks.drops[lane] = tasks.drops[lane].saturating_add(1);
+            two_bot_core::metrics::global()
+                .dispatch_drop(two_bot_core::metrics::DISPATCH_LANES[lane]);
+        }
+        let now = std::time::Instant::now();
+        let due = tasks
+            .last_drop_log
+            .is_none_or(|at| now.duration_since(at).as_secs() >= SATURATION_LOG_WINDOW_SECS);
+        if due {
+            tasks.last_drop_log = Some(now);
+            warn!(
+                ?lanes,
+                "command dispatch saturated; event not admitted (sampled; see two_bot_dispatch_drops_total)"
+            );
+        }
         false
     }
 
@@ -778,6 +809,14 @@ impl CommandRuntime {
         self.spawn(lane, async move {
             tokio::time::sleep(duration).await;
         })
+    }
+
+    /// Test-only saturation count for `lane`: every `spawn_first` drop
+    /// increments it alongside the global metric, so the pin stays
+    /// deterministic under parallel suites that share the global registry.
+    #[cfg(test)]
+    pub(crate) fn dispatch_drops_total(&self, lane: usize) -> u64 {
+        self.tasks.lock().expect("command task scope").drops[lane]
     }
 
     #[cfg(test)]
