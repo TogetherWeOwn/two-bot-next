@@ -223,21 +223,23 @@ network incident.
 The SQLx pool sat at its maximum with zero idle connections for three
 consecutive keepalive samples. This is pool exhaustion, a proxy for DB trouble;
 there is no DB error counter yet. It means every checkout is held — new queries
-wait rather than fail fast — not proof that Neon itself is down (pool gauges
-sample SQLx bookkeeping, not DB reachability).
+wait rather than fail fast — not proof that the database itself is down (pool
+gauges sample SQLx bookkeeping, not DB reachability).
 
-First response: check Neon status for the staging branch before touching the
-bot; then look at recent deploys for a change that could hold checkouts open
-(new query path, widened job fan-out, a job whose cadence no longer matches its
-duration). Compare against the scrape window — a short burst that self-clears
-across the next samples is not exhaustion. Do not run SQL probes against
-staging or production, add grants, or restart the container to "free" the
-pool; a replacement restarts the shard without fixing a leak.
+First response: check the affected provider's status (PlanetScale for
+production, Neon for staging) before touching the bot; then look at recent
+deploys for a change that could hold checkouts open (new query path, widened
+job fan-out, a job whose cadence no longer matches its duration). Compare
+against the scrape window — a short burst that self-clears across the next
+samples is not exhaustion. Do not run SQL probes against staging or
+production, add grants, or restart the container to "free" the pool; a
+replacement restarts the shard without fixing a leak.
 
 Escalate when the streak persists after the suspect deploy is identified,
 when exhaustion coincides with gateway `starting`/`down` or job-failure
-alerts, or when the Neon dashboard shows trouble on the staging branch — the
-fix then belongs to the dependency owner, not a redeploy.
+alerts, or when the affected provider's dashboard shows trouble on the
+deployed branch — the fix then belongs to the dependency owner, not a
+redeploy.
 
 #### Alert: DB errors
 
@@ -249,15 +251,17 @@ A counter reset (process restart) skips the window rather than firing, and a
 slow trickle below threshold stays silent — sustained low-rate failures
 surface instead through `job_consecutive_failures`.
 
-First response: check Neon status for the staging branch before touching the
-bot; then correlate with the `op` label and recent deploys (a new query path
-or migration can explain a fresh error burst). Do not run SQL probes against
-staging or production, add grants, or restart the container to "clear" the
-errors; a replacement restarts the shard without fixing the failing writes.
+First response: check the affected provider's status (PlanetScale for
+production, Neon for staging) before touching the bot; then correlate with
+the `op` label and recent deploys (a new query path or migration can explain
+a fresh error burst). Do not run SQL probes against staging or production,
+add grants, or restart the container to "clear" the errors; a replacement
+restarts the shard without fixing the failing writes.
 
 Escalate when the burst repeats across windows, when it coincides with pool
-saturation or job-failure alerts, or when the Neon dashboard shows trouble on
-the staging branch — the fix then belongs to the dependency owner.
+saturation or job-failure alerts, or when the affected provider's dashboard
+shows trouble on the deployed branch — the fix then belongs to the dependency
+owner.
 
 #### Alert: send admission blocked
 

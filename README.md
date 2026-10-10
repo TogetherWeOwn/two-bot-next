@@ -36,7 +36,7 @@ failures. See also [backup procedures](docs/backup.md) and
 - **`wrangler/`**: Cloudflare Worker + Durable Object wrapper routes HTTP to a
   singleton `lite` Container and keeps it alive on a 60-second schedule. The Rust
   process owns the long-lived Discord gateway connection; the Worker does not.
-- **Shared Neon Postgres**: the bot and two-web-next use the shared database
+- **Shared Postgres (PlanetScale in production, Neon for staging)**: the bot and two-web-next use the shared database
   contract. Schema/cutover work lives in `sql/` and the cutover crate, not a second
   isolated website datastore.
 
