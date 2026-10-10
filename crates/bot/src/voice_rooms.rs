@@ -1104,6 +1104,10 @@ pub struct GuildSnapshot {
     pub channels: Vec<Channel>,
     pub members: Vec<VoiceMember>,
     pub bot: BotAccess,
+    /// Guild-scoped role IDs per member, for vote-kick target-authority
+    /// resolution (VK-01). A missing entry means the lookup is unavailable and
+    /// the vote must fail closed. Ordinary members carry an empty list.
+    pub member_roles: HashMap<Snowflake, Vec<Snowflake>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1143,6 +1147,9 @@ pub(crate) struct LiveState {
     channels: HashMap<Snowflake, Channel>,
     channel_revisions: HashMap<Snowflake, u64>,
     members: HashMap<Snowflake, MemberState>,
+    /// Guild-scoped role IDs per member, mirrored from the gateway cache.
+    /// Missing entries fail closed for target-authority checks.
+    member_roles: HashMap<Snowflake, Vec<Snowflake>>,
     bot: Option<BotAccess>,
     protected_channels: HashSet<Snowflake>,
     /// Continuous human-empty evidence in this authoritative gateway session.
@@ -1264,6 +1271,35 @@ impl LiveState {
             .collect();
         ids.sort_unstable();
         ids
+    }
+
+    /// Guild-base permissions for one member (VK-01): guild owner and
+    /// Administrator resolve to all bits; channel overwrites are never
+    /// consulted. `None` means the guild-role snapshot or the member's role
+    /// list is incomplete, and the caller must fail closed.
+    fn guild_member_permissions(&self, guild: Snowflake, member: Snowflake) -> Option<Permissions> {
+        let bot = self.bot.as_ref()?;
+        let roles = self.member_roles.get(&member)?;
+        let member_roles: Vec<Id<RoleMarker>> = roles.iter().map(|id| Id::new(*id)).collect();
+        effective_permissions(
+            guild,
+            bot.guild_owner_id,
+            member,
+            &member_roles,
+            &bot.roles,
+            &[],
+        )
+    }
+
+    /// Whether the target holds effective Kick Members or Administrator in
+    /// this guild. `None` means the lookup is unavailable: no vote, no
+    /// disconnect, no permission edit.
+    fn target_privileged(&self, guild: Snowflake, target: Snowflake) -> Option<bool> {
+        let permissions = self.guild_member_permissions(guild, target)?;
+        Some(
+            permissions.contains(Permissions::KICK_MEMBERS)
+                || permissions.contains(Permissions::ADMINISTRATOR),
+        )
     }
 
     /// Current occupants of one room as a V2 ownership snapshot. Unknown
@@ -1403,6 +1439,7 @@ impl LiveGuild {
                 )
             })
             .collect();
+        live.member_roles = snapshot.member_roles;
         live.bot = Some(snapshot.bot);
         live.empty_since.clear();
         let channels: Vec<_> = live.channels.keys().copied().collect();
@@ -1487,6 +1524,20 @@ impl LiveGuild {
     /// affect the next guard evaluation.
     pub fn refresh_bot(&self, access: BotAccess) {
         self.write_state().bot = Some(access);
+    }
+
+    /// Track one member's guild-scoped roles for VK-01 target-authority checks.
+    /// `None` removes the entry so the next check fails closed.
+    pub fn set_member_roles(&self, member: Snowflake, roles: Option<Vec<Snowflake>>) {
+        let mut live = self.write_state();
+        match roles {
+            Some(roles) => {
+                live.member_roles.insert(member, roles);
+            }
+            None => {
+                live.member_roles.remove(&member);
+            }
+        }
     }
 
     /// Validate logging targets against the live cache, not resolved picker data.
@@ -2920,16 +2971,22 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     fn kick_facts(
         &self,
         room_id: Snowflake,
-    ) -> Result<(Snowflake, Snowflake, Vec<Snowflake>), KickRefusal> {
+        target_id: Snowflake,
+    ) -> Result<(Snowflake, Snowflake, Vec<Snowflake>, Option<bool>), KickRefusal> {
         let live = self.live.read_state();
         if !live.ready || self.halted {
             return Err(KickRefusal::Unavailable);
         }
         let room = self.rooms.get(&room_id).ok_or(KickRefusal::NotARoom)?;
+        // Guild-scoped authority in this worker's guild: the target's effective
+        // Kick Members / Administrator from guild roles only, never channel
+        // overwrites or another guild. `None` fails closed downstream.
+        let privileged = live.target_privileged(self.live.guild_id, target_id);
         Ok((
             room.owner_id,
             room.original_creator_id,
             live.occupants(room_id),
+            privileged,
         ))
     }
 
@@ -3089,13 +3146,15 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         target_id: Snowflake,
         now_ms: u64,
     ) -> Result<VoteKickUpdate, KickRefusal> {
-        let (owner_id, original_creator_id, occupants) = self.kick_facts(room_id)?;
+        let (owner_id, original_creator_id, occupants, target_privileged) =
+            self.kick_facts(room_id, target_id)?;
         let facts = VoteRoomFacts {
             guild_id: self.live.guild_id,
             room_id,
             owner_id,
             original_creator_id,
             occupants: &occupants,
+            target_privileged,
         };
         let update = self
             .votes
@@ -3120,13 +3179,15 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .vote_refs
             .get(&vote_id)
             .ok_or(KickRefusal::Vote(VoteKickError::UnknownVote))?;
-        let (owner_id, original_creator_id, occupants) = self.kick_facts(reference.room_id)?;
+        let (owner_id, original_creator_id, occupants, target_privileged) =
+            self.kick_facts(reference.room_id, reference.target_id)?;
         let facts = VoteRoomFacts {
             guild_id: self.live.guild_id,
             room_id: reference.room_id,
             owner_id,
             original_creator_id,
             occupants: &occupants,
+            target_privileged,
         };
         let update = self
             .votes
@@ -3148,8 +3209,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
         let mut finished = Vec::new();
         for reference in self.active_votes.clone() {
-            let (owner_id, original_creator_id, occupants) =
-                match self.kick_facts(reference.room_id) {
+            let (owner_id, original_creator_id, occupants, target_privileged) =
+                match self.kick_facts(reference.room_id, reference.target_id) {
                     Ok(facts) => facts,
                     // Evidence went stale mid-pass: leave the vote untouched.
                     Err(KickRefusal::Unavailable) => continue,
@@ -3162,6 +3223,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 owner_id,
                 original_creator_id,
                 occupants: &occupants,
+                target_privileged,
             };
             // A room that is gone has no occupants, so the core cancels the vote.
             let Ok(update) = self.votes.refresh(reference, facts, &ActorClock(now_ms)) else {
@@ -4187,15 +4249,28 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     .live
                     .read_state()
                     .permissions(self.live.guild_id, channel_id);
+                // Recheck guild authority immediately before enforcement (VK-01):
+                // a promotion granted after the vote passed, or an unavailable
+                // guild-authority lookup, must produce no Discord write.
+                // Statement-temporary guards: no named `RwLockReadGuard`
+                // (`!Send`) is held across the Discord awaits below, so this
+                // future stays `Send` for the actor spawn.
+                let privileged = self
+                    .live
+                    .read_state()
+                    .target_privileged(self.live.guild_id, member_id);
                 // What a clean `Ok` below means; each skip or partial write
                 // overrides it so the audit row says what Discord was asked.
                 let mut applied = EnforcementOutcome::ConnectDeniedAndDisconnected;
                 let result = if self.rooms.get(&channel_id).is_none_or(|room| {
                     member_id == room.owner_id || member_id == room.original_creator_id
-                }) {
+                }) || privileged != Some(false)
+                {
                     // Either the room is gone and its overwrites went with it, or
                     // ownership changed after the vote passed and the target is now
-                    // the owner or original creator: write nothing.
+                    // the owner, original creator, or a Kick Members /
+                    // Administrator holder (or the lookup is unavailable): write
+                    // nothing.
                     applied = if self.rooms.contains_key(&channel_id) {
                         EnforcementOutcome::SkippedTargetProtected
                     } else {
@@ -5351,6 +5426,20 @@ where
                 };
                 let member_id = update.user_id.get();
                 let bot = update.member.as_ref().map(|member| member.user.bot);
+                // Prefer the event's member roles when present; otherwise fall
+                // back to the cache. A member with no known roles stays absent
+                // and fails closed on the next authority check.
+                let roles: Option<Vec<Snowflake>> = update
+                    .member
+                    .as_ref()
+                    .map(|member| member.roles.iter().map(|id| id.get()).collect())
+                    .or_else(|| {
+                        let guild_key = Id::new(guild_id);
+                        let user_key = Id::new(member_id);
+                        cache
+                            .member(guild_key, user_key)
+                            .map(|member| member.roles().iter().map(|id| id.get()).collect())
+                    });
                 self.voice_frame(
                     guild_id,
                     member_id,
@@ -5358,6 +5447,9 @@ where
                     bot,
                     display_name(cache, guild_id, member_id),
                 );
+                if let Some(actor) = self.live_actor(guild_id) {
+                    actor.live.set_member_roles(member_id, roles);
+                }
             }
             Event::ChannelCreate(created) => {
                 if let Some(guild_id) = created.guild_id.map(|id| id.get()) {
@@ -5399,14 +5491,30 @@ where
                 }
             }
             Event::MemberUpdate(updated) => {
+                let guild_id = updated.guild_id.get();
                 if cache
                     .current_user()
                     .is_some_and(|bot| bot.id == updated.user.id)
                 {
-                    let guild_id = updated.guild_id.get();
                     if let Some(access) = bot_access_from_cache(cache, guild_id) {
                         self.update_live(guild_id, |live| live.refresh_bot(access));
                     }
+                }
+                // Keep VK-01 target authority current: a role granted after a
+                // vote started must be observed before enforcement.
+                let member_id = updated.user.id.get();
+                let roles: Option<Vec<Snowflake>> = {
+                    let guild_key = Id::new(guild_id);
+                    let user_key = Id::new(member_id);
+                    cache
+                        .member(guild_key, user_key)
+                        .map(|member| member.roles().iter().map(|id| id.get()).collect())
+                };
+                // Prefer the event's role list when the cache has not caught up.
+                let roles =
+                    roles.or_else(|| Some(updated.roles.iter().map(|id| id.get()).collect()));
+                if let Some(actor) = self.live_actor(guild_id) {
+                    actor.live.set_member_roles(member_id, roles);
                 }
             }
             // A warm RESUME replays missed dispatches before RESUMED; only then
@@ -5619,10 +5727,24 @@ fn snapshot_from_cache(cache: &DefaultInMemoryCache, guild_id: Snowflake) -> Opt
             })
         })
         .collect();
+    // Guild-scoped member roles for VK-01 target-authority checks. Only voice
+    // members are needed (a vote target must be an occupant); a member the
+    // cache has not populated yet stays absent and fails closed.
+    let mut member_roles = HashMap::new();
+    for member in &members {
+        let user_id = Id::new(member.member_id);
+        if let Some(cached) = cache.member(guild_key, user_id) {
+            member_roles.insert(
+                member.member_id,
+                cached.roles().iter().map(|id| id.get()).collect(),
+            );
+        }
+    }
     Some(GuildSnapshot {
         channels,
         members,
         bot: bot_access_from_cache(cache, guild_id)?,
+        member_roles,
     })
 }
 
@@ -7022,14 +7144,177 @@ fn parse_kick_target(options: &[CommandDataOption]) -> Option<Snowflake> {
     })
 }
 
+/// Public vote-kick reason bound (gate VK-04): at most this many characters of
+/// initiator-supplied text ever reach the ballot message. Overlong input is cut
+/// at parse time and again after sanitizing at render, so the wire text always
+/// fits this bound; the ballot never grows with the input length.
+const VOTE_KICK_PUBLIC_REASON_LIMIT: usize = 512;
+
+/// Render initiator-supplied vote-kick text as bounded plain text for the
+/// public ballot (gate VK-04). The ballot goes out under the bot's name, so a
+/// hostile reason must not become a ping, clickable link, embed or formatted
+/// endorsement:
+///
+/// - `@everyone`/`@here` (including zero-width-split obfuscation) are broken
+///   with the shared mention neutralizer; `<@`, `<#`, `<:` and `<a:` pills are
+///   split with a zero-width space so they render literally instead of tagging
+///   a user, role, custom emoji (including animated `<a:name:id>`) or channel.
+/// - `://` URL schemes, a word-boundary `www.` prefix (matched
+///   case-insensitively, so `WWW.` cannot evade the scan) and the dot of
+///   schemeless bare domains (`discord.gg/`, `evil.com/x`) are split so bare
+///   and disguised links are neither clickable nor link-preview embeds;
+///   `SUPPRESS_EMBEDS` on the ballot shell is the second embed fence.
+/// - Newlines are folded to spaces, so no reason text can start line-leading
+///   Discord markup (headings, quotes, code fences, lists).
+/// - Inline markdown characters are backslash-escaped; Discord renders the
+///   literal character with no formatting.
+///
+/// Plain text without any of these patterns passes through byte-identical.
+/// Applied once at the ballot render boundary; the escaped output is cut to
+/// [`VOTE_KICK_PUBLIC_REASON_LIMIT`] characters so the bound holds on the wire.
+#[must_use]
+fn sanitize_vote_reason(raw: &str) -> String {
+    let mut single_line = String::with_capacity(raw.len());
+    for chunk in raw.split(['\r', '\n']) {
+        if !single_line.is_empty() {
+            single_line.push(' ');
+        }
+        single_line.push_str(chunk);
+    }
+    let neutralized = two_bot_core::message_safety::neutralize_mentions(&single_line);
+    let pills = neutralized
+        .replace("<@", "<\u{200b}@")
+        .replace("<#", "<\u{200b}#")
+        .replace("<:", "<\u{200b}:")
+        .replace("<a:", "<\u{200b}a:");
+    let links = pills.replace("://", ":\u{200b}//");
+    let www = split_www_prefix(&links);
+    let www = split_bare_domain_dots(&www);
+    let mut escaped = String::with_capacity(www.len());
+    for ch in www.chars() {
+        if matches!(ch, '\\' | '`' | '*' | '_' | '~' | '|' | '[' | ']') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+        .chars()
+        .take(VOTE_KICK_PUBLIC_REASON_LIMIT)
+        .collect()
+}
+
+/// Split a word-boundary `www.` link prefix with a zero-width space so Discord
+/// does not linkify it. Matched case-insensitively, preserving the original
+/// casing: an uppercase `WWW.` is just as clickable. A plain replace would
+/// also rewrite the tail of words like "awww."; only a non-alphanumeric
+/// boundary (or the start) counts.
+fn split_www_prefix(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = find_www_dot(rest) {
+        let (head, tail) = rest.split_at(pos);
+        let boundary = head
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !ch.is_alphanumeric());
+        out.push_str(head);
+        // `tail` starts with four ASCII bytes (`www.` in any case), so these
+        // byte indices are always character boundaries.
+        out.push_str(&tail[..3]);
+        if boundary {
+            out.push('\u{200b}');
+        }
+        out.push('.');
+        rest = &tail[4..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Byte offset of a case-insensitive `www.` in `text`, if any.
+fn find_www_dot(text: &str) -> Option<usize> {
+    text.as_bytes().windows(4).position(|w| {
+        w[0].eq_ignore_ascii_case(&b'w')
+            && w[1].eq_ignore_ascii_case(&b'w')
+            && w[2].eq_ignore_ascii_case(&b'w')
+            && w[3] == b'.'
+    })
+}
+
+/// Bare-domain TLDs whose dot is split so schemeless `host.tld[/path]` text
+/// (including `discord.gg/` invite links) is not linkified. Mirrors the
+/// `BARE_TLDS` allowlist in `crates/core/src/automod.rs`: an allowlist, not
+/// "any dot followed by letters", keeps version strings (`v1.2`) and dotted
+/// filenames byte-identical.
+const BARE_LINK_TLDS: [&str; 14] = [
+    "app", "ca", "co", "com", "dev", "gg", "io", "me", "net", "org", "tv", "uk", "us", "xyz",
+];
+
+/// Split the dot of a schemeless bare domain (`evil.com/x` renders as
+/// `evil.<ZWSP>com/x`) with a zero-width space so Discord does not linkify it.
+/// Only a dot preceded by an alphanumeric label character and followed by an
+/// allowlisted TLD (matched case-insensitively) plus a non-alphanumeric
+/// boundary or the end of the string counts.
+fn split_bare_domain_dots(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(dot) = rest.find('.') {
+        let (head, tail) = rest.split_at(dot);
+        // `tail[0]` is the ASCII dot, so `tail[1..]` starts on a boundary.
+        let after_dot = &tail[1..];
+        let mut matched = 0usize;
+        if head
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch.is_alphanumeric())
+        {
+            for tld in BARE_LINK_TLDS {
+                let Some(prefix) = after_dot.get(..tld.len()) else {
+                    continue;
+                };
+                if !prefix.eq_ignore_ascii_case(tld) {
+                    continue;
+                }
+                // The match is ASCII, so this index is a character boundary.
+                let boundary = after_dot[tld.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|ch| !ch.is_alphanumeric());
+                if boundary {
+                    matched = tld.len();
+                    break;
+                }
+            }
+        }
+        out.push_str(head);
+        out.push('.');
+        if matched > 0 {
+            out.push('\u{200b}');
+            out.push_str(&after_dot[..matched]);
+            rest = &after_dot[matched..];
+        } else {
+            rest = after_dot;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The optional vote reason, trimmed and length-capped like the definition.
+/// The ballot render ([`sanitize_vote_reason`]) re-applies
+/// [`VOTE_KICK_PUBLIC_REASON_LIMIT`] after escaping, so overlong input is cut
+/// twice and the wire text always fits the documented bound.
 fn parse_kick_reason(options: &[CommandDataOption]) -> Option<String> {
     options
         .iter()
         .find(|option| option.name == "reason")
         .and_then(|option| match &option.value {
             CommandOptionValue::String(value) => {
-                let reason: String = value.trim().chars().take(512).collect();
+                let reason: String = value
+                    .trim()
+                    .chars()
+                    .take(VOTE_KICK_PUBLIC_REASON_LIMIT)
+                    .collect();
                 (!reason.is_empty()).then_some(reason)
             }
             _ => None,
@@ -7262,7 +7547,10 @@ fn vote_message(
         "<@{target}> — <@{initiator}> started a vote to disconnect them from this voice room."
     )];
     if let Some(reason) = reason {
-        lines.push(format!("Reason: {reason}"));
+        let safe = sanitize_vote_reason(reason);
+        if !safe.is_empty() {
+            lines.push(format!("Reason: {safe}"));
+        }
     }
     lines.push(format!(
         "Vote with the buttons: {}/{} needed. Not voting counts as No. The vote ends in 2 minutes.",
@@ -7333,6 +7621,10 @@ fn ballot_response(
         kind,
         data: Some(InteractionResponseData {
             content: Some(content.to_owned()),
+            // Ballots never carry embeds: suppress link previews so a reason
+            // URL that survived sanitizing still raises no embed. Sanitizing
+            // already splits `://`, so this is the second fence (gate VK-04).
+            flags: Some(MessageFlags::SUPPRESS_EMBEDS),
             allowed_mentions: Some(AllowedMentions {
                 parse: Vec::new(),
                 users: vec![Id::<UserMarker>::new(target)],
@@ -7364,8 +7656,18 @@ fn kick_refusal_text(refusal: &KickRefusal) -> &'static str {
         KickRefusal::Vote(VoteKickError::ProtectedTarget) => {
             "The room owner and original creator cannot be voted out."
         }
+        KickRefusal::Vote(VoteKickError::PrivilegedTarget) => "That member cannot be voted out.",
+        KickRefusal::Vote(VoteKickError::AuthorityUnavailable) => {
+            "Could not verify that member's permissions. Try again shortly."
+        }
         KickRefusal::Vote(VoteKickError::ActiveVoteExists) => {
             "A vote is already active for that member."
+        }
+        KickRefusal::Vote(VoteKickError::Cooldown) => {
+            "A recent vote against that member is in cooldown. Try again shortly."
+        }
+        KickRefusal::Vote(VoteKickError::InitiatorLimited) => {
+            "You have started too many votes recently. Try again shortly."
         }
         KickRefusal::Vote(VoteKickError::ReusedVoteId) => {
             "That vote was already started. Try again."

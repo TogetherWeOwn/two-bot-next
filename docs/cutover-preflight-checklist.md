@@ -126,7 +126,7 @@ staging or production.
   action are announced with the private-detail and public-notice split in
   the communication template.
 
-Source: [cutover.md § Registry swap](cutover.md#registry-swap-first-boot-and-go-no-go)
+Source: [cutover.md § Registry swap](cutover.md#registry-swap-first-boot-and-gono-go)
 (GO list and abort list);
 [production-deploy.md](production-deploy.md) 48-hour watch log
 rollback-decision rows;

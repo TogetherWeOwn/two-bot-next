@@ -127,6 +127,32 @@ mod tests {
     }
 
     #[test]
+    fn reaction_dispatches_increment_named_labels_not_other() {
+        // Self-role reactions ride their own bounded lane; the observer must
+        // count the Discord dispatch names the bot actually receives
+        // (`GUILD_MESSAGE_REACTIONS` intent, `ReactionAdd`/`ReactionRemove`
+        // handling) under their own labels instead of `other`.
+        let metrics = metrics::Metrics::default();
+        let mut observer = Observer::default();
+        observer.observe_text(
+            r#"{"op":0,"t":"MESSAGE_REACTION_ADD","s":9,"d":{}}"#,
+            None,
+            &metrics,
+        );
+        observer.observe_text(
+            r#"{"op":0,"t":"MESSAGE_REACTION_REMOVE","s":10,"d":{}}"#,
+            None,
+            &metrics,
+        );
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_gateway_events_total{event=\"MESSAGE_REACTION_ADD\"} 1\n"));
+        assert!(
+            text.contains("two_bot_gateway_events_total{event=\"MESSAGE_REACTION_REMOVE\"} 1\n")
+        );
+        assert!(text.contains("two_bot_gateway_events_total{event=\"other\"} 0\n"));
+    }
+
+    #[test]
     fn dispatch_commit_records_session_checkpoint_success() {
         // DispatchTimer commits durable gateway checkpoints under the stable
         // `session_checkpoint` job label. Supervisor outcomes (TOG-11144)
