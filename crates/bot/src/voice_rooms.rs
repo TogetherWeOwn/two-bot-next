@@ -752,6 +752,16 @@ pub trait RoomWrites: Send + Sync {
         channel: Snowflake,
         guard: WriteGuard,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// Bulk channel reorder (`PATCH /guilds/{id}/channels`) run before a
+    /// create that needs a free position. Writers without one accept it.
+    fn reorder_channels(
+        &self,
+        guild: Snowflake,
+        positions: &[(Snowflake, u64)],
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send {
+        let _ = (guild, positions);
+        async { Ok(()) }
+    }
     /// V4 vote-kick enforcement: disconnect the member from voice
     /// (`channel_id: null`); 404 (already left) is success.
     fn disconnect(
@@ -995,6 +1005,14 @@ impl RoomWrites for RoomHttp {
 
     async fn rename(&self, channel: Snowflake, name: &str) -> Result<(), RoomHttpError> {
         self.rename_room(channel, name).await
+    }
+
+    async fn reorder_channels(
+        &self,
+        guild: Snowflake,
+        positions: &[(Snowflake, u64)],
+    ) -> Result<(), RoomHttpError> {
+        RoomHttp::reorder_channels(self, guild, positions).await
     }
 
     fn detached_rename(&self, channel: Snowflake, name: &str) -> Option<DetachedRename> {
@@ -1848,6 +1866,17 @@ impl LiveGuild {
         })
     }
 
+    /// Apply a bulk reorder Discord accepted, before its CHANNEL_UPDATEs
+    /// arrive, so the next placement plans from the real positions.
+    pub fn set_channel_positions(&self, positions: &[(Snowflake, u64)]) {
+        let mut live = self.write_state();
+        for (id, position) in positions {
+            if let Some(channel) = live.channels.get_mut(id) {
+                channel.position = i32::try_from(*position).ok();
+            }
+        }
+    }
+
     pub fn upsert_channel(&self, channel: Channel) {
         if channel.guild_id.map(Id::get) == Some(self.guild_id) {
             let mut live = self.write_state();
@@ -2525,7 +2554,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 return false;
             }
         };
-        let seed = self.fresh_name_seed(ticket.creator_id, ticket.member_id, seed);
+        // Create the room under its template name: the later name pass then
+        // finds it unchanged, so most rooms never spend a rename.
+        let (seed, template_name) = self.first_room_name(ticket.creator_id, ticket.member_id, seed);
+        let name = match template_name {
+            Some(template_name) => {
+                metrics::global().voice_name("created_with_template");
+                template_name
+            }
+            None => name,
+        };
         let id = self.queue.enqueue(
             self.live.guild_id,
             RoomAction::CreateRoom {
@@ -4004,6 +4042,28 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         }
                     },
                 };
+                let mut attributes = attributes;
+                if !attributes.respace.is_empty() {
+                    let respace = std::mem::take(&mut attributes.respace);
+                    match self
+                        .http
+                        .reorder_channels(self.live.guild_id, &respace)
+                        .await
+                    {
+                        Ok(()) => self.live.set_channel_positions(&respace),
+                        // Refused: nothing moved, so tie with the channel
+                        // above the slot, or take no position.
+                        Err(
+                            RoomHttpError::RateLimited { .. }
+                            | RoomHttpError::Rejected { .. }
+                            | RoomHttpError::AccessDenied
+                            | RoomHttpError::InvalidRequest,
+                        ) => attributes.position = attributes.fallback_position,
+                        // Unknown: the reorder may have landed, so neither
+                        // the old nor the new positions are safe to use.
+                        Err(_) => attributes.position = None,
+                    }
+                }
                 let guard = self.live.join_guard(creation.ticket);
                 match self
                     .http
@@ -4759,23 +4819,37 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 self.dispatch_join(action, now_ms, started).await;
             }
             RoomAction::RenameRoom { channel_id, name } => {
-                let valid = {
+                let skip = {
                     let live = self.live.read_state();
-                    self.rooms.contains_key(&channel_id)
-                        && self.desired_names.get(&channel_id) == Some(&name)
-                        && live
-                            .channels
-                            .get(&channel_id)
-                            .is_some_and(|c| c.name.as_deref() != Some(&name))
-                        && can_manage_room(live.permissions(self.live.guild_id, channel_id))
+                    match live.channels.get(&channel_id) {
+                        _ if !self.rooms.contains_key(&channel_id)
+                            || self.desired_names.get(&channel_id) != Some(&name) =>
+                        {
+                            Some("rename_stale")
+                        }
+                        None => Some("rename_unseen"),
+                        Some(channel) if channel.name.as_deref() == Some(&name) => {
+                            Some("rename_stale")
+                        }
+                        Some(_)
+                            if !can_manage_room(
+                                live.permissions(self.live.guild_id, channel_id),
+                            ) =>
+                        {
+                            Some("rename_no_access")
+                        }
+                        Some(_) => None,
+                    }
                 };
-                if !valid {
+                if let Some(reason) = skip {
+                    metrics::global().voice_name(reason);
                     self.queue.mark_succeeded(&action);
                     return true;
                 }
                 // One rename per channel at a time: a newer name waits for
                 // the outcome of the one still running.
                 if self.renames_in_flight.contains_key(&channel_id) {
+                    metrics::global().voice_name("rename_held");
                     self.queue.mark_succeeded(&action);
                     self.rename_retries.insert(
                         channel_id,
@@ -4783,6 +4857,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     );
                     return true;
                 }
+                metrics::global().voice_name("rename_sent");
                 let result = match self.http.detached_rename(channel_id, &name) {
                     Some(request) => {
                         let mut task = tokio::spawn(request);
@@ -8486,6 +8561,8 @@ async fn execute_create<S: RoomPersistence, H: RoomWrites>(
         nsfw: false,
         user_limit: 0,
         position: None,
+        respace: Vec::new(),
+        fallback_position: None,
         overwrites: Vec::new(),
     };
     let always: WriteGuard = Arc::new(|| true);

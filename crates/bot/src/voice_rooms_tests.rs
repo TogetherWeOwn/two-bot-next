@@ -712,6 +712,12 @@ struct Http {
     slow_status: Mutex<Option<u64>>,
     /// Scripted failures for the next status writes.
     status_errors: Mutex<VecDeque<RoomHttpError>>,
+    /// Scripted outcomes for bulk channel reorders, oldest first, and the
+    /// reorders sent (sorted by channel id).
+    reorder_errors: Mutex<VecDeque<RoomHttpError>>,
+    reorders: Mutex<Vec<Vec<(u64, u64)>>>,
+    /// When set, a created channel reports the position it was created at.
+    echo_positions: Mutex<bool>,
 }
 
 impl Http {
@@ -746,6 +752,9 @@ impl Http {
             before_limit: None,
             overwrites_gate: None,
             limit_gate: None,
+            reorder_errors: Mutex::new(VecDeque::new()),
+            reorders: Mutex::new(Vec::new()),
+            echo_positions: Mutex::new(false),
             slow_renames: Mutex::new(None),
             slow_status: Mutex::new(None),
             status_errors: Mutex::new(VecDeque::new()),
@@ -785,6 +794,10 @@ impl RoomWrites for Http {
             .unwrap()
             .push(attributes.clone());
         let mut result = channel(id, 2, attributes.parent_id);
+        result.name = Some(name.to_owned());
+        if *self.echo_positions.lock().unwrap() {
+            result.position = attributes.position.and_then(|p| i32::try_from(p).ok());
+        }
         result.permission_overwrites = Some(attributes.overwrites.clone());
         if let Some(hook) = &self.after_create {
             hook();
@@ -916,6 +929,19 @@ impl RoomWrites for Http {
         }))
     }
 
+    async fn reorder_channels(
+        &self,
+        _: u64,
+        positions: &[(u64, u64)],
+    ) -> Result<(), RoomHttpError> {
+        let mut sorted = positions.to_vec();
+        sorted.sort_unstable();
+        self.reorders.lock().unwrap().push(sorted);
+        match self.reorder_errors.lock().unwrap().pop_front() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
     async fn rename(&self, channel: u64, name: &str) -> Result<(), RoomHttpError> {
         self.trace
             .lock()
@@ -3551,6 +3577,21 @@ fn fixture_policy(words: &[&str]) -> AutomodPolicy {
     AutomodPolicy {
         bad_words: words.iter().map(ToString::to_string).collect(),
         ..AutomodPolicy::default()
+    }
+}
+
+#[test]
+fn possessive_matches_auto_voice_for_names_ending_in_s() {
+    // Auto-Voice renders a literal `'s` (`@@owner@@'s room`) whatever the
+    // name ends with, so "PisnRzrs" is "PisnRzrs's room" there too.
+    let policy = AutomodPolicy::default();
+    for (display, expected) in [("PisnRzrs", "PisnRzrs's room"), ("JAMES", "JAMES's room")] {
+        assert_eq!(
+            resolve_room_name(display, &policy, &name_context())
+                .unwrap()
+                .name,
+            expected
+        );
     }
 }
 
@@ -9916,23 +9957,37 @@ async fn failed_create_compensation_orphan_is_counted_without_a_channel_id() {
 }
 
 #[tokio::test]
-async fn a_new_room_is_renamed_from_its_creator_template() {
+async fn a_new_room_is_created_with_its_template_name_and_never_renamed() {
     let (live, store, http, trace) = fixture();
-    store.creators.lock().unwrap()[0].name_template = "@@owner@@'s den ##".to_owned();
+    store.creators.lock().unwrap()[0].name_template = "@@owner@@'s den".to_owned();
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     join(&mut worker, MEMBER);
     dispatch(&mut worker, 0).await;
     dispatch(&mut worker, 1).await;
-    worker.refresh_template_names(2);
-    dispatch(&mut worker, 3).await;
+    worker.live.voice_update(MEMBER, Some(500), Some(false));
+    for now in 2..6 {
+        worker.refresh_template_names(now);
+        worker.dispatch_one(now).await;
+    }
+    assert_eq!(
+        *worker.http.created_names.lock().unwrap(),
+        ["new room's den"]
+    );
     assert_eq!(
         *trace.lock().unwrap(),
-        [
-            "create",
-            "persist:500",
-            "move:300:500",
-            "rename:500:new room's den #1"
-        ]
+        ["create", "persist:500", "move:300:500"]
+    );
+}
+
+#[tokio::test]
+async fn a_blank_template_creates_the_room_with_its_v1_name() {
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(
+        *worker.http.created_names.lock().unwrap(),
+        ["new room's room"]
     );
 }
 
@@ -10551,4 +10606,93 @@ fn empty_grace_config_accepts_zero_to_ten_minutes_and_refuses_garbage() {
     assert_eq!(configured_empty_grace(Some("601")), Err(InvalidEmptyGrace));
     assert_eq!(configured_empty_grace(Some("-1")), Err(InvalidEmptyGrace));
     assert_eq!(configured_empty_grace(Some("1m")), Err(InvalidEmptyGrace));
+}
+
+fn two_creator_worker_parts(a_position: i32, b_position: i32) -> (LiveGuild, Store, Http, Trace) {
+    let (live, store, http, trace) = fixture();
+    {
+        let mut creators = store.creators.lock().unwrap();
+        creators.push(CreatorChannel::new(GUILD, 210));
+        for creator in creators.iter_mut() {
+            creator.position = two_bot_core::voice_rooms::RoomPosition::Below;
+        }
+    }
+    let mut a = channel(CREATOR, 2, Some(CATEGORY));
+    a.position = Some(a_position);
+    live.upsert_channel(a);
+    let mut b = channel(210, 2, Some(CATEGORY));
+    b.position = Some(b_position);
+    live.upsert_channel(b);
+    *http.echo_positions.lock().unwrap() = true;
+    (live, store, http, trace)
+}
+
+fn join_creator(worker: &mut GuildRoomWorker<Store, Http>, member: u64, creator: u64) {
+    let ticket = worker
+        .live
+        .voice_update(member, Some(creator), Some(false))
+        .unwrap();
+    assert!(worker.accept_join(ticket, "new room", 7, NOW.to_owned()));
+}
+
+fn created_positions(worker: &GuildRoomWorker<Store, Http>) -> Vec<Option<u64>> {
+    worker
+        .http
+        .created_attributes
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|attributes| attributes.position)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_respace_reaches_the_snapshot_before_the_next_create_is_planned() {
+    // Creators at 2 and 3: the first room needs a re-space (A 16, room 32,
+    // B 48). The second join, on the other creator, comes before any
+    // CHANNEL_UPDATE and must plan from the re-spaced positions.
+    let (live, store, http, _) = two_creator_worker_parts(2, 3);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join_creator(&mut worker, MEMBER, CREATOR);
+    dispatch(&mut worker, 0).await;
+    join_creator(&mut worker, MEMBER + 1, 210);
+    for now in 1..4 {
+        worker.dispatch_one(now).await;
+    }
+    assert_eq!(
+        worker.http.reorders.lock().unwrap()[0],
+        [(CREATOR, 16), (210, 48)]
+    );
+    assert_eq!(created_positions(&worker), [Some(32), Some(49)]);
+}
+
+#[tokio::test]
+async fn a_refused_respace_ties_upwards_and_an_unknown_one_takes_no_position() {
+    let (live, store, http, _) = two_creator_worker_parts(2, 3);
+    http.reorder_errors.lock().unwrap().extend([
+        RoomHttpError::Rejected {
+            status: 403,
+            code: 50013,
+        },
+        RoomHttpError::UnknownOutcome,
+    ]);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join_creator(&mut worker, MEMBER, CREATOR);
+    dispatch(&mut worker, 0).await;
+    // Refused: nothing moved, so the room ties with its creator (2) and,
+    // being newer, renders directly below it.
+    assert_eq!(created_positions(&worker), [Some(2)]);
+    // The second creator's block again has no free position below it.
+    let mut room = worker.live.read_state().channels[&500].clone();
+    room.position = Some(4);
+    worker.live.upsert_channel(room);
+    let mut b = channel(210, 2, Some(CATEGORY));
+    b.position = Some(3);
+    worker.live.upsert_channel(b);
+    join_creator(&mut worker, MEMBER + 1, 210);
+    for now in 1..4 {
+        worker.dispatch_one(now).await;
+    }
+    // Unknown outcome: the reorder may have landed, so no stale position.
+    assert_eq!(created_positions(&worker)[1], None);
 }
