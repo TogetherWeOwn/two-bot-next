@@ -726,8 +726,8 @@ async fn community_ticks_write_rows_and_stay_gated() {
     .unwrap();
     assert_eq!(rows, vec![(42, Some(2)), (43, None)]);
 
-    // Monday 06:15 UTC: one stream heartbeat (only the captured
-    // `event_attended` stream is marked) then one run row. Completion
+    // Monday 06:15 UTC: two stream heartbeats (the captured `event_attended`
+    // and `message_created` streams are marked) then one run row. Completion
     // suppresses later ticks, including with a fresh process State.
     let monday = parse_iso_millis("2026-09-28T06:15:00.000Z").unwrap();
     run_once(Kind::Scorecard, &pool, &rest, guild, &state, monday)
@@ -767,7 +767,7 @@ async fn community_ticks_write_rows_and_stay_gated() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(beats, 1, "coverage marked only for the captured stream");
+    assert_eq!(beats, 2, "coverage marked only for the captured streams");
     run_once(
         Kind::Scorecard,
         &pool,
