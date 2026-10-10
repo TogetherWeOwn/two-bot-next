@@ -40,7 +40,7 @@ pub async fn audit<'c>(
 /// return the first result verbatim; `Ok(None)` means no such row (a receipt
 /// predating the summary row, or a rolled-back apply that never committed).
 pub async fn load_audit(
-    pool: &PgPool,
+    pool: &sqlx::PgPool,
     id: &str,
 ) -> Result<Option<(String, Option<String>)>, sqlx::Error> {
     sqlx::query_as("SELECT outcome, reason FROM automation_audit_log WHERE id = $1")
