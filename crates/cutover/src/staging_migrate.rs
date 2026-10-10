@@ -21,14 +21,16 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256, Sha384};
 use sqlx::{
     migrate::Migrator,
-    postgres::{PgConnection, PgPoolOptions},
+    postgres::{PgConnectOptions, PgConnection, PgPoolOptions},
     Executor, PgPool, Row,
 };
+use two_bot_core::database_tls::{self, TlsPolicy};
 
 /// Fixed binding names; each value is a secret and is never echoed.
 /// Plan reads only the RO binding; apply reads only the migrator binding.
@@ -49,6 +51,11 @@ pub const READ_ONLY_ROLE: &str = "two_bot_migrator_ro";
 /// SQLx library version this runner is pinned to (asserted against Cargo.lock).
 pub const SQLX_VERSION: &str = "0.9.0";
 pub const RUNNER_VERSION: u32 = 1;
+/// Target pool shape: max 2 connections with a 10 s acquire timeout, so a dead
+/// host fails the run instead of hanging pool checkout. Unlike application
+/// pools, this pool adds no statement timeout: migration DDL can exceed 15 s.
+pub const TARGET_POOL_MAX: u32 = 2;
+pub const TARGET_ACQUIRE_TIMEOUT_SECS: u64 = 10;
 
 /// Read-only audit inputs: the matrix and verifier compiled from the source SHA
 /// the workflow checked out and built, rendered the way
@@ -567,15 +574,33 @@ fn expected_role(req: &Request) -> &'static str {
     }
 }
 
-fn verify_target(req: &Request) -> Result<sqlx::postgres::PgConnectOptions, RunError> {
+/// Read the one TLS policy setting; an unset value is `Required`.
+fn tls_policy_from_env() -> Result<TlsPolicy, RunError> {
+    let value = std::env::var_os(database_tls::POLICY_SETTING);
+    // A non-UTF-8 value parses as "" and is refused like any unknown value.
+    TlsPolicy::from_setting(value.as_ref().map(|v| v.to_str().unwrap_or("")))
+        .map_err(|m| RunError::Refused(m.to_owned()))
+}
+
+/// Verify the secret binding points at the pinned target identity and fence
+/// it with the `TWO_DATABASE_TLS` policy (unset means `required`): validate
+/// before SQLx can WARN-log query values, enforce the TLS policy, then apply
+/// the effective mode. Preserve operator-supplied statement settings; do not
+/// add an application-style deadline to migration DDL.
+/// Failures are fixed strings; nothing echoes the URL, host or credential.
+fn verify_target(req: &Request, tls: TlsPolicy) -> Result<PgConnectOptions, RunError> {
     let binding = binding_env(req);
     let url = req.url.as_deref().unwrap_or_default();
     if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
         return refuse(format!("{binding} value is not a Postgres URL"));
     }
     two_bot_core::database_url::validate(url).map_err(|m| RunError::Refused(m.to_owned()))?;
+    // Threat-model F6: refuse plaintext/unverified modes and the wrong host
+    // class before SQLx parses the URL (see `docs/database-tls.md`).
+    database_tls::enforce(url, tls).map_err(|m| RunError::Refused(m.to_owned()))?;
     let options = two_bot_core::database_url::connect_options(url)
         .map_err(|_| RunError::Refused(format!("{binding} value is not a valid database URL")))?;
+    let options = database_tls::apply(options, tls);
     let host = options.get_host().to_ascii_lowercase();
     let database = options.get_database().unwrap_or_default();
     if host.contains("-pooler") {
@@ -830,12 +855,14 @@ async fn audit_queries(pool: &PgPool) -> Result<Value, &'static str> {
 }
 
 async fn connect(
-    options: sqlx::postgres::PgConnectOptions,
+    options: PgConnectOptions,
     role: &'static str,
     verified: Arc<AtomicUsize>,
 ) -> Result<PgPool, RunError> {
     PgPoolOptions::new()
-        .max_connections(2)
+        .max_connections(TARGET_POOL_MAX)
+        // Bound pool checkout, not the duration of migration statements.
+        .acquire_timeout(Duration::from_secs(TARGET_ACQUIRE_TIMEOUT_SECS))
         .after_connect(move |conn, _meta| {
             let verified = Arc::clone(&verified);
             Box::pin(async move {
@@ -867,10 +894,11 @@ async fn connect(
 }
 
 /// Run the plan (read-only, RO binding and role) or apply (migrator binding
-/// and role). Returns the sanitized manifest.
+/// and role) under the `TWO_DATABASE_TLS` policy (unset means `required`).
+/// Returns the sanitized manifest.
 pub async fn run(req: &Request) -> Result<Value, RunError> {
     validate_request(req)?;
-    let options = verify_target(req)?;
+    let options = verify_target(req, tls_policy_from_env()?)?;
     let verified = Arc::new(AtomicUsize::new(0));
     let role = expected_role(req);
     let pool = connect(options, role, Arc::clone(&verified)).await?;
@@ -1535,7 +1563,7 @@ mod tests {
             ..ok.clone()
         };
         assert!(validate_request(&planetscale_pin).is_ok());
-        assert!(verify_target(&planetscale_pin).is_ok());
+        assert!(verify_target(&planetscale_pin, TlsPolicy::Required).is_ok());
         // A PlanetScale pin without the branch id refuses: every branch
         // shares `postgres` as the database name, so host+database alone
         // cannot fix the branch.
@@ -1554,7 +1582,7 @@ mod tests {
             Err(RunError::Refused(_))
         ));
         assert!(matches!(
-            verify_target(&ps_missing_branch),
+            verify_target(&ps_missing_branch, TlsPolicy::Required),
             Err(RunError::Refused(_))
         ));
         // Pooled shapes refuse in both gates even when the pins match them.
@@ -1578,7 +1606,10 @@ mod tests {
                 "validate must refuse pooled/branch-mismatched binding {pooled}"
             );
             assert!(
-                matches!(verify_target(&req), Err(RunError::Refused(_))),
+                matches!(
+                    verify_target(&req, TlsPolicy::Required),
+                    Err(RunError::Refused(_))
+                ),
                 "verify must refuse pooled/branch-mismatched binding {pooled}"
             );
         }
@@ -1791,7 +1822,7 @@ mod tests {
             plan_manifest_path: None,
         };
         assert!(validate_request(&base).is_ok());
-        assert!(verify_target(&base).is_ok());
+        assert!(verify_target(&base, TlsPolicy::LocalOnly).is_ok());
         for pin in [
             Request {
                 expected_host: "other-host".to_owned(),
@@ -1802,7 +1833,10 @@ mod tests {
                 ..base.clone()
             },
         ] {
-            assert!(matches!(verify_target(&pin), Err(RunError::Refused(_))));
+            assert!(matches!(
+                verify_target(&pin, TlsPolicy::LocalOnly),
+                Err(RunError::Refused(_))
+            ));
         }
         // A pooler binding is refused even when the pins match it.
         let pooler = Request {
@@ -1817,7 +1851,10 @@ mod tests {
             validate_request(&pooler),
             Err(RunError::Refused(_))
         ));
-        assert!(matches!(verify_target(&pooler), Err(RunError::Refused(_))));
+        assert!(matches!(
+            verify_target(&pooler, TlsPolicy::Required),
+            Err(RunError::Refused(_))
+        ));
         // A PlanetScale pooler binding is refused even when the pins match it.
         let ps_pooler = Request {
             url: Some(
@@ -1834,7 +1871,7 @@ mod tests {
             Err(RunError::Refused(_))
         ));
         assert!(matches!(
-            verify_target(&ps_pooler),
+            verify_target(&ps_pooler, TlsPolicy::Required),
             Err(RunError::Refused(_))
         ));
         // A direct PlanetScale binding with the matching branch pin passes
@@ -1850,7 +1887,7 @@ mod tests {
             ..base.clone()
         };
         assert!(validate_request(&ps_direct).is_ok());
-        assert!(verify_target(&ps_direct).is_ok());
+        assert!(verify_target(&ps_direct, TlsPolicy::Required).is_ok());
         // Pooled and wrong-branch shapes refuse in both gates.
         for (url, branch) in [
             (
@@ -1878,7 +1915,10 @@ mod tests {
                 "validate must refuse {url}"
             );
             assert!(
-                matches!(verify_target(&req), Err(RunError::Refused(_))),
+                matches!(
+                    verify_target(&req, TlsPolicy::Required),
+                    Err(RunError::Refused(_))
+                ),
                 "verify must refuse {url}"
             );
         }
@@ -1968,8 +2008,13 @@ mod tests {
         let mut req = production_plan();
         req.expected_host = "prod-host.invalid".to_owned();
         req.url = Some("postgres://u@agent-testdb:5432/two_bot".to_owned());
-        assert!(matches!(verify_target(&req), Err(RunError::Refused(_))));
-        let err = verify_target(&req).unwrap_err().to_string();
+        assert!(matches!(
+            verify_target(&req, TlsPolicy::LocalOnly),
+            Err(RunError::Refused(_))
+        ));
+        let err = verify_target(&req, TlsPolicy::LocalOnly)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("staging"),
             "binding fence must name staging: {err}"
@@ -1981,7 +2026,10 @@ mod tests {
             "postgres://u@ep-staging-example.us-east-2.aws.neon.tech:5432/two_bot?sslmode=require"
                 .to_owned(),
         );
-        assert!(matches!(verify_target(&neon), Err(RunError::Refused(_))));
+        assert!(matches!(
+            verify_target(&neon, TlsPolicy::Required),
+            Err(RunError::Refused(_))
+        ));
     }
 
     #[test]
@@ -2000,7 +2048,9 @@ mod tests {
             err.contains("direct"),
             "pooled port must name the direct endpoint, got: {err}"
         );
-        let err = verify_target(&pooled_port).unwrap_err().to_string();
+        let err = verify_target(&pooled_port, TlsPolicy::Required)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("direct endpoint"),
             "pooled port must name the direct endpoint, got: {err}"
@@ -2017,7 +2067,9 @@ mod tests {
             err.contains("direct"),
             "pooled login must name the direct login, got: {err}"
         );
-        let err = verify_target(&pooled_login).unwrap_err().to_string();
+        let err = verify_target(&pooled_login, TlsPolicy::Required)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("direct login"),
             "pooled login must name the direct login, got: {err}"
@@ -2037,7 +2089,10 @@ mod tests {
                 "production validate must refuse pooled PlanetScale binding {pooled}"
             );
             assert!(
-                matches!(verify_target(&req), Err(RunError::Refused(_))),
+                matches!(
+                    verify_target(&req, TlsPolicy::Required),
+                    Err(RunError::Refused(_))
+                ),
                 "production verify must refuse pooled PlanetScale binding {pooled}"
             );
         }
@@ -2046,7 +2101,7 @@ mod tests {
         direct.expected_host = "prod-host.invalid".to_owned();
         direct.url = Some("postgres://u@prod-host.invalid:5432/two_bot?sslmode=require".to_owned());
         assert!(validate_request(&direct).is_ok());
-        assert!(verify_target(&direct).is_ok());
+        assert!(verify_target(&direct, TlsPolicy::Required).is_ok());
     }
 
     #[test]
@@ -2061,7 +2116,10 @@ mod tests {
             "postgresql://migrator@abc-useast1-1.horizon.psdb.cloud:5432/two_bot?sslmode=require"
                 .to_owned(),
         );
-        for gate in [validate_request(&req), verify_target(&req).map(|_| ())] {
+        for gate in [
+            validate_request(&req),
+            verify_target(&req, TlsPolicy::Required).map(|_| ()),
+        ] {
             let err = gate.unwrap_err().to_string();
             assert!(
                 err.contains("production branch pin"),
@@ -2155,19 +2213,215 @@ mod tests {
                 assert!(matches!(validate_request(&req), Err(RunError::Refused(_))));
             }
         }
-        // Binding mismatch refuses on both targets.
+        // Binding mismatch refuses on both targets. The URLs carry
+        // `sslmode=require` so the TLS fence passes and the pin-mismatch
+        // fence is what fires.
         let mut prod_mismatch = prod_plan.clone();
-        prod_mismatch.url = Some("postgres://u@other.invalid:5432/two_bot".to_owned());
+        prod_mismatch.url =
+            Some("postgres://u@other.invalid:5432/two_bot?sslmode=require".to_owned());
         assert!(matches!(
-            verify_target(&prod_mismatch),
+            verify_target(&prod_mismatch, TlsPolicy::Required),
             Err(RunError::Refused(_))
         ));
         let mut staging_mismatch = staging_plan();
-        staging_mismatch.url = Some("postgres://u@other.invalid:5432/two_staging".to_owned());
+        staging_mismatch.url =
+            Some("postgres://u@other.invalid:5432/two_staging?sslmode=require".to_owned());
         assert!(matches!(
-            verify_target(&staging_mismatch),
+            verify_target(&staging_mismatch, TlsPolicy::Required),
             Err(RunError::Refused(_))
         ));
+    }
+
+    /// Threat-model F6 refusal pins for the migration target pool: a remote
+    /// plaintext URL (and the other refusal cases) fails with a fixed string
+    /// before SQLx parses the URL or opens a socket, with no URL part in the
+    /// error. Hermetic: every case is refused, so no connection is attempted
+    /// and no database is needed.
+    #[test]
+    fn target_tls_fence_refuses_plaintext_and_wrong_hosts() {
+        let cases = [
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=disable",
+                "ep-fixture-host.us-east-2.aws.neon.tech",
+                "fixture-db",
+                TlsPolicy::Required,
+                "database sslmode does not require TLS",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=prefer",
+                "ep-fixture-host.us-east-2.aws.neon.tech",
+                "fixture-db",
+                TlsPolicy::Required,
+                "database sslmode does not require TLS",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db",
+                "ep-fixture-host.us-east-2.aws.neon.tech",
+                "fixture-db",
+                TlsPolicy::Required,
+                "database URL must set sslmode under the required TLS policy",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@agent-testdb:5432/fixture-db?sslmode=verify-full",
+                "agent-testdb",
+                "fixture-db",
+                TlsPolicy::Required,
+                "local database host is refused under the required TLS policy",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=verify-full",
+                "ep-fixture-host.us-east-2.aws.neon.tech",
+                "fixture-db",
+                TlsPolicy::LocalOnly,
+                "remote database host is refused under the local-only TLS policy",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@fixture-host/fixture-db?sslmode=fixture-mode",
+                "fixture-host",
+                "fixture-db",
+                TlsPolicy::LocalOnly,
+                "unsupported database sslmode",
+            ),
+        ];
+        for (url, host, database, policy, expected) in cases {
+            let req = Request {
+                url: Some(url.to_owned()),
+                target: Target::Staging,
+                source_sha: "a".repeat(40),
+                expected_host: host.to_owned(),
+                expected_database: database.to_owned(),
+                expected_branch_id: String::new(),
+                recovery_evidence_ref: "TOG-1#doc".to_owned(),
+                acl_plan_ref: "TOG-2#doc".to_owned(),
+                apply: false,
+                expected_pending: None,
+                plan_manifest_sha256: None,
+                plan_run_id: None,
+                plan_manifest_path: None,
+            };
+            // The TLS fence runs before the pin comparison, so the exact
+            // fixed string proves the TLS fence (not a pin fence) fired.
+            let error = verify_target(&req, policy).unwrap_err().to_string();
+            assert!(error.contains(expected), "{url} got: {error}");
+            assert!(!error.contains("fixture"), "TLS refusal echoed the URL");
+            let debug = format!("{:?}", verify_target(&req, policy).unwrap_err());
+            assert!(!debug.contains("fixture"), "TLS refusal echoed the URL");
+        }
+    }
+
+    /// Threat-model F6 happy path: preserve the effective TLS mode without
+    /// capping migration statements in either plan or apply. A lazy pool opens
+    /// no socket, so no database is needed.
+    #[tokio::test]
+    async fn target_fence_applies_tls_without_capping_migration_statements() {
+        use sqlx::postgres::{PgPoolOptions, PgSslMode};
+        // `LocalOnly` loopback keeps the URL mode as written.
+        let local = Request {
+            url: Some(
+                "postgres://fixture:fixture-password@127.0.0.1:5432/fixture?sslmode=disable"
+                    .to_owned(),
+            ),
+            target: Target::Staging,
+            source_sha: "a".repeat(40),
+            expected_host: "127.0.0.1".to_owned(),
+            expected_database: "fixture".to_owned(),
+            expected_branch_id: String::new(),
+            recovery_evidence_ref: "TOG-1#doc".to_owned(),
+            acl_plan_ref: "TOG-2#doc".to_owned(),
+            apply: false,
+            expected_pending: None,
+            plan_manifest_sha256: None,
+            plan_run_id: None,
+            plan_manifest_path: None,
+        };
+        // `Required` upgrades a remote `require` URL to `verify-full`.
+        let remote = Request {
+            url: Some(
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech:5432/fixture-db?sslmode=require"
+                    .to_owned(),
+            ),
+            expected_host: "ep-fixture-host.us-east-2.aws.neon.tech".to_owned(),
+            expected_database: "fixture-db".to_owned(),
+            ..local.clone()
+        };
+        for (request, policy, expected_mode) in [
+            (&local, TlsPolicy::LocalOnly, PgSslMode::Disable),
+            (&remote, TlsPolicy::Required, PgSslMode::VerifyFull),
+        ] {
+            for apply in [false, true] {
+                let mut req = request.clone();
+                req.apply = apply;
+                let options = verify_target(&req, policy).unwrap();
+                assert_eq!(options.get_ssl_mode(), expected_mode);
+                assert_eq!(options.get_options(), None);
+
+                // Keep an explicit operator budget, rather than overwriting
+                // it with an application-pool deadline (or disabling it).
+                req.url
+                    .as_mut()
+                    .unwrap()
+                    .push_str("&options%5Bstatement_timeout%5D=90000");
+                let options = verify_target(&req, policy).unwrap();
+                assert_eq!(options.get_ssl_mode(), expected_mode);
+                assert_eq!(options.get_options(), Some("-c statement_timeout=90000"));
+            }
+        }
+        let options = verify_target(&remote, TlsPolicy::Required).unwrap();
+        // A lazy pool from fenced options opens no socket.
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy_with(options);
+        assert_eq!(pool.size(), 0);
+        pool.close().await;
+    }
+
+    /// Target pool shape: max 2 connections and a 10 s acquire timeout.
+    #[test]
+    fn target_pool_shape_pins_acquire_timeout() {
+        assert_eq!(TARGET_POOL_MAX, 2);
+        assert_eq!(TARGET_ACQUIRE_TIMEOUT_SECS, 10);
+    }
+
+    /// The `run` entry refuses a plaintext remote binding before connecting
+    /// under either TLS policy (unset means `Required`, which refuses the weak
+    /// sslmode; `local-only` refuses the remote host), so no socket is opened
+    /// and no database is needed regardless of the ambient setting.
+    #[tokio::test]
+    async fn run_refuses_plaintext_remote_binding_before_connect() {
+        let req = Request {
+            url: Some(
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech:5432/fixture-db?sslmode=disable"
+                    .to_owned(),
+            ),
+            target: Target::Staging,
+            source_sha: "a".repeat(40),
+            expected_host: "ep-fixture-host.us-east-2.aws.neon.tech".to_owned(),
+            expected_database: "fixture-db".to_owned(),
+            expected_branch_id: String::new(),
+            recovery_evidence_ref: "TOG-1#doc".to_owned(),
+            acl_plan_ref: "TOG-2#doc".to_owned(),
+            apply: false,
+            expected_pending: None,
+            plan_manifest_sha256: None,
+            plan_run_id: None,
+            plan_manifest_path: None,
+        };
+        let err = run(&req).await.unwrap_err();
+        let shown = err.to_string();
+        assert!(
+            shown.contains("database sslmode does not require TLS")
+                || shown.contains("remote database host is refused"),
+            "TLS fence must fire before connect, got: {shown}"
+        );
+        assert!(
+            !shown.contains("fixture"),
+            "refusal echoed the URL: {shown}"
+        );
+        let debug = format!("{err:?}");
+        assert!(
+            !debug.contains("fixture"),
+            "refusal echoed the URL: {debug}"
+        );
     }
 
     #[test]
