@@ -55,10 +55,9 @@ a required value or an implemented consumer. Secret defaults are never rendered.
   Keys in\n\
   legacy `HOT_WIRED` are labeled “reload-report hot” (the `RefreshReport::hot`\n\
   partition in `settings.rs`); every other storable key reports cold.\n\n\
-The “stored unwired” labels in the table below come from the legacy\n\
-`HOT_WIRED` list and boot-env list (`crates/core/src/settings.rs:232-238`).\n\
-They do not show the per-runtime refresh reads above, which also apply stored\n\
-values: containment applies `TWO_ANTI_NUKE_WINDOW_SECONDS`,\n\
+The fourteen keys in `STORE_READ_KEYS`\n\
+(`crates/core/tests/reference_docs.rs`) say “applied live by runtime refresh”\n\
+instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECONDS`,\n\
 `TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS` and `TWO_ANTI_NUKE_HEAT_THRESHOLD`\n\
 (`crates/bot/src/containment_runtime.rs:61-67`, `:226`); join-risk applies\n\
 `TWO_JOIN_RISK_THRESHOLD`, `TWO_JOIN_RISK_WINDOW_SECONDS` and\n\
@@ -66,7 +65,8 @@ values: containment applies `TWO_ANTI_NUKE_WINDOW_SECONDS`,\n\
 `:238`); raid applies `TWO_RAID_JOIN_THRESHOLD` and `TWO_RAID_WINDOW_SECONDS`\n\
 (`crates/bot/src/raid_runtime.rs:45-46`, `:170`); onboarding merges its\n\
 `CONFIG_KEYS` from the snapshot on each relevant\n\
-event (`crates/bot/src/onboarding.rs:21-30`, `:175-182`).\n\n\
+event (`crates/bot/src/onboarding.rs:21-30`, `:175-182`). Every other\n\
+storable row's stored value is unwired.\n\n\
 Gateway boot reads process environment only, through a fixed set of loaders:\n\
 `Config::from_env` (`DISCORD_TOKEN`, `DATABASE_URL`, `LISTEN_ADDR`, `GUILD_ID`),\n\
 `StickyRuntime::from_env` (`FeatureGates`: `TWO_AUTOMATIONS`, `TWO_ANNOUNCEMENTS`,\n\
@@ -75,7 +75,8 @@ Gateway boot reads process environment only, through a fixed set of loaders:\n\
 and `intents_from_env` (`TWO_AUTOMOD`, `DISCORD_TICKET_CATEGORY_ID`,\n\
 `DISCORD_TICKET_STAFF_ROLE_ID`, `DISCORD_TICKET_PANEL_CHANNEL_ID`), with\n\
 `DISCORD_GATEWAY_URL` as a loopback-only test override. Rows for storable keys\n\
-read this way say “env at boot”; every other storable row's stored value is\n\
+read this way say “env at boot” (plus the live-refresh note where\n\
+`STORE_READ_KEYS` applies); every remaining storable row's stored value is\n\
 unwired, and `env_only` rows are never dashboard-stored.\n\
 When voice is enabled, `build_production_runtime` also reads\n\
 `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID`, `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID`,\n\
@@ -118,10 +119,11 @@ gates (`feature_commands.rs`), moderation (`moderation.rs`), onboarding\n\
 (`community.rs`). An empty ID list never contains a live ID.\n\n";
 
 /// Catalog keys with an implemented boot-time process-environment read
-/// (`StickyRuntime::from_env` gates and gateway intents). Every other
-/// storable key's value has no runtime consumer: a database-only setting
-/// stays inert after restart, and onboarding/automod/scorecard/classifier
-/// loaders below supply defaults without being called during boot.
+/// (`StickyRuntime::from_env` gates and gateway intents). Every storable key
+/// outside `BOOT_ENV` and `STORE_READ_KEYS` has no runtime consumer: a
+/// database-only setting stays inert after restart, and
+/// onboarding/automod/scorecard/classifier loaders below supply defaults
+/// without being called during boot.
 const BOOT_ENV: &[&str] = &[
     "TWO_AUTOMATIONS",
     "TWO_ANNOUNCEMENTS",
@@ -135,6 +137,31 @@ const BOOT_ENV: &[&str] = &[
     "TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID",
     "TWO_TEMP_VOICE_CATEGORY_ID",
     "TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS",
+];
+
+/// Catalog keys whose dashboard-stored values are applied at runtime through
+/// per-runtime store refreshes, not boot env or the reload-report path:
+/// containment (`containment_runtime.rs:61-67`, `:226`), join-risk
+/// (`join_risk_runtime.rs:66-70`, `:238`), raid (`raid_runtime.rs:45-46`,
+/// `:170`) and onboarding's per-event `CONFIG_KEYS` merge
+/// (`onboarding.rs:21-30`, `:175-182`). These rows say “applied live by
+/// runtime refresh” in the table below; every other storable key keeps the
+/// legacy `HOT_WIRED`/boot-env labels.
+const STORE_READ_KEYS: &[&str] = &[
+    "TWO_ANTI_NUKE_WINDOW_SECONDS",
+    "TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS",
+    "TWO_ANTI_NUKE_HEAT_THRESHOLD",
+    "TWO_JOIN_RISK_THRESHOLD",
+    "TWO_JOIN_RISK_WINDOW_SECONDS",
+    "TWO_BULK_JOIN_WINDOW_UNTIL",
+    "TWO_RAID_JOIN_THRESHOLD",
+    "TWO_RAID_WINDOW_SECONDS",
+    "TWO_ONBOARDING_DRY_RUN",
+    "DISCORD_LANDING_CHANNEL_IDS",
+    "DISCORD_GOODBYE_CHANNEL_IDS",
+    "DISCORD_ANCHOR_WELCOME_CHANNEL_ID",
+    "DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID",
+    "DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID",
 ];
 
 fn repository_root() -> PathBuf {
@@ -335,12 +362,29 @@ fn render_configuration() -> String {
     for (key, class) in settings {
         let boot_read = BOOT_ENV.contains(&key);
         let hot_wired = HOT_WIRED.contains(&key);
+        let store_read = STORE_READ_KEYS.contains(&key);
         let (class, application) = match class {
             SettingClass::EnvOnly => ("env_only", "environment only"),
+            SettingClass::Cold if store_read && boot_read => {
+                ("cold", "env at boot; stored, applied live by runtime refresh")
+            }
             SettingClass::Cold if boot_read => ("cold", "env at boot; stored unwired"),
+            SettingClass::Cold if store_read => {
+                ("cold", "stored, applied live by runtime refresh")
+            }
             SettingClass::Cold => ("cold", "stored unwired"),
+            SettingClass::Hot if store_read && hot_wired => (
+                "hot",
+                "stored, applied live by runtime refresh (reload-report hot)",
+            ),
+            SettingClass::Hot if store_read && boot_read => {
+                ("hot", "env at boot; stored, applied live by runtime refresh")
+            }
             SettingClass::Hot if hot_wired => ("hot", "stored unwired (reload-report hot)"),
             SettingClass::Hot if boot_read => ("hot", "env at boot; stored unwired"),
+            SettingClass::Hot if store_read => {
+                ("hot", "stored, applied live by runtime refresh")
+            }
             SettingClass::Hot => ("hot", "stored unwired"),
         };
         let default = if is_secret_key(key) {
@@ -429,6 +473,21 @@ fn boot_env_keys_are_catalogued_storable_keys() {
                 Some(SettingClass::Cold | SettingClass::Hot)
             ),
             "{key} is env-only; its row never consults BOOT_ENV"
+        );
+    }
+}
+
+#[test]
+fn store_read_keys_are_catalogued_storable_keys() {
+    let keys: BTreeSet<_> = SETTING_CLASSES.iter().map(|(key, _)| *key).collect();
+    for key in STORE_READ_KEYS {
+        assert!(keys.contains(key), "{key} is not a catalog key");
+        assert!(
+            matches!(
+                classify_key(key),
+                Some(SettingClass::Cold | SettingClass::Hot)
+            ),
+            "{key} is env-only; its row never consults STORE_READ_KEYS"
         );
     }
 }

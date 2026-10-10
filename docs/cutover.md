@@ -158,16 +158,17 @@ has RESUME disabled (see below).
 
 Baseline checked: `bce86a791` on 2026-10-09. Recheck candidate **source parsing**
 before invoking tools. `two-bot` with no subcommand starts the server;
-`two-bot serve` is **not** supported. For baseline help-only inspection, use
-**only `two-bot --help`** (top-level).
+`two-bot serve` is **not** supported.
 
-Do **not** run `two-bot backup --help` or
-`two-bot guild-config-snapshot --help`: dispatch ignores their trailing arguments
-and executes the backup/prune/upload or Discord snapshot/upload instead. The
-usage comment claiming help after any subcommand is not the dispatch behavior:
-[argument dispatch](../crates/bot/src/backup_cli.rs#L162). Other binaries or future
-subcommand help paths require source/fixture verification before approval; a
-`--help` suffix is not a read-only safety boundary.
+`--help` is read-only on the operator CLIs: `two-bot backup --help`,
+`two-bot guild-config-snapshot --help`, and `--help` after any subcommand print
+usage and exit 0 before any env, DB or network read, so `--help` never dumps,
+prunes or uploads
+([help routing](../crates/bot/src/backup_cli.rs#L216), [dispatch](../crates/bot/src/backup_cli.rs#L242)).
+A trailing argument that is not `--help` is refused with exit 2 (`:231-236`).
+Other binaries or future subcommand help paths still require source/fixture
+verification before approval; a `--help` suffix is not a universal read-only
+safety boundary.
 
 ### Existing tools: limited recovery, not the full cutover data path
 
@@ -222,13 +223,17 @@ paste them into a production shell without the cutover executor's approval:
 | `two-bot commands diff` | `crates/bot/src/commands_cli.rs:19-28`: read current guild registry and compare to compiled desired registry; no PUT/no gateway |
 | `two-bot commands publish --apply` | Same source: explicit overwrite; default dry-run and `--allow-live-guild` opt-in required. Global snapshot/restore is not implied by a guild tool |
 | `two-bot preflight --json` | `crates/bot/src/preflight.rs:31-40`: read-only REST identity/intents/role/channel checks, FAIL vs WARN |
+| `gateway-force-identify` (separate cutover binary), default dry-run; `--apply --reason`, `--allow-live-guild` | `crates/cutover/src/bin/gateway_force_identify.rs:1-14`: prints guild, shard, checkpoint age and directive, writes nothing; `--apply` arms a one-shot force-fresh IDENTIFY consumed by the next boot. Required for the first production boot ([gateway recovery](gateway-recovery.md#force-fresh-identify-first-production-boot)) |
+| `rollback-delta --since <RFC3339> [--export <path>]` (separate cutover binary) | `crates/cutover/src/bin/rollback_delta.rs:14-52`: read-only delta report; `--export` writes the report to a file. Reverse import is still missing |
 
-No `commands restore` (registry), complete database delta export/reverse-import, or
+No `commands restore` (registry), database delta reverse-import, or
 `--disable-resume` command is established by this baseline (re-checked at
 `bce86a791`: `commands_cli.rs` offers only `diff`/`publish`, no `restore`;
 no `disable-resume`/`RESUME=0` in `crates/bot/src`). Gateway RESUME is
-automatic; there is no verified disable environment flag either. Do not invent
-`RESUME=0`, delete session rows or omit the database to force a fresh session.
+automatic and there is no verified disable environment flag. Do not invent
+`RESUME=0`: to force a fresh session, arm the one-shot IDENTIFY directive with
+`gateway-force-identify --apply` (see table); manual session-row edits are not a
+reviewed path.
 These are required **capabilities**, not claimed existing subcommands. B4 must
 attach a reviewed, fixture-rehearsed execution/restore command sheet covering
 them before GO. Likewise, the merged generic backup is not a complete snapshot
@@ -359,8 +364,11 @@ alongside an unconfirmed Next gateway.
 - The baseline has no wired scheduled-unban handoff/sweeper. Moderator sign-off
   must identify a verified executor for every pending deadline before GO:
   [moderation port boundary](../crates/core/src/moderation.rs#L7).
-- `/health` reports process liveness; `/readyz` covers the three wired components (`process`, `gateway`, `database`, plus conditional `token_invalid`) (`crates/bot/src/server.rs:228-237`, `:196-198`; re-checked at `bce86a791`).
-  The baseline server does not expose `/internal/actions` or `/metrics`:
+- `/health` reports process liveness; `/readyz` always carries four components (`process`, `gateway`, `database`, plus `token_invalid` as Ready or Down, which forces 503) (`crates/bot/src/server.rs:228-240`, `:177`, `:191-209`; re-checked at `bce86a791`).
+  The baseline server does not expose `/internal/actions` (separate signed listener:
+  `crates/bot/src/internal_action_http.rs:285`, bound at `crates/bot/src/main.rs:301`),
+  but it does serve `/metrics` on the same listener
+  (`crates/bot/src/server.rs:65`, `crates/bot/src/metrics_http.rs:21`):
   [HTTP routes and readiness](../crates/bot/src/server.rs#L21). Feature and
   internal-action acceptance therefore require separate merged runtime evidence.
 
