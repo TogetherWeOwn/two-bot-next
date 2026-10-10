@@ -66,7 +66,7 @@ thresholds document for paging.
 | `MESSAGE_REACTION_ADD` | hot | unbounded; self-role bursts on their own lane | 5 |
 | `MESSAGE_REACTION_REMOVE` | hot | unbounded; self-role bursts on their own lane | 6 |
 | `VOICE_STATE_UPDATE` | hot | unbounded; voice churn | 4 |
-| `PRESENCE_UPDATE` | hot | unbounded; only with `TWO_VOICE_PRESENCE=1`; in-memory only, never checkpointed | 8 |
+| `PRESENCE_UPDATE` | hot | unbounded; only with `TWO_VOICE_PRESENCE=1`; in-memory only, ordered, never checkpointed | 8 |
 | `INVITE_CREATE` | steady | rare | never |
 | `INVITE_DELETE` | steady | rare | never |
 | `INTERACTION_CREATE` | steady | user-driven rate | never |
@@ -135,10 +135,10 @@ even if a future supervisor returns a larger payload.
 
 Subscription facts that bound the top of the funnel: the bot requests
 `GUILD_PRESENCES` only with `TWO_VOICE=1` and `TWO_VOICE_PRESENCE=1`
-(`docs/voice-presence.md`). Those `PRESENCE_UPDATE` dispatches update
-in-memory voice-room facts at reception and never reach the funnel, audit or
-the serial checkpoint writer; without the flag, presence arrives only through
-the hourly `presence_probe` job. `MESSAGE_CONTENT` is requested only when
+(`docs/voice-presence.md`). Those `PRESENCE_UPDATE` dispatches stay in
+gateway order on the dispatch worker but only update in-memory voice-room
+facts: no funnel, audit or checkpoint commit. Without the flag, presence
+arrives only through the hourly `presence_probe` job. `MESSAGE_CONTENT` is requested only when
 automod, tickets or text commands justify it.
 
 ## Maintenance
