@@ -314,6 +314,11 @@ def process_references(proc_root):
     entry under a container spelling cannot be mapped to a host path by
     lexical match, and its old inode may be gone from the workspace
     traversal, so callers must never silently treat it as no reference.
+
+    Scans cwd/exe/fd/maps plus cmdline argv tokens. Inodes are compared too,
+    so container mount path spellings need not match the host. cmdline entries
+    that no longer stat are kept as lexical-only references (dev/ino None);
+    any denied read aborts the whole scan.
     """
     references = []
     deleted = []
@@ -372,6 +377,36 @@ def process_references(proc_root):
                         references.append((fields[5],
                                            os.makedev(int(major, 16), int(minor, 16)),
                                            int(fields[4])))
+            # cmdline argv tokens: a process started with an absolute slot or
+            # target path (e.g. cargo --target-dir, a shell cd'd into output)
+            # is a live reference even when cwd/exe/fd/maps show nothing.
+            # Fixture proc roots may omit cmdline; treat a missing file as no
+            # cmdline references. Any denied read fails the whole scan closed.
+            try:
+                raw = (entry / 'cmdline').read_bytes()
+            except FileNotFoundError:
+                if entry.exists() and (entry / 'cmdline').exists():
+                    raise Refusal(f'incomplete process visibility: pid {entry.name}')
+            except PermissionError:
+                raise Refusal(f'incomplete process visibility: pid {entry.name}')
+            else:
+                for token in raw.split(b'\0'):
+                    if not token.startswith(b'/'):
+                        continue
+                    try:
+                        text = os.fsdecode(token)
+                    except (UnicodeDecodeError, ValueError):
+                        continue
+                    try:
+                        info = os.stat(text)
+                    except FileNotFoundError:
+                        references.append((text, None, None))
+                    except NotADirectoryError:
+                        references.append((text, None, None))
+                    except (PermissionError, OSError):
+                        raise Refusal(f'incomplete process visibility: pid {entry.name}')
+                    else:
+                        references.append((text, info.st_dev, info.st_ino))
         except FileNotFoundError:
             if entry.exists():
                 raise Refusal(f'incomplete process visibility: pid {entry.name}')
@@ -453,245 +488,31 @@ def workspace_inodes(workspace):
     return result
 
 
-def retention_audit(worktrees, inventory, proc_root='/proc', now=None, max_age=60):
-    """Only direct worktree/target candidates. Never cleans shared caches or sources."""
-    worktrees = real_directory(worktrees)
-    started = time.monotonic()
-    now = time.time() if now is None else now
-    if (inventory.get('version') != 1 or inventory.get('complete') is not True
-            or inventory.get('process_scope') != 'host'):
-        raise Refusal('need complete host-scope control-plane inventory')
-    captured = inventory.get('captured_at_unix')
-    if type(captured) not in (int, float) or not 0 <= now - captured <= max_age:
-        raise Refusal('control-plane inventory is stale or from the future')
-    rows = inventory.get('workspaces')
-    if not isinstance(rows, list):
-        raise Refusal('inventory workspaces must be a list')
-    indexed = {}
-    identities = {}
-    target_identities = {}
-    for row in rows:
-        raw = row['path']
-        # Inventory paths must be absolute strings. Lexical canonicalization
-        # alone cannot catch symlink/bind-mount aliases, so resolve symlink
-        # spellings and reconcile (st_dev, st_ino) identities for existing
-        # workspaces before indexing; any conflicting live row must refuse
-        # the whole audit, not be ignored.
-        if not isinstance(raw, str) or not os.path.isabs(raw):
-            raise Refusal('ambiguous workspace attribution')
-        canonical = os.path.normpath(raw)
-        if raw != canonical or canonical in indexed:
-            raise Refusal('ambiguous workspace attribution')
-        if type(row.get('live_run')) is not bool or type(row.get('referenced')) is not bool:
-            raise Refusal('ambiguous workspace attribution')
-        if not row.get('issue_id') or row.get('status') not in TERMINAL | {
-                'backlog', 'todo', 'in_progress', 'in_review', 'blocked'}:
-            raise Refusal('missing issue attribution/status')
-        try:
-            resolved = os.path.realpath(canonical)
-        except OSError:
-            raise Refusal('ambiguous workspace attribution')
-        if resolved != canonical:
-            raise Refusal('ambiguous workspace attribution')
-        try:
-            info = os.stat(canonical)
-        except FileNotFoundError:
-            identity = None  # path does not exist; no identity to reconcile
-        except (PermissionError, OSError):
-            raise Refusal(f'incomplete workspace visibility: {canonical}')
-        else:
-            identity = (info.st_dev, info.st_ino)
-            if identity in identities:
-                raise Refusal('ambiguous workspace attribution')
-            identities[identity] = canonical
-        # Workspace roots are not the only alias surface: distinct
-        # canonical roots can share one bind-aliased target directory. A
-        # terminal/unreferenced row under A and a live/queued/referenced
-        # row under B would both pass workspace-identity validation, and
-        # without target reconciliation the shared build output is offered
-        # as a retention candidate. Reconcile existing target identities
-        # across ALL rows — including live/queued/referenced rows outside
-        # the candidate directory — and refuse duplicate target attribution.
-        try:
-            target_info = os.stat(canonical + '/target')
-        except FileNotFoundError:
-            target_identity = None  # no target yet; nothing to reconcile
-        except (PermissionError, OSError):
-            raise Refusal(f'incomplete workspace visibility: {canonical}/target')
-        else:
-            target_identity = (target_info.st_dev, target_info.st_ino)
-            if target_identity in target_identities:
-                raise Refusal('ambiguous target attribution')
-            target_identities[target_identity] = canonical
-        indexed[canonical] = row
-    refs, deleted = process_references(proc_root)
-    # Deleted (unlinked/replaced) artifact references keep their deletion
-    # marker: under a container spelling they match neither a host path nor
-    # a current workspace inode, so they can never silently count as no
-    # reference. Resolve the real on-disk workspace set once so deleted
-    # attribution can be checked against every candidate; a deleted entry
-    # attributable to nothing still refuses the whole audit, not one row.
-    real_workspaces = {}
-    for workspace in sorted(worktrees.iterdir()):
-        target = workspace / 'target'
-        if not target.exists() and not target.is_symlink():
-            continue
-        if workspace.is_symlink() or target.is_symlink():
-            continue
-        try:
-            real = real_directory(workspace)
-        except Refusal:
-            continue
-        real_workspaces[str(real)] = real
-    # Scan workspace inodes once for the final unresolved-deleted check;
-    # per-candidate checks below reuse their own traversal.
-    all_nodes = set()
-    for real in real_workspaces.values():
-        all_nodes |= workspace_inodes(real)
-    results = []
-    for workspace in sorted(worktrees.iterdir()):
-        target = workspace / 'target'
-        if not target.exists() and not target.is_symlink():
-            continue
-        result = {'target': str(target), 'eligible': False}
-        results.append(result)
-        if workspace.is_symlink() or target.is_symlink():
-            result['reason'] = 'symlink'
-            continue
-        workspace = real_directory(workspace)
-        target = real_directory(target)
-        row = indexed.get(str(workspace))
-        if not row:
-            result['reason'] = 'unattributed'
-            continue
-        if row['status'] not in TERMINAL or row['live_run'] or row['referenced']:
-            result['reason'] = 'live run, workspace reference, or nonterminal issue'
-            continue
-        # Filename heuristics cannot establish provenance: an ignored target
-        # can hold evidence/archives/sources under Cargo's own subtrees
-        # (e.g. debug/incident-20260930.json, debug/snapshot.tar.gz,
-        # debug/src/main.py all pass name checks). Eligibility requires an
-        # independently recorded, exact-target Operator classification in the
-        # inventory row; missing/unknown/mixed provenance stays ineligible.
-        # This classification is attested control-plane data, never minted
-        # from the filename heuristics below (which remain as a backstop).
-        if row.get('target_provenance') != 'build_output_only':
-            result['reason'] = ('unclassified or mixed target provenance; '
-                                'Operator build-output-only classification required')
-            continue
-        # -C changes directory but does not neutralize an inherited
-        # GIT_INDEX_FILE, GIT_DIR, GIT_WORK_TREE, or GIT_COMMON_DIR: an
-        # alternate empty index would hide a force-tracked target file while
-        # the ignore rule still passes. Inspect the real repository index
-        # regardless of overrides, and refuse when the intended workspace
-        # repository cannot be verified.
-        git_env = {key: value for key, value in os.environ.items()
-                   if key not in {'GIT_INDEX_FILE', 'GIT_DIR', 'GIT_WORK_TREE',
-                                  'GIT_COMMON_DIR', 'GIT_NAMESPACE'}}
-        try:
-            toplevel = subprocess.run(['git', '-C', str(workspace), 'rev-parse',
-                                       '--show-toplevel'],
-                                      capture_output=True, check=True, env=git_env,
-                                      text=True)
-        except subprocess.CalledProcessError:
-            result['reason'] = 'unverified workspace repository'
-            continue
-        if Path(toplevel.stdout.strip()) != workspace:
-            result['reason'] = 'unverified workspace repository'
-            continue
-        tracked = subprocess.run(['git', '-C', str(workspace), 'ls-files', '-z', '--', 'target'],
-                                 capture_output=True, check=True, env=git_env)
-        ignored = subprocess.run(['git', '-C', str(workspace), 'check-ignore', '-q', 'target'],
-                                 env=git_env)
-        if tracked.stdout or ignored.returncode != 0:
-            result['reason'] = 'tracked or not ignored'
-            continue
-        # .gitignore proves nothing about provenance: an ignored target can
-        # still hold preserved evidence/backups/sources. Only Cargo's own
-        # top-level output entries pass; anything else vetoes eligibility.
-        veto = preservation_veto(target)
-        if veto is not None:
-            result['reason'] = veto
-            continue
-        nodes = workspace_inodes(workspace)
-        if any(within(path, workspace) or (device, inode) in nodes for path, device, inode in refs):
-            result['reason'] = 'actual process cwd/exe/fd/map reference'
-            continue
-        # Deleted-reference attribution carries its deletion marker from
-        # the scan above. An unlinked/replaced artifact under a container
-        # spelling cannot be mapped to a host path by lexical match, and
-        # its old inode may be gone from the current workspace traversal.
-        # A deleted entry whose path reads inside this workspace or whose
-        # inode survives in its traversal vetoes this candidate. Removing
-        # a replacement never reclaims the already-unlinked mapped inode,
-        # so this is a false-negative reference finding, not a deletion
-        # plan; no destructive deletion is demonstrated or authorized.
-        if any(within(path, workspace) or (device, inode) in nodes
-               for path, device, inode in deleted):
-            result['reason'] = 'actual process cwd/exe/fd/map reference (deleted artifact)'
-            continue
-        result.update(eligible=True, allocated_bytes=usage(target), reason='audit only; not deletion authority')
-    # Any deleted entry attributable to no audited workspace refuses the
-    # whole audit: unresolved namespace mapping must not silently establish
-    # no reference. Callers must supply an independently verified
-    # exact-path process-reference receipt before any such audit clears.
-    if any(not any(within(path, Path(root)) for root in real_workspaces)
-           and (device, inode) not in all_nodes
-           for path, device, inode in deleted):
-        raise Refusal('unresolved deleted process reference; '
-                      'exact-path process-reference receipt required')
-    if now - captured + time.monotonic() - started > max_age:
-        raise Refusal('audit took too long; capture a new inventory')
-    return {'version': 1, 'audit_only': True, 'captured_at_unix': now, 'candidates': results}
+def slot_output_inodes(target, scratch):
+    """(dev, ino) identities for every entry under target+scratch.
+
+    Symlinks are reported as a veto string instead of being followed, so the
+    caller skips the slot instead of measuring or deleting through a link.
+    Returns (veto_or_None, nodes).
+    """
+    nodes = set()
+
+    def unreadable(error):
+        raise Refusal(f'incomplete slot scan: {error.filename}')
+
+    for root in (target, scratch):
+        for base, dirs, files in os.walk(root, followlinks=False, onerror=unreadable):
+            for name in [None] + dirs + files:
+                path = Path(base) if name is None else Path(base) / name
+                try:
+                    info = path.lstat()
+                except FileNotFoundError:
+                    continue  # Cargo renamed output mid-scan; re-verify aborts below
+                if stat.S_ISLNK(info.st_mode):
+                    return f'symlink in slot output: {path}', set()
+                nodes.add((info.st_dev, info.st_ino))
+    return None, nodes
 
 
-def filesystem_finding(path, backing_path, floor):
-    path = real_directory(path)
-    backing_path = real_directory(backing_path)
-    if path.stat().st_dev != backing_path.stat().st_dev:
-        return {'finding': 'wrong_filesystem', 'monitored_path': str(path),
-                'backing_path': str(backing_path)}
-    free = available(path)
-    if free < floor:
-        return {'finding': 'low_available_bytes', 'path': str(path),
-                'available_bytes': free, 'floor_bytes': floor}
-    return None
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    commands = parser.add_subparsers(dest='command', required=True)
-    run = commands.add_parser('run')
-    run.add_argument('--pool', type=Path, default=DEFAULT_POOL)
-    run.add_argument('cargo_args', nargs=argparse.REMAINDER)
-    audit = commands.add_parser('audit')
-    audit.add_argument('--worktrees', type=Path, required=True)
-    audit.add_argument('--inventory', type=Path, required=True)
-    watch = commands.add_parser('filesystem')
-    watch.add_argument('--path', type=Path, default=Path('/home'))
-    watch.add_argument('--backing-path', type=Path, required=True)
-    watch.add_argument('--min-available-bytes', type=int, default=10 * GIB)
-    args = parser.parse_args()
-    try:
-        if args.command == 'run':
-            cargo_args = args.cargo_args
-            if cargo_args[:1] == ['--']:
-                cargo_args = cargo_args[1:]
-            return run_cargo(args.pool, cargo_args)
-        if args.command == 'audit':
-            result = retention_audit(args.worktrees, json.loads(args.inventory.read_text()))
-        else:
-            if args.min_available_bytes <= 0:
-                raise Refusal('available-byte floor must be positive')
-            result = filesystem_finding(args.path, args.backing_path, args.min_available_bytes)
-            if result is None:
-                return 0  # Healthy monitoring is silent.
-        print(json.dumps(result, sort_keys=True))
-        return 1 if args.command == 'filesystem' else 0
-    except (Refusal, OSError, ValueError, KeyError, IndexError, subprocess.CalledProcessError) as error:
-        print(json.dumps({'finding': 'refused', 'reason': str(error)}), file=sys.stderr)
-        return 75
-
-
-if __name__ == '__main__':
-    sys.exit(main())
+def _-retain-placeholder():
+    pass
