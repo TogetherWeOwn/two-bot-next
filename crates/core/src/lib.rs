@@ -194,10 +194,10 @@ pub use community::{
     COMMUNITY_FACT_TYPES, SCORECARD_TICK_INTERVAL_MS, STREAM_WRITERS,
 };
 pub use community_snapshots::{
-    build_community_snapshot, build_counter_reading, match_rank_roles, window_bounds,
-    CommunitySnapshot, CounterReading, CounterSkip, JobGate, JobGuard, MemberRank, RaidAnomaly,
-    RaidWindow, RankKey, RankRole, RankRow, RankSkip, RosterMember, LIVE_COUNTER_INTERVAL_MS,
-    RAID_ANOMALIES, RANK_SNAPSHOT_INTERVAL_MS,
+    build_community_snapshot, build_counter_reading, match_rank_roles, plan_rank_heal,
+    window_bounds, CommunitySnapshot, CounterReading, CounterSkip, JobGate, JobGuard, MemberRank,
+    RaidAnomaly, RaidWindow, RankHeal, RankKey, RankRole, RankRow, RankSkip, RosterMember,
+    LIVE_COUNTER_INTERVAL_MS, RAID_ANOMALIES, RANK_SNAPSHOT_INTERVAL_MS,
 };
 pub use config::Config;
 pub use containment::{
