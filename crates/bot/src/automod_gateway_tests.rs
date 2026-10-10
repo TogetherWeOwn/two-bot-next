@@ -266,8 +266,8 @@ fn live_snapshot_moves_automod_lists_and_thresholds_without_restart() {
 /// The running activation applies the live policy in place: the first
 /// refresh after a stored write reports a change, a repeat reports none, and
 /// repeat history is never rebuilt (no restart, no new activation).
-#[test]
-fn running_activation_applies_live_policy_without_restart() {
+#[tokio::test]
+async fn running_activation_applies_live_policy_without_restart() {
     crate::gateway::ensure_crypto_provider();
     let deployment = vars(&[
         ("TWO_AUTOMOD", "1"),
@@ -317,8 +317,8 @@ fn running_activation_applies_live_policy_without_restart() {
 /// One bad stored value does not take the whole policy down: the offending
 /// key falls back to its boot value while the other stored values still
 /// apply, so the refresh still reports a change.
-#[test]
-fn refresh_falls_back_per_key_on_a_bad_stored_value() {
+#[tokio::test]
+async fn refresh_falls_back_per_key_on_a_bad_stored_value() {
     crate::gateway::ensure_crypto_provider();
     let deployment = vars(&[
         ("TWO_AUTOMOD", "1"),
