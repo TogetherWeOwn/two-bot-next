@@ -281,3 +281,32 @@ test("/ops/metrics: wrong bearer and throttle responses never carry the token", 
     assert.ok(!(res.headers.get("www-authenticate") ?? "").includes(token));
   }
 });
+
+test("/ops/metrics: a full caller table never locks out the authenticated scraper", async () => {
+  const h = harness();
+  const token = "synthetic-metrics-full-table-token-0123456789";
+  const e = { ...h.env, METRICS_SCRAPE_TOKEN: token } as Env;
+  const get = (ip: string, auth?: string) =>
+    worker.fetch(
+      new Request("https://probe.invalid/ops/metrics", {
+        headers: { ...(auth ? { authorization: auth } : {}), "cf-connecting-ip": ip },
+      }),
+      e,
+      h.ctx,
+    );
+  // Fill the 10,000-caller table the way the review probed it: bearerless
+  // requests, each from a distinct documentation-range IPv6 address.
+  for (let i = 0; i < 10_000; i++) {
+    const res = await get(`2001:db8::${i.toString(16)}`);
+    assert.equal(res.status, 401, `fill ${i} must stay compared, not shed`);
+    await res.text();
+  }
+  // The table is full, so a fresh wrong bearer is still compared (401) while
+  // the authenticated scraper from another fresh address is served (200).
+  const wrong = await get("2001:db8::ffff", "Bearer wrong-bearer-value");
+  assert.equal(wrong.status, 401);
+  await wrong.text();
+  const ok = await get("2001:db8::eeee", `Bearer ${token}`);
+  assert.equal(ok.status, 200, "a scanner flood must not lock out the scraper");
+  assert.equal(h.forwarded.length, 1, "only the authenticated scrape reaches the container");
+});

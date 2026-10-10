@@ -158,7 +158,9 @@ const healthBuckets = new TokenBuckets();
 // otherwise all pass a read-only precheck). An exhausted caller is refused
 // without any comparison, so guessing cannot confirm a bearer while
 // throttled. Buckets are per caller (as with the probe cap), so another
-// caller's guessing cannot throttle a correct bearer; a correct bearer from
+// caller's guessing cannot throttle a correct bearer — even a caller shed
+// only because the 10,000-entry table is full is still compared, so a scanner
+// flood cannot lock out the authenticated scraper; a correct bearer from
 // the same exhausted caller waits out the retry-after like any other request.
 // A correct bearer consumes one token per scrape, which the production
 // scraper (~1/15 s against a 10-burst/1-per-second bucket) never nears.
@@ -932,7 +934,9 @@ export default {
     // secret comparison, so concurrent guesses cannot share one token; a
     // throttled caller is refused without any comparison, so guessing cannot
     // confirm a bearer while exhausted. Buckets are per caller, so someone
-    // else's guessing cannot throttle a correct bearer. Exact path only.
+    // else's guessing cannot throttle a correct bearer — and a caller shed
+    // only because the caller table is full is still compared, so a scanner
+    // flood cannot lock out the authenticated scraper. Exact path only.
     // CONTROL_PATH keeps its own gate (ownership.ts authenticated()): it
     // shares neither this bucket nor its budget.
     if (url.pathname === OPS_METRICS_PATH) {
@@ -956,7 +960,13 @@ export default {
       // the awaited digest comparison below. A correct bearer on a fresh
       // budget is unaffected (one token of a 10-burst).
       const verdict = metricsAuthBuckets.take(caller);
-      if (!verdict.allowed) {
+      if (!verdict.allowed && !metricsAuthBuckets.peek(caller).allowed) {
+        // Tracked caller out of budget (or in terminal hold): refuse without
+        // any comparison, so guessing cannot confirm a bearer while
+        // exhausted. peek is synchronous, so this cannot race the take above.
+        // An untracked caller denied only because the caller table is full
+        // falls through to the comparison below instead, so a flood of
+        // one-time scanners can never lock out the authenticated scraper.
         return new Response("slow down\n", {
           status: 429,
           headers: {

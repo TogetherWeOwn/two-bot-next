@@ -173,7 +173,9 @@ provisioned today). Every scrape attempt takes one token synchronously
 before the secret comparison, so concurrent guesses cannot share a token;
 an exhausted caller is refused without any comparison (`429` +
 `retry-after`). Buckets are per caller, so someone else's failures cannot
-throttle a correct bearer elsewhere.
+throttle a correct bearer elsewhere; a caller shed only because the
+10,000-entry table is full is still compared, so a scanner flood cannot
+lock out the authenticated scraper.
 
 #### Alert: job stale
 

@@ -251,7 +251,9 @@ No Prometheus server, no new infrastructure.
   refused without any comparison — guessing cannot confirm a bearer
   while exhausted (`429` + `retry-after` via the existing per-caller
   bucket, 10 burst, 1/sec). Buckets are per caller, so another caller's
-  guessing cannot throttle a correct bearer elsewhere; the scraper
+  guessing cannot throttle a correct bearer elsewhere; a caller shed only
+  because the 10,000-entry table is full is still compared, so a scanner
+  flood cannot lock out the authenticated scraper. The scraper
   (~1/15 s) never nears the budget. Non-GET →
   `404`. Unauthenticated requests never reach the container. `/metrics`
   itself stays `404`. The ownership control path (`/internal/ownership`)
