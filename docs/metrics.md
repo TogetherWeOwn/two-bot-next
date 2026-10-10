@@ -103,7 +103,7 @@ as dynamic labels.
   `GUILD_MEMBER_ADD`, `GUILD_MEMBER_REMOVE`, `GUILD_MEMBER_UPDATE`,
   `MESSAGE_CREATE`, `MESSAGE_UPDATE`, `MESSAGE_DELETE`,
   `MESSAGE_REACTION_ADD`, `MESSAGE_REACTION_REMOVE`,
-  `VOICE_STATE_UPDATE`, `INVITE_CREATE`, `INVITE_DELETE`,
+  `VOICE_STATE_UPDATE`, `PRESENCE_UPDATE`, `INVITE_CREATE`, `INVITE_DELETE`,
   `INTERACTION_CREATE`, `HEARTBEAT_ACK`, `GATEWAY_CLOSE`, `other`.
 - `two_bot_rest_requests_total{route,result}` — `result` is one of `2xx`,
   `3xx`, `4xx`, `429`, `5xx`, `transport`. `route` is one of the fixed

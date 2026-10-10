@@ -28,7 +28,7 @@ struct EventCap {
 }
 
 /// One row per `metrics::EVENTS` entry, in the same order.
-const EVENT_CAPS: [EventCap; 20] = [
+const EVENT_CAPS: [EventCap; 21] = [
     EventCap {
         label: "READY",
         class: VolumeClass::Session,
@@ -100,6 +100,11 @@ const EVENT_CAPS: [EventCap; 20] = [
         shed_order: Some(4),
     },
     EventCap {
+        label: "PRESENCE_UPDATE",
+        class: VolumeClass::Hot,
+        shed_order: Some(8),
+    },
+    EventCap {
         label: "INVITE_CREATE",
         class: VolumeClass::Steady,
         shed_order: None,
@@ -127,7 +132,7 @@ const EVENT_CAPS: [EventCap; 20] = [
     EventCap {
         label: "other",
         class: VolumeClass::Hot,
-        shed_order: Some(8),
+        shed_order: Some(9),
     },
 ];
 
@@ -405,8 +410,8 @@ fn hot_events_shed_first_and_session_events_never_shed() {
     shed.sort_unstable();
     assert_eq!(
         shed,
-        vec![1, 2, 3, 4, 5, 6, 7, 8],
-        "hot shed orders must be unique priorities 1-8; see docs/log-volume-guard.md"
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
+        "hot shed orders must be unique priorities 1-9; see docs/log-volume-guard.md"
     );
     let first = EVENT_CAPS
         .iter()
@@ -552,7 +557,7 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
 /// cardinality budget in the guard doc is updated with it.
 #[test]
 fn exposition_series_count_matches_the_cardinality_budget() {
-    assert_eq!(metrics::EVENTS.len(), 20, "event family changed the budget");
+    assert_eq!(metrics::EVENTS.len(), 21, "event family changed the budget");
     assert_eq!(
         metrics::REST_ROUTES.len(),
         26,
@@ -567,8 +572,8 @@ fn exposition_series_count_matches_the_cardinality_budget() {
     let text = metrics::Metrics::default().render(None);
     let series = text.lines().filter(|line| !line.starts_with('#')).count();
     assert_eq!(
-        series, 361,
-        "exposition grew past the 361-sample budget (20 events + 4 scalars + 1 latency \
+        series, 362,
+        "exposition grew past the 362-sample budget (21 events + 4 scalars + 1 latency \
          + 11 histogram + 156 rest + 48 jobs + 31 voice + 2 db-errors + 4 send-admissions + 6 dispatch-drops + 2 checkpoint-failures + 72 internal-actions + 4 pool); \
          update docs/log-volume-guard.md with the new series"
     );

@@ -20,7 +20,7 @@ high-rate event without a cap row fails the suite.
   guild/member/channel ID, token, query string, body or message content ever
   becomes a label or a log field.
 
-## Cardinality budget: 361 samples
+## Cardinality budget: 362 samples
 
 `GET /metrics` renders this many non-comment samples from process start,
 before any traffic. Adding any series fails the pinned count until this
@@ -28,7 +28,7 @@ table and the test are updated together.
 
 | Family | Series | How |
 | --- | --- | --- |
-| `two_bot_gateway_events_total{event}` | 20 | `EVENTS` allowlist |
+| `two_bot_gateway_events_total{event}` | 21 | `EVENTS` allowlist |
 | reconnects, resumes, disconnects, missed | 4 | scalar counters |
 | `two_bot_gateway_latency_seconds` | 1 | gauge, `NaN` until measured |
 | `two_bot_handler_duration_seconds` | 11 | 8 buckets + `+Inf` + sum + count |
@@ -67,12 +67,13 @@ thresholds document for paging.
 | `MESSAGE_REACTION_ADD` | hot | unbounded; self-role bursts on their own lane | 5 |
 | `MESSAGE_REACTION_REMOVE` | hot | unbounded; self-role bursts on their own lane | 6 |
 | `VOICE_STATE_UPDATE` | hot | unbounded; voice churn | 4 |
+| `PRESENCE_UPDATE` | hot | unbounded; only with `TWO_VOICE_PRESENCE=1`; in-memory only, ordered, never checkpointed | 8 |
 | `INVITE_CREATE` | steady | rare | never |
 | `INVITE_DELETE` | steady | rare | never |
 | `INTERACTION_CREATE` | steady | user-driven rate | never |
 | `HEARTBEAT_ACK` | steady | ~1 per 45 s; the latency signal | never |
 | `GATEWAY_CLOSE` | session | ~0/hr; pairs with reconnects | never |
-| `other` | hot | collapsed unknowns; growth means a new Discord type arrived | 8, last: shedding the catchall blinds us |
+| `other` | hot | collapsed unknowns; growth means a new Discord type arrived | 9, last: shedding the catchall blinds us |
 
 ## Log-line classes (catalog traced messages)
 
@@ -133,10 +134,13 @@ literals from `dispatch_bounded` (the `JoinError` payload is discarded
 there), so the type already bounds the output; the cap is a fence that holds
 even if a future supervisor returns a larger payload.
 
-Subscription facts that bound the top of the funnel: the bot never requests
-`GUILD_PRESENCES`, so presence arrives only through the hourly
-`presence_probe` job, never as gateway events; `MESSAGE_CONTENT` is requested
-only when automod, tickets or text commands justify it.
+Subscription facts that bound the top of the funnel: the bot requests
+`GUILD_PRESENCES` only with `TWO_VOICE=1` and `TWO_VOICE_PRESENCE=1`
+(`docs/voice-presence.md`). Those `PRESENCE_UPDATE` dispatches stay in
+gateway order on the dispatch worker but only update in-memory voice-room
+facts: no funnel, audit or checkpoint commit. Without the flag, presence
+arrives only through the hourly `presence_probe` job. `MESSAGE_CONTENT` is requested only when
+automod, tickets or text commands justify it.
 
 ## Maintenance
 
