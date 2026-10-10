@@ -262,7 +262,10 @@ pub(crate) struct AuditRuntime<M: AuditMirror> {
     /// Connection parts (pool, mirror, bot id) built once on first success; a
     /// failed connect caches nothing. The service rebuilds only when the
     /// destinations move, so halt-transition memory survives idle sweeps.
-    wired: AsyncMutex<Option<Wired<M>>>,
+    /// Shared through `Arc`: record and sweep clone the current wiring under
+    /// a brief lock, then run without holding it, so a paced multi-row sweep
+    /// never queues gateway records behind it.
+    wired: AsyncMutex<Option<Arc<Wired<M>>>>,
     /// Halt state seen by the previous sweep, for transition logs only —
     /// every sweep reads the store.
     halted: Mutex<Option<bool>>,
@@ -352,30 +355,27 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
         }
     }
 
-    fn rebuild_wired(wired: &mut Wired<M>, channels: AuditChannelIds, guild: &str) {
-        let fresh = Self::build_wired(
-            wired.pool.clone(),
-            wired.mirror.clone(),
-            wired.bot_user_id.clone(),
-            channels,
-            guild,
-        );
-        *wired = fresh;
-    }
-
-    async fn wired(&self) -> Result<tokio::sync::MappedMutexGuard<'_, Wired<M>>, ErrorClass> {
+    async fn wired(&self) -> Result<Arc<Wired<M>>, ErrorClass> {
         self.refresh_channels_with(crate::settings_jobs::live().as_ref());
-        let mut slot = self.wired.lock().await;
+        // Refresh outside the slot lock so a concurrent channel change lands
+        // on the next call instead of racing this one.
         let current = self
             .channels
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        match slot.as_mut() {
+        let mut slot = self.wired.lock().await;
+        match slot.as_ref() {
             Some(wired) if wired.channels == current => {}
             Some(wired) => {
                 let guild = self.guild.clone();
-                Self::rebuild_wired(wired, current, &guild);
+                *slot = Some(Arc::new(Self::build_wired(
+                    wired.pool.clone(),
+                    wired.mirror.clone(),
+                    wired.bot_user_id.clone(),
+                    current,
+                    &guild,
+                )));
             }
             None => {
                 let Parts {
@@ -384,18 +384,16 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
                     bot_user_id,
                 } = (self.connect)().await?;
                 let guild = self.guild.clone();
-                *slot = Some(Self::build_wired(
+                *slot = Some(Arc::new(Self::build_wired(
                     pool,
                     mirror,
                     bot_user_id,
                     current,
                     &guild,
-                ));
+                )));
             }
         }
-        Ok(tokio::sync::MutexGuard::map(slot, |slot| {
-            slot.as_mut().expect("wired set above")
-        }))
+        Ok(slot.as_ref().expect("wired set above").clone())
     }
 
     /// Durably record one event (route + insert) for the next sweep to

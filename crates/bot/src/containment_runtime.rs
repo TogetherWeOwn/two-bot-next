@@ -156,9 +156,9 @@ pub(crate) trait SettingsSource: Send + Sync + 'static {
     fn current(&mut self) -> impl Future<Output = ContainmentSettings> + Send;
 }
 
-/// Tuning is store-first (hot rows win over the deployment environment) and
-/// re-read at most every [`SETTINGS_MAX_AGE`]; a failed refresh keeps the last
-/// good values. The staff channel is the deployment value read once at boot.
+/// Tuning and the staff channel are store-first (hot rows win over the
+/// deployment environment) and re-read at most every [`SETTINGS_MAX_AGE`]; a
+/// failed refresh keeps the last good values.
 pub(crate) struct StoreSettings {
     pool: PgPool,
     guild_id: String,

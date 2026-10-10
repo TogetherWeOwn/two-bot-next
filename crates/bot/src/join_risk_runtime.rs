@@ -22,7 +22,7 @@
 //! tuning, claims the event through [`JoinRiskStore::record`] (atomic
 //! check-duplicate / count / score / insert under the guild advisory lock),
 //! logs the evidence first, then delivers `staff_message(persisted)` through
-//! the shared [`ActionExecutor`]: only to the boot-time staff channel the bot
+//! the shared [`ActionExecutor`]: only to the live staff channel the bot
 //! can View and Send in, with empty allowed mentions. Duplicates,
 //! undeliverable channels and failed sends are never retried: a failed send
 //! must not turn a replay into a second alert.
@@ -168,9 +168,9 @@ pub(crate) trait SettingsSource: Send + 'static {
     fn current(&mut self) -> impl Future<Output = JoinRiskSettings> + Send;
 }
 
-/// Tuning is store-first (hot rows win over the deployment environment) and
-/// re-read at most every [`SETTINGS_MAX_AGE`]; a failed refresh keeps the last
-/// good values. The staff channel is the deployment value read once at boot.
+/// Tuning, the bulk window and the staff channel are store-first (hot rows win
+/// over the deployment environment) and re-read at most every
+/// [`SETTINGS_MAX_AGE`]; a failed refresh keeps the last good values.
 pub(crate) struct StoreSettings {
     pool: PgPool,
     guild_id: String,
