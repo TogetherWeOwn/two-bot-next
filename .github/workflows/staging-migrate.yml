@@ -29,6 +29,10 @@ on:
       staging_database:
         description: Pinned staging database name, non-secret (binding must match; prod-like refused)
         required: true
+      staging_branch_id:
+        description: Pinned PlanetScale branch id, non-secret (required for *.psdb.cloud hosts; must match the binding username role.branch_id suffix; empty for Neon)
+        required: false
+        default: ''
       recovery_evidence_ref:
         description: Reference to approved recovery evidence (card/document, no URL secrets)
         required: true
@@ -96,6 +100,7 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
           STAGING_HOST: ${{ inputs.staging_host }}
           STAGING_DATABASE: ${{ inputs.staging_database }}
+          STAGING_BRANCH_ID: ${{ inputs.staging_branch_id }}
           RECOVERY_REF: ${{ inputs.recovery_evidence_ref }}
           ACL_REF: ${{ inputs.acl_plan_ref }}
           EXPECTED_PENDING: ${{ inputs.expected_pending }}
@@ -109,6 +114,7 @@ jobs:
           set -o pipefail
           ./target/debug/staging-migrate --target staging --plan --source-sha "$SOURCE_SHA" \
             --staging-host "$STAGING_HOST" --staging-database "$STAGING_DATABASE" \
+            --staging-branch-id "$STAGING_BRANCH_ID" \
             --recovery-evidence-ref "$RECOVERY_REF" --acl-plan-ref "$ACL_REF" \
             --expected-pending "$EXPECTED_PENDING" \
             | tee staging-migrate-manifest.json
@@ -156,6 +162,7 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
           STAGING_HOST: ${{ inputs.staging_host }}
           STAGING_DATABASE: ${{ inputs.staging_database }}
+          STAGING_BRANCH_ID: ${{ inputs.staging_branch_id }}
           RECOVERY_REF: ${{ inputs.recovery_evidence_ref }}
           ACL_REF: ${{ inputs.acl_plan_ref }}
           EXPECTED_PENDING: ${{ inputs.expected_pending }}
@@ -235,6 +242,7 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
           STAGING_HOST: ${{ inputs.staging_host }}
           STAGING_DATABASE: ${{ inputs.staging_database }}
+          STAGING_BRANCH_ID: ${{ inputs.staging_branch_id }}
           RECOVERY_REF: ${{ inputs.recovery_evidence_ref }}
           ACL_REF: ${{ inputs.acl_plan_ref }}
           EXPECTED_PENDING: ${{ inputs.expected_pending }}
@@ -250,6 +258,7 @@ jobs:
           set -o pipefail
           ./target/debug/staging-migrate --target staging --apply --source-sha "$SOURCE_SHA" \
             --staging-host "$STAGING_HOST" --staging-database "$STAGING_DATABASE" \
+            --staging-branch-id "$STAGING_BRANCH_ID" \
             --recovery-evidence-ref "$RECOVERY_REF" --acl-plan-ref "$ACL_REF" \
             --expected-pending "$EXPECTED_PENDING" \
             --plan-manifest-sha256 "$PLAN_MANIFEST_SHA256" --plan-run-id "$PLAN_RUN_ID" \

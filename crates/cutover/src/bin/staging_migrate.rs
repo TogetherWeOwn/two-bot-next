@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! staging-migrate --target staging|production --plan|--apply --source-sha <40hex>
-//!   --staging-host <host> --staging-database <db> (staging only)
+//!   --staging-host <host> --staging-database <db> [--staging-branch-id <branch>]
+//!   (staging only)
 //!   --production-host <host> --production-database <db> (production only)
 //!   --recovery-evidence-ref <ref> --acl-plan-ref <ref>
 //!   [--expected-pending <ascending,comma-separated versions>]
@@ -18,7 +19,16 @@
 //! unless --expected-pending equals the computed pending list exactly,
 //! --plan-manifest-sha256 equals the SHA-256 of the plan job's uploaded manifest
 //! for the same source SHA, and the downloaded manifest at --plan-manifest-path
-//! (fetched by the workflow from the --plan-run-id run) carries that same hash.
+//! (fetched by the workflow from the --plan-run-id run) carries that same hash,
+//! proving the bound hash came from the named producing run; --plan prints that
+//! manifest (including its own hash) and ignores the plan-binding flags.
+//!
+//! `--staging-branch-id` pins the PlanetScale branch id (non-secret, staging
+//! target only): it is required for `*.psdb.cloud` hosts and must match the
+//! binding username's `{role}.{branch_id}` suffix; empty (the default) means no
+//! pin and is accepted for Neon and test hosts. The production target takes no
+//! branch pin yet, so a production dispatch aimed at a `*.psdb.cloud` host
+//! fails closed until a production branch pin lands (follow-up).
 //! Exit: 0 ok, 2 refused before any DDL, 1 failed (evidence on stdout).
 
 // Operator CLI reports intentionally use stdout; runtime/library modules do not.
@@ -45,6 +55,7 @@ fn real_main() -> i32 {
             | "--source-sha"
             | "--staging-host"
             | "--staging-database"
+            | "--staging-branch-id"
             | "--production-host"
             | "--production-database"
             | "--recovery-evidence-ref"
@@ -74,22 +85,33 @@ fn real_main() -> i32 {
     let get = |k: &str| values.get(k).cloned().unwrap_or_default();
     // Each target uses only its own host/database flags: a staging run never
     // reads a production pin and a production run never reads a staging pin.
-    let (expected_host, expected_database) = match target {
+    let (expected_host, expected_database, expected_branch_id) = match target {
         Target::Staging => {
             if values.contains_key("--production-host")
                 || values.contains_key("--production-database")
             {
                 return refused("staging target takes --staging-host/--staging-database only");
             }
-            (get("--staging-host"), get("--staging-database"))
+            (
+                get("--staging-host"),
+                get("--staging-database"),
+                get("--staging-branch-id"),
+            )
         }
         Target::Production => {
-            if values.contains_key("--staging-host") || values.contains_key("--staging-database") {
+            if values.contains_key("--staging-host")
+                || values.contains_key("--staging-database")
+                || values.contains_key("--staging-branch-id")
+            {
                 return refused(
                     "production target takes --production-host/--production-database only",
                 );
             }
-            (get("--production-host"), get("--production-database"))
+            (
+                get("--production-host"),
+                get("--production-database"),
+                String::new(),
+            )
         }
     };
     // Each target and mode reads only its own binding: a plan run can never
@@ -107,6 +129,7 @@ fn real_main() -> i32 {
         source_sha: get("--source-sha"),
         expected_host,
         expected_database,
+        expected_branch_id,
         recovery_evidence_ref: get("--recovery-evidence-ref"),
         acl_plan_ref: get("--acl-plan-ref"),
         apply,

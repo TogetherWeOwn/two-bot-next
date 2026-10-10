@@ -12,7 +12,8 @@
   "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "target": {
     "host": "staging.invalid",
-    "database": "two_bot"
+    "database": "two_bot",
+    "branch_id": ""
   },
   "expected_pending": [
     "1",

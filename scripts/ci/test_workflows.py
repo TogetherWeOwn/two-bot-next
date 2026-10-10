@@ -180,12 +180,13 @@ def staging_claim_errors(claim, name="staging-migrate.yml",
                            claim_artifact="staging-migrate-apply-claim",
                            script="scripts/ci/staging_migrate_claim.py",
                            host_env="STAGING_HOST", host_input="staging_host",
-                           db_env="STAGING_DATABASE", db_input="staging_database"):
+                           db_env="STAGING_DATABASE", db_input="staging_database",
+                           branch_env="STAGING_BRANCH_ID", branch_input="staging_branch_id"):
     """Claim transport must complete before the protected apply job waits.
 
     Parametrized by workflow name, job identity, artifact names, publisher
-    script and host/database env/input names so the production mirror pins the
-    same shape with its own names.
+    script and host/database/branch env/input names so the production mirror
+    pins the same shape with its own names (production passes no branch pin).
     """
     errors = []
     prefix = f"{name}:claim:"
@@ -210,11 +211,15 @@ def staging_claim_errors(claim, name="staging-migrate.yml",
     if (not str(fetch.get("uses", "")).startswith("actions/download-artifact@")
             or fetch.get("with") != {"name": manifest, "path": "current-plan"}):
         errors.append(f"{prefix} must read this dispatch's plan artifact, not an arbitrary run")
-    expected_env = {key: "${{ inputs." + value + " }}" for key, value in (
-        ("MODE", "mode"), ("SOURCE_SHA", "source_sha"), (host_env, host_input),
-        (db_env, db_input), ("RECOVERY_REF", "recovery_evidence_ref"),
-        ("ACL_REF", "acl_plan_ref"), ("EXPECTED_PENDING", "expected_pending"),
-        ("PLAN_MANIFEST_SHA256", "plan_manifest_sha256"), ("PLAN_RUN_ID", "plan_run_id"))}
+    pairs = [("MODE", "mode"), ("SOURCE_SHA", "source_sha"), (host_env, host_input),
+             (db_env, db_input)]
+    if branch_env is not None and branch_input is not None:
+        pairs.append((branch_env, branch_input))
+    pairs.extend([("RECOVERY_REF", "recovery_evidence_ref"),
+                  ("ACL_REF", "acl_plan_ref"), ("EXPECTED_PENDING", "expected_pending"),
+                  ("PLAN_MANIFEST_SHA256", "plan_manifest_sha256"),
+                  ("PLAN_RUN_ID", "plan_run_id")])
+    expected_env = {key: "${{ inputs." + value + " }}" for key, value in pairs}
     if publish.get("env") != expected_env or publish.get("shell") != "bash":
         errors.append(f"{prefix} must pass exactly the dispatch fields via env, in bash")
     script_text = str(publish.get("run", ""))
@@ -245,6 +250,8 @@ def production_claim_errors(claim):
         host_input="production_host",
         db_env="PRODUCTION_DATABASE",
         db_input="production_database",
+        branch_env=None,
+        branch_input=None,
     )
 
 
@@ -257,27 +264,35 @@ def job_env_text(job):
 def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
                      migrator_secret, host_input, db_input, manifest,
                      target_flag, host_flag, db_flag, other_host_flag,
-                     other_db_flag, other_plan_secret, other_migrator_secret):
+                     other_db_flag, other_plan_secret, other_migrator_secret,
+                     branch_input="staging_branch_id", branch_flag="--staging-branch-id",
+                     other_branch_flag=None):
     """Parametrized migration-runner shape (staging and production mirrors).
 
-    Dispatch-only with exactly the nine reviewed inputs, three jobs
+    Dispatch-only with exactly the reviewed inputs (staging carries the
+    PlanetScale branch pin, production does not yet), three jobs
     (plan always runs through the no-reviewer plan environment, unprotected
     claim transports the apply request, apply runs only for mode=apply after a
     green plan and claim through the reviewed apply environment), each job with
     its own routed runner and pipefail Run step. No push/pull_request/schedule
     trigger, no wrangler/probe markers. The caller supplies the workflow file
-    name, environment names, secret names, host/database input names, artifact
-    prefix, runner target/host/database flags and the other target's flags and
-    secrets (which must never appear).
+    name, environment names, secret names, host/database/branch input names,
+    artifact prefix, runner target/host/database/branch flags and the other
+    target's flags and secrets (which must never appear). A None branch pin
+    skips the branch assertions for that target.
     """
     errors = []
     on = workflow.get("on") or {}
     if set(on) != {"workflow_dispatch"}:
         errors.append(f"{name}: must be dispatch-only (no push/pull_request/schedule)")
     inputs = ((on.get("workflow_dispatch") or {}).get("inputs") or {})
+    optional = {"mode", "expected_pending", "plan_manifest_sha256", "plan_run_id"}
     expected = {"mode", "source_sha", host_input, db_input,
                 "recovery_evidence_ref", "acl_plan_ref", "expected_pending",
                 "plan_manifest_sha256", "plan_run_id"}
+    if branch_input is not None:
+        expected.add(branch_input)
+        optional.add(branch_input)
     if set(inputs) != expected:
         errors.append(f"{name}: workflow_dispatch inputs must be exactly {sorted(expected)}")
     else:
@@ -286,10 +301,17 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
                 or set(mode.get("options") or []) != {"plan", "apply"}
                 or mode.get("default") != "plan"):
             errors.append(f"{name}: mode must be plan/apply defaulting to plan")
-        for key in expected - {"mode", "expected_pending", "plan_manifest_sha256", "plan_run_id"}:
+        for key in expected - optional:
             field = inputs.get(key) or {}
             if str(field.get("required")).lower() != "true":
                 errors.append(f"{name}: input {key} must be required")
+        if branch_input is not None:
+            branch = inputs.get(branch_input) or {}
+            if (str(branch.get("required")).lower() != "false"
+                    or branch.get("default") != ""
+                    or "branch" not in str(branch.get("description")).lower()):
+                errors.append(f"{name}: {branch_input} must stay optional, default empty, "
+                              "and documented as the PlanetScale branch pin")
         pending = inputs.get("expected_pending") or {}
         if (str(pending.get("required")).lower() != "false"
                 or pending.get("default") != ""
@@ -379,6 +401,9 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
         errors.append(f"{name}: must never pass the other target's {other_host_flag} flag")
     if other_db_flag in plan_runs or other_db_flag in apply_runs:
         errors.append(f"{name}: must never pass the other target's {other_db_flag} flag")
+    if other_branch_flag is not None and (other_branch_flag in plan_runs
+                                          or other_branch_flag in apply_runs):
+        errors.append(f"{name}: must never pass the other target's {other_branch_flag} flag")
     if host_flag not in plan_runs or host_flag not in apply_runs:
         errors.append(f"{name}: must pass {host_flag} to the runner on both jobs")
     if db_flag not in plan_runs or db_flag not in apply_runs:
@@ -395,6 +420,15 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
         errors.append(f"{name}:apply: must pass the producing run's downloaded manifest to the runner")
     if "--plan-manifest-path" in plan_runs:
         errors.append(f"{name}:plan: must not take the provenance manifest path (it produces the manifest)")
+    # PlanetScale branch pin: a target that declares the pin passes the
+    # non-secret branch id to the runner on both jobs; the runner requires it
+    # for `*.psdb.cloud` hosts and refuses pooled ports, `|bouncer` usernames
+    # and branch mismatches before any DDL.
+    if branch_flag is not None:
+        if branch_flag not in plan_runs:
+            errors.append(f"{name}:plan: must pass the staging branch pin to the runner")
+        if branch_flag not in apply_runs:
+            errors.append(f"{name}:apply: must pass the staging branch pin to the runner")
     apply_fetch = [step for step in apply.get("steps", [])
                    if str(step.get("uses", "")).startswith("actions/download-artifact@")]
     if len(apply_fetch) != 1:
@@ -448,7 +482,12 @@ def staging_migrate_errors(workflow, name="staging-migrate.yml",
 
 
 def production_migrate_errors(workflow):
-    """Production mirror of the migration-runner shape."""
+    """Production mirror of the migration-runner shape.
+
+    Production declares no branch pin yet (the runner fails closed on
+    `*.psdb.cloud` hosts until a production branch pin lands), so the
+    branch assertions are skipped for this target.
+    """
     return migrate_errors(workflow, name="production-migrate.yml",
                           plan_env="production-migrate-plan", apply_env="production-migrate-apply",
                           plan_secret="TWO_BOT_PRODUCTION_PLAN_DATABASE_URL",
@@ -459,7 +498,9 @@ def production_migrate_errors(workflow):
                           db_flag="--production-database", other_host_flag="--staging-host",
                           other_db_flag="--staging-database",
                           other_plan_secret="TWO_BOT_STAGING_PLAN_DATABASE_URL",
-                          other_migrator_secret="TWO_BOT_STAGING_MIGRATOR_DATABASE_URL")
+                          other_migrator_secret="TWO_BOT_STAGING_MIGRATOR_DATABASE_URL",
+                          branch_input=None, branch_flag=None,
+                          other_branch_flag="--staging-branch-id")
 
 
 ROLLBACK_DRILL_ENV = {
@@ -1236,7 +1277,7 @@ class WorkflowTests(unittest.TestCase):
                     del w["on"]["workflow_dispatch"]["inputs"][missing]
                 self.assertTrue(mutated(drop))
         # Staging inputs must not appear on the production workflow.
-        for staging_input in ("staging_host", "staging_database"):
+        for staging_input in ("staging_host", "staging_database", "staging_branch_id"):
             with self.subTest(staging_input=staging_input):
                 def add(w, staging_input=staging_input):
                     w["on"]["workflow_dispatch"]["inputs"][staging_input] = {"required": True}

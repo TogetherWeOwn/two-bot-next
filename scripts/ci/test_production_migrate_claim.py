@@ -33,7 +33,8 @@ def production_plan():
     """The shared synthetic vector, re-targeted at production and re-hashed."""
     plan = json.loads(PLAN.read_text())
     plan["migration_target"] = "production"
-    plan["target"] = {"host": ENV["PRODUCTION_HOST"], "database": ENV["PRODUCTION_DATABASE"]}
+    plan["target"] = {"host": ENV["PRODUCTION_HOST"], "database": ENV["PRODUCTION_DATABASE"],
+                      "branch_id": ""}
     plan["plan_manifest_sha256"] = projection_hash(plan)
     return plan
 
@@ -77,6 +78,18 @@ class ProductionClaimTests(unittest.TestCase):
                        "PLAN_MANIFEST_SHA256": plan["plan_manifest_sha256"]}
                 with self.assertRaises(Refused):
                     build_claim(plan, env)
+
+    def test_refuses_branched_production_target(self):
+        # Production takes no branch pin yet: a manifest carrying one fails
+        # closed until a production branch pin lands.
+        for branch_id in ("cnfixture01", "main"):
+            with self.subTest(branch_id=branch_id):
+                plan = deepcopy(self.plan)
+                plan["target"]["branch_id"] = branch_id
+                plan["plan_manifest_sha256"] = projection_hash(plan)
+                with self.assertRaises(Refused):
+                    build_claim(plan, {**self.env,
+                                       "PLAN_MANIFEST_SHA256": plan["plan_manifest_sha256"]})
 
     def test_refuses_wrong_workflow_identity(self):
         with self.assertRaises(Refused):

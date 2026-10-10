@@ -103,14 +103,20 @@ def build_claim(manifest, env):
     require(manifest.get("migration_target", "staging") == "staging",
             "manifest is not a staging plan")
     target = manifest.get("target")
-    require(isinstance(target, dict) and set(target) == {"host", "database"}, "plan target is invalid")
+    require(isinstance(target, dict) and set(target) == {"host", "database", "branch_id"},
+            "plan target is invalid")
     require(isinstance(target.get("host"), str)
             and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}", target["host"])
             and isinstance(target.get("database"), str)
             and re.fullmatch(r"[a-zA-Z0-9_.-]{1,63}", target["database"])
-            and all("prod" not in value.lower() for value in target.values()),
+            and isinstance(target.get("branch_id"), str)
+            and re.fullmatch(r"[A-Za-z0-9_-]{0,63}", target["branch_id"])
+            and all("prod" not in value.lower() for value in (target["host"], target["database"])),
             "target is not a bare staging identity")
-    require(target == {"host": env.get("STAGING_HOST"), "database": env.get("STAGING_DATABASE")},
+    if target["host"].lower().endswith(".psdb.cloud"):
+        require(target["branch_id"] != "", "PlanetScale target must carry the pinned branch id")
+    require(target == {"host": env.get("STAGING_HOST"), "database": env.get("STAGING_DATABASE"),
+                       "branch_id": env.get("STAGING_BRANCH_ID", "")},
             "plan target does not match the request")
     for key, env_key in (("recovery_evidence_ref", "RECOVERY_REF"), ("acl_plan_ref", "ACL_REF")):
         value = env.get(env_key, "")
