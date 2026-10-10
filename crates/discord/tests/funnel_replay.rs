@@ -939,10 +939,16 @@ fn pipeline_leave_closes_voice_first() {
 /// lock in `pipeline.rs`, so the concurrent case is covered by
 /// `pipeline_serializes_same_member_voice_frames` for the funnel rows and the
 /// facts share that same critical section.
+/// (member_id, channel_id, occurred_at, session_key).
+type RecordedVoiceStart = (u64, u64, String, String);
+/// (member_id, channel_id, occurred_at, started_at, duration_seconds,
+/// session_key).
+type RecordedVoiceEnd = (u64, u64, String, Option<String>, Option<i64>, String);
+
 #[derive(Debug, Default)]
 struct RecordingVoiceFacts {
-    starts: Mutex<Vec<(u64, u64, String, String)>>,
-    ends: Mutex<Vec<(u64, u64, String, Option<String>, Option<i64>, String)>>,
+    starts: Mutex<Vec<RecordedVoiceStart>>,
+    ends: Mutex<Vec<RecordedVoiceEnd>>,
 }
 
 impl FactsSink for &RecordingVoiceFacts {
