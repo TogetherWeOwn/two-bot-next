@@ -249,6 +249,9 @@ pub fn companion_view_grant(member_id: Snowflake) -> Option<PermissionOverwrite>
 }
 
 /// Sanitized errors: never surface HTTP bodies/tokens/member data in diagnostics.
+/// Upper bound for one rename request (admission plus Discord round trip).
+pub const RENAME_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Upper bound for one voice-status request (send admission plus the
 /// Discord round trip).
 pub const VOICE_STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1015,7 +1018,10 @@ impl RoomHttp {
             .map_err(classify_http_error)?;
         // Bounded even for a stalled transport: rename budgets are charged on
         // attempt, including an unknown outcome. The queue keeps its latest name.
-        tokio::time::timeout(Duration::from_secs(1), self.send(request, || true))
+        // The bound covers durable send admission plus the Discord round trip,
+        // which together exceed one second in production. The guild actor
+        // waits at most one second of it; the rest runs on its own task.
+        tokio::time::timeout(RENAME_REQUEST_TIMEOUT, self.send(request, || true))
             .await
             .map_err(|_| RoomHttpError::RenameDeferred)??;
         Ok(())
