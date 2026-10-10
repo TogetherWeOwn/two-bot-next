@@ -165,7 +165,11 @@ and historical records remain intact.
   `outage_seconds_min` as the lower bound); missing evidence is NOT VERIFIED,
   never PASS; a recovered outage at or over 60 s, or an open window already
   reaching 60 s, is NEEDS WORK. Exit status is nonzero unless the verdict is
-  PASS, so CI and wrappers fail closed.
+  PASS, so CI and wrappers fail closed. The tool reads a committed JSONL tick
+  log; there is no live producer. A pass verifies offline reconciliation only;
+  it does not prove a deployed build, live event coverage or staging
+  acceptance, so the Gate 5 recovery measurement stays NOT VERIFIED until a
+  reviewed log source exists.
 - The staging deploy workflow documents a **95–139-second gateway drop per
   deploy**, and a separate historical staging note records a **92–139-second
   redeploy**. These are documented historical interruption ranges, not a
