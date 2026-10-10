@@ -44,8 +44,9 @@ applies its ten live lists, thresholds and the enforce flag from the snapshot
 on every delivery (`crates/bot/src/automod_gateway.rs:192-203`, `:273`);
 the feed poller applies `TWO_FEED_POLL_SECONDS` from the snapshot before
 every tick (`crates/bot/src/feed_jobs.rs:232-259`). Two boot-only edges
-remain: the feed supervisor cadence stays the boot value, so a stored
-decrease below it waits for the next supervisor tick
+remain: the feed supervisor still wakes on the boot cadence, so a stored
+interval change takes effect no earlier than the previously scheduled slot
+and runs at the stored value rounded up to a multiple of the boot cadence
 (`crates/bot/src/feed_jobs.rs:227-244`), and the voice room-name policy is
 built once at boot from the process environment
 (`crates/bot/src/gateway.rs:1608`). Every other
@@ -177,7 +178,7 @@ Catalog entries: 122.
 | `TWO_COMMUNITY_WELCOME_CHANNEL_IDS` | hot | Not specified in Next | stored unwired | Welcome-channel classification for community analytics. |
 | `TWO_DATABASE_URL` | env_only | Not rendered (secret) | environment only | Administrative/shared admission database credential required for live preflight, cutover and guild-config; must reach the same database as Container DATABASE_URL for the same token. |
 | `TWO_DB_POOL_MAX` | env_only | Not specified in Next | environment only | Legacy database pool maximum read before the settings store exists. |
-| `TWO_FEED_POLL_SECONDS` | hot | `300` | env at boot; stored, applied live by runtime refresh | Feed polling interval (validated from 60 to 86400 seconds). |
+| `TWO_FEED_POLL_SECONDS` | hot | `300` | stored, applied live by runtime refresh (reload-report hot) | Feed polling interval (validated from 60 to 86400 seconds). |
 | `TWO_HEALTH_BIND_HOST` | env_only | Not specified in Next | environment only | Legacy health listener interface; environment-only network bind. |
 | `TWO_HEALTH_PORT` | env_only | Not specified in Next | environment only | Legacy health listener port; Container uses LISTEN_ADDR instead. |
 | `TWO_INACTIVITY_DAYS` | cold | Not specified in Next | stored unwired | Inactivity horizon used for community nudges. |

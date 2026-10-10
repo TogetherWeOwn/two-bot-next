@@ -1362,6 +1362,24 @@ mod tests {
     }
 
     #[test]
+    fn sanction_parsing_accepts_a_dashboard_stored_real_array() {
+        // The dashboard may store the ladder as a real JSON array rather than
+        // a string. The live snapshot renders stored values through
+        // `settings::to_env_string`, which must hand the parser the JSON
+        // shape instead of comma-joined objects.
+        let stored = serde_json::json!([
+            {"violations": 1, "action": "delete", "timeout_seconds": null},
+            {"violations": 2, "action": "warn", "timeout_seconds": null},
+            {"violations": 3, "action": "timeout", "timeout_seconds": 600},
+        ]);
+        let rendered = crate::settings::to_env_string(&stored).expect("renders");
+        assert_eq!(
+            parse_sanctions(Some(&rendered)).expect("stored array parses"),
+            parse_sanctions(Some("1:delete,2:warn,3:timeout:600")).expect("csv parses")
+        );
+    }
+
+    #[test]
     fn name_policy_preserves_normalized_content_rules_when_chat_config_is_invalid() {
         let vars: HashMap<String, String> = [
             ("TWO_AUTOMOD", "0"),

@@ -224,11 +224,12 @@ pub(crate) fn live_poll_seconds(guild: &str, fallback: u64) -> u64 {
     live_poll_seconds_with(guild, fallback, crate::settings_jobs::live().as_ref())
 }
 
-/// Live-aware job: the supervisor cadence stays the boot value, while the
+/// Live-aware job: the supervisor still wakes on the boot value, while the
 /// non-overlapping schedule gate re-reads the live interval before every
-/// tick. A stored increase takes effect on the next tick (later ticks skip);
-/// a stored decrease below the boot cadence waits for the next supervisor
-/// tick, bounded by the boot cadence (dynamic-cadence follow-up).
+/// tick. A stored change takes effect no earlier than the previously
+/// scheduled slot, and the effective interval is the stored value rounded up
+/// to a multiple of the boot cadence; only a restart re-baselines the
+/// supervisor cadence (dynamic-cadence follow-up).
 pub(crate) fn scheduled_job_live(
     seconds: u64,
     action: JobAction,

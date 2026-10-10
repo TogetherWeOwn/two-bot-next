@@ -73,8 +73,9 @@ applies its ten live lists, thresholds and the enforce flag from the snapshot\n\
 on every delivery (`crates/bot/src/automod_gateway.rs:192-203`, `:273`);\n\
 the feed poller applies `TWO_FEED_POLL_SECONDS` from the snapshot before\n\
 every tick (`crates/bot/src/feed_jobs.rs:232-259`). Two boot-only edges\n\
-remain: the feed supervisor cadence stays the boot value, so a stored\n\
-decrease below it waits for the next supervisor tick\n\
+remain: the feed supervisor still wakes on the boot cadence, so a stored\n\
+interval change takes effect no earlier than the previously scheduled slot\n\
+and runs at the stored value rounded up to a multiple of the boot cadence\n\
 (`crates/bot/src/feed_jobs.rs:227-244`), and the voice room-name policy is\n\
 built once at boot from the process environment\n\
 (`crates/bot/src/gateway.rs:1608`). Every other\n\

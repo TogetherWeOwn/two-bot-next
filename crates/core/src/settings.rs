@@ -347,13 +347,25 @@ pub fn to_env_string(value: &Value) -> Option<String> {
         // Id lists are comma-separated in the environment and stay that way,
         // so the dashboard can store a real array without every reader
         // learning a second shape. Unrenderable elements become "".
-        Value::Array(items) => Some(
-            items
+        // Arrays holding objects (e.g. stored automod sanctions) would not
+        // survive comma-joining, so they render as compact JSON, a shape the
+        // typed readers already accept.
+        Value::Array(items) => {
+            if items
                 .iter()
-                .map(|v| to_env_string(v).unwrap_or_default())
-                .collect::<Vec<_>>()
-                .join(","),
-        ),
+                .any(|v| matches!(v, Value::Object(_) | Value::Array(_)))
+            {
+                serde_json::to_string(value).ok()
+            } else {
+                Some(
+                    items
+                        .iter()
+                        .map(|v| to_env_string(v).unwrap_or_default())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                )
+            }
+        }
         Value::Object(_) => serde_json::to_string(value).ok(),
     }
 }
@@ -1025,6 +1037,22 @@ mod tests {
             to_env_string(&json!([3.0, u64::MAX])).as_deref(),
             Some("3,18446744073709551615")
         );
+    }
+
+    #[test]
+    fn object_arrays_render_as_json_for_typed_readers() {
+        // A dashboard-stored sanctions ladder is a real array of objects; the
+        // live snapshot must hand readers the JSON shape, not comma-joined
+        // objects no parser accepts.
+        let rendered = to_env_string(&json!([
+            {"violations": 1, "action": "delete", "timeout_seconds": null},
+            {"violations": 2, "action": "warn", "timeout_seconds": null},
+        ]))
+        .expect("renders");
+        assert!(rendered.starts_with('['), "{rendered}");
+        assert!(rendered.contains("\"violations\""), "{rendered}");
+        // Scalar arrays keep the comma-separated env shape.
+        assert_eq!(to_env_string(&json!(["1", "2"])).as_deref(), Some("1,2"));
     }
 
     #[test]
