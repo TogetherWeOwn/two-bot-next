@@ -4,10 +4,10 @@
 //!
 //! Wired effects: `announcement.post` (single-attempt send), `event.read`
 //! (keyless mapped GET) and the restrictive member verbs `moderation.ban`,
-//! `moderation.tempban`, `moderation.kick` and `moderation.warn` (member
-//! moderation through the shared moderation service). Every other verb stays
-//! refused by the per-effect fences below, even when the env-only flag gate
-//! authorizes it.
+//! `moderation.tempban`, `moderation.kick`, `moderation.warn` and
+//! `moderation.timeout` (member moderation through the shared moderation
+//! service). Every other verb stays refused by the per-effect fences below,
+//! even when the env-only flag gate authorizes it.
 
 use std::{
     future::IntoFuture,
@@ -102,8 +102,9 @@ impl ActionEffect for AnnouncementExecutor {
 }
 
 /// Restrictive-moderation effect: `moderation.ban`, `moderation.tempban`,
-/// `moderation.kick` and `moderation.warn` through the shared moderation
-/// service. The test seam is module-private like [`ActionEffect`]: the
+/// `moderation.kick`, `moderation.warn` and `moderation.timeout` through the
+/// shared moderation service. The test seam is module-private like
+/// [`ActionEffect`]: the
 /// production effect resolves actor/target from the configured staging guild
 /// using live member roles, positions, permissions and bot/owner flags — never
 /// from body-supplied roles or permissions. Mocks skip Discord and return a
@@ -229,9 +230,8 @@ impl ModerationEffect for ModerationExecutor {
 /// Discord `ADMINISTRATOR` bit (1 << 3): holders pass every permission check.
 const ADMINISTRATOR_BIT: u64 = 1 << 3;
 
-/// The four website-wired restrictive verbs. `moderation.timeout` belongs to
-/// the timeout family slice, channel verbs to the channel family slice: none
-/// of them may reach this resolver.
+/// The five website-wired restrictive verbs. Channel verbs belong to the
+/// channel family slice: none of them may reach this resolver.
 fn is_wired_moderation_verb(action: ModerationAction) -> bool {
     matches!(
         action,
@@ -239,13 +239,14 @@ fn is_wired_moderation_verb(action: ModerationAction) -> bool {
             | ModerationAction::TempBan
             | ModerationAction::Kick
             | ModerationAction::Warn
+            | ModerationAction::Timeout
     )
 }
 
 /// Per-verb actor gate (legacy `permissionFor`): bans check Ban Members,
-/// kicks check Kick Members, warns check Moderate Members. The resolver
-/// refuses verbs outside [`is_wired_moderation_verb`] before this runs; the
-/// shared service re-checks the same gate from its own table.
+/// kicks check Kick Members, warns and timeouts check Moderate Members. The
+/// resolver refuses verbs outside [`is_wired_moderation_verb`] before this
+/// runs; the shared service re-checks the same gate from its own table.
 fn moderation_required_permission(action: ModerationAction) -> u64 {
     match action {
         ModerationAction::Ban | ModerationAction::TempBan => PERM_BAN_MEMBERS,
@@ -255,8 +256,8 @@ fn moderation_required_permission(action: ModerationAction) -> u64 {
 }
 
 /// Bans address users, not just members: Discord bans a departed or
-/// never-joined user id outright. Kicks and warns act on a guild member, so
-/// they refuse a departed target instead of synthesizing one.
+/// never-joined user id outright. Kicks, warns and timeouts act on a guild
+/// member, so they refuse a departed target instead of synthesizing one.
 fn moderation_tolerates_departed_target(action: ModerationAction) -> bool {
     matches!(action, ModerationAction::Ban | ModerationAction::TempBan)
 }
@@ -629,6 +630,7 @@ fn moderation_executor_from_env(
         "moderation.tempban",
         "moderation.kick",
         "moderation.warn",
+        "moderation.timeout",
     ]
     .iter()
     .all(|verb| flags.is_enabled(verb));
@@ -900,12 +902,16 @@ async fn receive(state: &ReceiverState, request: Request, id: &str) -> Response 
     if decision.action == "event.read" {
         return read_event(state, &decision, id, key, action).await;
     }
-    // The four wired restrictive-moderation verbs. Every other verb without
+    // The five wired restrictive-moderation verbs. Every other verb without
     // an adapter stays refused below, even when the flag gate authorizes it
     // — shipping an implementation must never widen the allowlist by itself.
     if matches!(
         decision.action.as_str(),
-        "moderation.ban" | "moderation.tempban" | "moderation.kick" | "moderation.warn"
+        "moderation.ban"
+            | "moderation.tempban"
+            | "moderation.kick"
+            | "moderation.warn"
+            | "moderation.timeout"
     ) {
         return moderation_member(state, &decision, &raw, headers.idempotency, id, key, action)
             .await;
@@ -1002,16 +1008,17 @@ async fn read_event(
 }
 
 /// Website restrictive moderation (`moderation.ban`, `moderation.tempban`,
-/// `moderation.kick`, `moderation.warn`): idempotency-key validation and the
-/// durable claim match the announcement path. The body parses via
-/// [`InternalMemberRequest::from_body`] (actor/target snowflakes, trimmed
-/// reason, tempban `duration_seconds` 60–365d); actor and target resolve from
+/// `moderation.kick`, `moderation.warn`, `moderation.timeout`):
+/// idempotency-key validation and the durable claim match the announcement
+/// path. The body parses via [`InternalMemberRequest::from_body`]
+/// (actor/target snowflakes, trimmed reason, tempban `duration_seconds`
+/// 60–365d, timeout `duration_seconds` 60–28d); actor and target resolve from
 /// the configured staging guild using live member roles, positions,
 /// permissions and bot/owner flags — never from body-supplied roles. The outer
 /// [`InternalActionStore`] claim guards the exact signed bytes (replay,
 /// mismatch, in-flight); the inner [`InternalMemberExecutor`] guards the
 /// moderation content and writes the shared `moderation_audit` ledger, so rows
-/// are identical to the slash-command path. Only the four wired verbs reach
+/// are identical to the slash-command path. Only the five wired verbs reach
 /// here; every other verb stays refused by the fences in [`receive`].
 #[allow(clippy::too_many_arguments)]
 async fn moderation_member(
@@ -1138,15 +1145,16 @@ async fn moderation_member(
 }
 
 /// Legacy outcome string per wired verb (`MemberOutcome::as_str`): `banned`,
-/// `temporarily_banned`, `kicked`, `warned`. The stored receipt carries only
-/// the affected target, so the wire renders the outcome from the action — the
-/// first and every replayed response are identical.
+/// `temporarily_banned`, `kicked`, `warned`, `timed_out`. The stored receipt
+/// carries only the affected target, so the wire renders the outcome from the
+/// action — the first and every replayed response are identical.
 fn moderation_outcome(action: &str) -> Option<&'static str> {
     match action {
         "moderation.ban" => Some("banned"),
         "moderation.tempban" => Some("temporarily_banned"),
         "moderation.kick" => Some("kicked"),
         "moderation.warn" => Some("warned"),
+        "moderation.timeout" => Some("timed_out"),
         _ => None,
     }
 }

@@ -237,7 +237,7 @@ fn moderation_payload(action: &str) -> String {
         "discord_id": "333333333333333333",
         "reason": "spam",
     });
-    if action == "moderation.tempban" {
+    if action == "moderation.tempban" || action == "moderation.timeout" {
         body["duration_seconds"] = serde_json::json!(3600);
     }
     body.to_string()
@@ -250,7 +250,9 @@ fn moderation_payload_with(action: &str, extra: Value) -> String {
         "discord_id": "333333333333333333",
         "reason": "spam",
     });
-    if action == "moderation.tempban" && extra.get("duration_seconds").is_none() {
+    if (action == "moderation.tempban" || action == "moderation.timeout")
+        && extra.get("duration_seconds").is_none()
+    {
         body["duration_seconds"] = serde_json::json!(3600);
     }
     for (key, value) in extra.as_object().unwrap() {
@@ -264,6 +266,7 @@ fn moderation_outcome_for(action: &str) -> &'static str {
         "moderation.ban" => "banned",
         "moderation.tempban" => "temporarily_banned",
         "moderation.kick" => "kicked",
+        "moderation.timeout" => "timed_out",
         _ => "warned",
     }
 }
@@ -1006,6 +1009,10 @@ fn moderation_gates_are_verb_specific() {
         moderation_required_permission(ModerationAction::Warn),
         PERM_MODERATE_MEMBERS
     );
+    assert_eq!(
+        moderation_required_permission(ModerationAction::Timeout),
+        PERM_MODERATE_MEMBERS
+    );
     assert!(moderation_tolerates_departed_target(ModerationAction::Ban));
     assert!(moderation_tolerates_departed_target(
         ModerationAction::TempBan
@@ -1016,16 +1023,19 @@ fn moderation_gates_are_verb_specific() {
     assert!(!moderation_tolerates_departed_target(
         ModerationAction::Warn
     ));
+    assert!(!moderation_tolerates_departed_target(
+        ModerationAction::Timeout
+    ));
     for verb in [
         ModerationAction::Ban,
         ModerationAction::TempBan,
         ModerationAction::Kick,
         ModerationAction::Warn,
+        ModerationAction::Timeout,
     ] {
         assert!(is_wired_moderation_verb(verb), "{verb:?}");
     }
     for verb in [
-        ModerationAction::Timeout,
         ModerationAction::Purge,
         ModerationAction::Slowmode,
         ModerationAction::Lockdown,
@@ -1047,6 +1057,7 @@ async fn moderation_flag_off_is_refused_before_any_effect() {
         "moderation.tempban",
         "moderation.kick",
         "moderation.warn",
+        "moderation.timeout",
     ] {
         let (status, _, body) = answer(
             app.clone(),
@@ -1117,6 +1128,14 @@ async fn moderation_malformed_bodies_are_refused_before_any_effect() {
             "moderation.tempban",
             serde_json::json!({"duration_seconds": "3600"}),
         ),
+        (
+            "moderation.timeout",
+            serde_json::json!({"duration_seconds": 59}),
+        ),
+        (
+            "moderation.timeout",
+            serde_json::json!({"duration_seconds": 28 * 24 * 60 * 60 + 1}),
+        ),
         ("moderation.warn", serde_json::json!({"reason": ""})),
         (
             "moderation.warn",
@@ -1156,6 +1175,7 @@ async fn moderation_success_replays_without_second_effect_but_changed_bytes_conf
         "moderation.tempban",
         "moderation.kick",
         "moderation.warn",
+        "moderation.timeout",
     ] {
         let intent = format!("intent-moderation-{verb}");
         let raw = moderation_payload(verb);
@@ -1182,10 +1202,90 @@ async fn moderation_success_replays_without_second_effect_but_changed_bytes_conf
     set_moderation_flags(false);
     assert_eq!(
         moderation.calls(),
-        4,
+        5,
         "one effect per verb, replays effect-free"
     );
     db.close().await.unwrap();
+}
+
+/// A disabled moderation executor must bind despite invalid moderation
+/// settings: the executor never parses gates or secrets while the website
+/// verbs are off, so malformed settings must not stop the receiver from
+/// starting. Enabled misconfiguration stays fatal (next test).
+#[tokio::test]
+async fn moderation_executor_disabled_tolerates_invalid_settings() {
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    let prev_allow = std::env::var("TWO_INTERNAL_ALLOW_MODERATION").ok();
+    let prev_mod = std::env::var("TWO_MODERATION").ok();
+    let prev_owen = std::env::var("TWO_OWEN_USER_ID").ok();
+    let prev_protected = std::env::var("TWO_MODERATION_PROTECTED_ROLE_IDS").ok();
+    // Stray moderation publish gate without the internal allowlist: every
+    // website verb is off, with both invalid-settings shapes present at once.
+    std::env::remove_var("TWO_INTERNAL_ALLOW_MODERATION");
+    std::env::set_var("TWO_MODERATION", "1");
+    std::env::remove_var("TWO_OWEN_USER_ID");
+    std::env::set_var("TWO_MODERATION_PROTECTED_ROLE_IDS", "not-a-snowflake");
+    let api = MockEventApi::start().await;
+    let discord =
+        ActionExecutor::with_proxy("not-a-credential".to_owned(), Some(api.origin.clone()))
+            .unwrap();
+    let result = moderation_executor_from_env(lazy_pool(), discord);
+    if let Some(value) = prev_allow {
+        std::env::set_var("TWO_INTERNAL_ALLOW_MODERATION", value);
+    } else {
+        std::env::remove_var("TWO_INTERNAL_ALLOW_MODERATION");
+    }
+    if let Some(value) = prev_mod {
+        std::env::set_var("TWO_MODERATION", value);
+    } else {
+        std::env::remove_var("TWO_MODERATION");
+    }
+    if let Some(value) = prev_owen {
+        std::env::set_var("TWO_OWEN_USER_ID", value);
+    } else {
+        std::env::remove_var("TWO_OWEN_USER_ID");
+    }
+    if let Some(value) = prev_protected {
+        std::env::set_var("TWO_MODERATION_PROTECTED_ROLE_IDS", value);
+    } else {
+        std::env::remove_var("TWO_MODERATION_PROTECTED_ROLE_IDS");
+    }
+    assert!(
+        result.is_ok(),
+        "disabled executor must bind despite invalid settings"
+    );
+}
+
+/// Enabled misconfiguration stays fatal: `TWO_MODERATION=1` with the website
+/// verbs on but no valid `TWO_OWEN_USER_ID` must refuse the receiver bind.
+#[tokio::test]
+async fn moderation_executor_enabled_rejects_invalid_gates() {
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    let prev_owen = std::env::var("TWO_OWEN_USER_ID").ok();
+    let prev_protected = std::env::var("TWO_MODERATION_PROTECTED_ROLE_IDS").ok();
+    set_moderation_flags(true);
+    std::env::remove_var("TWO_OWEN_USER_ID");
+    std::env::remove_var("TWO_MODERATION_PROTECTED_ROLE_IDS");
+    let api = MockEventApi::start().await;
+    let discord =
+        ActionExecutor::with_proxy("not-a-credential".to_owned(), Some(api.origin.clone()))
+            .unwrap();
+    let result = moderation_executor_from_env(lazy_pool(), discord);
+    set_moderation_flags(false);
+    if let Some(value) = prev_owen {
+        std::env::set_var("TWO_OWEN_USER_ID", value);
+    } else {
+        std::env::remove_var("TWO_OWEN_USER_ID");
+    }
+    if let Some(value) = prev_protected {
+        std::env::set_var("TWO_MODERATION_PROTECTED_ROLE_IDS", value);
+    } else {
+        std::env::remove_var("TWO_MODERATION_PROTECTED_ROLE_IDS");
+    }
+    assert!(
+        result.is_err(),
+        "enabled executor must refuse invalid gates"
+    );
 }
 
 #[tokio::test]
@@ -1195,14 +1295,8 @@ async fn unwired_moderation_verbs_stay_refused_with_flags_on() {
     set_moderation_flags(true);
     let moderation = Arc::new(MockModeration::default());
     let app = moderation_app(db.pool().clone(), moderation.clone());
-    // `moderation.timeout` belongs to the timeout family slice and is still
-    // unwired on this branch; the channel verbs belong to the channel slice.
-    // This assertion drops its timeout line when the timeout slice merges.
+    // The channel verbs belong to the channel family slice and stay refused.
     for (verb, extra) in [
-        (
-            "moderation.timeout",
-            serde_json::json!({"duration_seconds": 60}),
-        ),
         ("moderation.purge", serde_json::json!({"count": 10})),
         ("moderation.slowmode", serde_json::json!({"seconds": 5})),
         ("moderation.lockdown", serde_json::json!({})),

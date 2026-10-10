@@ -569,16 +569,15 @@ async fn admission_transport(
 ) -> Result<HyperTransport, Check> {
     match std::env::var("TWO_DATABASE_URL") {
         Ok(url) => {
-            let options = two_bot_core::database_url::connect_options(&url).map_err(|_| {
+            // Threat-model F6: the shared website-jobs fence (validate + TLS
+            // enforce/apply + timeouts). Refusals read as the same redacted
+            // authority error. Lazy: no socket opens here; later wires fail closed.
+            let tls = crate::website_jobs::admission_tls_policy_from_env().map_err(|_| {
                 Check::fail("send admission", "runtime admission authority unavailable")
             })?;
-            let pool = sqlx::postgres::PgPoolOptions::new()
-                .max_connections(2)
-                .connect_with(options)
-                .await
-                .map_err(|_| {
-                    Check::fail("send admission", "runtime admission authority unavailable")
-                })?;
+            let pool = crate::website_jobs::admission_pool_with_tls(&url, tls).map_err(|_| {
+                Check::fail("send admission", "runtime admission authority unavailable")
+            })?;
             let gate = PgSendAdmission::new(pool, &token)
                 .map_err(|_| Check::fail("send admission", "invalid credential namespace"))?;
             HyperTransport::with_admission(token, proxy, std::sync::Arc::new(gate))
@@ -721,6 +720,150 @@ mod tests {
     #[test]
     fn admission_query_guard_redacts_dependency_logs() {
         crate::admission_test_support::run_probe("preflight::tests::admission_query_guard_child");
+    }
+
+    /// Threat-model F6: the shared admission fence (same helper as the website
+    /// jobs) refuses plaintext, unverified and wrong-host URLs with fixed
+    /// strings, and the `LocalOnly` happy path builds a lazy pool with no
+    /// socket. Explicit policies, so deterministic under any process setting.
+    #[test]
+    fn admission_tls_fence_refuses_plaintext_and_wrong_hosts() {
+        use two_bot_core::database_tls::TlsPolicy;
+        let cases = [
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=disable",
+                TlsPolicy::Required,
+                "database sslmode does not require TLS",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db",
+                TlsPolicy::Required,
+                "database URL must set sslmode under the required TLS policy",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@fixture-host/fixture-db?sslmode=verify-full",
+                TlsPolicy::Required,
+                "local database host is refused under the required TLS policy",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=verify-full",
+                TlsPolicy::LocalOnly,
+                "remote database host is refused under the local-only TLS policy",
+            ),
+        ];
+        let capture = crate::tracing_capture::Capture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                for (url, policy, expected) in cases {
+                    let error =
+                        crate::website_jobs::admission_pool_with_tls(url, policy).unwrap_err();
+                    assert_eq!(error, expected, "{url}");
+                    assert!(!error.contains("fixture"), "TLS refusal echoed the URL");
+                }
+                for (url, policy) in [
+                    (
+                        "postgres://fixture:fixture-password@127.0.0.1:1/fixture?sslmode=disable",
+                        TlsPolicy::LocalOnly,
+                    ),
+                    (
+                        "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=verify-full",
+                        TlsPolicy::Required,
+                    ),
+                ] {
+                    let pool =
+                        crate::website_jobs::admission_pool_with_tls(url, policy).unwrap();
+                    assert_eq!(pool.size(), 0);
+                    pool.close().await;
+                }
+                tracing::warn!("preflight admission capture remains active");
+            });
+        });
+        let text = capture.text();
+        assert!(text.contains("preflight admission capture remains active"));
+        assert!(!text.contains("fixture"), "TLS refusal reached logs");
+    }
+
+    /// Child-process probe for the transport wiring: refusal reads as the same
+    /// redacted authority error, and the `LocalOnly` happy path builds without
+    /// a socket. Runs only when `ADMISSION_TLS_PROBE` is set (see the parent).
+    #[test]
+    fn admission_tls_guard_child() {
+        if std::env::var_os("ADMISSION_TLS_PROBE").is_none() {
+            return;
+        }
+        let capture = crate::tracing_capture::Capture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                if std::env::var("ADMISSION_TLS_MODE").as_deref() == Ok("happy") {
+                    let transport = admission_transport("fixture-token".to_owned(), None).await;
+                    assert!(
+                        transport.is_ok(),
+                        "local-only happy path must build without a socket"
+                    );
+                } else {
+                    let error = admission_transport("fixture-token".to_owned(), None)
+                        .await
+                        .err()
+                        .unwrap();
+                    assert_eq!(error.detail, "runtime admission authority unavailable");
+                    assert!(!error.detail.contains("fixture"));
+                }
+                tracing::warn!("preflight TLS capture remains active");
+            });
+        });
+        let text = capture.text();
+        assert!(text.contains("preflight TLS capture remains active"));
+        assert!(!text.contains("fixture"), "TLS refusal reached logs");
+    }
+
+    /// Parent: re-run the probe above in env-cleared children, once refusing a
+    /// remote plaintext URL under the default `Required` policy and once
+    /// accepting a loopback URL under `LocalOnly`. Separate processes avoid
+    /// process-global environment races with the parallel suite.
+    #[test]
+    fn admission_tls_guard_redacts_dependency_logs() {
+        for (mode, url, tls) in [
+            (
+                "refusal",
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=disable",
+                None,
+            ),
+            (
+                "happy",
+                "postgres://fixture:fixture-password@127.0.0.1:1/fixture?sslmode=disable",
+                Some("local-only"),
+            ),
+        ] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["preflight::tests::admission_tls_guard_child", "--exact", "--nocapture"])
+                .env_clear()
+                .env("ADMISSION_TLS_PROBE", "1")
+                .env("ADMISSION_TLS_MODE", mode)
+                .env("TWO_DATABASE_URL", url);
+            if let Some(policy) = tls {
+                command.env("TWO_DATABASE_TLS", policy);
+            }
+            let output = command.output().expect("run isolated TLS probe");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "TLS {mode} probe failed: {stderr}"
+            );
+            assert!(stdout.contains("running 1 test"));
+            for text in [&stdout, &stderr] {
+                assert!(!text.contains("fixture"), "TLS {mode} probe leaked");
+            }
+        }
     }
 
     fn vars(guild: &str, mode: &str) -> HashMap<String, String> {

@@ -690,8 +690,8 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s5-15: `community_facts`, `community_stream_heartbeats`, `community_scorecard_runs/alerts` — scorecard facts/runs/alerts
 
 - **Method:** `waived` (not an execution verdict).
-- **Action:** Run fact/heartbeat/weekly-scorecard fixtures on test DB, excluding dropped rota extensions.
-- **Expected:** Facts and stream liveness yield one weekly run/alert; dropped rota tables are not required.
+- **Action:** Run fact/heartbeat/weekly-scorecard fixtures on test DB with only the captured event-attended stream marked, excluding dropped rota extensions.
+- **Expected:** One weekly run/alert fails closed as incomplete and names the uncaptured streams; dropped rota tables are not required.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
 - **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
