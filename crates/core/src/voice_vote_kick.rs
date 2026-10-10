@@ -11,6 +11,20 @@ use crate::Snowflake;
 
 pub const VOTE_KICK_TTL_MS: u64 = 120_000;
 
+/// Post-terminal cooldown per guild + target: after a vote passes, expires or
+/// is cancelled, a fresh vote against the same member in the same guild is
+/// refused until this long after the terminal transition. Room changes do not
+/// evade it. Pinned by `docs/voice-rooms.md` §V4 (VK-02).
+pub const VOTE_KICK_COOLDOWN_MS: u64 = 300_000;
+
+/// Per-initiator limit: at most this many successful starts per guild +
+/// initiator inside [`VOTE_KICK_INITIATOR_WINDOW_MS`], across targets and
+/// rooms. Pinned by `docs/voice-rooms.md` §V4 (VK-02).
+pub const VOTE_KICK_INITIATOR_LIMIT: usize = 3;
+
+/// Sliding window for [`VOTE_KICK_INITIATOR_LIMIT`].
+pub const VOTE_KICK_INITIATOR_WINDOW_MS: u64 = 600_000;
+
 /// Processing time, not a timestamp supplied by a button payload.
 pub trait VoteClock {
     fn now_ms(&self) -> u64;
@@ -117,6 +131,10 @@ pub enum VoteKickError {
     ProtectedTarget,
     #[error("a vote is already active for this target in this guild")]
     ActiveVoteExists,
+    #[error("a recent vote against this member is in cooldown")]
+    Cooldown,
+    #[error("the initiator has started too many votes recently")]
+    InitiatorLimited,
     #[error("the initiating interaction ID has already been used")]
     ReusedVoteId,
     #[error("unknown vote")]
@@ -139,6 +157,9 @@ struct Vote {
     ballots: BTreeMap<Snowflake, VoteBallot>,
     status: VoteKickStatus,
     progress: VoteProgress,
+    /// Processing time of the Active -> terminal transition. `None` while
+    /// active; drives the post-terminal cooldown keyed by guild + target.
+    terminal_at_ms: Option<u64>,
 }
 
 impl Vote {
@@ -166,12 +187,18 @@ impl Vote {
         };
         if !facts.occupants.contains(&self.reference.target_id) {
             self.status = VoteKickStatus::Cancelled(VoteCancellation::TargetLeft);
+            self.terminal_at_ms = Some(now_ms);
         } else if facts.protected(self.reference.target_id) {
             self.status = VoteKickStatus::Cancelled(VoteCancellation::TargetProtected);
+            self.terminal_at_ms = Some(now_ms);
         } else if now_ms >= self.expires_at_ms {
             self.status = VoteKickStatus::Expired;
+            // Expiry happened at the deadline even if observed late: backdate
+            // so a late refresh or lazy sweep does not extend the cooldown.
+            self.terminal_at_ms = Some(self.expires_at_ms);
         } else if self.progress.yes >= self.progress.required {
             self.status = VoteKickStatus::Passed;
+            self.terminal_at_ms = Some(now_ms);
             return Some(RoomKickDecision {
                 guild_id: self.reference.guild_id,
                 room_id: self.reference.room_id,
@@ -185,9 +212,27 @@ impl Vote {
 /// In-memory decision state, including finished IDs to reject command replay.
 /// Retain this core for the managed session; dropping it loses the replay ledger.
 /// Durable storage, restart reconciliation and retention belong to the parent.
+///
+/// The post-terminal cooldown is derived from terminal votes in `votes`; the
+/// per-initiator history keeps successful start times per guild + initiator and
+/// is pruned to [`VOTE_KICK_INITIATOR_WINDOW_MS`] on every start. Coordinated
+/// bounding of all retained state is VK-03 and out of scope here.
 #[derive(Debug, Default)]
 pub struct VoteKickCore {
     votes: BTreeMap<Snowflake, Vote>,
+    initiator_starts: BTreeMap<(Snowflake, Snowflake), Vec<u64>>,
+}
+
+impl VoteKickCore {
+    /// A start timestamp still counts toward the initiator limit at `now_ms`.
+    fn initiator_start_counts(started_at_ms: u64, now_ms: u64) -> bool {
+        now_ms < started_at_ms.saturating_add(VOTE_KICK_INITIATOR_WINDOW_MS)
+    }
+
+    /// A terminal vote still holds the guild + target cooldown at `now_ms`.
+    fn cooldown_holds(terminal_at_ms: u64, now_ms: u64) -> bool {
+        now_ms < terminal_at_ms.saturating_add(VOTE_KICK_COOLDOWN_MS)
+    }
 }
 
 impl VoteKickCore {
@@ -225,10 +270,12 @@ impl VoteKickCore {
             .checked_add(VOTE_KICK_TTL_MS)
             .ok_or(VoteKickError::InvalidTime)?;
         // A new command must not be blocked by an elapsed vote when the timer
-        // has not refreshed it yet. No passing decision is made on this path.
+        // has not refreshed it yet. No passing decision is made on this path,
+        // but the lazy expiry is a terminal transition and starts the cooldown.
         for vote in self.votes.values_mut() {
             if vote.status == VoteKickStatus::Active && now_ms >= vote.expires_at_ms {
                 vote.status = VoteKickStatus::Expired;
+                vote.terminal_at_ms = Some(vote.expires_at_ms);
             }
         }
         if self.votes.values().any(|vote| {
@@ -237,6 +284,26 @@ impl VoteKickCore {
                 && vote.reference.target_id == target_id
         }) {
             return Err(VoteKickError::ActiveVoteExists);
+        }
+        // Refusal order after the active guard: target cooldown, then the
+        // initiator cap. Both refuse without creating a vote, ballot,
+        // enforcement effect or initiator-history entry.
+        let in_cooldown = self.votes.values().any(|vote| {
+            vote.status != VoteKickStatus::Active
+                && vote.reference.guild_id == facts.guild_id
+                && vote.reference.target_id == target_id
+                && vote
+                    .terminal_at_ms
+                    .is_some_and(|terminal| Self::cooldown_holds(terminal, now_ms))
+        });
+        if in_cooldown {
+            return Err(VoteKickError::Cooldown);
+        }
+        let key = (facts.guild_id, initiator_id);
+        let starts = self.initiator_starts.entry(key).or_default();
+        starts.retain(|started| Self::initiator_start_counts(*started, now_ms));
+        if starts.len() >= VOTE_KICK_INITIATOR_LIMIT {
+            return Err(VoteKickError::InitiatorLimited);
         }
         let total = facts.eligible(target_id).len();
         let vote = Vote {
@@ -255,9 +322,11 @@ impl VoteKickCore {
                 required: total / 2 + 1,
                 total,
             },
+            terminal_at_ms: None,
         };
         let update = vote.update(None);
         self.votes.insert(id, vote);
+        self.initiator_starts.entry(key).or_default().push(now_ms);
         Ok(update)
     }
 
@@ -621,6 +690,17 @@ mod tests {
                 .unwrap(),
             update
         );
+        // The cancellation starts the post-terminal cooldown: a fresh ID is
+        // refused inside it and creates nothing, then succeeds at its end.
+        assert_eq!(
+            core.start(101, facts, 2, 9, &clock),
+            Err(VoteKickError::Cooldown)
+        );
+        assert_eq!(
+            core.refresh(reference, facts, &clock).unwrap().status,
+            VoteKickStatus::Cancelled(VoteCancellation::TargetLeft)
+        );
+        clock.set(1_000 + VOTE_KICK_COOLDOWN_MS);
         assert!(core.start(101, facts, 2, 9, &clock).is_ok());
         assert_eq!(
             core.start(100, facts, 2, 9, &clock),
@@ -721,6 +801,18 @@ mod tests {
                 Err(VoteKickError::ReusedVoteId)
             );
         }
+        // The pass starts the post-terminal cooldown: a fresh vote is refused
+        // inside it, then succeeds exactly at its end with no inherited ballots.
+        assert_eq!(
+            core.start(101, facts, 2, 9, &clock),
+            Err(VoteKickError::Cooldown)
+        );
+        clock.set(1_000 + VOTE_KICK_COOLDOWN_MS - 1);
+        assert_eq!(
+            core.start(101, facts, 2, 9, &clock),
+            Err(VoteKickError::Cooldown)
+        );
+        clock.set(1_000 + VOTE_KICK_COOLDOWN_MS);
         let new_vote = core.start(101, facts, 2, 9, &clock).unwrap();
         assert_eq!(new_vote.progress.yes, 0);
         core.cast(reference, facts, 4, VoteBallot::Yes, &clock)
@@ -740,7 +832,14 @@ mod tests {
         let clock = Clock::new();
         let mut core = VoteKickCore::new();
         let old = start(&mut core, facts, &clock);
+        // At the active-window deadline the elapsed vote has expired, but its
+        // post-terminal cooldown still refuses a fresh vote.
         clock.set(121_000);
+        assert_eq!(
+            core.start(101, facts, 2, 9, &clock),
+            Err(VoteKickError::Cooldown)
+        );
+        clock.set(121_000 + VOTE_KICK_COOLDOWN_MS);
         let new_vote = core.start(101, facts, 2, 9, &clock).unwrap();
         let old_button = core.cast(old, facts, 2, VoteBallot::Yes, &clock).unwrap();
         assert_eq!(old_button.status, VoteKickStatus::Expired);

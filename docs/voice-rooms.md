@@ -136,6 +136,18 @@ library code with no Discord dependency and can start immediately.
 - The owner and original creator can't be targeted, and members can't target
   themselves. Only one active vote per target. If the target leaves, the vote is
   cancelled.
+- After a vote passes, expires or is cancelled, a fresh vote against the same
+  member in the same guild is refused for 5 minutes (`Cooldown`,
+  `VOTE_KICK_COOLDOWN_MS = 300_000`). The key is guild + target: a new
+  interaction ID or a different room does not evade it. Expiry counts from the
+  2-minute deadline even when observed late, so a slow timer cannot extend the
+  cooldown.
+- Each initiator can start at most 3 votes per 10 minutes per guild
+  (`InitiatorLimited`, `VOTE_KICK_INITIATOR_LIMIT = 3`,
+  `VOTE_KICK_INITIATOR_WINDOW_MS = 600_000`), across targets and rooms; other
+  guilds are unaffected. Only successful starts count. Refused attempts create
+  no vote, ballot or enforcement effect. Refusal precedence after target
+  validation is: active vote, then target cooldown, then initiator cap.
 
 ## V5: Naming template engine (core library)
 
