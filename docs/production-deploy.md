@@ -22,11 +22,15 @@ since Environment settings can drift.
    `CLOUDFLARE_ACCOUNT_ID` secrets. Environment secrets override the
    repository secrets that staging uses.
 
-Until the Environment has reviewers and a main-only branch policy, the
-`sha guard` job refuses every dispatch. A job that names a missing Environment
-makes GitHub create it with no protection, so the guard checks before the
-deploy job can run. This repository is public, so required reviewers work on
-every plan; no Enterprise plan is needed.
+The `sha guard` job refuses every dispatch until the Environment has
+reviewers and a main-only branch policy. `PRODUCTION_AUTO_APPROVE=true`
+excuses only the missing-reviewers refusal, and only when the latest
+`deploy-staging` run on the SHA is a completed success; the main-only branch
+policy stays mandatory with or without it
+(see [PRODUCTION_AUTO_APPROVE](#production_auto_approve)). A job that
+names a missing Environment makes GitHub create it with no protection, so the
+guard checks before the deploy job can run. This repository is public, so
+required reviewers work on every plan; no Enterprise plan is needed.
 
 **Deploy.** Dispatch with `sha` set to a full 40-character commit that is on
 `main`. That commit needs successful, completed `ci-ok` and `worker check`
@@ -49,20 +53,96 @@ starts no staging run either, so the newest `main` commit may have no
 `deploy-staging` run: pin the latest commit that changes runtime inputs, or
 dispatch `deploy-staging` for the head you need. Docs-only commits after a
 staged commit change nothing the Worker or container serves.
-After the reviewer approves, the job:
+After the reviewer approves (or the automated approval passes), the job:
 
 1. checks out exactly that commit and re-verifies that it is on `origin/main`;
-2. runs `wrangler deploy --message <sha>`;
+2. renders the build-identity config and runs
+   `wrangler deploy --config <rendered> --env production --message <sha>`;
 3. writes the SHA and the old and new Worker version IDs to the run summary;
-4. gates on `/health` 200 and a truthful `/readyz` (200 ready, 503 parked),
-   with the same contract as staging.
+4. gates on `/health` 200 and on `/readyz` reporting this SHA (see
+   [Build identity and the `/readyz` gate](#build-identity-and-the-readyz-gate)).
 
 **Roll back.** Dispatch again with `rollback` set to the previous version ID
-from the failed run's summary. Set `sha` to that version's commit, or any other
-green `main` commit, which is recorded as the rollback message. The rollback
-passes the same guard and the same Environment approval. It then runs
-`wrangler rollback <version-id> --yes` and fails unless that version serves
-100% of traffic. The `/readyz` gate runs again after the rollback.
+from the failed run's summary. Set `sha` to the commit that version was built
+from. It is recorded as the rollback message, and the `/readyz` gate after the
+rollback must report that revision, or a pre-stamp version (see below). The
+rollback passes the same guard and the same Environment approval. It then runs
+`wrangler rollback <version-id> --message <sha> --yes` and fails unless that
+version serves 100% of traffic.
+
+## Build identity and the `/readyz` gate
+
+A deploy stamps its image the way `deploy-staging` does. The rendered Wrangler
+config sets `image_vars` on the production container: `BOT_BUILD_REVISION` is
+the guarded 40-hex SHA, and `BOT_BUILD_ID` is `<run id>-<run attempt>`. Wrangler
+passes both to `docker build` as build arguments, the Rust binary compiles them
+in, and `/readyz` reports them as `build_revision` and `build_id`. Neither value
+is secret. The SHA comes from the guard, not `GITHUB_SHA`: a dispatch runs on
+the head of `main`, which can be newer than the commit being deployed.
+
+Production renders its own config instead of calling `staging_rollout.py
+prepare`. That path also snapshots the staging Cloudflare application and
+checks the staging ownership receipt, which production does not use. Ownership
+takeover is roadmap item M1.5 and out of scope here. `scripts/production_deploy.py
+render` reads the checked-in `wrangler/wrangler.toml`, makes its paths absolute
+because the rendered file lives outside `wrangler/`, and sets `image_vars` on the
+single production container. Nothing else changes, and
+`scripts/test-deploy-production.py` pins that diff. The lockfile's Wrangler
+(4.147.0) runs the deploy: `wrangler-action` uses the installed version when
+`wranglerVersion` is omitted, and the job runs `npm ci` first.
+
+The gate polls `/readyz` every 10 seconds for up to 30 attempts. In deploy
+mode it passes an answer only when its JSON `build_revision` equals the
+guarded SHA **and** its `build_id` equals this run's `<run id>-<run
+attempt>`: the build ID proves the new container serves, not a previous
+build of the same SHA still draining. Rollback mode checks the revision
+only, because the serving version was built by an older run.
+
+| `/readyz` answer | Result |
+|---|---|
+| 200, revision is the SHA, `build_id` is this run's (deploy) or any stamped id (rollback) | Pass: gateway ready |
+| 503 with the SHA and a passing build id (same rule) | Pass: gateway parked (truthful 503 as a state, identity still matches) |
+| 503 `{"error":"ownership_fenced"}` with no build fields | Keep polling; fail at the end. The fence releases at cutover step 3.5, so the identity match is established only after the takeover |
+| Revision is the SHA but `build_id` is another run's (deploy mode) | Keep polling; fail at the end: the previous container still serves this SHA |
+| `build_revision` is another SHA | Keep polling; fail at the end |
+| `build_revision` and `build_id` are both `unknown` (not stamped) | Deploy: keep polling; fail at the end. Rollback: recorded as a pre-stamp version, not a failure |
+| `build_revision` is `unknown` and `build_id` is not | Keep polling; fail at the end |
+| `build_revision` or `build_id` is missing or not a string, or the body is not a JSON object | Keep polling; fail at the end |
+| Any other status, including `000` (no answer) | Keep polling; fail at the end |
+
+Polling matters because a replaced container can keep answering with the
+previous revision — or, on a same-SHA redeploy, the previous build — for a
+while. The gate sends an explicit agent,
+`two-bot-next-production-rollout/1.0`, the production twin of the staging
+gate's agent. The staging gate sets one because the edge rejects Python's
+default agent. The run summary records the status, the state and the
+`build_id`, so the watch log can tie an answer to one run.
+
+In rollback mode the same gate reads the revision that the rolled-back version
+reports, so `sha` must be that version's commit. A version built before this
+change reports `unknown` for both fields. The gate records that as a pre-stamp
+version and does not fail the rollback. Any other revision fails it.
+
+## `PRODUCTION_AUTO_APPROVE`
+
+The repository variable `PRODUCTION_AUTO_APPROVE` is unset by default. Only the
+exact value `true` changes the guard. With it set, the guard:
+
+- accepts a `production` Environment with no required reviewers, provided the
+  latest `deploy-staging` run on the SHA is a completed success. With no
+  reviewers and the variable unset, the guard refuses;
+- records `Approval: automated (PRODUCTION_AUTO_APPROVE)` in the run summary.
+
+It does not remove reviewers. If the Environment has required reviewers,
+GitHub still pauses the `production` job until one of them approves, and the
+variable only adds the staging check.
+
+When the Environment has no reviewers, setting the variable removes the human
+approval step from production dispatches. A repository administrator sets it
+under Settings, then Secrets and variables, then Actions, then Variables. Who
+approves production is a CEO and CISO decision, so enabling the variable needs
+their decision first. The guard does not record who set the variable or why.
+Read the variable and the Environment's reviewers again before each dispatch.
 
 ## 48-hour watch log (TOG-9699)
 
@@ -100,9 +180,12 @@ whole watch so the rollback dispatch never has to hunt for it.
 | | | `error-class` | one fixed class below, no raw text | |
 | | | `rollback-decision` | GO / EXTEND / ROLLBACK + version-ID record | |
 
-- `readyz`: HTTP status and the two wired components (`process`, `gateway`).
-  503 parked is truthful, never acceptance; sustained 503 past the measured
-  recovery budget is a rollback trigger.
+- `readyz`: HTTP status and the four always-present components (`process`, `gateway`,
+  `database`, `token_invalid`) (`crates/bot/src/server.rs:228-240`, `:177`, `:191-209`;
+  re-checked at `bce86a791`); 200 needs every component `ready`. Only a
+  `gateway` at `down` or `starting` is parked; a `database` or `token_invalid`
+  at `down` is a fault. 503 parked is truthful, never acceptance; sustained
+  503 past the measured recovery budget is a rollback trigger.
 - `revision`: the exact compiled revision/build ID baked into the Rust
   `/readyz` response (mirrors the `GITHUB_SHA` /
   `GITHUB_RUN_ID-GITHUB_RUN_ATTEMPT` provenance in
