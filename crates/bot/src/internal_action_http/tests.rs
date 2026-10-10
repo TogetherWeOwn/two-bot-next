@@ -2138,7 +2138,7 @@ async fn event_mutation_malformed_bodies_refused_before_any_discord_call() {
 }
 
 #[tokio::test]
-async fn moderation_timeout_other_verbs_stay_refused_without_widening() {
+async fn unwired_membership_verb_stays_refused_with_moderation_flags_on() {
     let Some(db) = database().await else { return };
     let effect = Arc::new(MockEffect::new(MockOutcome::Success));
     let moderation = Arc::new(MockModeration::default());
@@ -2151,11 +2151,11 @@ async fn moderation_timeout_other_verbs_stay_refused_without_widening() {
     ));
     let _flag = MODERATION_FLAG_LOCK.lock().await;
     set_moderation_flags(true);
+    // The moderation union wired ban, tempban, kick, warn and timeout: only a
+    // verb from another family (membership) still refuses here.
     for raw in [
-        r#"{"action":"moderation.ban","actor_id":"111111111111111111","discord_id":"333333333333333333","reason":"spam"}"#.to_owned(),
-        r#"{"action":"moderation.kick","actor_id":"111111111111111111","discord_id":"333333333333333333","reason":"spam"}"#.to_owned(),
-        r#"{"action":"moderation.warn","actor_id":"111111111111111111","discord_id":"333333333333333333","reason":"spam"}"#.to_owned(),
-        r#"{"action":"role.assign","discord_id":"111111111111111111","role_key":"fixture"}"#.to_owned(),
+        r#"{"action":"role.assign","discord_id":"111111111111111111","role_key":"fixture"}"#
+            .to_owned(),
     ] {
         let (status, _, body) = answer(app.clone(), signed(&raw, "old", "intent-no-widen")).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{raw}");
