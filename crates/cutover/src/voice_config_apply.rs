@@ -38,7 +38,7 @@ pub enum ApplyPlan {
     },
     /// Write `candidate` with `current` as the compare-and-swap expectation.
     Changes {
-        candidate: VoiceConfiguration,
+        candidate: Box<VoiceConfiguration>,
         hash: String,
         change_count: usize,
         text: String,
@@ -96,7 +96,7 @@ pub fn plan_apply(
     }
     ApplyPlan::Changes {
         hash: diff_content_hash(current, &remaining),
-        candidate: remaining,
+        candidate: Box::new(remaining),
         change_count,
         text,
         skipped_unknown_channels: skipped,
