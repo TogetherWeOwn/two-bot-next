@@ -348,6 +348,10 @@ async fn every_registered_job_reports_success_in_seconds() {
         .chain(crate::community_jobs::NAMES)
         .chain(crate::audit_runtime::NAMES)
         .chain(crate::scheduled_jobs::NAMES)
+        .chain([
+            crate::feed_jobs::NAME,
+            crate::self_role_handlers::RECOVERY_JOB_NAME,
+        ])
         .collect();
     let status = statuses(&names, false);
     let metrics = Arc::new(Metrics::default());
