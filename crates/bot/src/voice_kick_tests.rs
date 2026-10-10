@@ -916,6 +916,59 @@ fn reason_line(content: &str) -> &str {
         .expect("a Reason line")
 }
 
+/// Gate VK-04 hostile-matrix echo probes, shared by the ballot render test and
+/// the refusal/error/log echo test so both prove the same inputs.
+const HOSTILE_ECHO_PROBES: &[&str] = &[
+    "@everyone",
+    "@here",
+    "<@",
+    "<#",
+    "<:",
+    "://",
+    "www.",
+    "discord.gg",
+    ".gg/",
+    ".com/",
+    "**",
+    "__",
+    "~~",
+    "||",
+];
+
+/// Hostile snowflakes from the matrix above; none equals a test ID (ROOM=500,
+/// VOTE=7000, members in the 300s).
+const HOSTILE_ECHO_IDS: &[&str] = &["7654321", "987654321", "123456789"];
+
+/// Reason-derived echo probes: only substrings actually present in this hostile
+/// input. Bare "<@" / "<#" / "<:" prefixes are deliberately NOT probed:
+/// `failure_line` legitimately renders "<#ROOM>" channel mentions for real IDs,
+/// so a bare prefix cannot distinguish an echo from the fixed ID format.
+/// Mention-pill inputs are instead pinned by their hostile-specific snowflake.
+fn assert_no_reason_echo(hostile: &str, rendered: &str, where_: &str) {
+    let folded_rendered = rendered.to_lowercase();
+    let folded_hostile = hostile.to_lowercase();
+    for probe in HOSTILE_ECHO_PROBES {
+        if matches!(*probe, "<@" | "<#" | "<:") {
+            continue;
+        }
+        if !folded_hostile.contains(*probe) {
+            continue;
+        }
+        assert!(
+            !folded_rendered.contains(*probe),
+            "{hostile:?} probe {probe:?} in {where_}: {rendered:?}"
+        );
+    }
+    for needle in HOSTILE_ECHO_IDS.iter().copied() {
+        if hostile.contains(needle) {
+            assert!(
+                !rendered.contains(needle),
+                "{hostile:?} id {needle:?} echoed in {where_}: {rendered:?}"
+            );
+        }
+    }
+}
+
 /// Gate VK-04 hostile matrix from #692, shared by the ballot render test and
 /// the refusal/error/log echo test so both prove the same inputs.
 const HOSTILE_VOTE_REASONS: &[&str] = &[
@@ -1071,53 +1124,6 @@ fn kick_refusals_never_echo_initiator_text() {
 /// passes through via `ordinary_reasons_render_intact_and_absent_reason_renders_no_line`.
 #[tokio::test]
 async fn hostile_reasons_never_echo_in_refusals_errors_or_logs() {
-    const PROBES: &[&str] = &[
-        "@everyone",
-        "@here",
-        "<@",
-        "<#",
-        "<:",
-        "://",
-        "www.",
-        "discord.gg",
-        ".gg/",
-        ".com/",
-        "**",
-        "__",
-        "~~",
-        "||",
-    ];
-    // Reason-derived echo probes: only substrings actually present in this
-    // hostile input. Bare "<@" / "<#" / "<:" prefixes are deliberately NOT
-    // probed: `failure_line` legitimately renders "<#ROOM>" channel mentions
-    // for real IDs, so a bare prefix cannot distinguish an echo from the
-    // fixed ID format. Mention-pill inputs are instead pinned by their
-    // hostile-specific snowflake, which never equals a test ID (ROOM=500,
-    // VOTE=7000, members in the 300s).
-    let assert_no_reason_echo = |hostile: &str, rendered: &str, where_: &str| {
-        let folded_rendered = rendered.to_lowercase();
-        let folded_hostile = hostile.to_lowercase();
-        for probe in PROBES {
-            if matches!(*probe, "<@" | "<#" | "<:") {
-                continue;
-            }
-            if !folded_hostile.contains(&probe.to_lowercase()) {
-                continue;
-            }
-            assert!(
-                !folded_rendered.contains(&probe.to_lowercase()),
-                "{hostile:?} probe {probe:?} in {where_}: {rendered:?}"
-            );
-        }
-        for needle in ["7654321", "987654321", "123456789"] {
-            if hostile.contains(needle) {
-                assert!(
-                    !rendered.contains(needle),
-                    "{hostile:?} id {needle:?} echoed in {where_}: {rendered:?}"
-                );
-            }
-        }
-    };
     let admission = two_bot_core::voice_create_admission::CreateAdmissionConfig::default();
     let admission_reasons = [
         two_bot_core::voice_create_admission::RefusalReason::UserCap,
@@ -1173,9 +1179,9 @@ async fn hostile_reasons_never_echo_in_refusals_errors_or_logs() {
         );
         for text in [repeat_text, active_text] {
             let folded = text.to_lowercase();
-            for probe in PROBES {
+            for probe in HOSTILE_ECHO_PROBES.iter().copied() {
                 assert!(
-                    !folded.contains(&probe.to_lowercase()),
+                    !folded.contains(probe),
                     "{hostile:?} probe {probe:?} in refusal: {text:?}"
                 );
             }
