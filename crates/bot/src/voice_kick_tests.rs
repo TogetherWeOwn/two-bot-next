@@ -1087,7 +1087,8 @@ fn ordinary_reasons_render_intact_and_absent_reason_renders_no_line() {
 
 /// Gate VK-04 refusal half: every vote-kick refusal is a fixed acknowledgement
 /// that never interpolates initiator text, so raw input cannot leak through an
-/// error path.
+/// error path. The length assertion pins full coverage: a new refusal variant
+/// breaks it until it is listed here too.
 #[test]
 fn kick_refusals_never_echo_initiator_text() {
     let refusals = [
@@ -1097,7 +1098,11 @@ fn kick_refusals_never_echo_initiator_text() {
         KickRefusal::Vote(VoteKickError::TargetNotOccupant),
         KickRefusal::Vote(VoteKickError::SelfTarget),
         KickRefusal::Vote(VoteKickError::ProtectedTarget),
+        KickRefusal::Vote(VoteKickError::PrivilegedTarget),
+        KickRefusal::Vote(VoteKickError::AuthorityUnavailable),
         KickRefusal::Vote(VoteKickError::ActiveVoteExists),
+        KickRefusal::Vote(VoteKickError::Cooldown),
+        KickRefusal::Vote(VoteKickError::InitiatorLimited),
         KickRefusal::Vote(VoteKickError::ReusedVoteId),
         KickRefusal::Vote(VoteKickError::UnknownVote),
         KickRefusal::Vote(VoteKickError::WrongVoteBoundary),
@@ -1105,7 +1110,7 @@ fn kick_refusals_never_echo_initiator_text() {
         KickRefusal::Vote(VoteKickError::RepeatedVote),
         KickRefusal::Vote(VoteKickError::InvalidTime),
     ];
-    assert_eq!(refusals.len(), 13, "every refusal variant is covered");
+    assert_eq!(refusals.len(), 17, "every refusal variant is covered");
     for refusal in refusals {
         let text = kick_refusal_text(&refusal);
         for probe in ["@everyone", "https://", "<@", "**"] {
@@ -1117,11 +1122,16 @@ fn kick_refusals_never_echo_initiator_text() {
     }
 }
 
-/// Gate VK-04 echo half: hostile reasons from the #692 matrix never echo in
-/// vote refusal/error/log paths. Only `reason.code()` / sanitized text / IDs
-/// appear. The ballot render itself is covered by
-/// `hostile_reasons_render_as_mention_safe_plain_text`; ordinary text still
-/// passes through via `ordinary_reasons_render_intact_and_absent_reason_renders_no_line`.
+/// Gate VK-04 echo tripwire: holds every hostile reason from the #692 matrix
+/// in scope while exercising the vote refusal/error/log renderers, pinning
+/// their fixed outputs. Those paths take no reason input by construction
+/// (`kick_start` has no reason parameter; refusals render only from the
+/// `KickRefusal` enum; audit rows carry fixed codes plus snowflakes), so this
+/// test guards the plumbing rather than proving absence on its own. Genuine
+/// refusal-text proof lives in `kick_refusals_never_echo_initiator_text` and
+/// ballot render proof in `hostile_reasons_render_as_mention_safe_plain_text`;
+/// ordinary text still passes through via
+/// `ordinary_reasons_render_intact_and_absent_reason_renders_no_line`.
 #[tokio::test]
 async fn hostile_reasons_never_echo_in_refusals_errors_or_logs() {
     let admission = two_bot_core::voice_create_admission::CreateAdmissionConfig::default();
