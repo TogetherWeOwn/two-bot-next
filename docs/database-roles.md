@@ -201,11 +201,16 @@ their login status or silently removing memberships. It contains no passwords.
    migrations with `SET ROLE two_bot_migrator`, so new objects are
    migrator-owned from creation; (e) the provisioning identity applies the
    full phase (`two-bot db roles plan`, the default), idempotently; (f) verify
-   reads 0 findings. For later migrations, the dedicated migrator login must
-   `SET ROLE two_bot_migrator` before creating objects: creator-specific
-   default ACLs belong to the group, not automatically to a member login.
-   Reapply the reviewed full plan after migrations and view updates, then
-   verify. `sql/web_v1.sql` is applied with `public` as the bot-table search
+   reads 0 findings. For later migrations, the order is fixed: (a) dispatch the
+   matching migration workflow plan (`staging-migrate.yml` with
+   `--target staging` for staging, `production-migrate.yml` with
+   `--target production` for PlanetScale main `two_bot`) and review the pending
+   set; (b) dispatch apply through the reviewed environment so the dedicated
+   migrator login creates objects with `SET ROLE two_bot_migrator` from the
+   start: creator-specific default ACLs belong to the group, not automatically
+   to a member login; (c) the provisioning identity reapplies the reviewed full
+   plan after migrations and view updates, then `verify` reads 0 findings.
+   `sql/web_v1.sql` is applied with `public` as the bot-table search
    path before the bootstrap phase; functions stay strict in both phases.
 2. Review and apply the rendered role plan with the authorized provisioning
    identity. It transfers only allowlisted objects to `two_bot_migrator`; unrelated
