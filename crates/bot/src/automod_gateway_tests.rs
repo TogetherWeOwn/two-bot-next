@@ -6,8 +6,8 @@ use std::future::{pending, Future};
 use super::*;
 use serde_json::json;
 use two_bot_core::automod_runtime::{
-    AutomodMatch, DeliveryKey, LedgerClaim, MessageDeliveryKind, MessageSubject, StoredOutcome,
-    TargetFacts, ViolationRecord, STAGING_GUILD_ID,
+    AutomodMatch, CompletionKind, DeliveryKey, LedgerClaim, MessageDeliveryKind, MessageSubject,
+    StoredOutcome, TargetFacts, ViolationRecord, STAGING_GUILD_ID,
 };
 use two_bot_core::AutomodFilter;
 use two_bot_discord::automod_activation::{FetchedMessage, RetainReason};
@@ -226,9 +226,11 @@ async fn a_stalled_delivery_times_out_without_becoming_acceptance() {
             delivery(MessageDeliveryKind::Update),
             "2026-10-02T00:00:00.000Z"
         )
-        .await
-        .funnel,
-        FunnelDisposition::None
+        .await,
+        WorkerVerdict {
+            funnel: FunnelDisposition::None,
+            trigger: FunnelDisposition::None,
+        }
     );
 }
 
@@ -279,4 +281,398 @@ fn retained_completion_hands_triggers_a_capture_only_verdict() {
             trigger: FunnelDisposition::CaptureOnly,
         }
     );
+}
+
+#[test]
+fn verdict_mapping_covers_every_outcome_by_delivery_kind() {
+    fn clean_receipt() -> StoredOutcome {
+        StoredOutcome {
+            matched: false,
+            deleted: false,
+            outcome: CompletionKind::Accepted,
+        }
+    }
+
+    fn matched_deleted_receipt() -> StoredOutcome {
+        StoredOutcome {
+            matched: true,
+            deleted: true,
+            outcome: CompletionKind::Deleted,
+        }
+    }
+
+    fn matched_timed_out_receipt() -> StoredOutcome {
+        StoredOutcome {
+            matched: true,
+            deleted: true,
+            outcome: CompletionKind::TimedOut,
+        }
+    }
+
+    // Exhaustive expectation: every `ActivationOutcome` arm, every
+    // `RetainReason` arm and every `MessageDeliveryKind` arm is listed, so a
+    // future variant addition breaks this match instead of silently reusing a
+    // wildcard. Expected values are literals (never recomputed through
+    // `uncommitted_disposition` or `kind.funnel`) so a mapping change fails
+    // its named cell.
+    fn expected_verdict(outcome: &ActivationOutcome, kind: MessageDeliveryKind) -> WorkerVerdict {
+        match outcome {
+            ActivationOutcome::Bypassed => match kind {
+                MessageDeliveryKind::Create => WorkerVerdict {
+                    funnel: FunnelDisposition::Accept,
+                    trigger: FunnelDisposition::CaptureOnly,
+                },
+                MessageDeliveryKind::Update => WorkerVerdict {
+                    funnel: FunnelDisposition::None,
+                    trigger: FunnelDisposition::CaptureOnly,
+                },
+            },
+            ActivationOutcome::Duplicate(None) => match kind {
+                MessageDeliveryKind::Create => WorkerVerdict {
+                    funnel: FunnelDisposition::CaptureOnly,
+                    trigger: FunnelDisposition::CaptureOnly,
+                },
+                MessageDeliveryKind::Update => WorkerVerdict {
+                    funnel: FunnelDisposition::None,
+                    trigger: FunnelDisposition::None,
+                },
+            },
+            ActivationOutcome::Duplicate(Some(receipt)) => match receipt.matched {
+                false => match kind {
+                    MessageDeliveryKind::Create => WorkerVerdict {
+                        funnel: FunnelDisposition::Accept,
+                        trigger: FunnelDisposition::Accept,
+                    },
+                    MessageDeliveryKind::Update => WorkerVerdict {
+                        funnel: FunnelDisposition::None,
+                        trigger: FunnelDisposition::None,
+                    },
+                },
+                true => match kind {
+                    MessageDeliveryKind::Create => WorkerVerdict {
+                        funnel: FunnelDisposition::CaptureOnly,
+                        trigger: FunnelDisposition::CaptureOnly,
+                    },
+                    MessageDeliveryKind::Update => WorkerVerdict {
+                        funnel: FunnelDisposition::None,
+                        trigger: FunnelDisposition::None,
+                    },
+                },
+            },
+            ActivationOutcome::Unavailable => match kind {
+                MessageDeliveryKind::Create => WorkerVerdict {
+                    funnel: FunnelDisposition::CaptureOnly,
+                    trigger: FunnelDisposition::CaptureOnly,
+                },
+                MessageDeliveryKind::Update => WorkerVerdict {
+                    funnel: FunnelDisposition::None,
+                    trigger: FunnelDisposition::None,
+                },
+            },
+            ActivationOutcome::Completed(receipt) => match receipt.matched {
+                false => match kind {
+                    MessageDeliveryKind::Create => WorkerVerdict {
+                        funnel: FunnelDisposition::Accept,
+                        trigger: FunnelDisposition::Accept,
+                    },
+                    MessageDeliveryKind::Update => WorkerVerdict {
+                        funnel: FunnelDisposition::None,
+                        trigger: FunnelDisposition::None,
+                    },
+                },
+                true => match kind {
+                    MessageDeliveryKind::Create => WorkerVerdict {
+                        funnel: FunnelDisposition::CaptureOnly,
+                        trigger: FunnelDisposition::CaptureOnly,
+                    },
+                    MessageDeliveryKind::Update => WorkerVerdict {
+                        funnel: FunnelDisposition::None,
+                        trigger: FunnelDisposition::None,
+                    },
+                },
+            },
+            // Every retain reason maps identically; all seven variants are
+            // listed so a new reason breaks this match instead of silently
+            // inheriting the capture-only trigger.
+            ActivationOutcome::Retained(
+                RetainReason::Ledger
+                | RetainReason::PreserveRefused
+                | RetainReason::PlanUnavailable
+                | RetainReason::FenceRefused
+                | RetainReason::UncertainDelete
+                | RetainReason::UncertainTimeout
+                | RetainReason::CompletionRefused,
+            ) => match kind {
+                MessageDeliveryKind::Create => WorkerVerdict {
+                    funnel: FunnelDisposition::CaptureOnly,
+                    trigger: FunnelDisposition::CaptureOnly,
+                },
+                MessageDeliveryKind::Update => WorkerVerdict {
+                    funnel: FunnelDisposition::None,
+                    trigger: FunnelDisposition::CaptureOnly,
+                },
+            },
+        }
+    }
+
+    // Realistic dispositions as produced by `process`: duplicates restore the
+    // funnel from the receipt and carry `None`; everything else carries the
+    // funnel value that becomes the verdict's funnel.
+    let cases: Vec<(Activation, MessageDeliveryKind, &str)> = vec![
+        (
+            Activation {
+                disposition: FunnelDisposition::Accept,
+                outcome: ActivationOutcome::Bypassed,
+            },
+            MessageDeliveryKind::Create,
+            "bypassed create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Bypassed,
+            },
+            MessageDeliveryKind::Update,
+            "bypassed update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Duplicate(None),
+            },
+            MessageDeliveryKind::Create,
+            "in-flight duplicate create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Duplicate(None),
+            },
+            MessageDeliveryKind::Update,
+            "in-flight duplicate update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Duplicate(Some(clean_receipt())),
+            },
+            MessageDeliveryKind::Create,
+            "settled-clean duplicate create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Duplicate(Some(clean_receipt())),
+            },
+            MessageDeliveryKind::Update,
+            "settled-clean duplicate update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Duplicate(Some(matched_deleted_receipt())),
+            },
+            MessageDeliveryKind::Create,
+            "settled-matched duplicate create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Duplicate(Some(matched_timed_out_receipt())),
+            },
+            MessageDeliveryKind::Update,
+            "settled-matched duplicate update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::CaptureOnly,
+                outcome: ActivationOutcome::Unavailable,
+            },
+            MessageDeliveryKind::Create,
+            "unavailable create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Unavailable,
+            },
+            MessageDeliveryKind::Update,
+            "unavailable update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::Accept,
+                outcome: ActivationOutcome::Completed(clean_receipt()),
+            },
+            MessageDeliveryKind::Create,
+            "completed clean create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Completed(clean_receipt()),
+            },
+            MessageDeliveryKind::Update,
+            "completed clean update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::CaptureOnly,
+                outcome: ActivationOutcome::Completed(matched_deleted_receipt()),
+            },
+            MessageDeliveryKind::Create,
+            "completed matched create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Completed(matched_timed_out_receipt()),
+            },
+            MessageDeliveryKind::Update,
+            "completed matched update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::CaptureOnly,
+                outcome: ActivationOutcome::Retained(RetainReason::Ledger),
+            },
+            MessageDeliveryKind::Create,
+            "retained ledger create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Retained(RetainReason::Ledger),
+            },
+            MessageDeliveryKind::Update,
+            "retained ledger update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::CaptureOnly,
+                outcome: ActivationOutcome::Retained(RetainReason::PreserveRefused),
+            },
+            MessageDeliveryKind::Create,
+            "retained preserve-refused create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Retained(RetainReason::PreserveRefused),
+            },
+            MessageDeliveryKind::Update,
+            "retained preserve-refused update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::CaptureOnly,
+                outcome: ActivationOutcome::Retained(RetainReason::PlanUnavailable),
+            },
+            MessageDeliveryKind::Create,
+            "retained plan-unavailable create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Retained(RetainReason::PlanUnavailable),
+            },
+            MessageDeliveryKind::Update,
+            "retained plan-unavailable update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::CaptureOnly,
+                outcome: ActivationOutcome::Retained(RetainReason::FenceRefused),
+            },
+            MessageDeliveryKind::Create,
+            "retained fence-refused create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Retained(RetainReason::FenceRefused),
+            },
+            MessageDeliveryKind::Update,
+            "retained fence-refused update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::CaptureOnly,
+                outcome: ActivationOutcome::Retained(RetainReason::UncertainDelete),
+            },
+            MessageDeliveryKind::Create,
+            "retained uncertain-delete create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Retained(RetainReason::UncertainDelete),
+            },
+            MessageDeliveryKind::Update,
+            "retained uncertain-delete update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::CaptureOnly,
+                outcome: ActivationOutcome::Retained(RetainReason::UncertainTimeout),
+            },
+            MessageDeliveryKind::Create,
+            "retained uncertain-timeout create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Retained(RetainReason::UncertainTimeout),
+            },
+            MessageDeliveryKind::Update,
+            "retained uncertain-timeout update",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::CaptureOnly,
+                outcome: ActivationOutcome::Retained(RetainReason::CompletionRefused),
+            },
+            MessageDeliveryKind::Create,
+            "retained completion-refused create",
+        ),
+        (
+            Activation {
+                disposition: FunnelDisposition::None,
+                outcome: ActivationOutcome::Retained(RetainReason::CompletionRefused),
+            },
+            MessageDeliveryKind::Update,
+            "retained completion-refused update",
+        ),
+    ];
+
+    assert_eq!(
+        cases.len(),
+        28,
+        "outcome x delivery-kind matrix stays complete"
+    );
+    for (activation, kind, name) in &cases {
+        let verdict = verdict_of(activation, *kind);
+        assert_eq!(
+            verdict,
+            expected_verdict(&activation.outcome, *kind),
+            "{name}"
+        );
+        // `None` triggers belong to edits, never creates: a create carrying
+        // one is unexpected, so `acceptance_for_verdict` refuses it like a
+        // match (`gateway_commands.rs`). Pin the assumption here.
+        match kind {
+            MessageDeliveryKind::Create => {
+                assert!(
+                    verdict.trigger != FunnelDisposition::None,
+                    "{name}: create trigger is never None"
+                );
+            }
+            MessageDeliveryKind::Update => {
+                assert!(
+                    verdict.trigger != FunnelDisposition::Accept,
+                    "{name}: update trigger is never Accept"
+                );
+            }
+        }
+    }
 }
