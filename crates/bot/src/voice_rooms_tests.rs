@@ -704,6 +704,9 @@ struct Http {
     limit_gate: Option<Arc<LimitGate>>,
     downloaded_urls: Mutex<Vec<String>>,
     download_results: DownloadResults,
+    /// When set, renames run as detached requests answering after this
+    /// many milliseconds (the production `RoomHttp` path).
+    slow_renames: Mutex<Option<u64>>,
 }
 
 impl Http {
@@ -738,6 +741,7 @@ impl Http {
             before_limit: None,
             overwrites_gate: None,
             limit_gate: None,
+            slow_renames: Mutex::new(None),
             downloaded_urls: Mutex::new(Vec::new()),
             download_results: Arc::new(Mutex::new(VecDeque::new())),
         }
@@ -890,6 +894,20 @@ impl RoomWrites for Http {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+    fn detached_rename(&self, channel: u64, name: &str) -> Option<DetachedRename> {
+        let delay = (*self.slow_renames.lock().unwrap())?;
+        let trace = self.trace.clone();
+        let name = name.to_owned();
+        let outcome = self.rename_errors.lock().unwrap().pop_front();
+        Some(Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            trace
+                .lock()
+                .unwrap()
+                .push(format!("rename:{channel}:{name}"));
+            outcome.map_or(Ok(()), Err)
+        }))
     }
     async fn set_user_limit(
         &self,
@@ -10085,6 +10103,154 @@ async fn a_game_or_stream_change_rerenders_the_room_name() {
     assert_eq!(
         *trace.lock().unwrap(),
         ["rename:500:Hangout", "rename:500:Apex Legends 🔴"]
+    );
+}
+
+#[tokio::test]
+async fn a_rename_that_timed_out_retries_within_seconds_not_minutes() {
+    let (live, store, http, trace) = fixture();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER, Some(500), Some(false));
+    http.rename_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::RenameDeferred);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.propose_name(500, "templated", 0);
+    dispatch(&mut worker, 0).await;
+    assert!(!worker.dispatch_one(RENAME_DEFERRED_RETRY_MS - 1).await);
+    // The inline path adds the call's real duration to the deadline.
+    dispatch(&mut worker, RENAME_DEFERRED_RETRY_MS + 1_000).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["rename:500:templated", "rename:500:templated"]
+    );
+}
+
+fn slow_rename_room(live: &LiveGuild, store: &Store) {
+    store.rooms.lock().unwrap().insert(700, room(700));
+    live.upsert_channel(channel(700, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER, Some(700), Some(false));
+}
+
+fn renames_sent(trace: &Trace) -> Vec<String> {
+    trace
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry.starts_with("rename:"))
+        .cloned()
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn detached_rename_timeouts_retry_in_seconds_and_back_off() {
+    let (live, store, http, trace) = fixture();
+    slow_rename_room(&live, &store);
+    // Every attempt takes Discord's full 10 s; the first two time out.
+    *http.slow_renames.lock().unwrap() = Some(10_000);
+    for _ in 0..2 {
+        http.rename_errors
+            .lock()
+            .unwrap()
+            .push_back(RoomHttpError::RenameDeferred);
+    }
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.propose_name(700, "slow", 0);
+    dispatch(&mut worker, 0).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    // The timeout comes back at 11 s: first retry 15 s later.
+    assert!(!worker.dispatch_one(11_000).await);
+    assert!(
+        !worker
+            .dispatch_one(11_000 + RENAME_DEFERRED_RETRY_MS - 1)
+            .await
+    );
+    dispatch(&mut worker, 11_000 + RENAME_DEFERRED_RETRY_MS).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    // The second timeout doubles the wait.
+    let back = 11_000 + RENAME_DEFERRED_RETRY_MS + 11_000;
+    assert!(!worker.dispatch_one(back).await);
+    assert!(
+        !worker
+            .dispatch_one(back + 2 * RENAME_DEFERRED_RETRY_MS - 1)
+            .await
+    );
+    dispatch(&mut worker, back + 2 * RENAME_DEFERRED_RETRY_MS).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    worker
+        .dispatch_one(back + 2 * RENAME_DEFERRED_RETRY_MS + 11_000)
+        .await;
+    assert_eq!(renames_sent(&trace).len(), 3);
+    assert_eq!(
+        worker.live.read_state().channels[&700].name.as_deref(),
+        Some("slow")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_newer_name_waits_for_the_rename_in_flight() {
+    let (live, store, http, trace) = fixture();
+    slow_rename_room(&live, &store);
+    *http.slow_renames.lock().unwrap() = Some(400_000);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.propose_name(700, "first", 0);
+    dispatch(&mut worker, 0).await;
+    worker.propose_name(700, "second", 1);
+    // The rename budget releases the newer name while the first request
+    // is still running: it is held, not sent.
+    dispatch(&mut worker, RENAME_MIN_INTERVAL_MS).await;
+    assert!(renames_sent(&trace).is_empty());
+    tokio::time::sleep(Duration::from_secs(400)).await;
+    assert_eq!(renames_sent(&trace), ["rename:700:first"]);
+    // The first outcome lands, then the held name goes out.
+    dispatch(&mut worker, 401_000).await;
+    assert_eq!(
+        worker.live.read_state().channels[&700].name.as_deref(),
+        Some("first")
+    );
+    assert_eq!(
+        worker.renames_in_flight.get(&700).map(String::as_str),
+        Some("second")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_rename_releases_the_actor_and_still_lands() {
+    let (live, store, http, trace) = fixture();
+    *http.slow_renames.lock().unwrap() = Some(5_000);
+    store.rooms.lock().unwrap().insert(700, room(700));
+    live.upsert_channel(channel(700, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER, Some(700), Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.propose_name(700, "slow", 0);
+    let started = tokio::time::Instant::now();
+    dispatch(&mut worker, 0).await;
+    // The actor waited the inline bound, not the request's five seconds,
+    // so interactions it answers keep Discord's 3 s window.
+    assert_eq!(
+        started.elapsed(),
+        Duration::from_millis(RENAME_INLINE_WAIT_MS)
+    );
+    assert!(trace.lock().unwrap().is_empty());
+    // The guild lane is free while the rename runs: a join creates now.
+    join(&mut worker, MEMBER + 1);
+    dispatch(&mut worker, 1).await;
+    assert_eq!(trace.lock().unwrap()[0], "create");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    worker.dispatch_one(2).await;
+    let renames: Vec<String> = trace
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry.starts_with("rename:"))
+        .cloned()
+        .collect();
+    assert_eq!(renames, ["rename:700:slow"]);
+    assert_eq!(
+        worker.live.read_state().channels[&700].name.as_deref(),
+        Some("slow")
     );
 }
 
