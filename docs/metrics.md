@@ -129,7 +129,9 @@ as dynamic labels.
   `POST /guilds/:guild/scheduled-events`,
   `PATCH /guilds/:guild/scheduled-events/:event`,
   `DELETE /guilds/:guild/scheduled-events/:event`,
-  `POST /guilds/:guild/channels`, `DELETE /channels/:channel`, `other`).
+  `POST /guilds/:guild/channels`, `DELETE /channels/:channel`,
+  `GET /guilds/:guild/members/:member`, `GET /users/@me`,
+  `PATCH /webhooks/:application/:token/messages/@original`, `other`).
 - `two_bot_job_runs_total{job,outcome}`,
   `two_bot_job_last_success_timestamp_seconds{job}` and
   `two_bot_job_consecutive_failures{job}` — `job` is one of
