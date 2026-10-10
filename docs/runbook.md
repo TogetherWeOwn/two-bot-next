@@ -1208,9 +1208,8 @@ Source: [gateway and durable recovery](gateway-recovery.md),
 
 ### Neon or Hyperdrive outage
 
-**Detection.** Production is live on PlanetScale; Neon is used for staging
-history and its staging database. Gateway Postgres uses the forwarded
-`DATABASE_URL` directly.
+**Detection.** Production is live on PlanetScale; Neon hosts the staging
+database. Gateway Postgres uses the forwarded `DATABASE_URL` directly.
 Hyperdrive `REDIRECT_DB` is a separate redirect binding, **not** the Rust
 connection path. With `REDIRECT_DB`, the Worker supplies `connectPostgres` to
 `RedirectStore`: live lookup and click insertion are implemented. Without that
