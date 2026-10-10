@@ -294,5 +294,151 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue())["verdict"], "FAIL")
 
 
+class BodyCapRefusalTests(unittest.TestCase):
+    """Oversized bodies are refused before decoding/parsing (M4.42)."""
+
+    def setUp(self):
+        self.fixture = Fixture()
+        self.addCleanup(self.fixture.close)
+        self.server = self.fixture.server
+
+    def padded(self, value, size):
+        raw = json.dumps(value).encode().decode()
+        self.assertLessEqual(len(raw), size, "fixture must fit the target size")
+        return raw + " " * (size - len(raw))
+
+    def reply(self, body, status=200, headers=None):
+        return staging_probe.Reply(status, headers or {}, body)
+
+    def run_probes(self, fetch, **options):
+        results = run_probes(fetch, unknown_slug=SLUG, **options)
+        return {r["name"]: r for r in results}
+
+    def test_exact_cap_valid_input_passes(self):
+        health = self.padded({"status": "ok"}, staging_probe.MAX_BODY_BYTES)
+        self.assertEqual(len(health.encode()), staging_probe.MAX_BODY_BYTES)
+        self.assertEqual(json.loads(health), {"status": "ok"})
+        fetch = make_fetch(self.fixture.origin, timeout=5)
+        self.server.overrides["/health"] = (200, {"content-type": "application/json"}, health)
+        results = self.run_probes(fetch)
+        self.assertEqual(results["health"]["verdict"], "PASS", results["health"]["failures"])
+
+    def test_valid_json_padded_past_cap_refuses_before_parsing(self):
+        sentinel = "SENTINEL_BODY_probe_padded"
+        base = json.dumps({"status": "ok", "note": sentinel})
+        health = base + " " * (staging_probe.MAX_BODY_BYTES + 1 - len(base))
+        self.assertEqual(len(health.encode()), staging_probe.MAX_BODY_BYTES + 1)
+        self.assertEqual(json.loads(health)["note"], sentinel)
+        self.server.overrides["/health"] = (200, {"content-type": "application/json"}, health)
+        fetch = make_fetch(self.fixture.origin, timeout=5)
+        results = self.run_probes(fetch)
+        self.assertEqual(results["health"]["verdict"], "FAIL")
+        failures = json.dumps(results["health"]["failures"])
+        self.assertIn("answered over the body cap", failures)
+        self.assertNotIn(sentinel, json.dumps(results))
+
+    def test_cap_length_valid_prefix_with_hidden_tail_refuses(self):
+        prefix = self.padded({"status": "ok"}, staging_probe.MAX_BODY_BYTES)
+        self.assertEqual(json.loads(prefix), {"status": "ok"})
+        # Hidden tail: the first MAX bytes alone are valid JSON, so an
+        # exact-cap read would silently accept the prefix.
+        self.server.overrides["/health"] = (
+            200, {"content-type": "application/json"}, prefix + "X")
+        fetch = make_fetch(self.fixture.origin, timeout=5)
+        results = self.run_probes(fetch)
+        self.assertEqual(results["health"]["verdict"], "FAIL")
+        self.assertIn("answered over the body cap",
+                      json.dumps(results["health"]["failures"]))
+
+    def test_injected_oversize_reply_never_reaches_json(self):
+        sentinel = "SENTINEL_BODY_injected"
+        big = self.padded({"status": "ok", "note": sentinel},
+                           staging_probe.MAX_BODY_BYTES + 1)
+        seen_bodies = []
+
+        def fetch(method, path):
+            if path == "/health":
+                return self.reply(big)
+            if path == "/readyz":
+                status, body = self.server.readyz
+                return self.reply(json.dumps(body))
+            # Delegate the rest to the live fixture so the run stays green
+            # everywhere except the oversized health check.
+            live = make_fetch(self.fixture.origin, timeout=5)
+            reply = live(method, path)
+            seen_bodies.append(reply.body)
+            return reply
+
+        results = self.run_probes(fetch)
+        self.assertEqual(results["health"]["verdict"], "FAIL")
+        self.assertIn("answered over the body cap",
+                      json.dumps(results["health"]["failures"]))
+        self.assertNotIn(sentinel, json.dumps(results))
+        # The oversized body never reaches the error-text scan.
+        for failures in (r["failures"] for r in results.values()):
+            self.assertNotIn(sentinel, json.dumps(failures))
+
+    def test_readyz_oversize_fails_without_a_breakdown_verdict(self):
+        payload = dict(READY)
+        base = json.dumps(payload)
+        big = base + " " * (staging_probe.MAX_BODY_BYTES + 1 - len(base))
+        self.assertEqual(json.loads(big)["components"], READY["components"])
+
+        def fetch(method, path):
+            if path == "/readyz":
+                return self.reply(big)
+            live = make_fetch(self.fixture.origin, timeout=5)
+            return live(method, path)
+
+        results = self.run_probes(fetch)
+        self.assertEqual(results["readyz"]["verdict"], "FAIL")
+        self.assertIn("answered over the body cap",
+                      json.dumps(results["readyz"]["failures"]))
+
+    def test_transport_reads_bounded_cap_plus_one_and_raises(self):
+        seen = []
+
+        class FakeResponse:
+            status = 200
+
+            def __init__(self, payload):
+                self.payload = payload
+
+            def read(self, n):
+                seen.append(n)
+                return self.payload
+
+            def getheaders(self):
+                return []
+
+        class FakeConn:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def request(self, *args, **kwargs):
+                pass
+
+            def getresponse(self):
+                return FakeResponse(self.payload)
+
+            def close(self):
+                pass
+
+        with mock.patch.object(staging_probe.http.client, "HTTPSConnection",
+                               return_value=FakeConn(b"{}")):
+            reply = staging_probe.make_fetch("https://two-bot-next-staging.5150.workers.dev")( "GET", "/health")
+            self.assertEqual(reply.body, "{}")
+        self.assertEqual(seen, [staging_probe.MAX_BODY_BYTES + 1])
+        seen.clear()
+        big = b"x" * (staging_probe.MAX_BODY_BYTES + 1)
+        with mock.patch.object(staging_probe.http.client, "HTTPSConnection",
+                               return_value=FakeConn(big)):
+            with self.assertRaises(staging_probe.BodyTooLarge) as caught:
+                staging_probe.make_fetch("https://two-bot-next-staging.5150.workers.dev")("GET", "/health")
+        self.assertEqual(seen, [staging_probe.MAX_BODY_BYTES + 1])
+        self.assertEqual(str(caught.exception), "response body over the size cap")
+        self.assertNotIn("x" * 10, str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -25,6 +25,13 @@ shell history), and it is never printed, logged, or written to evidence.
 A 401 refuses with a fixed message: rotation is an operator decision, and no
 substitute credential is ever tried.
 
+Body-cap refusal contract: the transport reads at most BODY_CAP+1 bytes so a
+hidden suffix is detected. Any body longer than BODY_CAP (64 KiB) is refused
+before JSON parsing with the fixed message "interactions endpoint answered
+over the body cap"; exact-cap valid input passes, and the extra byte never
+reaches a successful JSON path. Refusals never echo the body, headers, URL or
+parse exceptions.
+
 Guild fence (fail-closed, before any request): the run proceeds only when the
 guild id is exactly the TWO Staging guild. The live guild, any other guild,
 or a missing id refuses with exit 2 and no request is sent.
@@ -127,6 +134,8 @@ def get_json(fetch_fn, url):
         raise SmokeError("rate limited (429); rerun later")
     if status != 200:
         raise SmokeError(f"interactions endpoint answered {status}, expected 200")
+    if len(body) > BODY_CAP:
+        raise SmokeError("interactions endpoint answered over the body cap")
     try:
         value = json.loads(body)
     except (ValueError, UnicodeDecodeError):

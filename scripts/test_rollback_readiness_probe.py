@@ -478,5 +478,119 @@ class UserAgentTests(unittest.TestCase):
         self.assertFalse(seen[0].startswith("Python-urllib"))
 
 
+class BodyCapRefusalTests(unittest.TestCase):
+    """Oversized /readyz bodies are refused before JSON parsing (M4.42)."""
+
+    def setUp(self):
+        guard = mock.patch.object(probe.urllib.request.OpenerDirector, "open",
+                                  side_effect=AssertionError("network access in a unit test"))
+        guard.start()
+        self.addCleanup(guard.stop)
+        self.fresh()
+
+    def fresh(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.fx = Fixture(tmp.name)
+        self.requested = []
+
+    def fetch(self, response=READY):
+        def fake(url):
+            self.requested.append(url)
+            if isinstance(response, Exception):
+                raise response
+            return response
+        return fake
+
+    def probe(self, *extra, fetch=None, env=None):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env or {}, clear=True), contextlib.redirect_stdout(out):
+            code = probe.main(self.fx.argv(*extra), fetch_fn=fetch or self.fetch())
+        lines = out.getvalue().splitlines()
+        return code, {line.split(":", 1)[0]: line for line in lines[:-1]}, lines[-1]
+
+    def padded(self, value, size):
+        raw = json.dumps(value).encode()
+        self.assertLessEqual(len(raw), size, "fixture must fit the target size")
+        return raw + b" " * (size - len(raw))
+
+    def valid_readyz(self, **extra):
+        payload = {"components": [["process", "ready"], ["gateway", "ready"],
+                                  ["database", "ready"], ["token_invalid", "ready"]],
+                   "jobs": {}, "build_revision": "unknown", "build_id": "unknown"}
+        payload.update(extra)
+        return payload
+
+    def test_exact_cap_valid_input_passes(self):
+        body = self.padded(self.valid_readyz(), probe.READYZ_BODY_CAP)
+        self.assertEqual(len(body), probe.READYZ_BODY_CAP)
+        self.assertEqual(json.loads(body)["build_revision"], "unknown")
+        code, results, _ = self.probe(fetch=self.fetch((200, body)))
+        self.assertEqual(code, 0, results)
+        self.assertIn("PASS readyz", results)
+
+    def test_valid_json_padded_past_cap_refuses_before_parsing(self):
+        sentinel = "SENTINEL_BODY_rollback_padded"
+        body = self.padded(self.valid_readyz(note=sentinel), probe.READYZ_BODY_CAP + 1)
+        self.assertEqual(len(body), probe.READYZ_BODY_CAP + 1)
+        self.assertEqual(json.loads(body)["note"], sentinel)
+        code, results, _ = self.probe(fetch=self.fetch((200, body)))
+        self.assertEqual(code, 1, results)
+        self.assertIn("/readyz answered over the body cap", results["FAIL readyz"])
+        self.assertNotIn(sentinel, results["FAIL readyz"])
+
+    def test_cap_length_valid_prefix_with_hidden_tail_refuses(self):
+        prefix = self.padded(self.valid_readyz(), probe.READYZ_BODY_CAP)
+        self.assertEqual(json.loads(prefix)["build_revision"], "unknown")
+        code, results, _ = self.probe(fetch=self.fetch((200, prefix + b"X")))
+        self.assertEqual(code, 1, results)
+        self.assertIn("/readyz answered over the body cap", results["FAIL readyz"])
+
+    def test_httperror_oversize_enforces_the_same_bound(self):
+        body = self.padded(self.valid_readyz(), probe.READYZ_BODY_CAP + 1)
+        code, results, _ = self.probe(fetch=self.fetch((503, body)))
+        self.assertEqual(code, 1, results)
+        self.assertIn("/readyz answered over the body cap", results["FAIL readyz"])
+
+    def test_transport_reads_bounded_cap_plus_one_both_paths(self):
+        import urllib.error
+        seen = []
+
+        class Response(io.BytesIO):
+            status = 200
+
+            def read(self, n=-1):
+                seen.append(n)
+                return super().read(n)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class OkOpener:
+            def open(self, request, timeout=None):
+                return Response(b"{}")
+
+        with mock.patch.object(probe.urllib.request, "build_opener",
+                               return_value=OkOpener()):
+            probe.fetch(STAGING + "/readyz")
+        self.assertEqual(seen, [probe.READYZ_BODY_CAP + 1])
+        seen.clear()
+
+        class ErrorOpener:
+            def open(self, request, timeout=None):
+                fp = Response(b"x")
+                raise urllib.error.HTTPError(request.full_url, 503,
+                                             "Service Unavailable", {}, fp)
+
+        with mock.patch.object(probe.urllib.request, "build_opener",
+                               return_value=ErrorOpener()):
+            status, _ = probe.fetch(STAGING + "/readyz")
+        self.assertEqual(status, 503)
+        self.assertEqual(seen, [probe.READYZ_BODY_CAP + 1])
+
+
 if __name__ == "__main__":
     unittest.main()
