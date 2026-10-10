@@ -64,7 +64,7 @@ RUN_ID_RE = re.compile(r"[0-9]+")
 # Opaque failure-signature IDs (docs/staging-slash-smoke.md "Failure signatures").
 SIGNATURE_HEALTH = "SMOKE-HEALTH-FAIL"
 SIGNATURE_READYZ = "SMOKE-READYZ-NOT-READY"
-SIGNATURE_DB_BEHIND = "SMOKE-READYZ-DB-BEHIND"
+SIGNATURE_CHECKPOINT_READ = "SMOKE-READYZ-CHECKPOINT-READ-FAILED"
 SIGNATURE_BUILD = "SMOKE-BUILD-MISMATCH"
 SIGNATURE_DISCORD = "SMOKE-DISCORD-REFUSED"
 SIGNATURE_MISSING = "SMOKE-REGISTRY-MISSING"
@@ -162,10 +162,11 @@ def health_rows(args, origin, run, fetch_fn):
         "build": ("readyz build identity", "build_revision is the tested revision",
                   "readyz", SIGNATURE_BUILD),
     }
+    failure = (report or {}).get("gateway_failure") or {}
     for result in results:
         name, expected, timing_key, signature = meta[result.name]
-        if "db-behind-binary" in result.reason:
-            signature = SIGNATURE_DB_BEHIND
+        if result.name == "readyz" and failure.get("class") == health_probe.CHECKPOINT_READ_CLASS:
+            signature = SIGNATURE_CHECKPOINT_READ
         run.rows.append(Row(name, "pass" if result.ok else "fail", expected, result.reason,
                             started, run.durations.get(timing_key, 0),
                             None if result.ok else signature))

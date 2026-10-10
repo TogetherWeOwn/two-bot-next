@@ -115,11 +115,18 @@ this proves the build answers readiness and the guild publishes the surface.
 | Row | Passes when | Failure signature |
 | --- | --- | --- |
 | `GET /health` | 200 with the exact `{"status":"ok"}` shape | `SMOKE-HEALTH-FAIL` |
-| `GET /readyz` | 200 and every component ready; a parked or down container fails | `SMOKE-READYZ-NOT-READY`, `SMOKE-READYZ-DB-BEHIND` |
+| `GET /readyz` | 200 and every component ready; a parked or down container fails | `SMOKE-READYZ-NOT-READY`, `SMOKE-READYZ-CHECKPOINT-READ-FAILED` |
 | `readyz build identity` | `build_revision` equals `--expected-sha` | `SMOKE-BUILD-MISMATCH` |
 | `identity and command list` | the token is the staging application and the guild command list reads | `SMOKE-DISCORD-REFUSED` |
 | `/rank`, `/leaderboard`, `/help` | listed and their own resource is scoped to the staging guild | `SMOKE-REGISTRY-MISSING`, `SMOKE-REGISTRY-DETAIL-MISMATCH` |
 | every other built-in | listed (`pass`) or unpublished (`skipped`, gate off or publish pending) | none: a skip is visible in the verdict, not a failure |
+
+`SMOKE-READYZ-CHECKPOINT-READ-FAILED` replaces the older
+`SMOKE-READYZ-DB-BEHIND` signature for new records. It names the failed read
+step, not migration drift: a root-cause claim requires separate reviewed
+schema/ACL/connectivity evidence and an independent receipt, as described in
+[the health-contract probe](staging-health-contract-probe.md#checkpoint-read-assertion-not-a-root-cause-diagnosis).
+No probe is allowed to apply a migration or test production.
 
 The record's deploy run id defaults to the `readyz` `build_id` prefix (the build
 id is `RUN_ID-RUN_ATTEMPT` of the `deploy-staging` run that built the image), but
@@ -151,6 +158,7 @@ credential-free half (`/health`, `/readyz`, build identity) is already enforced
 on every deploy by the `deploy-staging` gate.
 
 Offline coverage: `scripts/test_staging_smoke_run.py` (live-guild refusal before
-any request, container down, parked, db-behind and mismatched builds, missing
+any request, container down, parked, checkpoint-read failure without a root-cause
+claim, mismatched builds, missing
 core surface, foreign or rejected token, token never in output, record schema,
 drift against the command matrix).

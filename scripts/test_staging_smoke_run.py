@@ -252,15 +252,24 @@ class SmokeRunTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(self.rows(self.written())["GET /readyz"]["result"], "fail")
 
-    def test_db_behind_binary_has_its_own_signature(self):
-        behind = dict(READY, components=[["process", "ready"], ["gateway", "down"],
-                                         ["database", "ready"], ["token_invalid", "ready"]],
-                      gateway_failure={"phase": "durable_gateway",
-                                       "class": "checkpoint_load_failed"})
-        code, _ = self.drive(health=self.health_fetch(readyz=(503, {}, json.dumps(behind).encode())))
+    def test_checkpoint_read_failure_has_an_observed_step_signature(self):
+        failed_read = dict(READY, components=[["process", "ready"], ["gateway", "down"],
+                                              ["database", "ready"], ["token_invalid", "ready"]],
+                           gateway_failure={"phase": "durable_gateway",
+                                            "class": "checkpoint_load_failed"})
+        code, out = self.drive(health=self.health_fetch(
+            readyz=(503, {}, json.dumps(failed_read).encode())))
         self.assertEqual(code, 1)
-        self.assertEqual(self.rows(self.written())["GET /readyz"]["failure_signature"],
-                         smoke.SIGNATURE_DB_BEHIND)
+        record = self.written()
+        row = self.rows(record)["GET /readyz"]
+        self.assertEqual(record["verdict"]["disposition"], "NEEDS WORK")
+        self.assertEqual(row["failure_signature"], smoke.SIGNATURE_CHECKPOINT_READ)
+        self.assertIn("checkpoint read failed", row["actual"])
+        self.assertIn("root cause unverified", row["actual"])
+        for text in (out, json.dumps(record)):
+            self.assertNotIn("db-behind-binary", text)
+            self.assertNotIn("SMOKE-READYZ-DB-BEHIND", text)
+            self.assertNotIn("migrate before", text)
 
     def test_build_revision_mismatch_fails(self):
         code, _ = self.drive(extra=("--expected-sha", OTHER_SHA, "--deploy-run-id", "42"))
