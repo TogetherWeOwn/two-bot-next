@@ -175,7 +175,7 @@ fn registry_receipt(count: usize, first_id: u64) -> ScriptedResponse {
 /// Serializes the two tests that touch the process-global refused series.
 /// Exact delta asserts are only race-free while the sibling test (which also
 /// drives refused prefix candidates through `handle_message`) cannot run.
-static PREFIX_REFUSED_SERIES_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static PREFIX_REFUSED_SERIES_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn refused_verdict_total() -> u64 {
     // Callers must hold `PREFIX_REFUSED_SERIES_GUARD`: the global counter is
@@ -197,9 +197,7 @@ fn refused_verdict_total() -> u64 {
 #[tokio::test]
 async fn rejected_prefix_inputs_never_access_database_or_discord() {
     use AutomationMessageAcceptance::*;
-    let _series_guard = PREFIX_REFUSED_SERIES_GUARD
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _series_guard = PREFIX_REFUSED_SERIES_GUARD.lock().await;
     let pool = PgPoolOptions::new().connect_lazy_with(test_options());
     // A missed early gate fails immediately instead of trying a live connection.
     pool.close().await;
@@ -263,9 +261,7 @@ async fn rejected_prefix_inputs_never_access_database_or_discord() {
 #[tokio::test]
 async fn verdict_refusal_counts_separately_from_unmatched() {
     use AutomationMessageAcceptance::*;
-    let _series_guard = PREFIX_REFUSED_SERIES_GUARD
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _series_guard = PREFIX_REFUSED_SERIES_GUARD.lock().await;
     let pool = PgPoolOptions::new().connect_lazy_with(test_options());
     pool.close().await;
     let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
