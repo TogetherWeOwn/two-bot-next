@@ -443,7 +443,9 @@ pub use voice_rooms::{
 };
 pub use voice_vote_kick::{
     RoomKickDecision, VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError,
-    VoteKickRef, VoteKickStatus, VoteKickUpdate, VoteProgress, VoteRoomFacts, VOTE_KICK_TTL_MS,
+    VoteKickRef, VoteKickStatus, VoteKickUpdate, VoteProgress, VoteRoomFacts,
+    VOTE_KICK_COOLDOWN_MS, VOTE_KICK_INITIATOR_LIMIT, VOTE_KICK_INITIATOR_WINDOW_MS,
+    VOTE_KICK_TTL_MS,
 };
 #[cfg(feature = "db")]
 pub use website_store::{

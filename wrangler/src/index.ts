@@ -578,15 +578,26 @@ export class TwoBotContainer extends Container<Env> {
       return await this.gated(async () => {
         const id = this.id();
         if (request.headers.get(DEPLOYMENT_HEADER) !== id) throw new OwnershipRefused("deployment_mismatch");
-        const owner = change
-          ? await this.ownership.change(id, change, () => this.destroyInactive())
-          : await this.ownership.read();
-        if (change) {
+        if (!change) {
+          const owner = await this.ownership.read();
+          // Takeover does not start the gateway. A subsequent owned probe does.
+          return Response.json({ deploymentId: id, owner: owner ?? null, running: this.ctx.container?.running ?? false }, {
+            headers: { "cache-control": "no-store" },
+          });
+        }
+        // Recovery re-runs the full write/destroy/write sequence even for a
+        // repeat (force), and only a commit clears the flag. A no-op repeat
+        // returns the stored record at the posted epoch while every commit
+        // lands exactly one epoch higher, so equality is the no-op signal.
+        const owner = await this.ownership.change(id, change, () => this.destroyInactive(), { force: this.recoveryFailed });
+        if (change.action === "takeover" && owner.epoch === change.expectedEpoch) {
+          console.log(`two-bot ownership takeover already applied at epoch ${owner.epoch}`);
+        } else {
           this.recoveryFailed = false;
           console.log(`two-bot ownership change: ${JSON.stringify(owner)}`);
         }
         // Takeover does not start the gateway. A subsequent owned probe does.
-        return Response.json({ deploymentId: id, owner: owner ?? null, running: this.ctx.container?.running ?? false }, {
+        return Response.json({ deploymentId: id, owner, running: this.ctx.container?.running ?? false }, {
           headers: { "cache-control": "no-store" },
         });
       });

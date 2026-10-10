@@ -15,6 +15,34 @@ use two_bot_testsupport::TestDatabase;
 mod adapter;
 mod settings;
 
+/// Stored `internal_idempotency` receipt row: action, state, response code,
+/// status, resource, affected count, guild, actor, target, resolved role.
+type StoredReceiptRow = (
+    String,
+    String,
+    Option<String>,
+    Option<i32>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Terminal `internal_action_log` row: action, phase, response code, evidence
+/// code, status, guild, target, resolved role.
+type TerminalAuditRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<i32>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 fn secret(index: usize) -> String {
     let fixture: Value = serde_json::from_str(include_str!(
         "../../../core/tests/fixtures/internal-action-signing.json"
@@ -989,6 +1017,13 @@ async fn authenticated_membership_actions_succeed_and_refusals_stay_redacted() {
     assert_eq!(effect.calls(), 1);
 
     let add_ok = r#"{"action":"guild.add_member","discord_id":"111111111111111111","access_token":"fixture-oauth"}"#;
+    // Non-vacuous control: the raw signed bytes DO carry the token pre-persist,
+    // so the stored-state scan below would catch a leak instead of passing
+    // on empty input.
+    assert!(
+        add_ok.contains("fixture-oauth"),
+        "control: raw guild.add_member bytes must carry the token"
+    );
     let (status, _, add_first) = answer(app.clone(), signed(add_ok, "old", "intent-add-ok")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(add_first["result"], json!({"outcome": "added"}));
@@ -999,6 +1034,92 @@ async fn authenticated_membership_actions_succeed_and_refusals_stay_redacted() {
     assert_eq!(headers["idempotent-replay"], "true");
     assert_eq!(add_replay["result"], json!({"outcome": "added"}));
     assert_eq!(effect.calls(), 2);
+    // Wire responses never echo the transient token, including the replay.
+    assert!(
+        !add_first.to_string().contains("fixture-oauth"),
+        "first guild.add_member response must not echo the token"
+    );
+    assert!(
+        !add_replay.to_string().contains("fixture-oauth"),
+        "replayed guild.add_member response must not echo the token"
+    );
+    // Stored-state evidence: the OAuth token is absent from every persisted
+    // record for the happy path — the idempotency claim plus its
+    // `store.finish` receipt (same row, now completed) and the audit rows.
+    let claim_rows: Vec<String> = sqlx::query_scalar(
+        "SELECT row_to_json(i)::text FROM internal_idempotency i \
+         WHERE action = 'guild.add_member'",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(claim_rows.len(), 1, "exactly one guild.add_member claim");
+    for row in &claim_rows {
+        assert!(
+            !row.contains("fixture-oauth"),
+            "OAuth token persisted in idempotency claim/receipt"
+        );
+    }
+    // The receipt is durable: completed success with the stored-member
+    // `affected = 1`, no resource, and still no token bytes.
+    let state: String = sqlx::query_scalar(
+        "SELECT state FROM internal_idempotency WHERE action = 'guild.add_member'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(state, "completed");
+    let response_code: String = sqlx::query_scalar(
+        "SELECT response_code FROM internal_idempotency WHERE action = 'guild.add_member'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(response_code, "success");
+    let affected: i64 = sqlx::query_scalar(
+        "SELECT affected FROM internal_idempotency WHERE action = 'guild.add_member'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(affected, 1);
+    let resource_id: Option<String> = sqlx::query_scalar(
+        "SELECT resource_id FROM internal_idempotency WHERE action = 'guild.add_member'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(resource_id, None);
+    let audit_rows: Vec<String> = sqlx::query_scalar(
+        "SELECT row_to_json(a)::text FROM internal_action_log a \
+         WHERE intent_id IN (SELECT intent_id FROM internal_idempotency \
+         WHERE action = 'guild.add_member') ORDER BY audit_id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(audit_rows.len(), 2, "intent + terminal audit rows");
+    for row in &audit_rows {
+        assert!(
+            !row.contains("fixture-oauth"),
+            "OAuth token persisted in audit row"
+        );
+    }
+    // Sweep every persisted internal-action record so a cross-row leak
+    // cannot hide outside the happy-path intent.
+    let persisted: Vec<String> = sqlx::query_scalar(
+        "SELECT row_to_json(i)::text FROM internal_idempotency i \
+         UNION ALL SELECT row_to_json(a)::text FROM internal_action_log a",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    for row in &persisted {
+        assert!(
+            !row.contains("fixture-oauth"),
+            "OAuth token persisted in stored internal-action record"
+        );
+    }
 
     // Refusal-before-effect: malformed shapes and unknown keys refuse cleanly
     // with no secret echo and no Discord call. Each uses a fresh intent so a
@@ -1036,13 +1157,136 @@ async fn authenticated_membership_actions_succeed_and_refusals_stay_redacted() {
     assert_eq!(effect.calls(), 2, "refusals must not reach Discord");
 
     // Receipts are durable: both happy-path intents completed with the
-    // stored-member `None` + `affected` contract.
+    // stored-member `None` + `affected` contract. The stored rows carry the
+    // executed outcome (`affected` 1 renders as the verb's applied outcome)
+    // with the request linkage, so a receipt completing with the wrong
+    // outcome or linkage fails here, not just on the envelope.
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM internal_idempotency")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(total, 2, "replays and refusals create no extra intent rows");
     let completed: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM internal_idempotency WHERE state = 'completed'")
             .fetch_one(db.pool())
             .await
             .unwrap();
-    assert_eq!(completed, 2);
+    assert_eq!(completed, 2, "both membership intents complete");
+    // Stored receipt shape per verb, ordered by action so the linkage pins
+    // without echoing request bytes: `guild.add_member` sorts before
+    // `role.assign`. Only scalar linkage columns are selected; no hashes,
+    // tokens or raw bytes enter the assertion output.
+    let rows: Vec<StoredReceiptRow> = sqlx::query_as(
+        "SELECT action, state, response_code, http_status, resource_id, affected, \
+         guild_id, actor_id, target_id, resolved_role_id \
+         FROM internal_idempotency ORDER BY action",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2, "two stored membership receipts");
+    let guild = staging_guild();
+    // `guild.add_member`: applied `added` is `affected` 1 with member linkage
+    // and no resolved role.
+    assert_eq!(rows[0].0, "guild.add_member", "add receipt action");
+    assert_eq!(rows[0].1, "completed", "add receipt state");
+    assert_eq!(rows[0].2.as_deref(), Some("success"), "add receipt code");
+    assert_eq!(rows[0].3, Some(200), "add receipt status");
+    assert_eq!(rows[0].4, None, "add receipt has no message resource");
+    assert_eq!(rows[0].5, Some(1), "add receipt carries the applied effect");
+    assert_eq!(
+        rows[0].6.as_deref(),
+        Some(guild),
+        "add receipt guild linkage"
+    );
+    assert_eq!(rows[0].7, None, "add receipt has no actor linkage");
+    assert_eq!(
+        rows[0].8.as_deref(),
+        Some("111111111111111111"),
+        "add receipt target linkage"
+    );
+    assert_eq!(rows[0].9, None, "add receipt has no resolved role");
+    // `role.assign`: applied `assigned` is `affected` 1 with the allowlisted
+    // role pinned at claim time.
+    assert_eq!(rows[1].0, "role.assign", "assign receipt action");
+    assert_eq!(rows[1].1, "completed", "assign receipt state");
+    assert_eq!(rows[1].2.as_deref(), Some("success"), "assign receipt code");
+    assert_eq!(rows[1].3, Some(200), "assign receipt status");
+    assert_eq!(rows[1].4, None, "assign receipt has no message resource");
+    assert_eq!(
+        rows[1].5,
+        Some(1),
+        "assign receipt carries the applied effect"
+    );
+    assert_eq!(
+        rows[1].6.as_deref(),
+        Some(guild),
+        "assign receipt guild linkage"
+    );
+    assert_eq!(rows[1].7, None, "assign receipt has no actor linkage");
+    assert_eq!(
+        rows[1].8.as_deref(),
+        Some("111111111111111111"),
+        "assign receipt target linkage"
+    );
+    assert_eq!(
+        rows[1].9.as_deref(),
+        Some("222222222222222222"),
+        "assign receipt resolved-role linkage"
+    );
+    // The replayed envelopes above (`assigned` / `added` with
+    // `idempotent-replay`) return these stored rows: the stored `affected` 1
+    // is what renders each applied outcome, and the effect count proves no
+    // second dispatch ran.
+    assert_eq!(role_replay["result"], json!({"outcome": "assigned"}));
+    assert_eq!(add_replay["result"], json!({"outcome": "added"}));
+    // Terminal audit rows mirror the same outcome linkage with executor
+    // evidence, proving `store.finish` carried it to the ledger as well.
+    let logs: Vec<TerminalAuditRow> = sqlx::query_as(
+        "SELECT action, phase, response_code, evidence_code, http_status, \
+         guild_id, target_id, resolved_role_id \
+         FROM internal_action_log WHERE phase = 'terminal' ORDER BY action",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(logs.len(), 2, "two terminal audit rows");
+    assert_eq!(logs[0].0, "guild.add_member", "add audit action");
+    assert_eq!(logs[0].1, "terminal", "add audit phase");
+    assert_eq!(logs[0].2.as_deref(), Some("success"), "add audit code");
+    assert_eq!(logs[0].3.as_deref(), Some("executor"), "add audit evidence");
+    assert_eq!(logs[0].4, Some(200), "add audit status");
+    assert_eq!(logs[0].5.as_deref(), Some(guild), "add audit guild linkage");
+    assert_eq!(
+        logs[0].6.as_deref(),
+        Some("111111111111111111"),
+        "add audit target linkage"
+    );
+    assert_eq!(logs[0].7, None, "add audit has no resolved role");
+    assert_eq!(logs[1].0, "role.assign", "assign audit action");
+    assert_eq!(logs[1].1, "terminal", "assign audit phase");
+    assert_eq!(logs[1].2.as_deref(), Some("success"), "assign audit code");
+    assert_eq!(
+        logs[1].3.as_deref(),
+        Some("executor"),
+        "assign audit evidence"
+    );
+    assert_eq!(logs[1].4, Some(200), "assign audit status");
+    assert_eq!(
+        logs[1].5.as_deref(),
+        Some(guild),
+        "assign audit guild linkage"
+    );
+    assert_eq!(
+        logs[1].6.as_deref(),
+        Some("111111111111111111"),
+        "assign audit target linkage"
+    );
+    assert_eq!(
+        logs[1].7.as_deref(),
+        Some("222222222222222222"),
+        "assign audit resolved-role linkage"
+    );
     set_add_member_flag(false);
     db.close().await.unwrap();
 }
@@ -1622,26 +1866,30 @@ async fn moderation_channel_happy_paths_emit_planner_outcomes() {
     ));
     let _flag = MODERATION_FLAG_LOCK.lock().await;
     set_moderation_flags(true);
-    for (action, intent, expected) in [
+    for (action, intent, expected, expected_affected) in [
         (
             "moderation.purge",
             "intent-channel-purge",
             serde_json::json!({"outcome": "purged", "affected": 3}),
+            3_i64,
         ),
         (
             "moderation.slowmode",
             "intent-channel-slowmode",
             serde_json::json!({"outcome": "slowmode_updated"}),
+            1_i64,
         ),
         (
             "moderation.lockdown",
             "intent-channel-lockdown",
             serde_json::json!({"outcome": "locked_down"}),
+            1_i64,
         ),
         (
             "moderation.unlock",
             "intent-channel-unlock",
             serde_json::json!({"outcome": "unlocked"}),
+            1_i64,
         ),
     ] {
         let (status, headers, body) =
@@ -1650,6 +1898,39 @@ async fn moderation_channel_happy_paths_emit_planner_outcomes() {
         assert!(!headers.contains_key("idempotent-replay"), "{action}");
         assert_eq!(body["result"], expected, "{action}");
         assert_eq!(body["request_id"].as_str().unwrap().len(), 26, "{action}");
+        // The planner outcome renders on the wire (asserted above) while the
+        // persisted `store.finish` receipt carries it as the stored
+        // `affected` count plus the request linkage: moderated channel as both
+        // `resource_id` and `target_id`, actor and staging guild scalars.
+        // Reuses the canonical `StoredReceiptRow` shape so clippy's
+        // `type_complexity` stays quiet.
+        let row: StoredReceiptRow = sqlx::query_as(
+            "SELECT action, state, response_code, http_status, resource_id, affected, \
+             guild_id, actor_id, target_id, resolved_role_id FROM internal_idempotency \
+             WHERE action = $1",
+        )
+        .bind(action)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(row.0, action, "{action}");
+        assert_eq!(row.1, "completed", "{action}");
+        assert_eq!(row.2.as_deref(), Some("success"), "{action}");
+        assert_eq!(row.3, Some(200), "{action}");
+        assert_eq!(
+            row.4.as_deref(),
+            Some("222222222222222222"),
+            "{action}: stored channel linkage"
+        );
+        assert_eq!(
+            row.5,
+            Some(expected_affected),
+            "{action}: stored planner count"
+        );
+        assert_eq!(row.6.as_deref(), Some(staging_guild()), "{action}");
+        assert_eq!(row.7.as_deref(), Some("111111111111111111"), "{action}");
+        assert_eq!(row.8.as_deref(), Some("222222222222222222"), "{action}");
+        assert_eq!(row.9, None, "{action}: no resolved role");
     }
     set_moderation_flags(false);
     assert_eq!(channel.calls(), 4);
@@ -1763,6 +2044,11 @@ async fn moderation_channel_success_replays_and_mismatches_like_announcements() 
         first["result"],
         serde_json::json!({"outcome": "locked_down"})
     );
+    assert_eq!(
+        channel.calls(),
+        1,
+        "first lockdown reaches the channel effect once"
+    );
     let restarted = router(state_full_with_channel(
         db.independent_pool().await.unwrap(),
         effect.clone(),
@@ -1779,13 +2065,42 @@ async fn moderation_channel_success_replays_and_mismatches_like_announcements() 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers["idempotent-replay"], "true");
     assert_eq!(first["result"], replay["result"]);
+    assert_eq!(
+        channel.calls(),
+        1,
+        "idempotent replay returns the stored record without a second Discord call"
+    );
+    // The stored receipt keeps the planner linkage: completed success for the
+    // lockdown verb, moderated channel as resource and target, actor and guild.
+    let row: StoredReceiptRow = sqlx::query_as(
+        "SELECT action, state, response_code, http_status, resource_id, affected, \
+         guild_id, actor_id, target_id, resolved_role_id FROM internal_idempotency \
+         WHERE state = 'completed'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(row.0, "moderation.lockdown");
+    assert_eq!(row.1, "completed");
+    assert_eq!(row.2.as_deref(), Some("success"));
+    assert_eq!(row.3, Some(200));
+    assert_eq!(row.4.as_deref(), Some("222222222222222222"));
+    assert_eq!(row.5, Some(1));
+    assert_eq!(row.6.as_deref(), Some(staging_guild()));
+    assert_eq!(row.7.as_deref(), Some("111111111111111111"));
+    assert_eq!(row.8.as_deref(), Some("222222222222222222"));
+    assert_eq!(row.9, None, "lockdown receipt has no resolved role");
     let changed = format!("{raw} ");
     let (status, _, mismatch) =
         answer(restarted, signed(&changed, "new", "intent-channel-fixture")).await;
     set_moderation_flags(false);
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(mismatch["error"]["retryable"], false);
-    assert_eq!(channel.calls(), 1);
+    assert_eq!(
+        channel.calls(),
+        1,
+        "payload mismatch still performs no second Discord call"
+    );
     assert_eq!(effect.calls(), 0);
     assert_eq!(moderation.calls(), 0);
     db.close().await.unwrap();
@@ -2455,6 +2770,55 @@ async fn event_read_replayed_nonce_is_refused_without_a_second_discord_call() {
     assert_eq!(refused["error"]["retryable"], false);
     assert_eq!(api.count(), 1, "the replay must not reach Discord again");
     db.close().await.unwrap();
+}
+
+/// Authorize refusals recover the verb for both `ActionNotAllowed` and
+/// `RateLimited`: a rate-limited `guild.add_member` keeps the `membership`
+/// family instead of collapsing to `other`, so the counter series
+/// `membership`/`rate_limit` can increment. Earlier refusals stay unknown.
+#[test]
+fn authorize_refusals_recover_the_verb_for_disabled_and_rate_limited_actions() {
+    let member_body = br#"{"action":"guild.add_member"}"#;
+    let unknown_body = br#"{"action":"website.nonexistent"}"#;
+    let malformed_body = b"not json";
+    for (code, raw, expected) in [
+        (
+            ErrorCode::ActionNotAllowed,
+            member_body.as_slice(),
+            ActionLabel::Known("guild.add_member"),
+        ),
+        (
+            ErrorCode::RateLimited,
+            member_body.as_slice(),
+            ActionLabel::Known("guild.add_member"),
+        ),
+        (
+            ErrorCode::RateLimited,
+            unknown_body.as_slice(),
+            ActionLabel::Unknown,
+        ),
+        (
+            ErrorCode::RateLimited,
+            malformed_body.as_slice(),
+            ActionLabel::Unknown,
+        ),
+        (
+            ErrorCode::Malformed,
+            member_body.as_slice(),
+            ActionLabel::Unknown,
+        ),
+    ] {
+        let label = authorize_action_label(code, raw);
+        assert_eq!(label, expected, "code {code:?}");
+        assert_eq!(
+            internal_family(label),
+            match expected {
+                ActionLabel::Known("guild.add_member") => "membership",
+                _ => "other",
+            },
+            "code {code:?}"
+        );
+    }
 }
 
 #[tokio::test]

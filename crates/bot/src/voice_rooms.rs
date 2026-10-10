@@ -7663,6 +7663,12 @@ fn kick_refusal_text(refusal: &KickRefusal) -> &'static str {
         KickRefusal::Vote(VoteKickError::ActiveVoteExists) => {
             "A vote is already active for that member."
         }
+        KickRefusal::Vote(VoteKickError::Cooldown) => {
+            "A recent vote against that member is in cooldown. Try again shortly."
+        }
+        KickRefusal::Vote(VoteKickError::InitiatorLimited) => {
+            "You have started too many votes recently. Try again shortly."
+        }
         KickRefusal::Vote(VoteKickError::ReusedVoteId) => {
             "That vote was already started. Try again."
         }
