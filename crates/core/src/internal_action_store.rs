@@ -290,6 +290,16 @@ impl ReconciliationEvidence {
     }
 }
 
+/// One unknown website event intent awaiting operator reconciliation.
+/// Hashes never leave the database: the operator names the exact intent id,
+/// exactly like the member-moderation reconcile tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownEventIntent {
+    pub intent_id: i64,
+    pub action: String,
+    pub created_at_utc: String,
+}
+
 /// Reuses the runtime pool. Methods never migrate or contact Discord.
 #[derive(Clone)]
 pub struct InternalActionStore {
@@ -648,13 +658,155 @@ impl InternalActionStore {
         .bind(response.outcome())
         .execute(&mut *tx)
         .await?;
+        Self::complete_locked(&mut tx, intent_id, response, evidence).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Shared completion write: mark one locked intent completed with its
+    /// terminal response and evidence audit. Callers own all transition
+    /// checks; this helper checks nothing.
+    async fn complete_locked(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        intent_id: i64,
+        response: &TerminalResponse,
+        evidence: Option<ReconciliationEvidence>,
+    ) -> Result<(), InternalStoreError> {
+        sqlx::query(
+            "UPDATE internal_idempotency SET state = 'completed', response_code = $2, \
+             http_status = $3, resource_id = $4, affected = $5, outcome = $6, \
+             updated_at = clock_timestamp() WHERE intent_id = $1",
+        )
+        .bind(intent_id)
+        .bind(response.code())
+        .bind(i32::from(response.status()))
+        .bind(response.resource_id())
+        .bind(response.affected())
+        .bind(response.outcome())
+        .execute(&mut **tx)
+        .await?;
         Self::audit(
-            &mut tx,
+            tx,
             intent_id,
             "terminal",
             Some(evidence.map_or("executor", ReconciliationEvidence::as_str)),
         )
         .await?;
+        Ok(())
+    }
+
+    /// Read-only listing of `unknown` event intents for one guild, oldest
+    /// first. Never migrates, never writes, never contacts Discord.
+    pub async fn list_unknown_event_intents(
+        &self,
+        guild_id: &str,
+    ) -> Result<Vec<UnknownEventIntent>, InternalStoreError> {
+        if !is_snowflake(guild_id) {
+            return Err(InternalStoreError::InvalidInput);
+        }
+        Ok(sqlx::query(
+            "SELECT intent_id, action, \
+             to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at_utc \
+             FROM internal_idempotency \
+             WHERE state = 'unknown' AND action IN ('event.upsert', 'event.cancel') \
+             AND guild_id = $1 ORDER BY intent_id",
+        )
+        .bind(guild_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| UnknownEventIntent {
+            intent_id: row.try_get("intent_id").unwrap_or_default(),
+            action: row.try_get("action").unwrap_or_default(),
+            created_at_utc: row.try_get("created_at_utc").unwrap_or_default(),
+        })
+        .collect())
+    }
+
+    /// Operator resolution of one exact unknown event intent, in a single
+    /// transaction. `reconcile()` needs the caller's exact raw payload bytes,
+    /// which an operator never has; this path addresses the intent by id and
+    /// refuses anything but an `unknown` event row in the named guild.
+    ///
+    /// A confirmed `event.upsert` effect registers (or re-points) its key
+    /// mapping in the same transaction, before the terminal receipt commits:
+    /// a create whose mapping write failed heals here, and replay can never
+    /// report success for a key with no mapping. Cancels retain the mapping
+    /// the receiver kept, so an effect resolution for `event.cancel` carries
+    /// no mapping. A proven no-effect records a terminal `no_effect` failure
+    /// without touching mappings; retrying then needs a new idempotency key.
+    /// Only `Success` and `NoEffect` responses are accepted: malformed and
+    /// admission refusals are receiver-side, never operator evidence.
+    pub async fn resolve_event_intent(
+        &self,
+        intent_id: i64,
+        expected_action: &str,
+        guild_id: &str,
+        key_mapping: Option<(&str, &str)>,
+        response: &TerminalResponse,
+        evidence: ReconciliationEvidence,
+    ) -> Result<(), InternalStoreError> {
+        if intent_id <= 0
+            || !matches!(expected_action, "event.upsert" | "event.cancel")
+            || !is_snowflake(guild_id)
+            || !evidence.supports(response)
+            || !matches!(
+                response,
+                TerminalResponse::Success { .. }
+                    | TerminalResponse::Failure(TerminalFailure::NoEffect)
+            )
+        {
+            return Err(InternalStoreError::InvalidInput);
+        }
+        let upsert_success = matches!(response, TerminalResponse::Success { .. })
+            && expected_action == "event.upsert";
+        match (upsert_success, key_mapping) {
+            // Upsert effects (re)point the key; every other resolution must
+            // not rewrite mappings.
+            (true, Some(_)) | (false, None) => {}
+            (true, None) | (false, Some(_)) => return Err(InternalStoreError::InvalidInput),
+        }
+        if let (Some((event_key, event_id)), TerminalResponse::Success { resource_id, .. }) =
+            (key_mapping, response)
+        {
+            Self::check_event_key_shape(guild_id, event_key)?;
+            if !is_snowflake(event_id)
+                || resource_id
+                    .as_ref()
+                    .is_none_or(|id| id.as_str() != event_id)
+            {
+                return Err(InternalStoreError::InvalidInput);
+            }
+        }
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT state, action, guild_id FROM internal_idempotency \
+             WHERE intent_id = $1 FOR UPDATE",
+        )
+        .bind(intent_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(InternalStoreError::TransitionRefused)?;
+        let state: &str = row.try_get("state")?;
+        let action: &str = row.try_get("action")?;
+        let row_guild: Option<&str> = row.try_get("guild_id")?;
+        if state != "unknown" || action != expected_action || row_guild != Some(guild_id) {
+            return Err(InternalStoreError::TransitionRefused);
+        }
+        if let Some((event_key, event_id)) = key_mapping {
+            sqlx::query(
+                "INSERT INTO internal_event_keys (guild_id, event_key, event_id) \
+                 VALUES ($1, $2, $3) \
+                 ON CONFLICT (guild_id, event_key) DO UPDATE \
+                 SET event_id = EXCLUDED.event_id, updated_at = clock_timestamp()",
+            )
+            .bind(guild_id)
+            .bind(event_key)
+            .bind(event_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        Self::complete_locked(&mut tx, intent_id, response, Some(evidence)).await?;
         tx.commit().await?;
         Ok(())
     }

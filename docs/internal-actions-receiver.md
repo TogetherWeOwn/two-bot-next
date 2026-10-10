@@ -222,9 +222,14 @@ finish after that. A panic after a claim answers `needs_reconciliation`. A 504 o
 mutation is an unknown outcome that may still complete: retry the same key only.
 A claimed mutation holds the gate until it finishes, so a slow database can keep
 queued requests waiting for their 8 seconds. The events poller writes the mirror
-outside the gate, so a snapshot taken before a mutation can delete or overwrite
-that mutation's mirror row until the next poll; key mappings and receipts are
-unaffected. No production reconcile tool exists yet.
+outside the gate, but both writers stamp `updated_at` with the same UTC-millis
+clock and only overwrite rows at or below their own `observed_at`: a snapshot
+taken before a mutation leaves that mutation's newer mirror row in place, and a
+stale mutation write cannot overwrite a newer snapshot row; key mappings and
+receipts are unaffected. Operators reconcile unknown event intents with the
+inspection-first, explicitly confirmed `two-bot reconcile-event` CLI: list the
+fenced intents, verify the Discord event by hand, then resolve the exact intent
+as created/updated/cancelled (healing the key mapping for upserts) or no-effect.
 
 The website-compatible envelopes contain `ok`, `request_id`, and either
 `result.message_id` (announcements), `result.{outcome,event_id}` (event

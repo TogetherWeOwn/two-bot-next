@@ -70,6 +70,14 @@ also consumes mismatched attempts; do not undo a burn on later validation/error.
   audit. It never releases the claim.
 - `reconcile(&RequestIdentity, &TerminalResponse, ReconciliationEvidence)` accepts
   unknown/stale records only. It commits a proven terminal outcome, not a lease.
+- `list_unknown_event_intents(guild_id)` lists `unknown` event intents for one
+  guild oldest first, without hashes, keys or payloads. Read-only.
+- `resolve_event_intent(intent_id, action, guild_id, key_mapping, response, evidence)`
+  closes one exact unknown event intent in a single transaction. A confirmed
+  upsert effect registers its key mapping before the receipt commits; cancels
+  and no-effect resolutions never rewrite mappings. Only success/no-effect
+  responses are accepted; anything but an `unknown` event row in the named
+  guild refuses. Backs the `two-bot reconcile-event` operator CLI.
 - `claim_discord_event(stable_event_id) -> Result<bool, ...>` atomically burns the
   global event digest. Use a namespaced identity stable across redelivery; do not
   generate an ID per delivery. This is a dedup guard, not a retryable event queue.
