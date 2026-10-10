@@ -1988,6 +1988,14 @@ pub struct GuildRoomWorker<S, H> {
     name_directory: NameDirectory,
     name_settings: NameSettings,
     name_signatures: HashMap<Snowflake, NameSignature>,
+    /// Whether `name_settings` came from the store; a failed read is retried
+    /// on the next settings reload instead of keeping defaults for good.
+    name_settings_loaded: bool,
+    /// Actor clock of the last settings read (periodic reload).
+    name_settings_read_ms: Option<u64>,
+    /// Cheap fingerprint of every input automatic names depend on; an idle
+    /// guild skips the per-room work entirely.
+    name_inputs: Option<u64>,
     creations: HashMap<u64, Creation>,
     accepted: HashMap<Snowflake, (u64, u64)>,
     moves: HashMap<Snowflake, JoinTicket>,
@@ -2190,13 +2198,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .await?
             .into_iter()
             .collect();
-        // Unreadable settings keep the defaults: automatic names then render
-        // without named lists or a custom "no game" label, never block rooms.
-        let name_settings = store
-            .config_snapshot(live.guild_id)
-            .await
-            .map(|config| NameSettings::from_config(&config))
-            .unwrap_or_default();
+        // Unreadable settings keep the defaults until the next reload
+        // retries: automatic names never block room creation.
+        let (name_settings, name_settings_loaded) = match store.config_snapshot(live.guild_id).await
+        {
+            Ok(config) => (NameSettings::from_config(&config), true),
+            Err(_) => (NameSettings::default(), false),
+        };
         let guild_id = live.guild_id;
         let worker = Self {
             live,
@@ -2220,6 +2228,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             name_directory: NameDirectory::default(),
             name_settings,
             name_signatures: HashMap::new(),
+            name_settings_loaded,
+            name_settings_read_ms: None,
+            name_inputs: None,
             creations: HashMap::new(),
             accepted: HashMap::new(),
             moves: HashMap::new(),
@@ -4820,12 +4831,15 @@ struct GuildActor {
 
 enum ActorCommand {
     Reconcile,
-    /// A member's current display name from a voice event, for `@@owner@@`
-    /// in automatic room names.
+    /// A member's current display name from a voice event or the
+    /// GuildCreate snapshot, for `@@owner@@` in automatic room names.
     Display {
         member_id: Snowflake,
         display: String,
     },
+    /// The guild's voice configuration was written (`/import`): automatic
+    /// names use the same settings `/name` Restore reads from now on.
+    NameSettingsChanged(NameSettings),
     Join {
         ticket: JoinTicket,
         /// The joiner's display name; the worker renders and filters the room
@@ -5408,6 +5422,32 @@ where
     /// Hand an edited creator row to the guild worker (V9d `/textchannels`).
     /// Only rooms created afterwards read it: each companion keeps the
     /// settings snapshot taken when it was created.
+    /// Display names for everyone in voice when the guild (re)appears, so a
+    /// restarted worker renders `@@owner@@` for existing rooms instead of
+    /// waiting for each owner's next voice event.
+    fn seed_display_names(&self, cache: &DefaultInMemoryCache, guild_id: Snowflake) {
+        let Some(actor) = self.live_actor(guild_id) else {
+            return;
+        };
+        if let Some(users) = cache.guild_voice_states(Id::new(guild_id)) {
+            for user in users.iter() {
+                let _ = actor.tx.send(ActorCommand::Display {
+                    member_id: user.get(),
+                    display: display_name(cache, guild_id, user.get()),
+                });
+            }
+        }
+    }
+
+    /// Hand freshly written voice settings to the guild worker.
+    fn name_settings_updated(&self, guild_id: Snowflake, config: &VoiceConfiguration) {
+        if let Some(actor) = self.live_actor(guild_id) {
+            let _ = actor.tx.send(ActorCommand::NameSettingsChanged(
+                NameSettings::from_config(config),
+            ));
+        }
+    }
+
     fn creator_updated(&self, creator: &CreatorChannel) {
         if let Some(actor) = self.live_actor(creator.guild_id) {
             actor.live.protect_channels([creator.channel_id]);
@@ -5449,6 +5489,7 @@ where
                     let guild_id = gc.id().get();
                     if let Some(snapshot) = snapshot_from_cache(cache, guild_id) {
                         self.publish_snapshot(guild_id, snapshot);
+                        self.seed_display_names(cache, guild_id);
                     }
                 }
             }
@@ -5605,6 +5646,7 @@ async fn run_actor<S: RoomPersistence, H: RoomWrites>(
                 worker.kick_refresh(now_ms);
                 // V5: re-render template names whose facts changed (create,
                 // join/leave, owner handoff); the rename lane paces them.
+                worker.reload_name_settings(now_ms).await;
                 worker.refresh_template_names(now_ms);
                 // Return to the inbox after each await. Evidence is already
                 // live, but creator configuration/status commands must not sit
@@ -5629,6 +5671,11 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
         ActorCommand::Reconcile => worker.reconcile(),
         ActorCommand::Display { member_id, display } => {
             worker.name_directory.insert(member_id, display);
+        }
+        ActorCommand::NameSettingsChanged(settings) => {
+            worker.name_settings = settings;
+            worker.name_settings_loaded = true;
+            worker.name_settings_read_ms = Some(now_ms);
         }
         ActorCommand::Join {
             ticket,
@@ -8927,6 +8974,7 @@ where
             }
             match store.config_apply(guild_id, &candidate, &current).await {
                 Ok(()) => {
+                    runtime.name_settings_updated(guild_id, &candidate);
                     reply(ephemeral_response(&message)).await;
                 }
                 Err(StoreError::Conflict) => {
@@ -8967,6 +9015,7 @@ where
                                     // preview's.
                                     match store.config_apply(guild_id, &retry, &fresh).await {
                                         Ok(()) => {
+                                            runtime.name_settings_updated(guild_id, &retry);
                                             reply(ephemeral_response(&fresh_message)).await;
                                         }
                                         Err(_) => {

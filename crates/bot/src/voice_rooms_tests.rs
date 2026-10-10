@@ -9951,3 +9951,44 @@ async fn a_voice_display_update_reaches_the_owner_token() {
     dispatch(&mut worker, 0).await;
     assert_eq!(*trace.lock().unwrap(), ["rename:500:Sam"]);
 }
+
+#[tokio::test]
+async fn a_restarted_worker_waits_for_the_owner_name_instead_of_renaming_to_member() {
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "@@owner@@'s den".to_owned();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER, Some(500), Some(false));
+    // A fresh worker has no display names yet.
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.refresh_template_names(0);
+    assert!(!worker.dispatch_one(0).await);
+    // The GuildCreate seeding (or the owner's next voice event) supplies it.
+    apply_command(
+        &mut worker,
+        ActorCommand::Display {
+            member_id: MEMBER,
+            display: "Alex".to_owned(),
+        },
+        1,
+    );
+    worker.refresh_template_names(1);
+    dispatch(&mut worker, 1).await;
+    assert_eq!(*trace.lock().unwrap(), ["rename:500:Alex's den"]);
+}
+
+#[tokio::test]
+async fn written_settings_reach_automatic_names() {
+    let (live, store, http, _trace) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut config = empty_config();
+    config.settings.no_game_label = "Hangout".to_owned();
+    apply_command(
+        &mut worker,
+        ActorCommand::NameSettingsChanged(NameSettings::from_config(&config)),
+        5,
+    );
+    assert_eq!(worker.name_settings.no_game_label, "Hangout");
+    assert!(worker.name_settings_loaded);
+    assert_eq!(worker.name_settings_read_ms, Some(5));
+}

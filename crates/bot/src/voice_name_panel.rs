@@ -109,6 +109,23 @@ impl NameDirectory {
     fn get(&self, member: Snowflake) -> &str {
         self.names.get(&member).map_or("member", String::as_str)
     }
+
+    fn knows(&self, member: Snowflake) -> bool {
+        self.names.contains_key(&member)
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(Snowflake) -> bool) {
+        self.names.retain(|member, _| keep(*member));
+    }
+
+    fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut entries: Vec<_> = self.names.iter().collect();
+        entries.sort_unstable();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        entries.hash(&mut hasher);
+        hasher.finish()
+    }
 }
 
 /// Display names for one `/name` interaction, from the gateway cache. Any
@@ -209,6 +226,9 @@ const NOT_OWNER: &str = "Only the room's owner (or a server admin) can rename it
 const CHANNEL_UNSEEN: &str = "I can't see that channel right now. Try again in a moment.";
 const RENAME_NOTE: &str =
     "Discord limits renames to about two every ten minutes, so it may take a moment to show.";
+
+const NAME_SETTINGS_RELOAD_MS: u64 = 300_000;
+const NAME_SETTINGS_RETRY_MS: u64 = 60_000;
 
 /// The facts an automatic template name was rendered from: the room is
 /// re-rendered only when one of them changes, so an idle room costs nothing
@@ -336,10 +356,46 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         if self.halted || !self.live.read_state().ready {
             return;
         }
+        // Skip the whole pass while nothing automatic names read has moved:
+        // voice transitions, room owners and limits, display names, settings,
+        // templates, and forgotten signatures (a forced re-render).
+        let inputs = self.name_inputs_fingerprint();
+        if self.name_inputs == Some(inputs) {
+            return;
+        }
+        self.name_inputs = Some(inputs);
+        // Keep display names only for members who can still appear in a
+        // name: everyone in voice plus every room's owner and original
+        // creator.
+        {
+            let live = self.live.read_state();
+            let rooms = &self.rooms;
+            self.name_directory.retain(|member| {
+                live.members
+                    .get(&member)
+                    .is_some_and(|state| state.channel_id.is_some())
+                    || rooms
+                        .values()
+                        .any(|room| room.owner_id == member || room.original_creator_id == member)
+            });
+        }
+        let mut command = NameCommand {
+            actor_id: 0,
+            is_admin: true,
+            request: NameInteraction::Panel,
+            settings: self.name_settings.clone(),
+            directory: self.name_directory.clone(),
+            policy: Arc::clone(&self.name_policy),
+        };
         let rooms: Vec<VoiceRoom> = self.rooms.values().cloned().collect();
         for room in rooms {
             let room_id = room.channel_id;
             if self.custom_names.contains_key(&room_id) {
+                continue;
+            }
+            // An owner whose display name is unknown would render as
+            // "member": wait for the name instead of spending a rename.
+            if !self.name_directory.knows(room.owner_id) {
                 continue;
             }
             let Some(template) = self
@@ -350,14 +406,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             else {
                 continue;
             };
-            let command = NameCommand {
-                actor_id: room.owner_id,
-                is_admin: true,
-                request: NameInteraction::Restore { room_id },
-                settings: self.name_settings.clone(),
-                directory: self.name_directory.clone(),
-                policy: Arc::clone(&self.name_policy),
-            };
+            command.actor_id = room.owner_id;
+            command.request = NameInteraction::Restore { room_id };
             let facts = self.name_facts(&room, &command);
             let signature = NameSignature {
                 owner_name: facts.context.owner_name.clone(),
@@ -385,9 +435,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             match decide_template_name(&template, &render, &checks) {
                 Ok(name) => {
                     // A channel the live snapshot cannot see yet is retried
-                    // on a later tick.
+                    // on a later pass.
                     if self.propose_name(room_id, &name, now_ms).is_some() {
                         self.name_signatures.insert(room_id, signature);
+                    } else {
+                        self.name_inputs = None;
                     }
                 }
                 Err(_) => {
@@ -398,6 +450,66 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         let rooms = &self.rooms;
         self.name_signatures
             .retain(|room_id, _| rooms.contains_key(room_id));
+    }
+
+    /// Cheap hash over every input of [`Self::refresh_template_names`]; no
+    /// rendering, filtering or channel walk.
+    fn name_inputs_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let live = self.live.read_state();
+        live.next_transition.hash(&mut hasher);
+        live.generation.hash(&mut hasher);
+        let mut rooms: Vec<_> = self
+            .rooms
+            .values()
+            .map(|room| {
+                (
+                    room.channel_id,
+                    room.owner_id,
+                    room.creator_channel_id,
+                    live.channels
+                        .get(&room.channel_id)
+                        .and_then(|channel| channel.user_limit),
+                    self.custom_names.contains_key(&room.channel_id),
+                )
+            })
+            .collect();
+        rooms.sort_unstable();
+        rooms.hash(&mut hasher);
+        let mut creators: Vec<_> = self
+            .creators
+            .values()
+            .map(|creator| (creator.channel_id, creator.name_template.as_str()))
+            .collect();
+        creators.sort_unstable();
+        creators.hash(&mut hasher);
+        self.name_directory.fingerprint().hash(&mut hasher);
+        format!("{:?}", self.name_settings).hash(&mut hasher);
+        self.name_signatures.len().hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Re-read the guild's naming settings every five minutes, or a minute
+    /// after a failed read, so writers other than `/import` (the operator
+    /// CLI) reach automatic names and a transient error does not stick.
+    pub(super) async fn reload_name_settings(&mut self, now_ms: u64) {
+        let interval = if self.name_settings_loaded {
+            NAME_SETTINGS_RELOAD_MS
+        } else {
+            NAME_SETTINGS_RETRY_MS
+        };
+        if self
+            .name_settings_read_ms
+            .is_some_and(|last| now_ms.saturating_sub(last) < interval)
+        {
+            return;
+        }
+        self.name_settings_read_ms = Some(now_ms);
+        if let Ok(config) = self.store.config_snapshot(self.live.guild_id).await {
+            self.name_settings = NameSettings::from_config(&config);
+            self.name_settings_loaded = true;
+        }
     }
 
     /// Propose the new channel name first: a channel the live snapshot cannot
