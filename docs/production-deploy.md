@@ -172,9 +172,13 @@ signal.
    refuses the takeover when traffic is split or unreadable.
 3. P2 `Read production ownership state without starting`: authenticated GET
    against the production Worker URL. It confirms the serving deployment is
-   the recorded `NEW_VERSION` with `running=false`; any mismatch is NO-GO
-   and the run stops before any POST. The full response is tee'd to the run
-   log as the P2 receipt.
+   the recorded `NEW_VERSION` with `running=false`. For about 60 s (13 reads,
+   5 s apart) it waits out deploy propagation: a `503 deployment_mismatch` or
+   an answer still naming the previous version is read again, because the
+   edge can route to the old version for a few seconds after `wrangler
+   deploy`. A mismatch that outlasts the window, and every other refusal or a
+   running container, is NO-GO and the run stops before any POST. The full
+   response is tee'd to the run log as the P2 receipt.
 4. P3 `Take over production ownership at the read epoch`: one POST with
    exactly `{"action":"takeover","expectedEpoch":<P2 epoch>,"actor":...}`.
    The actor is `github-actions:<run id>:<guarded SHA>` (audit label only;
