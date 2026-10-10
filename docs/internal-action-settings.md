@@ -4,6 +4,10 @@ The settings executor is independent of the HTTP receiver and runtime hot-reload
 application. Its caller must enforce the signed action allowlist and claim the
 outer durable idempotency key before executing `settings.set`. Replaying that
 stored result must not execute another write, audit row or version increment.
+Re-checked at `86a6668a7`: the receiver now does exactly this — `write_setting`
+claims (`crates/bot/src/internal_action_http.rs:1287`) before
+`execute_settings` (`:1298`), and a replay returns the stored result without
+re-writing (`:1289-1290`).
 
 ## Legacy response contract
 
@@ -96,7 +100,10 @@ activation. This executor does not provision roles or credentials.
 The outer durable store and this transaction are separate. A receiver must not
 re-execute an ambiguous write after losing a terminal-response commit. Its
 terminal-response adapter must preserve the value-free `{key,outcome}` result;
-HTTP/durable-result integration belongs to the receiver slice.
+HTTP/durable-result integration belongs to the receiver slice. Re-checked at
+`86a6668a7`: that integration has since landed in
+`crates/bot/src/internal_action_http.rs:1255-1310` (`write_setting`;
+`read_setting` at `:1228-1242`).
 
 ## Verification
 

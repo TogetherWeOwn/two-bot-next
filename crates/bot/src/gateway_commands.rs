@@ -591,7 +591,11 @@ mod tests {
             crate::discord_test_common::ScriptedResponse::status(500),
         )
         .await;
+        // Offline harness: the closed loopback port may drop SYNs on hosted CI,
+        // so the default 30 s acquire would outlive the settle window below.
+        // Fail fast instead (same for the accepted/dispatch pools).
         let denied_pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_secs(2))
             .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
             .expect("lazy pool");
         let denied_router = std::sync::Arc::new(two_bot_core::InteractionRouter::new(
@@ -610,8 +614,7 @@ mod tests {
             },
         ));
         // Authoritative empty custom-command fixture, like the runtime tests.
-        let mut router_with_custom =
-            two_bot_core::InteractionRouter::new(denied_router.gates().clone());
+        let mut router_with_custom = two_bot_core::InteractionRouter::new(denied_router.gates());
         two_bot_discord::custom_commands::CustomCommandRuntime::register(&mut router_with_custom);
         let denied_runtime = two_bot_discord::custom_commands::CustomCommandRuntime::new(
             denied_pool,
@@ -651,6 +654,7 @@ mod tests {
         )
         .await;
         let accepted_pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_secs(2))
             .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
             .expect("lazy pool");
         let accepted_router = std::sync::Arc::new(two_bot_core::InteractionRouter::new(
@@ -669,7 +673,7 @@ mod tests {
             },
         ));
         let mut accepted_router_with_custom =
-            two_bot_core::InteractionRouter::new(accepted_router.gates().clone());
+            two_bot_core::InteractionRouter::new(accepted_router.gates());
         two_bot_discord::custom_commands::CustomCommandRuntime::register(
             &mut accepted_router_with_custom,
         );
@@ -724,6 +728,7 @@ mod tests {
         )
         .await;
         let dispatch_pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_secs(2))
             .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
             .expect("lazy pool");
         let dispatch_gates = two_bot_core::RouterGates {

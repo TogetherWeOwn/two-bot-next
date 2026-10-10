@@ -133,6 +133,13 @@ library code with no Discord dependency and can start immediately.
   counts as No. The vote expires after 2 minutes.
 - If it passes, the target is disconnected and denied Connect on **that room
   only**.
+- The public reason renders as bounded mention-safe plain text (gate VK-04):
+  at most 512 characters (`VOTE_KICK_PUBLIC_REASON_LIMIT`), mass/user/role
+  mentions and `<@`/`<#`/`<:`/`<a:` pills split so nothing pings, `://`,
+  word-boundary `www.` (any case) and schemeless bare-domain dots split and
+  inline markdown escaped so nothing is clickable, embedded or formatted, and
+  `SUPPRESS_EMBEDS` set on the ballot. Refusals are fixed strings that never
+  echo initiator text.
 - The owner and original creator can't be targeted, and members can't target
   themselves. Only one active vote per target. If the target leaves, the vote is
   cancelled.
