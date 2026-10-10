@@ -726,9 +726,9 @@ async fn community_ticks_write_rows_and_stay_gated() {
     .unwrap();
     assert_eq!(rows, vec![(42, Some(2)), (43, None)]);
 
-    // Monday 06:15 UTC: one heartbeat per captured stream (`event_attended`
-    // and `member_joined`) then one run row. Completion suppresses later
-    // ticks, including with a fresh process State.
+    // Monday 06:15 UTC: one stream heartbeat (only the captured
+    // `event_attended` stream is marked) then one run row. Completion
+    // suppresses later ticks, including with a fresh process State.
     let monday = parse_iso_millis("2026-09-28T06:15:00.000Z").unwrap();
     run_once(Kind::Scorecard, &pool, &rest, guild, &state, monday)
         .await
@@ -767,7 +767,7 @@ async fn community_ticks_write_rows_and_stay_gated() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(beats, 2, "coverage marked only for the captured streams");
+    assert_eq!(beats, 1, "coverage marked only for the captured stream");
     run_once(
         Kind::Scorecard,
         &pool,
@@ -838,10 +838,10 @@ async fn community_ticks_write_rows_and_stay_gated() {
         .expect("drop disposable test database");
 }
 
-/// Only streams with a live writer are marked: one Monday tick with
-/// `event_attended` and `member_joined` captured leaves two heartbeats, and
-/// the run fails closed — `incomplete`, never `complete` — naming the four
-/// uncaptured streams. Under production defaults the degraded run records one
+/// Only streams with a live writer are marked: one Monday tick with just
+/// `event_attended` captured leaves a single heartbeat, and the run fails
+/// closed — `incomplete`, never `complete` — naming the five uncaptured
+/// streams. Under production defaults the degraded run records one
 /// `INGESTION_INCOMPLETE` alert, and the retry tick does not duplicate it.
 #[tokio::test]
 #[ignore = "needs a disposable test database; routed to a check.yml step"]
@@ -892,7 +892,7 @@ async fn scorecard_marks_only_captured_streams() {
     .fetch_all(&pool)
     .await
     .unwrap();
-    assert_eq!(beats, ["event_attended", "member_joined"]);
+    assert_eq!(beats, ["event_attended"]);
     let runs: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM community_scorecard_runs WHERE guild_id=$1")
             .bind(guild)
@@ -918,6 +918,7 @@ async fn scorecard_marks_only_captured_streams() {
         "message_created",
         "voice_session_started",
         "voice_session_ended",
+        "member_joined",
         "rules_accepted",
     ] {
         assert!(
@@ -927,14 +928,12 @@ async fn scorecard_marks_only_captured_streams() {
             "uncaptured {stream} is named"
         );
     }
-    for stream in ["event_attended", "member_joined"] {
-        assert!(
-            !errors
-                .iter()
-                .any(|e| e == &json!(format!("missing_stream_coverage:{stream}"))),
-            "the captured {stream} stream is not flagged"
-        );
-    }
+    assert!(
+        !errors
+            .iter()
+            .any(|e| e == &json!("missing_stream_coverage:event_attended")),
+        "the captured stream is not flagged"
+    );
     assert_eq!(scorecard["intervention"]["code"], "INGESTION_INCOMPLETE");
     let alert_keys: Vec<String> =
         sqlx::query_scalar("SELECT alert_key FROM community_scorecard_alerts WHERE guild_id=$1")
