@@ -111,15 +111,15 @@ fn parse(args: &[String]) -> Result<Args, ()> {
         "--created" => Command::Resolve {
             intent: intent.ok_or(())?,
             mode: ResolveMode::Created {
-                event_key: event_key.ok_or(())?,
-                event_id: event_id.ok_or(())?,
+                event_key: event_key.clone().ok_or(())?,
+                event_id: event_id.clone().ok_or(())?,
             },
         },
         "--updated" => Command::Resolve {
             intent: intent.ok_or(())?,
             mode: ResolveMode::Updated {
-                event_key: event_key.ok_or(())?,
-                event_id: event_id.ok_or(())?,
+                event_key: event_key.clone().ok_or(())?,
+                event_id: event_id.clone().ok_or(())?,
             },
         },
         "--cancelled" => {
@@ -129,7 +129,7 @@ fn parse(args: &[String]) -> Result<Args, ()> {
             Command::Resolve {
                 intent: intent.ok_or(())?,
                 mode: ResolveMode::Cancelled {
-                    event_id: event_id.ok_or(())?,
+                    event_id: event_id.clone().ok_or(())?,
                 },
             }
         }
@@ -458,10 +458,11 @@ mod tests {
 
     #[test]
     fn resolutions_build_matching_receipts() {
-        let (response, evidence, mapping) = resolution_of(&ResolveMode::Created {
+        let created = ResolveMode::Created {
             event_key: "launch".to_owned(),
             event_id: "333333333333333333".to_owned(),
-        });
+        };
+        let (response, evidence, mapping) = resolution_of(&created);
         assert_eq!(
             response,
             TerminalResponse::Success {
