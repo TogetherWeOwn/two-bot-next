@@ -2,7 +2,7 @@
  "version": 1,
  "spec": {
   "path": "docs/voice-rooms.md",
-  "sha256": "79907c4c74fe43f220dc9d19e3b3f592d553767a7af2be4eadf567ee7aaa9be9"
+  "sha256": "c3efc1ff1f35c12fcc8b6da66ae7123425e403c84e62a209c9506b06360769dd"
  },
  "description": "V6b independent golden corpus over the voice_conditions evaluator (TOG-12468). Rows authored from docs/voice-rooms.md V6 plus the legacy two-bot tempVoice runtime state each head reads; basis=spec is determinate from the spec alone, basis=choice pins a choice TOG-12189 documents (line cited) where V6 alone does not decide the outcome.",
  "contexts": {
