@@ -71,12 +71,20 @@ come from [cutover.md](cutover.md) §§Registry swap and Rollback.
 
 ## Production decision window
 
-A recorded host decision established a 2-hour rollback decision window from
-the cutover start time (`T_0`). Writes acknowledged inside that window are
-accepted as lost if a rollback occurs. After the window closed, the recovery
-posture is forward-fix. Reopening legacy remains subject to the zero-loss
-reconciliation gate in §6 plus separate reopening authority; the decision
-window does not relax that gate.
+This window is closed. A recorded host decision defined a 2-hour rollback
+decision window from `T_0` (first production ready, the same `T_0` as §3),
+closing about two hours later. After closure the recovery posture is forward-fix: fix the
+current system in place rather than reopening legacy. Reopening legacy
+remains subject to the zero-loss reconciliation gate in §6 plus separate
+reopening authority.
+
+That decision recorded that writes acknowledged inside the window would be
+treated as lost if a rollback occurred. That record does not relax this
+runbook: any reopening must still reconcile every acknowledged write (§4
+steps 3–5, §6) and step 8 still forbids silently accepting loss to restore
+availability. If reconciliation cannot prove zero loss, keep affected
+writes in maintenance, preserve both data sets and escalate a decision
+brief.
 
 ## 4. Ordered rollback steps
 
