@@ -93,6 +93,39 @@ def check_invocation(doc_flags, allowed):
         )
 
 
+# Each exit code paired with the meaning the doc must teach for it. Codes
+# and meanings are checked as pairs: a table that swaps two meanings must
+# fail, not just one that drops a code or a word.
+EXPECTED_EXIT_CODE_MEANINGS = (
+    ("0", "dry run"),
+    ("1", "refused"),
+    ("2", "usage"),
+    ("3", "hash mismatch"),
+)
+
+
+def exit_code_table_text(doc_text=None):
+    text = doc_text if doc_text is not None else DOC.read_text()
+    collapsed = re.sub(r"\s+", " ", text)
+    table = re.search(r"Exit codes:(.*?)(?:\.|$)", collapsed)
+    assert table, "doc names no exit-code table"
+    return table.group(1)
+
+
+def check_exit_code_pairs(table_text, pairs=EXPECTED_EXIT_CODE_MEANINGS):
+    """Fail named when an exit code stops explaining its own meaning."""
+    segments = [seg.strip() for seg in table_text.split(";")]
+    for code, meaning in pairs:
+        hits = [seg for seg in segments if re.match(rf"{code}\b", seg)]
+        if not hits:
+            raise AssertionError(f"doc exit-code table names no exit {code}")
+        if not any(meaning in seg for seg in hits):
+            raise AssertionError(
+                f"doc exit-code table pairs exit {code} with no {meaning!r} "
+                f"(exit {code} explains: {hits})"
+            )
+
+
 class VoiceConfigApplyDocConformanceTests(unittest.TestCase):
     def test_doc_invocation_flags_match_binary_arg_parse(self):
         invocation = doc_invocation_text()
@@ -138,24 +171,17 @@ class VoiceConfigApplyDocConformanceTests(unittest.TestCase):
         self.assertIn("Refusing live guild", CLI.read_text())
 
     def test_doc_exit_code_table_matches_binary_exits(self):
-        doc = DOC.read_text()
-        collapsed = re.sub(r"\s+", " ", doc)
-        table = re.search(r"Exit codes:(.*?)(?:\.|$)", collapsed)
-        self.assertIsNotNone(table, "doc names no exit-code table")
-        table_text = table.group(1)
-        for code in ("0", "1", "2", "3"):
-            self.assertRegex(
-                table_text,
-                rf"(?:^|\D){code}(?:\D|$)",
-                f"doc exit-code table names no exit {code}",
-            )
-        for meaning in ("dry run", "refused", "usage", "hash mismatch"):
-            self.assertIn(
-                meaning,
-                table_text,
-                f"doc exit-code table explains no {meaning}",
-            )
-        self.assertIn("compare-and-swap conflict", table_text)
+        table_text = exit_code_table_text()
+        # Codes paired with their meanings: swapping two meanings fails.
+        try:
+            check_exit_code_pairs(table_text)
+        except AssertionError as exc:
+            self.fail(str(exc))
+        self.assertIn(
+            "compare-and-swap conflict",
+            table_text,
+            "doc exit-code table explains no compare-and-swap conflict",
+        )
         source = BIN.read_text()
         self.assertIn("std::process::exit(2)", source)
         self.assertIn("std::process::exit(1)", source)
@@ -179,6 +205,20 @@ class VoiceConfigApplyDocConformanceTests(unittest.TestCase):
             any("V11" in line or "voice-config-apply.md" in line for line in v11_step),
             "cutover-sequence.md pointer must sit at the V11 step",
         )
+        # Row 2.6 runs against the live guild, which the binary refuses
+        # (exit 2) without the flag, so both its commands must carry it.
+        command_rows = [line for line in v11_step if "--guild" in line]
+        self.assertTrue(
+            command_rows,
+            "cutover-sequence.md V11 row teaches no voice-config-apply command",
+        )
+        for row in command_rows:
+            self.assertEqual(
+                row.count("--allow-live-guild"),
+                2,
+                "cutover-sequence.md V11 row must pass --allow-live-guild "
+                "to both the dry run and the apply (live-guild fence is exit 2)",
+            )
 
     def test_deliberate_drift_fixture_fails_named(self):
         values, flags = binary_allowed_args()
@@ -194,6 +234,22 @@ class VoiceConfigApplyDocConformanceTests(unittest.TestCase):
         # Added flag: --verbose never existed in arg parse.
         with self.assertRaisesRegex(AssertionError, "--verbose"):
             check_invocation([*EXPECTED_DOC_FLAGS, "--verbose"], allowed)
+        # Swapped exit-code meanings: every code and word is still present,
+        # but paired wrong. Exits 1 and 2 trade meanings here, exits 2 and
+        # 3 trade meanings in the second fixture.
+        swap_1_2 = (
+            "0 dry run, no changes or applied; 1 usage or failed; "
+            "2 refused or live-guild fence; 3 hash mismatch or "
+            "compare-and-swap conflict"
+        )
+        with self.assertRaisesRegex(AssertionError, "exit 1"):
+            check_exit_code_pairs(swap_1_2)
+        swap_2_3 = (
+            "0 dry run; 1 refused or failed; 2 hash mismatch or fence; "
+            "3 usage or compare-and-swap conflict"
+        )
+        with self.assertRaisesRegex(AssertionError, "exit 2"):
+            check_exit_code_pairs(swap_2_3)
 
 
 if __name__ == "__main__":
