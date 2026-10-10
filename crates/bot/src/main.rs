@@ -467,7 +467,7 @@ async fn run(cli_args: &[String]) {
                                 step_failure(FailureClass::MilestonesLoadFailed, error)
                             })?,
                     );
-                    // Community voice capture (TOG-19605): arm the Postgres
+                    // Community voice + message capture: arm the Postgres
                     // facts sink only when the scorecard job is enabled, so a
                     // staging-gated rollout captures exactly while it scores.
                     if std::env::var("TWO_COMMUNITY_SCORECARD").is_ok_and(|v| v == "1") {

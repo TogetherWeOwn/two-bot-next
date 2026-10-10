@@ -111,6 +111,34 @@ pub fn message_fact(
     }
 }
 
+/// Record one gateway `MessageCreate` fact: build via [`message_fact`] and
+/// insert via [`record_fact`]. Returns `true` when inserted, `false` when the
+/// `discord-message:{message_id}` key already held it (duplicate delivery).
+/// Content-minimized by construction: [`message_fact`] carries IDs plus the
+/// classifier verdict plus the channel class only, never message content.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_message_fact(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    message_id: &str,
+    channel_id: &str,
+    channel_class: &str,
+    actor: &ClassifyInput,
+    occurred_at: &str,
+    classification: Classification,
+) -> Result<bool, CommunityStoreError> {
+    let write = message_fact(
+        guild_id,
+        message_id,
+        channel_id,
+        channel_class,
+        actor,
+        occurred_at,
+        classification,
+    );
+    record_fact(pool, &write).await
+}
+
 /// Member-join fact (legacy `recordMemberJoin`).
 #[must_use]
 pub fn member_join_fact(
@@ -935,6 +963,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn message_fact_carries_ids_and_verdict_without_content() {
+        // Idempotency shape plus content minimization: the row keys on the
+        // Discord message id, carries the classifier verdict, and stores no
+        // message text.
+        let input = actor("human-1");
+        let write = message_fact(
+            GUILD,
+            "msg-1",
+            "chan-9",
+            "human",
+            &input,
+            "2026-09-02T10:00:00.000Z",
+            verdict("eligible_human"),
+        );
+        assert_eq!(write.event_type, "message_created");
+        assert_eq!(write.source_event_id, "msg-1");
+        assert_eq!(write.idempotency_key, "discord-message:msg-1");
+        assert_eq!(write.source, "channel:chan-9");
+        assert_eq!(write.classification.classification, "eligible_human");
+        assert_eq!(write.classification.classifier_version, VERSION);
+        let metadata = write.metadata.expect("message metadata");
+        assert!(
+            metadata.contains("\"channelClass\":\"human\""),
+            "channel class travels: {metadata}"
+        );
+        assert!(
+            !metadata.contains("hello") && !metadata.contains("content"),
+            "no message content stored: {metadata}"
+        );
+    }
+
     /// Voice session start→end round-trip (TOG-19605): one session inserts a
     /// start and an honestly-measured end, a duplicate start dedupes on
     /// `voice-start:{session_key}`, and both stream heartbeats are present.
@@ -1030,6 +1090,76 @@ mod tests {
         .await
         .expect("voice heartbeats present");
         assert_eq!(beats.len(), 2, "both voice stream heartbeats present");
+        drop_schema(&pool, &schema).await;
+    }
+
+    /// Gateway `MessageCreate` round-trip (TOG-19603): one fact inserts, the
+    /// duplicate delivery returns `false`, and the stream heartbeat is
+    /// present. Routed to a `check.yml` ignored-db-runtime step.
+    #[tokio::test]
+    #[ignore = "needs a disposable test database; routed to a check.yml step"]
+    async fn message_created_fact_round_trip_is_idempotent() {
+        let Some((pool, schema)) = test_pool("tog_19603_message")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping community_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        let at = "2026-09-02T10:00:00.000Z";
+        let input = actor("human-1");
+        let first = record_message_fact(
+            &pool,
+            GUILD,
+            "msg-dup",
+            "general",
+            "human",
+            &input,
+            at,
+            verdict("eligible_human"),
+        )
+        .await
+        .expect("first insert");
+        assert!(first, "first delivery inserts");
+        let retry = record_message_fact(
+            &pool,
+            GUILD,
+            "msg-dup",
+            "general",
+            "human",
+            &input,
+            at,
+            verdict("eligible_human"),
+        )
+        .await
+        .expect("duplicate insert");
+        assert!(!retry, "duplicate delivery returns false");
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM community_facts WHERE guild_id = $1")
+                .bind(GUILD)
+                .fetch_one(&pool)
+                .await
+                .expect("count facts");
+        assert_eq!(count.0, 1, "no double row");
+        mark_stream_coverage(
+            &pool,
+            GUILD,
+            "message_created",
+            WEEK_START,
+            WEEK_END,
+            GENERATED_AT,
+        )
+        .await
+        .expect("heartbeat");
+        let beats: Vec<(String,)> = sqlx::query_as(
+            "SELECT stream FROM community_stream_heartbeats WHERE guild_id = $1 AND stream = $2",
+        )
+        .bind(GUILD)
+        .bind("message_created")
+        .fetch_all(&pool)
+        .await
+        .expect("heartbeat present");
+        assert_eq!(beats.len(), 1, "stream heartbeat present");
         drop_schema(&pool, &schema).await;
     }
 }

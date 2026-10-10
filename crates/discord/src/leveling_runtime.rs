@@ -19,7 +19,8 @@ use twilight_model::{
 use two_bot_core::{
     classify,
     community_store::{
-        record_fact, voice_ended_fact, voice_started_fact, CommunityStoreError, FactWrite,
+        message_fact, record_fact, voice_ended_fact, voice_started_fact, CommunityStoreError,
+        FactWrite,
     },
     leveling::{
         leaderboard_reply, plan_reward_roles, rank_reply, XpAward, LEADERBOARD_DEFAULT_LIMIT,
@@ -127,9 +128,9 @@ struct CommunityFactsState {
     pending: Vec<FactWrite>,
 }
 
-/// Buffered `voice_session_started` / `voice_session_ended` capture
-/// (TOG-19605). The synchronous [`FactsSink`] hooks only classify and buffer;
-/// the serial checkpoint writer drains via
+/// Buffered `voice_session_started` / `voice_session_ended` and
+/// `message_created` capture. The synchronous [`FactsSink`] hooks only
+/// classify and buffer; the serial checkpoint writer drains via
 /// [`OrderedLevelingPipeline::drain_facts`], which persists through
 /// `community_store::record_fact`. Mirrors [`DeferredLeveling`]: no
 /// `block_on`, no detached tasks, no mutex held over an await. Disabled
@@ -192,7 +193,37 @@ impl FactsSink for DeferredCommunityFacts {
 
     fn record_rules_accepted(&self, _fact: RulesAcceptedFact<'_>) {}
 
-    fn record_message(&self, _fact: MessageFact<'_>) {}
+    fn record_message(&self, fact: MessageFact<'_>) {
+        let mut state = self.0.lock().expect("community facts lock");
+        if state.pool.is_none() {
+            return;
+        }
+        // Content-minimized by construction: IDs plus the classifier verdict
+        // plus the channel class only, never message content. Bots, webhooks
+        // and staff automation are classified and captured here; the funnel
+        // gate in `on_message` already keeps them out of the XP/activity
+        // counts, so this sink never filters.
+        let input = ClassifyInput {
+            guild_id: fact.guild_id.to_string(),
+            actor_id: fact.member_id.to_string(),
+            is_bot: fact.is_bot,
+            webhook_id: fact.webhook_id.map(|w| w.to_string()),
+            is_staff_automation: fact.is_staff_automation,
+            is_raid: false,
+            is_staging: false,
+            is_test: false,
+        };
+        let verdict = classify(&state.config, &input);
+        state.pending.push(message_fact(
+            &input.guild_id,
+            fact.message_id,
+            &fact.channel_id.to_string(),
+            fact.channel_class.as_str(),
+            &input,
+            fact.occurred_at,
+            verdict,
+        ));
+    }
 
     fn record_voice_started(&self, fact: VoiceStartedFact<'_>) -> Option<String> {
         let mut state = self.0.lock().expect("community facts lock");
@@ -452,18 +483,19 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
         self.pipeline.handlers()
     }
 
-    /// Arm Postgres `voice_session_started` / `voice_session_ended` capture
-    /// (TOG-19605). Called once at boot when `TWO_COMMUNITY_SCORECARD=1`;
-    /// without it the sink drops every fact, exactly like the previous no-op
-    /// seam.
+    /// Arm Postgres `voice_session_started` / `voice_session_ended` and
+    /// `message_created` capture. Called once at boot when
+    /// `TWO_COMMUNITY_SCORECARD=1`; without it the sink drops every fact,
+    /// exactly like the previous no-op seam.
     pub fn enable_community_facts(&self, pool: PgPool) {
         self.facts.enable(pool);
     }
 
-    /// Persist buffered voice facts without holding the async dispatch lock.
-    /// The caller owns ordering (the serial checkpoint writer); call on every
-    /// dispatch, even when no award queued — bots capture facts but never
-    /// awards, and a move's end+start pair buffers two rows for one frame.
+    /// Persist buffered voice and message facts without holding the async
+    /// dispatch lock. The caller owns ordering (the serial checkpoint
+    /// writer); call on every dispatch, even when no award queued — bots,
+    /// webhooks and staff automation capture facts but never awards, and a
+    /// move's end+start pair buffers two rows for one frame.
     pub async fn drain_facts(&self) -> Result<usize, CommunityFactsError> {
         self.facts.drain().await
     }

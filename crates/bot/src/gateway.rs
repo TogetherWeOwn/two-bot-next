@@ -940,9 +940,10 @@ pub async fn run_shard<I: InviteSource + 'static>(
                                 panic!("gateway leveling dispatch failed; checkpoint unchanged")
                             });
                             }
-                            // Community facts (TOG-19605): drain buffered
-                            // voice_session_started/ended writes on every
-                            // dispatch, even when no XP award queued — bots
+                            // Community facts: drain buffered
+                            // voice_session_started/ended and message_created
+                            // writes on every dispatch, even when no XP award
+                            // queued — bots, webhooks and staff automation
                             // capture facts but never awards, and a move's
                             // end+start pair buffers two rows for one frame,
                             // so gating on `requests` would leak the buffer.

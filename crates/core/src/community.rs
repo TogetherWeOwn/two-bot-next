@@ -41,17 +41,19 @@ pub const COMMUNITY_FACT_TYPES: [&str; 6] = [
 
 /// Streams with a live production writer: the only streams `scorecard_once`
 /// may mark covered. That is `event_attended` (host check-in via
-/// `rsvp_store::record_checkin`) plus `voice_session_started` /
+/// `rsvp_store::record_checkin`), `voice_session_started` /
 /// `voice_session_ended` (gateway voice frames via
 /// `community_store::record_voice_started_fact` /
-/// `community_store::record_voice_ended_fact`); message, join and rules
-/// capture land in later slices, one per stream. This must always equal the
-/// `Some` rows of [`STREAM_WRITERS`]; the `captured_streams_match_live_writers`
-/// guard fails otherwise.
-pub const CAPTURED_STREAMS: [&str; 3] = [
+/// `community_store::record_voice_ended_fact`) and `message_created`
+/// (gateway `MessageCreate` via `community_store::record_message_fact`);
+/// join and rules capture land in later slices, one per stream. This must
+/// always equal the `Some` rows of [`STREAM_WRITERS`]; the
+/// `captured_streams_match_live_writers` guard fails otherwise.
+pub const CAPTURED_STREAMS: [&str; 4] = [
     "event_attended",
     "voice_session_started",
     "voice_session_ended",
+    "message_created",
 ];
 
 /// Capture registry: every fact stream with the production writer that appends
@@ -61,7 +63,10 @@ pub const CAPTURED_STREAMS: [&str; 3] = [
 /// is a writer the scorecard does not claim. Landing a writer flips its row
 /// and grows [`CAPTURED_STREAMS`] in the same PR.
 pub const STREAM_WRITERS: [(&str, Option<&str>); 6] = [
-    ("message_created", None),
+    (
+        "message_created",
+        Some("community_store::record_message_fact"),
+    ),
     (
         "voice_session_started",
         Some("community_store::record_voice_started_fact"),

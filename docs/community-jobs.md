@@ -166,8 +166,8 @@ write verb; bind that job to a capability in `BootActivation` before it ships.
   watermark/classifier changed or the completion write was lost. A successfully
   persisted incomplete scorecard is terminal, not a transient failure.
   Before scoring, mark honest stream coverage for the captured streams only
-  (`CAPTURED_STREAMS`, today `event_attended` plus `voice_session_started`
-  and `voice_session_ended`) from capture start through
+  (`CAPTURED_STREAMS`, today `event_attended`, `voice_session_started`,
+  `voice_session_ended` and `message_created`) from capture start through
   the closed week end; a mid-week start fails closed (`INGESTION_INCOMPLETE`,
   human numerators null). A Monday boot cannot claim closed-week coverage:
   leave missing heartbeats missing rather than inserting an inverted interval.
@@ -182,11 +182,15 @@ write verb; bind that job to a capability in `BootActivation` before it ships.
   voice join/leave/move frames land via `voice_started_fact` /
   `voice_ended_fact` + `record_fact`, keyed `voice-start:{session_key}` /
   `voice-end:{session_key}` so duplicate delivery returns `false`; a move
-  stays one atomic end+start pair on the per-member chain (TOG-5981) and
+  stays one atomic end+start pair on the per-member chain and
   mute/deafen/camera-only frames (no channel change) write nothing. End rows
   carry `sessionKey`, `startedAt`, `durationSeconds`, `startKnown`; an end
   without a seen start records `startKnown:false` with nulls, never a
-  fabricated start. Keep `TWO_COMMUNITY_SCORECARD` off by default
+  fabricated start. The `message_created` writer is live on the same seam:
+  gateway `MessageCreate` events land via `message_fact` + `record_fact`,
+  keyed `discord-message:{message_id}` so duplicate delivery returns `false`;
+  DMs never reach the sink (dropped in the pipeline) and bots, webhooks and
+  staff automation are captured but never funnel-counted. Keep `TWO_COMMUNITY_SCORECARD` off by default
   and `TWO_PRESENCE_PROBE` on (legacy default); restrict enabling to staging.
   No production guild or token was used to verify this slice.
 - The presence series is never published: no `web_v1` view may read
