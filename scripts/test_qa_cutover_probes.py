@@ -273,7 +273,9 @@ class UserAgentTests(unittest.TestCase):
 def readyz_with_jobs(jobs, status=200):
     """Build a /readyz double from {name: (parked, age_seconds_or_None)}.
 
-    age None omits last_success (a job with no success recorded yet).
+    age None omits last_success (a job with no success recorded yet). A
+    3-tuple (parked, age, extra_dict) merges extra status fields such as
+    consecutive_failures, last_error_class or last_start into the entry.
     """
     now_ms = int(time.time() * 1000)
     payload = {
@@ -281,10 +283,17 @@ def readyz_with_jobs(jobs, status=200):
         "jobs": {},
         "build_revision": "r", "build_id": "b",
     }
-    for name, (parked, age) in jobs.items():
+    for name, spec in jobs.items():
+        parked, age = spec[0], spec[1]
+        extra = spec[2] if len(spec) > 2 else {}
         entry = {"parked": parked, "running": not parked}
         if age is not None:
             entry["last_success"] = now_ms - age * 1000
+        for key, value in extra.items():
+            if key == "start_age" and value is not None:
+                entry["last_start"] = now_ms - value * 1000
+            else:
+                entry[key] = value
         payload["jobs"][name] = entry
     return (status, json.dumps(payload).encode())
 
@@ -293,7 +302,7 @@ class CadenceTest(unittest.TestCase):
     def test_one_stale_job_fails_and_names_it(self):
         body = readyz_with_jobs({
             "counter": (False, 10),
-            "rank": (False, 800),  # fail line is 720 s
+            "rank": (False, 1400),  # fail line is 1320 s (2x600 + 120)
         })
         code, out = run(double({"/health": HEALTH, "/readyz": body}),
                         "--base-url", "http://h/")
@@ -302,13 +311,23 @@ class CadenceTest(unittest.TestCase):
         self.assertIn("rank=", out)
         self.assertIn("stale", out)
 
+    def test_healthy_sample_just_inside_cadence_passes(self):
+        # Every graded job sampled at 0.95x its real cadence (plus no
+        # runtime yet) must PASS: bands sit above 1x cadence + timeout.
+        jobs = {name: (False, int(0.95 * cadence))
+                for name, cadence in probe.JOB_CADENCE_SECONDS.items()}
+        body = readyz_with_jobs(jobs)
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+
     def test_tabletop_baseline_passes(self):
         body = readyz_with_jobs({
             "counter": (False, 50),
             "member_unban_sweep": (False, 50),
             "scheduled_messages": (False, 50),
-            "settings": (False, 50),
-            "feeds": (False, 110),
+            "settings": (False, 10),
             "rank": (False, 350),
             "scheduled_events": (False, 350),
             "inactivity": (False, 3300),
@@ -319,16 +338,66 @@ class CadenceTest(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn("PASS jobs-map:", out)
 
+    def test_env_configured_feeds_is_not_graded(self):
+        # feeds cadence is env-configured (TWO_FEED_POLL_SECONDS), so even
+        # an ancient sample must not fail the probe.
+        body = readyz_with_jobs({
+            "feeds": (False, 10 ** 6),
+        })
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+
     def test_warn_band_stays_green_but_is_named(self):
         body = readyz_with_jobs({
-            "feeds": (False, 150),  # warn 120 s, fail 240 s
+            "rank": (False, 800),  # warn 720 s, fail 1320 s
         })
         code, out = run(double({"/health": HEALTH, "/readyz": body}),
                         "--base-url", "http://h/")
         self.assertEqual(code, 0, out)
         self.assertIn("PASS jobs-map:", out)
         self.assertIn("warn", out)
-        self.assertIn("feeds=", out)
+        self.assertIn("rank=", out)
+
+    def test_never_succeeded_with_failures_fails_and_names_it(self):
+        body = readyz_with_jobs({
+            "counter": (False, None, {"consecutive_failures": 40,
+                                      "last_error_class": "database"}),
+        })
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL jobs-map:", out)
+        self.assertIn("counter", out)
+        self.assertIn("consecutive failures", out)
+
+    def test_never_succeeded_without_attempts_passes(self):
+        now_ms = int(time.time() * 1000)
+        body = (200, json.dumps({
+            "components": [["process", "ready"], ["gateway", "ready"]],
+            "jobs": {"counter": {"parked": False, "running": True,
+                                 "consecutive_failures": 0,
+                                 "last_start": now_ms - 5_000}},
+            "build_revision": "r", "build_id": "b",
+        }).encode())
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+
+    def test_stale_last_start_without_success_fails(self):
+        body = readyz_with_jobs({
+            # counter fail line is 165 s; started 1000 s ago, never succeeded
+            "counter": (False, None, {"consecutive_failures": 0,
+                                      "start_age": 1000}),
+        })
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL jobs-map:", out)
+        self.assertIn("counter", out)
+        self.assertIn("last_start", out)
 
     def test_parked_job_with_ancient_success_passes(self):
         body = readyz_with_jobs({
