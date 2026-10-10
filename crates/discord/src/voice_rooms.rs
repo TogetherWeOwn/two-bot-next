@@ -988,7 +988,8 @@ impl RoomHttp {
         // Bounded even for a stalled transport: rename budgets are charged on
         // attempt, including an unknown outcome. The queue keeps its latest name.
         // The bound covers durable send admission plus the Discord round trip,
-        // which together exceed one second in production.
+        // which together exceed one second in production. The guild actor
+        // waits at most one second of it; the rest runs on its own task.
         tokio::time::timeout(RENAME_REQUEST_TIMEOUT, self.send(request, || true))
             .await
             .map_err(|_| RoomHttpError::RenameDeferred)??;
