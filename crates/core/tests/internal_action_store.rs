@@ -1555,24 +1555,37 @@ async fn resolve_event_intent_refuses_mismatched_rows_and_shapes() {
     let store = db.store();
     let claim = unknown_event(&store, "unknown-refuse:1", "event.upsert", EVENT_GUILD).await;
     let id = claim.intent_id();
-    let receipt = created_receipt(MAPPED_EVENT);
+    let created = created_receipt(MAPPED_EVENT);
+    let cancelled = TerminalResponse::Success {
+        resource_id: Some(DiscordId::new(MAPPED_EVENT).unwrap()),
+        affected: 1,
+        outcome: Some(EventOutcome::Cancelled),
+    };
     let effect = ReconciliationEvidence::DiscordConfirmedEffect;
     // Wrong guild, wrong action, and unknown intent ids never resolve.
-    for (intent, action, guild) in [
-        (id, "event.upsert", OTHER_GUILD),
-        (id, "event.cancel", EVENT_GUILD),
-        (id + 10_000, "event.upsert", EVENT_GUILD),
+    // Each case uses a shape-valid mapping/response for its action so the
+    // row-mismatch refusal (not the shape refusal) is what fires: cancels
+    // carry no mapping, upserts do.
+    for (intent, action, guild, mapping, response) in [
+        (
+            id,
+            "event.upsert",
+            OTHER_GUILD,
+            Some(("launch", MAPPED_EVENT)),
+            &created,
+        ),
+        (id, "event.cancel", EVENT_GUILD, None, &cancelled),
+        (
+            id + 10_000,
+            "event.upsert",
+            EVENT_GUILD,
+            Some(("launch", MAPPED_EVENT)),
+            &created,
+        ),
     ] {
         assert_eq!(
             store
-                .resolve_event_intent(
-                    intent,
-                    action,
-                    guild,
-                    Some(("launch", MAPPED_EVENT)),
-                    &receipt,
-                    effect
-                )
+                .resolve_event_intent(intent, action, guild, mapping, response, effect)
                 .await,
             Err(InternalStoreError::TransitionRefused),
             "{action}/{guild}"
@@ -1585,7 +1598,7 @@ async fn resolve_event_intent_refuses_mismatched_rows_and_shapes() {
             "event.upsert",
             EVENT_GUILD,
             Some(("launch", MAPPED_EVENT)),
-            &receipt,
+            &created,
             effect,
         )
         .await
