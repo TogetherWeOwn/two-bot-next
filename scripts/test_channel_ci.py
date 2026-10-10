@@ -108,9 +108,13 @@ class ChannelCiTests(unittest.TestCase):
         skip = {"rust": "false", "supply": "false"}
         full = {"rust": "true", "supply": "true"}
         self.assertEqual(self.selected_jobs("pull_request", "rust=true\nsupply=true",
-                                            diff="crates/bot/src/lib.rs Cargo.lock"), skip)
+                                            diff="crates/bot/src/lib.rs crates/core/src/x.rs"), skip)
+        # Rust source alone skips; nightly wiring and CI-standard Rule 4 full-run inputs run it.
+        self.assertEqual(self.selected_jobs("pull_request", diff="crates/core/src/lib.rs"), skip)
         for wiring in [".github/workflows/nightly.yml", ".github/workflows/pipeline-benchmark.yml",
-                       "scripts/job-inputs.py"]:
+                       ".github/workflows/check.yml", "scripts/job-inputs.py", "scripts/test_nightly_routing.py",
+                       "Cargo.lock", "Cargo.toml", "crates/bot/Cargo.toml", "rust-toolchain.toml",
+                       ".cargo/config.toml", "deny.toml"]:
             self.assertEqual(self.selected_jobs("pull_request", diff=f"README.md {wiring}"), full, wiring)
         # A path that merely contains a wiring name does not count.
         self.assertEqual(self.selected_jobs("pull_request", diff="docs/.github/workflows/nightly.yml.md"), skip)

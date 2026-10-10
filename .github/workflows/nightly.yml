@@ -43,13 +43,14 @@ jobs:
             # `check` matrix already runs the affected suites on every PR, and
             # this 45-minute sweep on each push cost ~170 runs/day (most of them
             # cancelled by the next push). A PR runs it only when it changes
-            # the nightly wiring itself; job-level gating keeps this workflow
-            # free of workflow-level paths filters.
+            # the nightly wiring or trips a CI-standard Rule 4 full-run trigger
+            # (.github/**, Cargo manifests/lock, toolchain, deny config); job-level
+            # gating keeps this workflow free of workflow-level paths filters.
             # CI standard: --no-renames -z, and a diff error fails closed (full run).
             if ! changed=$(git diff --name-only --no-renames -z "$BASE_SHA" "$HEAD_SHA" | tr '\0' '\n'); then
               :
             elif printf '%s\n' "$changed" \
-              | grep -qxE '\.github/workflows/(nightly|pipeline-benchmark)\.yml|scripts/job-inputs\.py'; then
+              | grep -qxE '\.github/.*|(.*/)?Cargo\.(toml|lock)|rust-toolchain(\.toml)?|\.cargo/.*|deny\.toml|scripts/(job-inputs|test_nightly_routing)\.py'; then
               :
             else
               rust=false supply=false
