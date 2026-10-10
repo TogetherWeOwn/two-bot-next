@@ -22,6 +22,8 @@ LINE_NUMBER = re.compile(r"\.rs:\d")
 QUOTED = re.compile(r'"([^"]+)"')
 BACKTICKED = re.compile(r"`([^`]+)`")
 ROUTE = re.compile(r"^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) /\S*$|^other$")
+CALLSITE = re.compile(r"`(crates/[^`]*\.rs)`\s*\(([^)]+)\)")
+IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(::[A-Za-z_][A-Za-z0-9_]*)*$")
 
 
 def rest_routes_from_source() -> list:
@@ -60,12 +62,54 @@ class ObservabilityConformanceTests(unittest.TestCase):
             if line.startswith("|") and "crates/" in line
         ]
         self.assertGreater(len(rows), 0, "expected callsite rows in the catalog")
+        sources: dict = {}
         for row in rows:
             with self.subTest(row=row[:80]):
-                # The file cell names the file plus its enclosing item, e.g.
-                # `crates/bot/src/gateway.rs` (`run_shard`).
-                self.assertIn("(", row)
+                # No file:line drift: line numbers move, symbols do not.
                 self.assertNotRegex(row, r"\.rs[\"`]*\s*:?\s*\d")
+                # The callsite cell names the file plus its enclosing item,
+                # e.g. `crates/bot/src/gateway.rs` (`run_shard`).
+                cells = row.split("|")
+                self.assertGreaterEqual(
+                    len(cells),
+                    4,
+                    f"callsite row is not a 3-column table row: {row[:80]}",
+                )
+                callsite = cells[2]
+                match = CALLSITE.search(callsite)
+                self.assertIsNotNone(
+                    match,
+                    "callsite cell must name the file plus the enclosing "
+                    "function/method, e.g. `crates/bot/src/gateway.rs` "
+                    f"(`run_shard`): {row[:80]}",
+                )
+                assert match is not None
+                rel, inside = match.group(1), match.group(2)
+                # Only identifier-like backticked tokens are anchors; message
+                # strings such as `voice_operation succeeded` and prose such
+                # as "three sites" are not.
+                anchors = [
+                    token for token in BACKTICKED.findall(inside) if IDENT.match(token)
+                ]
+                self.assertGreater(
+                    len(anchors),
+                    0,
+                    f"callsite cell names no enclosing function/method: {row[:80]}",
+                )
+                if rel not in sources:
+                    sources[rel] = (ROOT / rel).read_text()
+                src = sources[rel]
+                for qualified in anchors:
+                    # `HttpInvites::current` pins the method; the file must
+                    # still define a function with the final segment so a
+                    # rename or move turns this suite red.
+                    name = qualified.split("::")[-1]
+                    self.assertRegex(
+                        src,
+                        rf"\bfn {re.escape(name)}\b",
+                        f"stable anchor `{qualified}` names no function "
+                        f"in {rel}; update the catalog with the rename/move",
+                    )
 
     def test_doc_route_list_equals_rest_routes(self):
         self.assertEqual(
