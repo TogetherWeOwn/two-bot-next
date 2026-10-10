@@ -57,6 +57,8 @@ pub const STICKY_DEBOUNCE_DEFAULT_SECONDS: i64 = 5;
 /// limit. Builders advertise it via `max_length`; `crate::rsvp` refuses
 /// longer IDs before any record operation.
 pub const OCCURRENCE_ID_MAX_CHARS: usize = 128;
+/// Maximum user-supplied resource ID or prefix accepted by an admin command.
+pub const MAX_RESOURCE_ID_CHARS: usize = 128;
 
 /// Discord application-command option types (API integers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

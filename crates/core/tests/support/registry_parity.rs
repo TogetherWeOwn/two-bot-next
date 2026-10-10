@@ -1,10 +1,15 @@
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
-use two_bot_core::commands::{CommandDefinition, HELP_DESCRIPTION, OCCURRENCE_ID_MAX_CHARS};
+use two_bot_core::commands::{
+    CommandDefinition, HELP_DESCRIPTION, MAX_RESOURCE_ID_CHARS, OCCURRENCE_ID_MAX_CHARS,
+};
 use two_bot_core::custom_commands::{
     MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_TEMPLATE_CHARS, MAX_TEXT_TRIGGER_CHARS,
 };
+use two_bot_core::feeds_http::MAX_FEED_SOURCE_BYTES;
+use two_bot_core::lfg::{MAX_ROLE_SPEC_CHARS, MAX_TITLE_CHARS};
 use two_bot_core::router::{InteractionRouter, RouterGates};
+use two_bot_core::scheduled::MAX_BODY_CHARS;
 
 pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("rsvp-attendance", "docs/parity.md §1 #12 / #25"),
@@ -20,6 +25,13 @@ pub const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
     ("lfg-close", "docs/parity.md §1 #27 copy"),
     ("command", "docs/parity.md §1 #14 caps"),
     ("command-remove", "docs/parity.md §1 #15 caps"),
+    ("schedule", "docs/parity.md §1 #17 caps"),
+    ("schedule-remove", "docs/parity.md §1 #18 caps"),
+    ("sticky", "docs/parity.md §1 #20 caps"),
+    ("lfg", "docs/parity.md §1 #26 caps"),
+    ("lfg-close", "docs/parity.md §1 #27 caps"),
+    ("feed-add", "docs/parity.md §1 #28 caps"),
+    ("feed-remove", "docs/parity.md §1 #29 caps"),
 ];
 
 pub fn all_on_router() -> InteractionRouter {
@@ -206,6 +218,79 @@ pub fn expected_registry() -> Value {
             .find(|c| c["name"] == name)
             .expect("copy exception names a published command");
         *command.pointer_mut(pointer).expect("copy field exists") = json!(value);
+    }
+    // Further caps from the input-bound fix: advertise ONLY max_length
+    // matching the runtime validators; the frozen legacy registry fixture
+    // remains untouched. Custom-command caps are covered by the loop above.
+    for (name, option_name, max_length, reference) in [
+        (
+            "schedule",
+            "body",
+            MAX_BODY_CHARS,
+            "docs/parity.md §1 #17 caps",
+        ),
+        (
+            "schedule-remove",
+            "id",
+            MAX_RESOURCE_ID_CHARS,
+            "docs/parity.md §1 #18 caps",
+        ),
+        (
+            "sticky",
+            "body",
+            MAX_BODY_CHARS,
+            "docs/parity.md §1 #20 caps",
+        ),
+        (
+            "lfg",
+            "title",
+            MAX_TITLE_CHARS,
+            "docs/parity.md §1 #26 caps",
+        ),
+        (
+            "lfg",
+            "roles",
+            MAX_ROLE_SPEC_CHARS,
+            "docs/parity.md §1 #26 caps",
+        ),
+        (
+            "lfg-close",
+            "id",
+            MAX_RESOURCE_ID_CHARS,
+            "docs/parity.md §1 #27 caps",
+        ),
+        (
+            "feed-add",
+            "source",
+            MAX_FEED_SOURCE_BYTES,
+            "docs/parity.md §1 #28 caps",
+        ),
+        (
+            "feed-remove",
+            "id",
+            MAX_RESOURCE_ID_CHARS,
+            "docs/parity.md §1 #29 caps",
+        ),
+    ] {
+        let _ = INTENTIONAL_DIFFERENCES
+            .iter()
+            .find(|(command, _)| *command == name)
+            .expect("cap has a documented command exception");
+        let command = commands
+            .iter_mut()
+            .find(|command| command["name"] == name)
+            .expect(reference);
+        let option = command["options"]
+            .as_array_mut()
+            .expect("command options array")
+            .iter_mut()
+            .find(|option| option["name"] == option_name)
+            .expect(reference);
+        assert!(
+            option["max_length"].is_null(),
+            "legacy {name}/{option_name}"
+        );
+        option["max_length"] = json!(max_length);
     }
     canonical_registry(json!(commands))
 }

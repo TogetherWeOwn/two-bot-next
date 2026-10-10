@@ -37,6 +37,7 @@ CLI_MODULES = {
     "crates/cutover/src/bin/report.rs",
     "crates/cutover/src/bin/rollback_delta.rs",
     "crates/cutover/src/bin/staging_migrate.rs",
+    "crates/cutover/src/bin/voice_config_apply.rs",
 }
 
 

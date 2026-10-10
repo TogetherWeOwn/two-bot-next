@@ -2,11 +2,17 @@
 //!
 //! ```text
 //! staging-migrate --plan|--apply --source-sha <40hex> --staging-host <host>
-//!   --staging-database <db> --recovery-evidence-ref <ref> --acl-plan-ref <ref>
+//!   --staging-database <db> [--staging-branch-id <branch>] --recovery-evidence-ref <ref>
+//!   --acl-plan-ref <ref>
 //!   [--expected-pending <ascending,comma-separated versions>]
 //!   [--plan-manifest-sha256 <64hex> --plan-run-id <run id>
 //!    --plan-manifest-path <producing run's downloaded manifest>]
 //! ```
+//!
+//! `--staging-branch-id` pins the PlanetScale branch id (non-secret): it is
+//! required for `*.psdb.cloud` hosts and must match the binding username's
+//! `{role}.{branch_id}` suffix; empty (the default) means no pin and is
+//! accepted for Neon and test hosts.
 //!
 //! The database URL comes only from the mode's fixed binding:
 //! TWO_BOT_STAGING_PLAN_DATABASE_URL for --plan (a login holding only
@@ -41,6 +47,7 @@ fn real_main() -> i32 {
             "--source-sha"
             | "--staging-host"
             | "--staging-database"
+            | "--staging-branch-id"
             | "--recovery-evidence-ref"
             | "--acl-plan-ref"
             | "--expected-pending"
@@ -67,6 +74,10 @@ fn real_main() -> i32 {
         source_sha: get("--source-sha"),
         expected_host: get("--staging-host"),
         expected_database: get("--staging-database"),
+        expected_branch_id: values
+            .get("--staging-branch-id")
+            .cloned()
+            .unwrap_or_default(),
         recovery_evidence_ref: get("--recovery-evidence-ref"),
         acl_plan_ref: get("--acl-plan-ref"),
         apply,
