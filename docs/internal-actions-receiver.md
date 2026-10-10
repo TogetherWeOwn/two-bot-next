@@ -4,16 +4,19 @@
 
 The container source integrates an opt-in private `POST /internal/actions`
 listener with the durable store, announcement executor, event-read, settings,
-automations, moderation and membership executors, nonce-commit authentication
-capability and strict receiver configuration. It supports `announcement.post`,
-the keyless `event.read`, `settings.get`, `settings.set`, the automations pair
-`automations.export` (keyless redacted read) / `automations.import` (claimed
-transactional import), the restrictive member verbs `moderation.ban`,
-`moderation.tempban`, `moderation.kick`, `moderation.warn` and
-`moderation.timeout`, and the membership pair (`role.assign` through the
-allowlisted role-key map, `guild.add_member` behind its own allowlist flag
-with a transient OAuth token), regardless of the core action catalogue's
-broader defaults. Every other verb stays refused by the per-effect fences.
+automations, moderation, membership and channel-moderation executors,
+nonce-commit authentication capability and strict receiver configuration. It
+supports `announcement.post`, the keyless `event.read`, `settings.get`,
+`settings.set`, the automations pair `automations.export` (keyless redacted
+read) / `automations.import` (claimed transactional import), the restrictive
+member verbs `moderation.ban`, `moderation.tempban`, `moderation.kick`,
+`moderation.warn` and `moderation.timeout`, the membership pair
+(`role.assign` through the allowlisted role-key map, `guild.add_member`
+behind its own allowlist flag with a transient OAuth token), and the
+channel-moderation verbs (`moderation.purge`, `moderation.slowmode`,
+`moderation.lockdown`, `moderation.unlock`), regardless of the core action
+catalogue's broader defaults. Every other verb stays refused by the per-effect
+fences.
 The public health/readiness/metrics router has no action route. A merged,
 deployed receiver is dark until the Operator enables it, and it is reachable
 only through the staging-only Worker ingress described in

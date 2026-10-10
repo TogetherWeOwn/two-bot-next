@@ -310,6 +310,58 @@ identified, when a dead-letter or orphan names a stranded member, or when
 failures coincide with 429, DB-error or pool alerts — the fix then belongs
 to the on-call engineer, not another redeploy.
 
+#### Alert: gateway missed events
+
+`two_bot_gateway_missed_events_total` increased between two keepalive
+samples. These are dispatches Discord assigned but this process never
+received (sequence gaps inside one session). Any increase fails the
+zero-missed-events acceptance: the session continued, but part of the
+event stream is gone and RESUME does not replay it. The first sample after
+monitoring arms only stores the baseline and never fires, and a counter
+reset (process restart) skips the window rather than firing.
+
+First response: read the paired `two_bot_gateway_disconnects_total` counter
+via the authorized `/ops/metrics` scrape — a missed-events increase with no
+disconnect means the gap predates this instrumentation or the process
+restarted mid-window (re-baseline both scrapes after it); a rise next to
+disconnects means transport loss with sequence gaps. Correlate with recent
+deploys (a fresh deploy restarts the process and resets the counter) and
+the container logs for `gateway reconnect failed; Twilight will retry` and
+`gateway ready; checkpoint committed`. Do not restart the container to
+"clear" the counter; a replacement resets the baseline without recovering
+the missed dispatches.
+
+Escalate when the increase repeats across windows, when it coincides with
+unpaired disconnects (no later RESUME or fresh READY), or when missed
+events rise with no disconnect at all — the gap is then unexplained and
+the fix belongs to the on-call engineer, not another redeploy.
+
+#### Alert: ticker stale
+
+A 15 s ticker (`scheduled_messages` or `settings`) recorded no successful
+completion for more than 10 minutes
+(`two_bot_job_last_success_timestamp_seconds{job}`). These tickers wedge
+silently: skipped busy deadlines count neither as success nor failure, so
+neither `job_stale` nor `job_consecutive_failures` can see them. A job
+that never succeeded since start (timestamp zero) is not reported here:
+that covers both boot and parked tickers (never registered because
+`DATABASE_URL` is unset or the automations gate is off). If the Container
+restarted the series resets; wait one window before acting.
+
+First response: check the `jobs` map on `/readyz` for the ticker's
+`parked`, `last_success` and `consecutive_failures` fields, then read the
+Worker/container logs for `periodic job failed`. A parked ticker with a
+zero timestamp is configuration, not a wedge — confirm the expected
+`DATABASE_URL` binding and automations gating before touching the bot.
+Restart only after the logs show the ticker loop is wedged, per the
+[restart semantics](#restart-semantics-durable-resume-not-full-state-recovery).
+
+Escalate when staleness persists after the suspect deploy or dependency is
+identified, when it coincides with pool-saturation or DB-error alerts, or
+when a due schedule row or settings change stays unapplied past the
+window — the fix then belongs to the on-call engineer, not another
+redeploy.
+
 ## Persisted ownership control
 
 The Worker/DO fence is implemented, not implicitly released by deployment.
