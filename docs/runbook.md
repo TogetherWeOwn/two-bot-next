@@ -353,6 +353,14 @@ or unconfirmed shutdown leaves denial; do not assume a 503 stopped the old
 process. Preserve maintenance until teardown is confirmed. 401/auth failure is
 a stop, 409 requires state reconciliation, and 503 is never permission to clear
 storage/alarms. No operation clears SDK state or changes guild/database bindings.
+The deployment-takeover client re-reads the fresh epoch on every retry, so reads
+answered by converging versions never block the post. The transfer step pins the
+client to the receipt-validated Worker version (`OWNERSHIP_EXPECTED_DEPLOYMENT`).
+When its posted epoch shows up owned by a deployment other than the one
+answering the read, the client re-posts only if the answering version is the
+deployed one (old-to-new handover); an answer from any other version is stale,
+so it stops without posting rather than handing that version a further commit.
+Without the pin the client fails closed and always stops on such a mismatch.
 
 The workflow preflight stops **before deploy** if control configuration is absent.
 After deployment it explicitly transfers only a previously active owner. First
