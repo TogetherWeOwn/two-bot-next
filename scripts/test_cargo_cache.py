@@ -689,6 +689,18 @@ class RetentionTests(unittest.TestCase):
         with self.assertRaisesRegex(cache.Refusal, 'ambiguous target'):
             self.audit()
 
+    def test_non_file_maps_deleted_clears_audit(self):
+        # The read-only audit applies the same identity exclusion, so a host
+        # whose only unattributed deleted references are SYSV shm mappings
+        # does not refuse the whole audit. Per-candidate classification stays
+        # strict (the entry still marks its candidate ineligible); only the
+        # global refusal is lifted.
+        shm = os.makedev(0x00, 0x01)
+        with patch.object(cache, 'process_references',
+                          return_value=([], [('/SYSV00000000', shm, 1, False)])):
+            receipt = self.audit()
+        self.assertIn('candidates', receipt)
+
     def test_deleted_container_reference_vetoes_or_refuses(self):
         # An unlinked artifact opened under a container spelling matches
         # neither the host path nor a live workspace inode. When the path
@@ -1127,6 +1139,21 @@ class SharedPoolRetainTests(unittest.TestCase):
                 self.retain()
         self.assertTrue((target / 'debug' / 'fixture').exists())
         self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
+
+    def test_non_file_maps_deleted_excluded_by_identity(self):
+        # Shared-host shape: PostgreSQL backends map SYSV IPC segments and
+        # /dev/zero, shown deleted on device 00:01. Those paths denote kernel
+        # objects that can never be regular files, so they cannot alias slot
+        # output and are excluded (and counted) by identity -- never by
+        # device comparison. Real-path maps entries still refuse (above).
+        shm = os.makedev(0x00, 0x01)
+        with patch.object(cache, 'process_references',
+                          return_value=([], [('/SYSV00000000', shm, 1, False),
+                                             ('/dev/zero', shm, 2, False)])):
+            receipt = self.retain()
+        self.assertTrue(all(row['eligible'] for row in receipt['slots']))
+        self.assertEqual(receipt['excluded_deleted_references'], 2)
+        self.assertFalse((self.pool / 'slot-0' / 'lease.json').exists())
 
     def test_device_unknown_deleted_refuses_whole(self):
         # A deleted entry with no usable device identity cannot prove

@@ -325,7 +325,9 @@ def process_references(proc_root):
     maps devices are kernel-printed superblock numbers, which need not equal
     the stat device for the same file (btrfs per-subvolume anon_dev,
     pre-6.8 overlayfs), so maps entries must never prove non-aliasing by
-    device alone.
+    device alone. Deleted paths that cannot be regular files at all
+    (is_non_file_reference: SYSV shm segments, /dev/zero) are excludable by
+    identity instead.
     """
     references = []
     deleted = []
@@ -427,6 +429,24 @@ def process_references(proc_root):
 
 def within(path, root):
     return Path(path).is_relative_to(root)
+
+
+# Deleted maps paths that denote kernel objects which can never be regular
+# files, so they cannot alias slot build output: SYSV IPC shared memory
+# segments (no filesystem existence) and the zero device (fixed device-node
+# identity, never build output). PostgreSQL backends map both, shown as
+# `/SYSV<key> (deleted)` and `/dev/zero (deleted)`; without this rule those
+# ubiquitous shared-host mappings refuse every retention run. Anything else
+# -- including real tmpfs paths such as /dev/shm files, whose non-aliasing
+# cannot be proven without mount-namespace analysis -- stays fail-closed.
+NON_FILE_REFERENCE_EXACT = frozenset({'/dev/zero'})
+NON_FILE_REFERENCE_PREFIXES = ('/SYSV',)
+
+
+def is_non_file_reference(path):
+    """True when a deleted reference path cannot be a regular file."""
+    return (path in NON_FILE_REFERENCE_EXACT
+            or path.startswith(NON_FILE_REFERENCE_PREFIXES))
 
 
 # Top-level entries Cargo itself creates in a target directory. A .gitignore
@@ -813,7 +833,10 @@ def shared_pool_retain(pool, inventory, proc_root='/proc', now=None, max_age=60,
         # entries are never device-excluded: their kernel-printed superblock
         # device need not equal the stat device for the same file (btrfs
         # per-subvolume anon_dev, pre-6.8 overlayfs), so a "foreign" maps
-        # device proves nothing. Same-filesystem and device-unknown
+        # device proves nothing. The only maps exception is identity, not
+        # device: a deleted path that cannot be a regular file at all
+        # (is_non_file_reference: SYSV shm segments, /dev/zero) cannot alias
+        # slot output and is excluded by identity. Same-filesystem and device-unknown
         # unattributed entries still refuse: a deleted slot file held open
         # carries the slot's device with an inode already gone from the
         # traversal, which no scan can distinguish from an unrelated
@@ -847,6 +870,9 @@ def shared_pool_retain(pool, inventory, proc_root='/proc', now=None, max_age=60,
                 continue  # lexical attribution, including skipped-slot paths
             if device is not None and (device, inode) in all_nodes:
                 continue  # inode attribution to pending slot output
+            if is_non_file_reference(path):
+                excluded_deleted += 1
+                continue  # kernel object, not a file; cannot alias output
             if (stat_backed and devices_complete and device is not None
                     and device not in slot_devices):
                 excluded_deleted += 1
@@ -1100,7 +1126,10 @@ def retention_audit(worktrees, inventory, proc_root='/proc', now=None, max_age=6
     # whole audit: unresolved namespace mapping must not silently establish
     # no reference. Callers must supply an independently verified
     # exact-path process-reference receipt before any such audit clears.
-    if any(not any(within(path, Path(root)) for root in real_workspaces)
+    # The non-file identity exclusion applies here too: a SYSV shm segment
+    # or /dev/zero mapping cannot be a workspace file under any spelling.
+    if any(not is_non_file_reference(path)
+           and not any(within(path, Path(root)) for root in real_workspaces)
            and (device, inode) not in all_nodes
            for path, device, inode, _stat_backed in deleted):
         raise Refusal('unresolved deleted process reference; '
