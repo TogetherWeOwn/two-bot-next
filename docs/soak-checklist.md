@@ -1229,11 +1229,12 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-984175d: 984175d — TOG-3471: serialize and journal temp-voice ownership changes
 
-- **Method:** `manual` (not an execution verdict).
-- **Action:** Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Transfer room ownership with the panel/`/voice` controls, then let the owner leave; take a failed transfer from TOG-10099’s fixture.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Transfer room ownership with the panel/`/voice` controls, then let the owner leave; attempt a transfer from a non-owner and confirm rollback to the prior owner.
 - **Expected:** Ownership changes are serialized and journaled; a failed transfer rolls back to the prior owner.
-- **Evidence:** Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.
-- **Owner:** [TOG-10099](/TOG/issues/TOG-10099)
+- **Evidence:** Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference. Fixture half: the offline `verification` command at the exact head; the staging half above is unchanged.
+- **Owner:** [TOG-10119](/TOG/issues/TOG-10119)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- transfer_hands_room_to_occupant_and_remembers_creator owner_leave_hands_room_to_earliest_joiner_and_persists owner_grants_are_never_issued_after_failed_journal_preparation
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-0495e7d: 0495e7d — TOG-3186: one live-activation allowlist replacing five divergent staging fences
@@ -1626,11 +1627,12 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-38041a1: 38041a1 — fix(temp-voice): refuse renames that collide with a sibling channel name (#361)
 
-- **Method:** `manual` (not an execution verdict).
+- **Method:** `automated` (not an execution verdict).
 - **Action:** Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Rename a room to the name of a sibling channel in the same category, then to a unique name.
 - **Expected:** The colliding rename is refused; the unique name is applied.
-- **Evidence:** Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.
-- **Owner:** [TOG-10101](/TOG/issues/TOG-10101)
+- **Evidence:** Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference. Fixture half: the offline `verification` command at the exact head; the staging half above is unchanged.
+- **Owner:** [TOG-10119](/TOG/issues/TOG-10119)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- unique_names_conflict_only_when_the_setting_is_on && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_name_collision
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-a40d4a5: a40d4a5 — fix(onboarding): plan session picks in catalog order (#258)
@@ -1738,11 +1740,12 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 ### s13-a8d9f53: a8d9f53 — fix(announcements): defer interactions before service I/O (#424)
 
-- **Method:** `manual` (not an execution verdict).
-- **Action:** Invoke the LFG commands and select in the staging guild with a slow-service leg from a local mock; invoke /rsvp once TOG-10293 wires it.
-- **Expected:** Each interaction is deferred before service I/O, so no interaction-failed reply appears.
-- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Method:** `automated` (not an execution verdict).
+- **Action:** Run the LFG defer-before-I/O fixtures and the ordered-RSVP defer fixtures on disposable fixtures: LFG commands and the select defer before service I/O, and queued RSVPs defer within three seconds and drain in order.
+- **Expected:** Each interaction is deferred before service I/O, so no interaction-failed reply appears: one deferred callback first, one completion edit.
+- **Evidence:** Attach the owning slice's exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion.
 - **Owner:** [TOG-10293](/TOG/issues/TOG-10293)
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot lfg_sticky_and_feed_routes_coexist_without_db ordinary_member_lfg_select_reaches_the_feature_before_db && python3 scripts/cargo_cache.py run -- test -p two-bot queued_rsvp_is_deferred_within_three_seconds_and_drains_on_overflow sticky_and_feed_are_deferred_at_receipt_while_rsvp_is_pending -- --include-ignored
 
 ### s13-f5edc70: f5edc70 — fix(leveling): show absent members as unranked (#429)
 
