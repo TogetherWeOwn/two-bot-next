@@ -3266,7 +3266,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// and a queued enforcement still needs its initiator). Nothing new can
     /// arrive meanwhile — [`Self::kick_start`] and [`Self::kick_cast`] refuse
     /// while not ready or halted — so retention stays bounded by the outage,
-    /// and the first ready tick settles every live vote before reaping.
+    /// and the first ready tick settles every live vote before reaping. A vote
+    /// the core already reaped inside this same pass (its lazy expiry backdates
+    /// the deadline past the horizon) audits as expired through the UnknownVote
+    /// backstop in the loop, so no expiry loses its result row.
     pub fn kick_refresh(&mut self, now_ms: u64) -> Vec<VoteKickUpdate> {
         let ready = self.live.read_state().ready;
         if !ready || self.halted {
@@ -3291,9 +3294,39 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 target_privileged,
             };
             // A room that is gone has no occupants, so the core cancels the vote.
-            let Ok(update) = self.votes.refresh(reference, facts, &ActorClock(now_ms)) else {
-                self.active_votes.retain(|vote| vote.id != reference.id);
-                continue;
+            // A vote this worker never settled can still come back unknown: the
+            // core's lazy sweep expires elapsed votes with a backdated deadline,
+            // so a sibling refreshed earlier in this same pass can push a vote
+            // past the horizon before its own turn (or a command's pass reaped
+            // it between ticks). That vote expired — every other terminal path
+            // settles through the worker first — so audit the expiry instead of
+            // silently dropping the result row. Progress is best-effort from
+            // current facts: the ballots were reaped with the vote.
+            let update = match self.votes.refresh(reference, facts, &ActorClock(now_ms)) {
+                Ok(update) => update,
+                Err(VoteKickError::UnknownVote)
+                    if self.active_votes.iter().any(|vote| vote.id == reference.id) =>
+                {
+                    let eligible = facts
+                        .occupants
+                        .iter()
+                        .filter(|id| **id != reference.target_id)
+                        .count();
+                    VoteKickUpdate {
+                        vote: reference,
+                        status: VoteKickStatus::Expired,
+                        progress: VoteProgress {
+                            yes: 0,
+                            required: eligible / 2 + 1,
+                            total: eligible,
+                        },
+                        kick: None,
+                    }
+                }
+                Err(_) => {
+                    self.active_votes.retain(|vote| vote.id != reference.id);
+                    continue;
+                }
             };
             let update = self.settle_vote(update);
             if update.status != VoteKickStatus::Active {
@@ -3301,9 +3334,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             }
         }
         // Reap only after every live vote had the chance to settle above: at
-        // this point every evictable vote is worker-settled (settling runs on
-        // every ready tick), so eviction drops no unaudited terminal. The
-        // initiator still survives while its enforcement is queued.
+        // this point every evictable vote is worker-settled — directly, or
+        // through the UnknownVote expiry backstop in the loop — so eviction
+        // drops no unaudited terminal. The initiator still survives while its
+        // enforcement is queued.
         for evicted in self.votes.prune(&ActorClock(now_ms)) {
             self.forget_vote_maps(evicted);
         }

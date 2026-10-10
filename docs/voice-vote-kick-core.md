@@ -79,7 +79,11 @@ its own per-vote maps for them; do not treat recreating the core as durable
 replay protection. The timer must reap only when it can also settle — gate on
 authoritative evidence, settle every live vote first, then prune — and must
 keep a vote's initiator while its enforcement is still queued, so pruning never
-drops an unaudited terminal or an unresolved enforcement fence. Runtime wiring
+drops an unaudited terminal or an unresolved enforcement fence. The lazy sweep
+backdates expiry to the deadline, so a vote refreshed later in the same pass
+can already sit past the horizon: a refresh that returns UnknownVote for a vote
+the worker still tracks as live must audit it as expired (best-effort progress
+from current facts) instead of dropping the result row. Runtime wiring
 must preserve unique vote IDs and reject unknown/stale buttons after restart,
 rather than reconstructing a vote from button data.
 

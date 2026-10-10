@@ -229,6 +229,78 @@ async fn outage_gates_reaping_and_reconnect_settles_before_it_reaps() {
 }
 
 #[tokio::test]
+async fn long_outage_audits_every_expired_vote_not_just_the_first() {
+    // VK-03 review warning: after an outage past TTL + cooldown, the first
+    // ready tick used to audit only the first refreshed vote. The core's lazy
+    // sweep expires elapsed votes with a backdated deadline, so a sibling
+    // refreshed later in the same pass was already past the horizon: its
+    // refresh hit UnknownVote and the vote was dropped with no result row.
+    let (mut worker, _) = setup().await;
+    worker.kick_start(VOTE, ROOM, VOTER_A, TARGET, 0).unwrap();
+    worker
+        .kick_start(VOTE + 1, ROOM, VOTER_B, VOTER_C, 0)
+        .unwrap();
+    worker.live.disconnect();
+    let past_horizon = VOTE_KICK_TTL_MS + VOTE_KICK_COOLDOWN_MS + 1;
+    assert!(worker.kick_refresh(past_horizon).is_empty());
+    worker.live.publish(snapshot(&[ROOM], roster()));
+    let finished = worker.kick_refresh(past_horizon + 1);
+    assert_eq!(finished.len(), 2);
+    assert!(finished
+        .iter()
+        .all(|update| update.status == VoteKickStatus::Expired));
+    assert!(worker.flush_kick_audit(past_horizon + 2).await);
+    assert_eq!(
+        audit_trail(&worker),
+        [
+            (KickAuditEvent::VoteStarted, "started"),
+            (KickAuditEvent::VoteStarted, "started"),
+            (KickAuditEvent::VoteResult, "expired"),
+            (KickAuditEvent::VoteResult, "expired"),
+        ]
+    );
+    // Each result row names its own initiator and target.
+    let rows = worker.store.kick_audit.lock().unwrap().clone();
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.event == KickAuditEvent::VoteResult)
+            .map(|row| (row.vote_id, row.initiator_id, row.target_id))
+            .collect::<Vec<_>>(),
+        [(VOTE, VOTER_A, TARGET), (VOTE + 1, VOTER_B, VOTER_C)]
+    );
+}
+
+#[tokio::test]
+async fn start_before_first_ready_tick_does_not_swallow_the_expiry_audit() {
+    // Same backstop through the command path: a start that lands between
+    // reconnect and the first ready tick settles (but cannot evict) the
+    // elapsed vote, and the tick's own pass would otherwise reap it before
+    // its refresh turn.
+    let (mut worker, _) = setup().await;
+    worker.kick_start(VOTE, ROOM, VOTER_A, TARGET, 0).unwrap();
+    worker.live.disconnect();
+    let past_horizon = VOTE_KICK_TTL_MS + VOTE_KICK_COOLDOWN_MS + 1;
+    assert!(worker.kick_refresh(past_horizon).is_empty());
+    worker.live.publish(snapshot(&[ROOM], roster()));
+    worker
+        .kick_start(VOTE + 1, ROOM, VOTER_B, VOTER_C, past_horizon + 1)
+        .unwrap();
+    let finished = worker.kick_refresh(past_horizon + 2);
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].vote.id, VOTE);
+    assert_eq!(finished[0].status, VoteKickStatus::Expired);
+    assert!(worker.flush_kick_audit(past_horizon + 3).await);
+    assert_eq!(
+        audit_trail(&worker),
+        [
+            (KickAuditEvent::VoteStarted, "started"),
+            (KickAuditEvent::VoteStarted, "started"),
+            (KickAuditEvent::VoteResult, "expired"),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn owner_original_creator_and_self_cannot_be_targeted() {
     let (mut worker, trace) = setup().await;
     assert_eq!(
