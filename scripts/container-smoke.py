@@ -25,7 +25,8 @@ IMAGE_MAX_BYTES = 112 * MIB
 # channel-moderation union): CI measured 15,741,344 bytes (15.01 MiB) on the
 # event-executors head vs the 15 MiB budget — 12,704 bytes (0.08%) over, no
 # new dependencies. 16 MiB restores a working tripwire with room for the
-# queued reconcile tooling; revisit if the binary approaches it.
+# queued reconcile tooling; revisit if the binary approaches it. The settings
+# hot-reload head measured 15,730,600 bytes (15.00 MiB), also below this limit.
 BINARY_MAX_BYTES = 16 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.

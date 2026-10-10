@@ -114,7 +114,7 @@ headroom below are historical, not measurements of the current PR head:
 | Artifact | Historical definition | Measured | Maximum | Headroom |
 |---|---|---|---|---|
 | Runtime image | Docker image inspect `Size` (uncompressed layers, not registry transfer size) | 87.19 MiB / 91,429,497 bytes | 112 MiB / 117,440,512 bytes | 24.81 MiB / 28.4% |
-| Release binary | `stat` of `/home/two-bot/two-bot` in the final image | 10.30 MiB / 10,805,344 bytes | 15 MiB / 15,728,640 bytes | 4.70 MiB / 45.6% |
+| Release binary | `stat` of `/home/two-bot/two-bot` in the final image | 15.01 MiB / 15,739,344 bytes (2026-10-10; 10.30 MiB / 10,805,344 bytes at the 10-01 calibration) | 22 MiB / 23,068,672 bytes | 6.99 MiB / 31.8% |
 
 The baseline used the classic Docker image store. The gate now sums exact
 `docker image history --human=false --format '{{.Size}}'` layer bytes after
