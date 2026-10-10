@@ -788,6 +788,15 @@ pub trait RoomWrites: Send + Sync {
         channel: Snowflake,
         name: &str,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
+    /// The room's voice status line (`""` clears it). Writers without a
+    /// status surface accept and ignore it.
+    fn set_voice_status(
+        &self,
+        _channel: Snowflake,
+        _status: &str,
+    ) -> impl Future<Output = Result<(), RoomHttpError>> + Send {
+        async { Ok(()) }
+    }
     /// V3 `/limit` and `/unlimit`: set the room channel's user limit (`0` is
     /// unlimited, at most 99). Idempotent; a 429 returns to the queue.
     fn set_user_limit(
@@ -963,6 +972,14 @@ impl RoomWrites for RoomHttp {
 
     async fn rename(&self, channel: Snowflake, name: &str) -> Result<(), RoomHttpError> {
         self.rename_room(channel, name).await
+    }
+
+    async fn set_voice_status(
+        &self,
+        channel: Snowflake,
+        status: &str,
+    ) -> Result<(), RoomHttpError> {
+        self.set_room_voice_status(channel, status).await
     }
 
     async fn set_user_limit(
@@ -2073,6 +2090,12 @@ pub struct GuildRoomWorker<S, H> {
     /// Cheap fingerprint of every input automatic names depend on; an idle
     /// guild skips the per-room work entirely.
     name_inputs: Option<u64>,
+    /// V5 voice status: the last status line written per room, the latest
+    /// rendered line waiting for its write, and when each room may be
+    /// written next.
+    room_status: HashMap<Snowflake, String>,
+    pending_status: HashMap<Snowflake, String>,
+    status_not_before_ms: HashMap<Snowflake, u64>,
     /// When each room started waiting for an unknown display name.
     name_waits: HashMap<Snowflake, u64>,
     creations: HashMap<u64, Creation>,
@@ -2315,6 +2338,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             name_settings_loaded,
             name_settings_read_ms: None,
             name_inputs: None,
+            room_status: HashMap::new(),
+            pending_status: HashMap::new(),
+            status_not_before_ms: HashMap::new(),
             name_waits: HashMap::new(),
             creations: HashMap::new(),
             accepted: HashMap::new(),
@@ -3750,6 +3776,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             );
         }
         self.enqueue_owner_repairs(now_ms);
+        if self.dispatch_voice_status(now_ms).await {
+            return true;
+        }
         let Some(action) = self.queue.pop_due(self.live.guild_id, now_ms) else {
             return false;
         };

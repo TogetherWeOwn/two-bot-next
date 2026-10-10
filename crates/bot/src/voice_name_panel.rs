@@ -180,6 +180,8 @@ pub(super) struct NameSettings {
     pub aliases: Vec<(String, String)>,
     pub force_single_game: bool,
     pub count_members_without_activity: bool,
+    /// Voice status templates by creator channel (V5 voice status).
+    pub status_templates: HashMap<Snowflake, String>,
 }
 
 impl NameSettings {
@@ -199,6 +201,15 @@ impl NameSettings {
                 .collect(),
             force_single_game: config.settings.force_single_game,
             count_members_without_activity: config.settings.count_members_without_activity,
+            status_templates: config
+                .creators
+                .iter()
+                .filter_map(|creator| {
+                    let template = creator.status_template.as_deref()?.trim();
+                    let channel = creator.channel_id.parse::<Snowflake>().ok()?;
+                    (!template.is_empty()).then(|| (channel, template.to_owned()))
+                })
+                .collect(),
         }
     }
 }
@@ -245,6 +256,29 @@ const NAME_SETTINGS_RELOAD_MS: u64 = 300_000;
 /// template renders with the "member" fallback.
 pub(super) const NAME_WAIT_MS: u64 = 60_000;
 const NAME_SETTINGS_RETRY_MS: u64 = 60_000;
+
+/// Least time between two voice status writes for one room.
+pub(super) const STATUS_MIN_INTERVAL_MS: u64 = 10_000;
+
+/// Render a creator's voice status template against the room's facts. Unlike a
+/// name, an empty render clears the status; text the name filter blocks (links,
+/// configured words) clears it too, and Discord's 500-character cap applies.
+fn render_voice_status(template: &str, facts: &NameFacts, policy: &AutomodPolicy) -> String {
+    const EMPTY: &str = "\u{1}";
+    let rendered = two_bot_core::voice_template::resolve_room_name(
+        template,
+        &facts.context,
+        &facts.conditions,
+        EMPTY,
+    );
+    if rendered == EMPTY || rendered.trim().is_empty() {
+        return String::new();
+    }
+    match filter_channel_name(&rendered, policy, &facts.filter) {
+        Ok(_) => rendered.chars().take(500).collect(),
+        Err(_) => String::new(),
+    }
+}
 
 /// The facts an automatic template name was rendered from: the room is
 /// re-rendered only when one of them changes, so an idle room costs nothing
@@ -476,6 +510,18 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             if self.name_signatures.get(&room_id) == Some(&signature) {
                 continue;
             }
+            if let Some(status_template) = self
+                .name_settings
+                .status_templates
+                .get(&room.creator_channel_id)
+            {
+                let status = render_voice_status(status_template, &facts, &command.policy);
+                if self.room_status.get(&room_id) != Some(&status) {
+                    self.pending_status.insert(room_id, status);
+                } else {
+                    self.pending_status.remove(&room_id);
+                }
+            }
             let checks = NameChecks {
                 policy: &command.policy,
                 filter: &facts.filter,
@@ -507,6 +553,50 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .retain(|room_id, _| rooms.contains_key(room_id));
         self.name_waits
             .retain(|room_id, _| rooms.contains_key(room_id));
+    }
+
+    /// Write one due voice status line (the latest render per room), at most
+    /// once per [`STATUS_MIN_INTERVAL_MS`] per room. Returns true when a write
+    /// was attempted.
+    pub(super) async fn dispatch_voice_status(&mut self, now_ms: u64) -> bool {
+        let rooms = &self.rooms;
+        self.pending_status
+            .retain(|room_id, _| rooms.contains_key(room_id));
+        let due = self
+            .pending_status
+            .keys()
+            .copied()
+            .filter(|room_id| {
+                self.status_not_before_ms
+                    .get(room_id)
+                    .is_none_or(|not_before| now_ms >= *not_before)
+            })
+            .min();
+        let Some(room_id) = due else {
+            return false;
+        };
+        let Some(status) = self.pending_status.remove(&room_id) else {
+            return false;
+        };
+        self.status_not_before_ms
+            .insert(room_id, now_ms + STATUS_MIN_INTERVAL_MS);
+        match self.http.set_voice_status(room_id, &status).await {
+            Ok(()) => {
+                self.room_status.insert(room_id, status);
+            }
+            Err(RoomHttpError::RateLimited { retry_after_ms, .. }) => {
+                self.status_not_before_ms
+                    .insert(room_id, now_ms + retry_after_ms.max(STATUS_MIN_INTERVAL_MS));
+                self.pending_status.entry(room_id).or_insert(status);
+            }
+            Err(RoomHttpError::RenameDeferred | RoomHttpError::UnknownOutcome) => {
+                self.pending_status.entry(room_id).or_insert(status);
+            }
+            // Missing permission or a gone channel: drop this line; the next
+            // change renders again.
+            Err(_) => {}
+        }
+        true
     }
 
     /// Cheap hash over every input of [`Self::refresh_template_names`]; no

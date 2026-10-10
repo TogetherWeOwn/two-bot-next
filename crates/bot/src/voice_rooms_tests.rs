@@ -881,6 +881,14 @@ impl RoomWrites for Http {
             None => Ok(()),
         }
     }
+    async fn set_voice_status(&self, channel: u64, status: &str) -> Result<(), RoomHttpError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("status:{channel}:{status}"));
+        Ok(())
+    }
+
     async fn rename(&self, channel: u64, name: &str) -> Result<(), RoomHttpError> {
         self.trace
             .lock()
@@ -10085,5 +10093,62 @@ async fn a_game_or_stream_change_rerenders_the_room_name() {
     assert_eq!(
         *trace.lock().unwrap(),
         ["rename:500:Hangout", "rename:500:Apex Legends 🔴"]
+    );
+}
+
+#[tokio::test]
+async fn the_creator_status_template_sets_and_updates_the_voice_status() {
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "@@owner@@".to_owned();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER, Some(500), Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    worker
+        .name_settings
+        .status_templates
+        .insert(CREATOR, "@@num@@ <<person/people>>".to_owned());
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    // Same facts: nothing new to write.
+    worker.refresh_template_names(2);
+    assert!(!worker.dispatch_one(2).await);
+    worker.live.voice_update(MEMBER + 1, Some(500), Some(false));
+    worker.refresh_template_names(3);
+    // The status write for this room waits for its interval.
+    assert!(!worker.dispatch_one(3).await);
+    dispatch(&mut worker, name_panel::STATUS_MIN_INTERVAL_MS).await;
+    let trace = trace.lock().unwrap().clone();
+    assert!(
+        trace.contains(&"status:500:1 person".to_owned()),
+        "{trace:?}"
+    );
+    assert!(trace.contains(&"rename:500:Alex".to_owned()), "{trace:?}");
+    assert_eq!(trace.last().unwrap(), "status:500:2 people");
+}
+
+#[test]
+fn creator_status_templates_come_from_the_configuration() {
+    let mut config = empty_config();
+    config
+        .creators
+        .push(two_bot_core::voice_config::CreatorConfiguration {
+            channel_id: CREATOR.to_string(),
+            name_template: "Room".to_owned(),
+            status_template: Some("@@num@@ here".to_owned()),
+            default_limit: 0,
+            always_private: false,
+            text_channels: false,
+            position: two_bot_core::voice_config::RoomPosition::Below,
+            first_number: 1,
+            group_by_category: false,
+            permission_source: two_bot_core::voice_config::PermissionSource::Creator {},
+        });
+    let settings = NameSettings::from_config(&config);
+    assert_eq!(
+        settings.status_templates.get(&CREATOR).map(String::as_str),
+        Some("@@num@@ here")
     );
 }
