@@ -153,6 +153,37 @@ pub async fn handle_rsvp_interaction(
     complete_rsvp_interaction(prepared, pool, executor, classifier).await
 }
 
+/// RA-01 live-membership gate: the acting (and, for host check-in, target)
+/// member must currently belong to the interaction's guild. Only 404 means
+/// absent; transport, authorization, rate-limit and malformed evidence fail
+/// closed with no mutation or audit write. The `user.id` echo check keeps a
+/// proxy/cache returning another member from passing the gate.
+enum Membership {
+    Current,
+    Absent,
+    Unavailable,
+}
+
+async fn guild_membership(executor: &ActionExecutor, guild_id: &str, user_id: &str) -> Membership {
+    match executor
+        .get_json_strict(&format!("/guilds/{guild_id}/members/{user_id}"))
+        .await
+    {
+        Ok(Some(member))
+            if member
+                .get("user")
+                .and_then(|user| user.get("id"))
+                .and_then(|id| id.as_str())
+                == Some(user_id) =>
+        {
+            Membership::Current
+        }
+        Ok(Some(_)) => Membership::Unavailable,
+        Ok(None) => Membership::Absent,
+        Err(_) => Membership::Unavailable,
+    }
+}
+
 async fn execute(
     handler: HandlerId,
     pool: &Pool<Postgres>,
@@ -193,6 +224,21 @@ async fn execute(
                 return Ok(attendance_totals_text(&partition_rsvps(&rows)));
             }
             let status = RsvpStatus::parse(string_option("status")?).map_err(|e| e.to_string())?;
+            let actor_id = interaction
+                .author_id()
+                .ok_or("Missing command member.")?
+                .to_string();
+            // Membership precedes the event lookup so a departed member or a
+            // failed lookup learns nothing about the event and writes nothing.
+            match guild_membership(executor, &guild_id, &actor_id).await {
+                Membership::Current => {}
+                Membership::Absent => {
+                    return Err("You are no longer a member of this server.".to_owned());
+                }
+                Membership::Unavailable => {
+                    return Err("Unable to verify server membership.".to_owned());
+                }
+            }
             let event = executor
                 .get_scheduled_event(&guild_id, &event_id)
                 .await?
@@ -211,10 +257,7 @@ async fn execute(
             let record = RsvpRecord {
                 guild_id,
                 event_id,
-                user_id: interaction
-                    .author_id()
-                    .ok_or("Missing command member.")?
-                    .to_string(),
+                user_id: actor_id,
                 status,
                 responded_at: now_iso(),
             };
@@ -259,6 +302,37 @@ async fn execute(
                 .as_ref()
                 .and_then(|r| r.users.get(&member_id))
                 .ok_or("Unable to resolve attendance member.")?;
+            // RA-01: the acting host and the selected target must both
+            // currently belong to the interaction's guild. The free-text
+            // occurrence has no live-event binding in this slice (RA-02 owns
+            // trusted occurrence resolution); these gates still precede any
+            // attendance write. A self check-in needs one lookup, not two.
+            let actor_id = interaction
+                .author_id()
+                .ok_or("Missing command member.")?
+                .to_string();
+            match guild_membership(executor, &guild_id, &actor_id).await {
+                Membership::Current => {}
+                Membership::Absent => {
+                    return Err(
+                        "You must still belong to this server to record attendance.".to_owned()
+                    );
+                }
+                Membership::Unavailable => {
+                    return Err("Unable to verify server membership.".to_owned());
+                }
+            }
+            if member_id.to_string() != actor_id {
+                match guild_membership(executor, &guild_id, &member_id.to_string()).await {
+                    Membership::Current => {}
+                    Membership::Absent => {
+                        return Err("That member is no longer in this server.".to_owned());
+                    }
+                    Membership::Unavailable => {
+                        return Err("Unable to verify attendance membership.".to_owned());
+                    }
+                }
+            }
             let verdict = classify(
                 classifier,
                 &ClassifyInput {
