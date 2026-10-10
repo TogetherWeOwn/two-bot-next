@@ -220,6 +220,7 @@ impl ModerationEffect for ModerationExecutor {
                     Ok(TerminalResponse::Success {
                         resource_id: Some(target_id),
                         affected: 1,
+                        outcome: None,
                     })
                 }
                 Err(error) => match error.code {
@@ -1574,6 +1575,7 @@ async fn write_setting(
             let terminal = TerminalResponse::Success {
                 resource_id: None,
                 affected: u32::from(!deleted),
+                outcome: None,
             };
             if state.store.finish(&claim, &terminal).await.is_err() {
                 let _ = state.store.mark_unknown(&claim).await;
