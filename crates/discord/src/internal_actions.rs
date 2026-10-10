@@ -4,8 +4,10 @@
 //! `announcement.post` is implemented here; `event.upsert` and `event.cancel`
 //! run through [`ActionExecutor::execute_event`](crate::ActionExecutor::execute_event)
 //! (see [`crate::internal_events`]) with the receiver-owned claim and key
-//! mapping. Core feature flags are not executor capabilities. No runtime flags,
-//! stores or listeners are installed.
+//! mapping, and `settings.get`/`settings.set` are wired receiver verbs
+//! executed via the settings store (the receiver branches before this
+//! adapter), so this adapter never executes them. Core feature flags are not
+//! executor capabilities. No runtime flags, stores or listeners are installed.
 //! Every 429 feeds the caller-supplied per-token [`CooldownGovernor`].
 
 use bytes::Bytes;
@@ -30,11 +32,19 @@ use two_bot_core::send_admission::{
 mod governor;
 pub use governor::{Clock, CooldownGovernor, MAX_CHANNEL_HOLDS};
 
-/// Mutating verbs with a wired effect. The announcement adapter below owns
-/// only `announcement.post`; the two event verbs run through
-/// [`ActionExecutor::execute_event`](crate::ActionExecutor::execute_event) behind the
-/// receiver's claim and key mapping. `event.read` is a keyless read path, not listed.
-pub const SUPPORTED_ACTIONS: &[&str] = &["announcement.post", "event.upsert", "event.cancel"];
+/// Every verb the receiver will run: the Discord send, the two event verbs
+/// (executed through [`ActionExecutor::execute_event`](crate::ActionExecutor::execute_event)
+/// behind the receiver's claim and key mapping, never via this adapter's
+/// transport) and the two settings verbs (executed via the settings store,
+/// never via this adapter's transport). `event.read` is a keyless read path,
+/// not listed. All other core verbs stay refused.
+pub const SUPPORTED_ACTIONS: &[&str] = &[
+    "announcement.post",
+    "event.upsert",
+    "event.cancel",
+    "settings.get",
+    "settings.set",
+];
 
 /// True for the two event verbs the receiver executes through
 /// [`ActionExecutor::execute_event`](crate::ActionExecutor::execute_event). The env-only
@@ -212,9 +222,11 @@ impl AnnouncementExecutor {
 
     /// Authorize first; this method intentionally owns neither the store claim
     /// nor its audit/finalization. Caller cancellation after invocation is also
-    /// an unknown outcome, even if this method never returns.
+    /// an unknown outcome, even if this method never returns. Only the Discord
+    /// send runs here: settings verbs are wired (see [`SUPPORTED_ACTIONS`]) but
+    /// executed via the settings store by the receiver, never via this transport.
     pub async fn execute(&self, action: &str, body: &Map<String, Value>) -> ExecutionOutcome {
-        if !Self::supports(action) {
+        if action != "announcement.post" {
             return ExecutionOutcome::NoEffect(Refusal::ActionNotAllowed);
         }
         let outcome = self.post(body).await;

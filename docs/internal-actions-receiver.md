@@ -3,13 +3,16 @@
 ## Implementation and deployment boundary
 
 The container source integrates an opt-in private `POST /internal/actions`
-listener with the durable store, announcement executor, nonce-commit
-authentication capability and strict receiver configuration. It supports only
-`announcement.post`, `event.upsert`, and `event.cancel` (behind
-`TWO_INTERNAL_ALLOW_EVENT_CANCEL`), plus the keyless `event.read` (behind
-`TWO_INTERNAL_ALLOW_EVENT_READ`), and `moderation.timeout`, regardless of the
-core action catalogue's broader defaults; every other verb stays refused by
-the per-effect fences.
+listener with the durable store, announcement executor, event-read, event-mutation,
+settings and moderation executors, nonce-commit authentication capability and
+strict receiver configuration. It supports `announcement.post`, the keyless
+`event.read` (behind `TWO_INTERNAL_ALLOW_EVENT_READ`), `event.upsert` and
+`event.cancel` (cancel behind `TWO_INTERNAL_ALLOW_EVENT_CANCEL`),
+`settings.get`/`settings.set` (behind `TWO_INTERNAL_ALLOW_SETTINGS`) and the
+restrictive member verbs
+`moderation.ban`, `moderation.tempban`, `moderation.kick`, `moderation.warn`
+and `moderation.timeout`, regardless of the core action catalogue's broader
+defaults. Every other verb stays refused by the per-effect fences.
 The public health/readiness/metrics router has no action route. A merged,
 deployed receiver is dark until the Operator enables it, and it is reachable
 only through the staging-only Worker ingress described in
@@ -75,10 +78,10 @@ that is not yet deployed), deploy that one version, then run the takeover once.
 1. Merge this change. `deploy-staging` deploys it dark; `/health` and `/readyz` are unchanged.
 2. Operator stages `TWO_INTERNAL_CALLERS` and `TWO_INTERNAL_CHANNEL_KEYS` (plain values).
 3. Operator generates the key on the Operator host and stages `TWO_INTERNAL_KEYS`, and sets the website's `staging` environment secret `BOT_SHARED_SECRET` to the same value, without printing it.
-4. Operator applies migration `0423` first (the bot does not apply migrations; an enabled receiver's finish fails without the column), then stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
+4. Operator applies migrations `0423` (settings CAS) and `0424` (event outcome) first (the bot does not apply migrations; an enabled receiver's finish fails without the columns), then stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
 5. Rollback: stage deletion of `TWO_INTERNAL_ACTIONS` (`wrangler versions secret delete`), deploy and transfer ownership; or use the existing Worker-version rollback. The route is absent again and the next container start carries no receiver setting.
 
-Migration `0423` adds the nullable `internal_idempotency.outcome` column that
+Migration `0424` adds the nullable `internal_idempotency.outcome` column that
 event receipts read back. Roll back in this order: disable the receiver (step 5)
 and deploy the previous binary, then drop the column. Dropping it while this
 binary runs fails every finish and every success replay, not only event receipts.

@@ -83,7 +83,7 @@ columns; older intents remain NULL and must not be guessed from current config.
 outcome: Option<EventOutcome> }` (HTTP 200) or `Failure(TerminalFailure)` with
 fixed codes/statuses: `Malformed`/400, `ActionNotAllowed`/403,
 `DiscordRejected`/422, `NoEffect`/502. `EventOutcome` is the closed legacy
-result word (`created`/`updated`/`cancelled`, migration `0423`): event intents
+result word (`created`/`updated`/`cancelled`, migration `0424`): event intents
 always record one so replay returns the first result byte-identically, while
 announcement receipts stay `None` and render `message_id`. Failure is
 definitive; timeout/transport uncertainty must use `mark_unknown`.

@@ -91,7 +91,7 @@ fn app(pool: sqlx::PgPool, mock: &MockDiscord) -> Router {
     // stay uncalled.
     router(Arc::new(ReceiverState::new(
         config(),
-        pool.clone(),
+        pool,
         Arc::new(effect),
         Arc::new(MockEventRead::default()),
         Arc::new(MockEventMutate),

@@ -353,6 +353,14 @@ or unconfirmed shutdown leaves denial; do not assume a 503 stopped the old
 process. Preserve maintenance until teardown is confirmed. 401/auth failure is
 a stop, 409 requires state reconciliation, and 503 is never permission to clear
 storage/alarms. No operation clears SDK state or changes guild/database bindings.
+The deployment-takeover client re-reads the fresh epoch on every retry, so reads
+answered by converging versions never block the post. The transfer step pins the
+client to the receipt-validated Worker version (`OWNERSHIP_EXPECTED_DEPLOYMENT`).
+When its posted epoch shows up owned by a deployment other than the one
+answering the read, the client re-posts only if the answering version is the
+deployed one (old-to-new handover); an answer from any other version is stale,
+so it stops without posting rather than handing that version a further commit.
+Without the pin the client fails closed and always stops on such a mismatch.
 
 The workflow preflight stops **before deploy** if control configuration is absent.
 After deployment it explicitly transfers only a previously active owner. First
@@ -749,7 +757,7 @@ tokens, or redeploy with an unreviewed wiring change during this docs procedure.
 | Automations/announcements/text | `TWO_AUTOMATIONS=1`, `TWO_ANNOUNCEMENTS=1`; text needs automations **and** `TWO_TEXT_COMMANDS=1`. | Per-feature gates, not operational containment. Verify the affected deployed handler; registry publishing or a periodic job alone does not prove a specific action is active. |
 | Onboarding | `TWO_ONBOARDING_MODE=legacy|session|anchor`, default legacy; `TWO_ONBOARDING_DRY_RUN=1`. | Mode/dry-run contracts are feature-scoped, not bot-wide stop controls. Verify the affected handler and staging evidence; a catalogue value alone is not a runtime activation or reload receipt. |
 | Community scorecard | `TWO_COMMUNITY_SCORECARD=1`; recommendations on unless `TWO_COMMUNITY_RECOMMENDATIONS=0`. | Conditionally registered supervised job; durable retry budget and completion rules apply. A successful/no-op tick is not fresh publication proof. See the [database playbook](#neon-or-hyperdrive-outage). |
-| Internal actions | `announcement.post` and `event.upsert` are on whenever the receiver is; `event.cancel` needs `TWO_INTERNAL_ALLOW_EVENT_CANCEL=1`, `event.read` needs `TWO_INTERNAL_ALLOW_EVENT_READ=1`, moderation needs `TWO_INTERNAL_ALLOW_MODERATION=1` **and** `TWO_MODERATION=1`; remaining verbs stay refused. | Wired receivers are `announcement.post`, `event.upsert` (no extra flag: contained only by the dark switch below), `event.cancel`, `event.read`, and `moderation.timeout`, staging only: dark until the Operator sets the Worker secret `TWO_INTERNAL_ACTIONS` to `1` last; unset it to go dark again. Reachable solely through the staging Worker ingress for `POST /internal/actions`; production has none. Unsetting an allow flag stops that verb. See [staging ingress](internal-actions-receiver.md#staging-ingress-default-dark) and the [receiver verb list](internal-actions-receiver.md). |
+| Internal actions | `announcement.post` and `event.upsert` are on whenever the receiver is; `event.cancel` needs `TWO_INTERNAL_ALLOW_EVENT_CANCEL=1`, `event.read` needs `TWO_INTERNAL_ALLOW_EVENT_READ=1`, `settings.get`/`settings.set` need `TWO_INTERNAL_ALLOW_SETTINGS=1`, moderation needs `TWO_INTERNAL_ALLOW_MODERATION=1` **and** `TWO_MODERATION=1`; remaining verbs stay refused. | Wired receivers are `announcement.post`, `event.upsert` (no extra flag: contained only by the dark switch below), `event.cancel`, `event.read`, `settings.get`, `settings.set`, and `moderation.ban`, `moderation.tempban`, `moderation.kick`, `moderation.warn`, `moderation.timeout`, staging only: dark until the Operator sets the Worker secret `TWO_INTERNAL_ACTIONS` to `1` last; unset it to go dark again. Reachable solely through the staging Worker ingress for `POST /internal/actions`; production has none. Unsetting an allow flag stops that verb. See [staging ingress](internal-actions-receiver.md#staging-ingress-default-dark) and the [receiver verb list](internal-actions-receiver.md). |
 | Settings hot reload | Typed catalogue/store with env-only secret/moderation keys. | Poller/runtime rebuilding remains follow-up; no promise of changes applying without restart. |
 
 Source: [`automod.rs`](../crates/core/src/automod.rs),

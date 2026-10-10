@@ -191,10 +191,10 @@ class FakeClient:
 
 
 def make_control(world):
-    def control(action, epoch=None, release_fence=False):
+    def control(action, epoch=None, release_fence=False, expected_deployment=None):
         world.tick(1)
         count = sum(1 for call in world.calls if call[0] == action) + 1
-        world.calls.append((action, epoch, release_fence))
+        world.calls.append((action, epoch, release_fence, expected_deployment))
         failure = world.fail_control.get((action, count))
         if failure:
             raise failure
@@ -348,6 +348,9 @@ class HappyPathTests(unittest.TestCase):
                           "status", "fence", "deployment-takeover"])
         self.assertTrue(all(call[2] for call in world.calls
                             if call[0] == "deployment-takeover"))
+        self.assertEqual([call[3] for call in world.calls
+                          if call[0] == "deployment-takeover"],
+                         [BACKOUT_WORKER, PRE])
 
     def test_deploy_config_overrides_only_the_image(self):
         world = World()
@@ -631,9 +634,9 @@ class EvidenceTests(unittest.TestCase):
         world = World()
         control = make_control(world)
 
-        def hostile(action, epoch=None, release_fence=False):
-            state = control(action, epoch, release_fence)
-            if action == "status" and world.calls.count(("status", None, False)) >= 2:
+        def hostile(action, epoch=None, release_fence=False, expected_deployment=None):
+            state = control(action, epoch, release_fence, expected_deployment)
+            if action == "status" and world.calls.count(("status", None, False, None)) >= 2:
                 state["owner"]["phase"] = f"weird {SENTINEL}"
             return state
 
