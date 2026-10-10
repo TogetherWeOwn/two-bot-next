@@ -92,6 +92,45 @@ class Gate5OutageTests(unittest.TestCase):
         self.assertIsNone(summary["max_outage_seconds"])
         self.assertEqual(summary["verdict"], "NOT VERIFIED")
 
+    def test_open_outage_over_budget_needs_work(self):
+        summary = run(
+            '{"ts": "2026-10-01T00:00:00Z", "event": "readyz_ok"}\n'
+            '{"ts": "2026-10-01T00:00:10Z", "event": "readyz_fail", "status": 503}\n'
+            '{"ts": "2026-10-01T00:00:40Z", "event": "readyz_fail", "status": 503}\n'
+            '{"ts": "2026-10-01T00:01:10Z", "event": "readyz_fail", "status": 503}\n'
+            '{"ts": "2026-10-01T00:01:40Z", "event": "readyz_fail", "status": 503}\n'
+        )
+        self.assertEqual(len(summary["outage_windows"]), 1)
+        window = summary["outage_windows"][0]
+        self.assertEqual(window["status"], "unknown")
+        self.assertIsNone(window["end"])
+        self.assertIsNone(window["outage_seconds"])
+        # 90 s with no recovery: the lower bound already breaks the budget.
+        self.assertEqual(window["outage_seconds_min"], 90.0)
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_open_outage_at_exact_budget_needs_work(self):
+        summary = run(
+            '{"ts": "2026-10-01T00:00:00Z", "event": "readyz_ok"}\n'
+            '{"ts": "2026-10-01T00:00:10Z", "event": "readyz_fail", "status": 503}\n'
+            '{"ts": "2026-10-01T00:00:40Z", "event": "readyz_fail", "status": 503}\n'
+            '{"ts": "2026-10-01T00:01:10Z", "event": "readyz_fail", "status": 503}\n'
+        )
+        window = summary["outage_windows"][0]
+        self.assertEqual(window["status"], "unknown")
+        self.assertEqual(window["outage_seconds_min"], 60.0)
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_recovered_outage_at_exact_budget_needs_work(self):
+        summary = run(
+            '{"ts": "2026-10-01T00:00:00Z", "event": "readyz_ok"}\n'
+            '{"ts": "2026-10-01T00:00:10Z", "event": "readyz_fail", "status": 503}\n'
+            '{"ts": "2026-10-01T00:01:10Z", "event": "readyz_ok"}\n'
+        )
+        window = summary["outage_windows"][0]
+        self.assertEqual(window["outage_seconds"], 60.0)
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+
     def test_over_budget_recovery_needs_work(self):
         summary = run(
             '{"ts": "2026-10-01T00:00:01Z", "event": "readyz_ok"}\n'

@@ -27,15 +27,20 @@ an UNKNOWN interval, never silently dropped.
 A window still open when the log ends stays explicitly UNKNOWN
 (``status: "unknown"``, ``end: null``, ``outage_seconds: null``): like
 ``scripts/soak_evidence.py``, the outage length is unbounded there, so it is
-never scored as zero.
+never scored as zero. The window still carries ``outage_seconds_min``, the
+floored time from the first observed failure to the last record: a lower
+bound, since recovery only counts at a ``readyz_ok``. Once that lower bound
+reaches the budget, the Gate 5 rule has definitely failed.
 
-Verdict: NEEDS WORK when a recovered outage is at or over the budget. PASS needs
+Verdict: NEEDS WORK when a recovered outage is at or over the budget, or when
+an outage still open at the end already reaches the budget. PASS needs
 the acceptance interval and a log that covers it: the first record within a
 budget of the interval start, the last record at or after the interval end, and
 no silent gap longer than a budget. Missing evidence is NOT VERIFIED, never PASS:
 no interval, an empty log, a silent gap, an out-of-order or unknown record, a
 log that began mid-outage (NEEDS WORK instead when that outage already reaches
-the budget), an outage still open at the end, a start that cannot be pinned
+the budget), an outage still open at the end (NEEDS WORK instead when it
+already reaches the budget), a start that cannot be pinned
 within the budget (the last healthy sample is more than a budget before
 recovery), a readyz_ok with a non-200 status or a readyz_fail with status 200,
 and an outage that recurs within a budget of its recovery.
@@ -183,12 +188,19 @@ def summarize(lines, interval_start=None, interval_end=None):
             note_unknown(ts, ts, f"unrecognised event {event!r}")
 
     if outage_start is not None:
-        # Log ends while still down: the outage length is unbounded, so the
-        # window stays explicitly UNKNOWN instead of being scored as zero.
+        # Log ends while still down: the outage length is unbounded above, so
+        # the window stays explicitly UNKNOWN instead of being scored as zero.
+        # The time from the first observed failure to the last record is still
+        # a lower bound (recovery only counts at a readyz_ok): once it already
+        # reaches the budget, the Gate 5 rule has definitely failed.
+        lower = (last_ts - outage_start).total_seconds()
+        if lower >= OUTAGE_BUDGET_S:
+            breach = True
         outage_windows.append({
             "start": outage_start.isoformat(),
             "end": None,
             "outage_seconds": None,
+            "outage_seconds_min": _display_seconds(lower),
             "status": "unknown",
         })
     if not (readyz_ok or readyz_fail or tick_missed):
