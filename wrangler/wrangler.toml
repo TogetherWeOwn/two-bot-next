@@ -140,6 +140,10 @@ DISCORD_APPLICATION_ID = "1469137636663758888"
 # Never top-level and never production: scripts/check-env-bindings.py fails
 # either. Rollback: delete the line, redeploy.
 TWO_VOICE = "1"
+# Staging-only: request GUILD_PRESENCES so room names show games and streams
+# (docs/voice-presence.md). The staging app's Presence Intent is on
+# (GATEWAY_PRESENCE_LIMITED, 2026-10-10). Rollback: delete the line, redeploy.
+TWO_VOICE_PRESENCE = "1"
 
 [env.production.version_metadata]
 binding = "CF_VERSION_METADATA"
