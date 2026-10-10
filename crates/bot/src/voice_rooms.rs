@@ -1175,7 +1175,8 @@ pub(crate) struct LiveState {
     /// Continuous human-empty evidence in this authoritative gateway session.
     /// Reconnects restart the grace; human joins cancel it even between ticks.
     empty_since: HashMap<Snowflake, tokio::time::Instant>,
-    /// Fixture-only override of [`EMPTY_ROOM_GRACE`]; production never sets it.
+    /// Override of [`EMPTY_ROOM_GRACE`] (`TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS`
+    /// in production, shorter values in fixtures).
     empty_grace: Option<Duration>,
     /// Game/stream facts per member for room-name tokens. Only non-empty
     /// entries are kept, at most [`MAX_TRACKED_PRESENCES`]; empty without
@@ -3286,6 +3287,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             outcome.as_str(),
             None,
         ));
+        metrics::global().voice_vote_kick(outcome.as_str());
     }
 
     /// Append buffered audit rows, one batch per call. Driven by the actor's
@@ -3332,28 +3334,35 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         now_ms: u64,
     ) -> Result<VoteKickUpdate, KickRefusal> {
         let started = self.begin_vote(vote_id, room_id, initiator_id, target_id, now_ms);
-        let row = match &started {
-            Ok(update) => kick_audit_row(
-                KickAuditEvent::VoteStarted,
-                update.vote,
-                initiator_id,
+        let (row, outcome) = match &started {
+            Ok(update) => (
+                kick_audit_row(
+                    KickAuditEvent::VoteStarted,
+                    update.vote,
+                    initiator_id,
+                    OUTCOME_STARTED,
+                    Some(update.progress),
+                ),
                 OUTCOME_STARTED,
-                Some(update.progress),
             ),
-            Err(refusal) => kick_audit_row(
-                KickAuditEvent::VoteRefused,
-                VoteKickRef {
-                    id: vote_id,
-                    guild_id: self.live.guild_id,
-                    room_id,
-                    target_id,
-                },
-                initiator_id,
+            Err(refusal) => (
+                kick_audit_row(
+                    KickAuditEvent::VoteRefused,
+                    VoteKickRef {
+                        id: vote_id,
+                        guild_id: self.live.guild_id,
+                        room_id,
+                        target_id,
+                    },
+                    initiator_id,
+                    kick_refusal_outcome(*refusal),
+                    None,
+                ),
                 kick_refusal_outcome(*refusal),
-                None,
             ),
         };
         self.push_kick_audit(row);
+        metrics::global().voice_vote_kick(outcome);
         started
     }
 
@@ -5413,8 +5422,8 @@ where
         self
     }
 
-    /// Offline-fixture seam: shorten the empty-room grace for tests that
-    /// exercise unrelated lifecycle races. Production keeps the 60 s default.
+    /// Set the empty-room grace (`TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` in
+    /// production; fixtures shorten it for unrelated lifecycle races).
     pub fn with_empty_grace(mut self, grace: Duration) -> Self {
         self.empty_grace = Some(grace);
         self
@@ -6237,6 +6246,12 @@ pub fn build_production_runtime(
     // through its cataloged `voice HTTP setup failed` event.
     let protected = configured_protected_channels(|key| std::env::var(key).ok())
         .map_err(|_| RoomHttpError::InvalidRequest)?;
+    let empty_grace = configured_empty_grace(
+        std::env::var("TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS")
+            .ok()
+            .as_deref(),
+    )
+    .map_err(|_| RoomHttpError::InvalidRequest)?;
     let replies = RoomHttp::new(token.to_owned())?;
     let http = replies.clone();
     let store = PgRoomStore::new(pool);
@@ -6248,11 +6263,36 @@ pub fn build_production_runtime(
                 true,
             )
             .with_protected_channels(protected)
+            .with_empty_grace(empty_grace)
             .with_name_policy(name_policy),
         ),
         Arc::new(replies),
     ))
 }
+
+/// Longest configurable empty-room grace.
+const MAX_EMPTY_ROOM_GRACE_SECONDS: u64 = 600;
+
+/// `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS`: seconds an emptied room waits before
+/// deletion, `0..=600`; unset keeps the 60-second default. `0` deletes on the
+/// next tick after the last human leaves, like the interim voice bot. A
+/// malformed value refuses the runtime rather than guessing.
+pub fn configured_empty_grace(value: Option<&str>) -> Result<Duration, InvalidEmptyGrace> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(EMPTY_ROOM_GRACE),
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(seconds) if seconds <= MAX_EMPTY_ROOM_GRACE_SECONDS => {
+                Ok(Duration::from_secs(seconds))
+            }
+            _ => Err(InvalidEmptyGrace),
+        },
+    }
+}
+
+/// `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` was not a whole number of seconds in
+/// `0..=600`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidEmptyGrace;
 
 /// Complete guild snapshot from the post-update cache. Returns None until the
 /// cache holds the guild, the bot user and the voice states — never publish a
