@@ -1272,6 +1272,17 @@ impl ActionQueue {
         self.drain_for_channel(guild_id, channel_id).len()
     }
 
+    /// Whether the guild is waiting out a Discord rate limit.
+    #[must_use]
+    pub fn backed_off(&self, guild_id: Snowflake, now_ms: u64) -> bool {
+        self.inner
+            .lock()
+            .expect("queue lock")
+            .guild_not_before_ms
+            .get(&guild_id)
+            .is_some_and(|t| now_ms < *t)
+    }
+
     /// Pending (urgent, deferred) counts for the guild. Diagnostics/tests.
     #[must_use]
     pub fn pending_counts(&self, guild_id: Snowflake) -> (usize, usize) {

@@ -184,6 +184,19 @@ jobs:
         # Offline static audits need no GitHub credentials or security-events writes.
         run: '"$RUNNER_TEMP/zizmor/bin/zizmor" --offline --strict-collection --no-progress .github/workflows'
 
+      # Tier 0 (pipeline review 2026-10-10): workflow logic was the largest class of review
+      # findings a linter catches; zizmor covers security, actionlint covers syntax/expressions.
+      - name: Lint GitHub Actions workflows (actionlint)
+        # The check job runs in a container whose default shell is sh (no pipefail).
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/actionlint.tgz" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz
+          echo "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757  $RUNNER_TEMP/actionlint.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/actionlint.tgz" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -shellcheck= -pyflakes=
+
       - name: offline build-cache safety regressions
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
@@ -727,6 +740,16 @@ jobs:
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot-discord --features db --locked --test leveling_runtime -- --ignored --test-threads=1
+
+      - name: community voice fact capture (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-discord --features db --locked --test leveling_runtime community_voice_fact_capture_round_trip -- --ignored --test-threads=1
+
+      - name: community voice fact round trip (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-core --features db --locked --lib community_store::tests::voice_session_start_end_round_trip_is_idempotent -- --ignored
 
       - name: community message fact capture (CI service only)
         env:

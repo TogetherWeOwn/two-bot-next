@@ -225,6 +225,11 @@ library code with no Discord dependency and can start immediately.
   UTC), English names.
 - `@@random_emoji@@`, `[[a/b/c]]` and `[[list:name]]` (named lists from guild
   settings) are rolled from a per-room seed stored at creation and never re-rolled.
+  The seed is chosen so a new room's first name (rendered for the joiner alone,
+  with their presence) differs from every live voice channel name and from the
+  guild's last three first names, case-insensitively. Up to eight seeds are tried;
+  a pool too small to vary keeps the drawn seed. The memory is per guild and
+  in-process: a restart starts it empty.
 
 **Resting / in-use names**
 
@@ -377,7 +382,8 @@ library code with no Discord dependency and can start immediately.
 - Intents: Guild Voice States, Guild Members (privileged) and Guild Presences
   (privileged; game and stream data).
 - Bot permissions: View Channel, Connect, Manage Channels, Move Members, Manage
-  Roles and Send Messages. Evaluate effective permissions per channel, because
+  Roles and Send Messages, plus Set Voice Channel Status for room status lines (a
+  refused status write is logged once per guild and the line is skipped). Evaluate effective permissions per channel, because
   category overrides beat role permissions.
 - Limits: 100 characters per name, 50 channels per category, user limit 0–99, and
   bitrate capped by the guild's boost tier.
