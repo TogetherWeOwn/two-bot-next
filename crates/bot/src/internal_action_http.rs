@@ -1,6 +1,7 @@
-//! Private announcement receiver. Never merge this router into the health socket.
-//! Authentication and a committed nonce precede JSON; a committed intent precedes
-//! the effect. Cancellation leaves durable ownership, never a new execution lease.
+//! Private website-action receiver (announcement + membership). Never merge this
+//! router into the health socket. Authentication and a committed nonce precede
+//! JSON; a committed intent precedes the effect. Cancellation leaves durable
+//! ownership, never a new execution lease.
 
 use std::{
     future::IntoFuture,
@@ -28,12 +29,14 @@ use two_bot_core::{
         TerminalFailure, TerminalResponse,
     },
     internal_actions::{
-        new_request_id, unmapped_event_key, validate_announcement, validate_event_key,
-        validate_idempotency_key, ActionError, AuthDecision, AuthHeaders, AuthenticatedRequest,
-        ErrorCode, InternalFlags, TokenBuckets, ACTIONS_PATH, MAX_BODY_BYTES, SKEW_SECONDS,
+        new_request_id, require_field_str, unmapped_event_key, validate_announcement,
+        validate_event_key, validate_idempotency_key, ActionError, AuthDecision, AuthHeaders,
+        AuthenticatedRequest, ErrorCode, GuildAddMemberRequest, InternalFlags, RoleAssignRequest,
+        TokenBuckets, ACTIONS_PATH, MAX_BODY_BYTES, SKEW_SECONDS,
     },
     rejection_telemetry::{ActionLabel, KeyLabel, Rejection, RejectionRecord, RejectionTelemetry},
 };
+use two_bot_discord::executor::member::MemberOutcome;
 use two_bot_discord::internal_actions::{AnnouncementExecutor, ExecutionOutcome, Refusal};
 use two_bot_discord::{ActionExecutor, EventActionError, EventCall};
 
@@ -84,6 +87,68 @@ impl ActionEffect for AnnouncementExecutor {
                 ExecutionOutcome::Unknown(_) => return Effect::Unknown,
             };
             Effect::Terminal(response)
+        })
+    }
+}
+
+/// Membership mutations: `role.assign` (allowlisted key, hierarchy-checked)
+/// and `guild.add_member` (OAuth token, transient only). The receiver owns the
+/// durable claim; this trait owns only the Discord calls after the claim. The
+/// OAuth token is a per-call argument only: it never enters a struct, an audit
+/// row, a stored receipt, a log, or a `Debug` impl.
+trait MemberEffect: Send + Sync {
+    fn execute_assign<'a>(
+        &'a self,
+        guild_id: &'a str,
+        bot_user_id: &'a str,
+        request: &'a RoleAssignRequest<'a>,
+    ) -> BoxFuture<'a, Result<MemberOutcome, ActionError>>;
+    fn execute_add<'a>(
+        &'a self,
+        guild_id: &'a str,
+        request: &'a GuildAddMemberRequest<'a>,
+        access_token: &'a str,
+    ) -> BoxFuture<'a, Result<MemberOutcome, ActionError>>;
+    fn resolve_bot<'a>(&'a self) -> BoxFuture<'a, Result<String, ActionError>>;
+}
+
+impl MemberEffect for ActionExecutor {
+    fn execute_assign<'a>(
+        &'a self,
+        guild_id: &'a str,
+        bot_user_id: &'a str,
+        request: &'a RoleAssignRequest<'a>,
+    ) -> BoxFuture<'a, Result<MemberOutcome, ActionError>> {
+        Box::pin(async move {
+            self.assign_internal_role(guild_id, bot_user_id, request)
+                .await
+        })
+    }
+
+    fn execute_add<'a>(
+        &'a self,
+        guild_id: &'a str,
+        request: &'a GuildAddMemberRequest<'a>,
+        access_token: &'a str,
+    ) -> BoxFuture<'a, Result<MemberOutcome, ActionError>> {
+        Box::pin(async move {
+            self.add_internal_member(guild_id, request, access_token)
+                .await
+        })
+    }
+
+    fn resolve_bot<'a>(&'a self) -> BoxFuture<'a, Result<String, ActionError>> {
+        Box::pin(async move {
+            self.current_bot_user_id()
+                .await
+                .map(|id| id.to_string())
+                .map_err(|detail| {
+                    ActionError::new(
+                        ErrorCode::DiscordUnavailable,
+                        "Discord bot identity is unavailable",
+                        format!("bot_identity_unavailable: {}", detail.cause()),
+                    )
+                })
         })
     }
 }
@@ -142,6 +207,7 @@ struct ReceiverState {
     config: InternalActionConfig,
     store: InternalActionStore,
     effect: Arc<dyn ActionEffect>,
+    member: Arc<dyn MemberEffect>,
     event_read: Arc<dyn EventReadEffect>,
     clock: Mutex<ClockGuard>,
     buckets: Mutex<TokenBuckets>,
@@ -154,12 +220,14 @@ impl ReceiverState {
         config: InternalActionConfig,
         pool: sqlx::PgPool,
         effect: Arc<dyn ActionEffect>,
+        member: Arc<dyn MemberEffect>,
         event_read: Arc<dyn EventReadEffect>,
     ) -> Self {
         Self {
             config,
             store: InternalActionStore::new(pool),
             effect,
+            member,
             event_read,
             clock: Mutex::new(ClockGuard::new()),
             buckets: Mutex::new(TokenBuckets::new()),
@@ -200,7 +268,7 @@ impl ReceiverState {
                     .record(Rejection::new(code, key, action), now_ms()),
             );
         }
-        terminal_response(response, replayed, id)
+        terminal_response(response, action, replayed, id)
     }
 
     fn flush(&self, shutdown: bool) {
@@ -247,6 +315,10 @@ pub async fn bind(
         ActionExecutor::with_admission(token.to_owned(), None, admission).map_err(|_| {
             std::io::Error::other("internal-action event executor configuration invalid")
         })?;
+    // Membership shares the same admitted transport as event reads: one
+    // token-wide lane for every Discord send. Cloned before the read wrapper
+    // takes ownership; role hierarchy and add-member PUTs hold the same lane.
+    let member = events.clone();
     let listener = TcpListener::bind(config.listen_addr()).await?;
     Ok(BoundReceiver {
         listener,
@@ -254,6 +326,7 @@ pub async fn bind(
             config,
             pool.clone(),
             Arc::new(executor),
+            Arc::new(member),
             Arc::new(EventReadExecutor::new(events, pool)),
         )),
     })
@@ -431,6 +504,13 @@ async fn receive(state: &ReceiverState, request: Request, id: &str) -> Response 
     if decision.action == "event.read" {
         return read_event(state, &decision, id, key, action).await;
     }
+    // Membership family (M3.10 fam5): validated role-key assignment and
+    // OAuth-backed guild joins share the same nonce/bucket fences above. The
+    // durable claim below is the same store the announcement path uses, so
+    // audit (`intent`/`terminal`) and replay semantics match.
+    if decision.action == "role.assign" || decision.action == "guild.add_member" {
+        return execute_member(state, &decision, headers.idempotency, &raw, id, key, action).await;
+    }
     // This second fence is explicit: core phase-1 defaults are not capabilities.
     if !AnnouncementExecutor::supports(&decision.action) {
         return reject(Failure::code(ErrorCode::ActionNotAllowed), action);
@@ -519,6 +599,234 @@ async fn read_event(
     {
         Ok(result) => event_read_response(result, id),
         Err(error) => reject(Failure::from_action(error.action_error())),
+    }
+}
+
+/// Membership family: `role.assign` resolves a caller-supplied key through the
+/// configured role map (never a raw snowflake), `guild.add_member` carries a
+/// transient OAuth token that never enters audit rows, stored receipts, logs,
+/// or `Debug`. Field validation runs before the durable claim, so malformed
+/// keys and shapes refuse with no Discord call and no idempotency row. The
+/// claim, terminal receipt (`Success{None,0/1}` matching the stored-member
+/// executor), and replay mapping match the announcement path and the
+/// `execute_stored_member` contract: `1` is the applied effect (`assigned` /
+/// `added`), `0` the idempotent no-op (`already_held` / `already_member`).
+/// Only a definitive Discord rejection finishes as `discord_rejected`; every
+/// other post-claim failure (rate-limit, timeout, transport, identity read)
+/// retains the claim as `unknown` (`needs_reconciliation`), never releasing or
+/// retrying the mutation. This is deliberately conservative: local admission
+/// refusals also retain rather than release, so a held lane never grants a
+/// second dispatch under the same intent.
+async fn execute_member(
+    state: &ReceiverState,
+    decision: &AuthDecision,
+    idempotency_header: Option<&str>,
+    raw: &[u8],
+    id: &str,
+    key: KeyLabel,
+    action: ActionLabel,
+) -> Response {
+    let reject = |failure| state.reject(failure, key.clone(), action, id);
+    let idempotency = match validate_idempotency_key(idempotency_header, &decision.action) {
+        Ok(key) => key,
+        Err(error) => return reject(Failure::from_action(error)),
+    };
+    let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+    // Validate before the claim: no Discord call, no idempotency row on bad input.
+    // The `Failure` envelope drops validator text, so untrusted keys and the
+    // OAuth token never reach the wire; `AuthDecision`'s `Debug` already hides
+    // the body.
+    enum Validated {
+        Assign { discord_id: String, role_id: String },
+        Add { discord_id: String },
+    }
+    let validated = match decision.action.as_str() {
+        "role.assign" => {
+            match RoleAssignRequest::validate(&decision.body, state.config.role_keys()) {
+                Ok(request) => Validated::Assign {
+                    discord_id: request.discord_id().to_owned(),
+                    role_id: request.role_id().to_owned(),
+                },
+                Err(error) => return reject(Failure::from_action(error)),
+            }
+        }
+        "guild.add_member" => match GuildAddMemberRequest::validate(&decision.body) {
+            Ok(request) => {
+                // Presence only; the value stays transient for the Discord call
+                // below and is never stored or logged.
+                if require_field_str(&decision.body, "access_token").is_err() {
+                    return reject(Failure::code(ErrorCode::Internal));
+                }
+                Validated::Add {
+                    discord_id: request.discord_id().to_owned(),
+                }
+            }
+            Err(error) => return reject(Failure::from_action(error)),
+        },
+        _ => return reject(Failure::code(ErrorCode::ActionNotAllowed)),
+    };
+    let (target_id, resolved_role_id) = match &validated {
+        Validated::Assign {
+            discord_id,
+            role_id,
+        } => (discord_id.as_str(), Some(role_id.as_str())),
+        Validated::Add { discord_id } => (discord_id.as_str(), None),
+    };
+    let subject = {
+        let guild = match DiscordId::new(guild_id) {
+            Ok(id) => id,
+            Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+        };
+        let target = match DiscordId::new(target_id) {
+            Ok(id) => id,
+            Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+        };
+        let role = match resolved_role_id {
+            Some(role) => match DiscordId::new(role) {
+                Ok(id) => Some(id),
+                Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+            },
+            None => None,
+        };
+        AuditSubject {
+            guild_id: Some(guild),
+            target_id: Some(target),
+            actor_id: None,
+            resolved_role_id: role,
+        }
+    };
+    let Some(caller) = state.config.caller_for(&decision.key_id) else {
+        return reject(Failure::code(ErrorCode::Internal));
+    };
+    let identity = match RequestIdentity::new(caller, idempotency, &decision.action, raw) {
+        Ok(identity) => identity,
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    let claim = match state.store.claim(&identity, &subject).await {
+        Ok(InternalClaim::Claimed(claim)) => claim,
+        Ok(InternalClaim::Replay(response)) => {
+            return state.terminal(response, true, id, key.clone(), action);
+        }
+        Ok(InternalClaim::Mismatch) => {
+            return reject(Failure::code(ErrorCode::VersionConflict));
+        }
+        Ok(InternalClaim::InFlight) => return reject(Failure::code(ErrorCode::InProgress)),
+        Ok(InternalClaim::NeedsReconciliation) => return reject(Failure::reconciliation()),
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    // The claim is committed: every Discord call below runs after it, including
+    // the bot-identity read for the hierarchy check.
+    let outcome = match validated {
+        Validated::Assign { .. } => {
+            let bot_user_id = match state.member.resolve_bot().await {
+                Ok(id) => id,
+                Err(_) => {
+                    let _ = state.store.mark_unknown(&claim).await;
+                    return reject(Failure::reconciliation());
+                }
+            };
+            // Revalidate against the same map the pre-claim check used, so the
+            // request reaching Discord is the pinned allowlist entry, not a
+            // retargeted mid-request edit.
+            let request =
+                match RoleAssignRequest::validate(&decision.body, state.config.role_keys()) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        let _ = state
+                            .store
+                            .finish(
+                                &claim,
+                                &TerminalResponse::Failure(TerminalFailure::Malformed),
+                            )
+                            .await;
+                        return state.terminal(
+                            TerminalResponse::Failure(TerminalFailure::Malformed),
+                            false,
+                            id,
+                            key.clone(),
+                            action,
+                        );
+                    }
+                };
+            state
+                .member
+                .execute_assign(guild_id, &bot_user_id, &request)
+                .await
+        }
+        Validated::Add { .. } => {
+            let request = match GuildAddMemberRequest::validate(&decision.body) {
+                Ok(request) => request,
+                Err(_) => {
+                    let _ = state
+                        .store
+                        .finish(
+                            &claim,
+                            &TerminalResponse::Failure(TerminalFailure::Malformed),
+                        )
+                        .await;
+                    return state.terminal(
+                        TerminalResponse::Failure(TerminalFailure::Malformed),
+                        false,
+                        id,
+                        key.clone(),
+                        action,
+                    );
+                }
+            };
+            // Transient only: cloned for the single Discord PUT, never stored.
+            let token = match require_field_str(&decision.body, "access_token") {
+                Ok(token) => token.to_owned(),
+                Err(_) => {
+                    let _ = state
+                        .store
+                        .finish(
+                            &claim,
+                            &TerminalResponse::Failure(TerminalFailure::Malformed),
+                        )
+                        .await;
+                    return state.terminal(
+                        TerminalResponse::Failure(TerminalFailure::Malformed),
+                        false,
+                        id,
+                        key.clone(),
+                        action,
+                    );
+                }
+            };
+            let result = state.member.execute_add(guild_id, &request, &token).await;
+            // Drop the secret at once; the `String` lives only for this call.
+            drop(token);
+            result
+        }
+    };
+    match outcome {
+        Ok(member_outcome) => {
+            let affected = u32::from(matches!(
+                member_outcome,
+                MemberOutcome::Added | MemberOutcome::Assigned
+            ));
+            let response = TerminalResponse::Success {
+                resource_id: None,
+                affected,
+            };
+            if state.store.finish(&claim, &response).await.is_err() {
+                let _ = state.store.mark_unknown(&claim).await;
+                return reject(Failure::reconciliation());
+            }
+            state.terminal(response, false, id, key.clone(), action)
+        }
+        Err(error) if error.code == ErrorCode::DiscordRejected => {
+            let response = TerminalResponse::Failure(TerminalFailure::DiscordRejected);
+            if state.store.finish(&claim, &response).await.is_err() {
+                let _ = state.store.mark_unknown(&claim).await;
+                return reject(Failure::reconciliation());
+            }
+            state.terminal(response, false, id, key.clone(), action)
+        }
+        Err(_) => {
+            let _ = state.store.mark_unknown(&claim).await;
+            reject(Failure::reconciliation())
+        }
     }
 }
 
@@ -691,7 +999,12 @@ impl Failure {
     }
 }
 
-fn terminal_response(response: TerminalResponse, replayed: bool, id: &str) -> Response {
+fn terminal_response(
+    response: TerminalResponse,
+    action: ActionLabel,
+    replayed: bool,
+    id: &str,
+) -> Response {
     let mut wire = match response {
         TerminalResponse::Success {
             resource_id: Some(message_id),
@@ -700,6 +1013,20 @@ fn terminal_response(response: TerminalResponse, replayed: bool, id: &str) -> Re
             "ok": true, "result": {"message_id": message_id.as_str()}, "request_id": id,
         }))
         .into_response(),
+        // Membership receipts: `None` + `0/1` is the stored-member contract.
+        // `1` applied the effect, `0` is the idempotent no-op. Anything else
+        // (including a message-shaped receipt for a membership action) is a
+        // store inconsistency, never a success.
+        TerminalResponse::Success {
+            resource_id: None,
+            affected,
+        } => match (action.as_str(), affected) {
+            ("role.assign", 1) => member_success("assigned", id),
+            ("role.assign", 0) => member_success("already_held", id),
+            ("guild.add_member", 1) => member_success("added", id),
+            ("guild.add_member", 0) => member_success("already_member", id),
+            _ => Failure::reconciliation().response(id),
+        },
         TerminalResponse::Success { .. } => Failure::reconciliation().response(id),
         TerminalResponse::Failure(failure) => match failure {
             TerminalFailure::Malformed => Failure::code(ErrorCode::Malformed),
@@ -721,6 +1048,16 @@ fn terminal_response(response: TerminalResponse, replayed: bool, id: &str) -> Re
     wire.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     wire
+}
+
+/// Membership success envelope: the legacy `{"outcome": ...}` result object.
+/// Insertion order (`ok`, `result`, `request_id`) matches the stored-member
+/// `success_body` wire contract.
+fn member_success(outcome: &str, id: &str) -> Response {
+    Json(json!({
+        "ok": true, "result": {"outcome": outcome}, "request_id": id,
+    }))
+    .into_response()
 }
 
 fn log_records(records: Vec<RejectionRecord>) {
