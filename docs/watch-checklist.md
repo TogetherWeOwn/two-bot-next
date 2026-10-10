@@ -35,6 +35,7 @@ and the Worker (`packetFilename` in `wrangler/src/alert-rules.ts`).
 | `voice_failures` | room-op failures > 5% of >= 10 ops between samples, or any new dead-letter/orphan | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-failures) |
 | `gateway_missed_events` | any increase of `two_bot_gateway_missed_events_total` between samples (first sample and restarts skip the window) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-gateway-missed-events) |
 | `ticker_stale:<job>` | 15 s ticker with no success for more than 10 minutes (never-succeeded is ignored) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-ticker-stale) |
+| `receiver_refusals:<family>` | refused website-action outcomes grow in 3 consecutive samples per family (first sample and restarts skip the window; `other` holds pre-auth refusals) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-receiver-refusals) |
 
 Out of scope for paging (log-only findings, still recorded on the watch log):
 gateway session starts, handler-latency quantiles, unban-queue depth via

@@ -59,6 +59,8 @@ export const POOL_SATURATED_SAMPLES = 3;
 export const DB_ERROR_MIN_ERRORS = 3;
 /** ...and send-admission refusals must appear in this many consecutive samples. */
 export const SEND_BLOCKED_SAMPLES = 3;
+/** ...and per-family receiver refusals must grow in this many consecutive samples. */
+export const RECEIVER_REFUSAL_SAMPLES = 3;
 /** Voice failures must exceed this share of room operations between two samples... */
 export const VOICE_FAILURE_RATIO = 0.05;
 /** ...and the window must hold at least this many operations. */
@@ -74,7 +76,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "voice_failures", summary: `voice room lifecycle failures exceed ${VOICE_FAILURE_RATIO * 100}% of operations (min ${VOICE_FAILURE_MIN_OPS} ops), or new dead-letters/orphans`, runbook: "runbook.md#alert-voice-failures" },
   { id: "gateway_missed_events", summary: `gateway missed events increased between samples`, runbook: "runbook.md#alert-gateway-missed-events" },
   { id: "ticker_stale", summary: `15 s ticker has no success for more than ${TICKER_STALE_SECONDS / 60} minutes`, runbook: "runbook.md#alert-ticker-stale" },
-  { id: "receiver_refusals", summary: `website-action receiver refusals increased between samples`, runbook: "runbook.md#alert-receiver-refusals" },
+  { id: "receiver_refusals", summary: `website-action receiver refusals grew for ${RECEIVER_REFUSAL_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-receiver-refusals" },
 ];
 
 /**
@@ -109,9 +111,11 @@ export interface MetricsAlertState {
   receiverRefusals: Record<string, number>;
   /** False until the first evaluation stores a baseline: the first sample never fires. */
   receiverRefusalsSeen: boolean;
+  /** Consecutive samples with new refusals, by family: sustained abuse, not one bad tick. */
+  receiverRefusalStreaks: Record<string, number>;
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false };
+export const EMPTY_STATE: MetricsAlertState = { firing: [], rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {} };
 
 export function parseExposition(text: string): Sample[] {
   const samples: Sample[] = [];
@@ -245,10 +249,11 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   const gatewayReset = gatewayMissed < prevGatewayMissed;
   if (gatewaySeen && !gatewayReset && gatewayMissed > prevGatewayMissed) firing.push("gateway_missed_events");
 
-  // Website-action receiver refusals by family: any per-family increase of
-  // refused `two_bot_internal_actions_total` outcomes (every outcome other
-  // than `executed`) between two samples pages, so a receiver-abuse or
-  // refusal storm names its family. The first sample only stores the
+  // Website-action receiver refusals by family: refused
+  // `two_bot_internal_actions_total` outcomes (every outcome other than
+  // `executed`) must grow in consecutive samples before the family's storm
+  // pages, so one forged request or lone pre-auth refusal never pages and a
+  // slow trickle cannot flap the alert. The first sample only stores the
   // baseline and never fires; a per-family counter that went backwards
   // means the process restarted: no window for that family.
   // `??` covers DO storage written before these fields existed.
@@ -260,16 +265,22 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     }
   }
   const prevReceiverRefusals = prev.receiverRefusals ?? {};
+  const prevReceiverStreaks = prev.receiverRefusalStreaks ?? {};
   const receiverSeen = prev.receiverRefusalsSeen ?? false;
+  const receiverRefusalStreaks: Record<string, number> = {};
   if (receiverSeen) {
     for (const [family, count] of Object.entries(receiverRefusals)) {
       const prevCount = prevReceiverRefusals[family] ?? 0;
       // A counter that went backwards means the process restarted: no window.
-      if (count > prevCount) firing.push(`receiver_refusals:${family}`);
+      // Only windows with new refusals extend the streak, so idle windows and
+      // flat trickles never page.
+      const streak = count <= prevCount ? 0 : (prevReceiverStreaks[family] ?? 0) + 1;
+      receiverRefusalStreaks[family] = streak;
+      if (streak >= RECEIVER_REFUSAL_SAMPLES) firing.push(`receiver_refusals:${family}`);
     }
   }
 
-  return { firing, state: { firing, rest429, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, receiverRefusals, receiverRefusalsSeen: true } };
+  return { firing, state: { firing, rest429, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks } };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {

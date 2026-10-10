@@ -68,8 +68,9 @@ Scale to real traffic by replacing 10,000/hour with the observed
 ## Related immediate alerts (not burn)
 
 The fast/slow burn rules above stay silent on a single bad minute by
-design. Three Worker alert rules cover gaps the burn math cannot see, and
-page immediately rather than consuming budget:
+design. Three Worker alert rules cover gaps the burn math cannot see
+without consuming budget (the first two page immediately; receiver
+refusals need a three-window streak so one forged request never pages):
 
 - `gateway_missed_events`: any increase of
   `two_bot_gateway_missed_events_total` between two keepalive samples
@@ -80,10 +81,11 @@ page immediately rather than consuming budget:
   success for more than 10 minutes pages at once, because skipped busy
   deadlines are neither success nor failure and never spend burn budget.
   Runbook: [runbook](runbook.md#alert-ticker-stale).
-- `receiver_refusals:<family>`: any per-family increase of refused
-  `two_bot_internal_actions_total` outcomes between two keepalive samples
-  pages at once (zero threshold), because a receiver-abuse or refusal
-  storm stays quiet through the burn math. Runbook:
+- `receiver_refusals:<family>`: refused
+  `two_bot_internal_actions_total` outcomes grow in 3 consecutive
+  keepalive samples per family, because a receiver-abuse or refusal
+  storm stays quiet through the burn math while a single refusal must
+  not page. Runbook:
   [runbook](runbook.md#alert-receiver-refusals).
 
 None of these rules changes the burn thresholds, windows or budget above.
