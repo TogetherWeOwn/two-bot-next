@@ -103,6 +103,21 @@ pub fn plan_apply(
     }
 }
 
+/// Bind an `--apply` run to the dry run the Operator reviewed, the way
+/// `/import` Confirm is bound to its preview: the plan's content hash covers
+/// (`current`, `candidate`), so any configuration change since the dry run, or
+/// a different file, yields a different hash and refuses before any write.
+pub fn check_expected_hash(plan_hash: &str, expected: Option<&str>) -> Result<(), String> {
+    match expected {
+        Some(expected) if expected == plan_hash => Ok(()),
+        Some(_) => Err(
+            "the configuration or the file changed since the dry run (hash mismatch); nothing was changed, re-run the dry run"
+                .to_owned(),
+        ),
+        None => Err("--apply needs --expect-hash from the reviewed dry run".to_owned()),
+    }
+}
+
 /// Trusted inventory from Discord REST reads, built like the bot's
 /// `inventory_from_cache`: text, voice, stage and category channels of this
 /// guild only (a channel reporting another guild is left out), plus the
@@ -344,6 +359,62 @@ mod tests {
             }
             other => panic!("expected Changes, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn apply_is_bound_to_the_reviewed_dry_run_hash() {
+        let current = empty_config();
+        let ApplyPlan::Changes { hash, .. } =
+            plan_apply(&current, &with_creator(VOICE, "Room ##"), &inventory())
+        else {
+            panic!("expected Changes");
+        };
+        assert!(check_expected_hash(&hash, Some(&hash)).is_ok());
+        assert!(check_expected_hash(&hash, None).is_err());
+        assert!(check_expected_hash(&hash, Some("0000000000000000")).is_err());
+    }
+
+    #[test]
+    fn a_concurrent_change_after_the_dry_run_changes_the_hash() {
+        let current = empty_config();
+        let ApplyPlan::Changes { hash: reviewed, .. } =
+            plan_apply(&current, &with_creator(VOICE, "Room ##"), &inventory())
+        else {
+            panic!("expected Changes");
+        };
+        // Someone renames the generator template between dry run and apply.
+        let ApplyPlan::Changes {
+            candidate: changed, ..
+        } = plan_apply(&current, &with_creator(VOICE, "Other ##"), &inventory())
+        else {
+            panic!("expected Changes");
+        };
+        let ApplyPlan::Changes {
+            hash: replanned, ..
+        } = plan_apply(&changed, &with_creator(VOICE, "Room ##"), &inventory())
+        else {
+            panic!("expected Changes");
+        };
+        assert_ne!(reviewed, replanned);
+        assert!(check_expected_hash(&replanned, Some(&reviewed)).is_err());
+    }
+
+    #[test]
+    fn non_canonical_live_guild_spellings_are_not_snowflakes() {
+        // The binary takes --guild through `cli::require_guild`, whose
+        // canonical check refuses these before the live-guild fence compares.
+        for spelling in [
+            "0326474832151838730",
+            "+326474832151838730",
+            " 326474832151838730",
+        ] {
+            assert!(!crate::is_snowflake(spelling), "{spelling}");
+            assert_eq!(
+                spelling.trim().trim_start_matches('+').parse::<u64>().ok(),
+                Some(326_474_832_151_838_730)
+            );
+        }
+        assert!(crate::is_snowflake(crate::LIVE_GUILD_ID));
     }
 
     #[test]

@@ -5,11 +5,12 @@
 //! `voice-config-apply --guild <id> --file <v11.json>` reads a trusted guild
 //! inventory from Discord (channels, roles, members; never from the file),
 //! snapshots the stored configuration, and prints the same diff `/import`
-//! would preview. It writes nothing unless `--apply` is passed; the write is
-//! `PgVoiceConfigStore::apply` with the printed snapshot as its
-//! compare-and-swap expectation, so a guild that changed in between refuses
-//! (exit 3) instead of being overwritten. The live guild needs
-//! `--allow-live-guild`.
+//! would preview, with its content hash. It writes nothing unless `--apply`
+//! is passed with `--expect-hash` set to the hash of the reviewed dry run, so
+//! a configuration that changed after the dry run refuses (exit 3) instead of
+//! being overwritten. The write is `PgVoiceConfigStore::apply`, whose
+//! compare-and-swap also refuses a change between this run's snapshot and the
+//! write. The live guild needs `--allow-live-guild`.
 //!
 //! Env: `DISCORD_TOKEN` (or `DISCORD_BOT_TOKEN`), `TWO_DATABASE_URL`.
 
@@ -18,15 +19,18 @@
 
 use twilight_model::id::Id;
 use two_bot_core::voice_config_diff::diff_configuration;
-use two_bot_cutover::cli::{open_db, Args};
-use two_bot_cutover::voice_config_apply::{inventory_from_rest, plan_apply, ApplyPlan};
+use two_bot_cutover::cli::{open_db, require_guild, Args};
+use two_bot_cutover::voice_config_apply::{
+    check_expected_hash, inventory_from_rest, plan_apply, ApplyPlan,
+};
 use two_bot_cutover::voice_config_store::PgVoiceConfigStore;
 use two_bot_cutover::RestClient;
 
-const USAGE: &str = "Usage: voice-config-apply --guild <id> --file <v11.json> [--apply] \
-[--allow-live-guild] [--discord-base <url>]\n\
-Prints the /import diff for the file against the stored voice configuration.\n\
-Writes only with --apply. Env: DISCORD_TOKEN (or DISCORD_BOT_TOKEN), TWO_DATABASE_URL.";
+const USAGE: &str = "Usage: voice-config-apply --guild <id> --file <v11.json> \
+[--apply --expect-hash <hash>] [--allow-live-guild] [--discord-base <url>]\n\
+Prints the /import diff and its hash for the file against the stored voice configuration.\n\
+Writes only with --apply, and only when --expect-hash equals the hash of the reviewed dry run.\n\
+Env: DISCORD_TOKEN (or DISCORD_BOT_TOKEN), TWO_DATABASE_URL.";
 
 fn usage_error(message: &str) -> ! {
     eprintln!("voice-config-apply: {message}\n{USAGE}");
@@ -66,7 +70,10 @@ async fn main() {
         return;
     }
     for key in args.values.keys() {
-        if !matches!(key.as_str(), "guild" | "file" | "discord-base") {
+        if !matches!(
+            key.as_str(),
+            "guild" | "file" | "discord-base" | "expect-hash"
+        ) {
             usage_error(&format!("unknown argument --{key}"));
         }
     }
@@ -78,28 +85,22 @@ async fn main() {
     if !args.positionals.is_empty() {
         usage_error("unexpected positional argument");
     }
-    let guild = args
-        .get("guild")
-        .unwrap_or_else(|| usage_error("--guild is required"))
-        .to_owned();
+    // Canonical snowflake first (no sign, no leading zero), so the live-guild
+    // fence and every later read/write see the same id.
+    let guild = require_guild(&args, "guild");
     let guild_id: u64 = guild
         .parse()
-        .ok()
-        .filter(|id| *id != 0)
-        .unwrap_or_else(|| usage_error("--guild must be a Discord snowflake"));
-    if guild == two_bot_cutover::LIVE_GUILD_ID && !args.has("allow-live-guild") {
-        eprintln!(
-            "voice-config-apply: refusing live guild {}. Use --allow-live-guild only for an approved cutover.",
-            two_bot_cutover::LIVE_GUILD_ID
-        );
-        std::process::exit(2);
-    }
+        .unwrap_or_else(|_| usage_error("--guild must be a Discord snowflake"));
     let path = args
         .get("file")
         .unwrap_or_else(|| usage_error("--file is required"))
         .to_owned();
     let bytes = std::fs::read(&path).unwrap_or_else(|_| fail("cannot read --file"));
     let apply = args.has("apply");
+    let expected_hash = args.values.get("expect-hash").cloned();
+    if apply && expected_hash.is_none() {
+        usage_error("--apply needs --expect-hash <hash> from the reviewed dry run");
+    }
 
     // Trusted inventory first: a partial read refuses rather than validating
     // against an incomplete guild.
@@ -179,6 +180,16 @@ async fn main() {
         report["changes"] = serde_json::json!(change_count);
         report["hash"] = serde_json::json!(hash);
         if apply {
+            if let Err(message) = check_expected_hash(hash, expected_hash.as_deref()) {
+                report["status"] = serde_json::json!("conflict");
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).unwrap_or_default()
+                );
+                eprintln!("voice-config-apply: {message}");
+                db.close().await;
+                std::process::exit(3);
+            }
             match store.apply(guild_id, candidate, &current).await {
                 Ok(()) => {
                     let after = store
