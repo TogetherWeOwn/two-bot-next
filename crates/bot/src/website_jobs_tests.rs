@@ -1107,9 +1107,9 @@ async fn rank_tick_missing_rung_names_the_rung_and_writes_nothing() {
             .bind(guild).bind((9100 + index).to_string()).bind(start).execute(&pool).await.unwrap();
     }
     // Distinctive fixture ids plus injection text: none may reach the log.
-    // Note: the probe id is deliberately not a 17-20 digit snowflake so the
-    // snowflake gate (scripts/ci/check-src-snowflakes.py) stays clean.
-    let probe_id = "probe-9999";
+    // Note: the probe id is a short numeric id so `snowflake()` parses it
+    // while the snowflake gate (only 17-20 digit literals) stays clean.
+    let probe_id = "79999";
     let probe_name = "ladder-probe-evil-<script>alert(1)</script>";
     let members = json!([member(1000, false, &["11"])]);
     let roles = json!({"roles": [
