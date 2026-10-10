@@ -1697,38 +1697,68 @@ async fn moderation_executor_enabled_rejects_invalid_gates() {
 }
 
 #[tokio::test]
-async fn unwired_moderation_verbs_stay_refused_with_flags_on() {
+async fn all_nine_moderation_verbs_pass_admission_with_flags_on() {
     let Some(db) = database().await else { return };
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let moderation = Arc::new(MockModeration::default());
+    let channel = Arc::new(MockChannel::default());
+    let app = router(state_full_with_channel(
+        db.pool().clone(),
+        effect.clone(),
+        Arc::new(MockEventRead::default()),
+        moderation.clone(),
+        channel.clone(),
+    ));
     let _flag = MODERATION_FLAG_LOCK.lock().await;
     set_moderation_flags(true);
-    let moderation = Arc::new(MockModeration::default());
-    let app = moderation_app(db.pool().clone(), moderation.clone());
-    // The channel verbs belong to the channel family slice and stay refused.
-    for (verb, extra) in [
-        ("moderation.purge", serde_json::json!({"count": 10})),
-        ("moderation.slowmode", serde_json::json!({"seconds": 5})),
-        ("moderation.lockdown", serde_json::json!({})),
-        ("moderation.unlock", serde_json::json!({})),
+    // Both families are wired now: the five member verbs and the four
+    // channel verbs all pass the action_not_allowed gate. Per-verb outcomes
+    // live in the family happy-path tests; this pins the dispatch union so a
+    // future merge cannot silently drop a verb back to refused.
+    for action in [
+        "moderation.ban",
+        "moderation.tempban",
+        "moderation.kick",
+        "moderation.warn",
+        "moderation.timeout",
     ] {
         let (status, _, body) = answer(
             app.clone(),
             signed(
-                &moderation_payload_with(verb, extra),
+                &moderation_payload(action),
                 "old",
-                &format!("intent-unwired-{verb}"),
+                &format!("intent-all-wired-{action}"),
             ),
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{verb}");
-        assert_eq!(body["error"]["code"], "action_not_allowed", "{verb}");
-        assert_eq!(body["error"]["retryable"], false, "{verb}");
+        assert_eq!(status, StatusCode::OK, "{action}");
+        assert_ne!(body["error"]["code"], "action_not_allowed", "{action}");
+    }
+    for action in [
+        "moderation.purge",
+        "moderation.slowmode",
+        "moderation.lockdown",
+        "moderation.unlock",
+    ] {
+        let (status, _, body) = answer(
+            app.clone(),
+            signed(
+                &channel_payload(action),
+                "old",
+                &format!("intent-all-wired-{action}"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{action}");
+        assert_ne!(body["error"]["code"], "action_not_allowed", "{action}");
     }
     set_moderation_flags(false);
     assert_eq!(
         moderation.calls(),
-        0,
-        "unwired verbs never reach the effect"
+        5,
+        "member verbs reach the member effect"
     );
+    assert_eq!(channel.calls(), 4, "channel verbs reach the channel effect");
     db.close().await.unwrap();
 }
 
