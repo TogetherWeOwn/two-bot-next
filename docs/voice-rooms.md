@@ -223,6 +223,11 @@ library code with no Discord dependency and can start immediately.
   UTC), English names.
 - `@@random_emoji@@`, `[[a/b/c]]` and `[[list:name]]` (named lists from guild
   settings) are rolled from a per-room seed stored at creation and never re-rolled.
+  The seed is chosen so a new room's first name (rendered for the joiner alone,
+  with their presence) differs from every live voice channel name and from the
+  guild's last three first names, case-insensitively. Up to eight seeds are tried;
+  a pool too small to vary keeps the drawn seed. The memory is per guild and
+  in-process: a restart starts it empty.
 
 **Resting / in-use names**
 
