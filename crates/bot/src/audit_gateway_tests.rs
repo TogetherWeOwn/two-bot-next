@@ -29,7 +29,7 @@ use twilight_model::{
     util::Timestamp,
     voice::VoiceState,
 };
-use two_bot_core::audit::{AuditChannelIds, AuditEvent, AuditKind};
+use two_bot_core::audit::{AuditEvent, AuditKind};
 use two_bot_core::audit_mirror::{MirrorChannel, MirrorError, MirrorMessage, MirrorOverwrite};
 use two_bot_core::audit_store::AuditStore;
 use two_bot_core::classify::ModerationAuditAction;
@@ -546,14 +546,6 @@ impl two_bot_core::audit_mirror::AuditMirror for NoopMirror {
         _limit: u8,
     ) -> Result<Vec<MirrorMessage>, MirrorError> {
         Ok(vec![])
-    }
-}
-
-fn channels() -> AuditChannelIds {
-    AuditChannelIds {
-        audit: Some("1111".to_owned()),
-        voice: Some("2222".to_owned()),
-        moderation: Some("3333".to_owned()),
     }
 }
 
