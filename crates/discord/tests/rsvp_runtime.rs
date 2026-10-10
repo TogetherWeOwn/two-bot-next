@@ -84,6 +84,11 @@ fn event(status: u64) -> ScriptedResponse {
     )
 }
 
+/// RA-01 live-membership evidence: the member currently belongs to the guild.
+fn member(user: &str) -> ScriptedResponse {
+    ScriptedResponse::json(200, json!({"user": {"id": user}, "roles": []}))
+}
+
 /// RA-02 anchored occurrence: the live event plus a repeat label. Bare slugs
 /// name no anchorable event and refuse, so valid fixtures always anchor.
 fn anchored(label: &str) -> String {
@@ -234,16 +239,21 @@ async fn transitions_totals_and_audits_round_trip_through_router() {
     let mock = MockRest::start(
         vec![
             // Deferred edits require ID-bearing 200 receipts (executor mutation_receipt_id).
+            // RA-01 order per RSVP: ack, live-membership GET, live-event GET, edit.
             ScriptedResponse::status(204),
+            member(USER),
             event(1),
             ScriptedResponse::json(200, json!({"id": "99"})),
             ScriptedResponse::status(204),
+            member(USER),
             event(2),
             ScriptedResponse::json(200, json!({"id": "99"})),
             ScriptedResponse::status(204),
+            member(USER),
             event(3),
             ScriptedResponse::json(200, json!({"id": "99"})),
             ScriptedResponse::status(204),
+            member(USER),
             event(1),
             ScriptedResponse::json(200, json!({"id": "99"})),
             ScriptedResponse::status(204),
@@ -303,16 +313,21 @@ async fn transitions_totals_and_audits_round_trip_through_router() {
         );
     }
     let requests = mock.requests();
-    assert_eq!(requests.len(), 14);
-    assert_eq!(requests[12].method, "POST");
-    assert_eq!(requests[13].method, "PATCH");
-    for chunk in requests[..12].chunks(3) {
+    assert_eq!(requests.len(), 18);
+    assert_eq!(requests[16].method, "POST");
+    assert_eq!(requests[17].method, "PATCH");
+    for chunk in requests[..16].chunks(4) {
         let ack: Value = serde_json::from_slice(&chunk[0].body).unwrap();
         assert_eq!(ack["type"], 5);
         assert_eq!(ack["data"]["flags"], 64);
         assert_eq!(chunk[1].method, "GET");
         assert_eq!(
             chunk[1].path,
+            format!("/api/v10/guilds/{GUILD}/members/{USER}")
+        );
+        assert_eq!(chunk[2].method, "GET");
+        assert_eq!(
+            chunk[2].path,
             format!("/api/v10/guilds/{GUILD}/scheduled-events/{EVENT}")
         );
     }
@@ -362,6 +377,9 @@ async fn missing_cancelled_and_malformed_events_refuse_without_writes() {
         let mock = MockRest::start(
             vec![
                 ScriptedResponse::status(204),
+                // RA-01: the membership gate passes here, then the event lookup
+                // refuses; both precede any mutation or audit write.
+                member(USER),
                 lookup,
                 // Refusal text is still delivered as a deferred edit: ID receipt required.
                 ScriptedResponse::json(200, json!({"id": "99"})),
@@ -371,7 +389,73 @@ async fn missing_cancelled_and_malformed_events_refuse_without_writes() {
         .await;
         run(fixture.pool(), &mock, &rsvp(200, "going")).await;
         assert_reply(&mock, reply, true);
-        assert_eq!(mock.requests().len(), 3);
+        assert_eq!(mock.requests().len(), 4);
+        assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
+        mock.shutdown().await;
+    }
+    fixture.close().await;
+}
+
+/// RA-01: a departed acting member (404 membership read) is refused before
+/// the event lookup runs, with zero RSVP/audit writes.
+#[tokio::test]
+async fn rsvp_refuses_departed_member_before_event_lookup() {
+    let Some(fixture) = pool().await else {
+        return;
+    };
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            ScriptedResponse::status(404),
+            ScriptedResponse::json(200, json!({"id": "99"})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    run(fixture.pool(), &mock, &rsvp(210, "going")).await;
+    assert_reply(&mock, "You are no longer a member of this server.", true);
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(requests
+        .iter()
+        .all(|r| !r.path.contains("scheduled-events")));
+    assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
+    mock.shutdown().await;
+    fixture.close().await;
+}
+
+/// RA-01: a failed membership lookup (denied, malformed evidence, or a
+/// wrong-user echo) fails closed with zero writes, never treated as absence
+/// or success.
+#[tokio::test]
+async fn rsvp_membership_lookup_failure_fails_closed() {
+    let Some(fixture) = pool().await else {
+        return;
+    };
+    for broken in [
+        ScriptedResponse::status(403),
+        ScriptedResponse {
+            body: b"invalid-json".to_vec(),
+            ..ScriptedResponse::status(200)
+        },
+        ScriptedResponse::json(200, json!({"user": {"id": OTHER}, "roles": []})),
+    ] {
+        let mock = MockRest::start(
+            vec![
+                ScriptedResponse::status(204),
+                broken,
+                ScriptedResponse::json(200, json!({"id": "99"})),
+            ],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        run(fixture.pool(), &mock, &rsvp(220, "going")).await;
+        assert_reply(&mock, "Unable to verify server membership.", true);
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests
+            .iter()
+            .all(|r| !r.path.contains("scheduled-events")));
         assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
         mock.shutdown().await;
     }
@@ -510,12 +594,14 @@ async fn host_checkin_authorized_self_and_on_behalf_retain_host_checkin_proof() 
     let Some(fixture) = pool().await else {
         return;
     };
-    // RA-02 authorized paths: self-select (the invoker USER is also the
-    // target) and on-behalf (OTHER) both pass the Manage Events gate, resolve
-    // through the live guild event, verify live membership, and record with
-    // `host_checkin` proof — self-select neither bypasses authority nor
-    // downgrades the proof. Each check-in is one 204 callback, one live-event
-    // GET, one live-member GET, and one ID-bearing 200 deferred edit.
+    // Union sequences: self-select and on-behalf check-ins both pass the
+    // Manage Events gate, resolve through the live guild event, verify live
+    // membership, and record with `host_checkin` proof. Each check-in is one
+    // 204 callback, one live-event GET, live-member GET(s), and one
+    // ID-bearing 200 deferred edit. Self check-ins skip the RA-01
+    // acting-host lookup (the live target read verifies the same
+    // membership); the on-behalf check-in (actor USER, target OTHER) adds
+    // the host membership GET between the event and target reads.
     let occ = anchored("2026-09-30");
     let mock = MockRest::start(
         vec![
@@ -529,6 +615,7 @@ async fn host_checkin_authorized_self_and_on_behalf_retain_host_checkin_proof() 
             ScriptedResponse::json(200, json!({"id": "99"})),
             ScriptedResponse::status(204),
             event(1),
+            member(USER),
             member_get(OTHER, Some(true)),
             ScriptedResponse::json(200, json!({"id": "99"})),
             ScriptedResponse::status(204),
@@ -608,25 +695,131 @@ async fn host_checkin_authorized_self_and_on_behalf_retain_host_checkin_proof() 
         json!({"eventOccurrenceId": next, "proof": "host_checkin"})
     );
     // Every check-in proved its occurrence against the live guild event and
-    // its target against live membership, in that order.
+    // its target against live membership, in that order; the on-behalf
+    // check-in additionally proved the acting host between the two.
     let requests = mock.requests();
-    assert_eq!(requests.len(), 16);
+    assert_eq!(requests.len(), 17);
     let gets: Vec<_> = requests.iter().filter(|r| r.method == "GET").collect();
-    assert_eq!(gets.len(), 8);
-    for (i, chunk) in gets.chunks(2).enumerate() {
-        assert_eq!(
-            chunk[0].path,
-            scheduled_event_path(EVENT),
-            "check-in {i} event"
-        );
-    }
+    assert_eq!(gets.len(), 9);
+    assert_eq!(gets[0].path, scheduled_event_path(EVENT));
     assert_eq!(gets[1].path, guild_member_path(USER));
+    assert_eq!(gets[2].path, scheduled_event_path(EVENT));
     assert_eq!(gets[3].path, guild_member_path(USER));
-    assert_eq!(gets[5].path, guild_member_path(OTHER));
-    assert_eq!(gets[7].path, guild_member_path(USER));
+    assert_eq!(gets[4].path, scheduled_event_path(EVENT));
+    assert_eq!(gets[5].path, guild_member_path(USER));
+    assert_eq!(gets[6].path, guild_member_path(OTHER));
+    assert_eq!(gets[7].path, scheduled_event_path(EVENT));
+    assert_eq!(gets[8].path, guild_member_path(USER));
     assert_eq!(counts(fixture.pool()).await, (0, 0, 3));
     fixture.close().await;
     mock.shutdown().await;
+}
+
+/// RA-01 host gate on the RA-02 trusted path: a departed acting host, a
+/// departed target, and failed membership lookups refuse with zero attendance
+/// writes. Occurrences anchor to the live event first, so every case binds
+/// the event and then fails at the membership read. A self check-in skips
+/// the host lookup — the live target read verifies the same membership —
+/// while on-behalf check-ins prove the host between the event and target
+/// reads.
+#[tokio::test]
+async fn host_checkin_membership_gates_precede_attendance_writes() {
+    let Some(fixture) = pool().await else {
+        return;
+    };
+    let occ = anchored("2026-09-30");
+    // Departed self host: event binds, then the live target read 404s and the
+    // refusal edit follows. No host lookup runs for a self check-in.
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            event(1),
+            ScriptedResponse::status(404),
+            ScriptedResponse::json(200, json!({"id": "99"})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    run(
+        fixture.pool(),
+        &mock,
+        &attendance(410, MANAGE_EVENTS, USER, &occ),
+    )
+    .await;
+    assert_reply(&mock, "That member is not in this server.", true);
+    assert_eq!(mock.requests().len(), 4);
+    assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
+    mock.shutdown().await;
+    // Departed target: event binds, actor passes the host gate, target 404s,
+    // then the refusal edit.
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            event(1),
+            member(USER),
+            ScriptedResponse::status(404),
+            ScriptedResponse::json(200, json!({"id": "99"})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    run(
+        fixture.pool(),
+        &mock,
+        &attendance(411, MANAGE_EVENTS, OTHER, &occ),
+    )
+    .await;
+    assert_reply(&mock, "That member is not in this server.", true);
+    assert_eq!(mock.requests().len(), 5);
+    assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
+    mock.shutdown().await;
+    // Failed host lookup: malformed evidence fails closed with zero writes.
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            event(1),
+            ScriptedResponse {
+                body: b"invalid-json".to_vec(),
+                ..ScriptedResponse::status(200)
+            },
+            ScriptedResponse::json(200, json!({"id": "99"})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    run(
+        fixture.pool(),
+        &mock,
+        &attendance(412, MANAGE_EVENTS, OTHER, &occ),
+    )
+    .await;
+    assert_reply(&mock, "Unable to verify server membership.", true);
+    assert_eq!(mock.requests().len(), 4);
+    assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
+    mock.shutdown().await;
+    // Failed target lookup: wrong-user echo fails closed with zero writes.
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            event(1),
+            member(USER),
+            ScriptedResponse::json(200, json!({"user": {"id": USER}, "roles": []})),
+            ScriptedResponse::json(200, json!({"id": "99"})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    run(
+        fixture.pool(),
+        &mock,
+        &attendance(413, MANAGE_EVENTS, OTHER, &occ),
+    )
+    .await;
+    assert_reply(&mock, "Unable to verify attendance member.", true);
+    assert_eq!(mock.requests().len(), 5);
+    assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
+    mock.shutdown().await;
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -808,7 +1001,8 @@ async fn non_member_and_unverifiable_targets_refuse_without_writes() {
     };
     // RA-02 target membership: the resolved User proves identity, not
     // membership. Departed, cross-guild and unverifiable targets refuse after
-    // a successful occurrence binding, writing zero rows.
+    // a successful occurrence binding, writing zero rows. The acting host
+    // passes the RA-01 gate first, so every case carries its host lookup.
     let occ = anchored("2026-09-30");
     let cases: Vec<(ScriptedResponse, &str)> = vec![
         // Departed, never-joined or cross-guild target.
@@ -837,6 +1031,7 @@ async fn non_member_and_unverifiable_targets_refuse_without_writes() {
             vec![
                 ScriptedResponse::status(204),
                 event(1),
+                member(USER),
                 member_lookup,
                 ScriptedResponse::json(200, json!({"id": "99"})),
             ],
@@ -853,15 +1048,17 @@ async fn non_member_and_unverifiable_targets_refuse_without_writes() {
         let requests = mock.requests();
         assert_eq!(
             requests.len(),
-            4,
-            "callback, event lookup, member lookup, edit"
+            5,
+            "callback, event lookup, host lookup, member lookup, edit"
         );
         assert_eq!(requests[0].method, "POST");
         assert_eq!(requests[1].method, "GET");
         assert_eq!(requests[1].path, scheduled_event_path(EVENT));
         assert_eq!(requests[2].method, "GET");
-        assert_eq!(requests[2].path, guild_member_path(OTHER));
-        assert_eq!(requests[3].method, "PATCH");
+        assert_eq!(requests[2].path, guild_member_path(USER));
+        assert_eq!(requests[3].method, "GET");
+        assert_eq!(requests[3].path, guild_member_path(OTHER));
+        assert_eq!(requests[4].method, "PATCH");
         assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
         mock.shutdown().await;
     }
@@ -879,6 +1076,8 @@ async fn failed_final_reply_does_not_retry_committed_effects() {
     let mock = MockRest::start(
         vec![
             ScriptedResponse::status(204),
+            // RA-01 membership GET precedes the live-event lookup on mutations.
+            member(USER),
             event(1),
             ScriptedResponse::status(500),
             // Discord refuses a repeated acknowledgement for the same interaction.
@@ -900,17 +1099,19 @@ async fn failed_final_reply_does_not_retry_committed_effects() {
     let interaction = rsvp(600, "going");
     assert!(runtime.handle(&interaction).await.is_err());
     assert_eq!(counts(fixture.pool()).await, (1, 1, 0));
-    assert_eq!(mock.requests().len(), 3);
+    assert_eq!(mock.requests().len(), 4);
     assert!(runtime.handle(&interaction).await.is_err());
     assert_eq!(counts(fixture.pool()).await, (1, 1, 0));
-    assert_eq!(mock.requests().len(), 4);
+    assert_eq!(mock.requests().len(), 5);
 
     assert!(runtime
         .handle(&attendance(601, MANAGE_EVENTS, USER, &occ))
         .await
         .is_err());
     assert_eq!(counts(fixture.pool()).await, (1, 1, 1));
-    assert_eq!(mock.requests().len(), 8);
+    // Union sequence is callback, live-event GET, live-member GET, failed
+    // edit: one more request than the pre-RA-02 free-text path.
+    assert_eq!(mock.requests().len(), 9);
     assert!(runtime
         .handle(&attendance(602, MANAGE_EVENTS, USER, &occ))
         .await

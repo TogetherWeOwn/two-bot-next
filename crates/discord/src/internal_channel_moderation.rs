@@ -91,6 +91,24 @@ impl InternalChannelRequest {
             "durationSeconds": self.duration_seconds, "count": self.count, "seconds": self.seconds,
         }).to_string().as_bytes())
     }
+
+    /// Website receiver accessors: the HTTP layer owns auth, claims and audit
+    /// subjects and must read the validated routing fields without reaching
+    /// into executor internals.
+    #[must_use]
+    pub fn action(&self) -> ModerationAction {
+        self.action
+    }
+
+    #[must_use]
+    pub fn actor_id(&self) -> &str {
+        &self.actor_id
+    }
+
+    #[must_use]
+    pub fn channel_id(&self) -> &str {
+        &self.channel_id
+    }
 }
 
 /// Runtime-only configuration. `enabled` must reflect BOTH TWO_MODERATION and
