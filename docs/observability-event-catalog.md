@@ -27,6 +27,7 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `cold resume committed; requesting voice snapshot via identify` | `crates/bot/src/gateway.rs:362` | Cold voice RESUME committed; reception IDENTIFies for a fresh voice snapshot |
 | `gateway ready; checkpoint committed` | `crates/bot/src/gateway.rs:671` | Dispatch committed and shard marked Connected |
 | `gateway leveling dispatch failed` | `crates/bot/src/gateway.rs:609` | Leveling funnel drain failed inside the checkpoint deadline |
+| `gateway community facts drain failed` | `crates/bot/src/gateway.rs:959` | Community facts drain failed after the funnel rows; warn-only, the scorecard fails closed on the lost fact |
 | `onboarding interaction interrupted; member must reselect` | `crates/bot/src/gateway.rs:791` | Durable onboarding job recovered without callback credentials; kept as interruption receipt |
 | `invite counter read unavailable; retaining snapshot` | `crates/bot/src/gateway.rs:899` | REST invite read failed; persisted baseline kept instead of an empty listing |
 | `interaction acknowledgement blocked; advancing past lost callback` | `crates/bot/src/gateway.rs:287` | Ordered RSVP acknowledgement hit send-admission Blocked; checkpoint advances past the lost callback without replaying uncertain effects |
