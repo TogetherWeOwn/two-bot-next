@@ -33,8 +33,9 @@ library code with no Discord dependency and can start immediately.
   That member is the room's **owner** and **original creator**.
 - New rooms copy bitrate, RTC region, video quality, NSFW flag and default user
   limit from their creator channel.
-- Ordinary rooms are eligible for deletion after 60 continuous human-empty
-  seconds (bots don't count; unknown bot identity counts as human). A human join
+- Ordinary rooms are eligible for deletion after the empty grace (60 continuous
+  human-empty seconds unless `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` sets it; bots
+  don't count; unknown bot identity counts as human). A human join
   cancels the deadline; a later leave starts a full grace, even between ticks.
   Reconnect snapshots start a fresh grace rather than counting disconnected time.
   If someone deletes a room by hand, the bot quietly forgets it.
@@ -44,8 +45,9 @@ library code with no Discord dependency and can start immediately.
   `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID`, `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID`,
   `TWO_TEMP_VOICE_CATEGORY_ID` and comma-separated `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS`
   supply additional protection; malformed IDs disable the voice runtime. Stored
-  settings remain unwired. `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` is not consumed:
-  this safety grace is fixed at 60 seconds.
+  settings remain unwired. `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` (0 to 600, read
+  at boot) sets the empty grace; unset keeps 60 seconds. `0` deletes a room on
+  the next tick after its last human leaves, matching the interim voice bot.
 - If the member can't be moved in (missing Move Members, or they left first), the
   bot deletes the room immediately.
 - If the bot loses access to a room (View Channel, Connect, Manage Channels or Move
@@ -57,7 +59,7 @@ library code with no Discord dependency and can start immediately.
   settings". Anyone can view it; actions need admin.
 - **Accept when:**
   - Each join produces exactly one room, the member ends up in it, and the room is
-    deleted within a timer tick of the 60-second empty grace expiring.
+    deleted within a timer tick of the configured empty grace expiring.
   - Two members joining at the same moment get two rooms.
   - After a restart, the bot reconciles tracked rooms against the channels that
     actually exist and cleans up the empty ones.

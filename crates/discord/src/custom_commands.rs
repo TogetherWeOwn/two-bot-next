@@ -56,6 +56,10 @@ pub enum CustomCommandError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextCommandOutcome {
     Ignored,
+    /// The automod verdict refused the create before any trigger lookup.
+    /// Telemetry counts this separately from [`Self::Ignored`]; dispatch
+    /// still sends nothing, like ignored.
+    Refused,
     /// A distinct candidate from this actor is within the local window.
     CoolingDown,
     /// A prior invocation may have sent a reply. Never resend automatically.
@@ -291,6 +295,27 @@ impl CustomCommandRuntime {
         }
     }
 
+    /// Record a refused prefix candidate when the gateway worker rejects a
+    /// message before detached command dispatch. This is telemetry only: it
+    /// never performs a lookup or starts automation work.
+    pub fn record_refused_prefix_trigger(&self, message: &Message, text_commands_enabled: bool) {
+        let in_scope = message.guild_id.is_some()
+            && message.guild_id.map(|id| id.get()) == self.router.gates().configured_guild
+            && message.webhook_id.is_none();
+        if in_scope
+            && accepted_text_trigger(
+                self.router.gates().automations,
+                text_commands_enabled,
+                message.author.bot,
+                &message.content,
+                &builtin_command_names(),
+            )
+            .is_some()
+        {
+            two_bot_core::metrics::global().prefix_trigger_refused("verdict");
+        }
+    }
+
     /// Called with an explicit moderation acceptance, never a default. Never
     /// derive acceptance from MessageCreate, funnel capture, or whether
     /// deletion succeeded. Unknown errors fail closed (unlike the legacy
@@ -302,8 +327,11 @@ impl CustomCommandRuntime {
         text_commands_enabled: bool,
         guild_name: Option<&str>,
     ) -> Result<TextCommandOutcome, CustomCommandError> {
-        if !acceptance.permits_automations()
-            || message.guild_id.is_none()
+        if !acceptance.permits_automations() {
+            self.record_refused_prefix_trigger(message, text_commands_enabled);
+            return Ok(TextCommandOutcome::Refused);
+        }
+        if message.guild_id.is_none()
             || message.guild_id.map(|id| id.get()) != self.router.gates().configured_guild
             || message.webhook_id.is_some()
         {

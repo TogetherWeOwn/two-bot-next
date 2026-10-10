@@ -17,8 +17,11 @@
 //!    [`crate::build_counter_reading`], then [`write_counter`].
 //! 3. Rank tick: additionally [`crate::match_rank_roles`] (`None` is
 //!    [`crate::RankSkip::RankRoleMissing`]), then
-//!    [`crate::build_community_snapshot`], then [`write_rank_snapshot`]. The
-//!    `Invariant` error below is [`crate::RankSkip::RanksNotNested`].
+//!    [`crate::build_community_snapshot`]. A non-nested ladder self-heals
+//!    first ([`crate::plan_rank_heal`]: grant the missing lower rungs with an
+//!    audit reason, bounded and hierarchy-fenced), then rebuilds before
+//!    [`write_rank_snapshot`]. The `Invariant` error below is the still-bad
+//!    backstop ([`crate::RankSkip::RanksNotNested`]).
 //! 4. Events tick: fetch, [`crate::normalize_events`], then
 //!    [`replace_events`].
 //!
@@ -184,7 +187,8 @@ async fn write_counter_tables(
 ///
 /// Refuses a non-nested ladder or a ranked-over-human count before opening
 /// the transaction (legacy `rank_snapshot_invariant_failed`): a finding, not
-/// a row.
+/// a row. The rank tick heals a non-cumulative roster before calling this, so
+/// reaching the refusal means the ladder is still bad after the heal.
 pub async fn write_rank_snapshot(
     pool: &Pool<Postgres>,
     guild_id: &str,

@@ -167,11 +167,13 @@ def failed_call():
 
 
 class StaticGuardTests(unittest.TestCase):
-    def test_dispatch_is_the_only_trigger_and_sha_is_required(self):
+    def test_dispatch_is_the_only_trigger_and_sha_defaults_to_last_staged(self):
         triggers = children(TOP["on"][1:], 2)
         self.assertEqual(list(triggers), ["workflow_dispatch"])
         inputs = children(children(triggers["workflow_dispatch"][1:], 4)["inputs"][1:], 6)
-        self.assertEqual(value(children(inputs["sha"][1:], 8)["required"]), "true")
+        sha_input = children(inputs["sha"][1:], 8)
+        self.assertEqual(value(sha_input["required"]), "false")
+        self.assertEqual(value(sha_input["default"]), '""')
         self.assertEqual(value(children(inputs["rollback"][1:], 8)["required"]), "false")
         # The takeover flag is opt-in: a routine deploy leaves the fence held.
         takeover = children(inputs["takeover"][1:], 8)
@@ -335,22 +337,23 @@ class StaticGuardTests(unittest.TestCase):
 
 class GuardBehaviourTests(unittest.TestCase):
     def guard(self, sha=SHA, rollback="", takeover="false", ref="refs/heads/main", auto="", **responses):
-        api = {**green(), **responses}
+        api = {**green(), "staging-latest": {"total_count": 1, "workflow_runs": [staging_run()]}, **responses}
         calls = []
+        resolved = sha.strip().lower() or (SHA if not rollback else "")
 
         def fake_check_output(args, **kwargs):
             self.assertEqual(args[:4], ["gh", "api", "--method", "GET"])
             self.assertTrue(all(flag == "-f" for flag in args[5::2]), args)
             path, query = args[4], dict(arg.split("=", 1) for arg in args[6::2])
             calls.append((path, query))
-            if path == f"repos/{REPO}/compare/{sha.strip().lower()}...main":
+            if path == f"repos/{REPO}/compare/{resolved}...main":
                 key = "compare"
-            elif path == f"repos/{REPO}/commits/{sha.strip().lower()}/check-runs":
+            elif path == f"repos/{REPO}/commits/{resolved}/check-runs":
                 self.assertEqual(query["app_id"], "15368")
                 self.assertEqual(query["filter"], "latest")
                 key = query["check_name"]
             elif path == f"repos/{REPO}/actions/workflows/check.yml/runs":
-                self.assertEqual(query["head_sha"], sha.strip().lower())
+                self.assertEqual(query["head_sha"], resolved)
                 self.assertNotIn("status", query)
                 self.assertNotIn("branch", query)
                 key = "ci-runs"
@@ -358,17 +361,24 @@ class GuardBehaviourTests(unittest.TestCase):
                 key = "ci-run"
             elif re.fullmatch(rf"repos/{REPO}/actions/runs/[0-9]+/attempts/[0-9]+/jobs", path):
                 key = "ci-jobs"
+            elif path == f"repos/{REPO}/actions/workflows/deploy-staging.yml/runs" and "head_sha" not in query:
+                # Promotion: the latest successful staging deploy on main.
+                self.assertEqual(
+                    {k: query[k] for k in ("branch", "status", "per_page")},
+                    {"branch": "main", "status": "success", "per_page": "1"},
+                )
+                key = "staging-latest"
             elif path == f"repos/{REPO}/actions/workflows/deploy-staging.yml/runs" and "status" not in query:
                 # Automated approval: every run on the SHA, never a success-only filter.
                 self.assertEqual(
                     {k: query[k] for k in ("head_sha", "branch")},
-                    {"head_sha": sha.strip().lower(), "branch": "main"},
+                    {"head_sha": resolved, "branch": "main"},
                 )
                 key = "staging-all"
             elif path == f"repos/{REPO}/actions/workflows/deploy-staging.yml/runs":
                 self.assertEqual(
                     {k: query[k] for k in ("head_sha", "branch", "status")},
-                    {"head_sha": sha.strip().lower(), "branch": "main", "status": "success"},
+                    {"head_sha": resolved, "branch": "main", "status": "success"},
                 )
                 key = "staging"
             elif path == f"repos/{REPO}/environments/production":
@@ -437,8 +447,39 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(outputs["sha"], SHA)
 
+    def test_empty_sha_promotes_the_latest_successful_staging_deploy(self):
+        code, outputs, _, calls, stdout = self.guard(sha="")
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs["sha"], SHA)
+        self.assertIn("Promoting the latest successful staging deploy", stdout)
+        self.assertEqual(calls[0][0], f"repos/{REPO}/actions/workflows/deploy-staging.yml/runs")
+
+    def test_rollback_with_empty_sha_is_refused_never_promoted(self):
+        # During an incident the latest staged SHA is usually the faulty build:
+        # a rollback must always name its commit explicitly.
+        result = self.guard(sha="", rollback=VERSION)
+        self.assertRefused(result, "40-character hex")
+        self.assertEqual(result[3], [])
+
+    def test_runbook_documents_promotion_and_explicit_sha_for_recovery(self):
+        runbook = (ROOT / "docs/production-deploy.md").read_text()
+        self.assertIn("Leave `sha` empty to promote", runbook)
+        self.assertIn("always set `sha` explicitly", runbook)
+
+    def test_empty_sha_without_any_staging_success_is_refused(self):
+        self.assertRefused(
+            self.guard(sha="", **{"staging-latest": {"total_count": 0, "workflow_runs": []}}),
+            "no successful deploy-staging run on main to promote",
+        )
+
+    def test_promoted_sha_still_needs_its_own_green_gates(self):
+        self.assertRefused(
+            self.guard(sha="", compare={"status": "diverged"}),
+            "is not an ancestor of origin/main",
+        )
+
     def test_malformed_sha_is_refused_before_any_api_call(self):
-        for sha in ("", "main", SHA[:39], SHA + "0", "g" * 40, "$(id)", f"{SHA};id", f"{SHA[:20]} {SHA[20:]}"):
+        for sha in ("main", SHA[:39], SHA + "0", "g" * 40, "$(id)", f"{SHA};id", f"{SHA[:20]} {SHA[20:]}"):
             with self.subTest(sha=sha):
                 result = self.guard(sha=sha)
                 self.assertRefused(result, "40-character hex")
