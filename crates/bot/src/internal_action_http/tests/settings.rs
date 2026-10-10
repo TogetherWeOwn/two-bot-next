@@ -207,6 +207,50 @@ async fn settings_set_replay_returns_first_result_without_second_bump() {
 }
 
 #[tokio::test]
+async fn settings_set_replay_side_read_failure_needs_reconciliation() {
+    let Some(db) = database().await else { return };
+    let _flag = SETTINGS_FLAG_LOCK.lock().await;
+    set_settings_flag(true);
+    let app = settings_app(db.pool().clone());
+    let raw = set_payload(SETTINGS_KEY, json!("8"), None);
+    let (first_status, _, first) = answer(
+        app.clone(),
+        signed(&raw, "old", "intent-settings-replay-side-read"),
+    )
+    .await;
+    assert_eq!(first_status, StatusCode::OK);
+    assert!(
+        first["version"].as_i64().is_some(),
+        "first save returns a CAS token"
+    );
+    // Break the version side-read: the idempotency claim still replays, but
+    // the guild_settings lookup fails. The replay must fail closed to
+    // reconciliation, never a fabricated `version: 0` success.
+    sqlx::query("ALTER TABLE guild_settings RENAME TO settings_hidden_replay")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let (status, headers, body) = answer(
+        app.clone(),
+        signed(&raw, "new", "intent-settings-replay-side-read"),
+    )
+    .await;
+    sqlx::query("ALTER TABLE settings_hidden_replay RENAME TO guild_settings")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    set_settings_flag(false);
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "needs_reconciliation");
+    assert_eq!(body["error"]["retryable"], false);
+    assert!(
+        !headers.contains_key("idempotent-replay"),
+        "a refused replay carries no replay marker"
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn settings_concurrent_save_with_stale_token_does_not_revert() {
     let Some(db) = database().await else { return };
     let _flag = SETTINGS_FLAG_LOCK.lock().await;

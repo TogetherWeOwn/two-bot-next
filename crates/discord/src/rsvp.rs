@@ -153,6 +153,37 @@ pub async fn handle_rsvp_interaction(
     complete_rsvp_interaction(prepared, pool, executor, classifier).await
 }
 
+/// RA-01 live-membership gate: the acting (and, for host check-in, target)
+/// member must currently belong to the interaction's guild. Only 404 means
+/// absent; transport, authorization, rate-limit and malformed evidence fail
+/// closed with no mutation or audit write. The `user.id` echo check keeps a
+/// proxy/cache returning another member from passing the gate.
+enum Membership {
+    Current,
+    Absent,
+    Unavailable,
+}
+
+async fn guild_membership(executor: &ActionExecutor, guild_id: &str, user_id: &str) -> Membership {
+    match executor
+        .get_json_strict(&format!("/guilds/{guild_id}/members/{user_id}"))
+        .await
+    {
+        Ok(Some(member))
+            if member
+                .get("user")
+                .and_then(|user| user.get("id"))
+                .and_then(|id| id.as_str())
+                == Some(user_id) =>
+        {
+            Membership::Current
+        }
+        Ok(Some(_)) => Membership::Unavailable,
+        Ok(None) => Membership::Absent,
+        Err(_) => Membership::Unavailable,
+    }
+}
+
 async fn execute(
     handler: HandlerId,
     pool: &Pool<Postgres>,
@@ -193,6 +224,21 @@ async fn execute(
                 return Ok(attendance_totals_text(&partition_rsvps(&rows)));
             }
             let status = RsvpStatus::parse(string_option("status")?).map_err(|e| e.to_string())?;
+            let actor_id = interaction
+                .author_id()
+                .ok_or("Missing command member.")?
+                .to_string();
+            // Membership precedes the event lookup so a departed member or a
+            // failed lookup learns nothing about the event and writes nothing.
+            match guild_membership(executor, &guild_id, &actor_id).await {
+                Membership::Current => {}
+                Membership::Absent => {
+                    return Err("You are no longer a member of this server.".to_owned());
+                }
+                Membership::Unavailable => {
+                    return Err("Unable to verify server membership.".to_owned());
+                }
+            }
             let event = executor
                 .get_scheduled_event(&guild_id, &event_id)
                 .await?
@@ -211,10 +257,7 @@ async fn execute(
             let record = RsvpRecord {
                 guild_id,
                 event_id,
-                user_id: interaction
-                    .author_id()
-                    .ok_or("Missing command member.")?
-                    .to_string(),
+                user_id: actor_id,
                 status,
                 responded_at: now_iso(),
             };
@@ -287,6 +330,28 @@ async fn execute(
                 Some(4) => return Err("That scheduled event is cancelled.".to_owned()),
                 Some(1..=3) => {}
                 _ => return Err("Discord returned an invalid scheduled event status.".to_owned()),
+            }
+            // RA-01 acting-host gate: the invoker must currently belong to the
+            // interaction's guild. It runs after the landed RA-02 event
+            // binding so that block stays verbatim, and still precedes every
+            // attendance write. A self check-in skips this lookup: the live
+            // target read below verifies the same membership.
+            let actor_id = interaction
+                .author_id()
+                .ok_or("Missing command member.")?
+                .to_string();
+            if member_id.to_string() != actor_id {
+                match guild_membership(executor, &guild_id, &actor_id).await {
+                    Membership::Current => {}
+                    Membership::Absent => {
+                        return Err(
+                            "You must still belong to this server to record attendance.".to_owned()
+                        );
+                    }
+                    Membership::Unavailable => {
+                        return Err("Unable to verify server membership.".to_owned());
+                    }
+                }
             }
             // Current guild membership, live (RA-02): the resolved User proves
             // identity, not membership. A 404 is a departed, never-joined or

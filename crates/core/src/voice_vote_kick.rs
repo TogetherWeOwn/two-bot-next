@@ -32,6 +32,11 @@ pub trait VoteClock {
 
 /// Current facts for one managed room. Occupant IDs are deduplicated here;
 /// neither roles nor administrator status grant an outsider a vote.
+///
+/// `target_privileged` is the target's effective Kick Members or Administrator
+/// state in `guild_id`, resolved by the parent in the interaction's guild:
+/// `Some(true)` blocks the vote, `Some(false)` allows it, and `None` means the
+/// guild authority lookup was unavailable and the vote must fail closed.
 #[derive(Debug, Clone, Copy)]
 pub struct VoteRoomFacts<'a> {
     pub guild_id: Snowflake,
@@ -39,11 +44,27 @@ pub struct VoteRoomFacts<'a> {
     pub owner_id: Snowflake,
     pub original_creator_id: Snowflake,
     pub occupants: &'a [Snowflake],
+    pub target_privileged: Option<bool>,
 }
 
 impl VoteRoomFacts<'_> {
     fn protected(&self, member_id: Snowflake) -> bool {
         member_id == self.owner_id || member_id == self.original_creator_id
+    }
+
+    fn privileged(&self) -> bool {
+        self.target_privileged == Some(true)
+    }
+
+    fn authority_unknown(&self) -> bool {
+        self.target_privileged.is_none()
+    }
+
+    /// Owner, original creator, or a Kick Members / Administrator holder. The
+    /// parent re-supplies current facts on every transition, so a promotion
+    /// granted mid-vote is observed before enforcement.
+    fn target_protected(&self, target_id: Snowflake) -> bool {
+        self.protected(target_id) || self.privileged()
     }
 
     fn eligible(&self, target_id: Snowflake) -> BTreeSet<Snowflake> {
@@ -129,6 +150,10 @@ pub enum VoteKickError {
     SelfTarget,
     #[error("the owner and original creator cannot be targeted")]
     ProtectedTarget,
+    #[error("the target has moderation privilege and cannot be voted out")]
+    PrivilegedTarget,
+    #[error("target authority is unavailable")]
+    AuthorityUnavailable,
     #[error("a vote is already active for this target in this guild")]
     ActiveVoteExists,
     #[error("a recent vote against this member is in cooldown")]
@@ -188,7 +213,10 @@ impl Vote {
         if !facts.occupants.contains(&self.reference.target_id) {
             self.status = VoteKickStatus::Cancelled(VoteCancellation::TargetLeft);
             self.terminal_at_ms = Some(now_ms);
-        } else if facts.protected(self.reference.target_id) {
+        } else if facts.authority_unknown() || facts.target_protected(self.reference.target_id) {
+            // Fail closed on an unavailable guild-authority lookup, and cancel
+            // when the target gained owner/creator status or Kick Members /
+            // Administrator after the vote started. No kick is emitted.
             self.status = VoteKickStatus::Cancelled(VoteCancellation::TargetProtected);
             self.terminal_at_ms = Some(now_ms);
         } else if now_ms >= self.expires_at_ms {
@@ -262,8 +290,16 @@ impl VoteKickCore {
         if !facts.occupants.contains(&target_id) {
             return Err(VoteKickError::TargetNotOccupant);
         }
+        // Fail closed in the interaction's guild: without authoritative
+        // privilege evidence no vote, ballot, or enforcement effect follows.
+        if facts.authority_unknown() {
+            return Err(VoteKickError::AuthorityUnavailable);
+        }
         if facts.protected(target_id) {
             return Err(VoteKickError::ProtectedTarget);
+        }
+        if facts.privileged() {
+            return Err(VoteKickError::PrivilegedTarget);
         }
         let now_ms = clock.now_ms();
         let expires_at_ms = now_ms
@@ -428,6 +464,21 @@ mod tests {
             owner_id: 2,
             original_creator_id: 3,
             occupants,
+            target_privileged: Some(false),
+        }
+    }
+
+    fn privileged_room(occupants: &[Snowflake]) -> VoteRoomFacts<'_> {
+        VoteRoomFacts {
+            target_privileged: Some(true),
+            ..room(occupants)
+        }
+    }
+
+    fn unknown_authority_room(occupants: &[Snowflake]) -> VoteRoomFacts<'_> {
+        VoteRoomFacts {
+            target_privileged: None,
+            ..room(occupants)
         }
     }
 
@@ -469,6 +520,27 @@ mod tests {
             let mut core = VoteKickCore::new();
             assert_eq!(core.start(100, facts, actor, target, &clock), Err(error));
             // Refusal has not reserved the ID or target.
+            assert!(core.start(100, facts, 4, 9, &clock).is_ok());
+        }
+        // Each privileged class is denied separately at start with no
+        // vote, ballot, or enforcement effect.
+        {
+            let privileged = privileged_room(&[2, 3, 4, 9]);
+            let mut core = VoteKickCore::new();
+            assert_eq!(
+                core.start(100, privileged, 4, 9, &clock),
+                Err(VoteKickError::PrivilegedTarget)
+            );
+            assert!(core.start(100, facts, 4, 9, &clock).is_ok());
+        }
+        // An unavailable guild-authority lookup fails closed.
+        {
+            let unknown = unknown_authority_room(&[2, 3, 4, 9]);
+            let mut core = VoteKickCore::new();
+            assert_eq!(
+                core.start(100, unknown, 4, 9, &clock),
+                Err(VoteKickError::AuthorityUnavailable)
+            );
             assert!(core.start(100, facts, 4, 9, &clock).is_ok());
         }
     }
@@ -735,6 +807,93 @@ mod tests {
             );
             assert_eq!(update.kick, None);
         }
+    }
+
+    #[test]
+    fn privileged_promotion_mid_vote_cancels_before_enforcement() {
+        // VK-01 recheck: a promotion granted mid-vote must not be bypassed. A
+        // passed vote for a promoted target produces no kick effect.
+        let facts = room(&[2, 3, 4, 9]);
+        let promoted = privileged_room(&[2, 3, 4, 9]);
+        let clock = Clock::new();
+        let mut core = VoteKickCore::new();
+        let reference = start(&mut core, facts, &clock);
+        core.cast(reference, facts, 2, VoteBallot::Yes, &clock)
+            .unwrap();
+        // The second Yes would pass on the old roster; the recheck sees the
+        // privilege first and cancels instead.
+        let update = core
+            .cast(reference, promoted, 3, VoteBallot::Yes, &clock)
+            .unwrap();
+        assert_eq!(
+            update.status,
+            VoteKickStatus::Cancelled(VoteCancellation::TargetProtected)
+        );
+        assert_eq!(update.kick, None);
+        // A refresh on the promoted facts stays cancelled and emits nothing.
+        let again = core.refresh(reference, promoted, &clock).unwrap();
+        assert_eq!(
+            again.status,
+            VoteKickStatus::Cancelled(VoteCancellation::TargetProtected)
+        );
+        assert_eq!(again.kick, None);
+    }
+
+    #[test]
+    fn unavailable_lookup_mid_vote_cancels_without_enforcement() {
+        // Failing closed mid-vote: losing guild-authority evidence cancels the
+        // vote rather than letting a later ballot pass it.
+        let facts = room(&[2, 3, 4, 9]);
+        let unknown = unknown_authority_room(&[2, 3, 4, 9]);
+        let clock = Clock::new();
+        let mut core = VoteKickCore::new();
+        let reference = start(&mut core, facts, &clock);
+        core.cast(reference, facts, 2, VoteBallot::Yes, &clock)
+            .unwrap();
+        let update = core
+            .cast(reference, unknown, 3, VoteBallot::Yes, &clock)
+            .unwrap();
+        assert_eq!(
+            update.status,
+            VoteKickStatus::Cancelled(VoteCancellation::TargetProtected)
+        );
+        assert_eq!(update.kick, None);
+    }
+
+    #[test]
+    fn protected_boundary_owner_admin_and_ordinary_member() {
+        // Owner and original creator stay ProtectedTarget; a privileged
+        // (Kick Members / Administrator) target is PrivilegedTarget; an
+        // ordinary occupant with no privilege remains votable end to end.
+        let facts = room(&[2, 3, 4, 9]);
+        let clock = Clock::new();
+        for (target, error) in [
+            (2, VoteKickError::ProtectedTarget),
+            (3, VoteKickError::ProtectedTarget),
+        ] {
+            let mut core = VoteKickCore::new();
+            assert_eq!(core.start(100, facts, 4, target, &clock), Err(error));
+        }
+        let mut core = VoteKickCore::new();
+        assert_eq!(
+            core.start(100, privileged_room(&[2, 3, 4, 9]), 4, 9, &clock),
+            Err(VoteKickError::PrivilegedTarget)
+        );
+        let mut core = VoteKickCore::new();
+        assert_eq!(
+            core.start(100, unknown_authority_room(&[2, 3, 4, 9]), 4, 9, &clock),
+            Err(VoteKickError::AuthorityUnavailable)
+        );
+        // Ordinary target: start, two Yes ballots, pass with a decision.
+        let mut core = VoteKickCore::new();
+        let reference = start(&mut core, facts, &clock);
+        core.cast(reference, facts, 2, VoteBallot::Yes, &clock)
+            .unwrap();
+        let passed = core
+            .cast(reference, facts, 3, VoteBallot::Yes, &clock)
+            .unwrap();
+        assert_eq!(passed.status, VoteKickStatus::Passed);
+        assert!(passed.kick.is_some());
     }
 
     #[test]

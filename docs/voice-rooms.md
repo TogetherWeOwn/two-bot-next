@@ -141,8 +141,13 @@ library code with no Discord dependency and can start immediately.
   `SUPPRESS_EMBEDS` set on the ballot. Refusals are fixed strings that never
   echo initiator text.
 - The owner and original creator can't be targeted, and members can't target
-  themselves. Only one active vote per target. If the target leaves, the vote is
-  cancelled.
+  themselves. Targets with effective Kick Members or Administrator permission
+  in the interaction's guild can't be targeted either; an unavailable
+  guild-authority lookup fails closed with no vote. Only one active vote per
+  target. If the target leaves, the vote is
+  cancelled. Protection is rechecked on every ballot/refresh and again
+  immediately before the disconnect/deny writes, so a promotion granted
+  mid-vote produces no kick/disconnect effect.
 - After a vote passes, expires or is cancelled, a fresh vote against the same
   member in the same guild is refused for 5 minutes (`Cooldown`,
   `VOTE_KICK_COOLDOWN_MS = 300_000`). The key is guild + target: a new

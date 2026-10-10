@@ -65,6 +65,8 @@ pub const fn refusal_outcome(error: VoteKickError) -> &'static str {
         VoteKickError::TargetNotOccupant => "target_not_occupant",
         VoteKickError::SelfTarget => "self_target",
         VoteKickError::ProtectedTarget => "protected_target",
+        VoteKickError::PrivilegedTarget => "privileged_target",
+        VoteKickError::AuthorityUnavailable => "authority_unavailable",
         VoteKickError::ActiveVoteExists => "active_vote_exists",
         VoteKickError::Cooldown => "cooldown",
         VoteKickError::InitiatorLimited => "initiator_limited",
@@ -160,11 +162,13 @@ pub struct KickAuditRow {
 mod tests {
     use super::*;
 
-    const REFUSALS: [VoteKickError; 13] = [
+    const REFUSALS: [VoteKickError; 15] = [
         VoteKickError::InitiatorNotOccupant,
         VoteKickError::TargetNotOccupant,
         VoteKickError::SelfTarget,
         VoteKickError::ProtectedTarget,
+        VoteKickError::PrivilegedTarget,
+        VoteKickError::AuthorityUnavailable,
         VoteKickError::ActiveVoteExists,
         VoteKickError::Cooldown,
         VoteKickError::InitiatorLimited,
