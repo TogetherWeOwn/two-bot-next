@@ -911,11 +911,14 @@ pub async fn run_shard<I: InviteSource + 'static>(
                                     voice.disconnect();
                                 }
                             }
-                            let funnel = disposition.map(|verdict| verdict.funnel);
                             let trigger = disposition.map(|verdict| verdict.trigger);
+                            // Text automations gate on the trigger verdict, not
+                            // the funnel: a Bypassed create keeps funnel-Accept
+                            // but its trigger is capture-only and must not run
+                            // sticky (fail-closed; M2.19).
                             if automod_enabled
                                 && matches!(dispatch.event, Event::MessageCreate(_))
-                                && crate::automod_gateway::runs_text_automations(funnel)
+                                && crate::automod_gateway::runs_text_automations(trigger)
                             {
                                 if let Some(runtime) = command_runtime.as_ref() {
                                     // Detached spawn from the blocking worker needs the runtime.

@@ -204,9 +204,10 @@ otherwise the loop is unchanged.
 - **Maintenance.** `expire_repeat_history` runs on the existing periodic-job
   supervisor (`automod_expiry`, every 60 s, no I/O); no private timer.
 - **Text automations.** The command runtime's message hook is no longer fired at
-  reception for creates while automod is active; the worker fires it only for an
-  accepted create (`Accept`). Matched, unavailable and timed-out creates are
-  rejected for automations as well as for XP/activity.
+  reception for creates while automod is active; the worker fires it only when
+  the trigger verdict is `Accept` (an inspected clean create). Matched,
+  unavailable, timed-out and uninspected (`Bypassed`) creates are rejected for
+  automations as well as for XP/activity.
 - **Funnel once-per-message.** The funnel's writes commit with the gateway
   checkpoint, so a dispatch reaching `process` is not yet in the funnel. A
   replay after a crash between the claim write and the checkpoint finds a
