@@ -212,13 +212,29 @@ Read the variable and the Environment's reviewers again before each dispatch.
 
 ## 48-hour watch log (TOG-9699)
 
-The cutover executor copies this template onto the execution card at `T_0`
-(first `/readyz` 200 on the production revision) and fills it in through the
-watch deadline `T_0 + 48 h`. Watch checkpoints at +15 min, +1 h, +6 h, +24 h
-and +48 h follow [cutover.md](cutover.md) §48-hour watch. Poll read-only on a
-short cadence (suggested 60 s); record findings, not every healthy poll.
+The cutover executor records each checkpoint with
+`scripts/cutover_watch_checkpoint.py` — one checkpoint per call — and pastes
+the emitted row onto the execution card at `T_0` (first `/readyz` 200 on the
+production revision) through the watch deadline `T_0 + 48 h`:
 
-### Watch header (fill once at T_0)
+```sh
+python3 scripts/cutover_watch_checkpoint.py --checkpoint +15m \
+    --expected-sha <40-hex> --expected-build-id <run-id>-<attempt> \
+    --production-url https://<production-worker>/
+```
+
+`--checkpoint` is one of the five labels `+15m`, `+1h`, `+6h`, `+24h`,
+`+48h`, matching the five checkpoint rows below; `--expected-sha` is the
+deployed commit from the watch header and `--expected-build-id` is that
+deploy run's `<run id>-<attempt>` from the run summary. The script is
+read-only: one GET to `/readyz`, no writes, migrates, or DB connections. It
+emits GO only on a 200 with every component ready and an exact
+revision/build-ID match; anything short of a full match is EXTEND, never
+GO, and a ROLLBACK decision stays human. Checkpoints follow
+[cutover.md](cutover.md) §48-hour watch. Poll read-only on a short cadence
+(suggested 60 s); record findings, not every healthy poll.
+
+### Watch header (record once at T_0)
 
 | Field | Value |
 |---|---|
