@@ -797,6 +797,12 @@ pub trait RoomWrites: Send + Sync {
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send {
         async { Ok(()) }
     }
+    /// The same status write as an owned future the guild actor can stop
+    /// waiting on. `None` (the default) keeps it on the actor's await path.
+    fn detached_voice_status(&self, channel: Snowflake, status: &str) -> Option<DetachedWrite> {
+        let _ = (channel, status);
+        None
+    }
     /// V3 `/limit` and `/unlimit`: set the room channel's user limit (`0` is
     /// unlimited, at most 99). Idempotent; a 429 returns to the queue.
     fn set_user_limit(
@@ -914,6 +920,12 @@ pub trait RoomWrites: Send + Sync {
     }
 }
 
+/// A detached status write's outcome: room, text, result.
+type StatusOutcome = (Snowflake, String, Result<(), RoomHttpError>);
+
+/// An owned Discord write the guild actor can stop waiting on.
+pub type DetachedWrite = Pin<Box<dyn Future<Output = Result<(), RoomHttpError>> + Send>>;
+
 impl RoomWrites for RoomHttp {
     async fn create(
         &self,
@@ -980,6 +992,14 @@ impl RoomWrites for RoomHttp {
         status: &str,
     ) -> Result<(), RoomHttpError> {
         self.set_room_voice_status(channel, status).await
+    }
+
+    fn detached_voice_status(&self, channel: Snowflake, status: &str) -> Option<DetachedWrite> {
+        let http = self.clone();
+        let status = status.to_owned();
+        Some(Box::pin(async move {
+            http.set_room_voice_status(channel, &status).await
+        }))
     }
 
     async fn set_user_limit(
@@ -2096,6 +2116,13 @@ pub struct GuildRoomWorker<S, H> {
     room_status: HashMap<Snowflake, String>,
     pending_status: HashMap<Snowflake, String>,
     status_not_before_ms: HashMap<Snowflake, u64>,
+    /// Status writes still running on their own task, and where their
+    /// outcomes arrive.
+    status_in_flight: HashSet<Snowflake>,
+    status_outcomes: (
+        mpsc::UnboundedSender<StatusOutcome>,
+        mpsc::UnboundedReceiver<StatusOutcome>,
+    ),
     /// When each room started waiting for an unknown display name.
     name_waits: HashMap<Snowflake, u64>,
     creations: HashMap<u64, Creation>,
@@ -2341,6 +2368,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             room_status: HashMap::new(),
             pending_status: HashMap::new(),
             status_not_before_ms: HashMap::new(),
+            status_in_flight: HashSet::new(),
+            status_outcomes: mpsc::unbounded_channel(),
             name_waits: HashMap::new(),
             creations: HashMap::new(),
             accepted: HashMap::new(),
@@ -3776,11 +3805,15 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             );
         }
         self.enqueue_owner_repairs(now_ms);
-        if self.dispatch_voice_status(now_ms).await {
-            return true;
-        }
         let Some(action) = self.queue.pop_due(self.live.guild_id, now_ms) else {
-            return false;
+            // Status lines are the lowest priority: only when no lifecycle
+            // write is waiting and the guild is not rate limited.
+            if self.queue.pending_counts(self.live.guild_id).0 > 0
+                || self.queue.backed_off(self.live.guild_id, now_ms)
+            {
+                return false;
+            }
+            return self.dispatch_voice_status(now_ms).await;
         };
         let started = Instant::now();
         match action.action.clone() {
