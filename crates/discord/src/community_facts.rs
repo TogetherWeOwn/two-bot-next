@@ -21,12 +21,12 @@
 
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "db")]
+use two_bot_core::{classify, ClassifierConfig, ClassifyInput, ScorecardGates};
 use two_bot_core::{
     FactsSink, MemberJoinFact, MessageFact, RulesAcceptedFact, Snowflake, VoiceEndedFact,
     VoiceStartedFact,
 };
-#[cfg(feature = "db")]
-use two_bot_core::{classify, ClassifierConfig, ClassifyInput, ScorecardGates};
 
 /// One buffered gate-clearing: owned inputs for a later async
 /// `community_store::rules_accepted_fact` write. Bots are captured like any
