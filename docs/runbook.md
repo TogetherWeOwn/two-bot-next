@@ -397,6 +397,44 @@ when `executed` traffic for the same family collapses while refusals rise
 — the receiver may be refusing legitimate work and the fix belongs to the
 on-call engineer, not another redeploy.
 
+#### Alert: dispatch drops
+
+`two_bot_dispatch_drops_total{lane}` grew in three consecutive completed
+keepalive sample windows after a baseline. `dispatch_drops:<lane>` is a
+**ticket, not a page**, for each of the fixed `messages`, `interactions`,
+`registry`, `privileged`, `busy` and `reactions` lanes. A large single burst
+stays silent. Dispatch admission refused local work; this is **not proof of
+gateway packet loss** or a sequence gap. The `reactions` counter also includes
+per-member fairness refusals while lane slots remain free, so it can point at
+a hot member rather than an undersized lane.
+
+First response: triage within the watch shift. Read the affected lane's counter
+through the existing authorized `/ops/metrics` path, correlate the window with
+`command dispatch saturated` or `command dispatch fairness drop` sampled logs,
+and compare gateway readiness, missed-events and REST/DB alerts separately.
+The counter measures every refusal but logs are sampled once per 60 s per
+runtime; a quiet log is not proof of quiet counters. Record only fixed lane
+names and sanitized counts, never member/channel IDs, payloads or scrape tokens.
+
+Flat samples clear that lane's streak and resolve its ticket. A backwards
+counter in any observed lane signals a process reset: all valid lanes re-baseline
+with zero streaks and resolve, even if another lane's new count overtook its old
+value. Missing lanes still retain active tickets. Missing/invalid series or a
+failed scrape break the streak and discard
+the baseline, **not** the active ticket; the first valid sample after a gap is
+only a baseline, ongoing growth retains the ticket, and a subsequent valid
+flat/reset window proves recovery. A new DO field or legacy state starts
+unbaselined. Counter-only monitoring cannot detect a restart whose replacement
+counter already exceeds the old value; correlate deployment evidence rather
+than claiming that case is proven quiet.
+
+Do not enlarge lanes, relax fairness limits, replay dropped reactions or restart
+the bot to clear a counter. This alert adds neither automatic ticket-system
+integration nor paging escalation: it labels the existing transition delivery
+as `(ticket)` and supplies this runbook. Persist sanitized incident evidence and
+route a continuing dispatch problem to the on-call engineer through the normal
+triage path. No new webhook, production activation or live load test is authorized.
+
 ## Persisted ownership control
 
 The Worker/DO fence is implemented, not implicitly released by deployment.
