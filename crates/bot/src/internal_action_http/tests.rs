@@ -7,7 +7,9 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 use tower::ServiceExt;
-use two_bot_core::internal_actions::sign;
+use two_bot_core::internal_actions::{sign, ActionError, ErrorCode};
+use two_bot_core::internal_actions::{GuildAddMemberRequest, RoleAssignRequest};
+use two_bot_discord::executor::member::MemberOutcome;
 use two_bot_testsupport::TestDatabase;
 
 mod adapter;
@@ -39,6 +41,10 @@ fn config() -> InternalActionConfig {
         (
             "TWO_INTERNAL_CHANNEL_KEYS".to_owned(),
             "ann:333333333333333333".to_owned(),
+        ),
+        (
+            "TWO_INTERNAL_ROLE_KEYS".to_owned(),
+            "member:222222222222222222".to_owned(),
         ),
     ]))
     .unwrap()
@@ -117,6 +123,60 @@ impl ActionEffect for MockEffect {
     }
 }
 
+impl MemberEffect for MockEffect {
+    fn execute_assign<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+        _: &'a RoleAssignRequest<'a>,
+    ) -> BoxFuture<'a, Result<MemberOutcome, ActionError>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.outcome {
+                MockOutcome::Success | MockOutcome::Wait => Ok(MemberOutcome::Assigned),
+                MockOutcome::NoEffect => Err(ActionError::new(
+                    ErrorCode::DiscordRejected,
+                    "Discord refused the request",
+                    "discord_rejected",
+                )),
+                MockOutcome::Unknown => Err(ActionError::new(
+                    ErrorCode::DiscordUnavailable,
+                    "Discord was unreachable",
+                    "discord_unreachable",
+                )),
+            }
+        })
+    }
+
+    fn execute_add<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a GuildAddMemberRequest<'a>,
+        _: &'a str,
+    ) -> BoxFuture<'a, Result<MemberOutcome, ActionError>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.outcome {
+                MockOutcome::Success | MockOutcome::Wait => Ok(MemberOutcome::Added),
+                MockOutcome::NoEffect => Err(ActionError::new(
+                    ErrorCode::DiscordRejected,
+                    "Discord refused the request",
+                    "discord_rejected",
+                )),
+                MockOutcome::Unknown => Err(ActionError::new(
+                    ErrorCode::DiscordUnavailable,
+                    "Discord was unreachable",
+                    "discord_unreachable",
+                )),
+            }
+        })
+    }
+
+    fn resolve_bot<'a>(&'a self) -> BoxFuture<'a, Result<String, ActionError>> {
+        Box::pin(async move { Ok("999999999999999999".to_owned()) })
+    }
+}
+
 fn state(pool: sqlx::PgPool, effect: Arc<MockEffect>) -> Arc<ReceiverState> {
     state_with_reads(pool, effect, Arc::new(MockEventRead::default()))
 }
@@ -151,9 +211,13 @@ fn state_full_with_channel(
     moderation: Arc<MockModeration>,
     channel: Arc<MockChannel>,
 ) -> Arc<ReceiverState> {
+    // The announcement double also stands in as the membership double:
+    // membership tests share the mock and assert its calls, while moderation
+    // tests never reach the member effect.
     Arc::new(ReceiverState::new(
         config(),
         pool,
+        effect.clone(),
         effect,
         reads,
         moderation,
@@ -277,6 +341,18 @@ fn set_event_read_flag(on: bool) {
         std::env::set_var("TWO_INTERNAL_ALLOW_EVENT_READ", "1");
     } else {
         std::env::remove_var("TWO_INTERNAL_ALLOW_EVENT_READ");
+    }
+}
+
+/// `guild.add_member` stays dark until the CEO allowlist decision; the test
+/// flag serializes on its own lock so parallel event-read tests are unaffected.
+static ADD_MEMBER_FLAG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn set_add_member_flag(on: bool) {
+    if on {
+        std::env::set_var("TWO_INTERNAL_ALLOW_ADD_MEMBER", "1");
+    } else {
+        std::env::remove_var("TWO_INTERNAL_ALLOW_ADD_MEMBER");
     }
 }
 
@@ -815,15 +891,116 @@ async fn authenticated_unsupported_actions_and_bad_channel_keys_stay_redacted() 
     let Some(db) = database().await else { return };
     let effect = Arc::new(MockEffect::new(MockOutcome::Success));
     let app = router(state(db.pool().clone(), effect.clone()));
-    for raw in [
-        r#"{"action":"role.assign","discord_id":"111111111111111111","role_key":"fixture"}"#,
-        r#"{"action":"announcement.post","channel_key":"secret-sentinel","body":"secret-sentinel"}"#,
+    // `role.assign` is now a supported membership action (see the membership
+    // test below); unknown verbs and unmapped channel keys still refuse before
+    // any effect with no secret echo.
+    for (raw, intent) in [
+        (
+            r#"{"action":"settings.get","key":"secret-sentinel"}"#,
+            "intent-unsupported-verb",
+        ),
+        (
+            r#"{"action":"announcement.post","channel_key":"secret-sentinel","body":"secret-sentinel"}"#,
+            "intent-bad-channel",
+        ),
     ] {
-        let (_, _, body) = answer(app.clone(), signed(raw, "old", "intent-fixture")).await;
+        let (_, _, body) = answer(app.clone(), signed(raw, "old", intent)).await;
         assert_eq!(body["error"]["code"], "action_not_allowed");
         assert!(!body.to_string().contains("secret-sentinel"));
     }
     assert_eq!(effect.calls(), 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn authenticated_membership_actions_succeed_and_refusals_stay_redacted() {
+    let Some(db) = database().await else { return };
+    let _flag = ADD_MEMBER_FLAG_LOCK.lock().await;
+    // The add-member fence starts dark: without the flag the same signed bytes
+    // refuse before any Discord call.
+    set_add_member_flag(false);
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let app = router(state(db.pool().clone(), effect.clone()));
+    let dark = r#"{"action":"guild.add_member","discord_id":"111111111111111111","access_token":"fixture-oauth"}"#;
+    let (_, _, refused) = answer(app.clone(), signed(dark, "old", "intent-add-dark")).await;
+    assert_eq!(refused["error"]["code"], "action_not_allowed");
+    assert_eq!(effect.calls(), 0);
+
+    set_add_member_flag(true);
+    // Happy paths: allowlisted role key and OAuth-backed join through the
+    // signed path. Distinct intents so the second claim does not mismatch.
+    let role_ok =
+        r#"{"action":"role.assign","discord_id":"111111111111111111","role_key":"member"}"#;
+    let (status, _, role_first) =
+        answer(app.clone(), signed(role_ok, "old", "intent-role-ok")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(role_first["result"], json!({"outcome": "assigned"}));
+    assert!(role_first["request_id"].as_str().is_some());
+    assert_eq!(effect.calls(), 1);
+    // Same intent, fresh nonce: idempotent replay without a second effect.
+    let (status, headers, role_replay) =
+        answer(app.clone(), signed(role_ok, "new", "intent-role-ok")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["idempotent-replay"], "true");
+    assert_eq!(role_replay["result"], json!({"outcome": "assigned"}));
+    assert_eq!(effect.calls(), 1);
+
+    let add_ok = r#"{"action":"guild.add_member","discord_id":"111111111111111111","access_token":"fixture-oauth"}"#;
+    let (status, _, add_first) = answer(app.clone(), signed(add_ok, "old", "intent-add-ok")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(add_first["result"], json!({"outcome": "added"}));
+    assert_eq!(effect.calls(), 2);
+    let (status, headers, add_replay) =
+        answer(app.clone(), signed(add_ok, "new", "intent-add-ok")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["idempotent-replay"], "true");
+    assert_eq!(add_replay["result"], json!({"outcome": "added"}));
+    assert_eq!(effect.calls(), 2);
+
+    // Refusal-before-effect: malformed shapes and unknown keys refuse cleanly
+    // with no secret echo and no Discord call. Each uses a fresh intent so a
+    // refusal never collides with the happy-path claims above.
+    for (raw, intent, code) in [
+        (
+            r#"{"action":"role.assign","discord_id":"111111111111111111","role_key":"secret-sentinel"}"#,
+            "intent-role-unknown",
+            "action_not_allowed",
+        ),
+        (
+            r#"{"action":"role.assign","discord_id":"bad","role_key":"member"}"#,
+            "intent-role-malformed",
+            "malformed",
+        ),
+        (
+            r#"{"action":"guild.add_member","discord_id":"bad","access_token":"secret-sentinel"}"#,
+            "intent-add-malformed",
+            "malformed",
+        ),
+        (
+            r#"{"action":"guild.add_member","discord_id":"111111111111111111"}"#,
+            "intent-add-missing-token",
+            "malformed",
+        ),
+    ] {
+        let (status, _, body) = answer(app.clone(), signed(raw, "old", intent)).await;
+        assert_eq!(body["error"]["code"], code, "{raw}");
+        assert!(
+            !body.to_string().contains("secret-sentinel"),
+            "redacted refusal for {raw}"
+        );
+        assert!(status == StatusCode::BAD_REQUEST || status == StatusCode::FORBIDDEN);
+    }
+    assert_eq!(effect.calls(), 2, "refusals must not reach Discord");
+
+    // Receipts are durable: both happy-path intents completed with the
+    // stored-member `None` + `affected` contract.
+    let completed: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM internal_idempotency WHERE state = 'completed'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(completed, 2);
+    set_add_member_flag(false);
     db.close().await.unwrap();
 }
 
@@ -939,10 +1116,11 @@ fn read_app(pool: sqlx::PgPool, api: &MockEventApi) -> Router {
         ActionExecutor::with_proxy("not-a-credential".to_owned(), Some(api.origin.clone()))
             .unwrap();
     let reads: Arc<dyn EventReadEffect> = Arc::new(EventReadExecutor::new(executor, pool.clone()));
-    let effect: Arc<dyn ActionEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
+    let effect: Arc<MockEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
     router(Arc::new(ReceiverState::new(
         config(),
         pool,
+        effect.clone(),
         effect,
         reads,
         Arc::new(MockModeration::default()),
@@ -1997,10 +2175,13 @@ fn moderation_resolve_app(pool: sqlx::PgPool, mock: &MockMembers) -> Router {
     )
     .unwrap();
     let moderation: Arc<dyn ModerationEffect> = Arc::new(ModerationExecutor::new(inner, discord));
-    let effect: Arc<dyn ActionEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
+    // The membership double shares the announcement mock: deny-path tests refuse
+    // before any member effect runs, matching `state_full`.
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
     router(Arc::new(ReceiverState::new(
         config(),
         pool,
+        effect.clone(),
         effect,
         Arc::new(MockEventRead::default()),
         moderation,

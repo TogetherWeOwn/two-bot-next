@@ -244,6 +244,14 @@ things, in order:
 
 When all four hold, run §4 live and record timestamps in this section.
 
+Re-check at `86a6668a7`: the 2026-10-04 registry observation above is history,
+not current state. The code wiring it waited on has since landed — the voice
+set is defined in `voice_commands()` (`crates/core/src/voice_rooms.rs:1292-1660`),
+merged when the voice gate is on (`crates/core/src/router.rs:717-719`), and
+synced on ready (`crates/bot/src/command_runtime.rs:1009-1020`). Re-read the
+staging guild registry before the next rehearsal instead of reusing the
+17-command snapshot.
+
 ## 6. Gaps
 
 Each gap below is filed as its own card and linked from the rehearsal
@@ -251,9 +259,13 @@ issue. Live staging practice (§4 live run) is a follow-up blocked on the
 four items in the 2026-10-04 verdict above; it is not listed here as a code
 gap.
 
-1. Shared/category numbering (`/group`) is stored but not honored: the
+1. ~~Shared/category numbering (`/group`) is stored but not honored: the
    room planner hardcodes ungrouped placement, so an import carrying
-   `group_by_category` changes nothing at runtime.
+   `group_by_category` changes nothing at runtime~~ Resolved in code:
+   `group_by_category` is honored (`crates/bot/src/voice_rooms.rs:3427-3444`,
+   `crates/bot/src/voice_room_plan.rs:206-212`). Still open: staging practice
+   of shared numbering on the staging guild (§4 live run). Re-checked at
+   `86a6668a7`.
 2. ~~No dedicated ghost-channel count for cutover verification~~ Shipped:
    `report voice-ghosts --guild <id>` is the pollable read-only count
    (tracked-present, tracked-gone, untracked-present plus a `clean` flag),
