@@ -1110,26 +1110,33 @@ async fn rsvp_capacity_and_rate_refuse_without_extra_rows() {
     let Some(second) = pool().await else {
         return;
     };
-    // Ledger a full minute budget for USER at the store layer: 20 writes in
-    // one minute collapse onto one RSVP row plus 20 audit rows.
-    for i in 0..20 {
-        let at = format!("2026-09-10T10:00:{i:02}.000Z");
-        let record = two_bot_core::RsvpRecord {
-            guild_id: GUILD.into(),
-            event_id: EVENT.into(),
-            user_id: USER.into(),
-            status: two_bot_core::RsvpStatus::Going,
-            responded_at: at,
-        };
-        two_bot_core::put_rsvp(second.pool(), &record)
+    // Ledger a full minute budget for USER at the store layer. The live
+    // attempt below stamps `now_iso()`, so the ledger must cover the minute
+    // that attempt lands in: three consecutive minutes starting with the
+    // current one (ledgering takes seconds, so the attempt cannot escape).
+    // 20 writes per minute collapse onto one RSVP row plus 60 audit rows.
+    let epoch_ms = two_bot_core::funnel::now_millis_for_test();
+    let base_minute = epoch_ms - epoch_ms.rem_euclid(60_000);
+    for m in 0..3 {
+        for i in 0..20 {
+            let at = two_bot_core::format_iso_millis(base_minute + m * 60_000 + i * 1_000);
+            let record = two_bot_core::RsvpRecord {
+                guild_id: GUILD.into(),
+                event_id: EVENT.into(),
+                user_id: USER.into(),
+                status: two_bot_core::RsvpStatus::Going,
+                responded_at: at,
+            };
+            two_bot_core::put_rsvp(second.pool(), &record)
+                .await
+                .unwrap();
+            two_bot_core::write_audit(
+                second.pool(),
+                &two_bot_core::RsvpAudit::for_rsvp(&format!("rate-{m}-{i}"), &record),
+            )
             .await
             .unwrap();
-        two_bot_core::write_audit(
-            second.pool(),
-            &two_bot_core::RsvpAudit::for_rsvp(&format!("rate-{i}"), &record),
-        )
-        .await
-        .unwrap();
+        }
     }
     let mock = MockRest::start(
         vec![
@@ -1144,7 +1151,7 @@ async fn rsvp_capacity_and_rate_refuse_without_extra_rows() {
     run(second.pool(), &mock, &rsvp(806, "going")).await;
     assert_reply(&mock, &two_bot_core::rsvp_rate_limited_text(), true);
     assert_eq!(mock.requests().len(), 4);
-    assert_eq!(counts(second.pool()).await, (1, 20, 0));
+    assert_eq!(counts(second.pool()).await, (1, 60, 0));
     mock.shutdown().await;
     second.close().await;
 }
