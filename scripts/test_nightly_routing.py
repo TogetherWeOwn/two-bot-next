@@ -18,6 +18,18 @@ class NightlyRoutingTests(unittest.TestCase):
         routed = set(re.findall(r"--skip channel_moderation_store::tests::(\w+)", broad))
         self.assertEqual(routed, names, "no guarded fixture runs with the incompatible bootstrap")
 
+    def test_broad_sweep_never_regenerates_the_committed_reference_docs(self):
+        # The ignored regen test rewrites docs/commands.md and docs/configuration.md in
+        # the checkout; tests later in the same sweep would then compare against
+        # regenerated docs and hide drift. check.yml says it must never run in CI.
+        source = (ROOT / "crates/core/tests/reference_docs.rs").read_text()
+        self.assertRegex(source, r"#\[ignore[^\]]*\]\s*fn regenerate_reference_docs\(")
+        workflow = WORKFLOW.read_text()
+        broad = workflow.split("- name: Full workspace sweep including ignored tests", 1)[1]
+        broad = broad.split("- name: Channel moderation ignored tests with their guarded URL", 1)[0]
+        self.assertIn("--include-ignored", broad)
+        self.assertIn("--skip regenerate_reference_docs\n", broad)
+
     def test_dedicated_channel_suite_runs_all_fixtures_with_unchanged_guard(self):
         workflow = WORKFLOW.read_text()
         dedicated = workflow.split("- name: Channel moderation ignored tests with their guarded URL", 1)[1]
