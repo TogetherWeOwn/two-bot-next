@@ -145,6 +145,20 @@ class AlertBindingTests(unittest.TestCase):
                 config = BASE.replace('TWO_VOICE = "1"', f"TWO_VOICE = {value}")
                 self.assertTrue(any('must be exactly "1"' in e for e in self.check_config(config)))
 
+    def test_voice_presence_is_staging_only(self):
+        staging = BASE.split("[env.staging.vars]", 1)[1].split("\n[", 1)[0]
+        self.assertIn('TWO_VOICE_PRESENCE = "1"', staging)
+        for section in ["vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(f"[{section}]", f'[{section}]\nTWO_VOICE_PRESENCE = "1"', 1)
+                errors = self.check_config(config)
+                self.assertTrue(any("TWO_VOICE_PRESENCE is staging-only" in e for e in errors), errors)
+        self.assertEqual(self.check_config(BASE.replace('TWO_VOICE_PRESENCE = "1"\n', "")), [])
+        for value in ['"0"', '"true"', '""', "1"]:
+            with self.subTest(value=value):
+                config = BASE.replace('TWO_VOICE_PRESENCE = "1"', f"TWO_VOICE_PRESENCE = {value}")
+                self.assertTrue(any('must be exactly "1"' in e for e in self.check_config(config)))
+
     def test_receiver_config_is_never_a_toml_var(self):
         for section in ["vars", "env.staging.vars", "env.production.vars"]:
             for key in ["TWO_INTERNAL_KEYS", "TWO_INTERNAL_ACTIONS", "TWO_INTERNAL_BIND", "TWO_INTERNAL_CONTAINER"]:

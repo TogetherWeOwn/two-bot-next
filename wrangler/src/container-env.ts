@@ -79,6 +79,9 @@ export const FORWARDED_FLAGS = [
   "TWO_ANTI_NUKE_TRUSTED_USER_IDS",
   // Temporary voice rooms.
   "TWO_VOICE",
+  // Privileged GUILD_PRESENCES for room-name game/stream facts
+  // (docs/voice-presence.md); needs the app's Presence Intent grant first.
+  "TWO_VOICE_PRESENCE",
   "TWO_TEMP_VOICE",
   "TWO_TEMP_VOICE_CATEGORY_ID",
   "TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS",

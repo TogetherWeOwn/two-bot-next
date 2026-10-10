@@ -284,6 +284,39 @@ when either ticker has no success for more than 10 minutes (40 missed
 ticks; boot and parked stay silent). Runbook:
 [runbook](runbook.md#alert-ticker-stale).
 
+## 10. Website-action receiver refusals
+
+Source: `two_bot_internal_actions_total{family,outcome}` (signed
+website-action receiver executions by bounded family and outcome).
+`family` is one of `announcement`, `event`, `settings`, `moderation`,
+`membership` or `other`; `outcome` is `executed` or the refusal class
+(`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`,
+`rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`,
+`conflict`, `upstream` or `internal`). Every request counts once; replays
+count on each serve. Series contract: [metrics](metrics.md).
+
+```promql
+sum by (family) (increase(two_bot_internal_actions_total{outcome!="executed"}[48h]))
+sum by (family, outcome) (increase(two_bot_internal_actions_total{outcome!="executed"}[1h]))
+sum by (family) (increase(two_bot_internal_actions_total{outcome="executed"}[48h]))
+```
+
+Read the `family` label before acting: a rising `moderation` or
+`membership` refusal share points at website-action abuse or a caller
+misconfiguration, not at Discord or the database. A rising `executed`
+count next to refusals means the receiver is still serving legitimate
+traffic while refusing the surge. Correlate with the container logs for
+`internal action refused` warn lines (sampled summaries keyed by
+`kind`/`class`/`key`/`action`) before acting. A counter that reset to
+zero between scrapes means the process restarted; it does not mean the
+window was quiet.
+
+Alert rule: the Worker `receiver_refusals:<family>` rule implements the
+streak above — it fires after refused outcomes rise in 3 consecutive
+keepalive samples per family (the first sample and counter resets clear
+the streak rather than firing), so one forged pre-auth probe in `other`
+stays silent. Runbook: [runbook](runbook.md#alert-receiver-refusals).
+
 ## What this pack does not do
 
 - No threshold is set or changed here.
