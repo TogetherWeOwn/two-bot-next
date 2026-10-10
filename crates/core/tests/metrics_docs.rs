@@ -6,9 +6,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use two_bot_core::metrics::{
-    Metrics, DB_ERROR_OPS, DISPATCH_LANES, EVENTS, INTERNAL_ACTION_FAMILIES,
-    INTERNAL_ACTION_OUTCOMES, JOBS, JOB_OUTCOMES, REST_ROUTES, RESULTS, SEND_ADMISSION_OUTCOMES,
-    VOICE_DEAD_ACTIONS, VOICE_OPERATIONS, VOICE_OUTCOMES, VOICE_RECONCILE_ACTIONS,
+    Metrics, CHECKPOINT_FAILURE_STAGES, DB_ERROR_OPS, DISPATCH_LANES, EVENTS,
+    INTERNAL_ACTION_FAMILIES, INTERNAL_ACTION_OUTCOMES, JOBS, JOB_OUTCOMES, REST_ROUTES, RESULTS,
+    SEND_ADMISSION_OUTCOMES, VOICE_DEAD_ACTIONS, VOICE_OPERATIONS, VOICE_OUTCOMES,
+    VOICE_RECONCILE_ACTIONS,
 };
 
 fn repository_root() -> PathBuf {
@@ -121,6 +122,7 @@ fn allowlisted_labels(name: &str) -> Vec<&'static str> {
         "two_bot_send_admissions_total" => vec!["outcome"],
         "two_bot_dispatch_drops_total" => vec!["lane"],
         "two_bot_internal_actions_total" => vec!["family", "outcome"],
+        "two_bot_gateway_checkpoint_failures_total" => vec!["stage"],
         _ => Vec::new(),
     }
 }
@@ -157,6 +159,9 @@ fn expected_values(name: &str) -> Vec<(&'static str, Vec<&'static str>)> {
             ("family", INTERNAL_ACTION_FAMILIES.to_vec()),
             ("outcome", INTERNAL_ACTION_OUTCOMES.to_vec()),
         ],
+        "two_bot_gateway_checkpoint_failures_total" => {
+            vec![("stage", CHECKPOINT_FAILURE_STAGES.to_vec())]
+        }
         _ => Vec::new(),
     }
 }
@@ -180,6 +185,7 @@ const KNOWN_COUNTERS: &[&str] = &[
     "two_bot_send_admissions_total",
     "two_bot_dispatch_drops_total",
     "two_bot_internal_actions_total",
+    "two_bot_gateway_checkpoint_failures_total",
 ];
 
 fn check_docs_against_exposition(doc: &str, exposition: &str) -> Result<(), String> {

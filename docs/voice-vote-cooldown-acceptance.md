@@ -25,8 +25,12 @@ the cooldown and spam guard:
   `VOTE_KICK_INITIATOR_LIMIT` (3) starts per `VOTE_KICK_INITIATOR_WINDOW_MS`
   (600,000 ms) per guild, across targets and rooms; other guilds are separate.
   Further starts fail with `InitiatorLimited`. Only successful starts count.
-- **Replay ledger.** A vote's initiating interaction ID never starts another
-  vote (`ReusedVoteId`), even after the vote expires.
+- **Replay ledger.** A vote's initiating interaction ID is rejected with
+  `ReusedVoteId` while the vote is retained (through the post-terminal cooldown
+  horizon inclusive). Past that horizon VK-03 `prune` reaps the vote and the ID
+  may start a new vote; Discord interaction IDs are unique per interaction, so
+  only a delayed duplicate delivery could collide, and those arrive within
+  seconds, never past the five-minute horizon.
 - **One ballot per member.** A second button press from the same member,
   whether Yes or No, fails with `RepeatedVote`.
 
@@ -63,8 +67,17 @@ requires on every roster change.
 
 ## Not provided by the core (not parity evidence)
 
-- Coordinated retention bounding of all vote state (VK-03) remains a separate
-  card. Staff-permission protected targets (VK-01) and mention-safe reason
+- Coordinated retention bounding (VK-03) is provided by coordinated
+  settle/evict on every public core method plus a timer `prune` entry that
+  reaps expired state with no new starts, with every eviction reported through
+  a drain the parent collects after every call (`drain_evicted`), pinned by
+  `timer_prune_reaps_expired_state_without_new_starts` and
+  `sustained_churn_keeps_retained_state_proportional_to_the_live_window`.
+  The worker reaps only when it can also settle (gate on authoritative
+  evidence, settle live votes first, then prune) and fences initiators with
+  queued enforcement. Durable replay retention across restarts remains a
+  parent obligation.
+  Staff-permission protected targets (VK-01) and mention-safe reason
   rendering (VK-04) have landed on main and compose with this slice.
 - Slash/button routing, ephemeral reply text, durable replay retention across
   restarts and permission-bearing delivery remain parent obligations, as

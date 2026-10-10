@@ -14,13 +14,18 @@ import uuid
 
 MIB = 1024 * 1024
 IMAGE_MAX_BYTES = 112 * MIB
-# The automations head (before the event-executor merge) measured 15,769,872
-# bytes (15.04 MiB) on the ephemeral runner vs the 15,712,080-byte (14.98 MiB)
-# baseline at 6f21347 (plus the merged #735 voice-config CLI), with no new
-# dependencies. Current main uses a 16 MiB ceiling after CI measured 15,741,344
-# bytes (15.01 MiB) on the event-executors head against a 15 MiB ceiling, with
-# no new dependencies. Keep the current-main cap pending measurement of this
-# combined head.
+# Recalibrated for the linked S4 self-role runtime: PR head measured
+# 10,805,344 bytes (10.30 MiB) on the ephemeral runner vs main baseline
+# 10,377,112 bytes (9.90 MiB) at ec49663. Growth is linked runtime/handlers/REST
+# plus previously-dead domain/store code, with no new dependencies; release
+# profile is already minimal (opt-level=z, lto, strip). Per b1-baseline
+# calibration (measured * 1.4 rounded up to the next MiB), 10.30 * 1.4 = 14.42
+# -> 15 MiB. The 16 MiB ceiling now covers the event-executors head at
+# 15,741,344 bytes (15.01 MiB) and the RSVP bound-admissions head at
+# 15,734,960 bytes (15.01 MiB), both slightly above the former 15 MiB cap and
+# with no new dependencies. This automation-only head measured 15,769,872 bytes
+# (15.04 MiB) before the event-executor merge. Keep the current-main cap pending
+# measurement of this combined head.
 BINARY_MAX_BYTES = 16 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.
