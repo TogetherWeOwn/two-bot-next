@@ -707,6 +707,11 @@ struct Http {
     /// When set, renames run as detached requests answering after this
     /// many milliseconds (the production `RoomHttp` path).
     slow_renames: Mutex<Option<u64>>,
+    /// When set, status writes run as detached requests answering after
+    /// this many milliseconds (the production `RoomHttp` path).
+    slow_status: Mutex<Option<u64>>,
+    /// Scripted failures for the next status writes.
+    status_errors: Mutex<VecDeque<RoomHttpError>>,
 }
 
 impl Http {
@@ -742,6 +747,8 @@ impl Http {
             overwrites_gate: None,
             limit_gate: None,
             slow_renames: Mutex::new(None),
+            slow_status: Mutex::new(None),
+            status_errors: Mutex::new(VecDeque::new()),
             downloaded_urls: Mutex::new(Vec::new()),
             download_results: Arc::new(Mutex::new(VecDeque::new())),
         }
@@ -885,6 +892,30 @@ impl RoomWrites for Http {
             None => Ok(()),
         }
     }
+    async fn set_voice_status(&self, channel: u64, status: &str) -> Result<(), RoomHttpError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("status:{channel}:{status}"));
+        match self.status_errors.lock().unwrap().pop_front() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+    fn detached_voice_status(&self, channel: u64, status: &str) -> Option<DetachedWrite> {
+        let delay = (*self.slow_status.lock().unwrap())?;
+        let trace = self.trace.clone();
+        let status = status.to_owned();
+        Some(Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            trace
+                .lock()
+                .unwrap()
+                .push(format!("status:{channel}:{status}"));
+            Ok(())
+        }))
+    }
+
     async fn rename(&self, channel: u64, name: &str) -> Result<(), RoomHttpError> {
         self.trace
             .lock()
@@ -10251,6 +10282,215 @@ async fn a_slow_rename_releases_the_actor_and_still_lands() {
     assert_eq!(
         worker.live.read_state().channels[&700].name.as_deref(),
         Some("slow")
+    );
+}
+
+#[tokio::test]
+async fn the_creator_status_template_sets_and_updates_the_voice_status() {
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "@@owner@@".to_owned();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER, Some(500), Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    worker
+        .name_settings
+        .status_templates
+        .insert(CREATOR, "@@num@@ <<person/people>>".to_owned());
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    // Same facts: nothing new to write.
+    worker.refresh_template_names(2);
+    assert!(!worker.dispatch_one(2).await);
+    worker.live.voice_update(MEMBER + 1, Some(500), Some(false));
+    worker.refresh_template_names(3);
+    // The status write for this room waits for its interval.
+    assert!(!worker.dispatch_one(3).await);
+    dispatch(&mut worker, 1 + name_panel::STATUS_MIN_INTERVAL_MS).await;
+    let trace = trace.lock().unwrap().clone();
+    assert!(
+        trace.contains(&"status:500:1 person".to_owned()),
+        "{trace:?}"
+    );
+    assert!(trace.contains(&"rename:500:Alex".to_owned()), "{trace:?}");
+    assert_eq!(trace.last().unwrap(), "status:500:2 people");
+}
+
+fn status_worker_parts() -> (LiveGuild, Store, Http, Trace) {
+    let (live, store, http, trace) = fixture();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER, Some(500), Some(false));
+    (live, store, http, trace)
+}
+
+async fn status_worker(
+    live: LiveGuild,
+    store: Store,
+    http: Http,
+    template: &str,
+) -> GuildRoomWorker<Store, Http> {
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    worker
+        .name_settings
+        .status_templates
+        .insert(CREATOR, template.to_owned());
+    worker
+}
+
+#[tokio::test]
+async fn a_status_line_waits_behind_room_creation() {
+    let (live, store, http, trace) = status_worker_parts();
+    let mut worker = status_worker(live, store, http, "@@num@@ here").await;
+    worker.refresh_template_names(0);
+    join(&mut worker, MEMBER + 1);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(trace.lock().unwrap()[0], "create");
+}
+
+#[tokio::test]
+async fn a_status_line_follows_rooms_without_a_name_template_or_with_an_override() {
+    // The fixture creator's name template is blank.
+    let (live, store, http, trace) = status_worker_parts();
+    let mut worker = status_worker(live, store, http, "@@num@@ here").await;
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    worker.custom_names.insert(500, "my room".to_owned());
+    worker.live.voice_update(MEMBER + 1, Some(500), Some(false));
+    worker.refresh_template_names(1);
+    dispatch(&mut worker, name_panel::STATUS_MIN_INTERVAL_MS).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["status:500:1 here", "status:500:2 here"]
+    );
+}
+
+#[tokio::test]
+async fn a_status_line_keeps_up_to_500_characters() {
+    let template = format!("{} @@num@@", "x".repeat(150));
+    let (live, store, http, trace) = status_worker_parts();
+    let mut worker = status_worker(live, store, http, &template).await;
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(
+        trace.lock().unwrap()[0],
+        format!("status:500:{} 1", "x".repeat(150))
+    );
+}
+
+#[tokio::test]
+async fn a_suspended_lifecycle_write_does_not_hold_back_status_lines() {
+    let (live, store, http, trace) = status_worker_parts();
+    let mut worker = status_worker(live, store, http, "@@num@@ here").await;
+    worker
+        .queue
+        .enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 999 });
+    worker.queue.suspend(GUILD, 999);
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(*trace.lock().unwrap(), ["status:500:1 here"]);
+}
+
+#[tokio::test]
+async fn removing_the_status_template_clears_the_line() {
+    let (live, store, http, trace) = status_worker_parts();
+    let mut worker = status_worker(live, store, http, "@@num@@ here").await;
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    worker.name_settings.status_templates.clear();
+    worker.live.voice_update(MEMBER + 1, Some(500), Some(false));
+    worker.refresh_template_names(1);
+    dispatch(&mut worker, name_panel::STATUS_MIN_INTERVAL_MS).await;
+    assert_eq!(*trace.lock().unwrap(), ["status:500:1 here", "status:500:"]);
+    assert!(!worker.room_status.contains_key(&500) || worker.room_status[&500].is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_clear_is_retried_even_when_the_next_render_is_empty() {
+    let (live, store, http, trace) = status_worker_parts();
+    let mut worker = status_worker(live, store, http, "@@num@@ here").await;
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    worker.name_settings.status_templates.clear();
+    worker
+        .http
+        .status_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::UnknownOutcome);
+    worker.live.voice_update(MEMBER + 1, Some(500), Some(false));
+    worker.refresh_template_names(1);
+    let interval = name_panel::STATUS_MIN_INTERVAL_MS;
+    dispatch(&mut worker, interval).await;
+    // Another change renders empty again: the clear stays queued.
+    worker.live.voice_update(MEMBER + 2, Some(500), Some(false));
+    worker.refresh_template_names(2);
+    dispatch(&mut worker, 2 * interval).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["status:500:1 here", "status:500:", "status:500:"]
+    );
+    assert!(!worker.status_unknown.contains(&500));
+}
+
+#[tokio::test]
+async fn status_bookkeeping_is_dropped_with_the_room() {
+    let (live, store, http, _) = status_worker_parts();
+    let mut worker = status_worker(live, store, http, "@@num@@ here").await;
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    assert!(worker.room_status.contains_key(&500));
+    worker.rooms.remove(&500);
+    worker.name_inputs = None;
+    worker.refresh_template_names(1);
+    assert!(worker.room_status.is_empty());
+    assert!(worker.status_not_before_ms.is_empty());
+    assert!(worker.pending_status.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_status_write_releases_the_actor_and_still_lands() {
+    let (live, store, http, trace) = status_worker_parts();
+    *http.slow_status.lock().unwrap() = Some(5_000);
+    let mut worker = status_worker(live, store, http, "@@num@@ here").await;
+    worker.refresh_template_names(0);
+    let started = tokio::time::Instant::now();
+    dispatch(&mut worker, 0).await;
+    assert_eq!(
+        started.elapsed(),
+        Duration::from_millis(name_panel::STATUS_INLINE_WAIT_MS)
+    );
+    assert!(trace.lock().unwrap().is_empty());
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    worker.dispatch_one(1).await;
+    assert_eq!(*trace.lock().unwrap(), ["status:500:1 here"]);
+    assert_eq!(worker.room_status[&500], "1 here");
+}
+
+#[test]
+fn creator_status_templates_come_from_the_configuration() {
+    let mut config = empty_config();
+    config
+        .creators
+        .push(two_bot_core::voice_config::CreatorConfiguration {
+            channel_id: CREATOR.to_string(),
+            name_template: "Room".to_owned(),
+            status_template: Some("@@num@@ here".to_owned()),
+            default_limit: 0,
+            always_private: false,
+            text_channels: false,
+            position: two_bot_core::voice_config::RoomPosition::Below,
+            first_number: 1,
+            group_by_category: false,
+            permission_source: two_bot_core::voice_config::PermissionSource::Creator {},
+        });
+    let settings = NameSettings::from_config(&config);
+    assert_eq!(
+        settings.status_templates.get(&CREATOR).map(String::as_str),
+        Some("@@num@@ here")
     );
 }
 
