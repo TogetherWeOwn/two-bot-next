@@ -150,6 +150,7 @@ const BOOT_ENV: &[&str] = &[
     "TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID",
     "TWO_TEMP_VOICE_CATEGORY_ID",
     "TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS",
+    "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS",
 ];
 
 /// Catalog keys whose dashboard-stored values are applied at runtime through
