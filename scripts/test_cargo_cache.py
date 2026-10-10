@@ -1155,6 +1155,183 @@ class SharedPoolRetainTests(unittest.TestCase):
         self.assertEqual(receipt['excluded_deleted_references'], 2)
         self.assertFalse((self.pool / 'slot-0' / 'lease.json').exists())
 
+    def test_is_non_file_reference_predicate(self):
+        # Kernel-object identity must accept every anonymous form the
+        # multi-tenant host shows while never matching a real file path:
+        # slot outputs always carry absolute paths under slot target/scratch.
+        for anon in ('/SYSV00000000', '/dev/zero', '/memfd:shared-memory-region',
+                     '/memfd:memory-backend-memfd', 'memfd:jit-cache',
+                     '/[aio]', '[aio]', '[anon:thread stack]',
+                     '[heap]', '[stack]', 'anon_inode:[eventfd]',
+                     '/anon_inode:[signalfd]'):
+            self.assertTrue(cache.is_non_file_reference(anon), anon)
+        for real in ('/dev/shm/sem.fixture', '/tmp/.org.chromium.fixture',
+                     '/usr/lib/x86_64-linux-gnu/libc.so.6',
+                     str(self.pool / 'slot-0' / 'target' / 'debug' / 'fixture')):
+            self.assertFalse(cache.is_non_file_reference(real), real)
+
+    def test_anon_kernel_deleted_excluded_by_identity(self):
+        # Multi-tenant host residual shape: memfd anonymous files, aio
+        # contexts and anon_inode objects alongside the SYSV/zero pair. All
+        # denote kernel objects that can never be regular slot output, so
+        # they are excluded (and counted) by identity -- never by device.
+        shm = os.makedev(0x00, 0x01)
+        with patch.object(cache, 'process_references',
+                          return_value=([], [('/memfd:shared-memory-region', shm, 11, False),
+                                             ('/[aio]', shm, 12, False),
+                                             ('anon_inode:[eventfd]', shm, 13, False),
+                                             ('/SYSV00000000', shm, 14, False),
+                                             ('/dev/zero', shm, 15, False)])):
+            receipt = self.retain()
+        self.assertTrue(all(row['eligible'] for row in receipt['slots']))
+        self.assertEqual(receipt['excluded_deleted_references'], 5)
+        self.assertFalse((self.pool / 'slot-0' / 'lease.json').exists())
+
+    def test_map_files_stat_backs_maps_deleted(self):
+        # The scanner re-grounds a file-backed maps deleted entry through
+        # /proc/PID/map_files/<range>: the symlink stat reports the mapped
+        # file's real device/inode (stat_backed=True), unlike the
+        # kernel-printed maps superblock device.
+        pid = self.fake_pid()
+        backing = self.root / 'backing.so'
+        backing.write_bytes(b'y' * 64)
+        info = backing.stat()
+        (pid / 'map_files').mkdir()
+        (pid / 'map_files' / '100-200').symlink_to(backing)
+        pool_dev = os.stat(self.pool / 'slot-0' / 'target').st_dev
+        (pid / 'maps').write_text(
+            f'100-200 r--p 00000000 {os.major(pool_dev):x}:{os.minor(pool_dev):x} '
+            f'123456789 /elsewhere/stale.so (deleted)\n')
+        _refs, deleted = cache.process_references(self.proc)
+        self.assertEqual(len(deleted), 1)
+        path, device, inode, stat_backed = deleted[0]
+        self.assertEqual(path, '/elsewhere/stale.so')
+        self.assertTrue(stat_backed)
+        self.assertEqual((device, inode), (info.st_dev, info.st_ino))
+
+    def test_map_files_missing_stays_fail_closed(self):
+        # No map_files entry (anonymous object without one, hidepid, or an
+        # exit/munmap race): the kernel-printed identity is kept and stays
+        # fail-closed -- the whole run refuses with no mutation.
+        pid = self.fake_pid()
+        target = self.pool / 'slot-0' / 'target'
+        pool_dev = os.stat(target).st_dev
+        (pid / 'maps').write_text(
+            f'100-200 r--p 00000000 {os.major(pool_dev):x}:{os.minor(pool_dev):x} '
+            f'999999991 /different/container/mount/stale.so (deleted)\n')
+        with self.assertRaisesRegex(cache.Refusal, 'unresolved deleted'):
+            self.retain()
+        self.assertTrue((target / 'debug' / 'fixture').exists())
+        self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
+
+    @contextlib.contextmanager
+    def map_files_denied(self):
+        real_stat = Path.stat
+
+        def stat(path, *args, **kwargs):
+            if 'map_files' in path.parts:
+                raise PermissionError('map_files needs CAP_SYS_ADMIN or CAP_CHECKPOINT_RESTORE')
+            return real_stat(path, *args, **kwargs)
+
+        with patch.object(Path, 'stat', stat):
+            yield
+
+    def test_map_files_resolves_zero_padded_maps_range(self):
+        # /proc/PID/maps zero-pads ranges to 8 hex digits, but the kernel names
+        # map_files entries unpadded and rejects the padded spelling (ENOENT).
+        pid = self.fake_pid()
+        backing = self.root / 'node'
+        backing.write_bytes(b'n' * 64)
+        info = backing.stat()
+        (pid / 'map_files').mkdir()
+        (pid / 'map_files' / '400000-420000').symlink_to(backing)
+        pool_dev = os.stat(self.pool / 'slot-0' / 'target').st_dev
+        (pid / 'maps').write_text(
+            f'00400000-00420000 r-xp 00000000 {os.major(pool_dev):x}:{os.minor(pool_dev):x} '
+            f'123456789 /usr/local/bin/node (deleted)\n')
+        _refs, deleted = cache.process_references(self.proc)
+        self.assertEqual(deleted, [('/usr/local/bin/node', info.st_dev, info.st_ino, True)])
+
+    def test_denied_map_files_keeps_unproven_identity_without_aborting(self):
+        # Denied map_files reads are a capability limit, not lost visibility:
+        # the entry keeps the kernel-printed identity (stat_backed=False).
+        pid = self.fake_pid()
+        backing = self.root / 'backing.so'
+        backing.write_bytes(b'y' * 64)
+        (pid / 'map_files').mkdir()
+        (pid / 'map_files' / '100-200').symlink_to(backing)
+        pool_dev = os.stat(self.pool / 'slot-0' / 'target').st_dev
+        (pid / 'maps').write_text(
+            f'100-200 r--p 00000000 {os.major(pool_dev):x}:{os.minor(pool_dev):x} '
+            f'123456789 /elsewhere/stale.so (deleted)\n')
+        with self.map_files_denied():
+            _refs, deleted = cache.process_references(self.proc)
+        self.assertEqual(deleted, [('/elsewhere/stale.so', pool_dev, 123456789, False)])
+
+    def test_denied_map_files_vetoes_only_attributed_slot(self):
+        pid = self.fake_pid()
+        target = self.pool / 'slot-0' / 'target'
+        pool_dev = os.stat(target).st_dev
+        (pid / 'map_files').mkdir()
+        (pid / 'map_files' / '100-200').symlink_to(target / 'debug' / 'fixture')
+        (pid / 'maps').write_text(
+            f'100-200 r--p 00000000 {os.major(pool_dev):x}:{os.minor(pool_dev):x} '
+            f'123456789 {target}/debug/gone.so (deleted)\n')
+        with self.map_files_denied():
+            by_slot = self.by_slot(self.retain())
+        self.assertFalse(by_slot['slot-0']['eligible'])
+        self.assertIn('deleted artifact', by_slot['slot-0']['reason'])
+        self.assertTrue(by_slot['slot-1']['eligible'])
+
+    def test_map_files_stat_enables_foreign_filesystem_exclusion(self):
+        # End-to-end multi-tenant shape: a map_files-backed maps deleted
+        # entry on a filesystem holding no slot output is provably unable to
+        # alias slot output (stat device vs stat device), so it is excluded
+        # and counted exactly like a stat-backed fd entry.
+        observed = {os.stat(self.pool / f'slot-{n}' / sub).st_dev
+                    for n in range(2) for sub in ('target', 'scratch')}
+        foreign = os.makedev(0xAB, 0xCD)
+        self.assertNotIn(foreign, observed)
+        with patch.object(cache, 'process_references',
+                          return_value=([], [('/var/tmp/chromium.so', foreign, 999999991, True)])):
+            receipt = self.retain()
+        self.assertTrue(all(row['eligible'] for row in receipt['slots']))
+        self.assertEqual(receipt['excluded_deleted_references'], 1)
+        self.assertFalse((self.pool / 'slot-0' / 'lease.json').exists())
+
+    def test_host_shape_mixed_residual_clears_or_refuses(self):
+        # Generic form of the shared-host residual: anonymous kernel objects
+        # plus foreign-filesystem file-backed mappings clear together; one
+        # same-filesystem file-backed maps entry (indistinguishable from a
+        # deleted slot file held open) still refuses the whole run.
+        shm = os.makedev(0x00, 0x01)
+        foreign = os.makedev(0xAB, 0xCD)
+        observed = {os.stat(self.pool / f'slot-{n}' / sub).st_dev
+                    for n in range(2) for sub in ('target', 'scratch')}
+        self.assertNotIn(foreign, observed)
+        clearable = [('/memfd:shared-memory-region', shm, 11, False),
+                     ('/[aio]', shm, 12, False),
+                     ('/SYSV00000000', shm, 13, False),
+                     ('/dev/zero', shm, 14, False),
+                     ('/var/tmp/chromium.so', foreign, 999999991, True),
+                     ('/dev/shm/sem.stale', foreign, 999999992, True)]
+        pool_dev = os.stat(self.pool / 'slot-0' / 'target').st_dev
+        # Refusal first: nothing mutates, so the clearable case below runs
+        # on the same fresh fixture.
+        with patch.object(cache, 'process_references',
+                          return_value=([], list(clearable) + [
+                              ('/replaced/system.so', pool_dev, 999999993, False)])):
+            with self.assertRaisesRegex(cache.Refusal, 'unresolved deleted'):
+                self.retain()
+        self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
+        self.assertTrue((self.pool / 'slot-0' / 'target' / 'debug' / 'fixture').exists())
+        with patch.object(cache, 'process_references',
+                          return_value=([], list(clearable))):
+            receipt = self.retain()
+        self.assertTrue(all(row['eligible'] for row in receipt['slots']))
+        self.assertEqual(receipt['excluded_deleted_references'], 6)
+        self.assertFalse((self.pool / 'slot-0' / 'lease.json').exists())
+
     def test_device_unknown_deleted_refuses_whole(self):
         # A deleted entry with no usable device identity cannot prove
         # non-aliasing, so it stays fail-closed and refuses the whole run.
