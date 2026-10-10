@@ -90,3 +90,10 @@ path = "fuzz_targets/vote_kick_reason.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "slash_input_bounds"
+path = "fuzz_targets/slash_input_bounds.rs"
+test = false
+doc = false
+bench = false
