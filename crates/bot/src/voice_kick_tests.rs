@@ -908,6 +908,125 @@ fn kick_refusals_never_echo_initiator_text() {
     }
 }
 
+/// Gate VK-04 echo half: hostile reasons from the #692 matrix never echo in
+/// vote refusal/error/log paths. Only `reason.code()` / sanitized text / IDs
+/// appear. The ballot render itself is covered by
+/// `hostile_reasons_render_as_mention_safe_plain_text`; ordinary text still
+/// passes through via `ordinary_reasons_render_intact_and_absent_reason_renders_no_line`.
+#[tokio::test]
+async fn hostile_reasons_never_echo_in_refusals_errors_or_logs() {
+    const PROBES: &[&str] = &[
+        "@everyone",
+        "@here",
+        "<@",
+        "<#",
+        "<:",
+        "://",
+        "www.",
+        "discord.gg",
+        ".gg/",
+        ".com/",
+        "**",
+        "__",
+        "~~",
+        "||",
+    ];
+    // Reason-derived echo probes: only substrings actually present in this
+    // hostile input. Bare "<@" / "<#" / "<:" prefixes are deliberately NOT
+    // probed: `failure_line` legitimately renders "<#ROOM>" channel mentions
+    // for real IDs, so a bare prefix cannot distinguish an echo from the
+    // fixed ID format. Mention-pill inputs are instead pinned by their
+    // hostile-specific snowflake, which never equals a test ID (ROOM=500,
+    // VOTE=7000, members in the 300s).
+    let assert_no_reason_echo = |hostile: &str, rendered: &str, where_: &str| {
+        let folded_rendered = rendered.to_lowercase();
+        let folded_hostile = hostile.to_lowercase();
+        for probe in PROBES {
+            if matches!(*probe, "<@" | "<#" | "<:") {
+                continue;
+            }
+            if !folded_hostile.contains(&probe.to_lowercase()) {
+                continue;
+            }
+            assert!(
+                !folded_rendered.contains(&probe.to_lowercase()),
+                "{hostile:?} probe {probe:?} in {where_}: {rendered:?}"
+            );
+        }
+        for needle in ["7654321", "987654321", "123456789"] {
+            if hostile.contains(needle) {
+                assert!(
+                    !rendered.contains(needle),
+                    "{hostile:?} id {needle:?} echoed in {where_}: {rendered:?}"
+                );
+            }
+        }
+    };
+    let admission = two_bot_core::voice_create_admission::CreateAdmissionConfig::default();
+    let admission_reasons = [
+        two_bot_core::voice_create_admission::RefusalReason::UserCap,
+        two_bot_core::voice_create_admission::RefusalReason::GuildCap,
+        two_bot_core::voice_create_admission::RefusalReason::Cooldown,
+        two_bot_core::voice_create_admission::RefusalReason::UserBurst,
+        two_bot_core::voice_create_admission::RefusalReason::GuildBurst,
+    ];
+    assert_eq!(
+        HOSTILE_VOTE_REASONS.len(),
+        22,
+        "the #692 matrix must stay pinned"
+    );
+    for hostile in HOSTILE_VOTE_REASONS.iter().copied() {
+        // The ballot fences for this input are asserted in
+        // `hostile_reasons_render_as_mention_safe_plain_text`; here the same
+        // input is in scope while the refusal/error/log paths run.
+        let (content, _) = start_payload(Some(hostile));
+        assert!(
+            content.contains("Reason: "),
+            "{hostile:?} must render a Reason line: {content:?}"
+        );
+        let (mut worker, _) = setup().await;
+        start(&mut worker, VOTER_A, TARGET).unwrap();
+        worker.kick_cast(VOTE, VOTER_A, VoteBallot::Yes, 1).unwrap();
+
+        // Repeat-vote refusal and second-vote-for-one-target refusal.
+        let repeat = worker
+            .kick_cast(VOTE, VOTER_A, VoteBallot::No, 2)
+            .unwrap_err();
+        assert_eq!(
+            repeat,
+            KickRefusal::Vote(VoteKickError::RepeatedVote),
+            "{hostile:?}"
+        );
+        let repeat_text = kick_refusal_text(&repeat);
+        assert!(
+            !repeat_text.contains(hostile),
+            "{hostile:?} echoed in repeat refusal: {repeat_text:?}"
+        );
+        let active = worker
+            .kick_start(VOTE + 1, ROOM, VOTER_B, TARGET, 3)
+            .unwrap_err();
+        assert_eq!(
+            active,
+            KickRefusal::Vote(VoteKickError::ActiveVoteExists),
+            "{hostile:?}"
+        );
+        let active_text = kick_refusal_text(&active);
+        assert!(
+            !active_text.contains(hostile),
+            "{hostile:?} echoed in active-vote refusal: {active_text:?}"
+        );
+        for text in [repeat_text, active_text] {
+            let folded = text.to_lowercase();
+            for probe in PROBES {
+                assert!(
+                    !folded.contains(&probe.to_lowercase()),
+                    "{hostile:?} probe {probe:?} in refusal: {text:?}"
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn the_audit_buffer_is_bounded_and_drops_the_oldest_row() {
     let (mut worker, _trace) = setup().await;
