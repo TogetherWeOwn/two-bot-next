@@ -24,6 +24,31 @@ BACKTICKED = re.compile(r"`([^`]+)`")
 ROUTE = re.compile(r"^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) /\S*$|^other$")
 CALLSITE = re.compile(r"`(crates/[^`]*\.rs)`\s*\(([^)]+)\)")
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(::[A-Za-z_][A-Za-z0-9_]*)*$")
+FN_DEF = re.compile(
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+"
+    r"([A-Za-z_][A-Za-z0-9_]*)\b",
+    re.MULTILINE,
+)
+INLINE_TESTS_MOD = re.compile(r"#\[cfg\(test\)\]\s*\n\s*mod tests\s*\{")
+
+
+def production_source(source: str) -> str:
+    """Source outside the inline `#[cfg(test)] mod tests` block.
+
+    The inline test module (when present) runs to the end of the file, so
+    truncating there keeps emit-site occurrences while excluding test-only
+    helpers with colliding names.
+    """
+    match = INLINE_TESTS_MOD.search(source)
+    return source[: match.start()] if match else source
+
+
+def enclosing_fn(prod: str, index: int) -> str | None:
+    """Name of the nearest `fn` definition above `index`, if any."""
+    last = None
+    for match in FN_DEF.finditer(prod, 0, index):
+        last = match.group(1)
+    return last
 
 
 def rest_routes_from_source() -> list:
@@ -97,19 +122,66 @@ class ObservabilityConformanceTests(unittest.TestCase):
                     f"callsite cell names no enclosing function/method: {row[:80]}",
                 )
                 if rel not in sources:
-                    sources[rel] = (ROOT / rel).read_text()
-                src = sources[rel]
+                    sources[rel] = production_source((ROOT / rel).read_text())
+                prod = sources[rel]
+                anchor_finals = {qualified.split("::")[-1] for qualified in anchors}
                 for qualified in anchors:
                     # `HttpInvites::current` pins the method; the file must
                     # still define a function with the final segment so a
-                    # rename or move turns this suite red.
+                    # rename turns this suite red. Moves are caught below by
+                    # the containment check.
                     name = qualified.split("::")[-1]
                     self.assertRegex(
-                        src,
+                        prod,
                         rf"\bfn {re.escape(name)}\b",
                         f"stable anchor `{qualified}` names no function "
                         f"in {rel}; update the catalog with the rename/move",
                     )
+                # Each row's message literal must be emitted inside one of
+                # its anchor functions: the nearest enclosing `fn` above
+                # every occurrence has to be an anchor, so pointing a row at
+                # the wrong (but existing) function turns this suite red.
+                # Event names live in the first column; voice rows name the
+                # field there and carry the message literals in the callsite
+                # cell instead.
+                messages: list = []
+                for token in BACKTICKED.findall(cells[1]):
+                    if '="' not in token and "crates/" not in token and ".rs" not in token:
+                        messages.append(token)
+                for token in BACKTICKED.findall(callsite):
+                    if (
+                        not IDENT.match(token)
+                        and "crates/" not in token
+                        and ".rs" not in token
+                        and '="' not in token
+                    ):
+                        messages.append(token)
+                messages = list(dict.fromkeys(messages))
+                self.assertGreater(
+                    len(messages),
+                    0,
+                    f"callsite row names no emitted message: {row[:80]}",
+                )
+                for message in messages:
+                    starts = [
+                        match.start()
+                        for match in re.finditer(re.escape(message), prod)
+                    ]
+                    self.assertGreater(
+                        len(starts),
+                        0,
+                        f"message `{message}` is not emitted in {rel}; "
+                        "update the catalog with the rename/move",
+                    )
+                    for start in starts:
+                        owner = enclosing_fn(prod, start)
+                        self.assertIn(
+                            owner,
+                            anchor_finals,
+                            f"message `{message}` in {rel} is emitted in "
+                            f"`{owner}`, not in {sorted(anchor_finals)}; "
+                            "update the catalog with the move",
+                        )
 
     def test_doc_route_list_equals_rest_routes(self):
         self.assertEqual(
