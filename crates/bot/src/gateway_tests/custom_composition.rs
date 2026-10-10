@@ -63,6 +63,14 @@ fn gates() -> RouterGates {
 async fn composition_rest(seen: Arc<AtomicBool>, hold: Duration) -> MockRest {
     let held = Arc::new(AtomicBool::new(false));
     MockRest::with_responder(move |request| {
+        // RA-01 live-membership gate precedes the live-event read: echo the
+        // requested user so the gate sees a current member and reaches the
+        // scheduled-events hold below.
+        if request.method == "GET" && request.path.contains("/members/") {
+            let user = request.path.rsplit('/').next().unwrap_or("77");
+            let user = user.split('?').next().unwrap_or("77");
+            return ScriptedResponse::json(200, json!({"user": {"id": user}, "roles": []}));
+        }
         if request.method == "GET" && request.path.contains("scheduled-events") {
             seen.store(true, Ordering::Release);
             if !held.swap(true, Ordering::AcqRel) {

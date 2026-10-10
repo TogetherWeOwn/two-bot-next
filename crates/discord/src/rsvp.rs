@@ -421,6 +421,28 @@ async fn execute(
                 Some(1..=3) => {}
                 _ => return Err("Discord returned an invalid scheduled event status.".to_owned()),
             }
+            // RA-01 acting-host gate: the invoker must currently belong to the
+            // interaction's guild. It runs after the landed RA-02 event
+            // binding so that block stays verbatim, and still precedes every
+            // attendance write. A self check-in skips this lookup: the live
+            // target read below verifies the same membership.
+            let actor_id = interaction
+                .author_id()
+                .ok_or("Missing command member.")?
+                .to_string();
+            if member_id.to_string() != actor_id {
+                match guild_membership(executor, &guild_id, &actor_id).await {
+                    Membership::Current => {}
+                    Membership::Absent => {
+                        return Err(
+                            "You must still belong to this server to record attendance.".to_owned()
+                        );
+                    }
+                    Membership::Unavailable => {
+                        return Err("Unable to verify server membership.".to_owned());
+                    }
+                }
+            }
             // Current guild membership, live (RA-02): the resolved User proves
             // identity, not membership. A 404 is a departed, never-joined or
             // cross-guild target; transport or shape failures fail closed. The

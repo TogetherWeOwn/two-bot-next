@@ -244,6 +244,14 @@ async fn connect_governed(
 async fn lane_holding_rest(seen: Arc<AtomicBool>, hold: Duration) -> MockRest {
     let held = Arc::new(AtomicBool::new(false));
     MockRest::with_responder(move |request| {
+        // RA-01 live-membership gate precedes the live-event read: echo the
+        // requested user so the gate sees a current member and reaches the
+        // scheduled-events hold below.
+        if request.method == "GET" && request.path.contains("/members/") {
+            let user = request.path.rsplit('/').next().unwrap_or("77");
+            let user = user.split('?').next().unwrap_or("77");
+            return ScriptedResponse::json(200, json!({"user": {"id": user}, "roles": []}));
+        }
         if request.method == "GET" && request.path.contains("scheduled-events") {
             seen.store(true, Ordering::Release);
             if !held.swap(true, Ordering::AcqRel) {
@@ -341,7 +349,7 @@ async fn queued_commands(
     ws.send(Message::text(interaction(2, "going").to_string()))
         .await
         .unwrap();
-    wait_requests(&rest, 4).await; // First defer and live-event read are underway.
+    wait_requests(&rest, 5).await; // First defer, membership, and live-event read are underway.
     let delivered = tokio::time::Instant::now();
     ws.send(Message::text(interaction(3, "interested").to_string()))
         .await
@@ -581,7 +589,7 @@ async fn sticky_and_feed_are_deferred_at_receipt_while_rsvp_is_pending() {
     ws.send(Message::text(interaction(2, "going").to_string()))
         .await
         .unwrap();
-    wait_requests(&rest, 4).await;
+    wait_requests(&rest, 5).await;
     let delivered = tokio::time::Instant::now();
     let commands: Vec<_> = [(3, "sticky"), (4, "feed-remove")]
         .into_iter()
@@ -1049,6 +1057,11 @@ async fn handoff_rest(seen: Arc<AtomicBool>) -> MockRest {
     use std::sync::atomic::AtomicUsize;
     let calls = Arc::new(AtomicUsize::new(0));
     MockRest::with_responder(move |request| {
+        if request.method == "GET" && request.path.contains("/members/") {
+            let user = request.path.rsplit('/').next().unwrap_or("77");
+            let user = user.split('?').next().unwrap_or("77");
+            return ScriptedResponse::json(200, json!({"user": {"id": user}, "roles": []}));
+        }
         if request.method == "GET" && request.path.contains("scheduled-events") {
             seen.store(true, Ordering::Release);
             let call = calls.fetch_add(1, Ordering::AcqRel);
@@ -1146,6 +1159,11 @@ async fn receipt_callback_total_stays_inside_absolute_budget() {
     let seen = Arc::new(AtomicBool::new(false));
     let seen_probe = Arc::clone(&seen);
     let rest = MockRest::with_responder(move |request| {
+        if request.method == "GET" && request.path.contains("/members/") {
+            let user = request.path.rsplit('/').next().unwrap_or("77");
+            let user = user.split('?').next().unwrap_or("77");
+            return ScriptedResponse::json(200, json!({"user": {"id": user}, "roles": []}));
+        }
         if request.method == "GET" && request.path.contains("scheduled-events") {
             seen_probe.store(true, Ordering::Release);
             // Occupancy ends 100 ms before the receipt budget does, but the

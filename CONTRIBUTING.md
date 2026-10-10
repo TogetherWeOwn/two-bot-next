@@ -164,7 +164,7 @@ workspace's release version:
 
 ```toml
 [dev-dependencies]
-two-bot-testsupport = { path = "../testsupport", version = "0.3.0" } # x-release-please-version
+two-bot-testsupport = { path = "../testsupport", version = "0.4.0" } # x-release-please-version
 ```
 
 ```rust,ignore

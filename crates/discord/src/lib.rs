@@ -56,6 +56,7 @@ pub mod voice_rooms;
 #[cfg(feature = "db")]
 pub use leveling_runtime::{
     CommunityFactsError, DeferredCommunityFacts, LevelingRuntime, OrderedLevelingPipeline,
+    RulesAcceptedWrite,
 };
 
 pub use adapter::event_to_core;
