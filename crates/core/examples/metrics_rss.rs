@@ -6,7 +6,7 @@
 
 use std::{hint::black_box, time::Duration};
 use two_bot_core::metrics::{
-    Metrics, DB_ERROR_OPS, EVENTS, JOBS, REST_ROUTES, SEND_ADMISSION_OUTCOMES,
+    JobErrorClass, Metrics, DB_ERROR_OPS, EVENTS, JOBS, REST_ROUTES, SEND_ADMISSION_OUTCOMES,
 };
 
 fn rss_bytes() -> u64 {
@@ -36,7 +36,7 @@ fn main() {
     }
     for job in JOBS {
         metrics.job_success(job, 123);
-        metrics.job_failure(job);
+        metrics.job_failure(job, JobErrorClass::Database);
     }
     for op in DB_ERROR_OPS {
         metrics.db_error(op);
@@ -50,7 +50,7 @@ fn main() {
         metrics.gateway_event(&unknown);
         metrics.rest_response(&unknown, Some(429));
         metrics.job_success(&unknown, 123);
-        metrics.job_failure(&unknown);
+        metrics.job_failure(&unknown, JobErrorClass::Database);
         metrics.db_error(&unknown);
         metrics.send_admission(&unknown);
         metrics.handler_duration(Duration::from_millis(id % 1000));

@@ -10,22 +10,11 @@ use tokio::{
 };
 use two_bot_core::metrics::{self, Metrics};
 
+pub use two_bot_core::metrics::JobErrorClass as ErrorClass;
+
 pub type JobFuture = Pin<Box<dyn Future<Output = Result<(), ErrorClass>> + Send>>;
 pub type JobAction = Arc<dyn Fn() -> JobFuture + Send + Sync>;
 pub type SharedStatus = Arc<RwLock<BTreeMap<String, JobStatus>>>;
-
-/// Fixed classes only: never expose database URLs, REST bodies or panic payloads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ErrorClass {
-    Database,
-    Rest,
-    Configuration,
-    Timeout,
-    Panic,
-    Feed,
-    RecoveryRequired,
-}
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct JobStatus {
@@ -123,7 +112,7 @@ async fn record_completion(
         Err(class) => {
             current.last_error_class = Some(class);
             current.consecutive_failures = current.consecutive_failures.saturating_add(1);
-            metrics.job_failure(name);
+            metrics.job_failure(name, class);
             tracing::warn!(job = name, error_class = ?class, "periodic job failed");
         }
     }

@@ -34,6 +34,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_job_runs_total{job,outcome}` | Completed attempts; outcome is `success` or `failure` (including returned errors, timeouts and isolated panics) |
 | `two_bot_job_last_success_timestamp_seconds{job}` | Last successful completion time in Unix seconds; zero means no success recorded |
 | `two_bot_job_consecutive_failures{job}` | Failed completions since the last success; resets to zero on success |
+| `two_bot_job_last_error_class{job,class}` | One-hot class of the last failed completion; clears on success; fixed 12 × 7 = 84 series |
 | `two_bot_voice_operations_total{op,outcome}` | Finished room create/move/delete outcomes; `op` is `create`, `move` or `delete`, `outcome` is `success`, `category_full`, `discord`, `persistence` or `cancelled`; retries and 429 backoffs are not outcomes |
 | `two_bot_voice_reconcile_actions_total{action}` | Reconcile plan sizes; `action` is `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued` |
 | `two_bot_voice_dead_letters_total{action}` | Queue writes that exhausted `QUEUE_MAX_ATTEMPTS` (10); `action` is `create`, `move`, `delete`, `companion`, `ownership`, `kick`, `rename`, `limit` or `other` |
@@ -137,6 +138,12 @@ as dynamic labels.
   `session_checkpoint` records successful durable gateway commits; zero means
   never run. `audit_retry` is the audit supervisor's 30 s retry sweep.
   `settings` is the DB-only 15 s `guild_settings` version poll.
+- `two_bot_job_last_error_class{job,class}` — `job` uses the list above;
+  `class` is one of `database`, `rest`, `configuration`, `timeout`, `panic`,
+  `feed` or `recovery_required` (the fixed `ErrorClass` variants). Each of the
+  12 jobs has one series per class (84 total); exactly the latest failure's class
+  is `1`, and every class is `0` before a failure or after success. Unknown job
+  names fold into `other`; class labels are fixed enum names, never error text.
 - `two_bot_voice_operations_total{op,outcome}` — `op` is `create`, `move`
   or `delete`; `outcome` is `success`, `category_full`, `discord`,
   `persistence` or `cancelled`. `Rejected` status/code values never become
@@ -234,8 +241,9 @@ controller's bounded cache pool was missing at implementation time.
   hostile labels, saturating job counters, status groups and missing latency.
 - Docs conformance (`crates/core/tests/metrics_docs.rs`): every counter row
   in the table above renders in the exposition with its allowlisted labels,
-  and every exposition counter has a row here; deliberate-drift fixtures
-  prove both directions fail by name.
+  and every exposition counter has a row here; the job error-class gauge is
+  pinned to its documented labels and complete fixed `JOBS × ErrorClass`
+  series. Deliberate-drift fixtures prove counter drift fails by name.
 - Supervisor fixtures (paused Tokio time, local `Metrics` registries): first
   success for every website/community registration, seconds conversion, returned
   failures, preserved success timestamps, streak reset, timeout/future/factory
