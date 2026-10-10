@@ -219,7 +219,11 @@ impl CommunityFactsRuntime {
 mod tests {
     use super::*;
 
-    fn gate(member_id: Snowflake, occurred_at: &str, source: &str) -> RulesAcceptedFact<'_> {
+    fn gate<'a>(
+        member_id: Snowflake,
+        occurred_at: &'a str,
+        source: &'a str,
+    ) -> RulesAcceptedFact<'a> {
         RulesAcceptedFact {
             guild_id: 100,
             member_id,
