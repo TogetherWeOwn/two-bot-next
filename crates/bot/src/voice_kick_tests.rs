@@ -1210,7 +1210,7 @@ async fn hostile_reasons_never_echo_in_refusals_errors_or_logs() {
             assert_no_reason_echo(hostile, &rendered, "failure_line");
         }
         // Other failure families carry IDs and typed errors only.
-        let others = vec![
+        let others = [
             LifecycleFailure::CategoryFull {
                 creator_id: ROOM,
                 message: "category is full".to_owned(),
@@ -1245,7 +1245,8 @@ async fn hostile_reasons_never_echo_in_refusals_errors_or_logs() {
         // Vote log sites: audit rows carry snowflakes and fixed codes only, and
         // follow-up ballot edits never interpolate the reason.
         assert!(worker.flush_kick_audit(4).await, "{hostile:?}");
-        for row in worker.store.kick_audit.lock().unwrap().iter() {
+        let rows = worker.store.kick_audit.lock().unwrap().clone();
+        for row in &rows {
             assert!(
                 !row.outcome.contains(hostile),
                 "{hostile:?} echoed in audit outcome: {row:?}"
