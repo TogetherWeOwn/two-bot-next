@@ -563,3 +563,15 @@ jobs:
               sys.exit(1)
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write(f"- Takeover confirmed: `{expected}` still serves 100% after the owned probes\n")
+
+  release:
+    name: release
+    # Tag the commit that is now live and publish its notes (release.yml).
+    # A rollback serves an older version, so it is never released.
+    needs: [guard, production]
+    if: needs.guard.outputs.mode == 'deploy'
+    permissions:
+      contents: write # Create the tag and its GitHub Release (and attach SBOMs).
+    uses: ./.github/workflows/release.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
+    with:
+      sha: ${{ needs.guard.outputs.sha }}

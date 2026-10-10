@@ -30,12 +30,10 @@ on:
     types: [opened, edited, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
-  # Dispatched by the release workflow (TOG-10035) on release-please branches:
-  # PRs opened with GITHUB_TOKEN trigger no workflows, so the required
-  # `pr-lint` / `gitleaks` checks would never run on the release PR without
-  # this path. The release workflow passes the release PR number; the pr-lint
-  # job fetches the title/body via the API (needs pull-requests: read) and
-  # validates them with the same inline script as the pull_request path.
+  # Manual validation of an open PR by number (releases no longer dispatch
+  # it: there is no release PR, docs/releases.md). The pr-lint job fetches
+  # the title/body via the API (needs pull-requests: read) and validates them
+  # with the same inline script as the pull_request path.
   workflow_dispatch:
     inputs:
       pr_number:

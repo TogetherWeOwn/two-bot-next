@@ -204,8 +204,10 @@ class StaticGuardTests(unittest.TestCase):
 
     def test_every_job_uses_the_shared_runner_routing(self):
         # scripts/test-runner-routing.py pins the full expression (TOG-12339).
-        self.assertEqual(list(JOBS), ["guard", "production"])
+        self.assertEqual(list(JOBS), ["guard", "production", "release"])
         for name, job in JOBS.items():
+            if name == "release":
+                continue  # reusable call to release.yml; its jobs carry the routing
             runs_on = value(children(job[1:], 4)["runs-on"])
             self.assertTrue(runs_on.startswith("${{ fromJSON((!github.event.repository.private && "), name)
             self.assertIn(f"vars.CI_OVERFLOW_JOBS || '[]'), '{name}')", runs_on)
@@ -218,6 +220,10 @@ class StaticGuardTests(unittest.TestCase):
                 for key, block in children(children(job[1:], 4)["permissions"][1:], 6).items()
             }
             self.assertTrue(granted, name)
+            if name == "release":
+                # Only the post-deploy release call writes: tag + GitHub Release.
+                self.assertEqual(granted, {"contents": "write"})
+                continue
             self.assertEqual(set(granted.values()), {"read"}, name)
         self.assertEqual(
             set(children(children(JOBS["production"][1:], 4)["permissions"][1:], 6)), {"contents"}
@@ -227,6 +233,8 @@ class StaticGuardTests(unittest.TestCase):
         uses = [line.split("uses:", 1)[1].strip() for line in LINES if "uses:" in line]
         self.assertTrue(uses)
         for ref in uses:
+            if ref.startswith("./.github/workflows/release.yml"):
+                continue  # same-repo reusable call, pinned to the checked-out commit
             self.assertRegex(ref, r"^[\w.-]+/[\w.-]+@[0-9a-f]{40}(\s|$)", ref)
         staging = {
             line.split("uses:", 1)[1].split()[0]
