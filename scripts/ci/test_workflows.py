@@ -200,7 +200,8 @@ def staging_claim_errors(claim):
         errors.append(f"{prefix} must read this dispatch's plan artifact, not an arbitrary run")
     expected_env = {key: "${{ inputs." + value + " }}" for key, value in (
         ("MODE", "mode"), ("SOURCE_SHA", "source_sha"), ("STAGING_HOST", "staging_host"),
-        ("STAGING_DATABASE", "staging_database"), ("RECOVERY_REF", "recovery_evidence_ref"),
+        ("STAGING_DATABASE", "staging_database"), ("STAGING_BRANCH_ID", "staging_branch_id"),
+        ("RECOVERY_REF", "recovery_evidence_ref"),
         ("ACL_REF", "acl_plan_ref"), ("EXPECTED_PENDING", "expected_pending"),
         ("PLAN_MANIFEST_SHA256", "plan_manifest_sha256"), ("PLAN_RUN_ID", "plan_run_id"))}
     if publish.get("env") != expected_env or publish.get("shell") != "bash":
@@ -252,6 +253,7 @@ def staging_migrate_errors(workflow):
         errors.append(f"{name}: must be dispatch-only (no push/pull_request/schedule)")
     inputs = ((on.get("workflow_dispatch") or {}).get("inputs") or {})
     expected = {"mode", "source_sha", "staging_host", "staging_database",
+                "staging_branch_id",
                 "recovery_evidence_ref", "acl_plan_ref", "expected_pending",
                 "plan_manifest_sha256", "plan_run_id"}
     if set(inputs) != expected:
@@ -262,10 +264,17 @@ def staging_migrate_errors(workflow):
                 or set(mode.get("options") or []) != {"plan", "apply"}
                 or mode.get("default") != "plan"):
             errors.append(f"{name}: mode must be plan/apply defaulting to plan")
-        for key in expected - {"mode", "expected_pending", "plan_manifest_sha256", "plan_run_id"}:
+        for key in expected - {"mode", "staging_branch_id", "expected_pending",
+                                "plan_manifest_sha256", "plan_run_id"}:
             field = inputs.get(key) or {}
             if str(field.get("required")).lower() != "true":
                 errors.append(f"{name}: input {key} must be required")
+        branch = inputs.get("staging_branch_id") or {}
+        if (str(branch.get("required")).lower() != "false"
+                or branch.get("default") != ""
+                or "branch" not in str(branch.get("description")).lower()):
+            errors.append(f"{name}: staging_branch_id must stay optional, default empty, "
+                          "and documented as the PlanetScale branch pin")
         pending = inputs.get("expected_pending") or {}
         if (str(pending.get("required")).lower() != "false"
                 or pending.get("default") != ""
@@ -366,6 +375,13 @@ def staging_migrate_errors(workflow):
         errors.append(f"{name}:apply: must pass the producing run's downloaded manifest to the runner")
     if "--plan-manifest-path" in plan_runs:
         errors.append(f"{name}:plan: must not take the provenance manifest path (it produces the manifest)")
+    # PlanetScale branch pin: both modes pass the non-secret branch id to the
+    # runner, which requires it for `*.psdb.cloud` hosts and refuses pooled
+    # ports, `|bouncer` usernames and branch mismatches before any DDL.
+    if "--staging-branch-id" not in plan_runs:
+        errors.append(f"{name}:plan: must pass the staging branch pin to the runner")
+    if "--staging-branch-id" not in apply_runs:
+        errors.append(f"{name}:apply: must pass the staging branch pin to the runner")
     apply_fetch = [step for step in apply.get("steps", [])
                    if str(step.get("uses", "")).startswith("actions/download-artifact@")]
     if len(apply_fetch) != 1:

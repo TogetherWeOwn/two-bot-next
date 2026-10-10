@@ -88,7 +88,7 @@ unresolved.
 |---|---|---|---|---|
 | 4.1 | Readiness | `curl --include "$PRODUCTION_WORKER_URL/health"` (200) and `/readyz` (200 with all components ready, exact compiled revision/build ID); re-read rollout/Worker control-plane state after the probes | Statuses, revision match, rollout ID | [production-deploy.md](production-deploy.md) `/readyz` gate; 503 parked is truthful, never acceptance |
 | 4.2 | Event continuity | Compare real join/message/voice observations against the moderator record; verify agreed non-destructive command/web journeys; confirm due jobs/unbans reconciled before releasing their single consumer | Moderator cross-check, journey receipts, job last-success times | [cutover.md §Registry swap](cutover.md#registry-swap-first-boot-and-gono-go) GO/abort lists |
-| 4.3 | GO decision | Lead declares GO only with: no overlapping gateway/writers; final data/registry checks match; preflight no FAIL; fresh READY with all required components healthy; no unexplained gap, duplicate or missed deadline; all sign-offs and rollback receipts present | GO record with `T_0` (first `/readyz` 200 on the production revision) | Any abort trigger starts the [rollback path](cutover.md#rollback-preserve-next-window-writes-before-reopening-legacy), not a retry loop |
+| 4.3 | GO decision | Lead declares GO only with: no overlapping gateway/writers; final data/registry checks match; preflight no FAIL; fresh READY with all required components healthy; no unexplained gap, duplicate or missed deadline; all sign-offs and rollback receipts present | GO record with `T_0` (first `/readyz` 200 on the production revision) | Any abort trigger starts the [rollback path](cutover.md#rollback-preserve-next-window-writes-before-reopening-legacy) through the single production rollback dispatch with `takeover: true` ([production-deploy.md](production-deploy.md); coverage: dry-walk [runbook §7](cutover-rollback-runbook.md#7-staging-rehearsal-log), no executed dispatch), not a retry loop |
 
 Release producers in the recorded order only after GO. `RESUME` may then
 be enabled only with Next's own persisted session, by the reviewed
@@ -97,8 +97,23 @@ configuration path.
 ## 5. Watch handoff
 
 `T_0` is the first `/readyz` 200 on the production revision. The lead
-copies the [watch template](production-deploy.md) onto the execution card
-at `T_0` and fills it through `T_0 + 48 h`.
+records each checkpoint with `scripts/cutover_watch_checkpoint.py` — one
+checkpoint per call — and pastes the emitted row onto the execution card,
+from `T_0` through `T_0 + 48 h`:
+
+```sh
+python3 scripts/cutover_watch_checkpoint.py --checkpoint +15m \
+    --expected-sha <40-hex> --expected-build-id <run-id>-<attempt> \
+    --production-url https://<production-worker>/
+```
+
+`--checkpoint` is one of the five labels `+15m`, `+1h`, `+6h`, `+24h`,
+`+48h`; `--expected-sha` is the deployed commit from the watch header and
+`--expected-build-id` is that deploy run's `<run id>-<attempt>` from the
+run summary. The script is read-only: one GET to `/readyz`, no writes,
+migrates, or DB connections. It emits GO only on a 200 with every
+component ready and an exact revision/build-ID match; anything short of a
+full match is EXTEND, never GO, and a ROLLBACK decision stays human.
 
 - Header: `T_0`, deployed SHA, new and previous Worker version IDs (the
   previous ID is the rollback dispatch `<version-id>`), watch deadline,

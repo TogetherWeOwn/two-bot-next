@@ -284,8 +284,11 @@ version; there is no client-supplied target deployment. `expectedEpoch` is 0 onl
 for a never-initialized record; a stale/replayed epoch returns 409. It is not safe
 to invent 0 or retry a conflict without reading and reconciling the new state.
 
-Each accepted change increments the epoch, atomically persists a **fenced**
+Each accepted change commits exactly one epoch higher, atomically persists a **fenced**
 owner and audit receipt, then awaits native destruction and checks `running=false`.
+The single exception is an idempotent repeat: a same-owner exact-epoch takeover
+over an `active` record with no recovery pending returns the stored record
+unchanged, with no write, no audit row, no destroy and no epoch increment.
 Only a successful takeover writes `phase=active`; it does **not** start the new
 container. A stop/crash/final-write failure leaves persisted denial and must be
 reconciled with a fresh authenticated epoch change. The independent audit keys

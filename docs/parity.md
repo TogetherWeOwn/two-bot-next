@@ -26,24 +26,24 @@ Original registry surface: `CORE_COMMAND_DATA` (always published) = leveling onl
 | 9 | `/slowmode` | `seconds` Int 0–21600 req, `reason` req | `ManageChannels` | **S4** |
 | 10 | `/lockdown` | `reason` req (current channel) | `ManageChannels` | **S4** |
 | 11 | `/unlock` | `reason` req (current channel) | `ManageChannels` | **S4** |
-| 12 | `/attendance` (scorecard) | `event-occurrence` String req, `member` User req | `ManageEvents` | **S4**. Known defect to fix in port: name collides with #25 — both land in `additionalBuiltins` and collide on `guild.commands.set` |
+| 12 | `/attendance` (scorecard) | `event-occurrence` String req, `member` User req | `ManageEvents` | **S4**. Known defect to fix in port: name collides with #25 — both land in `additionalBuiltins` and collide on `guild.commands.set`. Intentional security difference: a bare slug refuses — only a bare scheduled-event id (which binds the event itself) or `{event_id}:{label}` records; the anchored free-text format is otherwise preserved |
 | 13 | `/rota-acknowledge` | `message-link` String req | `ManageGuild` + must be configured primary actor | **DROP** — staging-only rota measurement experiment, never enabled in prod; re-enable on demand post-cutover |
-| 14 | `/command` | `name` req, `template` req (`{user} {username} {server} {channel}`), `description` opt, `text-trigger` opt | `ManageGuild` (builder + runtime) | **S4** |
-| 15 | `/command-remove` | `name` req | `ManageGuild` | **S4** |
+| 14 | `/command` | `name` req ≤32, `template` req ≤2000 (`{user} {username} {server} {channel}`), `description` opt ≤100, `text-trigger` opt ≤33 | `ManageGuild` (builder + runtime) | **S4** |
+| 15 | `/command-remove` | `name` req ≤32 | `ManageGuild` | **S4** |
 | 16 | `/command-list` | none | `ManageGuild` | **S4** |
-| 17 | `/schedule` | `body` req; `in-minutes` 1–525600 opt; `every-minutes` 60–525600 opt (one required) | `ManageGuild`, runs in invoking channel | **S4** |
-| 18 | `/schedule-remove` | `id` req (prefix-resolved) | `ManageGuild` | **S4** |
+| 17 | `/schedule` | `body` req ≤2000; `in-minutes` 1–525600 opt; `every-minutes` 60–525600 opt (one required) | `ManageGuild`, runs in invoking channel | **S4** |
+| 18 | `/schedule-remove` | non-empty `id` prefix req ≤128 | `ManageGuild` | **S4** |
 | 19 | `/schedule-list` | none | `ManageGuild` | **S4** |
-| 20 | `/sticky` | `body` req, `debounce` 1–300 default 5 opt | `ManageGuild`, current channel | **S4** |
+| 20 | `/sticky` | `body` req ≤2000, `debounce` 1–300 default 5 opt | `ManageGuild`, current channel | **S4** |
 | 21 | `/sticky-remove` | none (current channel) | `ManageGuild` | **S4** |
 | 22 | `/<custom>` (dynamic, DB-backed via `/command`) | none (template render) | everyone while automations enabled; refused when disabled | **S4** |
 | 23 | `!<trigger>` (prefix, e.g. `!faq`) | first token only | everyone; requires `TWO_TEXT_COMMANDS=1`; builtin names excluded | **S4** (only prefix surface; no hardcoded `!` commands) |
 | 24 | `/rsvp` | `event-id` String req, `status` req (`going`/`interested`/`declined`) | everyone | **S4** |
 | 25 | `/attendance` (RSVP totals) | `event-id` String req | everyone | **S4** (see #12 collision — port must namespace) |
-| 26 | `/lfg` | `title` req, `starts-at` ISO-8601 req, `roles` req (`tank:Tank:2,…`) | `ManageEvents` (builder + runtime) | **S4** |
-| 27 | `/lfg-close` | `id` req | `ManageEvents` | **S4** |
-| 28 | `/feed-add` | `kind` req (`rss`/`youtube`/`twitch`), `source` req | `ManageGuild` | **S4** |
-| 29 | `/feed-remove` | `id` req | `ManageGuild` | **S4** |
+| 26 | `/lfg` | `title` req ≤100, `starts-at` ISO-8601 req, `roles` req ≤2339 UTF-16 units (`tank:Tank:2,…`) | `ManageEvents` (builder + runtime) | **S4** |
+| 27 | `/lfg-close` | `id` req ≤128 | `ManageEvents` | **S4** |
+| 28 | `/feed-add` | `kind` req (`rss`/`youtube`/`twitch`), `source` req ≤2048 | `ManageGuild` | **S4** |
+| 29 | `/feed-remove` | `id` req ≤128 | `ManageGuild` | **S4** |
 | 30 | `/feed-list` | none | `ManageGuild` | **S4** |
 
 Runtime permission contract: `crates/core/src/command_permissions.rs` represents
@@ -79,15 +79,22 @@ golden exception or a claim of whole-baseline registry parity.
 | `timeout` | docs/parity.md §1 #6 duration ceiling | Advertise only `max_value` 2419200 on `duration_seconds`, matching Discord's 28-day cap; every other field stays legacy-identical. |
 | `rota-acknowledge` | docs/parity.md §1 #13 / §9 drop 1 | Remove the staging-only command; no replacement. |
 | `help` | docs/parity.md §1 help | Add the Next-only `/help` discovery command (no legacy counterpart): always published, open to everyone, guild-only, no options. Answers from the live publish set with grouped permission hints. |
-| `attendance` | docs/parity.md §1 #12 copy | Picker copy only: description names the scorecard check-in, and `event-occurrence` says where to find the id with an example. Options, bounds and permissions stay legacy-identical. |
+| `attendance` | docs/parity.md §1 #12 copy | Picker copy only: description names the scorecard check-in, and `event-occurrence` states the trusted occurrence rule (bare event id binds that event, other text anchors as `{event_id}:{label}`, bare slugs refuse) with an example. Options and permissions stay legacy-identical except for its separately listed `max_length` bound. |
 | `rsvp` | docs/parity.md §1 #24 copy | Picker copy only: `event-id` says where to find the id with an example. Options, bounds and permissions stay legacy-identical. |
 | `rsvp-attendance` | docs/parity.md §1 #25 copy | Picker copy only: description drops the legacy bot name, and `event-id` says where to find the id with an example. Options, bounds and permissions stay legacy-identical. |
-| `lfg` | docs/parity.md §1 #26 copy | Picker copy only: `starts-at` shows an ISO-8601 example and `roles` documents the `role:Label:count` format with an example. Options, bounds and permissions stay legacy-identical. |
-| `lfg-close` | docs/parity.md §1 #27 copy | Picker copy only: `id` says it comes from the posted signup. Options, bounds and permissions stay legacy-identical. |
+| `lfg` | docs/parity.md §1 #26 copy | Picker copy only: `starts-at` shows an ISO-8601 example and `roles` documents the `role:Label:count` format with an example. Options and permissions stay legacy-identical except for the separately listed `title` and `roles` `max_length` bounds. |
+| `lfg-close` | docs/parity.md §1 #27 copy | Picker copy only: `id` says it comes from the posted signup. Options and permissions stay legacy-identical except for its separately listed `max_length` bound. |
 | `command` | docs/parity.md §1 #14 caps | Advertise only `max_length` matching the runtime caps (`name` 32, `template` 2000, `description` 100, `text-trigger` 33); every other field stays legacy-identical. |
 | `command-remove` | docs/parity.md §1 #15 caps | Advertise only `max_length` 32 on `name`, matching the runtime cap; every other field stays legacy-identical. |
+| `schedule` | docs/parity.md §1 #17 caps | Advertise only `max_length` 2000 on `body`, matching the runtime cap; every other field stays legacy-identical. |
+| `schedule-remove` | docs/parity.md §1 #18 caps | Advertise only `max_length` 128 on `id`; empty and overlong prefixes are refused before resolution. |
+| `sticky` | docs/parity.md §1 #20 caps | Advertise only `max_length` 2000 on `body`, matching the runtime cap; every other field stays legacy-identical. |
+| `lfg` | docs/parity.md §1 #26 caps | Advertise only `max_length` matching the runtime caps (`title` 100, `roles` 2339 UTF-16 units); every other field stays legacy-identical. |
+| `lfg-close` | docs/parity.md §1 #27 caps | Advertise only `max_length` 128 on `id`; every other field stays legacy-identical. |
+| `feed-add` | docs/parity.md §1 #28 caps | Advertise only `max_length` 2048 on `source`, matching the server-side byte bound enforced before URL parsing. |
+| `feed-remove` | docs/parity.md §1 #29 caps | Advertise only `max_length` 128 on `id`; every other field stays legacy-identical. |
 
-These are the complete behavioural exceptions, mirrored by the test allowlist.
+These are the complete registry exceptions, mirrored by the test allowlist.
 Only equivalent guild-API representation defaults are canonicalized: omitted
 command type = ChatInput (`1`), omitted command options = `[]`, optional
 `required` omitted = `false`, permission gate `null` = omitted, guild-only
