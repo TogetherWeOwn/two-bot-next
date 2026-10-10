@@ -1340,7 +1340,7 @@ async fn counted_vote_kick_paths_emit_metric_covered_outcomes() {
     use two_bot_core::metrics::{Metrics, VOICE_VOTE_KICK_OUTCOMES};
 
     // Worker->global wiring: deleting either `voice_vote_kick` increment must
-    // fail here. Global counters are monotonic, so assert `>= before + 1`
+    // fail here. Global counters are monotonic, so assert `> before`
     // (safe under parallel test threads, matching `global_series` callers).
     let started_before = super::global_series("two_bot_voice_vote_kick_total{outcome=\"started\"}");
     let refused_before =
@@ -1361,19 +1361,18 @@ async fn counted_vote_kick_paths_emit_metric_covered_outcomes() {
     assert_eq!(passed.status, VoteKickStatus::Passed);
     dispatch(&mut worker, 3).await;
     assert!(
-        super::global_series("two_bot_voice_vote_kick_total{outcome=\"started\"}")
-            >= started_before + 1,
+        super::global_series("two_bot_voice_vote_kick_total{outcome=\"started\"}") > started_before,
         "kick_start success must advance the started series"
     );
     assert!(
         super::global_series("two_bot_voice_vote_kick_total{outcome=\"active_vote_exists\"}")
-            >= refused_before + 1,
+            > refused_before,
         "kick_start refusal must advance its refusal series"
     );
     assert!(
         super::global_series(
             "two_bot_voice_vote_kick_total{outcome=\"connect_denied_and_disconnected\"}"
-        ) >= enforced_before + 1,
+        ) > enforced_before,
         "terminal KickMember enforcement must advance its enforcement series"
     );
     assert!(worker.flush_kick_audit(4).await);
