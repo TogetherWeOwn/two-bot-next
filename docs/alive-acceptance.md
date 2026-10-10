@@ -35,7 +35,7 @@ five-second step deadlines. Assertion failures print captured stdout/stderr.
 | Before RESUMED | Readiness still 503 despite persisted session/authentication |
 | After replay and RESUMED | Checkpoint sequence 3; still one funnel row; readiness 200 |
 | Logging | Listener log precedes gateway initialization; committed-ready log on each boot |
-| JSON logging | Request `LOG_FORMAT=json`; validate every line if JSON is emitted; otherwise explicit skip until format support lands |
+| JSON logging | Request `LOG_FORMAT=json` (the binary defaults to JSON: `crates/bot/src/logging.rs:28-32`); validate every emitted line as a JSON object with a string `msg` (`crates/bot/tests/alive.rs:678-689`) |
 
 The mock uses one stable endpoint across boots. The second child receives an
 unreachable bootstrap URL, proving that its unchanged persisted resume endpoint
@@ -56,5 +56,8 @@ is actually selected. HELLO and READY/RESUMED are separately gated by the test.
   serves `{"id":"999","bot":true}` on loopback and 404 otherwise. No real
   Discord service is contacted.
 - The connected log is emitted only after READY/RESUMED and its checkpoint
-  commit. `LOG_FORMAT=json` is not implemented in the current binary; the
-  acceptance reports the skip rather than pretending plain text is JSON.
+  commit. `LOG_FORMAT=json` is implemented and is the default
+  (`crates/bot/src/logging.rs:28-32`); the acceptance runs the child with it
+  (`crates/bot/tests/alive.rs:136`) and requires every line to parse as JSON
+  with a string `msg` (`crates/bot/tests/alive.rs:681-689`). Re-checked at
+  `bce86a791`.
