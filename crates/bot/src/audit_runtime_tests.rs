@@ -94,6 +94,76 @@ fn channels() -> AuditChannelIds {
     }
 }
 
+// ------------------------------------------------------- live destinations --
+
+use two_bot_core::settings::{live_channel, SettingRow, SettingsSnapshot};
+
+/// A runtime whose connector is never called: destination refresh is pure.
+fn unconnected_runtime(deployment: HashMap<String, String>) -> AuditRuntime<ScriptMirror> {
+    AuditRuntime::new(
+        deployment,
+        GUILD.to_owned(),
+        Box::new(move || {
+            Box::pin(async { Err::<Parts<ScriptMirror>, ErrorClass>(ErrorClass::Database) })
+        }),
+    )
+    .unwrap()
+}
+
+#[test]
+fn stored_destination_rows_move_the_live_mirror_without_restart() {
+    let (mut writer, live) = live_channel();
+    let runtime = unconnected_runtime(all_vars());
+    assert_eq!(runtime.channels_for_test(), channels());
+
+    // A stored audit row wins over the boot deployment value on the next
+    // refresh; the other two destinations are untouched.
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![SettingRow {
+            guild_id: GUILD.to_owned(),
+            key: "DISCORD_AUDIT_LOG_CHANNEL_ID".to_owned(),
+            value: json!("4444"),
+            version: 1,
+        }],
+    });
+    runtime.refresh_channels_with(Some(&live));
+    let moved = runtime.channels_for_test();
+    assert_eq!(moved.audit.as_deref(), Some("4444"));
+    assert_eq!(moved.voice.as_deref(), Some(VOICE_CH));
+    assert_eq!(moved.moderation.as_deref(), Some(MOD_CH));
+
+    // Deleting the row hands the key back to the boot deployment value.
+    writer.publish(&SettingsSnapshot {
+        revision: 2,
+        rows: vec![],
+    });
+    runtime.refresh_channels_with(Some(&live));
+    assert_eq!(runtime.channels_for_test(), channels());
+}
+
+#[test]
+fn malformed_stored_destination_keeps_the_last_good() {
+    let (mut writer, live) = live_channel();
+    let runtime = unconnected_runtime(all_vars());
+
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![SettingRow {
+            guild_id: GUILD.to_owned(),
+            key: "DISCORD_VOICE_LOG_CHANNEL_ID".to_owned(),
+            value: json!("not-a-snowflake"),
+            version: 1,
+        }],
+    });
+    runtime.refresh_channels_with(Some(&live));
+    assert_eq!(
+        runtime.channels_for_test(),
+        channels(),
+        "a malformed stored row must not move or park a running mirror"
+    );
+}
+
 // ---------------------------------------------------------- mirror double --
 
 type PostResult = Result<String, MirrorError>;
@@ -249,18 +319,21 @@ async fn database(test: &str) -> Option<TestDatabase> {
 
 fn runtime(pool: &PgPool, mirror: &ScriptMirror) -> Arc<AuditRuntime<ScriptMirror>> {
     let (pool, mirror) = (pool.clone(), mirror.clone());
-    Arc::new(AuditRuntime::new(
-        channels(),
-        GUILD.to_owned(),
-        Box::new(move || {
-            let parts = Parts {
-                pool: pool.clone(),
-                mirror: mirror.clone(),
-                bot_user_id: BOT.to_owned(),
-            };
-            Box::pin(async move { Ok(parts) })
-        }),
-    ))
+    Arc::new(
+        AuditRuntime::new(
+            all_vars(),
+            GUILD.to_owned(),
+            Box::new(move || {
+                let parts = Parts {
+                    pool: pool.clone(),
+                    mirror: mirror.clone(),
+                    bot_user_id: BOT.to_owned(),
+                };
+                Box::pin(async move { Ok(parts) })
+            }),
+        )
+        .unwrap(),
+    )
 }
 
 async fn record(runtime: &AuditRuntime<ScriptMirror>, entry: &str) {
@@ -464,10 +537,11 @@ async fn sweep_delivers_through_the_rest_executor() {
             .unwrap();
     let pool = db.pool().clone();
     let runtime: AuditRuntime<ActionExecutor> = AuditRuntime::new(
-        channels(),
+        all_vars(),
         GUILD.to_owned(),
         Box::new(move || Box::pin(rest_parts(pool.clone(), rest.clone()))),
-    );
+    )
+    .unwrap();
     assert_eq!(
         runtime.record(&event("rest-1")).await.unwrap(),
         RecordOutcome::Queued {
@@ -502,7 +576,7 @@ fn sample(text: &str, series: &str) -> Option<u64> {
         .find_map(|line| line.strip_prefix(series)?.strip_prefix(' ')?.parse().ok())
 }
 
-async fn supervise_once<M: AuditMirror + 'static>(
+async fn supervise_once<M: AuditMirror + Clone + 'static>(
     runtime: Arc<AuditRuntime<M>>,
 ) -> jobs::JobStatus {
     let status = jobs::statuses(&NAMES, false);
@@ -551,14 +625,17 @@ async fn sweep_outcome_reaches_job_metrics() {
 async fn unreachable_dependencies_fail_the_job_and_retry_next_sweep() {
     let connects = Arc::new(AtomicUsize::new(0));
     let counter = connects.clone();
-    let runtime: Arc<AuditRuntime<ScriptMirror>> = Arc::new(AuditRuntime::new(
-        channels(),
-        GUILD.to_owned(),
-        Box::new(move || {
-            counter.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Err(ErrorClass::Database) })
-        }),
-    ));
+    let runtime: Arc<AuditRuntime<ScriptMirror>> = Arc::new(
+        AuditRuntime::new(
+            all_vars(),
+            GUILD.to_owned(),
+            Box::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Err(ErrorClass::Database) })
+            }),
+        )
+        .unwrap(),
+    );
 
     let status = supervise_once(runtime.clone()).await;
     assert_eq!(status.last_error_class, Some(ErrorClass::Database));

@@ -64,7 +64,7 @@ const HEAT_KEY: &str = "TWO_ANTI_NUKE_HEAT_THRESHOLD";
 const TRUSTED_KEY: &str = "TWO_ANTI_NUKE_TRUSTED_USER_IDS";
 const PROTECTED_KEY: &str = "TWO_ANTI_NUKE_PROTECTED_USER_IDS";
 const CHANNEL_KEY: &str = "DISCORD_STAFF_ALERT_CHANNEL_ID";
-const HOT_KEYS: [&str; 3] = [WINDOW_KEY, MAX_AGE_KEY, HEAT_KEY];
+const HOT_KEYS: [&str; 4] = [WINDOW_KEY, MAX_AGE_KEY, HEAT_KEY, CHANNEL_KEY];
 
 /// Discord audit-log action to legacy destructive weight. Unsupported actions
 /// never acquire a weight and are skipped before any claim.
@@ -217,8 +217,9 @@ impl SettingsSource for StoreSettings {
         self.refresh().await;
         let mut vars = self.deployment.clone();
         if let Some(cache) = &self.cache {
-            // Only the three containment keys are live (`HOT_WIRED`); the
-            // staff channel stays the boot-time deployment value.
+            // Tuning and the staff channel are live (`HOT_WIRED`): a stored
+            // row moves the next observation, a delete hands the key back to
+            // the boot-time deployment value.
             vars.extend(
                 cache
                     .env_snapshot(Some(self.guild_id.as_str()))
@@ -768,16 +769,13 @@ pub(crate) fn start_from_env(
         armed = fences.armed,
         "containment_fences: dry-run default; removals execute only when armed"
     );
-    let mut deployment: HashMap<String, String> = HOT_KEYS
+    let deployment: HashMap<String, String> = HOT_KEYS
         .iter()
         .filter_map(|key| {
             vars.get(*key)
                 .map(|value| ((*key).to_owned(), value.clone()))
         })
         .collect();
-    if let Some(channel) = vars.get(CHANNEL_KEY) {
-        deployment.insert(CHANNEL_KEY.to_owned(), channel.clone());
-    }
     let (runtime, _worker) = start(
         guild_id,
         StoreSettings::new(pool.clone(), guild_id, deployment),

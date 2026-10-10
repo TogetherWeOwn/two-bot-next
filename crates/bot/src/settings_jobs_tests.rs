@@ -152,6 +152,52 @@ fn applied_swap_logs_spec_events_and_never_cold_values() {
 }
 
 #[test]
+fn log_and_ticket_destination_keys_report_hot() {
+    let destinations = [
+        "DISCORD_AUDIT_LOG_CHANNEL_ID",
+        "DISCORD_MODERATION_LOG_CHANNEL_ID",
+        "DISCORD_STAFF_ALERT_CHANNEL_ID",
+        "DISCORD_TICKET_CATEGORY_ID",
+        "DISCORD_TICKET_PANEL_CHANNEL_ID",
+        "DISCORD_TICKET_STAFF_ROLE_ID",
+        "DISCORD_VOICE_LOG_CHANNEL_ID",
+    ];
+    let (mut writer, reader) = live_channel();
+    let report = writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: destinations
+            .iter()
+            .map(|key| row("g1", key, json!("123456789012345678")))
+            .collect(),
+    });
+    assert_eq!(report.hot.len(), destinations.len(), "{report:?}");
+    assert!(report.cold.is_empty(), "{report:?}");
+    for key in destinations {
+        assert!(
+            report.hot.iter().any(|change| change.key == key),
+            "missing {key}: {report:?}"
+        );
+    }
+    // The published snapshot serves every destination live.
+    for key in destinations {
+        assert!(
+            reader
+                .get("g1", key)
+                .is_some_and(|value| value == json!("123456789012345678")),
+            "missing live {key}"
+        );
+    }
+    let (capture, _guard) = captured();
+    log_applied(&report);
+    let log = capture.contents();
+    assert!(log.contains("settings_applied"), "{log}");
+    for key in destinations {
+        assert!(log.contains(key), "missing {key}: {log}");
+    }
+    assert!(!log.contains("settings_restart_required"), "{log}");
+}
+
+#[test]
 fn settings_log_capture_excludes_unrelated_numeric_trace_events() {
     let (mut writer, _reader) = live_channel();
     let report = writer.publish(&SettingsSnapshot {
