@@ -140,6 +140,7 @@ pub mod voice_ownership;
 pub mod voice_permission_health;
 pub mod voice_permissions;
 pub mod voice_placement;
+pub mod voice_presence;
 pub mod voice_private;
 pub mod voice_reconcile;
 pub mod voice_rename_coalescer;

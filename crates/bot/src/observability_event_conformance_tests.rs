@@ -95,7 +95,7 @@ const VOICE_EVENT_VALUES: [&str; 4] = [
 
 /// Metric event labels, in `two_bot_core::metrics::EVENTS` order. Unknown
 /// dispatch types collapse to `other`; scrapers match these spellings.
-const METRIC_EVENT_LABELS: [&str; 20] = [
+const METRIC_EVENT_LABELS: [&str; 21] = [
     "READY",
     "RESUMED",
     "GUILD_CREATE",
@@ -110,6 +110,7 @@ const METRIC_EVENT_LABELS: [&str; 20] = [
     "MESSAGE_REACTION_ADD",
     "MESSAGE_REACTION_REMOVE",
     "VOICE_STATE_UPDATE",
+    "PRESENCE_UPDATE",
     "INVITE_CREATE",
     "INVITE_DELETE",
     "INTERACTION_CREATE",

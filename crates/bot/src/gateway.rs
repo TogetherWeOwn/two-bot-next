@@ -147,7 +147,14 @@ pub fn intents_from_env(activation: &crate::activation::BootActivation) -> Inten
             &var("TWO_AUTOMATIONS"),
             &var("TWO_TEXT_COMMANDS"),
         );
-    base | gateway_intents(text_commands)
+    // Voice-room presence facts (game/stream tokens) need privileged
+    // GUILD_PRESENCES; off unless explicitly enabled, so a bot whose app lacks
+    // the Presence Intent grant never closes with 4014.
+    let presences = two_bot_discord::intents::needs_voice_presences(
+        &var("TWO_VOICE"),
+        &var("TWO_VOICE_PRESENCE"),
+    );
+    two_bot_discord::intents::with_presences(base | gateway_intents(text_commands), presences)
 }
 
 fn intents_for_settings(
@@ -581,6 +588,22 @@ fn apply_dispatch<I: InviteSource>(
     acknowledgement: Option<tokio::sync::oneshot::Receiver<bool>>,
     committed: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), sqlx::Error> {
+    // Presence updates (TWO_VOICE_PRESENCE) only feed in-memory voice-room
+    // name facts: no funnel, audit or durable effect. They stay in gateway
+    // order with GUILD_CREATE (whose presence snapshot this worker applies)
+    // but skip the checkpoint commit, one Postgres transaction per dispatch.
+    // The next committed dispatch carries the cursor past them, and a RESUME
+    // replays them idempotently; reception already advanced, so no gap.
+    if let Some(ReceivedDispatch {
+        event: Event::PresenceUpdate(update),
+        ..
+    }) = dispatch.as_deref()
+    {
+        if let Some(voice) = worker_voice.as_ref() {
+            voice.presence(update);
+        }
+        return Ok(());
+    }
     let timer = crate::gateway_metrics::DispatchTimer::start();
     let mut connected: Option<&str> = None;
     let mut onboarding_job = None;
@@ -2248,6 +2271,85 @@ mod tests {
         );
     }
 
+    /// `PRESENCE_UPDATE` reaches the voice sink in gateway order on the
+    /// dispatch worker and never commits: the lazy pool below can never
+    /// connect, so any checkpoint attempt would surface as an error here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_worker_applies_presence_without_a_checkpoint_commit() {
+        struct Presences(std::sync::Mutex<Vec<u64>>);
+        impl VoiceEventSink for Presences {
+            fn handle(&self, _: &Event, _: &twilight_cache_inmemory::DefaultInMemoryCache) {
+                panic!("presence must not take the full voice handler path");
+            }
+            fn presence(
+                &self,
+                update: &twilight_model::gateway::payload::incoming::PresenceUpdate,
+            ) {
+                let id = match &update.0.user {
+                    twilight_model::gateway::presence::UserOrId::User(user) => user.id.get(),
+                    twilight_model::gateway::presence::UserOrId::UserId { id } => id.get(),
+                };
+                self.0.lock().unwrap().push(id);
+            }
+            fn disconnect(&self) {}
+            fn needs_bootstrap(&self, _: &twilight_cache_inmemory::DefaultInMemoryCache) -> bool {
+                false
+            }
+        }
+        let pipeline = build_pipeline(vec![], None);
+        let state = RwLock::new(GatewayState::Armed);
+        let generation = AtomicU64::new(0);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        let store = GatewaySessionStore::new(pool, "test-guild".to_owned(), 1);
+        let sink = Arc::new(Presences(std::sync::Mutex::new(Vec::new())));
+        let update: twilight_model::gateway::payload::incoming::PresenceUpdate =
+            serde_json::from_value(serde_json::json!({
+                "user": {"id": "42"},
+                "guild_id": "22",
+                "status": "online",
+                "activities": [{"type": 0, "name": "Apex Legends"}],
+                "client_status": {"desktop": "online"}
+            }))
+            .expect("presence");
+        let dispatch = ReceivedDispatch::new(Event::PresenceUpdate(Box::new(update)));
+        let checkpoint = GatewaySession {
+            session_id: "test-session".to_owned(),
+            sequence: 8,
+            resume_url: "ws://127.0.0.1:1".to_owned(),
+            updated_at_ms: two_bot_core::funnel::now_millis_for_test(),
+        };
+        let voice: Arc<dyn VoiceEventSink> = sink.clone();
+        let outcome = tokio::task::block_in_place(|| {
+            apply_dispatch(
+                &tokio::runtime::Handle::current(),
+                &state,
+                &generation,
+                &pipeline,
+                &store,
+                None,
+                None,
+                Some(voice),
+                None,
+                LiveInteractions::default(),
+                Arc::new(tokio::sync::Notify::new()),
+                Some(Box::new(dispatch)),
+                None,
+                checkpoint,
+                CHECKPOINT_IO_MAX,
+                0,
+                None,
+                None,
+            )
+        });
+        assert!(
+            outcome.is_ok(),
+            "presence must not attempt a commit: {outcome:?}"
+        );
+        assert_eq!(*sink.0.lock().unwrap(), [42]);
+    }
+
     /// The worker itself — not just the error constructor — records a failed
     /// leveling drain as a typed error and skips the checkpoint commit. A
     /// message that queues a leveling award drains through a runtime whose
@@ -2359,6 +2461,289 @@ mod tests {
             *state.read().await,
             GatewayState::Armed,
             "a failed dispatch must leave the checkpoint where it was"
+        );
+    }
+
+    /// M2.22: the worker's trigger gate (the exact `worker_prefix_trigger`
+    /// call site above) posts no sticky automation for a Bypassed create while
+    /// an inspected Accept through the same path still dispatches. Both verdicts
+    /// come from the real worker function `automod_gateway::process` (not
+    /// hand-built `Activation`s): the Bypassed guild sits outside the staging
+    /// fence so no claim or REST happens, and the clean in-scope create inspects
+    /// to `Accept` through a succeeding in-memory ledger. The Bypassed funnel
+    /// stays `Accept` (the old gate would dispatch) while its trigger is
+    /// capture-only (the new gate refuses). The second fence
+    /// (`acceptance_for_verdict`) agrees. Actual Discord POSTs for dispatched
+    /// sticky work are covered by the existing `command_runtime_tests` sticky
+    /// suite; here admission (`true`/`false` from the call site) plus no spawned
+    /// message-lane work proves a Bypassed create never reaches `on_message`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_worker_trigger_gate_posts_no_sticky_for_bypassed_while_accept_dispatches() {
+        use two_bot_core::automod_runtime::{
+            AutomodClaimLedger, AutomodMatch, AutomodRuntime, AutomodScope, DeliveryKey,
+            FunnelDisposition, LedgerClaim, MessageDelivery, MessageDeliveryKind, MessageSubject,
+            StoredOutcome, TargetFacts, ViolationRecord, STAGING_GUILD_ID,
+        };
+        use two_bot_core::router::RouterGates;
+        use two_bot_core::{AutomodConfig, AutomodFilter};
+        use two_bot_discord::automod_activation::{
+            AutomodActivation, AutomodFacts, FetchedMessage,
+        };
+        use two_bot_discord::ActionExecutor;
+
+        ensure_crypto_provider();
+
+        struct AcceptLedger;
+        struct UnitClaim;
+        impl AutomodClaimLedger for AcceptLedger {
+            type Claim = UnitClaim;
+            type Error = String;
+            async fn ledger_claim(
+                &self,
+                _: &DeliveryKey,
+            ) -> Result<LedgerClaim<UnitClaim>, String> {
+                Ok(LedgerClaim::Acquired(UnitClaim))
+            }
+            async fn ledger_preserve(
+                &self,
+                _: &UnitClaim,
+                _: &AutomodMatch,
+            ) -> Result<bool, String> {
+                Ok(false)
+            }
+            async fn ledger_mark_started(&self, _: &UnitClaim) -> Result<bool, String> {
+                Ok(true)
+            }
+            async fn ledger_complete(
+                &self,
+                _: &UnitClaim,
+                _: &StoredOutcome,
+            ) -> Result<bool, String> {
+                Ok(true)
+            }
+            async fn ledger_release(&self, _: &UnitClaim) -> Result<bool, String> {
+                Ok(true)
+            }
+            async fn ledger_record(
+                &self,
+                _: &UnitClaim,
+                _: &MessageSubject,
+                _: AutomodFilter,
+                _: &str,
+            ) -> Result<ViolationRecord, String> {
+                Err("unused".to_owned())
+            }
+        }
+
+        struct NeverFacts;
+        impl AutomodFacts for NeverFacts {
+            async fn fetch_message(&self, _: &str, _: &str, _: &str) -> Option<FetchedMessage> {
+                None
+            }
+            async fn target_facts(&self, _: &MessageSubject) -> Option<TargetFacts> {
+                None
+            }
+        }
+
+        const AT: &str = "2026-10-02T00:00:00.000Z";
+        let vars: HashMap<String, String> =
+            HashMap::from([("TWO_AUTOMOD".to_owned(), "1".to_owned())]);
+        let config = AutomodConfig::from_map(&vars).expect("test automod config");
+        let scope = AutomodScope {
+            guild_id: STAGING_GUILD_ID.to_owned(),
+            live_approved: false,
+        };
+        let executor = ActionExecutor::with_proxy(
+            "mock-token".to_owned(),
+            Some("http://127.0.0.1:1".to_owned()),
+        )
+        .expect("test executor");
+
+        // Bypassed: outside the fence, so the worker never claims or reads.
+        let bypassed_delivery = MessageDelivery {
+            kind: MessageDeliveryKind::Create,
+            guild_id: Some("42".to_owned()),
+            channel_id: "8".to_owned(),
+            message_id: "9".to_owned(),
+            snapshot: None,
+            create_pending_roles: None,
+            edited_timestamp_ms: None,
+            observed_timestamp_ms: 1,
+        };
+        let bypassed_activation = AutomodActivation::new(
+            AutomodRuntime::new(config.clone(), scope.clone()),
+            AcceptLedger,
+            NeverFacts,
+            executor.clone(),
+        );
+        let bypassed_verdict =
+            crate::automod_gateway::process(&bypassed_activation, bypassed_delivery, AT).await;
+        assert_eq!(
+            bypassed_verdict,
+            crate::automod_gateway::WorkerVerdict {
+                funnel: FunnelDisposition::Accept,
+                trigger: FunnelDisposition::CaptureOnly,
+            },
+            "uninspected create keeps funnel-Accept with a capture-only trigger"
+        );
+
+        // Inspected Accept: clean in-scope create with a snapshot, so enrichment
+        // needs no fetch and inspection accepts without target facts.
+        let snapshot = two_bot_core::automod::AutomodMessage {
+            guild_id: STAGING_GUILD_ID.to_owned(),
+            channel_id: "8".to_owned(),
+            message_id: "10".to_owned(),
+            author_id: "44".to_owned(),
+            author_is_bot: false,
+            role_ids: Vec::new(),
+            content: "hello".to_owned(),
+            mentioned_user_ids: Vec::new(),
+            attachment_names: Vec::new(),
+            observed_timestamp_ms: 1,
+        };
+        let accept_delivery = MessageDelivery {
+            kind: MessageDeliveryKind::Create,
+            guild_id: Some(STAGING_GUILD_ID.to_owned()),
+            channel_id: "8".to_owned(),
+            message_id: "10".to_owned(),
+            snapshot: Some(snapshot),
+            create_pending_roles: None,
+            edited_timestamp_ms: None,
+            observed_timestamp_ms: 1,
+        };
+        struct NeverFactsAgain;
+        impl AutomodFacts for NeverFactsAgain {
+            async fn fetch_message(&self, _: &str, _: &str, _: &str) -> Option<FetchedMessage> {
+                None
+            }
+            async fn target_facts(&self, _: &MessageSubject) -> Option<TargetFacts> {
+                None
+            }
+        }
+        let accept_activation = AutomodActivation::new(
+            AutomodRuntime::new(config, scope),
+            AcceptLedger,
+            NeverFactsAgain,
+            executor,
+        );
+        let accept_verdict =
+            crate::automod_gateway::process(&accept_activation, accept_delivery, AT).await;
+        assert_eq!(
+            accept_verdict,
+            crate::automod_gateway::WorkerVerdict {
+                funnel: FunnelDisposition::Accept,
+                trigger: FunnelDisposition::Accept,
+            },
+            "inspected clean create hands Accept to triggers"
+        );
+
+        // The gate split: the old funnel gate would dispatch Bypassed, the new
+        // trigger gate refuses it, and the prefix-trigger fence agrees.
+        assert!(
+            crate::automod_gateway::runs_text_automations(Some(bypassed_verdict.funnel)),
+            "funnel-Accept would have dispatched under the old gate"
+        );
+        assert!(
+            !crate::automod_gateway::runs_text_automations(Some(bypassed_verdict.trigger)),
+            "trigger capture-only refuses under the worker gate"
+        );
+        assert!(
+            crate::automod_gateway::runs_text_automations(Some(accept_verdict.trigger)),
+            "inspected Accept still passes the worker gate"
+        );
+        assert!(
+            !crate::gateway_commands::acceptance_for_verdict(Some(bypassed_verdict.trigger))
+                .permits_automations(),
+            "Bypassed trigger denies prefix automations at the second fence"
+        );
+        assert!(
+            crate::gateway_commands::acceptance_for_verdict(Some(accept_verdict.trigger))
+                .permits_automations(),
+            "Accept trigger permits prefix automations at the second fence"
+        );
+
+        // The exact worker call site: Bypassed never dispatches (so `on_message`
+        // never runs and no sticky post is possible); Accept still dispatches.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        let runtime_executor = ActionExecutor::with_proxy(
+            "mock-token".to_owned(),
+            Some("http://127.0.0.1:1".to_owned()),
+        )
+        .expect("test executor");
+        let gates = RouterGates {
+            configured_guild: Some(22),
+            scorecard: false,
+            automations: true,
+            announcements: false,
+            moderation: false,
+            voice: false,
+            voice_assistant: false,
+            tickets: false,
+            self_roles: false,
+            onboarding_picker: false,
+            session_picker: false,
+        };
+        let runtime = crate::command_runtime::CommandRuntime::new(
+            pool,
+            runtime_executor,
+            crate::command_runtime::router_with_commands(gates),
+            22,
+            true,
+        );
+        let handle = tokio::runtime::Handle::current();
+        let message_event = |id: &str, guild: &str| {
+            Event::MessageCreate(Box::new(
+                serde_json::from_value(serde_json::json!({
+                    "id": id,
+                    "guild_id": guild,
+                    "channel_id": "66",
+                    "author": {"id": "44", "username": "member", "discriminator": "0", "bot": false},
+                    "content": "hello",
+                    "timestamp": "2026-09-28T00:00:00.000000+00:00",
+                    "edited_timestamp": null,
+                    "tts": false,
+                    "mention_everyone": false,
+                    "mentions": [],
+                    "mention_roles": [],
+                    "attachments": [],
+                    "embeds": [],
+                    "pinned": false,
+                    "type": 0,
+                    "components": []
+                }))
+                .unwrap(),
+            ))
+        };
+        // The exact worker call site (`worker_prefix_trigger` decision plus the
+        // detached `dispatch_with_verdict` effect): Bypassed never dispatches
+        // (so `on_message` never runs and no sticky post is possible) while an
+        // inspected Accept through the same path still dispatches.
+        let bypassed_event = message_event("4000000000000000001", "42");
+        assert!(
+            crate::gateway::worker_prefix_trigger(Some(bypassed_verdict), &bypassed_event, true)
+                .is_none(),
+            "Bypassed create must not dispatch text automations"
+        );
+        assert_eq!(
+            runtime.lane_in_flight(crate::command_runtime::LANE_MESSAGES),
+            0,
+            "no message-lane work means no sticky side effect for Bypassed"
+        );
+        let accept_event = message_event("4000000000000000002", STAGING_GUILD_ID);
+        let trigger =
+            crate::gateway::worker_prefix_trigger(Some(accept_verdict), &accept_event, true)
+                .expect("inspected Accept still dispatches text automations");
+        assert_eq!(
+            trigger,
+            Some(FunnelDisposition::Accept),
+            "the worker forwards the trigger verdict, not the funnel"
+        );
+        let _guard = handle.enter();
+        assert!(
+            runtime.dispatch_with_verdict(&accept_event, trigger),
+            "inspected Accept dispatches through the worker call site"
         );
     }
 

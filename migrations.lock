@@ -324,6 +324,14 @@
     "crates/cutover/migrations/0423_internal_actions_version_conflict.sql": {
       "sha256": "43331694352efa7ba37848d2f17364fe8256058158388c24048ce2084c26f7c2",
       "justification": "Settings CAS idempotency: admit version_conflict as a terminal 409 claim so a stale save replays the first result without a second write."
+    },
+    "crates/cutover/migrations/0424_internal_action_outcome.sql": {
+      "sha256": "4f1c1752195f4989bce6a555da6c35071f3a3043fd35a0b71371a105c0c45df7",
+      "justification": "Durable website-event outcome for idempotent receipts: nullable created/updated/cancelled on internal_idempotency so a create replayed after key registration still reads created; additive, backout drops the column."
+    },
+    "crates/cutover/migrations/0425_internal_action_audit_resources.sql": {
+      "sha256": "f5280fb02325d7f63a2f563f410f71bb7b79e228a4362537511ae687cab27980",
+      "justification": "Audit resource witness for event intents: nullable resource_id/affected/outcome on internal_action_log copied from the completed receipt so a target-less event create still names its Discord event; additive, backout drops the columns."
     }
   }
 }
