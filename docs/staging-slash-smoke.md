@@ -108,6 +108,11 @@ DISCORD_STAGING_BOT_TOKEN=... DISCORD_STAGING_GUILD_ID=... \
         [--record staging-smoke-run-record.json]
 ```
 
+These smokes (this one and `staging_voice_smoke.py`) never follow a redirect on an
+authenticated Discord read. Any 301, 302, 303, 307 or 308 stops the request before a
+second one is built, even to the same origin, and fails with a fixed message that
+names no token, `Location` or response body. Production targets stay refused.
+
 Exit 0 is PASS, 1 is NEEDS WORK, 2 is a fence refusal with nothing sent. Run it
 after every `deploy-staging` run you accept; the deploy gate proves the rollout,
 this proves the build answers readiness and the guild publishes the surface.
