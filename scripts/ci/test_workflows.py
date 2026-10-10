@@ -98,6 +98,7 @@ RUNTIME_PATHS = (
     ".github/workflows/deploy-staging.yml", ".github/workflows/check.yml",
     ".github/scripts/anything.py", "deploy/two-bot.service", "tests/voice_templates/corpus.json",
     "release-please-config.json", ".release-please-manifest.json", "fuzz/Cargo.toml",
+    "fuzz/Cargo.lock",
     "a-new-top-level-dir/file.txt", ".cargo/config.toml",
 )
 NON_RUNTIME_PATHS = (

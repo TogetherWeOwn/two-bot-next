@@ -3,7 +3,7 @@
 This is a separate `cargo-fuzz` workspace, explicitly excluded from the root
 workspace. Normal `cargo build`, workspace tests/clippy, `check` and cargo-deny
 keep their existing members, dependency lockfile and stable toolchain. The required
-`fuzz-compile` CI job (`check.yml`, gated by `ci-ok`) builds all ten targets
+`fuzz-compile` CI job (`check.yml`, gated by `ci-ok`) builds all eleven targets
 compile-only on pinned nightly `nightly-2026-10-01` + `cargo-fuzz 0.13.2`; no
 scheduled or continuous fuzz campaign exists, and CI never executes `cargo fuzz run`.
 
@@ -81,9 +81,17 @@ cargo fmt --all -- --check
 cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check
 ```
 
-`fuzz/Cargo.lock` is independent of the root lockfile. Preserve the generated
-fuzz lockfile with the verification evidence before reporting a campaign; record
-nightly, cargo-fuzz, libfuzzer-sys and OS versions and exact git HEAD. The required
+`fuzz/Cargo.lock` is committed and seeded from the root lockfile: every shared
+crate pins the same version as the root build, plus exactly three fuzz-only
+crates (`arbitrary`, `jobserver`, `libfuzzer-sys`). The required `fuzz-compile`
+job runs `cargo fetch --locked` before building, so the gate fails instead of
+silently resolving fresh crates.io versions. Dependabot tracks `/fuzz` for
+bump PRs; when the root lockfile moves, re-seed with `cp Cargo.lock
+fuzz/Cargo.lock` plus `cargo generate-lockfile --manifest-path
+fuzz/Cargo.toml` and pin any drifted shared crate back with `cargo update -p
+<crate> --precise <root version>`. Preserve the generated fuzz lockfile with
+the verification evidence before reporting a campaign; record nightly,
+cargo-fuzz, libfuzzer-sys and OS versions and exact git HEAD. The required
 `fuzz-compile` job proves the excluded targets build; it does not execute them. A
 bounded smoke result must cite its own non-controller host, command, elapsed time
 and artifacts, never CI compile alone.

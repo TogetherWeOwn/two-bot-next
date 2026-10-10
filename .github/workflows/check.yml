@@ -1544,7 +1544,13 @@ jobs:
           save-if: ${{ github.event_name == 'push' }}
       - name: Install pinned cargo-fuzz
         run: cargo install cargo-fuzz --version 0.13.2 --locked
-      # Compile-only: builds all ten libFuzzer targets without executing them.
+      # Pinned dependencies: the committed fuzz/Cargo.lock (seeded from the
+      # root lockfile) is this gate's version inventory. `--locked` fails the
+      # required job instead of silently resolving fresh crates.io versions.
+      - name: Fetch pinned fuzz dependencies (locked)
+        working-directory: fuzz
+        run: cargo +nightly-2026-10-01 fetch --locked
+      # Compile-only: builds all eleven libFuzzer targets without executing them.
       # No execution, no corpus output, no schedule; the bounded
       # vote_kick smoke stays a manual non-controller step (see fuzz/README.md).
       # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the

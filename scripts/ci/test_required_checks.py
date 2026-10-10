@@ -120,6 +120,13 @@ class RequiredChecksReportTests(unittest.TestCase):
         # from the repo-root rust-toolchain.toml (stable), so a bare
         # `cargo fuzz build` runs under stable and fails on `-Zsanitizer`.
         self.assertIn("cargo +nightly-2026-10-01 fuzz build", build[0].get("run", ""))
+        # Pinned dependencies: the committed fuzz/Cargo.lock is the gate's
+        # version inventory. `--locked` fails the required job instead of
+        # silently resolving fresh crates.io versions on every run.
+        fetch = [step for step in job.get("steps", []) if "fetch --locked" in str(step.get("run", ""))]
+        self.assertEqual(len(fetch), 1)
+        self.assertEqual(fetch[0].get("working-directory"), "fuzz")
+        self.assertIn("cargo +nightly-2026-10-01 fetch --locked", fetch[0].get("run", ""))
         agg = self.workflows["check.yml"]["jobs"]["ci-ok"]
         self.assertIn("fuzz-compile", agg["needs"])
         self.assertIn("FUZZ_COMPILE_RESULT", "\n".join(step.get("run", "") for step in agg["steps"]))

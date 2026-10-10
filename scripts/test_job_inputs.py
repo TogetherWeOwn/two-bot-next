@@ -103,6 +103,17 @@ class SelectionTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {RUST}, path)
 
+    def test_fuzz_workspace_inputs_run_everything(self):
+        # The separate cargo-fuzz workspace resolves outside the root
+        # lockfile, so any of its inputs runs the full matrix (including the
+        # locked fuzz-compile gate) rather than silently skipping it. The
+        # fuzz README stays docs-only: it selects no job.
+        for path in ["fuzz/Cargo.toml", "fuzz/Cargo.lock",
+                     "fuzz/fuzz_targets/rsvp.rs"]:
+            with self.subTest(path=path):
+                self.assertEqual(inputs.classify(path), inputs.ALL_JOBS, path)
+        self.assertEqual(inputs.classify("fuzz/README.md"), set())
+
     def test_voice_template_assets_skip_heavy_jobs(self):
         # Coverage, validator tests and readme are validated by the check
         # job's hermetic offline step, which always runs. Only the corpus
@@ -649,6 +660,7 @@ class WorkflowSurfaceTests(unittest.TestCase):
         # rust-toolchain.toml (stable) otherwise wins over the installed
         # nightly and `-Zsanitizer` fails.
         self.assertIn("cargo +nightly-2026-10-01 fuzz build", body)
+        self.assertIn("cargo +nightly-2026-10-01 fetch --locked", body)
         self.assertNotIn("cargo fuzz run", body)
 
     def test_guard_scan_flags_an_unguarded_db_step(self):
