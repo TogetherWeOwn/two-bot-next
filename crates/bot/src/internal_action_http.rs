@@ -47,7 +47,10 @@ use two_bot_core::{
     },
     internal_settings::SettingsCommand,
     member_moderation_store::PgMemberModerationStore,
-    rejection_telemetry::{ActionLabel, KeyLabel, Rejection, RejectionRecord, RejectionTelemetry},
+    metrics,
+    rejection_telemetry::{
+        ActionLabel, KeyLabel, Rejection, RejectionClass, RejectionRecord, RejectionTelemetry,
+    },
     ModerationAction, ModerationActor, ModerationGates, ModerationPolicy, ModerationTarget,
 };
 use two_bot_cutover::{internal_settings::execute_settings, settings::SettingsStore};
@@ -63,6 +66,28 @@ const MAX_HEADERS: usize = 64;
 const MAX_REQUESTS: usize = 32;
 const BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Bounded receiver family for `two_bot_internal_actions_total{family,outcome}`
+/// (TOG-20119). Maps the already-bounded [`ActionLabel`] to one of
+/// `metrics::INTERNAL_ACTION_FAMILIES`: `announcement.post` to
+/// `announcement`, `event.*` to `event`, `settings.*` to `settings`,
+/// `moderation.*` to `moderation`, `role.assign`/`guild.add_member` to
+/// `membership`; anything else (including unwired catalog verbs and unknown
+/// verbs) to `other`. Takes only the bounded label, never raw request bytes,
+/// so no secret, token, key id or body can become a metric label.
+fn internal_family(action: ActionLabel) -> &'static str {
+    match action {
+        ActionLabel::Known(name) => match name {
+            "announcement.post" => "announcement",
+            "event.read" | "event.upsert" | "event.cancel" => "event",
+            "settings.get" | "settings.set" => "settings",
+            "role.assign" | "guild.add_member" => "membership",
+            _ if name.starts_with("moderation.") => "moderation",
+            _ => "other",
+        },
+        ActionLabel::Unknown | ActionLabel::Other => "other",
+    }
+}
 
 /// The test seam is module-private: runtime effects can only use the admitted
 /// announcement adapter. It does not expose an origin override or a resend API.
@@ -631,6 +656,12 @@ impl ReceiverState {
     }
 
     fn reject(&self, failure: Failure, key: KeyLabel, action: ActionLabel, id: &str) -> Response {
+        // Bounded receiver counter (TOG-20119): family from the bounded action
+        // label, outcome from the refusal class. Labels are closed sets only;
+        // the warn-summary below stays sampled as-is.
+        let family = internal_family(action);
+        let class = RejectionClass::classify(failure.class_code, &key, action);
+        metrics::global().internal_action(family, class.as_str());
         let records = self
             .telemetry
             .lock()
@@ -648,6 +679,10 @@ impl ReceiverState {
         key: KeyLabel,
         action: ActionLabel,
     ) -> Response {
+        // Bounded receiver counter (TOG-20119): terminal successes count as
+        // `executed`; terminal failures count with their refusal class, using
+        // the same classification as `reject`. Replays count on each serve.
+        let family = internal_family(action);
         if let TerminalResponse::Failure(failure) = &response {
             let code = match failure {
                 TerminalFailure::Malformed => ErrorCode::Malformed,
@@ -656,12 +691,16 @@ impl ReceiverState {
                 TerminalFailure::NoEffect => ErrorCode::DiscordUnavailable,
                 TerminalFailure::VersionConflict => ErrorCode::VersionConflict,
             };
+            let class = RejectionClass::classify(code, &key, action);
+            metrics::global().internal_action(family, class.as_str());
             log_records(
                 self.telemetry
                     .lock()
                     .expect("telemetry lock")
                     .record(Rejection::new(code, key, action), now_ms()),
             );
+        } else {
+            metrics::global().internal_action(family, "executed");
         }
         terminal_response(response, action, replayed, id)
     }
@@ -1094,7 +1133,10 @@ async fn read_event(
         .execute_read(guild_id, &event_id, &observed_at)
         .await
     {
-        Ok(result) => event_read_response(result, id),
+        Ok(result) => {
+            metrics::global().internal_action(internal_family(action), "executed");
+            event_read_response(result, id)
+        }
         Err(error) => reject(Failure::from_action(error.action_error())),
     }
 }
@@ -1498,6 +1540,7 @@ fn moderation_terminal(
             let Some(outcome) = moderation_outcome(action) else {
                 return state.reject(Failure::code(ErrorCode::Internal), key, action_label, id);
             };
+            metrics::global().internal_action(internal_family(action_label), "executed");
             let mut wire = (
                 StatusCode::OK,
                 Json(json!({"ok": true, "result": {"outcome": outcome}, "request_id": id})),
@@ -1546,7 +1589,10 @@ async fn read_setting(
     let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
     let store = SettingsStore::new(state.store.pool());
     match execute_settings(&store, guild_id, &command).await {
-        Ok(outcome) => settings_read_response(outcome.result, outcome.observed_version, id),
+        Ok(outcome) => {
+            metrics::global().internal_action(internal_family(action), "executed");
+            settings_read_response(outcome.result, outcome.observed_version, id)
+        }
         Err(error) => reject(Failure::from_action(error)),
     }
 }
@@ -1612,6 +1658,7 @@ async fn write_setting(
                 let _ = state.store.mark_unknown(&claim).await;
                 return reject(Failure::reconciliation());
             }
+            metrics::global().internal_action(internal_family(action), "executed");
             settings_write_response(outcome.result, outcome.observed_version, id, false)
         }
         Err(error) => {
@@ -1660,6 +1707,7 @@ async fn replay_setting(
                 })
                 .unwrap_or_else(|_| json!({"key": "", "outcome": "saved"}));
             let version = current_setting_version(state, body).await;
+            metrics::global().internal_action(internal_family(action), "executed");
             settings_write_response(rebuilt, version, id, true)
         }
         TerminalResponse::Failure(_) => state.terminal(response, true, id, key, action),

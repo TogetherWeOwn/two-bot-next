@@ -41,6 +41,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_voice_compensation_pending` | Tracked rooms awaiting compensating delete after a failed write |
 | `two_bot_voice_orphans_total` | Untracked creator-channel orphans needing manual deletion after failed `/create` compensation |
 | `two_bot_dispatch_drops_total{lane}` | Dispatch-lane saturation drops: every event refused because every attempted lane was full. `lane` is one of `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` (see label allowlists below). A single-lane refusal counts its lane once; a privileged spill refused by both lanes counts both. Logs sample the first drop per 60 s per runtime, so bursts are O(1) lines with N counter increments. Alert-threshold hook for M2.1 (lands once TOG-18943 unblocks): alert when any lane's drops increase across consecutive keepalive samples; a single drop inside one burst is not paging |
+| `two_bot_internal_actions_total{family,outcome}` | Signed website-action receiver executions by bounded family and outcome. `family` is one of `announcement`, `event`, `settings`, `moderation`, `membership` or `other` (see label allowlists below). `outcome` is `executed` or the refusal class (`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`, `conflict`, `upstream` or `internal`). Every request counts once; replays count on each serve. Refusal warn-summaries stay sampled; this counter is the alertable signal. Alert-threshold hook for M2.1 (lands once TOG-18943 unblocks): alert when refused outcomes increase across consecutive keepalive samples; a single refusal inside one burst is not paging |
 
 ## Job coverage and outcomes
 
@@ -155,6 +156,20 @@ as dynamic labels.
   bot's `DISPATCH_LIMITS` order (`crates/core/src/metrics.rs`
   `DISPATCH_LANES`). Recorded on every `spawn_first` saturation refusal,
   including the busy-lane path; scope-shutdown refusals are not drops.
+- `two_bot_internal_actions_total{family,outcome}` — `family` is one of
+  `announcement`, `event`, `settings`, `moderation`, `membership` or
+  `other`, mapped from the signed `action` verb in
+  `crates/bot/src/internal_action_http.rs` (`announcement.post` →
+  `announcement`, `event.*` → `event`, `settings.*` → `settings`,
+  `moderation.*` → `moderation`, `role.assign`/`guild.add_member` →
+  `membership`, everything else → `other`). `outcome` is `executed` or one
+  of the bounded refusal classes (`auth_failure`, `unknown_key`,
+  `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`,
+  `action_disabled`, `malformed_body`, `conflict`, `upstream`, `internal`).
+  Recorded once per receiver request (`ReceiverState::reject` for refusals,
+  `ReceiverState::terminal` plus the keyless-read and settings/moderation
+  success envelopes for executions); no key id, token, body or request bytes
+  ever become labels.
 - Log fields (coordinated with blocked structured-log work, which owns JSON
   formatting): `voice_event="voice_operation"` with `op`/`outcome`,
   `voice_event="voice_reconcile"` with plan counts,
