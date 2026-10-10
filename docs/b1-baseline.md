@@ -114,7 +114,7 @@ headroom below are historical, not measurements of the current PR head:
 | Artifact | Historical definition | Measured | Maximum | Headroom |
 |---|---|---|---|---|
 | Runtime image | Docker image inspect `Size` (uncompressed layers, not registry transfer size) | 87.19 MiB / 91,429,497 bytes | 112 MiB / 117,440,512 bytes | 24.81 MiB / 28.4% |
-| Release binary | `stat` of `/home/two-bot/two-bot` in the final image | 10.30 MiB / 10,805,344 bytes | 15 MiB / 15,728,640 bytes | 4.70 MiB / 45.6% |
+| Release binary | `stat` of `/home/two-bot/two-bot` in the final image | 15.01 MiB / 15,734,960 bytes | 16 MiB / 16,777,216 bytes | 0.99 MiB / 6.2% |
 
 The baseline used the classic Docker image store. The gate now sums exact
 `docker image history --human=false --format '{{.Size}}'` layer bytes after
@@ -136,7 +136,13 @@ growth is linked runtime/handlers/REST plus previously-dead domain/store code
 with no new dependencies, release profile already minimal (opt-level=z, lto,
 strip). Per calibration (measured * 1.4 rounded up to the next MiB):
 10.30 * 1.4 = 14.42 -> 15 MiB. Docker is not available in the controller
-workspace; offline fixture sizes are not measurements.
+workspace; offline fixture sizes are not measurements. Recalibrated 2026-10-10
+for the RSVP bound-admissions slice (PR #709): main measured 15,712,080 bytes
+(14.98 MiB) with ~16 KiB of headroom under the 15 MiB guard, and the slice head
+measured 15,734,960 bytes (15.01 MiB) of race-safe stores, compensations and
+prune with no new dependencies. The x1.4 rule would give
+15.01 * 1.4 = 21.01 -> 22 MiB; chosen 16 MiB instead (a one-MiB bump) so the
+advisory guard keeps headroom instead of wedging every code-adding PR.
 
 ### Docker history image measurement and immutable-ID pinning
 
