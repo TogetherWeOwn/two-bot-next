@@ -5,6 +5,7 @@ import io
 import json
 import sys
 import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -267,6 +268,107 @@ class UserAgentTests(unittest.TestCase):
             probe.fetch("https://two-bot-next-staging.example-sub.workers.dev/readyz", 10)
         self.assertEqual(seen, [probe.USER_AGENT])
         self.assertFalse(seen[0].startswith("Python-urllib"))
+
+
+def readyz_with_jobs(jobs, status=200):
+    """Build a /readyz double from {name: (parked, age_seconds_or_None)}.
+
+    age None omits last_success (a job with no success recorded yet).
+    """
+    now_ms = int(time.time() * 1000)
+    payload = {
+        "components": [["process", "ready"], ["gateway", "ready"]],
+        "jobs": {},
+        "build_revision": "r", "build_id": "b",
+    }
+    for name, (parked, age) in jobs.items():
+        entry = {"parked": parked, "running": not parked}
+        if age is not None:
+            entry["last_success"] = now_ms - age * 1000
+        payload["jobs"][name] = entry
+    return (status, json.dumps(payload).encode())
+
+
+class CadenceTest(unittest.TestCase):
+    def test_one_stale_job_fails_and_names_it(self):
+        body = readyz_with_jobs({
+            "counter": (False, 10),
+            "rank": (False, 800),  # fail line is 720 s
+        })
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL jobs-map:", out)
+        self.assertIn("rank=", out)
+        self.assertIn("stale", out)
+
+    def test_tabletop_baseline_passes(self):
+        body = readyz_with_jobs({
+            "counter": (False, 50),
+            "member_unban_sweep": (False, 50),
+            "scheduled_messages": (False, 50),
+            "settings": (False, 50),
+            "feeds": (False, 110),
+            "rank": (False, 350),
+            "scheduled_events": (False, 350),
+            "inactivity": (False, 3300),
+            "presence_probe": (False, 3300),
+        })
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+
+    def test_warn_band_stays_green_but_is_named(self):
+        body = readyz_with_jobs({
+            "feeds": (False, 150),  # warn 120 s, fail 240 s
+        })
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+        self.assertIn("warn", out)
+        self.assertIn("feeds=", out)
+
+    def test_parked_job_with_ancient_success_passes(self):
+        body = readyz_with_jobs({
+            "inactivity": (True, 10 ** 6),
+        })
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+
+    def test_unknown_job_is_not_graded(self):
+        body = readyz_with_jobs({
+            "brand_new_job": (False, 10 ** 6),
+        })
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+
+    def test_missing_last_success_is_not_evidence(self):
+        body = readyz_with_jobs({
+            "counter": (False, None),
+        })
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+
+    def test_future_timestamp_clamps_to_zero(self):
+        now_ms = int(time.time() * 1000)
+        body = (200, json.dumps({
+            "components": [["process", "ready"], ["gateway", "ready"]],
+            "jobs": {"counter": {"parked": False, "running": True,
+                                 "last_success": now_ms + 60_000}},
+            "build_revision": "r", "build_id": "b",
+        }).encode())
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
 
 
 if __name__ == "__main__":

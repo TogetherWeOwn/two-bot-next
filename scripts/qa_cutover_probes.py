@@ -27,7 +27,10 @@ Probes and the code path each one checks:
                    Source: crates/bot/src/gateway.rs GatewayState::status,
                    crates/bot/src/server.rs readiness_after_ping.
   jobs-map         /readyz carries the informational jobs map (each entry
-                   with boolean parked/running). Jobs never flip readiness.
+                   with boolean parked/running). Jobs never flip readiness,
+                   but every unparked job with a known cadence must show a
+                   recent last_success: a job older than its
+                   max_last_success_age_seconds fails and is named.
                    Source: crates/bot/src/jobs.rs statuses,
                    crates/bot/src/server.rs failing_jobs test.
   fence-watch      the /readyz body is the container's breakdown, never a
@@ -63,6 +66,27 @@ DEFAULT_TIMEOUT_SECONDS = 10
 USER_AGENT = "two-bot-next-staging-rollout/1.0"
 KNOWN_STATUSES = ("ready", "starting", "down")
 REQUIRED_COMPONENTS = ("process", "gateway")
+# Per-job last_success freshness bands, in seconds, from the 2026-10-06 staging
+# tabletop (docs/incident-tabletop-2026-10-06.md:40): counter,
+# member_unban_sweep, scheduled_messages and settings were all under 1 min;
+# feeds 2 min; rank and scheduled_events 6 min; inactivity and presence_probe
+# 56 min. The warn line is the observed band (one missed cycle is suspicious);
+# max_last_success_age_seconds is twice that (two missed cycles proves the job
+# is stuck, not jittered), so a healthy-but-slow sample never fails cutover.
+WARN_LAST_SUCCESS_AGE_SECONDS = {
+    "counter": 60,
+    "member_unban_sweep": 60,
+    "scheduled_messages": 60,
+    "settings": 60,
+    "feeds": 120,
+    "rank": 360,
+    "scheduled_events": 360,
+    "inactivity": 3360,
+    "presence_probe": 3360,
+}
+MAX_LAST_SUCCESS_AGE_SECONDS = {
+    name: 2 * warn for name, warn in WARN_LAST_SUCCESS_AGE_SECONDS.items()
+}
 
 
 class ProbeError(Exception):
@@ -196,7 +220,20 @@ def check_gateway(state, status, expect_ready):
     raise ProbeError(f"gateway {gateway!r} disagrees with HTTP {status}")
 
 
-def check_jobs(report):
+def job_age_seconds(entry, now_ms):
+    """Seconds since the entry's last_success, or None when unassessable.
+
+    None covers a job that never succeeded (fresh boot), an absent field, or
+    a non-numeric value from an older build: none of those is evidence the job
+    is stuck. A timestamp ahead of this clock clamps to 0, never negative.
+    """
+    last = entry.get("last_success")
+    if isinstance(last, bool) or not isinstance(last, (int, float)):
+        return None
+    return max(0, int(now_ms - last) // 1000)
+
+
+def check_jobs(report, now_ms=None):
     jobs = report.get("jobs")
     if not isinstance(jobs, dict) or not jobs:
         raise ProbeError("/readyz carries no informational jobs map")
@@ -207,7 +244,33 @@ def check_jobs(report):
     if bad:
         shown = ", ".join(sorted(bad)[:3]) + ("..." if len(bad) > 3 else "")
         raise ProbeError(f"/readyz jobs map has malformed entries: {shown}")
-    return f"{len(jobs)} jobs reported (informational; never gates readiness)"
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    stale, warns, parked = [], [], 0
+    for name in sorted(jobs):
+        entry = jobs[name]
+        if entry.get("parked"):
+            parked += 1
+            continue
+        limit = MAX_LAST_SUCCESS_AGE_SECONDS.get(name)
+        if limit is None:
+            continue  # unknown job: a newer build's cadence is not ours to grade
+        age = job_age_seconds(entry, now_ms)
+        if age is None:
+            continue  # no success recorded yet; not evidence of stuck
+        if age > limit:
+            stale.append(f"{name}={age}s > {limit}s")
+        elif age > WARN_LAST_SUCCESS_AGE_SECONDS[name]:
+            warns.append(f"{name}={age}s")
+    if stale:
+        shown = ", ".join(stale)
+        raise ProbeError(f"stale jobs past max_last_success_age_seconds: {shown}")
+    fresh = len(jobs) - parked
+    reason = (f"{fresh} jobs fresh within cadence, {parked} parked "
+              f"(informational; never gates readiness)")
+    if warns:
+        reason += f" [warn: {', '.join(warns)}]"
+    return reason
 
 
 def run(args, fetch_fn=None):
