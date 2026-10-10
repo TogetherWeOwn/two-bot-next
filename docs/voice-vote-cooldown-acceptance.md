@@ -67,12 +67,16 @@ requires on every roster change.
 
 ## Not provided by the core (not parity evidence)
 
-- Coordinated retention bounding (VK-03) is provided by `VoteKickCore::prune`
-  (coordinated settle/evict on every public method plus a timer entry that
-  reaps expired state with no new starts), pinned by
+- Coordinated retention bounding (VK-03) is provided by coordinated
+  settle/evict on every public core method plus a timer `prune` entry that
+  reaps expired state with no new starts, with every eviction reported through
+  a drain the parent collects after every call (`drain_evicted`), pinned by
   `timer_prune_reaps_expired_state_without_new_starts` and
   `sustained_churn_keeps_retained_state_proportional_to_the_live_window`.
-  Durable replay retention across restarts remains a parent obligation.
+  The worker reaps only when it can also settle (gate on authoritative
+  evidence, settle live votes first, then prune) and fences initiators with
+  queued enforcement. Durable replay retention across restarts remains a
+  parent obligation.
   Staff-permission protected targets (VK-01) and mention-safe reason
   rendering (VK-04) have landed on main and compose with this slice.
 - Slash/button routing, ephemeral reply text, durable replay retention across

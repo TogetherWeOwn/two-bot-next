@@ -72,11 +72,16 @@ scheduled expiry, durable/restart reconciliation and replay-ledger retention.
 The in-memory core retains finished votes (and their IDs) only through the
 post-terminal cooldown horizon inclusive, and initiator starts only through the
 10-minute sliding window. The parent timer must call `VoteKickCore::prune` so
-expired entries are reaped even with no new starts, and must drop its own
-per-vote maps for the IDs `prune` reports; do not treat recreating the core as
-durable replay protection. Runtime wiring must preserve unique vote IDs and
-reject unknown/stale buttons after restart, rather than reconstructing a vote
-from button data.
+expired entries are reaped even with no new starts, and must collect evicted
+IDs after every core call (`drain_evicted`; `prune` returns them for the timer
+pass, while `start`/`cast`/`refresh` report only through the drain) and drop
+its own per-vote maps for them; do not treat recreating the core as durable
+replay protection. The timer must reap only when it can also settle — gate on
+authoritative evidence, settle every live vote first, then prune — and must
+keep a vote's initiator while its enforcement is still queued, so pruning never
+drops an unaudited terminal or an unresolved enforcement fence. Runtime wiring
+must preserve unique vote IDs and reject unknown/stale buttons after restart,
+rather than reconstructing a vote from button data.
 
 The parent must independently gate and idempotently deliver permission-bearing
 actions, check effective room permissions and target presence/protection again

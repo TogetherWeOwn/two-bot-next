@@ -248,17 +248,24 @@ impl Vote {
 /// active votes (expiry backdated to the deadline), evicts terminal votes
 /// strictly past the [`VOTE_KICK_COOLDOWN_MS`] horizon, and drops initiator
 /// starts past [`VOTE_KICK_INITIATOR_WINDOW_MS`], removing keys left empty.
-/// Call [`VoteKickCore::prune`] from the parent timer so expired entries are
-/// reaped even with no new starts. Sustained activity keeps memory
-/// proportional to the live window, not total history. A terminal vote's
-/// interaction ID is rejected as [`VoteKickError::ReusedVoteId`] while the
-/// vote is retained (through the cooldown horizon inclusive); after eviction
-/// the ID may start a new vote — see [`VoteKickCore::prune`] for why that
-/// horizon is safe.
+/// Every eviction is reported to the parent: [`VoteKickCore::prune`] returns
+/// the evicted IDs, and evictions from `start`/`cast`/`refresh` wait in a
+/// buffer for [`VoteKickCore::drain_evicted`], so per-vote parent maps stay
+/// bounded no matter which entry point reaps. Call [`VoteKickCore::prune`]
+/// from the parent timer so expired entries are reaped even with no new
+/// starts. Sustained activity keeps memory proportional to the live window,
+/// not total history. A terminal vote's interaction ID is rejected as
+/// [`VoteKickError::ReusedVoteId`] while the vote is retained (through the
+/// cooldown horizon inclusive); after eviction the ID may start a new vote —
+/// see [`VoteKickCore::prune`] for why that horizon is safe.
 #[derive(Debug, Default)]
 pub struct VoteKickCore {
     votes: BTreeMap<Snowflake, Vote>,
     initiator_starts: BTreeMap<(Snowflake, Snowflake), Vec<u64>>,
+    /// Vote IDs evicted by `start`/`cast`/`refresh`/`prune` and not yet
+    /// collected. Each vote is evicted (and buffered) at most once: eviction
+    /// removes it from `votes`, so a later pass cannot report it again.
+    pending_evicted: Vec<Snowflake>,
 }
 
 impl VoteKickCore {
@@ -284,13 +291,14 @@ impl VoteKickCore {
 
     /// Settle elapsed active votes, evict terminal votes past the retention
     /// horizon, and drop initiator starts past the sliding window (with keys
-    /// left empty). Returns the evicted vote IDs so the parent can drop its
-    /// own per-vote maps in the same pass.
+    /// left empty). Evicted vote IDs accumulate in the drain buffer for
+    /// [`Self::drain_evicted`]: the parent collects them after every call so
+    /// its own per-vote maps stay bounded whatever reaps.
     ///
     /// Eviction runs before settling so a vote that just elapsed on this call
     /// survives until a later pass; its terminal transition is backdated to
     /// the deadline either way, so the cooldown is unaffected.
-    fn prune_at(&mut self, now_ms: u64) -> Vec<Snowflake> {
+    fn prune_at(&mut self, now_ms: u64) {
         let mut evicted = Vec::new();
         self.votes.retain(|id, vote| {
             let keep = Self::vote_retained(vote.status, vote.terminal_at_ms, now_ms);
@@ -299,6 +307,7 @@ impl VoteKickCore {
             }
             keep
         });
+        self.pending_evicted.extend(evicted);
         // A new command must not be blocked by an elapsed vote when the timer
         // has not refreshed it yet. No passing decision is made on this path,
         // but the lazy expiry is a terminal transition and starts the cooldown.
@@ -312,7 +321,6 @@ impl VoteKickCore {
             starts.retain(|started| Self::initiator_start_counts(*started, now_ms));
             !starts.is_empty()
         });
-        evicted
     }
 }
 
@@ -326,8 +334,9 @@ impl VoteKickCore {
     ///
     /// The parent timer should call this even when no new vote starts: without
     /// it, terminal votes and initiator history are only reaped on the next
-    /// `start`/`cast`/`refresh`. Returns the evicted vote IDs so the parent
-    /// can drop its own per-vote maps in the same pass.
+    /// `start`/`cast`/`refresh`. Returns every vote ID evicted since the last
+    /// drain — this pass's plus any buffered by earlier `start`/`cast`/`refresh`
+    /// calls — so the parent can drop its own per-vote maps in the same pass.
     ///
     /// Retention horizon: a terminal vote (and its replay rejection) is kept
     /// through `terminal_at + VOTE_KICK_COOLDOWN_MS` inclusive. Past that, the
@@ -338,7 +347,18 @@ impl VoteKickCore {
     /// Durable replay protection across restarts stays a parent obligation
     /// (see the type docs).
     pub fn prune(&mut self, clock: &impl VoteClock) -> Vec<Snowflake> {
-        self.prune_at(clock.now_ms())
+        self.prune_at(clock.now_ms());
+        self.drain_evicted()
+    }
+
+    /// Collect vote IDs evicted by `start`/`cast`/`refresh` since the last
+    /// drain, so the parent can drop its own per-vote maps for them. Call
+    /// after every core call: only the timer's [`Self::prune`] reports
+    /// evictions in its return value, while a command that arrives first may
+    /// have reaped other votes on its own pass. Each evicted ID is reported
+    /// exactly once; an empty buffer drains to an empty vec.
+    pub fn drain_evicted(&mut self) -> Vec<Snowflake> {
+        std::mem::take(&mut self.pending_evicted)
     }
 
     /// Starting does not cast a ballot: V4 says votes are cast with buttons.
