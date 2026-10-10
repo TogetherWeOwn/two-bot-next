@@ -110,7 +110,7 @@ impl NameDirectory {
         self.names.get(&member).map_or("member", String::as_str)
     }
 
-    fn knows(&self, member: Snowflake) -> bool {
+    pub(super) fn knows(&self, member: Snowflake) -> bool {
         self.names.contains_key(&member)
     }
 
@@ -393,11 +393,6 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             if self.custom_names.contains_key(&room_id) {
                 continue;
             }
-            // An owner whose display name is unknown would render as
-            // "member": wait for the name instead of spending a rename.
-            if !self.name_directory.knows(room.owner_id) {
-                continue;
-            }
             let Some(template) = self
                 .creators
                 .get(&room.creator_channel_id)
@@ -406,6 +401,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             else {
                 continue;
             };
+            // A person whose display name is unknown would render as
+            // "member": wait for the name instead of spending a rename.
+            if !self.name_directory.knows(room.owner_id)
+                || (template.contains("@@original_creator@@")
+                    && !self.name_directory.knows(room.original_creator_id))
+            {
+                continue;
+            }
             command.actor_id = room.owner_id;
             command.request = NameInteraction::Restore { room_id };
             let facts = self.name_facts(&room, &command);

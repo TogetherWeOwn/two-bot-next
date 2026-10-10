@@ -4840,6 +4840,9 @@ enum ActorCommand {
     /// The guild's voice configuration was written (`/import`): automatic
     /// names use the same settings `/name` Restore reads from now on.
     NameSettingsChanged(NameSettings),
+    /// Test probe: the worker's naming settings and known display names.
+    #[cfg(test)]
+    NamingProbe(oneshot::Sender<(NameSettings, NameDirectory)>),
     Join {
         ticket: JoinTicket,
         /// The joiner's display name; the worker renders and filters the room
@@ -5429,14 +5432,18 @@ where
         let Some(actor) = self.live_actor(guild_id) else {
             return;
         };
-        if let Some(users) = cache.guild_voice_states(Id::new(guild_id)) {
-            for user in users.iter() {
-                let _ = actor.tx.send(ActorCommand::Display {
-                    member_id: user.get(),
-                    display: display_name(cache, guild_id, user.get()),
-                });
-            }
+        for (member_id, display) in cached_display_names(cache, guild_id) {
+            let _ = actor.tx.send(ActorCommand::Display { member_id, display });
         }
+    }
+
+    /// Test probe: the worker's naming settings and known display names.
+    #[cfg(test)]
+    async fn naming_probe(&self, guild_id: Snowflake) -> Option<(NameSettings, NameDirectory)> {
+        let actor = self.live_actor(guild_id)?;
+        let (reply, inbox) = oneshot::channel();
+        actor.tx.send(ActorCommand::NamingProbe(reply)).ok()?;
+        inbox.await.ok()
     }
 
     /// Hand freshly written voice settings to the guild worker.
@@ -5677,6 +5684,10 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             worker.name_settings_loaded = true;
             worker.name_settings_read_ms = Some(now_ms);
         }
+        #[cfg(test)]
+        ActorCommand::NamingProbe(reply) => {
+            let _ = reply.send((worker.name_settings.clone(), worker.name_directory.clone()));
+        }
         ActorCommand::Join {
             ticket,
             display,
@@ -5912,6 +5923,26 @@ pub fn inventory_from_cache(
         roles,
         members,
     })
+}
+
+/// Display names for every cached guild member and everyone in voice: room
+/// owners and original creators who left voice still render by name after a
+/// restart. The worker prunes the names it cannot use.
+fn cached_display_names(
+    cache: &DefaultInMemoryCache,
+    guild_id: Snowflake,
+) -> Vec<(Snowflake, String)> {
+    let guild_key = Id::new(guild_id);
+    let mut ids: std::collections::BTreeSet<Snowflake> = std::collections::BTreeSet::new();
+    if let Some(users) = cache.guild_voice_states(guild_key) {
+        ids.extend(users.iter().map(|user| user.get()));
+    }
+    if let Some(members) = cache.guild_members(guild_key) {
+        ids.extend(members.iter().map(|member| member.get()));
+    }
+    ids.into_iter()
+        .map(|id| (id, display_name(cache, guild_id, id)))
+        .collect()
 }
 
 fn display_name(cache: &DefaultInMemoryCache, guild_id: Snowflake, member_id: Snowflake) -> String {

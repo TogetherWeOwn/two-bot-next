@@ -9992,3 +9992,39 @@ async fn written_settings_reach_automatic_names() {
     assert!(worker.name_settings_loaded);
     assert_eq!(worker.name_settings_read_ms, Some(5));
 }
+
+#[tokio::test]
+async fn an_unknown_original_creator_name_waits_instead_of_rendering_member() {
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template =
+        "@@owner@@ from @@original_creator@@".to_owned();
+    let mut handed = room(500);
+    handed.owner_id = MEMBER + 1;
+    store.rooms.lock().unwrap().insert(500, handed);
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER + 1, Some(500), Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.name_directory.insert(MEMBER + 1, "Sam".to_owned());
+    worker.refresh_template_names(0);
+    assert!(!worker.dispatch_one(0).await);
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    worker.refresh_template_names(1);
+    dispatch(&mut worker, 1).await;
+    assert_eq!(*trace.lock().unwrap(), ["rename:500:Sam from Alex"]);
+}
+
+#[tokio::test]
+async fn a_confirmed_import_hands_its_settings_to_the_worker() {
+    let trace = Trace::default();
+    let bytes = serde_json::to_vec(&full_config()).unwrap();
+    let (runtime, _) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let (confirm_id, _) = preview_buttons(&preview.expect("preview"));
+    let confirm = component_interaction(&confirm_id, manager(), UPLOADER);
+    let (_, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
+    let (settings, _) = runtime.naming_probe(GUILD).await.expect("probe");
+    assert_eq!(settings, NameSettings::from_config(&full_config()));
+}
