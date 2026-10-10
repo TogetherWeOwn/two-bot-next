@@ -78,6 +78,13 @@ async fn composition_rest(seen: Arc<AtomicBool>, hold: Duration) -> MockRest {
             return ScriptedResponse::json(200, json!({"id":"1111"}));
         }
         if request.method == "GET" {
+            // RA-01 live-membership gate echoes the looked-up user id back
+            // inside `user.id`: answer member reads with that shape so the
+            // fenced RSVP passes. Other guild reads keep the bootstrap body.
+            if request.path.contains("/members/") {
+                let user = request.path.rsplit('/').next().unwrap_or_default();
+                return ScriptedResponse::json(200, json!({"user": {"id": user}, "roles": []}));
+            }
             // Custom-command bootstrap guild read.
             return ScriptedResponse::json(200, json!({"id":GUILD,"name":"Bootstrap guild"}));
         }

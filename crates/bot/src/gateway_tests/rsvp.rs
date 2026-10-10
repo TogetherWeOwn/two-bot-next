@@ -256,6 +256,14 @@ async fn lane_holding_rest(seen: Arc<AtomicBool>, hold: Duration) -> MockRest {
             return ScriptedResponse::json(200, json!({"id":EVENT,"guild_id":GUILD,"status":1}));
         }
         if request.method == "GET" {
+            // RA-01 live-membership gate echoes the looked-up user id back
+            // inside `user.id`: answer member reads with that shape so fenced
+            // commands pass. Every other GET (boot application id, guild
+            // reads) keeps the legacy bare-id body its consumer parses.
+            if request.path.contains("/members/") {
+                let user = request.path.rsplit('/').next().unwrap_or_default();
+                return ScriptedResponse::json(200, json!({"user": {"id": user}, "roles": []}));
+            }
             return ScriptedResponse::json(200, json!({"id":"1111"}));
         }
         if request.method == "PUT" {
@@ -313,24 +321,19 @@ async fn queued_commands(
     } else {
         None
     };
-    let event = ScriptedResponse::json(200, json!({"id":EVENT,"guild_id":GUILD,"status":1}));
-    let rest = MockRest::start(
-        vec![
-            ScriptedResponse::json(200, json!({"id":"1111"})),
-            ScriptedResponse::status(200),
-            ScriptedResponse::status(204),
-            event.clone().delayed(if slow_database {
-                Duration::ZERO
-            } else {
-                Duration::from_millis(3200)
-            }),
-            ScriptedResponse::status(204),
-            // Deferred original edits require ID-bearing 200 receipts.
-            ScriptedResponse::json(200, json!({"id": "99"})),
-            event,
-            ScriptedResponse::json(200, json!({"id": "99"})),
-        ],
-        ScriptedResponse::status(500),
+    // Route-aware responder: the first live-event read is held (or instant
+    // for the slow-database case) while later reads pass through, and
+    // membership reads echo the RA-01 `user.id` evidence. A strict FIFO
+    // script cannot survive the concurrent defer/execute interleave, so the
+    // exact per-RSVP call sequence is pinned in the discord runtime tests
+    // instead; here only arrival order and timing are asserted.
+    let rest = lane_holding_rest(
+        Arc::new(AtomicBool::new(false)),
+        if slow_database {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(3200)
+        },
     )
     .await;
     let (shutdown, receiver) = tokio::sync::watch::channel(false);
@@ -361,12 +364,14 @@ async fn queued_commands(
     }
     wait_requests(&rest, 5).await;
     let requests = rest.requests();
-    assert!(requests[4]
+    // Index 5: boot application id, registry PUT, first defer, pre-write
+    // membership read, held event read, then the second command's defer.
+    assert!(requests[5]
         .path
         .ends_with("/interactions/3/mock-rsvp-3/callback"));
-    assert!(requests[4].received_at.duration_since(delivered) < Duration::from_secs(3));
+    assert!(requests[5].received_at.duration_since(delivered) < Duration::from_secs(3));
     assert_eq!(
-        serde_json::from_slice::<Value>(&requests[4].body).unwrap()["type"],
+        serde_json::from_slice::<Value>(&requests[5].body).unwrap()["type"],
         5
     );
     assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 1);
@@ -542,17 +547,13 @@ async fn acknowledged_queue_drains_before_graceful_shutdown_returns() {
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn sticky_and_feed_are_deferred_at_receipt_while_rsvp_is_pending() {
     let db = TestDb::new().await;
-    let rest = MockRest::start(
-        vec![
-            ScriptedResponse::json(200, json!({"id":"1111"})),
-            ScriptedResponse::status(200),
-            ScriptedResponse::status(204),
-            ScriptedResponse::json(200, json!({"id":EVENT,"guild_id":GUILD,"status":1}))
-                .delayed(Duration::from_millis(3200)),
-        ],
-        // Catch-all must satisfy receipt validation for both 200 callbacks and
-        // successful deferred-original edits.
-        ScriptedResponse::json(200, json!({"id": "99"})),
+    // Route-aware responder: the first live-event read is held 3.2 s while
+    // later reads pass through, membership reads echo the RA-01 `user.id`
+    // evidence, and callbacks/edits get wire-correct receipts regardless of
+    // the sticky/feed defer interleave.
+    let rest = lane_holding_rest(
+        Arc::new(AtomicBool::new(false)),
+        Duration::from_millis(3200),
     )
     .await;
     let (runner, mut ws) = connect(&db, &rest).await;
@@ -601,7 +602,10 @@ async fn sticky_and_feed_are_deferred_at_receipt_while_rsvp_is_pending() {
     assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 1);
     ws.send(Message::text(leave(5).to_string())).await.unwrap();
     wait_sequence(&db.store, 5).await;
-    assert_eq!(rest.requests().len(), 9); // No second dispatch at queue consumption.
+    // Twelve: boot application id + registry PUT, defer, pre-write
+    // membership/event reads, both validation defers with edits, then the
+    // fence re-reads and completion edit. No second dispatch at consumption.
+    assert_eq!(rest.requests().len(), 12); // No second dispatch at queue consumption.
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM announcements_audit_log")
             .fetch_one(&db.pool)
@@ -614,7 +618,7 @@ async fn sticky_and_feed_are_deferred_at_receipt_while_rsvp_is_pending() {
     }
     ws.send(Message::text(leave(6).to_string())).await.unwrap();
     wait_sequence(&db.store, 6).await;
-    assert_eq!(rest.requests().len(), 9);
+    assert_eq!(rest.requests().len(), 12);
     runner.abort();
     let _ = runner.await;
     drop(ws);

@@ -877,11 +877,15 @@ mod tests {
     fn admission_bounds_and_retention_floors_are_pinned() {
         // RA-03: every admission bound is a positive finite cap, and the
         // audit floor governs joint purges (it is the stricter horizon).
-        assert!(MAX_RSVPS_PER_EVENT > 0);
-        assert!(MAX_CHECKINS_PER_OCCURRENCE > 0);
-        assert!(MAX_RSVP_WRITES_PER_USER_PER_MINUTE > 0);
-        assert!(RSVP_RETENTION_DAYS > 0);
-        assert!(AUDIT_RETENTION_DAYS >= RSVP_RETENTION_DAYS);
+        // Const context: clippy `assertions_on_constants` rejects these as
+        // runtime asserts, and a bound edited to zero fails the build here.
+        const _: () = {
+            assert!(MAX_RSVPS_PER_EVENT > 0);
+            assert!(MAX_CHECKINS_PER_OCCURRENCE > 0);
+            assert!(MAX_RSVP_WRITES_PER_USER_PER_MINUTE > 0);
+            assert!(RSVP_RETENTION_DAYS > 0);
+            assert!(AUDIT_RETENTION_DAYS >= RSVP_RETENTION_DAYS);
+        };
     }
 
     #[test]

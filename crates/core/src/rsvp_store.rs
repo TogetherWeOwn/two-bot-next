@@ -568,8 +568,11 @@ mod tests {
             status: RsvpStatus::Interested,
             ..going.clone()
         };
-        // Hold the empty key before either writer starts. Both must wait here,
-        // not read an absent row then race their upserts with previous=None.
+        // Hold the event admission lock before either writer starts. put_rsvp
+        // takes the coarser event lock first, so both writers queue here and
+        // then serialize through the identity lock after release. Holding
+        // only the identity lock strands the second writer on the event lock
+        // instead, and the waiter count below never reaches two.
         let mut guard = pool.begin().await.expect("guard transaction");
         let guard_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
             .fetch_one(&mut *guard)
@@ -577,11 +580,10 @@ mod tests {
             .expect("guard pid");
         sqlx::query(
             "SELECT pg_advisory_xact_lock(hashtextextended(
-                jsonb_build_array($1::text, $2::text, $3::text)::text, 0))",
+                jsonb_build_array($1::text, $2::text)::text, 0))",
         )
         .bind(&going.guild_id)
         .bind(&going.event_id)
-        .bind(&going.user_id)
         .execute(&mut *guard)
         .await
         .expect("hold empty RSVP key");
