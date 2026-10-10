@@ -271,6 +271,62 @@ async fn import_malformed_bodies_are_refused_before_any_effect() {
 }
 
 #[tokio::test]
+async fn import_over_capacity_keeps_audit_id_out_of_gateway_namespace() {
+    let Some(db) = database().await else { return };
+    let _flag = AUTOMATIONS_FLAG_LOCK.lock().await;
+    set_automations_flags(true, false);
+    let app = automations_app(db.pool().clone());
+    let seed = import_own_payload(AUTOMATIONS_ACTOR, false);
+    let (status, _, _) = answer(
+        app.clone(),
+        signed(&seed, "old", "intent-automations-capacity-seed"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(command_names(db.pool()).await, ["faq"]);
+    // The document fits the parser budget, but its union with the seeded
+    // command exceeds capacity and reaches the service's rejection audit.
+    let commands: Vec<Value> = (0..max_import_entries())
+        .map(|i| json!({"name": format!("capacity{i}"), "description": "Capacity fixture", "template": "hello"}))
+        .collect();
+    let raw = json!({
+        "action": "automations.import",
+        "actor_id": AUTOMATIONS_ACTOR,
+        "version": 1,
+        "commands": commands,
+    })
+    .to_string();
+    let intent = "custom:text:attempt:111111111111111111";
+    let (status, _, body) = answer(app, signed(&raw, "old", intent)).await;
+    set_automations_flags(false, false);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "malformed");
+    assert_eq!(body["error"]["retryable"], false);
+    let raw_id_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM automation_audit_log WHERE id = $1")
+            .bind(intent)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        raw_id_rows, 0,
+        "caller keys cannot occupy gateway audit ids"
+    );
+    let rejection: (String, Option<String>) =
+        sqlx::query_as("SELECT outcome, reason FROM automation_audit_log WHERE id = $1")
+            .bind(format!("internal:automations.import:{intent}"))
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        rejection,
+        ("rejected".to_owned(), Some("over_capacity".to_owned()))
+    );
+    assert_eq!(command_names(db.pool()).await, ["faq"], "no partial import");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn import_success_replays_without_second_apply_but_changed_bytes_conflict() {
     let Some(db) = database().await else { return };
     let _flag = AUTOMATIONS_FLAG_LOCK.lock().await;

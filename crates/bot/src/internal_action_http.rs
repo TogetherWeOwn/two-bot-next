@@ -2675,19 +2675,12 @@ async fn import_automations(
         Ok(identity) => identity,
         Err(_) => return reject(Failure::code(ErrorCode::Internal)),
     };
+    let audit_id = format!("internal:automations.import:{idempotency}");
     let claim = match state.store.claim(&identity, &subject).await {
         Ok(InternalClaim::Claimed(claim)) => claim,
         Ok(InternalClaim::Replay(response)) => {
-            return replay_import(
-                state,
-                &decision.body,
-                &idempotency,
-                response,
-                id,
-                key,
-                action,
-            )
-            .await;
+            return replay_import(state, &decision.body, &audit_id, response, id, key, action)
+                .await;
         }
         Ok(InternalClaim::Mismatch) => return reject(Failure::code(ErrorCode::VersionConflict)),
         Ok(InternalClaim::InFlight) => return reject(Failure::code(ErrorCode::InProgress)),
@@ -2701,7 +2694,7 @@ async fn import_automations(
         &actor,
         &parsed,
         overwrite_allowed,
-        &idempotency,
+        &audit_id,
         &at,
     )
     .await
@@ -2748,7 +2741,7 @@ async fn import_automations(
 
 /// Replay a stored `automations.import` terminal without re-executing the
 /// apply. Success returns the first `{imported,skipped,conflicts}` result
-/// verbatim from the `{idempotency}#summary` audit row the first apply
+/// verbatim from the `{audit_id}#summary` audit row the first apply
 /// committed (no writes, no new audit rows): a blind retry after a lost
 /// response sees exactly what the first call reported, even when an admin
 /// edited a command out of band between the two calls. When the summary row
@@ -2758,7 +2751,7 @@ async fn import_automations(
 async fn replay_import(
     state: &ReceiverState,
     body: &Map<String, Value>,
-    idempotency: &str,
+    audit_id: &str,
     response: TerminalResponse,
     id: &str,
     key: KeyLabel,
@@ -2768,7 +2761,7 @@ async fn replay_import(
         TerminalResponse::Success { affected, .. } => {
             let imported = usize::try_from(affected).unwrap_or(usize::MAX);
             let stored =
-                stored_import_outcome(state, &format!("{idempotency}#summary"), imported).await;
+                stored_import_outcome(state, &format!("{audit_id}#summary"), imported).await;
             let rebuilt = match stored {
                 Some(outcome) => outcome,
                 None => rebuilt_import_outcome(state, body, imported).await,
