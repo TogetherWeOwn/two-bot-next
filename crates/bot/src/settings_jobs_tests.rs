@@ -115,6 +115,7 @@ fn applied_swap_logs_spec_events_and_never_cold_values() {
         rows: vec![
             row("g1", "TWO_RAID_JOIN_THRESHOLD", json!(5)),
             row("g1", "TWO_FEED_POLL_SECONDS", json!(600)),
+            row("g1", "TWO_TICKET_COOLDOWN_SECONDS", json!(777)),
             row("g1", "TWO_MADE_UP_KEY", json!("unlisted")),
         ],
     });
@@ -128,6 +129,7 @@ fn applied_swap_logs_spec_events_and_never_cold_values() {
         "setting_ignored_not_applied",
         "TWO_RAID_JOIN_THRESHOLD",
         "TWO_FEED_POLL_SECONDS",
+        "TWO_TICKET_COOLDOWN_SECONDS",
         "TWO_MADE_UP_KEY",
     ] {
         assert!(log.contains(needle), "missing {needle}: {log}");
@@ -136,13 +138,16 @@ fn applied_swap_logs_spec_events_and_never_cold_values() {
         .lines()
         .find(|line| line.contains("settings_applied"))
         .unwrap();
+    // Both hot-wired keys report applied (TOG-19027: the feed interval is hot).
     assert!(applied.contains("TWO_RAID_JOIN_THRESHOLD"), "{applied}");
+    assert!(applied.contains("TWO_FEED_POLL_SECONDS"), "{applied}");
     assert!(
-        !applied.contains("TWO_FEED_POLL_SECONDS"),
+        !applied.contains("TWO_TICKET_COOLDOWN_SECONDS"),
         "cold key reported as applied: {applied}"
     );
-    // Key names only for the applied line's `keys`; cold values are never rendered.
-    assert!(!log.contains("600"), "cold value leaked: {log}");
+    // Key names only for the applied line's `keys`; hot values appear only on
+    // their own `setting_changed` lines, cold values are never rendered.
+    assert!(!log.contains("777"), "cold value leaked: {log}");
     assert!(!log.contains("unlisted"), "ignored value leaked: {log}");
 }
 
@@ -151,7 +156,7 @@ fn settings_log_capture_excludes_unrelated_numeric_trace_events() {
     let (mut writer, _reader) = live_channel();
     let report = writer.publish(&SettingsSnapshot {
         revision: 1,
-        rows: vec![row("g1", "TWO_FEED_POLL_SECONDS", json!(600))],
+        rows: vec![row("g1", "TWO_TICKET_COOLDOWN_SECONDS", json!(600))],
     });
     let (capture, _guard) = captured();
     tracing::trace!(
@@ -167,7 +172,7 @@ fn settings_log_capture_excludes_unrelated_numeric_trace_events() {
     log_applied(&report);
     let log = capture.contents();
     assert!(log.contains("settings_restart_required"), "{log}");
-    assert!(log.contains("TWO_FEED_POLL_SECONDS"), "{log}");
+    assert!(log.contains("TWO_TICKET_COOLDOWN_SECONDS"), "{log}");
     assert!(
         !log.contains("elapsed_secs"),
         "unrelated event captured: {log}"
@@ -314,23 +319,47 @@ async fn supervised_poll_applies_real_guild_settings_writes() {
     .await;
     assert_eq!(reader.get("g1", "TWO_RAID_JOIN_THRESHOLD"), Some(json!(5)));
 
-    // A cold key is stored and logged as restart-required, but never exposed
-    // through any live read API, including after a subsequent update.
-    let (capture, _guard) = captured();
+    // The feed interval is hot (TOG-19027): a stored write reaches the live
+    // reader within one tick, without a restart.
     for value in [600, 900] {
         store
             .set("g1", "TWO_FEED_POLL_SECONDS", Some(json!(value)), "test")
             .await
+            .expect("hot feed write");
+        until_change("hot feed value publish", || {
+            reader.get("g1", "TWO_FEED_POLL_SECONDS") == Some(json!(value))
+        })
+        .await;
+        assert!(reader
+            .env_snapshot(Some("g1"))
+            .contains_key("TWO_FEED_POLL_SECONDS"));
+    }
+
+    // A cold key is stored and logged as restart-required, but never exposed
+    // through any live read API, including after a subsequent update.
+    let (capture, _guard) = captured();
+    for value in [771, 772] {
+        store
+            .set(
+                "g1",
+                "TWO_TICKET_COOLDOWN_SECONDS",
+                Some(json!(value)),
+                "test",
+            )
+            .await
             .expect("cold write");
         let (revision, _) = store.poll_marks().await.expect("cold write revision");
         until_change("cold revision observed", || reader.revision() == revision).await;
-        assert_eq!(reader.get("g1", "TWO_FEED_POLL_SECONDS"), None);
-        assert_eq!(reader.snapshot().get("g1", "TWO_FEED_POLL_SECONDS"), None);
+        assert_eq!(reader.get("g1", "TWO_TICKET_COOLDOWN_SECONDS"), None);
+        assert_eq!(
+            reader.snapshot().get("g1", "TWO_TICKET_COOLDOWN_SECONDS"),
+            None
+        );
         assert!(!reader
             .env_snapshot(Some("g1"))
-            .contains_key("TWO_FEED_POLL_SECONDS"));
+            .contains_key("TWO_TICKET_COOLDOWN_SECONDS"));
         let stored: serde_json::Value = sqlx::query_scalar(
-            "SELECT value FROM guild_settings WHERE guild_id = 'g1' AND key = 'TWO_FEED_POLL_SECONDS'",
+            "SELECT value FROM guild_settings WHERE guild_id = 'g1' AND key = 'TWO_TICKET_COOLDOWN_SECONDS'",
         )
         .fetch_one(&pool)
         .await
@@ -343,9 +372,9 @@ async fn supervised_poll_applies_real_guild_settings_writes() {
     .await;
     let log = capture.contents();
     assert!(log.contains("settings_applied"), "{log}");
-    assert!(log.contains("TWO_FEED_POLL_SECONDS"), "{log}");
-    assert!(!log.contains("600"), "cold value leaked: {log}");
-    assert!(!log.contains("900"), "updated cold value leaked: {log}");
+    assert!(log.contains("TWO_TICKET_COOLDOWN_SECONDS"), "{log}");
+    assert!(!log.contains("771"), "cold value leaked: {log}");
+    assert!(!log.contains("772"), "updated cold value leaked: {log}");
 
     stop.send(true).unwrap();
     task.await.unwrap();

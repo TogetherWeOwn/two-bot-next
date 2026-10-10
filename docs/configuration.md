@@ -15,9 +15,12 @@ a required value or an implemented consumer. Secret defaults are never rendered.
 - `cold` / `hot`: legacy-catalog storage classes, not application promises.
 The Container registers a `guild_settings` poll job
 (`crates/bot/src/website_jobs.rs:152`) publishing through
-`settings_jobs::live` (`crates/bot/src/settings_jobs.rs:53`), but no feature
-runtime reads that snapshot yet; direct stored reads happen only through
-per-runtime store refreshes (`raid_runtime.rs:136`,
+`settings_jobs::live` (`crates/bot/src/settings_jobs.rs:53`). Message-path
+automod refreshes its lists, thresholds and enforce flag from that snapshot
+on every delivery (`automod_gateway.rs:192-203`, `:273`); the feed poller
+re-reads its interval from the snapshot before every tick
+(`feed_jobs.rs:232-259`). Other stored reads happen through per-runtime
+store refreshes (`raid_runtime.rs:136`,
 `containment_runtime.rs:186`, `join_risk_runtime.rs:198`) and onboarding's
 per-event refresh (`onboarding.rs:167`). Gateway feature gates still come
 from process environment only, so a database-only value such as
@@ -26,7 +29,7 @@ Keys in
 legacy `HOT_WIRED` are labeled “reload-report hot” (the `RefreshReport::hot`
 partition in `settings.rs`); every other storable key reports cold.
 
-The fourteen keys in `STORE_READ_KEYS`
+The twenty-five keys in `STORE_READ_KEYS`
 (`crates/core/tests/reference_docs.rs`) say “applied live by runtime refresh”
 instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECONDS`,
 `TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS` and `TWO_ANTI_NUKE_HEAT_THRESHOLD`
@@ -36,7 +39,17 @@ instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECON
 `:238`); raid applies `TWO_RAID_JOIN_THRESHOLD` and `TWO_RAID_WINDOW_SECONDS`
 (`crates/bot/src/raid_runtime.rs:45-46`, `:170`); onboarding merges its
 `CONFIG_KEYS` from the snapshot on each relevant
-event (`crates/bot/src/onboarding.rs:21-30`, `:175-182`). Every other
+event (`crates/bot/src/onboarding.rs:21-30`, `:175-182`); message-path automod
+applies its ten live lists, thresholds and the enforce flag from the snapshot
+on every delivery (`crates/bot/src/automod_gateway.rs:192-203`, `:273`);
+the feed poller applies `TWO_FEED_POLL_SECONDS` from the snapshot before
+every tick (`crates/bot/src/feed_jobs.rs:232-259`). Two boot-only edges
+remain: the feed supervisor still wakes on the boot cadence, so a stored
+interval change takes effect no earlier than the previously scheduled slot
+and runs at the stored value rounded up to a multiple of the boot cadence
+(`crates/bot/src/feed_jobs.rs:227-244`), and the voice room-name policy is
+built once at boot from the process environment
+(`crates/bot/src/gateway.rs:1608`). Every other
 storable row's stored value is unwired.
 
 Gateway boot reads process environment only, through a fixed set of loaders:
@@ -135,16 +148,16 @@ Catalog entries: 122.
 | `TWO_ASSISTANT_MODEL` | env_only | Not specified in Next | environment only | Template-assistant model name; environment-only so a web form cannot redirect it. |
 | `TWO_AUTOMATIONS` | cold | `false` | env at boot; stored unwired | Enable automation administration and custom command publication/routing. |
 | `TWO_AUTOMOD` | cold | `false` | env at boot; stored unwired | Enable automod message inspection. |
-| `TWO_AUTOMOD_ALLOWED_DOMAINS` | hot | `[]` | stored unwired | Domains permitted by the external-link matcher. |
-| `TWO_AUTOMOD_BAD_WORDS` | hot | `[]` | stored unwired | Bad-word list normalized with NFKC and lowercase. |
-| `TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS` | hot | `["bat","cmd","com","exe","js","jse","msi","ps1","scr","vbs","wsf"]` | stored unwired | Blocked attachment extensions, lowercase without a leading dot. |
-| `TWO_AUTOMOD_BYPASS_ROLE_IDS` | hot | `[]` | stored unwired | Roles exempt from automod inspection. |
-| `TWO_AUTOMOD_ENFORCE` | hot | `false` | stored unwired | Enable automod enforcement; absent/disabled remains dry-run. |
-| `TWO_AUTOMOD_EXEMPT_CHANNEL_IDS` | hot | `[]` | stored unwired | Channels exempt from automod inspection. |
-| `TWO_AUTOMOD_MENTION_LIMIT` | hot | `5` | stored unwired | Mention threshold for automod (validated from 1 to 50). |
-| `TWO_AUTOMOD_REPEAT_COUNT` | hot | `3` | stored unwired (reload-report hot) | Repeated-message threshold (validated from 2 to 20). |
-| `TWO_AUTOMOD_REPEAT_WINDOW_SECONDS` | hot | `30` | stored unwired | Repeated-message window (validated from 1 to 3600 seconds). |
-| `TWO_AUTOMOD_SANCTIONS` | hot | `[{"violations":1,"action":"delete","timeout_seconds":null},{"violations":2,"action":"warn","timeout_seconds":null},{"violations":3,"action":"timeout","timeout_seconds":600}]` | stored unwired | Ordered violation ladder, starting at one; delete, warn or timeout actions. |
+| `TWO_AUTOMOD_ALLOWED_DOMAINS` | hot | `[]` | stored, applied live by runtime refresh (reload-report hot) | Domains permitted by the external-link matcher. |
+| `TWO_AUTOMOD_BAD_WORDS` | hot | `[]` | stored, applied live by runtime refresh (reload-report hot) | Bad-word list normalized with NFKC and lowercase. |
+| `TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS` | hot | `["bat","cmd","com","exe","js","jse","msi","ps1","scr","vbs","wsf"]` | stored, applied live by runtime refresh (reload-report hot) | Blocked attachment extensions, lowercase without a leading dot. |
+| `TWO_AUTOMOD_BYPASS_ROLE_IDS` | hot | `[]` | stored, applied live by runtime refresh (reload-report hot) | Roles exempt from automod inspection. |
+| `TWO_AUTOMOD_ENFORCE` | hot | `false` | stored, applied live by runtime refresh (reload-report hot) | Enable automod enforcement; absent/disabled remains dry-run. |
+| `TWO_AUTOMOD_EXEMPT_CHANNEL_IDS` | hot | `[]` | stored, applied live by runtime refresh (reload-report hot) | Channels exempt from automod inspection. |
+| `TWO_AUTOMOD_MENTION_LIMIT` | hot | `5` | stored, applied live by runtime refresh (reload-report hot) | Mention threshold for automod (validated from 1 to 50). |
+| `TWO_AUTOMOD_REPEAT_COUNT` | hot | `3` | stored, applied live by runtime refresh (reload-report hot) | Repeated-message threshold (validated from 2 to 20). |
+| `TWO_AUTOMOD_REPEAT_WINDOW_SECONDS` | hot | `30` | stored, applied live by runtime refresh (reload-report hot) | Repeated-message window (validated from 1 to 3600 seconds). |
+| `TWO_AUTOMOD_SANCTIONS` | hot | `[{"violations":1,"action":"delete","timeout_seconds":null},{"violations":2,"action":"warn","timeout_seconds":null},{"violations":3,"action":"timeout","timeout_seconds":600}]` | stored, applied live by runtime refresh (reload-report hot) | Ordered violation ladder, starting at one; delete, warn or timeout actions. |
 | `TWO_BACKUP_S3_ACCESS_KEY_ID` | env_only | Not rendered (secret) | environment only | Backup object-store access credential; never rendered. |
 | `TWO_BACKUP_S3_BUCKET` | env_only | Not specified in Next | environment only | Backup destination bucket; environment-only to prevent web-selected exfiltration. |
 | `TWO_BACKUP_S3_ENDPOINT` | env_only | Not specified in Next | environment only | Backup object-store endpoint; environment-only destination boundary. |
@@ -165,7 +178,7 @@ Catalog entries: 122.
 | `TWO_COMMUNITY_WELCOME_CHANNEL_IDS` | hot | Not specified in Next | stored unwired | Welcome-channel classification for community analytics. |
 | `TWO_DATABASE_URL` | env_only | Not rendered (secret) | environment only | Administrative/shared admission database credential required for live preflight, cutover and guild-config; must reach the same database as Container DATABASE_URL for the same token. |
 | `TWO_DB_POOL_MAX` | env_only | Not specified in Next | environment only | Legacy database pool maximum read before the settings store exists. |
-| `TWO_FEED_POLL_SECONDS` | cold | `300` | env at boot; stored unwired | Feed polling interval (validated from 60 to 86400 seconds). |
+| `TWO_FEED_POLL_SECONDS` | hot | `300` | stored, applied live by runtime refresh (reload-report hot) | Feed polling interval (validated from 60 to 86400 seconds). |
 | `TWO_HEALTH_BIND_HOST` | env_only | Not specified in Next | environment only | Legacy health listener interface; environment-only network bind. |
 | `TWO_HEALTH_PORT` | env_only | Not specified in Next | environment only | Legacy health listener port; Container uses LISTEN_ADDR instead. |
 | `TWO_INACTIVITY_DAYS` | cold | Not specified in Next | stored unwired | Inactivity horizon used for community nudges. |
