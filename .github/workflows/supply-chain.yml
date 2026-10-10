@@ -14,8 +14,8 @@ name: supply-chain
 # Org convention for every change that lands on main (TogetherWeOwn GitHub standard):
 #   * PR title = Conventional Commits header: `type(scope): summary`, <= 100 chars, no trailing period.
 #     Types: feat fix perf refactor test docs build ci chore revert style security.
-#   * PR body follows .github/pull_request_template.md: Thinking Path, Linked Issues or Issue
-#     Description, What Changed, Verification, Risks, Model Used, Checklist. The rules live in
+#   * PR body follows .github/pull_request_template.md: Linked Issues or Issue Description
+#     (non-light types) and Verification are required; the rest is optional. The rules live in
 #     .github/scripts/pr_standards.py with tests beside it; this job runs both.
 #   * This repo is public. No card reference is required (`REQUIRE_CARD_REF: "false"`), and an
 #     internal tracker ID (a `TOG-` or `PAP-` prefix followed by digits) must not appear in a
