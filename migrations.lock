@@ -324,6 +324,10 @@
     "crates/cutover/migrations/0423_internal_actions_version_conflict.sql": {
       "sha256": "43331694352efa7ba37848d2f17364fe8256058158388c24048ce2084c26f7c2",
       "justification": "Settings CAS idempotency: admit version_conflict as a terminal 409 claim so a stale save replays the first result without a second write."
+    },
+    "crates/cutover/migrations/0424_community_facts_guild_source.sql": {
+      "sha256": "999ec5cb2622ec8d80bf8cf079ce76d58a15e25de3cee62e9ad9a63dae37f06b",
+      "justification": "RSVP check-in capacity count index: cover (guild_id, source) so record_checkin counts the occurrence without scanning the guild message history while holding the occurrence lock."
     }
   }
 }
