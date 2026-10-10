@@ -58,7 +58,7 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 
 ## Gateway metric event labels
 
-Fixed allowlist in `crates/core/src/metrics.rs:11-30`, observed in
+Fixed allowlist in `crates/core/src/metrics.rs:11-32`, observed in
 `crates/bot/src/gateway_metrics.rs:27-42`. Unknown dispatch types
 collapse to `other`; scrapers must match these exact spellings.
 
@@ -75,6 +75,8 @@ collapse to `other`; scrapers must match these exact spellings.
 | `MESSAGE_CREATE` | `two_bot_gateway_events_total` | Message created dispatch |
 | `MESSAGE_UPDATE` | `two_bot_gateway_events_total` | Message edited dispatch |
 | `MESSAGE_DELETE` | `two_bot_gateway_events_total` | Message deleted dispatch |
+| `MESSAGE_REACTION_ADD` | `two_bot_gateway_events_total` | Reaction added dispatch (self-role lane) |
+| `MESSAGE_REACTION_REMOVE` | `two_bot_gateway_events_total` | Reaction removed dispatch (self-role lane) |
 | `VOICE_STATE_UPDATE` | `two_bot_gateway_events_total` | Voice state changed dispatch |
 | `INVITE_CREATE` | `two_bot_gateway_events_total` | Invite created dispatch |
 | `INVITE_DELETE` | `two_bot_gateway_events_total` | Invite deleted dispatch |
