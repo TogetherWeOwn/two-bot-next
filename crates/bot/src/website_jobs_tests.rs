@@ -143,20 +143,21 @@ async fn tick_gated(
 
 /// Twilight percent-encodes `X-Audit-Log-Reason` on the wire (`-` arrives as
 /// `%2D`, spaces as `%20`), so assertions decode the captured header first.
-fn decode_reason(header: &str) -> String {
+fn decode_reason(header: &str) -> Option<String> {
     let mut bytes = Vec::new();
     let input = header.as_bytes();
     let mut i = 0;
     while i < input.len() {
         if input[i] == b'%' {
-            bytes.push(u8::from_str_radix(&header[i + 1..i + 3], 16).unwrap());
+            let hex = header.get(i + 1..i + 3)?;
+            bytes.push(u8::from_str_radix(hex, 16).ok()?);
             i += 3;
         } else {
             bytes.push(input[i]);
             i += 1;
         }
     }
-    String::from_utf8(bytes).unwrap()
+    String::from_utf8(bytes).ok()
 }
 
 fn executor(mock: &MockRest) -> ActionExecutor {
@@ -628,7 +629,11 @@ async fn rank_heal_grants_missing_rungs_with_audit_reason() {
     let reason = put
         .header("x-audit-log-reason")
         .expect("audit reason header");
-    assert!(decode_reason(reason).contains("self-heal"), "{reason}");
+    assert_eq!(
+        decode_reason(reason).as_deref(),
+        Some(RANK_SELF_HEAL_AUDIT_REASON),
+        "{reason}"
+    );
     mock.shutdown().await;
 }
 
@@ -834,8 +839,9 @@ fn rank_tick_self_heals_non_cumulative_ladder_and_publishes() {
             assert_eq!(put.path, "/api/v10/guilds/2222/members/1001/roles/11");
             assert!(
                 put.header("x-audit-log-reason")
-                    .is_some_and(|reason| decode_reason(reason).contains("self-heal")),
-                "heal grant carries the audit reason"
+                    .and_then(decode_reason)
+                    .is_some_and(|reason| reason == RANK_SELF_HEAL_AUDIT_REASON),
+                "heal grant carries the exact audit reason"
             );
             let rank: Option<String> =
                 sqlx::query_scalar("SELECT rank_key FROM member_ranks WHERE guild_id=$1 AND member_id='1001'")
