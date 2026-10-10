@@ -589,7 +589,7 @@ mod tests {
         rest.shutdown().await;
 
         // Denied create never reaches the store or the wire: the real trigger
-        // handler early-returns `Ignored` before any DB lookup or POST, even
+        // handler early-returns `Refused` before any DB lookup or POST, even
         // with a lazy pool that could never serve one.
         let denied_rest = crate::discord_test_common::MockRest::start(
             Vec::new(),
@@ -642,7 +642,7 @@ mod tests {
             .expect("denied trigger returns");
         assert_eq!(
             denied_outcome,
-            two_bot_discord::custom_commands::TextCommandOutcome::Ignored
+            two_bot_discord::custom_commands::TextCommandOutcome::Refused
         );
         assert!(
             denied_rest.requests().is_empty(),
@@ -651,7 +651,7 @@ mod tests {
         denied_rest.shutdown().await;
 
         // Accepted verdict passes the same real gate: with a lazy pool it
-        // reaches the store lookup and reports `Storage` instead of `Ignored`,
+        // reaches the store lookup and reports `Storage` instead of `Refused`,
         // proving it was not refused before the in-memory row above would reply.
         let accepted_rest = crate::discord_test_common::MockRest::start(
             Vec::new(),
