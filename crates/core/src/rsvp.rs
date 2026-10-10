@@ -112,25 +112,40 @@ pub struct RsvpRecord {
 
 /// What one write changed (legacy `putRsvp` is a blind upsert; the read-back
 /// of the previous row is what makes going/interested/declined transitions
-/// observable to the router).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// observable to the router). `previous` and `previous_responded_at` are set
+/// together from the same locked read: both `Some` on a re-response, both
+/// `None` on a first response — so a refused re-response can restore the exact
+/// prior row instead of deleting it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RsvpTransition {
     pub previous: Option<RsvpStatus>,
+    pub previous_responded_at: Option<String>,
     pub current: RsvpStatus,
 }
 
 impl RsvpTransition {
     /// First response from this member for this event.
     #[must_use]
-    pub fn is_new(self) -> bool {
+    pub fn is_new(&self) -> bool {
         self.previous.is_none()
     }
 
     /// The member moved between responses (including re-selecting the same
     /// one — legacy still rewrites `responded_at` and audits every response).
     #[must_use]
-    pub fn changed(self) -> bool {
+    pub fn changed(&self) -> bool {
         self.previous.is_some_and(|p| p != self.current)
+    }
+
+    /// The exact prior response to restore when this write must be undone
+    /// (post-write fence refusal): status plus the timestamp the row carried
+    /// before this write. `None` on a first response (nothing to restore).
+    #[must_use]
+    pub fn previous_response(&self) -> Option<(RsvpStatus, &str)> {
+        match (self.previous, self.previous_responded_at.as_deref()) {
+            (Some(status), Some(responded_at)) => Some((status, responded_at)),
+            _ => None,
+        }
     }
 }
 
@@ -579,19 +594,27 @@ mod tests {
     fn transitions_distinguish_new_change_and_repeat() {
         let fresh = RsvpTransition {
             previous: None,
+            previous_responded_at: None,
             current: RsvpStatus::Going,
         };
         assert!(fresh.is_new());
         assert!(!fresh.changed());
+        assert_eq!(fresh.previous_response(), None);
         let moved = RsvpTransition {
             previous: Some(RsvpStatus::Going),
+            previous_responded_at: Some("2026-09-10T10:00:00.000Z".to_owned()),
             current: RsvpStatus::Interested,
         };
         assert!(!moved.is_new());
         assert!(moved.changed());
+        assert_eq!(
+            moved.previous_response(),
+            Some((RsvpStatus::Going, "2026-09-10T10:00:00.000Z"))
+        );
         // Re-selecting the same status still rewrites responded_at + audits.
         let repeat = RsvpTransition {
             previous: Some(RsvpStatus::Going),
+            previous_responded_at: Some("2026-09-10T10:00:00.000Z".to_owned()),
             current: RsvpStatus::Going,
         };
         assert!(!repeat.changed());

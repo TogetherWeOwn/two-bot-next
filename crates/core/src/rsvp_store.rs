@@ -92,8 +92,8 @@ pub async fn put_rsvp(
     .bind(&record.user_id)
     .execute(&mut *tx)
     .await?;
-    let previous: Option<String> = sqlx::query_scalar(
-        "SELECT status FROM event_rsvps
+    let previous: Option<(String, sqlx::types::time::OffsetDateTime)> = sqlx::query_as(
+        "SELECT status, responded_at FROM event_rsvps
          WHERE guild_id = $1 AND event_id = $2 AND user_id = $3 FOR UPDATE",
     )
     .bind(&record.guild_id)
@@ -103,12 +103,14 @@ pub async fn put_rsvp(
     .await?;
     // Per-user rate first (caller behavior), then the event admission cap.
     // The window buckets on the write's own timestamp, not the database
-    // clock, so the bound is deterministic for a given audit trail.
+    // clock, so the bound is deterministic for a given audit trail. The range
+    // form keeps the `idx_announcements_audit_guild_time` prefix usable
+    // instead of scanning on a `date_trunc` expression.
     let recent: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM announcements_audit_log
          WHERE guild_id = $1 AND actor_id = $2 AND action = $3
-           AND date_trunc('minute', created_at)
-             = date_trunc('minute', $4::timestamptz)",
+           AND created_at >= date_trunc('minute', $4::timestamptz)
+           AND created_at < date_trunc('minute', $4::timestamptz) + interval '1 minute'",
     )
     .bind(&record.guild_id)
     .bind(&record.user_id)
@@ -145,11 +147,17 @@ pub async fn put_rsvp(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    let previous = previous
-        .map(|s| RsvpStatus::parse(&s).map_err(|_| RsvpStoreError::UnknownStatus(s)))
-        .transpose()?;
+    let (previous, previous_responded_at) = previous
+        .map(|(s, at)| {
+            RsvpStatus::parse(&s)
+                .map_err(|_| RsvpStoreError::UnknownStatus(s))
+                .map(|status| (Some(status), Some(iso_millis(at))))
+        })
+        .transpose()?
+        .unwrap_or((None, None));
     Ok(RsvpTransition {
         previous,
+        previous_responded_at,
         current: record.status,
     })
 }
@@ -316,13 +324,16 @@ pub async fn record_checkin(
     Ok(inserted.is_some())
 }
 
-/// RA-03 compensation (TOG-19773): remove exactly the RSVP write one attempt
+/// RA-03 compensation (TOG-19773): undo exactly the RSVP write one attempt
 /// made when post-write revalidation finds the event or membership gone.
-/// The row delete is guarded by this attempt's `responded_at`: a newer
-/// concurrent rewrite of the same member's row survives (the newer attempt
-/// delivers its own reply), while this attempt's audit row — owned by its
-/// unique id — is always removed. Net effect on refusal: zero rows from this
-/// attempt.
+/// A first response (`previous` is `None`) deletes the row this attempt
+/// wrote; a re-response restores the member's exact prior row (status plus
+/// timestamp) instead, so a refused rewrite never destroys the earlier
+/// response that was live before this attempt. Both paths are guarded by
+/// this attempt's `responded_at`: a newer concurrent rewrite of the same
+/// member's row survives (the newer attempt delivers its own reply), while
+/// this attempt's audit row — owned by its unique id — is always removed.
+/// Net effect on refusal: the table looks as if this attempt never ran.
 pub async fn compensate_rsvp_write(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -330,18 +341,35 @@ pub async fn compensate_rsvp_write(
     user_id: &str,
     responded_at: &str,
     audit_id: &str,
+    previous: Option<(RsvpStatus, &str)>,
 ) -> Result<(), RsvpStoreError> {
-    sqlx::query(
-        "DELETE FROM event_rsvps
-         WHERE guild_id = $1 AND event_id = $2 AND user_id = $3
-           AND responded_at = $4::timestamptz",
-    )
-    .bind(guild_id)
-    .bind(event_id)
-    .bind(user_id)
-    .bind(responded_at)
-    .execute(pool)
-    .await?;
+    if let Some((status, previous_responded_at)) = previous {
+        sqlx::query(
+            "UPDATE event_rsvps SET status = $4, responded_at = $5::timestamptz
+             WHERE guild_id = $1 AND event_id = $2 AND user_id = $3
+               AND responded_at = $6::timestamptz",
+        )
+        .bind(guild_id)
+        .bind(event_id)
+        .bind(user_id)
+        .bind(status.as_str())
+        .bind(previous_responded_at)
+        .bind(responded_at)
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query(
+            "DELETE FROM event_rsvps
+             WHERE guild_id = $1 AND event_id = $2 AND user_id = $3
+               AND responded_at = $4::timestamptz",
+        )
+        .bind(guild_id)
+        .bind(event_id)
+        .bind(user_id)
+        .bind(responded_at)
+        .execute(pool)
+        .await?;
+    }
     sqlx::query("DELETE FROM announcements_audit_log WHERE id = $1")
         .bind(audit_id)
         .execute(pool)
@@ -363,8 +391,11 @@ pub async fn compensate_checkin_write(
     Ok(())
 }
 
-/// RA-03 retention (TOG-19773): delete RSVP and audit rows strictly older
-/// than `cutoff_iso`, returning `(rsvps_deleted, audits_deleted)`. The
+/// RA-03 retention (TOG-19773): delete RSVP rows and this slice's own audit
+/// rows strictly older than `cutoff_iso`, returning
+/// `(rsvps_deleted, audits_deleted)`. The audit delete is scoped to
+/// [`RSVP_AUDIT_ACTION`] rows: the log table is shared with feed, LFG and
+/// recovery writers, and their evidence must survive an RSVP purge. The
 /// cutoff must be older than the audit retention floor
 /// ([`AUDIT_RETENTION_DAYS`], the stricter horizon, which also covers the
 /// RSVP floor); a newer cutoff is refused with
@@ -389,12 +420,15 @@ pub async fn prune_rsvp_history(
         .execute(pool)
         .await?
         .rows_affected();
-    let audits =
-        sqlx::query("DELETE FROM announcements_audit_log WHERE created_at < $1::timestamptz")
-            .bind(cutoff_iso)
-            .execute(pool)
-            .await?
-            .rows_affected();
+    let audits = sqlx::query(
+        "DELETE FROM announcements_audit_log
+         WHERE action = $2 AND created_at < $1::timestamptz",
+    )
+    .bind(cutoff_iso)
+    .bind(RSVP_AUDIT_ACTION)
+    .execute(pool)
+    .await?
+    .rows_affected();
     Ok((rsvps, audits))
 }
 
@@ -537,6 +571,7 @@ mod tests {
         .await
         .expect("first write");
         assert!(first.is_new());
+        assert_eq!(first.previous_response(), None);
         let moved = put_rsvp(
             &pool,
             &rsvp(RsvpStatus::Interested, "u1", "2026-09-10T10:01:00.000Z"),
@@ -544,6 +579,10 @@ mod tests {
         .await
         .expect("second write");
         assert_eq!(moved.previous, Some(RsvpStatus::Going));
+        assert_eq!(
+            moved.previous_response(),
+            Some((RsvpStatus::Going, "2026-09-10T10:00:00.000Z"))
+        );
         assert!(moved.changed());
         let rows = list_rsvps(&pool, "1545644954272137297", "1546451670500642999")
             .await
@@ -1016,7 +1055,8 @@ mod tests {
     /// RA-03 retention: history older than the cutoff is purged from both
     /// tables while floored rows survive; a cutoff newer than the audit
     /// floor is refused before any delete, and a malformed cutoff fails as
-    /// a database error rather than a partial purge.
+    /// a database error rather than a partial purge. Audit rows from other
+    /// slices sharing the log table always survive the purge.
     #[tokio::test]
     async fn retention_prune_keeps_floor_and_clears_history() {
         let Some((pool, schema)) = test_pool("rsvp_retain").await.expect("test database setup")
@@ -1042,6 +1082,23 @@ mod tests {
         write_audit(&pool, &RsvpAudit::for_rsvp("audit-new", &fresh))
             .await
             .expect("recent audit");
+        // Another slice's audit evidence shares the log table: the purge
+        // must leave it alone even when it predates the cutoff.
+        write_audit(
+            &pool,
+            &RsvpAudit {
+                id: "audit-foreign".to_owned(),
+                guild_id: "1545644954272137297".to_owned(),
+                actor_id: Some("other-user".to_owned()),
+                action: "feed.relay".to_owned(),
+                target_key: None,
+                outcome: "delivered".to_owned(),
+                reason: None,
+                created_at: "2020-01-01T00:00:00.000Z".to_owned(),
+            },
+        )
+        .await
+        .expect("foreign audit");
         let pruned = prune_rsvp_history(&pool, "2021-06-01T00:00:00.000Z")
             .await
             .expect("history purge");
@@ -1051,11 +1108,12 @@ mod tests {
             .expect("list");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].user_id, "new-user");
-        let audits: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM announcements_audit_log")
-            .fetch_one(&pool)
-            .await
-            .expect("count");
-        assert_eq!(audits, 1);
+        let audits: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM announcements_audit_log ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .expect("audit ids");
+        assert_eq!(audits, ["audit-foreign".to_owned(), "audit-new".to_owned()]);
         assert_eq!(
             prune_rsvp_history(&pool, "2021-06-01T00:00:00.000Z")
                 .await
@@ -1078,10 +1136,10 @@ mod tests {
         drop_schema(&pool, &schema).await;
     }
 
-    /// RA-03 compensation: removing a raced write deletes exactly this
-    /// attempt's rows — a newer concurrent rewrite of the same member's row
-    /// survives (it delivers its own reply), while the attempt's own audit
-    /// row is always removed. Check-in compensation keys on the exact
+    /// RA-03 compensation: undoing a raced first response deletes exactly
+    /// this attempt's rows — a newer concurrent rewrite of the same member's
+    /// row survives (it delivers its own reply), while the attempt's own
+    /// audit row is always removed. Check-in compensation keys on the exact
     /// idempotency key.
     #[tokio::test]
     async fn compensation_removes_only_the_raced_write() {
@@ -1107,6 +1165,7 @@ mod tests {
             "u1",
             "2026-09-10T10:00:00.000Z",
             "audit-first",
+            None,
         )
         .await
         .expect("compensate");
@@ -1128,6 +1187,7 @@ mod tests {
             "u1",
             "2026-09-10T10:01:00.000Z",
             "audit-missing",
+            None,
         )
         .await
         .expect("compensate exact");
@@ -1163,6 +1223,77 @@ mod tests {
             .await
             .expect("keys");
         assert_eq!(keys, [checkin_idempotency_key("occ-comp", "m2")]);
+        drop_schema(&pool, &schema).await;
+    }
+
+    /// RA-03 compensation: a refused re-response restores the member's exact
+    /// prior row (status plus timestamp) instead of deleting it, while the
+    /// refused attempt's audit row is still removed. A newer concurrent
+    /// rewrite keeps the guarded restore from touching it.
+    #[tokio::test]
+    async fn compensation_restores_previous_response_on_refused_rewrite() {
+        let Some((pool, schema)) = test_pool("rsvp_compensate_restore")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping rsvp_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        let first = rsvp(RsvpStatus::Going, "u1", "2026-09-10T10:00:00.000Z");
+        put_rsvp(&pool, &first).await.expect("first");
+        write_audit(&pool, &RsvpAudit::for_rsvp("audit-restore-first", &first))
+            .await
+            .expect("audit");
+        let second = rsvp(RsvpStatus::Interested, "u1", "2026-09-10T10:01:00.000Z");
+        let transition = put_rsvp(&pool, &second).await.expect("rewrite");
+        write_audit(&pool, &RsvpAudit::for_rsvp("audit-restore-second", &second))
+            .await
+            .expect("audit");
+        // The fence refuses the rewrite (event or membership gone): the
+        // member's earlier `going` row must survive the compensation.
+        compensate_rsvp_write(
+            &pool,
+            "1545644954272137297",
+            "1546451670500642999",
+            "u1",
+            "2026-09-10T10:01:00.000Z",
+            "audit-restore-second",
+            transition.previous_response(),
+        )
+        .await
+        .expect("compensate rewrite");
+        let rows = list_rsvps(&pool, "1545644954272137297", "1546451670500642999")
+            .await
+            .expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, RsvpStatus::Going);
+        assert_eq!(rows[0].responded_at, "2026-09-10T10:00:00.000Z");
+        let audits: Vec<String> = sqlx::query_scalar("SELECT id FROM announcements_audit_log")
+            .fetch_all(&pool)
+            .await
+            .expect("audit ids");
+        assert_eq!(audits, ["audit-restore-first".to_owned()]);
+        // A newer rewrite landing after the refused attempt is untouched by
+        // a repeat of that attempt's compensation.
+        let third = rsvp(RsvpStatus::Declined, "u1", "2026-09-10T10:02:00.000Z");
+        put_rsvp(&pool, &third).await.expect("newer rewrite");
+        compensate_rsvp_write(
+            &pool,
+            "1545644954272137297",
+            "1546451670500642999",
+            "u1",
+            "2026-09-10T10:01:00.000Z",
+            "audit-restore-second",
+            transition.previous_response(),
+        )
+        .await
+        .expect("stale compensate");
+        let rows = list_rsvps(&pool, "1545644954272137297", "1546451670500642999")
+            .await
+            .expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, RsvpStatus::Declined);
+        assert_eq!(rows[0].responded_at, "2026-09-10T10:02:00.000Z");
         drop_schema(&pool, &schema).await;
     }
 }

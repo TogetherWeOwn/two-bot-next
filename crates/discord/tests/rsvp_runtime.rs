@@ -1231,6 +1231,80 @@ async fn rsvp_mid_write_membership_loss_is_compensated_and_refused() {
     fixture.close().await;
 }
 
+/// RA-03: a re-response refused at the post-write fence restores the
+/// member's earlier response instead of deleting it. The first `going`
+/// write commits; the `interested` rewrite hits a transient membership
+/// lookup failure at the fence, is refused, and the `going` row (with its
+/// original timestamp) plus its audit row survive.
+#[tokio::test]
+async fn rsvp_refused_rewrite_restores_previous_response() {
+    let Some(fixture) = pool().await else {
+        return;
+    };
+    let saved = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            member(USER),
+            event(1),
+            member(USER),
+            event(1),
+            ScriptedResponse::json(200, json!({"id": "99"})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    run(fixture.pool(), &saved, &rsvp(810, "going")).await;
+    assert_reply(&saved, "RSVP saved: going.", true);
+    assert_eq!(saved.requests().len(), 6);
+    saved.shutdown().await;
+    let before: (String, String) = sqlx::query_as(
+        "SELECT status, responded_at::text FROM event_rsvps WHERE guild_id=$1 AND event_id=$2 AND user_id=$3",
+    )
+    .bind(GUILD)
+    .bind(EVENT)
+    .bind(USER)
+    .fetch_one(fixture.pool())
+    .await
+    .unwrap();
+    assert_eq!(before.0, "going");
+    let refused = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            member(USER),
+            event(1),
+            // Post-write fence: transient membership lookup failure. The
+            // fence short-circuits, so no second event re-read runs.
+            ScriptedResponse::status(403),
+            ScriptedResponse::json(200, json!({"id": "99"})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    run(fixture.pool(), &refused, &rsvp(811, "interested")).await;
+    assert_reply(&refused, "Unable to verify server membership.", true);
+    assert_eq!(refused.requests().len(), 5);
+    refused.shutdown().await;
+    // The refused rewrite left no trace: the exact prior row is back and
+    // only the first attempt's audit row remains.
+    let after: (String, String) = sqlx::query_as(
+        "SELECT status, responded_at::text FROM event_rsvps WHERE guild_id=$1 AND event_id=$2 AND user_id=$3",
+    )
+    .bind(GUILD)
+    .bind(EVENT)
+    .bind(USER)
+    .fetch_one(fixture.pool())
+    .await
+    .unwrap();
+    assert_eq!(after, before);
+    assert_eq!(counts(fixture.pool()).await, (1, 1, 0));
+    let audits: Vec<String> = sqlx::query_scalar("SELECT id FROM announcements_audit_log")
+        .fetch_all(fixture.pool())
+        .await
+        .unwrap();
+    assert_eq!(audits, ["rsvp:810".to_owned()]);
+    fixture.close().await;
+}
+
 /// RA-03: the check-in target departing between lookup and commit is
 /// refused and compensated — no attendance fact survives.
 #[tokio::test]

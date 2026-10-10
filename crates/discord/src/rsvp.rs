@@ -319,28 +319,27 @@ async fn execute(
                 status,
                 responded_at: now_iso(),
             };
-            if let Err(err) = put_rsvp(pool, &record).await {
-                return Err(match err {
-                    RsvpStoreError::EventAtCapacity => rsvp_event_full_text(),
-                    RsvpStoreError::RsvpRateLimited => rsvp_rate_limited_text(),
-                    // Occurrence capacity and retention floors cannot come
-                    // out of an RSVP write; transport/parse failures stay
-                    // generic. Every variant is mapped: a refused or failed
-                    // write is never reported as saved.
-                    RsvpStoreError::OccurrenceAtCapacity
-                    | RsvpStoreError::CutoffTooRecent
-                    | RsvpStoreError::Db(_)
-                    | RsvpStoreError::UnknownStatus(_) => "Unable to save RSVP.".to_owned(),
-                });
-            }
+            let transition = put_rsvp(pool, &record).await.map_err(|err| match err {
+                RsvpStoreError::EventAtCapacity => rsvp_event_full_text(),
+                RsvpStoreError::RsvpRateLimited => rsvp_rate_limited_text(),
+                // Occurrence capacity and retention floors cannot come
+                // out of an RSVP write; transport/parse failures stay
+                // generic. Every variant is mapped: a refused or failed
+                // write is never reported as saved.
+                RsvpStoreError::OccurrenceAtCapacity
+                | RsvpStoreError::CutoffTooRecent
+                | RsvpStoreError::Db(_)
+                | RsvpStoreError::UnknownStatus(_) => "Unable to save RSVP.".to_owned(),
+            })?;
             let audit_id = format!("rsvp:{}", interaction.id);
             write_audit(pool, &RsvpAudit::for_rsvp(&audit_id, &record))
                 .await
                 .map_err(|_| "Unable to audit RSVP.")?;
             // RA-03 race fence: the event or membership may have vanished
             // between the pre-write lookups and the commit. Re-read the same
-            // evidence; on loss or lookup failure compensate (remove exactly
-            // this attempt's rows) and refuse.
+            // evidence; on loss or lookup failure compensate (a first
+            // response is removed, a re-response restores the member's exact
+            // prior row) and refuse.
             if let Err(refusal) = revalidate_rsvp(
                 executor,
                 &record.guild_id,
@@ -356,6 +355,7 @@ async fn execute(
                     &record.user_id,
                     &record.responded_at,
                     &audit_id,
+                    transition.previous_response(),
                 )
                 .await;
                 return Err(refusal);
