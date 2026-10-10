@@ -2240,11 +2240,17 @@ async fn mutate_event(
         }
         Err(error) => {
             // A local admission refusal proves nothing was sent, so the claim
-            // is released and the same key may retry. A 429 proves no effect
-            // and, like announcements, is recorded as a refusal, never resent.
-            // Anything uncertain retains the fence for reconciliation.
+            // is released and the same key may retry. An admission storage
+            // failure is typed the same way: `admit()` never issued a permit,
+            // so nothing reached the wire; the wire error stays `internal`
+            // (see `EventActionError::is_admission_storage`), never
+            // `discord_unavailable` and never `needs_reconciliation`. A 429
+            // proves no effect and, like announcements, is recorded as a
+            // refusal, never resent. Anything uncertain retains the fence for
+            // reconciliation.
             if matches!(error, EventActionError::Discord(DiscordError::Guard(_)))
                 || error.is_admission_blocked()
+                || error.is_admission_storage()
             {
                 let wire = error.action_error();
                 if state.store.release_proven_not_sent(claim).await.is_err() {

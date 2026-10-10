@@ -3018,6 +3018,67 @@ async fn event_cancel_admission_refusal_releases_claim_for_same_key_retry() {
 }
 
 #[tokio::test]
+async fn event_create_admission_storage_is_typed_internal_and_releases_claim() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_event_cancel_flag(false);
+    let storage = two_bot_core::send_admission::AdmissionError::Storage.to_string();
+    let error = EventActionError::Discord(DiscordError::Unavailable(storage));
+    assert!(
+        error.is_admission_storage(),
+        "admission storage must be typed, not generic unavailable"
+    );
+    assert!(!error.is_admission_blocked());
+    let wire = error.action_error();
+    assert_eq!(wire.code, ErrorCode::Internal);
+    assert_eq!(wire.log_reason, "admission_storage_unavailable");
+    let mutates: Arc<dyn EventMutateEffect> = Arc::new(ScriptedEventMutate {
+        replies: Mutex::new(vec![
+            Err(EventActionError::Discord(DiscordError::Unavailable(
+                two_bot_core::send_admission::AdmissionError::Storage.to_string(),
+            ))),
+            Ok(json!({"event_id": CREATE_EVENT_ID})),
+        ]),
+    });
+    let reads: Arc<dyn EventReadEffect> = Arc::new(MockEventRead::default());
+    let effect: Arc<dyn ActionEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
+    let app = router(Arc::new(ReceiverState::new(
+        config(),
+        db.pool().clone(),
+        effect,
+        Arc::new(MockEffect::new(MockOutcome::Success)),
+        reads,
+        mutates,
+        Arc::new(MockModeration::default()),
+        Arc::new(MockChannel::default()),
+    )));
+    let raw = upsert_payload("lane-storage");
+    let (status, _, refused) =
+        answer(app.clone(), signed(&raw, "old", "intent-lane-storage")).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(refused["error"]["code"], "internal");
+    assert_eq!(refused["error"]["retryable"], true);
+    // The storage refusal proved nothing was sent, so the same key may retry.
+    let (status, headers, created) = answer(app, signed(&raw, "old", "intent-lane-storage")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!headers.contains_key("idempotent-replay"));
+    assert_eq!(
+        created["result"],
+        json!({"outcome": "created", "event_id": CREATE_EVENT_ID})
+    );
+    let store = InternalActionStore::new(db.pool().clone());
+    assert_eq!(
+        store
+            .event_id_for_key(staging_guild(), "lane-storage")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(CREATE_EVENT_ID)
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn event_mutation_queued_behind_the_gate_is_refused_before_any_claim() {
     let Some(db) = database().await else { return };
     let _flag = INTERNAL_FLAG_LOCK.lock().await;

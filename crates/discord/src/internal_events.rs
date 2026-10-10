@@ -11,6 +11,7 @@ use twilight_http::request::Request;
 use twilight_http::routing::Route;
 use twilight_model::id::marker::{GuildMarker, ScheduledEventMarker};
 use two_bot_core::internal_actions::{ActionError, ErrorCode, EventInput, EventPlace};
+use two_bot_core::send_admission::AdmissionError;
 use two_bot_core::{normalize_event, EventStatus, RawScheduledEvent, ScheduledEventMirror};
 
 use crate::executor::snowflake;
@@ -56,10 +57,31 @@ impl EventActionError {
         matches!(self, Self::Discord(error) if error.is_admission_blocked())
     }
 
+    /// The send-admission store was unavailable before any request reached
+    /// the wire. Typed separately from [`Self::is_admission_blocked`] (lane
+    /// occupied): nothing was sent, so the claim is safe to release, but the
+    /// wire error is `internal`, never `discord_unavailable`. String-matched
+    /// against the typed [`AdmissionError::Storage`] display, exactly like
+    /// [`DiscordError::is_admission_blocked`](crate::DiscordError::is_admission_blocked)
+    /// does for [`AdmissionError::Blocked`]: the transport stringifies the
+    /// typed error, so this is the only seam that can recover it.
+    #[must_use]
+    pub fn is_admission_storage(&self) -> bool {
+        matches!(self, Self::Discord(DiscordError::Unavailable(detail))
+            if detail == &AdmissionError::Storage.to_string())
+    }
+
     /// Wire error for the receiver. Details never include upstream event text
     /// or database errors; those are not safe response payloads.
     #[must_use]
     pub fn action_error(&self) -> ActionError {
+        if self.is_admission_storage() {
+            return ActionError::new(
+                ErrorCode::Internal,
+                self.to_string(),
+                "admission_storage_unavailable",
+            );
+        }
         let (code, reason) = match self {
             // Local guard refusals never reached the wire: a dead token is an
             // outage, any other refusal is a retryable local pause. Neither is
