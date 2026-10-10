@@ -36,6 +36,12 @@ use super::commands::PERM_MANAGE_EVENTS;
 pub const MAX_TITLE_CHARS: usize = 100;
 /// Legacy `MAX_LFG_ROLES`.
 pub const MAX_LFG_ROLES: usize = 20;
+pub const MAX_ROLE_KEY_CHARS: usize = 32;
+pub const MAX_ROLE_LABEL_CHARS: usize = 80;
+/// Longest canonical comma-separated role specification accepted by `/lfg`.
+pub const MAX_ROLE_SPEC_CHARS: usize =
+    MAX_LFG_ROLES * (MAX_ROLE_KEY_CHARS + 1 + MAX_ROLE_LABEL_CHARS + 1 + 2) + (MAX_LFG_ROLES - 1);
+const MAX_ROLE_KEY_ERROR_CHARS: usize = 128;
 /// Legacy role slot bounds (1–99).
 pub const MAX_ROLE_SLOTS: u8 = 99;
 /// Legacy `LFG_PREFIX` — select `custom_id` is `two:lfg:<post id>`.
@@ -64,9 +70,12 @@ pub enum RoleSpecError {
     /// A comma-separated entry is not exactly `key:label:slots`.
     #[error("roles must be key:label:slots entries separated by commas.")]
     BadShape,
-    /// Key fails `^[a-z0-9_-]{{1,32}}$` after trim+lowercase; carries the raw field.
+    /// Key fails `^[a-z0-9_-]{{1,32}}$` after trim+lowercase; carries a bounded raw prefix.
     #[error("Invalid LFG role key \"{0}\".")]
     BadKey(String),
+    /// The raw specification exceeds the published input bound.
+    #[error("LFG role specification is too long.")]
+    TooLong,
     /// Normalized key equals the reserved leave-action value (`__leave__`);
     /// carries the normalized key. Legacy `normalizeRoles` throws
     /// `LFG role key "__leave__" is reserved for leaving the group.`
@@ -110,6 +119,9 @@ fn trim_ecmascript(value: &str) -> &str {
 /// Parse a `tank:Tank:2,healer:Healer:2,dps:DPS:6` role spec (legacy
 /// `parseRoleSpec` + `normalizeRoles`).
 pub fn parse_role_spec(spec: &str) -> Result<Vec<LfgRoleSpec>, RoleSpecError> {
+    if spec.encode_utf16().take(MAX_ROLE_SPEC_CHARS + 1).count() > MAX_ROLE_SPEC_CHARS {
+        return Err(RoleSpecError::TooLong);
+    }
     let parts: Vec<&str> = spec.split(',').collect();
     if parts.is_empty() || parts.len() > MAX_LFG_ROLES {
         return Err(RoleSpecError::BadCount);
@@ -124,13 +136,15 @@ pub fn parse_role_spec(spec: &str) -> Result<Vec<LfgRoleSpec>, RoleSpecError> {
         let raw_key = fields[0];
         let key = trim_ecmascript(raw_key).to_lowercase();
         if !valid_role_key(&key) {
-            return Err(RoleSpecError::BadKey(raw_key.to_owned()));
+            return Err(RoleSpecError::BadKey(
+                raw_key.chars().take(MAX_ROLE_KEY_ERROR_CHARS).collect(),
+            ));
         }
         if key == LFG_LEAVE_VALUE {
             return Err(RoleSpecError::ReservedKey(key));
         }
         let label = trim_ecmascript(fields[1]);
-        if label.is_empty() || label.encode_utf16().count() > 80 {
+        if label.is_empty() || label.encode_utf16().count() > MAX_ROLE_LABEL_CHARS {
             return Err(RoleSpecError::BadLabel);
         }
         let slots = parse_slots(fields[2]).ok_or(RoleSpecError::BadSlots)?;
@@ -150,7 +164,7 @@ pub fn parse_role_spec(spec: &str) -> Result<Vec<LfgRoleSpec>, RoleSpecError> {
 #[must_use]
 pub fn valid_role_key(key: &str) -> bool {
     !key.is_empty()
-        && key.len() <= 32
+        && key.len() <= MAX_ROLE_KEY_CHARS
         && key
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
@@ -833,6 +847,31 @@ mod tests {
         assert_eq!(
             parse_role_spec("tank:Tank:1,TANK:Other:1"),
             Err(RoleSpecError::DuplicateKey("tank".to_owned()))
+        );
+    }
+
+    #[test]
+    fn role_key_errors_echo_only_a_bounded_raw_prefix() {
+        let raw_key = "k".repeat(MAX_ROLE_KEY_ERROR_CHARS + 64);
+        let bounded_key = "k".repeat(MAX_ROLE_KEY_ERROR_CHARS);
+        let error = parse_role_spec(&format!("{raw_key}:Tank:2")).unwrap_err();
+
+        assert_eq!(error, RoleSpecError::BadKey(bounded_key.clone()));
+        assert_eq!(
+            error.to_string(),
+            format!("Invalid LFG role key \"{bounded_key}\".")
+        );
+    }
+
+    #[test]
+    fn role_spec_rejects_input_over_the_published_utf16_bound() {
+        assert_eq!(
+            parse_role_spec(&"x".repeat(MAX_ROLE_SPEC_CHARS + 1)),
+            Err(RoleSpecError::TooLong)
+        );
+        assert_eq!(
+            parse_role_spec(&"😀".repeat(MAX_ROLE_SPEC_CHARS / 2 + 1)),
+            Err(RoleSpecError::TooLong)
         );
     }
 
