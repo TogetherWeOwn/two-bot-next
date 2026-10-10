@@ -1614,6 +1614,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_events_read.py -v
       - name: Verify cutover acceptance probes (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_qa_cutover_probes.py -v
+      - name: Verify cutover freeze drill (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_cutover_freeze_drill.py -v
       - name: Verify cutover watch checkpoint (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_cutover_watch_checkpoint.py -v
       - name: Verify runner routing for every workflow job
