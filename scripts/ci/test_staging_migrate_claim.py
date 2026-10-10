@@ -31,6 +31,7 @@ ENV = {
     "SOURCE_SHA": "a" * 40,
     "STAGING_HOST": "staging.invalid",
     "STAGING_DATABASE": "two_bot",
+    "STAGING_BRANCH_ID": "",
     "RECOVERY_REF": "recovery-review#decision",
     "ACL_REF": "acl-review#decision",
     "EXPECTED_PENDING": "1,9007199254740993",
@@ -85,6 +86,7 @@ class ClaimTests(unittest.TestCase):
                          ("PLAN_RUN_ID", ENV["GITHUB_RUN_ID"]),
                          ("PLAN_MANIFEST_SHA256", "c" * 64), ("SOURCE_SHA", "c" * 40),
                          ("STAGING_HOST", "elsewhere.invalid"), ("STAGING_DATABASE", "other_db"),
+                         ("STAGING_BRANCH_ID", "otherbranch"),
                          ("RECOVERY_REF", "other-review"), ("ACL_REF", "other-review"),
                          ("EXPECTED_PENDING", "1"), ("EXPECTED_PENDING", "1,9007199254740992"),
                          ("EXPECTED_PENDING", "1,"), ("EXPECTED_PENDING", "1,,9007199254740993"),
@@ -124,7 +126,7 @@ class ClaimTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as directory:
             directory = Path(directory)
             for body in (None, b"not json", b'{}', b'{"mode":"plan","mode":"apply"}',
-                         json.dumps({**self.plan, "target": {"host": "sentinel", "database": "x"}}).encode(),
+                         json.dumps({**self.plan, "target": {"host": "sentinel", "database": "x", "branch_id": ""}}).encode(),
                          b"x" * (1024 * 1024 + 1)):
                 with self.subTest(body_length=None if body is None else len(body)):
                     manifest, output = directory / "plan.json", directory / "claim.json"
@@ -174,6 +176,24 @@ class ClaimTests(unittest.TestCase):
                 plan["target"]["database"] = database
                 with self.assertRaises(Refused):
                     build_claim(plan, {**ENV, "STAGING_DATABASE": database})
+
+    def test_branch_pin_binds_planetscale_identity(self):
+        plan = deepcopy(self.plan)
+        plan["target"] = {"host": "psdb-fixture-1.pg.psdb.cloud", "database": "postgres",
+                          "branch_id": "cnfixture01"}
+        claim = build_claim(plan, {**ENV, "STAGING_HOST": plan["target"]["host"],
+                                   "STAGING_DATABASE": "postgres",
+                                   "STAGING_BRANCH_ID": "cnfixture01"})
+        self.assertEqual(claim["target"], plan["target"])
+        with self.assertRaises(Refused):
+            build_claim(plan, {**ENV, "STAGING_HOST": plan["target"]["host"],
+                               "STAGING_DATABASE": "postgres",
+                               "STAGING_BRANCH_ID": "otherbranch"})
+        plan["target"]["branch_id"] = ""
+        with self.assertRaises(Refused):
+            build_claim(plan, {**ENV, "STAGING_HOST": plan["target"]["host"],
+                               "STAGING_DATABASE": "postgres",
+                               "STAGING_BRANCH_ID": ""})
 
     def test_reviewer_examples_publish_through_the_actual_cli(self):
         plan = deepcopy(self.plan)

@@ -2362,6 +2362,175 @@ mod tests {
         );
     }
 
+    /// A failed community-facts drain never stalls serial dispatch: the worker
+    /// warns and still commits the cursor. The facts writer is broken here
+    /// with an unconnectable pool (short acquire timeout) while the session
+    /// store stays healthy, so a gate-clearing dispatch must return `Ok` with
+    /// the checkpoint committed and a `gateway community facts dispatch
+    /// failed` warn — no panic and no held cursor. Needs a migrated test
+    /// database; skips without one (CI supplies `TWO_TEST_DATABASE_URL`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_worker_community_facts_drain_failure_warns_and_commits() {
+        let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+            assert!(
+                std::env::var("GITHUB_ACTIONS").is_err(),
+                "CI must supply the guarded test database"
+            );
+            eprintln!("SKIP gateway_worker_community_facts_drain_failure_warns_and_commits: TWO_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let db = two_bot_testsupport::TestDatabase::create(
+            &url,
+            &sqlx::migrate!("../cutover/migrations"),
+        )
+        .await
+        .expect("create migrated agent-testdb fixture");
+        let pool = db.pool().clone();
+        // Facts writer only: unconnectable with a short acquire timeout so
+        // the drain hits the write-failure arm (`dispatch failed`) inside
+        // the dispatch deadline instead of the timeout arm, without
+        // touching the healthy session store below.
+        let broken = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        let pipeline = build_pipeline(vec![], None);
+        pipeline.enable_community_facts(broken);
+        // Gate-clearing join: `pending: false` buffers two facts, one
+        // `member_joined` via `on_join` plus one `rules_accepted` via
+        // `on_gate_cleared`, so the drain has work to fail on. A
+        // `RESUMED` event would drain nothing and prove nothing.
+        let join = || {
+            use std::str::FromStr as _;
+            let stamp = twilight_model::util::Timestamp::from_str("2026-09-28T00:00:00.000+00:00")
+                .expect("fixture stamp");
+            Event::MemberAdd(Box::new(
+                twilight_model::gateway::payload::incoming::MemberAdd {
+                    guild_id: twilight_model::id::Id::new(22),
+                    member: twilight_model::guild::Member {
+                        avatar: None,
+                        avatar_decoration_data: None,
+                        banner: None,
+                        communication_disabled_until: None,
+                        deaf: false,
+                        flags: twilight_model::guild::MemberFlags::empty(),
+                        joined_at: Some(stamp),
+                        mute: false,
+                        nick: None,
+                        pending: false,
+                        premium_since: None,
+                        roles: vec![],
+                        user: twilight_model::user::User {
+                            accent_color: None,
+                            avatar: None,
+                            avatar_decoration: None,
+                            avatar_decoration_data: None,
+                            banner: None,
+                            bot: false,
+                            discriminator: 0,
+                            email: None,
+                            flags: None,
+                            global_name: None,
+                            id: twilight_model::id::Id::new(44),
+                            locale: None,
+                            mfa_enabled: None,
+                            name: "member".to_owned(),
+                            premium_type: None,
+                            primary_guild: None,
+                            public_flags: None,
+                            system: None,
+                            verified: None,
+                        },
+                    },
+                },
+            ))
+        };
+        // Pin the fixture precondition explicitly: the join must buffer both
+        // facts (`member_joined` via `on_join` plus `rules_accepted` via
+        // `on_gate_cleared`), or this test would exercise the empty-drain
+        // path instead of the failure site.
+        {
+            let scratch = build_pipeline(vec![], None);
+            scratch.enable_community_facts(pool.clone());
+            scratch.collect_at(
+                &join(),
+                &two_bot_core::now_iso(),
+                two_bot_discord::MessageEligibility::default(),
+            );
+            assert_eq!(
+                scratch.drain_facts().await.expect("scratch drain"),
+                2,
+                "fixture join must buffer member_joined plus rules_accepted"
+            );
+        }
+        #[derive(Clone)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let capture = Capture(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let state = RwLock::new(GatewayState::Armed);
+        let generation = AtomicU64::new(0);
+        let store = GatewaySessionStore::new(pool, "22".to_owned(), 1);
+        let checkpoint = GatewaySession {
+            session_id: "test-session".to_owned(),
+            sequence: 7,
+            resume_url: "ws://127.0.0.1:1".to_owned(),
+            updated_at_ms: two_bot_core::funnel::now_millis_for_test(),
+        };
+        // The worker step blocks on the drain: run it the way the dispatch
+        // worker does, on a blocking thread.
+        let outcome = tokio::task::block_in_place(|| {
+            apply_dispatch(
+                &tokio::runtime::Handle::current(),
+                &state,
+                &generation,
+                &pipeline,
+                &store,
+                None,
+                None,
+                None,
+                None,
+                LiveInteractions::default(),
+                Arc::new(tokio::sync::Notify::new()),
+                Some(Box::new(ReceivedDispatch::new(join()))),
+                None,
+                checkpoint,
+                CHECKPOINT_IO_MAX,
+                0,
+                None,
+                None,
+            )
+        });
+        assert!(
+            outcome.is_ok(),
+            "facts drain failure must warn and continue, got {outcome:?}"
+        );
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("gateway community facts dispatch failed"),
+            "failed facts drain must warn, got: {output}"
+        );
+        assert_eq!(
+            store.load().await.expect("load").expect("session").sequence,
+            7,
+            "failed facts drain must still commit the cursor"
+        );
+    }
+
     /// The worker itself records a committed interaction job without an
     /// ingress ticket as a typed error. The commit already holds the durable
     /// job for bounded restart recovery, so the message says the checkpoint
