@@ -365,26 +365,24 @@ fn render_configuration() -> String {
         let store_read = STORE_READ_KEYS.contains(&key);
         let (class, application) = match class {
             SettingClass::EnvOnly => ("env_only", "environment only"),
-            SettingClass::Cold if store_read && boot_read => {
-                ("cold", "env at boot; stored, applied live by runtime refresh")
-            }
+            SettingClass::Cold if store_read && boot_read => (
+                "cold",
+                "env at boot; stored, applied live by runtime refresh",
+            ),
             SettingClass::Cold if boot_read => ("cold", "env at boot; stored unwired"),
-            SettingClass::Cold if store_read => {
-                ("cold", "stored, applied live by runtime refresh")
-            }
+            SettingClass::Cold if store_read => ("cold", "stored, applied live by runtime refresh"),
             SettingClass::Cold => ("cold", "stored unwired"),
             SettingClass::Hot if store_read && hot_wired => (
                 "hot",
                 "stored, applied live by runtime refresh (reload-report hot)",
             ),
-            SettingClass::Hot if store_read && boot_read => {
-                ("hot", "env at boot; stored, applied live by runtime refresh")
-            }
+            SettingClass::Hot if store_read && boot_read => (
+                "hot",
+                "env at boot; stored, applied live by runtime refresh",
+            ),
             SettingClass::Hot if hot_wired => ("hot", "stored unwired (reload-report hot)"),
             SettingClass::Hot if boot_read => ("hot", "env at boot; stored unwired"),
-            SettingClass::Hot if store_read => {
-                ("hot", "stored, applied live by runtime refresh")
-            }
+            SettingClass::Hot if store_read => ("hot", "stored, applied live by runtime refresh"),
             SettingClass::Hot => ("hot", "stored unwired"),
         };
         let default = if is_secret_key(key) {
