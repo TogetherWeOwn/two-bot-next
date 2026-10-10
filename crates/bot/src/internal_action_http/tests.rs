@@ -11,6 +11,7 @@ use two_bot_core::internal_actions::sign;
 use two_bot_testsupport::TestDatabase;
 
 mod adapter;
+mod automations;
 mod settings;
 
 fn secret(index: usize) -> String {
