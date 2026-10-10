@@ -143,8 +143,8 @@ pub type VoiceKickVote =
 /// `PRIVILEGED` is reserved for permission-gated slash commands from members who
 /// hold the permission; open interactions never enter it, so a burst of them
 /// cannot starve moderation. `BUSY` carries the one-call "busy" replies.
-/// `REACTIONS` carries self-role reaction adds/removes so a panel burst cannot
-/// starve message automations (and a message burst cannot starve reactions).
+/// `REACTIONS` keeps self-role reaction bursts off the message lane, so neither
+/// burst can discard the other's automations.
 pub(crate) const DISPATCH_LIMITS: [usize; 6] = [16, 16, 1, 8, 8, 8];
 pub(crate) const LANE_MESSAGES: usize = 0;
 const LANE_INTERACTIONS: usize = 1;
@@ -761,7 +761,7 @@ impl CommandRuntime {
     }
 
     /// Test-only lane depth: prunes finished tasks, then reports the live
-    /// count for `lane`. Reactions use `LANE_REACTIONS`; the bound test
+    /// count for `lane`. Reactions run on `LANE_REACTIONS`; the bound test
     /// asserts this never exceeds `DISPATCH_LIMITS[LANE_REACTIONS]`.
     #[cfg(test)]
     pub(crate) fn lane_in_flight(&self, lane: usize) -> usize {
@@ -944,8 +944,8 @@ impl CommandRuntime {
         }
     }
 
-    /// Reactions use the dedicated reaction lane: a reaction burst must not
-    /// consume interaction acknowledgement or message automation capacity,
+    /// Reactions run on their own lane: a reaction burst must consume neither
+    /// message automation capacity nor interaction acknowledgement capacity,
     /// and saturation drops with only a log line, exactly like message bursts.
     fn dispatch_self_role_reaction(&self, reaction: &GatewayReaction, remove: bool) -> bool {
         if !self.interactions.router.gates().self_roles {
