@@ -141,3 +141,45 @@ def validate_cargo_args(args, workspace):
             value = arg.split('=', 1)[1] if '=' in arg else args[number + 1]
             if not (workspace / value).resolve().is_relative_to(workspace):
                 raise Refusal('manifest must stay in this workspace')
+
+
+def resolve_cargo(cargo):
+    """Executable Cargo path, resolved before any pool access.
+
+    Agent PATH may lack rustup's bin directory, so a bare name falls back to
+    $CARGO_HOME/bin, then ~/.cargo/bin. A miss is a Refusal: a spawn that
+    cannot exec must never be able to leave a lease behind.
+    """
+    found = shutil.which(cargo)
+    if found:
+        return found
+    if os.sep not in cargo:
+        for home in (os.environ.get('CARGO_HOME'), os.path.expanduser('~/.cargo')):
+            if home:
+                candidate = os.path.join(home, 'bin', cargo)
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    return candidate
+    raise Refusal(f'{cargo} not found on PATH, in $CARGO_HOME/bin or ~/.cargo/bin; '
+                  'no lease taken')
+
+
+def group_alive(pid):
+    try:
+        os.killpg(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def stop_group(child):
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(child.pid, sig)
+        except ProcessLookupError:
+            break
+        if sig == signal.SIGTERM:
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+    child.wait()
