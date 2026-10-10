@@ -23,6 +23,7 @@ pub const EVENTS: &[&str] = &[
     "MESSAGE_REACTION_ADD",
     "MESSAGE_REACTION_REMOVE",
     "VOICE_STATE_UPDATE",
+    "PRESENCE_UPDATE",
     "INVITE_CREATE",
     "INVITE_DELETE",
     "INTERACTION_CREATE",
@@ -58,7 +59,7 @@ pub const REST_ROUTES: &[&str] = &[
     "DELETE /channels/:channel",
     "other",
 ];
-const RESULTS: &[&str] = &["2xx", "3xx", "4xx", "429", "5xx", "transport"];
+pub const RESULTS: &[&str] = &["2xx", "3xx", "4xx", "429", "5xx", "transport"];
 pub const JOBS: &[&str] = &[
     "invite_snapshot",
     "session_checkpoint",
@@ -73,11 +74,11 @@ pub const JOBS: &[&str] = &[
     "scheduled_messages",
     "other",
 ];
-const JOB_OUTCOMES: &[&str] = &["success", "failure"];
+pub const JOB_OUTCOMES: &[&str] = &["success", "failure"];
 /// Room lifecycle operations (TOG-13543): creator-channel create/move/delete
 /// outcomes only. Retries (429/backoff) are not outcomes.
 pub const VOICE_OPERATIONS: &[&str] = &["create", "move", "delete"];
-const VOICE_OUTCOMES: &[&str] = &[
+pub const VOICE_OUTCOMES: &[&str] = &[
     "success",
     "category_full",
     "discord",
@@ -146,9 +147,10 @@ pub const DISPATCH_LANES: &[&str] = &[
 /// verbs) collapses to `other`. No key id, token, body or request bytes ever
 /// become a family label.
 ///
-/// Alert-threshold hook for M2.1: alert when refused outcomes increase
-/// across consecutive scrapes (exact rule lands with M2.1 once TOG-18943
-/// unblocks); a single refusal inside one burst is not paging.
+/// Alert rule `receiver_refusals:<family>` in `wrangler/src/alert-rules.ts`:
+/// refused outcomes rising in 3 consecutive scrapes per family pages; the
+/// first sample and restarts clear the streak, and one forged pre-auth
+/// probe (family `other`) stays silent.
 pub const INTERNAL_ACTION_FAMILIES: &[&str] = &[
     "announcement",
     "event",

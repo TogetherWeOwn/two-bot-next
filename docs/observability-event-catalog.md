@@ -79,6 +79,7 @@ dispatch types collapse to `other`; scrapers must match these exact spellings.
 | `MESSAGE_REACTION_ADD` | `two_bot_gateway_events_total` | Reaction added dispatch (self-role lane) |
 | `MESSAGE_REACTION_REMOVE` | `two_bot_gateway_events_total` | Reaction removed dispatch (self-role lane) |
 | `VOICE_STATE_UPDATE` | `two_bot_gateway_events_total` | Voice state changed dispatch |
+| `PRESENCE_UPDATE` | `two_bot_gateway_events_total` | Member presence changed (only with `TWO_VOICE_PRESENCE=1`) |
 | `INVITE_CREATE` | `two_bot_gateway_events_total` | Invite created dispatch |
 | `INVITE_DELETE` | `two_bot_gateway_events_total` | Invite deleted dispatch |
 | `INTERACTION_CREATE` | `two_bot_gateway_events_total` | Interaction received dispatch |

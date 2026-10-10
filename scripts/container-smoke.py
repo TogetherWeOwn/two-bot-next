@@ -14,15 +14,14 @@ import uuid
 
 MIB = 1024 * 1024
 IMAGE_MAX_BYTES = 112 * MIB
-# Recalibrated for the automations import/export executor slice: PR head
-# measured 15,769,872 bytes (15.04 MiB) on the ephemeral runner vs main
-# baseline 15,712,080 bytes (14.98 MiB) at 6f21347 (plus the merged #735
-# voice-config CLI). Growth is the automations executor slice (keyless export
-# read plus claimed transactional import with replay/audit), no new
-# dependencies; release profile already minimal (opt-level=z, lto, strip).
-# Per b1-baseline calibration (measured * 1.4 rounded up to the next MiB):
-# 15.04 * 1.4 = 21.06 -> 22 MiB. Image still within budget (41.47/112).
-BINARY_MAX_BYTES = 22 * MIB
+# The automations head (before the event-executor merge) measured 15,769,872
+# bytes (15.04 MiB) on the ephemeral runner vs the 15,712,080-byte (14.98 MiB)
+# baseline at 6f21347 (plus the merged #735 voice-config CLI), with no new
+# dependencies. Current main uses a 16 MiB ceiling after CI measured 15,741,344
+# bytes (15.01 MiB) on the event-executors head against a 15 MiB ceiling, with
+# no new dependencies. Keep the current-main cap pending measurement of this
+# combined head.
+BINARY_MAX_BYTES = 16 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.
 BINARY = "/home/nonroot/two-bot"

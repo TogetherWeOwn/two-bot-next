@@ -37,7 +37,7 @@ scaffolding and never ship. Exact byte counts need `docker history` /
 | R1 | `FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792…` | Base layers (count/size TBD) | Debian trust bundle plus 14 documented OS packages; no shell, package manager, or OpenSSL CLI |
 | R2 | `LABEL org.opencontainers.image.revision`, `com.togetherweown.build-id` | Metadata only | Non-secret build provenance; zero bytes |
 | R3 | `USER 65532:65532`, `WORKDIR /home/nonroot` | Metadata only | Config, no filesystem delta |
-| R4 | `COPY --from=builder /app/target/release/two-bot ./two-bot` | Yes, one file layer (size TBD) | The only added content: the stripped release binary (`opt-level=z`, LTO, stripped). Budget: 22 MiB per `scripts/container-smoke.py` |
+| R4 | `COPY --from=builder /app/target/release/two-bot ./two-bot` | Yes, one file layer (size TBD) | The only added content: the stripped release binary (`opt-level=z`, LTO, stripped). Budget: 16 MiB per `scripts/container-smoke.py` |
 | R5 | `EXPOSE 8080`, `ENV LISTEN_ADDR=0.0.0.0:8080` | Metadata only | Liveness/readiness port and bind address |
 | R6 | `HEALTHCHECK CMD ["/home/nonroot/two-bot", "--healthcheck"]` | Metadata only | Exec-form probe; needs no shell |
 | R7 | `ENTRYPOINT ["/home/nonroot/two-bot"]` | Metadata only | Exec form so PID 1 receives SIGTERM |
@@ -119,5 +119,5 @@ or the current PR diff.
    names, `SHA256SUMS`, and both gate results in the cutover evidence
    manifest.
 3. Run `docker history` / `docker inspect` on the recorded image ID to fill
-   in the TBD byte counts for R1 and R4 and confirm the 112 MiB / 22 MiB
+   in the TBD byte counts for R1 and R4 and confirm the 112 MiB / 16 MiB
    budgets before pinning the deployment digest.

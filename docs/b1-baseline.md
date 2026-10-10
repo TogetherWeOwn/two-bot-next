@@ -114,7 +114,7 @@ headroom below are historical, not measurements of the current PR head:
 | Artifact | Historical definition | Measured | Maximum | Headroom |
 |---|---|---|---|---|
 | Runtime image | Docker image inspect `Size` (uncompressed layers, not registry transfer size) | 87.19 MiB / 91,429,497 bytes | 112 MiB / 117,440,512 bytes | 24.81 MiB / 28.4% |
-| Release binary | `stat` of `/home/two-bot/two-bot` in the final image | 15.04 MiB / 15,769,872 bytes | 22 MiB / 23,068,672 bytes | 6.96 MiB / 46.3% |
+| Release binary | `stat` of `/home/two-bot/two-bot` in the final image | 15.04 MiB / 15,769,872 bytes | 16 MiB / 16,777,216 bytes | 0.96 MiB / 6.0% |
 
 The baseline used the classic Docker image store. The gate now sums exact
 `docker image history --human=false --format '{{.Size}}'` layer bytes after
@@ -123,7 +123,8 @@ With the containerd store, inspect `Size` includes compressed blobs **plus**
 unpacked snapshots and is logged separately, not compared to that ceiling.
 See [Docker's store documentation](https://docs.docker.com/engine/storage/containerd/)
 and [Moby's layer-history implementation](https://github.com/moby/moby/blob/master/daemon/containerd/image_history.go).
-Neither the 112 MiB image nor the 22 MiB binary budget is increased.
+This PR keeps the current-main 16 MiB binary ceiling; the combined exact-head CI
+measurement is still required.
 
 Measured on 2026-09-30 in [PR #78's hosted container job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36770739970/job/110076173793)
 at source `307b50708ec42e8fc4744c1b804216a22a17625e`. Ceilings allow roughly
@@ -135,15 +136,14 @@ ephemeral runner vs main baseline 10,377,112 bytes (9.90 MiB) at `ec49663`;
 growth is linked runtime/handlers/REST plus previously-dead domain/store code
 with no new dependencies, release profile already minimal (opt-level=z, lto,
 strip). Per calibration (measured * 1.4 rounded up to the next MiB):
-10.30 * 1.4 = 14.42 -> 15 MiB. Recalibrated 2026-10-10 for the automations
-import/export executor slice (PR #700): PR head measured 15,769,872 bytes
-(15.04 MiB) on the ephemeral runner vs main baseline 15,712,080 bytes
-(14.98 MiB) at `6f21347` (plus the merged #735 voice-config CLI); growth is
-the automations executor slice with no new dependencies, release profile
-already minimal (opt-level=z, lto, strip). Per calibration (measured * 1.4
-rounded up to the next MiB): 15.04 * 1.4 = 21.06 -> 22 MiB. Docker is not
-available in the controller workspace; offline fixture sizes are not
-measurements.
+10.30 * 1.4 = 14.42 -> 15 MiB. On 2026-10-10, the current-main threshold
+was recalibrated for the internal-actions families: CI measured 15,741,344
+bytes (15.01 MiB) on the event-executors head, 12,704 bytes (0.08%) above the
+15 MiB ceiling, with no new dependencies; current main uses 16 MiB. This PR's
+automation-only head separately measured 15,769,872 bytes (15.04 MiB) before
+the event-executor merge. The combined head must be measured in hosted CI;
+offline fixture sizes are not measurements. Docker is not available in the
+controller workspace.
 
 ### Docker history image measurement and immutable-ID pinning
 

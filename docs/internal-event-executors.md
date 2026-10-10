@@ -15,10 +15,15 @@ raw website `event_id`. The receiver retains/records the key mapping and owns
 terminal result replay; these executors neither add an HTTP route nor implement
 that mapping/replay policy. A replay must not invoke the executor again.
 
-Pass the caller's UTC-millisecond clock value as `observed_at`. After each valid
-Discord response the executor awaits `ScheduledEventMirror::upsert` before
-acknowledging. The `PgPool` implementation writes one `(guild_id, event_id)` row
-via `website_store::upsert_event`; it never runs the poller's full-guild swap.
+Pass a stamp callback rendering UTC milliseconds (`now_iso`). After each valid
+Discord response the executor calls it once, and that reading serves both the
+mirror row and the read response, then awaits `ScheduledEventMirror::upsert`
+before acknowledging. Stamping after the return (never a pre-send reading) keeps
+last-observed-wins honest: a slow PATCH wins over a snapshot whose GET was
+served from the pre-mutation row, while the poller stamps before its GET so a
+late-arriving fetch cannot clobber a newer mutation. The `PgPool`
+implementation writes one `(guild_id, event_id)` row via
+`website_store::upsert_event`; it never runs the poller's full-guild swap.
 Null channel/description values replace older values. Unrelated rows survive.
 
 ## Legacy parity and strict mirror handling
@@ -51,6 +56,19 @@ rejection (typically 400). A 404 is also `discord_rejected`, not a fabricated
 successful cancellation. Same-key idempotency is durable replay of the first
 result. No 429, 5xx or uncertain mutation is automatically retried here.
 
+Status classification shares one helper with the announcement transport:
+`two_bot_discord::executor::is_definitive_rejection` (400/401/403/404/405 plus
+413/415/422). 404 proves absence, 413/415/422 prove Discord validated before
+mutating, so all four are terminal `discord_rejected` on every event call
+(create/update/cancel/read), release the send-admission lane on receipt, and
+never retain the execution fence. 408, redirects, 409, 425 and 5xx stay
+uncertain (`needs_reconciliation` on the mutation path).
+
+An upsert whose mapped event was deleted in Discord fails the same way: its PATCH
+404 is `discord_rejected`, and the mapping is kept. That key needs an operator to
+clear the mapping before a new create. Classifying that 404 as absence is a
+follow-up.
+
 Synchronous persistence adds stricter response checks than legacy mutations,
 which ignored PATCH bodies: require a complete normalizable row, known status,
 parseable start time, valid event ID, matching requested ID and matching guild
@@ -58,11 +76,13 @@ when present. A cancellation response must actually be cancelled. Unknown
 numeric status names remain supported by `event_status_name`, but cannot be
 persisted as a valid mirror row. Unreadable responses leave the prior row intact.
 
-`EventActionError::is_safe_pre_mutation()` is true only for a proven Discord/local
-refusal. Unreadable success and mirror failure are **not** safe claim-release
-signals: preserve the execution fence and require reconciliation, never create
-a second event to recover a missing acknowledgement. Mirror failures map to
-`internal`; unreadable upstream rows map to `discord_unavailable`.
+`EventActionError::is_safe_pre_mutation()` marks a proven Discord or local refusal.
+The receiver releases a claim only for the send guard and admission-blocked refusals
+(`is_admission_blocked()`) and records a Discord rejection as terminal. Unreadable
+success and mirror failure are **not** release signals: they keep the execution
+fence and require reconciliation, never a second event to recover a missing
+acknowledgement. On the read path, mirror failures map to `internal` and unreadable
+rows to `discord_unavailable`; on the mutation path both become `needs_reconciliation`.
 
 ## Verification
 
