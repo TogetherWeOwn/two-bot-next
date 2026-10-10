@@ -58,7 +58,7 @@ pub const REST_ROUTES: &[&str] = &[
     "DELETE /channels/:channel",
     "other",
 ];
-const RESULTS: &[&str] = &["2xx", "3xx", "4xx", "429", "5xx", "transport"];
+pub const RESULTS: &[&str] = &["2xx", "3xx", "4xx", "429", "5xx", "transport"];
 pub const JOBS: &[&str] = &[
     "invite_snapshot",
     "session_checkpoint",
@@ -73,11 +73,11 @@ pub const JOBS: &[&str] = &[
     "scheduled_messages",
     "other",
 ];
-const JOB_OUTCOMES: &[&str] = &["success", "failure"];
+pub const JOB_OUTCOMES: &[&str] = &["success", "failure"];
 /// Room lifecycle operations (TOG-13543): creator-channel create/move/delete
 /// outcomes only. Retries (429/backoff) are not outcomes.
 pub const VOICE_OPERATIONS: &[&str] = &["create", "move", "delete"];
-const VOICE_OUTCOMES: &[&str] = &[
+pub const VOICE_OUTCOMES: &[&str] = &[
     "success",
     "category_full",
     "discord",
