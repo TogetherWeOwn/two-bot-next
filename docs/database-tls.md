@@ -4,11 +4,13 @@ Threat-model [F6](threat-model.md) requires authenticated TLS for Neon. The
 `two_bot_core::database_tls` module fences the database URL before SQLx parses
 it. `two_bot_cutover::connect` (cutover CLIs, `two-bot db roles verify` and the
 bot's website/community job pool) calls it after the `database_url` key
-allowlist and before `connect_options`. The three send-admission pools share
-one helper (`website_jobs::admission_pool_with_tls`, used by the website jobs,
-the preflight `admission_transport` and the commands CLI `executor`) that does
-the same: `database_url::validate`, `database_tls::enforce`, `connect_options`,
-`database_tls::apply`, plus the statement timeout and the acquire timeout.
+allowlist and before `connect_options`. The three bot-side send-admission pools
+share one helper
+(`website_jobs::admission_pool_with_tls`, used by the website jobs, the preflight
+`admission_transport` and the commands CLI `executor`). The cutover tools' fourth
+pool (`RestClient::from_env`) uses its own `admission_connect_options` helper.
+Both paths validate before enforcing TLS, then parse and apply the effective TLS
+mode; each configures the statement and acquire timeouts.
 
 ## Setting
 
@@ -96,7 +98,8 @@ Fenced: every caller of `two_bot_cutover::connect`, the gateway store pool
 `channel_moderation_store::connect` (via `connect_with_tls`), and all four
 send-admission pools (`website_jobs::admission_pool_with_tls` for the website
 jobs, the preflight `admission_transport`, the commands CLI `executor`, and
-`two_bot_cutover::rest::RestClient::from_env` via `from_url_with_tls` for the
+`two_bot_cutover::rest::RestClient::from_env` via `admission_connect_options`
+(with `from_url_with_tls` as the explicit URL/policy test constructor) for the
 `report`, `ghost_cleanup` and `backfill_messages` operator tools).
 
 Known gaps (not yet fenced): `staging_migrate::verify_target` plus `connect`
