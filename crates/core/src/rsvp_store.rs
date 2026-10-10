@@ -636,7 +636,8 @@ mod tests {
         .await
         .expect("hold empty RSVP key");
         let first_pool = pool.clone();
-        let first = tokio::spawn(async move { put_rsvp(&first_pool, &going).await });
+        let first_record = going.clone();
+        let first = tokio::spawn(async move { put_rsvp(&first_pool, &first_record).await });
         let second_pool = pool.clone();
         let second = tokio::spawn(async move { put_rsvp(&second_pool, &interested).await });
         // Both spawned writers must be polled onto the advisory lock before
