@@ -774,11 +774,18 @@ fn hostile_reasons_render_as_mention_safe_plain_text() {
         "<@987654321> user pill",
         "<#123456789> channel pill",
         "<:custom:123456789> emoji pill",
+        "<a:dance:123456789> animated emoji pill",
         "see https://evil.example/phish for proof",
         "see http://evil.example/phish for proof",
         "see HTTPS://evil.example/phish for proof",
         "[click here](https://evil.example/phish)",
         "www.evil.example/phish",
+        "WWW.EVIL.EXAMPLE/PHISH",
+        "Www.evil.example/phish",
+        "join discord.gg/abc123 for backup",
+        "join DISCORD.GG/ABC123 for backup",
+        "visit evil.com/phish for proof",
+        "visit EVIL.COM/PHISH for proof",
         "**BAN THEM** __now__ ~~please~~ `code` ||spoiler||",
         "# heading\n> quote\n```fence```\n- list\nmultiline",
     ] {
@@ -789,8 +796,16 @@ fn hostile_reasons_render_as_mention_safe_plain_text() {
         assert!(!line.contains("<@"), "{hostile:?} -> {line:?}");
         assert!(!line.contains("<#"), "{hostile:?} -> {line:?}");
         assert!(!line.contains("<:"), "{hostile:?} -> {line:?}");
+        assert!(!line.contains("<a:"), "{hostile:?} -> {line:?}");
         assert!(!line.contains("://"), "{hostile:?} -> {line:?}");
         assert!(!line.contains("www."), "{hostile:?} -> {line:?}");
+        // Uppercase variants must not survive either: the `www.` scan and
+        // the bare-domain dot split are case-insensitive.
+        let folded = line.to_lowercase();
+        assert!(!folded.contains("www."), "{hostile:?} -> {line:?}");
+        assert!(!folded.contains("discord.gg"), "{hostile:?} -> {line:?}");
+        assert!(!folded.contains(".gg/"), "{hostile:?} -> {line:?}");
+        assert!(!folded.contains(".com/"), "{hostile:?} -> {line:?}");
         for markup in ["**", "__", "~~", "||", "[click here]("] {
             assert!(!line.contains(markup), "{hostile:?} -> {line:?}");
         }

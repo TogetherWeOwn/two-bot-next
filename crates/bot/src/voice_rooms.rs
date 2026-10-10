@@ -7034,11 +7034,13 @@ const VOTE_KICK_PUBLIC_REASON_LIMIT: usize = 512;
 /// endorsement:
 ///
 /// - `@everyone`/`@here` (including zero-width-split obfuscation) are broken
-///   with the shared mention neutralizer; `<@`, `<:` and `<#` pills are split
-///   with a zero-width space so they render literally instead of tagging a
-///   user, role, custom emoji or channel.
-/// - `://` URL schemes and a word-boundary `www.` prefix are split so bare and
-///   disguised links are neither clickable nor link-preview embeds;
+///   with the shared mention neutralizer; `<@`, `<#`, `<:` and `<a:` pills are
+///   split with a zero-width space so they render literally instead of tagging
+///   a user, role, custom emoji (including animated `<a:name:id>`) or channel.
+/// - `://` URL schemes, a word-boundary `www.` prefix (matched
+///   case-insensitively, so `WWW.` cannot evade the scan) and the dot of
+///   schemeless bare domains (`discord.gg/`, `evil.com/x`) are split so bare
+///   and disguised links are neither clickable nor link-preview embeds;
 ///   `SUPPRESS_EMBEDS` on the ballot shell is the second embed fence.
 /// - Newlines are folded to spaces, so no reason text can start line-leading
 ///   Discord markup (headings, quotes, code fences, lists).
@@ -7061,9 +7063,11 @@ fn sanitize_vote_reason(raw: &str) -> String {
     let pills = neutralized
         .replace("<@", "<\u{200b}@")
         .replace("<#", "<\u{200b}#")
-        .replace("<:", "<\u{200b}:");
+        .replace("<:", "<\u{200b}:")
+        .replace("<a:", "<\u{200b}a:");
     let links = pills.replace("://", ":\u{200b}//");
     let www = split_www_prefix(&links);
+    let www = split_bare_domain_dots(&www);
     let mut escaped = String::with_capacity(www.len());
     for ch in www.chars() {
         if matches!(ch, '\\' | '`' | '*' | '_' | '~' | '|' | '[' | ']') {
@@ -7078,24 +7082,97 @@ fn sanitize_vote_reason(raw: &str) -> String {
 }
 
 /// Split a word-boundary `www.` link prefix with a zero-width space so Discord
-/// does not linkify it. A plain replace would also rewrite the tail of words
-/// like "awww."; only a non-alphanumeric boundary (or the start) counts.
+/// does not linkify it. Matched case-insensitively, preserving the original
+/// casing: an uppercase `WWW.` is just as clickable. A plain replace would
+/// also rewrite the tail of words like "awww."; only a non-alphanumeric
+/// boundary (or the start) counts.
 fn split_www_prefix(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(pos) = rest.find("www.") {
+    while let Some(pos) = find_www_dot(rest) {
         let (head, tail) = rest.split_at(pos);
         let boundary = head
             .chars()
             .next_back()
             .is_none_or(|ch| !ch.is_alphanumeric());
         out.push_str(head);
+        // `tail` starts with four ASCII bytes (`www.` in any case), so these
+        // byte indices are always character boundaries.
+        out.push_str(&tail[..3]);
         if boundary {
-            out.push_str("www\u{200b}.");
-        } else {
-            out.push_str("www.");
+            out.push('\u{200b}');
         }
-        rest = &tail["www.".len()..];
+        out.push('.');
+        rest = &tail[4..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Byte offset of a case-insensitive `www.` in `text`, if any.
+fn find_www_dot(text: &str) -> Option<usize> {
+    text.as_bytes().windows(4).position(|w| {
+        w[0].eq_ignore_ascii_case(&b'w')
+            && w[1].eq_ignore_ascii_case(&b'w')
+            && w[2].eq_ignore_ascii_case(&b'w')
+            && w[3] == b'.'
+    })
+}
+
+/// Bare-domain TLDs whose dot is split so schemeless `host.tld[/path]` text
+/// (including `discord.gg/` invite links) is not linkified. Mirrors the
+/// `BARE_TLDS` allowlist in `crates/core/src/automod.rs`: an allowlist, not
+/// "any dot followed by letters", keeps version strings (`v1.2`) and dotted
+/// filenames byte-identical.
+const BARE_LINK_TLDS: [&str; 14] = [
+    "app", "ca", "co", "com", "dev", "gg", "io", "me", "net", "org", "tv", "uk", "us", "xyz",
+];
+
+/// Split the dot of a schemeless bare domain (`evil.com/x` renders as
+/// `evil.<ZWSP>com/x`) with a zero-width space so Discord does not linkify it.
+/// Only a dot preceded by an alphanumeric label character and followed by an
+/// allowlisted TLD (matched case-insensitively) plus a non-alphanumeric
+/// boundary or the end of the string counts.
+fn split_bare_domain_dots(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(dot) = rest.find('.') {
+        let (head, tail) = rest.split_at(dot);
+        // `tail[0]` is the ASCII dot, so `tail[1..]` starts on a boundary.
+        let after_dot = &tail[1..];
+        let mut matched = 0usize;
+        if head
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch.is_alphanumeric())
+        {
+            for tld in BARE_LINK_TLDS {
+                let Some(prefix) = after_dot.get(..tld.len()) else {
+                    continue;
+                };
+                if !prefix.eq_ignore_ascii_case(tld) {
+                    continue;
+                }
+                // The match is ASCII, so this index is a character boundary.
+                let boundary = after_dot[tld.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|ch| !ch.is_alphanumeric());
+                if boundary {
+                    matched = tld.len();
+                    break;
+                }
+            }
+        }
+        out.push_str(head);
+        out.push('.');
+        if matched > 0 {
+            out.push('\u{200b}');
+            out.push_str(&after_dot[..matched]);
+            rest = &after_dot[matched..];
+        } else {
+            rest = after_dot;
+        }
     }
     out.push_str(rest);
     out
