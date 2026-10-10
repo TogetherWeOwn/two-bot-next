@@ -166,7 +166,7 @@ write verb; bind that job to a capability in `BootActivation` before it ships.
   watermark/classifier changed or the completion write was lost. A successfully
   persisted incomplete scorecard is terminal, not a transient failure.
   Before scoring, mark honest stream coverage for the captured streams only
-  (`CAPTURED_STREAMS`, today just `event_attended`) from capture start through
+  (`CAPTURED_STREAMS`, today `event_attended` and `member_joined`) from capture start through
   the closed week end; a mid-week start fails closed (`INGESTION_INCOMPLETE`,
   human numerators null). A Monday boot cannot claim closed-week coverage:
   leave missing heartbeats missing rather than inserting an inverted interval.
