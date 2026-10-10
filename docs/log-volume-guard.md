@@ -20,7 +20,7 @@ high-rate event without a cap row fails the suite.
   guild/member/channel ID, token, query string, body or message content ever
   becomes a label or a log field.
 
-## Cardinality budget: 289 samples
+## Cardinality budget: 361 samples
 
 `GET /metrics` renders this many non-comment samples from process start,
 before any traffic. Adding any series fails the pinned count until this
@@ -40,6 +40,7 @@ table and the test are updated together.
 | `two_bot_send_admissions_total{outcome}` | 4 | `admitted`, `blocked`, `storage_error`, `other` |
 | `two_bot_gateway_prefix_trigger_refused_total{reason}` | 2 | `verdict`, `other` |
 | `two_bot_dispatch_drops_total{lane}` | 6 | `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` |
+| `two_bot_internal_actions_total{family,outcome}` | 72 | 6 families x 12 outcomes (`announcement`, `event`, `settings`, `moderation`, `membership`, `other` x `executed` + 11 refusal classes) |
 | `# HELP` / `# TYPE` headers | 50 | 25 families x 2 |
 
 ## Per-event caps (gateway metric labels)
@@ -115,6 +116,23 @@ free lane slots), so `reactions` growth points at a hot member before an
 undersized lane; the M2.1 alert rule should treat `reactions` drops as
 member-hot until lane saturation is confirmed.
 
+Website-action receiver executions (TOG-20119, roadmap M4.23) follow the same
+shape: every signed-receiver request increments
+`two_bot_internal_actions_total{family,outcome}` exactly once, while refusal
+`warn!` summaries stay sampled. A burst is O(1) log lines with N counter
+increments. The six families and twelve outcomes are class steady and never
+shed; unknown verbs collapse to `other` and unknown outcomes to `internal`,
+so growth means a real family or refusal class arrived and needs the M2.1
+alert rule, not a new label.
+
+Fatal-runner reasons are class `session` and O(1) bytes: both dispatch-join
+`map_err` sites in `crates/bot/src/gateway.rs` pass the surfaced reason
+through `bounded_runner_reason`, capped at `RUNNER_REASON_MAX_CHARS`
+(512 chars, char-boundary). Today every reason is one of six `&'static str`
+literals from `dispatch_bounded` (the `JoinError` payload is discarded
+there), so the type already bounds the output; the cap is a fence that holds
+even if a future supervisor returns a larger payload.
+
 Subscription facts that bound the top of the funnel: the bot never requests
 `GUILD_PRESENCES`, so presence arrives only through the hourly
 `presence_probe` job, never as gateway events; `MESSAGE_CONTENT` is requested
@@ -126,5 +144,7 @@ The catalog, this guard, the conformance test and the guard test move
 together. Add a dispatch label: add its cap row here and in `EVENT_CAPS`.
 Add a job or voice family: same for `JOB_CAPS` and the cardinality table.
 Add a dispatch lane: add its label row here and in `DISPATCH_LANE_CAPS`.
+Add a receiver family or outcome: add its label row here and in
+`INTERNAL_ACTION_CAP_FAMILIES` / `INTERNAL_ACTION_CAP_OUTCOMES`.
 Add a log line on the session path: record it in the catalog and in
 `SESSION_LOG_CAPS`. Unknowns fail closed on purpose.

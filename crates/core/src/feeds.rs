@@ -1173,4 +1173,25 @@ impl FeedPollSchedule {
     pub fn finish(&mut self) {
         self.running = false;
     }
+
+    /// Hot-reload the poll interval without a restart (TOG-19027): the next
+    /// `begin` gates on the new interval. Out-of-range values are refused and
+    /// keep the current interval. Returns true when the interval changed.
+    pub fn set_interval_seconds(&mut self, seconds: u64) -> bool {
+        if !(60..=86400).contains(&seconds) {
+            return false;
+        }
+        let interval_ms = seconds as i64 * 1000;
+        if interval_ms == self.interval_ms {
+            return false;
+        }
+        self.interval_ms = interval_ms;
+        true
+    }
+
+    /// Current interval, for live-reload tests.
+    #[must_use]
+    pub fn interval_seconds(&self) -> u64 {
+        (self.interval_ms / 1000).max(0) as u64
+    }
 }

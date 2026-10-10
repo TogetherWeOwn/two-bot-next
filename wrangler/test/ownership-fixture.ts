@@ -27,7 +27,7 @@ export class OwnershipFixture extends DurableObject {
               // A failure here must leave a persisted revocation, not an owner.
               if (input.stopError) throw new Error("synthetic stop failure");
               await this.ctx.storage.put("running", null);
-            });
+            }, { force: input.force ?? false });
             return Response.json(record);
           }
           case "/probe": {

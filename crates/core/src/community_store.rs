@@ -139,6 +139,16 @@ pub async fn record_message_fact(
     record_fact(pool, &write).await
 }
 
+/// Member-join invite metadata (legacy `recordMemberJoin` inviter shape):
+/// `{"inviterId":"<snowflake>"}` when the gateway invite tracker attributed
+/// the join, otherwise no metadata. The funnel row carries the same object;
+/// the fact keeps it so the Monday tick can audit attribution without
+/// re-reading invites.
+#[must_use]
+pub fn member_join_metadata(inviter_id: Option<u64>) -> Option<String> {
+    inviter_id.map(|id| format!("{{\"inviterId\":\"{id}\"}}"))
+}
+
 /// Member-join fact (legacy `recordMemberJoin`).
 #[must_use]
 pub fn member_join_fact(
@@ -624,6 +634,48 @@ mod tests {
             classifier_version: VERSION.to_owned(),
             matched_rule: "fixture".to_owned(),
         }
+    }
+
+    #[test]
+    fn member_join_fact_keys_on_guild_actor_and_time() {
+        // The idempotency key is `member-join:{guild}:{actor}:{occurred_at}`:
+        // a redelivered gateway burst shares the key and loses, while a later
+        // rejoin is a new fact.
+        let actor_obj = actor("m1");
+        let first = member_join_fact(
+            GUILD,
+            &actor_obj,
+            "2026-09-02T10:00:00.000Z",
+            "1:2:2026-09-02T10:00:00.000Z",
+            "invite:abc",
+            verdict("eligible_human"),
+            member_join_metadata(Some(9)),
+        );
+        assert_eq!(first.event_type, "member_joined");
+        assert_eq!(
+            first.idempotency_key,
+            "member-join:guild-a:m1:2026-09-02T10:00:00.000Z"
+        );
+        assert_eq!(first.source, "invite:abc");
+        assert_eq!(
+            first.metadata.as_deref(),
+            Some("{\"inviterId\":\"9\"}"),
+            "invite attribution survives the fact shape"
+        );
+        let later = member_join_fact(
+            GUILD,
+            &actor_obj,
+            "2026-09-03T10:00:00.000Z",
+            "1:2:2026-09-03T10:00:00.000Z",
+            "invite:abc",
+            verdict("eligible_human"),
+            None,
+        );
+        assert_ne!(
+            first.idempotency_key, later.idempotency_key,
+            "a later rejoin is a new fact, not a dedupe hit"
+        );
+        assert_eq!(member_join_metadata(None), None);
     }
 
     async fn seed_fixture(pool: &Pool<Postgres>) {

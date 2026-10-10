@@ -42,6 +42,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_voice_compensation_pending` | Tracked rooms awaiting compensating delete after a failed write |
 | `two_bot_voice_orphans_total` | Untracked creator-channel orphans needing manual deletion after failed `/create` compensation |
 | `two_bot_dispatch_drops_total{lane}` | Dispatch-lane saturation drops: every event refused because every attempted lane was full. `lane` is one of `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` (see label allowlists below). The `reactions` lane additionally counts per-member fairness refusals: a reaction refused because its member already holds `PER_USER_IN_FLIGHT` reaction slots, even while the lane has free slots. A single-lane refusal counts its lane once; a privileged spill refused by both lanes counts both. Logs sample the first drop per 60 s per runtime, so bursts are O(1) lines with N counter increments. Alert-threshold hook for M2.1 (lands once TOG-18943 unblocks): alert when any lane's drops increase across consecutive keepalive samples; a single drop inside one burst is not paging. `reactions`-lane growth points at a hot member before an undersized lane |
+| `two_bot_internal_actions_total{family,outcome}` | Signed website-action receiver executions by bounded family and outcome. `family` is one of `announcement`, `event`, `settings`, `moderation`, `membership` or `other` (see label allowlists below). `outcome` is `executed` or the refusal class (`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`, `conflict`, `upstream` or `internal`). Every request counts once; replays count on each serve. Refusal warn-summaries stay sampled; this counter is the alertable signal. Alert-threshold hook for M2.1 (lands once TOG-18943 unblocks): alert when refused outcomes increase across consecutive keepalive samples; a single refusal inside one burst is not paging |
 
 ## Job coverage and outcomes
 
@@ -125,7 +126,8 @@ as dynamic labels.
   `DELETE /guilds/:guild/members/:member/roles/:role`,
   `POST /guilds/:guild/scheduled-events`,
   `PATCH /guilds/:guild/scheduled-events/:event`,
-  `DELETE /guilds/:guild/scheduled-events/:event`, `other`).
+  `DELETE /guilds/:guild/scheduled-events/:event`,
+  `POST /guilds/:guild/channels`, `DELETE /channels/:channel`, `other`).
 - `two_bot_job_runs_total{job,outcome}`,
   `two_bot_job_last_success_timestamp_seconds{job}` and
   `two_bot_job_consecutive_failures{job}` — `job` is one of
@@ -164,6 +166,20 @@ as dynamic labels.
   including the busy-lane path, plus per-member fairness refusals on the
   `reactions` lane (the `dispatch_self_role_reaction` per-member cap, via the
   shared `record_drop` path); scope-shutdown refusals are not drops.
+- `two_bot_internal_actions_total{family,outcome}` — `family` is one of
+  `announcement`, `event`, `settings`, `moderation`, `membership` or
+  `other`, mapped from the signed `action` verb in
+  `crates/bot/src/internal_action_http.rs` (`announcement.post` →
+  `announcement`, `event.*` → `event`, `settings.*` → `settings`,
+  `moderation.*` → `moderation`, `role.assign`/`guild.add_member` →
+  `membership`, everything else → `other`). `outcome` is `executed` or one
+  of the bounded refusal classes (`auth_failure`, `unknown_key`,
+  `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`,
+  `action_disabled`, `malformed_body`, `conflict`, `upstream`, `internal`).
+  Recorded once per receiver request (`ReceiverState::reject` for refusals,
+  `ReceiverState::terminal` plus the keyless-read and settings/moderation
+  success envelopes for executions); no key id, token, body or request bytes
+  ever become labels.
 - Log fields (coordinated with blocked structured-log work, which owns JSON
   formatting): `voice_event="voice_operation"` with `op`/`outcome`,
   `voice_event="voice_reconcile"` with plan counts,
