@@ -89,6 +89,30 @@ fn member(user: &str) -> ScriptedResponse {
     ScriptedResponse::json(200, json!({"user": {"id": user}, "roles": []}))
 }
 
+/// RA-02 anchored occurrence: the live event plus a repeat label. Bare slugs
+/// name no anchorable event and refuse, so valid fixtures always anchor.
+fn anchored(label: &str) -> String {
+    format!("{EVENT}:{label}")
+}
+
+/// Live `GET /guilds/{g}/members/{u}` read: `bot: None` omits the key (Discord
+/// omits it for humans), exercising the default-false path.
+fn member_get(user: &str, bot: Option<bool>) -> ScriptedResponse {
+    let mut member = json!({"id": user});
+    if let Some(bot) = bot {
+        member["bot"] = json!(bot);
+    }
+    ScriptedResponse::json(200, json!({"user": member, "roles": []}))
+}
+
+fn scheduled_event_path(event: &str) -> String {
+    format!("/api/v10/guilds/{GUILD}/scheduled-events/{event}")
+}
+
+fn guild_member_path(user: &str) -> String {
+    format!("/api/v10/guilds/{GUILD}/members/{user}")
+}
+
 fn executor(mock: &MockRest) -> ActionExecutor {
     ActionExecutor::with_proxy(
         "mock-token-not-a-credential".to_owned(),
@@ -514,14 +538,26 @@ async fn permissions_gates_and_guild_fence_precede_store_access() {
         return;
     };
     let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+    // RA-02 unauthorized self: the invoker selects themself with no Manage
+    // Events. The router refuses before any callback deferral, store work or
+    // network, so self-select opens no unprivileged path.
     run(
         fixture.pool(),
         &mock,
-        &attendance(300, 0, USER, "weekly:2026-09-30"),
+        &attendance(300, 0, USER, &anchored("2026-09-30")),
     )
     .await;
     assert_reply(&mock, "You need the Manage Events permission to use this command. Ask a server admin to grant it.", false);
     assert_eq!(mock.requests().len(), 1);
+    // RA-02 unauthorized on-behalf: same refusal when selecting someone else.
+    run(
+        fixture.pool(),
+        &mock,
+        &attendance(304, 0, OTHER, &anchored("2026-09-30")),
+    )
+    .await;
+    assert_reply(&mock, "You need the Manage Events permission to use this command. Ask a server admin to grant it.", false);
+    assert_eq!(mock.requests().len(), 2);
     let off = InteractionRouter::new(RouterGates {
         scorecard: false,
         announcements: false,
@@ -567,46 +603,56 @@ async fn permissions_gates_and_guild_fence_precede_store_access() {
     )
     .await
     .unwrap());
-    assert_eq!(mock.requests().len(), 3);
+    assert_eq!(mock.requests().len(), 4);
     assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
     fixture.close().await;
     mock.shutdown().await;
 }
 
 #[tokio::test]
-async fn host_checkin_identity_duplicate_and_classifier_are_preserved() {
+async fn host_checkin_authorized_self_and_on_behalf_retain_host_checkin_proof() {
     let Some(fixture) = pool().await else {
         return;
     };
-    // Four check-ins: each a 204 callback, RA-01 live-membership GET(s), the
-    // RA-03 post-write membership re-read(s) on every effective write, then
-    // an ID-bearing 200 deferred edit. Self check-ins need one membership
-    // lookup; the on-behalf check-in (actor USER, target OTHER) needs two.
-    // The duplicate check-in writes nothing, so it revalidates nothing.
+    // RA-02 authorized paths: self-select (the invoker USER is also the
+    // target) and on-behalf (OTHER) both pass the Manage Events gate, resolve
+    // through the live guild event, verify live membership, and record with
+    // `host_checkin` proof — self-select neither bypasses authority nor
+    // downgrades the proof. Each check-in is one 204 callback, one live-event
+    // GET, one live-member GET, and one ID-bearing 200 deferred edit, plus
+    // the RA-03 post-write fence (one live-event re-read, one live-member
+    // re-read) on every effective write. The duplicate check-in writes
+    // nothing, so it revalidates nothing.
+    let occ = anchored("2026-09-30");
     let mock = MockRest::start(
         vec![
             ScriptedResponse::status(204),
-            member(USER),
-            member(USER),
+            event(1),
+            member_get(USER, None),
+            event(1),
+            member_get(USER, None),
             ScriptedResponse::json(200, json!({"id": "99"})),
             ScriptedResponse::status(204),
-            member(USER),
+            event(1),
+            member_get(USER, None),
             ScriptedResponse::json(200, json!({"id": "99"})),
             ScriptedResponse::status(204),
-            member(USER),
-            member(OTHER),
-            member(USER),
-            member(OTHER),
+            event(1),
+            member_get(OTHER, Some(true)),
+            event(1),
+            member_get(OTHER, Some(true)),
             ScriptedResponse::json(200, json!({"id": "99"})),
             ScriptedResponse::status(204),
-            member(USER),
-            member(USER),
+            event(2),
+            member_get(USER, None),
+            event(2),
+            member_get(USER, None),
             ScriptedResponse::json(200, json!({"id": "99"})),
         ],
         ScriptedResponse::status(204),
     )
     .await;
-    let occ = "weekly:2026-09-30";
+    // Padded input canonicalizes to the anchored id in the reply and the fact.
     run(
         fixture.pool(),
         &mock,
@@ -621,7 +667,7 @@ async fn host_checkin_identity_duplicate_and_classifier_are_preserved() {
     run(
         fixture.pool(),
         &mock,
-        &attendance(401, MANAGE_EVENTS, USER, occ),
+        &attendance(401, MANAGE_EVENTS, USER, &occ),
     )
     .await;
     assert_reply(
@@ -632,7 +678,7 @@ async fn host_checkin_identity_duplicate_and_classifier_are_preserved() {
     run(
         fixture.pool(),
         &mock,
-        &attendance(402, MANAGE_EVENTS, OTHER, occ),
+        &attendance(402, MANAGE_EVENTS, OTHER, &occ),
     )
     .await;
     assert_eq!(counts(fixture.pool()).await, (0, 0, 2));
@@ -651,6 +697,8 @@ async fn host_checkin_identity_duplicate_and_classifier_are_preserved() {
         );
         assert_eq!(row.6, format!("event-attended:{occ}:{member}"));
     }
+    // A labeled repeat occurrence of a live event records as its own fact.
+    let next = anchored("next");
     let mut config = ClassifierConfig::default();
     config.test_actor_ids.insert(USER.into());
     handle_rsvp_interaction(
@@ -658,137 +706,45 @@ async fn host_checkin_identity_duplicate_and_classifier_are_preserved() {
         fixture.pool(),
         &executor(&mock),
         &config,
-        &attendance(403, MANAGE_EVENTS, USER, "next-occurrence"),
+        &attendance(403, MANAGE_EVENTS, USER, &next),
     )
     .await
     .unwrap();
-    let verdict: (String, String, String) = sqlx::query_as("SELECT classifier_version, classification, matched_rule FROM community_facts WHERE source_event_id = $1")
-        .bind(format!("next-occurrence:{USER}")).fetch_one(fixture.pool()).await.unwrap();
+    let verdict: (String, String, String, String) = sqlx::query_as("SELECT classifier_version, classification, matched_rule, metadata FROM community_facts WHERE source_event_id = $1")
+        .bind(format!("{next}:{USER}")).fetch_one(fixture.pool()).await.unwrap();
     assert_eq!(
-        verdict,
-        (
-            "community-v1".into(),
-            "test".into(),
-            "configured_test_actor".into()
-        )
+        (verdict.0.as_str(), verdict.1.as_str(), verdict.2.as_str()),
+        ("community-v1", "test", "configured_test_actor")
     );
-    // RA-01 evidence: five pre-write membership GETs (self check-ins need
-    // one, the on-behalf check-in needs two), plus four RA-03 post-write
-    // re-reads (one per effective write; the duplicate revalidates nothing),
-    // and no scheduled-event lookup on the free-text occurrence path
-    // (trusted occurrence resolution is RA-02).
-    let gets: Vec<_> = mock
-        .requests()
-        .iter()
-        .filter(|r| r.method == "GET")
-        .map(|r| r.path.clone())
-        .collect();
-    assert_eq!(gets.len(), 9);
-    assert!(gets
-        .iter()
-        .all(|p| p.starts_with(&format!("/api/v10/guilds/{GUILD}/members/"))));
+    assert_eq!(
+        serde_json::from_str::<Value>(&verdict.3).unwrap(),
+        json!({"eventOccurrenceId": next, "proof": "host_checkin"})
+    );
+    // Every check-in proved its occurrence against the live guild event and
+    // its target against live membership, in that order — pre-write reads and
+    // the RA-03 post-write fence alike. The duplicate wrote nothing, so only
+    // the three effective writes carry fence re-reads.
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 22);
+    let gets: Vec<_> = requests.iter().filter(|r| r.method == "GET").collect();
+    assert_eq!(gets.len(), 14);
+    for (i, chunk) in gets.chunks(2).enumerate() {
+        assert_eq!(
+            chunk[0].path,
+            scheduled_event_path(EVENT),
+            "check-in {i} event"
+        );
+    }
+    assert_eq!(gets[1].path, guild_member_path(USER));
+    assert_eq!(gets[3].path, guild_member_path(USER));
+    assert_eq!(gets[5].path, guild_member_path(USER));
+    assert_eq!(gets[7].path, guild_member_path(OTHER));
+    assert_eq!(gets[9].path, guild_member_path(OTHER));
+    assert_eq!(gets[11].path, guild_member_path(USER));
+    assert_eq!(gets[13].path, guild_member_path(USER));
+    assert_eq!(counts(fixture.pool()).await, (0, 0, 3));
     fixture.close().await;
     mock.shutdown().await;
-}
-
-/// RA-01: host check-in refuses a departed acting host, a departed target,
-/// and failed membership lookups with zero attendance writes.
-#[tokio::test]
-async fn host_checkin_membership_gates_precede_attendance_writes() {
-    let Some(fixture) = pool().await else {
-        return;
-    };
-    let occ = "weekly:2026-09-30";
-    // Departed actor: one membership GET (404), then the refusal edit.
-    let mock = MockRest::start(
-        vec![
-            ScriptedResponse::status(204),
-            ScriptedResponse::status(404),
-            ScriptedResponse::json(200, json!({"id": "99"})),
-        ],
-        ScriptedResponse::status(500),
-    )
-    .await;
-    run(
-        fixture.pool(),
-        &mock,
-        &attendance(410, MANAGE_EVENTS, USER, occ),
-    )
-    .await;
-    assert_reply(
-        &mock,
-        "You must still belong to this server to record attendance.",
-        true,
-    );
-    assert_eq!(mock.requests().len(), 3);
-    assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
-    mock.shutdown().await;
-    // Departed target: actor passes, target 404s, then the refusal edit.
-    let mock = MockRest::start(
-        vec![
-            ScriptedResponse::status(204),
-            member(USER),
-            ScriptedResponse::status(404),
-            ScriptedResponse::json(200, json!({"id": "99"})),
-        ],
-        ScriptedResponse::status(500),
-    )
-    .await;
-    run(
-        fixture.pool(),
-        &mock,
-        &attendance(411, MANAGE_EVENTS, OTHER, occ),
-    )
-    .await;
-    assert_reply(&mock, "That member is no longer in this server.", true);
-    assert_eq!(mock.requests().len(), 4);
-    assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
-    mock.shutdown().await;
-    // Failed actor lookup: malformed evidence fails closed with zero writes.
-    let mock = MockRest::start(
-        vec![
-            ScriptedResponse::status(204),
-            ScriptedResponse {
-                body: b"invalid-json".to_vec(),
-                ..ScriptedResponse::status(200)
-            },
-            ScriptedResponse::json(200, json!({"id": "99"})),
-        ],
-        ScriptedResponse::status(500),
-    )
-    .await;
-    run(
-        fixture.pool(),
-        &mock,
-        &attendance(412, MANAGE_EVENTS, USER, occ),
-    )
-    .await;
-    assert_reply(&mock, "Unable to verify server membership.", true);
-    assert_eq!(mock.requests().len(), 3);
-    assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
-    mock.shutdown().await;
-    // Failed target lookup: wrong-user echo fails closed with zero writes.
-    let mock = MockRest::start(
-        vec![
-            ScriptedResponse::status(204),
-            member(USER),
-            ScriptedResponse::json(200, json!({"user": {"id": USER}, "roles": []})),
-            ScriptedResponse::json(200, json!({"id": "99"})),
-        ],
-        ScriptedResponse::status(500),
-    )
-    .await;
-    run(
-        fixture.pool(),
-        &mock,
-        &attendance(413, MANAGE_EVENTS, OTHER, occ),
-    )
-    .await;
-    assert_reply(&mock, "Unable to verify attendance membership.", true);
-    assert_eq!(mock.requests().len(), 4);
-    assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
-    mock.shutdown().await;
-    fixture.close().await;
 }
 
 #[tokio::test]
@@ -817,15 +773,26 @@ async fn malformed_inputs_and_failed_ack_do_not_write() {
     )
     .await;
     assert_reply(&mock, "event occurrence must not be empty.", true);
+    // Forged user id with a well-formed anchored occurrence: the resolved-user
+    // pre-check refuses before any event or member lookup hits the network.
     run(
         fixture.pool(),
         &mock,
-        &attendance(502, MANAGE_EVENTS, "1546451670500642111", "occ"),
+        &attendance(
+            502,
+            MANAGE_EVENTS,
+            "1546451670500642111",
+            &anchored("2026-09-30"),
+        ),
     )
     .await;
     assert_reply(&mock, "Unable to resolve attendance member.", true);
     assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
     assert_eq!(mock.requests().len(), 6);
+    assert!(
+        mock.requests().iter().all(|r| r.method != "GET"),
+        "malformed and forged inputs refuse before any Discord lookup"
+    );
     let denied = MockRest::start(vec![], ScriptedResponse::status(403)).await;
     assert!(handle_rsvp_interaction(
         &router(),
@@ -844,10 +811,189 @@ async fn malformed_inputs_and_failed_ack_do_not_write() {
 }
 
 #[tokio::test]
+async fn unknown_and_cross_guild_occurrences_refuse_without_writes() {
+    let Some(fixture) = pool().await else {
+        return;
+    };
+    // RA-02 occurrence binding: unknown, foreign, cancelled and unreadable
+    // anchors refuse, as do bare slugs with no anchor to look up. Every case
+    // leaves RSVP, audit and attendance row counts at zero.
+    const UNANCHORED: &str =
+        "\"event occurrence\" must be a scheduled event id, optionally with a :label suffix";
+    let anchored_unknown = format!("{OTHER}:2026-10-03");
+    let cases: Vec<(String, Option<String>, Option<ScriptedResponse>, &str)> = vec![
+        // Unknown snowflake event.
+        (
+            OTHER.to_owned(),
+            Some(OTHER.to_owned()),
+            Some(ScriptedResponse::status(404)),
+            "No scheduled event with that id exists in this server.",
+        ),
+        // Anchored to an unknown event.
+        (
+            anchored_unknown,
+            Some(OTHER.to_owned()),
+            Some(ScriptedResponse::status(404)),
+            "No scheduled event with that id exists in this server.",
+        ),
+        // Anchor lives in another guild.
+        (
+            EVENT.to_owned(),
+            Some(EVENT.to_owned()),
+            Some(ScriptedResponse::json(
+                200,
+                json!({"id": EVENT, "guild_id": "999", "status": 1}),
+            )),
+            "Discord returned an invalid scheduled event status.",
+        ),
+        // Anchor is cancelled.
+        (
+            EVENT.to_owned(),
+            Some(EVENT.to_owned()),
+            Some(event(4)),
+            "That scheduled event is cancelled.",
+        ),
+        // Anchor has an unknown status.
+        (
+            EVENT.to_owned(),
+            Some(EVENT.to_owned()),
+            Some(event(9)),
+            "Discord returned an invalid scheduled event status.",
+        ),
+        // Anchor lookup is unreadable: fail closed, not absent.
+        (
+            EVENT.to_owned(),
+            Some(EVENT.to_owned()),
+            Some(ScriptedResponse {
+                body: b"invalid-json".to_vec(),
+                ..ScriptedResponse::status(200)
+            }),
+            "Discord returned an invalid scheduled event status.",
+        ),
+        // Anchor lookup fails: fail closed with zero writes.
+        (
+            EVENT.to_owned(),
+            Some(EVENT.to_owned()),
+            Some(ScriptedResponse::status(500)),
+            "Discord request failed: HTTP 500",
+        ),
+        // Bare slugs name no anchorable event: refuse before any lookup.
+        (
+            "weekly-standup-2026-10-03".to_owned(),
+            None,
+            None,
+            UNANCHORED,
+        ),
+        (format!("{EVENT}:"), None, None, UNANCHORED),
+        ("not-an-event:2026-10-03".to_owned(), None, None, UNANCHORED),
+    ];
+    for (i, (occurrence, anchor, lookup, reply)) in cases.into_iter().enumerate() {
+        let mut script = vec![ScriptedResponse::status(204)];
+        if let Some(lookup) = lookup {
+            script.push(lookup);
+        }
+        script.push(ScriptedResponse::json(200, json!({"id": "99"})));
+        let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+        run(
+            fixture.pool(),
+            &mock,
+            &attendance(600 + i as u64, MANAGE_EVENTS, USER, &occurrence),
+        )
+        .await;
+        assert_reply(&mock, reply, true);
+        let requests = mock.requests();
+        match anchor {
+            Some(anchor) => {
+                assert_eq!(requests.len(), 3, "callback, lookup, edit");
+                assert_eq!(requests[1].method, "GET");
+                assert_eq!(requests[1].path, scheduled_event_path(&anchor));
+            }
+            None => {
+                assert_eq!(requests.len(), 2, "callback and edit only");
+                assert!(requests.iter().all(|r| r.method != "GET"));
+            }
+        }
+        assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
+        mock.shutdown().await;
+    }
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn non_member_and_unverifiable_targets_refuse_without_writes() {
+    let Some(fixture) = pool().await else {
+        return;
+    };
+    // RA-02 target membership: the resolved User proves identity, not
+    // membership. Departed, cross-guild and unverifiable targets refuse after
+    // a successful occurrence binding, writing zero rows.
+    let occ = anchored("2026-09-30");
+    let cases: Vec<(ScriptedResponse, &str)> = vec![
+        // Departed, never-joined or cross-guild target.
+        (
+            ScriptedResponse::status(404),
+            "That member is not in this server.",
+        ),
+        // Live read names a different user: fail closed.
+        (
+            ScriptedResponse::json(200, json!({"user": {"id": USER}, "roles": []})),
+            "Unable to verify attendance member.",
+        ),
+        // Malformed member document: fail closed.
+        (
+            ScriptedResponse::json(200, json!({"no_user": true})),
+            "Unable to verify attendance member.",
+        ),
+        // Transport failure: fail closed without transport detail.
+        (
+            ScriptedResponse::status(500),
+            "Unable to verify attendance member.",
+        ),
+    ];
+    for (i, (member_lookup, reply)) in cases.into_iter().enumerate() {
+        let mock = MockRest::start(
+            vec![
+                ScriptedResponse::status(204),
+                event(1),
+                member_lookup,
+                ScriptedResponse::json(200, json!({"id": "99"})),
+            ],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        run(
+            fixture.pool(),
+            &mock,
+            &attendance(750 + i as u64, MANAGE_EVENTS, OTHER, &occ),
+        )
+        .await;
+        assert_reply(&mock, reply, true);
+        let requests = mock.requests();
+        assert_eq!(
+            requests.len(),
+            4,
+            "callback, event lookup, member lookup, edit"
+        );
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[1].method, "GET");
+        assert_eq!(requests[1].path, scheduled_event_path(EVENT));
+        assert_eq!(requests[2].method, "GET");
+        assert_eq!(requests[2].path, guild_member_path(OTHER));
+        assert_eq!(requests[3].method, "PATCH");
+        assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
+        mock.shutdown().await;
+    }
+    fixture.close().await;
+}
+
+#[tokio::test]
 async fn failed_final_reply_does_not_retry_committed_effects() {
     let Some(fixture) = pool().await else {
         return;
     };
+    // Anchored check-in occurrence: the trusted path still commits the fact
+    // before the reply edit, so a failed edit must not double-record.
+    let occ = anchored("weekly");
     let mock = MockRest::start(
         vec![
             ScriptedResponse::status(204),
@@ -861,13 +1007,16 @@ async fn failed_final_reply_does_not_retry_committed_effects() {
             // Discord refuses a repeated acknowledgement for the same interaction.
             ScriptedResponse::status(400),
             ScriptedResponse::status(204),
-            // Self check-in needs one membership lookup before the write and
-            // one RA-03 re-read after it.
-            member(USER),
-            member(USER),
+            event(1),
+            member_get(USER, None),
+            // RA-03 post-write fence re-reads the live event + membership
+            // before the edit; the failed edit still leaves one fact.
+            event(1),
+            member_get(USER, None),
             ScriptedResponse::status(500),
             ScriptedResponse::status(204),
-            member(USER),
+            event(1),
+            member_get(USER, None),
             // Intended successful duplicate check-in edit: ID receipt required.
             ScriptedResponse::json(200, json!({"id": "99"})),
         ],
@@ -884,18 +1033,18 @@ async fn failed_final_reply_does_not_retry_committed_effects() {
     assert_eq!(mock.requests().len(), 7);
 
     assert!(runtime
-        .handle(&attendance(601, MANAGE_EVENTS, USER, "weekly"))
+        .handle(&attendance(601, MANAGE_EVENTS, USER, &occ))
         .await
         .is_err());
     assert_eq!(counts(fixture.pool()).await, (1, 1, 1));
-    assert_eq!(mock.requests().len(), 11);
+    assert_eq!(mock.requests().len(), 13);
     assert!(runtime
-        .handle(&attendance(602, MANAGE_EVENTS, USER, "weekly"))
+        .handle(&attendance(602, MANAGE_EVENTS, USER, &occ))
         .await
         .unwrap());
     assert_reply(
         &mock,
-        &two_bot_core::checkin_duplicate_text(USER, "weekly"),
+        &two_bot_core::checkin_duplicate_text(USER, &occ),
         true,
     );
     assert_eq!(counts(fixture.pool()).await, (1, 1, 1));
@@ -970,14 +1119,14 @@ async fn checkin_mid_write_target_departure_is_compensated_and_refused() {
     let Some(fixture) = pool().await else {
         return;
     };
-    let occ = "weekly:2026-09-30";
+    let occ = anchored("2026-09-30");
     let mock = MockRest::start(
         vec![
             ScriptedResponse::status(204),
-            member(USER),
-            member(OTHER),
-            // Post-write fence: host still current, target now gone.
-            member(USER),
+            event(1),
+            member_get(OTHER, None),
+            // Post-write fence: the anchor is still live, the target now gone.
+            event(1),
             ScriptedResponse::status(404),
             ScriptedResponse::json(200, json!({"id": "99"})),
         ],
@@ -987,7 +1136,7 @@ async fn checkin_mid_write_target_departure_is_compensated_and_refused() {
     run(
         fixture.pool(),
         &mock,
-        &attendance(802, MANAGE_EVENTS, OTHER, occ),
+        &attendance(802, MANAGE_EVENTS, OTHER, &occ),
     )
     .await;
     assert_reply(&mock, "That member is no longer in this server.", true);
@@ -1038,10 +1187,12 @@ async fn store_failures_never_report_success() {
         .execute(second.pool())
         .await
         .unwrap();
+    let occ = anchored("2026-09-30");
     let mock = MockRest::start(
         vec![
             ScriptedResponse::status(204),
-            member(USER),
+            event(1),
+            member_get(USER, None),
             ScriptedResponse::json(200, json!({"id": "99"})),
         ],
         ScriptedResponse::status(500),
@@ -1050,11 +1201,11 @@ async fn store_failures_never_report_success() {
     run(
         second.pool(),
         &mock,
-        &attendance(804, MANAGE_EVENTS, USER, "weekly:2026-09-30"),
+        &attendance(804, MANAGE_EVENTS, USER, &occ),
     )
     .await;
     assert_reply(&mock, "Attendance was not recorded.", true);
-    assert_eq!(mock.requests().len(), 3);
+    assert_eq!(mock.requests().len(), 4);
     let rsvps: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_rsvps")
         .fetch_one(second.pool())
         .await
@@ -1163,6 +1314,9 @@ async fn checkin_at_capacity_refuses_without_new_facts() {
     let Some(fixture) = pool().await else {
         return;
     };
+    // The live attempt records under the RA-02 canonical id, so the
+    // pre-fill uses that same string: an anchored occurrence of the live event.
+    let occ = anchored("full");
     let human = two_bot_core::checkin_classification(false);
     for i in 0..1_000 {
         assert!(
@@ -1170,7 +1324,7 @@ async fn checkin_at_capacity_refuses_without_new_facts() {
                 fixture.pool(),
                 &two_bot_core::CheckinWrite {
                     guild_id: GUILD.into(),
-                    event_occurrence_id: "full-occ".into(),
+                    event_occurrence_id: occ.clone(),
                     member_id: format!("member-{i:04}"),
                     occurred_at: "2026-09-02T10:00:00.000Z".into(),
                     proof: two_bot_core::AttendanceProof::HostCheckin,
@@ -1187,7 +1341,8 @@ async fn checkin_at_capacity_refuses_without_new_facts() {
     let mock = MockRest::start(
         vec![
             ScriptedResponse::status(204),
-            member(USER),
+            event(1),
+            member_get(USER, None),
             ScriptedResponse::json(200, json!({"id": "99"})),
         ],
         ScriptedResponse::status(500),
@@ -1196,11 +1351,11 @@ async fn checkin_at_capacity_refuses_without_new_facts() {
     run(
         fixture.pool(),
         &mock,
-        &attendance(807, MANAGE_EVENTS, USER, "full-occ"),
+        &attendance(807, MANAGE_EVENTS, USER, &occ),
     )
     .await;
     assert_reply(&mock, &two_bot_core::checkin_occurrence_full_text(), true);
-    assert_eq!(mock.requests().len(), 3);
+    assert_eq!(mock.requests().len(), 4);
     assert_eq!(counts(fixture.pool()).await, (0, 0, 1000));
     mock.shutdown().await;
     fixture.close().await;

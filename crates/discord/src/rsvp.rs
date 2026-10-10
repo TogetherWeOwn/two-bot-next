@@ -11,11 +11,11 @@ use twilight_model::{
 use two_bot_core::{
     attendance_totals_text, checkin_duplicate_text, checkin_idempotency_key,
     checkin_occurrence_full_text, checkin_recorded_text, classify, compensate_checkin_write,
-    compensate_rsvp_write, list_rsvps, now_iso, partition_rsvps, put_rsvp, record_checkin,
-    require_manage_events, rsvp_event_full_text, rsvp_rate_limited_text, rsvp_saved_text,
-    validate_event_id, validate_occurrence_id, write_audit, AttendanceProof, CheckinWrite,
-    ClassifierConfig, ClassifyInput, HandlerId, InteractionRouter, RsvpAudit, RsvpRecord,
-    RsvpStatus, RsvpStoreError, SlashOutcome,
+    compensate_rsvp_write, list_rsvps, now_iso, parse_attendance_occurrence, partition_rsvps,
+    put_rsvp, record_checkin, require_manage_events, rsvp_event_full_text, rsvp_rate_limited_text,
+    rsvp_saved_text, validate_event_id, validate_occurrence_id, write_audit, AttendanceProof,
+    CheckinWrite, ClassifierConfig, ClassifyInput, HandlerId, InteractionRouter, RsvpAudit,
+    RsvpRecord, RsvpStatus, RsvpStoreError, SlashOutcome,
 };
 
 use crate::{
@@ -192,10 +192,9 @@ async fn guild_membership(executor: &ActionExecutor, guild_id: &str, user_id: &s
 /// attempt with zero rows from that attempt, never a success reply. Lookup
 /// errors fail closed before any write; store errors fail closed without a
 /// success reply; a loss racing the write is compensated (the attempt's
-/// exact rows are deleted) and refused. Occurrence liveness has no binding
-/// on the free-text path — trusted occurrence resolution is RA-02 — so the
-/// check-in fence revalidates the memberships its gates read. Historical
-/// totals reads (`list_rsvps`) perform no lookup and no write.
+/// exact rows are deleted) and refused. The check-in fence re-reads the
+/// RA-02 anchor event plus the target membership. Historical totals reads
+/// (`list_rsvps`) perform no lookup and no write.
 async fn check_live_event(
     executor: &ActionExecutor,
     guild_id: &str,
@@ -236,36 +235,22 @@ async fn revalidate_rsvp(
     check_live_event(executor, guild_id, event_id).await
 }
 
-/// RA-03 post-write fence for host check-in: acting host and target must
-/// still belong to the guild after the commit. A self check-in needs one
-/// re-read, not two.
+/// RA-03 post-write fence for host check-in: the RA-02 anchor event must
+/// still be live and the target must still belong to the guild after the
+/// commit. The acting host needs no membership re-read: authority on this
+/// path is Manage Events, checked pre-write, not guild belonging.
 async fn revalidate_attendance(
     executor: &ActionExecutor,
     guild_id: &str,
-    actor_id: &str,
+    anchor_event_id: &str,
     target_id: &str,
 ) -> Result<(), String> {
-    match guild_membership(executor, guild_id, actor_id).await {
-        Membership::Current => {}
-        Membership::Absent => {
-            return Err("You must still belong to this server to record attendance.".to_owned());
-        }
-        Membership::Unavailable => {
-            return Err("Unable to verify server membership.".to_owned());
-        }
+    check_live_event(executor, guild_id, anchor_event_id).await?;
+    match guild_membership(executor, guild_id, target_id).await {
+        Membership::Current => Ok(()),
+        Membership::Absent => Err("That member is no longer in this server.".to_owned()),
+        Membership::Unavailable => Err("Unable to verify attendance membership.".to_owned()),
     }
-    if target_id != actor_id {
-        match guild_membership(executor, guild_id, target_id).await {
-            Membership::Current => {}
-            Membership::Absent => {
-                return Err("That member is no longer in this server.".to_owned());
-            }
-            Membership::Unavailable => {
-                return Err("Unable to verify attendance membership.".to_owned());
-            }
-        }
-    }
-    Ok(())
 }
 
 async fn execute(
@@ -375,6 +360,10 @@ async fn execute(
             Ok(rsvp_saved_text(status))
         }
         HandlerId::ScorecardAttendance => {
+            // RA-02: Manage Events first, for every host check-in including
+            // self-select. Selecting oneself takes this same path — there is
+            // no unprivileged self-check-in branch — and the proof below stays
+            // `HostCheckin` on all of them.
             require_manage_events(
                 interaction
                     .member
@@ -385,6 +374,10 @@ async fn execute(
             .map_err(|e| e.to_string())?;
             let occurrence = validate_occurrence_id(string_option("event-occurrence")?)
                 .map_err(|e| e.to_string())?;
+            // Trusted guild-scoped occurrence form (RA-02): a bare event id or
+            // `{event_id}:{label}`. Bare slugs refuse here, before any network
+            // or store work.
+            let resolved = parse_attendance_occurrence(&occurrence).map_err(|e| e.to_string())?;
             let member_id = data
                 .options
                 .iter()
@@ -397,50 +390,63 @@ async fn execute(
                     None
                 })
                 .ok_or("Missing or invalid member option.")?;
-            // Discord resolves the selected User; fail closed rather than
-            // silently counting an unresolved bot as an eligible human.
-            let member = data
+            // Discord resolves the selected User; fail closed before any
+            // network rather than looking up a forged id.
+            let user_known = data
                 .resolved
                 .as_ref()
-                .and_then(|r| r.users.get(&member_id))
-                .ok_or("Unable to resolve attendance member.")?;
-            // RA-01: the acting host and the selected target must both
-            // currently belong to the interaction's guild. The free-text
-            // occurrence has no live-event binding in this slice (RA-02 owns
-            // trusted occurrence resolution); these gates still precede any
-            // attendance write. A self check-in needs one lookup, not two.
-            let actor_id = interaction
-                .author_id()
-                .ok_or("Missing command member.")?
-                .to_string();
-            match guild_membership(executor, &guild_id, &actor_id).await {
-                Membership::Current => {}
-                Membership::Absent => {
-                    return Err(
-                        "You must still belong to this server to record attendance.".to_owned()
-                    );
-                }
-                Membership::Unavailable => {
-                    return Err("Unable to verify server membership.".to_owned());
-                }
+                .is_some_and(|r| r.users.contains_key(&member_id));
+            if !user_known {
+                return Err("Unable to resolve attendance member.".to_owned());
             }
-            if member_id.to_string() != actor_id {
-                match guild_membership(executor, &guild_id, &member_id.to_string()).await {
-                    Membership::Current => {}
-                    Membership::Absent => {
-                        return Err("That member is no longer in this server.".to_owned());
-                    }
-                    Membership::Unavailable => {
-                        return Err("Unable to verify attendance membership.".to_owned());
-                    }
-                }
+            // Trusted guild-scoped event binding (RA-02): the anchor must be a
+            // live scheduled event in this guild. Unknown, foreign, cancelled
+            // or unreadable events refuse with zero writes, mirroring the
+            // `/rsvp` event-gate replies.
+            let event = executor
+                .get_scheduled_event(&guild_id, &resolved.anchor_event_id)
+                .await?
+                .ok_or("No scheduled event with that id exists in this server.")?;
+            // A malformed or mismatched response is not evidence of a live event.
+            if event["id"].as_str() != Some(resolved.anchor_event_id.as_str())
+                || event["guild_id"].as_str() != Some(&guild_id)
+            {
+                return Err("Discord returned an invalid scheduled event status.".to_owned());
             }
+            match event["status"].as_u64() {
+                Some(4) => return Err("That scheduled event is cancelled.".to_owned()),
+                Some(1..=3) => {}
+                _ => return Err("Discord returned an invalid scheduled event status.".to_owned()),
+            }
+            // Current guild membership, live (RA-02): the resolved User proves
+            // identity, not membership. A 404 is a departed, never-joined or
+            // cross-guild target; transport or shape failures fail closed. The
+            // bot flag comes from the same live read so a stale resolved copy
+            // can never smuggle a bot into human attendance.
+            let member_id_str = member_id.to_string();
+            let live_member = executor
+                .get_json_strict(&format!("/guilds/{guild_id}/members/{member_id_str}"))
+                .await
+                .map_err(|_| "Unable to verify attendance member.")?
+                .ok_or("That member is not in this server.")?;
+            let live_user = live_member
+                .get("user")
+                .ok_or_else(|| "Unable to verify attendance member.".to_owned())?;
+            if live_user.get("id").and_then(serde_json::Value::as_str)
+                != Some(member_id_str.as_str())
+            {
+                return Err("Unable to verify attendance member.".to_owned());
+            }
+            let member_is_bot = live_user
+                .get("bot")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
             let verdict = classify(
                 classifier,
                 &ClassifyInput {
                     guild_id: guild_id.clone(),
-                    actor_id: member_id.to_string(),
-                    is_bot: member.bot,
+                    actor_id: member_id_str.clone(),
+                    is_bot: member_is_bot,
                     webhook_id: None,
                     is_staff_automation: false,
                     is_raid: false,
@@ -448,13 +454,12 @@ async fn execute(
                     is_test: false,
                 },
             );
-            let target_id = member_id.to_string();
             let inserted = record_checkin(
                 pool,
                 &CheckinWrite {
                     guild_id: guild_id.clone(),
-                    event_occurrence_id: occurrence.clone(),
-                    member_id: target_id.clone(),
+                    event_occurrence_id: resolved.canonical_id.clone(),
+                    member_id: member_id_str.clone(),
                     occurred_at: now_iso(),
                     proof: AttendanceProof::HostCheckin,
                     classifier_version: verdict.classifier_version,
@@ -476,24 +481,37 @@ async fn execute(
                 | RsvpStoreError::UnknownStatus(_) => "Attendance was not recorded.".to_owned(),
             })?;
             if !inserted {
-                return Ok(checkin_duplicate_text(&target_id, &occurrence));
+                return Ok(checkin_duplicate_text(
+                    &member_id_str,
+                    &resolved.canonical_id,
+                ));
             }
-            // RA-03 race fence: a membership lost between the pre-write gates
-            // and the commit must not stand as a recorded check-in.
-            // Duplicates return above without revalidation: they wrote
-            // nothing. (Free-text occurrences have no live binding to
-            // re-read; trusted occurrence resolution is RA-02.)
-            if let Err(refusal) =
-                revalidate_attendance(executor, &guild_id, &actor_id, &target_id).await
+            // RA-03 race fence: the anchor event or target membership may have
+            // vanished between the pre-write RA-02 reads and the commit. The
+            // `record_checkin` transaction only bounds the occurrence count —
+            // it cannot see Discord-side removal — so re-read the same live
+            // evidence here; on loss or lookup failure compensate (delete
+            // exactly this attempt's fact) and refuse. Duplicates return above
+            // without revalidation: they wrote nothing.
+            if let Err(refusal) = revalidate_attendance(
+                executor,
+                &guild_id,
+                &resolved.anchor_event_id,
+                &member_id_str,
+            )
+            .await
             {
                 let _ = compensate_checkin_write(
                     pool,
-                    &checkin_idempotency_key(&occurrence, &target_id),
+                    &checkin_idempotency_key(&resolved.canonical_id, &member_id_str),
                 )
                 .await;
                 return Err(refusal);
             }
-            Ok(checkin_recorded_text(&target_id, &occurrence))
+            Ok(checkin_recorded_text(
+                &member_id_str,
+                &resolved.canonical_id,
+            ))
         }
         _ => unreachable!("only RSVP handlers execute here"),
     }

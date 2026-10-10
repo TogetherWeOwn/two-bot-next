@@ -199,6 +199,12 @@ pub enum CheckinError {
     // boundary test below pins it against `OCCURRENCE_ID_MAX_CHARS`.
     #[error("\"event occurrence\" is longer than 128 characters")]
     OccurrenceTooLong,
+    /// Free text with no live-event anchor: no Discord or guild authority can
+    /// vouch for the occurrence, so the handler must refuse before any write.
+    /// The format itself stays accepted (parity §1 #12) — only unanchored
+    /// values refuse. Never echoes the input (overlong-adjacent hygiene).
+    #[error("\"event occurrence\" must be a scheduled event id, optionally with a :label suffix")]
+    UnanchoredOccurrence,
 }
 
 /// Server-side `ManageEvents` gate for host check-in (parity §1 #12: the
@@ -229,6 +235,51 @@ pub fn validate_occurrence_id(value: &str) -> Result<String, CheckinError> {
     } else {
         Ok(trimmed.to_owned())
     }
+}
+
+/// A validated attendance occurrence plus the live scheduled-event anchor that
+/// proves it belongs to the interaction's guild (RA-02). The handler looks the
+/// anchor up with the same live-event read the `/rsvp` path uses; only that
+/// lookup passing makes the canonical id recordable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttendanceOccurrence {
+    /// Live scheduled-event id the occurrence is anchored to (Discord is the
+    /// authority; the handler verifies id, guild and status before writing).
+    pub anchor_event_id: String,
+    /// Recorded `event_occurrence_id`: the event id itself, or
+    /// `{anchor}:{label}` for a labeled repeat occurrence. Never longer than
+    /// the validated input it derives from, so the length bound still holds.
+    pub canonical_id: String,
+}
+
+/// Resolve a validated occurrence string into its trusted form (RA-02).
+///
+/// A bare Discord snowflake names the scheduled event itself. Any other text
+/// must anchor to one as `{event_id}:{label}` so the handler can prove the
+/// event exists in this guild before recording; the free-text format stays
+/// accepted (parity §1 #12) while bare slugs with no anchor refuse, because no
+/// live authority could vouch for them. Input must already be trimmed
+/// ([`validate_occurrence_id`]); the anchor and label trim again so the
+/// canonical id has one stable shape.
+pub fn parse_attendance_occurrence(value: &str) -> Result<AttendanceOccurrence, CheckinError> {
+    if is_snowflake(value) {
+        return Ok(AttendanceOccurrence {
+            anchor_event_id: value.to_owned(),
+            canonical_id: value.to_owned(),
+        });
+    }
+    let (anchor_raw, label_raw) = value
+        .split_once(':')
+        .ok_or(CheckinError::UnanchoredOccurrence)?;
+    let anchor = anchor_raw.trim();
+    let label = label_raw.trim();
+    if !is_snowflake(anchor) || label.is_empty() {
+        return Err(CheckinError::UnanchoredOccurrence);
+    }
+    Ok(AttendanceOccurrence {
+        anchor_event_id: anchor.to_owned(),
+        canonical_id: format!("{anchor}:{label}"),
+    })
 }
 
 /// Attendance proof (legacy `AttendanceProof`). Only `host_checkin` is
@@ -629,6 +680,88 @@ mod tests {
             validate_occurrence_id(""),
             Err(CheckinError::EmptyOccurrence)
         );
+    }
+
+    #[test]
+    fn attendance_occurrence_binds_every_format_to_a_live_event_anchor() {
+        // Bare snowflake: the event itself is the occurrence.
+        assert_eq!(
+            parse_attendance_occurrence(EVENT),
+            Ok(AttendanceOccurrence {
+                anchor_event_id: EVENT.to_owned(),
+                canonical_id: EVENT.to_owned(),
+            })
+        );
+        // Anchored free text keeps the full label as the recorded id.
+        assert_eq!(
+            parse_attendance_occurrence(&format!("{EVENT}:2026-09-30")),
+            Ok(AttendanceOccurrence {
+                anchor_event_id: EVENT.to_owned(),
+                canonical_id: format!("{EVENT}:2026-09-30"),
+            })
+        );
+        // Anchor and label trim so one occurrence has one stable id.
+        assert_eq!(
+            parse_attendance_occurrence(&format!("  {EVENT} : 2026-09-30  ")),
+            Ok(AttendanceOccurrence {
+                anchor_event_id: EVENT.to_owned(),
+                canonical_id: format!("{EVENT}:2026-09-30"),
+            })
+        );
+        // Labels may contain further colons; the first one separates.
+        assert_eq!(
+            parse_attendance_occurrence(&format!("{EVENT}:week:3")),
+            Ok(AttendanceOccurrence {
+                anchor_event_id: EVENT.to_owned(),
+                canonical_id: format!("{EVENT}:week:3"),
+            })
+        );
+        // Bare slugs name no anchorable event, so no live authority could vouch
+        // for them: refused without removing the free-text format.
+        let overlong_snowflake = "9".repeat(21);
+        for bare in [
+            "weekly-standup-2026-10-03",
+            "weekly:2026-09-30",
+            "event-1",
+            "not-an-id",
+            "1",
+            overlong_snowflake.as_str(),
+        ] {
+            assert_eq!(
+                parse_attendance_occurrence(bare),
+                Err(CheckinError::UnanchoredOccurrence),
+                "{bare} names no anchor"
+            );
+        }
+        // Empty anchor or empty label refuses.
+        for malformed in [
+            ":label".to_owned(),
+            format!("{EVENT}:"),
+            format!("{EVENT}:   "),
+            " : ".to_owned(),
+            ":".to_owned(),
+        ] {
+            assert_eq!(
+                parse_attendance_occurrence(&malformed),
+                Err(CheckinError::UnanchoredOccurrence),
+                "{malformed} is not anchored"
+            );
+        }
+        // The refusal names the accepted shape without echoing the input.
+        let err = parse_attendance_occurrence("weekly-standup-2026-10-03")
+            .expect_err("bare slug refuses");
+        let text = err.to_string();
+        assert!(
+            !text.contains("weekly-standup-2026-10-03"),
+            "refusal echoes nothing: {text}"
+        );
+        assert!(text.contains(":label"), "refusal guides hosts: {text}");
+        // Canonical ids never exceed the validated input length, so the
+        // advertised bound still governs the recorded reply.
+        let canonical = parse_attendance_occurrence(&format!("  {EVENT} : x  "))
+            .expect("parses")
+            .canonical_id;
+        assert!(canonical.encode_utf16().count() <= OCCURRENCE_ID_MAX_CHARS);
     }
 
     #[test]
