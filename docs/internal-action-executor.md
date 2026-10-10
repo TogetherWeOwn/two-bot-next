@@ -3,7 +3,12 @@
 `two_bot_discord::internal_actions::AnnouncementExecutor` is a callable effect
 adapter, not an HTTP receiver, deployment or authorization boundary. It does not
 change runtime flags, expose a listener, claim/audit an operation, or release any
-HMAC provisioning HOLD. Future receiver work owns those steps.
+HMAC provisioning HOLD. Future receiver work owns those steps. Re-checked at
+`86a6668a7`: that receiver work has since landed in
+`crates/bot/src/internal_action_http.rs` — durable burn (`:882`), `authorize`
+(`:892`), `AnnouncementExecutor::supports` capability check (`:933`), durable
+claim (`:959`), execute (`:971`) and finish/mark-unknown (`:973-982`) — in the
+order this document requires.
 
 ## Capability and validation
 

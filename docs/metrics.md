@@ -41,6 +41,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_voice_tracked_rooms` | Rooms tracked in memory; compare with live Discord channels for ghosts |
 | `two_bot_voice_compensation_pending` | Tracked rooms awaiting compensating delete after a failed write |
 | `two_bot_voice_orphans_total` | Untracked creator-channel orphans needing manual deletion after failed `/create` compensation |
+| `two_bot_dispatch_drops_total{lane}` | Dispatch-lane saturation drops: every event refused because every attempted lane was full. `lane` is one of `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` (see label allowlists below). A single-lane refusal counts its lane once; a privileged spill refused by both lanes counts both. Logs sample the first drop per 60 s per runtime, so bursts are O(1) lines with N counter increments. Alert-threshold hook for M2.1 (lands once TOG-18943 unblocks): alert when any lane's drops increase across consecutive keepalive samples; a single drop inside one burst is not paging |
 
 ## Job coverage and outcomes
 
@@ -154,6 +155,11 @@ as dynamic labels.
   `verdict` or `other`. Recorded once on the verdict-refusal arm in
   `crates/discord/src/custom_commands.rs` before any trigger lookup; unmatched
   content, scope mismatches and the disabled fast path never increment it.
+- `two_bot_dispatch_drops_total{lane}` — `lane` is one of `messages`,
+  `interactions`, `registry`, `privileged`, `busy` or `reactions`, in the
+  bot's `DISPATCH_LIMITS` order (`crates/core/src/metrics.rs`
+  `DISPATCH_LANES`). Recorded on every `spawn_first` saturation refusal,
+  including the busy-lane path; scope-shutdown refusals are not drops.
 - Log fields (coordinated with blocked structured-log work, which owns JSON
   formatting): `voice_event="voice_operation"` with `op`/`outcome`,
   `voice_event="voice_reconcile"` with plan counts,

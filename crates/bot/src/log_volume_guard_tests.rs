@@ -187,6 +187,16 @@ const JOB_CAPS: [JobCap; 12] = [
 const DB_ERROR_CAP_OPS: [&str; 2] = ["admission", "other"];
 const SEND_ADMISSION_CAP_OUTCOMES: [&str; 4] = ["admitted", "blocked", "storage_error", "other"];
 const PREFIX_TRIGGER_REFUSED_CAP_REASONS: [&str; 2] = ["verdict", "other"];
+/// One row per `metrics::DISPATCH_LANES` entry, in the same order. A new
+/// dispatch lane fails here until it gets a budget row in the guard doc.
+const DISPATCH_LANE_CAPS: [&str; 6] = [
+    "messages",
+    "interactions",
+    "registry",
+    "privileged",
+    "busy",
+    "reactions",
+];
 
 #[test]
 fn storage_and_send_gate_labels_match_their_caps() {
@@ -204,6 +214,11 @@ fn storage_and_send_gate_labels_match_their_caps() {
         metrics::PREFIX_TRIGGER_REFUSED_REASONS,
         &PREFIX_TRIGGER_REFUSED_CAP_REASONS[..],
         "PREFIX_TRIGGER_REFUSED_REASONS grew without a budget row; update docs/log-volume-guard.md"
+    );
+    assert_eq!(
+        metrics::DISPATCH_LANES,
+        &DISPATCH_LANE_CAPS[..],
+        "DISPATCH_LANES grew without a budget row; update docs/log-volume-guard.md"
     );
 }
 
@@ -226,11 +241,11 @@ const LOG_SCOPED_SOURCES: [(&str, &str); 6] = [
     ("voice_rooms.rs", include_str!("voice_rooms.rs")),
 ];
 
-/// (file, message) for the 32 catalog session-path rows: the 30 traced
+/// (file, message) for the 33 catalog session-path rows: the 31 traced
 /// messages plus the 2 drain outcomes that surface as error text. Every row
 /// is class `session` in the guard doc, so the table records presence, not
 /// a second class column. A cataloged line without a row here fails closed.
-const SESSION_LOG_CAPS: [(&str, &str); 32] = [
+const SESSION_LOG_CAPS: [(&str, &str); 33] = [
     (
         "gateway.rs",
         "cold resume committed; requesting voice snapshot via identify",
@@ -243,6 +258,7 @@ const SESSION_LOG_CAPS: [(&str, &str); 32] = [
     ("gateway.rs", "gateway leveling dispatch failed"),
     ("gateway.rs", "gateway community facts dispatch failed"),
     ("gateway.rs", "gateway community facts dispatch timed out"),
+    ("gateway.rs", "gateway onboarding job invalid"),
     ("gateway.rs", "gateway ready; checkpoint committed"),
     (
         "gateway.rs",
@@ -449,6 +465,11 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
         2,
         "prefix-refused family grew; update the cardinality budget and the guard doc"
     );
+    assert_eq!(
+        metrics::DISPATCH_LANES.len(),
+        6,
+        "dispatch-lane family grew; update the cardinality budget and the guard doc"
+    );
     for (allowlist, name) in [
         (metrics::EVENTS, "EVENTS"),
         (metrics::REST_ROUTES, "routes"),
@@ -480,12 +501,22 @@ fn exposition_series_count_matches_the_cardinality_budget() {
         "route family changed the budget"
     );
     assert_eq!(metrics::JOBS.len(), 12, "job family changed the budget");
+    assert_eq!(
+        metrics::PREFIX_TRIGGER_REFUSED_REASONS.len(),
+        2,
+        "prefix-refused family changed the budget"
+    );
+    assert_eq!(
+        metrics::DISPATCH_LANES.len(),
+        6,
+        "dispatch-lane family changed the budget"
+    );
     let text = metrics::Metrics::default().render(None);
     let series = text.lines().filter(|line| !line.starts_with('#')).count();
     assert_eq!(
-        series, 281,
-        "exposition grew past the 281-sample budget (18 events + 4 scalars + 1 latency \
-         + 11 histogram + 156 rest + 48 jobs + 31 voice + 2 db-errors + 4 send-admissions + 2 prefix-refused + 4 pool); \
+        series, 287,
+        "exposition grew past the 287-sample budget (18 events + 4 scalars + 1 latency \
+         + 11 histogram + 156 rest + 48 jobs + 31 voice + 2 db-errors + 4 send-admissions + 2 prefix-refused + 6 dispatch-drops + 4 pool); \
          update docs/log-volume-guard.md with the new series"
     );
 }

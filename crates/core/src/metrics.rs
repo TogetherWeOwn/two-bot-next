@@ -118,6 +118,27 @@ pub const SEND_ADMISSION_OUTCOMES: &[&str] = &["admitted", "blocked", "storage_e
 /// production reason today; unknown reasons collapse to `other`. Unmatched
 /// content (no trigger) never increments this family.
 pub const PREFIX_TRIGGER_REFUSED_REASONS: &[&str] = &["verdict", "other"];
+/// Dispatch-lane names for `two_bot_dispatch_drops_total{lane}`, in the bot's
+/// `DISPATCH_LIMITS` order (messages, interactions, registry, privileged,
+/// busy, reactions). Length must equal the lane count; unknown names collapse
+/// to the trailing `reactions` slot only when the allowlist grows, never to a
+/// dynamic label.
+///
+/// Saturation-drop policy (TOG-19878): the counter increments on **every**
+/// saturation drop in `spawn_first`, including the busy-lane path. Logs emit
+/// at most one `warn!` per 60 s per runtime (the first drop in the window);
+/// a burst of N drops is therefore O(1) log lines with N counter
+/// increments. Alert-threshold hook for M2.1: alert when any lane's drop rate
+/// is sustained above zero across consecutive scrapes (exact rule lands with
+/// M2.1 once TOG-18943 unblocks); a single drop during a burst is not paging.
+pub const DISPATCH_LANES: &[&str] = &[
+    "messages",
+    "interactions",
+    "registry",
+    "privileged",
+    "busy",
+    "reactions",
+];
 const BUCKETS_MICROS: &[u64] = &[
     1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
 ];
@@ -191,6 +212,7 @@ struct Values {
     db_errors: [u64; DB_ERROR_OPS.len()],
     send_admissions: [u64; SEND_ADMISSION_OUTCOMES.len()],
     prefix_trigger_refused: [u64; PREFIX_TRIGGER_REFUSED_REASONS.len()],
+    dispatch_drops: [u64; DISPATCH_LANES.len()],
 }
 
 /// All storage is fixed-size. Unknown labels collapse to `other`, including hostile input.
@@ -404,6 +426,21 @@ impl Metrics {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let counter = &mut values.prefix_trigger_refused
             [bounded_index(reason, PREFIX_TRIGGER_REFUSED_REASONS)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One dispatch-lane saturation drop (TOG-19878). Call once per saturated
+    /// lane per dropped event from `spawn_first`: a single-lane drop increments
+    /// that lane; a multi-lane attempt whose every lane is full increments each
+    /// attempted lane. Unknown lanes collapse to `other` only when the
+    /// allowlist grows; today every caller passes a member, so the trailing
+    /// slot stays zero. No IDs, tokens or bodies are retained.
+    pub fn dispatch_drop(&self, lane: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.dispatch_drops[bounded_index(lane, DISPATCH_LANES)];
         *counter = counter.saturating_add(1);
     }
 
@@ -631,6 +668,19 @@ impl Metrics {
             )
             .unwrap();
         }
+        header(
+            &mut out,
+            "two_bot_dispatch_drops_total",
+            "counter",
+            "Dispatch-lane saturation drops by bounded lane; logs sample one warn per 60 s per runtime.",
+        );
+        for (lane, count) in DISPATCH_LANES.iter().zip(values.dispatch_drops) {
+            writeln!(
+                out,
+                "two_bot_dispatch_drops_total{{lane=\"{lane}\"}} {count}"
+            )
+            .unwrap();
+        }
         let (size, idle, max) = pool.unwrap_or_default();
         scalar(
             &mut out,
@@ -713,6 +763,7 @@ mod tests {
             metrics.db_error(&hostile);
             metrics.send_admission(&hostile);
             metrics.prefix_trigger_refused(&hostile);
+            metrics.dispatch_drop(&hostile);
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
@@ -873,6 +924,40 @@ mod tests {
             assert!(series.insert(key), "duplicate series: {key}");
             assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
         }
+    }
+
+    #[test]
+    fn dispatch_drops_stay_bounded_and_saturate() {
+        let metrics = Metrics::default();
+        metrics.dispatch_drop("messages");
+        metrics.dispatch_drop("messages");
+        metrics.dispatch_drop("busy");
+        metrics.dispatch_drop("reactions");
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_dispatch_drops_total{lane=\"messages\"} 2\n"));
+        assert!(text.contains("two_bot_dispatch_drops_total{lane=\"busy\"} 1\n"));
+        assert!(text.contains("two_bot_dispatch_drops_total{lane=\"reactions\"} 1\n"));
+        assert!(text.contains("two_bot_dispatch_drops_total{lane=\"interactions\"} 0\n"));
+        // Fixed cardinality: six lanes.
+        let mut series = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, value) = line.rsplit_once(' ').unwrap();
+            assert!(series.insert(key), "duplicate series: {key}");
+            assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
+    }
+
+    #[test]
+    fn dispatch_hostile_labels_collapse_without_new_series() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.dispatch_drop(&hostile);
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        assert!(!text.contains("secret"));
     }
 
     #[test]
