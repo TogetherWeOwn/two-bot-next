@@ -846,7 +846,7 @@ fn corpus_exact_conditional_cases_pass() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 48, "every exact conditional case is asserted");
+    assert_eq!(checked, 58, "every exact conditional case is asserted");
 }
 
 /// Deferred probes record this slice's chosen semantics (see
