@@ -299,6 +299,15 @@ pub fn resolve_scheduled_id<'a, I>(ids: I, prefix: &str) -> IdResolution<'a>
 where
     I: IntoIterator<Item = &'a str>,
 {
+    if prefix.is_empty()
+        || prefix
+            .encode_utf16()
+            .take(crate::commands::MAX_RESOURCE_ID_CHARS + 1)
+            .count()
+            > crate::commands::MAX_RESOURCE_ID_CHARS
+    {
+        return IdResolution::Missing;
+    }
     let mut matches: Vec<&'a str> = ids
         .into_iter()
         .filter(|id| *id == prefix || id.starts_with(prefix))
