@@ -24,3 +24,11 @@ TERMINAL = {'done', 'cancelled'}
 
 class Refusal(Exception):
     pass
+
+
+def real_directory(path):
+    path = Path(os.path.abspath(path))
+    # Reject symlinks anywhere in the path, not just at the leaf.
+    if path.resolve() != path or not path.is_dir():
+        raise Refusal(f'not a real directory: {path}')
+    return path
