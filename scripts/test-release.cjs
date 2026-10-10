@@ -48,7 +48,7 @@ function assertExcludedConsumers(snapshot, version) {
   const fuzz = parseCargoManifest(snapshot['fuzz/Cargo.toml']);
   assert.equal(fuzz.package.version, '0.0.0', 'The unpublished fuzz harness keeps its own version');
   const original = parseCargoManifest(bootstrapSnapshot['fuzz/Cargo.toml']);
-  assert.equal(fuzz.bin.length, 7, 'Retain all seven fuzz targets');
+  assert.equal(fuzz.bin.length, 8, 'Retain all eight fuzz targets');
   assert.deepEqual(fuzz.bin, original.bin, 'Release updates must preserve the fuzz target definitions');
   for (const [name, dependency] of Object.entries(original.dependencies)) {
     if (dependency.path) {

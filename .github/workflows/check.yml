@@ -1041,6 +1041,11 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot --locked --bin two-bot scorecard_marks_only_captured_streams -- --ignored
 
+      - name: Community rules_accepted capture (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-discord --features db --locked --test community_facts_capture -- --ignored --test-threads=1
+
   moderation-db:
     name: moderation db
     permissions:
