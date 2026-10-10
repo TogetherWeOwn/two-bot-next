@@ -928,6 +928,87 @@ mod tests {
         assert!(bot.event.is_none());
     }
 
+    /// One captured join fact: (source, inviter_id, source_event_id).
+    type JoinRecord = (String, Option<Snowflake>, String);
+
+    /// Capturing scorecard sink: records every join fact, including bots.
+    #[derive(Debug, Default, Clone)]
+    struct JoinSpy {
+        joins: std::sync::Arc<Mutex<Vec<JoinRecord>>>,
+    }
+
+    impl FactsSink for JoinSpy {
+        fn record_member_join(&self, fact: MemberJoinFact<'_>) {
+            self.joins.lock().expect("spy lock").push((
+                fact.source.to_owned(),
+                fact.inviter_id,
+                fact.source_event_id.to_owned(),
+            ));
+        }
+
+        fn record_rules_accepted(&self, _fact: RulesAcceptedFact<'_>) {}
+
+        fn record_message(&self, _fact: MessageFact<'_>) {}
+
+        fn record_voice_started(&self, _fact: VoiceStartedFact<'_>) -> Option<String> {
+            None
+        }
+
+        fn record_voice_ended(&self, _fact: VoiceEndedFact<'_>) {}
+    }
+
+    fn spied() -> (FunnelHandlers<MemStore, NoopLeveling, JoinSpy>, JoinSpy) {
+        let spy = JoinSpy::default();
+        let h = FunnelHandlers::new(MemStore::new(), Some(NoopLeveling), Some(spy.clone()));
+        (h, spy)
+    }
+
+    #[test]
+    fn join_fact_preserves_invite_attribution() {
+        // The gateway's invite snapshot + expected-join + vanity attribution
+        // reaches the fact unchanged: source, inviter and the gateway
+        // `guild:member:joined_at` event id all survive `on_join`.
+        let (h, spy) = spied();
+        h.on_join(JoinInput {
+            source: "invite:abc".to_owned(),
+            inviter_id: Some(9),
+            source_event_id: Some("1:2:2026-09-20T12:00:00.000Z".to_owned()),
+            ..join_input("invite:abc")
+        });
+        assert_eq!(
+            spy.joins.lock().expect("spy lock").as_slice(),
+            [(
+                "invite:abc".to_owned(),
+                Some(9),
+                "1:2:2026-09-20T12:00:00.000Z".to_owned()
+            )],
+        );
+    }
+
+    #[test]
+    fn bot_join_is_captured_but_never_funnel_counted() {
+        // Bots are captured in facts but write no funnel row: the fact fires
+        // first and the bot gate returns before `store.record`.
+        let (h, spy) = spied();
+        let out = h.on_join(JoinInput {
+            is_bot: true,
+            source: "invite:abc".to_owned(),
+            inviter_id: Some(9),
+            source_event_id: Some("1:7:2026-09-20T12:00:00.000Z".to_owned()),
+            ..join_input("invite:abc")
+        });
+        assert!(out.event.is_none(), "bots write no funnel row");
+        assert_eq!(
+            spy.joins.lock().expect("spy lock").as_slice(),
+            [(
+                "invite:abc".to_owned(),
+                Some(9),
+                "1:7:2026-09-20T12:00:00.000Z".to_owned()
+            )],
+            "the bot join is still captured"
+        );
+    }
+
     #[test]
     fn gate_clear_defaults_source_gateway() {
         let h = handlers();

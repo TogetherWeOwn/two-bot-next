@@ -2739,14 +2739,15 @@ mod tests {
 
     #[test]
     fn catalog_counts_match_legacy_census() {
-        // Shared legacy census: hot 41 / cold 28 / env_only 48, plus the
+        // Shared legacy census: hot 42 / cold 27 / env_only 48, plus the
         // receiver's combined bind, caller mapping and container marker
         // (all env-only), plus the two template-assistant endpoint keys
         // (both env-only). Count actual entries, not just representatives
-        // of each class.
+        // of each class. TOG-19027 moves TWO_FEED_POLL_SECONDS from cold
+        // to hot, shifting one entry between those classes.
         for (class, expected) in [
-            (SettingClass::Hot, 41),
-            (SettingClass::Cold, 28),
+            (SettingClass::Hot, 42),
+            (SettingClass::Cold, 27),
             (SettingClass::EnvOnly, 53),
         ] {
             assert_eq!(

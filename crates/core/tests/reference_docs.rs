@@ -45,9 +45,12 @@ a required value or an implemented consumer. Secret defaults are never rendered.
 - `cold` / `hot`: legacy-catalog storage classes, not application promises.\n\
   The Container registers a `guild_settings` poll job\n\
   (`crates/bot/src/website_jobs.rs:152`) publishing through\n\
-  `settings_jobs::live` (`crates/bot/src/settings_jobs.rs:53`), but no feature\n\
-  runtime reads that snapshot yet; direct stored reads happen only through\n\
-  per-runtime store refreshes (`raid_runtime.rs:136`,\n\
+  `settings_jobs::live` (`crates/bot/src/settings_jobs.rs:53`). Message-path\n\
+  automod refreshes its lists, thresholds and enforce flag from that snapshot\n\
+  on every delivery (`automod_gateway.rs:192-203`, `:273`); the feed poller\n\
+  re-reads its interval from the snapshot before every tick\n\
+  (`feed_jobs.rs:232-259`). Other stored reads happen through per-runtime\n\
+  store refreshes (`raid_runtime.rs:136`,\n\
   `containment_runtime.rs:186`, `join_risk_runtime.rs:198`) and onboarding's\n\
   per-event refresh (`onboarding.rs:167`). Gateway feature gates still come\n\
   from process environment only, so a database-only value such as\n\
@@ -55,7 +58,7 @@ a required value or an implemented consumer. Secret defaults are never rendered.
   Keys in\n\
   legacy `HOT_WIRED` are labeled “reload-report hot” (the `RefreshReport::hot`\n\
   partition in `settings.rs`); every other storable key reports cold.\n\n\
-The fourteen keys in `STORE_READ_KEYS`\n\
+The twenty-five keys in `STORE_READ_KEYS`\n\
 (`crates/core/tests/reference_docs.rs`) say “applied live by runtime refresh”\n\
 instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECONDS`,\n\
 `TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS` and `TWO_ANTI_NUKE_HEAT_THRESHOLD`\n\
@@ -65,7 +68,17 @@ instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECON
 `:238`); raid applies `TWO_RAID_JOIN_THRESHOLD` and `TWO_RAID_WINDOW_SECONDS`\n\
 (`crates/bot/src/raid_runtime.rs:45-46`, `:170`); onboarding merges its\n\
 `CONFIG_KEYS` from the snapshot on each relevant\n\
-event (`crates/bot/src/onboarding.rs:21-30`, `:175-182`). Every other\n\
+event (`crates/bot/src/onboarding.rs:21-30`, `:175-182`); message-path automod\n\
+applies its ten live lists, thresholds and the enforce flag from the snapshot\n\
+on every delivery (`crates/bot/src/automod_gateway.rs:192-203`, `:273`);\n\
+the feed poller applies `TWO_FEED_POLL_SECONDS` from the snapshot before\n\
+every tick (`crates/bot/src/feed_jobs.rs:232-259`). Two boot-only edges\n\
+remain: the feed supervisor still wakes on the boot cadence, so a stored\n\
+interval change takes effect no earlier than the previously scheduled slot\n\
+and runs at the stored value rounded up to a multiple of the boot cadence\n\
+(`crates/bot/src/feed_jobs.rs:227-244`), and the voice room-name policy is\n\
+built once at boot from the process environment\n\
+(`crates/bot/src/gateway.rs:1608`). Every other\n\
 storable row's stored value is unwired.\n\n\
 Gateway boot reads process environment only, through a fixed set of loaders:\n\
 `Config::from_env` (`DISCORD_TOKEN`, `DATABASE_URL`, `LISTEN_ADDR`, `GUILD_ID`),\n\
@@ -143,10 +156,12 @@ const BOOT_ENV: &[&str] = &[
 /// per-runtime store refreshes, not boot env or the reload-report path:
 /// containment (`containment_runtime.rs:61-67`, `:226`), join-risk
 /// (`join_risk_runtime.rs:66-70`, `:238`), raid (`raid_runtime.rs:45-46`,
-/// `:170`) and onboarding's per-event `CONFIG_KEYS` merge
-/// (`onboarding.rs:21-30`, `:175-182`). These rows say “applied live by
-/// runtime refresh” in the table below; every other storable key keeps the
-/// legacy `HOT_WIRED`/boot-env labels.
+/// `:170`), onboarding's per-event `CONFIG_KEYS` merge
+/// (`onboarding.rs:21-30`, `:175-182`), message-path automod's per-delivery
+/// live refresh (`automod_gateway.rs:192-203`, `:273`) and the feed poller's
+/// per-tick schedule gate (`feed_jobs.rs:232-259`). These rows say “applied
+/// live by runtime refresh” in the table below; every other storable key
+/// keeps the legacy `HOT_WIRED`/boot-env labels.
 const STORE_READ_KEYS: &[&str] = &[
     "TWO_ANTI_NUKE_WINDOW_SECONDS",
     "TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS",
@@ -162,6 +177,17 @@ const STORE_READ_KEYS: &[&str] = &[
     "DISCORD_ANCHOR_WELCOME_CHANNEL_ID",
     "DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID",
     "DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID",
+    "TWO_AUTOMOD_ALLOWED_DOMAINS",
+    "TWO_AUTOMOD_BAD_WORDS",
+    "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS",
+    "TWO_AUTOMOD_BYPASS_ROLE_IDS",
+    "TWO_AUTOMOD_ENFORCE",
+    "TWO_AUTOMOD_EXEMPT_CHANNEL_IDS",
+    "TWO_AUTOMOD_MENTION_LIMIT",
+    "TWO_AUTOMOD_REPEAT_COUNT",
+    "TWO_AUTOMOD_REPEAT_WINDOW_SECONDS",
+    "TWO_AUTOMOD_SANCTIONS",
+    "TWO_FEED_POLL_SECONDS",
 ];
 
 fn repository_root() -> PathBuf {

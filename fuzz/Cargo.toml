@@ -18,6 +18,7 @@ libfuzzer-sys = "=0.4.13"
 serde_json = { version = "1", features = ["preserve_order"] }
 two-bot-core = { version = "0.4.0", path = "../crates/core", default-features = false } # x-release-please-version
 two-bot-cutover = { version = "0.4.0", path = "../crates/cutover" } # x-release-please-version
+two-bot = { version = "0.4.0", path = "../crates/bot" } # x-release-please-version
 
 [[bin]]
 name = "internal_action"
@@ -78,6 +79,13 @@ bench = false
 [[bin]]
 name = "vote_kick"
 path = "fuzz_targets/vote_kick.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vote_kick_reason"
+path = "fuzz_targets/vote_kick_reason.rs"
 test = false
 doc = false
 bench = false
