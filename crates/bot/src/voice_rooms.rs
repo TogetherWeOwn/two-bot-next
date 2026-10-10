@@ -4879,6 +4879,10 @@ pub trait VoiceEventSink: Send + Sync {
     ) {
     }
     fn handle(&self, event: &Event, cache: &DefaultInMemoryCache);
+    /// One `PRESENCE_UPDATE` (`TWO_VOICE_PRESENCE`), fed at reception: it only
+    /// updates in-memory room-name facts, so it never reaches the serial
+    /// checkpoint writer.
+    fn presence(&self, _update: &twilight_model::gateway::payload::incoming::PresenceUpdate) {}
     /// Invalidate occupancy immediately on connection loss, including while an
     /// actor is awaiting SQL, HTTP or token-global rate-limit backoff.
     fn disconnect(&self);
@@ -5583,6 +5587,17 @@ where
             .command_identities
             .write()
             .expect("voice identity lock") = identities;
+    }
+
+    fn presence(&self, update: &twilight_model::gateway::payload::incoming::PresenceUpdate) {
+        if !self.enabled {
+            return;
+        }
+        self.presence_frame(
+            update.0.guild_id.get(),
+            presence::member_id(&update.0),
+            presence::facts(&update.0),
+        );
     }
 
     fn handle(&self, event: &Event, cache: &DefaultInMemoryCache) {

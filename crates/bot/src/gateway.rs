@@ -1069,6 +1069,18 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         };
                         received = Some(checkpoint.clone());
                         let mut dispatch = parsed.map(|parsed| Box::new(ReceivedDispatch { event: Event::from(parsed), observed_at, completion: None }));
+                        // Presence updates (TWO_VOICE_PRESENCE) only feed in-memory
+                        // voice-room name facts: no funnel, audit or durable effect.
+                        // They skip the serial checkpoint writer (one Postgres
+                        // transaction per dispatch); the next committed dispatch
+                        // carries the cursor past them and a RESUME replays them
+                        // idempotently. `received` already advanced, so no gap.
+                        if let Some(ReceivedDispatch { event: Event::PresenceUpdate(update), .. }) = dispatch.as_deref() {
+                            if let Some(voice) = voice.as_ref() {
+                                voice.presence(update);
+                            }
+                            continue;
+                        }
                         // Detached command ingress must not wait behind the
                         // serial funnel writer's REST/SQL latency. Main's
                         // command claims remain independent of this checkpoint.
