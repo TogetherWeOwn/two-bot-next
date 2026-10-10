@@ -42,8 +42,7 @@ JOB_INVENTORY = {
 # TOG-10893 registers the read-only sbom.yml calls alongside the benchmark one.
 REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pipeline-benchmark.yml",
                    ("check.yml", "supply-chain"): "./.github/workflows/sbom.yml",
-                   ("release.yml", "release-sbom"): "./.github/workflows/sbom.yml",
-                   ("deploy-production.yml", "release"): "./.github/workflows/release.yml"}
+                   ("release.yml", "release-sbom"): "./.github/workflows/sbom.yml"}
 # Main's runner routing (#265, 2026-10-02): the repo is public and the org's
 # self-hosted runner group refuses public repos, so every job routes through
 # one expression — public repo -> GitHub-hosted, private -> CI_OVERFLOW_* switch
@@ -1628,9 +1627,12 @@ class WorkflowTests(unittest.TestCase):
                         expected = {"contents": "read", "actions": "read"}
                     elif (name, job_id) == ("deploy-production.yml", "guard"):
                         expected = {"contents": "read", "actions": "read", "checks": "read"}
-                    elif (name, job_id) in (("release.yml", "tag"), ("deploy-production.yml", "release")):
+                    elif (name, job_id) == ("release.yml", "tag"):
                         # Tags the promoted commit and publishes its release.
                         expected = {"contents": "write"}
+                    elif (name, job_id) == ("deploy-production.yml", "release"):
+                        # Only dispatches release.yml for the deployed SHA.
+                        expected = {"actions": "write"}
                     elif (name, job_id) == ("release.yml", "attach-sbom"):
                         # TOG-10893: uploads verified SBOMs to the published tag.
                         expected = {"contents": "write"}

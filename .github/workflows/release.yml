@@ -1,22 +1,18 @@
 name: release
 
 # Release on production promote (replaces the release-please release PR).
-# deploy-production calls this after a successful production deploy with the
-# exact deployed SHA. The `tag` job tags that commit vX.Y.Z and publishes a
+# deploy-production dispatches this after a successful production deploy with
+# the exact deployed SHA, as its own run, so the deploy run (the production
+# rollback path) never waits for the tag + SBOM chain. The `tag` job tags that commit vX.Y.Z and publishes a
 # GitHub Release whose notes come from the Conventional Commit subjects since
 # the previous tag (.github/scripts/release-on-promote.cjs). Bump rules and
 # note sections stay in release-please-config.json, so versions continue the
 # existing tag line. No release PR: nothing new needs CI or review, nothing
 # goes stale, and main never needs a freeze (docs/releases.md).
-# Manual dispatch: `sha` repairs a missed release for a deployed commit;
-# `dry_run` / `release_tag` keep the SBOM dry-run and repair paths.
+# Dispatch inputs: `sha` tags and publishes a deployed commit (deploy-production,
+# or a manual repair); `dry_run` / `release_tag` keep the SBOM dry-run and
+# repair paths.
 on:
-  workflow_call:
-    inputs:
-      sha:
-        description: Deployed commit to tag
-        type: string
-        required: true
   workflow_dispatch:
     inputs:
       sha:

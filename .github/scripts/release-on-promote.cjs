@@ -8,6 +8,8 @@
 //
 // Bump rules and note sections are read from release-please-config.json (the
 // same keys release-please used), so versions continue the existing tag line.
+// `release-as` forces the next version (e.g. 1.0.0 for the production cutover)
+// while it is above the previous tag; once that tag exists it is ignored.
 //
 // Env: RELEASE_SHA (40-hex, must be on origin/main), GH_REPO, GH_TOKEN,
 // GITHUB_SERVER_URL, GITHUB_OUTPUT, DRY_RUN=true to print without publishing.
@@ -73,6 +75,7 @@ function loadOptions(path) {
     bumpMinorPreMajor: pkg['bump-minor-pre-major'] === true,
     bumpPatchForMinorPreMajor: pkg['bump-patch-for-minor-pre-major'] === true,
     sections: pkg['changelog-sections'] || [],
+    releaseAs: pkg['release-as'] ? parseTag(`v${pkg['release-as']}`) : null,
   };
 }
 
@@ -155,7 +158,9 @@ function main() {
     // missing GitHub Release.
     version = tagsAt.map(parseTag).sort((a, b) => compareVersions(b, a))[0];
   } else {
-    version = nextVersion(parseTag(prevTag), commits, opts);
+    const prev = parseTag(prevTag);
+    version = opts.releaseAs && compareVersions(opts.releaseAs, prev) > 0
+      ? opts.releaseAs : nextVersion(prev, commits, opts);
     const highest = git('tag', '--list', 'v*').split('\n').map(parseTag).filter(Boolean)
       .sort((a, b) => compareVersions(b, a))[0];
     if (highest && compareVersions(version, highest) <= 0) {
@@ -185,7 +190,7 @@ function main() {
   output({ tag_name: tag, released: 'true' });
 }
 
-module.exports = { parseCommit, parseTag, nextVersion, renderNotes, compareVersions };
+module.exports = { parseCommit, parseTag, nextVersion, renderNotes, compareVersions, loadOptions };
 
 if (require.main === module) {
   try {

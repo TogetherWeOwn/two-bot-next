@@ -71,7 +71,8 @@
           "section": "Style",
           "hidden": true
         }
-      ]
+      ],
+      "release-as": "1.0.0"
     }
   }
 }

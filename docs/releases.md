@@ -7,7 +7,10 @@ crates are not released separately.
 
 A release is cut by the production promote itself. When `deploy-production`
 deploys (mode `deploy`, not `rollback`) and its readiness gate passes, its
-`release` job calls `.github/workflows/release.yml` with the exact guarded SHA:
+`release` job dispatches `.github/workflows/release.yml` with the exact guarded
+SHA. That is a separate run, so the deploy run and its `deploy-production`
+concurrency group (the single production rollback path) end at the readiness
+gate and never wait for the tag + SBOM chain:
 
 1. The `tag` job runs `.github/scripts/release-on-promote.cjs`. It refuses a
    SHA that is not on `origin/main` and finds the previous `vX.Y.Z` tag
@@ -29,6 +32,11 @@ review to land.
 - Bump rules and note sections are read from `release-please-config.json`
   (`bump-minor-pre-major`, `bump-patch-for-minor-pre-major`,
   `changelog-sections`), so versions continue the existing tag line.
+- `release-as` in `release-please-config.json` forces the next version while it
+  is above the previous tag. It is `1.0.0`: production cutover happened on
+  2026-10-10 on the 0.4.0 line, so the next production promote cuts `v1.0.0`.
+  Once `v1.0.0` exists it is ignored and normal bumps resume (remove it in any
+  later PR).
 - Before `1.0.0`, `feat!` / `BREAKING CHANGE` and `feat` bump the minor version;
   everything else bumps the patch version. From `1.0.0` onward, breaking bumps
   major, `feat` bumps minor, anything else bumps patch. Production cutover stays
@@ -61,8 +69,8 @@ gh workflow run release.yml --ref main -f dry_run=true
 
 `scripts/test-release-on-promote.cjs` (worker CI) pins the parsing, the bump
 rules and the note rendering. It also dry-runs the script on a throwaway git
-repository: the version, the rollback guard, the off-main refusal and an invalid
-SHA. `scripts/ci/test_workflows.py` and `scripts/test-deploy-production.py` pin
+repository: the version, the rollback guard, `release-as`, the off-main refusal and an
+invalid SHA. `scripts/ci/test_workflows.py` and `scripts/test-deploy-production.py` pin
 the workflow shapes and the `contents: write` grant on the release jobs.
 
 The root `src/lib.rs` release-metadata library was added for release-please's

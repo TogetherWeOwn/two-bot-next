@@ -206,8 +206,6 @@ class StaticGuardTests(unittest.TestCase):
         # scripts/test-runner-routing.py pins the full expression (TOG-12339).
         self.assertEqual(list(JOBS), ["guard", "production", "release"])
         for name, job in JOBS.items():
-            if name == "release":
-                continue  # reusable call to release.yml; its jobs carry the routing
             runs_on = value(children(job[1:], 4)["runs-on"])
             self.assertTrue(runs_on.startswith("${{ fromJSON((!github.event.repository.private && "), name)
             self.assertIn(f"vars.CI_OVERFLOW_JOBS || '[]'), '{name}')", runs_on)
@@ -221,8 +219,15 @@ class StaticGuardTests(unittest.TestCase):
             }
             self.assertTrue(granted, name)
             if name == "release":
-                # Only the post-deploy release call writes: tag + GitHub Release.
-                self.assertEqual(granted, {"contents": "write"})
+                # Only dispatches release.yml: the tag + SBOM chain runs outside this run's
+                # deploy-production group, so a rollback never queues behind it.
+                self.assertEqual(granted, {"actions": "write"})
+                release = "\n".join(JOBS["release"])
+                self.assertIn("needs: [guard, production]", release)
+                self.assertIn("if: needs.guard.outputs.mode == 'deploy'", release)
+                self.assertIn('run: gh workflow run release.yml --ref main -f sha="$SHA"', release)
+                self.assertIn("SHA: ${{ needs.guard.outputs.sha }}", release)
+                self.assertNotIn("uses:", release)
                 continue
             self.assertEqual(set(granted.values()), {"read"}, name)
         self.assertEqual(
@@ -233,8 +238,6 @@ class StaticGuardTests(unittest.TestCase):
         uses = [line.split("uses:", 1)[1].strip() for line in LINES if "uses:" in line]
         self.assertTrue(uses)
         for ref in uses:
-            if ref.startswith("./.github/workflows/release.yml"):
-                continue  # same-repo reusable call, pinned to the checked-out commit
             self.assertRegex(ref, r"^[\w.-]+/[\w.-]+@[0-9a-f]{40}(\s|$)", ref)
         staging = {
             line.split("uses:", 1)[1].split()[0]
