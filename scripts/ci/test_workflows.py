@@ -17,7 +17,9 @@ JOB_INVENTORY = {
                   "community-db", "feeds-db", "tickets-postgres", "worker", "supply-chain", "ci-ok",
                   # `check` is now the lint lane; the test steps it used to
                   # carry run in these three parallel lanes, all gated by ci-ok.
-                  "rust-tests", "ignored-db-stores", "ignored-db-runtime"},
+                  "rust-tests", "ignored-db-stores", "ignored-db-runtime",
+                  # Compile-only libFuzzer build, gated by ci-ok like the Rust lanes.
+                  "fuzz-compile"},
     "deploy-production.yml": {"guard", "production"},
     "deploy-staging.yml": {"deploy"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
@@ -1349,10 +1351,17 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(set(installers), {
             "check", "rust-tests", "ignored-db-stores", "ignored-db-runtime",
             "moderation-db", "self-role-store", "community-db", "tickets-postgres", "feeds-db",
+            "fuzz-compile",
         })
         for job_id, steps in installers.items():
             with self.subTest(job=job_id):
                 self.assertEqual(len(steps), 1)
+                if job_id == "fuzz-compile":
+                    # libFuzzer needs nightly; pinned date, not floating stable.
+                    self.assertEqual(steps[0].get("with", {}).get("toolchain"), "nightly-2026-10-01")
+                    self.assertEqual(set(steps[0]["with"]["components"].replace(" ", "").split(",")),
+                                     {"rust-src"})
+                    continue
                 # Floating stable can install a different fmt/clippy than Cargo
                 # selects from the repository pin inside the job container.
                 self.assertEqual(steps[0].get("with", {}).get("toolchain"), channel)

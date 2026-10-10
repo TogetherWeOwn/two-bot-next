@@ -474,7 +474,8 @@ class WorkflowSurfaceTests(unittest.TestCase):
     def test_consumer_jobs_wait_on_selector(self):
         for job in ("check", "rust-tests", "ignored-db-stores",
                     "ignored-db-runtime", "community-db", "feeds-db",
-                    "tickets-postgres", "worker", "supply-chain", "ci-ok"):
+                    "tickets-postgres", "worker", "supply-chain", "ci-ok",
+                    "fuzz-compile"):
             head = self.text.split(f"\n  {job}:")[1].split("steps:", 1)[0]
             with self.subTest(job=job):
                 self.assertIn("job-inputs", head)
@@ -505,10 +506,11 @@ class WorkflowSurfaceTests(unittest.TestCase):
         for job in ("job-inputs", "container-inputs", "supply-chain", "check", "rust-tests",
                     "ignored-db-stores", "ignored-db-runtime", "worker",
                     "parity-docs", "self-role-store", "community-db",
-                    "feeds-db", "tickets-postgres", "moderation-db"):
+                    "feeds-db", "tickets-postgres", "moderation-db", "fuzz-compile"):
             self.assertIn(job, head)
         body = self.text.split("\n  ci-ok:")[1]
         self.assertIn("SUPPLY_SELECTED", body)
+        self.assertIn("FUZZ_COMPILE_RESULT", body)
         self.assertIn("ci-ok passed", body)
 
     def test_weekly_full_run_schedule_exists(self):
@@ -621,6 +623,16 @@ class WorkflowSurfaceTests(unittest.TestCase):
                     self.assertNotRegex(
                         body, r"(?m)^\s+if:.*outputs\.rust",
                         f"{name!r}: the lane is already gated at the job level")
+
+    def test_fuzz_compile_lane_skips_at_the_job_level(self):
+        # Compile-only libFuzzer lane follows the same rust selector as the
+        # test lanes; ci-ok only accepts its skip when rust was deselected.
+        head = self.job_text(self.text, "fuzz-compile").split("\n    steps:\n", 1)[0]
+        self.assertIn(f"\n    {self.LANE_GUARD}\n", head)
+        self.assertIn("job-inputs", head)
+        body = self.job_text(self.text, "fuzz-compile")
+        self.assertIn("cargo fuzz build", body)
+        self.assertNotIn("cargo fuzz run", body)
 
     def test_guard_scan_flags_an_unguarded_db_step(self):
         # Self-test of the scan: dropping the guard on a step that needs the
