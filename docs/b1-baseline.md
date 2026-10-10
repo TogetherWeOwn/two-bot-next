@@ -147,15 +147,18 @@ Applying that historical binary calibration: 10.30 * 1.4 = 14.42 -> 15 MiB.
 Docker is not available in the controller workspace; offline fixture sizes are
 not measurements.
 
-The 2026-10-10 voice template-naming head measured 15,712,080 bytes
-(14.98 MiB) in its [container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/38066321077/job/114254613820),
-16,560 bytes below the prior 15 MiB ceiling. A later event-executors head
+On 2026-10-10, the main binary measured 15,712,080 bytes (14.98 MiB), leaving
+about 16 KiB under the 15 MiB guard. The RSVP bound-admissions slice (PR #709)
+measured 15,734,960 bytes (15.01 MiB) with no new dependencies; the x1.4 rule
+would yield 22 MiB, but the budget was set to 16 MiB instead to retain a useful
+tripwire without wedging ordinary code changes. A later event-executors head
 measured 15,770,928 bytes (15.04 MiB) in the [container smoke job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/38062362788/job/114254309361),
-42,288 bytes above that ceiling. Main sets the binary budget to 16 MiB as a
-working tripwire with room for queued reconcile tooling, leaving 1,006,288
-bytes (0.96 MiB, 6.4%) of headroom. No new dependencies or release-profile
-changes; revisit if the binary approaches the limit. The 112 MiB image ceiling
-is unchanged.
+42,288 bytes above the former ceiling. The internal-actions families (event
+executors plus channel-moderation union) measured 15,741,344 bytes (15.01 MiB).
+The 16 MiB working tripwire leaves 1,006,288 bytes (0.96 MiB, 6.4%) above the
+event-executors measurement. No new dependencies or release-profile changes;
+revisit if the binary approaches the limit. The 112 MiB image ceiling is
+unchanged.
 
 ### Docker history image measurement and immutable-ID pinning
 

@@ -512,11 +512,11 @@ other mode's binding, and an absent binding refuses before any connection.
 Invocation (secret-free; each URL comes only from its existing binding):
 
 ```text
-staging-migrate --plan --source-sha <40hex> --staging-host <host> \
+staging-migrate --target staging --plan --source-sha <40hex> --staging-host <host> \
   --staging-database <db> [--staging-branch-id <branch>] \
   --recovery-evidence-ref <ref> --acl-plan-ref <ref> \
   [--expected-pending <ascending,comma-separated versions>]
-staging-migrate --apply <same flags> --expected-pending <list> \
+staging-migrate --target staging --apply <same flags> --expected-pending <list> \
   --plan-manifest-sha256 <64hex> --plan-run-id <run id> \
   --plan-manifest-path <producing run's downloaded manifest>
 ```
@@ -635,6 +635,60 @@ pre-split runner, which looks for `TWO_BOT_STAGING_MIGRATOR_DATABASE_URL`; the
 `plan` job never exports that binding, so the old runner refuses before any
 connection (fail closed). Dispatch plan and apply with a `source_sha` at or
 after the split.
+
+### Production migration runner
+
+`.github/workflows/production-migrate.yml` (manual, production-only) is the
+exact mirror of the staging runner for post-cutover releases that carry a new
+migration. It runs the same `staging-migrate` binary with
+`--target production` from `crates/cutover/src/bin/staging_migrate.rs`, embeds
+the same crate migrations through SQLx **0.9.0**, keeps the same ledger and
+`SET ROLE` behavior, and keeps every staging refusal (pooler, `SET ROLE`
+membership, `expected_pending`, manifest hash, `plan_run_id` provenance).
+Invocation (secret-free; each URL comes only from its existing binding):
+
+```text
+staging-migrate --target production --plan --source-sha <40hex> \
+  --production-host <host> --production-database <db> \
+  --recovery-evidence-ref <ref> --acl-plan-ref <ref> \
+  [--expected-pending <ascending,comma-separated versions>]
+staging-migrate --target production --apply <same flags> --expected-pending <list> \
+  --plan-manifest-sha256 <64hex> --plan-run-id <run id> \
+  --plan-manifest-path <producing run's downloaded manifest>
+```
+
+`--target` is explicit with no default: a run without it refuses, a staging
+run never reads a production pin or binding, and a production run never reads
+a staging pin or binding. Production reads only
+`TWO_BOT_PRODUCTION_PLAN_DATABASE_URL` (plan, read-only
+`two_bot_migrator_ro`) and `TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL` (apply,
+`two_bot_migrator`); staging keeps its own pair. The production target drops
+the `prod`-substring refusal (the production host and `two_bot` database are
+production-like by construction) and instead refuses any staging host pin
+(fixture hosts, any `staging` label, any Neon endpoint) at both validation and
+the binding-host check, so a mistaken production pin aimed at staging still
+fails closed before any DDL. The binding-host check additionally refuses any
+non-`5432` port and any pooled (`|…`) login on production, so a binding
+copied from the app's pooled connection string still fails closed (pooler
+`SET ROLE` and the migrator lock need the direct endpoint). The manifest carries `migration_target`
+(`staging` or `production`); the claim publisher requires the matching value.
+
+The workflow mirrors the staging shape with the `production-migrate-` prefix:
+three jobs (`plan`, `claim`, `apply`), environments
+`production-migrate-plan` (no reviewer, plan only) and
+`production-migrate-apply` (required reviewer, main-only), the same pinned
+actions, routed runner, pipefail shell, and artifact names
+(`production-migrate-manifest`, `production-migrate-apply-claim`, 14-day
+retention, stored ZIP entries). The `claim` job runs
+`scripts/ci/production_migrate_claim.py`, which binds the same projection hash
+but requires the production workflow path, environment, and
+`PRODUCTION_HOST`/`PRODUCTION_DATABASE` pins. The production target takes no
+branch pin yet, so a production dispatch refuses
+closed (exit 2) until the production branch-pin follow-up lands; the
+production path is unavailable until then. Both environments
+and both secrets must exist before dispatch; the host provisions them after
+this change merges. The cutover itself does not need this path: the fresh
+`two_bot` bootstrap uses the tested provisioner flow.
 
 ### Redeploy the approved revision
 
