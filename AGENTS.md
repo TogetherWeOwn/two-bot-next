@@ -11,7 +11,7 @@ tested and reviewable.
 
 1. [`CONTRIBUTING.md`](CONTRIBUTING.md): commits, releases, local checks and database tests.
 2. [`README.md`](README.md): architecture, status and operator references.
-3. [`.github/pull_request_template.md`](.github/pull_request_template.md): the seven sections every PR fills in.
+3. [`.github/pull_request_template.md`](.github/pull_request_template.md): the PR body; Linked Issues and Verification are required, the rest is optional.
 4. [`SECURITY.md`](SECURITY.md): private vulnerability reporting and secret handling.
 
 ## Pull request contract
@@ -29,9 +29,8 @@ tested and reviewable.
 - Keep references public-safe. Put no secret, token, private URL or internal
   tracker ID (`TOG-`, `PAP-`) in any title, body, commit, comment or branch name.
   Link public GitHub issues as `Closes #123`.
-- Disclose the model and the tests honestly. Name the exact model ID in Model
-  Used, or write "None — human-authored". Report only runs you saw. Say what you
-  did not run.
+- Disclose the tests honestly in Verification. Report only runs you saw. Say what
+  you did not run.
 - Address every review finding, or reply with why it does not apply.
 - Credit the contributors whose work you build on.
 - Done means merged. Do not leave an orphan PR open: merge it, or close it with a

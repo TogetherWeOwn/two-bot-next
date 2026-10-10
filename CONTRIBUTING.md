@@ -42,8 +42,8 @@ and force-pushes. `ci-ok`, `gitleaks` and `pr-lint` are required checks on `main
 `ci-ok` runs from `check.yml`; the other two run from `supply-chain.yml`.
 `pr-lint` runs `.github/scripts/pr_standards.py` (tests beside it): it checks
 the title format, the 100-character limit, the trailing period and a non-empty
-body as errors, and the template sections, duplicate search and internal
-references in warn mode (`PR_STANDARDS_MODE: "warn"`). On a push to `main` it
+body as errors, and the two required template sections (Linked Issues and
+Verification) and internal references in warn mode (`PR_STANDARDS_MODE: "warn"`). On a push to `main` it
 also checks every commit subject. All required checks must be green on the
 exact head commit. Never bypass or weaken a check.
 
