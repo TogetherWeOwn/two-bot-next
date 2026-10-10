@@ -59,8 +59,9 @@ fn community_jobs_have_no_discord_write_path() {
 /// Rank self-healing exception to the pin above: the rank tick is the one website job
 /// with a Discord write path (the ladder self-heal grants missing lower rungs
 /// and reads the bot hierarchy first). This pins the exception instead: exactly
-/// the two heal verbs, nothing else, and the heal sits behind the
-/// live-identity fence.
+/// the two heal verbs, nothing else, and the heal delegates to the tested
+/// `BootActivation::rank_heal_permitted` helper, which is the single place
+/// that may name `LiveCapability::RankHeal`.
 #[test]
 fn rank_heal_is_the_only_fenced_discord_write_path() {
     const HEAL_VERBS: [&str; 2] = [".set_", ".member_role_ids"];
@@ -81,7 +82,16 @@ fn rank_heal_is_the_only_fenced_discord_write_path() {
         );
     }
     assert!(
-        source.contains("LiveCapability::RankHeal"),
+        source.contains("rank_heal_permitted"),
+        "rank self-heal grants must sit behind the live-identity fence via rank_heal_permitted"
+    );
+    assert!(
+        !source.contains("LiveCapability::"),
+        "website_jobs.rs must delegate the fence to BootActivation::rank_heal_permitted instead of naming a LiveCapability directly"
+    );
+    let activation = include_str!("activation.rs");
+    assert!(
+        activation.contains("LiveCapability::RankHeal"),
         "rank self-heal grants must sit behind the live-identity fence"
     );
 }
