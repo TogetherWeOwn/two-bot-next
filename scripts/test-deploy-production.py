@@ -97,6 +97,7 @@ TOP = children(LINES, 0)
 JOBS = children(TOP["jobs"][1:], 2)
 GUARD = inline_script(GUARD_STEP)
 RECORD = inline_script("Record the Worker version and SHA")
+CONFIRM = inline_script("Confirm the taken-over version still serves")
 URL_CHECK = inline_script("Require a production Worker URL distinct from staging")
 RENDER = inline_script(RENDER_STEP)
 GATE = inline_script(GATE_STEP)
@@ -172,6 +173,11 @@ class StaticGuardTests(unittest.TestCase):
         inputs = children(children(triggers["workflow_dispatch"][1:], 4)["inputs"][1:], 6)
         self.assertEqual(value(children(inputs["sha"][1:], 8)["required"]), "true")
         self.assertEqual(value(children(inputs["rollback"][1:], 8)["required"]), "false")
+        # The takeover flag is opt-in: a routine deploy leaves the fence held.
+        takeover = children(inputs["takeover"][1:], 8)
+        self.assertEqual(value(takeover["required"]), "false")
+        self.assertEqual(value(takeover["type"]), "boolean")
+        self.assertEqual(value(takeover["default"]), "false")
         text = "\n".join(TOP["on"])
         for trigger in ("push", "pull_request", "pull_request_target", "schedule", "workflow_run", "workflow_call"):
             self.assertNotRegex(text, rf"(?m)^\s*{trigger}:", trigger)
@@ -184,7 +190,8 @@ class StaticGuardTests(unittest.TestCase):
         self.assertNotIn("environment", guard)
         self.assertNotIn("secrets.", "\n".join(JOBS["guard"]))
         wrangler = [s for s in steps(JOBS["production"]) if WRANGLER_ACTION in "\n".join(s)]
-        self.assertEqual(len(wrangler), 4)
+        # Deploy/rollback, the before/after version reads, and the post-takeover re-read.
+        self.assertEqual(len(wrangler), 5)
         for step in wrangler:
             self.assertIn("          environment: production", step)
 
@@ -242,7 +249,8 @@ class StaticGuardTests(unittest.TestCase):
         # Raw inputs reach only the guard step's env; everything downstream
         # reads the guard's validated outputs.
         input_lines = [line.strip() for line in LINES if "inputs." in line]
-        self.assertEqual(input_lines, ["SHA: ${{ inputs.sha }}", "ROLLBACK: ${{ inputs.rollback }}"])
+        self.assertEqual(input_lines, ["SHA: ${{ inputs.sha }}", "ROLLBACK: ${{ inputs.rollback }}",
+                                       "TAKEOVER: ${{ inputs.takeover }}"])
         production = "\n".join(JOBS["production"])
         self.assertNotIn("inputs.", production)
         self.assertIn("ref: ${{ needs.guard.outputs.sha }}", production)
@@ -292,9 +300,41 @@ class StaticGuardTests(unittest.TestCase):
             self.assertNotIn("secrets.", text)
             self.assertNotIn("token", text.lower())
 
+    def test_takeover_steps_run_only_when_requested_with_production_bindings(self):
+        names = [step[0].strip() for step in steps(JOBS["production"])]
+        preflight = "- name: Require production ownership-control configuration"
+        status = "- name: Read production ownership state without starting"
+        takeover = "- name: Take over production ownership at the read epoch"
+        reread = "- name: Re-read the active production version after takeover"
+        confirm = "- name: Confirm the taken-over version still serves"
+        for name in (preflight, status, takeover, reread, confirm):
+            self.assertIn(name, names)
+        by_name = {step[0].strip(): step for step in steps(JOBS["production"])}
+        for name in (preflight, status, takeover, reread, confirm):
+            conditions = [line.strip() for line in by_name[name] if line.strip().startswith("if:")]
+            self.assertEqual(conditions, ["if: env.TAKEOVER == 'true'"], name)
+        text = "\n".join(sum((by_name[name] for name in (preflight, status, takeover)), []))
+        # Production bindings only: the control token comes from the
+        # production Environment secret, the URL from its variable.
+        self.assertIn("OWNERSHIP_CONTROL_TOKEN: ${{ secrets.PRODUCTION_OWNERSHIP_CONTROL_TOKEN }}", text)
+        self.assertIn("PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}", text)
+        self.assertIn("STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}", text)
+        self.assertNotIn("STAGING_OWNERSHIP_CONTROL_TOKEN", text)
+        self.assertIn("node scripts/production-ownership-control.mjs preflight", text)
+        self.assertIn("node scripts/production-ownership-control.mjs status", text)
+        self.assertIn('node scripts/production-ownership-control.mjs takeover "$epoch"', text)
+        # The takeover posts exactly the P2 epoch with an explicit release and
+        # a run-derived audit actor naming the guarded SHA, never GITHUB_SHA.
+        self.assertIn('OWNERSHIP_RELEASE_FENCE: "true"', text)
+        self.assertIn("OWNERSHIP_ACTOR: github-actions:${{ github.run_id }}:${{ needs.guard.outputs.sha }}", text)
+        self.assertIn("OWNERSHIP_EXPECTED_DEPLOYMENT: ${{ env.NEW_VERSION }}", text)
+        production = "\n".join(JOBS["production"])
+        self.assertNotIn("inputs.takeover", production)
+        self.assertIn("TAKEOVER: ${{ needs.guard.outputs.takeover }}", production)
+
 
 class GuardBehaviourTests(unittest.TestCase):
-    def guard(self, sha=SHA, rollback="", ref="refs/heads/main", auto="", **responses):
+    def guard(self, sha=SHA, rollback="", takeover="false", ref="refs/heads/main", auto="", **responses):
         api = {**green(), **responses}
         calls = []
 
@@ -356,7 +396,7 @@ class GuardBehaviourTests(unittest.TestCase):
             output, summary = Path(tmp) / "output", Path(tmp) / "summary"
             env = {
                 "GITHUB_REPOSITORY": REPO, "GITHUB_REF": ref, "SHA": sha, "ROLLBACK": rollback,
-                "AUTO_APPROVE": auto,
+                "TAKEOVER": takeover, "AUTO_APPROVE": auto,
                 "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary),
             }
             stdout, code = io.StringIO(), 0
@@ -382,7 +422,8 @@ class GuardBehaviourTests(unittest.TestCase):
     def test_green_main_sha_passes_and_reports(self):
         code, outputs, summary, calls, _ = self.guard()
         self.assertEqual(code, 0)
-        self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": ""})
+        self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "takeover": "false"})
+        self.assertIn("Takeover: not requested", summary)
         self.assertIn(SHA, summary)
         self.assertIn("full `ci-ok` verdict", summary)
         self.assertIn("green ci-ok", "\n".join(TOP["on"]))
@@ -411,8 +452,19 @@ class GuardBehaviourTests(unittest.TestCase):
                 self.assertEqual(result[3], [])
         code, outputs, summary, _, _ = self.guard(rollback=VERSION.upper())
         self.assertEqual(code, 0)
-        self.assertEqual(outputs, {"sha": SHA, "mode": "rollback", "version": VERSION})
+        self.assertEqual(outputs, {"sha": SHA, "mode": "rollback", "version": VERSION, "takeover": "false"})
         self.assertIn(VERSION, summary)
+
+    def test_takeover_flag_is_validated_before_any_api_call(self):
+        for flag in ("", "yes", "True", "1", " true", "takeover"):
+            with self.subTest(flag=flag):
+                result = self.guard(takeover=flag)
+                self.assertRefused(result, "takeover must be true or false")
+                self.assertEqual(result[3], [])
+        code, outputs, summary, _, _ = self.guard(takeover="true")
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs["takeover"], "true")
+        self.assertIn("Takeover: requested", summary)
 
     def test_dispatch_from_another_ref_is_refused(self):
         for ref in ("refs/heads/feature", "refs/tags/v1", "refs/heads/main2", ""):
@@ -639,7 +691,7 @@ class GuardBehaviourTests(unittest.TestCase):
         environment = {**green()["environment"], "protection_rules": [{"type": "branch_policy"}]}
         code, outputs, summary, calls, _ = self.guard(auto="true", environment=environment)
         self.assertEqual(code, 0)
-        self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": ""})
+        self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "takeover": "false"})
         self.assertIn("Approval: automated", summary)
         self.assertIn("deploy-staging run `501`", summary)
         self.assertTrue(any(path.endswith("deploy-staging.yml/runs") and "status" not in q for path, q in calls))
@@ -694,12 +746,14 @@ def deployment(*versions):
 
 
 class RecordStepTests(unittest.TestCase):
-    def record(self, mode="deploy", before="", after="", target=""):
+    def record(self, mode="deploy", before="", after="", target="", takeover="false"):
         with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
             summary = Path(tmp) / "summary"
+            github_env = Path(tmp) / "github_env"
             env = {
-                "SHA": SHA, "MODE": mode, "TARGET_VERSION": target, "BEFORE": before, "AFTER": after,
-                "GITHUB_STEP_SUMMARY": str(summary),
+                "SHA": SHA, "MODE": mode, "TARGET_VERSION": target, "TAKEOVER": takeover,
+                "BEFORE": before, "AFTER": after,
+                "GITHUB_STEP_SUMMARY": str(summary), "GITHUB_ENV": str(github_env),
             }
             stdout, code = io.StringIO(), 0
             with patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(stdout):
@@ -709,10 +763,14 @@ class RecordStepTests(unittest.TestCase):
                     code = exit_.code
             text = summary.read_text()
             self.assertNotIn("deployer@example.com", text + stdout.getvalue())
-            return code, text
+            exported = dict(
+                line.split("=", 1) for line in
+                (github_env.read_text().splitlines() if github_env.exists() else [])
+            )
+            return code, text, exported
 
     def test_deploy_records_sha_new_version_and_rollback_target(self):
-        code, summary = self.record(
+        code, summary, exported = self.record(
             before=deployment((OLD_VERSION, 100)), after=f"⛅️ wrangler 4\n{deployment((VERSION, 100))}\n"
         )
         self.assertEqual(code, 0)
@@ -720,9 +778,10 @@ class RecordStepTests(unittest.TestCase):
         self.assertIn(f"now active: `{VERSION}` (100%)", summary)
         self.assertIn(f"Previously active: `{OLD_VERSION}` (100%)", summary)
         self.assertIn(f"`rollback={OLD_VERSION}`", summary)
+        self.assertEqual(exported, {})
 
     def test_first_deploy_has_no_previous_version(self):
-        code, summary = self.record(before="", after=deployment((VERSION, 100)))
+        code, summary, _ = self.record(before="", after=deployment((VERSION, 100)))
         self.assertEqual(code, 0)
         self.assertIn("Previously active: none", summary)
         self.assertNotIn("rollback=", summary)
@@ -734,7 +793,7 @@ class RecordStepTests(unittest.TestCase):
     def test_unreadable_new_version_fails_but_still_records(self):
         for after in ("", "X [ERROR] Authentication error", "{not json}", json.dumps({"versions": "?"})):
             with self.subTest(after=after):
-                code, summary = self.record(before=deployment((OLD_VERSION, 100)), after=after)
+                code, summary, _ = self.record(before=deployment((OLD_VERSION, 100)), after=after)
                 self.assertEqual(code, 1)
                 self.assertIn(f"`rollback={OLD_VERSION}`", summary)
 
@@ -744,6 +803,53 @@ class RecordStepTests(unittest.TestCase):
         self.assertEqual(self.record("rollback", before, before, VERSION)[0], 1)
         split = deployment((VERSION, 50), (OLD_VERSION, 50))
         self.assertEqual(self.record("rollback", before, split, VERSION)[0], 1)
+
+    def test_takeover_exports_the_single_serving_version(self):
+        code, _, exported = self.record(
+            before=deployment((OLD_VERSION, 100)), after=deployment((VERSION, 100)),
+            takeover="true",
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(exported, {"NEW_VERSION": VERSION})
+
+    def test_takeover_refuses_without_one_version_at_full_traffic(self):
+        split = deployment((VERSION, 50), (OLD_VERSION, 50))
+        for after in ("", split):
+            with self.subTest(after=after[:40]):
+                code, _, exported = self.record(
+                    before=deployment((OLD_VERSION, 100)), after=after, takeover="true")
+                self.assertEqual(code, 1)
+                self.assertEqual(exported, {})
+
+
+class ConfirmStepTests(unittest.TestCase):
+    def confirm(self, reread="", new_version=VERSION):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
+            summary = Path(tmp) / "summary"
+            env = {"REREAD": reread, "NEW_VERSION": new_version,
+                   "GITHUB_STEP_SUMMARY": str(summary)}
+            stdout, code = io.StringIO(), 0
+            with patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(stdout):
+                try:
+                    exec(CONFIRM, {})
+                except SystemExit as exit_:
+                    code = exit_.code
+            return code, summary.read_text() if summary.exists() else ""
+
+    def test_matching_version_confirms(self):
+        code, summary = self.confirm(reread=f"noise\n{deployment((VERSION, 100))}\n")
+        self.assertEqual(code, 0)
+        self.assertIn(f"Takeover confirmed: `{VERSION}` still serves 100%", summary)
+
+    def test_anything_else_fails_closed(self):
+        split = deployment((VERSION, 50), (OLD_VERSION, 50))
+        for reread, new_version in (
+            ("", VERSION), ("not json", VERSION), (deployment((OLD_VERSION, 100)), VERSION),
+            (split, VERSION), (deployment((VERSION, 100)), ""), (deployment((VERSION, 100)), OLD_VERSION),
+        ):
+            with self.subTest(reread=reread[:30], new_version=new_version):
+                code, _ = self.confirm(reread=reread, new_version=new_version)
+                self.assertEqual(code, 1)
 
 
 class ScriptedWorker:
