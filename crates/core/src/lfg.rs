@@ -1251,4 +1251,346 @@ mod tests {
         assert_eq!(LfgStatus::from_stored("archived"), None);
         assert_eq!(LfgStatus::Open.as_str(), "open");
     }
+
+    /// Gate M4.36 hostile matrix, shared from #718 (vote-kick #692 matrix) so
+    /// LFG proves the same inputs: mass mentions (plain and zero-width-split),
+    /// user/role/channel/emoji pills, links (scheme, www, bare domain,
+    /// invite), markdown and multiline block markup. Overlong payloads are
+    /// driven separately below (title >100, label >80 refuse with fixed
+    /// text).
+    const HOSTILE_LFG_TITLES_AND_LABELS: &[&str] = &[
+        "@everyone get in here",
+        "@here vote yes",
+        "@\u{200b}everyone split obfuscation",
+        "@\u{200c}here split obfuscation",
+        "<@&7654321> role pill",
+        "<@987654321> user pill",
+        "<#123456789> channel pill",
+        "<:custom:123456789> emoji pill",
+        "<a:dance:123456789> animated emoji pill",
+        "see https://evil.example/phish for proof",
+        "see http://evil.example/phish for proof",
+        "see HTTPS://evil.example/phish for proof",
+        "[click here](https://evil.example/phish)",
+        "www.evil.example/phish",
+        "WWW.EVIL.EXAMPLE/PHISH",
+        "Www.evil.example/phish",
+        "join discord.gg/abc123 for backup",
+        "join DISCORD.GG/ABC123 for backup",
+        "visit evil.com/phish for proof",
+        "visit EVIL.COM/PHISH for proof",
+        "**BAN THEM** __now__ ~~please~~ `code` ||spoiler||",
+        "# heading\n> quote\n```fence```\n- list\nmultiline",
+    ];
+
+    /// Hostile snowflakes from the matrix above; none equals a test ID used
+    /// in this module (`sample_post` guild/channel/message IDs).
+    const HOSTILE_LFG_IDS: &[&str] = &["7654321", "987654321", "123456789"];
+
+    /// Hostile-derived echo probes shared with #718: only substrings actually
+    /// present in the hostile input are asserted. Bare `<@` / `<#` / `<:`
+    /// prefixes are deliberately NOT probed: board content legitimately
+    /// renders `<@user>` signup mentions, so a bare prefix cannot distinguish
+    /// an echo from the fixed member format. Mention-pill inputs are pinned
+    /// by their hostile-specific snowflake instead.
+    fn assert_no_lfg_echo(hostile: &str, rendered: &str, where_: &str) {
+        const PROBES: &[&str] = &[
+            "@everyone",
+            "@here",
+            "<@",
+            "<#",
+            "<:",
+            "://",
+            "www.",
+            "discord.gg",
+            ".gg/",
+            ".com/",
+            "**",
+            "__",
+            "~~",
+            "||",
+        ];
+        let folded_rendered = rendered.to_lowercase();
+        let folded_hostile = hostile.to_lowercase();
+        for probe in PROBES {
+            if matches!(*probe, "<@" | "<#" | "<:") {
+                continue;
+            }
+            if !folded_hostile.contains(*probe) {
+                continue;
+            }
+            assert!(
+                !folded_rendered.contains(*probe),
+                "{hostile:?} probe {probe:?} in {where_}: {rendered:?}"
+            );
+        }
+        for needle in HOSTILE_LFG_IDS {
+            if hostile.contains(*needle) {
+                assert!(
+                    !rendered.contains(*needle),
+                    "{hostile:?} id {needle:?} echoed in {where_}: {rendered:?}"
+                );
+            }
+        }
+    }
+
+    /// Gate M4.36 board-render half: hostile titles and labels render
+    /// mention-safe and bounded. `lfg_content` goes through
+    /// `message_safety::content` (mass-mention neutralization + 2000
+    /// UTF-16 cap); links, markdown and pills are preserved by design, so
+    /// only mass mentions are asserted absent here. Full no-echo proof for
+    /// refusal/error paths lives in
+    /// `hostile_titles_and_labels_never_echo_in_refusals_errors_or_logs`.
+    #[test]
+    fn hostile_titles_and_labels_render_mention_safe_and_bounded() {
+        use crate::message_safety::{contains_mass_mention, text_len, CONTENT_LIMIT};
+        for hostile in HOSTILE_LFG_TITLES_AND_LABELS.iter().copied() {
+            if let Ok(title) = validate_title(hostile) {
+                let mut post = sample_post(LfgStatus::Open);
+                post.title = title;
+                let content = lfg_content(&post, &sample_roles(), &[]);
+                assert!(
+                    !content.contains("@everyone"),
+                    "{hostile:?} mass mention in board content: {content:?}"
+                );
+                assert!(
+                    !content.contains("@here"),
+                    "{hostile:?} mass mention in board content: {content:?}"
+                );
+                assert!(
+                    !contains_mass_mention(&content),
+                    "{hostile:?} obfuscated mention survives: {content:?}"
+                );
+                assert!(
+                    text_len(&content) <= CONTENT_LIMIT,
+                    "{hostile:?} board content over the bound"
+                );
+            }
+            match parse_role_spec(&format!("tank:{hostile}:2")) {
+                Ok(parsed) => {
+                    let roles = spec_roles("lfg-proof", &parsed);
+                    let content = lfg_content(&sample_post(LfgStatus::Open), &roles, &[]);
+                    assert!(
+                        !content.contains("@everyone"),
+                        "{hostile:?} label mention in board content: {content:?}"
+                    );
+                    assert!(
+                        !content.contains("@here"),
+                        "{hostile:?} label mention in board content: {content:?}"
+                    );
+                    assert!(
+                        !contains_mass_mention(&content),
+                        "{hostile:?} label obfuscation survives: {content:?}"
+                    );
+                    assert!(
+                        text_len(&content) <= CONTENT_LIMIT,
+                        "{hostile:?} label board content over the bound"
+                    );
+                    // Select option labels are Discord plain-text entries (no
+                    // mention parsing); the mention-safe surface is
+                    // `lfg_content` via `message_safety::content`. Options
+                    // must stay within the legacy 100 UTF-16 cap without
+                    // panicking on hostile Unicode.
+                    for option in lfg_select_options(LfgStatus::Open, &roles, &[]) {
+                        assert!(
+                            option.label.encode_utf16().count() <= MAX_OPTION_LABEL_CHARS,
+                            "{hostile:?} option label over the bound: {option:?}"
+                        );
+                    }
+                }
+                Err(err) => {
+                    assert!(
+                        !err.to_string().contains(hostile),
+                        "{hostile:?} label echoed in refusal: {err:?}"
+                    );
+                }
+            }
+        }
+        // Overlong hostile titles/labels refuse with fixed text, never echo.
+        for hostile in [
+            format!("@everyone {}", "x".repeat(200)),
+            "x".repeat(600),
+            format!("**{}**", "x".repeat(600)),
+        ] {
+            assert_eq!(validate_title(&hostile), Err(TitleError::BadTitle));
+            assert!(
+                !TitleError::BadTitle.to_string().contains(&hostile),
+                "overlong title echoed"
+            );
+        }
+        for label in ["y".repeat(81), "y".repeat(600)] {
+            assert_eq!(
+                parse_role_spec(&format!("tank:{label}:2")),
+                Err(RoleSpecError::BadLabel)
+            );
+            assert!(
+                !RoleSpecError::BadLabel.to_string().contains(&label),
+                "overlong label echoed"
+            );
+        }
+    }
+
+    /// Gate M4.36 refusal/error/log/audit half: every LFG refusal is a fixed
+    /// acknowledgement that never interpolates title/label text, so hostile
+    /// input cannot leak through an error, log or audit path. The length
+    /// assertions pin full coverage: a new refusal variant or audit outcome
+    /// breaks them until it is listed here too. Log safety holds by
+    /// construction (no `tracing`/`log` calls in `lfg`, `lfg_store` or the
+    /// LFG interaction handlers carry title/label values) and every
+    /// `Display` below is fixed, so even a logged error line carries no
+    /// hostile text. Key-echoing variants (`BadKey`, `ReservedKey`,
+    /// `DuplicateKey`) echo only normalized keys under the #694 bound and
+    /// are out of scope for titles/labels: this test drives hostile input
+    /// as titles and labels (fixed key `tank`), never as keys.
+    #[test]
+    fn hostile_titles_and_labels_never_echo_in_refusals_errors_or_logs() {
+        use crate::scheduled::{
+            no_such_schedule_text, no_unique_match_text, schedule_cancelled_text,
+        };
+        assert_eq!(
+            HOSTILE_LFG_TITLES_AND_LABELS.len(),
+            22,
+            "the #718 matrix must stay pinned"
+        );
+        // Every LFG audit outcome code written by `lfg_interactions::audit`
+        // (`posted`/`failed` on create, `closed`/`already_closed_or_missing`
+        // on close, `signup_lfg` wire words on signup, `left`/`not_signed_up`
+        // on leave). Audit rows carry these codes plus snowflake IDs with
+        // `reason: None` — never titles or labels.
+        let audit_outcomes = [
+            "posted",
+            "failed",
+            "closed",
+            "already_closed_or_missing",
+            "joined",
+            "moved",
+            "full",
+            "missing",
+            "left",
+            "not_signed_up",
+        ];
+        assert_eq!(
+            audit_outcomes.len(),
+            10,
+            "every LFG audit outcome is covered"
+        );
+        let signup_outcomes = [
+            SignupOutcome::Joined,
+            SignupOutcome::Moved,
+            SignupOutcome::Full,
+            SignupOutcome::Closed,
+            SignupOutcome::Missing,
+        ];
+        assert_eq!(signup_outcomes.len(), 5, "every signup outcome is covered");
+        for hostile in HOSTILE_LFG_TITLES_AND_LABELS.iter().copied() {
+            // Post validation: hostile titles refuse with fixed text or parse
+            // as inert valid titles; hostile labels refuse with fixed text or
+            // parse as inert valid labels. Neither error echoes its input.
+            match validate_title(hostile) {
+                Ok(_) => {}
+                Err(err) => {
+                    assert_eq!(err, TitleError::BadTitle, "{hostile:?}");
+                    assert!(
+                        !err.to_string().contains(hostile),
+                        "{hostile:?} echoed in title refusal: {err:?}"
+                    );
+                }
+            }
+            if let Err(err) = parse_role_spec(&format!("tank:{hostile}:2")) {
+                assert!(
+                    !err.to_string().contains(hostile),
+                    "{hostile:?} echoed in label refusal: {err:?}"
+                );
+                assert_no_lfg_echo(hostile, &err.to_string(), "role-spec error");
+            }
+            // `starts-at` takes no title/label: hostile input refuses as
+            // non-ISO-8601 with fixed text.
+            let starts_at_err = normalize_starts_at(hostile, 1_789_034_400_000).unwrap_err();
+            assert_eq!(starts_at_err, StartsAtError::NotIso8601, "{hostile:?}");
+            assert!(
+                !starts_at_err.to_string().contains(hostile),
+                "{hostile:?} echoed in starts-at refusal"
+            );
+            // Signup with a hostile select value adjudicates `missing` (unknown
+            // role) and replies with the fixed word; close/leave/permission
+            // replies are fixed too. `created_reply` echoes only the
+            // server-shaped post id, never the title.
+            let hostile_action = parse_lfg_select("two:lfg:lfg-proof", hostile)
+                .expect("hostile values route to signup");
+            let hostile_role = match hostile_action {
+                LfgSelectAction::Signup { role_key, .. } => role_key,
+                LfgSelectAction::Leave { .. } => unreachable!("{hostile:?}"),
+            };
+            assert_eq!(
+                adjudicate_signup(true, LfgStatus::Open, None, None, &hostile_role, 0),
+                SignupOutcome::Missing,
+                "{hostile:?}"
+            );
+            let mut fixed_texts = vec![
+                TitleError::BadTitle.to_string(),
+                StartsAtError::NotIso8601.to_string(),
+                StartsAtError::NotFuture.to_string(),
+                RoleSpecError::BadShape.to_string(),
+                RoleSpecError::TooLong.to_string(),
+                RoleSpecError::BadLabel.to_string(),
+                RoleSpecError::BadSlots.to_string(),
+                RoleSpecError::BadCount.to_string(),
+                LfgPermissionError::ManageEventsRequired.to_string(),
+                leave_reply(true),
+                leave_reply(false),
+                close_reply(true),
+                close_reply(false),
+                created_reply("lfg-proof"),
+                signup_reply(SignupOutcome::Missing),
+                // Schedule-remove takes only an id prefix, never a
+                // title/label: with a safe id in scope the hostile
+                // title/label cannot leak into these failure texts. The
+                // id-prefix echo itself stays bounded and backtick-fenced
+                // behind the caller's 128 UTF-16 guard (existing behavior,
+                // separate property).
+                no_unique_match_text("abc"),
+                no_such_schedule_text("abc"),
+                schedule_cancelled_text().to_owned(),
+            ];
+            for outcome in signup_outcomes {
+                fixed_texts.push(signup_reply(outcome));
+            }
+            for text in &fixed_texts {
+                assert!(
+                    !text.contains(hostile),
+                    "{hostile:?} echoed in refusal/error text: {text:?}"
+                );
+                assert_no_lfg_echo(hostile, text, "refusal/error text");
+            }
+            // Audit outcome codes are fixed snake-case words.
+            for outcome in audit_outcomes {
+                assert!(
+                    !outcome.contains(hostile),
+                    "{hostile:?} echoed in audit outcome: {outcome:?}"
+                );
+                assert!(
+                    outcome.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+                    "audit outcome must stay a fixed code: {outcome:?}"
+                );
+            }
+        }
+        // Overlong hostile input refuses with fixed text on every
+        // title/label path without echo, panic or hang.
+        for hostile in ["x".repeat(600), format!("@everyone {}", "x".repeat(600))] {
+            assert_eq!(validate_title(&hostile), Err(TitleError::BadTitle));
+            assert_eq!(
+                parse_role_spec(&format!("tank:{hostile}:2")),
+                Err(RoleSpecError::BadLabel),
+                "overlong label must refuse, not echo"
+            );
+            for text in [
+                TitleError::BadTitle.to_string(),
+                RoleSpecError::BadLabel.to_string(),
+                signup_reply(SignupOutcome::Full),
+                close_reply(false),
+            ] {
+                assert!(!text.contains(&hostile), "overlong input echoed: {text:?}");
+            }
+        }
+    }
 }
