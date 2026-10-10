@@ -466,7 +466,7 @@ async fn queued_commands(
         assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 1);
         assert_eq!(db.count().await, 0);
         assert!(
-            global_series(commit_series) >= commit_before + 1,
+            global_series(commit_series) > commit_before,
             "a forced checkpoint failure must bump the `commit` counter"
         );
         None

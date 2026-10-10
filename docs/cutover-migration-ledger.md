@@ -111,6 +111,8 @@ All migrations are up-only; there are no down files. The `direction` column is
 | 0419_send_admission_lease | up | discord_send_admission | re-runnable | Drop column `in_flight_since_ms`; lanes revert to hold-forever (a stuck lane needs the manual release again). |
 | 0420_send_admission_lease_backfill | up | discord_send_admission | re-runnable | Data-only stamp of legacy-held rows; nothing to undo (re-apply only moves rows still at the legacy default). |
 | 0422_voice_create_reservations | up | voice_create_reservations | re-runnable | Drop the table; room creates lose their rolling burst and cooldown history (in-flight creates stop holding cap slots). |
+| 0424_internal_action_outcome | up | internal_idempotency | backout-script | Unguarded `ADD COLUMN` with a closed-set `CHECK`. Backout: disable the receiver and deploy the previous binary, then drop the column; dropping it under the outcome-aware binary fails every finish and every success replay. No member PII in the column; no seed writes to the table. |
+| 0425_internal_action_audit_resources | up | internal_action_log | backout-script | Unguarded `ADD COLUMN` with format/closed-set `CHECK`s. Backout: drop the three columns (terminal audits lose their resource witness until re-recorded; the columns hold no member PII beyond the receipt's own snowflakes and counts). |
 
 ## Notes
 
