@@ -64,18 +64,25 @@ After the reviewer approves (or the automated approval passes), the job:
 
 **Roll back.** This dispatch is the single production rollback method.
 Dispatch again with `rollback` set to the previous version ID
-from the failed run's summary. Set `sha` to the commit that version was built
+from the failed run's summary and `takeover: true`. Set `sha` to the commit that version was built
 from. It is recorded as the rollback message, and the `/readyz` gate after the
 rollback must report that revision, or a pre-stamp version (see below). The
 rollback passes the same guard and the same Environment approval. It then runs
 `wrangler rollback <version-id> --message <sha> --yes` and fails unless that
-version serves 100% of traffic. When the Rust image itself is the fault,
-dispatch in deploy mode with the prior good SHA instead; a standalone full
+version serves 100% of traffic. Without the takeover the fence stays held,
+fenced answers carry no build fields, and the gate fails without being a
+rollback signal. When the Rust image itself is the fault,
+dispatch in deploy mode with `takeover: true` and the prior good SHA instead; a standalone full
 redeploy outside this workflow is superseded as a production rollback path.
-Drill record: the rehearsal log in
+Coverage: the rehearsal log in
 [cutover-rollback-runbook.md](cutover-rollback-runbook.md#7-staging-rehearsal-log)
-and the staging rollback drill
-([ci-security.md](ci-security.md#staging-rollback-drill-manual)).
+is a dry-walk that checked this route without executing a rollback or deploy;
+the staging rollback drill
+([ci-security.md](ci-security.md#staging-rollback-drill-manual)) rehearses
+fence, unforced deployment with immediate Durable Object update, takeover and
+restore, which differs from this dispatch's `rollback --yes` with deferred
+Durable Object default. The deploy-mode path with a prior good SHA has no
+production drill record.
 
 ## Build identity and the `/readyz` gate
 
