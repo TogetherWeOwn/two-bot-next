@@ -69,6 +69,15 @@ come from [cutover.md](cutover.md) §§Registry swap and Rollback.
 - The ownership fence stays active throughout legacy ownership, across
   deployments and the retirement wait, until the lead hands Next back.
 
+## Production decision window
+
+A recorded host decision established a 2-hour rollback decision window from
+the cutover start time (`T_0`). Writes acknowledged inside that window are
+accepted as lost if a rollback occurs. After the window closed, the recovery
+posture is forward-fix. Reopening legacy remains subject to the zero-loss
+reconciliation gate in §6 plus separate reopening authority; the decision
+window does not relax that gate.
+
 ## 4. Ordered rollback steps
 
 1. Declare rollback with UTC time and reason. Freeze all Next and web
