@@ -314,6 +314,11 @@ def process_references(proc_root):
     entry under a container spelling cannot be mapped to a host path by
     lexical match, and its old inode may be gone from the workspace
     traversal, so callers must never silently treat it as no reference.
+
+    Scans cwd/exe/fd/maps plus cmdline argv tokens. Inodes are compared too,
+    so container mount path spellings need not match the host. cmdline entries
+    that no longer stat are kept as lexical-only references (dev/ino None);
+    any denied read aborts the whole scan.
     """
     references = []
     deleted = []
@@ -372,6 +377,36 @@ def process_references(proc_root):
                         references.append((fields[5],
                                            os.makedev(int(major, 16), int(minor, 16)),
                                            int(fields[4])))
+            # cmdline argv tokens: a process started with an absolute slot or
+            # target path (e.g. cargo --target-dir, a shell cd'd into output)
+            # is a live reference even when cwd/exe/fd/maps show nothing.
+            # Fixture proc roots may omit cmdline; treat a missing file as no
+            # cmdline references. Any denied read fails the whole scan closed.
+            try:
+                raw = (entry / 'cmdline').read_bytes()
+            except FileNotFoundError:
+                if entry.exists() and (entry / 'cmdline').exists():
+                    raise Refusal(f'incomplete process visibility: pid {entry.name}')
+            except PermissionError:
+                raise Refusal(f'incomplete process visibility: pid {entry.name}')
+            else:
+                for token in raw.split(b'\0'):
+                    if not token.startswith(b'/'):
+                        continue
+                    try:
+                        text = os.fsdecode(token)
+                    except (UnicodeDecodeError, ValueError):
+                        continue
+                    try:
+                        info = os.stat(text)
+                    except FileNotFoundError:
+                        references.append((text, None, None))
+                    except NotADirectoryError:
+                        references.append((text, None, None))
+                    except (PermissionError, OSError):
+                        raise Refusal(f'incomplete process visibility: pid {entry.name}')
+                    else:
+                        references.append((text, info.st_dev, info.st_ino))
         except FileNotFoundError:
             if entry.exists():
                 raise Refusal(f'incomplete process visibility: pid {entry.name}')
@@ -451,6 +486,385 @@ def workspace_inodes(workspace):
             info = path.lstat()
             result.add((info.st_dev, info.st_ino))
     return result
+
+
+def _veto_scan_names(base, target, dirs, files, check_top_level, first):
+    """Shared protected-name veto used by target and scratch scans."""
+    if first and check_top_level:
+        for name in dirs + files:
+            if name not in CARGO_TARGET_TOP_LEVEL:
+                return f'preserved foreign top-level entry: {name}'
+    under_codegen_out = (
+        Path(base).name == 'out'
+        and 'build' in Path(base).relative_to(target).parts)
+    for name in dirs:
+        if name.lower() in PROTECTED_DIR_NAMES:
+            return f'preserved directory in target: {name}'
+    for name in files:
+        lowered = name.lower()
+        stem = lowered
+        while '.' in stem:
+            stem = stem.rsplit('.', 1)[0]
+        if stem in PROTECTED_DIR_NAMES:
+            return f'preserved file in target: {name}'
+        suffix = Path(lowered).suffix
+        if suffix in PROTECTED_SUFFIXES:
+            if suffix == '.rs' and under_codegen_out:
+                continue  # build-script codegen output, not stashed source
+            return f'preserved file in target: {name}'
+    return None
+
+
+def scratch_preservation_veto(scratch):
+    """Reason a slot scratch tree vetoes retention, or None.
+
+    Scratch holds cooperative compiler/test temp files with arbitrary names,
+    so unlike target there is no Cargo-defined top-level allowlist: any
+    non-protected entry is treated as regenerable temp output. Protected
+    directory names, protected file stems/suffixes, foreign symlinks and any
+    other top-level foreign material still veto. Heuristics are a backstop
+    veto only; eligibility still needs the attested classification.
+    """
+    def unreadable(error):
+        raise Refusal(f'incomplete scratch scan: {error.filename}')
+
+    for base, dirs, files in os.walk(scratch, followlinks=False, onerror=unreadable):
+        for name in dirs + files:
+            try:
+                if (Path(base) / name).is_symlink():
+                    return f'symlink in scratch: {name}'
+            except OSError:
+                raise Refusal(f'incomplete scratch scan: {name}')
+        veto = _veto_scan_names(base, scratch, dirs, files,
+                                check_top_level=False, first=False)
+        if veto is not None:
+            return veto.replace('in target', 'in scratch')
+    return None
+
+
+def slot_output_inodes(target, scratch):
+    """(dev, ino) identities for every entry under target+scratch.
+
+    Symlinks are reported as a veto string instead of being followed, so the
+    caller skips the slot instead of measuring or deleting through a link.
+    Returns (veto_or_None, nodes).
+    """
+    nodes = set()
+
+    def unreadable(error):
+        raise Refusal(f'incomplete slot scan: {error.filename}')
+
+    for root in (target, scratch):
+        for base, dirs, files in os.walk(root, followlinks=False, onerror=unreadable):
+            for name in [None] + dirs + files:
+                path = Path(base) if name is None else Path(base) / name
+                try:
+                    info = path.lstat()
+                except FileNotFoundError:
+                    continue  # Cargo renamed output mid-scan; re-verify aborts below
+                if stat.S_ISLNK(info.st_mode):
+                    return f'symlink in slot output: {path}', set()
+                nodes.add((info.st_dev, info.st_ino))
+    return None, nodes
+
+
+def validate_shared_pool_inventory(pool, policy, inventory, now, max_age):
+    """Validate a shared-pool retain inventory; refuse the whole run on ambiguity.
+
+    Expected shape (caller-supplied, host-scope, fresh):
+      {"version": 1, "complete": True, "process_scope": "host",
+       "captured_at_unix": <unix>,
+       "slots": [{"path": "<pool>/slot-N", "issue_id": "<uuid>",
+                  "status": "done|...", "live_run": bool, "referenced": bool,
+                  "target_provenance": "build_output_only"}, ...]}
+    live_run covers running/queued/retry runs; referenced covers all
+    execution/project/shared workspace refs. Returns (indexed, captured).
+    """
+    if (inventory.get('version') != 1 or inventory.get('complete') is not True
+            or inventory.get('process_scope') != 'host'):
+        raise Refusal('need complete host-scope control-plane inventory')
+    captured = inventory.get('captured_at_unix')
+    if type(captured) not in (int, float) or not 0 <= now - captured <= max_age:
+        raise Refusal('control-plane inventory is stale or from the future')
+    rows = inventory.get('slots')
+    if not isinstance(rows, list):
+        raise Refusal('inventory slots must be a list')
+    indexed = {}
+    identities = {}
+    target_identities = {}
+    for row in rows:
+        raw = row['path']
+        if not isinstance(raw, str) or not os.path.isabs(raw):
+            raise Refusal('ambiguous slot attribution')
+        canonical = os.path.normpath(raw)
+        if raw != canonical or canonical in indexed:
+            raise Refusal('ambiguous slot attribution')
+        if type(row.get('live_run')) is not bool or type(row.get('referenced')) is not bool:
+            raise Refusal('ambiguous slot attribution')
+        if not row.get('issue_id') or row.get('status') not in TERMINAL | {
+                'backlog', 'todo', 'in_progress', 'in_review', 'blocked'}:
+            raise Refusal('missing slot attribution/status')
+        try:
+            resolved = os.path.realpath(canonical)
+        except OSError:
+            raise Refusal('ambiguous slot attribution')
+        if resolved != canonical:
+            raise Refusal('ambiguous slot attribution')
+        try:
+            info = os.stat(canonical)
+        except FileNotFoundError:
+            identity = None  # dangling row; covers nothing, matches nothing
+        except (PermissionError, OSError):
+            raise Refusal(f'incomplete slot visibility: {canonical}')
+        else:
+            if not stat.S_ISDIR(info.st_mode):
+                raise Refusal('ambiguous slot attribution')
+            identity = (info.st_dev, info.st_ino)
+            if identity in identities:
+                raise Refusal('ambiguous slot attribution')
+            identities[identity] = canonical
+        try:
+            target_info = os.stat(canonical + '/target')
+        except FileNotFoundError:
+            target_identity = None
+        except (PermissionError, OSError):
+            raise Refusal(f'incomplete slot visibility: {canonical}/target')
+        else:
+            target_identity = (target_info.st_dev, target_info.st_ino)
+            if target_identity in target_identities:
+                raise Refusal('ambiguous slot target attribution')
+            target_identities[target_identity] = canonical
+        indexed[canonical] = row
+    return indexed, captured
+
+
+def _lock_identity(fd):
+    info = os.fstat(fd)
+    return (info.st_dev, info.st_ino)
+
+
+def _lock_path_identity(lock_path):
+    info = os.stat(lock_path)
+    return (info.st_dev, info.st_ino)
+
+
+def shared_pool_retain(pool, inventory, proc_root='/proc', now=None, max_age=60,
+                       _before_mutation=None):
+    """Reclaim over-budget shared-pool slots with lock held through mutation.
+
+    Distinct from the legacy-worktree audit: exact slot paths only, never
+    /tmp globbing, registries, quotas or policies. For each policy slot the
+    SAME lock fd/inode is held from re-verify through deletion and
+    recreation; the lock file is never replaced and policy.json is never
+    touched. Any doubt skips that slot and keeps its lease. Global ambiguity
+    (bad inventory, unreadable proc scan, replaced pool layout) refuses the
+    whole run with no mutation. Returns a JSON-serializable receipt.
+    """
+    pool = real_directory(pool)
+    policy = load_policy(pool)
+    started = time.monotonic()
+    now = time.time() if now is None else now
+    indexed, captured = validate_shared_pool_inventory(pool, policy, inventory, now, max_age)
+    # Phase 1: acquire every available slot lock non-blocking and hold the
+    # fds. Unacquirable slots skip (keep lease); nothing is mutated yet.
+    held = {}
+    results = {}
+    for number in range(policy['slots']):
+        name = f'slot-{number}'
+        slot = pool / name
+        try:
+            fd = os.open(slot / 'lock', os.O_RDWR | os.O_NOFOLLOW)
+        except OSError:
+            results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                             'reason': 'lock open failed; skipped, lease kept'}
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                             'reason': 'lock held by another process; skipped, lease kept'}
+            continue
+        try:
+            if _lock_path_identity(slot / 'lock') != _lock_identity(fd):
+                os.close(fd)
+                results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                 'reason': 'lock file replaced; skipped, lease kept'}
+                continue
+        except OSError:
+            os.close(fd)
+            results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                             'reason': 'lock stat failed; skipped, lease kept'}
+            continue
+        held[name] = (slot, fd)
+    try:
+        if not 0 <= now - captured <= max_age:
+            raise Refusal('control-plane inventory is stale or from the future')
+        # Single root-visible process scan while ALL acquired locks are held,
+        # so no new wrapper/Cargo writer can start mid-scan for a held slot.
+        refs, deleted = process_references(proc_root)
+        # Per-slot re-verify while holding that slot's lock. No mutation yet,
+        # so the unresolved-deleted fail-closed check below runs before any
+        # deletion.
+        pending = {}
+        for name in sorted(held):
+            slot, _fd = held[name]
+            try:
+                if {p.name for p in slot.iterdir()} - {'lock', 'target', 'scratch', 'lease.json'}:
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': 'unexpected slot contents; skipped, lease kept'}
+                    continue
+                target = real_directory(slot / 'target')
+                scratch = real_directory(slot / 'scratch')
+                try:
+                    before_bytes = usage(slot)
+                except Refusal as error:
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': f'incomplete slot scan ({error}); skipped, lease kept'}
+                    continue
+                row = indexed.get(str(slot))
+                if row is None:
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': 'unattributed slot; skipped, lease kept'}
+                    continue
+                if row['status'] not in TERMINAL or row['live_run'] or row['referenced']:
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': ('live run, slot reference, or nonterminal issue; '
+                                                'skipped, lease kept')}
+                    continue
+                if row.get('target_provenance') != 'build_output_only':
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': ('unclassified or mixed slot provenance; Operator '
+                                                'build-output-only classification required; skipped')}
+                    continue
+                try:
+                    veto = preservation_veto(target)
+                except Refusal as error:
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': f'incomplete target scan ({error}); skipped'}
+                    continue
+                if veto is not None:
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': f'{veto}; skipped, lease kept'}
+                    continue
+                try:
+                    veto = scratch_preservation_veto(scratch)
+                except Refusal as error:
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': f'incomplete scratch scan ({error}); skipped'}
+                    continue
+                if veto is not None:
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': f'{veto}; skipped, lease kept'}
+                    continue
+                try:
+                    link_veto, nodes = slot_output_inodes(target, scratch)
+                except Refusal as error:
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': f'incomplete slot scan ({error}); skipped'}
+                    continue
+                if link_veto is not None:
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': f'{link_veto}; skipped, lease kept'}
+                    continue
+                if any(within(path, target) or within(path, scratch)
+                       or (device is not None and (device, inode) in nodes)
+                       for path, device, inode in refs):
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': ('actual process cwd/exe/fd/map/cmdline reference; '
+                                                'skipped, lease kept')}
+                    continue
+                if any(within(path, target) or within(path, scratch)
+                       or (device is not None and (device, inode) in nodes)
+                       for path, device, inode in deleted):
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': ('actual process reference (deleted artifact); '
+                                                'skipped, lease kept')}
+                    continue
+                pending[name] = {'slot': slot, 'target': target, 'scratch': scratch,
+                                 'nodes': nodes, 'before_bytes': before_bytes}
+            except (OSError, ValueError, KeyError, IndexError, subprocess.CalledProcessError) as error:
+                results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                 'reason': f'verify failed ({error}); skipped, lease kept'}
+        # Fail-closed unresolved-deleted check before ANY mutation: a deleted
+        # artifact attributable to no held slot refuses the whole run, since
+        # container spellings and reclaimed inodes cannot prove no reference.
+        all_nodes = set()
+        for entry in pending.values():
+            all_nodes |= entry['nodes']
+        slot_roots = [str((held[name][0] / 'target')) for name in held]
+        slot_roots += [str((held[name][0] / 'scratch')) for name in held]
+        for name in sorted(set(results) - set(held)):
+            # Skipped (lock-held) slots still own lexical paths; an entry
+            # inside one attributes there and must not force a whole refusal.
+            slot = pool / name
+            slot_roots += [str(slot / 'target'), str(slot / 'scratch')]
+        unresolved = [
+            (path, device, inode) for path, device, inode in deleted
+            if not any(within(path, Path(root)) for root in slot_roots)
+            and not (device is not None and (device, inode) in all_nodes)]
+        if unresolved:
+            raise Refusal('unresolved deleted process reference; '
+                          'exact-path process-reference receipt required')
+        if now - captured + time.monotonic() - started > max_age:
+            raise Refusal('retain took too long; capture a new inventory')
+        # Phase 2: exact-path mutation per eligible slot, lock still held.
+        ordered = []
+        for name in sorted(pending):
+            slot = pending[name]['slot']
+            target = pending[name]['target']
+            scratch = pending[name]['scratch']
+            before_bytes = pending[name]['before_bytes']
+            _slot, fd = held[name]
+            try:
+                if _lock_path_identity(slot / 'lock') != _lock_identity(fd):
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': 'lock file replaced before mutation; skipped'}
+                    continue
+                if _before_mutation is not None:
+                    _before_mutation(slot, fd)
+                    if _lock_path_identity(slot / 'lock') != _lock_identity(fd):
+                        results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                         'reason': 'lock file replaced; skipped, lease kept'}
+                        continue
+                # Exact paths only: slot-N/target, slot-N/scratch,
+                # slot-N/lease.json. Lock inode and policy.json are preserved.
+                if not target.is_relative_to(slot) or not scratch.is_relative_to(slot):
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': 'slot path escape; skipped, lease kept'}
+                    continue
+                shutil.rmtree(target)
+                shutil.rmtree(scratch)
+                lease = slot / 'lease.json'
+                try:
+                    lease.unlink()
+                except FileNotFoundError:
+                    pass
+                target.mkdir()
+                scratch.mkdir()
+                if _lock_path_identity(slot / 'lock') != _lock_identity(fd):
+                    raise Refusal(f'lock file replaced during mutation: {name}')
+                after_bytes = usage(slot)
+                results[name] = {'slot': name, 'path': str(slot), 'eligible': True,
+                                 'reason': 'retained; exact slot output reclaimed',
+                                 'before_bytes': before_bytes, 'after_bytes': after_bytes,
+                                 'reclaimed_bytes': before_bytes - after_bytes,
+                                 'lock_held_through_mutation': True}
+            except Refusal:
+                raise
+            except (OSError, ValueError) as error:
+                results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                 'reason': f'mutation failed ({error}); skipped'}
+        for name in sorted(results):
+            ordered.append(results[name])
+        return {'version': 1, 'retain': True, 'mutation': True,
+                'captured_at_unix': now, 'slots': ordered}
+    finally:
+        for _slot, fd in held.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def retention_audit(worktrees, inventory, proc_root='/proc', now=None, max_age=60):
@@ -667,6 +1081,13 @@ def main():
     audit = commands.add_parser('audit')
     audit.add_argument('--worktrees', type=Path, required=True)
     audit.add_argument('--inventory', type=Path, required=True)
+    retain = commands.add_parser('retain',
+                                 help='shared-pool lock-through-mutation retention')
+    retain.add_argument('--pool', type=Path, default=DEFAULT_POOL)
+    retain.add_argument('--inventory', type=Path, required=True)
+    retain.add_argument('--proc-root', type=Path, default=Path('/proc'))
+    retain.add_argument('--evidence', type=Path, default=None,
+                        help='optional receipt path for the host evidence file')
     watch = commands.add_parser('filesystem')
     watch.add_argument('--path', type=Path, default=Path('/home'))
     watch.add_argument('--backing-path', type=Path, required=True)
@@ -680,6 +1101,11 @@ def main():
             return run_cargo(args.pool, cargo_args)
         if args.command == 'audit':
             result = retention_audit(args.worktrees, json.loads(args.inventory.read_text()))
+        elif args.command == 'retain':
+            result = shared_pool_retain(args.pool, json.loads(args.inventory.read_text()),
+                                        proc_root=args.proc_root)
+            if args.evidence is not None:
+                args.evidence.write_text(json.dumps(result, sort_keys=True))
         else:
             if args.min_available_bytes <= 0:
                 raise Refusal('available-byte floor must be positive')
