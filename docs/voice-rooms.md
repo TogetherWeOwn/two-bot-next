@@ -223,6 +223,16 @@ library code with no Discord dependency and can start immediately.
 
 - `@@weekday@@`, `@@month@@`, `@@hour@@` (0–23): in the guild time zone (default
   UTC), English names.
+- `@@daypart@@`: `morning` (05–11), `afternoon` (12–16), `evening` (17–21),
+  `night` (22–01) or `late night` (02–04), local time.
+- `@@room_minutes@@`: whole minutes since the room was created. `@@room_tier@@`:
+  0 to 5 at 0, 15, 45, 90, 180 and 360 minutes.
+- `@@game_minutes@@`: combined member-minutes the room has played the game it
+  shows now (two players for ten minutes count twenty), kept in memory for the
+  live room only and reset by a restart. `@@game_tier@@`: the same tiers.
+- Time facts re-render a name only when a tier, the local hour or another fact
+  changes, so a raw minute count shown in a name moves at those points, not every
+  minute. The rename budget still applies.
 - `@@random_emoji@@`, `[[a/b/c]]` and `[[list:name]]` (named lists from guild
   settings) are rolled from a per-room seed stored at creation and never re-rolled.
 
@@ -245,7 +255,8 @@ library code with no Discord dependency and can start immediately.
 
 - `// no` is optional, and blocks nest.
 - Comparisons `< > <= >= = !=` work on numbers and counter tokens (`@@num@@`,
-  `@@limit@@`, `@@slots@@`, `@@hour@@`, `$#`), including token against token.
+  `@@limit@@`, `@@slots@@`, `@@hour@@`, `@@room_minutes@@`, `@@room_tier@@`,
+  `@@game_minutes@@`, `@@game_tier@@`, `$#`), including token against token.
 
 | Group | Keywords |
 |---|---|
@@ -254,6 +265,7 @@ library code with no Discord dependency and can start immediately.
 | Game and party | `GAME` (`:` contains; `=` / `!=` exact), `PLAYERS`, `MAX`, `RICH` |
 | Room state | `FULL`, `PRIVATE` |
 | Date | `WEEKEND` (Saturday or Sunday), `WEEKDAY`, `MONTH` |
+| Time of day | `MORNING`, `AFTERNOON`, `EVENING`, `NIGHT`, `LATE_NIGHT` (the `@@daypart@@` hours) |
 
 - `FULL` requires a limit. `PRIVATE` is always false on standalone channels.
 - An unknown condition is false.

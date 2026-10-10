@@ -33,7 +33,7 @@ pub const MAX_MESSAGE_CHARS: usize = 120;
 /// Seed shared by every scenario, so random picks never vary between runs.
 pub const SCENARIO_SEED: u64 = 0x5CE7_A210_0000_0007;
 /// Token names the V5 evaluator substitutes; any other `@@name@@` renders empty.
-pub const KNOWN_TOKENS: [&str; 19] = [
+pub const KNOWN_TOKENS: [&str; 24] = [
     "owner",
     "creator",
     "original_creator",
@@ -53,6 +53,11 @@ pub const KNOWN_TOKENS: [&str; 19] = [
     "hour",
     "random_emoji",
     "nato",
+    "daypart",
+    "room_minutes",
+    "room_tier",
+    "game_minutes",
+    "game_tier",
 ];
 
 // Isolation parses of possibly unclosed constructs, and conditional blocks

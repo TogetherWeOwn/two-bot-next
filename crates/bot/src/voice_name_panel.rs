@@ -32,7 +32,7 @@ use two_bot_core::{
     voice_conditions::ConditionFacts,
     voice_custom_id::{name_custom_custom_id, name_modal_custom_id, name_restore_custom_id},
     voice_name_filter::{filter_channel_name, NameFilterContext},
-    voice_naming::{GameOptions, RoomContext},
+    voice_naming::{local_hour, minutes_tier, GameOptions, RoomContext},
     voice_presence::{apply_room_presence, OccupantPresence},
     voice_room_name::{
         decide_custom_name, decide_template_name, NameChecks, RenderFacts, MAX_CUSTOM_NAME_CHARS,
@@ -265,6 +265,9 @@ pub(super) struct NameSignature {
     stream_title: String,
     parties: usize,
     presence_conditions: (bool, bool, bool, u32, u32),
+    /// Time-aware inputs: room and game tiers plus the local hour, so a
+    /// name re-renders on a tier or hour change and not every minute.
+    time: (u32, u32, u32),
 }
 
 impl NameSignature {
@@ -288,6 +291,11 @@ impl NameSignature {
                 facts.conditions.owner_live_external,
                 facts.conditions.live_discord_count,
                 facts.conditions.live_external_count,
+            ),
+            time: (
+                minutes_tier(facts.context.room_minutes),
+                minutes_tier(facts.context.game_minutes),
+                local_hour(&facts.context),
             ),
         }
     }
@@ -472,6 +480,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             command.actor_id = room.owner_id;
             command.request = NameInteraction::Restore { room_id };
             let facts = self.name_facts(&room, &command);
+            self.playtime.entry(room_id).or_default().observe(
+                shown_game(&facts),
+                facts.context.members_playing,
+                (self.wall_clock)(),
+            );
             let signature = NameSignature::of(&facts);
             if self.name_signatures.get(&room_id) == Some(&signature) {
                 continue;
@@ -506,6 +519,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         self.name_signatures
             .retain(|room_id, _| rooms.contains_key(room_id));
         self.name_waits
+            .retain(|room_id, _| rooms.contains_key(room_id));
+        self.playtime
             .retain(|room_id, _| rooms.contains_key(room_id));
     }
 
@@ -545,6 +560,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         self.name_directory.fingerprint().hash(&mut hasher);
         format!("{:?}", self.name_settings).hash(&mut hasher);
         self.name_signatures.len().hash(&mut hasher);
+        // Time-aware names: look again every wall-clock minute.
+        ((self.wall_clock)() / 60_000).hash(&mut hasher);
         hasher.finish()
     }
 
@@ -658,6 +675,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             })
             .count() as u64;
         let label = command.settings.no_game_label.trim();
+        let wall_ms = (self.wall_clock)();
         let filter = NameFilterContext {
             guild_id: self.live.guild_id.to_string(),
             channel_id: room.channel_id.to_string(),
@@ -680,7 +698,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 user_limit,
                 game_name: if label.is_empty() { "General" } else { label }.to_owned(),
                 seed: room.name_seed,
-                timestamp: i64::try_from(unix_now_ms() / 1000).unwrap_or(0),
+                timestamp: i64::try_from(wall_ms / 1000).unwrap_or(0),
+                room_minutes: minutes_since(&room.created_at, wall_ms),
                 named_lists: command.settings.lists.clone(),
                 ..RoomContext::default()
             },
@@ -738,6 +757,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             &aliases,
             &options,
         );
+        facts.context.game_minutes = shown_game(&facts).map_or(0, |game| {
+            self.playtime
+                .get(&room.channel_id)
+                .map_or(0, |playtime| playtime.minutes(game, wall_ms))
+        });
         facts
     }
 
@@ -966,4 +990,61 @@ pub(super) fn modal_response(room_id: Snowflake, prefill: Option<&str>) -> Inter
             ..Default::default()
         }),
     }
+}
+
+/// Combined playtime of one live room: member-milliseconds per shown game
+/// title, plus the game and player count observed last. Kept in memory for
+/// the room's life only.
+#[derive(Debug, Default)]
+pub(super) struct RoomPlaytime {
+    since_ms: u64,
+    game: Option<String>,
+    players: u32,
+    played_ms: HashMap<String, u64>,
+}
+
+impl RoomPlaytime {
+    /// Whole member-minutes the room has spent on `game`, including the
+    /// running stretch when it is the game observed last.
+    pub(super) fn minutes(&self, game: &str, wall_ms: u64) -> u32 {
+        let mut played = self.played_ms.get(game).copied().unwrap_or(0);
+        if self.game.as_deref() == Some(game) {
+            played = played.saturating_add(self.running_ms(wall_ms));
+        }
+        u32::try_from(played / 60_000).unwrap_or(u32::MAX)
+    }
+
+    /// Credit the stretch since the last observation to the game seen then,
+    /// and start a new stretch.
+    pub(super) fn observe(&mut self, game: Option<&str>, players: u32, wall_ms: u64) {
+        if let Some(previous) = self.game.take() {
+            let running = self.running_ms(wall_ms);
+            let total = self.played_ms.entry(previous).or_insert(0);
+            *total = total.saturating_add(running);
+        }
+        self.since_ms = wall_ms;
+        self.game = game.map(str::to_owned);
+        self.players = players;
+    }
+
+    fn running_ms(&self, wall_ms: u64) -> u64 {
+        wall_ms
+            .saturating_sub(self.since_ms)
+            .saturating_mul(u64::from(self.players))
+    }
+}
+
+/// The game title the room name shows, when someone is playing.
+fn shown_game(facts: &NameFacts) -> Option<&str> {
+    (!facts.conditions.games.is_empty()).then_some(facts.context.game_name.as_str())
+}
+
+/// Whole minutes between an ISO creation stamp and `wall_ms`; 0 when the
+/// stamp does not parse.
+fn minutes_since(created_at: &str, wall_ms: u64) -> u32 {
+    two_bot_core::funnel::parse_iso_millis(created_at)
+        .and_then(|created| u64::try_from(created).ok())
+        .map_or(0, |created| {
+            u32::try_from(wall_ms.saturating_sub(created) / 60_000).unwrap_or(u32::MAX)
+        })
 }

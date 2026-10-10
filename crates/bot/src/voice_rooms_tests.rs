@@ -9887,6 +9887,55 @@ async fn a_new_room_is_renamed_from_its_creator_template() {
     );
 }
 
+#[test]
+fn room_playtime_adds_up_member_minutes_per_game() {
+    let minute = 60_000;
+    let mut playtime = name_panel::RoomPlaytime::default();
+    playtime.observe(Some("Apex"), 2, 0);
+    assert_eq!(playtime.minutes("Apex", 10 * minute), 20);
+    playtime.observe(None, 0, 10 * minute);
+    assert_eq!(playtime.minutes("Apex", 60 * minute), 20);
+    playtime.observe(Some("Apex"), 1, 60 * minute);
+    assert_eq!(playtime.minutes("Apex", 70 * minute), 30);
+    assert_eq!(playtime.minutes("Valorant", 70 * minute), 0);
+}
+
+static TEST_WALL_MS: AtomicU64 = AtomicU64::new(0);
+
+fn test_wall_clock() -> u64 {
+    TEST_WALL_MS.load(Ordering::SeqCst)
+}
+
+#[tokio::test]
+async fn a_room_tier_change_renames_the_room_once() {
+    let created = two_bot_core::funnel::parse_iso_millis(NOW).unwrap() as u64;
+    let minute = 60_000;
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template =
+        "{{@@room_tier@@ >= 1 ?? veterans // fresh}}".to_owned();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER, Some(500), Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.wall_clock = test_wall_clock;
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    TEST_WALL_MS.store(created + minute, Ordering::SeqCst);
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    // Minutes pass inside the tier: no new name.
+    TEST_WALL_MS.store(created + 10 * minute, Ordering::SeqCst);
+    worker.refresh_template_names(1);
+    assert!(!worker.dispatch_one(1).await);
+    TEST_WALL_MS.store(created + 16 * minute, Ordering::SeqCst);
+    worker.refresh_template_names(2);
+    assert_eq!(worker.desired_names[&500], "veterans");
+    dispatch(&mut worker, 600_000).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["rename:500:fresh", "rename:500:veterans"]
+    );
+}
+
 #[tokio::test]
 async fn template_names_rerender_only_when_their_facts_change() {
     let (live, store, http, trace) = fixture();

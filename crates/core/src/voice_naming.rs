@@ -28,6 +28,10 @@
 //! @@party_size@@      party maximum, falling back to the limit
 //! @@party_state@@ / @@party_details@@  from the largest party
 //! @@weekday@@ / @@month@@ / @@hour@@   guild time zone (default UTC)
+//! @@daypart@@         morning, afternoon, evening, night or late night
+//! @@room_minutes@@ / @@room_tier@@     time since the room was created
+//! @@game_minutes@@ / @@game_tier@@     combined minutes the room has played
+//!                     the game it shows now
 //! @@random_emoji@@    seeded emoji pick, stable across renames
 //! <<singular/plural>>       singular only with exactly one member
 //! <<singular\plural>>       counts members excluding the owner
@@ -264,6 +268,11 @@ pub struct RoomContext {
     pub parties: Vec<PartyInfo>,
     /// Unix timestamp for the time tokens.
     pub timestamp: i64,
+    /// Whole minutes since the room was created.
+    pub room_minutes: u32,
+    /// Combined member-minutes this room has spent on the game it shows
+    /// now (two players for ten minutes count twenty).
+    pub game_minutes: u32,
     /// Guild time-zone offset in minutes east of UTC (default `0` = UTC).
     pub tz_offset_minutes: i32,
     /// Per-room seed stored at creation; random picks never re-roll.
@@ -1159,6 +1168,11 @@ fn render_token(name: &str, ctx: &RoomContext) -> String {
         "party_state" => largest_party(ctx).map_or(String::new(), |p| p.state.clone()),
         "party_details" => largest_party(ctx).map_or(String::new(), |p| p.details.clone()),
         "weekday" | "month" | "hour" => render_time_token(name, ctx),
+        "daypart" => daypart(local_hour(ctx)).to_owned(),
+        "room_minutes" => ctx.room_minutes.to_string(),
+        "room_tier" => minutes_tier(ctx.room_minutes).to_string(),
+        "game_minutes" => ctx.game_minutes.to_string(),
+        "game_tier" => minutes_tier(ctx.game_minutes).to_string(),
         "random_emoji" => {
             let mut dice = Dice::new(ctx.seed, u64::MAX);
             RANDOM_EMOJI[dice.below(RANDOM_EMOJI.len())].to_string()
@@ -1190,6 +1204,38 @@ fn largest_party(ctx: &RoomContext) -> Option<&PartyInfo> {
     } else {
         Some(first)
     }
+}
+
+/// Lower bounds, in minutes, of the elapsed-time tiers 0 to 5 shared by
+/// `@@room_tier@@` and `@@game_tier@@`.
+pub const MINUTE_TIERS: [u32; 6] = [0, 15, 45, 90, 180, 360];
+
+/// The tier (0 to 5) a minute count falls in; see [`MINUTE_TIERS`].
+#[must_use]
+pub fn minutes_tier(minutes: u32) -> u32 {
+    MINUTE_TIERS
+        .iter()
+        .rposition(|bound| minutes >= *bound)
+        .map_or(0, |tier| tier as u32)
+}
+
+/// Part of the day for a local hour: morning 5–11, afternoon 12–16,
+/// evening 17–21, night 22–1, late night 2–4.
+#[must_use]
+pub fn daypart(hour: u32) -> &'static str {
+    match hour {
+        5..=11 => "morning",
+        12..=16 => "afternoon",
+        17..=21 => "evening",
+        2..=4 => "late night",
+        _ => "night",
+    }
+}
+
+/// Local hour (0–23) in the room's time zone.
+#[must_use]
+pub fn local_hour(ctx: &RoomContext) -> u32 {
+    civil_parts(ctx.timestamp, ctx.tz_offset_minutes).2
 }
 
 fn render_time_token(name: &str, ctx: &RoomContext) -> String {
@@ -1468,6 +1514,8 @@ mod tests {
             members_playing: 3,
             parties: Vec::new(),
             timestamp: 1_790_683_200, // 2026-09-29 12:00:00 UTC (a Tuesday).
+            room_minutes: 0,
+            game_minutes: 0,
             tz_offset_minutes: 0,
             seed: 42,
             named_lists: HashMap::new(),

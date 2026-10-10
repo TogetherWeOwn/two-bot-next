@@ -119,7 +119,7 @@ mod name_panel;
 pub use name_panel::NameDirectory;
 use name_panel::{
     handle_name_interaction, name_component_action, name_directory_from_cache, NameCommand,
-    NameInteraction, NameReply, NameSettings, NameSignature,
+    NameInteraction, NameReply, NameSettings, NameSignature, RoomPlaytime,
 };
 
 pub type WriteGuard = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -2076,6 +2076,10 @@ pub struct GuildRoomWorker<S, H> {
     name_inputs: Option<u64>,
     /// When each room started waiting for an unknown display name.
     name_waits: HashMap<Snowflake, u64>,
+    /// Combined playtime per live room (time-aware names); memory only.
+    playtime: HashMap<Snowflake, RoomPlaytime>,
+    /// Wall clock (Unix milliseconds) for the time-aware name facts.
+    wall_clock: fn() -> u64,
     creations: HashMap<u64, Creation>,
     accepted: HashMap<Snowflake, (u64, u64)>,
     moves: HashMap<Snowflake, JoinTicket>,
@@ -2317,6 +2321,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             name_settings_read_ms: None,
             name_inputs: None,
             name_waits: HashMap::new(),
+            playtime: HashMap::new(),
+            wall_clock: unix_now_ms,
             creations: HashMap::new(),
             accepted: HashMap::new(),
             moves: HashMap::new(),

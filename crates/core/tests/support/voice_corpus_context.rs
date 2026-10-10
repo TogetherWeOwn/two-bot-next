@@ -132,6 +132,8 @@ pub fn room_context(context: &CorpusContext) -> RoomContext {
         members_playing: context.members.iter().filter(|m| m.game.is_some()).count() as u32,
         parties: parties.into_iter().map(|(_, party)| party).collect(),
         timestamp: civil_timestamp(&context.clock),
+        room_minutes: 0,
+        game_minutes: 0,
         tz_offset_minutes: 0,
         seed: seed(&context.seed),
         named_lists: context.settings.named_lists.clone(),

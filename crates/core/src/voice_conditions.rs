@@ -17,7 +17,7 @@
 use std::cell::Cell;
 
 use crate::voice_naming::{
-    parse, ChannelKind, Evaluation, Extension, ExtensionPolicy, PartyInfo, PassthroughExtensions,
+    daypart, local_hour, parse, ChannelKind, Evaluation, Extension, ExtensionPolicy, PartyInfo, PassthroughExtensions,
     RoomContext, Segment, Template,
 };
 
@@ -139,6 +139,16 @@ pub enum Keyword {
     Weekend,
     /// Monday to Friday in the room's local time.
     Weekday,
+    /// 05:00–11:59 local time.
+    Morning,
+    /// 12:00–16:59 local time.
+    Afternoon,
+    /// 17:00–21:59 local time.
+    Evening,
+    /// 22:00–01:59 local time.
+    Night,
+    /// 02:00–04:59 local time.
+    LateNight,
 }
 
 /// Whose roles or identity a person condition checks.
@@ -231,10 +241,18 @@ pub enum Counter {
     PartySize,
     /// `@@hour@@`
     Hour,
+    /// `@@room_minutes@@`
+    RoomMinutes,
+    /// `@@room_tier@@`
+    RoomTier,
+    /// `@@game_minutes@@`
+    GameMinutes,
+    /// `@@game_tier@@`
+    GameTier,
 }
 
 impl Counter {
-    const ALL: [Counter; 8] = [
+    const ALL: [Counter; 12] = [
         Counter::Members,
         Counter::Others,
         Counter::Live,
@@ -243,6 +261,10 @@ impl Counter {
         Counter::Slots,
         Counter::PartySize,
         Counter::Hour,
+        Counter::RoomMinutes,
+        Counter::RoomTier,
+        Counter::GameMinutes,
+        Counter::GameTier,
     ];
 
     fn token(self) -> &'static str {
@@ -255,6 +277,10 @@ impl Counter {
             Counter::Slots => "slots",
             Counter::PartySize => "party_size",
             Counter::Hour => "hour",
+            Counter::RoomMinutes => "room_minutes",
+            Counter::RoomTier => "room_tier",
+            Counter::GameMinutes => "game_minutes",
+            Counter::GameTier => "game_tier",
         }
     }
 }
@@ -391,7 +417,7 @@ fn find_operator(text: &str) -> Option<(usize, usize, Operator)> {
 }
 
 fn bare_keyword(text: &str) -> Option<Keyword> {
-    const KEYWORDS: [(&str, Keyword); 14] = [
+    const KEYWORDS: [(&str, Keyword); 19] = [
         ("PLAYING", Keyword::Playing),
         ("LIVE", Keyword::Live),
         ("LIVE_DISCORD", Keyword::LiveDiscord),
@@ -406,6 +432,11 @@ fn bare_keyword(text: &str) -> Option<Keyword> {
         ("PRIVATE", Keyword::Private),
         ("WEEKEND", Keyword::Weekend),
         ("WEEKDAY", Keyword::Weekday),
+        ("MORNING", Keyword::Morning),
+        ("AFTERNOON", Keyword::Afternoon),
+        ("EVENING", Keyword::Evening),
+        ("NIGHT", Keyword::Night),
+        ("LATE_NIGHT", Keyword::LateNight),
     ];
     KEYWORDS
         .iter()
@@ -520,6 +551,11 @@ impl Keyword {
             Keyword::Weekday => Calendar::Weekday
                 .value(room)
                 .is_some_and(|day| (1..=5).contains(&day)),
+            Keyword::Morning => daypart(local_hour(room)) == "morning",
+            Keyword::Afternoon => daypart(local_hour(room)) == "afternoon",
+            Keyword::Evening => daypart(local_hour(room)) == "evening",
+            Keyword::Night => daypart(local_hour(room)) == "night",
+            Keyword::LateNight => daypart(local_hour(room)) == "late night",
         }
     }
 }
