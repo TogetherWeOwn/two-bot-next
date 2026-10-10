@@ -931,6 +931,137 @@ fn pipeline_leave_closes_voice_first() {
     );
 }
 
+/// Voice community-facts capture (TOG-19605): a recording sink proves the
+/// handler seam every production writer uses — join/leave/move frames record
+/// start/end facts, mute-only frames write nothing, and an end without a seen
+/// start stays honestly unknown. The per-member serial chain (TOG-5981) holds
+/// the move's end(A)→start(B) pair atomic: both halves run inside one chain
+/// lock in `pipeline.rs`, so the concurrent case is covered by
+/// `pipeline_serializes_same_member_voice_frames` for the funnel rows and the
+/// facts share that same critical section.
+#[derive(Debug, Default)]
+struct RecordingVoiceFacts {
+    starts: Mutex<Vec<(u64, u64, String, String)>>,
+    ends: Mutex<Vec<(u64, u64, String, Option<String>, Option<i64>, String)>>,
+}
+
+impl FactsSink for &RecordingVoiceFacts {
+    fn record_member_join(&self, _: MemberJoinFact<'_>) {}
+    fn record_rules_accepted(&self, _: RulesAcceptedFact<'_>) {}
+    fn record_message(&self, _: MessageFact<'_>) {}
+    fn record_voice_started(&self, fact: VoiceStartedFact<'_>) -> Option<String> {
+        let key = format!(
+            "{}:{}:{}:{}",
+            fact.guild_id, fact.member_id, fact.occurred_at, fact.channel_id
+        );
+        self.starts.lock().expect("starts lock").push((
+            fact.member_id,
+            fact.channel_id,
+            fact.occurred_at.to_owned(),
+            key.clone(),
+        ));
+        Some(key)
+    }
+    fn record_voice_ended(&self, fact: VoiceEndedFact<'_>) {
+        self.ends.lock().expect("ends lock").push((
+            fact.member_id,
+            fact.channel_id,
+            fact.occurred_at.to_owned(),
+            fact.started_at.map(str::to_owned),
+            fact.duration_seconds,
+            fact.session_key.clone(),
+        ));
+    }
+}
+
+#[test]
+fn voice_facts_move_is_one_atomic_end_plus_start_pair() {
+    let recording = RecordingVoiceFacts::default();
+    let pipeline = Pipeline::new(
+        MemStore::new(),
+        Some(NoopLeveling),
+        Some(&recording),
+        ScriptedInvites::new(),
+        NoClassification,
+    );
+    pipeline.handle_at(&voice_event(A, Some(CH_VOICE_A)), &stamp("12:00:00"));
+    // A move is one frame: end(A) then start(B) at the same instant.
+    pipeline.handle_at(&voice_event(A, Some(CH_VOICE_B)), &stamp("12:00:10"));
+    let starts = recording.starts.lock().expect("starts lock");
+    let ends = recording.ends.lock().expect("ends lock");
+    assert_eq!(starts.len(), 2, "join plus move-start");
+    assert_eq!(ends.len(), 1, "move-end");
+    assert_eq!(starts[0].1, CH_VOICE_A);
+    assert_eq!(ends[0].1, CH_VOICE_A, "end credits the session channel");
+    assert_eq!(starts[1].1, CH_VOICE_B);
+    assert_eq!(ends[0].2, stamp("12:00:10"));
+    assert_eq!(starts[1].2, stamp("12:00:10"), "one instant, not a gap");
+    assert_eq!(ends[0].3.as_deref(), Some(stamp("12:00:00").as_str()));
+    assert_eq!(ends[0].4, Some(10), "honest 10 s duration");
+    assert_eq!(ends[0].5, starts[0].3, "end reuses the start's session key");
+    assert_ne!(starts[1].3, starts[0].3, "move-start mints a fresh key");
+}
+
+#[test]
+fn voice_facts_mute_only_frames_write_nothing() {
+    let recording = RecordingVoiceFacts::default();
+    let pipeline = Pipeline::new(
+        MemStore::new(),
+        Some(NoopLeveling),
+        Some(&recording),
+        ScriptedInvites::new(),
+        NoClassification,
+    );
+    pipeline.handle_at(&voice_event(A, Some(CH_VOICE_A)), &stamp("12:00:00"));
+    assert_eq!(recording.starts.lock().expect("starts lock").len(), 1);
+    // Same channel (mute/deafen/camera frame): no channel change, no facts.
+    pipeline.handle_at(&voice_event(A, Some(CH_VOICE_A)), &stamp("12:00:05"));
+    assert_eq!(recording.starts.lock().expect("starts lock").len(), 1);
+    assert!(recording.ends.lock().expect("ends lock").is_empty());
+}
+
+#[test]
+fn voice_facts_end_without_start_is_honestly_unknown() {
+    let recording = RecordingVoiceFacts::default();
+    let pipeline = Pipeline::new(
+        MemStore::new(),
+        Some(NoopLeveling),
+        Some(&recording),
+        ScriptedInvites::new(),
+        NoClassification,
+    );
+    // No cached channel and no open session means no boundary at all:
+    // a leave with nothing seen writes nothing (not even an orphan end).
+    pipeline.handle_at(&voice_event(A, None), &stamp("12:00:05"));
+    assert!(
+        recording.ends.lock().expect("ends lock").is_empty(),
+        "leave with no cached channel writes nothing"
+    );
+    // Seed the cache with a join, clear only the tracker (reconnect drop),
+    // then leave: one honestly-unknown end, never a fabricated start.
+    pipeline.handle_at(&voice_event(A, Some(CH_VOICE_A)), &stamp("12:00:00"));
+    pipeline
+        .handlers()
+        .voice_sessions
+        .lock()
+        .expect("voice lock")
+        .clear();
+    recording.starts.lock().expect("starts lock").clear();
+    recording.ends.lock().expect("ends lock").clear();
+    pipeline.handle_at(&voice_event(A, None), &stamp("12:00:05"));
+    let ends = recording.ends.lock().expect("ends lock");
+    assert_eq!(ends.len(), 1, "orphan leave records one end");
+    assert_eq!(ends[0].1, CH_VOICE_A, "credited to the leave frame channel");
+    assert_eq!(ends[0].3, None, "no start invented");
+    assert_eq!(ends[0].4, None, "no duration invented");
+    assert!(
+        ends[0].5.contains("unknown-start"),
+        "honest unknown-start key: {}",
+        ends[0].5
+    );
+    assert!(recording.starts.lock().expect("starts lock").is_empty());
+}
+
 /// Voice boundary rows (start/end only) in insert order.
 fn voice_boundaries(pipeline: &MemPipeline) -> Vec<StoredRow> {
     pipeline

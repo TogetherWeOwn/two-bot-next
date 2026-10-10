@@ -40,12 +40,19 @@ pub const COMMUNITY_FACT_TYPES: [&str; 6] = [
 ];
 
 /// Streams with a live production writer: the only streams `scorecard_once`
-/// may mark covered. Today that is just `event_attended` (host check-in via
-/// `rsvp_store::record_checkin`); message, voice, join and rules capture land
-/// in later slices, one per stream. This must always equal the `Some` rows of
-/// [`STREAM_WRITERS`]; the `captured_streams_match_live_writers` guard fails
-/// otherwise.
-pub const CAPTURED_STREAMS: [&str; 1] = ["event_attended"];
+/// may mark covered. That is `event_attended` (host check-in via
+/// `rsvp_store::record_checkin`) plus `voice_session_started` /
+/// `voice_session_ended` (gateway voice frames via
+/// `community_store::record_voice_started_fact` /
+/// `community_store::record_voice_ended_fact`); message, join and rules
+/// capture land in later slices, one per stream. This must always equal the
+/// `Some` rows of [`STREAM_WRITERS`]; the `captured_streams_match_live_writers`
+/// guard fails otherwise.
+pub const CAPTURED_STREAMS: [&str; 3] = [
+    "event_attended",
+    "voice_session_started",
+    "voice_session_ended",
+];
 
 /// Capture registry: every fact stream with the production writer that appends
 /// it, or `None` while no live path writes it. Single source of truth for both
@@ -55,8 +62,14 @@ pub const CAPTURED_STREAMS: [&str; 1] = ["event_attended"];
 /// and grows [`CAPTURED_STREAMS`] in the same PR.
 pub const STREAM_WRITERS: [(&str, Option<&str>); 6] = [
     ("message_created", None),
-    ("voice_session_started", None),
-    ("voice_session_ended", None),
+    (
+        "voice_session_started",
+        Some("community_store::record_voice_started_fact"),
+    ),
+    (
+        "voice_session_ended",
+        Some("community_store::record_voice_ended_fact"),
+    ),
     ("member_joined", None),
     ("event_attended", Some("rsvp_store::record_checkin")),
     ("rules_accepted", None),

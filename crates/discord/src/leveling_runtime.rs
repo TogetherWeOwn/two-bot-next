@@ -17,12 +17,17 @@ use twilight_model::{
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
 use two_bot_core::{
+    classify,
+    community_store::{
+        record_fact, voice_ended_fact, voice_started_fact, CommunityStoreError, FactWrite,
+    },
     leveling::{
         leaderboard_reply, plan_reward_roles, rank_reply, XpAward, LEADERBOARD_DEFAULT_LIMIT,
     },
     leveling_store::{self, LevelingStoreError},
-    FunnelHandlers, FunnelStore, HandlerId, InviteSnapshotStore, LevelOutcome, LevelingHook,
-    NoopFacts, Snowflake,
+    ClassifierConfig, ClassifyInput, FactsSink, FunnelHandlers, FunnelStore, HandlerId,
+    InviteSnapshotStore, LevelOutcome, LevelingHook, MemberJoinFact, MessageFact,
+    RulesAcceptedFact, Snowflake, VoiceEndedFact, VoiceStartedFact,
 };
 
 use two_bot_core::automod_runtime::FunnelDisposition;
@@ -104,6 +109,136 @@ impl DeferredLeveling {
 
     fn take(&self) -> Vec<AwardRequest> {
         std::mem::take(&mut *self.0.lock().expect("leveling buffer"))
+    }
+}
+
+/// Failures propagate to the gateway supervisor; Display never includes SQL
+/// connection details, Discord tokens, response bodies or member content.
+#[derive(Debug, thiserror::Error)]
+pub enum CommunityFactsError {
+    #[error("community facts store operation failed")]
+    Store(#[from] CommunityStoreError),
+}
+
+#[derive(Debug, Default)]
+struct CommunityFactsState {
+    pool: Option<PgPool>,
+    config: ClassifierConfig,
+    pending: Vec<FactWrite>,
+}
+
+/// Buffered `voice_session_started` / `voice_session_ended` capture
+/// (TOG-19605). The synchronous [`FactsSink`] hooks only classify and buffer;
+/// the serial checkpoint writer drains via
+/// [`OrderedLevelingPipeline::drain_facts`], which persists through
+/// `community_store::record_fact`. Mirrors [`DeferredLeveling`]: no
+/// `block_on`, no detached tasks, no mutex held over an await. Disabled
+/// (no pool) it drops every fact, exactly like [`two_bot_core::NoopFacts`].
+#[derive(Debug, Clone, Default)]
+pub struct DeferredCommunityFacts(Arc<Mutex<CommunityFactsState>>);
+
+impl DeferredCommunityFacts {
+    /// Arm Postgres capture with the scorecard classifier resolved once from
+    /// the process environment. Called once at boot when
+    /// `TWO_COMMUNITY_SCORECARD=1`; tests call it with their fixture pool.
+    pub fn enable(&self, pool: PgPool) {
+        let mut state = self.0.lock().expect("community facts lock");
+        state.pool = Some(pool);
+        state.config = ClassifierConfig::from_env();
+    }
+
+    /// Persist every buffered fact. Returns the inserted count; a duplicate
+    /// delivery returns `false` from the store and is not counted twice.
+    pub async fn drain(&self) -> Result<usize, CommunityFactsError> {
+        let (pool, pending) = {
+            let mut state = self.0.lock().expect("community facts lock");
+            (state.pool.clone(), std::mem::take(&mut state.pending))
+        };
+        let Some(pool) = pool else {
+            return Ok(0);
+        };
+        let mut inserted = 0;
+        for write in &pending {
+            if record_fact(&pool, write).await? {
+                inserted += 1;
+            }
+        }
+        Ok(inserted)
+    }
+}
+
+fn voice_classify(
+    config: &ClassifierConfig,
+    guild_id: u64,
+    member_id: u64,
+    is_bot: bool,
+) -> (ClassifyInput, two_bot_core::Classification) {
+    let input = ClassifyInput {
+        guild_id: guild_id.to_string(),
+        actor_id: member_id.to_string(),
+        is_bot,
+        webhook_id: None,
+        is_staff_automation: false,
+        is_raid: false,
+        is_staging: false,
+        is_test: false,
+    };
+    let verdict = classify(config, &input);
+    (input, verdict)
+}
+
+impl FactsSink for DeferredCommunityFacts {
+    fn record_member_join(&self, _fact: MemberJoinFact<'_>) {}
+
+    fn record_rules_accepted(&self, _fact: RulesAcceptedFact<'_>) {}
+
+    fn record_message(&self, _fact: MessageFact<'_>) {}
+
+    fn record_voice_started(&self, fact: VoiceStartedFact<'_>) -> Option<String> {
+        let mut state = self.0.lock().expect("community facts lock");
+        if state.pool.is_none() {
+            return None;
+        }
+        // Bots are classified and captured here; the funnel gate in
+        // `on_voice_join` already keeps them out of the XP/activity counts,
+        // so this sink never filters. The durable session key is generated
+        // now (guild:member:stamp:channel) so the tracker stores it before
+        // any database write; a redelivered join reuses the key and dedupes.
+        let (input, verdict) =
+            voice_classify(&state.config, fact.guild_id, fact.member_id, fact.is_bot);
+        let (key, write) = voice_started_fact(
+            &input.guild_id,
+            &input,
+            &fact.channel_id.to_string(),
+            fact.occurred_at,
+            None,
+            verdict,
+        );
+        state.pending.push(write);
+        Some(key)
+    }
+
+    fn record_voice_ended(&self, fact: VoiceEndedFact<'_>) {
+        let mut state = self.0.lock().expect("community facts lock");
+        if state.pool.is_none() {
+            return;
+        }
+        // End-without-start stays honest: the handler supplies
+        // `started_at: None` / `duration: None` with an `unknown-start`
+        // session key, and `voice_ended_fact` records `startKnown: false`
+        // with nulls — never a fabricated start.
+        let (input, verdict) =
+            voice_classify(&state.config, fact.guild_id, fact.member_id, fact.is_bot);
+        state.pending.push(voice_ended_fact(
+            &input.guild_id,
+            &input,
+            &fact.session_key,
+            &fact.channel_id.to_string(),
+            fact.occurred_at,
+            fact.started_at,
+            fact.duration_seconds,
+            verdict,
+        ));
     }
 }
 
@@ -263,8 +398,9 @@ impl LevelingRuntime {
 /// persistent gateway runner seeds both from the store, while unit and
 /// database tests keep the in-memory defaults.
 pub struct OrderedLevelingPipeline<S, I = NoInvites, P = PipelineSnapshots> {
-    pipeline: Pipeline<S, DeferredLeveling, NoopFacts, I, NoClassification, P>,
+    pipeline: Pipeline<S, DeferredLeveling, DeferredCommunityFacts, I, NoClassification, P>,
     pending: DeferredLeveling,
+    facts: DeferredCommunityFacts,
     dispatch: tokio::sync::Mutex<()>,
     runtime: Option<LevelingRuntime>,
 }
@@ -272,15 +408,17 @@ pub struct OrderedLevelingPipeline<S, I = NoInvites, P = PipelineSnapshots> {
 impl<S: FunnelStore> OrderedLevelingPipeline<S> {
     pub fn new(store: S, runtime: Option<LevelingRuntime>) -> Self {
         let pending = DeferredLeveling::default();
+        let facts = DeferredCommunityFacts::default();
         Self {
             pipeline: Pipeline::new(
                 store,
                 Some(pending.clone()),
-                None,
+                Some(facts.clone()),
                 NoInvites,
                 NoClassification,
             ),
             pending,
+            facts,
             dispatch: tokio::sync::Mutex::new(()),
             runtime,
         }
@@ -295,23 +433,41 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
         snapshots: P,
     ) -> Self {
         let pending = DeferredLeveling::default();
+        let facts = DeferredCommunityFacts::default();
         Self {
             pipeline: Pipeline::with_snapshots(
                 store,
                 Some(pending.clone()),
-                None,
+                Some(facts.clone()),
                 invite_source,
                 NoClassification,
                 snapshots,
             ),
             pending,
+            facts,
             dispatch: tokio::sync::Mutex::new(()),
             runtime,
         }
     }
 
-    pub fn handlers(&self) -> &FunnelHandlers<S, DeferredLeveling, NoopFacts> {
+    pub fn handlers(&self) -> &FunnelHandlers<S, DeferredLeveling, DeferredCommunityFacts> {
         self.pipeline.handlers()
+    }
+
+    /// Arm Postgres `voice_session_started` / `voice_session_ended` capture
+    /// (TOG-19605). Called once at boot when `TWO_COMMUNITY_SCORECARD=1`;
+    /// without it the sink drops every fact, exactly like the previous no-op
+    /// seam.
+    pub fn enable_community_facts(&self, pool: PgPool) {
+        self.facts.enable(pool);
+    }
+
+    /// Persist buffered voice facts without holding the async dispatch lock.
+    /// The caller owns ordering (the serial checkpoint writer); call on every
+    /// dispatch, even when no award queued — bots capture facts but never
+    /// awards, and a move's end+start pair buffers two rows for one frame.
+    pub async fn drain_facts(&self) -> Result<usize, CommunityFactsError> {
+        self.facts.drain().await
     }
 
     /// Access the cache (shard runner updates, tests seed).
