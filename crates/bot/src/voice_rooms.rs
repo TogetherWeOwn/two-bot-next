@@ -7022,14 +7022,100 @@ fn parse_kick_target(options: &[CommandDataOption]) -> Option<Snowflake> {
     })
 }
 
+/// Public vote-kick reason bound (gate VK-04): at most this many characters of
+/// initiator-supplied text ever reach the ballot message. Overlong input is cut
+/// at parse time and again after sanitizing at render, so the wire text always
+/// fits this bound; the ballot never grows with the input length.
+const VOTE_KICK_PUBLIC_REASON_LIMIT: usize = 512;
+
+/// Render initiator-supplied vote-kick text as bounded plain text for the
+/// public ballot (gate VK-04). The ballot goes out under the bot's name, so a
+/// hostile reason must not become a ping, clickable link, embed or formatted
+/// endorsement:
+///
+/// - `@everyone`/`@here` (including zero-width-split obfuscation) are broken
+///   with the shared mention neutralizer; `<@`, `<:` and `<#` pills are split
+///   with a zero-width space so they render literally instead of tagging a
+///   user, role, custom emoji or channel.
+/// - `://` URL schemes and a word-boundary `www.` prefix are split so bare and
+///   disguised links are neither clickable nor link-preview embeds;
+///   `SUPPRESS_EMBEDS` on the ballot shell is the second embed fence.
+/// - Newlines are folded to spaces, so no reason text can start line-leading
+///   Discord markup (headings, quotes, code fences, lists).
+/// - Inline markdown characters are backslash-escaped; Discord renders the
+///   literal character with no formatting.
+///
+/// Plain text without any of these patterns passes through byte-identical.
+/// Applied once at the ballot render boundary; the escaped output is cut to
+/// [`VOTE_KICK_PUBLIC_REASON_LIMIT`] characters so the bound holds on the wire.
+#[must_use]
+fn sanitize_vote_reason(raw: &str) -> String {
+    let mut single_line = String::with_capacity(raw.len());
+    for chunk in raw.split(['\r', '\n']) {
+        if !single_line.is_empty() {
+            single_line.push(' ');
+        }
+        single_line.push_str(chunk);
+    }
+    let neutralized = two_bot_core::message_safety::neutralize_mentions(&single_line);
+    let pills = neutralized
+        .replace("<@", "<\u{200b}@")
+        .replace("<#", "<\u{200b}#")
+        .replace("<:", "<\u{200b}:");
+    let links = pills.replace("://", ":\u{200b}//");
+    let www = split_www_prefix(&links);
+    let mut escaped = String::with_capacity(www.len());
+    for ch in www.chars() {
+        if matches!(ch, '\\' | '`' | '*' | '_' | '~' | '|' | '[' | ']') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+        .chars()
+        .take(VOTE_KICK_PUBLIC_REASON_LIMIT)
+        .collect()
+}
+
+/// Split a word-boundary `www.` link prefix with a zero-width space so Discord
+/// does not linkify it. A plain replace would also rewrite the tail of words
+/// like "awww."; only a non-alphanumeric boundary (or the start) counts.
+fn split_www_prefix(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find("www.") {
+        let (head, tail) = rest.split_at(pos);
+        let boundary = head
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !ch.is_alphanumeric());
+        out.push_str(head);
+        if boundary {
+            out.push_str("www\u{200b}.");
+        } else {
+            out.push_str("www.");
+        }
+        rest = &tail["www.".len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The optional vote reason, trimmed and length-capped like the definition.
+/// The ballot render ([`sanitize_vote_reason`]) re-applies
+/// [`VOTE_KICK_PUBLIC_REASON_LIMIT`] after escaping, so overlong input is cut
+/// twice and the wire text always fits the documented bound.
 fn parse_kick_reason(options: &[CommandDataOption]) -> Option<String> {
     options
         .iter()
         .find(|option| option.name == "reason")
         .and_then(|option| match &option.value {
             CommandOptionValue::String(value) => {
-                let reason: String = value.trim().chars().take(512).collect();
+                let reason: String = value
+                    .trim()
+                    .chars()
+                    .take(VOTE_KICK_PUBLIC_REASON_LIMIT)
+                    .collect();
                 (!reason.is_empty()).then_some(reason)
             }
             _ => None,
@@ -7262,7 +7348,10 @@ fn vote_message(
         "<@{target}> — <@{initiator}> started a vote to disconnect them from this voice room."
     )];
     if let Some(reason) = reason {
-        lines.push(format!("Reason: {reason}"));
+        let safe = sanitize_vote_reason(reason);
+        if !safe.is_empty() {
+            lines.push(format!("Reason: {safe}"));
+        }
     }
     lines.push(format!(
         "Vote with the buttons: {}/{} needed. Not voting counts as No. The vote ends in 2 minutes.",
@@ -7333,6 +7422,10 @@ fn ballot_response(
         kind,
         data: Some(InteractionResponseData {
             content: Some(content.to_owned()),
+            // Ballots never carry embeds: suppress link previews so a reason
+            // URL that survived sanitizing still raises no embed. Sanitizing
+            // already splits `://`, so this is the second fence (gate VK-04).
+            flags: Some(MessageFlags::SUPPRESS_EMBEDS),
             allowed_mentions: Some(AllowedMentions {
                 parse: Vec::new(),
                 users: vec![Id::<UserMarker>::new(target)],
