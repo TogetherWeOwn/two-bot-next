@@ -29,7 +29,7 @@ use twilight_model::{
     util::Timestamp,
     voice::VoiceState,
 };
-use two_bot_core::audit::{AuditChannelIds, AuditEvent, AuditKind};
+use two_bot_core::audit::{AuditEvent, AuditKind};
 use two_bot_core::audit_mirror::{MirrorChannel, MirrorError, MirrorMessage, MirrorOverwrite};
 use two_bot_core::audit_store::AuditStore;
 use two_bot_core::classify::ModerationAuditAction;
@@ -549,12 +549,15 @@ impl two_bot_core::audit_mirror::AuditMirror for NoopMirror {
     }
 }
 
-fn channels() -> AuditChannelIds {
-    AuditChannelIds {
-        audit: Some("1111".to_owned()),
-        voice: Some("2222".to_owned()),
-        moderation: Some("3333".to_owned()),
-    }
+fn deployment_vars() -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::from([
+        ("DISCORD_AUDIT_LOG_CHANNEL_ID".to_owned(), "1111".to_owned()),
+        ("DISCORD_VOICE_LOG_CHANNEL_ID".to_owned(), "2222".to_owned()),
+        (
+            "DISCORD_MODERATION_LOG_CHANNEL_ID".to_owned(),
+            "3333".to_owned(),
+        ),
+    ])
 }
 
 async fn database(test: &str) -> Option<TestDatabase> {
@@ -580,20 +583,23 @@ async fn translated_fixtures_produce_stored_rows() {
         return;
     };
     let pool = db.pool().clone();
-    let runtime = std::sync::Arc::new(AuditRuntime::new(
-        channels(),
-        guild_str(),
-        Box::new(move || {
-            let pool = pool.clone();
-            Box::pin(async move {
-                Ok(crate::audit_runtime::Parts {
-                    pool: pool.clone(),
-                    mirror: NoopMirror,
-                    bot_user_id: BOT.to_string(),
+    let runtime = std::sync::Arc::new(
+        AuditRuntime::new(
+            deployment_vars(),
+            guild_str(),
+            Box::new(move || {
+                let pool = pool.clone();
+                Box::pin(async move {
+                    Ok(crate::audit_runtime::Parts {
+                        pool: pool.clone(),
+                        mirror: NoopMirror,
+                        bot_user_id: BOT.to_string(),
+                    })
                 })
-            })
-        }),
-    ));
+            }),
+        )
+        .unwrap(),
+    );
 
     let cache = build_cache();
     seed_member(&cache, MEMBER, &[11, 12], None);
@@ -652,10 +658,11 @@ async fn translated_fixtures_produce_stored_rows() {
 #[tokio::test]
 async fn store_failure_is_logged_as_a_scalar_while_the_event_continues() {
     let runtime: AuditRuntime<NoopMirror> = AuditRuntime::new(
-        channels(),
+        deployment_vars(),
         guild_str(),
         Box::new(|| Box::pin(async { Err(ErrorClass::Database) })),
-    );
+    )
+    .unwrap();
     let event = AuditEvent::new(
         "member-update:1:2:2026-09-30T00:01:02.003Z:fixture".to_owned(),
         AuditKind::MemberUpdate,
