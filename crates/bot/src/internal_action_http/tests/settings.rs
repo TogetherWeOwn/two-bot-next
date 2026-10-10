@@ -272,6 +272,11 @@ async fn settings_concurrent_save_with_stale_token_does_not_revert() {
 async fn unwired_verbs_stay_refused_with_settings_flag_on() {
     let Some(db) = database().await else { return };
     let _flag = SETTINGS_FLAG_LOCK.lock().await;
+    // `moderation.ban` and `guild.add_member` refuse on process-global flags
+    // owned by sibling tests; hold their locks so a parallel flag-mutating
+    // test cannot flip the verdict mid-assertion.
+    let _moderation_flag = MODERATION_FLAG_LOCK.lock().await;
+    let _add_member_flag = ADD_MEMBER_FLAG_LOCK.lock().await;
     set_settings_flag(true);
     let app = settings_app(db.pool().clone());
     // `role.assign` is wired by the membership slice, so it no longer belongs
