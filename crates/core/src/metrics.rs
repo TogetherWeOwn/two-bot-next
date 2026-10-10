@@ -116,6 +116,42 @@ pub const DB_ERROR_OPS: &[&str] = &["admission", "other"];
 /// `other`. Failed `complete()`/`extend()` storage writes count only in
 /// db_errors: the admit decision was already recorded.
 pub const SEND_ADMISSION_OUTCOMES: &[&str] = &["admitted", "blocked", "storage_error", "other"];
+/// Vote-kick outcomes for `two_bot_voice_vote_kick_total{outcome}` (M4.30):
+/// one `started` per successful `kick_start`, one refusal code per refused
+/// `kick_start` (the worker-level `evidence_unavailable` / `not_a_room` plus
+/// every `voice_vote_kick_audit::refusal_outcome` code, including `cooldown`
+/// and `initiator_limited`), and one enforcement code per terminal
+/// `KickMember` dispatch (`EnforcementOutcome::as_str`). Unknown outcomes
+/// collapse to the trailing `other`, never to a dynamic label. No IDs,
+/// tokens or bodies are retained.
+pub const VOICE_VOTE_KICK_OUTCOMES: &[&str] = &[
+    "started",
+    "evidence_unavailable",
+    "not_a_room",
+    "initiator_not_occupant",
+    "target_not_occupant",
+    "self_target",
+    "protected_target",
+    "privileged_target",
+    "authority_unavailable",
+    "active_vote_exists",
+    "cooldown",
+    "initiator_limited",
+    "reused_vote_id",
+    "unknown_vote",
+    "wrong_vote_boundary",
+    "ineligible_voter",
+    "repeated_vote",
+    "invalid_time",
+    "connect_denied_and_disconnected",
+    "connect_denied_target_absent",
+    "skipped_room_gone",
+    "skipped_target_protected",
+    "permission_missing",
+    "discord_error",
+    "gave_up",
+    "other",
+];
 /// Dispatch-lane names for `two_bot_dispatch_drops_total{lane}`, in the bot's
 /// `DISPATCH_LIMITS` order (messages, interactions, registry, privileged,
 /// busy, reactions). Length must equal the lane count; unknown names collapse
@@ -268,6 +304,7 @@ struct Values {
     voice_tracked: u64,
     voice_compensation: u64,
     voice_orphans: u64,
+    voice_vote_kick: [u64; VOICE_VOTE_KICK_OUTCOMES.len()],
     db_errors: [u64; DB_ERROR_OPS.len()],
     send_admissions: [u64; SEND_ADMISSION_OUTCOMES.len()],
     dispatch_drops: [u64; DISPATCH_LANES.len()],
@@ -441,6 +478,20 @@ impl Metrics {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         values.voice_tracked = tracked;
         values.voice_compensation = compensation;
+    }
+
+    /// One vote-kick start, refusal or enforcement (M4.30). Call once per
+    /// `kick_start` decision (`started` or the refusal code) and once per
+    /// terminal `KickMember` enforcement (`EnforcementOutcome::as_str`).
+    /// `vote_result` rows (passed/expired/cancelled) are not outcomes here.
+    /// Unknown outcomes collapse to `other`.
+    pub fn voice_vote_kick(&self, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.voice_vote_kick[bounded_index(outcome, VOICE_VOTE_KICK_OUTCOMES)];
+        *counter = counter.saturating_add(1);
     }
 
     /// One untracked creator-channel orphan needing manual deletion after
@@ -725,6 +776,19 @@ impl Metrics {
         );
         header(
             &mut out,
+            "two_bot_voice_vote_kick_total",
+            "counter",
+            "Vote-kick starts, refusals by refusal code and terminal enforcements by enforcement code; vote results are audit-only.",
+        );
+        for (outcome, count) in VOICE_VOTE_KICK_OUTCOMES.iter().zip(values.voice_vote_kick) {
+            writeln!(
+                out,
+                "two_bot_voice_vote_kick_total{{outcome=\"{outcome}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
             "two_bot_db_errors_total",
             "counter",
             "Storage-layer failures by bounded operation; pool gauges are pressure, this is errors.",
@@ -887,6 +951,7 @@ mod tests {
             metrics.db_error(&hostile);
             metrics.send_admission(&hostile);
             metrics.dispatch_drop(&hostile);
+            metrics.voice_vote_kick(&hostile);
             metrics.checkpoint_failure(&hostile);
             metrics.internal_action(&hostile, &hostile);
         }
@@ -980,10 +1045,57 @@ mod tests {
             metrics.voice_operation(&hostile, &hostile);
             metrics.voice_reconcile(&hostile, 1);
             metrics.voice_dead_letter(&hostile);
+            metrics.voice_vote_kick(&hostile);
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
         assert!(!text.contains("secret"));
+    }
+
+    #[test]
+    fn vote_kick_starts_refusals_and_enforcements_stay_bounded() {
+        let metrics = Metrics::default();
+        metrics.voice_vote_kick("started");
+        metrics.voice_vote_kick("started");
+        metrics.voice_vote_kick("cooldown");
+        metrics.voice_vote_kick("initiator_limited");
+        metrics.voice_vote_kick("connect_denied_and_disconnected");
+        metrics.voice_vote_kick("gave_up");
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_vote_kick_total{outcome=\"started\"} 2\n"));
+        assert!(text.contains("two_bot_voice_vote_kick_total{outcome=\"cooldown\"} 1\n"));
+        assert!(text.contains("two_bot_voice_vote_kick_total{outcome=\"initiator_limited\"} 1\n"));
+        assert!(text.contains(
+            "two_bot_voice_vote_kick_total{outcome=\"connect_denied_and_disconnected\"} 1\n"
+        ));
+        assert!(text.contains("two_bot_voice_vote_kick_total{outcome=\"gave_up\"} 1\n"));
+        assert!(text.contains("two_bot_voice_vote_kick_total{outcome=\"other\"} 0\n"));
+        // Fixed cardinality: every allowlisted outcome renders exactly once.
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("two_bot_voice_vote_kick_total{"))
+            .collect();
+        assert_eq!(series.len(), VOICE_VOTE_KICK_OUTCOMES.len());
+        let mut unique = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, value) = line.rsplit_once(' ').unwrap();
+            assert!(unique.insert(key), "duplicate series: {key}");
+            assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
+    }
+
+    #[test]
+    fn vote_kick_counters_saturate_without_wrapping() {
+        let metrics = Metrics::default();
+        {
+            let mut values = metrics.0.lock().unwrap();
+            values.voice_vote_kick[bounded_index("started", VOICE_VOTE_KICK_OUTCOMES)] = u64::MAX;
+        }
+        metrics.voice_vote_kick("started");
+        assert!(metrics.render(None).contains(&format!(
+            "two_bot_voice_vote_kick_total{{outcome=\"started\"}} {}\n",
+            u64::MAX
+        )));
     }
 
     #[test]
