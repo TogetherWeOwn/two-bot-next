@@ -152,9 +152,9 @@ fn live_key_of(error: &two_bot_core::AutomodGateError) -> Option<&'static str> {
 
 /// Apply the live policy to a running activation (store-first). A stored
 /// value that fails validation falls back to its boot value while the other
-/// stored values still apply; only an error that names no key keeps the last
-/// good policy. Every fallback carries the offending key. Returns true on
-/// change.
+/// stored values still apply; only an error that names no key (such as a
+/// sanctions-shape error) keeps the last good policy. Keyed fallbacks name
+/// the offending key in the warn. Returns true on change.
 pub(crate) fn refresh_live<L: AutomodClaimLedger, F: AutomodFacts>(
     activation: &AutomodActivation<L, F>,
     deployment: &HashMap<String, String>,
