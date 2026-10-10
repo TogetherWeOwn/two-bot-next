@@ -314,6 +314,40 @@ async fn import_success_replays_without_second_apply_but_changed_bytes_conflict(
 }
 
 #[tokio::test]
+async fn import_replay_returns_first_result_after_out_of_band_row_edit() {
+    let Some(db) = database().await else { return };
+    let _flag = AUTOMATIONS_FLAG_LOCK.lock().await;
+    set_automations_flags(true, false);
+    let app = automations_app(db.pool().clone());
+    let raw = import_mee6_payload(AUTOMATIONS_ACTOR, None);
+    let intent = "intent-automations-replay-edit";
+    let (status, _, first) = answer(app.clone(), signed(&raw, "old", intent)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["result"]["imported"], json!(2));
+    let audits = audit_count(db.pool()).await;
+    // An admin edits a command out of band between the first call and the
+    // retry: the stored rows no longer match the first diff.
+    sqlx::query("UPDATE automation_commands SET template = 'edited in discord' WHERE guild_id = $1 AND name = 'faq'")
+        .bind(staging_guild())
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let (_, headers, replay) = answer(app, signed(&raw, "new", intent)).await;
+    set_automations_flags(false, false);
+    assert_eq!(headers["idempotent-replay"], "true");
+    assert_eq!(
+        replay["result"], first["result"],
+        "replay returns the first result verbatim despite the row edit"
+    );
+    assert_eq!(
+        audit_count(db.pool()).await,
+        audits,
+        "replay writes no second audit row"
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn import_overwrite_needs_the_separate_capability() {
     let Some(db) = database().await else { return };
     let _flag = AUTOMATIONS_FLAG_LOCK.lock().await;

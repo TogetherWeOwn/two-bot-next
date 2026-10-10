@@ -2341,7 +2341,16 @@ async fn import_automations(
     let claim = match state.store.claim(&identity, &subject).await {
         Ok(InternalClaim::Claimed(claim)) => claim,
         Ok(InternalClaim::Replay(response)) => {
-            return replay_import(state, &decision.body, response, id, key, action).await;
+            return replay_import(
+                state,
+                &decision.body,
+                &idempotency,
+                response,
+                id,
+                key,
+                action,
+            )
+            .await;
         }
         Ok(InternalClaim::Mismatch) => return reject(Failure::code(ErrorCode::VersionConflict)),
         Ok(InternalClaim::InFlight) => return reject(Failure::code(ErrorCode::InProgress)),
@@ -2400,16 +2409,18 @@ async fn import_automations(
 }
 
 /// Replay a stored `automations.import` terminal without re-executing the
-/// apply. Success rebuilds the value-stable `{imported,skipped,conflicts}`
-/// result: `imported` comes from the stored receipt, while `skipped` and
-/// `conflicts` re-derive from a read-only diff of the claimed body against the
-/// current rows (no writes, no new audit rows). Absent an intervening import
-/// the rebuild matches the first response exactly; a later import's token is
-/// what a blind retry must see rather than a stale copy. Failures reuse the
+/// apply. Success returns the first `{imported,skipped,conflicts}` result
+/// verbatim from the `{idempotency}#summary` audit row the first apply
+/// committed (no writes, no new audit rows): a blind retry after a lost
+/// response sees exactly what the first call reported, even when an admin
+/// edited a command out of band between the two calls. When the summary row
+/// is missing or unparseable (a receipt predating the conflict-names edge),
+/// the result rebuilds from a read-only diff instead. Failures reuse the
 /// generic terminal envelope with the replay marker.
 async fn replay_import(
     state: &ReceiverState,
     body: &Map<String, Value>,
+    idempotency: &str,
     response: TerminalResponse,
     id: &str,
     key: KeyLabel,
@@ -2418,17 +2429,78 @@ async fn replay_import(
     match response {
         TerminalResponse::Success { affected, .. } => {
             let imported = usize::try_from(affected).unwrap_or(usize::MAX);
-            let rebuilt = rebuilt_import_outcome(state, body, imported).await;
+            let stored =
+                stored_import_outcome(state, &format!("{idempotency}#summary"), imported).await;
+            let rebuilt = match stored {
+                Some(outcome) => outcome,
+                None => rebuilt_import_outcome(state, body, imported).await,
+            };
             import_success_response(&rebuilt, id, true)
         }
         TerminalResponse::Failure(_) => state.terminal(response, true, id, key, action),
     }
 }
 
-/// Read-only rebuild of an import result for replay. Never writes. Falls back
-/// to the stored `imported` count with empty `skipped`/`conflicts` when the
-/// claimed body no longer parses or the store is unavailable — still no second
-/// apply.
+/// Load the first `{imported,skipped,conflicts}` result from the summary audit
+/// row. Read-only; `None` on any miss or mismatch so the caller falls back to
+/// the diff rebuild.
+async fn stored_import_outcome(
+    state: &ReceiverState,
+    summary_id: &str,
+    imported: usize,
+) -> Option<ImportOutcome> {
+    let (outcome, reason) = custom_command_store::load_audit(state.store.pool(), summary_id)
+        .await
+        .ok()??;
+    parse_stored_import_outcome(&outcome, reason.as_deref(), imported)
+}
+
+/// Parse a summary row back into the first result. The outcome string keeps
+/// the stable `imported:N,skipped:S,conflicts:C` shape and `reason` carries
+/// the conflict names as a JSON array; anything else (including a count/name
+/// mismatch or an `imported` that disagrees with the stored receipt) is `None`.
+fn parse_stored_import_outcome(
+    outcome: &str,
+    reason: Option<&str>,
+    imported: usize,
+) -> Option<ImportOutcome> {
+    let (counts, rest) = outcome.split_once("imported:")?;
+    if !counts.is_empty() {
+        return None;
+    }
+    let (imported_raw, rest) = rest.split_once(",skipped:")?;
+    let (skipped_raw, rest) = rest.split_once(",conflicts:")?;
+    if rest.contains(',') {
+        return None;
+    }
+    let stored_imported: usize = imported_raw.parse().ok()?;
+    let skipped: usize = skipped_raw.parse().ok()?;
+    let conflict_count: usize = rest.parse().ok()?;
+    if stored_imported != imported {
+        return None;
+    }
+    let conflicts: Vec<String> = match reason {
+        Some(names) => serde_json::from_str(names).ok()?,
+        // Rows predating the conflict-names edge carry no reason; with a
+        // zero count the empty list is still the verbatim first result.
+        None if conflict_count == 0 => Vec::new(),
+        None => return None,
+    };
+    if conflicts.len() != conflict_count {
+        return None;
+    }
+    Some(ImportOutcome {
+        imported,
+        skipped,
+        conflicts,
+    })
+}
+
+/// Read-only rebuild of an import result for replay, used only when the
+/// summary audit row is missing or unparseable (see [`stored_import_outcome`]).
+/// Never writes. Falls back to the stored `imported` count with empty
+/// `skipped`/`conflicts` when the claimed body no longer parses or the store
+/// is unavailable — still no second apply.
 async fn rebuilt_import_outcome(
     state: &ReceiverState,
     body: &Map<String, Value>,
@@ -2470,8 +2542,9 @@ async fn rebuilt_import_outcome(
 }
 
 /// Successful imports carry the transactional counts on the wire. The stored
-/// receipt keeps only `affected = imported`; `skipped`/`conflicts` rebuild on
-/// replay without a second apply (see [`replay_import`]).
+/// receipt keeps only `affected = imported`; `skipped`/`conflicts` replay
+/// from the summary audit row without a second apply, rebuilding from a
+/// read-only diff only as a fallback (see [`replay_import`]).
 fn import_success_response(outcome: &ImportOutcome, id: &str, replayed: bool) -> Response {
     let mut wire = (
         StatusCode::OK,
