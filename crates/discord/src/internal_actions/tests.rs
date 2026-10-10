@@ -383,9 +383,24 @@ async fn twilight_posts_exact_mapped_route_and_mention_safe_payload() {
 async fn refuses_bad_inputs_missing_mapping_and_every_other_core_verb_without_http() {
     let mock = MockDiscord::start(Reply::success()).await;
     let executor = mock.executor(keys());
-    assert_eq!(SUPPORTED_ACTIONS, ["announcement.post"]);
+    assert_eq!(
+        SUPPORTED_ACTIONS,
+        ["announcement.post", "settings.get", "settings.set"]
+    );
     for action in two_bot_core::internal_actions::IMPLEMENTED_ACTIONS {
-        if action == "announcement.post" {
+        if matches!(
+            action,
+            "announcement.post" | "settings.get" | "settings.set"
+        ) {
+            assert!(AnnouncementExecutor::supports(action));
+            // Settings verbs are wired at the receiver via the settings store;
+            // this Discord transport never executes them.
+            if action != "announcement.post" {
+                assert_eq!(
+                    run_action(&executor, action, &announcement("ok")).await,
+                    ExecutionOutcome::NoEffect(Refusal::ActionNotAllowed)
+                );
+            }
             continue;
         }
         assert!(!AnnouncementExecutor::supports(action));

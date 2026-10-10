@@ -17,21 +17,24 @@ use twilight_model::{
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
 use two_bot_core::{
+    classify,
+    community_store::{
+        message_fact, record_fact, rules_accepted_fact, CommunityStoreError, FactWrite,
+    },
     leveling::{
         leaderboard_reply, plan_reward_roles, rank_reply, XpAward, LEADERBOARD_DEFAULT_LIMIT,
     },
     leveling_store::{self, LevelingStoreError},
-    FactsSink, FunnelHandlers, FunnelStore, HandlerId, InviteSnapshotStore, LevelOutcome,
-    LevelingHook, NoopFacts, Snowflake,
+    ClassifierConfig, ClassifyInput, FactsSink, FunnelHandlers, FunnelStore, HandlerId,
+    InviteSnapshotStore, LevelOutcome, LevelingHook, MemberJoinFact, MessageFact,
+    RulesAcceptedFact, Snowflake, VoiceEndedFact, VoiceStartedFact,
 };
 
 use two_bot_core::automod_runtime::FunnelDisposition;
 
 use crate::{
-    community_facts::{DeferredCommunityFacts, RulesAcceptedWrite},
-    pipeline::MessageEligibility,
-    ActionExecutor, DiscordError, InviteSource, NoClassification, NoInvites, Pipeline,
-    PipelineSnapshots,
+    pipeline::MessageEligibility, ActionExecutor, DiscordError, InviteSource, NoClassification,
+    NoInvites, Pipeline, PipelineSnapshots,
 };
 
 /// Failures propagate to the gateway supervisor; Display never includes SQL
@@ -107,6 +110,193 @@ impl DeferredLeveling {
     fn take(&self) -> Vec<AwardRequest> {
         std::mem::take(&mut *self.0.lock().expect("leveling buffer"))
     }
+}
+
+/// Failures propagate to the gateway supervisor; Display never includes SQL
+/// connection details, Discord tokens, response bodies or member content.
+#[derive(Debug, thiserror::Error)]
+pub enum CommunityFactsError {
+    #[error("community facts store operation failed")]
+    Store(#[from] CommunityStoreError),
+}
+
+#[derive(Debug, Default)]
+struct CommunityFactsState {
+    pool: Option<PgPool>,
+    config: ClassifierConfig,
+    pending: Vec<FactWrite>,
+    rules: Vec<RulesAcceptedWrite>,
+}
+
+/// One buffered gate-clearing: owned inputs for a later async
+/// `community_store::rules_accepted_fact` write. Bots are captured like any
+/// other member (classified `bot`, never funnel-counted).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RulesAcceptedWrite {
+    pub guild_id: Snowflake,
+    pub member_id: Snowflake,
+    pub is_bot: bool,
+    pub occurred_at: String,
+    pub source_event_id: String,
+    pub source: String,
+}
+
+/// Buffered `message_created` (TOG-19603) and `rules_accepted` capture. The
+/// synchronous [`FactsSink`] hook only classifies and buffers; the serial
+/// checkpoint writer drains via [`OrderedLevelingPipeline::drain_facts`],
+/// which persists through `community_store::record_fact`. Mirrors
+/// [`DeferredLeveling`]: no `block_on`, no detached tasks, no mutex held over
+/// an await.
+///
+/// The two streams buffer differently by construction. Messages classify at
+/// record time and are dropped while unarmed (no pool), so a staging-gated
+/// rollout captures exactly while it scores. Gate-clearings buffer raw even
+/// while unarmed — they are tiny, classified at drain with the same boot
+/// config, and the unarmed drain drops them — so funnel replay tests can
+/// assert the buffer without a database. Either way, disabled (no pool)
+/// persists nothing, exactly like [`two_bot_core::NoopFacts`].
+#[derive(Debug, Clone, Default)]
+pub struct DeferredCommunityFacts(Arc<Mutex<CommunityFactsState>>);
+
+impl DeferredCommunityFacts {
+    /// Empty buffer.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Arm Postgres capture with the scorecard classifier resolved once from
+    /// the process environment. Called once at boot when
+    /// `TWO_COMMUNITY_SCORECARD=1`; tests call it with their fixture pool.
+    pub fn enable(&self, pool: PgPool) {
+        let mut state = self.0.lock().expect("community facts lock");
+        state.pool = Some(pool);
+        state.config = ClassifierConfig::from_env();
+    }
+
+    /// Take every buffered gate-clearing, leaving that buffer empty. Order is
+    /// arrival order; gate-clear facts are order-insensitive (once per member).
+    pub fn take(&self) -> Vec<RulesAcceptedWrite> {
+        std::mem::take(&mut self.0.lock().expect("community facts lock").rules)
+    }
+
+    /// Buffered gate-clearing count (tests, health).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.lock().expect("community facts lock").rules.len()
+    }
+
+    /// Whether the gate-clearing buffer holds no writes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Persist every buffered fact. Returns the inserted count; a duplicate
+    /// delivery returns `false` from the store and is not counted twice.
+    pub async fn drain(&self) -> Result<usize, CommunityFactsError> {
+        let (pool, config, pending, rules) = {
+            let mut state = self.0.lock().expect("community facts lock");
+            (
+                state.pool.clone(),
+                state.config.clone(),
+                std::mem::take(&mut state.pending),
+                std::mem::take(&mut state.rules),
+            )
+        };
+        let Some(pool) = pool else {
+            return Ok(0);
+        };
+        let mut inserted = 0;
+        for write in &pending {
+            if record_fact(&pool, write).await? {
+                inserted += 1;
+            }
+        }
+        for write in &rules {
+            let input = ClassifyInput {
+                guild_id: write.guild_id.to_string(),
+                actor_id: write.member_id.to_string(),
+                is_bot: write.is_bot,
+                webhook_id: None,
+                is_staff_automation: false,
+                is_raid: false,
+                is_staging: false,
+                is_test: false,
+            };
+            let verdict = classify(&config, &input);
+            let fact = rules_accepted_fact(
+                &input.guild_id,
+                &input,
+                &write.occurred_at,
+                &write.source_event_id,
+                &write.source,
+                verdict,
+                None,
+            );
+            if record_fact(&pool, &fact).await? {
+                inserted += 1;
+            }
+        }
+        Ok(inserted)
+    }
+}
+
+impl FactsSink for DeferredCommunityFacts {
+    fn record_member_join(&self, _fact: MemberJoinFact<'_>) {}
+
+    fn record_rules_accepted(&self, fact: RulesAcceptedFact<'_>) {
+        self.0
+            .lock()
+            .expect("community facts lock")
+            .rules
+            .push(RulesAcceptedWrite {
+                guild_id: fact.guild_id,
+                member_id: fact.member_id,
+                is_bot: fact.is_bot,
+                occurred_at: fact.occurred_at.to_owned(),
+                source_event_id: fact.source_event_id.clone(),
+                source: fact.source.to_owned(),
+            });
+    }
+
+    fn record_message(&self, fact: MessageFact<'_>) {
+        let mut state = self.0.lock().expect("community facts lock");
+        if state.pool.is_none() {
+            return;
+        }
+        // Content-minimized by construction: IDs plus the classifier verdict
+        // plus the channel class only, never message content. Bots, webhooks
+        // and staff automation are classified and captured here; the funnel
+        // gate in `on_message` already keeps them out of the XP/activity
+        // counts, so this sink never filters.
+        let input = ClassifyInput {
+            guild_id: fact.guild_id.to_string(),
+            actor_id: fact.member_id.to_string(),
+            is_bot: fact.is_bot,
+            webhook_id: fact.webhook_id.map(|w| w.to_string()),
+            is_staff_automation: fact.is_staff_automation,
+            is_raid: false,
+            is_staging: false,
+            is_test: false,
+        };
+        let verdict = classify(&state.config, &input);
+        state.pending.push(message_fact(
+            &input.guild_id,
+            fact.message_id,
+            &fact.channel_id.to_string(),
+            fact.channel_class.as_str(),
+            &input,
+            fact.occurred_at,
+            verdict,
+        ));
+    }
+
+    fn record_voice_started(&self, _fact: VoiceStartedFact<'_>) -> Option<String> {
+        None
+    }
+
+    fn record_voice_ended(&self, _fact: VoiceEndedFact<'_>) {}
 }
 
 /// Award/reply slice of the shared command runtime; no private router or client.
@@ -264,9 +454,10 @@ impl LevelingRuntime {
 /// `I` serves invite counters and `P` persists invite snapshots; the
 /// persistent gateway runner seeds both from the store, while unit and
 /// database tests keep the in-memory defaults.
-pub struct OrderedLevelingPipeline<S, I = NoInvites, P = PipelineSnapshots, F = NoopFacts> {
-    pipeline: Pipeline<S, DeferredLeveling, F, I, NoClassification, P>,
+pub struct OrderedLevelingPipeline<S, I = NoInvites, P = PipelineSnapshots> {
+    pipeline: Pipeline<S, DeferredLeveling, DeferredCommunityFacts, I, NoClassification, P>,
     pending: DeferredLeveling,
+    facts: DeferredCommunityFacts,
     dispatch: tokio::sync::Mutex<()>,
     runtime: Option<LevelingRuntime>,
 }
@@ -274,24 +465,24 @@ pub struct OrderedLevelingPipeline<S, I = NoInvites, P = PipelineSnapshots, F = 
 impl<S: FunnelStore> OrderedLevelingPipeline<S> {
     pub fn new(store: S, runtime: Option<LevelingRuntime>) -> Self {
         let pending = DeferredLeveling::default();
+        let facts = DeferredCommunityFacts::default();
         Self {
             pipeline: Pipeline::new(
                 store,
                 Some(pending.clone()),
-                Some(NoopFacts),
+                Some(facts.clone()),
                 NoInvites,
                 NoClassification,
             ),
             pending,
+            facts,
             dispatch: tokio::sync::Mutex::new(()),
             runtime,
         }
     }
 }
 
-impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore, F: FactsSink + Default>
-    OrderedLevelingPipeline<S, I, P, F>
-{
+impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPipeline<S, I, P> {
     pub fn with_snapshots(
         store: S,
         runtime: Option<LevelingRuntime>,
@@ -299,23 +490,40 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore, F: FactsSink + Def
         snapshots: P,
     ) -> Self {
         let pending = DeferredLeveling::default();
+        let facts = DeferredCommunityFacts::default();
         Self {
             pipeline: Pipeline::with_snapshots(
                 store,
                 Some(pending.clone()),
-                Some(F::default()),
+                Some(facts.clone()),
                 invite_source,
                 NoClassification,
                 snapshots,
             ),
             pending,
+            facts,
             dispatch: tokio::sync::Mutex::new(()),
             runtime,
         }
     }
 
-    pub fn handlers(&self) -> &FunnelHandlers<S, DeferredLeveling, F> {
+    pub fn handlers(&self) -> &FunnelHandlers<S, DeferredLeveling, DeferredCommunityFacts> {
         self.pipeline.handlers()
+    }
+
+    /// Arm Postgres community-facts capture (message TOG-19603, rules this
+    /// slice). Called once at boot when `TWO_COMMUNITY_SCORECARD=1`; without
+    /// it the sink drops every fact, exactly like the previous no-op seam.
+    pub fn enable_community_facts(&self, pool: PgPool) {
+        self.facts.enable(pool);
+    }
+
+    /// Persist buffered community facts without holding the async dispatch
+    /// lock. The caller owns ordering (the serial checkpoint writer); call on
+    /// every dispatch, even when no award queued — bots, webhooks and staff
+    /// automation capture facts but never awards.
+    pub async fn drain_facts(&self) -> Result<usize, CommunityFactsError> {
+        self.facts.drain().await
     }
 
     /// Access the cache (shard runner updates, tests seed).
@@ -404,16 +612,90 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore, F: FactsSink + Def
     }
 }
 
-impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore>
-    OrderedLevelingPipeline<S, I, P, DeferredCommunityFacts>
-{
-    /// Take the buffered gate-clear facts for the community drain. Empty when
-    /// the dispatch carried no gate-clearing; the caller drains only then.
-    pub fn take_community_facts(&self) -> Vec<RulesAcceptedWrite> {
-        self.pipeline
-            .handlers()
-            .facts()
-            .map(DeferredCommunityFacts::take)
-            .unwrap_or_default()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gate<'a>(
+        member_id: Snowflake,
+        occurred_at: &'a str,
+        source: &'a str,
+    ) -> RulesAcceptedFact<'a> {
+        RulesAcceptedFact {
+            guild_id: 100,
+            member_id,
+            is_bot: false,
+            occurred_at,
+            source_event_id: format!("100:{member_id}:rules"),
+            source,
+        }
+    }
+
+    #[test]
+    fn rules_take_returns_arrival_order_and_empties() {
+        let buffer = DeferredCommunityFacts::new();
+        assert!(buffer.is_empty());
+        buffer.record_rules_accepted(gate(1, "2026-09-20T12:00:00.000Z", "gateway"));
+        buffer.record_rules_accepted(gate(2, "2026-09-20T12:01:00.000Z", "backfill:member_list"));
+        assert_eq!(buffer.len(), 2);
+        let writes = buffer.take();
+        assert_eq!(
+            writes.iter().map(|w| w.member_id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(writes[1].source, "backfill:member_list");
+        assert!(buffer.is_empty());
+        assert!(buffer.take().is_empty());
+    }
+
+    #[test]
+    fn rules_buffer_unarmed_while_messages_and_joins_do_not() {
+        // Gate-clearings buffer raw even before `enable` (funnel replay
+        // asserts the buffer without a database); messages are dropped while
+        // unarmed so a staging-gated rollout captures exactly while it
+        // scores; joins and voice never buffer on this slice.
+        let buffer = DeferredCommunityFacts::new();
+        buffer.record_rules_accepted(gate(1, "2026-09-20T12:00:00.000Z", "gateway"));
+        buffer.record_member_join(MemberJoinFact {
+            guild_id: 100,
+            member_id: 1,
+            is_bot: false,
+            occurred_at: "2026-09-20T12:00:00.000Z",
+            source_event_id: "100:1:2026-09-20T12:00:00.000Z",
+            source: "invite:abc",
+            inviter_id: None,
+        });
+        buffer.record_message(MessageFact {
+            guild_id: 100,
+            member_id: 1,
+            is_bot: false,
+            webhook_id: None,
+            is_staff_automation: false,
+            message_id: "m1",
+            channel_id: 10,
+            channel_class: two_bot_core::ChannelClass::Human,
+            occurred_at: "2026-09-20T12:01:00.000Z",
+        });
+        assert_eq!(
+            buffer.record_voice_started(VoiceStartedFact {
+                guild_id: 100,
+                member_id: 1,
+                is_bot: false,
+                channel_id: 10,
+                occurred_at: "2026-09-20T12:02:00.000Z",
+            }),
+            None
+        );
+        buffer.record_voice_ended(VoiceEndedFact {
+            guild_id: 100,
+            member_id: 1,
+            is_bot: false,
+            session_key: "s".to_owned(),
+            channel_id: 10,
+            occurred_at: "2026-09-20T12:03:00.000Z",
+            started_at: None,
+            duration_seconds: None,
+        });
+        assert_eq!(buffer.len(), 1, "only the gate-clearing buffers unarmed");
     }
 }

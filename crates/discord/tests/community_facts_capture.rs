@@ -15,11 +15,8 @@ use twilight_model::{
     user::User,
     util::Timestamp,
 };
-use two_bot_core::{ClassifierConfig, MemStore, NoopLeveling};
-use two_bot_discord::{
-    CommunityDrainOutcome, CommunityFactsRuntime, DeferredCommunityFacts, NoClassification,
-    Pipeline, ScriptedInvites,
-};
+use two_bot_core::{MemStore, NoopLeveling};
+use two_bot_discord::{DeferredCommunityFacts, NoClassification, Pipeline, ScriptedInvites};
 use two_bot_testsupport::TestDatabase;
 
 const GUILD: u64 = 100_000_000_000_000_007;
@@ -81,7 +78,6 @@ struct Fixture {
     pipeline:
         Pipeline<MemStore, NoopLeveling, DeferredCommunityFacts, ScriptedInvites, NoClassification>,
     buffer: DeferredCommunityFacts,
-    runtime: CommunityFactsRuntime,
 }
 
 impl Fixture {
@@ -93,6 +89,7 @@ impl Fixture {
             .expect("create migrated test database; no credential fallback");
         let pool = db.pool().clone();
         let buffer = DeferredCommunityFacts::new();
+        buffer.enable(pool.clone());
         let pipeline = Pipeline::new(
             MemStore::new(),
             Some(NoopLeveling),
@@ -100,23 +97,19 @@ impl Fixture {
             ScriptedInvites::new(),
             NoClassification,
         );
-        let runtime = CommunityFactsRuntime::new(pool.clone(), ClassifierConfig::default());
         Self {
             _db: db,
             pool,
             pipeline,
             buffer,
-            runtime,
         }
     }
 
-    async fn drain(&self) -> CommunityDrainOutcome {
-        let writes = self.buffer.take();
-        assert!(!writes.is_empty(), "gate-clear must buffer a fact");
-        self.runtime
-            .drain_writes(writes)
-            .await
-            .expect("drain persists")
+    /// Drain the shared sink: returns the inserted count (a redelivered clear
+    /// dedupes to zero through the once-per-member key).
+    async fn drain(&self) -> usize {
+        assert!(!self.buffer.is_empty(), "gate-clear must buffer a fact");
+        self.buffer.drain().await.expect("drain persists")
     }
 }
 
@@ -129,8 +122,7 @@ async fn gate_clear_drains_one_fact_and_dedupes_repeats() {
 
     fx.pipeline
         .handle_at(&join_event(MEMBER, "12:00:00"), "2026-09-20T12:10:00.000Z");
-    let outcome = fx.drain().await;
-    assert_eq!((outcome.inserted, outcome.duplicates), (1, 0));
+    assert_eq!(fx.drain().await, 1);
 
     let row: (String, String, String, String, String, String) = sqlx::query_as(
         "SELECT event_type, source_event_id, actor_id, occurred_at, source, idempotency_key
@@ -155,8 +147,7 @@ async fn gate_clear_drains_one_fact_and_dedupes_repeats() {
     // Redelivered clear: same member, same key — duplicate, no second row.
     fx.pipeline
         .handle_at(&join_event(MEMBER, "12:00:00"), "2026-09-20T12:10:00.000Z");
-    let outcome = fx.drain().await;
-    assert_eq!((outcome.inserted, outcome.duplicates), (0, 1));
+    assert_eq!(fx.drain().await, 0);
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM community_facts")
         .fetch_one(&fx.pool)
         .await
@@ -166,6 +157,5 @@ async fn gate_clear_drains_one_fact_and_dedupes_repeats() {
     // A second member inserts under its own key.
     fx.pipeline
         .handle_at(&join_event(OTHER, "12:05:00"), "2026-09-20T12:10:00.000Z");
-    let outcome = fx.drain().await;
-    assert_eq!((outcome.inserted, outcome.duplicates), (1, 0));
+    assert_eq!(fx.drain().await, 1);
 }

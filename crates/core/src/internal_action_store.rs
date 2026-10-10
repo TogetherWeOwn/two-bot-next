@@ -107,6 +107,8 @@ pub enum TerminalFailure {
     DiscordRejected,
     /// The executor has proved that no side effect occurred.
     NoEffect,
+    /// A settings CAS token went stale; refresh, do not retry blindly.
+    VersionConflict,
 }
 
 /// Minimal replayable response contract. Extend with typed scalars, never raw JSON.
@@ -128,6 +130,7 @@ impl TerminalResponse {
             Self::Failure(TerminalFailure::ActionNotAllowed) => "action_not_allowed",
             Self::Failure(TerminalFailure::DiscordRejected) => "discord_rejected",
             Self::Failure(TerminalFailure::NoEffect) => "no_effect",
+            Self::Failure(TerminalFailure::VersionConflict) => "version_conflict",
         }
     }
 
@@ -139,6 +142,7 @@ impl TerminalResponse {
             Self::Failure(TerminalFailure::ActionNotAllowed) => 403,
             Self::Failure(TerminalFailure::DiscordRejected) => 422,
             Self::Failure(TerminalFailure::NoEffect) => 502,
+            Self::Failure(TerminalFailure::VersionConflict) => 409,
         }
     }
 
@@ -172,6 +176,7 @@ impl TerminalResponse {
             "action_not_allowed" => Self::Failure(TerminalFailure::ActionNotAllowed),
             "discord_rejected" => Self::Failure(TerminalFailure::DiscordRejected),
             "no_effect" => Self::Failure(TerminalFailure::NoEffect),
+            "version_conflict" => Self::Failure(TerminalFailure::VersionConflict),
             _ => return Err(InternalStoreError::Unavailable),
         };
         if row.try_get::<i32, _>("http_status")? != i32::from(response.status()) {
@@ -245,6 +250,14 @@ impl InternalActionStore {
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Borrow the runtime pool for settings reads/writes that share the
+    /// receiver's database authority. The settings transaction stays separate
+    /// from the idempotency claim; callers must finish/mark the claim.
+    #[must_use]
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     /// Signature/freshness first, then durable burn, BEFORE body parsing/buckets.

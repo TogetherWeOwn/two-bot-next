@@ -157,7 +157,6 @@ async fn spawn_governed_with_commands(
         Some(commands),
         None,
         None,
-        None,
         async move {
             match shutdown {
                 Some(receiver) => crate::server::shutdown_requested(receiver).await,

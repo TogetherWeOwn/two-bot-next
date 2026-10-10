@@ -241,9 +241,27 @@ No Prometheus server, no new infrastructure.
 
 - Authenticated pull: `GET /ops/metrics` on the Worker with
   `Authorization: Bearer <METRICS_SCRAPE_TOKEN>`. The token is an optional
-  Worker secret (never a plain var). Unset → `404`; missing or wrong bearer →
-  `401` (compared via SHA-256 digests); non-GET → `404`. Unauthenticated
-  requests never reach the container. `/metrics` itself stays `404`.
+  Worker secret (never a plain var) and must be at least 32 characters —
+  the same floor as the ownership control token. Unset or shorter → `404`
+  (plus one redacted log line naming the requirement); a short staging
+  token must be reissued, never padded (none is provisioned today).
+  Missing or wrong bearer → `401` (compared via SHA-256 digests);
+  every attempt takes one token synchronously before the comparison, so
+  concurrent guesses cannot share a token and a throttled caller is
+  refused without any comparison — guessing cannot confirm a bearer
+  while exhausted (`429` + `retry-after` via the existing per-caller
+  bucket, 10 burst, 1/sec). Buckets are per caller, so another caller's
+  guessing cannot throttle a correct bearer elsewhere; a caller shed only
+  because the 10,000-entry table is full is still compared, so a scanner
+  flood cannot lock out the authenticated scraper. The scraper
+  (~1/15 s) never nears the budget. Non-GET →
+  `404`. Unauthenticated requests never reach the container. `/metrics`
+  itself stays `404`. The ownership control path (`/internal/ownership`)
+  keeps its own gate and shares neither this bucket nor its budget.
+  The DO container fetch aborts after 6 s (`504`, generic body — the SDK
+  resolves aborts as a 500 Response, which is mapped to 504 without
+  proxying its text) and the upstream body is capped at 64 KiB
+  (larger → `502`, generic body).
 - Rules live in `wrangler/src/alert-rules.ts`; each links to a
   [runbook](runbook.md#metrics-alerts) section (a test enforces the anchors):
 
