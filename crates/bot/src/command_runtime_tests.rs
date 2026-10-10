@@ -5063,6 +5063,11 @@ async fn self_role_reactions_enforce_per_member_fairness() {
             0,
             "dropped reactions spawn nothing"
         );
+        assert_eq!(
+            runtime.dispatch_drops_total(LANE_REACTIONS),
+            2,
+            "fairness drops share the lane's drop counter"
+        );
 
         let add_b = Event::ReactionAdd(Box::new(ReactionAdd(reaction_for(MEMBER_B))));
         assert!(
@@ -5082,6 +5087,11 @@ async fn self_role_reactions_enforce_per_member_fairness() {
         assert!(
             runtime.dispatch(&add_a),
             "released per-member slots admit again"
+        );
+        assert_eq!(
+            runtime.dispatch_drops_total(LANE_REACTIONS),
+            2,
+            "admissions never increment the drop counter"
         );
         assert!(
             runtime.lane_in_flight(LANE_REACTIONS) <= reaction_cap,

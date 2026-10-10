@@ -173,11 +173,36 @@ const SATURATION_LOG_WINDOW_SECS: u64 = 60;
 struct DispatchTasks {
     stopped: bool,
     lanes: [Vec<tokio::task::AbortHandle>; DISPATCH_LIMITS.len()],
-    /// Per-lane saturation drops (test-visible mirror of the global
-    /// `two_bot_dispatch_drops_total{lane}` counter, which `spawn_first`
-    /// increments alongside).
+    /// Per-lane drops (test-visible mirror of the global
+    /// `two_bot_dispatch_drops_total{lane}` counter, incremented alongside by
+    /// `DispatchTasks::record_drop`; fairness drops share their lane's
+    /// counter).
     drops: [u64; DISPATCH_LIMITS.len()],
     last_drop_log: Option<std::time::Instant>,
+}
+
+impl DispatchTasks {
+    /// Record a refused event on `lanes`: increment each lane's drop counter
+    /// (test-visible mirror of the global `two_bot_dispatch_drops_total{lane}`
+    /// counter, incremented alongside) and emit at most one `warn!` per 60 s
+    /// per runtime. Fairness drops share their lane's counter so every refused
+    /// event stays observable through one path; each caller keeps its own
+    /// sampled message so existing log filters keep matching.
+    fn record_drop(&mut self, lanes: &[usize], reason: &'static str, message: &'static str) {
+        for &lane in lanes {
+            self.drops[lane] = self.drops[lane].saturating_add(1);
+            two_bot_core::metrics::global()
+                .dispatch_drop(two_bot_core::metrics::DISPATCH_LANES[lane]);
+        }
+        let now = std::time::Instant::now();
+        let due = self
+            .last_drop_log
+            .is_none_or(|at| now.duration_since(at).as_secs() >= SATURATION_LOG_WINDOW_SECS);
+        if due {
+            self.last_drop_log = Some(now);
+            warn!(?lanes, reason, "{message}");
+        }
+    }
 }
 
 // Lane labels stay in `DISPATCH_LIMITS` order with the global metric allowlist.
@@ -686,22 +711,11 @@ impl CommandRuntime {
                 return true;
             }
         }
-        for &lane in lanes {
-            tasks.drops[lane] = tasks.drops[lane].saturating_add(1);
-            two_bot_core::metrics::global()
-                .dispatch_drop(two_bot_core::metrics::DISPATCH_LANES[lane]);
-        }
-        let now = std::time::Instant::now();
-        let due = tasks
-            .last_drop_log
-            .is_none_or(|at| now.duration_since(at).as_secs() >= SATURATION_LOG_WINDOW_SECS);
-        if due {
-            tasks.last_drop_log = Some(now);
-            warn!(
-                ?lanes,
-                "command dispatch saturated; event not admitted (sampled; see two_bot_dispatch_drops_total)"
-            );
-        }
+        tasks.record_drop(
+            lanes,
+            "lane saturated",
+            "command dispatch saturated; event not admitted (sampled; see two_bot_dispatch_drops_total)",
+        );
         false
     }
 
@@ -1018,13 +1032,13 @@ impl CommandRuntime {
     }
 
     /// Reactions run on their own lane: a reaction burst must consume neither
-    /// message automation capacity nor interaction acknowledgement capacity,
-    /// and saturation drops with only a log line, exactly like message bursts.
+    /// message automation capacity nor interaction acknowledgement capacity.
     /// Per-member fairness mirrors the interaction lane: one member holds at
     /// most [`PER_USER_IN_FLIGHT`] reaction slots, so a single-member burst
     /// cannot fill `LANE_REACTIONS` and starve other members. Excess reactions
-    /// drop (`false`) through the same saturated path; no busy reply exists on
-    /// the reaction path, which carries no interaction token.
+    /// drop (`false`) through the same counted, log-sampled path as saturated
+    /// lanes; no busy reply exists on the reaction path, which carries no
+    /// interaction token.
     fn dispatch_self_role_reaction(&self, reaction: &GatewayReaction, remove: bool) -> bool {
         if !self.interactions.router.gates().self_roles {
             return true;
@@ -1036,7 +1050,11 @@ impl CommandRuntime {
             return true;
         };
         let Some(slot) = self.user_slots.acquire(reaction.user_id.get()) else {
-            warn!("reaction per-member cap reached; event not admitted");
+            self.tasks.lock().expect("command task scope").record_drop(
+                &[LANE_REACTIONS],
+                "reaction per-member cap reached",
+                "command dispatch fairness drop; event not admitted (sampled; see two_bot_dispatch_drops_total)",
+            );
             return false;
         };
         self.spawn(LANE_REACTIONS, async move {
