@@ -3189,17 +3189,35 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             occupants: &occupants,
             target_privileged,
         };
-        let update = self
+        let update = match self
             .votes
             .cast(reference, facts, voter_id, ballot, &ActorClock(now_ms))
-            .map_err(KickRefusal::Vote)?;
+        {
+            Err(VoteKickError::UnknownVote) => {
+                // The core reaped this vote past its retention horizon (or it
+                // never existed here): drop the worker's refs so these maps
+                // stay bounded too.
+                self.vote_refs.remove(&vote_id);
+                self.vote_initiators.remove(&vote_id);
+                return Err(KickRefusal::Vote(VoteKickError::UnknownVote));
+            }
+            result => result.map_err(KickRefusal::Vote)?,
+        };
         Ok(self.settle_vote(update))
     }
 
     /// Timer entry: expire votes and react to roster, ownership and room-delete
     /// changes. Returns the updates that finished a vote. Skipped while live
     /// evidence is not authoritative: a stale roster must not cancel a vote.
+    ///
+    /// Retention is bounded first (VK-03): the core reaps terminal votes and
+    /// initiator history past their windows even with no new starts, and this
+    /// worker drops its own per-vote maps for the same IDs in the same pass.
     pub fn kick_refresh(&mut self, now_ms: u64) -> Vec<VoteKickUpdate> {
+        for evicted in self.votes.prune(&ActorClock(now_ms)) {
+            self.vote_refs.remove(&evicted);
+            self.vote_initiators.remove(&evicted);
+        }
         if self.active_votes.is_empty() {
             return Vec::new();
         }

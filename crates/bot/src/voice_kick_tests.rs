@@ -1,6 +1,6 @@
 use super::*;
 use two_bot_core::voice_vote_kick::{
-    VoteBallot, VoteCancellation, VoteKickError, VOTE_KICK_TTL_MS,
+    VoteBallot, VoteCancellation, VoteKickError, VOTE_KICK_COOLDOWN_MS, VOTE_KICK_TTL_MS,
 };
 
 const OWNER: u64 = MEMBER;
@@ -123,6 +123,37 @@ async fn not_voting_counts_as_no() {
     assert!(worker.kick_refresh(4).is_empty());
     assert!(!worker.dispatch_one(5).await);
     assert!(trace.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn timer_prune_reaps_evicted_vote_refs_past_the_cooldown_horizon() {
+    let (mut worker, _) = setup().await;
+    start(&mut worker, VOTER_A, TARGET).unwrap();
+    worker.kick_cast(VOTE, VOTER_A, VoteBallot::Yes, 1).unwrap();
+    worker.kick_cast(VOTE, VOTER_B, VoteBallot::Yes, 2).unwrap();
+    let passed = worker.kick_cast(VOTE, VOTER_C, VoteBallot::Yes, 3).unwrap();
+    assert_eq!(passed.status, VoteKickStatus::Passed);
+    // Through the horizon inclusive a stale button still replays terminal.
+    let horizon_end = 3 + VOTE_KICK_COOLDOWN_MS;
+    let replay = worker
+        .kick_cast(VOTE, VOTER_C, VoteBallot::Yes, horizon_end)
+        .unwrap();
+    assert_eq!(replay.status, VoteKickStatus::Passed);
+    // Strictly past the horizon the timer reaps the core vote and this
+    // worker's ref maps: the stale button is unknown and the target is
+    // votable again with a fresh interaction ID.
+    let after = horizon_end + 1;
+    assert!(worker.kick_refresh(after).is_empty());
+    assert!(worker.vote_refs.get(&VOTE).is_none());
+    assert_eq!(
+        worker
+            .kick_cast(VOTE, VOTER_A, VoteBallot::Yes, after)
+            .unwrap_err(),
+        KickRefusal::Vote(VoteKickError::UnknownVote)
+    );
+    worker
+        .kick_start(VOTE + 1, ROOM, VOTER_A, TARGET, after)
+        .unwrap();
 }
 
 #[tokio::test]
