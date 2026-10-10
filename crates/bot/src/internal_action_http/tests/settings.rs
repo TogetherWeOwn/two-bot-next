@@ -269,16 +269,16 @@ async fn settings_concurrent_save_with_stale_token_does_not_revert() {
 }
 
 #[tokio::test]
-async fn unwired_verbs_stay_refused_with_settings_flag_on() {
+async fn unwired_membership_verb_stays_refused_with_settings_flag_on() {
     let Some(db) = database().await else { return };
     let _flag = SETTINGS_FLAG_LOCK.lock().await;
     set_settings_flag(true);
     let app = settings_app(db.pool().clone());
-    for raw in [
-        r#"{"action":"role.assign","discord_id":"111111111111111111","role_key":"member"}"#,
-        r#"{"action":"event.upsert","event_key":"launch","name":"Launch","starts_at":"2026-09-01T20:00:00.000Z"}"#,
-        r#"{"action":"moderation.ban","discord_id":"111111111111111111","reason":"fixture reason for the ban"}"#,
-    ] {
+    // The event union wired event.upsert/event.cancel and the moderation union
+    // wired all five moderation verbs: only a verb from another family
+    // (membership) still refuses here.
+    for raw in [r#"{"action":"role.assign","discord_id":"111111111111111111","role_key":"member"}"#]
+    {
         let (status, _, body) =
             answer(app.clone(), signed(raw, "old", "intent-settings-unwired")).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{raw}");
