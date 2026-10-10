@@ -314,9 +314,10 @@ fn verdict_mapping_covers_every_outcome_by_delivery_kind() {
     // future variant addition breaks this match instead of silently reusing a
     // wildcard. Expected values are literals (never recomputed through
     // `uncommitted_disposition` or `kind.funnel`) so a mapping change fails
-    // its named cell.
-    fn expected_verdict(outcome: &ActivationOutcome, kind: MessageDeliveryKind) -> WorkerVerdict {
-        match outcome {
+    // its named cell. The expectation reads the whole activation because a
+    // retained delivery keeps its own funnel disposition (see below).
+    fn expected_verdict(activation: &Activation, kind: MessageDeliveryKind) -> WorkerVerdict {
+        match &activation.outcome {
             ActivationOutcome::Bypassed => match kind {
                 MessageDeliveryKind::Create => WorkerVerdict {
                     funnel: FunnelDisposition::Accept,
@@ -391,9 +392,19 @@ fn verdict_mapping_covers_every_outcome_by_delivery_kind() {
                     },
                 },
             },
-            // Every retain reason maps identically; all seven variants are
-            // listed so a new reason breaks this match instead of silently
-            // inheriting the capture-only trigger.
+            // A retained delivery keeps its own funnel disposition while its
+            // trigger verdict is capture-only (`verdict_of` passes the
+            // disposition through for `Retained`). The disposition varies:
+            // the retain paths carry the matched funnel, but a clean
+            // accepted create whose receipt commit is refused settles as
+            // `Retained(CompletionRefused)` with an `Accept` disposition
+            // (`settle` keeps the funnel it was given), so the funnel arm
+            // matches the activation's own disposition explicitly. All seven
+            // reasons are listed so a new reason breaks this match instead
+            // of silently inheriting the capture-only trigger; the
+            // `unreachable!` arms name combinations `process` cannot
+            // produce (updates always carry `None`, creates never do), so a
+            // future path producing one fails loudly here.
             ActivationOutcome::Retained(
                 RetainReason::Ledger
                 | RetainReason::PreserveRefused
@@ -402,22 +413,41 @@ fn verdict_mapping_covers_every_outcome_by_delivery_kind() {
                 | RetainReason::UncertainDelete
                 | RetainReason::UncertainTimeout
                 | RetainReason::CompletionRefused,
-            ) => match kind {
-                MessageDeliveryKind::Create => WorkerVerdict {
+            ) => match (activation.disposition, kind) {
+                (FunnelDisposition::CaptureOnly, MessageDeliveryKind::Create) => WorkerVerdict {
                     funnel: FunnelDisposition::CaptureOnly,
                     trigger: FunnelDisposition::CaptureOnly,
                 },
-                MessageDeliveryKind::Update => WorkerVerdict {
+                (FunnelDisposition::Accept, MessageDeliveryKind::Create) => WorkerVerdict {
+                    funnel: FunnelDisposition::Accept,
+                    trigger: FunnelDisposition::CaptureOnly,
+                },
+                (FunnelDisposition::None, MessageDeliveryKind::Update) => WorkerVerdict {
                     funnel: FunnelDisposition::None,
                     trigger: FunnelDisposition::CaptureOnly,
                 },
+                // Every remaining pair is listed so a future disposition or
+                // delivery-kind variant breaks this match at compile time
+                // instead of falling into a wildcard.
+                (FunnelDisposition::None, MessageDeliveryKind::Create)
+                | (FunnelDisposition::Accept, MessageDeliveryKind::Update)
+                | (FunnelDisposition::CaptureOnly, MessageDeliveryKind::Update) => {
+                    unreachable!(
+                        "retained delivery carries an unproducible disposition: {:?} for {:?}",
+                        activation.disposition, kind
+                    )
+                }
             },
         }
     }
 
     // Realistic dispositions as produced by `process`: duplicates restore the
     // funnel from the receipt and carry `None`; everything else carries the
-    // funnel value that becomes the verdict's funnel.
+    // funnel value that becomes the verdict's funnel, including the
+    // clean-accept create refused at receipt commit, which settles as
+    // `Retained(CompletionRefused)` with an `Accept` disposition (it matches
+    // the older `retained_completion_hands_triggers_a_capture_only_verdict`
+    // test, routed here through the shared expectation).
     let cases: Vec<(Activation, MessageDeliveryKind, &str)> = vec![
         (
             Activation {
@@ -637,6 +667,14 @@ fn verdict_mapping_covers_every_outcome_by_delivery_kind() {
         ),
         (
             Activation {
+                disposition: FunnelDisposition::Accept,
+                outcome: ActivationOutcome::Retained(RetainReason::CompletionRefused),
+            },
+            MessageDeliveryKind::Create,
+            "retained completion-refused clean-accept create",
+        ),
+        (
+            Activation {
                 disposition: FunnelDisposition::None,
                 outcome: ActivationOutcome::Retained(RetainReason::CompletionRefused),
             },
@@ -647,16 +685,12 @@ fn verdict_mapping_covers_every_outcome_by_delivery_kind() {
 
     assert_eq!(
         cases.len(),
-        28,
+        29,
         "outcome x delivery-kind matrix stays complete"
     );
     for (activation, kind, name) in &cases {
         let verdict = verdict_of(activation, *kind);
-        assert_eq!(
-            verdict,
-            expected_verdict(&activation.outcome, *kind),
-            "{name}"
-        );
+        assert_eq!(verdict, expected_verdict(activation, *kind), "{name}");
         // `None` triggers belong to edits, never creates: a create carrying
         // one is unexpected, so `acceptance_for_verdict` refuses it like a
         // match (`gateway_commands.rs`). Pin the assumption here.
