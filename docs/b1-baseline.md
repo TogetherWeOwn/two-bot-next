@@ -138,6 +138,13 @@ strip). Per calibration (measured * 1.4 rounded up to the next MiB):
 10.30 * 1.4 = 14.42 -> 15 MiB. Docker is not available in the controller
 workspace; offline fixture sizes are not measurements.
 
+Recalibrated 2026-10-10 for the voice runtime: main had reached 15,712,080
+bytes (14.98 MiB), and the voice template-naming head measured 15,739,344
+bytes (15.01 MiB) in container smoke, over the 15 MiB ceiling. No new
+dependencies; release profile unchanged (opt-level=z, lto, strip). Same rule:
+15.01 * 1.4 = 21.02 -> 22 MiB. The 112 MiB image ceiling is unchanged
+(41.44 MiB measured).
+
 ### Docker history image measurement and immutable-ID pinning
 
 Docker 29.8.1 with the containerd image store reports packed content plus
