@@ -68,7 +68,7 @@ Scale to real traffic by replacing 10,000/hour with the observed
 ## Related immediate alerts (not burn)
 
 The fast/slow burn rules above stay silent on a single bad minute by
-design. Three Worker alert rules cover gaps the burn math cannot see, and
+design. Four Worker alert rules cover gaps the burn math cannot see, and
 page immediately rather than consuming budget:
 
 - `gateway_missed_events`: any increase of
@@ -85,6 +85,11 @@ page immediately rather than consuming budget:
   forged pre-auth probe, always family `other`, stays silent), because a
   receiver-abuse or refusal storm stays quiet through the burn math.
   Runbook: [runbook](runbook.md#alert-receiver-refusals).
+- `gateway_checkpoint_failures`: any increase of
+  `two_bot_gateway_checkpoint_failures_total` summed over every `stage`
+  between two keepalive samples pages at once (zero threshold), because
+  every checkpoint failure stops the dispatch worker.
+  Runbook: [runbook](runbook.md#alert-checkpoint-failures).
 
 None of these rules changes the burn thresholds, windows or budget above.
 

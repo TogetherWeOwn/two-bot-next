@@ -41,7 +41,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_voice_compensation_pending` | Tracked rooms awaiting compensating delete after a failed write |
 | `two_bot_voice_orphans_total` | Untracked creator-channel orphans needing manual deletion after failed `/create` compensation |
 | `two_bot_dispatch_drops_total{lane}` | Dispatch-lane saturation drops: every event refused because every attempted lane was full. `lane` is one of `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` (see label allowlists below). The `reactions` lane additionally counts per-member fairness refusals: a reaction refused because its member already holds `PER_USER_IN_FLIGHT` reaction slots, even while the lane has free slots. A single-lane refusal counts its lane once; a privileged spill refused by both lanes counts both. Logs sample the first drop per 60 s per runtime, so bursts are O(1) lines with N counter increments. Alert-threshold hook for M2.1 (lands once TOG-18943 unblocks): alert when any lane's drops increase across consecutive keepalive samples; a single drop inside one burst is not paging. `reactions`-lane growth points at a hot member before an undersized lane |
-| `two_bot_gateway_checkpoint_failures_total{stage}` | Failed gateway checkpoint commits from `apply_dispatch` and failed checkpoint clears: every failure stops the dispatch worker and is recorded on `operation`. `stage` is `pre_commit` (commit skipped after a funnel/leveling/acknowledgement failure) or `commit` (the durable store write itself failed); failure causes are never labels. Alert-threshold hook for M2.1 (lands once TOG-18943 unblocks): alert on any increase across consecutive keepalive samples; unlike bursty dispatch drops, a single checkpoint failure stops the worker, so there is no benign-singleton case |
+| `two_bot_gateway_checkpoint_failures_total{stage}` | Failed gateway checkpoint commits from `apply_dispatch` and failed checkpoint clears: every failure stops the dispatch worker and is recorded on `operation`. `stage` is `pre_commit` (commit skipped after a funnel/leveling/acknowledgement failure) or `commit` (the durable store write itself failed); failure causes are never labels. Alert rule `gateway_checkpoint_failures` fires on any increase summed over every `stage` between consecutive keepalive samples (first sample and restarts skip the window); unlike bursty dispatch drops, a single checkpoint failure stops the worker, so there is no benign-singleton case |
 | `two_bot_internal_actions_total{family,outcome}` | Signed website-action receiver executions by bounded family and outcome. `family` is one of `announcement`, `event`, `settings`, `moderation`, `membership` or `other` (see label allowlists below). `outcome` is `executed` or the refusal class (`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`, `conflict`, `upstream` or `internal`). Every request counts once; replays count on each serve. Refusal warn-summaries stay sampled; this counter is the alertable signal. Alert rule `receiver_refusals:<family>` fires when a family's refused outcomes rise in 3 consecutive keepalive samples (first sample and restarts clear the streak; one forged pre-auth probe in `other` stays silent) |
 
 ## Job coverage and outcomes
@@ -168,7 +168,11 @@ as dynamic labels.
   clear on the `ReceivedWork::Clear` path: `pre_commit` when the commit was
   skipped after a funnel/leveling/acknowledgement failure, `commit` when the
   durable store write itself failed (including a failed clear). Failure
-  causes are never labels.
+  causes are never labels. Alert rule `gateway_checkpoint_failures` fires
+  on any increase summed over every `stage` between consecutive keepalive
+  samples (first sample and restarts skip the window); unlike bursty
+  dispatch drops, a single checkpoint failure stops the worker, so there is
+  no benign-singleton case.
 - `two_bot_internal_actions_total{family,outcome}` — `family` is one of
   `announcement`, `event`, `settings`, `moderation`, `membership` or
   `other`, mapped from the signed `action` verb in
@@ -315,6 +319,7 @@ No Prometheus server, no new infrastructure.
 | `gateway_missed_events` | any increase of `two_bot_gateway_missed_events_total` between samples (first sample and restarts skip the window) | [gateway missed events](runbook.md#alert-gateway-missed-events) |
 | `ticker_stale:<job>` | 15 s ticker with no success for more than 10 minutes (never-succeeded is ignored) | [ticker stale](runbook.md#alert-ticker-stale) |
 | `receiver_refusals:<family>` | refused `two_bot_internal_actions_total` outcomes rising in 3 consecutive samples per family (first sample and restarts clear the streak) | [receiver refusals](runbook.md#alert-receiver-refusals) |
+| `gateway_checkpoint_failures` | any increase of `two_bot_gateway_checkpoint_failures_total` summed over every `stage` between samples (first sample and restarts skip the window) | [checkpoint failures](runbook.md#alert-checkpoint-failures) |
 
 `job_stale` uses `JOB_INTERVAL_SECONDS`, which must equal each scheduled job's
 Rust `*_INTERVAL_MS / 1000`. The 15 s tickers (`scheduled_messages`,
@@ -334,7 +339,7 @@ used on both sides of the B2 soak evidence seam. The Rust canonical list is
 is named `evidence-{ruleId}-{window}.json` (soak-ledger packets stamp the
 `soak_expected_committed` ledger identity), so the QA evidence table can
 attribute packets when several rules fire in one window. Both sides pin all
-ten spellings with tests; the payload shape is unchanged.
+eleven spellings with tests; the payload shape is unchanged.
 
 Known gaps: the DB error counter currently records only send-admission SQL,
 so non-admission stores still surface only through the pool proxy and the

@@ -135,6 +135,52 @@ test("gateway missed events fire on any increase, never on the first sample or a
   assert.deepEqual(ev([`two_bot_gateway_missed_events_total 2`], restart.state).firing, ["gateway_missed_events"]);
 });
 
+test("gateway checkpoint failures fire on any increase, never on the first sample or a reset", () => {
+  // Baseline samples are silent, even with a nonzero counter.
+  const base = ev([`two_bot_gateway_checkpoint_failures_total{stage="pre_commit"} 0`, `two_bot_gateway_checkpoint_failures_total{stage="commit"} 0`]);
+  assert.deepEqual(base.firing, []);
+  const first = ev([`two_bot_gateway_checkpoint_failures_total{stage="pre_commit"} 2`, `two_bot_gateway_checkpoint_failures_total{stage="commit"} 3`]);
+  assert.deepEqual(first.firing, []);
+  // An increase on `commit` fires; the next flat sample resolves.
+  const fire = ev(
+    [`two_bot_gateway_checkpoint_failures_total{stage="pre_commit"} 2`, `two_bot_gateway_checkpoint_failures_total{stage="commit"} 4`],
+    first.state,
+  );
+  assert.deepEqual(fire.firing, ["gateway_checkpoint_failures"]);
+  assert.deepEqual(
+    ev(
+      [`two_bot_gateway_checkpoint_failures_total{stage="pre_commit"} 2`, `two_bot_gateway_checkpoint_failures_total{stage="commit"} 4`],
+      fire.state,
+    ).firing,
+    [],
+  );
+  // An increase on `pre_commit` fires too: the rule sums over every stage.
+  assert.deepEqual(
+    ev(
+      [`two_bot_gateway_checkpoint_failures_total{stage="pre_commit"} 3`, `two_bot_gateway_checkpoint_failures_total{stage="commit"} 4`],
+      fire.state,
+    ).firing,
+    ["gateway_checkpoint_failures"],
+  );
+  // A counter that went backwards means the process restarted: no window.
+  const restart = ev([`two_bot_gateway_checkpoint_failures_total{stage="commit"} 1`], fire.state);
+  assert.deepEqual(restart.firing, []);
+  // The post-restart baseline fires again on the next increase.
+  assert.deepEqual(
+    ev([`two_bot_gateway_checkpoint_failures_total{stage="commit"} 2`], restart.state).firing,
+    ["gateway_checkpoint_failures"],
+  );
+  // An exposition without the series neither fires nor throws.
+  assert.deepEqual(ev([], first.state).firing.filter((k) => k === "gateway_checkpoint_failures"), []);
+  // DO storage written before the new fields existed does not throw: the
+  // missing counters read as zero and the missing seen-flags as false.
+  const legacy = { ...first.state, checkpointFailures: undefined, checkpointFailuresSeen: undefined } as unknown as typeof first.state;
+  assert.deepEqual(
+    ev([`two_bot_gateway_checkpoint_failures_total{stage="commit"} 9`], legacy).firing.filter((k) => k === "gateway_checkpoint_failures"),
+    [],
+  );
+});
+
 test("receiver refusals need three consecutive windows with new refusals, never the first sample or a reset", () => {
   const refused = (family: string, outcome: string, n: number) =>
     `two_bot_internal_actions_total{family="${family}",outcome="${outcome}"} ${n}`;
@@ -206,7 +252,7 @@ test("ticker stale fires past 10 minutes, ignores boot, parked and fresh tickers
 test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   const window = "2026-10-09T20-11-06Z";
   // Single shared spelling with the Rust canonical list (ALERT_RULE_IDS in
-  // crates/core/src/evidence.rs); both sides pin all ten here and there.
+  // crates/core/src/evidence.rs); both sides pin all eleven here and there.
   assert.deepEqual(RULES.map((r) => r.id), [
     "job_stale",
     "job_consecutive_failures",
@@ -218,6 +264,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "gateway_missed_events",
     "ticker_stale",
     "receiver_refusals",
+    "gateway_checkpoint_failures",
   ]);
   assert.equal(packetFilename("job_stale:rank", window), `evidence-job_stale-${window}.json`);
   assert.equal(packetFilename("job_consecutive_failures:counter", window), `evidence-job_consecutive_failures-${window}.json`);
@@ -229,6 +276,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("gateway_missed_events", window), `evidence-gateway_missed_events-${window}.json`);
   assert.equal(packetFilename("ticker_stale:scheduled_messages", window), `evidence-ticker_stale-${window}.json`);
   assert.equal(packetFilename("receiver_refusals:moderation", window), `evidence-receiver_refusals-${window}.json`);
+  assert.equal(packetFilename("gateway_checkpoint_failures", window), `evidence-gateway_checkpoint_failures-${window}.json`);
   // Unknown keys get no filename rather than a misleading one; hostile
   // window stamps stay filename-safe.
   assert.equal(packetFilename("no_such_rule", window), undefined);
@@ -291,6 +339,12 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
     refused = ev([`two_bot_internal_actions_total{family="moderation",outcome="auth_failure"} ${n}`], refused.state);
   }
   firing.push(...refused.firing);
+  firing.push(
+    ...ev(
+      [`two_bot_gateway_checkpoint_failures_total{stage="commit"} 1`],
+      ev([`two_bot_gateway_checkpoint_failures_total{stage="commit"} 0`]).state,
+    ).firing,
+  );
   assert.equal(firing.length, RULES.length, `expected one firing key per rule, got: ${firing.join(", ")}`);
   const packets = transitionMessages([], firing);
   assert.equal(packets.length, RULES.length);

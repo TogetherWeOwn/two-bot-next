@@ -77,6 +77,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "gateway_missed_events", summary: `gateway missed events increased between samples`, runbook: "runbook.md#alert-gateway-missed-events" },
   { id: "ticker_stale", summary: `15 s ticker has no success for more than ${TICKER_STALE_SECONDS / 60} minutes`, runbook: "runbook.md#alert-ticker-stale" },
   { id: "receiver_refusals", summary: `website-action receiver refusals for ${RECEIVER_REFUSAL_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-receiver-refusals" },
+  { id: "gateway_checkpoint_failures", summary: `gateway checkpoint commit failures increased between samples`, runbook: "runbook.md#alert-checkpoint-failures" },
 ];
 
 /**
@@ -107,6 +108,9 @@ export interface MetricsAlertState {
   gatewayMissed: number;
   /** False until the first evaluation stores a baseline: the first sample never fires. */
   gatewayMissedSeen: boolean;
+  checkpointFailures: number;
+  /** False until the first evaluation stores a baseline: the first sample never fires. */
+  checkpointFailuresSeen: boolean;
   /** Refused `two_bot_internal_actions_total` outcomes summed by family. */
   receiverRefusals: Record<string, number>;
   /** False until the first evaluation stores a baseline: the first sample never fires. */
@@ -115,7 +119,7 @@ export interface MetricsAlertState {
   receiverRefusalStreaks: Record<string, number>;
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {} };
+export const EMPTY_STATE: MetricsAlertState = { firing: [], rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {} };
 
 export function parseExposition(text: string): Sample[] {
   const samples: Sample[] = [];
@@ -249,6 +253,18 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   const gatewayReset = gatewayMissed < prevGatewayMissed;
   if (gatewaySeen && !gatewayReset && gatewayMissed > prevGatewayMissed) firing.push("gateway_missed_events");
 
+  // Gateway checkpoint commit failures (every failure stops the dispatch
+  // worker, so there is no benign singleton): any increase between two
+  // samples pages. The first sample only stores the baseline and never
+  // fires; a counter that went backwards means the process restarted: no
+  // window. `??` covers DO storage written before these fields existed.
+  let checkpointFailures = 0;
+  for (const s of gauge("two_bot_gateway_checkpoint_failures_total")) checkpointFailures += s.value;
+  const prevCheckpointFailures = prev.checkpointFailures ?? 0;
+  const checkpointSeen = prev.checkpointFailuresSeen ?? false;
+  const checkpointReset = checkpointFailures < prevCheckpointFailures;
+  if (checkpointSeen && !checkpointReset && checkpointFailures > prevCheckpointFailures) firing.push("gateway_checkpoint_failures");
+
   // Website-action receiver refusals by family: refused
   // `two_bot_internal_actions_total` outcomes (every outcome other than
   // `executed`) must rise in RECEIVER_REFUSAL_SAMPLES consecutive windows
@@ -283,7 +299,7 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     for (const family of Object.keys(receiverRefusals)) receiverRefusalStreaks[family] = 0;
   }
 
-  return { firing, state: { firing, rest429, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks } };
+  return { firing, state: { firing, rest429, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks } };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {

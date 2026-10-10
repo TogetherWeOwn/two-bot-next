@@ -396,6 +396,32 @@ when `executed` traffic for the same family collapses while refusals rise
 — the receiver may be refusing legitimate work and the fix belongs to the
 on-call engineer, not another redeploy.
 
+#### Alert: checkpoint failures
+
+`two_bot_gateway_checkpoint_failures_total` increased between two keepalive
+samples. Every checkpoint failure stops the dispatch worker, so there is no
+benign singleton: a single increase pages. The first sample after monitoring
+arms only stores the baseline and never fires, and a counter reset (process
+restart) skips the window rather than firing.
+
+First response: read the `stage` label on
+`two_bot_gateway_checkpoint_failures_total` via the authorized
+`/ops/metrics` scrape — `pre_commit` means the commit was skipped after a
+funnel, leveling or acknowledgement failure, while `commit` means the
+durable store write itself failed. Then check the `gateway` component on
+`/readyz` and the Neon status for the staging branch: a `commit` failure
+next to DB-error or pool alerts points at the database, not the gateway.
+Restart only after the logs show the dispatch worker stopped, per the
+[restart semantics](#restart-semantics-durable-resume-not-full-state-recovery);
+do not restart to "clear" the counter, since a replacement resets the
+baseline without recovering the uncommitted checkpoint.
+
+Escalate when the increase repeats across windows, when `commit` failures
+coincide with DB-error or pool-saturation alerts, or when `pre_commit`
+failures rise with no failing dependency in the logs — the cause is then
+unexplained and the fix belongs to the on-call engineer, not another
+redeploy.
+
 ## Persisted ownership control
 
 The Worker/DO fence is implemented, not implicitly released by deployment.
