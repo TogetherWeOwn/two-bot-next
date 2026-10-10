@@ -54,7 +54,9 @@ mod test_clock;
 pub mod voice_rooms;
 
 #[cfg(feature = "db")]
-pub use leveling_runtime::{LevelingRuntime, OrderedLevelingPipeline};
+pub use leveling_runtime::{
+    CommunityFactsError, DeferredCommunityFacts, LevelingRuntime, OrderedLevelingPipeline,
+};
 
 pub use adapter::event_to_core;
 pub use executor::{

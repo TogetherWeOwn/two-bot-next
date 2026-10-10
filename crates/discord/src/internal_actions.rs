@@ -1,9 +1,12 @@
 //! Callable internal-action effects, not an authenticated HTTP receiver.
 //!
 //! The caller must authorize and commit its durable execution claim first.
-//! Only `announcement.post` is implemented here; core feature flags are not
-//! executor capabilities. No runtime flags, stores or listeners are installed.
-//! Every 429 feeds the caller-supplied per-token [`CooldownGovernor`].
+//! `announcement.post` is implemented here; `settings.get`/`settings.set` are
+//! wired receiver verbs executed via the settings store (the receiver branches
+//! before this adapter), so this adapter never executes them. Core feature
+//! flags are not executor capabilities. No runtime flags, stores or listeners
+//! are installed. Every 429 feeds the caller-supplied per-token
+//! [`CooldownGovernor`].
 
 use bytes::Bytes;
 use http::header::{HeaderValue, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER, USER_AGENT};
@@ -27,7 +30,10 @@ use two_bot_core::send_admission::{
 mod governor;
 pub use governor::{Clock, CooldownGovernor, MAX_CHANNEL_HOLDS};
 
-pub const SUPPORTED_ACTIONS: &[&str] = &["announcement.post"];
+/// Every verb the receiver will run: the Discord send plus the two settings
+/// verbs (executed via the settings store, never via this adapter's transport).
+/// All other core verbs stay refused.
+pub const SUPPORTED_ACTIONS: &[&str] = &["announcement.post", "settings.get", "settings.set"];
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const BOT_USER_AGENT: &str = concat!(
     "DiscordBot (https://github.com/TogetherWeOwn/two-bot-next, ",
@@ -192,9 +198,11 @@ impl AnnouncementExecutor {
 
     /// Authorize first; this method intentionally owns neither the store claim
     /// nor its audit/finalization. Caller cancellation after invocation is also
-    /// an unknown outcome, even if this method never returns.
+    /// an unknown outcome, even if this method never returns. Only the Discord
+    /// send runs here: settings verbs are wired (see [`SUPPORTED_ACTIONS`]) but
+    /// executed via the settings store by the receiver, never via this transport.
     pub async fn execute(&self, action: &str, body: &Map<String, Value>) -> ExecutionOutcome {
-        if !Self::supports(action) {
+        if action != "announcement.post" {
             return ExecutionOutcome::NoEffect(Refusal::ActionNotAllowed);
         }
         let outcome = self.post(body).await;
