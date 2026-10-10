@@ -1189,6 +1189,28 @@ impl ActionQueue {
         true
     }
 
+    /// True while a room-scoped kick enforcement for this vote is still queued
+    /// (either lane, including backed-off, suspended or not-yet-due entries).
+    /// The worker keeps the vote's initiator until the enforcement audit runs,
+    /// so pruning past the retention horizon never drops an unresolved
+    /// enforcement fence (VK-03). An action being dispatched cannot coincide
+    /// with this read: the single-threaded actor holds the worker mutably
+    /// across the whole dispatch, so in-flight needs no fence of its own.
+    #[must_use]
+    pub fn has_queued_kick(&self, vote_id: Snowflake) -> bool {
+        let inner = self.inner.lock().expect("queue lock");
+        [&inner.urgent, &inner.deferred].iter().any(|lanes| {
+            lanes.values().any(|queue| {
+                queue.iter().any(|queued| {
+                    matches!(
+                        queued.action,
+                        RoomAction::KickMember { vote_id: id, .. } if id == vote_id
+                    )
+                })
+            })
+        })
+    }
+
     /// Access lost on a room (spec V1): its actions wait, nothing retries.
     pub fn suspend(&self, guild_id: Snowflake, channel_id: Snowflake) {
         self.inner
