@@ -285,10 +285,11 @@ impl Drop for AckPermit {
 }
 
 /// Dispatch-worker failures are recorded errors, never worker panics: the
-/// worker stops, already-accepted commands drain, the checkpoint stays
-/// unchanged, and the runner surfaces these typed errors instead of a bare
-/// "dispatch worker failed". Each message keeps the `; checkpoint unchanged`
-/// suffix so the failure contract reads the same at every failure site.
+/// worker stops, already-accepted commands drain, and the runner surfaces
+/// these typed errors instead of a bare "dispatch worker failed". Each
+/// message names its stage. Pre-commit failures keep the
+/// `; checkpoint unchanged` suffix; the missing-ticket error is raised after
+/// a successful commit, so it says `; checkpoint committed` instead.
 fn leveling_dispatch_failure() -> sqlx::Error {
     sqlx::Error::InvalidArgument("leveling gateway dispatch failed; checkpoint unchanged".into())
 }
@@ -303,7 +304,7 @@ fn invalid_onboarding_job_failure() -> sqlx::Error {
 
 fn missing_ingress_ticket_failure() -> sqlx::Error {
     sqlx::Error::InvalidArgument(
-        "onboarding interaction missing ingress ticket; checkpoint unchanged".into(),
+        "onboarding interaction missing ingress ticket; checkpoint committed".into(),
     )
 }
 
@@ -2194,6 +2195,241 @@ mod tests {
         );
     }
 
+    /// The worker itself — not just the error constructor — records a failed
+    /// leveling drain as a typed error and skips the checkpoint commit. A
+    /// message that queues a leveling award drains through a runtime whose
+    /// store is unreachable, so restoring a `panic!` at the leveling site
+    /// fails here instead of slipping through constructor-only coverage.
+    /// The lazy pool below can never connect, so any commit attempt surfaces
+    /// as a different error and fails this test outright.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_worker_leveling_drain_failure_records_typed_error_without_commit() {
+        let message = || {
+            Event::MessageCreate(Box::new(
+                serde_json::from_value(serde_json::json!({
+                    "id": "4000000000000000001",
+                    "guild_id": "22",
+                    "channel_id": "66",
+                    "author": {"id": "44", "username": "member", "discriminator": "0", "bot": false},
+                    "content": "hello",
+                    "timestamp": "2026-09-28T00:00:00.000000+00:00",
+                    "edited_timestamp": null,
+                    "tts": false,
+                    "mention_everyone": false,
+                    "mentions": [],
+                    "mention_roles": [],
+                    "attachments": [],
+                    "embeds": [],
+                    "pinned": false,
+                    "type": 0,
+                    "components": []
+                }))
+                .unwrap(),
+            ))
+        };
+        // Pin the fixture precondition explicitly: the message must queue a
+        // leveling award, or this test would exercise the commit path instead
+        // of the drain-failure site.
+        assert!(
+            !build_pipeline(vec![], None)
+                .collect_at(
+                    &message(),
+                    &two_bot_core::now_iso(),
+                    two_bot_discord::MessageEligibility::default(),
+                )
+                .is_empty(),
+            "fixture message must queue a leveling award"
+        );
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        let executor = two_bot_discord::ActionExecutor::with_proxy(
+            "mock-token".into(),
+            Some("http://127.0.0.1:1".into()),
+        )
+        .expect("test executor");
+        let pipeline = build_pipeline(
+            vec![],
+            Some(LevelingRuntime::new(
+                pool.clone(),
+                std::sync::Arc::new(executor),
+                22,
+                two_bot_core::OnboardingGates {
+                    mode: two_bot_core::OnboardingMode::Legacy,
+                    dry_run: true,
+                },
+            )),
+        );
+        let state = RwLock::new(GatewayState::Armed);
+        let generation = AtomicU64::new(0);
+        let store = GatewaySessionStore::new(pool, "22".to_owned(), 1);
+        let checkpoint = GatewaySession {
+            session_id: "test-session".to_owned(),
+            sequence: 7,
+            resume_url: "ws://127.0.0.1:1".to_owned(),
+            updated_at_ms: two_bot_core::funnel::now_millis_for_test(),
+        };
+        // The worker step blocks on the drain: run it the way the dispatch
+        // worker does, on a blocking thread.
+        let outcome = tokio::task::block_in_place(|| {
+            apply_dispatch(
+                &tokio::runtime::Handle::current(),
+                &state,
+                &generation,
+                &pipeline,
+                &store,
+                None,
+                None,
+                None,
+                None,
+                LiveInteractions::default(),
+                Arc::new(tokio::sync::Notify::new()),
+                Some(Box::new(ReceivedDispatch::new(message()))),
+                None,
+                checkpoint,
+                CHECKPOINT_IO_MAX,
+                0,
+                None,
+                None,
+            )
+        });
+        match outcome {
+            Err(sqlx::Error::InvalidArgument(message)) => {
+                assert_eq!(
+                    message,
+                    "leveling gateway dispatch failed; checkpoint unchanged"
+                )
+            }
+            outcome => panic!("worker must record a typed error, got {outcome:?}"),
+        }
+        assert_eq!(
+            *state.read().await,
+            GatewayState::Armed,
+            "a failed dispatch must leave the checkpoint where it was"
+        );
+    }
+
+    /// The worker itself records a committed interaction job without an
+    /// ingress ticket as a typed error. The commit already holds the durable
+    /// job for bounded restart recovery, so the message says the checkpoint
+    /// was committed rather than unchanged. Restoring a `panic!` at the
+    /// ticket site fails here. Needs a migrated test database; skips without
+    /// one (CI supplies `TWO_TEST_DATABASE_URL`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_worker_missing_ingress_ticket_records_typed_error_after_commit() {
+        let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+            assert!(
+                std::env::var("GITHUB_ACTIONS").is_err(),
+                "CI must supply the guarded test database"
+            );
+            eprintln!("SKIP gateway_worker_missing_ingress_ticket_records_typed_error_after_commit: TWO_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let db = two_bot_testsupport::TestDatabase::create(
+            &url,
+            &sqlx::migrate!("../cutover/migrations"),
+        )
+        .await
+        .expect("create migrated agent-testdb fixture");
+        let pool = db.pool().clone();
+        let executor = two_bot_discord::ActionExecutor::with_proxy(
+            "mock-token".into(),
+            Some("http://127.0.0.1:1".into()),
+        )
+        .expect("test executor");
+        let onboarding = std::sync::Arc::new(
+            crate::onboarding::OnboardingRuntime::new(
+                pool.clone(),
+                executor,
+                &std::collections::HashMap::from([
+                    ("DISCORD_GUILD_ID".to_owned(), "22".to_owned()),
+                    ("TWO_ONBOARDING_MODE".to_owned(), "session".to_owned()),
+                    ("TWO_ONBOARDING_DRY_RUN".to_owned(), "0".to_owned()),
+                    ("DISCORD_LANDING_CHANNEL_IDS".to_owned(), "12".to_owned()),
+                    ("DISCORD_GOODBYE_CHANNEL_IDS".to_owned(), "13".to_owned()),
+                    (
+                        "DISCORD_ANCHOR_WELCOME_CHANNEL_ID".to_owned(),
+                        "14".to_owned(),
+                    ),
+                    (
+                        "DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID".to_owned(),
+                        "10".to_owned(),
+                    ),
+                    (
+                        "DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID".to_owned(),
+                        "11".to_owned(),
+                    ),
+                ]),
+                22,
+                999,
+            )
+            .expect("test onboarding runtime"),
+        );
+        let interaction: twilight_model::application::interaction::Interaction =
+            serde_json::from_value(serde_json::json!({
+                "application_id": "111",
+                "authorizing_integration_owners": {"0": "22"},
+                "id": "333",
+                "token": "mock-callback",
+                "type": 3,
+                "version": 1,
+                "guild_id": "22",
+                "member": {"user": {"id": "44", "username": "member", "discriminator": "0"},
+                           "roles": [], "deaf": false, "mute": false, "flags": 0},
+                "data": {"custom_id": "two:onboarding:session", "component_type": 3,
+                          "values": ["find-players"]}
+            }))
+            .unwrap();
+        let event = Event::InteractionCreate(Box::new(
+            twilight_model::gateway::payload::incoming::InteractionCreate(interaction),
+        ));
+        let pipeline = build_pipeline(vec![], None);
+        assert!(
+            onboarding.capture(&event, &pipeline).is_some(),
+            "fixture interaction must capture an onboarding job"
+        );
+        let state = RwLock::new(GatewayState::Armed);
+        let generation = AtomicU64::new(0);
+        let store = GatewaySessionStore::new(pool, "22".to_owned(), 1);
+        let checkpoint = GatewaySession {
+            session_id: "test-session".to_owned(),
+            sequence: 7,
+            resume_url: "ws://127.0.0.1:1".to_owned(),
+            updated_at_ms: two_bot_core::funnel::now_millis_for_test(),
+        };
+        // No acknowledgement ticket: reception never admitted one, so the
+        // committed interaction job reaches the missing-ticket site.
+        let outcome = tokio::task::block_in_place(|| {
+            apply_dispatch(
+                &tokio::runtime::Handle::current(),
+                &state,
+                &generation,
+                &pipeline,
+                &store,
+                None,
+                None,
+                None,
+                Some(onboarding),
+                LiveInteractions::default(),
+                Arc::new(tokio::sync::Notify::new()),
+                Some(Box::new(ReceivedDispatch::new(event))),
+                None,
+                checkpoint,
+                CHECKPOINT_IO_MAX,
+                0,
+                None,
+                None,
+            )
+        });
+        match outcome {
+            Err(sqlx::Error::InvalidArgument(message)) => assert_eq!(
+                message,
+                "onboarding interaction missing ingress ticket; checkpoint committed"
+            ),
+            outcome => panic!("worker must record a typed error, got {outcome:?}"),
+        }
+    }
+
     /// The ACK permit is a drop guard: a panicking acknowledgement releases its
     /// slot during unwind, so repeated panics never trip ingress capacity.
     #[tokio::test]
@@ -2254,7 +2490,7 @@ mod tests {
                 "leveling gateway dispatch failed; checkpoint unchanged",
                 "interaction drain failed; checkpoint unchanged",
                 "invalid onboarding job; checkpoint unchanged",
-                "onboarding interaction missing ingress ticket; checkpoint unchanged",
+                "onboarding interaction missing ingress ticket; checkpoint committed",
             ]
         );
     }
