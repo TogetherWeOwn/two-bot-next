@@ -312,10 +312,10 @@ zero between scrapes means the process restarted; it does not mean the
 window was quiet.
 
 Alert rule: the Worker `receiver_refusals:<family>` rule implements the
-zero threshold above — it fires on any per-family increase of refused
-outcomes between two keepalive samples (the first sample and counter
-resets skip the window rather than firing). Runbook:
-[runbook](runbook.md#alert-receiver-refusals).
+streak above — it fires after refused outcomes rise in 3 consecutive
+keepalive samples per family (the first sample and counter resets clear
+the streak rather than firing), so one forged pre-auth probe in `other`
+stays silent. Runbook: [runbook](runbook.md#alert-receiver-refusals).
 
 ## What this pack does not do
 

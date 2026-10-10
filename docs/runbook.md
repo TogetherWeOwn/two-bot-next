@@ -364,17 +364,21 @@ redeploy.
 
 #### Alert: receiver refusals
 
-Refused `two_bot_internal_actions_total` outcomes increased for one family
-between two keepalive samples. Every outcome other than `executed`
+Refused `two_bot_internal_actions_total` outcomes rose for one family in
+3 consecutive keepalive samples. Every outcome other than `executed`
 (`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`,
 `rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`,
 `conflict`, `upstream`, `internal`) counts as a refusal: the signed
-website-action receiver saw the request and refused it. Any per-family
-increase pages at once (zero threshold), because a receiver-abuse or
-refusal storm stays quiet through the burn math. The firing key names its
-family (`receiver_refusals:moderation`). The first sample after monitoring
-arms only stores the baseline and never fires, and a counter reset
-(process restart) skips the window rather than firing.
+website-action receiver saw the request and refused it. The streak (not
+a single window) pages, because a receiver-abuse or refusal storm stays
+quiet through the burn math while one forged probe must not. The firing
+key names its family (`receiver_refusals:moderation`). The first sample
+after monitoring arms only stores the baseline and never fires, and a
+counter reset (process restart) clears that family's streak rather than
+firing. Family `other` holds every pre-auth refusal (bad signature,
+unknown key, clock skew, nonce replay map through `ActionLabel::Unknown`),
+so a lone `receiver_refusals:other` streak points at forged traffic
+before a wired-family misconfiguration.
 
 First response: scope the refusing family from the `family`/`outcome`
 labels on `two_bot_internal_actions_total` via the authorized

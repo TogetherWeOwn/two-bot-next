@@ -147,8 +147,9 @@ pub const DISPATCH_LANES: &[&str] = &[
 /// become a family label.
 ///
 /// Alert rule `receiver_refusals:<family>` in `wrangler/src/alert-rules.ts`:
-/// any per-family increase of refused outcomes across consecutive scrapes
-/// pages; the first sample and restarts skip the window.
+/// refused outcomes rising in 3 consecutive scrapes per family pages; the
+/// first sample and restarts clear the streak, and one forged pre-auth
+/// probe (family `other`) stays silent.
 pub const INTERNAL_ACTION_FAMILIES: &[&str] = &[
     "announcement",
     "event",
