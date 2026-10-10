@@ -72,10 +72,10 @@ import {
 import {
   EMPTY_STATE,
   evaluateMetrics,
-  parseExposition,
   transitionMessages,
   type MetricsAlertState,
 } from "./alert-rules.ts";
+import { parseAlertScrape } from "./metrics-scrape.ts";
 
 /**
  * Plus the optional reviewed TWO_* flags in container-env.ts (TOG-12020) and
@@ -282,30 +282,46 @@ function isBotProbeResponse(response: Response): boolean {
 const FAILURE_TOKEN = /^[a-z0-9_]{1,32}$/;
 const MAX_PROBE_BODY_BYTES = 64 * 1024;
 
-/**
- * Read at most `limit` bytes as text. Returns null when the body is larger
- * (drained first so the SDK proxy pipe is not left hanging), so an oversized
- * container response can be refused without buffering it.
- */
-async function readBoundedText(response: Response, limit: number): Promise<string | null> {
+/** Bound awaits even when the SDK/response stream does not observe abort. */
+async function abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  let onAbort = () => {};
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(new Error("metrics scrape failed"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+  try {
+    return await Promise.race([work, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
+/** Read at most `limit` bytes; cancel oversize/failed bodies without buffering. */
+async function readBoundedText(response: Response, limit: number, signal?: AbortSignal): Promise<string | null> {
   const reader = response.body?.getReader();
   if (!reader) return "";
   const chunks: Uint8Array[] = [];
   let size = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    size += value.byteLength;
-    if (size > limit) {
-      await reader.cancel().catch(() => {});
-      return null;
+  let complete = false;
+  try {
+    for (;;) {
+      const read = reader.read();
+      const { done, value } = await (signal ? abortable(read, signal) : read);
+      if (done) { complete = true; break; }
+      size += value.byteLength;
+      if (size > limit) return null;
+      chunks.push(value);
     }
-    chunks.push(value);
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    return new TextDecoder().decode(bytes);
+  } finally {
+    // A hostile cancel hook can itself stall or reject. Do not await it.
+    if (!complete) void reader.cancel().catch(() => {});
+    reader.releaseLock();
   }
-  const bytes = new Uint8Array(size);
-  let offset = 0;
-  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-  return new TextDecoder().decode(bytes);
 }
 
 function gatewayFailure(body: ArrayBuffer): { phase: string; class: string } | null {
@@ -762,12 +778,20 @@ export class TwoBotContainer extends Container<Env> {
   /** Pull /metrics, evaluate rules, notify on transitions. Never throws. */
   private async evaluateMetricsAlerts(): Promise<void> {
     try {
-      const res = await this.containerFetch("http://c/metrics", { signal: AbortSignal.timeout(6000) });
-      if (!res.ok) {
-        await res.arrayBuffer();
-        return;
+      const signal = AbortSignal.timeout(METRICS_FETCH_TIMEOUT_MS);
+      const request = this.containerFetch("http://c/metrics", { signal }).then((res) => {
+        // Release even a late SDK response after the deadline has already won.
+        if (signal.aborted) void res.body?.cancel().catch(() => {});
+        return res;
+      });
+      const res = await abortable(request, signal);
+      if (signal.aborted || !res.ok) {
+        void res.body?.cancel().catch(() => {});
+        throw new Error("metrics scrape failed");
       }
-      const samples = parseExposition(await res.text());
+      const body = await readBoundedText(res, MAX_METRICS_BODY_BYTES, signal);
+      const samples = body === null ? null : parseAlertScrape(body);
+      if (signal.aborted || samples === null) throw new Error("metrics scrape failed");
       const previous = (await this.ctx.storage.get<MetricsAlertState>(METRICS_ALERT_KEY)) ?? EMPTY_STATE;
       const { firing, state } = evaluateMetrics(samples, previous, Date.now() / 1000);
       // Persist before notifying: at most one attempt per transition.

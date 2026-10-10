@@ -298,6 +298,22 @@ Both readiness and metrics share the [Discord-only destination validator and
 non-destructive disable switch](container-readiness.md#threshold-and-notifications).
 No Prometheus server, no new infrastructure.
 
+Background alert scrapes share the streaming 64 KiB body cap and a single
+six-second request/body deadline. Non-OK bodies are cancelled without buffering;
+oversize or stalled bodies are cancelled too, without waiting on a cancellation
+hook. Failed scrapes log only `two-bot metrics scrape failed`: no response body,
+exception detail, token or URL. Empty/non-exposition, malformed or interrupted
+bodies, timeouts, and missing/duplicate/invalid alert inputs leave the previous
+firing set, counter baselines and streaks untouched and emit no `RESOLVED`.
+The validator requires every always-emitted series consumed by the rules,
+including all current label combinations from `crates/core/src/metrics.rs`,
+with finite nonnegative integer inputs (pool-configured is 0 or 1). Additional
+series are accepted, including new label values with the same consumed schema;
+unrelated `NaN` latency and histogram `+Inf` remain valid Prometheus values.
+A complete valid scrape still persists state before notifying. This validation
+is only for background evaluation; the authenticated pull remains a bounded
+exposition proxy, and ownership and bearer controls are unchanged.
+
 - Authenticated pull: `GET /ops/metrics` on the Worker with
   `Authorization: Bearer <METRICS_SCRAPE_TOKEN>`. The token is an optional
   Worker secret (never a plain var) and must be at least 32 characters —
