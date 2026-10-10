@@ -2120,6 +2120,12 @@ pub struct GuildRoomWorker<S, H> {
     /// Status writes still running on their own task, and where their
     /// outcomes arrive.
     status_in_flight: HashSet<Snowflake>,
+    /// Rooms whose last status write failed or has no known outcome: the
+    /// channel may still show an older line, so every render is written.
+    status_unknown: HashSet<Snowflake>,
+    /// Whether a refused status write (missing Set Voice Channel Status)
+    /// has been logged for this guild.
+    status_refusal_logged: bool,
     status_outcomes: (
         mpsc::UnboundedSender<StatusOutcome>,
         mpsc::UnboundedReceiver<StatusOutcome>,
@@ -2370,6 +2376,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             pending_status: HashMap::new(),
             status_not_before_ms: HashMap::new(),
             status_in_flight: HashSet::new(),
+            status_unknown: HashSet::new(),
+            status_refusal_logged: false,
             status_outcomes: mpsc::unbounded_channel(),
             name_waits: HashMap::new(),
             creations: HashMap::new(),

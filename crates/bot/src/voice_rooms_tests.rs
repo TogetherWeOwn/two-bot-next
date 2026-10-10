@@ -707,6 +707,8 @@ struct Http {
     /// When set, status writes run as detached requests answering after
     /// this many milliseconds (the production `RoomHttp` path).
     slow_status: Mutex<Option<u64>>,
+    /// Scripted failures for the next status writes.
+    status_errors: Mutex<VecDeque<RoomHttpError>>,
 }
 
 impl Http {
@@ -742,6 +744,7 @@ impl Http {
             overwrites_gate: None,
             limit_gate: None,
             slow_status: Mutex::new(None),
+            status_errors: Mutex::new(VecDeque::new()),
             downloaded_urls: Mutex::new(Vec::new()),
             download_results: Arc::new(Mutex::new(VecDeque::new())),
         }
@@ -890,7 +893,10 @@ impl RoomWrites for Http {
             .lock()
             .unwrap()
             .push(format!("status:{channel}:{status}"));
-        Ok(())
+        match self.status_errors.lock().unwrap().pop_front() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
     fn detached_voice_status(&self, channel: u64, status: &str) -> Option<DetachedWrite> {
         let delay = (*self.slow_status.lock().unwrap())?;
@@ -10234,6 +10240,34 @@ async fn removing_the_status_template_clears_the_line() {
     dispatch(&mut worker, name_panel::STATUS_MIN_INTERVAL_MS).await;
     assert_eq!(*trace.lock().unwrap(), ["status:500:1 here", "status:500:"]);
     assert!(!worker.room_status.contains_key(&500) || worker.room_status[&500].is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_clear_is_retried_even_when_the_next_render_is_empty() {
+    let (live, store, http, trace) = status_worker_parts();
+    let mut worker = status_worker(live, store, http, "@@num@@ here").await;
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    worker.name_settings.status_templates.clear();
+    worker
+        .http
+        .status_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::UnknownOutcome);
+    worker.live.voice_update(MEMBER + 1, Some(500), Some(false));
+    worker.refresh_template_names(1);
+    let interval = name_panel::STATUS_MIN_INTERVAL_MS;
+    dispatch(&mut worker, interval).await;
+    // Another change renders empty again: the clear stays queued.
+    worker.live.voice_update(MEMBER + 2, Some(500), Some(false));
+    worker.refresh_template_names(2);
+    dispatch(&mut worker, 2 * interval).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["status:500:1 here", "status:500:", "status:500:"]
+    );
+    assert!(!worker.status_unknown.contains(&500));
 }
 
 #[tokio::test]

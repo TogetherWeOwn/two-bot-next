@@ -554,6 +554,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .retain(|room_id, _| rooms.contains_key(room_id));
         self.status_not_before_ms
             .retain(|room_id, _| rooms.contains_key(room_id));
+        self.status_unknown
+            .retain(|room_id| rooms.contains_key(room_id));
     }
 
     /// Render the room's voice status line and leave it pending when it
@@ -567,11 +569,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .get(&room.creator_channel_id)
             .cloned()
             .unwrap_or_default();
+        // After a failed write the channel's line is unknown: write
+        // whatever renders, an empty clear included.
+        let unknown = self.status_unknown.contains(&room.channel_id);
         let current = self
             .room_status
             .get(&room.channel_id)
             .map_or("", String::as_str);
-        if template.is_empty() && current.is_empty() {
+        if template.is_empty() && current.is_empty() && !unknown {
             self.pending_status.remove(&room.channel_id);
             return;
         }
@@ -581,7 +586,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             let facts = self.name_facts(room, command);
             render_voice_status(&template, &facts, &command.policy)
         };
-        if current == status {
+        if current == status && !unknown {
             self.pending_status.remove(&room.channel_id);
         } else {
             self.pending_status.insert(room.channel_id, status);
@@ -662,21 +667,30 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     ) {
         match result {
             Ok(()) => {
+                self.status_unknown.remove(&room_id);
                 self.room_status.insert(room_id, status);
             }
             Err(RoomHttpError::RateLimited { retry_after_ms, .. }) => {
-                self.room_status.remove(&room_id);
+                self.status_unknown.insert(room_id);
                 self.status_not_before_ms
                     .insert(room_id, now_ms + retry_after_ms.max(STATUS_MIN_INTERVAL_MS));
                 self.pending_status.entry(room_id).or_insert(status);
             }
             Err(RoomHttpError::RenameDeferred | RoomHttpError::UnknownOutcome) => {
-                self.room_status.remove(&room_id);
+                self.status_unknown.insert(room_id);
                 self.pending_status.entry(room_id).or_insert(status);
             }
             // Missing permission or a gone channel: drop this line; the next
             // change renders again.
-            Err(_) => {
+            Err(error) => {
+                if error == RoomHttpError::AccessDenied && !self.status_refusal_logged {
+                    self.status_refusal_logged = true;
+                    tracing::warn!(
+                        guild_id = self.live.guild_id.to_string(),
+                        "voice status write refused; the bot needs Set Voice Channel Status"
+                    );
+                }
+                self.status_unknown.remove(&room_id);
                 self.room_status.remove(&room_id);
             }
         }
