@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DOC = ROOT / "docs/voice-config-apply.md"
 SEQ = ROOT / "docs/cutover-sequence.md"
 BIN = ROOT / "crates/cutover/src/bin/voice_config_apply.rs"
+LIB = ROOT / "crates/cutover/src/voice_config_apply.rs"
 CLI = ROOT / "crates/cutover/src/cli.rs"
 
 # The operator invocation the doc teaches: dry run plus the bound apply.
@@ -163,7 +164,7 @@ class VoiceConfigApplyDocConformanceTests(unittest.TestCase):
         # Exit 3 has exactly its two sites: reviewed-hash mismatch and the
         # compare-and-swap conflict on a changed stored configuration.
         self.assertEqual(source.count("std::process::exit(3)"), 2)
-        self.assertIn("hash mismatch", BIN.parents[1].joinpath("voice_config_apply.rs").read_text())
+        self.assertIn("hash mismatch", LIB.read_text())
         self.assertIn("RowNotFound", source)
 
     def test_cutover_sequence_names_voice_config_apply_at_v11(self):
