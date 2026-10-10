@@ -1959,15 +1959,21 @@ mod tests {
 
     #[test]
     fn production_refuses_pooled_bindings() {
-        // PlanetScale serves PgBouncer on the same host at port 6432, so a
-        // production binding copied from the app's pooled connection string
-        // passes the host pin but must still refuse before any DDL.
+        // Pooled bindings refuse pre-connect in `validate_request` (shared
+        // `check_binding_shape`) and again in `verify_target` before any DDL.
+        // Use a non-PlanetScale host so the `*.psdb.cloud` branch-pin fence
+        // stays out of this test; PlanetScale pin coverage lives in
+        // `validation_refuses_before_connecting`.
         let mut pooled_port = production_plan();
-        pooled_port.expected_host = "abc-useast1-1.horizon.psdb.cloud".to_owned();
+        pooled_port.expected_host = "prod-host.invalid".to_owned();
         pooled_port.url = Some(
-            "postgres://u@abc-useast1-1.horizon.psdb.cloud:6432/two_bot?sslmode=require".to_owned(),
+            "postgres://u@prod-host.invalid:6432/two_bot?sslmode=require".to_owned(),
         );
-        assert!(validate_request(&pooled_port).is_ok());
+        let err = validate_request(&pooled_port).unwrap_err().to_string();
+        assert!(
+            err.contains("direct"),
+            "pooled port must name the direct endpoint, got: {err}"
+        );
         let err = verify_target(&pooled_port).unwrap_err().to_string();
         assert!(
             err.contains("direct endpoint"),
@@ -1976,12 +1982,15 @@ mod tests {
         // Dedicated-PgBouncer logins carry a `|name` suffix on the username;
         // SQLx percent-decodes it, so the encoded form refuses the same way.
         let mut pooled_login = production_plan();
-        pooled_login.expected_host = "abc-useast1-1.horizon.psdb.cloud".to_owned();
+        pooled_login.expected_host = "prod-host.invalid".to_owned();
         pooled_login.url = Some(
-            "postgres://u%7Cpgbouncer@abc-useast1-1.horizon.psdb.cloud:5432/two_bot?sslmode=require"
-                .to_owned(),
+            "postgres://u%7Cpgbouncer@prod-host.invalid:5432/two_bot?sslmode=require".to_owned(),
         );
-        assert!(validate_request(&pooled_login).is_ok());
+        let err = validate_request(&pooled_login).unwrap_err().to_string();
+        assert!(
+            err.contains("direct"),
+            "pooled login must name the direct login, got: {err}"
+        );
         let err = verify_target(&pooled_login).unwrap_err().to_string();
         assert!(
             err.contains("direct login"),
@@ -1989,9 +1998,9 @@ mod tests {
         );
         // The direct endpoint on the same host still verifies.
         let mut direct = production_plan();
-        direct.expected_host = "abc-useast1-1.horizon.psdb.cloud".to_owned();
+        direct.expected_host = "prod-host.invalid".to_owned();
         direct.url = Some(
-            "postgres://u@abc-useast1-1.horizon.psdb.cloud:5432/two_bot?sslmode=require".to_owned(),
+            "postgres://u@prod-host.invalid:5432/two_bot?sslmode=require".to_owned(),
         );
         assert!(validate_request(&direct).is_ok());
         assert!(verify_target(&direct).is_ok());
