@@ -109,13 +109,17 @@ class RequiredChecksReportTests(unittest.TestCase):
         text = str(job)
         self.assertIn("cargo-fuzz --version 0.13.2 --locked", text)
         self.assertIn("nightly-2026-10-01", text)
-        self.assertIn("cargo fuzz build", text)
+        self.assertIn("cargo +nightly-2026-10-01 fuzz build", text)
         self.assertNotIn("fuzz run", text)
         self.assertNotIn("max_total_time", text)
         # Separate workspace: the build runs inside fuzz/, never the root lockfile.
-        build = [step for step in job.get("steps", []) if "cargo fuzz build" in str(step.get("run", ""))]
+        build = [step for step in job.get("steps", []) if "fuzz build" in str(step.get("run", ""))]
         self.assertEqual(len(build), 1)
         self.assertEqual(build[0].get("working-directory"), "fuzz")
+        # The `+nightly` selector is load-bearing: rustup resolves the toolchain
+        # from the repo-root rust-toolchain.toml (stable), so a bare
+        # `cargo fuzz build` runs under stable and fails on `-Zsanitizer`.
+        self.assertIn("cargo +nightly-2026-10-01 fuzz build", build[0].get("run", ""))
         agg = self.workflows["check.yml"]["jobs"]["ci-ok"]
         self.assertIn("fuzz-compile", agg["needs"])
         self.assertIn("FUZZ_COMPILE_RESULT", "\n".join(step.get("run", "") for step in agg["steps"]))

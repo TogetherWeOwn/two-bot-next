@@ -644,7 +644,11 @@ class WorkflowSurfaceTests(unittest.TestCase):
         self.assertIn(f"\n    {self.LANE_GUARD}\n", head)
         self.assertIn("job-inputs", head)
         body = self.job_text(self.text, "fuzz-compile")
-        self.assertIn("cargo fuzz build", body)
+        self.assertIn("fuzz build", body)
+        # The `+nightly` selector is load-bearing: the repo-root
+        # rust-toolchain.toml (stable) otherwise wins over the installed
+        # nightly and `-Zsanitizer` fails.
+        self.assertIn("cargo +nightly-2026-10-01 fuzz build", body)
         self.assertNotIn("cargo fuzz run", body)
 
     def test_guard_scan_flags_an_unguarded_db_step(self):

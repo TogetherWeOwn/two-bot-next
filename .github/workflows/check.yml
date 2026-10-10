@@ -1546,9 +1546,13 @@ jobs:
       # Compile-only: builds all ten libFuzzer targets without executing them.
       # No execution, no corpus output, no schedule; the bounded
       # vote_kick smoke stays a manual non-controller step (see fuzz/README.md).
+      # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the
+      # toolchain from the repo-root rust-toolchain.toml (stable 1.98.1) even
+      # with working-directory fuzz/, so a bare `cargo fuzz build` runs under
+      # stable and fails on `-Zsanitizer`. The `+toolchain` form bypasses it.
       - name: Compile-only fuzz build (no execution)
         working-directory: fuzz
-        run: cargo fuzz build
+        run: cargo +nightly-2026-10-01 fuzz build
 
   worker:
     name: worker check
