@@ -9,7 +9,11 @@ share one helper
 (`website_jobs::admission_pool_with_tls`, used by the website jobs, the preflight
 `admission_transport` and the commands CLI `executor`). The cutover tools' fourth
 pool (`RestClient::from_env`) uses its own `admission_connect_options` helper.
-Both paths validate before enforcing TLS, then parse and apply the effective TLS
+The migration target pool (`staging_migrate::verify_target` plus `connect`,
+serving both the staging and production targets) enforces the same policy on
+its secret binding after the host/database pin checks' URL allowlist step and
+before `connect_options`, then applies the effective TLS mode. All paths
+validate before enforcing TLS, then parse and apply the effective TLS
 mode; each configures the statement and acquire timeouts.
 
 ## Setting
@@ -101,11 +105,15 @@ jobs, the preflight `admission_transport`, the commands CLI `executor`, and
 `two_bot_cutover::rest::RestClient::from_env` via `admission_connect_options`
 (with `from_url_with_tls` as a public explicit URL/policy constructor used by
 tests) for the `report`, `ghost_cleanup`, `backfill_messages`, `backfill`,
-`capture` and `voice_config_apply` operator tools).
+`capture` and `voice_config_apply` operator tools), and the migration target
+pool (`staging_migrate::verify_target` plus `connect` in
+`crates/cutover/src/staging_migrate.rs`, serving both the staging and
+production targets: pins the expected host and database, enforces the
+`TWO_DATABASE_TLS` policy before SQLx parses the binding, applies the
+effective TLS mode, and sets the 15 s statement timeout on the options with a
+10 s acquire timeout on the pool).
 
-Known gaps (not yet fenced): `staging_migrate::verify_target` plus `connect`
-(`crates/cutover/src/staging_migrate.rs`) pins the expected host and database
-but never calls `database_tls::enforce`/`apply` and sets no timeouts; the
+Known gaps (not yet fenced): the
 `legacy_copy` binary (`crates/cutover/src/bin/legacy_copy.rs`) builds its
 source/target pools with raw `PgPoolOptions::connect_with` from operator URLs
 without calling `database_tls::enforce`/`apply`; and the `legacy_verify`
@@ -135,6 +143,17 @@ F6 stays open until the deployment card records a non-secret TLS receipt.
   for a realistic remote URL, and the dial-discriminating
   `admission_bootstrap_tls_spy_refuses_before_any_socket`, which fails when
   the fence is reverted to raw `connect_options`).
+- The migration target pool mirrors that proof in
+  `staging_migrate::target_tls_fence_refuses_plaintext_and_wrong_hosts` (a
+  remote plaintext URL fails with the same fixed strings before SQLx parses
+  the binding or opens a socket), with the happy path and timeout presence in
+  `target_fence_applies_verify_full_and_statement_timeout` (effective
+  `verify-full` mode plus `statement_timeout=15000ms` on the fenced options,
+  lazy pool opens no socket), the pool shape in
+  `target_pool_shape_pins_timeouts`, and the entry proof in
+  `run_refuses_plaintext_remote_binding_before_connect` (the `run` entry
+  refuses under either policy, so the test holds regardless of the ambient
+  `TWO_DATABASE_TLS` setting).
 - DB suites and CLIs pass `LocalOnly` explicitly (`connect_with_tls` /
   `connect_pool_with_tls` / `open_pool_with_tls`, or
   `TWO_DATABASE_TLS=local-only` on `env_clear()` subprocesses). The CI `check`
