@@ -2,8 +2,10 @@
 
 This is a separate `cargo-fuzz` workspace, explicitly excluded from the root
 workspace. Normal `cargo build`, workspace tests/clippy, `check` and cargo-deny
-keep their existing members, dependency lockfile and stable toolchain. No nightly
-workflow currently exists, so no scheduled smoke/service is added.
+keep their existing members, dependency lockfile and stable toolchain. The required
+`fuzz-compile` CI job (`check.yml`, gated by `ci-ok`) builds all ten targets
+compile-only on pinned nightly `nightly-2026-10-01` + `cargo-fuzz 0.13.2`; no
+scheduled or continuous fuzz campaign exists, and CI never executes `cargo fuzz run`.
 
 ## Coverage
 
@@ -81,8 +83,10 @@ cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check
 
 `fuzz/Cargo.lock` is independent of the root lockfile. Preserve the generated
 fuzz lockfile with the verification evidence before reporting a campaign; record
-nightly, cargo-fuzz, libfuzzer-sys and OS versions and exact git HEAD. Do not claim
-the root's required checks compile these excluded targets.
+nightly, cargo-fuzz, libfuzzer-sys and OS versions and exact git HEAD. The required
+`fuzz-compile` job proves the excluded targets build; it does not execute them. A
+bounded smoke result must cite its own non-controller host, command, elapsed time
+and artifacts, never CI compile alone.
 
 ## Crashes and evidence
 
