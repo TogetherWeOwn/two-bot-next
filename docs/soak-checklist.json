@@ -2360,16 +2360,15 @@
         ]
       },
       "owner": [
-        "TOG-10093",
-        "TOG-15336",
+        "TOG-20913",
         "TOG-10119"
       ],
       "status": "manual",
-      "action": "Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Have two disposable members join the creator channel together; take the overwrite-preflight refusal from TOG-10093’s fixture.",
-      "expected": "Each member gets one distinct room with no duplicate reservation; a create whose overwrites exceed bot permissions is refused before any channel exists.",
-      "evidence": "Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference. Partial offline fixture evidence, not a PASS: the `verification` command covers only the two refusal cases (missing Manage Channels; private default without Manage Roles) and sequential distinct-room dispatch. The capped durable guild reservation and the general overwrite-bit permission preflight are unverified.",
+      "action": "Have two disposable members join the creator channel together on the staging fixture guild (attach the TOG-10119 temp-voice scenario; do not run a second voice scenario here). Take the overwrite-bit preflight refusal from TOG-20913's fixture: a create whose overwrites exceed the bot's permission bits must be refused before any channel exists.",
+      "expected": "Each member gets one distinct room with no duplicate reservation (durable per-guild claim); a create whose overwrites exceed bot permissions is refused before any channel exists.",
+      "evidence": "Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference. Partial offline fixture evidence, not a PASS: the `verification` command covers the concurrent-cap admission across two pools plus the two refusal cases (missing Manage Channels; private default without Manage Roles) and sequential distinct-room dispatch. The general overwrite-bit permission preflight is unverified (see TOG-20913).",
       "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
-      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- refused_creation_plan_records_a_failure_before_any_channel_is_created two_simultaneous_members_get_distinct_persisted_rooms"
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test voice_create_admission_store -- concurrent_claims_across_stores_cannot_both_pass_the_guild_cap -- --ignored && python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- refused_creation_plan_records_a_failure_before_any_channel_is_created two_simultaneous_members_get_distinct_persisted_rooms"
     },
     {
       "id": "s13-a891063",
@@ -2401,20 +2400,18 @@
           "[50c3e9f](https://github.com/TogetherWeOwn/two-bot/commit/50c3e9f584e89ba4a8ff9edb504b531f1a5e938c)",
           "`src/tempVoice/`",
           "TOG-3471: retain temp-voice provenance after rollback failure",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
-        "TOG-10093",
-        "TOG-15336",
         "TOG-10119"
       ],
-      "status": "manual",
-      "action": "In TOG-10093’s mock-Discord fixture, fail a create and then its rollback.",
-      "expected": "The room keeps its provenance so a later sweep removes it; no unmanaged orphan channel.",
-      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. No live fault injection, staging/production SQL or credentials. Partial offline fixture evidence, not a PASS: the `verification` command covers same-worker, in-memory retention only. Durable provenance, fresh-worker restart recovery, attachment retry, missing-channel cleanup and cap accounting retained until a guarded delete or 404 are unverified (the `#[ignore]`d restart test states the missing behaviour; it is skipped in CI until a durable witness exists).",
+      "status": "automated",
+      "action": "Run the disposable-database store test `crates/cutover/tests/voice_create_admission_store.rs` (set `TWO_TEST_DATABASE_URL` to the agent-testdb CI service; it creates and drops its own database) plus the worker rollback-retention regression in `crates/bot/src/voice_rooms_tests.rs`. No live fault injection, staging/production SQL or credentials.",
+      "expected": "A channel whose persist failed and whose rollback delete was refused stays bound to its claim across a restart (fresh pool), keeps its cap slot until a confirmed delete or 404 settles it, and frees the slot only then; same-worker retention keeps owner/creator provenance until a later sweep removes it.",
+      "evidence": "Attach exact-head fixture commands and PASS/NEEDS WORK result with the test names; fixture proof only. Staging proof (rollback-failure recovery across the TOG-10119 restart) stays on [TOG-10119](/TOG/issues/TOG-10119); do not infer PASS from this row.",
       "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
-      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- failed_rollback_keeps_the_room_tracked_until_a_later_sweep_removes_it"
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test voice_create_admission_store -- bound_channel_witness_survives_restart_and_holds_the_slot_until_settled -- --ignored && python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- failed_rollback_keeps_the_room_tracked_until_a_later_sweep_removes_it"
     },
     {
       "id": "s13-984175d",
