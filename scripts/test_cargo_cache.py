@@ -1080,11 +1080,47 @@ class SharedPoolRetainTests(unittest.TestCase):
         (stale / 'stat').write_text('999 (fixture) S 1 999 999 0 -1 0\n')
         (stale / 'cwd').symlink_to(self.root)
         (stale / 'exe').symlink_to(sys.executable)
-        (stale / 'maps').write_text('100-200 r--p 00000000 00:01 999999991 '
-                                    '/different/container/mount/stale.so (deleted)\n')
+        # Same-filesystem deleted entry outside every slot path, with an
+        # inode in no slot traversal: indistinguishable from a deleted slot
+        # file held open, so the whole run still refuses with no mutation.
+        pool_dev = os.stat(self.pool / 'slot-0' / 'target').st_dev
+        (stale / 'maps').write_text(
+            f'100-200 r--p 00000000 {os.major(pool_dev):x}:{os.minor(pool_dev):x} '
+            f'999999991 /different/container/mount/stale.so (deleted)\n')
         with self.assertRaisesRegex(cache.Refusal, 'unresolved deleted'):
             self.retain()
         self.assertTrue((target / 'debug' / 'fixture').exists())
+
+    def test_different_filesystem_deleted_excluded(self):
+        # Multi-tenant host shape: unrelated deleted artifacts on filesystems
+        # holding no slot output are provably unable to alias slot output, so
+        # they are excluded (and counted) instead of refusing the whole run.
+        stale = self.proc / '999'
+        stale.mkdir()
+        (stale / 'fd').mkdir()
+        (stale / 'stat').write_text('999 (fixture) S 1 999 999 0 -1 0\n')
+        (stale / 'cwd').symlink_to(self.root)
+        (stale / 'exe').symlink_to(sys.executable)
+        observed = {os.stat(self.pool / f'slot-{n}' / sub).st_dev
+                    for n in range(2) for sub in ('target', 'scratch')}
+        foreign = os.makedev(0xAB, 0xCD)
+        self.assertNotIn(foreign, observed)
+        (stale / 'maps').write_text(
+            f'100-200 r--p 00000000 ab:cd 999999991 /other/tenant/stale.so (deleted)\n'
+            f'200-300 r--p 00000000 ab:cd 999999992 /other/tenant/old.so (deleted)\n')
+        receipt = self.retain()
+        self.assertTrue(all(row['eligible'] for row in receipt['slots']))
+        self.assertEqual(receipt['excluded_deleted_references'], 2)
+        self.assertFalse((self.pool / 'slot-0' / 'lease.json').exists())
+
+    def test_device_unknown_deleted_refuses_whole(self):
+        # A deleted entry with no usable device identity cannot prove
+        # non-aliasing, so it stays fail-closed and refuses the whole run.
+        with patch.object(cache, 'process_references',
+                          return_value=([], [('/elsewhere/stale.so', None, 7)])):
+            with self.assertRaisesRegex(cache.Refusal, 'unresolved deleted'):
+                self.retain()
+        self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
 
     def test_denied_process_scan_refuses_whole_without_mutation(self):
         self.fake_pid()

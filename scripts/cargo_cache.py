@@ -791,9 +791,21 @@ def shared_pool_retain(pool, inventory, proc_root='/proc', now=None, max_age=60,
             except (OSError, ValueError, KeyError, IndexError, subprocess.CalledProcessError) as error:
                 results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
                                  'reason': f'verify failed ({error}); skipped, lease kept'}
-        # Fail-closed unresolved-deleted check before ANY mutation: a deleted
-        # artifact attributable to no held slot refuses the whole run, since
-        # container spellings and reclaimed inodes cannot prove no reference.
+        # Fail-closed unresolved-deleted check before ANY mutation. A deleted
+        # (unlinked/replaced) artifact keeps its deletion marker: under a
+        # container spelling it matches neither a host path nor a live slot
+        # inode, so an entry attributable to no held slot refuses the whole
+        # run -- EXCEPT provable different-filesystem exclusion. One
+        # filesystem's unlinked inode can never be another filesystem's file,
+        # so a deleted entry whose device appears in no held slot output is
+        # provably unable to reference slot output and is excluded (counted
+        # in the receipt, never silently dropped). Same-filesystem and
+        # device-unknown unattributed entries still refuse: a deleted slot
+        # file held open carries the slot's device with an inode already gone
+        # from the traversal, which no scan can distinguish from an unrelated
+        # same-filesystem temp file. Exclusion also needs complete device
+        # knowledge: if any held slot's output device is unreadable, nothing
+        # is excluded and the strict rule applies.
         all_nodes = set()
         for entry in pending.values():
             all_nodes |= entry['nodes']
@@ -804,10 +816,28 @@ def shared_pool_retain(pool, inventory, proc_root='/proc', now=None, max_age=60,
             # inside one attributes there and must not force a whole refusal.
             slot = pool / name
             slot_roots += [str(slot / 'target'), str(slot / 'scratch')]
-        unresolved = [
-            (path, device, inode) for path, device, inode in deleted
-            if not any(within(path, Path(root)) for root in slot_roots)
-            and not (device is not None and (device, inode) in all_nodes)]
+        slot_devices = {device for device, _inode in all_nodes}
+        devices_complete = True
+        for name in held:
+            for sub in ('target', 'scratch'):
+                try:
+                    slot_devices.add(os.stat(held[name][0] / sub).st_dev)
+                except OSError:
+                    # That slot is already skipped; without its device the
+                    # different-filesystem proof is unsound, so exclude nothing.
+                    devices_complete = False
+        unresolved = []
+        excluded_deleted = 0
+        for path, device, inode in deleted:
+            if any(within(path, Path(root)) for root in slot_roots):
+                continue  # lexical attribution, including skipped-slot paths
+            if device is not None and (device, inode) in all_nodes:
+                continue  # inode attribution to pending slot output
+            if (devices_complete and device is not None
+                    and device not in slot_devices):
+                excluded_deleted += 1
+                continue
+            unresolved.append((path, device, inode))
         if unresolved:
             raise Refusal('unresolved deleted process reference; '
                           'exact-path process-reference receipt required')
@@ -863,7 +893,9 @@ def shared_pool_retain(pool, inventory, proc_root='/proc', now=None, max_age=60,
         for name in sorted(results):
             ordered.append(results[name])
         return {'version': 1, 'retain': True, 'mutation': True,
-                'captured_at_unix': now, 'slots': ordered}
+                'captured_at_unix': now,
+                'excluded_deleted_references': excluded_deleted,
+                'slots': ordered}
     finally:
         for _slot, fd in held.values():
             try:
