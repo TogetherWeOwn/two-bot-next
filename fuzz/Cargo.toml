@@ -60,3 +60,10 @@ path = "fuzz_targets/voice_config.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "rsvp"
+path = "fuzz_targets/rsvp.rs"
+test = false
+doc = false
+bench = false
