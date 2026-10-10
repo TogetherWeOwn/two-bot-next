@@ -814,6 +814,7 @@ struct ReceiverState {
 }
 
 impl ReceiverState {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         config: InternalActionConfig,
         pool: sqlx::PgPool,

@@ -1581,6 +1581,7 @@ async fn moderation_channel_flag_off_is_refused_before_any_effect() {
         db.pool().clone(),
         effect.clone(),
         Arc::new(MockEventRead::default()),
+        Arc::new(MockEventMutate),
         moderation.clone(),
         channel.clone(),
     ));
@@ -1617,6 +1618,7 @@ async fn moderation_channel_happy_paths_emit_planner_outcomes() {
         db.pool().clone(),
         effect.clone(),
         Arc::new(MockEventRead::default()),
+        Arc::new(MockEventMutate),
         moderation.clone(),
         channel.clone(),
     ));
@@ -1668,6 +1670,7 @@ async fn moderation_channel_bad_channel_keys_are_refused_before_any_effect() {
         db.pool().clone(),
         effect.clone(),
         Arc::new(MockEventRead::default()),
+        Arc::new(MockEventMutate),
         moderation.clone(),
         channel.clone(),
     ));
@@ -1747,6 +1750,7 @@ async fn moderation_channel_success_replays_and_mismatches_like_announcements() 
         db.pool().clone(),
         effect.clone(),
         Arc::new(MockEventRead::default()),
+        Arc::new(MockEventMutate),
         moderation.clone(),
         channel.clone(),
     ));
@@ -1765,6 +1769,7 @@ async fn moderation_channel_success_replays_and_mismatches_like_announcements() 
         db.independent_pool().await.unwrap(),
         effect.clone(),
         Arc::new(MockEventRead::default()),
+        Arc::new(MockEventMutate),
         moderation.clone(),
         channel.clone(),
     ));
@@ -1981,6 +1986,7 @@ async fn all_nine_moderation_verbs_pass_admission_with_flags_on() {
         db.pool().clone(),
         effect.clone(),
         Arc::new(MockEventRead::default()),
+        Arc::new(MockEventMutate),
         moderation.clone(),
         channel.clone(),
     ));
