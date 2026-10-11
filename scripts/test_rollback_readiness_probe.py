@@ -573,6 +573,53 @@ class DeepNestingRefusalTests(unittest.TestCase):
             probe.load_live_sequences(str(self.fx.sequences))
         self.assertIn("is not JSON", str(caught.exception))
 
+    def int_digit_body(self):
+        body = b'{"components":[],"n":' + b"1" * 4301 + b"}"
+        self.assertLessEqual(len(body), probe.READYZ_BODY_CAP)
+        return body
+
+    def test_readyz_state_refuses_int_digit_overflow(self):
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.readyz_state(200, self.int_digit_body())
+        self.assertIn("without the bot's component breakdown", str(caught.exception))
+
+    def test_manifest_line_int_digit_overflow_refuses_as_not_json(self):
+        self.fx.write_archive("two-funnel-20261002T041700Z.ndjson.gz",
+                              [b"1" * 4301, *archive_lines(manifest())[1:]])
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.read_manifest(self.fx.backups / "two-funnel-20261002T041700Z.ndjson.gz")
+        self.assertIn("manifest line is not JSON", str(caught.exception))
+
+    def test_end_marker_int_digit_overflow_refuses_as_truncated(self):
+        lines = [*archive_lines(manifest())[:-1], b"1" * 4301]
+        self.fx.write_archive("two-funnel-20261002T041700Z.ndjson.gz", lines)
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.read_manifest(self.fx.backups / "two-funnel-20261002T041700Z.ndjson.gz")
+        self.assertIn("has no end marker", str(caught.exception))
+
+    def test_live_sequences_int_digit_overflow_refuses_as_not_json(self):
+        self.fx.sequences.write_bytes(b"1" * 4301)
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.load_live_sequences(str(self.fx.sequences))
+        self.assertIn("is not JSON", str(caught.exception))
+
+    def test_live_sequences_invalid_utf8_refuses_as_not_json(self):
+        self.fx.sequences.write_bytes(b"\xff\xfe[]")
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.load_live_sequences(str(self.fx.sequences))
+        self.assertIn("is not JSON", str(caught.exception))
+
+    def test_probe_main_with_int_digit_readyz_fails_closed_without_traceback(self):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(out):
+            code = probe.main(self.fx.argv(), fetch_fn=self.fetch((200, self.int_digit_body())))
+        text = out.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL readyz: /readyz 200 without the bot's component breakdown", text)
+        self.assertIn("rollback readiness: 3/4 checks passed", text)
+        self.assertNotIn("Traceback", text)
+        self.assertEqual(self.requested, [STAGING + "/readyz"])
+
     def test_probe_main_with_deeply_nested_readyz_fails_closed_without_traceback(self):
         deep = self.deep_array()
         out = io.StringIO()

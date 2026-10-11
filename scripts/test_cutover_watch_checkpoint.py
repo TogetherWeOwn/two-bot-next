@@ -170,6 +170,16 @@ class CutoverWatchCheckpointTests(unittest.TestCase):
                 self.assertEqual(code, 1, row)
                 self.assertTrue(row.endswith("| EXTEND |"), row)
 
+    def test_int_digit_overflow_is_extend_not_a_traceback(self):
+        body = b'{"components":[],"n":' + b"1" * 4301 + b"}"
+        code, row, requested = self.run_checkpoint((200, body))
+        self.assertEqual(code, 1)
+        self.assertIn("without the bot's component breakdown", row)
+        self.assertTrue(row.endswith("| EXTEND |"), row)
+        self.assertNotIn("\n", row)
+        self.assertEqual(row.count("|"), 6, row)
+        self.assertEqual(requested, [PRODUCTION + "/readyz"])
+
     def test_refuses_non_production_origins_without_a_request(self):
         for url in ("http://two-bot-next-production.example.workers.dev",
                     "https://two-bot-next-production.example.workers.dev:8443",
