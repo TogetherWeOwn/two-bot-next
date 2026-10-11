@@ -4,7 +4,8 @@
 //! [`VoiceRuntime`] (below) is the V1 wiring: a per-guild actor registry fed
 //! by a gateway sink. Each guild gets one actor task owning its
 //! [`GuildRoomWorker`]; the sink translates twilight events into actor
-//! commands, and a timer drains the worker's ordered queue. Single-attempt
+//! commands, and accepted joins immediately drain the ordered queue. A timer
+//! handles retries and maintenance. Single-attempt
 //! REST plus deferred rename backoff are preserved so a rename backlog can
 //! never monopolize a guild lane. The runtime is inert unless constructed
 //! (gated on `TWO_VOICE=1` by the binary).
@@ -814,10 +815,9 @@ pub trait RoomWrites: Send + Sync {
         channel: Snowflake,
         name: &str,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
-    /// The same rename as an owned future the guild actor can stop waiting
-    /// on: after [`RENAME_INLINE_WAIT_MS`] the request keeps running on its
-    /// own task and its outcome comes back on the next dispatch. `None` (the
-    /// default) keeps the rename on the actor's await path.
+    /// An owned rename future, detached immediately so cosmetic HTTP never
+    /// delays a creator join. Its outcome comes back on a later dispatch.
+    /// `None` (test/simple adapters) keeps the rename on the await path.
     fn detached_rename(&self, channel: Snowflake, name: &str) -> Option<DetachedRename> {
         let _ = (channel, name);
         None
@@ -2186,7 +2186,6 @@ struct JoinTiming {
     post: Duration,
     persist: Duration,
     move_member: Duration,
-    reorder_deferred: bool,
 }
 
 impl JoinTiming {
@@ -2201,7 +2200,6 @@ impl JoinTiming {
             post: Duration::ZERO,
             persist: Duration::ZERO,
             move_member: Duration::ZERO,
-            reorder_deferred: false,
         }
     }
 
@@ -2221,7 +2219,6 @@ impl JoinTiming {
             wait_before_dispatch_seconds = self.wait_before_dispatch.as_secs_f64(),
             claim_seconds = self.claim.as_secs_f64(),
             reorder_seconds = self.reorder.as_secs_f64(),
-            reorder_deferred = self.reorder_deferred,
             post_seconds = self.post.as_secs_f64(),
             persist_seconds = self.persist.as_secs_f64(),
             move_seconds = self.move_member.as_secs_f64(),
@@ -2243,7 +2240,8 @@ struct Creation {
 
 /// One mutable worker per guild. `load` must succeed before use. `reconcile`
 /// responds to complete snapshots, channel/role changes and voice transitions;
-/// `dispatch_one` is driven by the actor's timer, not by the gateway itself.
+/// Accepted joins wake dispatch immediately; the timer remains a retry and
+/// reconciliation backstop. Gateway receipt never waits for the HTTP writes.
 pub struct GuildRoomWorker<S, H> {
     live: LiveGuild,
     store: S,
@@ -2466,11 +2464,6 @@ const KICK_AUDIT_BATCH: usize = 32;
 /// [`RENAME_MIN_INTERVAL_MS`].
 const RENAME_DEFERRED_RETRY_MS: u64 = 15_000;
 
-/// Longest the guild actor waits on a rename before leaving the request to
-/// finish on its own task. Interactions answered through the actor (vote
-/// ballots, join requests, `/kick`) must reply within Discord's 3 s window.
-pub const RENAME_INLINE_WAIT_MS: u64 = 1_000;
-
 /// How soon a newer name for a channel whose rename is still in flight is
 /// looked at again.
 const RENAME_IN_FLIGHT_RECHECK_MS: u64 = 1_000;
@@ -2494,6 +2487,23 @@ struct NoticeState {
     failure: LifecycleFailure,
     ledger: RepeatLedger,
     last_attempt_ms: Option<u64>,
+}
+
+impl<S, H> GuildRoomWorker<S, H> {
+    fn finish_pending_joins(&mut self) {
+        for (_, creation) in self.creations.drain() {
+            creation.timing.finish("cancelled");
+        }
+        for (_, timing) in self.move_timings.drain() {
+            timing.finish("cancelled");
+        }
+    }
+}
+
+impl<S, H> Drop for GuildRoomWorker<S, H> {
+    fn drop(&mut self) {
+        self.finish_pending_joins();
+    }
 }
 
 impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
@@ -4268,7 +4278,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// Executes at most one write, releasing the guild lane on every outcome.
     /// `now_ms` is a monotonic actor clock, not a wall-clock timestamp.
     pub async fn dispatch_one(&mut self, now_ms: u64) -> bool {
-        if self.halted || !self.live.read_state().ready {
+        if self.halted {
+            self.finish_pending_joins();
+            return false;
+        }
+        if !self.live.read_state().ready {
             return false;
         }
         self.collect_rename_outcomes(now_ms);
@@ -4472,10 +4486,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         creation.timing.persist += persist_started.elapsed();
                         match transferred {
                             Ok(()) => {
-                                // V9c: companion first (same ordered lane), then
-                                // the move. The plan's settings snapshot is the
-                                // creator row at room-creation time, so later
-                                // `/textchannels` changes never alter it.
+                                // Snapshot companion settings now; the priority
+                                // move goes ahead of it and all unrelated writes.
+                                // Later `/textchannels` changes still cannot
+                                // alter this creation-time companion plan.
                                 observe_voice_operation("create", "success");
                                 self.observe_voice_state();
                                 self.enqueue_companion_create(channel_id);
@@ -5306,33 +5320,20 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 metrics::global().voice_name("rename_sent");
                 let result = match self.http.detached_rename(channel_id, &name) {
                     Some(request) => {
-                        let mut task = tokio::spawn(request);
-                        match tokio::time::timeout(
-                            Duration::from_millis(RENAME_INLINE_WAIT_MS),
-                            &mut task,
-                        )
-                        .await
-                        {
-                            Ok(joined) => joined.unwrap_or(Err(RoomHttpError::UnknownOutcome)),
-                            Err(_) => {
-                                // Still running: release the actor and the
-                                // guild lane, and collect the outcome later.
-                                let outcomes = self.rename_outcomes.0.clone();
-                                let detached = name.clone();
-                                tokio::spawn(async move {
-                                    let result =
-                                        task.await.unwrap_or(Err(RoomHttpError::UnknownOutcome));
-                                    let _ = outcomes.send(RenameOutcome {
-                                        channel_id,
-                                        name: detached,
-                                        result,
-                                    });
-                                });
-                                self.renames_in_flight.insert(channel_id, name);
-                                self.queue.mark_succeeded(&action);
-                                return true;
-                            }
-                        }
+                        let task = tokio::spawn(request);
+                        let outcomes = self.rename_outcomes.0.clone();
+                        let detached = name.clone();
+                        tokio::spawn(async move {
+                            let result = task.await.unwrap_or(Err(RoomHttpError::UnknownOutcome));
+                            let _ = outcomes.send(RenameOutcome {
+                                channel_id,
+                                name: detached,
+                                result,
+                            });
+                        });
+                        self.renames_in_flight.insert(channel_id, name);
+                        self.queue.mark_succeeded(&action);
+                        return true;
                     }
                     None => self.http.rename(channel_id, &name).await,
                 };
@@ -5661,7 +5662,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         self.finish_error(action, channel_id, error, Some(write));
     }
 
-    /// Apply the outcomes of renames that outlived [`RENAME_INLINE_WAIT_MS`].
+    /// Apply outcomes of detached renames, including 429s and unknown outcomes.
     /// A retry goes through the normal rename checks again, so a name that
     /// is no longer wanted, or a room that is gone, drops out there.
     fn collect_rename_outcomes(&mut self, now_ms: u64) {
@@ -5784,7 +5785,7 @@ fn elapsed_ms(now_ms: u64, started: Instant) -> u64 {
 /// Gateway-loop sink for voice events. The shard runner calls [`VoiceEventSink::handle`]
 /// after the pipeline's cache update, so every snapshot the runtime builds is
 /// complete. Live evidence is published synchronously before actor commands;
-/// network/database writes remain serialized on each guild actor's timer.
+/// network/database writes remain serialized on each guild actor.
 pub trait VoiceEventSink: Send + Sync {
     /// Share the registry publisher's live identity snapshots before dispatch.
     fn set_command_identities(
@@ -5992,7 +5993,8 @@ where
     H: RoomWrites + Send + 'static,
 {
     /// Build the runtime. `make` produces a fresh store/http pair per guild
-    /// actor; `tick` drives the ordered-queue drain (250 ms production);
+    /// actor; joins wake the ordered queue immediately and `tick` is its retry
+    /// and reconciliation backstop (250 ms production);
     /// `enabled` gates on `TWO_VOICE=1` so construction without the gate is inert.
     pub fn new(
         make: impl Fn() -> (S, H) + Send + Sync + 'static,
@@ -6738,9 +6740,13 @@ async fn run_actor<S: RoomPersistence, H: RoomWrites>(
     mut inbox: mpsc::UnboundedReceiver<ActorCommand>,
     tick: Duration,
 ) {
-    let start = Instant::now();
+    let start = tokio::time::Instant::now();
     let mut timer = tokio::time::interval(tick);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut dispatch_ready = false;
+    let mut maintenance_ready = false;
+    let mut dispatch_budget = 8u8;
+    let mut complete_join_pair = false;
     loop {
         tokio::select! {
             biased;
@@ -6750,7 +6756,17 @@ async fn run_actor<S: RoomPersistence, H: RoomWrites>(
                     .elapsed()
                     .as_millis()
                     .min(u128::from(u64::MAX)) as u64;
-                apply_command(worker, command, now_ms);
+                dispatch_ready |= apply_command(worker, command, now_ms);
+            }
+            // Inbox first between writes, but no timer between a persisted
+            // create and its priority move. A backed-off/idle queue returns
+            // false, disarming this wake until a command or timer can retry.
+            _ = std::future::ready(()), if dispatch_ready && (dispatch_budget > 0 || complete_join_pair) => {
+                let now_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                let pending_moves = worker.moves.len();
+                dispatch_ready = worker.dispatch_one(now_ms).await;
+                complete_join_pair = worker.moves.len() > pending_moves;
+                dispatch_budget = dispatch_budget.saturating_sub(1);
             }
             _ = timer.tick() => {
                 worker.reconcile();
@@ -6763,17 +6779,27 @@ async fn run_actor<S: RoomPersistence, H: RoomWrites>(
                 worker.kick_refresh(now_ms);
                 // V5: re-render template names whose facts changed (create,
                 // join/leave, owner handoff); the rename lane paces them.
-                worker.reload_name_settings(now_ms).await;
                 worker.refresh_template_names(now_ms);
-                // Return to the inbox after each await. Evidence is already
-                // live, but creator configuration/status commands must not sit
-                // behind a 64-write burst either.
-                worker.dispatch_one(now_ms).await;
+                dispatch_ready = true;
+                maintenance_ready = true;
+            }
+            // Never interpose maintenance SQL/notices between create and move.
+            _ = std::future::ready(()), if maintenance_ready => {
+                maintenance_ready = false;
+                let now_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                worker.reload_name_settings(now_ms).await;
                 worker.send_notices(now_ms).await;
                 worker.flush_kick_audit(now_ms).await;
+                dispatch_budget = 8;
+            }
+            // Yield after a bounded turn even when the next timer is not due.
+            // A persisted creator move is allowed to finish the current pair.
+            _ = tokio::task::yield_now(), if dispatch_ready => {
+                dispatch_budget = 8;
             }
         }
     }
+    worker.finish_pending_joins();
     // Inbox closed: append what is left (one failed batch ends it) so a clean
     // shutdown keeps the trail.
     while worker.flush_kick_audit(u64::MAX).await {}
@@ -6783,7 +6809,8 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
     worker: &mut GuildRoomWorker<S, H>,
     command: ActorCommand,
     now_ms: u64,
-) {
+) -> bool {
+    let mut accepted_join = false;
     match command {
         ActorCommand::Reconcile => worker.reconcile(),
         ActorCommand::Display { member_id, display } => {
@@ -6806,7 +6833,8 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             created_at,
             received,
         } => {
-            worker.accept_join_received(ticket, &display, seed, created_at, received);
+            accepted_join =
+                worker.accept_join_received(ticket, &display, seed, created_at, received);
             worker.reconcile();
         }
         ActorCommand::CreatorAdded(creator) => {
@@ -6883,6 +6911,7 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             let _ = reply.send(worker.apply_join_decision(decision));
         }
     }
+    accepted_join
 }
 
 /// Build the production sink: lifecycle actors plus the S4 responder.
@@ -10626,6 +10655,10 @@ where
                 .await;
             });
         }
+    }
+
+    fn presence(&self, update: &twilight_model::gateway::payload::incoming::PresenceUpdate) {
+        self.runtime.presence(update);
     }
 
     fn disconnect(&self) {

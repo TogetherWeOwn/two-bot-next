@@ -38,10 +38,51 @@ fn tls_policy_from_env() -> Result<TlsPolicy, sqlx::Error> {
         .map_err(|message| sqlx::Error::InvalidArgument(message.to_owned()))
 }
 
+fn pool_options(pool_max: u32) -> PgPoolOptions {
+    PgPoolOptions::new().max_connections(pool_max)
+}
+
+fn voice_pool_options(pool_max: u32) -> PgPoolOptions {
+    pool_options(pool_max)
+        .min_connections(1)
+        // SQLx 0.9 reaps idle connections even at the minimum, then reconnects.
+        // Disable that churn for voice; retain the normal max-lifetime rotation.
+        .idle_timeout(None)
+        // A warm socket may have died during a DB/proxy restart. Keep the
+        // liveness round trip so acquire replaces it before a room transaction.
+        .test_before_acquire(true)
+}
+
+/// Open the latency-sensitive voice pool with one warm connection, using the
+/// same URL validation, TLS policy and migration behavior as [`connect`].
+/// Other runtime and CLI pools deliberately retain their existing defaults.
+pub async fn connect_voice(
+    url: &str,
+    pool_max: u32,
+    skip_migrations: bool,
+) -> Result<CutoverDb, sqlx::Error> {
+    connect_with_pool_options(
+        url,
+        voice_pool_options(pool_max),
+        skip_migrations,
+        tls_policy_from_env()?,
+    )
+    .await
+}
+
 /// [`connect`] with an explicit TLS policy (tests pass `LocalOnly`).
 pub async fn connect_with_tls(
     url: &str,
     pool_max: u32,
+    skip_migrations: bool,
+    tls: TlsPolicy,
+) -> Result<CutoverDb, sqlx::Error> {
+    connect_with_pool_options(url, pool_options(pool_max), skip_migrations, tls).await
+}
+
+async fn connect_with_pool_options(
+    url: &str,
+    pool_options: PgPoolOptions,
     skip_migrations: bool,
     tls: TlsPolicy,
 ) -> Result<CutoverDb, sqlx::Error> {
@@ -68,8 +109,7 @@ pub async fn connect_with_tls(
     // Statement timeout rides the connection options (server-side setting
     // per connection), so no per-connection SET is needed.
     options = options.options([("statement_timeout", format!("{}ms", STATEMENT_TIMEOUT_MS))]);
-    let pool = PgPoolOptions::new()
-        .max_connections(pool_max)
+    let pool = pool_options
         .connect_with(options)
         .await
         .map_err(|_| sqlx::Error::InvalidArgument("database connection failed".to_owned()))?;
@@ -81,6 +121,114 @@ pub async fn connect_with_tls(
         }
     }
     Ok(db)
+}
+
+#[cfg(test)]
+mod pool_options_tests {
+    use super::*;
+
+    #[test]
+    fn voice_pool_keeps_a_warm_connection_and_checks_liveness() {
+        let options = voice_pool_options(DB_POOL_MAX_DEFAULT);
+        assert_eq!(options.get_min_connections(), 1);
+        assert_eq!(options.get_max_connections(), DB_POOL_MAX_DEFAULT);
+        assert_eq!(options.get_idle_timeout(), None);
+        assert!(options.get_test_before_acquire());
+        assert_eq!(
+            options.get_max_lifetime(),
+            PgPoolOptions::new().get_max_lifetime()
+        );
+        assert_eq!(
+            options.get_acquire_timeout(),
+            PgPoolOptions::new().get_acquire_timeout()
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_pool_recovers_a_terminated_idle_connection(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let url = match std::env::var("TWO_TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(std::env::VarError::NotPresent) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let fixture =
+            two_bot_testsupport::TestDatabase::create(&url, &sqlx::migrate!("./migrations"))
+                .await?;
+        // Use the real voice profile but retain the fixture's guarded target,
+        // empty password, disabled passfile fallback and 5s statement timeout.
+        let pool = voice_pool_options(1)
+            .connect_with(fixture.pool().connect_options().as_ref().clone())
+            .await;
+        let pool = match pool {
+            Ok(pool) => pool,
+            Err(error) => {
+                fixture.close().await?;
+                return Err(error.into());
+            }
+        };
+        let warmed = pool.size();
+        let result = async {
+            let mut connection = pool.acquire().await?;
+            let original: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *connection)
+                .await?;
+            drop(connection);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while pool.num_idle() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            // Kill only the identified connection inside this fixture's owned
+            // database, waiting for exit before testing the very next acquire.
+            let terminated: bool = sqlx::query_scalar(
+                "SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity
+                 WHERE pid = $1 AND datname = current_database()",
+            )
+            .bind(original)
+            .fetch_one(fixture.pool())
+            .await?;
+            let (replacement, value): (i32, i32) = sqlx::query_as("SELECT pg_backend_pid(), 42")
+                .fetch_one(&pool)
+                .await?;
+            Ok::<_, Box<dyn std::error::Error>>((terminated, original, replacement, value))
+        }
+        .await;
+        pool.close().await;
+        let cleanup = fixture.close().await;
+        let (terminated, original, replacement, value) = result?;
+        cleanup?;
+        assert_eq!(warmed, 1, "voice pool is warm before its first query");
+        assert!(terminated);
+        assert_ne!(original, replacement);
+        assert_eq!(
+            value, 42,
+            "first query succeeds without an application retry"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nonvoice_pool_preserves_sqlx_defaults() {
+        let options = pool_options(DB_POOL_MAX_DEFAULT);
+        let defaults = PgPoolOptions::new();
+        assert_eq!(options.get_max_connections(), DB_POOL_MAX_DEFAULT);
+        assert_eq!(
+            options.get_min_connections(),
+            defaults.get_min_connections()
+        );
+        assert_eq!(options.get_idle_timeout(), defaults.get_idle_timeout());
+        assert_eq!(options.get_max_lifetime(), defaults.get_max_lifetime());
+        assert_eq!(
+            options.get_acquire_timeout(),
+            defaults.get_acquire_timeout()
+        );
+        assert_eq!(
+            options.get_test_before_acquire(),
+            defaults.get_test_before_acquire()
+        );
+    }
 }
 
 /// Apply the same embedded migrations to an already-authorized pool.

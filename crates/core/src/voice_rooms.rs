@@ -1017,8 +1017,10 @@ impl QueueInner {
 /// Per-guild ordered action queue with 429 retry-after (spec "Discord API
 /// notes": per-guild ordered queues, honour retry-after on 429).
 ///
-/// Two FIFO lanes per guild: urgent (create/move/delete) drains before
-/// deferred (rename). A backed-off delete may be bypassed only by actions
+/// Two lanes per guild: urgent (create/move/delete) drains before deferred
+/// (rename). A persisted room's creator move precedes unrelated urgent work
+/// and companion creation, but not earlier writes scoped to its own room. Other
+/// actions retain FIFO order. A backed-off delete may be bypassed only by actions
 /// for other known room channels, never its own follow-ups or an unscoped
 /// create. Other backoffs retain lane order; urgent 429s still hold the guild.
 #[derive(Debug, Default)]
@@ -1058,7 +1060,20 @@ impl ActionQueue {
             Lane::Urgent => &mut inner.urgent,
             Lane::Deferred => &mut inner.deferred,
         };
-        lane.entry(guild_id).or_default().push_back(queued);
+        let queue = lane.entry(guild_id).or_default();
+        // Complete a persisted room's join before unrelated work or companion
+        // creation, without overtaking prior writes to the same room (notably
+        // a backed-off delete). Companion creation has no channel_id scope.
+        // pop_due still enforces suspension, the single-writer fence and 429s.
+        if let RoomAction::MoveMember { channel_id, .. } = action {
+            let index = queue
+                .iter()
+                .rposition(|pending| pending.action.channel_id() == Some(channel_id))
+                .map_or(0, |index| index + 1);
+            queue.insert(index, queued);
+        } else {
+            queue.push_back(queued);
+        }
         inner.next_id
     }
 

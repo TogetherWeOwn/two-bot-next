@@ -269,10 +269,6 @@ const FRESH_SEED_TRIES: u64 = 8;
 /// Least time between two voice status writes for one room.
 pub(super) const STATUS_MIN_INTERVAL_MS: u64 = 10_000;
 
-/// Longest the guild actor waits on a status write before leaving it to
-/// finish on its own task (interactions it answers have 3 s).
-pub(super) const STATUS_INLINE_WAIT_MS: u64 = 1_000;
-
 /// Render a creator's voice status template against the room's facts. Unlike a
 /// name, an empty render clears the status; text the name filter blocks (links,
 /// configured words) clears it too, and Discord's 500-character cap applies.
@@ -730,8 +726,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// Write one due voice status line (the latest render per room), at most
     /// once per [`STATUS_MIN_INTERVAL_MS`] per room. The caller runs it only
     /// when no lifecycle write is due and the guild is not rate limited. The
-    /// actor waits at most [`STATUS_INLINE_WAIT_MS`]; a slower request
-    /// finishes on its own task and reports back on a later dispatch.
+    /// production request detaches immediately and reports its outcome on
+    /// a later dispatch, never blocking creator joins.
     /// Returns true when a write was attempted.
     pub(super) async fn dispatch_voice_status(&mut self, now_ms: u64) -> bool {
         self.collect_status_outcomes(now_ms);
@@ -760,23 +756,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .insert(room_id, now_ms + STATUS_MIN_INTERVAL_MS);
         let result = match self.http.detached_voice_status(room_id, &status) {
             Some(request) => {
-                let mut task = tokio::spawn(request);
-                match tokio::time::timeout(Duration::from_millis(STATUS_INLINE_WAIT_MS), &mut task)
-                    .await
-                {
-                    Ok(joined) => joined.unwrap_or(Err(RoomHttpError::UnknownOutcome)),
-                    Err(_) => {
-                        let outcomes = self.status_outcomes.0.clone();
-                        let detached = status.clone();
-                        tokio::spawn(async move {
-                            let result = task.await.unwrap_or(Err(RoomHttpError::UnknownOutcome));
-                            let _ = outcomes.send((room_id, detached, result));
-                        });
-                        self.status_in_flight.insert(room_id);
-                        self.room_status.insert(room_id, status);
-                        return true;
-                    }
-                }
+                let task = tokio::spawn(request);
+                let outcomes = self.status_outcomes.0.clone();
+                let detached = status.clone();
+                tokio::spawn(async move {
+                    let result = task.await.unwrap_or(Err(RoomHttpError::UnknownOutcome));
+                    let _ = outcomes.send((room_id, detached, result));
+                });
+                self.status_in_flight.insert(room_id);
+                self.room_status.insert(room_id, status);
+                return true;
             }
             None => self.http.set_voice_status(room_id, &status).await,
         };
@@ -784,7 +773,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         true
     }
 
-    /// Apply the outcomes of status writes that outlived the inline wait.
+    /// Collect immediately detached status writes before coalescing the next value.
     fn collect_status_outcomes(&mut self, now_ms: u64) {
         while let Ok((room_id, status, result)) = self.status_outcomes.1.try_recv() {
             self.status_in_flight.remove(&room_id);

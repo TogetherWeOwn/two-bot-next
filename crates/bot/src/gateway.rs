@@ -31,7 +31,7 @@ use two_bot_core::gateway_session::{
 };
 use two_bot_core::{AutomodPolicy, ComponentStatus, Config, InviteState, Snowflake};
 use two_bot_cutover::gateway_session::{GatewayJob, GatewaySessionStore};
-use two_bot_cutover::{connect, DB_POOL_MAX_DEFAULT};
+use two_bot_cutover::{db::connect_voice, DB_POOL_MAX_DEFAULT};
 use two_bot_discord::{
     gateway_intents, needs_message_content, InviteSource, LevelingRuntime, OrderedLevelingPipeline,
 };
@@ -1713,7 +1713,7 @@ pub async fn build_voice_runtime(
     };
     // Migrations belong to the operator's migrator role, never the DML-only
     // runtime credential. Voice consumes the already-migrated schema.
-    let db = match connect(database_url, DB_POOL_MAX_DEFAULT, true).await {
+    let db = match connect_voice(database_url, DB_POOL_MAX_DEFAULT, true).await {
         Ok(db) => db,
         Err(_) => {
             warn!("voice database unavailable; voice rooms disabled");
