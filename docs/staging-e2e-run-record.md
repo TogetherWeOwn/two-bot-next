@@ -105,6 +105,12 @@ the mock label. Public-safety failures report only the JSON path and marker
 pattern, never the matched value; they stop validation before schema diagnostics
 can echo the same value. Secret-shaped path keys are redacted too.
 
+Input limits: a record or schema may nest at most 32 container levels
+(`MAX_NESTING_DEPTH` in the validator). Deeper input, and input the decoder
+refuses (a recursion overflow or an oversized integer literal), is refused
+with a fixed diagnostic. Bytes that are not UTF-8 are refused with their byte
+offset. None of these diagnostics echo raw bytes or values.
+
 Execution window: `window.end_utc` must not precede `window.start_utc`.
 Every `commands[].started_utc` must fall within `[start, end]`, and its
 completion (`started_utc` + `duration_ms`) must not exceed the window end.

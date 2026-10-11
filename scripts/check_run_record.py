@@ -26,6 +26,11 @@ Two record-specific rules live here, not in the schema:
   parse as timezone-aware datetimes.
 * public-safety scan: no internal tracker IDs (`TOG-`, `PAP-`) and no
   high-confidence secret markers in any string value. This repo is public.
+* input limits: a record or schema may nest at most `MAX_NESTING_DEPTH`
+  container levels (the root container is level 1). Deeper input, and input
+  the decoder refuses (recursion overflow or an oversized integer literal),
+  is refused with a fixed message. Bytes that are not UTF-8 are refused with
+  their byte offset. No diagnostic echoes raw bytes or values.
 
 Timestamp policy for fields named `*_utc` (`window.start_utc`,
 `window.end_utc`, `commands[].started_utc`, `deployment.first_readyz_utc`):
@@ -101,8 +106,22 @@ TYPE_NAMES = {
 }
 
 
+# Keeps every recursive walk far below the interpreter's recursion limit.
+MAX_NESTING_DEPTH = 32
+NESTING_MESSAGE = f"nesting depth exceeds the {MAX_NESTING_DEPTH}-level budget"
+DECODER_DIGITS_MESSAGE = "integer literal exceeds the decoder digit limit"
+
+
 class DuplicateKeyError(ValueError):
     """A JSON object has repeated keys; diagnostics never include its values."""
+
+
+class DecoderLimitError(ValueError):
+    """Input nests past the budget or exceeds a decoder limit; never echoes content."""
+
+
+class InvalidUtf8Error(ValueError):
+    """Input bytes are not UTF-8; reports the byte offset, never the bytes."""
 
 
 class _ObjectPairs(list):
@@ -118,6 +137,28 @@ def safe_key(key):
 
 def child_path(path, key):
     return f"{path}.{safe_key(key)}"
+
+
+def exceeds_nesting_budget(value):
+    """True when any container nests deeper than MAX_NESTING_DEPTH levels.
+
+    Iterative, so deep or self-referencing input cannot exhaust the stack.
+    """
+    pending = [(value, 1)]
+    while pending:
+        node, level = pending.pop()
+        if isinstance(node, _ObjectPairs):
+            children = [item for _key, item in node]
+        elif isinstance(node, dict):
+            children = list(node.values())
+        elif isinstance(node, list):
+            children = node
+        else:
+            continue
+        if level > MAX_NESTING_DEPTH:
+            return True
+        pending.extend((child, level + 1) for child in children)
+    return False
 
 
 def load_json(text):
@@ -136,7 +177,26 @@ def load_json(text):
                     for index, item in enumerate(value)]
         return value
 
-    return unique_objects(json.loads(text, object_pairs_hook=_ObjectPairs), "$")
+    try:
+        raw = json.loads(text, object_pairs_hook=_ObjectPairs)
+    except json.JSONDecodeError:
+        raise
+    except RecursionError:
+        raise DecoderLimitError(NESTING_MESSAGE) from None
+    except ValueError:
+        # Besides JSONDecodeError, json.loads raises ValueError only for the int digit cap.
+        raise DecoderLimitError(DECODER_DIGITS_MESSAGE) from None
+    if exceeds_nesting_budget(raw):
+        raise DecoderLimitError(NESTING_MESSAGE)
+    return unique_objects(raw, "$")
+
+
+def load_document(path):
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise InvalidUtf8Error(f"invalid UTF-8 at byte offset {exc.start}") from None
+    return load_json(text)
 
 
 def check_format(value, fmt, path, errors):
@@ -274,6 +334,8 @@ def scan_public_safety(value, path, errors):
 
 def validate(record, schema, allow_mock=False):
     """Return a list of error strings; empty means valid."""
+    if exceeds_nesting_budget(record) or exceeds_nesting_budget(schema):
+        return [f"$: {NESTING_MESSAGE}"]
     errors = []
     scan_public_safety(record, "$", errors)
     # Schema diagnostics can also echo values (enum, pattern, date-time).
@@ -433,6 +495,15 @@ def check_verdict_consistency(record, errors):
         )
 
 
+LOAD_ERRORS = (
+    OSError,
+    json.JSONDecodeError,
+    DuplicateKeyError,
+    DecoderLimitError,
+    InvalidUtf8Error,
+)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Validate a staging E2E run record against its schema."
@@ -450,13 +521,13 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
     try:
-        record = load_json(Path(args.record).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, DuplicateKeyError) as exc:
+        record = load_document(args.record)
+    except LOAD_ERRORS as exc:
         print(f"{args.record}: cannot load record: {exc}")
         return 1
     try:
-        schema = load_json(Path(args.schema).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, DuplicateKeyError) as exc:
+        schema = load_document(args.schema)
+    except LOAD_ERRORS as exc:
         print(f"{args.schema}: cannot load schema: {exc}")
         return 1
     errors = validate(record, schema, allow_mock=args.allow_mock)
