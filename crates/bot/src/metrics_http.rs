@@ -42,8 +42,8 @@ fn install_replace(slot: &RwLock<Option<PgPool>>, pool: PgPool) {
 /// one `tracing::warn` per process. Returns whether the pool was installed.
 /// The rejected handle is dropped, never closed: `PgPool` clones share the
 /// underlying pool, so closing could kill the live pool.
-pub(crate) fn register_pool(pool: PgPool) -> bool {
-    if try_install(pool_slot(), pool) {
+fn register_into(slot: &RwLock<Option<PgPool>>, pool: PgPool) -> bool {
+    if try_install(slot, pool) {
         return true;
     }
     DUPLICATE_REGISTRATIONS.fetch_add(1, Ordering::Relaxed);
@@ -51,6 +51,10 @@ pub(crate) fn register_pool(pool: PgPool) -> bool {
         tracing::warn!("metrics pool already registered; keeping first pool");
     });
     false
+}
+
+pub(crate) fn register_pool(pool: PgPool) -> bool {
+    register_into(pool_slot(), pool)
 }
 
 /// Explicit escape hatch for deliberate replacement (tests, future reconnect
@@ -339,9 +343,11 @@ mod tests {
 
     #[tokio::test]
     async fn double_registration_keeps_first_pool() {
-        // Exercises the `register_pool` keep-first path on a local slot so
-        // the global scrape slot stays untouched for other tests. Distinct
-        // max-connections values identify which handle survived.
+        // Exercises the `register_pool` keep-first wiring through
+        // `register_into` on a local slot so the global scrape slot stays
+        // untouched for other tests. Distinct max-connections values identify
+        // which handle survived; the rejection counter pins the duplicate
+        // path that a revert to always-overwrite would drop.
         let slot = RwLock::new(None);
         let first = sqlx::postgres::PgPoolOptions::new()
             .max_connections(3)
@@ -351,8 +357,10 @@ mod tests {
             .max_connections(7)
             .connect_lazy("postgres://agent_test@agent-testdb/agent_test")
             .unwrap();
-        assert!(try_install(&slot, first));
-        assert!(!try_install(&slot, second));
+        let before = duplicate_registration_count();
+        assert!(register_into(&slot, first));
+        assert!(!register_into(&slot, second));
+        assert_eq!(duplicate_registration_count(), before + 1);
         let guard = slot.read().unwrap();
         assert_eq!(guard.as_ref().unwrap().options().get_max_connections(), 3);
     }
