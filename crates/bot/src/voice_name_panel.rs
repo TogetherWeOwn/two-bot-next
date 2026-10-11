@@ -182,6 +182,8 @@ pub(super) struct NameSettings {
     pub aliases: Vec<(String, String)>,
     pub force_single_game: bool,
     pub count_members_without_activity: bool,
+    /// The guild's `settings.time_zone` for the time tokens.
+    pub time_zone: String,
     /// Voice status templates by creator channel (V5 voice status).
     pub status_templates: HashMap<Snowflake, String>,
 }
@@ -203,6 +205,7 @@ impl NameSettings {
                 .collect(),
             force_single_game: config.settings.force_single_game,
             count_members_without_activity: config.settings.count_members_without_activity,
+            time_zone: config.settings.time_zone.clone(),
             status_templates: config
                 .creators
                 .iter()
@@ -1002,6 +1005,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 game_name: if label.is_empty() { "General" } else { label }.to_owned(),
                 seed: room.name_seed,
                 timestamp: i64::try_from(wall_ms / 1000).unwrap_or(0),
+                // An unknown zone (never stored: `/import` refuses it) is UTC.
+                tz_offset_minutes: two_bot_core::voice_time_zone::offset_minutes(
+                    &command.settings.time_zone,
+                    i64::try_from(wall_ms / 1000).unwrap_or(0),
+                )
+                .unwrap_or(0),
                 room_minutes: minutes_since(&room.created_at, wall_ms),
                 named_lists: command.settings.lists.clone(),
                 ..RoomContext::default()

@@ -222,7 +222,11 @@ library code with no Discord dependency and can start immediately.
 **Time and random**
 
 - `@@weekday@@`, `@@month@@`, `@@hour@@` (0–23): in the guild time zone (default
-  UTC), English names.
+  UTC), English names. The time zone (`settings.time_zone`) is `UTC`, a fixed
+  offset (`UTC-5`, `+05:30`) or a supported IANA name (US, Canadian, European,
+  Australian and New Zealand zones follow their current daylight-saving rule;
+  `crates/core/src/voice_time_zone.rs` lists them). `/import` refuses any other
+  value. Daypart and date conditions use the same local time.
 - `@@daypart@@`: `morning` (05–11), `afternoon` (12–16), `evening` (17–21),
   `night` (22–01) or `late night` (02–04), local time.
 - `@@room_minutes@@`: whole minutes since the room was created. `@@room_tier@@`:
