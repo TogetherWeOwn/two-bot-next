@@ -333,7 +333,9 @@ pub async fn record_checkin(
 /// this attempt's `responded_at`: a newer concurrent rewrite of the same
 /// member's row survives (the newer attempt delivers its own reply), while
 /// this attempt's audit row — owned by its unique id — is always removed.
-/// Net effect on refusal: the table looks as if this attempt never ran.
+/// Net effect on refusal when this call succeeds: the table looks as if this
+/// attempt never ran. A failed call can leave the attempt's rows; the caller
+/// reports that as a `compensation_failed` diagnostic.
 pub async fn compensate_rsvp_write(
     pool: &Pool<Postgres>,
     guild_id: &str,

@@ -75,8 +75,10 @@ by `crates/core/src/rsvp.rs::tests::attendance_occurrence_binds_every_format_to_
 `permissions_gates_and_guild_fence_precede_store_access`,
 `malformed_inputs_and_failed_ack_do_not_write`,
 `non_member_and_unverifiable_targets_refuse_without_writes`), which assert zero
-attendance/audit writes on every refusal. Restricting input further to
-Discord-derived IDs alone would still require an explicit parity decision, a
+attendance/audit writes on every refusal. The one exception is a refusal whose
+compensating delete also fails: `failed_compensation_keeps_refusal_and_emits_one_diagnostic`
+pins the residual rows and the `compensation_failed` diagnostic. Restricting
+input further to Discord-derived IDs alone would still require an explicit parity decision, a
 recorded intentional difference and coordinated command reference, fixture and
 regression updates. This checklist grants no such waiver and does not change
 the accepted formats.
