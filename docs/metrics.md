@@ -307,7 +307,7 @@ as dynamic labels.
   `gateway_runtime_failed` or `gateway_task_panicked` (every `FailureClass`
   variant in `crates/bot/src/gateway_failure.rs`). Only `[a-z0-9_]{1,32}`
   tokens are ever logged; anything else is dropped. See
-  [startup diagnostics](startup-diagnostics.md#self-diagnosing-gateway-failures-readyz-gatewayfailure).
+  [startup diagnostics](startup-diagnostics.md#self-diagnosing-gateway-failures-readyz-gateway_failure).
 - `two_bot_handler_duration_seconds` histogram buckets (`le`, seconds):
   `0.001`, `0.005`, `0.01`, `0.05`, `0.1`, `0.5`, `1`, `5`, `+Inf`, plus
   `_sum` and `_count`.
