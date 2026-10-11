@@ -10158,6 +10158,8 @@ async fn terminal_queue_failure_dead_letters_exactly_once_per_family() {
 }
 
 fn reconcile_signals(worker: &mut GuildRoomWorker<Store, Http>) -> Vec<String> {
+    // Keep callsite interest stable while other test threads also reconcile.
+    tracing_capture::global();
     let capture = tracing_capture::Capture::default();
     tracing::subscriber::with_default(capture.clone(), || worker.reconcile());
     capture
