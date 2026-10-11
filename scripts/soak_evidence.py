@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Offline soak-evidence parser: gateway event log (JSONL) -> soak summary (JSON).
 
-Tooling for TOG-10955's live 7-day collection. This script never touches
-staging or production; it only reads a committed or piped JSONL fixture and
-prints the summary shape required by docs/staging-soak.md:
+Offline parser only: it never touches staging or production, only reads a
+committed JSONL fixture and prints the summary shape required by
+docs/staging-soak.md. An offline PASS here verifies offline reconciliation
+only; it makes no claim of live staging coverage or four-hour soak
+acceptance:
 
 - connects / disconnects / resumes counts,
 - missed-sequence windows (dispatch seq gaps within one session),
 - UNKNOWN intervals, preserved verbatim, never silently dropped.
 
 Log format (one JSON object per line):
-
     {"ts": "2026-09-20T00:00:01Z", "event": "connect", "session": "a1"}
     {"ts": "...", "event": "dispatch", "session": "a1", "seq": 42}
     {"ts": "...", "event": "disconnect", "session": "a1", "code": 4007}
@@ -220,7 +221,14 @@ def summarize(lines):
     missed_events = sum(window["count"] for window in missed)
     max_gap = max(gaps) if gaps else None
     within_budget = (max_gap is None or max_gap < REDEPLOY_GAP_BUDGET_S)
-    verdict = "PASS" if (missed_events == 0 and not unknowns
+    # Empty, blank-only, or dispatch-free input leaves no evidence of live
+    # traffic. That is missing evidence, not a clean run (per
+    # docs/staging-soak.md missing evidence remains UNKNOWN), so it must not
+    # PASS. Keep the honest null window/zero counts; fail closed via verdict.
+    # missed_events derives only from dispatch seq gaps, so zero dispatches
+    # makes "0 missed" vacuous; require at least one dispatch as evidence.
+    has_evidence = first_ts is not None and dispatches > 0
+    verdict = "PASS" if (has_evidence and missed_events == 0 and not unknowns
                           and within_budget) else "NEEDS WORK"
     return {
         "schema_version": SCHEMA_VERSION,

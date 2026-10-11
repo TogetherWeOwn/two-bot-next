@@ -1,14 +1,16 @@
 """Soak-evidence parser regressions: committed fixtures only, no staging."""
 
+import contextlib
 import io
 import json
+import tempfile
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
 
-from soak_evidence import summarize
+from soak_evidence import main, summarize
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "scripts/fixtures/soak_evidence_sample.jsonl"
@@ -152,6 +154,79 @@ class SoakEvidenceTests(unittest.TestCase):
         dumped = json.dumps(summary)
         self.assertNotIn(nested, dumped)
         self.assertNotIn("Traceback", dumped)
+
+    def test_empty_input_refuses_pass_with_honest_nulls(self):
+        summary = run("")
+        self.assertIsNone(summary["window"]["start"])
+        self.assertIsNone(summary["window"]["end"])
+        self.assertEqual(summary["missed_events"], 0)
+        self.assertEqual(summary["missed_sequence_windows"], [])
+        self.assertEqual(summary["connects"], 0)
+        self.assertEqual(summary["dispatches"], 0)
+        self.assertNotEqual(summary["verdict"], "PASS")
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_blank_only_input_refuses_pass_with_honest_nulls(self):
+        summary = run("   \n\n  \n\t\n")
+        self.assertIsNone(summary["window"]["start"])
+        self.assertIsNone(summary["window"]["end"])
+        self.assertEqual(summary["missed_events"], 0)
+        self.assertEqual(summary["connects"], 0)
+        self.assertEqual(summary["dispatches"], 0)
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_connect_only_input_refuses_pass_without_dispatches(self):
+        summary = run(
+            '{"ts": "2026-09-20T00:00:01Z", "event": "connect",'
+            ' "session": "a"}\n'
+        )
+        self.assertEqual(summary["connects"], 1)
+        self.assertEqual(summary["dispatches"], 0)
+        self.assertEqual(summary["missed_events"], 0)
+        self.assertEqual(summary["unknown_intervals"], [])
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_connect_plus_resume_without_dispatches_refuses_pass(self):
+        summary = run(
+            '{"ts": "2026-09-20T00:00:01Z", "event": "connect",'
+            ' "session": "a"}\n'
+            '{"ts": "2026-09-20T04:00:01Z", "event": "resume",'
+            ' "session": "a", "seq": 7}\n'
+        )
+        self.assertEqual(summary["connects"], 1)
+        self.assertEqual(summary["resumes"], 1)
+        self.assertEqual(summary["dispatches"], 0)
+        self.assertEqual(summary["missed_events"], 0)
+        self.assertEqual(summary["unknown_intervals"], [])
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_cli_exit_code_empty_fails_clean_passes(self):
+        with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".jsonl", delete=True,
+                encoding="utf-8") as empty:
+            empty.write("")
+            empty.flush()
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main([empty.name]), 1)
+        with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".jsonl", delete=True,
+                encoding="utf-8") as blank:
+            blank.write("   \n\n")
+            blank.flush()
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main([blank.name]), 1)
+        with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".jsonl", delete=True,
+                encoding="utf-8") as clean:
+            clean.write(
+                '{"ts": "2026-09-20T00:00:01Z", "event": "connect",'
+                ' "session": "a"}\n'
+                '{"ts": "2026-09-20T00:00:02Z", "event": "dispatch",'
+                ' "session": "a", "seq": 1}\n'
+            )
+            clean.flush()
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main([clean.name]), 0)
 
     def test_decoder_recursion_overflow_becomes_unknown_then_continues(self):
         # Deep enough to overflow the C JSON decoder itself (default
