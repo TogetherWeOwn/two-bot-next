@@ -4,6 +4,7 @@ Run: python3 -m unittest discover -s scripts -p 'test_cutover_doc_links.py' -v
 """
 
 import re
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -11,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CUTOVER_DOCS = sorted((ROOT / "docs").glob("cutover*.md"))
 LINK = re.compile(r"\]\(([^)\s]+)\)")
 SCHEME = re.compile(r"[a-z][a-z0-9+.-]*:", re.IGNORECASE)
-LINE_TARGET = re.compile(r"L(\d+)(?:-L\d+)?")
+LINE_TARGET = re.compile(r"L(\d+)(?:-L(\d+))?")
 HEADING = re.compile(r"#{1,6}\s+(.*?)\s*#*\s*$")
 # Internal tracker links are a repo-wide convention that only resolves inside Paperclip.
 INTERNAL_TRACKER = "/TOG/issues/"
@@ -20,7 +21,7 @@ INTERNAL_TRACKER = "/TOG/issues/"
 def _prose_lines(text):
     fenced = False
     for number, line in enumerate(text.splitlines(), start=1):
-        if line.lstrip().startswith("```"):
+        if line.lstrip().startswith(("```", "~~~")):
             fenced = not fenced
         elif not fenced:
             yield number, line
@@ -53,15 +54,22 @@ def _problems(doc, text):
             where = f"{doc.name}:{number}: {target}"
             if not resolved.exists():
                 found.append(f"{where} -> missing file")
+            elif resolved.is_dir():
+                if anchor:
+                    found.append(f"{where} -> anchor on a directory")
             elif resolved.suffix == ".md" and anchor:
                 if anchor not in _heading_anchors(resolved):
                     found.append(f"{where} -> no such heading")
             elif anchor and LINE_TARGET.fullmatch(anchor):
                 lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
-                line_no = int(anchor[1:].split("-")[0])
-                if line_no > len(lines):
+                match = LINE_TARGET.fullmatch(anchor)
+                start = int(match.group(1))
+                end = int(match.group(2) or start)
+                if start < 1 or end < start:
+                    found.append(f"{where} -> invalid line range")
+                elif end > len(lines):
                     found.append(f"{where} -> line beyond end of file ({len(lines)} lines)")
-                elif not re.search(r"\w", lines[line_no - 1]):
+                elif not re.search(r"\w", lines[start - 1]):
                     found.append(f"{where} -> points at a blank or punctuation-only line")
             elif anchor:
                 found.append(f"{where} -> unsupported anchor")
@@ -79,19 +87,36 @@ class CutoverDocLinks(unittest.TestCase):
         self.assertEqual(problems, [])
 
     def test_the_checker_reports_stale_targets_and_accepts_live_ones(self):
-        doc = ROOT / "docs" / "cutover-link-fixture.md"
-        stale = (
-            "[backup](backup.md#coverage-and-recovery-semantics-v4-tog-11142)\n"
-            "[overrun](../crates/core/src/backup/dump_file.rs#L99999)\n"
-            "[closer](../crates/core/src/config.rs#L34)\n"
-        )
-        live = (
-            "[backup](backup.md#coverage-and-recovery-semantics-v4-and-v5)\n"
-            "[table](../crates/core/src/backup/dump_file.rs#L44)\n"
-            "[tracker](/TOG/issues/TOG-9699)\n"
-        )
-        self.assertEqual(len(_problems(doc, stale)), 3)
-        self.assertEqual(_problems(doc, live), [])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "docs").mkdir()
+            (root / "crates").mkdir()
+            (root / "docs" / "backup-fixture.md").write_text(
+                "# Backup\n\n## Coverage and recovery semantics (v4 and v5)\n", encoding="utf-8"
+            )
+            (root / "crates" / "table.rs").write_text(
+                'pub const TABLES: &[&str] = &[\n    "a",\n];\n', encoding="utf-8"
+            )
+            doc = root / "docs" / "cutover-fixture.md"
+            stale = (
+                "[backup](backup-fixture.md#coverage-and-recovery-semantics-v4-old-suffix)\n"
+                "[overrun](../crates/table.rs#L99)\n"
+                "[closer](../crates/table.rs#L3)\n"
+                "[reversed](../crates/table.rs#L3-L1)\n"
+                "[range](../crates/table.rs#L1-L99)\n"
+                "[directory](../crates#L1)\n"
+                "~~~\n"
+                "[fenced](../crates/table.rs#L99)\n"
+                "~~~\n"
+            )
+            live = (
+                "[backup](backup-fixture.md#coverage-and-recovery-semantics-v4-and-v5)\n"
+                "[table](../crates/table.rs#L1)\n"
+                "[tracker](/TOG/issues/fixture-link)\n"
+                "[directory](../crates)\n"
+            )
+            self.assertEqual(len(_problems(doc, stale)), 6)
+            self.assertEqual(_problems(doc, live), [])
 
 
 if __name__ == "__main__":

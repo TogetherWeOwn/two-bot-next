@@ -350,15 +350,17 @@ alongside an unconfirmed Next gateway.
 - Server binds `DISCORD_TOKEN`, `DATABASE_URL`, `GUILD_ID`, and optional
   `LISTEN_ADDR`. Cutover utilities instead use `TWO_DATABASE_URL`, and some
   use `DISCORD_GUILD_ID`. Do not silently substitute bindings. Worker forwarding
-  currently covers token/database/guild/listener, **not feature flags**:
+  currently covers token/database/guild/listener, the non-secret flags in
+  [`FORWARDED_FLAGS`](../wrangler/src/container-env.ts#L20) and the ids in
+  `FORWARDED_DISCORD_IDS`:
   [configuration](../crates/core/src/config.rs#L24),
-  [tool connection](../crates/cutover/src/bin/backfill.rs#L9),
+  [tool connection](../crates/cutover/src/cli.rs#L180),
   [Worker environment](../wrangler/src/index.ts#L360).
 - Configured server startup runs embedded migrations; it is not a read-only
   preflight. Gateway boot wires the funnel pipeline, not the full feature/job
   stack. Domain/store libraries and command definitions are not activated
   runtime evidence: [boot](../crates/bot/src/main.rs#L106),
-  [pipeline construction](../crates/bot/src/gateway.rs#L203).
+  [pipeline construction](../crates/bot/src/gateway.rs#L1651).
 - Fresh checkpoints (up to 15 minutes old) automatically trigger RESUME.
   Persistence deduplicates funnel batches, not all Discord effects:
   [session policy](../crates/core/src/gateway_session.rs#L4),
