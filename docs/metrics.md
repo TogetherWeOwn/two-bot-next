@@ -25,6 +25,17 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_gateway_events_total{event}` | Received dispatches, including replays/duplicates, plus heartbeat ACKs and closes; fixed type allowlist, remainder `other` |
 | `two_bot_handler_duration_seconds` | Cumulative histogram over nonduplicate dispatch parse/pipeline/durable commit, including failures; seconds |
 | `two_bot_rest_requests_total{route,result}` | Executor HTTP sends, including retries; result `2xx`, `3xx`, `4xx`, `429`, `5xx` at response headers or `transport` (failure/cancellation/timeout before headers); later body failures do not hide 429/5xx |
+| `two_bot_rest_guard_invalid_requests_total` | Shared guard observations of 401, 403 or 429 response headers, across guarded REST callers |
+| `two_bot_rest_guard_rejected_requests_total` | Shared guard local refusals from `admit` or `check_now`, before any REST wire attempt; excludes admission timeout/cancellation |
+| `two_bot_rest_guard_breaker_opens_total` | Invalid-request breaker transitions to open |
+| `two_bot_rest_guard_breaker_closes_total` | Invalid-request breaker transitions to closed |
+| `two_bot_rest_guard_global_pauses_total` | New global-pause episodes, not extensions or overlapping pending responses |
+| `two_bot_rest_guard_invalid_requests_in_window` | Invalid response observations still inside the configured rolling window |
+| `two_bot_rest_guard_breaker_open` | 1 when the invalid-request breaker is open, otherwise 0 |
+| `two_bot_rest_guard_token_invalid` | 1 after a bot-authenticated 401, otherwise 0; fatal until process restart |
+| `two_bot_rest_guard_pending_global_responses` | Global-header responses whose bodies are still unresolved |
+| `two_bot_rest_guard_global_paused` | 1 while a global deadline remains or any global response body is unresolved, otherwise 0 |
+| `two_bot_rest_guard_global_pause_remaining_seconds` | Finite nonnegative seconds until the longest global deadline; zero does not release unresolved response holds |
 | `two_bot_db_pool_configured` | Whether gateway initialization has registered a pool |
 | `two_bot_db_pool_connections` | Current pool size |
 | `two_bot_db_pool_idle_connections` | Current idle connections |
@@ -35,6 +46,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_job_runs_total{job,outcome}` | Completed attempts; outcome is `success` or `failure` (including returned errors, timeouts and isolated panics) |
 | `two_bot_job_last_success_timestamp_seconds{job}` | Last successful completion time in Unix seconds; zero means no success recorded |
 | `two_bot_job_consecutive_failures{job}` | Failed completions since the last success; resets to zero on success |
+| `two_bot_job_last_error_class{job,class}` | One-hot class of the last failed completion; clears on success; fixed 12 × 7 = 84 series |
 | `two_bot_voice_operations_total{op,outcome}` | Finished room create/move/delete outcomes; `op` is `create`, `move` or `delete`, `outcome` is `success`, `category_full`, `discord`, `persistence` or `cancelled`; retries and 429 backoffs are not outcomes |
 | `two_bot_voice_reconcile_actions_total{action}` | Reconcile plan sizes; `action` is `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued` |
 | `two_bot_voice_dead_letters_total{action}` | Queue writes that exhausted `QUEUE_MAX_ATTEMPTS` (10); `action` is `create`, `move`, `delete`, `companion`, `ownership`, `kick`, `rename`, `limit` or `other` |
@@ -44,9 +56,34 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_voice_names_total{outcome}` | Automatic room-name decisions: a room created with its template name, each template render, and each queued rename sent or dropped at dispatch; `outcome` is `created_with_template`, `proposed`, `unchanged`, `waiting_for_name`, `blocked`, `channel_unseen`, `rename_sent`, `rename_stale`, `rename_unseen`, `rename_no_access`, `rename_held` or `other` |
 | `two_bot_voice_vote_kick_total{outcome}` | Vote-kick starts, refusals and terminal enforcements; `outcome` is `started`, a refusal code (`evidence_unavailable`, `not_a_room`, `initiator_not_occupant`, `target_not_occupant`, `self_target`, `protected_target`, `privileged_target`, `authority_unavailable`, `active_vote_exists`, `cooldown`, `initiator_limited`, `reused_vote_id`, `unknown_vote`, `wrong_vote_boundary`, `ineligible_voter`, `repeated_vote`, `invalid_time`), an enforcement code (`connect_denied_and_disconnected`, `connect_denied_target_absent`, `skipped_room_gone`, `skipped_target_protected`, `permission_missing`, `discord_error`, `gave_up`) or `other`; vote results (`passed`/`expired`/`cancelled`) are audit-only and never counted |
 | `two_bot_dispatch_drops_total{lane}` | Dispatch-lane saturation drops: every event refused because every attempted lane was full. `lane` is one of `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` (see label allowlists below). The `reactions` lane additionally counts per-member fairness refusals: a reaction refused because its member already holds `PER_USER_IN_FLIGHT` reaction slots, even while the lane has free slots. A single-lane refusal counts its lane once; a privileged spill refused by both lanes counts both. Logs sample the first drop per 60 s per runtime, so bursts are O(1) lines with N counter increments. `dispatch_drops:<lane>` raises a ticket after growth in 3 consecutive completed keepalive sample windows; the first valid sample only establishes a baseline. A flat sample or counter reset clears the streak; missing/invalid samples break growth but never falsely resolve an active ticket. A single burst never pages. `reactions`-lane growth can reflect per-member fairness rather than an undersized lane. Dispatch refusals are not proof of gateway packet loss |
-| `two_bot_gateway_checkpoint_failures_total{stage}` | Failed gateway checkpoint commits from `apply_dispatch` and failed checkpoint clears: every failure stops the dispatch worker and is recorded on `operation`. `stage` is `pre_commit` (commit skipped after a funnel/leveling/acknowledgement failure) or `commit` (the durable store write itself failed); failure causes are never labels. Alert-threshold hook for M2.1 (lands once TOG-18943 unblocks): alert on any increase across consecutive keepalive samples; unlike bursty dispatch drops, a single checkpoint failure stops the worker, so there is no benign-singleton case |
+| `two_bot_gateway_checkpoint_failures_total{stage}` | Failed gateway checkpoint commits from `apply_dispatch` and failed checkpoint clears: every failure stops the dispatch worker and is recorded on `operation`. `stage` is `pre_commit` (commit skipped after a funnel/leveling/acknowledgement failure) or `commit` (the durable store write itself failed); failure causes are never labels. Alert rule `gateway_checkpoint_failures` fires on any increase summed over every `stage` between consecutive keepalive samples (the first sample is baseline-only; the failing process lingers 75 s so a scrape lands before the restart resets the counter); unlike bursty dispatch drops, a single checkpoint failure stops the worker, so there is no benign-singleton case |
 | `two_bot_internal_actions_total{family,outcome}` | Signed website-action receiver executions by bounded family and outcome. `family` is one of `announcement`, `event`, `settings`, `moderation`, `membership` or `other` (see label allowlists below). `outcome` is `executed` or the refusal class (`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`, `conflict`, `upstream` or `internal`). Every request counts once; replays count on each serve. Refusal warn-summaries stay sampled; this counter is the alertable signal. Alert rule `receiver_refusals:<family>` fires when a family's refused outcomes rise in 3 consecutive keepalive samples (first sample and restarts clear the streak; one forged pre-auth probe in `other` stays silent) |
 | `two_bot_community_facts_drain_failures_total{reason}` | Warn-and-continue community-facts drain failures in the gateway dispatch worker. `reason` is `error` (the facts writer returned an error) or `timeout` (the drain missed the dispatch deadline), or `other` (see label allowlists below). Each failed dispatch counts once; a committed drain counts nothing. The worker never stalls on this, and the scorecard fails closed on missing coverage. Alert-threshold hook for M2.1: alert when the counter increases across consecutive scrapes; a single failed drain is not paging |
+
+## REST admission guard
+
+The eleven `two_bot_rest_guard_*` series have constant names and **no labels**.
+The private scrape samples `ratelimit_guard::process_guard()`, the same instance
+used by production REST executors and readiness, not a new guard or mirrored
+counter registry. Fresh/unconfigured guard state renders all eleven series at
+zero; counters reset on process restart. There is no reset/control endpoint.
+Snapshot sampling uses the guard's existing rolling-window refresh, without
+changing thresholds, clocks, admission decisions or readiness policy.
+
+Invalid-response counts cover HTTP 401, 403 and 429 headers across guarded REST
+callers, not just executor sends. Rejected counts include only refusals from
+`admit` or `check_now` (breaker, invalid bot token or late global pause), not
+admission timeouts or cancellations. These refusals and pre-wire admission
+wait timeouts happen before an HTTP send, so they are **not**
+`two_bot_rest_requests_total{route,result}` outcomes; they must not be added to
+that family's denominator as transport failures.
+
+Remaining duration is finite, nonnegative seconds, including fractional seconds.
+It can be zero while admission remains globally paused: unresolved global-header
+response bodies still hold admission until settled or dropped. Read remaining
+duration together with `global_paused` and `pending_global_responses`, not as a
+standalone readiness signal. This export adds no alert rule or threshold and
+leaves the existing Worker authentication gate and 64 KiB scrape cap intact.
 
 ## Job coverage and outcomes
 
@@ -144,6 +181,12 @@ as dynamic labels.
   `session_checkpoint` records successful durable gateway commits; zero means
   never run. `audit_retry` is the audit supervisor's 30 s retry sweep.
   `settings` is the DB-only 15 s `guild_settings` version poll.
+- `two_bot_job_last_error_class{job,class}` — `job` uses the list above;
+  `class` is one of `database`, `rest`, `configuration`, `timeout`, `panic`,
+  `feed` or `recovery_required` (the fixed `ErrorClass` variants). Each of the
+  12 jobs has one series per class (84 total); exactly the latest failure's class
+  is `1`, and every class is `0` before a failure or after success. Unknown job
+  names fold into `other`; class labels are fixed enum names, never error text.
 - `two_bot_voice_operations_total{op,outcome}` — `op` is `create`, `move`
   or `delete`; `outcome` is `success`, `category_full`, `discord`,
   `persistence` or `cancelled`. `Rejected` status/code values never become
@@ -195,7 +238,13 @@ as dynamic labels.
   clear on the `ReceivedWork::Clear` path: `pre_commit` when the commit was
   skipped after a funnel/leveling/acknowledgement failure, `commit` when the
   durable store write itself failed (including a failed clear). Failure
-  causes are never labels.
+  causes are never labels. Alert rule `gateway_checkpoint_failures` fires
+  on any increase summed over every `stage` between consecutive keepalive
+  samples (the first sample is baseline-only; the failing process lingers
+  75 s so a scrape lands before the restart resets the counter, and the
+  post-restart reset sample resolves); unlike bursty
+  dispatch drops, a single checkpoint failure stops the worker, so there is
+  no benign-singleton case.
 - `two_bot_internal_actions_total{family,outcome}` — `family` is one of
   `announcement`, `event`, `settings`, `moderation`, `membership` or
   `other`, mapped from the signed `action` verb in
@@ -275,8 +324,9 @@ controller's bounded cache pool was missing at implementation time.
   hostile labels, saturating job counters, status groups and missing latency.
 - Docs conformance (`crates/core/tests/metrics_docs.rs`): every counter row
   in the table above renders in the exposition with its allowlisted labels,
-  and every exposition counter has a row here; deliberate-drift fixtures
-  prove both directions fail by name.
+  and every exposition counter has a row here; the job error-class gauge is
+  pinned to its documented labels and complete fixed `JOBS × ErrorClass`
+  series. Deliberate-drift fixtures prove counter drift fails by name.
 - Supervisor fixtures (paused Tokio time, local `Metrics` registries): first
   success for every website/community registration, seconds conversion, returned
   failures, preserved success timestamps, streak reset, timeout/future/factory
@@ -367,6 +417,7 @@ exposition proxy, and ownership and bearer controls are unchanged.
 | `receiver_refusals:<family>` | refused `two_bot_internal_actions_total` outcomes rising in 3 consecutive samples per family (first sample and restarts clear the streak) | [receiver refusals](runbook.md#alert-receiver-refusals) |
 | `dispatch_drops:<lane>` | **ticket**, not page: `two_bot_dispatch_drops_total{lane}` grows in 3 consecutive completed sample windows per bounded lane; first sample is baseline, flat/reset clears, missing/invalid retains active alerts | [dispatch drops](runbook.md#alert-dispatch-drops) |
 | `job_unknown_stale:<job>` | **ticket**, not page: job without a cadence entry with no success for more than 2 hours (never-succeeded is ignored) | [job unknown stale](runbook.md#alert-job-unknown-stale) |
+| `gateway_checkpoint_failures` | any increase of `two_bot_gateway_checkpoint_failures_total` summed over every `stage` between samples (first sample is baseline-only; the 75 s runtime linger leaves ~3 s margin over a 60 s tick plus two 6 s probes for a pre-exit scrape, the post-restart reset resolves) | [checkpoint failures](runbook.md#alert-checkpoint-failures) |
 
 `dispatch_drops` covers `messages`, `interactions`, `registry`, `privileged`,
 `busy` and `reactions` independently (the Worker allowlist is pinned to Rust).

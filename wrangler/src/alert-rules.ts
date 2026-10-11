@@ -78,6 +78,17 @@ export const UNKNOWN_JOB_STALE_SECONDS = 7200;
  */
 export const UNKNOWN_STALE_EXCLUDED: readonly string[] = ["session_checkpoint"];
 export const FAILURE_THRESHOLD = 3;
+export const JOB_ERROR_CLASSES = [
+  "database",
+  "rest",
+  "configuration",
+  "timeout",
+  "panic",
+  "feed",
+  "recovery_required",
+] as const;
+export type JobErrorClass = (typeof JOB_ERROR_CLASSES)[number];
+const JOB_ERROR_CLASS_SET: ReadonlySet<string> = new Set(JOB_ERROR_CLASSES);
 /** 429s must exceed this share of REST requests between two samples... */
 export const REST_429_RATIO = 0.1;
 /** ...and the window must hold at least this many requests. */
@@ -112,6 +123,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "receiver_refusals", summary: `website-action receiver refusals for ${RECEIVER_REFUSAL_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-receiver-refusals" },
   { id: "dispatch_drops", summary: `dispatch-lane drops grew for ${DISPATCH_DROP_SAMPLES} consecutive sample windows (reactions include fairness refusals; not proof of gateway packet loss)`, runbook: "runbook.md#alert-dispatch-drops", severity: "ticket" },
   { id: "job_unknown_stale", summary: `job without a cadence entry has no success for more than ${UNKNOWN_JOB_STALE_SECONDS / 3600} hours`, runbook: "runbook.md#alert-job-unknown-stale", severity: "ticket" },
+  { id: "gateway_checkpoint_failures", summary: `gateway checkpoint commit failures increased between samples`, runbook: "runbook.md#alert-checkpoint-failures" },
 ];
 
 /**
@@ -129,6 +141,8 @@ export function runbookUrl(rule: RuleDef): string {
 export interface MetricsAlertState {
   /** Rule ids (with subject) currently firing, e.g. `job_stale:rank`. */
   firing: string[];
+  /** Latest fixed failure class by job; absent on state stored by older Worker versions. */
+  jobErrorClasses?: Record<string, JobErrorClass>;
   rest429: number;
   restTotal: number;
   poolStreak: number;
@@ -142,6 +156,9 @@ export interface MetricsAlertState {
   gatewayMissed: number;
   /** False until the first evaluation stores a baseline: the first sample never fires. */
   gatewayMissedSeen: boolean;
+  checkpointFailures: number;
+  /** False until the first evaluation stores a baseline: the first sample never fires. */
+  checkpointFailuresSeen: boolean;
   /** Refused `two_bot_internal_actions_total` outcomes summed by family. */
   receiverRefusals: Record<string, number>;
   /** False until the first evaluation stores a baseline: the first sample never fires. */
@@ -154,7 +171,7 @@ export interface MetricsAlertState {
   dispatchDropStreaks?: Record<string, number>;
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, dispatchDrops: {}, dispatchDropStreaks: {} };
+export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, dispatchDrops: {}, dispatchDropStreaks: {} };
 
 /** An unsuccessful scrape breaks the dispatch streak, never an existing alert. */
 export function interruptDispatchDrops(state: MetricsAlertState): MetricsAlertState {
@@ -196,6 +213,21 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   }
   for (const s of gauge("two_bot_job_consecutive_failures")) {
     if (s.value >= FAILURE_THRESHOLD) firing.push(`job_consecutive_failures:${s.labels["job"] ?? "other"}`);
+  }
+  const activeJobErrorClasses = new Map<string, string[]>();
+  for (const s of gauge("two_bot_job_last_error_class")) {
+    const job = s.labels["job"];
+    if (s.value !== 1 || job === undefined) continue;
+    const active = activeJobErrorClasses.get(job) ?? [];
+    active.push(s.labels["class"] ?? "");
+    activeJobErrorClasses.set(job, active);
+  }
+  const jobErrorClasses = Object.create(null) as Record<string, JobErrorClass>;
+  for (const [job, classes] of activeJobErrorClasses) {
+    const [errorClass] = classes;
+    if (classes.length === 1 && errorClass !== undefined && JOB_ERROR_CLASS_SET.has(errorClass)) {
+      jobErrorClasses[job] = errorClass as JobErrorClass;
+    }
   }
   for (const s of gauge("two_bot_job_last_success_timestamp_seconds")) {
     const job = s.labels["job"] ?? "";
@@ -310,6 +342,22 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   const gatewayReset = gatewayMissed < prevGatewayMissed;
   if (gatewaySeen && !gatewayReset && gatewayMissed > prevGatewayMissed) firing.push("gateway_missed_events");
 
+  // Gateway checkpoint commit failures (every failure stops the dispatch
+  // worker, so there is no benign singleton): any increase between two
+  // samples pages. The first sample only stores the baseline and never
+  // fires. A runtime failure lingers 75 s (`shutdown::RUNTIME_FAILURE_LINGER`,
+  // pinned against the keepalive tick plus probe timeouts in
+  // checkpoint-linger.test.ts) past one full keepalive tick, so the increase
+  // is normally scraped before the exit resets the counter; the post-restart
+  // reset sample resolves rather than firing. `??` covers DO storage written
+  // before these fields existed.
+  let checkpointFailures = 0;
+  for (const s of gauge("two_bot_gateway_checkpoint_failures_total")) checkpointFailures += s.value;
+  const prevCheckpointFailures = prev.checkpointFailures ?? 0;
+  const checkpointSeen = prev.checkpointFailuresSeen ?? false;
+  const checkpointReset = checkpointFailures < prevCheckpointFailures;
+  if (checkpointSeen && !checkpointReset && checkpointFailures > prevCheckpointFailures) firing.push("gateway_checkpoint_failures");
+
   // Website-action receiver refusals by family: refused
   // `two_bot_internal_actions_total` outcomes (every outcome other than
   // `executed`) must rise in RECEIVER_REFUSAL_SAMPLES consecutive windows
@@ -395,7 +443,7 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     if (grew && (wasFiring || streak >= DISPATCH_DROP_SAMPLES)) firing.push(key);
   }
 
-  return { firing, state: { firing, rest429, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, dispatchDrops, dispatchDropStreaks } };
+  return { firing, state: { firing, jobErrorClasses, rest429, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, dispatchDrops, dispatchDropStreaks } };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {
@@ -418,17 +466,36 @@ export function packetFilename(key: string, window: string): string | undefined 
   return `evidence-${safe(rule.id)}-${safe(window)}.json`;
 }
 
+function jobErrorClassForAlert(
+  key: string,
+  classes: Record<string, JobErrorClass> | undefined,
+): JobErrorClass | undefined {
+  const prefix = "job_consecutive_failures:";
+  if (!key.startsWith(prefix)) return undefined;
+  const errorClass = classes?.[key.slice(prefix.length)];
+  return errorClass !== undefined && JOB_ERROR_CLASS_SET.has(errorClass) ? errorClass : undefined;
+}
+
 /** Alert-message lines for transitions; no mentions, no secrets. */
-export function transitionMessages(before: string[], after: string[]): string[] {
+export function transitionMessages(
+  before: string[],
+  after: string[],
+  beforeJobErrorClasses?: Record<string, JobErrorClass>,
+  afterJobErrorClasses?: Record<string, JobErrorClass>,
+): string[] {
   const out: string[] = [];
   for (const key of after.filter((k) => !before.includes(k))) {
     const rule = ruleFor(key);
     const runbook = rule ? runbookUrl(rule) : `${RUNBOOK_BASE_URL}runbook.md`;
+    const errorClass = jobErrorClassForAlert(key, afterJobErrorClasses);
+    const classSuffix = errorClass ? ` (last error class: ${errorClass})` : "";
     const severity = rule?.severity ? ` (${rule.severity})` : "";
-    out.push(`two-bot-next ALERT ${key}${severity}: ${rule?.summary ?? key}. Runbook: ${runbook}`);
+    out.push(`two-bot-next ALERT ${key}${classSuffix}${severity}: ${rule?.summary ?? key}. Runbook: ${runbook}`);
   }
   for (const key of before.filter((k) => !after.includes(k))) {
-    out.push(`two-bot-next RESOLVED ${key}.`);
+    const errorClass = jobErrorClassForAlert(key, beforeJobErrorClasses);
+    const classSuffix = errorClass ? ` (last error class: ${errorClass})` : "";
+    out.push(`two-bot-next RESOLVED ${key}${classSuffix}.`);
   }
   return out;
 }

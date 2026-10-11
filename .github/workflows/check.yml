@@ -256,7 +256,7 @@ jobs:
 
       - name: Install Rust toolchain
         if: needs.job-inputs.outputs.rust != 'false'
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
@@ -412,7 +412,7 @@ jobs:
           exit 1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
@@ -613,7 +613,7 @@ jobs:
           exit 1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
@@ -891,7 +891,7 @@ jobs:
           exit 1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
@@ -1108,7 +1108,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         if: needs.job-inputs.outputs.rust != 'false'
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
@@ -1185,7 +1185,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
       # Per-job dependency cache: the key includes the job id (no
@@ -1230,6 +1230,7 @@ jobs:
       parity: ${{ steps.select.outputs.parity }}
       supply: ${{ steps.select.outputs.supply }}
       docs: ${{ steps.select.outputs.docs }}
+      voice: ${{ steps.select.outputs.voice }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1245,7 +1246,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          rust=true worker=true parity=true supply=true docs=false
+          rust=true worker=true parity=true supply=true docs=false voice=true
           if [ "${{ github.event_name }}" = "pull_request" ] \
             && [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ] \
             && result=$(python3 scripts/job-inputs.py \
@@ -1255,13 +1256,14 @@ jobs:
             parity=$(printf '%s' "$result" | sed -n 's/^parity=//p')
             supply=$(printf '%s' "$result" | sed -n 's/^supply=//p')
             docs=$(printf '%s' "$result" | sed -n 's/^docs=//p')
+            voice=$(printf '%s' "$result" | sed -n 's/^voice=//p')
             rust=${rust:-true} worker=${worker:-true} parity=${parity:-true}
-            supply=${supply:-true} docs=${docs:-false}
+            supply=${supply:-true} docs=${docs:-false} voice=${voice:-true}
           fi
-          printf 'job-inputs: rust=%s worker=%s parity=%s supply=%s docs=%s (event=%s)\n' \
-            "$rust" "$worker" "$parity" "$supply" "$docs" "${{ github.event_name }}"
-          printf 'rust=%s\nworker=%s\nparity=%s\nsupply=%s\ndocs=%s\n' \
-            "$rust" "$worker" "$parity" "$supply" "$docs" >>"$GITHUB_OUTPUT"
+          printf 'job-inputs: rust=%s worker=%s parity=%s supply=%s docs=%s voice=%s (event=%s)\n' \
+            "$rust" "$worker" "$parity" "$supply" "$docs" "$voice" "${{ github.event_name }}"
+          printf 'rust=%s\nworker=%s\nparity=%s\nsupply=%s\ndocs=%s\nvoice=%s\n' \
+            "$rust" "$worker" "$parity" "$supply" "$docs" "$voice" >>"$GITHUB_OUTPUT"
 
   # Dependency-aware selector for the container job (TOG-12056): PRs that
   # touch only docs, worker UI or unrelated CI tooling skip the ~15-minute
@@ -1420,7 +1422,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: clippy
@@ -1470,7 +1472,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
           components: clippy
@@ -1516,7 +1518,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
       # TOG-11810: dependency build cache, as in the `check` job. The key
@@ -1556,7 +1558,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-09-12)
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
         with:
           toolchain: "nightly-2026-10-01" # Pinned nightly for libFuzzer; stable pin stays in rust-toolchain.toml.
           components: rust-src
@@ -1614,7 +1616,7 @@ jobs:
       - name: require job inputs selection to pass
         if: needs.job-inputs.result != 'success'
         run: exit 1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         if: needs.job-inputs.outputs.worker != 'false'
         with:
           node-version: 22
@@ -1662,6 +1664,11 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_automation_read_smoke.py -v
       - name: Verify staging voice smoke (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_voice_smoke.py -v
+      # Voice synthetic offline suite, only when voice inputs change (owner
+      # policy 2026-10-11). The live run gates promotion after deploy-staging.
+      - name: Verify staging voice synthetic (offline fixtures)
+        if: needs.job-inputs.outputs.voice != 'false'
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_voice_synthetic.py -v
       - name: Verify staging health-contract probe (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_health_contract_probe.py -v
       - name: Verify voice denied-copy fixtures (offline fixtures)
@@ -1678,6 +1685,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_qa_cutover_probes.py -v
       - name: Verify cutover freeze drill (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_cutover_freeze_drill.py -v
+      - name: Verify rollback readiness probe (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_rollback_readiness_probe.py -v
       - name: Verify cutover watch checkpoint (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_cutover_watch_checkpoint.py -v
       - name: Verify runner routing for every workflow job

@@ -2753,11 +2753,12 @@ mod tests {
         // (all env-only), plus the two template-assistant endpoint keys
         // (both env-only). Count actual entries, not just representatives
         // of each class. TOG-19027 moves TWO_FEED_POLL_SECONDS from cold
-        // to hot, shifting one entry between those classes.
+        // to hot, shifting one entry between those classes. The staging
+        // voice synthetic adds one env-only key (TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS).
         for (class, expected) in [
             (SettingClass::Hot, 42),
             (SettingClass::Cold, 27),
-            (SettingClass::EnvOnly, 53),
+            (SettingClass::EnvOnly, 54),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),

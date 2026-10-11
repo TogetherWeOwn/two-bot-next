@@ -27,7 +27,7 @@ and the Worker (`packetFilename` in `wrangler/src/alert-rules.ts`).
 | `container_keepalive_arm_failed` | keepalive schedule lookup/insert fails (monitoring outage, not a readiness sample) | Worker logs | [container-readiness.md](container-readiness.md) |
 | `container_unready_webhook_failed` | alert/recovery webhook POST failed or timed out (type + HTTP status only) | Worker logs | [container-readiness.md](container-readiness.md) |
 | `job_stale:<job>` | job's last success older than 2 x its cadence (never-succeeded is ignored) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-job-stale) |
-| `job_consecutive_failures:<job>` | 3 failed completions in a row | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-job-failures) |
+| `job_consecutive_failures:<job>` | 3 failed completions in a row; page includes the latest fixed error class when available | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-job-failures) |
 | `rest_429_rate` | 429s above 10% of REST requests between samples (min 10 requests; restarts skip the window) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-rest-429) |
 | `db_pool_saturated` | pool at max with zero idle for 3 consecutive samples | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-db-pool) |
 | `db_errors` | 3 or more storage-layer errors between samples (restarts skip the window; currently counts send-admission SQL) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-db-errors) |
@@ -38,6 +38,7 @@ and the Worker (`packetFilename` in `wrangler/src/alert-rules.ts`).
 | `receiver_refusals:<family>` | refused website-action outcomes rising in 3 consecutive samples per family (first sample and restarts clear the streak; `other` holds pre-auth refusals) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-receiver-refusals) |
 | `dispatch_drops:<lane>` | **ticket**, not page: drops grow in 3 consecutive completed sample windows per bounded lane after a baseline; reactions include fairness refusals, not proof of gateway packet loss | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-dispatch-drops) |
 | `job_unknown_stale:<job>` | **ticket**, not page: job without a cadence entry with no success for more than 2 hours (never-succeeded is ignored; `session_checkpoint` is event-driven and excluded) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-job-unknown-stale) |
+| `gateway_checkpoint_failures` | any increase of `two_bot_gateway_checkpoint_failures_total` summed over every `stage` between samples (first sample is baseline-only; the 75 s runtime linger leaves ~3 s margin over a 60 s tick plus two 6 s probes for a pre-exit scrape) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-checkpoint-failures) |
 
 Out of scope for paging (log-only findings, still recorded on the watch log):
 gateway session starts, handler-latency quantiles, unban-queue depth via
@@ -76,9 +77,11 @@ only, never staging/production), and restart counts. See the query pack.
 3. Each transition emits one structured log line and, only when the
    per-environment webhook secret is provisioned, one Discord-compatible
    webhook POST with an empty `allowed_mentions.parse`:
-   `two-bot-next ALERT <rule>: <summary>. Runbook: <deep link>` or
-   `two-bot-next RESOLVED <rule>.` Messages carry no mentions,
-   credentials, guild/user identifiers or probe bodies.
+   `two-bot-next ALERT <rule> [(last error class: <class>)]: <summary>. Runbook: <deep link>` or
+   `two-bot-next RESOLVED <rule> [(last error class: <class>)].` The optional
+   class suffix appears only on job-failure transitions when the fixed class
+   series is available; missing/older exposition keeps the classless format.
+   Messages carry no mentions, credentials, guild/user identifiers or probe bodies.
 4. The operator responds per the linked runbook section, records the
    finding on the watch log, and confirms `container_unready_recovery`
    (or the RESOLVED line) before closing the incident.
@@ -106,8 +109,9 @@ provisioner and records the receipt on the execution card:
 - [ ] No `container_keepalive_arm_failed` in recent Worker logs
   (the loop is actually armed).
 - [ ] One test page received end to end (forced job failure showing
-  `job_consecutive_failures:<job>` within about one keepalive tick, or
-  the equivalent rehearsed trigger), then resolved.
+  `job_consecutive_failures:<job>` and `(last error class: <class>)` when the
+  series is available, within about one keepalive tick; a missing class series
+  still pages), then resolved.
 
 ## 5. Paging dry-run receipt
 
