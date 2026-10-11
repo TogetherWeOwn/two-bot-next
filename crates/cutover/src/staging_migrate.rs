@@ -2352,7 +2352,12 @@ mod tests {
                 let mut req = request.clone();
                 req.apply = apply;
                 let options = verify_target(&req, policy).unwrap();
-                assert_eq!(options.get_ssl_mode(), expected_mode);
+                // `PgSslMode` has no `PartialEq`; all variants are fieldless, so
+                // discriminant equality is exact equality.
+                assert_eq!(
+                    std::mem::discriminant(&options.get_ssl_mode()),
+                    std::mem::discriminant(&expected_mode)
+                );
                 assert_eq!(options.get_options(), None);
 
                 // Keep an explicit operator budget, rather than overwriting
@@ -2362,7 +2367,12 @@ mod tests {
                     .unwrap()
                     .push_str("&options%5Bstatement_timeout%5D=90000");
                 let options = verify_target(&req, policy).unwrap();
-                assert_eq!(options.get_ssl_mode(), expected_mode);
+                // `PgSslMode` has no `PartialEq`; all variants are fieldless, so
+                // discriminant equality is exact equality.
+                assert_eq!(
+                    std::mem::discriminant(&options.get_ssl_mode()),
+                    std::mem::discriminant(&expected_mode)
+                );
                 assert_eq!(options.get_options(), Some("-c statement_timeout=90000"));
             }
         }
