@@ -153,7 +153,7 @@ def get_json(fetch_fn, url):
         raise SmokeError("interactions endpoint answered over the body cap")
     try:
         value = json.loads(body)
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
         raise SmokeError("interactions endpoint answered 200 with invalid JSON")
     return value
 

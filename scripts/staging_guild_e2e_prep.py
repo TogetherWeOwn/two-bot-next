@@ -124,7 +124,7 @@ def get_json(fetch_fn, url):
         raise PrepError("interactions endpoint answered over the body cap")
     try:
         return json.loads(body)
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
         raise PrepError("interactions endpoint answered 200 with invalid JSON")
 
 
