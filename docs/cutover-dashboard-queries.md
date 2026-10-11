@@ -205,8 +205,10 @@ sum by (outcome) (increase(two_bot_send_admissions_total[1h]))
 ```
 
 The `send_admission_blocked` rule fires on new `outcome="blocked"` refusals
-in 3 consecutive keepalive windows; first samples and counter resets clear
-the streak. Admission SQL failures instead increment
+in 3 consecutive keepalive windows; idle windows (no new blocked refusals)
+and counter resets clear the streak. The first sample after monitoring arms
+counts as a window whenever the blocked counter is already nonzero.
+Admission SQL failures instead increment
 `two_bot_db_errors_total{op="admission"}` and feed `db_errors`.
 
 REST 429 share (`rest_429_rate`) plus the hot route:
