@@ -741,6 +741,9 @@ pub enum MemberError {
     /// `moderation_idempotency_key_reused`).
     #[error("this idempotency key was used for a different moderation request")]
     KeyMismatch,
+    /// Scheduled unbans wait for the bot identity; they never run unattributed.
+    #[error("the bot identity is unresolved; scheduled unbans wait for it")]
+    BotIdentityUnknown,
     #[error(transparent)]
     Discord(#[from] DiscordError),
     #[error(transparent)]
@@ -964,13 +967,16 @@ where
         guild_id: &'a str,
     ) -> impl Future<Output = Result<usize, MemberError>> + Send + 'a {
         async move {
+            let Some(bot_id) = self.policy.bot_user_id.as_deref() else {
+                return Err(MemberError::BotIdentityUnknown);
+            };
             let now = format_iso_millis((self.now)());
             let mut completed = 0usize;
             for _ in 0..UNBAN_SWEEP_CLAIM_LIMIT {
                 let Some(job) = self.store.claim_due_unbans(guild_id, &now, 1).await?.pop() else {
                     break;
                 };
-                match self.run_unban_job(&job).await {
+                match self.run_unban_job(&job, bot_id).await {
                     Ok(true) => completed += 1,
                     Ok(false) => {}
                     Err(err) => return Err(err),
@@ -1264,7 +1270,7 @@ where
         }
     }
 
-    async fn run_unban_job(&self, job: &UnbanJob) -> Result<bool, MemberError> {
+    async fn run_unban_job(&self, job: &UnbanJob, bot_id: &str) -> Result<bool, MemberError> {
         self.store
             .serialize_member(&job.guild_id, &job.user_id, || async {
                 if !self
@@ -1293,7 +1299,7 @@ where
                 // independently of the completion write. If completion fails
                 // afterward the claim stays `running` (uncertain, correct),
                 // but the audit of the successful unban already exists.
-                self.audit_unban_job(job).await;
+                self.audit_unban_job(job, bot_id).await;
                 self.store
                     .complete_unban(&job.request_id, &job.claim_token)
                     .await?;
@@ -1305,18 +1311,13 @@ where
     /// Best-effort audit of a dispatched scheduled unban. Idempotent on the
     /// derived request id, so a later retry never duplicates it; loss is
     /// logged, never fatal, and never releases or repeats the DELETE.
-    async fn audit_unban_job(&self, job: &UnbanJob) {
-        let bot_id = self
-            .policy
-            .bot_user_id
-            .clone()
-            .unwrap_or_else(|| self.policy.owen_user_id.clone());
+    async fn audit_unban_job(&self, job: &UnbanJob, bot_id: &str) {
         if let Err(err) = self
             .store
             .record_audit(&AuditRow {
                 request_id: format!("{}:unban", job.request_id),
                 guild_id: job.guild_id.clone(),
-                actor_id: bot_id,
+                actor_id: bot_id.to_owned(),
                 action: "moderation.unban_scheduled",
                 target_id: Some(job.user_id.clone()),
                 reason: job.reason.clone(),
@@ -3206,6 +3207,42 @@ mod tests {
         assert_eq!(unban.action, "moderation.unban_scheduled");
         assert_eq!(unban.request_id, "req-tempban:unban");
         assert_eq!(unban.target_id.as_deref(), Some(TARGET_ID));
+    }
+
+    #[tokio::test]
+    async fn sweep_without_bot_identity_claims_nothing_and_never_attributes_owner() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let clock = AtomicI64::new(1_700_000_000_000);
+        let discord = MockMemberDiscord::new();
+        let store = MemMemberStore::new();
+        let armed = MemberModerationService::new(discord.clone(), store.clone(), policy(), || {
+            clock.load(Ordering::SeqCst)
+        });
+        armed
+            .execute(&execution(ModerationAction::TempBan))
+            .await
+            .expect("tempban");
+        clock.store(1_700_003_600_000, Ordering::SeqCst);
+        let unresolved_bot = ModerationPolicy {
+            bot_user_id: None,
+            ..policy()
+        };
+        let unresolved =
+            MemberModerationService::new(discord.clone(), store.clone(), unresolved_bot, || {
+                clock.load(Ordering::SeqCst)
+            });
+        assert_eq!(
+            unresolved.run_due_unbans(GUILD).await,
+            Err(MemberError::BotIdentityUnknown)
+        );
+        assert_eq!(discord.call_count("unban"), 0);
+        assert_eq!(store.unban_state("req-tempban"), Some("pending".to_owned()));
+        assert_eq!(store.audits().len(), 1);
+
+        assert_eq!(armed.run_due_unbans(GUILD).await.expect("sweep"), 1);
+        let audits = store.audits();
+        assert_eq!(audits.len(), 2);
+        assert_eq!(audits[1].actor_id, BOT_ID);
     }
 
     #[tokio::test]

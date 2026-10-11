@@ -387,9 +387,14 @@ async fn tempban_schedules_unban_and_sweep_dispatches_it() {
     // The queued expiry is claimable by the sweep once due; dispatch needs no
     // REST double here because the sweep path is service-owned.
     let discord = MockMemberDiscord::new();
-    let sweep = MemberModerationService::new(discord.clone(), store.clone(), policy(), move || {
-        NOW_MS + 3_600_000 + 1_000
-    });
+    let sweep_policy = ModerationPolicy {
+        bot_user_id: Some("555555555555555555".to_owned()),
+        ..policy()
+    };
+    let sweep =
+        MemberModerationService::new(discord.clone(), store.clone(), sweep_policy, move || {
+            NOW_MS + 3_600_000 + 1_000
+        });
     assert_eq!(sweep.run_due_unbans(GUILD).await.unwrap(), 1);
     assert!(matches!(
         discord.calls().as_slice(),
