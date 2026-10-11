@@ -128,13 +128,15 @@ fn containment_settings_defaults_and_bad_values() {
 #[test]
 fn containment_seconds_refuse_values_that_are_not_whole_positive_milliseconds() {
     let defaults = ContainmentSettings::from_vars(&vars(&[]));
-    let cases: [(&str, Option<i64>); 11] = [
+    let cases: [(&str, Option<i64>); 13] = [
         ("0.0004", None),
         ("1e-9", None),
         ("0.0009999", None),
         ("0.001", Some(1)),
         ("0.0015", Some(1)),
         ("1.0005", Some(1_000)),
+        ("9223372036854774", Some(9_223_372_036_854_773_760)),
+        ("9223372036854775.808", None),
         ("9200000000000000", Some(9_200_000_000_000_000_000)),
         ("9300000000000000", None),
         ("1e300", None),
