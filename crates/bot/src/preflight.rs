@@ -24,7 +24,7 @@ use two_bot_core::onboarding::{
     game_picker_allowed, level_role_writes_allowed, OnboardingGates, GAME_PICKS, PLATFORM_PICKS,
     TWO_GUILD_ID,
 };
-use two_bot_core::self_roles::parse_self_role_panels;
+use two_bot_core::self_roles::{parse_self_role_dry_run, parse_self_role_panels};
 use two_bot_core::send_admission::PgSendAdmission;
 use two_bot_discord::channel_access::{guild_permissions, resolve_channel_access};
 use two_bot_discord::executor::HyperTransport;
@@ -205,7 +205,8 @@ impl Targets {
         };
         let guild_id =
             snowflake(&guild).map_err(|_| "GUILD_ID must be a nonzero Discord snowflake")?;
-        let gates = OnboardingGates::from_map(vars).map_err(|_| "invalid TWO_ONBOARDING_MODE")?;
+        let gates = OnboardingGates::from_map(vars)
+            .map_err(|_| "invalid TWO_ONBOARDING_MODE or TWO_ONBOARDING_DRY_RUN")?;
         let role_writes = level_role_writes_allowed(gates.mode) && !gates.dry_run;
         let ticket_keys = [
             "DISCORD_TICKET_CATEGORY_ID",
@@ -287,6 +288,7 @@ impl Targets {
                 snowflake(staff_raw.trim()).map_err(|_| "invalid configured staff role ID")?;
             targets.roles.insert(staff_id, "ticket staff");
         }
+        parse_self_role_dry_run(vars).map_err(|_| "invalid TWO_SELF_ROLE_DRY_RUN")?;
         let raw = env("TWO_SELF_ROLE_PANELS");
         if !raw.trim().is_empty() {
             let panels = parse_self_role_panels(&raw)
@@ -1053,5 +1055,15 @@ mod tests {
             let err = Targets::from_map(&env, None).expect_err("boot-refused catalogue");
             assert_eq!(err, "invalid TWO_SELF_ROLE_PANELS catalogue");
         }
+    }
+
+    #[test]
+    fn self_role_dry_run_refuses_values_other_than_zero_or_one() {
+        let mut env = vars("2222", "session");
+        env.insert("TWO_SELF_ROLE_DRY_RUN".into(), "true".into());
+        let err = Targets::from_map(&env, None).expect_err("refused dry run");
+        assert_eq!(err, "invalid TWO_SELF_ROLE_DRY_RUN");
+        env.insert("TWO_SELF_ROLE_DRY_RUN".into(), "1".into());
+        assert!(Targets::from_map(&env, None).is_ok());
     }
 }

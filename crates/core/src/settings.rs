@@ -752,7 +752,13 @@ pub enum WriteRefusal {
     MissingActor,
     #[error("refused: setting values cannot contain U+0000")]
     NullCharacter,
+    #[error("refused: {0} accepts only a boolean, 0 or 1")]
+    InvalidGateValue(String),
 }
+
+/// Dry-run gates the env parsers accept only as `0` or `1`; a stored value
+/// that renders to anything else would be refused at every hot refresh.
+const ZERO_ONE_GATE_KEYS: &[&str] = &["TWO_ONBOARDING_DRY_RUN", "TWO_SELF_ROLE_DRY_RUN"];
 
 /// Postgres JSONB cannot represent decoded NUL in strings or object keys.
 /// Inspect the domain value, not its encoding (literal `\\u0000` is valid).
@@ -797,6 +803,14 @@ pub fn validate_write(
     }
     if value.as_ref().is_some_and(contains_json_nul) {
         return Err(WriteRefusal::NullCharacter);
+    }
+    if ZERO_ONE_GATE_KEYS.contains(&key)
+        && value
+            .as_ref()
+            .and_then(to_env_string)
+            .is_some_and(|rendered| rendered != "0" && rendered != "1")
+    {
+        return Err(WriteRefusal::InvalidGateValue(key.to_owned()));
     }
     Ok(ValidatedWrite {
         guild_id: guild_id.to_owned(),
@@ -1290,6 +1304,34 @@ mod tests {
         let delete = validate_write("g1", "TWO_ONBOARDING_DRY_RUN", None, "admin")
             .expect("delete validates");
         assert_eq!(delete.action, WriteAction::Delete);
+    }
+
+    #[test]
+    fn gate_values_accept_only_boolean_zero_or_one() {
+        for value in [
+            json!(true),
+            json!(false),
+            json!("1"),
+            json!("0"),
+            json!(1),
+            json!(0),
+        ] {
+            assert!(
+                validate_write("g1", "TWO_ONBOARDING_DRY_RUN", Some(value.clone()), "admin")
+                    .is_ok(),
+                "{value}"
+            );
+        }
+        for value in [json!("true"), json!("on"), json!(""), json!(2)] {
+            assert_eq!(
+                validate_write("g1", "TWO_SELF_ROLE_DRY_RUN", Some(value.clone()), "admin"),
+                Err(WriteRefusal::InvalidGateValue(
+                    "TWO_SELF_ROLE_DRY_RUN".to_owned()
+                )),
+                "{value}"
+            );
+        }
+        assert!(validate_write("g1", "TWO_SELF_ROLE_DRY_RUN", None, "admin").is_ok());
     }
 
     #[test]

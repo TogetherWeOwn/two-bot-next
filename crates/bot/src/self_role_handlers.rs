@@ -109,7 +109,10 @@ impl SelfRoleService {
             Ok(gates) => gates,
             Err(err) => {
                 // Parked, not ignored: old panels stay unserved until fixed.
-                tracing::error!(error = %err, "TWO_SELF_ROLE_PANELS invalid; self-roles disabled");
+                tracing::error!(
+                    error = %err,
+                    "TWO_SELF_ROLE_PANELS or TWO_SELF_ROLE_DRY_RUN invalid; self-roles disabled"
+                );
                 return None;
             }
         };
