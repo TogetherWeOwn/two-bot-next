@@ -233,6 +233,17 @@ containment, when the hot route belongs to a writer this team does not own, or
 when 429s coincide with 5xx/transport failures suggesting a wider Discord or
 network incident.
 
+Executor route templates (fixed vocabulary): `GET /guilds/:guild/members/:member`
+counts member fetches, `GET /users/@me` counts current-user reads (literal
+`@me`, never a user id), `PATCH /webhooks/:application/:token/messages/@original`
+counts interaction-response edits (literal `@original`). Snowflakes, interaction
+tokens and query strings never appear in labels: `guilds/100/members/300?limit=1`
+counts as the member template, `users/@me?limit=100` as `GET /users/@me`,
+`webhooks/7/tok-abc/messages/@original?wait=true` as the webhook template.
+Unknown, wrong-method and overlong shapes collapse to `other` with no new
+series. Source: [`metrics.rs`](../crates/core/src/metrics.rs),
+[`executor_metrics.rs`](../crates/discord/src/executor_metrics.rs).
+
 #### Alert: DB pool
 
 The SQLx pool sat at its maximum with zero idle connections for three
