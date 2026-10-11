@@ -1432,16 +1432,19 @@ mod tests {
 
     /// Gate M4.36 refusal/error/log/audit half: every LFG refusal is a fixed
     /// acknowledgement that never interpolates title/label text, so hostile
-    /// input cannot leak through an error, log or audit path. The length
-    /// assertions pin full coverage: a new refusal variant or audit outcome
-    /// breaks them until it is listed here too. Log safety holds by
-    /// construction (no `tracing`/`log` calls in `lfg`, `lfg_store` or the
-    /// LFG interaction handlers carry title/label values) and every
-    /// `Display` below is fixed, so even a logged error line carries no
-    /// hostile text. Key-echoing variants (`BadKey`, `ReservedKey`,
-    /// `DuplicateKey`) echo only normalized keys under the #694 bound and
-    /// are out of scope for titles/labels: this test drives hostile input
-    /// as titles and labels (fixed key `tank`), never as keys.
+    /// input cannot leak through an error, log or audit path. Coverage is
+    /// pinned by exhaustive `match`es, not length assertions: a new
+    /// `RoleSpecError`, `SignupOutcome` or `StartsAtError` variant fails to
+    /// compile until it is classified below. Log safety holds by construction
+    /// (no `tracing`/`log` calls in `lfg`, and neither `lfg_store` nor the
+    /// LFG interaction handlers carry title/label values into a log line)
+    /// and every `Display` below is fixed, so even a logged error line
+    /// carries no hostile text. Key-echoing variants are out of scope for
+    /// titles/labels: this test drives hostile input as titles and labels
+    /// (fixed key `tank`), never as keys. `BadKey` carries a bounded *raw*
+    /// 128-char key prefix (`parse_role_spec`, `MAX_ROLE_KEY_ERROR_CHARS`,
+    /// pinned by `role_key_errors_echo_only_a_bounded_raw_prefix`);
+    /// `ReservedKey` and `DuplicateKey` carry the normalized key.
     #[test]
     fn hostile_titles_and_labels_never_echo_in_refusals_errors_or_logs() {
         use crate::scheduled::{
@@ -1455,8 +1458,13 @@ mod tests {
         // Every LFG audit outcome code written by `lfg_interactions::audit`
         // (`posted`/`failed` on create, `closed`/`already_closed_or_missing`
         // on close, `signup_lfg` wire words on signup, `left`/`not_signed_up`
-        // on leave). Audit rows carry these codes plus snowflake IDs with
-        // `reason: None` — never titles or labels.
+        // on leave; see the `LfgRequest` arms in
+        // `crates/discord/src/lfg_interactions.rs`). Audit rows carry these
+        // codes plus snowflake IDs with `reason: None` — never titles or
+        // labels. The signup half is cross-checked against the real
+        // `SignupOutcome` enum below; the create/close/leave codes live in
+        // the discord adapter, so a new adapter outcome needs a matching
+        // entry here by review.
         let audit_outcomes = [
             "posted",
             "failed",
@@ -1469,11 +1477,6 @@ mod tests {
             "left",
             "not_signed_up",
         ];
-        assert_eq!(
-            audit_outcomes.len(),
-            10,
-            "every LFG audit outcome is covered"
-        );
         let signup_outcomes = [
             SignupOutcome::Joined,
             SignupOutcome::Moved,
@@ -1481,7 +1484,65 @@ mod tests {
             SignupOutcome::Closed,
             SignupOutcome::Missing,
         ];
-        assert_eq!(signup_outcomes.len(), 5, "every signup outcome is covered");
+        // Exhaustive over the real enum (no wildcard): a new `SignupOutcome`
+        // variant fails to compile here until its wire word joins
+        // `audit_outcomes` and its reply joins `fixed_texts`.
+        for outcome in signup_outcomes {
+            let wire = match outcome {
+                SignupOutcome::Joined => "joined",
+                SignupOutcome::Moved => "moved",
+                SignupOutcome::Full => "full",
+                SignupOutcome::Closed => "closed",
+                SignupOutcome::Missing => "missing",
+            };
+            assert_eq!(wire, outcome.as_str(), "wire word drift: {outcome:?}");
+            assert!(
+                audit_outcomes.contains(&wire),
+                "signup outcome {outcome:?} missing from audit outcomes"
+            );
+        }
+        // Exhaustive over the real enum (no wildcard): a new `RoleSpecError`
+        // variant fails to compile here until it is classified as fixed-text
+        // (asserted per-input below) or key-echoing (#694-pinned, out of
+        // scope for titles/labels). The counts prove the visit list itself
+        // was not shortened.
+        let mut fixed_count = 0;
+        let mut key_echoing_count = 0;
+        for err in [
+            RoleSpecError::BadShape,
+            RoleSpecError::BadKey("key".to_owned()),
+            RoleSpecError::TooLong,
+            RoleSpecError::ReservedKey("tank".to_owned()),
+            RoleSpecError::BadLabel,
+            RoleSpecError::BadSlots,
+            RoleSpecError::BadCount,
+            RoleSpecError::DuplicateKey("tank".to_owned()),
+        ] {
+            match err {
+                RoleSpecError::BadShape
+                | RoleSpecError::TooLong
+                | RoleSpecError::BadLabel
+                | RoleSpecError::BadSlots
+                | RoleSpecError::BadCount => fixed_count += 1,
+                RoleSpecError::BadKey(_)
+                | RoleSpecError::ReservedKey(_)
+                | RoleSpecError::DuplicateKey(_) => key_echoing_count += 1,
+            }
+        }
+        assert_eq!(fixed_count, 5, "fixed-text refusal set drifted");
+        assert_eq!(key_echoing_count, 3, "key-echoing refusal set drifted");
+        // Exhaustive over the real enum (no wildcard): a new `StartsAtError`
+        // variant fails to compile here.
+        for err in [StartsAtError::NotIso8601, StartsAtError::NotFuture] {
+            let text = match err {
+                StartsAtError::NotIso8601 => StartsAtError::NotIso8601.to_string(),
+                StartsAtError::NotFuture => StartsAtError::NotFuture.to_string(),
+            };
+            assert!(
+                text.starts_with("starts-at"),
+                "starts-at refusal drifted: {text:?}"
+            );
+        }
         for hostile in HOSTILE_LFG_TITLES_AND_LABELS.iter().copied() {
             // Post validation: hostile titles refuse with fixed text or parse
             // as inert valid titles; hostile labels refuse with fixed text or
