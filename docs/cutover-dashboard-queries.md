@@ -7,12 +7,11 @@ When this file and a live rule disagree, the live rule wins and this file is
 the one to fix.
 
 Scope: DB-error and send-admission signals from the shipped series, plus
-gateway and `/readyz` health. Two shipped gaps shape every panel below: there
-is **no DB error counter** (the pool rule is a proxy) and **no send-admission
-series**, so neither is alerted today (see
-[metrics](metrics.md#off-container-scrape-and-alert-rules)). Queries below use
-the closest shipped proxies and say so. Out of scope: installing alerts,
-paging tests, log-catalog extraction.
+gateway and `/readyz` health. The `db_errors`, `send_admission_blocked` and
+`gateway_missed_events` rules already ship (see
+[metrics](metrics.md#off-container-scrape-and-alert-rules)). Pool and job
+health remain complementary signals, not substitutes for those counters.
+Out of scope: installing alerts, paging tests, log-catalog extraction.
 
 Rules for every query: read-only; never run SQL, probes, or restores against
 staging or production databases (table queries run only against an authorized
@@ -122,14 +121,27 @@ Sources: [gateway recovery](gateway-recovery.md),
 [container readiness](container-readiness.md),
 [production deploy watch](production-deploy.md#48-hour-watch-log-tog-9699).
 
-## Panel 2 — DB-error signals (proxies; no dedicated counter ships)
+## Panel 2 — DB-error signals and pool/job health
 
 Owner: on-call operator; DB-side cause belongs to the database dependency
 owner. Do not probe staging/production SQL, add grants, or restart the
 container to "free" the pool.
 
-Pool saturation (the shipped proxy for DB trouble — SQLx bookkeeping, not DB
-reachability):
+Recorded storage failures by producer:
+
+```promql
+sum by (op) (increase(two_bot_db_errors_total[1h]))
+```
+
+The `db_errors` rule fires at 3+ errors across all `op` labels between two
+keepalive samples (resets skip the window). Producers are send-admission SQL
+(`op="admission"`) and voice actor load (`op="other"`), not all stores.
+Correlate voice load failures with `voice actor load failed; actor respawns
+on the next guild snapshot` in container stdout; the warn is throttled to
+once per 300 s process-wide, but every failure increments the counter.
+
+Pool saturation (a complementary proxy for DB trouble — SQLx bookkeeping,
+not DB reachability):
 
 ```promql
 two_bot_db_pool_configured == 1
@@ -180,13 +192,24 @@ vocabulary: [startup diagnostics](startup-diagnostics.md), [runbook](runbook.md#
 Sources: [metrics](metrics.md#off-container-scrape-and-alert-rules),
 [runbook Alert: DB pool](runbook.md#alert-db-pool).
 
-## Panel 3 — Send-admission and REST guard signals (proxies; no admission series ships)
+## Panel 3 — Send-admission and REST guard signals
 
 Owner: on-call operator; containment uses the actual writer's verified control
 ([runbook containment](runbook.md#containment-kill-switches-and-feature-flags)).
 Never hammer Discord, replay uncertain writes, or invent a breaker reset.
 
-REST 429 share (the one shipped send-path alert) plus the hot route:
+Send-admission decisions by outcome:
+
+```promql
+sum by (outcome) (increase(two_bot_send_admissions_total[1h]))
+```
+
+The `send_admission_blocked` rule fires on new `outcome="blocked"` refusals
+in 3 consecutive keepalive windows; first samples and counter resets clear
+the streak. Admission SQL failures instead increment
+`two_bot_db_errors_total{op="admission"}` and feed `db_errors`.
+
+REST 429 share (`rest_429_rate`) plus the hot route:
 
 ```promql
 sum(increase(two_bot_rest_requests_total{result="429"}[1h]))
@@ -256,8 +279,8 @@ Sources: [metrics](metrics.md#off-container-scrape-and-alert-rules),
 | Panel | Warn (record, keep watching) | Page (freeze writers, decide rollback) |
 |---|---|---|
 | Readiness / gateway | Single 503; paired reconnect | 503 past 60 s; unready alert; reconnects with no RESUME/READY; any missed-events increase |
-| DB-error proxies | 1 saturated sample; 1–2 job failures | Pool saturated x3; 3 consecutive failures; job stale; store/checkpoint class persists |
-| Send-admission proxies | Single 429 window; 5xx/transport spike; one global pause | Repeat 429 after containment; breaker open; token invalid; indefinite/wedged lane |
+| DB errors / pool / jobs | 1 saturated sample; 1–2 job failures | `db_errors` (3+ between samples); pool saturated x3; 3 consecutive failures; job stale; store/checkpoint class persists |
+| Send admission / REST | Single 429 window; 5xx/transport spike; one global pause | `send_admission_blocked` (3 windows); repeat 429 after containment; breaker open; token invalid; indefinite/wedged lane |
 
 ## What this doc does not do
 
