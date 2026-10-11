@@ -58,6 +58,9 @@ pub const REST_ROUTES: &[&str] = &[
     "DELETE /guilds/:guild/scheduled-events/:event",
     "POST /guilds/:guild/channels",
     "DELETE /channels/:channel",
+    "GET /guilds/:guild/members/:member",
+    "GET /users/@me",
+    "PATCH /webhooks/:application/:token/messages/@original",
     "other",
 ];
 pub const RESULTS: &[&str] = &["2xx", "3xx", "4xx", "429", "5xx", "transport"];
