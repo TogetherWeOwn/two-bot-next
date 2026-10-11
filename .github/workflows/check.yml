@@ -1631,6 +1631,8 @@ jobs:
         if: needs.job-inputs.outputs.worker != 'false'
       # TOG-9907: named envs do not inherit bindings; fail if any [env.*]
       # omits the Container/DO/exports/vars wiring (staging HTTP 1101).
+      # Both [env.staging] and [env.production] must be present; a missing
+      # environment or an unreadable/invalid TOML fails with a fixed diagnostic.
       - name: check env bindings are explicit
         if: needs.job-inputs.outputs.worker != 'false'
         run: |
