@@ -1089,9 +1089,9 @@ for (const failure of ["http", "fetch", "body", "missing", "invalid"] as const) 
         if (failure === "http") return new Response(null, { status: 503 });
         if (failure === "missing") return new Response("");
         if (failure === "invalid") return new Response('two_bot_dispatch_drops_total{lane="reactions"} NaN\n');
-        const response = new Response("");
-        t.mock.method(response, "text", async () => { throw new Error("synthetic metrics body failure"); });
-        return response;
+        return new Response(new ReadableStream({
+          pull() { throw new Error("synthetic metrics body failure"); },
+        }));
       }
       return new Response(`two_bot_dispatch_drops_total{lane="reactions"} ${count}\n`);
     });
