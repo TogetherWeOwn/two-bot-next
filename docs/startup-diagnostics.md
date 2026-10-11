@@ -32,6 +32,7 @@ Rust logs fixed `startup_phase` / `error_class` fields before fatal exits:
 | Milestone read | `milestones_load_failed` |
 | Automod configuration rejected | `automod_config_invalid` |
 | Automod REST executor build | `automod_executor_failed` |
+| Raid-watch REST executor build | `raid_executor_failed` |
 | Running gateway operation | `gateway_runtime_failed` |
 | Gateway task panicked | `gateway_task_panicked` |
 | HTTP/gateway supervisor termination | `container_service_failed` |
