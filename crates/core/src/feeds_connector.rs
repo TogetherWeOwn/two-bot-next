@@ -28,7 +28,8 @@
 //! sees parsed XML. Concatenated gzip members all decode; stacked
 //! `Content-Encoding` layers are refused; non-ASCII policy headers
 //! (content-type, content-encoding, location) fail closed while unrelated
-//! headers stay lenient. The absolute deadline also governs the blocking
+//! headers stay lenient. Repeated `location` or `content-type` headers are
+//! refused as ambiguous instead of reading the first value. The absolute deadline also governs the blocking
 //! decode and is re-checked before success is returned.
 //!
 //! Tests inject [`FeedResolver`]/[`FeedConnector`] doubles; there is no seam
@@ -367,16 +368,31 @@ async fn read_wire(mut stream: FeedBodyStream) -> Result<Vec<u8>, FeedConnectErr
 /// Headers that drive policy: content-type, content-encoding, redirect
 /// location. Non-ASCII bytes in these are a policy refusal — silently mapping
 /// them to empty would turn a declared `br` into `identity`, drop the
-/// content-type gate, or join a garbage redirect. The caller picks the
-/// matching [`FetchError`] so a bad Location reads as a refused redirect,
-/// not a bad body. All other headers stay lenient.
+/// content-type gate, or join a garbage redirect. Repeated policy headers are
+/// also refused: reading only the first value would silently ignore a
+/// conflicting second one, so any duplicate `location` or `content-type`
+/// (matched case-insensitively) fails closed before redirect or body
+/// processing. The caller picks the matching [`FetchError`] so a bad Location
+/// reads as a refused redirect, not a bad body. All other headers stay
+/// lenient.
 impl FeedResponse {
     fn policy_header(
         &self,
         name: &str,
         refusal: FetchError,
     ) -> Result<Option<&str>, FeedConnectError> {
-        self.header(name)
+        let mut found: Option<&str> = None;
+        for (header_name, value) in &self.headers {
+            if header_name.eq_ignore_ascii_case(name) {
+                if found.is_some() {
+                    // Ambiguous: two values for one policy header. Refuse
+                    // rather than reading the first and ignoring the rest.
+                    return Err(FeedConnectError::Policy(refusal));
+                }
+                found = Some(value.as_str());
+            }
+        }
+        found
             .map(|value| {
                 if value.is_ascii() {
                     Ok(value)
