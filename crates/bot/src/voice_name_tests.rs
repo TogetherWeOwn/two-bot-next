@@ -652,6 +652,92 @@ async fn flush_recheck_drops_now_duplicate_rename_and_clears_override() {
 }
 
 #[tokio::test]
+async fn token_built_name_is_not_dropped_by_the_flush_recheck() {
+    // A token-built rename stays exempt at flush, matching submit time: even
+    // when a sibling already shows the folded rendered name, the rename
+    // lands and the override keeps the typed template.
+    const SECOND_ROOM: u64 = 501;
+    let trace = Trace::default();
+    let live = LiveGuild::new(GUILD);
+    live.publish(snapshot(
+        &[ROOM, SECOND_ROOM],
+        vec![occupant(OWNER, ROOM), occupant(GUEST, SECOND_ROOM)],
+    ));
+    live.upsert_channel(named_channel(ROOM, "Alpha"));
+    live.upsert_channel(named_channel(SECOND_ROOM, "Ava"));
+    let store = Store::new(trace.clone());
+    store.rooms.lock().unwrap().insert(ROOM, room(ROOM));
+    let mut second = room(SECOND_ROOM);
+    second.owner_id = GUEST;
+    store.rooms.lock().unwrap().insert(SECOND_ROOM, second);
+    let mut worker = GuildRoomWorker::load(live, store, Http::new(trace.clone()))
+        .await
+        .unwrap();
+    worker.name_settings.unique_names = true;
+
+    let mut tokens = command(OWNER, false, submit("@@owner@@"));
+    tokens.settings.unique_names = true;
+    applied(worker.apply_name(tokens, 0));
+    drain(&mut worker).await;
+
+    assert_eq!(channel_name(&worker, ROOM).as_deref(), Some("Ava"));
+    assert_eq!(
+        worker.custom_names.get(&ROOM).map(String::as_str),
+        Some("@@owner@@"),
+        "the exempt override keeps the typed template"
+    );
+    let renames: Vec<String> = trace
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry.strip_prefix("rename:").map(ToString::to_string))
+        .collect();
+    assert_eq!(renames, vec!["500:Ava".to_owned()]);
+}
+
+#[tokio::test]
+async fn flush_recheck_is_skipped_when_unique_names_turns_off() {
+    // A rename accepted while unique-names is on still lands when the setting
+    // is turned off before the flush: the recheck is skipped, so no duplicate
+    // drop clears the override.
+    const SECOND_ROOM: u64 = 501;
+    let trace = Trace::default();
+    let live = LiveGuild::new(GUILD);
+    live.publish(snapshot(
+        &[ROOM, SECOND_ROOM],
+        vec![occupant(OWNER, ROOM), occupant(GUEST, SECOND_ROOM)],
+    ));
+    live.upsert_channel(named_channel(ROOM, "Alpha"));
+    live.upsert_channel(named_channel(SECOND_ROOM, "Beta"));
+    let store = Store::new(trace.clone());
+    store.rooms.lock().unwrap().insert(ROOM, room(ROOM));
+    let mut second = room(SECOND_ROOM);
+    second.owner_id = GUEST;
+    store.rooms.lock().unwrap().insert(SECOND_ROOM, second);
+    let mut worker = GuildRoomWorker::load(live, store, Http::new(trace.clone()))
+        .await
+        .unwrap();
+    worker.name_settings.unique_names = true;
+
+    let mut first = command(OWNER, false, submit("Squad"));
+    first.settings.unique_names = true;
+    applied(worker.apply_name(first, 0));
+
+    // The sibling lands the folded name, then the setting is turned off.
+    worker
+        .live
+        .upsert_channel(named_channel(SECOND_ROOM, "squad"));
+    worker.name_settings.unique_names = false;
+    drain(&mut worker).await;
+
+    assert_eq!(channel_name(&worker, ROOM).as_deref(), Some("Squad"));
+    assert_eq!(
+        worker.custom_names.get(&ROOM).map(String::as_str),
+        Some("Squad")
+    );
+}
+
+#[tokio::test]
 async fn stale_last_proposed_entry_never_holds_a_name() {
     // A landed rename that later diverges externally (gateway shows
     // Moderated while desired still says Squad) must not block a folded
