@@ -971,7 +971,7 @@ impl Metrics {
             .unwrap();
         }
         header(
-            out,
+            &mut out,
             "two_bot_audit_delivery_halt",
             "gauge",
             "Audit mirror delivery halt; 1 while the persistent kill switch is engaged, 0 otherwise. Set once per readable audit_retry sweep; an unreadable halt keeps the last reported state.",
