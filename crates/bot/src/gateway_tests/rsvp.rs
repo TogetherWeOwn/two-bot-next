@@ -244,6 +244,14 @@ async fn connect_governed(
 async fn lane_holding_rest(seen: Arc<AtomicBool>, hold: Duration) -> MockRest {
     let held = Arc::new(AtomicBool::new(false));
     MockRest::with_responder(move |request| {
+        // RA-01 live-membership gate precedes the live-event read: echo the
+        // requested user so the gate sees a current member and reaches the
+        // scheduled-events hold below.
+        if request.method == "GET" && request.path.contains("/members/") {
+            let user = request.path.rsplit('/').next().unwrap_or("77");
+            let user = user.split('?').next().unwrap_or("77");
+            return ScriptedResponse::json(200, json!({"user": {"id": user}, "roles": []}));
+        }
         if request.method == "GET" && request.path.contains("scheduled-events") {
             seen.store(true, Ordering::Release);
             if !held.swap(true, Ordering::AcqRel) {
@@ -256,6 +264,14 @@ async fn lane_holding_rest(seen: Arc<AtomicBool>, hold: Duration) -> MockRest {
             return ScriptedResponse::json(200, json!({"id":EVENT,"guild_id":GUILD,"status":1}));
         }
         if request.method == "GET" {
+            // RA-01 live-membership gate echoes the looked-up user id back
+            // inside `user.id`: answer member reads with that shape so fenced
+            // commands pass. Every other GET (boot application id, guild
+            // reads) keeps the legacy bare-id body its consumer parses.
+            if request.path.contains("/members/") {
+                let user = request.path.rsplit('/').next().unwrap_or_default();
+                return ScriptedResponse::json(200, json!({"user": {"id": user}, "roles": []}));
+            }
             return ScriptedResponse::json(200, json!({"id":"1111"}));
         }
         if request.method == "PUT" {
@@ -296,6 +312,24 @@ enum CheckpointFailure {
     Timeout,
 }
 
+/// Read one counter series from the process-global metrics exposition.
+/// Global counters are monotonic and shared with parallel tests, so callers
+/// assert `after >= before + expected`, never an exact value.
+fn global_series(prefix: &str) -> u64 {
+    two_bot_core::metrics::global()
+        .render(None)
+        .lines()
+        .filter(|line| line.starts_with(prefix))
+        .map(|line| {
+            line.rsplit_once(' ')
+                .unwrap_or_else(|| panic!("bad sample: {line}"))
+                .1
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("bad sample: {line}"))
+        })
+        .sum()
+}
+
 async fn queued_commands(
     slow_database: bool,
     checkpoint_failure: Option<CheckpointFailure>,
@@ -313,24 +347,19 @@ async fn queued_commands(
     } else {
         None
     };
-    let event = ScriptedResponse::json(200, json!({"id":EVENT,"guild_id":GUILD,"status":1}));
-    let rest = MockRest::start(
-        vec![
-            ScriptedResponse::json(200, json!({"id":"1111"})),
-            ScriptedResponse::status(200),
-            ScriptedResponse::status(204),
-            event.clone().delayed(if slow_database {
-                Duration::ZERO
-            } else {
-                Duration::from_millis(3200)
-            }),
-            ScriptedResponse::status(204),
-            // Deferred original edits require ID-bearing 200 receipts.
-            ScriptedResponse::json(200, json!({"id": "99"})),
-            event,
-            ScriptedResponse::json(200, json!({"id": "99"})),
-        ],
-        ScriptedResponse::status(500),
+    // Route-aware responder: the first live-event read is held (or instant
+    // for the slow-database case) while later reads pass through, and
+    // membership reads echo the RA-01 `user.id` evidence. A strict FIFO
+    // script cannot survive the concurrent defer/execute interleave, so the
+    // exact per-RSVP call sequence is pinned in the discord runtime tests
+    // instead; here only arrival order and timing are asserted.
+    let rest = lane_holding_rest(
+        Arc::new(AtomicBool::new(false)),
+        if slow_database {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(3200)
+        },
     )
     .await;
     let (shutdown, receiver) = tokio::sync::watch::channel(false);
@@ -338,7 +367,7 @@ async fn queued_commands(
     ws.send(Message::text(interaction(2, "going").to_string()))
         .await
         .unwrap();
-    wait_requests(&rest, 4).await; // First defer and live-event read are underway.
+    wait_requests(&rest, 5).await; // First defer, membership, and live-event read are underway.
     let delivered = tokio::time::Instant::now();
     ws.send(Message::text(interaction(3, "interested").to_string()))
         .await
@@ -359,14 +388,26 @@ async fn queued_commands(
             .await
             .unwrap();
     }
-    wait_requests(&rest, 5).await;
+    wait_requests(&rest, 6).await;
     let requests = rest.requests();
-    assert!(requests[4]
-        .path
-        .ends_with("/interactions/3/mock-rsvp-3/callback"));
-    assert!(requests[4].received_at.duration_since(delivered) < Duration::from_secs(3));
+    // Six arrivals regardless of interleave: boot application id, registry
+    // PUT, first defer, pre-write membership/event reads, and the second
+    // command's defer. The defer travels the unpaced interaction lane while
+    // the second paced read waits out the 110 ms lane gap, so the defer is
+    // usually recorded before the held event read: filter by token suffix
+    // instead of pinning the arrival index.
+    let defer: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            request
+                .path
+                .ends_with("/interactions/3/mock-rsvp-3/callback")
+        })
+        .collect();
+    assert_eq!(defer.len(), 1, "one prompt defer for the queued command");
+    assert!(defer[0].received_at.duration_since(delivered) < Duration::from_secs(3));
     assert_eq!(
-        serde_json::from_slice::<Value>(&requests[4].body).unwrap()["type"],
+        serde_json::from_slice::<Value>(&defer[0].body).unwrap()["type"],
         5
     );
     assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 1);
@@ -380,6 +421,13 @@ async fn queued_commands(
     if graceful_shutdown {
         shutdown.send_replace(true);
     }
+    // Pin the counter wiring, not just the error text: a forced checkpoint
+    // failure must bump the `commit` series. Both fixtures fail the durable
+    // store write through the `apply_dispatch` Err arm, and the worker stops
+    // at the first failure, so this run contributes exactly one increment.
+    // The series is global and monotonic, hence the lower-bound assertion.
+    let commit_series = "two_bot_gateway_checkpoint_failures_total{stage=\"commit\"} ";
+    let commit_before = global_series(commit_series);
     match checkpoint_failure {
         Some(CheckpointFailure::Rejected) => {
             sqlx::raw_sql(
@@ -426,6 +474,10 @@ async fn queued_commands(
         }
         assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 1);
         assert_eq!(db.count().await, 0);
+        assert!(
+            global_series(commit_series) > commit_before,
+            "a forced checkpoint failure must bump the `commit` counter"
+        );
         None
     } else if graceful_shutdown {
         tokio::time::timeout(Duration::from_secs(15), runner)
@@ -478,11 +530,22 @@ async fn queued_commands(
         2
     );
     let requests = rest.requests();
-    assert_eq!(requests.len(), 8);
-    for (index, content) in [(5, "RSVP saved: going."), (7, "RSVP saved: interested.")] {
-        assert_eq!(requests[index].method, "PATCH");
+    // Fourteen: boot application id + registry PUT, then per RSVP one defer,
+    // pre-write membership/event reads, fence membership/event re-reads and
+    // the completion edit. Completes serialize in dispatch order, so filter
+    // the edits by token instead of pinning positions.
+    assert_eq!(requests.len(), 14);
+    for (token, content) in [
+        ("mock-rsvp-2", "RSVP saved: going."),
+        ("mock-rsvp-3", "RSVP saved: interested."),
+    ] {
+        let edits: Vec<_> = requests
+            .iter()
+            .filter(|request| request.method == "PATCH" && request.path.contains(token))
+            .collect();
+        assert_eq!(edits.len(), 1, "one completion edit for {token}");
         assert_eq!(
-            serde_json::from_slice::<Value>(&requests[index].body).unwrap()["content"],
+            serde_json::from_slice::<Value>(&edits[0].body).unwrap()["content"],
             content
         );
     }
@@ -493,7 +556,7 @@ async fn queued_commands(
             .unwrap();
         ws.send(Message::text(leave(7).to_string())).await.unwrap();
         wait_sequence(&db.store, 7).await;
-        assert_eq!(rest.requests().len(), 8);
+        assert_eq!(rest.requests().len(), 14);
         shutdown.send_replace(true);
         runner.await.unwrap().unwrap();
     }
@@ -542,24 +605,20 @@ async fn acknowledged_queue_drains_before_graceful_shutdown_returns() {
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn sticky_and_feed_are_deferred_at_receipt_while_rsvp_is_pending() {
     let db = TestDb::new().await;
-    let rest = MockRest::start(
-        vec![
-            ScriptedResponse::json(200, json!({"id":"1111"})),
-            ScriptedResponse::status(200),
-            ScriptedResponse::status(204),
-            ScriptedResponse::json(200, json!({"id":EVENT,"guild_id":GUILD,"status":1}))
-                .delayed(Duration::from_millis(3200)),
-        ],
-        // Catch-all must satisfy receipt validation for both 200 callbacks and
-        // successful deferred-original edits.
-        ScriptedResponse::json(200, json!({"id": "99"})),
+    // Route-aware responder: the first live-event read is held 3.2 s while
+    // later reads pass through, membership reads echo the RA-01 `user.id`
+    // evidence, and callbacks/edits get wire-correct receipts regardless of
+    // the sticky/feed defer interleave.
+    let rest = lane_holding_rest(
+        Arc::new(AtomicBool::new(false)),
+        Duration::from_millis(3200),
     )
     .await;
     let (runner, mut ws) = connect(&db, &rest).await;
     ws.send(Message::text(interaction(2, "going").to_string()))
         .await
         .unwrap();
-    wait_requests(&rest, 4).await;
+    wait_requests(&rest, 5).await;
     let delivered = tokio::time::Instant::now();
     let commands: Vec<_> = [(3, "sticky"), (4, "feed-remove")]
         .into_iter()
@@ -576,7 +635,9 @@ async fn sticky_and_feed_are_deferred_at_receipt_while_rsvp_is_pending() {
     for command in &commands {
         ws.send(Message::text(command.to_string())).await.unwrap();
     }
-    wait_requests(&rest, 8).await;
+    // Nine: boot application id + registry PUT, defer + pre-write
+    // membership/event reads, then both validation defers with edits.
+    wait_requests(&rest, 9).await;
     let requests = rest.requests();
     for sequence in [3, 4] {
         let suffix = format!("/interactions/{sequence}/mock-rsvp-{sequence}/callback");
@@ -601,7 +662,10 @@ async fn sticky_and_feed_are_deferred_at_receipt_while_rsvp_is_pending() {
     assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 1);
     ws.send(Message::text(leave(5).to_string())).await.unwrap();
     wait_sequence(&db.store, 5).await;
-    assert_eq!(rest.requests().len(), 9); // No second dispatch at queue consumption.
+    // Twelve: boot application id + registry PUT, defer, pre-write
+    // membership/event reads, both validation defers with edits, then the
+    // fence re-reads and completion edit. No second dispatch at consumption.
+    assert_eq!(rest.requests().len(), 12); // No second dispatch at queue consumption.
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM announcements_audit_log")
             .fetch_one(&db.pool)
@@ -614,7 +678,7 @@ async fn sticky_and_feed_are_deferred_at_receipt_while_rsvp_is_pending() {
     }
     ws.send(Message::text(leave(6).to_string())).await.unwrap();
     wait_sequence(&db.store, 6).await;
-    assert_eq!(rest.requests().len(), 9);
+    assert_eq!(rest.requests().len(), 12);
     runner.abort();
     let _ = runner.await;
     drop(ws);
@@ -1022,6 +1086,11 @@ async fn handoff_rest(seen: Arc<AtomicBool>) -> MockRest {
     use std::sync::atomic::AtomicUsize;
     let calls = Arc::new(AtomicUsize::new(0));
     MockRest::with_responder(move |request| {
+        if request.method == "GET" && request.path.contains("/members/") {
+            let user = request.path.rsplit('/').next().unwrap_or("77");
+            let user = user.split('?').next().unwrap_or("77");
+            return ScriptedResponse::json(200, json!({"user": {"id": user}, "roles": []}));
+        }
         if request.method == "GET" && request.path.contains("scheduled-events") {
             seen.store(true, Ordering::Release);
             let call = calls.fetch_add(1, Ordering::AcqRel);
@@ -1119,6 +1188,11 @@ async fn receipt_callback_total_stays_inside_absolute_budget() {
     let seen = Arc::new(AtomicBool::new(false));
     let seen_probe = Arc::clone(&seen);
     let rest = MockRest::with_responder(move |request| {
+        if request.method == "GET" && request.path.contains("/members/") {
+            let user = request.path.rsplit('/').next().unwrap_or("77");
+            let user = user.split('?').next().unwrap_or("77");
+            return ScriptedResponse::json(200, json!({"user": {"id": user}, "roles": []}));
+        }
         if request.method == "GET" && request.path.contains("scheduled-events") {
             seen_probe.store(true, Ordering::Release);
             // Occupancy ends 100 ms before the receipt budget does, but the

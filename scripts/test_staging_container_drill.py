@@ -191,10 +191,10 @@ class FakeClient:
 
 
 def make_control(world):
-    def control(action, epoch=None, release_fence=False):
+    def control(action, epoch=None, release_fence=False, expected_deployment=None):
         world.tick(1)
         count = sum(1 for call in world.calls if call[0] == action) + 1
-        world.calls.append((action, epoch, release_fence))
+        world.calls.append((action, epoch, release_fence, expected_deployment))
         failure = world.fail_control.get((action, count))
         if failure:
             raise failure
@@ -348,6 +348,9 @@ class HappyPathTests(unittest.TestCase):
                           "status", "fence", "deployment-takeover"])
         self.assertTrue(all(call[2] for call in world.calls
                             if call[0] == "deployment-takeover"))
+        self.assertEqual([call[3] for call in world.calls
+                          if call[0] == "deployment-takeover"],
+                         [BACKOUT_WORKER, PRE])
 
     def test_deploy_config_overrides_only_the_image(self):
         world = World()
@@ -631,9 +634,9 @@ class EvidenceTests(unittest.TestCase):
         world = World()
         control = make_control(world)
 
-        def hostile(action, epoch=None, release_fence=False):
-            state = control(action, epoch, release_fence)
-            if action == "status" and world.calls.count(("status", None, False)) >= 2:
+        def hostile(action, epoch=None, release_fence=False, expected_deployment=None):
+            state = control(action, epoch, release_fence, expected_deployment)
+            if action == "status" and world.calls.count(("status", None, False, None)) >= 2:
                 state["owner"]["phase"] = f"weird {SENTINEL}"
             return state
 
@@ -686,6 +689,26 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(str(caught.exception), "wrong_staging_config")
 
 
+class WranglerEnvTests(unittest.TestCase):
+    def test_deploy_child_gets_only_the_allowlisted_environment(self):
+        job_env = {"PATH": "/usr/bin:/bin", "HOME": "/home/runner",
+                   "CLOUDFLARE_API_TOKEN": "c" * 40, "CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
+                   "OWNERSHIP_CONTROL_TOKEN": SENTINEL,
+                   "UNRELATED_JOB_SECRET": "unrelated-sentinel"}
+        deploy = container_drill.wrangler_deploy("node_modules/.bin/wrangler", "/work/wrangler",
+                                                 job_env)
+        with patch.object(container_drill.subprocess, "run",
+                          return_value=MagicMock(returncode=0)) as run:
+            self.assertEqual(deploy("staging-deploy.json"), 0)
+        args, kwargs = run.call_args
+        self.assertEqual(args[0], ["node_modules/.bin/wrangler", "deploy", "--config",
+                                   "staging-deploy.json", "--env", "staging"])
+        self.assertEqual(kwargs["env"], {"PATH": "/usr/bin:/bin", "HOME": "/home/runner",
+                                         "CLOUDFLARE_API_TOKEN": "c" * 40,
+                                         "CLOUDFLARE_ACCOUNT_ID": ACCOUNT})
+        self.assertNotIn(SENTINEL, repr(kwargs))
+
+
 class MainTests(unittest.TestCase):
     def environ(self, **changes):
         env = {"STAGING_WORKER_URL": URL, "OWNERSHIP_CONTROL_TOKEN": SENTINEL,
@@ -719,7 +742,7 @@ class MainTests(unittest.TestCase):
             summary = Path(directory) / "summary.md"
             env = {**env, "GITHUB_STEP_SUMMARY": str(summary)}
 
-            def deploy_factory(wrangler_bin, directory):
+            def deploy_factory(wrangler_bin, directory, environ):
                 def deploy(config_path):
                     config = json.loads(Path(config_path).read_text())
                     world.deploys.append(

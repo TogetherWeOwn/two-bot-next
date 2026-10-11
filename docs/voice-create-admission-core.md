@@ -108,7 +108,8 @@ The pure core is now called by the runtime with persisted history:
   errors reach the bounded setup failure report; a credential refusal halts all
   subsequent writes. A transient compensation settlement error retries only SQL
   after the channel is known gone. A refusal is a policy outcome, not a lifecycle
-  failure, so it adds no `two_bot_voice_operations_total` outcome.
+  failure: it is counted as `two_bot_voice_operations_total{outcome="refused"}`
+  but never pages (`voice_failures` excludes it).
 
 ## Residual parent work
 

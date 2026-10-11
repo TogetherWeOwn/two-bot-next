@@ -6,15 +6,15 @@ The Together We Own Discord bot (Owen), rewritten in Rust to run in a single alw
 Cloudflare Container. It replaces [two-bot](https://github.com/TogetherWeOwn/two-bot)
 (TypeScript/discord.js), which is now in maintenance mode: fixes only, no new features.
 
-Status: Rust gateway and durable recovery implemented; feature/core and storage
-ports are in place, with runtime integration still incomplete. Twilight is the
-Discord framework — see [ADR 0001](docs/adr/0001-discord-framework.md). The
-`two-bot` binary exposes health/readiness, persists gateway sessions and funnel
-effects, and provides backup/restore operator commands. The `wrangler/` wrapper
-targets one Cloudflare Container; this is not a production-cutover or soak claim.
-Command publication metadata is not proof that every feature is wired into the
-runtime: remaining seams and drop decisions are tracked in the
-[parity matrix](docs/parity.md).
+Status: the bot has been live in production on one Cloudflare Container since
+2026-10-10. A subset of commands is published; see the
+[command publication guide](docs/command-publish.md) for the enabled registry
+and its gates. Publication metadata is not proof that every feature is wired
+into the runtime: remaining seams and drop decisions are tracked in the
+[parity matrix](docs/parity.md). Twilight is the Discord framework — see
+[ADR 0001](docs/adr/0001-discord-framework.md). The `two-bot` binary exposes
+health/readiness, persists gateway sessions and funnel effects, and provides
+backup/restore operator commands.
 
 On-call: [operations runbook](docs/runbook.md) — health/logs, redeploy/rollback,
 RESUME semantics, kill-switch/feature wiring boundaries, backups and common
@@ -36,14 +36,15 @@ failures. See also [backup procedures](docs/backup.md) and
 - **`wrangler/`**: Cloudflare Worker + Durable Object wrapper routes HTTP to a
   singleton `lite` Container and keeps it alive on a 60-second schedule. The Rust
   process owns the long-lived Discord gateway connection; the Worker does not.
-- **Shared Neon Postgres**: the bot and two-web-next use the shared database
+- **Shared Postgres (PlanetScale in production, Neon for staging)**: the bot and two-web-next use the shared database
   contract. Schema/cutover work lives in `sql/` and the cutover crate, not a second
   isolated website datastore.
 
 The `lite` design target remains one gateway session and less than 256 MiB RSS.
 This placement/deployment reference is not B2 soak acceptance: B2 requires flat
 memory and defines no numeric RSS threshold. This README makes no measurement
-claim. Staging deploys from `main`; production is a separate manual gate.
+claim. Staging deploys from `main`; production deploys through the manual
+[`deploy-production` gate](docs/production-deploy.md).
 
 ## Operator references
 
@@ -51,9 +52,14 @@ claim. Staging deploys from `main`; production is a separate manual gate.
   Discord permissions, rendered from the compiled all-enabled registry.
 - [Configuration](docs/configuration.md): all catalog keys/classes, known parsed
   defaults and descriptions. Classes are legacy-catalog labels only: gateway
-  boot reads a fixed set of process-environment keys, and the Container wires
-  no settings store/poller/consumer, so stored values are unwired even after
-  a restart (see the reference).
+  boot reads a fixed set of process-environment keys, and the Container's
+  `guild_settings` poll (`crates/bot/src/website_jobs.rs:152`) publishes through
+  `settings_jobs::live` (`crates/bot/src/settings_jobs.rs:53`) with no feature
+  runtime reading that snapshot yet, so stored values reach the runtime only
+  through per-runtime store refreshes (`raid_runtime.rs:136`,
+  `containment_runtime.rs:186`, `join_risk_runtime.rs:198`) and onboarding's
+  per-event refresh (`onboarding.rs:167`), if at all (see the reference;
+  re-checked at `bce86a791`).
 - [Gateway recovery runbook](docs/gateway-recovery.md): readiness, durable RESUME,
   failure handling and rollback.
 - [Staging soak acceptance](docs/staging-soak.md): the evidence required before

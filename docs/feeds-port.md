@@ -91,7 +91,9 @@ it. `fetch_feed`/`fetch_feed_with` enforce the full contract:
    parser. DNS names resolve from the parsed URL host (IPv6 literals stay
    bracket-free); concatenated gzip members all decode; stacked
    `Content-Encoding` layers are refused before the body drains; non-ASCII
-   content-type, content-encoding and location headers fail closed. One total
+   content-type, content-encoding and location headers fail closed, and a
+   repeated `location` or `content-type` header is refused as ambiguous
+   instead of reading the first value. One total
    15-second deadline (`FetchOptions::default`) covers DNS, every hop, the
    blocking decode and the body read, and is re-checked before success.
 5. The injected `FeedResolver`/`FeedConnector` seams prove the orchestration

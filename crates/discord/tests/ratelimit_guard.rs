@@ -879,3 +879,188 @@ async fn followup_401_is_an_expired_interaction_token_not_a_bot_token_failure() 
     assert_eq!(mock.requests().len(), 3);
     mock.shutdown().await;
 }
+
+// Evidence-read 429 budget: every 429 spends one of the MAX_HTTP_TRIES
+// attempts in the two shared GET helpers, so persistent rate limiting
+// terminates instead of parking the read until a separate guard refuses it.
+// Local 429s sleep retry-after; global 429s ride the shared pause at next
+// admission — both still advance the attempt budget.
+fn local_429() -> ScriptedResponse {
+    ScriptedResponse::json(429, serde_json::json!({"retry_after": 0, "global": false}))
+}
+
+fn global_429() -> ScriptedResponse {
+    ScriptedResponse::json(429, serde_json::json!({"retry_after": 0, "global": true}))
+}
+
+fn read_budget() -> u64 {
+    u64::from(two_bot_core::MAX_HTTP_TRIES)
+}
+
+#[tokio::test]
+async fn observed_persistent_local_429_terminates_absent_within_budget() {
+    let mock = MockRest::start(vec![], local_429()).await;
+    let guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());
+    let exec = executor(&mock, &guard);
+    let result = tokio::time::timeout(
+        Duration::from_secs(8),
+        exec.get_json_observed("/guilds/2222"),
+    )
+    .await
+    .expect("persistent local 429 must terminate");
+    assert_eq!(result.unwrap(), None);
+    assert_eq!(mock.requests().len() as u64, read_budget());
+    assert_eq!(exec.requests(), read_budget());
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn observed_persistent_global_429_terminates_absent_within_budget() {
+    let mock = MockRest::start(vec![], global_429()).await;
+    let guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());
+    let exec = executor(&mock, &guard);
+    let result = tokio::time::timeout(
+        Duration::from_secs(8),
+        exec.get_json_observed("/guilds/2222"),
+    )
+    .await
+    .expect("persistent global 429 must terminate");
+    assert_eq!(result.unwrap(), None);
+    assert_eq!(mock.requests().len() as u64, read_budget());
+    assert_eq!(exec.requests(), read_budget());
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn checked_persistent_local_429_reports_evidence_unavailable_within_budget() {
+    let mock = MockRest::start(vec![], local_429()).await;
+    let guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());
+    let exec = executor(&mock, &guard);
+    let result = tokio::time::timeout(
+        Duration::from_secs(8),
+        exec.get_json_checked("/guilds/2222"),
+    )
+    .await
+    .expect("persistent local 429 must terminate");
+    assert_eq!(result, Err("Discord evidence unavailable".to_owned()));
+    assert_eq!(mock.requests().len() as u64, read_budget());
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn checked_persistent_global_429_reports_evidence_unavailable_within_budget() {
+    let mock = MockRest::start(vec![], global_429()).await;
+    let guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());
+    let exec = executor(&mock, &guard);
+    let result = tokio::time::timeout(
+        Duration::from_secs(8),
+        exec.get_json_checked("/guilds/2222"),
+    )
+    .await
+    .expect("persistent global 429 must terminate");
+    assert_eq!(result, Err("Discord evidence unavailable".to_owned()));
+    assert_eq!(mock.requests().len() as u64, read_budget());
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn observed_mixed_429_and_5xx_exhausts_within_one_budget() {
+    let mock = MockRest::start(
+        vec![
+            local_429(),
+            ScriptedResponse::status(500),
+            local_429(),
+            ScriptedResponse::status(500),
+            local_429(),
+        ],
+        ScriptedResponse::json(200, serde_json::json!({"ok": true})),
+    )
+    .await;
+    let guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());
+    let exec = executor(&mock, &guard);
+    let result = tokio::time::timeout(
+        Duration::from_secs(8),
+        exec.get_json_observed("/guilds/2222"),
+    )
+    .await
+    .expect("mixed 429/5xx must terminate");
+    assert_eq!(result.unwrap(), None);
+    assert_eq!(
+        mock.requests().len() as u64,
+        read_budget(),
+        "every 429 and 5xx shares one attempt budget"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn checked_mixed_429_and_5xx_exhausts_within_one_budget() {
+    let mock = MockRest::start(
+        vec![
+            global_429(),
+            ScriptedResponse::status(503),
+            local_429(),
+            ScriptedResponse::status(500),
+            global_429(),
+        ],
+        ScriptedResponse::json(200, serde_json::json!({"ok": true})),
+    )
+    .await;
+    let guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());
+    let exec = executor(&mock, &guard);
+    let result = tokio::time::timeout(
+        Duration::from_secs(8),
+        exec.get_json_checked("/guilds/2222"),
+    )
+    .await
+    .expect("mixed 429/5xx must terminate");
+    assert_eq!(result, Err("Discord evidence unavailable".to_owned()));
+    assert_eq!(
+        mock.requests().len() as u64,
+        read_budget(),
+        "every 429 and 5xx shares one attempt budget"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn evidence_reads_recover_after_a_single_429() {
+    for make_429 in [local_429, global_429] {
+        let mock = MockRest::start(
+            vec![make_429()],
+            ScriptedResponse::json(200, serde_json::json!({"ok": true})),
+        )
+        .await;
+        let guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());
+        let exec = executor(&mock, &guard);
+        let (data, _) = tokio::time::timeout(
+            Duration::from_secs(8),
+            exec.get_json_observed("/guilds/2222"),
+        )
+        .await
+        .expect("one 429 then success must terminate")
+        .unwrap()
+        .expect("recovery carries evidence");
+        assert_eq!(data, serde_json::json!({"ok": true}));
+        assert_eq!(mock.requests().len(), 2);
+        mock.shutdown().await;
+
+        let mock = MockRest::start(
+            vec![make_429()],
+            ScriptedResponse::json(200, serde_json::json!({"ok": true})),
+        )
+        .await;
+        let guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());
+        let exec = executor(&mock, &guard);
+        let data = tokio::time::timeout(
+            Duration::from_secs(8),
+            exec.get_json_checked("/guilds/2222"),
+        )
+        .await
+        .expect("one 429 then success must terminate")
+        .unwrap();
+        assert_eq!(data, Some(serde_json::json!({"ok": true})));
+        assert_eq!(mock.requests().len(), 2);
+        mock.shutdown().await;
+    }
+}

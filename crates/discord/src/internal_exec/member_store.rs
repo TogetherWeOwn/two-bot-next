@@ -48,6 +48,7 @@ fn replay(action: &str, response: TerminalResponse) -> Result<MemberExecution, A
         TerminalResponse::Success {
             resource_id: None,
             affected,
+            outcome: None,
         } if affected <= 1 => match (action, affected) {
             ("role.assign", 1) => MemberOutcome::Assigned,
             ("role.assign", 0) => MemberOutcome::AlreadyHeld,
@@ -79,6 +80,11 @@ fn replay(action: &str, response: TerminalResponse) -> Result<MemberExecution, A
                     "The recorded attempt had no effect",
                     "no_effect",
                 ),
+                // Member intents never record a settings CAS conflict; a stored
+                // version_conflict here is a database inconsistency, not a replay.
+                TerminalFailure::VersionConflict => {
+                    return Err(storage_error(InternalStoreError::Unavailable));
+                }
             };
             return Err(ActionError::new(code, message, reason));
         }
@@ -186,6 +192,7 @@ impl ActionExecutor {
                         &TerminalResponse::Success {
                             resource_id: None,
                             affected,
+                            outcome: None,
                         },
                     )
                     .await

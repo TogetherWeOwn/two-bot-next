@@ -148,9 +148,10 @@ async fn record_async(
 /// of `ON CONFLICT DO NOTHING` never reaches here; concurrent reconfirmations
 /// serialize on `FOR UPDATE` and converge on the newest hint, so a delayed
 /// stale duplicate cannot overwrite a newer maximum. The `IS NOT DISTINCT
-/// FROM` predicate is the compare-and-swap fallback: the update lands only
-/// against the value this transaction locked and read. Duplicates without a
-/// usable hint skip the lock entirely.
+/// FROM` predicate is the compare-and-swap revision check: the update lands
+/// only against the value this transaction locked and read, and a lost update
+/// (zero rows) fails loudly as `RowNotFound` instead of silently dropping the
+/// maximum. Duplicates without a usable hint skip the lock entirely.
 async fn advance_duplicate(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     event: &FunnelEvent,
@@ -182,7 +183,7 @@ async fn advance_duplicate(
     advance_observation(&mut stored, hint);
     let next = stored.metadata.as_ref().map(|v| v.to_string());
     if next != current_meta {
-        sqlx::query(
+        let updated = sqlx::query(
             "UPDATE events SET metadata = $1 WHERE idempotency_key = $2 AND metadata IS NOT DISTINCT FROM $3",
         )
         .bind(next.as_deref())
@@ -190,6 +191,12 @@ async fn advance_duplicate(
         .bind(current_meta.as_deref())
         .execute(&mut **tx)
         .await?;
+        if updated.rows_affected() != 1 {
+            // Another writer replaced the locked value out from under this
+            // compare-and-swap: surface the lost update loudly instead of
+            // reporting a quiet duplicate with a dropped maximum.
+            return Err(sqlx::Error::RowNotFound);
+        }
     }
     Ok(RecordOutcome { inserted: false })
 }

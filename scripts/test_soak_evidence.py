@@ -1,11 +1,16 @@
 """Soak-evidence parser regressions: committed fixtures only, no staging."""
 
+import contextlib
 import io
 import json
+import tempfile
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
 
-from soak_evidence import summarize
+from soak_evidence import main, summarize
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "scripts/fixtures/soak_evidence_sample.jsonl"
@@ -75,6 +80,348 @@ class SoakEvidenceTests(unittest.TestCase):
         self.assertIn("disconnected", summary["unknown_intervals"][0]["reason"])
         self.assertIsNone(summary["unknown_intervals"][0]["end"])
         self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_duplicate_event_refused_both_orders(self):
+        lines = [
+            '{"ts": "2026-09-20T00:00:01Z", "event": "connect", '
+            '"session": "a", "event": "dispatch", "seq": 1}\n',
+            '{"ts": "2026-09-20T00:00:01Z", "event": "dispatch", "seq": 1, '
+            '"session": "a", "event": "connect"}\n',
+        ]
+        for text in lines:
+            summary = run(text)
+            self.assertEqual(len(summary["unknown_intervals"]), 1)
+            reason = summary["unknown_intervals"][0]["reason"]
+            self.assertEqual(reason, "malformed line 1: duplicate field")
+            self.assertNotIn("connect", reason)
+            self.assertNotIn("dispatch", reason)
+            # Refused instead of last-wins: neither side is counted.
+            self.assertEqual(summary["connects"], 0)
+            self.assertEqual(summary["dispatches"], 0)
+            self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_duplicate_identity_and_time_refused_both_orders(self):
+        cases = [
+            # duplicate identity (session) in both orders
+            ('{"ts": "2026-09-20T00:00:01Z", "event": "connect", '
+             '"session": "sess-AAA-111", "session": "sess-BBB-222"}\n',
+             "sess-AAA-111", "sess-BBB-222"),
+            ('{"ts": "2026-09-20T00:00:01Z", "event": "connect", '
+             '"session": "sess-BBB-222", "session": "sess-AAA-111"}\n',
+             "sess-AAA-111", "sess-BBB-222"),
+            # duplicate time (ts) in both orders
+            ('{"ts": "2026-09-20T00:00:01Z", "event": "connect", '
+             '"session": "sess-AAA-111", "ts": "2026-09-20T00:00:02Z"}\n',
+             "2026-09-20T00:00:01Z", "2026-09-20T00:00:02Z"),
+            ('{"ts": "2026-09-20T00:00:02Z", "event": "connect", '
+             '"session": "sess-AAA-111", "ts": "2026-09-20T00:00:01Z"}\n',
+             "2026-09-20T00:00:01Z", "2026-09-20T00:00:02Z"),
+        ]
+        for text, first, second in cases:
+            summary = run(text)
+            self.assertEqual(len(summary["unknown_intervals"]), 1)
+            reason = summary["unknown_intervals"][0]["reason"]
+            self.assertEqual(reason, "malformed line 1: duplicate field")
+            self.assertNotIn(first, reason)
+            self.assertNotIn(second, reason)
+            self.assertEqual(summary["connects"], 0)
+            self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_deeply_nested_record_becomes_unknown_then_continues(self):
+        nested = "[" * 500 + "]" * 500
+        bad = (
+            '{"ts": "2026-09-20T00:00:01Z", "event": "connect", '
+            f'"session": "a", "payload": {nested}}}\n'
+        )
+        good = (
+            '{"ts": "2026-09-20T00:00:02Z", "event": "connect", '
+            '"session": "a"}\n'
+        )
+        # Must not raise (no traceback); the bad line is UNKNOWN and the
+        # good line still counts.
+        summary = run(bad + good)
+        self.assertEqual(len(summary["unknown_intervals"]), 1)
+        reason = summary["unknown_intervals"][0]["reason"]
+        self.assertEqual(reason, "malformed line 1: too deeply nested")
+        self.assertNotIn(nested, reason)
+        self.assertNotIn("payload", reason)
+        self.assertEqual(summary["connects"], 1)
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+        self.assertEqual(summary["window"]["start"],
+                         "2026-09-20T00:00:02+00:00")
+        self.assertEqual(summary["window"]["end"],
+                         "2026-09-20T00:00:02+00:00")
+        dumped = json.dumps(summary)
+        self.assertNotIn(nested, dumped)
+        self.assertNotIn("Traceback", dumped)
+
+    def test_empty_input_refuses_pass_with_honest_nulls(self):
+        summary = run("")
+        self.assertIsNone(summary["window"]["start"])
+        self.assertIsNone(summary["window"]["end"])
+        self.assertEqual(summary["missed_events"], 0)
+        self.assertEqual(summary["missed_sequence_windows"], [])
+        self.assertEqual(summary["connects"], 0)
+        self.assertEqual(summary["dispatches"], 0)
+        self.assertNotEqual(summary["verdict"], "PASS")
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_blank_only_input_refuses_pass_with_honest_nulls(self):
+        summary = run("   \n\n  \n\t\n")
+        self.assertIsNone(summary["window"]["start"])
+        self.assertIsNone(summary["window"]["end"])
+        self.assertEqual(summary["missed_events"], 0)
+        self.assertEqual(summary["connects"], 0)
+        self.assertEqual(summary["dispatches"], 0)
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_connect_only_input_refuses_pass_without_dispatches(self):
+        summary = run(
+            '{"ts": "2026-09-20T00:00:01Z", "event": "connect",'
+            ' "session": "a"}\n'
+        )
+        self.assertEqual(summary["connects"], 1)
+        self.assertEqual(summary["dispatches"], 0)
+        self.assertEqual(summary["missed_events"], 0)
+        self.assertEqual(summary["unknown_intervals"], [])
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_connect_plus_resume_without_dispatches_refuses_pass(self):
+        summary = run(
+            '{"ts": "2026-09-20T00:00:01Z", "event": "connect",'
+            ' "session": "a"}\n'
+            '{"ts": "2026-09-20T04:00:01Z", "event": "resume",'
+            ' "session": "a", "seq": 7}\n'
+        )
+        self.assertEqual(summary["connects"], 1)
+        self.assertEqual(summary["resumes"], 1)
+        self.assertEqual(summary["dispatches"], 0)
+        self.assertEqual(summary["missed_events"], 0)
+        self.assertEqual(summary["unknown_intervals"], [])
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_cli_exit_code_empty_fails_clean_passes(self):
+        with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".jsonl", delete=True,
+                encoding="utf-8") as empty:
+            empty.write("")
+            empty.flush()
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main([empty.name]), 1)
+        with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".jsonl", delete=True,
+                encoding="utf-8") as blank:
+            blank.write("   \n\n")
+            blank.flush()
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main([blank.name]), 1)
+        with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".jsonl", delete=True,
+                encoding="utf-8") as clean:
+            clean.write(
+                '{"ts": "2026-09-20T00:00:01Z", "event": "connect",'
+                ' "session": "a"}\n'
+                '{"ts": "2026-09-20T00:00:02Z", "event": "dispatch",'
+                ' "session": "a", "seq": 1}\n'
+            )
+            clean.flush()
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main([clean.name]), 0)
+
+    def test_decoder_recursion_overflow_becomes_unknown_then_continues(self):
+        # Deep enough to overflow the C JSON decoder itself (default
+        # recursion limit 1000), so json.loads raises RecursionError before
+        # _too_deeply_nested is reached. This pins the except RecursionError
+        # branch in summarize(): without it the whole run aborts.
+        bad = "[" * 100000 + "\n"
+        good = (
+            '{"ts": "2026-09-20T00:00:02Z", "event": "connect", '
+            '"session": "a"}\n'
+        )
+        # Must not raise; the bad line is UNKNOWN and the good line counts.
+        summary = run(bad + good)
+        self.assertEqual(len(summary["unknown_intervals"]), 1)
+        reason = summary["unknown_intervals"][0]["reason"]
+        self.assertEqual(reason, "malformed line 1: too deeply nested")
+        self.assertEqual(summary["connects"], 1)
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+        self.assertEqual(summary["window"]["start"],
+                         "2026-09-20T00:00:02+00:00")
+        self.assertEqual(summary["window"]["end"],
+                         "2026-09-20T00:00:02+00:00")
+
+    def test_invalid_session_identities_become_unknown_then_continues(self):
+        # State-bearing events require a nonempty string session. Array,
+        # object, null, missing and empty identities must not raise, must
+        # not touch counters/sequence/recovery state, and later valid
+        # records are still summarized. Reasons are fixed per event with
+        # no identity/value echo.
+        bad = (
+            '{"ts": "2026-09-20T00:00:01Z", "event": "connect", "session": []}\n'
+            '{"ts": "2026-09-20T00:00:02Z", "event": "dispatch", '
+            '"session": {}, "seq": 1}\n'
+            '{"ts": "2026-09-20T00:00:03Z", "event": "dispatch", "seq": 1}\n'
+            '{"ts": "2026-09-20T00:00:04Z", "event": "dispatch", '
+            '"session": null, "seq": 1}\n'
+            '{"ts": "2026-09-20T00:00:05Z", "event": "dispatch", '
+            '"session": "", "seq": 1}\n'
+            '{"ts": "2026-09-20T00:00:06Z", "event": "resume", '
+            '"session": [], "seq": 1}\n'
+        )
+        good = (
+            '{"ts": "2026-09-20T00:00:07Z", "event": "connect", "session": "a"}\n'
+            '{"ts": "2026-09-20T00:00:08Z", "event": "dispatch", '
+            '"session": "a", "seq": 1}\n'
+            '{"ts": "2026-09-20T00:00:09Z", "event": "dispatch", '
+            '"session": "a", "seq": 2}\n'
+        )
+        # Must not raise (no traceback); bad lines are UNKNOWN and the
+        # good lines still count.
+        summary = run(bad + good)
+        self.assertEqual(len(summary["unknown_intervals"]), 6)
+        reasons = [u["reason"] for u in summary["unknown_intervals"]]
+        self.assertEqual(reasons.count("connect with invalid session"), 1)
+        self.assertEqual(reasons.count("dispatch with invalid session"), 4)
+        self.assertEqual(reasons.count("resume with invalid session"), 1)
+        for reason in reasons:
+            self.assertNotIn("[]", reason)
+            self.assertNotIn("{}", reason)
+            self.assertNotIn("None", reason)
+            self.assertNotIn("null", reason)
+            self.assertNotIn("Traceback", reason)
+        # Invalid identities leave no counter, sequence or recovery trace.
+        self.assertEqual(summary["connects"], 1)
+        self.assertEqual(summary["dispatches"], 2)
+        self.assertEqual(summary["resumes"], 0)
+        self.assertEqual(summary["missed_sequence_windows"], [])
+        self.assertEqual(summary["missed_events"], 0)
+        self.assertEqual(summary["redeploy_gaps_s"], [])
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+        dumped = json.dumps(summary)
+        self.assertNotIn("Traceback", dumped)
+
+    def test_invalid_session_does_not_clear_reconnect_gap(self):
+        # A malformed connect/resume must not consume the pending
+        # disconnect: only the later valid connect closes the gap.
+        summary = run(
+            '{"ts": "2026-09-20T00:00:01Z", "event": "connect", "session": "a"}\n'
+            '{"ts": "2026-09-20T00:00:02Z", "event": "disconnect", "session": "a"}\n'
+            '{"ts": "2026-09-20T00:00:03Z", "event": "connect", "session": []}\n'
+            '{"ts": "2026-09-20T00:00:04Z", "event": "resume", "session": ""}\n'
+            '{"ts": "2026-09-20T00:00:12Z", "event": "connect", "session": "b"}\n'
+        )
+        reasons = [u["reason"] for u in summary["unknown_intervals"]]
+        self.assertIn("connect with invalid session", reasons)
+        self.assertIn("resume with invalid session", reasons)
+        self.assertEqual(summary["connects"], 2)
+        self.assertEqual(summary["resumes"], 0)
+        # Gap measured from the disconnect to the valid connect only.
+        self.assertEqual(summary["redeploy_gaps_s"], [10.0])
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_timestamp_regression_cannot_close_outage(self):
+        summary = run(
+            '{"ts": "2026-09-20T00:00:00Z", "event": "dispatch", "session": "a", "seq": 1}\n'
+            '{"ts": "2026-09-20T00:00:01Z", "event": "disconnect", "session": "a"}\n'
+            '{"ts": "2026-09-20T00:00:00Z", "event": "resume", "session": "a", "seq": 50}\n'
+            '{"ts": "2026-09-20T00:00:03Z", "event": "resume", "session": "a", "seq": 2}\n'
+            '{"ts": "2026-09-20T00:00:04Z", "event": "dispatch", "session": "a", "seq": 4}\n'
+        )
+        self.assertEqual(summary["redeploy_gaps_s"], [2.0])
+        self.assertTrue(all(gap >= 0 for gap in summary["redeploy_gaps_s"]))
+        self.assertEqual(summary["resumes"], 1)
+        self.assertEqual(summary["missed_sequence_windows"][0]["count"], 1)
+        self.assertEqual(summary["window"], {
+            "start": "2026-09-20T00:00:00+00:00",
+            "end": "2026-09-20T00:00:04+00:00",
+        })
+        self.assertEqual(len(summary["unknown_intervals"]), 1)
+        self.assertEqual(summary["unknown_intervals"][0]["reason"],
+                         "timestamp regression on line 3")
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_timestamp_regression_does_not_advance_sequence(self):
+        summary = run(
+            '{"ts": "2026-09-20T00:00:01Z", "event": "connect", "session": "a"}\n'
+            '{"ts": "2026-09-20T00:00:02Z", "event": "dispatch", "session": "a", "seq": 1}\n'
+            '{"ts": "2026-09-20T00:00:01Z", "event": "dispatch", "session": "a", "seq": 50}\n'
+            '{"ts": "2026-09-20T00:00:03Z", "event": "dispatch", "session": "a", "seq": 4}\n'
+        )
+        self.assertEqual(summary["dispatches"], 2)
+        self.assertEqual(summary["missed_sequence_windows"], [{
+            "session": "a",
+            "expected_after": 1,
+            "received": 4,
+            "count": 2,
+            "at": "2026-09-20T00:00:03+00:00",
+        }])
+        self.assertEqual(summary["unknown_intervals"][0]["reason"],
+                         "timestamp regression on line 3")
+
+    def test_timestamp_regression_does_not_reset_session_sequence(self):
+        summary = run(
+            '{"ts": "2026-09-20T00:00:01Z", "event": "dispatch", "session": "a", "seq": 1}\n'
+            '{"ts": "2026-09-20T00:00:03Z", "event": "dispatch", "session": "a", "seq": 2}\n'
+            '{"ts": "2026-09-20T00:00:02Z", "event": "connect", "session": "a"}\n'
+            '{"ts": "2026-09-20T00:00:04Z", "event": "dispatch", "session": "a", "seq": 4}\n'
+        )
+        self.assertEqual(summary["connects"], 0)
+        self.assertEqual(summary["missed_sequence_windows"][0]["count"], 1)
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_equal_timestamps_and_ordered_duplicate_dispatches_are_accepted(self):
+        summary = run(
+            '{"ts": "2026-09-20T00:00:01Z", "event": "connect", "session": "a"}\n'
+            '{"ts": "2026-09-20T00:00:01Z", "event": "dispatch", "session": "a", "seq": 1}\n'
+            '{"ts": "2026-09-20T00:00:01Z", "event": "dispatch", "session": "a", "seq": 1}\n'
+            '{"ts": "2026-09-20T00:00:02Z", "event": "dispatch", "session": "a", "seq": 2}\n'
+        )
+        self.assertEqual(summary["dispatches"], 3)
+        self.assertEqual(summary["missed_events"], 0)
+        self.assertEqual(summary["unknown_intervals"], [])
+        self.assertEqual(summary["verdict"], "PASS")
+
+    def test_regressed_unknown_record_is_not_applied_and_window_ignores_it(self):
+        summary = run(
+            '{"ts": "2026-09-20T00:00:02Z", "event": "connect", "session": "a"}\n'
+            '{"ts": "2026-09-20T00:00:01Z", "event": "unknown", '
+            '"start": "2026-09-20T00:00:00Z", '
+            '"end": "2026-09-20T00:00:01Z", "reason": "ignored regression"}\n'
+            '{"ts": "2026-09-20T00:00:03Z", "event": "dispatch", "session": "a", "seq": 1}\n'
+        )
+        self.assertEqual(summary["window"], {
+            "start": "2026-09-20T00:00:02+00:00",
+            "end": "2026-09-20T00:00:03+00:00",
+        })
+        self.assertEqual(summary["connects"], 1)
+        self.assertEqual(summary["dispatches"], 1)
+        self.assertEqual(summary["unknown_intervals"], [{
+            "start": "2026-09-20T00:00:01+00:00",
+            "end": "2026-09-20T00:00:01+00:00",
+            "reason": "timestamp regression on line 2",
+        }])
+
+    def test_cli_timestamp_regression_exits_nonzero_without_raw_record(self):
+        raw_record = (
+            '{"ts": "2026-09-20T00:00:00Z", "event": "resume", '
+            '"session": "private-session-value", "seq": 999}\n'
+        )
+        text = (
+            '{"ts": "2026-09-20T00:00:01Z", "event": "disconnect", "session": "a"}\n'
+            + raw_record
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "regression.jsonl"
+            path.write_text(text, encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/soak_evidence.py"), str(path)],
+                capture_output=True, text=True, check=False,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        summary = json.loads(result.stdout)
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+        self.assertNotIn("private-session-value", result.stdout + result.stderr)
+        self.assertNotIn("999", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

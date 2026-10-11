@@ -140,6 +140,7 @@ pub mod voice_ownership;
 pub mod voice_permission_health;
 pub mod voice_permissions;
 pub mod voice_placement;
+pub mod voice_presence;
 pub mod voice_private;
 pub mod voice_reconcile;
 pub mod voice_rename_coalescer;
@@ -150,6 +151,7 @@ pub mod voice_style;
 pub mod voice_template;
 pub mod voice_template_lint;
 pub mod voice_text_channel;
+pub mod voice_time_zone;
 pub mod voice_utilities;
 pub mod voice_vote_kick;
 pub mod voice_vote_kick_audit;
@@ -190,13 +192,14 @@ pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryErr
 pub use community::{
     build_scorecard, classify, is_scorecard_run_time, previous_closed_week, scorecard_tick,
     week_start_ms, Classification, ClassifierConfig, ClassifyInput, FactRow, ScorecardGates,
-    ScorecardInputs, ScorecardOutcome, StreamCoverage, COMMUNITY_CLASSIFICATIONS,
-    COMMUNITY_FACT_TYPES, SCORECARD_TICK_INTERVAL_MS,
+    ScorecardInputs, ScorecardOutcome, StreamCoverage, CAPTURED_STREAMS, COMMUNITY_CLASSIFICATIONS,
+    COMMUNITY_FACT_TYPES, SCORECARD_TICK_INTERVAL_MS, STREAM_WRITERS,
 };
 pub use community_snapshots::{
-    build_community_snapshot, build_counter_reading, match_rank_roles, window_bounds,
-    CommunitySnapshot, CounterReading, CounterSkip, JobGate, JobGuard, MemberRank, RaidAnomaly,
-    RaidWindow, RankKey, RankRole, RankRow, RankSkip, RosterMember, LIVE_COUNTER_INTERVAL_MS,
+    build_community_snapshot, build_counter_reading, diagnose_rank_roles, match_rank_roles,
+    plan_rank_heal, window_bounds, CommunitySnapshot, CounterReading, CounterSkip, JobGate,
+    JobGuard, MemberRank, RaidAnomaly, RaidWindow, RankHeal, RankKey, RankRole, RankRow,
+    RankRungFailure, RankRungProblem, RankSkip, RosterMember, LIVE_COUNTER_INTERVAL_MS,
     RAID_ANOMALIES, RANK_SNAPSHOT_INTERVAL_MS,
 };
 pub use config::Config;
@@ -221,7 +224,7 @@ pub use custom_commands::{
     validate_put_input, validate_template, AuditRecord, CommandError, DeleteDecision,
     PutCommandInput, PutDecision, RunOutcome, StoredCommand, TemplateContext, TemplateError,
     MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_RENDERED_CHARS, MAX_TEMPLATE_CHARS,
-    TEMPLATE_PLACEHOLDERS,
+    MAX_TEXT_TRIGGER_CHARS, TEMPLATE_PLACEHOLDERS,
 };
 pub use events::{CoreEvent, VoiceSessionDelta};
 pub use evidence::{
@@ -354,15 +357,19 @@ pub use router::{
 };
 pub use rsvp::{
     attendance_totals_text, checkin_classification, checkin_duplicate_text,
-    checkin_idempotency_key, checkin_metadata_json, checkin_recorded_text, checkin_source,
-    checkin_source_event_id, is_snowflake, partition_rsvps, require_manage_events, rsvp_saved_text,
-    validate_event_id, validate_occurrence_id, AttendanceClassification, AttendanceProof,
-    CheckinError, RsvpAudit, RsvpError, RsvpRecord, RsvpStatus, RsvpTotals, RsvpTransition,
-    ATTENDANCE_EVENT_TYPE, RSVP_AUDIT_ACTION,
+    checkin_idempotency_key, checkin_metadata_json, checkin_occurrence_full_text,
+    checkin_recorded_text, checkin_source, checkin_source_event_id, is_snowflake,
+    parse_attendance_occurrence, partition_rsvps, require_manage_events, rsvp_event_full_text,
+    rsvp_rate_limited_text, rsvp_saved_text, validate_event_id, validate_occurrence_id,
+    AttendanceClassification, AttendanceOccurrence, AttendanceProof, CheckinError, RsvpAudit,
+    RsvpError, RsvpRecord, RsvpStatus, RsvpTotals, RsvpTransition, ATTENDANCE_EVENT_TYPE,
+    AUDIT_RETENTION_DAYS, MAX_CHECKINS_PER_OCCURRENCE, MAX_RSVPS_PER_EVENT,
+    MAX_RSVP_WRITES_PER_USER_PER_MINUTE, RSVP_AUDIT_ACTION, RSVP_RETENTION_DAYS,
 };
 #[cfg(feature = "db")]
 pub use rsvp_store::{
-    list_rsvps, put_rsvp, record_checkin, write_audit, CheckinWrite, RsvpStoreError,
+    compensate_checkin_write, compensate_rsvp_write, list_rsvps, prune_rsvp_history, put_rsvp,
+    record_checkin, write_audit, CheckinWrite, RsvpStoreError,
 };
 pub use scheduled::{
     advance_next_run_iso, advance_next_run_ms, clamp_retry_delay_ms, format_iso_ms, lease_until_ms,
@@ -437,11 +444,14 @@ pub use voice_rooms::{
     PermissionSource, ProposeOutcome, QueuedAction, ReconcilePlan, RenameCoalescer, RoomAction,
     RoomJoinDecision, RoomJoinRequest, RoomLeaveDecision, RoomLeaveReport, RoomPosition, RoomStore,
     SeenChannel, TextCompanion, VoiceGates, VoiceRoom, MAX_CHANNELS_PER_CATEGORY,
-    MAX_CHANNEL_NAME_LEN, MAX_USER_LIMIT, QUEUE_MAX_ATTEMPTS, RENAME_MIN_INTERVAL_MS,
+    MAX_CHANNEL_NAME_LEN, MAX_FAILED_ACTIONS, MAX_USER_LIMIT, QUEUE_MAX_ATTEMPTS,
+    RENAME_MIN_INTERVAL_MS,
 };
 pub use voice_vote_kick::{
     RoomKickDecision, VoteBallot, VoteCancellation, VoteClock, VoteKickCore, VoteKickError,
-    VoteKickRef, VoteKickStatus, VoteKickUpdate, VoteProgress, VoteRoomFacts, VOTE_KICK_TTL_MS,
+    VoteKickRef, VoteKickStatus, VoteKickUpdate, VoteProgress, VoteRoomFacts,
+    VOTE_KICK_COOLDOWN_MS, VOTE_KICK_INITIATOR_LIMIT, VOTE_KICK_INITIATOR_WINDOW_MS,
+    VOTE_KICK_TTL_MS,
 };
 #[cfg(feature = "db")]
 pub use website_store::{

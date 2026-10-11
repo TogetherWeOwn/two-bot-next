@@ -370,6 +370,44 @@ export class TokenBuckets {
     return verdict;
   }
 
+  /**
+   * Read-only throttle check: reports whether `take` would allow this caller
+   * right now without consuming budget, touching recency, denials or holds.
+   * Unknown callers report allowed without minting an entry, so scanners
+   * cannot grow the map through this path. Use it to refuse throttled
+   * callers before a secret comparison, so guessing cannot confirm a bearer
+   * while the bucket is exhausted; record real failures with `take`.
+   */
+  peek(key: string): ThrottleVerdict {
+    const canonical = canonicalCallerKey(key);
+    const t = this.clock();
+    const b = this.buckets.get(canonical);
+    if (!b) return { allowed: true, retryAfter: 0 };
+    if (b.heldUntil !== undefined) {
+      if (t < b.heldUntil) {
+        return {
+          allowed: false,
+          retryAfter: Math.max(1, Math.ceil((b.heldUntil - t) / 1000)),
+        };
+      }
+      // Hold elapsed: the next take clears the streak; a peek stays allowed
+      // only if refill has restored a token.
+    }
+    if (Math.max(0, t - b.updatedAt) >= this.idleTtlMs) {
+      // Idle-expired buckets restart full on next take; report allowed.
+      return { allowed: true, retryAfter: 0 };
+    }
+    // Map-full fail-closed state in take() only sheds unknown callers; a
+    // tracked caller keeps its computed verdict here.
+    const tokens = Math.min(
+      this.spec.capacity,
+      b.tokens + Math.max(0, (t - b.updatedAt) / 1000) * this.spec.refillPerSecond,
+    );
+    if (tokens >= 1) return { allowed: true, retryAfter: 0 };
+    const wait = Math.ceil((1 - tokens) / this.spec.refillPerSecond);
+    return { allowed: false, retryAfter: Math.max(1, wait) };
+  }
+
   /** Visit up to `sweepBudget` entries from the least-recent end. */
   private sweep(t: number): void {
     let budget = this.sweepBudget;

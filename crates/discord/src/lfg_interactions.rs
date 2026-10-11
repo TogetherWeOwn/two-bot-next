@@ -2,6 +2,7 @@
 
 use crate::{automation_admission::ActorCooldowns, ActionExecutor, DiscordError};
 use serde_json::{json, Value};
+use two_bot_core::commands::MAX_RESOURCE_ID_CHARS;
 use two_bot_core::lfg::{self, LfgPost, LfgRole, LfgSelectAction, LfgSignup, LfgStatus};
 use two_bot_core::{lfg_store as store, rsvp::RsvpAudit, rsvp_store};
 
@@ -149,7 +150,20 @@ impl LfgInteractions {
         let at = lfg::iso_millis_utc(now);
         let id = match &request {
             LfgRequest::Create { .. } => format!("lfg-{interaction_id}"),
-            LfgRequest::Close { post_id } => post_id.clone(),
+            LfgRequest::Close { post_id } => {
+                if post_id.is_empty()
+                    || post_id
+                        .encode_utf16()
+                        .take(MAX_RESOURCE_ID_CHARS + 1)
+                        .count()
+                        > MAX_RESOURCE_ID_CHARS
+                {
+                    return Err(LfgError::Invalid(
+                        "LFG id must be between 1 and 128 characters.".into(),
+                    ));
+                }
+                post_id.clone()
+            }
             LfgRequest::Select(
                 LfgSelectAction::Signup { post_id, .. } | LfgSelectAction::Leave { post_id },
             ) => post_id.clone(),

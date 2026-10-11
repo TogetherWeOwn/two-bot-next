@@ -33,6 +33,7 @@ mod db_log;
 mod discord_test_common;
 mod dispatch;
 mod erasure_cli;
+mod event_cli;
 mod feed_jobs;
 mod gateway;
 mod gateway_commands;
@@ -471,6 +472,12 @@ async fn run(cli_args: &[String]) {
                                 step_failure(FailureClass::MilestonesLoadFailed, error)
                             })?,
                     );
+                    // Community voice + message capture: arm the Postgres
+                    // facts sink only when the scorecard job is enabled, so a
+                    // staging-gated rollout captures exactly while it scores.
+                    if std::env::var("TWO_COMMUNITY_SCORECARD").is_ok_and(|v| v == "1") {
+                        pipeline.enable_community_facts(pool.clone());
+                    }
                     // Join-burst watch is always on, as legacy raid watch was (TWO-56),
                     // and independent of the anti-nuke flags. It shares the command
                     // runtime's REST executor and runs behind the funnel's join row.
@@ -611,12 +618,16 @@ async fn run(cli_args: &[String]) {
             match failed {
                 None => Ok(()),
                 Some(failed) => {
+                    // Only a running-gateway failure lingers 75 s so a
+                    // keepalive scrape sees the checkpoint counter; startup
+                    // failures keep the short 15 s linger.
+                    let linger = shutdown::failure_linger(failed.class);
                     publish_gateway_failure(
                         &state,
                         &failure_slot,
                         failed.class,
                         linger_stop,
-                        shutdown::FAILURE_LINGER,
+                        linger,
                     )
                     .await;
                     Err(failed.error)

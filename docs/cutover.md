@@ -123,7 +123,10 @@ that can mutate the copied data can be paused and resumed without duplication.
 **T−15 min:** run read-only command diff and preflight with the production
 application/guild through the authorized REST executor (no gateway startup).
 Capture token-valid/application identity, intent flags, role/channel results and
-session-start budget; FAIL is NO-GO, WARN needs a recorded disposition. Snapshot
+the `session start budget` check (`GET /gateway/bot`: `remaining`, `total`,
+`reset_after_ms`, `max_concurrency`); FAIL is NO-GO (exit 1), including
+`remaining` below 10 or an unreadable budget, while WARN (`remaining` below
+100) needs a recorded disposition but keeps exit 0. Snapshot
 legacy configuration, command definitions **and separate guild permissions**
 *before* any overwrite. Confirm the legacy restart path does not auto-register a
 different registry or resume a stale session. Verify the persisted Worker/DO
@@ -156,18 +159,19 @@ has RESUME disabled (see below).
 
 ## Tool availability and command sheet
 
-Baseline checked: `44338b2` on 2026-09-30. Recheck candidate **source parsing**
+Baseline checked: `bce86a791` on 2026-10-09. Recheck candidate **source parsing**
 before invoking tools. `two-bot` with no subcommand starts the server;
-`two-bot serve` is **not** supported. For baseline help-only inspection, use
-**only `two-bot --help`** (top-level).
+`two-bot serve` is **not** supported.
 
-Do **not** run `two-bot backup --help` or
-`two-bot guild-config-snapshot --help`: dispatch ignores their trailing arguments
-and executes the backup/prune/upload or Discord snapshot/upload instead. The
-usage comment claiming help after any subcommand is not the dispatch behavior:
-[argument dispatch](../crates/bot/src/backup_cli.rs#L162). Other binaries or future
-subcommand help paths require source/fixture verification before approval; a
-`--help` suffix is not a read-only safety boundary.
+`--help` is read-only on the operator CLIs: `two-bot backup --help`,
+`two-bot guild-config-snapshot --help`, and `--help` after any subcommand print
+usage and exit 0 before any env, DB or network read, so `--help` never dumps,
+prunes or uploads
+([help routing](../crates/bot/src/backup_cli.rs#L216), [dispatch](../crates/bot/src/backup_cli.rs#L242)).
+A trailing argument that is not `--help` is refused with exit 2 (`:231-236`).
+Other binaries or future subcommand help paths still require source/fixture
+verification before approval; a `--help` suffix is not a universal read-only
+safety boundary.
 
 ### Existing tools: limited recovery, not the full cutover data path
 
@@ -211,22 +215,28 @@ Do not use `dedupe-events` during cutover: it defaults to deletion and has no
 guild fence. Their exact behavior is in the
 [cutover CLI sources](../crates/cutover/src/bin) and is outside this procedure.
 
-### Planned copy, registry and preflight tools
+### Merged copy, registry and preflight tools
 
-The following are **planned, not merged into this baseline**; do not paste them
-into a production shell or invent flags to make them work:
+The following are merged in this baseline (re-checked at `bce86a791`); do not
+paste them into a production shell without the cutover executor's approval:
 
-| Planned invocation | Owner / use / missing evidence |
+| Merged invocation | Source / use / limit |
 |---|---|
-| `legacy_copy` (separate cutover binary), default dry-run; `--apply`, `--allow-live-target` planned | [TOG-10868](/TOG/issues/TOG-10868): per-group legacy→Next mapping and row-count plan. Pending schema groups must fail, not be omitted. Exact source/target binding flags and verification invocation require merged tool documentation. A forward upsert is **not** a rollback delta exporter |
-| `two-bot commands diff` | [TOG-10860](/TOG/issues/TOG-10860): read current guild registry and compare to compiled desired registry; no PUT/no gateway |
-| `two-bot commands publish --apply` | Same card: explicit overwrite; default dry-run and live-guild opt-in required. Verify final flag spelling after merge; global snapshot/restore is not implied by a guild tool |
-| `two-bot preflight --json` | [TOG-10858](/TOG/issues/TOG-10858): read-only REST identity/intents/role/channel checks, FAIL vs WARN. Verify target selection and live-target guards after merge |
+| `legacy_copy` (separate cutover binary), default dry-run; `--apply`, `--allow-live-target` | `crates/cutover/src/bin/legacy_copy.rs:9-18`: per-group legacy→Next mapping and row-count plan. Pending schema groups fail, not omitted. A forward upsert is **not** a rollback delta exporter |
+| `two-bot commands diff` | `crates/bot/src/commands_cli.rs:19-28`: read current guild registry and compare to compiled desired registry; no PUT/no gateway |
+| `two-bot commands publish --apply` | Same source: explicit overwrite; default dry-run and `--allow-live-guild` opt-in required. Global snapshot/restore is not implied by a guild tool |
+| `two-bot preflight --json` | `crates/bot/src/preflight.rs:31-40`: read-only REST identity/intents/role/channel checks, FAIL vs WARN |
+| `gateway-force-identify` (separate cutover binary), default dry-run; `--apply --reason`, `--allow-live-guild` | `crates/cutover/src/bin/gateway_force_identify.rs:1-14`: prints guild, shard, checkpoint age and directive, writes nothing; `--apply` arms a one-shot force-fresh IDENTIFY consumed by the next boot. Required for the first production boot ([gateway recovery](gateway-recovery.md#force-fresh-identify-first-production-boot)) |
+| `rollback-delta --since <RFC3339> [--export <path>]` (separate cutover binary) | `crates/cutover/src/bin/rollback_delta.rs:14-52`: read-only delta report; `--export` writes the report to a file. Reverse import is still missing |
 
-No `commands restore`, complete database delta export/reverse-import, or
-`--disable-resume` command is established by this baseline. Gateway RESUME is
-automatic; there is no verified disable environment flag either. Do not invent
-`RESUME=0`, delete session rows or omit the database to force a fresh session.
+No `commands restore` (registry), database delta reverse-import, or
+`--disable-resume` command is established by this baseline (re-checked at
+`bce86a791`: `commands_cli.rs` offers only `diff`/`publish`, no `restore`;
+no `disable-resume`/`RESUME=0` in `crates/bot/src`). Gateway RESUME is
+automatic and there is no verified disable environment flag. Do not invent
+`RESUME=0`: to force a fresh session, arm the one-shot IDENTIFY directive with
+`gateway-force-identify --apply` (see table); manual session-row edits are not a
+reviewed path.
 These are required **capabilities**, not claimed existing subcommands. B4 must
 attach a reviewed, fixture-rehearsed execution/restore command sheet covering
 them before GO. Likewise, the merged generic backup is not a complete snapshot
@@ -277,8 +287,11 @@ version; there is no client-supplied target deployment. `expectedEpoch` is 0 onl
 for a never-initialized record; a stale/replayed epoch returns 409. It is not safe
 to invent 0 or retry a conflict without reading and reconciling the new state.
 
-Each accepted change increments the epoch, atomically persists a **fenced**
+Each accepted change commits exactly one epoch higher, atomically persists a **fenced**
 owner and audit receipt, then awaits native destruction and checks `running=false`.
+The single exception is an idempotent repeat: a same-owner exact-epoch takeover
+over an `active` record with no recovery pending returns the stored record
+unchanged, with no write, no audit row, no destroy and no epoch increment.
 Only a successful takeover writes `phase=active`; it does **not** start the new
 container. A stop/crash/final-write failure leaves persisted denial and must be
 reconciled with a fresh authenticated epoch change. The independent audit keys
@@ -357,8 +370,11 @@ alongside an unconfirmed Next gateway.
 - The baseline has no wired scheduled-unban handoff/sweeper. Moderator sign-off
   must identify a verified executor for every pending deadline before GO:
   [moderation port boundary](../crates/core/src/moderation.rs#L7).
-- `/health` reports process liveness; `/readyz` covers process + gateway only.
-  The baseline server does not expose `/internal/actions` or `/metrics`:
+- `/health` reports process liveness; `/readyz` always carries four components (`process`, `gateway`, `database`, plus `token_invalid` as Ready or Down, which forces 503) (`crates/bot/src/server.rs:228-240`, `:177`, `:191-209`; re-checked at `bce86a791`).
+  The baseline server does not expose `/internal/actions` (separate signed listener:
+  `crates/bot/src/internal_action_http.rs:285`, bound at `crates/bot/src/main.rs:301`),
+  but it does serve `/metrics` on the same listener
+  (`crates/bot/src/server.rs:65`, `crates/bot/src/metrics_http.rs:21`):
   [HTTP routes and readiness](../crates/bot/src/server.rs#L21). Feature and
   internal-action acceptance therefore require separate merged runtime evidence.
 
@@ -596,6 +612,12 @@ warm until separate retirement authorization; do not close B4 on a failed watch.
 ## Rollback: preserve Next-window writes before reopening legacy
 
 **Maximum accepted loss:** **0 acknowledged committed database writes**.
+See the "Production decision window" section in
+[cutover-rollback-runbook.md](cutover-rollback-runbook.md#production-decision-window)
+for the recorded 2-hour decision window from `T_0` and the forward-fix posture
+after its closure. The zero-loss gate below continues to govern reopening
+legacy.
+
 The Next write window is `[T_0, T_r]` (up to the full 48-hour watch, longer if
 extended), not merely the time since the last nightly backup. Restore-to-`T_f`
 alone would lose that entire window and is **not an acceptable rollback**.
@@ -676,6 +698,18 @@ writes in maintenance, preserve both data sets, and escalate a decision brief to
 the Director of Engineering. **Never silently choose a 48-hour data loss** to
 restore availability. Any proposed loss/irreversible recovery requires its
 separate authority; the lead cannot waive this runbook's zero-loss gate.
+
+**Decision D5 (live cutover, declared by the cutover lead — see
+[cutover-rollback-runbook.md](cutover-rollback-runbook.md) §1 Decider):**
+the production cutover is live. Production is
+the PlanetScale main database `two_bot`. Writes made during the Next window
+are accepted as lost on rollback, bounded by a 2-hour rollback decision
+window; after that window it is forward-fix only, never rollback. Mitigation
+is the pre-cutover PlanetScale backup plus the untouched Coolify `twobot`
+database. The zero-loss gate above describes the pre-cutover plan; during
+the 2-hour rollback decision window this decision supersedes it for
+rollback. After the window closes it is forward-fix only, never rollback,
+so no rollback supersession applies there.
 
 ## Communication template
 

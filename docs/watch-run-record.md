@@ -129,7 +129,10 @@ gateway, no credential substitution).
 ## 5. Checkpoint go/no-go annotations
 
 Checkpoints sit at +15 min, +1 h, +6 h, +24 h, +48 h from `T_0`. One row
-each on the execution card.
+each on the execution card. The ``readyz`` + revision match cell comes from
+`scripts/cutover_watch_checkpoint.py` output (one call per checkpoint — see
+the [48-hour watch log](production-deploy.md#48-hour-watch-log-tog-9699)),
+not hand-filled; the verdict, decider, and deadline cells stay human.
 
 | Checkpoint | UTC time | `readyz` + revision match | Open incidents (name or none) | Verdict | Decider | New deadline (EXTEND only) |
 | --- | --- | --- | --- | --- | --- | --- |

@@ -233,12 +233,28 @@ impl Occurrence<'_> {
             }
             Ok(None) => {
                 // The definition changed or was cancelled while Discord was
-                // posting: remove the orphan rather than let it survive.
-                if let Some(message_id) = &message_id {
-                    let _ = self.delete(message_id).await;
-                }
-                self.audit(&OccurrenceOutcome::StaleCompletion, None, audit_failed)
-                    .await;
+                // posting: remove the orphan rather than let it survive. A
+                // refused or timed-out delete is surfaced in the audit reason
+                // (and a structured warning) instead of reported as a clean
+                // cleanup; the orphan is left alone, never retried here or
+                // re-posted.
+                let cleanup_reason = match &message_id {
+                    Some(message_id) => match self.delete(message_id).await {
+                        Ok(()) => None,
+                        Err(error) => {
+                            let reason = discord_error_name(&error);
+                            tracing::warn!(guild = %self.row.guild_id, schedule = %self.row.id, reason, "scheduled stale-message cleanup failed");
+                            Some(reason)
+                        }
+                    },
+                    None => None,
+                };
+                self.audit(
+                    &OccurrenceOutcome::StaleCompletion,
+                    cleanup_reason,
+                    audit_failed,
+                )
+                .await;
                 Ok(Step::Next)
             }
             Err(error) => {

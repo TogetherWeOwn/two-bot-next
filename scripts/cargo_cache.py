@@ -314,6 +314,26 @@ def process_references(proc_root):
     entry under a container spelling cannot be mapped to a host path by
     lexical match, and its old inode may be gone from the workspace
     traversal, so callers must never silently treat it as no reference.
+
+    Scans cwd/exe/fd/maps plus cmdline argv tokens. Inodes are compared too,
+    so container mount path spellings need not match the host. cmdline entries
+    that no longer stat are kept as lexical-only references (dev/ino None);
+    any other denied read aborts the whole scan.
+
+    Deleted entries are (path, device, inode, stat_backed): fd/cwd/exe
+    devices come from stat and compare directly with slot stat devices;
+    maps devices are kernel-printed superblock numbers, which need not equal
+    the stat device for the same file (btrfs per-subvolume anon_dev,
+    pre-6.8 overlayfs), so a maps entry must never prove non-aliasing by
+    device alone -- UNLESS its identity was re-grounded through
+    /proc/PID/map_files/<range> (a symlink to the mapped file itself, whose
+    fstat device/inode compare exactly like fd stat; stat_backed=True). A
+    missing or denied map_files stat keeps the kernel-printed identity
+    (stat_backed=False) instead of refusing the scan.
+    Deleted paths that cannot be regular files at all
+    (is_non_file_reference: SYSV shm segments, /dev/zero, memfd anonymous
+    files, bracketed anonymous kernel mappings such as [aio]/[heap]/[stack])
+    are excludable by identity instead.
     """
     references = []
     deleted = []
@@ -356,22 +376,80 @@ def process_references(proc_root):
                     raise
                 if name.endswith(' (deleted)'):
                     deleted.append((name.removesuffix(' (deleted)'),
-                                    info.st_dev, info.st_ino))
+                                    info.st_dev, info.st_ino, True))
                 elif name.startswith('/'):
                     references.append((name, info.st_dev, info.st_ino))
             for line in (entry / 'maps').read_text().splitlines():
                 fields = line.split(None, 5)
                 if len(fields) == 6 and fields[5].startswith('/'):
                     if fields[5].endswith(' (deleted)'):
-                        major, minor = fields[3].split(':')
-                        deleted.append((fields[5].removesuffix(' (deleted)'),
-                                        os.makedev(int(major, 16), int(minor, 16)),
-                                        int(fields[4])))
+                        pathname = fields[5].removesuffix(' (deleted)')
+                        if is_non_file_reference(pathname):
+                            # Kernel object, not a file: no map_files proof
+                            # needed; identity exclusion applies downstream.
+                            # Device/inode kept for receipt attribution only.
+                            major, minor = fields[3].split(':')
+                            deleted.append((pathname,
+                                            os.makedev(int(major, 16), int(minor, 16)),
+                                            int(fields[4]), False))
+                            continue
+                        # File-backed mapping: re-ground identity through
+                        # /proc/PID/map_files/<start>-<end>, whose symlink
+                        # stat reports the mapped file's real device/inode
+                        # even when deleted. The kernel names these entries
+                        # unpadded, while maps zero-pads the range.
+                        start, end = fields[0].split('-')
+                        map_name = f'{int(start, 16):x}-{int(end, 16):x}'
+                        try:
+                            info = (entry / 'map_files' / map_name).stat()
+                        except OSError:
+                            # Missing entry (anonymous object, hidepid, exit or
+                            # munmap race) or denied read (needs CAP_SYS_ADMIN
+                            # or CAP_CHECKPOINT_RESTORE): keep the
+                            # kernel-printed superblock identity, which is
+                            # incomparable with stat devices on some
+                            # filesystems, so never device-excludable.
+                            major, minor = fields[3].split(':')
+                            deleted.append((pathname,
+                                            os.makedev(int(major, 16), int(minor, 16)),
+                                            int(fields[4]), False))
+                        else:
+                            deleted.append((pathname, info.st_dev, info.st_ino, True))
                     else:
                         major, minor = fields[3].split(':')
                         references.append((fields[5],
                                            os.makedev(int(major, 16), int(minor, 16)),
                                            int(fields[4])))
+            # cmdline argv tokens: a process started with an absolute slot or
+            # target path (e.g. cargo --target-dir, a shell cd'd into output)
+            # is a live reference even when cwd/exe/fd/maps show nothing.
+            # Fixture proc roots may omit cmdline; treat a missing file as no
+            # cmdline references. Any denied read fails the whole scan closed.
+            try:
+                raw = (entry / 'cmdline').read_bytes()
+            except FileNotFoundError:
+                if entry.exists() and (entry / 'cmdline').exists():
+                    raise Refusal(f'incomplete process visibility: pid {entry.name}')
+            except PermissionError:
+                raise Refusal(f'incomplete process visibility: pid {entry.name}')
+            else:
+                for token in raw.split(b'\0'):
+                    if not token.startswith(b'/'):
+                        continue
+                    try:
+                        text = os.fsdecode(token)
+                    except (UnicodeDecodeError, ValueError):
+                        continue
+                    try:
+                        info = os.stat(text)
+                    except FileNotFoundError:
+                        references.append((text, None, None))
+                    except NotADirectoryError:
+                        references.append((text, None, None))
+                    except (PermissionError, OSError):
+                        raise Refusal(f'incomplete process visibility: pid {entry.name}')
+                    else:
+                        references.append((text, info.st_dev, info.st_ino))
         except FileNotFoundError:
             if entry.exists():
                 raise Refusal(f'incomplete process visibility: pid {entry.name}')
@@ -382,6 +460,41 @@ def process_references(proc_root):
 
 def within(path, root):
     return Path(path).is_relative_to(root)
+
+
+# Deleted paths that denote kernel objects which can never be regular
+# files, so they cannot alias slot build output. Kernel /proc docs name the
+# shape: an anonymous mapping has an empty pathname or a bracketed label
+# ([heap], [stack], named private/shared anonymous mappings), and map_files
+# holds symlinks only for real mapped files. Concrete shared-host instances:
+# SYSV IPC shared memory segments (no filesystem existence), the zero device
+# (fixed device-node identity, never build output), memfd anonymous RAM files
+# (shown as `/memfd:<name> (deleted)`), async-IO contexts (`[aio]`, seen with
+# a container `/` spelling as `/[aio]`), and anon_inode objects
+# (`anon_inode:[eventfd]`). PostgreSQL backends map the SYSV/zero pair, so
+# without this rule those ubiquitous shared-host mappings refuse every
+# retention run. The bracket catch-all only matches a path whose whole name
+# past an optional leading slash is bracketed; a real slot output always
+# carries an absolute path under a slot target/scratch directory (checked by
+# lexical attribution before identity exclusion ever applies), so no regular
+# file can match. Anything else -- including real tmpfs paths such as
+# /dev/shm files, whose non-aliasing cannot be proven without
+# mount-namespace analysis -- stays fail-closed.
+# Source: https://docs.kernel.org/filesystems/proc.html (/proc/PID/maps
+# columns and anonymous-mapping labels; map_files as symlinks "which
+# represent memory mapped files" for inode-number comparison).
+NON_FILE_REFERENCE_EXACT = frozenset({'/dev/zero', '/[aio]', '[aio]'})
+NON_FILE_REFERENCE_PREFIXES = ('/SYSV', '/memfd:', 'memfd:',
+                               'anon_inode:', '/anon_inode:')
+
+
+def is_non_file_reference(path):
+    """True when a deleted reference path cannot be a regular file."""
+    if (path in NON_FILE_REFERENCE_EXACT
+            or path.startswith(NON_FILE_REFERENCE_PREFIXES)):
+        return True
+    base = path[1:] if path.startswith('/') else path
+    return base.startswith('[') and base.endswith(']')
 
 
 # Top-level entries Cargo itself creates in a target directory. A .gitignore
@@ -451,6 +564,434 @@ def workspace_inodes(workspace):
             info = path.lstat()
             result.add((info.st_dev, info.st_ino))
     return result
+
+
+def _veto_scan_names(base, target, dirs, files, check_top_level, first):
+    """Shared protected-name veto used by target and scratch scans."""
+    if first and check_top_level:
+        for name in dirs + files:
+            if name not in CARGO_TARGET_TOP_LEVEL:
+                return f'preserved foreign top-level entry: {name}'
+    under_codegen_out = (
+        Path(base).name == 'out'
+        and 'build' in Path(base).relative_to(target).parts)
+    for name in dirs:
+        if name.lower() in PROTECTED_DIR_NAMES:
+            return f'preserved directory in target: {name}'
+    for name in files:
+        lowered = name.lower()
+        stem = lowered
+        while '.' in stem:
+            stem = stem.rsplit('.', 1)[0]
+        if stem in PROTECTED_DIR_NAMES:
+            return f'preserved file in target: {name}'
+        suffix = Path(lowered).suffix
+        if suffix in PROTECTED_SUFFIXES:
+            if suffix == '.rs' and under_codegen_out:
+                continue  # build-script codegen output, not stashed source
+            return f'preserved file in target: {name}'
+    return None
+
+
+def scratch_preservation_veto(scratch):
+    """Reason a slot scratch tree vetoes retention, or None.
+
+    Scratch holds cooperative compiler/test temp files with arbitrary names,
+    so unlike target there is no Cargo-defined top-level allowlist: any
+    non-protected entry is treated as regenerable temp output. Protected
+    directory names, protected file stems/suffixes, foreign symlinks and any
+    other top-level foreign material still veto. Heuristics are a backstop
+    veto only; eligibility still needs the attested classification.
+    """
+    def unreadable(error):
+        raise Refusal(f'incomplete scratch scan: {error.filename}')
+
+    for base, dirs, files in os.walk(scratch, followlinks=False, onerror=unreadable):
+        for name in dirs + files:
+            try:
+                if (Path(base) / name).is_symlink():
+                    return f'symlink in scratch: {name}'
+            except OSError:
+                raise Refusal(f'incomplete scratch scan: {name}')
+        veto = _veto_scan_names(base, scratch, dirs, files,
+                                check_top_level=False, first=False)
+        if veto is not None:
+            return veto.replace('in target', 'in scratch')
+    return None
+
+
+def slot_output_inodes(target, scratch):
+    """(dev, ino) identities for every entry under target+scratch.
+
+    Symlinks are reported as a veto string instead of being followed, so the
+    caller skips the slot instead of measuring or deleting through a link.
+    Returns (veto_or_None, nodes).
+    """
+    nodes = set()
+
+    def unreadable(error):
+        raise Refusal(f'incomplete slot scan: {error.filename}')
+
+    for root in (target, scratch):
+        for base, dirs, files in os.walk(root, followlinks=False, onerror=unreadable):
+            for name in [None] + dirs + files:
+                path = Path(base) if name is None else Path(base) / name
+                try:
+                    info = path.lstat()
+                except FileNotFoundError:
+                    continue  # Cargo renamed output mid-scan; re-verify aborts below
+                if stat.S_ISLNK(info.st_mode):
+                    return f'symlink in slot output: {path}', set()
+                nodes.add((info.st_dev, info.st_ino))
+    return None, nodes
+
+
+def validate_shared_pool_inventory(pool, policy, inventory, now, max_age):
+    """Validate a shared-pool retain inventory; refuse the whole run on ambiguity.
+
+    Expected shape (caller-supplied, host-scope, fresh):
+      {"version": 1, "complete": True, "process_scope": "host",
+       "captured_at_unix": <unix>,
+       "slots": [{"path": "<pool>/slot-N", "issue_id": "<uuid>",
+                  "status": "done|...", "live_run": bool, "referenced": bool,
+                  "target_provenance": "build_output_only"}, ...]}
+    live_run covers running/queued/retry runs; referenced covers all
+    execution/project/shared workspace refs. Returns (indexed, captured).
+    """
+    if (inventory.get('version') != 1 or inventory.get('complete') is not True
+            or inventory.get('process_scope') != 'host'):
+        raise Refusal('need complete host-scope control-plane inventory')
+    captured = inventory.get('captured_at_unix')
+    if type(captured) not in (int, float) or not 0 <= now - captured <= max_age:
+        raise Refusal('control-plane inventory is stale or from the future')
+    rows = inventory.get('slots')
+    if not isinstance(rows, list):
+        raise Refusal('inventory slots must be a list')
+    indexed = {}
+    identities = {}
+    target_identities = {}
+    for row in rows:
+        raw = row['path']
+        if not isinstance(raw, str) or not os.path.isabs(raw):
+            raise Refusal('ambiguous slot attribution')
+        canonical = os.path.normpath(raw)
+        if raw != canonical or canonical in indexed:
+            raise Refusal('ambiguous slot attribution')
+        if type(row.get('live_run')) is not bool or type(row.get('referenced')) is not bool:
+            raise Refusal('ambiguous slot attribution')
+        if not row.get('issue_id') or row.get('status') not in TERMINAL | {
+                'backlog', 'todo', 'in_progress', 'in_review', 'blocked'}:
+            raise Refusal('missing slot attribution/status')
+        try:
+            resolved = os.path.realpath(canonical)
+        except OSError:
+            raise Refusal('ambiguous slot attribution')
+        if resolved != canonical:
+            raise Refusal('ambiguous slot attribution')
+        try:
+            info = os.stat(canonical)
+        except FileNotFoundError:
+            identity = None  # dangling row; covers nothing, matches nothing
+        except (PermissionError, OSError):
+            raise Refusal(f'incomplete slot visibility: {canonical}')
+        else:
+            if not stat.S_ISDIR(info.st_mode):
+                raise Refusal('ambiguous slot attribution')
+            identity = (info.st_dev, info.st_ino)
+            if identity in identities:
+                raise Refusal('ambiguous slot attribution')
+            identities[identity] = canonical
+        try:
+            target_info = os.stat(canonical + '/target')
+        except FileNotFoundError:
+            target_identity = None
+        except (PermissionError, OSError):
+            raise Refusal(f'incomplete slot visibility: {canonical}/target')
+        else:
+            target_identity = (target_info.st_dev, target_info.st_ino)
+            if target_identity in target_identities:
+                raise Refusal('ambiguous slot target attribution')
+            target_identities[target_identity] = canonical
+        indexed[canonical] = row
+    return indexed, captured
+
+
+def _lock_identity(fd):
+    info = os.fstat(fd)
+    return (info.st_dev, info.st_ino)
+
+
+def _lock_path_identity(lock_path):
+    info = os.stat(lock_path)
+    return (info.st_dev, info.st_ino)
+
+
+def shared_pool_retain(pool, inventory, proc_root='/proc', now=None, max_age=60,
+                       _before_mutation=None):
+    """Reclaim over-budget shared-pool slots with lock held through mutation.
+
+    Distinct from the legacy-worktree audit: exact slot paths only, never
+    /tmp globbing, registries, quotas or policies. For each policy slot the
+    SAME lock fd/inode is held from re-verify through deletion and
+    recreation; the lock file is never replaced and policy.json is never
+    touched. Any doubt skips that slot and keeps its lease. Global ambiguity
+    (bad inventory, unreadable proc scan, replaced pool layout) refuses the
+    whole run with no mutation. Returns a JSON-serializable receipt.
+    """
+    pool = real_directory(pool)
+    policy = load_policy(pool)
+    started = time.monotonic()
+    now = time.time() if now is None else now
+    indexed, captured = validate_shared_pool_inventory(pool, policy, inventory, now, max_age)
+    # Phase 1: acquire every available slot lock non-blocking and hold the
+    # fds. Unacquirable slots skip (keep lease); nothing is mutated yet.
+    held = {}
+    results = {}
+    for number in range(policy['slots']):
+        name = f'slot-{number}'
+        slot = pool / name
+        try:
+            fd = os.open(slot / 'lock', os.O_RDWR | os.O_NOFOLLOW)
+        except OSError:
+            results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                             'reason': 'lock open failed; skipped, lease kept'}
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                             'reason': 'lock held by another process; skipped, lease kept'}
+            continue
+        try:
+            if _lock_path_identity(slot / 'lock') != _lock_identity(fd):
+                os.close(fd)
+                results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                 'reason': 'lock file replaced; skipped, lease kept'}
+                continue
+        except OSError:
+            os.close(fd)
+            results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                             'reason': 'lock stat failed; skipped, lease kept'}
+            continue
+        held[name] = (slot, fd)
+    try:
+        if not 0 <= now - captured <= max_age:
+            raise Refusal('control-plane inventory is stale or from the future')
+        # Single root-visible process scan while ALL acquired locks are held,
+        # so no new wrapper/Cargo writer can start mid-scan for a held slot.
+        refs, deleted = process_references(proc_root)
+        # Per-slot re-verify while holding that slot's lock. No mutation yet,
+        # so the unresolved-deleted fail-closed check below runs before any
+        # deletion.
+        pending = {}
+        for name in sorted(held):
+            slot, _fd = held[name]
+            try:
+                if {p.name for p in slot.iterdir()} - {'lock', 'target', 'scratch', 'lease.json'}:
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': 'unexpected slot contents; skipped, lease kept'}
+                    continue
+                try:
+                    target = real_directory(slot / 'target')
+                    scratch = real_directory(slot / 'scratch')
+                except Refusal as error:
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': f'not a real slot directory ({error}); skipped, lease kept'}
+                    continue
+                try:
+                    before_bytes = usage(slot)
+                except Refusal as error:
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': f'incomplete slot scan ({error}); skipped, lease kept'}
+                    continue
+                row = indexed.get(str(slot))
+                if row is None:
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': 'unattributed slot; skipped, lease kept'}
+                    continue
+                if row['status'] not in TERMINAL or row['live_run'] or row['referenced']:
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': ('live run, slot reference, or nonterminal issue; '
+                                                'skipped, lease kept')}
+                    continue
+                if row.get('target_provenance') != 'build_output_only':
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': ('unclassified or mixed slot provenance; Operator '
+                                                'build-output-only classification required; skipped')}
+                    continue
+                try:
+                    veto = preservation_veto(target)
+                except Refusal as error:
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': f'incomplete target scan ({error}); skipped'}
+                    continue
+                if veto is not None:
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': f'{veto}; skipped, lease kept'}
+                    continue
+                try:
+                    veto = scratch_preservation_veto(scratch)
+                except Refusal as error:
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': f'incomplete scratch scan ({error}); skipped'}
+                    continue
+                if veto is not None:
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': f'{veto}; skipped, lease kept'}
+                    continue
+                try:
+                    link_veto, nodes = slot_output_inodes(target, scratch)
+                except Refusal as error:
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': f'incomplete slot scan ({error}); skipped'}
+                    continue
+                if link_veto is not None:
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': f'{link_veto}; skipped, lease kept'}
+                    continue
+                if any(within(path, target) or within(path, scratch)
+                       or (device is not None and (device, inode) in nodes)
+                       for path, device, inode in refs):
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': ('actual process cwd/exe/fd/map/cmdline reference; '
+                                                'skipped, lease kept')}
+                    continue
+                if any(within(path, target) or within(path, scratch)
+                       or (device is not None and (device, inode) in nodes)
+                       for path, device, inode, _stat_backed in deleted):
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': ('actual process reference (deleted artifact); '
+                                                'skipped, lease kept')}
+                    continue
+                pending[name] = {'slot': slot, 'target': target, 'scratch': scratch,
+                                 'nodes': nodes, 'before_bytes': before_bytes}
+            except (OSError, ValueError, KeyError, IndexError, subprocess.CalledProcessError) as error:
+                results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                 'reason': f'verify failed ({error}); skipped, lease kept'}
+        # Fail-closed unresolved-deleted check before ANY mutation. A deleted
+        # (unlinked/replaced) artifact keeps its deletion marker: under a
+        # container spelling it matches neither a host path nor a live slot
+        # inode, so an entry attributable to no held slot refuses the whole
+        # run -- EXCEPT provable different-filesystem exclusion. One
+        # filesystem's unlinked inode can never be another filesystem's file,
+        # so a stat-backed (fd/cwd/exe, or maps re-grounded through map_files)
+        # deleted entry whose device appears in no held slot output is
+        # provably unable to reference slot output and is excluded (counted
+        # in the receipt, never silently dropped). Maps entries WITHOUT a
+        # map_files stat are never device-excluded: their kernel-printed
+        # superblock device need not equal the stat device for the same file
+        # (btrfs per-subvolume anon_dev, pre-6.8 overlayfs), so a "foreign"
+        # maps device proves nothing. The other maps exception is identity,
+        # not device: a deleted path that cannot be a regular file at all
+        # (is_non_file_reference: SYSV shm segments, /dev/zero, memfd
+        # anonymous files, bracketed anonymous kernel mappings) cannot alias
+        # slot output and is excluded by identity. Same-filesystem and device-unknown
+        # unattributed entries still refuse: a deleted slot file held open
+        # carries the slot's device with an inode already gone from the
+        # traversal, which no scan can distinguish from an unrelated
+        # same-filesystem temp file. Exclusion also needs complete device
+        # knowledge: if any held slot's output device is unreadable, nothing
+        # is excluded and the strict rule applies.
+        all_nodes = set()
+        for entry in pending.values():
+            all_nodes |= entry['nodes']
+        slot_roots = [str((held[name][0] / 'target')) for name in held]
+        slot_roots += [str((held[name][0] / 'scratch')) for name in held]
+        for name in sorted(set(results) - set(held)):
+            # Skipped (lock-held) slots still own lexical paths; an entry
+            # inside one attributes there and must not force a whole refusal.
+            slot = pool / name
+            slot_roots += [str(slot / 'target'), str(slot / 'scratch')]
+        slot_devices = {device for device, _inode in all_nodes}
+        devices_complete = True
+        for name in held:
+            for sub in ('target', 'scratch'):
+                try:
+                    slot_devices.add(os.stat(held[name][0] / sub).st_dev)
+                except OSError:
+                    # That slot is already skipped; without its device the
+                    # different-filesystem proof is unsound, so exclude nothing.
+                    devices_complete = False
+        unresolved = []
+        excluded_deleted = 0
+        for path, device, inode, stat_backed in deleted:
+            if any(within(path, Path(root)) for root in slot_roots):
+                continue  # lexical attribution, including skipped-slot paths
+            if device is not None and (device, inode) in all_nodes:
+                continue  # inode attribution to pending slot output
+            if is_non_file_reference(path):
+                excluded_deleted += 1
+                continue  # kernel object, not a file; cannot alias output
+            if (stat_backed and devices_complete and device is not None
+                    and device not in slot_devices):
+                excluded_deleted += 1
+                continue
+            unresolved.append((path, device, inode))
+        if unresolved:
+            raise Refusal('unresolved deleted process reference; '
+                          'exact-path process-reference receipt required')
+        if now - captured + time.monotonic() - started > max_age:
+            raise Refusal('retain took too long; capture a new inventory')
+        # Phase 2: exact-path mutation per eligible slot, lock still held.
+        ordered = []
+        for name in sorted(pending):
+            slot = pending[name]['slot']
+            target = pending[name]['target']
+            scratch = pending[name]['scratch']
+            before_bytes = pending[name]['before_bytes']
+            _slot, fd = held[name]
+            try:
+                if _lock_path_identity(slot / 'lock') != _lock_identity(fd):
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': 'lock file replaced before mutation; skipped'}
+                    continue
+                if _before_mutation is not None:
+                    _before_mutation(slot, fd)
+                    if _lock_path_identity(slot / 'lock') != _lock_identity(fd):
+                        results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                         'reason': 'lock file replaced; skipped, lease kept'}
+                        continue
+                # Exact paths only: slot-N/target, slot-N/scratch,
+                # slot-N/lease.json. Lock inode and policy.json are preserved.
+                if not target.is_relative_to(slot) or not scratch.is_relative_to(slot):
+                    results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                     'reason': 'slot path escape; skipped, lease kept'}
+                    continue
+                shutil.rmtree(target)
+                shutil.rmtree(scratch)
+                lease = slot / 'lease.json'
+                try:
+                    lease.unlink()
+                except FileNotFoundError:
+                    pass
+                target.mkdir()
+                scratch.mkdir()
+                if _lock_path_identity(slot / 'lock') != _lock_identity(fd):
+                    raise Refusal(f'lock file replaced during mutation: {name}')
+                after_bytes = usage(slot)
+                results[name] = {'slot': name, 'path': str(slot), 'eligible': True,
+                                 'reason': 'retained; exact slot output reclaimed',
+                                 'before_bytes': before_bytes, 'after_bytes': after_bytes,
+                                 'reclaimed_bytes': before_bytes - after_bytes,
+                                 'lock_held_through_mutation': True}
+            except Refusal:
+                raise
+            except (OSError, ValueError) as error:
+                results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
+                                 'reason': f'mutation failed ({error}); skipped'}
+        for name in sorted(results):
+            ordered.append(results[name])
+        return {'version': 1, 'retain': True, 'mutation': True,
+                'captured_at_unix': now,
+                'excluded_deleted_references': excluded_deleted,
+                'slots': ordered}
+    finally:
+        for _slot, fd in held.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def retention_audit(worktrees, inventory, proc_root='/proc', now=None, max_age=60):
@@ -627,7 +1168,7 @@ def retention_audit(worktrees, inventory, proc_root='/proc', now=None, max_age=6
         # so this is a false-negative reference finding, not a deletion
         # plan; no destructive deletion is demonstrated or authorized.
         if any(within(path, workspace) or (device, inode) in nodes
-               for path, device, inode in deleted):
+               for path, device, inode, _stat_backed in deleted):
             result['reason'] = 'actual process cwd/exe/fd/map reference (deleted artifact)'
             continue
         result.update(eligible=True, allocated_bytes=usage(target), reason='audit only; not deletion authority')
@@ -635,9 +1176,12 @@ def retention_audit(worktrees, inventory, proc_root='/proc', now=None, max_age=6
     # whole audit: unresolved namespace mapping must not silently establish
     # no reference. Callers must supply an independently verified
     # exact-path process-reference receipt before any such audit clears.
-    if any(not any(within(path, Path(root)) for root in real_workspaces)
+    # The non-file identity exclusion applies here too: a SYSV shm segment
+    # or /dev/zero mapping cannot be a workspace file under any spelling.
+    if any(not is_non_file_reference(path)
+           and not any(within(path, Path(root)) for root in real_workspaces)
            and (device, inode) not in all_nodes
-           for path, device, inode in deleted):
+           for path, device, inode, _stat_backed in deleted):
         raise Refusal('unresolved deleted process reference; '
                       'exact-path process-reference receipt required')
     if now - captured + time.monotonic() - started > max_age:
@@ -667,6 +1211,13 @@ def main():
     audit = commands.add_parser('audit')
     audit.add_argument('--worktrees', type=Path, required=True)
     audit.add_argument('--inventory', type=Path, required=True)
+    retain = commands.add_parser('retain',
+                                 help='shared-pool lock-through-mutation retention')
+    retain.add_argument('--pool', type=Path, default=DEFAULT_POOL)
+    retain.add_argument('--inventory', type=Path, required=True)
+    retain.add_argument('--proc-root', type=Path, default=Path('/proc'))
+    retain.add_argument('--evidence', type=Path, default=None,
+                        help='optional receipt path for the host evidence file')
     watch = commands.add_parser('filesystem')
     watch.add_argument('--path', type=Path, default=Path('/home'))
     watch.add_argument('--backing-path', type=Path, required=True)
@@ -680,6 +1231,11 @@ def main():
             return run_cargo(args.pool, cargo_args)
         if args.command == 'audit':
             result = retention_audit(args.worktrees, json.loads(args.inventory.read_text()))
+        elif args.command == 'retain':
+            result = shared_pool_retain(args.pool, json.loads(args.inventory.read_text()),
+                                        proc_root=args.proc_root)
+            if args.evidence is not None:
+                args.evidence.write_text(json.dumps(result, sort_keys=True))
         else:
             if args.min_available_bytes <= 0:
                 raise Refusal('available-byte floor must be positive')

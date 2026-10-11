@@ -22,14 +22,22 @@ since Environment settings can drift.
    `CLOUDFLARE_ACCOUNT_ID` secrets. Environment secrets override the
    repository secrets that staging uses.
 
-Until the Environment has reviewers and a main-only branch policy, the
-`sha guard` job refuses every dispatch. A job that names a missing Environment
-makes GitHub create it with no protection, so the guard checks before the
-deploy job can run. This repository is public, so required reviewers work on
-every plan; no Enterprise plan is needed.
+The `sha guard` job refuses every dispatch until the Environment has
+reviewers and a main-only branch policy. `PRODUCTION_AUTO_APPROVE=true`
+excuses only the missing-reviewers refusal, and only when the latest
+`deploy-staging` run on the SHA is a completed success; the main-only branch
+policy stays mandatory with or without it
+(see [PRODUCTION_AUTO_APPROVE](#production_auto_approve)). A job that
+names a missing Environment makes GitHub create it with no protection, so the
+guard checks before the deploy job can run. This repository is public, so
+required reviewers work on every plan; no Enterprise plan is needed.
 
-**Deploy.** Dispatch with `sha` set to a full 40-character commit that is on
-`main`. That commit needs successful, completed `ci-ok` and `worker check`
+**Deploy.** Leave `sha` empty to promote the commit of the latest successful
+`deploy-staging` run on `main` (the normal case: merges keep superseding pending
+staging runs, so the newest `main` commit is often not staged). The guard then
+applies every rule below to that commit and refuses it if its `ci-ok` or
+`worker check` has not finished green. To deploy a specific commit, dispatch
+with `sha` set to a full 40-character commit that is on `main`. That commit needs successful, completed `ci-ok` and `worker check`
 runs from GitHub Actions and a successful `deploy-staging` run. `ci-ok` is the
 full verdict over lint, worker checks and every selected Rust/DB test lane;
 a green lint-only `check` job is not enough. The guard enumerates `check.yml`
@@ -43,36 +51,226 @@ pagination and a run/attempt change during validation fail closed. If a partial
 rerun omits a required job from the current attempt, rerun **all jobs**; do not
 reuse the earlier attempt's receipt. The summary records the admitted run/attempt.
 Staging runs queue in a single concurrency group, so an intermediate commit may
-never stage. Pick one that did. A push to `main` that touches only docs, root
+never stage; the empty-`sha` promotion picks the latest one that did. A push to `main` that touches only docs, root
 markdown or repository chrome (the `paths-ignore` list in `deploy-staging.yml`)
 starts no staging run either, so the newest `main` commit may have no
 `deploy-staging` run: pin the latest commit that changes runtime inputs, or
 dispatch `deploy-staging` for the head you need. Docs-only commits after a
 staged commit change nothing the Worker or container serves.
-After the reviewer approves, the job:
+After the reviewer approves (or the automated approval passes), the job:
 
 1. checks out exactly that commit and re-verifies that it is on `origin/main`;
-2. runs `wrangler deploy --message <sha>`;
+2. renders the build-identity config and runs
+   `wrangler deploy --config <rendered> --env production --message <sha>`;
 3. writes the SHA and the old and new Worker version IDs to the run summary;
-4. gates on `/health` 200 and a truthful `/readyz` (200 ready, 503 parked),
-   with the same contract as staging.
+4. gates on `/health` 200 and on `/readyz` reporting this SHA (see
+   [Build identity and the `/readyz` gate](#build-identity-and-the-readyz-gate)).
 
-**Roll back.** Dispatch again with `rollback` set to the previous version ID
-from the failed run's summary. Set `sha` to that version's commit, or any other
-green `main` commit, which is recorded as the rollback message. The rollback
-passes the same guard and the same Environment approval. It then runs
-`wrangler rollback <version-id> --yes` and fails unless that version serves
-100% of traffic. The `/readyz` gate runs again after the rollback.
+**Roll back.** This dispatch is the single production rollback method. A rollback,
+and a redeploy of a prior good commit, must always set `sha` explicitly: an empty
+`sha` promotes the latest staged commit, which during an incident is usually the
+build that just broke production (the guard refuses a rollback without `sha`).
+Dispatch again with `rollback` set to the previous version ID
+from the failed run's summary and `takeover: true`. Set `sha` to the commit that version was built
+from. It is recorded as the rollback message, and the `/readyz` gate after the
+rollback must report that revision, or a pre-stamp version (see below). The
+rollback passes the same guard and the same Environment approval. It then runs
+`wrangler rollback <version-id> --message <sha> --yes` and fails unless that
+version serves 100% of traffic. Without the takeover the fence stays held,
+fenced answers carry no build fields, and the gate fails without being a
+rollback signal. When the Rust image itself is the fault,
+dispatch in deploy mode with `takeover: true` and the prior good SHA instead; a standalone full
+redeploy outside this workflow is superseded as a production rollback path.
+Coverage: the rehearsal log in
+[cutover-rollback-runbook.md](cutover-rollback-runbook.md#7-staging-rehearsal-log)
+is a dry-walk that checked this route without executing a rollback or deploy;
+the staging rollback drill
+([ci-security.md](ci-security.md#staging-rollback-drill-manual)) rehearses
+fence, unforced deployment with immediate Durable Object update, takeover and
+restore, which differs from this dispatch's `rollback --yes` with deferred
+Durable Object default. The deploy-mode path with a prior good SHA has no
+production drill record.
+
+## Build identity and the `/readyz` gate
+
+A deploy stamps its image the way `deploy-staging` does. The rendered Wrangler
+config sets `image_vars` on the production container: `BOT_BUILD_REVISION` is
+the guarded 40-hex SHA, and `BOT_BUILD_ID` is `<run id>-<run attempt>`. Wrangler
+passes both to `docker build` as build arguments, the Rust binary compiles them
+in, and `/readyz` reports them as `build_revision` and `build_id`. Neither value
+is secret. The SHA comes from the guard, not `GITHUB_SHA`: a dispatch runs on
+the head of `main`, which can be newer than the commit being deployed.
+
+Production renders its own config instead of calling `staging_rollout.py
+prepare`. That path also snapshots the staging Cloudflare application and
+checks the staging ownership receipt, which production does not use. Ownership
+takeover runs as the P2–P4 steps in
+[Production ownership takeover](#production-ownership-takeover-p2p4) below.
+`scripts/production_deploy.py
+render` reads the checked-in `wrangler/wrangler.toml`, makes its paths absolute
+because the rendered file lives outside `wrangler/`, and sets `image_vars` on the
+single production container. Nothing else changes, and
+`scripts/test-deploy-production.py` pins that diff. The lockfile's Wrangler
+(4.148.0) runs the deploy: `wrangler-action` uses the installed version when
+`wranglerVersion` is omitted, and the job runs `npm ci` first.
+
+The gate polls `/readyz` every 10 seconds for up to 30 attempts. In deploy
+mode it passes an answer only when its JSON `build_revision` equals the
+guarded SHA **and** its `build_id` equals this run's `<run id>-<run
+attempt>`: the build ID proves the new container serves, not a previous
+build of the same SHA still draining. Rollback mode checks the revision
+only, because the serving version was built by an older run.
+
+| `/readyz` answer | Result |
+|---|---|
+| 200, revision is the SHA, `build_id` is this run's (deploy) or any stamped id (rollback) | Pass: gateway ready |
+| 503 with the SHA and a passing build id (same rule) | Pass: gateway parked (truthful 503 as a state, identity still matches) |
+| 503 `{"error":"ownership_fenced"}` with no build fields | Keep polling; fail at the end. The fence releases at cutover step 3.5, so the identity match is established only after the takeover |
+| Revision is the SHA but `build_id` is another run's (deploy mode) | Keep polling; fail at the end: the previous container still serves this SHA |
+| `build_revision` is another SHA | Keep polling; fail at the end |
+| `build_revision` and `build_id` are both `unknown` (not stamped) | Deploy: keep polling; fail at the end. Rollback: recorded as a pre-stamp version, not a failure |
+| `build_revision` is `unknown` and `build_id` is not | Keep polling; fail at the end |
+| `build_revision` or `build_id` is missing or not a string, or the body is not a JSON object | Keep polling; fail at the end |
+| JSON repeats an object key, nests past the depth bound, or `build_revision`/`build_id` has an unexpected shape | Keep polling; fail at the end with a fixed single-line reason that echoes no remote value |
+| Any other status, including `000` (no answer) | Keep polling; fail at the end |
+
+Remote identity shapes are validated before any value enters diagnostics:
+only `unknown`, a 40-character hex revision, or a bounded digits-digits
+build ID can appear in output. Newline, pipe, control, overlong and
+secret-shaped values yield the fixed unexpected-shape refusal above. The
+raw `/health` and `/readyz` bodies reach the log only through
+`production_deploy.py excerpt`, which prints the first 2048 body bytes as
+one escaped line (escaping can make that line longer), so a hostile answer
+cannot forge log or summary lines.
+
+Polling matters because a replaced container can keep answering with the
+previous revision — or, on a same-SHA redeploy, the previous build — for a
+while. The gate sends an explicit agent,
+`two-bot-next-production-rollout/1.0`, the production twin of the staging
+gate's agent. The staging gate sets one because the edge rejects Python's
+default agent. The run summary records the status, the state and the
+`build_id`, so the watch log can tie an answer to one run.
+
+In rollback mode the same gate reads the revision that the rolled-back version
+reports, so `sha` must be that version's commit. A version built before this
+change reports `unknown` for both fields. The gate records that as a pre-stamp
+version and does not fail the rollback. Any other revision fails it.
+
+## Production ownership takeover (P2–P4)
+
+Implements P2–P4 of the approved design
+([cutover-production-takeover-design.md](cutover-production-takeover-design.md)).
+Staging keeps its own client and behavior; nothing here renames, repoints, or
+relaxes the staging gate. This step never activates production: GO stays the
+cutover lead's separate decision on the B4 execution card
+([cutover-sequence.md](cutover-sequence.md) §§4–5).
+
+**Requesting it.** Dispatch with `takeover: true` (default `false`). The guard
+validates the flag and records `Takeover: requested/not requested` in the run
+summary. With `false` the job deploys and stops: the fence stays held, fenced
+answers carry no build fields, and the gate fails without being a rollback
+signal.
+
+**Order inside the `production` job** (same Environment approval as the deploy):
+
+1. `Require production ownership-control configuration`: `preflight` through
+   `wrangler/scripts/production-ownership-control.mjs` before anything is
+   replaced. It refuses a missing/short control token or a non-production
+   origin before the deploy.
+2. Deploy (or rollback) runs as before. `Record the Worker version and SHA`
+   exports the single Worker version serving 100% as `NEW_VERSION`, and
+   refuses the takeover when traffic is split or unreadable.
+3. P2 `Read production ownership state without starting`: authenticated GET
+   against the production Worker URL. It confirms the serving deployment is
+   the recorded `NEW_VERSION` with `running=false`. For about 330 s (34 reads,
+   10 s apart) it waits out the version change: a `503 deployment_mismatch` or
+   an answer still naming the previous version is read again, because the
+   ownership Durable Object keeps running the previous code until
+   Cloudflare's deferred update reaches it (up to about 300 s, observed on
+   2026-10-10 after both a deploy and a secret change). A mismatch that outlasts the window, and every other refusal or a
+   running container, is NO-GO and the run stops before any POST. The full
+   response is tee'd to the run log as the P2 receipt.
+4. P3 `Take over production ownership at the read epoch`: one POST with
+   exactly `{"action":"takeover","expectedEpoch":<P2 epoch>,"actor":...}`.
+   The actor is `github-actions:<run id>:<guarded SHA>` (audit label only;
+   authentication is the bearer token). The explicit release (`true` only in
+   these steps) authorizes unparking; a routine deploy never unparks. Only
+   5xx POSTs retry inside a bounded window with the epoch re-read first; a
+   5xx after a committed takeover is confirmed by GET, never re-posted.
+   401, 400, 405 and 409 never retry. Every refused state answers with the
+   design's documented code (401/400/405 outside the fence vocabulary, 409
+   on epoch conflict, otherwise 503 `ownership_fenced` with `no-store`).
+5. P4: the `/health` + `/readyz` gate above runs the first owned probes
+   (one container start, revision/build-ID match, single gateway session),
+   then `Re-read the active production version after takeover` plus
+   `Confirm the taken-over version still serves` prove the taken-over
+   version still serves 100%.
+
+**Secrets.** GitHub `production` Environment only — no host-held secrets, no
+new secret surface. `PRODUCTION_OWNERSHIP_CONTROL_TOKEN` (Environment
+secret, ≥32 chars; provisioning/rotation is a separate governed step, never
+part of takeover) is read only inside the `production`-gated job and never
+forwarded into the container. `PRODUCTION_WORKER_URL` (Environment variable,
+non-secret) must be `https://` and differ from `STAGING_WORKER_URL`; the job
+and the client both refuse otherwise, and the client never follows redirects.
+Receipts, logs and cards name only bindings, version IDs and fixed refusal
+words — never secret values.
+
+**Rollback.** On any failed gate, follow the ordered checklist in
+[cutover-rollback-runbook.md §4](cutover-rollback-runbook.md#4-ordered-rollback-steps)
+and the full procedure in [cutover.md §Rollback](cutover.md#rollback-preserve-next-window-writes-before-reopening-legacy):
+fence the singleton first (`fence` action of the same client, with the
+current readback epoch and the explicit release), reconcile before
+reopening, then revert traffic with a `rollback=<previous version-id>`
+dispatch from the watch header. The same guard, Environment approval and
+takeover order apply to the revert.
+
+## `PRODUCTION_AUTO_APPROVE`
+
+The repository variable `PRODUCTION_AUTO_APPROVE` is unset by default. Only the
+exact value `true` changes the guard. With it set, the guard:
+
+- accepts a `production` Environment with no required reviewers, provided the
+  latest `deploy-staging` run on the SHA is a completed success. With no
+  reviewers and the variable unset, the guard refuses;
+- records `Approval: automated (PRODUCTION_AUTO_APPROVE)` in the run summary.
+
+It does not remove reviewers. If the Environment has required reviewers,
+GitHub still pauses the `production` job until one of them approves, and the
+variable only adds the staging check.
+
+When the Environment has no reviewers, setting the variable removes the human
+approval step from production dispatches. A repository administrator sets it
+under Settings, then Secrets and variables, then Actions, then Variables. Who
+approves production is a CEO and CISO decision, so enabling the variable needs
+their decision first. The guard does not record who set the variable or why.
+Read the variable and the Environment's reviewers again before each dispatch.
 
 ## 48-hour watch log (TOG-9699)
 
-The cutover executor copies this template onto the execution card at `T_0`
-(first `/readyz` 200 on the production revision) and fills it in through the
-watch deadline `T_0 + 48 h`. Watch checkpoints at +15 min, +1 h, +6 h, +24 h
-and +48 h follow [cutover.md](cutover.md) §48-hour watch. Poll read-only on a
-short cadence (suggested 60 s); record findings, not every healthy poll.
+The cutover executor records each checkpoint with
+`scripts/cutover_watch_checkpoint.py` — one checkpoint per call — and pastes
+the emitted row onto the execution card at `T_0` (first `/readyz` 200 on the
+production revision) through the watch deadline `T_0 + 48 h`:
 
-### Watch header (fill once at T_0)
+```sh
+python3 scripts/cutover_watch_checkpoint.py --checkpoint +15m \
+    --expected-sha <40-hex> --expected-build-id <run-id>-<attempt> \
+    --production-url https://<production-worker>/
+```
+
+`--checkpoint` is one of the five labels `+15m`, `+1h`, `+6h`, `+24h`,
+`+48h`, matching the five checkpoint rows below; `--expected-sha` is the
+deployed commit from the watch header and `--expected-build-id` is that
+deploy run's `<run id>-<attempt>` from the run summary. The script is
+read-only: one GET to `/readyz`, no writes, migrates, or DB connections. It
+emits GO only on a 200 with every component ready and an exact
+revision/build-ID match; anything short of a full match is EXTEND, never
+GO, and a ROLLBACK decision stays human. Checkpoints follow
+[cutover.md](cutover.md) §48-hour watch. Poll read-only on a short cadence
+(suggested 60 s); record findings, not every healthy poll.
+
+### Watch header (record once at T_0)
 
 | Field | Value |
 |---|---|
@@ -100,9 +298,12 @@ whole watch so the rollback dispatch never has to hunt for it.
 | | | `error-class` | one fixed class below, no raw text | |
 | | | `rollback-decision` | GO / EXTEND / ROLLBACK + version-ID record | |
 
-- `readyz`: HTTP status and the two wired components (`process`, `gateway`).
-  503 parked is truthful, never acceptance; sustained 503 past the measured
-  recovery budget is a rollback trigger.
+- `readyz`: HTTP status and the four always-present components (`process`, `gateway`,
+  `database`, `token_invalid`) (`crates/bot/src/server.rs:228-240`, `:177`, `:191-209`;
+  re-checked at `bce86a791`); 200 needs every component `ready`. Only a
+  `gateway` at `down` or `starting` is parked; a `database` or `token_invalid`
+  at `down` is a fault. 503 parked is truthful, never acceptance; sustained
+  503 past the measured recovery budget is a rollback trigger.
 - `revision`: the exact compiled revision/build ID baked into the Rust
   `/readyz` response (mirrors the `GITHUB_SHA` /
   `GITHUB_RUN_ID-GITHUB_RUN_ATTEMPT` provenance in
@@ -119,8 +320,8 @@ whole watch so the rollback dispatch never has to hunt for it.
   `gateway_pool_connect_failed`, `checkpoint_load_failed`,
   `onboarding_gates_invalid`, `onboarding_init_failed`,
   `custom_commands_init_failed`, `milestones_load_failed`, `automod_config_invalid`,
-  `automod_executor_failed`, `gateway_runtime_failed`,
-  `gateway_task_panicked`,
+  `automod_executor_failed`, `raid_executor_failed`,
+  `gateway_runtime_failed`, `gateway_task_panicked`,
   `container_service_failed`, `container_lifecycle_failed`,
   `container_unavailable`. Never paste raw messages, URLs, credentials or
   backup paths into the log.
@@ -154,13 +355,67 @@ acceptance.
 | REST 5xx and action latency | Single-attempt calls keep their 5 s body-read deadline; 429 `retry-after + 250 ms` honored, 5xx backoff 500…8000 ms across the bounded retry budget; moderation uses one timed attempt | Any uncertain send without a recorded disposition, or a route whose `job_consecutive_failures` reaches 3: freeze that writer and reconcile; roll back if the failing path shipped in this revision | [rest-guard.md](rest-guard.md); [pacing-backoff-acceptance.md](pacing-backoff-acceptance.md); [metrics.md](metrics.md#off-container-scrape-and-alert-rules) |
 | Bot token | Zero 401s on bot-authenticated endpoints | First latched `token_invalid`: stop retries, freeze writers; no rollback until provisioning is corrected through the governed path | [rest-guard.md](rest-guard.md) |
 | Unban queue | Sweep every 30 s (`UNBAN_SWEEP_INTERVAL_SECONDS`), at most 25 jobs claimed per sweep; no due unban left pending across sweeps without a named disposition | Any overdue sanction without a named disposition is a finding; zero unexplained overdue is required for GO at each checkpoint | [member-moderation.md](member-moderation.md); [cutover.md](cutover.md) §§T-minus, 48-hour watch |
-| Scheduled jobs | Last success within twice the job cadence; fewer than 3 consecutive failures | `job_stale` or 3 consecutive failures on a watch-critical job (unban sweep, session checkpoint): freeze the consumer, fix the dependency; roll back if the regression shipped in this revision | [metrics.md](metrics.md#off-container-scrape-and-alert-rules) |
+| Scheduled jobs | Scheduled jobs: last success within twice the cadence; fewer than 3 consecutive failures. Unban sweep, automod expiry and event-driven session checkpoint: manual checks below | Installed `job_stale` covers only registered cadences, `ticker_stale` covers the two 15 s tickers, `job_consecutive_failures` covers labelled failed completions per job (including `member_unban_sweep` and `automod_expiry` on their own labels), and the coarse `job_unknown_stale` ticket covers a stale nonzero success on any label without a cadence entry. `session_checkpoint` is stale-exempt and records successes only in these job series. A manual failure/stall finding has the same response: freeze the consumer, fix the dependency; roll back if the regression shipped in this revision | [metrics.md](metrics.md#off-container-scrape-and-alert-rules); [manual checks](#scheduled-job-manual-checkpoints) |
 | DB pool | Idle connections above zero, below max | Pool at max with zero idle for 3 consecutive keepalive samples: do not restart to free it; freeze writers, fix the holder; roll back if a new query path holds checkouts | [metrics.md](metrics.md#off-container-scrape-and-alert-rules); [runbook.md](runbook.md) Alert: DB pool |
 | `db_errors` | Fewer than 3 storage failures between keepalive samples; a counter reset (process restart) skips the window, not proof of health; sustained low-rate failures surface through `job_consecutive_failures` | 3 or more storage failures between samples: correlate the `op` label and recent deploys; do not run SQL probes or restart to clear errors; escalate repeated bursts per the runbook, evaluate rollback if this revision introduced the failing writes | [metrics.md](metrics.md#off-container-scrape-and-alert-rules); [runbook.md](runbook.md#alert-db-errors) |
 | `send_admission_blocked` | Fewer than 3 consecutive keepalive samples with new admission refusals; a sample with no new refusals breaks the streak; admission SQL failures count in `db_errors`, not refusals | New admission refusals in 3 consecutive samples: investigate cooldowns and held lanes; do not replay uncertain sends or restart to free the lane; escalate persistent refusals per the runbook, evaluate rollback if this revision introduced the regression | [metrics.md](metrics.md#off-container-scrape-and-alert-rules); [runbook.md](runbook.md#alert-send-admission-blocked) |
 | RSS and placement | RSS near the B1 soak-measured floor (~140 MiB, under the ~200 MiB `lite` gate signal) on the shipped `basic` placement; image/binary sizes inside the B1 ceilings (25% image and 40% binary headroom policy) | Sustained RSS growth versus the B1 floor with no attribution, sustained use pressing the placement cap, or any OOM-kill: freeze writers, investigate or roll back | [b1-baseline.md](b1-baseline.md) (`basic` verdict, ceilings); [cutover.md](cutover.md) §48-hour watch; this is a separate production-watch signal, not B2's numeric RSS acceptance |
 | Event continuity | Zero unexplained gaps or duplicated effects versus independent moderator observations | Any unexplained gap or duplicated execution is a stop condition: freeze writers, evaluate rollback | [cutover.md](cutover.md) §48-hour watch; [staging-soak.md](staging-soak.md) acceptance |
 | Shutdown drain | SIGTERM drain completes inside 35 s (`SHUTDOWN_TIMEOUT_SECONDS` default) | `shutdown_deadline_exceeded` (exit 1): the restart reads the last committed checkpoint; repeated misses block GO until investigated | [configuration.md](configuration.md) |
+
+### Scheduled-job manual checkpoints
+
+At +15 min, +1 h, +6 h, +24 h and +48 h, inspect the current checkpoint's
+container logs with these exact JSON-field filters (not the `msg` envelope):
+
+```text
+message = "periodic job failed" AND job = "member_unban_sweep"
+message = "member unban sweep completed jobs"
+```
+
+Keep each failure's timestamp and bounded `error_class`; the completion line carries
+`completed` only when work was actually done. Do not copy guild/member IDs into
+the watch log. Zero-work successes emit no completion line, and a stalled
+attempt emits no failure until it finishes or times out, so **no matching log
+line is not success**. Inspect the saved `/readyz` response too:
+
+```sh
+jq '.jobs.member_unban_sweep | {running, parked, last_success, consecutive_failures}' readyz.json
+```
+
+`last_success` is Unix **milliseconds** (unlike metric timestamps). Compare it
+with the read timestamp and prior checkpoint: a parked/missing job is not an
+accepted sweep; three failures or no recent success needs a disposition. The
+30 s cadence is not an attempt deadline: a sweep may run for up to 180 s, so
+investigate a >60 s age with `running`/logs before declaring it stalled.
+`job="member_unban_sweep"` is valid per-sweep evidence: `job_consecutive_failures`
+fires at 3 on its own label and a stale nonzero success tickets via the coarse
+`job_unknown_stale` fallback. `job="other"` remains the shared unknown-name
+catch-all, never per-sweep evidence.
+
+For automod expiry, inspect the saved `/readyz` response (there is no
+completion log line: the 60 s tick is a no-op success until the gateway builds
+the activation, and it only does real expiry work when `TWO_AUTOMOD=1`):
+
+```sh
+jq '.jobs.automod_expiry | {running, parked, last_success, consecutive_failures}' readyz.json
+```
+
+When `TWO_AUTOMOD` is not `1` the job is not registered and the entry is
+absent: record the checkpoint as not-applicable, never green. Otherwise compare
+`last_success` (Unix **milliseconds**) with the read timestamp and prior
+checkpoint like the unban sweep: three failures or no recent success needs a
+disposition. `job_consecutive_failures` fires at 3 on the `automod_expiry`
+label and a stale nonzero success tickets via the coarse `job_unknown_stale`
+fallback.
+
+For the event-driven session checkpoint, use the
+[manual checkpoint queries](voice-cutover-rollback-triggers.md#manual-checkpoint-queries)
+for success age, commit traffic and commit failures; there is no periodic
+"two cadences" stale rule. For uninstalled multi-window burn alerts, evaluate
+[the manual burn windows](error-budget-alerts.md#manual-checkpoint-evaluation)
+at each checkpoint. Record missing history or signals as unknown, never green
+because an alert stayed silent.
 
 ## Deploy-timer mapping (parity §4)
 

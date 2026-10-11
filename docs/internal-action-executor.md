@@ -3,14 +3,22 @@
 `two_bot_discord::internal_actions::AnnouncementExecutor` is a callable effect
 adapter, not an HTTP receiver, deployment or authorization boundary. It does not
 change runtime flags, expose a listener, claim/audit an operation, or release any
-HMAC provisioning HOLD. Future receiver work owns those steps.
+HMAC provisioning HOLD. Future receiver work owns those steps. Re-checked at
+`86a6668a7`: that receiver work has since landed in
+`crates/bot/src/internal_action_http.rs` — durable burn (`:882`), `authorize`
+(`:892`), `AnnouncementExecutor::supports` capability check (`:933`), durable
+claim (`:959`), execute (`:971`) and finish/mark-unknown (`:973-982`) — in the
+order this document requires.
 
 ## Capability and validation
 
-`SUPPORTED_ACTIONS` and `AnnouncementExecutor::supports` expose exactly
-`announcement.post`. Every other action is refused without HTTP, including other
-core phase-1 defaults. The receiver must intersect its enabled/authorized actions
-with this capability; the core's 19-verb catalogue is not executor parity.
+`SUPPORTED_ACTIONS` exposes `announcement.post`, `settings.get` and
+`settings.set`; `AnnouncementExecutor::supports` matches the same list, but
+`AnnouncementExecutor::execute` runs only `announcement.post` and refuses the
+settings verbs without HTTP. Settings run via the settings store in the receiver,
+never via this transport. Every other action is refused without HTTP, including
+other core phase-1 defaults. The receiver must intersect its enabled/authorized
+actions with this capability; the core's 19-verb catalogue is not executor parity.
 
 Pass the body `authorize` returned (or `parse_body_object` output); never
 re-parse the signed bytes with a lenient parser. That parser refuses a JSON

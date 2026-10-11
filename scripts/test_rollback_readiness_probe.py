@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unittest
@@ -15,7 +16,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rollback_readiness_probe as probe  # noqa: E402
 
 STAGING = "https://two-bot-next-staging.example-sub.workers.dev"
-READY = (200, json.dumps({"components": [["process", "ready"], ["gateway", "ready"]]}).encode())
+def readyz_body(*components):
+    return json.dumps({"components": [list(c) for c in components], "jobs": {},
+                       "build_revision": "unknown", "build_id": "unknown"}).encode()
+
+
+# The bot's real /readyz bodies (crates/bot/src/server.rs), one per state the gate must classify.
+READYZ = {
+    "ready": (200, readyz_body(("process", "ready"), ("gateway", "ready"),
+                               ("database", "ready"), ("token_invalid", "ready"))),
+    "parked": (503, readyz_body(("process", "ready"), ("gateway", "starting"),
+                                ("database", "ready"), ("token_invalid", "ready"))),
+    "database down": (503, readyz_body(("process", "ready"), ("gateway", "ready"),
+                                       ("database", "down"), ("token_invalid", "ready"))),
+    "token invalid": (503, readyz_body(("process", "ready"), ("gateway", "ready"),
+                                       ("database", "ready"), ("token_invalid", "down"))),
+    "gateway and database down": (503, readyz_body(("process", "ready"), ("gateway", "down"),
+                                                   ("database", "down"), ("token_invalid", "ready"))),
+}
+READY = READYZ["ready"]
 CONFIG = """\
 [vars]
 BOT_PORT = "8080"
@@ -136,11 +155,103 @@ class RollbackReadinessProbeTests(unittest.TestCase):
         self.assertEqual(self.requested, [STAGING + "/readyz"])
         self.assertEqual(self.snapshot(), before, "the probe must never write")
 
+    def readyz(self, status, body):
+        _, results, _ = self.probe(fetch=self.fetch((status, body)))
+        return next(line for key, line in results.items() if key.endswith(" readyz"))
+
+    def test_every_real_server_state_is_accepted(self):
+        for label in ("ready", "parked"):
+            with self.subTest(label):
+                self.assertTrue(self.readyz(*READYZ[label]).startswith("PASS readyz"))
+
+    def test_database_and_token_faults_are_never_parked(self):
+        for label, component in (("database down", "database down"),
+                                 ("token invalid", "token_invalid down"),
+                                 ("gateway and database down", "database down")):
+            with self.subTest(label):
+                line = self.readyz(*READYZ[label])
+                self.assertTrue(line.startswith("FAIL readyz"), line)
+                self.assertIn(component, line)
+
     def test_parked_staging_gateway_is_a_truthful_response(self):
-        parked = (503, json.dumps({"components": [["process", "ready"], ["gateway", "starting"]]}).encode())
-        code, results, _ = self.probe(fetch=self.fetch(parked))
-        self.assertEqual(code, 0)
-        self.assertIn("gateway starting (parked, not E2E approval)", results["PASS readyz"])
+        self.assertIn("gateway starting (parked, not E2E approval)", self.readyz(*READYZ["parked"]))
+
+    def test_readyz_is_classified_by_component_name_and_status(self):
+        process, gateway = ("process", "ready"), ("gateway", "ready")
+        database, token = ("database", "ready"), ("token_invalid", "ready")
+        accepted = {
+            "503 with gateway starting": (503, readyz_body(process, ("gateway", "starting"), database, token)),
+            "503 with gateway down": (503, readyz_body(process, ("gateway", "down"), database, token)),
+        }
+        rejected = {
+            "200 without database or token_invalid": (200, readyz_body(process, gateway),
+                                                      "lacks database, token_invalid"),
+            "200 with gateway starting": (200, readyz_body(process, ("gateway", "starting"), database, token),
+                                          "unexpected components"),
+            "200 with database down": (200, readyz_body(process, gateway, ("database", "down"), token),
+                                       "unexpected components"),
+            "200 with token invalid down": (200, readyz_body(process, gateway, database, ("token_invalid", "down")),
+                                            "unexpected components"),
+            "200 with an unknown ready component": (200, readyz_body(process, gateway, database, token,
+                                                                    ("voice", "ready")),
+                                                   "carries an unknown component name"),
+            "200 with an unknown component down": (200, readyz_body(process, gateway, database, token,
+                                                                    ("voice", "down")),
+                                                   "carries an unknown component name"),
+            "500 with a complete body": (500, readyz_body(process, gateway, database, token),
+                                         "/readyz 500 with unexpected"),
+            "503 with every component ready": (503, readyz_body(process, gateway, database, token),
+                                               "unexpected components"),
+            "503 with process down": (503, readyz_body(("process", "down"), ("gateway", "down"), database, token),
+                                      "unexpected components"),
+            "503 with an unknown component down": (503, readyz_body(process, ("gateway", "starting"), database,
+                                                                    token, ("voice", "down")),
+                                                   "carries an unknown component name"),
+            "503 with an unknown ready component": (503, readyz_body(process, gateway, database, token,
+                                                                    ("voice", "ready")),
+                                                   "carries an unknown component name"),
+            "503 with gateway starting and token invalid down": (503, readyz_body(
+                process, ("gateway", "starting"), database, ("token_invalid", "down")), "unexpected components"),
+            "503 with gateway and database down": (503, readyz_body(
+                process, ("gateway", "down"), ("database", "down"), token), "unexpected components"),
+            "503 with database and token invalid down": (503, readyz_body(
+                process, gateway, ("database", "down"), ("token_invalid", "down")), "unexpected components"),
+            "503 without database or token_invalid": (503, readyz_body(process, ("gateway", "starting")),
+                                                      "lacks database, token_invalid"),
+            "missing process": (200, readyz_body(gateway, database, token), "lacks process"),
+            "missing gateway": (200, readyz_body(process, database, token), "lacks gateway"),
+            "empty breakdown": (200, readyz_body(), "lacks process, gateway, database, token_invalid"),
+            "duplicate component": (200, readyz_body(process, gateway, gateway), "repeats a component name"),
+            "status outside ready, starting, down": (200, readyz_body(process, ("gateway", "ok")),
+                                                     "without the bot's component breakdown"),
+            "row of the wrong length": (200, readyz_body(("process",)), "without the bot's component breakdown"),
+            "ownership refusal carrying components": (503, json.dumps(
+                {"error": "ownership_fenced", "components": [list(process), list(gateway)]}).encode(),
+                "without the bot's component breakdown"),
+            "non-JSON body": (503, b"<html>not the bot</html>", "without the bot's component breakdown"),
+        }
+        for label, (status, body) in accepted.items():
+            with self.subTest(label):
+                self.assertTrue(self.readyz(status, body).startswith("PASS readyz"))
+        for label, (status, body, reason) in rejected.items():
+            with self.subTest(label):
+                line = self.readyz(status, body)
+                self.assertTrue(line.startswith("FAIL readyz"), line)
+                self.assertIn(reason, line)
+
+    def test_unknown_component_refused_without_echoing_data(self):
+        sentinel = "SENTINEL_unknown_rollback_abc123"
+        for status, extra in ((200, (sentinel, "ready")),
+                              (503, (sentinel, "down")),
+                              (200, (sentinel, "starting"))):
+            with self.subTest(status=status, extra=extra):
+                body = readyz_body(("process", "ready"), ("gateway", "ready"),
+                                   ("database", "ready"), ("token_invalid", "ready"),
+                                   extra)
+                line = self.readyz(status, body)
+                self.assertTrue(line.startswith("FAIL readyz"), line)
+                self.assertIn("carries an unknown component name", line)
+                self.assertNotIn(sentinel, line)
 
     def test_newest_archive_by_mtime_skips_decoys(self):
         self.fx.write_archive("two-funnel-zz-older.ndjson.gz", [b"not json"], mtime=1_000_000_000)
@@ -186,7 +297,7 @@ class RollbackReadinessProbeTests(unittest.TestCase):
                 {}, "sequences", "is not a JSON array"),
             "readyz ownership refusal": (
                 lambda: None, {"fetch": (503, b'{"error":"not owner"}')},
-                "readyz", "without the bot's process/gateway breakdown"),
+                "readyz", "without the bot's component breakdown"),
             "readyz broken deploy": (
                 lambda: None, {"fetch": (500, b"error code: 1101")},
                 "readyz", "/readyz 500 without"),
@@ -195,7 +306,8 @@ class RollbackReadinessProbeTests(unittest.TestCase):
                 "readyz", "did not respond (TimeoutError)"),
             "readyz gateway down at 200": (
                 lambda: None,
-                {"fetch": (200, b'{"components":[["process","ready"],["gateway","down"]]}')},
+                {"fetch": (200, readyz_body(("process", "ready"), ("gateway", "down"),
+                                            ("database", "ready"), ("token_invalid", "ready")))},
                 "readyz", "unexpected components"),
             "production env lacks TWO_GUILD_NAME": (
                 lambda: self.fx.config.write_text(missing_guild),
@@ -212,6 +324,12 @@ class RollbackReadinessProbeTests(unittest.TestCase):
             "extra required key": (
                 lambda: None, {"argv": ("--require", "TWO_MODERATION")},
                 "deploy-config", "lacks TWO_MODERATION"),
+            "int-digit overflow in wrangler config": (
+                lambda: self.fx.config.write_text(CONFIG.replace("[vars]\n", "[vars]\nDIGITS = " + "1" * 4301 + "\n")),
+                {}, "deploy-config", "is not valid TOML"),
+            "deeply nested wrangler config": (
+                lambda: self.fx.config.write_text("a = " + "[" * 1000 + "]" * 1000 + "\n"),
+                {}, "deploy-config", "is not valid TOML"),
         }
         for label, (arrange, opts, name, reason) in cases.items():
             with self.subTest(label):
@@ -347,6 +465,19 @@ class RollbackReadinessProbeTests(unittest.TestCase):
                       probe.check_deploy_config(probe.DEFAULT_CONFIG, probe.DEFAULT_ENVS, []))
 
 
+class ServerComponentDriftTests(unittest.TestCase):
+    def test_gate_and_fixtures_name_exactly_the_components_the_server_serves(self):
+        source = (probe.ROOT / "crates/bot/src/server.rs").read_text()
+        served = set()
+        for fn in ("readiness_report", "with_token_state"):
+            match = re.search(rf"^fn {fn}\(.*?^\}}$", source, re.M | re.S)
+            self.assertIsNotNone(match, f"server.rs no longer defines fn {fn}; update this drift guard")
+            served.update(re.findall(r'"([a-z_]+)"\.to_owned\(\)', match.group(0)))
+        fixtures = {name for _, body in READYZ.values() for name, _ in json.loads(body)["components"]}
+        self.assertEqual(fixtures, served)
+        self.assertEqual(set(probe.READYZ_REQUIRED), served)
+
+
 class UserAgentTests(unittest.TestCase):
     def test_fetch_sends_an_explicit_user_agent(self):
         seen = []
@@ -369,6 +500,258 @@ class UserAgentTests(unittest.TestCase):
             probe.fetch("https://two-bot-next-staging.example-sub.workers.dev/readyz")
         self.assertEqual(seen, [probe.USER_AGENT])
         self.assertFalse(seen[0].startswith("Python-urllib"))
+
+
+class DeepNestingRefusalTests(unittest.TestCase):
+    """Excessively nested JSON fails closed, never aborting the probe.
+
+    Fixtures stay under READYZ_BODY_CAP so the byte cap cannot mask the
+    decoder backstop; shallow valid/malformed controls prove the decode
+    entry points still classify ordinary input.
+    """
+
+    ARRAY_DEPTH = 10000
+    OBJECT_DEPTH = 10000
+
+    def setUp(self):
+        guard = mock.patch.object(probe.urllib.request.OpenerDirector, "open",
+                                  side_effect=AssertionError("network access in a unit test"))
+        guard.start()
+        self.addCleanup(guard.stop)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.fx = Fixture(tmp.name)
+        self.requested = []
+
+    def deep_array(self, depth=ARRAY_DEPTH):
+        body = b"[" * depth + b"]" * depth
+        self.assertLessEqual(len(body), probe.READYZ_BODY_CAP)
+        return body
+
+    def deep_object(self, depth=OBJECT_DEPTH):
+        body = b'{"a":' * depth + b"0" + b"}" * depth
+        self.assertLessEqual(len(body), probe.READYZ_BODY_CAP)
+        return body
+
+    def fetch(self, response):
+        def fake(url):
+            self.requested.append(url)
+            if isinstance(response, Exception):
+                raise response
+            return response
+        return fake
+
+    def test_readyz_state_refuses_deeply_nested_array_and_object(self):
+        for body in (self.deep_array(), self.deep_object()):
+            with self.subTest(length=len(body)):
+                with self.assertRaises(probe.ProbeError) as caught:
+                    probe.readyz_state(200, body)
+                self.assertIn("without the bot's component breakdown", str(caught.exception))
+
+    def test_shallow_valid_and_malformed_readyz_controls(self):
+        self.assertEqual(
+            probe.readyz_state(*READY),
+            {"process": "ready", "gateway": "ready",
+             "database": "ready", "token_invalid": "ready"})
+        with self.assertRaises(probe.ProbeError):
+            probe.readyz_state(200, b"{not json")
+
+    def test_manifest_line_overflow_refuses_as_not_json(self):
+        deep = self.deep_array()
+        self.fx.write_archive("two-funnel-20261002T041700Z.ndjson.gz",
+                              [deep, *archive_lines(manifest())[1:]])
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.read_manifest(self.fx.backups / "two-funnel-20261002T041700Z.ndjson.gz")
+        self.assertIn("manifest line is not JSON", str(caught.exception))
+
+    def test_end_marker_overflow_refuses_as_truncated(self):
+        deep = self.deep_array()
+        lines = [*archive_lines(manifest())[:-1], deep]
+        self.fx.write_archive("two-funnel-20261002T041700Z.ndjson.gz", lines)
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.read_manifest(self.fx.backups / "two-funnel-20261002T041700Z.ndjson.gz")
+        self.assertIn("has no end marker", str(caught.exception))
+
+    def test_live_sequences_overflow_refuses_as_not_json(self):
+        deep = self.deep_array()
+        self.fx.sequences.write_bytes(deep)
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.load_live_sequences(str(self.fx.sequences))
+        self.assertIn("is not JSON", str(caught.exception))
+
+    def int_digit_body(self):
+        body = b'{"components":[],"n":' + b"1" * 4301 + b"}"
+        self.assertLessEqual(len(body), probe.READYZ_BODY_CAP)
+        return body
+
+    def test_readyz_state_refuses_int_digit_overflow(self):
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.readyz_state(200, self.int_digit_body())
+        self.assertIn("without the bot's component breakdown", str(caught.exception))
+
+    def test_manifest_line_int_digit_overflow_refuses_as_not_json(self):
+        self.fx.write_archive("two-funnel-20261002T041700Z.ndjson.gz",
+                              [b"1" * 4301, *archive_lines(manifest())[1:]])
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.read_manifest(self.fx.backups / "two-funnel-20261002T041700Z.ndjson.gz")
+        self.assertIn("manifest line is not JSON", str(caught.exception))
+
+    def test_end_marker_int_digit_overflow_refuses_as_truncated(self):
+        lines = [*archive_lines(manifest())[:-1], b"1" * 4301]
+        self.fx.write_archive("two-funnel-20261002T041700Z.ndjson.gz", lines)
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.read_manifest(self.fx.backups / "two-funnel-20261002T041700Z.ndjson.gz")
+        self.assertIn("has no end marker", str(caught.exception))
+
+    def test_live_sequences_int_digit_overflow_refuses_as_not_json(self):
+        self.fx.sequences.write_bytes(b"1" * 4301)
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.load_live_sequences(str(self.fx.sequences))
+        self.assertIn("is not JSON", str(caught.exception))
+
+    def test_live_sequences_invalid_utf8_refuses_as_not_json(self):
+        self.fx.sequences.write_bytes(b"\xff\xfe[]")
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.load_live_sequences(str(self.fx.sequences))
+        self.assertIn("is not JSON", str(caught.exception))
+
+    def test_probe_main_with_int_digit_readyz_fails_closed_without_traceback(self):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(out):
+            code = probe.main(self.fx.argv(), fetch_fn=self.fetch((200, self.int_digit_body())))
+        text = out.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL readyz: /readyz 200 without the bot's component breakdown", text)
+        self.assertIn("rollback readiness: 3/4 checks passed", text)
+        self.assertNotIn("Traceback", text)
+        self.assertEqual(self.requested, [STAGING + "/readyz"])
+
+    def test_probe_main_with_deeply_nested_readyz_fails_closed_without_traceback(self):
+        deep = self.deep_array()
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(out):
+            code = probe.main(self.fx.argv(), fetch_fn=self.fetch((200, deep)))
+        text = out.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL readyz: /readyz 200 without the bot's component breakdown", text)
+        self.assertIn("rollback readiness: 3/4 checks passed", text)
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("[[[[[", text)
+        self.assertEqual(self.requested, [STAGING + "/readyz"])
+
+
+class BodyCapRefusalTests(unittest.TestCase):
+    """Oversized /readyz bodies are refused before JSON parsing (M4.42)."""
+
+    def setUp(self):
+        guard = mock.patch.object(probe.urllib.request.OpenerDirector, "open",
+                                  side_effect=AssertionError("network access in a unit test"))
+        guard.start()
+        self.addCleanup(guard.stop)
+        self.fresh()
+
+    def fresh(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.fx = Fixture(tmp.name)
+        self.requested = []
+
+    def fetch(self, response=READY):
+        def fake(url):
+            self.requested.append(url)
+            if isinstance(response, Exception):
+                raise response
+            return response
+        return fake
+
+    def probe(self, *extra, fetch=None, env=None):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env or {}, clear=True), contextlib.redirect_stdout(out):
+            code = probe.main(self.fx.argv(*extra), fetch_fn=fetch or self.fetch())
+        lines = out.getvalue().splitlines()
+        return code, {line.split(":", 1)[0]: line for line in lines[:-1]}, lines[-1]
+
+    def padded(self, value, size):
+        raw = json.dumps(value).encode()
+        self.assertLessEqual(len(raw), size, "fixture must fit the target size")
+        return raw + b" " * (size - len(raw))
+
+    def valid_readyz(self, **extra):
+        payload = {"components": [["process", "ready"], ["gateway", "ready"],
+                                  ["database", "ready"], ["token_invalid", "ready"]],
+                   "jobs": {}, "build_revision": "unknown", "build_id": "unknown"}
+        payload.update(extra)
+        return payload
+
+    def test_exact_cap_valid_input_passes(self):
+        body = self.padded(self.valid_readyz(), probe.READYZ_BODY_CAP)
+        self.assertEqual(len(body), probe.READYZ_BODY_CAP)
+        self.assertEqual(json.loads(body)["build_revision"], "unknown")
+        code, results, _ = self.probe(fetch=self.fetch((200, body)))
+        self.assertEqual(code, 0, results)
+        self.assertIn("PASS readyz", results)
+
+    def test_valid_json_padded_past_cap_refuses_before_parsing(self):
+        sentinel = "SENTINEL_BODY_rollback_padded"
+        body = self.padded(self.valid_readyz(note=sentinel), probe.READYZ_BODY_CAP + 1)
+        self.assertEqual(len(body), probe.READYZ_BODY_CAP + 1)
+        self.assertEqual(json.loads(body)["note"], sentinel)
+        code, results, _ = self.probe(fetch=self.fetch((200, body)))
+        self.assertEqual(code, 1, results)
+        self.assertIn("/readyz answered over the body cap", results["FAIL readyz"])
+        self.assertNotIn(sentinel, results["FAIL readyz"])
+
+    def test_cap_length_valid_prefix_with_hidden_tail_refuses(self):
+        prefix = self.padded(self.valid_readyz(), probe.READYZ_BODY_CAP)
+        self.assertEqual(json.loads(prefix)["build_revision"], "unknown")
+        code, results, _ = self.probe(fetch=self.fetch((200, prefix + b"X")))
+        self.assertEqual(code, 1, results)
+        self.assertIn("/readyz answered over the body cap", results["FAIL readyz"])
+
+    def test_httperror_oversize_enforces_the_same_bound(self):
+        body = self.padded(self.valid_readyz(), probe.READYZ_BODY_CAP + 1)
+        code, results, _ = self.probe(fetch=self.fetch((503, body)))
+        self.assertEqual(code, 1, results)
+        self.assertIn("/readyz answered over the body cap", results["FAIL readyz"])
+
+    def test_transport_reads_bounded_cap_plus_one_both_paths(self):
+        import urllib.error
+        seen = []
+
+        class Response(io.BytesIO):
+            status = 200
+
+            def read(self, n=-1):
+                seen.append(n)
+                return super().read(n)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class OkOpener:
+            def open(self, request, timeout=None):
+                return Response(b"{}")
+
+        with mock.patch.object(probe.urllib.request, "build_opener",
+                               return_value=OkOpener()):
+            probe.fetch(STAGING + "/readyz")
+        self.assertEqual(seen, [probe.READYZ_BODY_CAP + 1])
+        seen.clear()
+
+        class ErrorOpener:
+            def open(self, request, timeout=None):
+                fp = Response(b"x")
+                raise urllib.error.HTTPError(request.full_url, 503,
+                                             "Service Unavailable", {}, fp)
+
+        with mock.patch.object(probe.urllib.request, "build_opener",
+                               return_value=ErrorOpener()):
+            status, _ = probe.fetch(STAGING + "/readyz")
+        self.assertEqual(status, 503)
+        self.assertEqual(seen, [probe.READYZ_BODY_CAP + 1])
 
 
 if __name__ == "__main__":

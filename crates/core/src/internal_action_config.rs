@@ -6,7 +6,9 @@ use std::{collections::HashMap, env, net::SocketAddr};
 
 use crate::{
     config::ConfigError,
-    internal_actions::{assert_private_bind, build_channel_keys, parse_keys, KeyRing},
+    internal_actions::{
+        assert_private_bind, build_channel_keys, build_role_keys, parse_keys, KeyRing,
+    },
 };
 
 /// Validated configuration; no public constructor or secret-bearing Debug.
@@ -16,6 +18,7 @@ pub struct InternalActionConfig {
     keys: KeyRing,
     callers: HashMap<String, String>,
     channel_keys: HashMap<String, String>,
+    role_keys: HashMap<String, String>,
 }
 
 impl std::fmt::Debug for InternalActionConfig {
@@ -24,6 +27,7 @@ impl std::fmt::Debug for InternalActionConfig {
             .field("listen_addr", &self.listen_addr)
             .field("key_count", &self.keys.len())
             .field("channel_count", &self.channel_keys.len())
+            .field("role_count", &self.role_keys.len())
             .finish_non_exhaustive()
     }
 }
@@ -147,11 +151,59 @@ impl InternalActionConfig {
             ));
         }
 
+        // Membership role map: optional, empty by default. An explicit map lets
+        // `role.assign` resolve a caller-supplied key; empty refuses every key,
+        // which is the correct answer for an unconfigured bot, not a gap.
+        let role_spec = match lookup("TWO_INTERNAL_ROLE_KEYS") {
+            Ok(spec) => spec,
+            Err(env::VarError::NotPresent) => String::new(),
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err(invalid(
+                    "TWO_INTERNAL_ROLE_KEYS",
+                    "value is not valid unicode",
+                ));
+            }
+        };
+        let role_keys = build_role_keys(&role_spec)
+            .map_err(|_| invalid("TWO_INTERNAL_ROLE_KEYS", "invalid role-key specification"))?;
+        {
+            let mut role_names = std::collections::HashSet::new();
+            for entry in role_spec
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let Some((name, id)) = entry.split_once(':') else {
+                    return Err(invalid("TWO_INTERNAL_ROLE_KEYS", "invalid role-key entry"));
+                };
+                if !valid_name(name.trim())
+                    || id.contains(':')
+                    || !role_names.insert(name.trim().to_owned())
+                {
+                    return Err(invalid(
+                        "TWO_INTERNAL_ROLE_KEYS",
+                        "invalid or duplicate role key",
+                    ));
+                }
+            }
+            if role_keys.values().any(|id| {
+                id.parse::<u64>()
+                    .ok()
+                    .is_none_or(|value| value == 0 || value.to_string() != *id)
+            }) {
+                return Err(invalid(
+                    "TWO_INTERNAL_ROLE_KEYS",
+                    "expected canonical nonzero Discord role IDs",
+                ));
+            }
+        }
+
         Ok(Some(Self {
             listen_addr,
             keys: KeyRing::new(keys),
             callers,
             channel_keys,
+            role_keys,
         }))
     }
 
@@ -175,6 +227,11 @@ impl InternalActionConfig {
     #[must_use]
     pub fn channel_keys(&self) -> &HashMap<String, String> {
         &self.channel_keys
+    }
+
+    #[must_use]
+    pub fn role_keys(&self) -> &HashMap<String, String> {
+        &self.role_keys
     }
 }
 

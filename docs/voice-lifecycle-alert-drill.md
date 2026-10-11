@@ -13,7 +13,7 @@ per terminal outcome (`crates/bot/src/voice_rooms.rs`, `crates/core/src/metrics.
 
 | Exposition series | Log event and fields | Emit site |
 | --- | --- | --- |
-| `two_bot_voice_operations_total{op,outcome}` (`op`: create/move/delete; `outcome`: success/category_full/discord/persistence/cancelled) | `voice_event="voice_operation"` with `op`, `outcome` (`info` on success, `warn` otherwise) | `voice_rooms.rs:371` (`observe_voice_operation`) |
+| `two_bot_voice_operations_total{op,outcome}` (`op`: create/move/delete; `outcome`: success/category_full/discord/persistence/cancelled/refused) | `voice_event="voice_operation"` with `op`, `outcome` (`info` on success, `warn` otherwise) | `voice_rooms.rs:371` (`observe_voice_operation`) |
 | `two_bot_voice_reconcile_actions_total{action}` (delete_enqueued/suspended/resumed/succession_enqueued) | `voice_event="voice_reconcile"` with plan counts (`info`, only when nonzero) | `voice_rooms.rs:1463` |
 | `two_bot_voice_dead_letters_total{action}` (create/move/delete/companion/ownership/kick/rename/other, after 10 attempts) | `voice_event="voice_dead_letter"` with `action`, `attempts` (`warn`) | `voice_rooms.rs:1995` (`mark_failed_observed`) |
 | `two_bot_voice_tracked_rooms`, `two_bot_voice_compensation_pending` (gauges) | state refreshed per reconcile pass via `voice_state` | `voice_rooms.rs:1468` |

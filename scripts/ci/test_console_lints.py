@@ -23,6 +23,7 @@ CLI_MODULES = {
     "crates/cutover/src/bin/levels_import_rewards_probe.rs",
     "crates/cutover/src/bin/levels_role_rewards.rs",
     "crates/bot/src/erasure_cli.rs",
+    "crates/bot/src/event_cli.rs",
     "crates/bot/src/member_cli.rs",
     "crates/bot/src/restore_drill.rs",
     "crates/discord/examples/pipeline_bench.rs",
@@ -37,6 +38,7 @@ CLI_MODULES = {
     "crates/cutover/src/bin/report.rs",
     "crates/cutover/src/bin/rollback_delta.rs",
     "crates/cutover/src/bin/staging_migrate.rs",
+    "crates/cutover/src/bin/voice_config_apply.rs",
 }
 
 

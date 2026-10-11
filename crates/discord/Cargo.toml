@@ -1,6 +1,6 @@
 [package]
 name = "two-bot-discord"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -19,7 +19,7 @@ workspace = true
 # Explicit version on the intra-workspace dep (see crates/bot/Cargo.toml):
 # cargo-deny `wildcards = "deny"` rejects version-less deps.
 [dependencies]
-two-bot-core = { version = "0.3.0", path = "../core" }
+two-bot-core = { version = "0.4.0", path = "../core" }
 bytes = { workspace = true }
 hex = { workspace = true }
 http = { workspace = true }
@@ -46,9 +46,9 @@ time = { workspace = true, optional = true }
 [dev-dependencies]
 axum = { workspace = true }
 anyhow = { workspace = true }
-two-bot-cutover = { version = "0.3.0", path = "../cutover" }
+two-bot-cutover = { version = "0.4.0", path = "../cutover" }
 sqlx = { workspace = true }
-two-bot-testsupport = { path = "../testsupport", version = "0.3.0" }
+two-bot-testsupport = { path = "../testsupport", version = "0.4.0" }
 futures-util = { workspace = true, features = ["sink"] }
 rustls = { workspace = true }
 serde_json = { workspace = true }

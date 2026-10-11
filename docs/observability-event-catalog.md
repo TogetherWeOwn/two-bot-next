@@ -1,7 +1,8 @@
 # Observability event catalog (gateway/session path)
 
 Read-only extract of the structured log event names and metric labels
-emitted on the gateway cutover path. This file renames nothing and changes
+emitted on the gateway cutover path and the scheduled-job / alert-rule
+path. This file renames nothing and changes
 no emit site; it records the current spellings so watch queries, scrapers
 and alert rules can match them exactly.
 
@@ -9,9 +10,15 @@ Method: offline code search over `crates/bot/src/gateway.rs`,
 `crates/bot/src/main.rs`, `crates/bot/src/server.rs`,
 `crates/bot/src/shutdown.rs`, `crates/bot/src/gateway_metrics.rs`,
 `crates/bot/src/gateway_failure.rs`, `crates/core/src/metrics.rs` and
-`crates/bot/src/voice_rooms.rs`. File and line numbers were read on
-2026-10-03; they drift as the code moves, so re-run the search before
-quoting a line in an incident.
+`crates/bot/src/voice_rooms.rs`, plus the scheduled-job producers
+(`feed_jobs.rs`, `self_role_handlers.rs`, `member_runtime.rs`,
+`automod_gateway.rs`), the job allowlist and render in `metrics.rs`
+(`JOBS`, `render_with_rest_guard`), and the Worker alert sources
+(`metrics-scrape.ts` `ALERT_INPUT_LABELS`, `alert-rules.ts` `RULES` and
+`evaluateMetrics`). Rust callsites name the file and the enclosing
+item (function or method), never a line number: line numbers drift as the
+code moves, so re-run the search before quoting a line in an incident.
+Worker rule rows name the file and function for the same reason.
 
 ## Gateway lifecycle log lines
 
@@ -19,46 +26,49 @@ The message string (last argument to the `tracing` macro) is the event
 name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 `guild_id` are context, not the name.
 
-| Event name | Callsite | Meaning |
+| Event name | Callsite (stable anchor) | Meaning |
 | --- | --- | --- |
-| `durable gateway initialized; shard connecting` | `crates/bot/src/main.rs:516` | Supervisor built the shard; `resume=true` means a saved checkpoint was offered, `false` means fresh IDENTIFY |
-| `gateway shard loop started` | `crates/bot/src/gateway.rs:495` | Reception task entered the Twilight stream loop |
-| `gateway reconnect failed; Twilight will retry` | `crates/bot/src/gateway.rs:371` | Transport reconnect attempt failed; Twilight owns the retry |
-| `cold resume committed; requesting voice snapshot via identify` | `crates/bot/src/gateway.rs:362` | Cold voice RESUME committed; reception IDENTIFies for a fresh voice snapshot |
-| `gateway ready; checkpoint committed` | `crates/bot/src/gateway.rs:671` | Dispatch committed and shard marked Connected |
-| `gateway leveling dispatch failed` | `crates/bot/src/gateway.rs:609` | Leveling funnel drain failed inside the checkpoint deadline |
-| `onboarding interaction interrupted; member must reselect` | `crates/bot/src/gateway.rs:791` | Durable onboarding job recovered without callback credentials; kept as interruption receipt |
-| `invite counter read unavailable; retaining snapshot` | `crates/bot/src/gateway.rs:899` | REST invite read failed; persisted baseline kept instead of an empty listing |
-| `interaction acknowledgement blocked; advancing past lost callback` | `crates/bot/src/gateway.rs:287` | Ordered RSVP acknowledgement hit send-admission Blocked; checkpoint advances past the lost callback without replaying uncertain effects |
-| `interaction response failed; not replaying command` | `crates/bot/src/gateway.rs:290`, `:294`, `:300` | Ordered RSVP preparation or completion failed without admission blockage; command advances without replaying uncertain effects |
-| `READY identity differs from boot token; ordered identity not armed` | `crates/bot/src/gateway.rs:682` | READY application id differs from the boot/REST pin; ordered identity stays disarmed and its fence keeps refusing |
-| `gateway prerequisites missing; gateway parked, /readyz reports down` | `crates/bot/src/main.rs:564` | Token, database URL or guild ID missing; shard never starts |
-| `feature gates invalid; ordered interaction surface parked` | `crates/bot/src/main.rs:639` | Feature-gate parsing failed; gateway still boots, only the ordered interaction surface stays off |
-| `moderation gates invalid; ordered interaction surface parked` | `crates/bot/src/main.rs:646` | Moderation-gate parsing failed; gateway still boots, only the ordered interaction surface stays off |
-| `durable gateway failed; checkpoint unchanged, readiness unavailable` | `crates/bot/src/main.rs:617` | Gateway task failed with the fixed class in `error_class`; checkpoint not advanced |
-| `gateway task stopped; container restart required` | `crates/bot/src/main.rs:709` | Supervisor saw the essential task end; process must restart from checkpoint |
-| `gateway drain failed; restart required` | `crates/bot/src/main.rs:716` | Drain path failed; restart required |
-| `container service failed` | `crates/bot/src/main.rs:586` | Service supervisor failed (`startup_phase=service_supervisor`) |
-| `shutdown_deadline_exceeded: abandoning in-flight work` | `crates/bot/src/main.rs:724` | Drain deadline elapsed; in-flight work abandoned |
-| `listening` | `crates/bot/src/server.rs:176` | HTTP listener bound; one line per process start |
-| `SIGTERM received; draining` | `crates/bot/src/server.rs:221` | SIGTERM observed; effects drain before exit |
-| `SIGINT received; draining` | `crates/bot/src/server.rs:222` | SIGINT observed; effects drain before exit |
-| `shutdown_completed` | `crates/bot/src/server.rs:254` | HTTP graceful drain completed; stable `msg` name with no human message |
-| `response failed` | `crates/bot/src/server.rs:85,93` | HTTP 5xx response from the trace layer; DEBUG for the routine `/readyz` 503, ERROR otherwise |
-| `second shutdown signal received; exiting immediately` | `crates/bot/src/shutdown.rs:62` | Second signal during drain; process exits at once |
-| `invalid shutdown timeout; using default` | `crates/bot/src/shutdown.rs:36` | `SHUTDOWN_TIMEOUT_SECONDS` unparsable; default deadline kept |
-| `periodic job failed` | `crates/bot/src/jobs.rs:127` | Completed scheduled-job attempt failed; `job` and `error_class` name the job |
-| `TWO_VOICE=1 but no discord token; voice rooms disabled` | `crates/bot/src/gateway.rs:968` | Voice gate on but no token; gateway continues voice-off |
-| `TWO_VOICE=1 but no database URL; voice rooms disabled` | `crates/bot/src/gateway.rs:980` | Voice gate on but no database; gateway continues voice-off |
-| `voice database unavailable; voice rooms disabled` | `crates/bot/src/gateway.rs:989` | Voice store connect failed; gateway continues voice-off |
-| `voice rooms enabled; gateway sink attached` | `crates/bot/src/gateway.rs:995` | Voice runtime built; sink attached to the gateway writer |
-| `voice HTTP setup failed; voice rooms disabled` | `crates/bot/src/gateway.rs:999` | Voice HTTP setup failed; gateway continues voice-off |
+| `durable gateway initialized; shard connecting` | `crates/bot/src/main.rs` (`run`) | Supervisor built the shard; `resume=true` means a saved checkpoint was offered, `false` means fresh IDENTIFY |
+| `gateway shard loop started` | `crates/bot/src/gateway.rs` (`run_shard`) | Reception task entered the Twilight stream loop |
+| `gateway reconnect failed; Twilight will retry` | `crates/bot/src/gateway.rs` (`run_shard`) | Transport reconnect attempt failed; Twilight owns the retry |
+| `cold resume committed; requesting voice snapshot via identify` | `crates/bot/src/gateway.rs` (`run_shard`) | Cold voice RESUME committed; reception IDENTIFies for a fresh voice snapshot |
+| `gateway ready; checkpoint committed` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Dispatch committed and shard marked Connected |
+| `gateway leveling dispatch failed` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Leveling funnel drain failed inside the checkpoint deadline |
+| `gateway community facts dispatch failed` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Community facts drain failed; worker continues and the scorecard fails closed on missing coverage |
+| `gateway community facts dispatch timed out` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Community facts drain missed the checkpoint deadline; worker continues and the scorecard fails closed on missing coverage |
+| `gateway onboarding job invalid` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Dispatch-worker durable onboarding payload failed to serialize; recorded as a typed error, checkpoint unchanged |
+| `onboarding interaction interrupted; member must reselect` | `crates/bot/src/gateway.rs` (`onboarding_queue`) | Durable onboarding job recovered without callback credentials; kept as interruption receipt |
+| `invite counter read unavailable; retaining snapshot` | `crates/bot/src/gateway.rs` (`HttpInvites::current`) | REST invite read failed; persisted baseline kept instead of an empty listing |
+| `interaction acknowledgement blocked; advancing past lost callback` | `crates/bot/src/gateway.rs` (`complete_acknowledgement`) | Ordered RSVP acknowledgement hit send-admission Blocked; checkpoint advances past the lost callback without replaying uncertain effects |
+| `interaction response failed; not replaying command` | `crates/bot/src/gateway.rs` (`complete_acknowledgement`, three sites) | Ordered RSVP preparation or completion failed without admission blockage; command advances without replaying uncertain effects |
+| `READY identity differs from boot token; ordered identity not armed` | `crates/bot/src/gateway.rs` (`run_shard`) | READY application id differs from the boot/REST pin; ordered identity stays disarmed and its fence keeps refusing |
+| `gateway prerequisites missing; gateway parked, /readyz reports down` | `crates/bot/src/main.rs` (`run`) | Token, database URL or guild ID missing; shard never starts |
+| `feature gates invalid; ordered interaction surface parked` | `crates/bot/src/main.rs` (`build_interaction_runtime`) | Feature-gate parsing failed; gateway still boots, only the ordered interaction surface stays off |
+| `moderation gates invalid; ordered interaction surface parked` | `crates/bot/src/main.rs` (`build_interaction_runtime`) | Moderation-gate parsing failed; gateway still boots, only the ordered interaction surface stays off |
+| `durable gateway failed; checkpoint unchanged, readiness unavailable` | `crates/bot/src/main.rs` (`publish_gateway_failure`) | Gateway task failed with the fixed class in `error_class`; checkpoint not advanced |
+| `gateway task stopped; container restart required` | `crates/bot/src/main.rs` (`supervise_gateway_bounded`) | Supervisor saw the essential task end; process must restart from checkpoint |
+| `gateway drain failed; restart required` | `crates/bot/src/main.rs` (`supervise_gateway_bounded`) | Drain path failed; restart required |
+| `container service failed` | `crates/bot/src/main.rs` (`run`) | Service supervisor failed (`startup_phase=service_supervisor`) |
+| `shutdown_deadline_exceeded: abandoning in-flight work` | `crates/bot/src/main.rs` (`supervise_gateway_bounded`) | Drain deadline elapsed; in-flight work abandoned |
+| `listening` | `crates/bot/src/server.rs` (`bind`) | HTTP listener bound; one line per process start |
+| `SIGTERM received; draining` | `crates/bot/src/server.rs` (`shutdown_signal`) | SIGTERM observed; effects drain before exit |
+| `SIGINT received; draining` | `crates/bot/src/server.rs` (`shutdown_signal`) | SIGINT observed; effects drain before exit |
+| `shutdown_completed` | `crates/bot/src/server.rs` (`serve_with_shutdown`) | HTTP graceful drain completed; stable `msg` name with no human message |
+| `response failed` | `crates/bot/src/server.rs` (`router_with_guard` trace layer, two sites) | HTTP 5xx response from the trace layer; DEBUG for the routine `/readyz` 503, ERROR otherwise |
+| `second shutdown signal received; exiting immediately` | `crates/bot/src/shutdown.rs` (`exit_on_second_signal`) | Second signal during drain; process exits at once |
+| `invalid shutdown timeout; using default` | `crates/bot/src/shutdown.rs` (`deadline_from`) | `SHUTDOWN_TIMEOUT_SECONDS` unparsable; default deadline kept |
+| `periodic job failed` | `crates/bot/src/jobs.rs` (`record_completion`) | Completed scheduled-job attempt failed; `job` and `error_class` name the job |
+| `TWO_VOICE=1 but no discord token; voice rooms disabled` | `crates/bot/src/gateway.rs` (`build_voice_runtime`) | Voice gate on but no token; gateway continues voice-off |
+| `TWO_VOICE=1 but no database URL; voice rooms disabled` | `crates/bot/src/gateway.rs` (`build_voice_runtime`) | Voice gate on but no database; gateway continues voice-off |
+| `voice database unavailable; voice rooms disabled` | `crates/bot/src/gateway.rs` (`build_voice_runtime`) | Voice store connect failed; gateway continues voice-off |
+| `voice rooms enabled; gateway sink attached` | `crates/bot/src/gateway.rs` (`build_voice_runtime`) | Voice runtime built; sink attached to the gateway writer |
+| `voice HTTP setup failed; voice rooms disabled` | `crates/bot/src/gateway.rs` (`build_voice_runtime`) | Voice HTTP setup failed; gateway continues voice-off |
 
 ## Gateway metric event labels
 
-Fixed allowlist in `crates/core/src/metrics.rs:11-30`, observed in
-`crates/bot/src/gateway_metrics.rs:27-42`. Unknown dispatch types
-collapse to `other`; scrapers must match these exact spellings.
+Fixed allowlist `metrics::EVENTS` in `crates/core/src/metrics.rs`, observed in
+`Observer::observe_text` in `crates/bot/src/gateway_metrics.rs`. Unknown
+dispatch types collapse to `other`; scrapers must match these exact spellings.
 
 | Event label | Series | Meaning |
 | --- | --- | --- |
@@ -73,7 +83,10 @@ collapse to `other`; scrapers must match these exact spellings.
 | `MESSAGE_CREATE` | `two_bot_gateway_events_total` | Message created dispatch |
 | `MESSAGE_UPDATE` | `two_bot_gateway_events_total` | Message edited dispatch |
 | `MESSAGE_DELETE` | `two_bot_gateway_events_total` | Message deleted dispatch |
+| `MESSAGE_REACTION_ADD` | `two_bot_gateway_events_total` | Reaction added dispatch (self-role lane) |
+| `MESSAGE_REACTION_REMOVE` | `two_bot_gateway_events_total` | Reaction removed dispatch (self-role lane) |
 | `VOICE_STATE_UPDATE` | `two_bot_gateway_events_total` | Voice state changed dispatch |
+| `PRESENCE_UPDATE` | `two_bot_gateway_events_total` | Member presence changed (only with `TWO_VOICE_PRESENCE=1`) |
 | `INVITE_CREATE` | `two_bot_gateway_events_total` | Invite created dispatch |
 | `INVITE_DELETE` | `two_bot_gateway_events_total` | Invite deleted dispatch |
 | `INTERACTION_CREATE` | `two_bot_gateway_events_total` | Interaction received dispatch |
@@ -90,10 +103,41 @@ Scalar gateway series pair with the labels above:
 | `two_bot_gateway_disconnects_total` | Transport losses through the shard supervisor; each must pair with a later RESUME or fresh READY |
 | `two_bot_gateway_missed_events_total` | Sequence gaps inside one session; any nonzero increase fails the zero-missed-events acceptance |
 | `two_bot_gateway_latency_seconds` | Last heartbeat ACK round-trip; `NaN` until measured |
+| `two_bot_gateway_prefix_trigger_refused_total{reason="verdict"}` | In-scope prefix candidates refused by the automod verdict; the worker records candidates even when its capture-only gate prevents detached dispatch. Unmatched content, scope mismatches, bot/webhook messages and disabled text-command gates never increment it |
+
+## Scheduled job labels
+
+Each label owns independent `two_bot_job_runs_total{job,outcome}`,
+`two_bot_job_last_success_timestamp_seconds{job}`,
+`two_bot_job_consecutive_failures{job}` and
+`two_bot_job_last_error_class{job,class}` series (see the job allowlist
+`JOBS` in `metrics.rs`). Success in one label never clears another label's
+streak. None of these four has a `JOB_INTERVAL_SECONDS` cadence entry, so
+staleness tickets via `job_unknown_stale` below instead of `job_stale`.
+
+| Job label | Producer (stable anchor) | Meaning |
+| --- | --- | --- |
+| `feeds` | `feed_jobs.rs` (`scheduled_job_live` via `register` / `register_fenced`) | Feed poller sweep on the boot-configured interval with a live inner polling gate; gated skips return success and reset the streak |
+| `self_role_recovery` | `self_role_handlers.rs` (`recovery_job`) | Self-role repair sweep every 30 s; a successful sweep need not settle every pending repair; failure-only alerting, no `job_stale` paging |
+| `member_unban_sweep` | `member_runtime.rs` (`sweep_job`) | Member unban sweep every 30 s with an attempt timeout that may outlive its cadence; a successful sweep need not complete any unban; failure-only alerting |
+| `automod_expiry` | `automod_gateway.rs` (`expiry_job`) | Automod repeat-history expiry tick every 60 s; a gateway without built activation is a no-op success, and real expiry work runs only with the automod gate on; failure-only alerting |
+
+## Alert rules
+
+Rule ids evaluated in `alert-rules.ts` (`evaluateMetrics`) against the
+scrape inputs pinned in `metrics-scrape.ts` (`ALERT_INPUT_LABELS`). The id
+is the single shared spelling also pinned in `evidence.rs`
+(`ALERT_RULE_IDS`), so soak evidence packets attribute correctly.
+
+| Rule | Input series | Meaning |
+| --- | --- | --- |
+| `job_unknown_stale` | `two_bot_job_last_success_timestamp_seconds{job}` for labels outside `JOB_INTERVAL_SECONDS`, `TICKER_STALE_JOBS` and `UNKNOWN_STALE_EXCLUDED` | Ticket when a job without a cadence entry has a nonzero success timestamp older than 2 hours; never-succeeded stays silent; `session_checkpoint` is event-driven and excluded |
+| `gateway_unpaired_disconnect` | `two_bot_gateway_disconnects_total` against `two_bot_gateway_resumes_total` plus fresh `two_bot_gateway_events_total{event="READY"}` | Pages after 3 consecutive samples with disconnect growth and no RESUMED or fresh READY growth (pairing in `pairGatewayDisconnects`); any recovery growth clears at once; the disconnect counter increments in `gateway.rs` (`transport_disconnected`) |
 
 ## Gateway failure classes (`/readyz` `gateway_failure`)
 
-Enum in `crates/bot/src/gateway_failure.rs:80-95`, served as
+`FailureClass` enum in `crates/bot/src/gateway_failure.rs`
+(`FailureClass::ALL` / `as_str`), served as
 `{"phase":"durable_gateway","class":"…"}`. One class is logged once by
 `publish_gateway_failure`; SQL errors never reach the field.
 
@@ -125,12 +169,22 @@ Startup `error_class` values logged before fatal exits (see
 member, token, body or ID leaves the process. Included because the voice
 sink attaches to the gateway writer on the cutover path.
 
-| Field value | Callsite | Meaning |
+| Field value | Callsite (stable anchor) | Meaning |
 | --- | --- | --- |
-| `voice_event="voice_operation"` | `crates/bot/src/voice_rooms.rs:375` (`voice_operation succeeded`), `:382` (`voice_operation failed`) | One finished room create/move/delete outcome with bounded `op`/`outcome` |
-| `voice_event="voice_reconcile"` | `crates/bot/src/voice_rooms.rs:1470` (`voice_reconcile planned`) | One reconcile pass plan size with per-action counts |
-| `voice_event="voice_dead_letter"` | `crates/bot/src/voice_rooms.rs:2002` (`voice action dead-lettered`) | Queue write exhausted retries with bounded `action` and attempts |
-| `voice_event="voice_creator_orphan"` | `crates/bot/src/voice_rooms.rs:4904` (`voice creator orphan needs manual deletion`) | Untracked creator-channel orphan needing manual deletion |
+| `voice_event="voice_operation"` | `crates/bot/src/voice_rooms.rs` (`observe_voice_operation`: `voice_operation succeeded` / `voice_operation failed`) | One finished room create/move/delete outcome with bounded `op`/`outcome` |
+| `voice_event="voice_reconcile"` | `crates/bot/src/voice_rooms.rs` (`reconcile`: `voice_reconcile planned`) | One reconcile pass plan size with per-action counts |
+| `voice_event="voice_dead_letter"` | `crates/bot/src/voice_rooms.rs` (`mark_failed_observed`: `voice action dead-lettered`) | Queue write exhausted retries with bounded `action` and attempts |
+| `voice_event="voice_creator_orphan"` | `crates/bot/src/voice_rooms.rs` (`execute_create`: `voice creator orphan needs manual deletion`) | Untracked creator-channel orphan needing manual deletion |
+
+Adjacent actor message without a `voice_event` field:
+`voice actor load failed; actor respawns on the next guild snapshot`
+(`observe_voice_actor_load_failure` in `crates/bot/src/voice_rooms.rs`):
+the guild actor's store load failed. Every failure bumps
+`two_bot_db_errors_total{op="other"}`; the warn is throttled process-wide to
+one line per 5 minutes, so a burst across guilds names only the first. The
+actor respawns on the next guild snapshot (`publish_snapshot` on
+`GuildCreate`/resumed replay); voice, channel and role events for the guild
+are dropped until then.
 
 ## Unknowns (TBD)
 
@@ -151,3 +205,9 @@ sink attaches to the gateway writer on the cutover path.
 - `crates/bot/src/gateway_failure.rs`, `docs/startup-diagnostics.md`
 - `docs/metrics.md`, `docs/watch-signal-queries.md`,
   `docs/gateway-recovery.md`
+- Job producers: `crates/bot/src/feed_jobs.rs`,
+  `crates/bot/src/self_role_handlers.rs`, `crates/bot/src/member_runtime.rs`,
+  `crates/bot/src/automod_gateway.rs`
+- Alert sources: `wrangler/src/alert-rules.ts`,
+  `wrangler/src/metrics-scrape.ts`, `crates/core/src/evidence.rs`,
+  `docs/runbook.md`

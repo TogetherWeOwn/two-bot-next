@@ -96,12 +96,20 @@ export class OwnershipFence {
    * teardown permits release. A crash/write/stop failure leaves durable denial.
    * Record and audit are written atomically, with an optimistic epoch check.
    */
-  async change(id: string, change: OwnershipChange, destroy: () => Promise<void>): Promise<OwnerRecord> {
+  async change(id: string, change: OwnershipChange, destroy: () => Promise<void>, opts?: { force?: boolean }): Promise<OwnerRecord> {
     deploymentId(id);
     const old = await this.read();
     const oldEpoch = old?.epoch ?? 0;
     if (oldEpoch !== change.expectedEpoch) throw new OwnershipRefused("epoch_conflict");
     if (oldEpoch === Number.MAX_SAFE_INTEGER) throw new OwnershipRefused("epoch_exhausted");
+    // Idempotent repeat: the deployment that already owns the active singleton,
+    // re-posting at its own epoch, gets the stored record back unchanged: no
+    // write, no audit row, no destroy. A fenced (crash-recovery) record and an
+    // explicit recovery pass (force) still commit, and any other deployment
+    // still takes over at the fresh epoch.
+    if (!opts?.force && change.action === "takeover" && old?.phase === "active" && old.deploymentId === id) {
+      return old;
+    }
     const pending: OwnerRecord = {
       deploymentId: change.action === "takeover" ? id : null,
       epoch: oldEpoch + 1,

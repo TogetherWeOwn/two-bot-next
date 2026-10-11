@@ -219,7 +219,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
 
     /// The room's cached overwrites, for rewriting one entry.
     pub(super) fn live_overwrites(&self, room: Snowflake) -> Option<Vec<PermissionOverwrite>> {
-        let live = self.live.inner.read().expect("live voice lock");
+        let live = self.live.read_state();
         live.channels
             .get(&room)
             .map(|channel| channel.permission_overwrites.clone().unwrap_or_default())
@@ -238,7 +238,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// Record a written overwrite in the live snapshot, so the next decision
     /// reads what Discord now holds without waiting for the gateway echo.
     pub(super) fn note_overwrite(&self, room: Snowflake, overwrite: &PermissionOverwrite) {
-        let mut live = self.live.inner.write().expect("live voice lock");
+        let mut live = self.live.write_state();
         if let Some(channel) = live.channels.get_mut(&room) {
             let current = channel.permission_overwrites.take().unwrap_or_default();
             channel.permission_overwrites = Some(with_overwrite(&current, overwrite));
@@ -302,7 +302,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             return PAUSED.to_owned();
         }
         let (channel, room, members, bot_permissions) = {
-            let live = self.live.inner.read().expect("live voice lock");
+            let live = self.live.read_state();
             if !live.ready {
                 return WARMING.to_owned();
             }
@@ -622,7 +622,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         room: Snowflake,
         deny: bool,
     ) -> Option<Result<ConnectWrites, RoomHttpError>> {
-        let live = self.live.inner.read().expect("live voice lock");
+        let live = self.live.read_state();
         let channel = live.channels.get(&room)?;
         let Some(bot) = live.bot.as_ref() else {
             return Some(Err(RoomHttpError::AccessDenied));
@@ -728,22 +728,15 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 return;
             }
         }
-        let placement = self
-            .live
-            .inner
-            .read()
-            .expect("live voice lock")
-            .channels
-            .get(&room)
-            .map(|channel| {
-                (
-                    channel.parent_id.map(Id::get),
-                    // Directly after the room, in its category.
-                    channel
-                        .position
-                        .and_then(|position| u64::try_from(position.saturating_add(1)).ok()),
-                )
-            });
+        let placement = self.live.read_state().channels.get(&room).map(|channel| {
+            (
+                channel.parent_id.map(Id::get),
+                // Directly after the room, in its category.
+                channel
+                    .position
+                    .and_then(|position| u64::try_from(position.saturating_add(1)).ok()),
+            )
+        });
         let Some((parent_id, position)) = placement else {
             self.queue.mark_succeeded(&action);
             return;
@@ -805,7 +798,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// than the room and held by no tracked room or Join channel: the Join
     /// channel an earlier, unknown-outcome create left behind.
     fn adopt_join_channel(&self, room: Snowflake, name: &str) -> Option<Snowflake> {
-        let live = self.live.inner.read().expect("live voice lock");
+        let live = self.live.read_state();
         let parent = live.channels.get(&room)?.parent_id;
         live.channels
             .values()
@@ -930,20 +923,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// Delete one Join channel. A channel the snapshot no longer shows, or one
     /// Discord reports gone, counts as deleted.
     async fn delete_join_channel(&mut self, channel_id: Snowflake) -> Result<(), RoomHttpError> {
-        let present = self
-            .live
-            .inner
-            .read()
-            .expect("live voice lock")
-            .channels
-            .contains_key(&channel_id);
+        let present = self.live.read_state().channels.contains_key(&channel_id);
         if !present {
             self.join_deletable.remove(&channel_id);
             return Ok(());
         }
         let live = self.live.clone();
         let guard: WriteGuard = Arc::new(move || {
-            let state = live.inner.read().expect("live voice lock");
+            let state = live.read_state();
             state.ready && state.channels.contains_key(&channel_id)
         });
         match self.http.delete(channel_id, guard).await {
@@ -975,7 +962,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     pub(super) fn reconcile_privacy(&mut self) {
         let mut forgotten = Vec::new();
         {
-            let live = self.live.inner.read().expect("live voice lock");
+            let live = self.live.read_state();
             if !live.ready {
                 return;
             }

@@ -1,10 +1,10 @@
-# Security gates for vote-kick, template assistant and RSVP/attendance
+# Security gates for vote-kick, template assistant, RSVP/attendance and slash input bounds
 
 This checklist is the security acceptance contract for runtime wiring of these
-features. A published command, pure-core test or merged documentation change
+features and for slash-command input handling (IN- rows). A published command, pure-core test or merged documentation change
 is not proof that its runtime path satisfies the gates. Requirements already
 covered by code still need exact-head evidence; unresolved requirements stay
-open. This document does not authorize a feature enablement or production test.
+open. Slash-command input-handling PRs touching `/lfg`, `/command`, `/schedule*`, `/sticky` or `/feed*` cite the IN- rows the same way wiring PRs cite VK/RA/TA rows. This document does not authorize a feature enablement or production test.
 
 ## Source boundary
 
@@ -24,7 +24,7 @@ majority and one-ballot-per-member rules in
 | VK-01 | Protect targets with effective **Kick Members** or **Administrator** permission, as well as the room owner and original creator. Resolve target authority in the interaction's guild, fail closed when it is unavailable, and recheck before enforcement so a promotion during a vote cannot be bypassed. | Deny each protected target separately at start and after a mid-vote promotion; an unavailable authority lookup causes no disconnect or permission edit. An ordinary target can still be voted on. |
 | VK-02 | Ship a finite post-terminal cooldown and a per-initiator limit across targets. Pin the duration, limit, keys and pass/defeat/expiry/cancel behavior in the implementation and tests; a two-minute active-vote window alone is not a post-terminal cooldown. | Repeated attempts, fresh interaction IDs and target/room changes cannot evade the chosen limits. Test just before and exactly at the deadline and show refused attempts create no vote or enforcement effect. |
 | VK-03 | Bound all retained vote state: `VoteKickCore::votes`, including terminal votes and their ballots, active-vote tracking, `vote_refs` and `vote_initiators`. Define coordinated retention across these stores. Pruning must not reopen a replay or drop an unresolved enforcement fence. If safe capacity cannot be recovered, refuse new admissions rather than grow without limit or forget an accepted interaction. | At-capacity and high-churn tests assert finite counts of active/terminal votes, retained ballots and both runtime maps; replay after pruning/restart is refused for the documented replay horizon, and pending enforcement remains fenced. |
-| VK-04 | Render the public reason as bounded, mention-safe plain text without clickable links, markdown formatting or embeds under the bot's name. Do not echo raw input in errors or logs. | Everyone/role/user mentions, disguised links, bare URLs, markdown and overlong reasons cannot create a ping, link, embed or formatted bot endorsement in the final Discord payload. |
+| VK-04 | Render the public reason as bounded, mention-safe plain text without clickable links, markdown formatting or embeds under the bot's name. Do not echo raw input in errors or logs. | Everyone/role/user mentions, disguised links, bare URLs, markdown and overlong reasons cannot create a ping, link, embed or formatted bot endorsement in the final Discord payload. Proved by `hostile_reasons_render_as_mention_safe_plain_text` (ballot payload) in `crates/bot/src/voice_kick_tests.rs`; ordinary text passes through via `ordinary_reasons_render_intact_and_absent_reason_renders_no_line`. Refusal, error and log paths are reason-free by construction: `kick_start` takes no reason parameter, refusals render only from the `KickRefusal` enum via `kick_refusal_text` (fixed `&'static str` per variant, all 17 pinned by `kick_refusals_never_echo_initiator_text`), audit rows carry fixed outcome codes plus snowflakes, and follow-up ballot edits never take the reason; `hostile_reasons_never_echo_in_refusals_errors_or_logs` holds the hostile matrix in scope over those paths as a regression tripwire. |
 
 The [cooldown checklist](voice-vote-kick-cooldown-checklist.md) records the
 existing active-vote window and the intentional **no post-terminal cooldown**
@@ -61,19 +61,47 @@ totals after event cancellation or deletion, without requiring a live-event look
 | RA-02 | Resolve the supplied occurrence through a trusted, guild-scoped event/occurrence binding, not arbitrary caller text. Preserve runtime **Manage Events** authority for every `/attendance` host check-in, including when the actor selects themself, and verify the selected target's current guild membership. Selecting oneself must not create an unprivileged self-check-in path or downgrade `AttendanceProof::HostCheckin`. | Unknown/cross-event occurrences, forged user IDs, cross-guild targets and unauthorized host check-ins create no attendance or audit rows. Explicitly test unauthorized self and on-behalf refusals, and authorized self and on-behalf paths that retain HostCheckin proof. |
 | RA-03 | Bound admissions and storage growth even for valid events: pin per-user rate/cap limits and occurrence bounds, deduplicate retries, and define retention for RSVP and audit rows without deleting required recovery/audit evidence. Keep validation and writes race-safe. | Burst, duplicate and concurrent requests have bounded row counts. Event/occurrence removal or membership loss between lookup and write is refused under the chosen consistency contract; lookup/store errors do not become successful check-ins. |
 
-The current [`event-occurrence` command contract](commands.md#attendance) accepts
-a scheduled-event ID or a free-text occurrence ID. The
-[parity contract](parity.md) permits only the documented length bound and picker
-copy changes, not removal of those accepted formats. RA-02 therefore requires a
-hardening PR to define and test trusted event/occurrence resolution for both
-formats. Restricting input to Discord-derived IDs instead requires an explicit
-parity decision, a recorded intentional difference and coordinated command
-reference, fixture and regression updates. This checklist grants no such waiver
-and does not change the accepted formats.
+The current [`event-occurrence` command contract](commands.md#attendance) states
+the trusted rule: a bare scheduled-event id binds the event itself, any other
+text must anchor as `{event_id}:{label}`, and bare slugs refuse. The
+[parity contract](parity.md) records the bare-slug refusal as an intentional
+security difference; the anchored free-text format is preserved, not removed.
+Trusted resolution is defined and tested by the RA-02 hardening change, pinned
+by `crates/core/src/rsvp.rs::tests::attendance_occurrence_binds_every_format_to_a_live_event_anchor`
+(shape, refusal classes, no-echo refusal) and the
+`crates/discord/tests/rsvp_runtime.rs` acceptance battery
+(`unknown_and_cross_guild_occurrences_refuse_without_writes`,
+`host_checkin_authorized_self_and_on_behalf_retain_host_checkin_proof`,
+`permissions_gates_and_guild_fence_precede_store_access`,
+`malformed_inputs_and_failed_ack_do_not_write`,
+`non_member_and_unverifiable_targets_refuse_without_writes`), which assert zero
+attendance/audit writes on every refusal. Restricting input further to
+Discord-derived IDs alone would still require an explicit parity decision, a
+recorded intentional difference and coordinated command reference, fixture and
+regression updates. This checklist grants no such waiver and does not change
+the accepted formats.
 
 The store functions above are persistence primitives, not permission checks.
 Exercise the actual interaction-to-store path with a disposable test database;
 a store-only happy-path test cannot establish RA-01 or RA-02.
+
+## Slash input bounds
+
+The input-bound fix (PR #694) closed four gaps found in an internal
+slash-command review: an unbounded `/lfg` role-key echo plus a raw reply
+path that could abandon the deferral, unbounded custom-command audit
+`target_key` values, empty/overlong schedule-id prefix matching, and
+published string options with no `max_length` while handlers enforce caps
+server-side. These rows record those gates so the next review does not
+start from zero. They change no bound; the code and tests cited are the
+implementation.
+
+| ID | Required control | Minimum regression evidence |
+| --- | --- | --- |
+| IN-01 | Bound the `/lfg` role-key echo to a 128-character prefix of the raw key and reject role specs over the published UTF-16 bound (`MAX_ROLE_SPEC_CHARS`, 2339) before parsing. Route the LFG failure reply through the sanitizing interaction edit (truncate to the message bound with neutral mentions, `allowed_mentions` parse `[]`) so the deferred interaction never hangs thinking and hostile mentions never echo. | `crates/core/src/lfg.rs::tests::role_key_errors_echo_only_a_bounded_raw_prefix` (echo capped at 128 chars) and `role_spec_rejects_input_over_the_published_utf16_bound` (ASCII and multibyte over-long refused); hostile tail of `crates/discord/tests/lfg_interactions.rs::router_runs_create_signup_full_switch_leave_close_with_audit` (reply is `PATCH`, content within `MAX_MESSAGE_CHARS`, no `@everyone`, `parse == []`). |
+| IN-02 | Cap custom-command audit `target_key` values at the command-name bound (`MAX_COMMAND_NAME_CHARS`, 32 chars) for put, reject, delete and run rows, so unbounded `/command name` input never lands raw in audit rows. | `crates/core/src/custom_commands.rs::tests::rejected_and_absent_audits_bound_untrusted_names` (overlong multibyte name bounded to 32 chars on reject and absent-delete paths) and `crates/core/src/custom_commands.rs::tests::successful_audits_bound_target_key_by_characters_at_the_name_limit` (put created and updated, ok delete, ok and failed run rows; under-limit, exact, one-over and overlong multibyte names bounded by characters, with action, outcome and reason pinned). Every audit constructor that writes `target_key` uses the shared `bounded_audit_name` helper (`custom_commands.rs:360,383,395,407`), and each is pinned by an executed overlong-name assertion. |
+| IN-03 | Refuse empty and overlong (`MAX_RESOURCE_ID_CHARS`, 128 UTF-16 units) schedule-id prefixes in the shared schedule resolver (`scheduled::resolve_scheduled_id`) and the store wrapper (`scheduled_store::resolve_scheduled_id`) before any database access. The `/schedule-remove` handler guards (`schedule_runtime.rs:194-210`) and the `/lfg-close` guard (`lfg_interactions.rs:153-164`) apply the same bounds at the interaction edge and mutate nothing: empty prefixes return the shared no-unique-match text, the overlong `/schedule-remove` reply is a hard-coded literal with the same suffix, and `/lfg-close` refuses with its own 1-to-128-characters message. | `crates/core/tests/schedule_queue_order.rs::prefix_resolution_refuses_missing_and_ambiguous_ids` (empty and 129-char prefixes resolve `Missing`, shared reply pins the suffix); `crates/core/src/scheduled_store.rs::tests::empty_and_overlong_prefixes_refuse_before_database_access` (lazy pool proves refusal happens before database access). No handler-level test sends empty/129-char ids to `/schedule-remove` or `/lfg-close`; the handler guards and the overlong literal are implementation, not pinned evidence. |
+| IN-04 | Advertise `max_length` on published string options equal to the runtime caps: `/command` name 32, template 2000, description 100, text-trigger 33, `/command-remove` name 32; `/schedule` body 2000, `/schedule-remove` id 128, `/sticky` body 2000; `/lfg` title 100, roles 2339, `/lfg-close` id 128; `/feed-add` source 2048 bytes, `/feed-remove` id 128. Server-side validators stay authoritative; picker bounds only restrict what Discord sends. | `crates/core/src/feature_commands.rs` automation/announcement `max_length` assertions (each option pinned to its constant); `crates/core/tests/support/registry_parity.rs::expected_registry` caps plus `crates/core/tests/registry_golden.rs::diff_detects_each_kind_of_unlisted_drift_including_exception_bodies` (drift on any unlisted `max_length` change); `crates/core/tests/feeds.rs::source_length_bound_matches_published_byte_limit_before_trimming` (byte ceiling enforced before trimming, multibyte over-ceiling refused). |
 
 ## Wiring PR evidence contract
 

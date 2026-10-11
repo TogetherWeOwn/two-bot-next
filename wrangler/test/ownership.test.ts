@@ -124,6 +124,59 @@ test("real DO storage: parking owner fences both deployments and survives reload
   assert.equal((await call("/state")).body.running, null);
 });
 
+test("real DO storage: same-owner exact-epoch takeover repeat is a read-only no-op", async (t) => {
+  const { call } = await fixture(t);
+  const first = await call("/change", { id: "A", epoch: 0 });
+  assert.equal(first.status, 200);
+  assert.equal(first.body.epoch, 1);
+  await call("/probe", { id: "A" });
+  const before = (await call("/state")).body;
+  const repeat = await call("/change", { id: "A", epoch: 1 });
+  assert.equal(repeat.status, 200);
+  assert.deepEqual(repeat.body, first.body);
+  const after = (await call("/state")).body;
+  assert.deepEqual(Object.keys(after.audit).sort(), Object.keys(before.audit).sort(), "no-op writes no audit row");
+  assert.equal(after.running, "A", "no-op runs no teardown");
+  assert.deepEqual(after.starts, ["A"]);
+  assert.equal((await call("/change", { id: "A", epoch: 0 })).body.reason, "epoch_conflict");
+});
+
+test("real DO storage: forced same-owner exact-epoch takeover still commits (recovery path)", async (t) => {
+  const { call } = await fixture(t);
+  await call("/change", { id: "A", epoch: 0 });
+  await call("/probe", { id: "A" });
+  const forced = await call("/change", { id: "A", epoch: 1, force: true });
+  assert.equal(forced.status, 200);
+  assert.equal(forced.body.epoch, 2);
+  assert.equal(forced.body.deploymentId, "A");
+  assert.equal(forced.body.phase, "active");
+  const state = (await call("/state")).body;
+  assert.equal(state.running, null, "recovery re-runs teardown");
+  assert.ok(state.audit[`${AUDIT_PREFIX}2:active`]);
+});
+
+test("real DO storage: fenced-pending same-id retry still commits", async (t) => {
+  const { call } = await fixture(t);
+  await call("/change", { id: "A", epoch: 0 });
+  await call("/probe", { id: "A" });
+  assert.equal((await call("/change", { id: "B", epoch: 1, stopError: true })).status, 503);
+  const retry = await call("/change", { id: "B", epoch: 2 });
+  assert.equal(retry.status, 200);
+  assert.equal(retry.body.epoch, 3);
+  assert.equal(retry.body.phase, "active");
+  assert.equal(retry.body.deploymentId, "B");
+});
+
+test("real DO storage: different-deployment takeover at the fresh epoch still commits", async (t) => {
+  const { call } = await fixture(t);
+  await call("/change", { id: "A", epoch: 0 });
+  const handoff = await call("/change", { id: "B", epoch: 1 });
+  assert.equal(handoff.status, 200);
+  assert.equal(handoff.body.epoch, 2);
+  assert.equal(handoff.body.deploymentId, "B");
+  assert.equal(handoff.body.phase, "active");
+});
+
 test("real DO storage: malformed persisted records fail closed", async (t) => {
   const { call } = await fixture(t);
   await call("/corrupt");

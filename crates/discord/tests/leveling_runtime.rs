@@ -440,3 +440,148 @@ async fn gateway_reward_and_interaction_executor_errors_propagate() {
     mock.shutdown().await;
     db.close().await;
 }
+
+/// Gateway voice capture: a human join inserts one
+/// `voice_session_started` fact keyed `voice-start:{session_key}`, the leave
+/// inserts one honestly-measured `voice_session_ended` fact (330 s for the
+/// 5.5-minute session) carrying `sessionKey`, `startedAt`,
+/// `durationSeconds` and `startKnown:true`, and a redelivered join at the
+/// original stamp dedupes to zero inserts.
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or credential-free CI service"]
+async fn community_voice_fact_capture_round_trip() {
+    let db = TestDb::new().await;
+    let pipeline = OrderedLevelingPipeline::new(MemStore::new(), None);
+    pipeline.enable_community_facts(db.pool.clone());
+    const VOICE_CHANNEL: u64 = 300000000000000002;
+
+    // Join: one start fact, and the durable session key travels with it.
+    let requests = pipeline.collect_at(
+        &voice(Some(VOICE_CHANNEL)),
+        &at(10),
+        MessageEligibility::default(),
+    );
+    pipeline.drain(requests).await.unwrap();
+    assert_eq!(pipeline.drain_facts().await.unwrap(), 1);
+    let (session_key, metadata): (String, String) = sqlx::query_as(
+        "SELECT source_event_id, metadata FROM community_facts WHERE guild_id = $1 AND event_type = 'voice_session_started'",
+    )
+    .bind(GUILD.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(
+        session_key.starts_with(&format!("{GUILD}:{MEMBER}:")),
+        "session key binds guild and member"
+    );
+    assert!(
+        session_key.ends_with(&format!(":{VOICE_CHANNEL}")),
+        "session key binds channel"
+    );
+    assert!(
+        metadata.contains(&format!("\"sessionKey\":\"{session_key}\"")),
+        "start carries its session key"
+    );
+
+    // Leave 330 s later: one measured end with honest duration math.
+    let requests = pipeline.collect_at(&voice(None), &at(340), MessageEligibility::default());
+    pipeline.drain(requests).await.unwrap();
+    assert_eq!(pipeline.drain_facts().await.unwrap(), 1);
+
+    // Redelivered join at the original stamp reuses the same session key, so
+    // the `voice-start:{session_key}` row dedupes to zero inserts (a
+    // same-channel frame without a leave would never reach the sink at all).
+    let requests = pipeline.collect_at(
+        &voice(Some(VOICE_CHANNEL)),
+        &at(10),
+        MessageEligibility::default(),
+    );
+    pipeline.drain(requests).await.unwrap();
+    assert_eq!(pipeline.drain_facts().await.unwrap(), 0);
+    let row: (String, String, String) = sqlx::query_as(
+        "SELECT event_type, source_event_id, metadata FROM community_facts WHERE guild_id = $1 AND event_type = 'voice_session_ended'",
+    )
+    .bind(GUILD.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.1, session_key, "end reuses the start's session key");
+    for field in [
+        format!("\"sessionKey\":\"{session_key}\"").as_str(),
+        "\"durationSeconds\":330",
+        "\"startKnown\":true",
+    ] {
+        assert!(row.2.contains(field), "end carries expected field");
+    }
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM community_facts")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 2, "one start plus one end, no double row");
+    db.close().await;
+}
+
+/// Gateway `MessageCreate` capture: a human message inserts one
+/// `message_created` fact with its classifier verdict, a duplicate delivery
+/// inserts nothing, a bot message is captured as `bot` while queuing no
+/// award, and a DM inserts nothing.
+#[tokio::test]
+#[ignore = "requires approved agent-testdb or credential-free CI service"]
+async fn community_message_fact_capture_round_trip() {
+    let db = TestDb::new().await;
+    let pipeline = OrderedLevelingPipeline::new(MemStore::new(), None);
+    pipeline.enable_community_facts(db.pool.clone());
+
+    // Human message: one fact, and the classifier verdict travels with it.
+    let requests = pipeline.collect_at(&message(10), &at(10), MessageEligibility::default());
+    pipeline.drain(requests).await.unwrap();
+    assert_eq!(pipeline.drain_facts().await.unwrap(), 1);
+    let row: (String, String) =
+        sqlx::query_as("SELECT classification, metadata FROM community_facts WHERE guild_id = $1")
+            .bind(GUILD.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(row.0, "eligible_human");
+    assert!(row.1.contains("\"channelClass\""), "channel class travels");
+    assert!(!row.1.contains("hello"), "no message content stored");
+
+    // Duplicate delivery: the same message id dedupes to zero inserts.
+    let requests = pipeline.collect_at(&message(10), &at(10), MessageEligibility::default());
+    pipeline.drain(requests).await.unwrap();
+    assert_eq!(pipeline.drain_facts().await.unwrap(), 0);
+
+    // Bot message: captured as `bot` but queues no award.
+    let mut bot = message(11);
+    if let Event::MessageCreate(m) = &mut bot {
+        m.author.bot = true;
+    }
+    let requests = pipeline.collect_at(&bot, &at(11), MessageEligibility::default());
+    assert!(requests.is_empty(), "bots never funnel-count");
+    pipeline.drain(requests).await.unwrap();
+    assert_eq!(pipeline.drain_facts().await.unwrap(), 1);
+
+    // DM: dropped in the pipeline, never reaches the sink.
+    let mut dm = message(12);
+    if let Event::MessageCreate(m) = &mut dm {
+        m.guild_id = None;
+    }
+    let requests = pipeline.collect_at(&dm, &at(12), MessageEligibility::default());
+    pipeline.drain(requests).await.unwrap();
+    assert_eq!(pipeline.drain_facts().await.unwrap(), 0);
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM community_facts")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 2, "human plus bot rows, no double row, no DM row");
+    let bot_class: String =
+        sqlx::query_scalar("SELECT classification FROM community_facts WHERE source_event_id = $1")
+            .bind((4_000_000_000_000_000_000_u64 + 11).to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(bot_class, "bot");
+    db.close().await;
+}

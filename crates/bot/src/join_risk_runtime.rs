@@ -22,7 +22,7 @@
 //! tuning, claims the event through [`JoinRiskStore::record`] (atomic
 //! check-duplicate / count / score / insert under the guild advisory lock),
 //! logs the evidence first, then delivers `staff_message(persisted)` through
-//! the shared [`ActionExecutor`]: only to the boot-time staff channel the bot
+//! the shared [`ActionExecutor`]: only to the live staff channel the bot
 //! can View and Send in, with empty allowed mentions. Duplicates,
 //! undeliverable channels and failed sends are never retried: a failed send
 //! must not turn a replay into a second alert.
@@ -67,7 +67,7 @@ const THRESHOLD_KEY: &str = "TWO_JOIN_RISK_THRESHOLD";
 const WINDOW_KEY: &str = "TWO_JOIN_RISK_WINDOW_SECONDS";
 const BULK_UNTIL_KEY: &str = "TWO_BULK_JOIN_WINDOW_UNTIL";
 const CHANNEL_KEY: &str = "DISCORD_STAFF_ALERT_CHANNEL_ID";
-const HOT_KEYS: [&str; 3] = [THRESHOLD_KEY, WINDOW_KEY, BULK_UNTIL_KEY];
+const HOT_KEYS: [&str; 4] = [THRESHOLD_KEY, WINDOW_KEY, BULK_UNTIL_KEY, CHANNEL_KEY];
 
 fn is_snowflake(value: &str) -> bool {
     (17..=20).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_digit())
@@ -168,9 +168,9 @@ pub(crate) trait SettingsSource: Send + 'static {
     fn current(&mut self) -> impl Future<Output = JoinRiskSettings> + Send;
 }
 
-/// Tuning is store-first (hot rows win over the deployment environment) and
-/// re-read at most every [`SETTINGS_MAX_AGE`]; a failed refresh keeps the last
-/// good values. The staff channel is the deployment value read once at boot.
+/// Tuning, the bulk window and the staff channel are store-first (hot rows win
+/// over the deployment environment) and re-read at most every
+/// [`SETTINGS_MAX_AGE`]; a failed refresh keeps the last good values.
 pub(crate) struct StoreSettings {
     pool: PgPool,
     guild_id: String,
@@ -229,8 +229,9 @@ impl SettingsSource for StoreSettings {
         self.refresh().await;
         let mut vars = self.deployment.clone();
         if let Some(cache) = &self.cache {
-            // Only the three join-risk keys are live (`HOT_WIRED`); the staff
-            // channel stays the boot-time deployment value, as legacy read `cfg`.
+            // Tuning, the bulk window and the staff channel are live
+            // (`HOT_WIRED`): a stored row moves the next observation, a
+            // delete hands the key back to the boot-time deployment value.
             vars.extend(
                 cache
                     .env_snapshot(Some(self.guild_id.as_str()))
@@ -476,10 +477,6 @@ pub(crate) fn chain_from_env(
             vars.get(*key)
                 .map(|value| ((*key).to_owned(), value.clone()))
         })
-        .chain(
-            vars.get(CHANNEL_KEY)
-                .map(|value| (CHANNEL_KEY.to_owned(), value.clone())),
-        )
         .collect();
     let (risk, _worker) = start(
         guild_id,

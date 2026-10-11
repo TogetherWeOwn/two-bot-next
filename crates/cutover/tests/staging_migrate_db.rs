@@ -211,6 +211,8 @@ impl Fixture {
     ) -> (i32, String, String) {
         let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_staging-migrate"));
         cmd.args([
+            "--target",
+            "staging",
             mode,
             "--source-sha",
             SHA,
@@ -252,12 +254,19 @@ impl Fixture {
         for key in [
             "TWO_BOT_STAGING_PLAN_DATABASE_URL",
             "TWO_BOT_STAGING_MIGRATOR_DATABASE_URL",
+            "TWO_BOT_PRODUCTION_PLAN_DATABASE_URL",
+            "TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL",
             "PGOPTIONS",
             "PGPASSFILE",
             "PGSERVICE",
         ] {
             cmd.env_remove(key);
         }
+        // The runner fences its target pool with the `TWO_DATABASE_TLS`
+        // policy: the disposable CI-service URLs are plaintext local hosts,
+        // so pin `local-only` explicitly instead of inheriting the ambient
+        // setting.
+        cmd.env("TWO_DATABASE_TLS", "local-only");
         if let Some(url) = url {
             cmd.env(binding, url);
         }

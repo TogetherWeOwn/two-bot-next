@@ -33,8 +33,9 @@ library code with no Discord dependency and can start immediately.
   That member is the room's **owner** and **original creator**.
 - New rooms copy bitrate, RTC region, video quality, NSFW flag and default user
   limit from their creator channel.
-- Ordinary rooms are eligible for deletion after 60 continuous human-empty
-  seconds (bots don't count; unknown bot identity counts as human). A human join
+- Ordinary rooms are eligible for deletion after the empty grace (60 continuous
+  human-empty seconds unless `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` sets it; bots
+  don't count; unknown bot identity counts as human). A human join
   cancels the deadline; a later leave starts a full grace, even between ticks.
   Reconnect snapshots start a fresh grace rather than counting disconnected time.
   If someone deletes a room by hand, the bot quietly forgets it.
@@ -44,10 +45,18 @@ library code with no Discord dependency and can start immediately.
   `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID`, `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID`,
   `TWO_TEMP_VOICE_CATEGORY_ID` and comma-separated `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS`
   supply additional protection; malformed IDs disable the voice runtime. Stored
-  settings remain unwired. `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` is not consumed:
-  this safety grace is fixed at 60 seconds.
+  settings remain unwired. `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` (0 to 600, read
+  at boot) sets the empty grace; unset keeps 60 seconds. `0` deletes a room on
+  the next tick after its last human leaves, matching the interim voice bot.
 - If the member can't be moved in (missing Move Members, or they left first), the
   bot deletes the room immediately.
+- Create admission (Auto-Voice parity): one room per member, 40 per guild, no
+  cooldown, and the rolling bursts (3 creates per member and 10 per guild in any
+  60 seconds). Rooms the member just left for the creator (no human left in
+  them, no move pending) do not count toward the caps, so hopping from your own
+  room back into the creator gets a new room. A refused join records
+  `two_bot_voice_operations_total{op="create",outcome="refused"}` and a recent
+  failure line with the reason.
 - If the bot loses access to a room (View Channel, Connect, Manage Channels or Move
   Members), it stops managing it without retry storms and resumes once access
   comes back.
@@ -57,7 +66,9 @@ library code with no Discord dependency and can start immediately.
   settings". Anyone can view it; actions need admin.
 - **Accept when:**
   - Each join produces exactly one room, the member ends up in it, and the room is
-    deleted within a timer tick of the 60-second empty grace expiring.
+    deleted within a timer tick of the configured empty grace expiring.
+  - A member who leaves their own room for the creator gets a new room and is
+    moved into it (the voice synthetic's `rejoin` check).
   - Two members joining at the same moment get two rooms.
   - After a restart, the bot reconciles tracked rooms against the channels that
     actually exist and cleans up the empty ones.
@@ -133,9 +144,33 @@ library code with no Discord dependency and can start immediately.
   counts as No. The vote expires after 2 minutes.
 - If it passes, the target is disconnected and denied Connect on **that room
   only**.
+- The public reason renders as bounded mention-safe plain text (gate VK-04):
+  at most 512 characters (`VOTE_KICK_PUBLIC_REASON_LIMIT`), mass/user/role
+  mentions and `<@`/`<#`/`<:`/`<a:` pills split so nothing pings, `://`,
+  word-boundary `www.` (any case) and schemeless bare-domain dots split and
+  inline markdown escaped so nothing is clickable, embedded or formatted, and
+  `SUPPRESS_EMBEDS` set on the ballot. Refusals are fixed strings that never
+  echo initiator text.
 - The owner and original creator can't be targeted, and members can't target
-  themselves. Only one active vote per target. If the target leaves, the vote is
-  cancelled.
+  themselves. Targets with effective Kick Members or Administrator permission
+  in the interaction's guild can't be targeted either; an unavailable
+  guild-authority lookup fails closed with no vote. Only one active vote per
+  target. If the target leaves, the vote is
+  cancelled. Protection is rechecked on every ballot/refresh and again
+  immediately before the disconnect/deny writes, so a promotion granted
+  mid-vote produces no kick/disconnect effect.
+- After a vote passes, expires or is cancelled, a fresh vote against the same
+  member in the same guild is refused for 5 minutes (`Cooldown`,
+  `VOTE_KICK_COOLDOWN_MS = 300_000`). The key is guild + target: a new
+  interaction ID or a different room does not evade it. Expiry counts from the
+  2-minute deadline even when observed late, so a slow timer cannot extend the
+  cooldown.
+- Each initiator can start at most 3 votes per 10 minutes per guild
+  (`InitiatorLimited`, `VOTE_KICK_INITIATOR_LIMIT = 3`,
+  `VOTE_KICK_INITIATOR_WINDOW_MS = 600_000`), across targets and rooms; other
+  guilds are unaffected. Only successful starts count. Refused attempts create
+  no vote, ballot or enforcement effect. Refusal precedence after target
+  validation is: active vote, then target cooldown, then initiator cap.
 
 ## V5: Naming template engine (core library)
 
@@ -196,9 +231,32 @@ library code with no Discord dependency and can start immediately.
 **Time and random**
 
 - `@@weekday@@`, `@@month@@`, `@@hour@@` (0–23): in the guild time zone (default
-  UTC), English names.
+  UTC), English names. The time zone (`settings.time_zone`) is `UTC`, a fixed
+  offset (`UTC-5`, `+05:30`) or a supported IANA name (US, Canadian, European,
+  Australian and New Zealand zones follow their current daylight-saving rule;
+  `crates/core/src/voice_time_zone.rs` lists them). `/import` refuses any other
+  value. Daypart and date conditions use the same local time.
+- `@@daypart@@`: `morning` (05–11), `afternoon` (12–16), `evening` (17–21),
+  `night` (22–01) or `late night` (02–04), local time.
+- `@@room_minutes@@`: whole minutes since the room was created. `@@room_tier@@`:
+  0 to 5 at 0, 15, 45, 90, 180 and 360 minutes.
+- `@@game_minutes@@`: combined member-minutes the room has played the game it
+  shows now (two players for ten minutes count twenty). Only members playing a
+  selected, alias-resolved game count; a two-game name combines both groups.
+  Tracking continues under a custom name, a blank template or a display-name
+  wait. A paused worker or gateway reconnect discards the unobserved stretch,
+  retaining previously settled time. Totals live in memory for the room only
+  and reset by a restart. `@@game_tier@@`: the same tiers.
+- Time facts re-render a name only when a tier, the local hour or another fact
+  changes, so a raw minute count shown in a name moves at those points, not every
+  minute. The rename budget still applies.
 - `@@random_emoji@@`, `[[a/b/c]]` and `[[list:name]]` (named lists from guild
   settings) are rolled from a per-room seed stored at creation and never re-rolled.
+  The seed is chosen so a new room's first name (rendered for the joiner alone,
+  with their presence) differs from every live voice channel name and from the
+  guild's last three first names, case-insensitively. Up to eight seeds are tried;
+  a pool too small to vary keeps the drawn seed. The memory is per guild and
+  in-process: a restart starts it empty.
 
 **Resting / in-use names**
 
@@ -219,7 +277,8 @@ library code with no Discord dependency and can start immediately.
 
 - `// no` is optional, and blocks nest.
 - Comparisons `< > <= >= = !=` work on numbers and counter tokens (`@@num@@`,
-  `@@limit@@`, `@@slots@@`, `@@hour@@`, `$#`), including token against token.
+  `@@limit@@`, `@@slots@@`, `@@hour@@`, `@@room_minutes@@`, `@@room_tier@@`,
+  `@@game_minutes@@`, `@@game_tier@@`, `$#`), including token against token.
 
 | Group | Keywords |
 |---|---|
@@ -228,6 +287,7 @@ library code with no Discord dependency and can start immediately.
 | Game and party | `GAME` (`:` contains; `=` / `!=` exact), `PLAYERS`, `MAX`, `RICH` |
 | Room state | `FULL`, `PRIVATE` |
 | Date | `WEEKEND` (Saturday or Sunday), `WEEKDAY`, `MONTH` |
+| Time of day | `MORNING`, `AFTERNOON`, `EVENING`, `NIGHT`, `LATE_NIGHT` (the `@@daypart@@` hours) |
 
 - `FULL` requires a limit. `PRIVATE` is always false on standalone channels.
 - An unknown condition is false.
@@ -351,7 +411,8 @@ library code with no Discord dependency and can start immediately.
 - Intents: Guild Voice States, Guild Members (privileged) and Guild Presences
   (privileged; game and stream data).
 - Bot permissions: View Channel, Connect, Manage Channels, Move Members, Manage
-  Roles and Send Messages. Evaluate effective permissions per channel, because
+  Roles and Send Messages, plus Set Voice Channel Status for room status lines (a
+  refused status write is logged once per guild and the line is skipped). Evaluate effective permissions per channel, because
   category overrides beat role permissions.
 - Limits: 100 characters per name, 50 channels per category, user limit 0–99, and
   bitrate capped by the guild's boost tier.

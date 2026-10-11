@@ -263,6 +263,91 @@ fn default_off_and_interval_validation() {
     }
 }
 
+/// TOG-19027: the stored feed interval reaches the consumer through the
+/// live snapshot, without a restart. Store-first: the live value wins, an
+/// absent/unparsable/out-of-range value falls back to the boot value.
+#[test]
+fn live_poll_seconds_prefers_the_stored_value() {
+    use two_bot_core::settings::{live_channel, SettingRow, SettingsSnapshot};
+
+    assert_eq!(live_poll_seconds_with(GUILD, 300, None), 300);
+    let (_, live) = live_channel();
+    assert_eq!(
+        live_poll_seconds_with(GUILD, 300, Some(&live)),
+        300,
+        "empty snapshot falls back"
+    );
+    assert_eq!(
+        live_poll_seconds_with("other-guild", 300, Some(&live)),
+        300,
+        "other guilds fall back"
+    );
+
+    let (mut writer, live) = live_channel();
+    for ((value, expected), revision) in [
+        (json!(600), 600),
+        (json!("120"), 120),
+        // Out of range and unparsable values keep the boot interval.
+        (json!(59), 300),
+        (json!(86401), 300),
+        (json!("hourly"), 300),
+        (json!(["600"]), 300),
+    ]
+    .into_iter()
+    .zip(1i64..)
+    {
+        writer.publish(&SettingsSnapshot {
+            revision,
+            rows: vec![SettingRow {
+                guild_id: GUILD.to_owned(),
+                key: INTERVAL_KEY.to_owned(),
+                value,
+                version: 1,
+            }],
+        });
+        assert_eq!(
+            live_poll_seconds_with(GUILD, 300, Some(&live)),
+            expected,
+            "stored value applies without restart"
+        );
+    }
+
+    // A deleted row hands the interval back to the boot value.
+    writer.publish(&SettingsSnapshot {
+        revision: 7,
+        rows: vec![],
+    });
+    assert_eq!(live_poll_seconds_with(GUILD, 300, Some(&live)), 300);
+}
+
+/// The per-tick schedule gate observes a stored increase without a restart:
+/// after the interval moves 60 s to 3600 s, a tick one minute later skips.
+#[test]
+fn schedule_gate_observes_a_stored_increase_without_restart() {
+    use two_bot_core::feeds::FeedPollSchedule;
+
+    let mut schedule = FeedPollSchedule::new(60).expect("valid boot interval");
+    assert!(schedule.begin(0));
+    schedule.finish();
+
+    // The stored interval moves 60 s to 3600 s without re-registering.
+    assert!(schedule.set_interval_seconds(3600));
+    assert_eq!(schedule.interval_seconds(), 3600);
+    assert!(
+        !schedule.set_interval_seconds(3600),
+        "same interval is a no-op"
+    );
+    assert!(!schedule.set_interval_seconds(59), "out of range refused");
+    assert_eq!(schedule.interval_seconds(), 3600);
+
+    // The next run gates on the new interval, and the tick one boot interval
+    // after it skips: the stored increase applied without a restart.
+    assert!(schedule.begin(61_000));
+    schedule.finish();
+    assert!(!schedule.begin(122_000));
+    assert!(schedule.begin(3_661_000));
+}
+
 #[tokio::test(start_paused = true)]
 async fn registration_parks_off_values_without_constructing_work() {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -279,7 +364,7 @@ async fn registration_parks_off_values_without_constructing_work() {
             vars.insert("TWO_ANNOUNCEMENTS".to_owned(), value.to_owned());
         }
         let gates = FeatureGates::from_map(&vars).unwrap();
-        assert!(register_gated(gates, action.clone()).is_none());
+        assert!(register_gated(gates, action.clone(), GUILD.to_owned()).is_none());
     }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     let gates = FeatureGates::from_map(&std::collections::HashMap::from([
@@ -287,7 +372,7 @@ async fn registration_parks_off_values_without_constructing_work() {
         ("TWO_FEED_POLL_SECONDS".to_owned(), "60".to_owned()),
     ]))
     .unwrap();
-    let job = register_gated(gates, action).unwrap();
+    let job = register_gated(gates, action, GUILD.to_owned()).unwrap();
     assert_eq!(job.cadence, Duration::from_secs(60));
     assert_eq!(calls.load(Ordering::SeqCst), 0, "registration is lazy");
     (job.action)().await.unwrap();
@@ -318,7 +403,7 @@ async fn identity_fence_registers_the_poller_only_where_announcements_are_permit
     });
     let on = announcements(Some("1"));
 
-    let job = register_fenced(on, &fixtures::staging(), action.clone())
+    let job = register_fenced(on, &fixtures::staging(), action.clone(), GUILD.to_owned())
         .expect("staging identity registers the poller");
     assert_eq!(job.name, "feeds");
     (job.action)().await.unwrap();
@@ -326,7 +411,7 @@ async fn identity_fence_registers_the_poller_only_where_announcements_are_permit
 
     for (label, activation) in fixtures::refused() {
         assert!(
-            register_fenced(on, &activation, action.clone()).is_none(),
+            register_fenced(on, &activation, action.clone(), GUILD.to_owned()).is_none(),
             "{label} must not register the poller"
         );
     }
@@ -334,9 +419,13 @@ async fn identity_fence_registers_the_poller_only_where_announcements_are_permit
 
     // Identity never enables what the environment left off.
     for value in [None, Some("0")] {
-        assert!(
-            register_fenced(announcements(value), &fixtures::staging(), action.clone()).is_none()
-        );
+        assert!(register_fenced(
+            announcements(value),
+            &fixtures::staging(),
+            action.clone(),
+            GUILD.to_owned()
+        )
+        .is_none());
     }
 }
 

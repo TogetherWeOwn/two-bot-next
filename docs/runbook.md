@@ -1,9 +1,10 @@
 # two-bot-next operations runbook
 
 For the on-call operator of the Rust bot and its Cloudflare Worker/Container.
-This describes the shipped source, not proof that an environment is deployed,
-that a soak passed, or that production cutover is approved. Cutover, production
-restores, token rotation, and live-guild changes need their separate authorization.
+The bot is live in production on one Cloudflare Container; this describes the
+shipped source, not proof that a soak passed or that any specific recovery is
+complete. Production restores, token rotation, and live-guild changes need their
+separate authorization.
 
 ## Start here
 
@@ -20,7 +21,7 @@ restores, token rotation, and live-guild changes need their separate authorizati
    returning success alone does not prove recovery.
 
 All npm commands below run **from the repository root** and use the pinned
-Wrangler 4.147.0 through `wrangler/package.json`. Use only the already-authorized
+Wrangler 4.148.0 through `wrangler/package.json`. Use only the already-authorized
 Cloudflare connection. An authentication/permission failure is a stop: report
 it, do not try another credential, elevate access, or use a personal token.
 Examples target `staging`; do not substitute `production` without its own gate.
@@ -64,7 +65,8 @@ origin as `--base-url` (or `QA_PROBE_BASE_URL`); add `--expect-ready` only when
 the gate needs the service itself ready. A parked preview (truthful 503) stays
 green without the flag. Each probe line cites the code path it checks. The five
 probes cover liveness, the readyz breakdown shape, gateway truthfulness, the
-informational jobs map, and that the body is the container's breakdown rather
+jobs map (freshness-graded when ready or with --expect-ready, otherwise
+informational), and that the body is the container's breakdown rather
 than an ownership-fence refusal.
 
 The container listens on `LISTEN_ADDR` (default `0.0.0.0:8080`). The Worker
@@ -110,20 +112,29 @@ invocation, unsampled; production traces are off (`wrangler/wrangler.toml`).
 
 `logs` is **Worker/DO tail**, not Rust stdout. Stop it when the bounded incident
 observation is complete. For Rust stdout/stderr, use the affected container's
-logs in the Cloudflare dashboard. Wrangler 4.147.0 has no `containers logs`
+logs in the Cloudflare dashboard. Wrangler 4.148.0 has no `containers logs`
 subcommand; do not invent one. Container inspection may list account-wide
 resources: match the affected environment/application before taking any action.
-No Cloudflare API reaches container stdout either, so voice-event emission has
-no CI read path; follow [staging voice-event verification](staging-voice-event-verification.md)
-for the dashboard procedure.
+Container stdout is also in the Workers Observability `containers` dataset, which a
+read-only `CLOUDFLARE_API_TOKEN` can query without starting the container:
+`python3 scripts/container_stdout_read.py --service <container-application-id>`
+(see [Reading container stdout](startup-diagnostics.md#reading-container-stdout)).
+That script keeps each line's message and a fixed allowlist of fields that excludes
+`voice_event`; it can find a voice line by message, and the
+[staging voice-event verification](staging-voice-event-verification.md) dashboard procedure
+reads the `voice_event` field.
 
 Rust uses JSON `tracing` logs, configured by `RUST_LOG`, fallback
 `error,two_bot={LOG_LEVEL:-info}` (dependency crates stay ERROR-only unless
-`RUST_LOG` opts in); `/readyz` 503s log at DEBUG, not ERROR. This wrapper currently
-forwards **only** `DISCORD_TOKEN`, `DATABASE_URL`, `GUILD_ID` and its computed
-`LISTEN_ADDR`, not `RUST_LOG` or arbitrary `TWO_*` flags. Adding a Worker var
-alone will not configure the container. Do not dump env or HTTP headers to
-troubleshoot; redact tokens, connection strings, and member data from evidence.
+`RUST_LOG` opts in); `/readyz` 503s log at DEBUG, not ERROR. This wrapper forwards
+`DISCORD_TOKEN`, `DATABASE_URL`, `GUILD_ID`, its computed `LISTEN_ADDR`, the reviewed
+`TWO_*` flags (`FORWARDED_FLAGS` in `wrangler/src/container-env.ts`), the validated
+`DISCORD_APPLICATION_ID`, and the 12 validated non-secret `DISCORD_*` IDs
+(`FORWARDED_DISCORD_IDS` there: audit/voice/moderation log channels, staff alert
+channel, ticket category/panel/staff role, landing/goodbye/anchor-welcome channels,
+session lobby/looking-to-play) — not `RUST_LOG`, secrets, or arbitrary vars. Adding
+a Worker var alone will not configure the container. Do not dump env or HTTP headers
+to troubleshoot; redact tokens, connection strings, and member data from evidence.
 
 Look for these literal messages:
 
@@ -136,6 +147,7 @@ Look for these literal messages:
 - `durable gateway failed; checkpoint unchanged, readiness unavailable` — fatal
   initialization failure; underlying SQL error deliberately not logged. Its
   `error_class` is also on `/readyz` as `gateway_failure` for 15 s before exit
+  (startup failures linger 15 s; only a running-gateway failure lingers 75 s)
   and in Workers Logs as `container_gateway_failure` (see
   [startup-diagnostics.md](startup-diagnostics.md)).
 - `container service failed` / `SIGTERM received; draining`.
@@ -167,6 +179,15 @@ transition (fire, resolve). It posts to `OPS_ALERT_WEBHOOK_URL` only when
 retains the credential and monitoring. See
 [metrics](metrics.md#off-container-scrape-and-alert-rules). Fetch the live data
 with `curl -H "Authorization: Bearer $METRICS_SCRAPE_TOKEN" "$WORKER_URL/ops/metrics"`.
+`METRICS_SCRAPE_TOKEN` must be at least 32 characters; a shorter value leaves
+the route at `404` and a short staging token must be reissued (none is
+provisioned today). Every scrape attempt takes one token synchronously
+before the secret comparison, so concurrent guesses cannot share a token;
+an exhausted caller is refused without any comparison (`429` +
+`retry-after`). Buckets are per caller, so someone else's failures cannot
+throttle a correct bearer elsewhere; a caller shed only because the
+10,000-entry table is full is still compared, so a scanner flood cannot
+lock out the authenticated scraper.
 
 #### Alert: job stale
 
@@ -176,11 +197,51 @@ succeeded since start (timestamp zero) is not reported here. If the Container
 restarted the series resets; wait one cadence before acting. Restart only after
 the logs show the job loop is wedged, per the [restart semantics](#restart-semantics-durable-resume-not-full-state-recovery).
 
+#### Alert: job unknown stale
+
+A job without a staleness cadence entry recorded no successful completion for
+more than 2 hours (`two_bot_job_last_success_timestamp_seconds{job}`). This is
+a **ticket, not a page**: without a mapped cadence the monitor cannot tell a
+slow-but-healthy schedule from a wedge, so it fails closed and nags for an
+explicit cadence, ticker coverage, or event-driven exclusion instead of
+staying silent. `session_checkpoint` is event-driven (one success per durable
+gateway commit) and is excluded from this rule in
+`UNKNOWN_STALE_EXCLUDED` (`wrangler/src/alert-rules.ts`): it never tickets
+however stale. A job that never succeeded since start (timestamp zero) is not
+reported here: that covers both boot and parked jobs.
+
+First response: check the `jobs` map on `/readyz` for the job's `parked`,
+`last_success` and `consecutive_failures` fields, then read the
+Worker/container logs for `periodic job failed`. A parked job with a zero
+timestamp is configuration, not a wedge. The standing fix is an explicit
+cadence entry, ticker coverage, or event-driven exclusion for the job — a
+reasoned catalog note alone does not stop the ticket — until then this ticket
+re-fires while the timestamp stays stale. Restart only after the
+logs show the job loop is wedged, per the [restart semantics](#restart-semantics-durable-resume-not-full-state-recovery).
+
+Escalate when staleness persists after the suspect deploy or dependency is
+identified, or when it coincides with pool-saturation or DB-error alerts —
+the fix then belongs to the on-call engineer, not another redeploy.
+
 #### Alert: job failures
 
-A job failed three completions in a row. Read `periodic job failed` logs (error
-class only; payloads are never logged). Usual causes: database unreachable,
-Discord REST failing. Fix the dependency; the streak clears on the next success.
+A job failed three completions in a row. The page includes the latest failure
+class when the `two_bot_job_last_error_class` series is available. If it is
+missing (for example, on an older build), the page still fires without a class;
+use sanitized `periodic job failed` logs instead. Error classes are fixed enum
+names, never error text or payloads. Take the first action for the reported class:
+
+| Class | First action |
+|---|---|
+| `database` | Check the database dependency and expected schema/grant state through its authorized owner; do not run SQL probes or widen grants. |
+| `rest` | Check Discord status and REST metrics for 429, 5xx or transport failures; honor `retry-after` and do not replay uncertain writes. |
+| `configuration` | Compare non-secret binding names and feature gates with the reviewed deployment; do not dump values or substitute credentials. |
+| `timeout` | Check the job status and pool-pressure metrics to locate the bounded operation before considering a restart. |
+| `panic` | Correlate the sanitized failure log with the deployed revision; the panic payload is intentionally unavailable. |
+| `feed` | Check the configured feed source's availability and recent fetch status through authorized diagnostics; do not copy response bodies. |
+| `recovery_required` | Preserve feed cursor and pending recovery state; follow the established recovery path before any manual replay or cursor change. |
+
+The streak clears on the next successful completion.
 
 #### Alert: REST 429
 
@@ -204,46 +265,68 @@ containment, when the hot route belongs to a writer this team does not own, or
 when 429s coincide with 5xx/transport failures suggesting a wider Discord or
 network incident.
 
+Executor route templates (fixed vocabulary): `GET /guilds/:guild/members/:member`
+counts member fetches, `GET /users/@me` counts current-user reads (literal
+`@me`, never a user id), `PATCH /webhooks/:application/:token/messages/@original`
+counts interaction-response edits (literal `@original`). Snowflakes, interaction
+tokens and query strings never appear in labels: `guilds/100/members/300?limit=1`
+counts as the member template, `users/@me?limit=100` as `GET /users/@me`,
+`webhooks/7/tok-abc/messages/@original?wait=true` as the webhook template.
+Unknown, wrong-method and overlong shapes collapse to `other` with no new
+series. Source: [`metrics.rs`](../crates/core/src/metrics.rs),
+[`executor_metrics.rs`](../crates/discord/src/executor_metrics.rs).
+
 #### Alert: DB pool
 
 The SQLx pool sat at its maximum with zero idle connections for three
 consecutive keepalive samples. This is pool exhaustion, a proxy for DB trouble;
-there is no DB error counter yet. It means every checkout is held — new queries
-wait rather than fail fast — not proof that Neon itself is down (pool gauges
+recorded storage failures have a separate [DB-error alert](#alert-db-errors).
+It means every checkout is held — new queries wait rather than fail fast —
+not proof that the database itself is down (pool gauges
 sample SQLx bookkeeping, not DB reachability).
 
-First response: check Neon status for the staging branch before touching the
-bot; then look at recent deploys for a change that could hold checkouts open
-(new query path, widened job fan-out, a job whose cadence no longer matches its
-duration). Compare against the scrape window — a short burst that self-clears
-across the next samples is not exhaustion. Do not run SQL probes against
-staging or production, add grants, or restart the container to "free" the
-pool; a replacement restarts the shard without fixing a leak.
+First response: check the affected provider's status (PlanetScale for
+production, Neon for staging) before touching the bot; then look at recent
+deploys for a change that could hold checkouts open (new query path, widened
+job fan-out, a job whose cadence no longer matches its duration). Compare
+against the scrape window — a short burst that self-clears across the next
+samples is not exhaustion. Do not run SQL probes against staging or
+production, add grants, or restart the container to "free" the pool; a
+replacement restarts the shard without fixing a leak.
 
 Escalate when the streak persists after the suspect deploy is identified,
 when exhaustion coincides with gateway `starting`/`down` or job-failure
-alerts, or when the Neon dashboard shows trouble on the staging branch — the
-fix then belongs to the dependency owner, not a redeploy.
+alerts, or when the affected provider's dashboard shows trouble on the
+deployed branch — the fix then belongs to the dependency owner, not a
+redeploy.
 
 #### Alert: DB errors
 
-Three or more storage-layer failures arrived between two keepalive samples
-(`two_bot_db_errors_total`, currently counting send-admission SQL; other
-stores adopt the counter incrementally). Unlike the pool rule above, this is
-errors, not pressure: queries already failed, they are not merely waiting.
-A counter reset (process restart) skips the window rather than firing, and a
-slow trickle below threshold stays silent — sustained low-rate failures
-surface instead through `job_consecutive_failures`.
+Three or more storage-layer failures arrived between two keepalive samples.
+`two_bot_db_errors_total` counts send-admission SQL failures (`op="admission"`)
+and voice actor load failures (`op="other"`); other stores adopt the counter
+incrementally, so this is not a database-wide total. Unlike the pool rule
+above, this is errors, not pressure: queries already failed, they are not
+merely waiting. A counter reset (process restart) skips the window rather
+than firing, and a slow trickle below threshold stays silent. Failed jobs
+may also surface through `job_consecutive_failures`; that rule does not
+cover every storage path.
 
-First response: check Neon status for the staging branch before touching the
-bot; then correlate with the `op` label and recent deploys (a new query path
-or migration can explain a fresh error burst). Do not run SQL probes against
-staging or production, add grants, or restart the container to "clear" the
-errors; a replacement restarts the shard without fixing the failing writes.
+First response: check the affected provider's status (PlanetScale for
+production, Neon for staging) before touching the bot; then correlate with
+the `op` label and recent deploys (a new query path or migration can explain
+a fresh error burst). For voice actor load failures, read `voice actor load
+failed; actor respawns on the next guild snapshot` in container stdout.
+Every failure increments the counter, but that warn is throttled
+process-wide to once per 300 s; its absence in a short window does not
+prove the actor loaded. Do not run SQL probes against staging or
+production, add grants, or restart the container to "clear" the errors;
+a replacement restarts the shard without fixing the failing storage path.
 
 Escalate when the burst repeats across windows, when it coincides with pool
-saturation or job-failure alerts, or when the Neon dashboard shows trouble on
-the staging branch — the fix then belongs to the dependency owner.
+saturation or job-failure alerts, or when the affected provider's dashboard
+shows trouble on the deployed branch — the fix then belongs to the dependency
+owner.
 
 #### Alert: send admission blocked
 
@@ -280,8 +363,13 @@ orphan (an untracked creator-channel orphan needing manual deletion)
 appears — so a low-volume stranded-member failure still pages. Any outcome
 other than `success` (`category_full`, `discord`, `persistence`,
 `cancelled`) counts as a failure: the join did not place a room, or the
-move/delete did not complete. A counter reset (process restart) skips the
-window rather than firing, and a slow trickle below threshold stays silent.
+move/delete did not complete. `refused` (a room cap or create burst, per
+member or per guild) is admission policy working as designed, so it never
+pages. No installed rule watches it: read it from
+`two_bot_voice_operations_total{outcome="refused"}`, and if joins stop placing
+rooms while it climbs, look for a stuck cap (an unsettled reservation holding a
+slot). A counter reset (process restart) skips the window rather than firing,
+and a slow trickle below threshold stays silent.
 
 First response: scope the failing operation from the `op`/`outcome` labels
 on `two_bot_voice_operations_total` via the authorized `/ops/metrics`
@@ -296,6 +384,209 @@ Escalate when failures persist across windows after the suspect deploy is
 identified, when a dead-letter or orphan names a stranded member, or when
 failures coincide with 429, DB-error or pool alerts — the fix then belongs
 to the on-call engineer, not another redeploy.
+
+#### Alert: gateway missed events
+
+`two_bot_gateway_missed_events_total` increased between two keepalive
+samples. These are dispatches Discord assigned but this process never
+received (sequence gaps inside one session). Any increase fails the
+zero-missed-events acceptance: the session continued, but part of the
+event stream is gone and RESUME does not replay it. The first sample after
+monitoring arms only stores the baseline and never fires, and a counter
+reset (process restart) skips the window rather than firing.
+
+First response: read the paired `two_bot_gateway_disconnects_total` counter
+via the authorized `/ops/metrics` scrape. A missed-events increase without
+a disconnect increase is an unexplained same-session sequence gap, not
+proof that instrumentation predates the gap or that the process restarted.
+A rise next to disconnects warrants investigating transport loss with
+sequence gaps. Re-baseline both scrapes after a confirmed restart.
+Correlate with recent
+deploys (a fresh deploy restarts the process and resets the counter) and
+the container logs for `gateway reconnect failed; Twilight will retry` and
+`gateway ready; checkpoint committed`. Do not restart the container to
+"clear" the counter; a replacement resets the baseline without recovering
+the missed dispatches.
+
+Escalate when the increase repeats across windows, when it coincides with
+unpaired disconnects (no later RESUME or fresh READY), or when missed
+events rise with no disconnect at all — the gap is then unexplained and
+the fix belongs to the on-call engineer, not another redeploy.
+
+#### Alert: gateway unpaired disconnect
+
+`two_bot_gateway_disconnects_total` grew between keepalive samples and the
+recoveries (`two_bot_gateway_resumes_total` plus fresh READY from
+`two_bot_gateway_events_total{event="READY"}`) have not caught up for 3
+consecutive completed samples. Every disconnect should pair with a later
+RESUMED or fresh READY; an unpaired one means the gateway never came back.
+This is page severity (SEV-1 in the
+[watch escalation path](watch-escalation-path.md)).
+
+The bound is 3 samples. Samples arrive about every 60 s and a normal reconnect
+resumes within seconds. A RESUMED that lands before the next sample or the one
+after clears the unpaired count while the streak is at most 2, one short of
+the bound. The third consecutive unpaired sample comes about two to three
+minutes after the disconnect, so a reconnect that resumes within two samples
+never pages and a gateway that stays down does.
+
+A disconnect is outstanding while the recovery counters have not grown since
+the disconnect growth started. Any growth in RESUMED plus fresh READY clears
+the outstanding loss at once, even when the same window also added
+disconnects: the disconnect series counts every failed Twilight retry, close
+frame, op 9 invalid session and cold-resume IDENTIFY, so one recovered outage
+routinely adds several disconnects against a single recovery, and subtracting
+the growths would page forever on the leftover (see the pairing warning in
+[cutover dashboard queries](cutover-dashboard-queries.md)). The alert fires
+when a loss stays outstanding for 3 consecutive samples and resolves on the
+first sample with recovery growth. The first sample only stores the baseline. A
+missing, duplicated, or non-numeric sample changes nothing and holds the current
+state. A counter that went backwards means the process restarted: that sample is
+not a window, the streak restarts, and a firing alert holds rather than
+clearing. The firing key is the constant `gateway_unpaired_disconnect`.
+
+First response: scrape `/ops/metrics` as described above and compare the
+disconnect and recovery counters with the previous scrape. Then read the
+container logs for `gateway reconnect failed; Twilight will retry` (the gateway
+is still retrying) and `gateway ready; checkpoint committed` (a recovery). If
+the logs show no `gateway ready` after the last disconnect, the gateway is still
+down: escalate to the on-call engineer through the watch escalation path. Do not
+restart the container to clear the alert. A restart re-baselines the counters
+without showing that the gateway came back, so confirm `gateway ready` in the
+new process's logs first.
+
+#### Alert: ticker stale
+
+A 15 s ticker (`scheduled_messages` or `settings`) recorded no successful
+completion for more than 10 minutes
+(`two_bot_job_last_success_timestamp_seconds{job}`). These tickers wedge
+silently: skipped busy deadlines count neither as success nor failure, so
+neither `job_stale` nor `job_consecutive_failures` can see them. A job
+that never succeeded since start (timestamp zero) is not reported here:
+that covers both boot and parked tickers (never registered because
+`DATABASE_URL` is unset or the automations gate is off). If the Container
+restarted the series resets; wait one window before acting.
+
+First response: check the `jobs` map on `/readyz` for the ticker's
+`parked`, `last_success` and `consecutive_failures` fields, then read the
+Worker/container logs for `periodic job failed`. A parked ticker with a
+zero timestamp is configuration, not a wedge — confirm the expected
+`DATABASE_URL` binding and automations gating before touching the bot.
+Restart only after the logs show the ticker loop is wedged, per the
+[restart semantics](#restart-semantics-durable-resume-not-full-state-recovery).
+
+Escalate when staleness persists after the suspect deploy or dependency is
+identified, when it coincides with pool-saturation or DB-error alerts, or
+when a due schedule row or settings change stays unapplied past the
+window — the fix then belongs to the on-call engineer, not another
+redeploy.
+
+#### Alert: receiver refusals
+
+Refused `two_bot_internal_actions_total` outcomes rose for one family in
+3 consecutive keepalive samples. Every outcome other than `executed`
+(`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`,
+`rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`,
+`conflict`, `upstream`, `internal`) counts as a refusal: the signed
+website-action receiver saw the request and refused it. The streak (not
+a single window) pages, because a receiver-abuse or refusal storm stays
+quiet through the burn math while one forged probe must not. The firing
+key names its family (`receiver_refusals:moderation`). The first sample
+after monitoring arms only stores the baseline and never fires, and a
+counter reset (process restart) clears that family's streak rather than
+firing. Family `other` holds every pre-auth refusal (bad signature,
+unknown key, clock skew, nonce replay map through `ActionLabel::Unknown`),
+so a lone `receiver_refusals:other` streak points at forged traffic
+before a wired-family misconfiguration.
+
+First response: scope the refusing family from the `family`/`outcome`
+labels on `two_bot_internal_actions_total` via the authorized
+`/ops/metrics` scrape; confirm no deploy is in progress (a fresh deploy
+restarts the process and resets the counter); then read the container logs
+for the matching `internal action refused` warn lines (sampled summaries
+with `kind`/`class`/`key`/`action`). A single historic refusal with no
+growth never re-pages. Do not retry-loop a signed request with a new
+nonce, rotate keys, or restart the container to "clear" the counter; a
+replacement resets the baseline without stopping the abusive caller.
+
+Escalate when refusals persist across windows after the suspect deploy or
+caller is identified, when they coincide with 429 or DB-error alerts, or
+when `executed` traffic for the same family collapses while refusals rise
+— the receiver may be refusing legitimate work and the fix belongs to the
+on-call engineer, not another redeploy.
+
+#### Alert: checkpoint failures
+
+`two_bot_gateway_checkpoint_failures_total` increased between two keepalive
+samples. Every checkpoint failure stops the dispatch worker, so there is no
+benign singleton: a single increase pages. The first sample after monitoring
+arms only stores the baseline and never fires. A running-gateway failure
+lingers 75 s before it exits (startup failures still linger 15 s), which
+leaves about 3 s of margin over one 60 s keepalive tick plus two 6 s probe
+timeouts for a scrape to see the increase; the post-restart reset sample
+resolves the alert rather than firing.
+
+First response: if the failing process is still up (within the linger), read
+the `stage` label on `two_bot_gateway_checkpoint_failures_total` via the
+authorized `/ops/metrics` scrape — `pre_commit` means the commit was skipped
+after a funnel, leveling or acknowledgement failure, while `commit` means the
+durable store write itself failed. Once the process has restarted, the stage
+is not recoverable: the counter resets to zero and the Worker log line
+(`{"event":"container_gateway_failure","phase":…,"class":…}`) carries only
+`phase` and `class` — both stages map to `gateway_runtime_failed` — never
+the `stage`. Do not wait for the stage then; check the `gateway` component on
+`/readyz` and the Neon status for the staging branch instead: a `commit`
+failure next to DB-error or pool alerts points at the database, not the
+gateway. Do not restart manually: the process exits on its own after
+the linger and the supervisor restarts from the committed checkpoint — verify
+the replacement is healthy per the
+[restart semantics](#restart-semantics-durable-resume-not-full-state-recovery).
+Do not restart to "clear" the counter, since a replacement resets the
+baseline without recovering the uncommitted checkpoint.
+
+Escalate when the increase repeats across windows, when `commit` failures
+coincide with DB-error or pool-saturation alerts, or when `pre_commit`
+failures rise with no failing dependency in the logs — the cause is then
+unexplained and the fix belongs to the on-call engineer, not another
+redeploy.
+
+#### Alert: dispatch drops
+
+`two_bot_dispatch_drops_total{lane}` grew in three consecutive completed
+keepalive sample windows after a baseline. `dispatch_drops:<lane>` is a
+**ticket, not a page**, for each of the fixed `messages`, `interactions`,
+`registry`, `privileged`, `busy` and `reactions` lanes. A large single burst
+stays silent. Dispatch admission refused local work; this is **not proof of
+gateway packet loss** or a sequence gap. The `reactions` counter also includes
+per-member fairness refusals while lane slots remain free, so it can point at
+a hot member rather than an undersized lane.
+
+First response: triage within the watch shift. Read the affected lane's counter
+through the existing authorized `/ops/metrics` path, correlate the window with
+`command dispatch saturated` or `command dispatch fairness drop` sampled logs,
+and compare gateway readiness, missed-events and REST/DB alerts separately.
+The counter measures every refusal but logs are sampled once per 60 s per
+runtime; a quiet log is not proof of quiet counters. Record only fixed lane
+names and sanitized counts, never member/channel IDs, payloads or scrape tokens.
+
+Flat samples clear that lane's streak and resolve its ticket. A backwards
+counter in any observed lane signals a process reset: all valid lanes re-baseline
+with zero streaks and resolve, even if another lane's new count overtook its old
+value. Missing lanes still retain active tickets. Missing/invalid series or a
+failed scrape break the streak and discard
+the baseline, **not** the active ticket; the first valid sample after a gap is
+only a baseline, ongoing growth retains the ticket, and a subsequent valid
+flat/reset window proves recovery. A new DO field or legacy state starts
+unbaselined. Counter-only monitoring cannot detect a restart whose replacement
+counter already exceeds the old value; correlate deployment evidence rather
+than claiming that case is proven quiet.
+
+Do not enlarge lanes, relax fairness limits, replay dropped reactions or restart
+the bot to clear a counter. This alert adds neither automatic ticket-system
+integration nor paging escalation: it labels the existing transition delivery
+as `(ticket)` and supplies this runbook. Persist sanitized incident evidence and
+route a continuing dispatch problem to the on-call engineer through the normal
+triage path. No new webhook, production activation or live load test is authorized.
 
 ## Persisted ownership control
 
@@ -334,12 +625,25 @@ node wrangler/scripts/ownership-control.mjs status
 Refresh the epoch before **each** change. `fence` is a persisted parking owner
 (`deploymentId=null`, `phase=fenced`); health/readyz and stale schedules refuse.
 Takeover/fence increment the epoch and record actor, timestamp, old/new epoch and
-owner. Durable revocation is written before awaited native destruction;
+owner, except a same-version repeat takeover by the deployment that already owns
+the active singleton: the Worker returns the stored record unchanged (no write,
+no audit row, no teardown) and the client stops with "Ownership transition not
+confirmed; preserve maintenance". That is the safe direction; the normal staging
+deploy path mints a new version id, so the verify gate is unaffected.
+Durable revocation is written before awaited native destruction;
 `running=false` is required before active release. A crash, storage-write failure
 or unconfirmed shutdown leaves denial; do not assume a 503 stopped the old
 process. Preserve maintenance until teardown is confirmed. 401/auth failure is
 a stop, 409 requires state reconciliation, and 503 is never permission to clear
 storage/alarms. No operation clears SDK state or changes guild/database bindings.
+The deployment-takeover client re-reads the fresh epoch on every retry, so reads
+answered by converging versions never block the post. The transfer step pins the
+client to the receipt-validated Worker version (`OWNERSHIP_EXPECTED_DEPLOYMENT`).
+When its posted epoch shows up owned by a deployment other than the one
+answering the read, the client re-posts only if the answering version is the
+deployed one (old-to-new handover); an answer from any other version is stale,
+so it stops without posting rather than handing that version a further commit.
+Without the pin the client fails closed and always stops on such a mismatch.
 
 The workflow preflight stops **before deploy** if control configuration is absent.
 After deployment it explicitly transfers only a previously active owner. First
@@ -400,13 +704,19 @@ other mode's binding, and an absent binding refuses before any connection.
 Invocation (secret-free; each URL comes only from its existing binding):
 
 ```text
-staging-migrate --plan --source-sha <40hex> --staging-host <host> \
-  --staging-database <db> --recovery-evidence-ref <ref> --acl-plan-ref <ref> \
+staging-migrate --target staging --plan --source-sha <40hex> --staging-host <host> \
+  --staging-database <db> [--staging-branch-id <branch>] \
+  --recovery-evidence-ref <ref> --acl-plan-ref <ref> \
   [--expected-pending <ascending,comma-separated versions>]
-staging-migrate --apply <same flags> --expected-pending <list> \
+staging-migrate --target staging --apply <same flags> --expected-pending <list> \
   --plan-manifest-sha256 <64hex> --plan-run-id <run id> \
   --plan-manifest-path <producing run's downloaded manifest>
 ```
+
+`--staging-branch-id` pins the PlanetScale branch id (non-secret). It is
+required when `--staging-host` ends in `.psdb.cloud` (PlanetScale routes
+branches by the binding username's `{role}.{branch_id}` suffix); other hosts
+leave it empty.
 
 Reconcile is set-based: pending is every source version absent from the
 ledger, in source order, so a ledger may lag the source by any subset. `--plan`
@@ -449,8 +759,11 @@ string instead of failing the plan.
 
 It refuses (exit 2, before any DDL) when the binding is absent, the target does
 not equal the pinned staging host/database inputs, either pin is empty or looks
-like production, either host pin or the binding host is a pooler endpoint
-(session `SET ROLE` and the migrator lock need the direct endpoint), the login
+like production, either host pin or the binding host is a pooler endpoint,
+the binding uses a pooled port (anything but 5432) or a pooler-style `|` username
+(session `SET ROLE` and the migrator lock need the direct 5432 endpoint),
+a `*.psdb.cloud` pin has no `--staging-branch-id`, the pin is malformed, or the
+binding username's branch suffix does not match the pinned branch, the login
 cannot assume `two_bot_migrator` (apply) or `two_bot_migrator_ro` (plan), the
 plan login also holds `two_bot_migrator`, a reference is missing, `--apply` has no
 `--expected-pending` or it mismatches, `--apply` has no `plan_manifest_sha256`/
@@ -515,6 +828,60 @@ pre-split runner, which looks for `TWO_BOT_STAGING_MIGRATOR_DATABASE_URL`; the
 connection (fail closed). Dispatch plan and apply with a `source_sha` at or
 after the split.
 
+### Production migration runner
+
+`.github/workflows/production-migrate.yml` (manual, production-only) is the
+exact mirror of the staging runner for post-cutover releases that carry a new
+migration. It runs the same `staging-migrate` binary with
+`--target production` from `crates/cutover/src/bin/staging_migrate.rs`, embeds
+the same crate migrations through SQLx **0.9.0**, keeps the same ledger and
+`SET ROLE` behavior, and keeps every staging refusal (pooler, `SET ROLE`
+membership, `expected_pending`, manifest hash, `plan_run_id` provenance).
+Invocation (secret-free; each URL comes only from its existing binding):
+
+```text
+staging-migrate --target production --plan --source-sha <40hex> \
+  --production-host <host> --production-database <db> \
+  --recovery-evidence-ref <ref> --acl-plan-ref <ref> \
+  [--expected-pending <ascending,comma-separated versions>]
+staging-migrate --target production --apply <same flags> --expected-pending <list> \
+  --plan-manifest-sha256 <64hex> --plan-run-id <run id> \
+  --plan-manifest-path <producing run's downloaded manifest>
+```
+
+`--target` is explicit with no default: a run without it refuses, a staging
+run never reads a production pin or binding, and a production run never reads
+a staging pin or binding. Production reads only
+`TWO_BOT_PRODUCTION_PLAN_DATABASE_URL` (plan, read-only
+`two_bot_migrator_ro`) and `TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL` (apply,
+`two_bot_migrator`); staging keeps its own pair. The production target drops
+the `prod`-substring refusal (the production host and `two_bot` database are
+production-like by construction) and instead refuses any staging host pin
+(fixture hosts, any `staging` label, any Neon endpoint) at both validation and
+the binding-host check, so a mistaken production pin aimed at staging still
+fails closed before any DDL. The binding-host check additionally refuses any
+non-`5432` port and any pooled (`|…`) login on production, so a binding
+copied from the app's pooled connection string still fails closed (pooler
+`SET ROLE` and the migrator lock need the direct endpoint). The manifest carries `migration_target`
+(`staging` or `production`); the claim publisher requires the matching value.
+
+The workflow mirrors the staging shape with the `production-migrate-` prefix:
+three jobs (`plan`, `claim`, `apply`), environments
+`production-migrate-plan` (no reviewer, plan only) and
+`production-migrate-apply` (required reviewer, main-only), the same pinned
+actions, routed runner, pipefail shell, and artifact names
+(`production-migrate-manifest`, `production-migrate-apply-claim`, 14-day
+retention, stored ZIP entries). The `claim` job runs
+`scripts/ci/production_migrate_claim.py`, which binds the same projection hash
+but requires the production workflow path, environment, and
+`PRODUCTION_HOST`/`PRODUCTION_DATABASE` pins. The production target takes no
+branch pin yet, so a production dispatch refuses
+closed (exit 2) until the production branch-pin follow-up lands; the
+production path is unavailable until then. Both environments
+and both secrets must exist before dispatch; the host provisions them after
+this change merges. The cutover itself does not need this path: the fresh
+`two_bot` bootstrap uses the tested provisioner flow.
+
 ### Redeploy the approved revision
 
 With the correct revision already selected in a separate clean operator checkout,
@@ -546,7 +913,7 @@ npm --prefix wrangler run deployments -- list --env staging
 ```
 
 Read the interactive target and confirm the incident's known-good version.
-Do not add `--yes` or override warnings. Wrangler 4.147 updates Durable Object
+Do not add `--yes` or override warnings. Wrangler 4.148 updates Durable Object
 code with `deferred` mode and a 300 s maximum delay by default, so a bare
 rollback can leave the old code serving for up to five minutes. For a manual
 incident rollback add `--durable-objects-code-update-mode immediate`, and expect
@@ -736,7 +1103,7 @@ tokens, or redeploy with an unreviewed wiring change during this docs procedure.
 | Automations/announcements/text | `TWO_AUTOMATIONS=1`, `TWO_ANNOUNCEMENTS=1`; text needs automations **and** `TWO_TEXT_COMMANDS=1`. | Per-feature gates, not operational containment. Verify the affected deployed handler; registry publishing or a periodic job alone does not prove a specific action is active. |
 | Onboarding | `TWO_ONBOARDING_MODE=legacy|session|anchor`, default legacy; `TWO_ONBOARDING_DRY_RUN=1`. | Mode/dry-run contracts are feature-scoped, not bot-wide stop controls. Verify the affected handler and staging evidence; a catalogue value alone is not a runtime activation or reload receipt. |
 | Community scorecard | `TWO_COMMUNITY_SCORECARD=1`; recommendations on unless `TWO_COMMUNITY_RECOMMENDATIONS=0`. | Conditionally registered supervised job; durable retry budget and completion rules apply. A successful/no-op tick is not fresh publication proof. See the [database playbook](#neon-or-hyperdrive-outage). |
-| Internal actions | Moderation requires `TWO_INTERNAL_ALLOW_MODERATION=1` **and** `TWO_MODERATION=1`; other verbs have allow flags. | Only the private `announcement.post` receiver exists, and only in staging: dark until the Operator sets the Worker secret `TWO_INTERNAL_ACTIONS` to `1` last; unset it to go dark again. Reachable solely through the staging Worker ingress for `POST /internal/actions`; production has none. The other allow flags still authorize nothing. See [staging ingress](internal-actions-receiver.md#staging-ingress-default-dark). |
+| Internal actions | `announcement.post`, `role.assign` and `event.upsert` are on whenever the receiver is; `event.cancel` needs `TWO_INTERNAL_ALLOW_EVENT_CANCEL=1`, `event.read` needs `TWO_INTERNAL_ALLOW_EVENT_READ=1`, `settings.get`/`settings.set` need `TWO_INTERNAL_ALLOW_SETTINGS=1`, `guild.add_member` needs `TWO_INTERNAL_ALLOW_ADD_MEMBER=1`, member and channel moderation need `TWO_INTERNAL_ALLOW_MODERATION=1` **and** `TWO_MODERATION=1`; remaining verbs stay refused. | Wired receivers are `announcement.post`, `role.assign` and `event.upsert` (no extra flag: contained only by the dark switch below), `event.cancel`, `event.read`, `settings.get`, `settings.set`, `guild.add_member`, `moderation.ban`, `moderation.tempban`, `moderation.kick`, `moderation.warn`, `moderation.timeout`, `moderation.purge`, `moderation.slowmode`, `moderation.lockdown`, `moderation.unlock`, staging only: dark until the Operator sets the Worker secret `TWO_INTERNAL_ACTIONS` to `1` last; unset it to go dark again. Reachable solely through the staging Worker ingress for `POST /internal/actions`; production has none. Unsetting an allow flag stops that verb. See [staging ingress](internal-actions-receiver.md#staging-ingress-default-dark) and the [receiver verb list](internal-actions-receiver.md). |
 | Settings hot reload | Typed catalogue/store with env-only secret/moderation keys. | Poller/runtime rebuilding remains follow-up; no promise of changes applying without restart. |
 
 Source: [`automod.rs`](../crates/core/src/automod.rs),
@@ -875,11 +1242,12 @@ or existing operator handoff; see [backup.md](backup.md) for unit contracts.
 |---|---|
 | Token missing / invalid | Missing `DISCORD_TOKEN` parks the gateway. A present rejected token can produce generic gateway failure rather than a dedicated invalid-token log. Confirm the expected secret **name/environment** with its provisioner; stop on rejection. Do not use legacy `DISCORD_BOT_TOKEN` as an automatic replacement or rotate credentials in this procedure. |
 | Missing Discord intents | GUILD_MEMBERS is always requested. MESSAGE_CONTENT is conditional on automod or all three ticket identifiers. Check the intended bot's Developer Portal intent grants and runtime configuration through the authorized actor; no speculative privilege expansion or token switch. There is no separate intents health component. |
-| DB unreachable / missing schema or grants | `DATABASE_URL` is required. Gateway connect/hydration/checkpoint failure can exit the process; its SQL error is withheld. Gateway and lazy jobs are DML-only; runtime will not provision schema. Job failures may coexist with ready gateway state, while the live `database` ping can independently make `/readyz` 503. Follow the [Neon/Hyperdrive playbook](#neon-or-hyperdrive-outage); repair the named dependency through its owner, not another credential, SQL probe or widened grant. |
+| DB unreachable / missing schema or grants | `DATABASE_URL` is required. Gateway connect/hydration/checkpoint failure can exit the process; its SQL error is withheld. Gateway and lazy jobs are DML-only; runtime will not provision schema. Job failures may coexist with ready gateway state, while the live `database` ping can independently make `/readyz` 503. Follow the [database outage playbook](#neon-or-hyperdrive-outage); repair the named dependency through its owner, not another credential, SQL probe or widened grant. |
 | HTTP 200 health but persistent 503 ready | Listener works; inspect `gateway`, `database` and `token_invalid` state and sanitized logs. A database failure or rejected-token latch need not be a gateway transport outage. Never soften readiness or count the scaffold-era deploy gate as recovery. |
 | Reconnect / RESUME refused | Follow [restart semantics](#restart-semantics-durable-resume-not-full-state-recovery); 4007/4009 force fresh IDENTIFY. Preserve the durable checkpoint, don't hand-edit sequence or start another shard. |
 | Discord REST 429 / suspected breaker | Separate token-wide durable admission, executor-local pacing, process-wide global pause/invalid-request breaker, and the private announcement governor. Refusal can precede HTTP; retry bounds vary by action. There is no manual reset endpoint. Do not hammer Discord, replay uncertain moderation writes or restart/delete state to clear a hold. Identify the actual writer and use verified containment; see the [Discord playbook](#discord-gateway-or-api-outage). |
 | Channel moderation lane stuck `in_progress` after an ambiguous write | No automatic retry/expiry. Quiesce original workers, establish old REST settlement, and read actual Discord overwrites/slowmode before using the inspection-first, explicitly confirmed operator CLI. It preserves recovery and audits the prior claim. See [channel lane reconciliation](channel-lane-reconciliation.md); never release a lane while a delayed unlock can still write. |
+| Website event action stuck `needs_reconciliation` after an ambiguous create | No automatic retry: re-submitting under a new key can make a second event. Read the actual guild scheduled events in Discord, then resolve the exact intent with the inspection-first, explicitly confirmed `two-bot reconcile-event` CLI (`--list`, then `--created`/`--updated`/`--cancelled`/`--no-effect` with `--execute`). See [the receiver contract](internal-actions-receiver.md); never re-submit the operation under a new key before reconciling. |
 | `POST /internal/actions` 404 on staging | The route is dark unless the Worker var `INTERNAL_ACTIONS_INGRESS` (staging env) **and** the secret `TWO_INTERNAL_ACTIONS` are both exactly `1`. Wrong method, a trailing slash or any query string is also 404 by design. Production is always 404. |
 | `POST /internal/actions` 503 `unavailable` | The container is not running (public ingress never starts it; wait for the probe or keepalive), the ownership fence refused this deployment, or the receiver answered something other than its JSON envelope. Check `/readyz` and ownership status; do not retry-loop a signed request with a new nonce. |
 | Ready but feature inactive | Gateway readiness says nothing about library-only commands/jobs/kill switches. Check [runtime boundaries](#containment-kill-switches-and-feature-flags), not extra environment guesses. |
@@ -1031,7 +1399,8 @@ Source: [gateway and durable recovery](gateway-recovery.md),
 
 ### Neon or Hyperdrive outage
 
-**Detection.** Gateway Postgres uses the forwarded `DATABASE_URL` directly.
+**Detection.** Production is live on PlanetScale; Neon hosts the staging
+database. Gateway Postgres uses the forwarded `DATABASE_URL` directly.
 Hyperdrive `REDIRECT_DB` is a separate redirect binding, **not** the Rust
 connection path. With `REDIRECT_DB`, the Worker supplies `connectPostgres` to
 `RedirectStore`: live lookup and click insertion are implemented. Without that
@@ -1072,14 +1441,15 @@ publicly. Preserve sanitized evidence, not URLs or unredacted SQL errors.
 
 **First five minutes.**
 
-1. Identify the affected staging dependency from approved non-secret deployment
-   metadata: [staging configuration](staging-soak.md#provisioning-operator-once)
-   records dedicated `two_bot` DB/role on Neon staging, separate from the web's
-   `two`/`two_app`. Never derive a replacement URL from another application's
-   secrets. The deployed binding must be confirmed, not merely assumed from
-   this configuration document.
+1. Identify the affected dependency from approved non-secret deployment
+   metadata. For staging, [staging configuration](staging-soak.md#provisioning-operator-once)
+   records the dedicated `two_bot` DB/role on Neon, separate from the web's
+   `two`/`two_app`; production uses PlanetScale. Never derive a replacement URL
+   from another application's secrets. The deployed binding must be confirmed,
+   not merely assumed from this configuration document.
 2. Save both bot health responses and available sanitized startup/checkpoint
-   logs. Check [Neon status](https://neonstatus.com/) and
+   logs. Check the affected provider's status—[Neon](https://neonstatus.com/)
+   for staging or PlanetScale for production—and
    [Cloudflare status](https://www.cloudflarestatus.com/) alongside the actual
    dependency owner's evidence. Missing schema/grants, rejected credentials,
    startup failure and provider unavailability require different repairs.

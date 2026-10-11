@@ -128,6 +128,40 @@ fn sources_reject_credentials_and_canonicalized_private_literals() {
 }
 
 #[test]
+fn source_length_bound_matches_published_byte_limit_before_trimming() {
+    let base = "https://example.org/";
+    let at_limit = format!("{base}{}", "x".repeat(MAX_FEED_SOURCE_BYTES - base.len()));
+    assert_eq!(at_limit.len(), MAX_FEED_SOURCE_BYTES);
+    assert!(validate_source(&at_limit).is_ok());
+    assert!(normalize_source(FeedKind::Twitch, &at_limit).is_ok());
+
+    // Multibyte input counts bytes, not characters: this path is exactly
+    // 2048 UTF-16 units but over the byte ceiling, so it is refused.
+    let unicode_path = format!(
+        "{base}{}",
+        "😀".repeat((MAX_FEED_SOURCE_BYTES - base.len()) / 2)
+    );
+    assert!(unicode_path.len() > MAX_FEED_SOURCE_BYTES);
+    assert!(matches!(
+        validate_source(&unicode_path),
+        Err(FetchError::InvalidSource)
+    ));
+
+    let over_limit = format!(
+        "{base}{}",
+        "x".repeat(MAX_FEED_SOURCE_BYTES - base.len() + 1)
+    );
+    assert!(matches!(
+        normalize_source(FeedKind::Twitch, &format!(" {over_limit} ")),
+        Err(FeedError::Fetch(FetchError::InvalidSource))
+    ));
+    assert!(matches!(
+        validate_source(&over_limit),
+        Err(FetchError::InvalidSource)
+    ));
+}
+
+#[test]
 fn dns_results_are_all_or_nothing_and_socket_targets_are_pinned() {
     let url = validate_source("https://example.org/feed").unwrap();
     let plan = PublicRequest::prepare(url.clone(), &[ip("8.8.8.8"), ip("1.1.1.1")]).unwrap();
@@ -195,6 +229,53 @@ fn body_cap_counts_chunked_decompressed_bytes_and_utf8() {
     assert!(validate_content_type(Some("application/atom+xml; charset=UTF-8")).is_ok());
     assert!(validate_content_type(None).is_ok());
     assert!(validate_content_type(Some("text/html")).is_err());
+}
+
+#[test]
+fn content_type_validates_media_type_not_parameters() {
+    // Supported feed media types pass, with any parameters ignored.
+    // The `x-` and `text/rss+xml` entries are legacy media types some
+    // servers still send for real feeds.
+    for valid in [
+        "application/rss+xml",
+        "application/x-rss+xml",
+        "text/rss+xml",
+        "application/atom+xml; charset=UTF-8",
+        "application/x-atom+xml; charset=UTF-8",
+        "application/xml",
+        "text/xml",
+        "application/rdf+xml",
+        "Application/RSS+XML; Charset=UTF-8",
+        "  application/rss+xml  ;  charset=utf-8  ",
+    ] {
+        assert!(
+            validate_content_type(Some(valid)).is_ok(),
+            "rejected {valid}"
+        );
+    }
+    // Missing header stays lenient.
+    assert!(validate_content_type(None).is_ok());
+    assert!(validate_content_type(Some("")).is_ok());
+    assert!(validate_content_type(Some("   ")).is_ok());
+    // An unrelated type must not pass because a parameter contains a magic
+    // substring; the media type alone decides, before any body parsing.
+    for hostile in [
+        "text/html; foo=atom",
+        "text/html; foo=x-rss+xml",
+        "text/html; charset=xml",
+        "text/plain; x=rss",
+        "application/json; xml=true",
+        "text/html; profile=\"rss\"",
+        "text/html",
+        "application/json",
+        "image/svg+xml",
+        "; foo=atom",
+    ] {
+        assert!(
+            validate_content_type(Some(hostile)).is_err(),
+            "accepted {hostile}"
+        );
+    }
 }
 
 #[test]

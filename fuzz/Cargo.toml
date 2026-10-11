@@ -16,8 +16,10 @@ resolver = "2"
 [dependencies]
 libfuzzer-sys = "=0.4.13"
 serde_json = { version = "1", features = ["preserve_order"] }
-two-bot-core = { version = "0.3.0", path = "../crates/core", default-features = false } # x-release-please-version
-two-bot-cutover = { version = "0.3.0", path = "../crates/cutover" } # x-release-please-version
+two-bot-core = { version = "0.4.0", path = "../crates/core", default-features = false } # x-release-please-version
+two-bot-cutover = { version = "0.4.0", path = "../crates/cutover" } # x-release-please-version
+two-bot = { version = "0.4.0", path = "../crates/bot" } # x-release-please-version
+two-bot-discord = { version = "0.4.0", path = "../crates/discord", features = ["db"] } # x-release-please-version
 
 [[bin]]
 name = "internal_action"
@@ -57,6 +59,55 @@ bench = false
 [[bin]]
 name = "voice_config"
 path = "fuzz_targets/voice_config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rsvp"
+path = "fuzz_targets/rsvp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "settings_map"
+path = "fuzz_targets/settings_map.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vote_kick"
+path = "fuzz_targets/vote_kick.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vote_kick_reason"
+path = "fuzz_targets/vote_kick_reason.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "slash_input_bounds"
+path = "fuzz_targets/slash_input_bounds.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cutover_parse"
+path = "fuzz_targets/cutover_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lfg_select"
+path = "fuzz_targets/lfg_select.rs"
 test = false
 doc = false
 bench = false

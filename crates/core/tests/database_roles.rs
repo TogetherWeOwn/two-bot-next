@@ -1110,11 +1110,26 @@ async fn verifier_gap_regressions(pool: &PgPool, roles: &[String]) -> Result<(),
         (format!("GRANT EXECUTE ON FUNCTION public.guild_settings_assign_version() TO {runtime}"), "function privilege differs:"),
         ("GRANT EXECUTE ON FUNCTION public.guild_settings_assign_version() TO PUBLIC".to_owned(), "function privilege differs:"),
         ("ALTER FUNCTION public.guild_settings_assign_version() SECURITY DEFINER".to_owned(), "function owner/security differs:"),
+        // A provider schema becomes reachable once anyone grants USAGE on it.
+        ("CREATE SCHEMA provider_ext; CREATE FUNCTION provider_ext.probe() RETURNS integer LANGUAGE sql AS 'SELECT 1'; GRANT USAGE ON SCHEMA provider_ext TO PUBLIC".to_owned(), "function privilege differs:"),
     ] {
         let detected = transactional_drift(pool, roles, &change).await?;
         require(detected.iter().any(|f| f.starts_with(expected)), &format!("missed drift: {change}"))?;
         require(findings(pool, roles).await?.is_empty(), "rollback drifted")?;
     }
+    // Managed Postgres (PlanetScale `hypopg` in `pscale_extensions`) installs
+    // functions with default PUBLIC EXECUTE in a provider-owned schema nobody
+    // else may use. They are not callable, so they are not drift.
+    require(
+        transactional_drift(
+            pool,
+            roles,
+            "CREATE SCHEMA provider_ext; CREATE FUNCTION provider_ext.probe() RETURNS integer LANGUAGE sql AS 'SELECT 1'",
+        )
+        .await?
+        .is_empty(),
+        "unreachable provider-schema function reported as drift",
+    )?;
     for spelling in ["true", "on", "yes", "1", "t", "y", "TRUE", "ON"] {
         let change = format!("ALTER VIEW web_v1.members SET (security_invoker = '{spelling}')");
         let detected = transactional_drift(pool, roles, &change).await?;

@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import worker, { type Env } from "../src/index.ts";
 import {
-  EMPTY_STATE, RULES, RUNBOOK_BASE_URL, evaluateMetrics, packetFilename, parseExposition, ruleFor, runbookUrl, transitionMessages,
+  EMPTY_STATE, JOB_ERROR_CLASSES, RULES, RUNBOOK_BASE_URL, evaluateMetrics, packetFilename, parseExposition, ruleFor, runbookUrl, transitionMessages,
+  type MetricsAlertState,
 } from "../src/alert-rules.ts";
 
 const NOW = 1_000_000;
@@ -12,11 +13,15 @@ function body(extra: string[]): string {
 }
 const ev = (lines: string[], prev = EMPTY_STATE) => evaluateMetrics(parseExposition(body(lines)), prev, NOW);
 
+/** GitHub-style heading slugs for a doc's text; literal underscores survive. */
+function headingAnchors(text: string): Set<string> {
+  return new Set([...text.matchAll(/^#+ (.+)$/gm)].map((m) =>
+    m[1]!.toLowerCase().replace(/[^a-z0-9 _-]/g, "").replace(/ /g, "-")));
+}
+
 /** Heading-slug index for one checked-in doc (single definition reused below). */
 function docAnchors(doc: string): Set<string> {
-  const text = readFileSync(new URL(`../../docs/${doc}`, import.meta.url), "utf8");
-  return new Set([...text.matchAll(/^#+ (.+)$/gm)].map((m) =>
-    m[1]!.toLowerCase().replace(/[^a-z0-9 -]/g, "").replace(/ /g, "-")));
+  return headingAnchors(readFileSync(new URL(`../../docs/${doc}`, import.meta.url), "utf8"));
 }
 
 test("job stale fires only past two intervals and ignores never-succeeded", () => {
@@ -25,9 +30,95 @@ test("job stale fires only past two intervals and ignores never-succeeded", () =
   assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="rank"} 0`]).firing, []);
 });
 
-test("consecutive failures fire at 3", () => {
+test("consecutive failures fire at 3 and retain classless messages for older exposition", () => {
   assert.deepEqual(ev([`two_bot_job_consecutive_failures{job="counter"} 2`]).firing, []);
-  assert.deepEqual(ev([`two_bot_job_consecutive_failures{job="counter"} 3`]).firing, ["job_consecutive_failures:counter"]);
+  const failed = ev([`two_bot_job_consecutive_failures{job="counter"} 3`]);
+  assert.deepEqual(failed.firing, ["job_consecutive_failures:counter"]);
+  assert.doesNotMatch(transitionMessages([], failed.firing)[0]!, /last error class/);
+});
+
+test("job failure alerts include only a fixed last error class and retain it through resolution", () => {
+  for (const errorClass of JOB_ERROR_CLASSES) {
+    const failing = ev([
+      `two_bot_job_consecutive_failures{job="counter"} 3`,
+      ...JOB_ERROR_CLASSES.map((candidate) =>
+        `two_bot_job_last_error_class{job="counter",class="${candidate}"} ${candidate === errorClass ? 1 : 0}`),
+    ]);
+    assert.deepEqual(failing.firing, ["job_consecutive_failures:counter"]);
+    assert.equal(failing.state.jobErrorClasses?.["counter"], errorClass);
+    const fired = transitionMessages([], failing.firing, {}, failing.state.jobErrorClasses)[0]!;
+    assert.ok(fired.includes(`job_consecutive_failures:counter (last error class: ${errorClass})`));
+
+    const resolved = ev([
+      `two_bot_job_consecutive_failures{job="counter"} 0`,
+      ...JOB_ERROR_CLASSES.map((candidate) =>
+        `two_bot_job_last_error_class{job="counter",class="${candidate}"} 0`),
+    ], failing.state);
+    assert.deepEqual(resolved.firing, []);
+    const resolution = transitionMessages(
+      failing.firing,
+      resolved.firing,
+      failing.state.jobErrorClasses,
+      resolved.state.jobErrorClasses,
+    )[0]!;
+    assert.ok(resolution.includes(`job_consecutive_failures:counter (last error class: ${errorClass})`));
+  }
+});
+
+test("unrecognized or ambiguous job error classes never enter alert messages", () => {
+  const failed = ev([
+    `two_bot_job_consecutive_failures{job="counter"} 3`,
+    `two_bot_job_last_error_class{job="counter",class="database"} 1`,
+    `two_bot_job_last_error_class{job="counter",class="https://example.invalid/member/123?body=synthetic"} 1`,
+  ]);
+  assert.equal(failed.state.jobErrorClasses?.["counter"], undefined);
+  const message = transitionMessages([], failed.firing, {}, failed.state.jobErrorClasses)[0]!;
+  assert.doesNotMatch(message, /example\.invalid|member\/123|body=synthetic/);
+});
+
+test("feed and self-role failures alert and resolve independently without a fixed stale policy", () => {
+  const jobs = ["feeds", "self_role_recovery"];
+  // Fresh timestamps (within the 2-hour job_unknown_stale window) so the
+  // coarse fallback stays silent and this test proves consecutive-failure
+  // independence alone; staleness coverage is pinned by the catalog guard.
+  const failing = ev(jobs.flatMap((job) => [
+    `two_bot_job_consecutive_failures{job="${job}"} 3`,
+    `two_bot_job_last_success_timestamp_seconds{job="${job}"} ${NOW - 60}`,
+  ]));
+  assert.deepEqual(failing.firing, jobs.map((job) => `job_consecutive_failures:${job}`));
+  for (const recovered of jobs) {
+    const remaining = jobs.find((job) => job !== recovered)!;
+    const result = ev(jobs.map((job) =>
+      `two_bot_job_consecutive_failures{job="${job}"} ${job === recovered ? 0 : 3}`), failing.state);
+    assert.deepEqual(result.firing, [`job_consecutive_failures:${remaining}`]);
+    const messages = transitionMessages(failing.firing, result.firing);
+    assert.equal(messages.length, 1);
+    assert.match(messages[0]!, /RESOLVED/);
+    assert.ok(messages[0]!.includes(`job_consecutive_failures:${recovered}`));
+  }
+});
+
+test("unban sweep and automod expiry failures alert and resolve independently without a fixed stale policy", () => {
+  const jobs = ["member_unban_sweep", "automod_expiry"];
+  // Fresh timestamps (within the 2-hour job_unknown_stale window) so the
+  // coarse fallback stays silent and this test proves consecutive-failure
+  // independence alone; staleness coverage is pinned by the catalog guard.
+  // In particular, an automod success must not clear a failing unban streak.
+  const failing = ev(jobs.flatMap((job) => [
+    `two_bot_job_consecutive_failures{job="${job}"} 3`,
+    `two_bot_job_last_success_timestamp_seconds{job="${job}"} ${NOW - 60}`,
+  ]));
+  assert.deepEqual(failing.firing, jobs.map((job) => `job_consecutive_failures:${job}`));
+  for (const recovered of jobs) {
+    const remaining = jobs.find((job) => job !== recovered)!;
+    const result = ev(jobs.map((job) =>
+      `two_bot_job_consecutive_failures{job="${job}"} ${job === recovered ? 0 : 3}`), failing.state);
+    assert.deepEqual(result.firing, [`job_consecutive_failures:${remaining}`]);
+    const messages = transitionMessages(failing.firing, result.firing);
+    assert.equal(messages.length, 1);
+    assert.match(messages[0]!, /RESOLVED/);
+    assert.ok(messages[0]!.includes(`job_consecutive_failures:${recovered}`));
+  }
 });
 
 test("429 rate uses the delta, ignores resets and tiny windows", () => {
@@ -96,6 +187,25 @@ test("voice failures fire on the lifecycle-drill failure exposition, silent on h
   assert.deepEqual(ev(healthy).firing, []);
 });
 
+test("admission refusals never page voice failures or dilute a real failure ratio", () => {
+  const base = ev([`two_bot_voice_operations_total{op="create",outcome="success"} 3`]);
+  // One member hopping between their room and the creator: ten creates succeed
+  // while ten admission refusals land in the same window.
+  const hopping = ev([
+    `two_bot_voice_operations_total{op="create",outcome="success"} 13`,
+    `two_bot_voice_operations_total{op="create",outcome="refused"} 10`,
+  ], base.state);
+  assert.deepEqual(hopping.firing, []);
+  // One failure in ten admitted operations is 10%: the same refusals must not
+  // dilute it below the 5% line.
+  const diluted = ev([
+    `two_bot_voice_operations_total{op="create",outcome="success"} 12`,
+    `two_bot_voice_operations_total{op="create",outcome="discord"} 1`,
+    `two_bot_voice_operations_total{op="create",outcome="refused"} 10`,
+  ], base.state);
+  assert.deepEqual(diluted.firing, ["voice_failures"]);
+});
+
 test("voice failures ignore trickles and restarts, fire on lone dead-letters/orphans", () => {
   const base = ev([`two_bot_voice_operations_total{op="create",outcome="success"} 42`]);
   // One failure in 43 ops (2.3%) is a trickle, not a storm.
@@ -117,10 +227,317 @@ test("voice failures ignore trickles and restarts, fire on lone dead-letters/orp
   assert.deepEqual(ev([`two_bot_voice_orphans_total 1`], quiet.state).firing, ["voice_failures"]);
 });
 
+test("gateway missed events fire on any increase, never on the first sample or a reset", () => {
+  const base = ev([`two_bot_gateway_missed_events_total 0`]);
+  assert.deepEqual(base.firing, []);
+  // First sample with a nonzero counter only stores the baseline.
+  const first = ev([`two_bot_gateway_missed_events_total 5`]);
+  assert.deepEqual(first.firing, []);
+  // An increase between two samples fires.
+  const fire = ev([`two_bot_gateway_missed_events_total 6`], first.state);
+  assert.deepEqual(fire.firing, ["gateway_missed_events"]);
+  // A flat window recovers (no increase, no fire).
+  assert.deepEqual(ev([`two_bot_gateway_missed_events_total 6`], fire.state).firing, []);
+  // A counter that went backwards means the process restarted: no window.
+  const restart = ev([`two_bot_gateway_missed_events_total 1`], fire.state);
+  assert.deepEqual(restart.firing, []);
+  // The post-restart baseline fires again on the next increase.
+  assert.deepEqual(ev([`two_bot_gateway_missed_events_total 2`], restart.state).firing, ["gateway_missed_events"]);
+});
+
+const gateway = (disconnects: number, recoveries: number, ready = 0) => [
+  `two_bot_gateway_disconnects_total ${disconnects}`,
+  `two_bot_gateway_resumes_total ${recoveries}`,
+  `two_bot_gateway_events_total{event="READY"} ${ready}`,
+];
+const UNPAIRED = "gateway_unpaired_disconnect";
+
+test("gateway unpaired: a reconnect that resumes within two samples never pages", () => {
+  const base = ev(gateway(0, 0));
+  const sameSample = ev(gateway(1, 1), base.state);
+  assert.deepEqual(sameSample.firing, []);
+  const nextSample = ev(gateway(2, 1), sameSample.state);
+  assert.deepEqual(nextSample.firing, []);
+  assert.deepEqual(ev(gateway(2, 2), nextSample.state).firing, []);
+  // A fresh READY pairs with a disconnect just like a RESUMED does.
+  const readyPaired = ev(gateway(3, 2, 1), ev(gateway(2, 2), nextSample.state).state);
+  assert.deepEqual(readyPaired.firing, []);
+  // Two samples without a recovery stay below the bound; the recovery lands on the second.
+  const late1 = ev(gateway(4, 2, 1), readyPaired.state);
+  const late2 = ev(gateway(4, 2, 1), late1.state);
+  assert.deepEqual([late1.firing, late2.firing], [[], []]);
+  assert.equal(late2.state.gatewayUnpairedStreak, 2);
+  assert.deepEqual(ev(gateway(4, 3, 1), late2.state).firing, []);
+});
+
+test("gateway unpaired pages on the third unpaired sample and resolves once recoveries catch up", () => {
+  const base = ev(gateway(0, 0));
+  const one = ev(gateway(1, 0), base.state);
+  const two = ev(gateway(1, 0), one.state);
+  assert.deepEqual([one.firing, two.firing], [[], []]);
+  const fire = ev(gateway(1, 0), two.state);
+  assert.deepEqual(fire.firing, [UNPAIRED]);
+  assert.deepEqual(ev(gateway(1, 0), fire.state).firing, [UNPAIRED]);
+  assert.deepEqual(ev(gateway(1, 1), fire.state).firing, []);
+});
+
+test("gateway unpaired: one outage with failed retries ends in a single RESUMED and never pages", () => {
+  // A close frame plus one failed Twilight retry, then a single RESUMED in the
+  // same window: N disconnects against one recovery is retry noise, not a loss.
+  const base = ev(gateway(0, 0));
+  const recovered = ev(gateway(2, 1), base.state);
+  assert.deepEqual(recovered.state.gatewayUnpaired, 0);
+  assert.deepEqual(recovered.firing, []);
+  // No remainder lingers: flat samples stay quiet indefinitely.
+  let quiet = recovered;
+  for (let i = 0; i < 5; i++) {
+    quiet = ev(gateway(2, 1), quiet.state);
+    assert.deepEqual(quiet.firing, []);
+  }
+  assert.equal(quiet.state.gatewayUnpairedStreak, 0);
+  // A later healthy disconnect+resume pair stays quiet too.
+  const pair = ev(gateway(3, 2), quiet.state);
+  assert.deepEqual(pair.firing, []);
+  assert.deepEqual(ev(gateway(3, 2), pair.state).firing, []);
+});
+
+test("gateway unpaired: close frame, then op 9, then a fresh READY never pages", () => {
+  const base = ev(gateway(0, 0));
+  const close = ev(gateway(1, 0), base.state);
+  const op9 = ev(gateway(2, 0), close.state);
+  assert.deepEqual([close.firing, op9.firing], [[], []]);
+  const ready = ev(gateway(2, 0, 1), op9.state);
+  assert.deepEqual(ready.firing, []);
+  let quiet = ready;
+  for (let i = 0; i < 5; i++) {
+    quiet = ev(gateway(2, 0, 1), quiet.state);
+    assert.deepEqual(quiet.firing, []);
+  }
+});
+
+test("gateway unpaired never fires on the first sample, which only stores the baseline", () => {
+  const first = ev(gateway(5, 0));
+  assert.deepEqual(first.firing, []);
+  assert.equal(first.state.gatewayUnpaired, 0);
+  assert.deepEqual(ev(gateway(5, 0), first.state).firing, []);
+});
+
+test("gateway unpaired restart holds the firing key for one sample, then re-baselines", () => {
+  const base = ev(gateway(0, 0));
+  const fire = [1, 1, 1].reduce((s) => ev(gateway(1, 0), s.state), base);
+  assert.deepEqual(fire.firing, [UNPAIRED]);
+  // Counters went backwards: no window, so the sample neither pages nor clears.
+  const restart = ev(gateway(0, 1), fire.state);
+  assert.deepEqual(restart.firing, [UNPAIRED]);
+  assert.equal(restart.state.gatewayUnpaired, 0);
+  // Growth after the restart is measured from the new baseline and holds while unpaired.
+  const again = ev(gateway(1, 1), restart.state);
+  assert.deepEqual(again.firing, [UNPAIRED]);
+  assert.deepEqual(ev(gateway(1, 2), again.state).firing, []);
+});
+
+test("gateway unpaired restart never pages by itself", () => {
+  const base = ev(gateway(0, 0));
+  const pending = ev(gateway(1, 0), base.state);
+  const restart = ev(gateway(0, 0), pending.state);
+  assert.deepEqual(restart.firing, []);
+  const s1 = ev(gateway(1, 0), restart.state);
+  const s2 = ev(gateway(1, 0), s1.state);
+  assert.deepEqual([s1.firing, s2.firing], [[], []]);
+});
+
+test("gateway unpaired: missing, duplicated, or non-numeric samples never clear a firing state", () => {
+  let fired = ev(gateway(0, 0));
+  for (let i = 0; i < 3; i++) fired = ev(gateway(1, 0), fired.state);
+  assert.deepEqual(fired.firing, [UNPAIRED]);
+  const absent = ev([`two_bot_job_consecutive_failures{job="counter"} 0`], fired.state);
+  assert.deepEqual(absent.firing, [UNPAIRED]);
+  assert.deepEqual(absent.state.gatewayUnpaired, fired.state.gatewayUnpaired);
+  const nan = ev(["two_bot_gateway_disconnects_total NaN", "two_bot_gateway_resumes_total 0", `two_bot_gateway_events_total{event="READY"} 0`], fired.state);
+  assert.deepEqual(nan.firing, [UNPAIRED]);
+  const duplicated = ev([...gateway(1, 0), "two_bot_gateway_resumes_total 0"], fired.state);
+  assert.deepEqual(duplicated.firing, [UNPAIRED]);
+  assert.deepEqual(ev(gateway(1, 1), absent.state).firing, []);
+});
+
+test("gateway unpaired reads Durable Object state written before its fields existed", () => {
+  const legacy = {
+    firing: [] as string[], rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0,
+    voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false,
+    receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {},
+  } as MetricsAlertState;
+  const first = ev(gateway(7, 0), legacy);
+  assert.deepEqual(first.firing, []);
+  assert.deepEqual(ev(gateway(8, 0), first.state).firing, []);
+});
+
+test("gateway checkpoint failures fire on any increase, never on the first sample or a reset", () => {
+  // Baseline samples are silent, even with a nonzero counter.
+  const base = ev([`two_bot_gateway_checkpoint_failures_total{stage="pre_commit"} 0`, `two_bot_gateway_checkpoint_failures_total{stage="commit"} 0`]);
+  assert.deepEqual(base.firing, []);
+  const first = ev([`two_bot_gateway_checkpoint_failures_total{stage="pre_commit"} 2`, `two_bot_gateway_checkpoint_failures_total{stage="commit"} 3`]);
+  assert.deepEqual(first.firing, []);
+  // An increase on `commit` fires; the next flat sample resolves.
+  const fire = ev(
+    [`two_bot_gateway_checkpoint_failures_total{stage="pre_commit"} 2`, `two_bot_gateway_checkpoint_failures_total{stage="commit"} 4`],
+    first.state,
+  );
+  assert.deepEqual(fire.firing, ["gateway_checkpoint_failures"]);
+  assert.deepEqual(
+    ev(
+      [`two_bot_gateway_checkpoint_failures_total{stage="pre_commit"} 2`, `two_bot_gateway_checkpoint_failures_total{stage="commit"} 4`],
+      fire.state,
+    ).firing,
+    [],
+  );
+  // An increase on `pre_commit` fires too: the rule sums over every stage.
+  assert.deepEqual(
+    ev(
+      [`two_bot_gateway_checkpoint_failures_total{stage="pre_commit"} 3`, `two_bot_gateway_checkpoint_failures_total{stage="commit"} 4`],
+      fire.state,
+    ).firing,
+    ["gateway_checkpoint_failures"],
+  );
+  // A counter that went backwards means the process restarted: no window.
+  const restart = ev([`two_bot_gateway_checkpoint_failures_total{stage="commit"} 1`], fire.state);
+  assert.deepEqual(restart.firing, []);
+  // The post-restart baseline fires again on the next increase.
+  assert.deepEqual(
+    ev([`two_bot_gateway_checkpoint_failures_total{stage="commit"} 2`], restart.state).firing,
+    ["gateway_checkpoint_failures"],
+  );
+  // An exposition without the series neither fires nor throws.
+  assert.deepEqual(ev([], first.state).firing.filter((k) => k === "gateway_checkpoint_failures"), []);
+  // DO storage written before the new fields existed does not throw: the
+  // missing counters read as zero and the missing seen-flags as false.
+  const legacy = { ...first.state, checkpointFailures: undefined, checkpointFailuresSeen: undefined } as unknown as typeof first.state;
+  assert.deepEqual(
+    ev([`two_bot_gateway_checkpoint_failures_total{stage="commit"} 9`], legacy).firing.filter((k) => k === "gateway_checkpoint_failures"),
+    [],
+  );
+});
+
+test("gateway checkpoint failure pages on the pre-exit scrape and resolves after the restart", () => {
+  // Models the linger-then-exit lifecycle: `shutdown::RUNTIME_FAILURE_LINGER`
+  // (75 s) outlasts one 60 s keepalive tick plus two 6 s probe timeouts with
+  // about 3 s of margin (pinned in checkpoint-linger.test.ts), so the
+  // incremented counter is scraped before the process exits and the restart
+  // resets it to zero.
+  const baseline = ev([`two_bot_gateway_checkpoint_failures_total{stage="commit"} 0`]);
+  assert.deepEqual(baseline.firing, []);
+  // Pre-exit scrape during the linger: the increase pages.
+  const page = ev([`two_bot_gateway_checkpoint_failures_total{stage="commit"} 1`], baseline.state);
+  assert.deepEqual(page.firing, ["gateway_checkpoint_failures"]);
+  // Post-restart scrape: the counter reset resolves without firing.
+  const afterRestart = ev([`two_bot_gateway_checkpoint_failures_total{stage="commit"} 0`], page.state);
+  assert.deepEqual(afterRestart.firing, []);
+  // The replacement stays quiet until a new failure increments again.
+  assert.deepEqual(ev([`two_bot_gateway_checkpoint_failures_total{stage="commit"} 0`], afterRestart.state).firing, []);
+  assert.deepEqual(
+    ev([`two_bot_gateway_checkpoint_failures_total{stage="commit"} 1`], afterRestart.state).firing,
+    ["gateway_checkpoint_failures"],
+  );
+});
+
+test("receiver refusals need three consecutive windows with new refusals, never the first sample or a reset", () => {
+  const refused = (family: string, outcome: string, n: number) =>
+    `two_bot_internal_actions_total{family="${family}",outcome="${outcome}"} ${n}`;
+  const executed = (family: string, n: number) =>
+    `two_bot_internal_actions_total{family="${family}",outcome="executed"} ${n}`;
+  const mod = (auth: number, rate = 2, exec = 10) => [
+    refused("moderation", "auth_failure", auth),
+    refused("moderation", "rate_limit", rate),
+    executed("moderation", exec),
+  ];
+  // First sample only stores the baseline, even with nonzero refusals.
+  const first = ev(mod(5));
+  assert.deepEqual(first.firing, []);
+  // One or two rising windows stay silent: a single forged pre-auth probe
+  // (always family `other`) must not page.
+  const second = ev(mod(6, 2, 100), first.state);
+  assert.deepEqual(second.firing, []);
+  const singleOther = ev(
+    [`two_bot_internal_actions_total{family="other",outcome="auth_failure"} 1`],
+    ev([`two_bot_internal_actions_total{family="other",outcome="auth_failure"} 0`]).state,
+  );
+  assert.deepEqual(singleOther.firing, []);
+  // Two rising windows stay silent; the third consecutive rise fires with
+  // the family subject; executed growth alone stays silent.
+  const third = ev(mod(7, 2, 101), second.state);
+  assert.deepEqual(third.firing, []);
+  const fire = ev(mod(8, 2, 102), third.state);
+  assert.deepEqual(fire.firing, ["receiver_refusals:moderation"]);
+  // A flat window clears the streak and recovers (no increase, no fire).
+  const flat = ev(mod(8, 2, 103), fire.state);
+  assert.deepEqual(flat.firing, []);
+  assert.equal(flat.state.receiverRefusalStreaks["moderation"], 0);
+  // Other families track their own streak: one `membership` refusal stays silent.
+  const mixedOne = ev([
+    refused("moderation", "auth_failure", 8),
+    refused("moderation", "rate_limit", 2),
+    refused("membership", "unknown_key", 1),
+    executed("membership", 3),
+  ], flat.state);
+  assert.deepEqual(mixedOne.firing, []);
+  // A counter that went backwards means the process restarted: no window.
+  const restart = ev([refused("moderation", "auth_failure", 1)], fire.state);
+  assert.deepEqual(restart.firing, []);
+  assert.equal(restart.state.receiverRefusalStreaks["moderation"] ?? 0, 0);
+  // The post-restart baseline needs three fresh rises before firing again.
+  const r1 = ev([refused("moderation", "auth_failure", 2)], restart.state);
+  const r2 = ev([refused("moderation", "auth_failure", 3)], r1.state);
+  assert.deepEqual(r1.firing, []);
+  assert.deepEqual(r2.firing, []);
+  assert.deepEqual(ev([refused("moderation", "auth_failure", 4)], r2.state).firing, ["receiver_refusals:moderation"]);
+});
+
+test("ticker stale fires past 10 minutes, ignores boot, parked and fresh tickers", () => {
+  // Boot (never succeeded) and parked (never registered) stay zero: silent.
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="scheduled_messages"} 0`]).firing, []);
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="settings"} 0`]).firing, []);
+  // Fresh ticks are silent; a 10-minute-old success is stale.
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="scheduled_messages"} ${NOW - 600}`]).firing, []);
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="scheduled_messages"} ${NOW - 601}`]).firing, ["ticker_stale:scheduled_messages"]);
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="settings"} ${NOW - 601}`]).firing, ["ticker_stale:settings"]);
+  // Recovery: a fresh success after a stale window stops firing.
+  const stale = ev([`two_bot_job_last_success_timestamp_seconds{job="settings"} ${NOW - 601}`]);
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="settings"} ${NOW - 1}`], stale.state).firing, []);
+  // Jobs outside TICKER_STALE_JOBS never fire this rule, however stale.
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="audit_retry"} ${NOW - 3600}`]).firing, []);
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="rank"} ${NOW - 3600}`]).firing.filter((k) => k.startsWith("ticker_stale")), []);
+});
+
+test("unknown-cadence jobs ticket past the fallback window, never on fresh or never-succeeded", () => {
+  // Boot (never succeeded) and parked (never registered) stay zero: silent.
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="audit_retry"} 0`]).firing, []);
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="other"} 0`]).firing, []);
+  // Fresh successes are silent, up to and including the 2-hour fallback edge.
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="audit_retry"} ${NOW - 7200}`]).firing, []);
+  // A stale success timestamp tickets (never pages) with the job subject.
+  const firing = ev([`two_bot_job_last_success_timestamp_seconds{job="audit_retry"} ${NOW - 7201}`]).firing;
+  assert.deepEqual(firing, ["job_unknown_stale:audit_retry"]);
+  assert.equal(ruleFor("job_unknown_stale:audit_retry")?.severity, "ticket");
+  // Future labels the scrape accepts fail closed the same way, with no catalog entry.
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="unban_sweep"} ${NOW - 7201}`]).firing, ["job_unknown_stale:unban_sweep"]);
+  // Event-driven session_checkpoint never tickets however stale: idle guilds
+  // (no dispatches for 2+ hours) are healthy, not wedged.
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="session_checkpoint"} 0`]).firing, []);
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="session_checkpoint"} ${NOW - 7200}`]).firing, []);
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="session_checkpoint"} ${NOW - 7201}`]).firing, []);
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="session_checkpoint"} ${NOW - 86400}`]).firing, []);
+  // Mapped jobs never take this path, however stale: rank keeps its exact
+  // job_stale key and tickers keep ticker_stale.
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="rank"} ${NOW - 7201}`]).firing, ["job_stale:rank"]);
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="scheduled_messages"} ${NOW - 7201}`]).firing, ["ticker_stale:scheduled_messages"]);
+  // Recovery: a fresh success after a stale window stops firing.
+  const stale = ev([`two_bot_job_last_success_timestamp_seconds{job="other"} ${NOW - 7201}`]);
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="other"} ${NOW - 1}`], stale.state).firing, []);
+});
+
 test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   const window = "2026-10-09T20-11-06Z";
   // Single shared spelling with the Rust canonical list (ALERT_RULE_IDS in
-  // crates/core/src/evidence.rs); both sides pin all seven here and there.
+  // crates/core/src/evidence.rs); both sides pin every spelling here and there.
   assert.deepEqual(RULES.map((r) => r.id), [
     "job_stale",
     "job_consecutive_failures",
@@ -129,6 +546,13 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "db_errors",
     "send_admission_blocked",
     "voice_failures",
+    "gateway_missed_events",
+    "gateway_unpaired_disconnect",
+    "ticker_stale",
+    "receiver_refusals",
+    "dispatch_drops",
+    "job_unknown_stale",
+    "gateway_checkpoint_failures",
   ]);
   assert.equal(packetFilename("job_stale:rank", window), `evidence-job_stale-${window}.json`);
   assert.equal(packetFilename("job_consecutive_failures:counter", window), `evidence-job_consecutive_failures-${window}.json`);
@@ -137,6 +561,13 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("db_errors", window), `evidence-db_errors-${window}.json`);
   assert.equal(packetFilename("send_admission_blocked", window), `evidence-send_admission_blocked-${window}.json`);
   assert.equal(packetFilename("voice_failures", window), `evidence-voice_failures-${window}.json`);
+  assert.equal(packetFilename("gateway_missed_events", window), `evidence-gateway_missed_events-${window}.json`);
+  assert.equal(packetFilename("gateway_unpaired_disconnect", window), `evidence-gateway_unpaired_disconnect-${window}.json`);
+  assert.equal(packetFilename("ticker_stale:scheduled_messages", window), `evidence-ticker_stale-${window}.json`);
+  assert.equal(packetFilename("receiver_refusals:moderation", window), `evidence-receiver_refusals-${window}.json`);
+  assert.equal(packetFilename("dispatch_drops:reactions", window), `evidence-dispatch_drops-${window}.json`);
+  assert.equal(packetFilename("job_unknown_stale:audit_retry", window), `evidence-job_unknown_stale-${window}.json`);
+  assert.equal(packetFilename("gateway_checkpoint_failures", window), `evidence-gateway_checkpoint_failures-${window}.json`);
   // Unknown keys get no filename rather than a misleading one; hostile
   // window stamps stay filename-safe.
   assert.equal(packetFilename("no_such_rule", window), undefined);
@@ -148,6 +579,22 @@ test("every rule links to an existing runbook heading", () => {
   for (const rule of RULES) {
     const anchor = rule.runbook.split("#")[1]!;
     assert.ok(slugs.has(anchor), `${rule.id}: missing runbook heading for #${anchor}`);
+  }
+});
+
+test("heading anchors keep literal underscores from inline-code headings", () => {
+  const slugs = headingAnchors("## Self-diagnosing gateway failures (`/readyz` `gateway_failure`)\n");
+  assert.deepEqual([...slugs], ["self-diagnosing-gateway-failures-readyz-gateway_failure"]);
+});
+
+test("job failure runbook has a first action for every fixed error class", () => {
+  const text = readFileSync(new URL("../../docs/runbook.md", import.meta.url), "utf8");
+  const rows = new Map(text.split("\n").filter((line) => line.startsWith("| `")).map((line) => {
+    const cells = line.split("|");
+    return [cells[1]!.trim().replaceAll("`", ""), cells[2]!.trim()];
+  }));
+  for (const errorClass of JOB_ERROR_CLASSES) {
+    assert.ok(rows.get(errorClass), `missing first response for ${errorClass}`);
   }
 });
 
@@ -185,6 +632,35 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
       `two_bot_voice_dead_letters_total{action="create"} 3`,
     ]).firing,
   );
+  firing.push(
+    ...ev(
+      [`two_bot_gateway_missed_events_total 1`],
+      ev([`two_bot_gateway_missed_events_total 0`]).state,
+    ).firing,
+  );
+  let unpaired = ev(gateway(0, 0));
+  for (let i = 0; i < 3; i++) unpaired = ev(gateway(1, 0), unpaired.state);
+  firing.push(...unpaired.firing);
+  firing.push(
+    ...ev([`two_bot_job_last_success_timestamp_seconds{job="scheduled_messages"} ${NOW - 601}`]).firing,
+  );
+  let refused = ev([`two_bot_internal_actions_total{family="moderation",outcome="auth_failure"} 0`]);
+  for (const n of [1, 2, 3]) {
+    refused = ev([`two_bot_internal_actions_total{family="moderation",outcome="auth_failure"} ${n}`], refused.state);
+  }
+  firing.push(...refused.firing);
+  let dropped = ev([`two_bot_dispatch_drops_total{lane="reactions"} 0`]);
+  for (const n of [1, 2, 3]) {
+    dropped = ev([`two_bot_dispatch_drops_total{lane="reactions"} ${n}`], dropped.state);
+  }
+  firing.push(...dropped.firing);
+  firing.push(
+    ...ev([`two_bot_job_last_success_timestamp_seconds{job="audit_retry"} ${NOW - 7201}`]).firing,
+    ...ev(
+      [`two_bot_gateway_checkpoint_failures_total{stage="commit"} 1`],
+      ev([`two_bot_gateway_checkpoint_failures_total{stage="commit"} 0`]).state,
+    ).firing,
+  );
   assert.equal(firing.length, RULES.length, `expected one firing key per rule, got: ${firing.join(", ")}`);
   const packets = transitionMessages([], firing);
   assert.equal(packets.length, RULES.length);
@@ -211,16 +687,18 @@ test("/ops/metrics: 404 without a configured token, 401 without/with a wrong bea
     TWO_BOT: { getByName: () => ({ fetch: async (r: Request) => { calls.push(r); return new Response("ok"); } }) },
   }) as unknown as Env;
   const ctx = {} as ExecutionContext;
+  const token = "synthetic-alert-rules-scrape-token-0123456789";
   const get = (e: Env, auth?: string) =>
     worker.fetch(new Request("https://w.invalid/ops/metrics", { headers: auth ? { authorization: auth } : {} }), e, ctx);
   assert.equal((await get(env(), "Bearer anything")).status, 404);
-  assert.equal((await get(env("s3cret"))).status, 401);
-  assert.equal((await get(env("s3cret"), "Bearer nope")).status, 401);
-  assert.equal((await get(env("s3cret"), "Basic s3cret")).status, 401);
+  assert.equal((await get(env("short"))).status, 404, "short token is not configured");
+  assert.equal((await get(env(token))).status, 401);
+  assert.equal((await get(env(token), "Bearer nope")).status, 401);
+  assert.equal((await get(env(token), "Basic nope")).status, 401);
   assert.equal(calls.length, 0, "unauthenticated requests never reach the container");
-  const ok = await get(env("s3cret"), "Bearer s3cret");
+  const ok = await get(env(token), `Bearer ${token}`);
   assert.equal(ok.status, 200);
   assert.equal(calls.length, 1);
-  const post = await worker.fetch(new Request("https://w.invalid/ops/metrics", { method: "POST", headers: { authorization: "Bearer s3cret" } }), env("s3cret"), ctx);
+  const post = await worker.fetch(new Request("https://w.invalid/ops/metrics", { method: "POST", headers: { authorization: `Bearer ${token}` } }), env(token), ctx);
   assert.equal(post.status, 404);
 });

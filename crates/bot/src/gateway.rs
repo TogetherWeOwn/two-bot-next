@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
 
@@ -44,6 +44,50 @@ use two_bot_discord::{
 pub fn ensure_crypto_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
+/// Worker decision for prefix triggers: `Some(trigger)` means the serial
+/// dispatch worker must call `dispatch_with_verdict(event, trigger)`, `None`
+/// means it must not. `trigger` is `disposition.map(|verdict| verdict.trigger)`;
+/// the text-automation gate stays on the trigger verdict, not the funnel: an
+/// uninspected create keeps funnel `Accept` but its trigger is capture-only
+/// and must not run sticky or prefix triggers (fail-closed).
+pub(crate) fn worker_prefix_trigger(
+    disposition: Option<crate::automod_gateway::WorkerVerdict>,
+    event: &Event,
+    automod_enabled: bool,
+) -> Option<Option<two_bot_core::automod_runtime::FunnelDisposition>> {
+    let trigger = disposition.map(|verdict| verdict.trigger);
+    if automod_enabled
+        && matches!(event, Event::MessageCreate(_))
+        && crate::automod_gateway::runs_text_automations(trigger)
+    {
+        Some(trigger)
+    } else {
+        None
+    }
+}
+
+/// Dispatch accepted creates, while recording only telemetry for candidates
+/// refused by the worker's capture-only gate. The refusal path never spawns
+/// text-automation work.
+fn dispatch_or_record_prefix_trigger(
+    command_runtime: Option<&Arc<crate::command_runtime::CommandRuntime>>,
+    disposition: Option<crate::automod_gateway::WorkerVerdict>,
+    event: &Event,
+    automod_enabled: bool,
+) -> bool {
+    if let Some(trigger) = worker_prefix_trigger(disposition, event, automod_enabled) {
+        command_runtime.is_some_and(|runtime| runtime.dispatch_with_verdict(event, trigger))
+    } else {
+        if !automod_enabled || !matches!(event, Event::MessageCreate(_)) {
+            return false;
+        }
+        if let Some(runtime) = command_runtime {
+            runtime.record_refused_prefix_trigger(event);
+        }
+        false
     }
 }
 
@@ -125,7 +169,14 @@ pub fn intents_from_env(activation: &crate::activation::BootActivation) -> Inten
             &var("TWO_AUTOMATIONS"),
             &var("TWO_TEXT_COMMANDS"),
         );
-    base | gateway_intents(text_commands)
+    // Voice-room presence facts (game/stream tokens) need privileged
+    // GUILD_PRESENCES; off unless explicitly enabled, so a bot whose app lacks
+    // the Presence Intent grant never closes with 4014.
+    let presences = two_bot_discord::intents::needs_voice_presences(
+        &var("TWO_VOICE"),
+        &var("TWO_VOICE_PRESENCE"),
+    );
+    two_bot_discord::intents::with_presences(base | gateway_intents(text_commands), presences)
 }
 
 fn intents_for_settings(
@@ -248,6 +299,94 @@ async fn checkpoint_io<T>(
         }
     }
     result
+}
+
+/// Drop guard for the bounded detached-ACK admission counter (`ACK_LIMIT`).
+///
+/// The permit releases when its acknowledgement task finishes — including by
+/// panic unwind — so a panicking `acknowledge` cannot leak capacity until
+/// every later interaction fails with "gateway ingress capacity exhausted".
+struct AckPermit {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl AckPermit {
+    /// Admit one detached acknowledgement, or `None` at capacity. A refused
+    /// admission rolls its optimistic increment back immediately.
+    fn try_acquire(in_flight: &Arc<AtomicUsize>) -> Option<Self> {
+        if in_flight.fetch_add(1, Ordering::AcqRel) >= ACK_LIMIT {
+            in_flight.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(Self {
+            in_flight: Arc::clone(in_flight),
+        })
+    }
+
+    #[cfg(test)]
+    fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for AckPermit {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Dispatch-worker failures are recorded errors, never worker panics: the
+/// worker stops, already-accepted commands drain, and the runner surfaces
+/// these typed errors instead of a bare "dispatch worker failed". Each
+/// message names its stage. Pre-commit failures keep the
+/// `; checkpoint unchanged` suffix; the missing-ticket error is raised after
+/// a successful commit, so it says `; checkpoint committed` instead.
+fn leveling_dispatch_failure() -> sqlx::Error {
+    sqlx::Error::InvalidArgument("leveling gateway dispatch failed; checkpoint unchanged".into())
+}
+
+fn interaction_drain_failure() -> sqlx::Error {
+    sqlx::Error::InvalidArgument("interaction drain failed; checkpoint unchanged".into())
+}
+
+fn invalid_onboarding_job_failure() -> sqlx::Error {
+    sqlx::Error::InvalidArgument("invalid onboarding job; checkpoint unchanged".into())
+}
+
+fn missing_ingress_ticket_failure() -> sqlx::Error {
+    sqlx::Error::InvalidArgument(
+        "onboarding interaction missing ingress ticket; checkpoint committed".into(),
+    )
+}
+
+/// Bounded detached-ACK admission is full: reception refuses the interaction
+/// instead of queueing unbounded acknowledgement work.
+fn ingress_capacity_failure() -> sqlx::Error {
+    sqlx::Error::InvalidArgument("gateway ingress capacity exhausted".into())
+}
+
+/// Fatal-runner reason fence: at most 512 chars of the dispatch-supervisor
+/// reason reach the surfaced runner error (logs + `operation`). Class
+/// `session` per `docs/log-volume-guard.md`: the runner fails at most a
+/// handful of times per process lifetime. Today every reason is one of six
+/// `&'static str` literals from `dispatch_bounded` (the `JoinError` payload
+/// is discarded there), so the bound is defense in depth: it holds even if a
+/// future supervisor returns a larger payload. Char-boundary truncation keeps
+/// the surfaced string valid UTF-8.
+const RUNNER_REASON_MAX_CHARS: usize = 512;
+
+fn bounded_runner_reason(reason: &str) -> sqlx::Error {
+    let bounded: String = reason.chars().take(RUNNER_REASON_MAX_CHARS).collect();
+    sqlx::Error::InvalidArgument(bounded)
+}
+
+/// Await one RSVP completion ticket on the dispatch worker. A dropped sender
+/// becomes [`interaction_drain_failure`] — a recorded error that holds the
+/// cursor — instead of a worker panic that would discard accepted commands.
+async fn await_interaction_completion(
+    completion: tokio::sync::oneshot::Receiver<bool>,
+) -> Result<bool, sqlx::Error> {
+    completion.await.map_err(|_| interaction_drain_failure())
 }
 
 async fn transport_disconnected(state: &RwLock<GatewayState>, generation: &AtomicU64) {
@@ -438,6 +577,335 @@ impl Drop for VoiceConnectionGuard {
 fn voice_disconnected(voice: Option<&Arc<dyn VoiceEventSink>>) {
     if let Some(voice) = voice {
         voice.disconnect();
+    }
+}
+
+/// Counts one warn-and-continue community-facts drain failure: a facts-writer
+/// error or a missed dispatch deadline. A committed drain counts nothing.
+fn count_community_facts_drain_failure<T, E>(
+    metrics: &two_bot_core::metrics::Metrics,
+    drained: &Result<Result<T, E>, tokio::time::error::Elapsed>,
+) {
+    let reason = match drained {
+        Ok(Ok(_)) => return,
+        Ok(Err(_)) => "error",
+        Err(_) => "timeout",
+    };
+    metrics.community_facts_drain_failure(reason);
+}
+
+/// One blocking-worker dispatch step: run the funnel/leveling drain, await the
+/// interaction completion, serialize any onboarding job and commit the
+/// checkpoint — or record the first failure as a typed error and skip the
+/// commit so the cursor stays unchanged.
+///
+/// Extracted verbatim from the `dispatch_bounded` worker closure so tests can
+/// drive a failing dispatch through the real worker path: restoring a `panic!`
+/// at any failure site below fails the worker-level test instead of slipping
+/// through constructor-only coverage.
+#[allow(clippy::too_many_arguments)]
+fn apply_dispatch<I: InviteSource>(
+    handle: &tokio::runtime::Handle,
+    worker_state: &RwLock<GatewayState>,
+    generation: &AtomicU64,
+    pipeline: &GatewayPipeline<I>,
+    store: &GatewaySessionStore,
+    automod: Option<Arc<crate::automod_gateway::ProductionAutomod>>,
+    command_runtime: Option<Arc<crate::command_runtime::CommandRuntime>>,
+    worker_voice: Option<Arc<dyn VoiceEventSink>>,
+    writer_onboarding: Option<Arc<crate::onboarding::OnboardingRuntime>>,
+    writer_live: LiveInteractions,
+    writer_signal: Arc<tokio::sync::Notify>,
+    dispatch: Option<Box<ReceivedDispatch>>,
+    edit: Option<Box<(two_bot_core::automod_runtime::MessageDelivery, String)>>,
+    checkpoint: GatewaySession,
+    deadline: std::time::Duration,
+    observed_generation: u64,
+    acknowledgement: Option<tokio::sync::oneshot::Receiver<bool>>,
+    committed: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), sqlx::Error> {
+    // Presence updates (TWO_VOICE_PRESENCE) only feed in-memory voice-room
+    // name facts: no funnel, audit or durable effect. They stay in gateway
+    // order with GUILD_CREATE (whose presence snapshot this worker applies)
+    // but skip the checkpoint commit, one Postgres transaction per dispatch.
+    // The next committed dispatch carries the cursor past them, and a RESUME
+    // replays them idempotently; reception already advanced, so no gap.
+    if let Some(ReceivedDispatch {
+        event: Event::PresenceUpdate(update),
+        ..
+    }) = dispatch.as_deref()
+    {
+        if let Some(voice) = worker_voice.as_ref() {
+            voice.presence(update);
+        }
+        return Ok(());
+    }
+    let timer = crate::gateway_metrics::DispatchTimer::start();
+    let mut connected: Option<&str> = None;
+    let mut onboarding_job = None;
+    // Automod decides first, in gateway order, once per delivery.
+    let disposition = automod.as_ref().and_then(|automod| {
+        let (delivery, at) = match (edit, dispatch.as_deref()) {
+            (Some(edit), _) => *edit,
+            (None, Some(dispatch)) => (
+                two_bot_discord::automod::event_to_automod(
+                    &dispatch.event,
+                    crate::automod_gateway::receipt_ms(&dispatch.observed_at),
+                )?,
+                dispatch.observed_at.clone(),
+            ),
+            (None, None) => return None,
+        };
+        Some(handle.block_on(crate::automod_gateway::process(automod, delivery, &at)))
+    });
+    let mut acknowledgement_held = false;
+    // The worker dispatches text automations itself once automod has decided.
+    let automod_enabled = automod.is_some();
+    // Dispatch-worker failures below are recorded on
+    // `operation` (the worker stops, accepted RSVP drains,
+    // the checkpoint stays unchanged) instead of panicking
+    // away accepted commands. The first failure wins; the
+    // commit below is skipped while one is held.
+    let mut dispatch_error: Option<sqlx::Error> = None;
+    // Staff audit rows: translated pre-update (member deltas and
+    // voice boundaries need the rows the funnel is about to
+    // mutate), stored before the checkpoint commits. The store
+    // write is idempotent, so a crash between the two replays
+    // safely; a failed write never stalls this worker.
+    let mut audit_events = Vec::new();
+    if let Some(dispatch) = dispatch {
+        // A cold voice RESUME is followed by IDENTIFY; READY connects.
+        connected = match &dispatch.event {
+            Event::Ready(_) if committed.is_none() => Some("ready"),
+            Event::Resumed if committed.is_none() => Some("gateway_resumed"),
+            _ => None,
+        };
+        // Capture member state before the cache pipeline mutates it.
+        onboarding_job = writer_onboarding
+            .as_ref()
+            .and_then(|runtime| runtime.capture(&dispatch.event, pipeline));
+        audit_events = crate::audit_gateway::translate(
+            &dispatch.event,
+            pipeline.cache(),
+            &dispatch.observed_at,
+            checkpoint.sequence,
+        );
+        // Exactly one funnel call per dispatch, then drain deferred
+        // XP awards through the leveling runtime under the
+        // checkpoint deadline before the cursor commits. Without a
+        // leveling runtime the drain is a no-op.
+        let requests = match disposition {
+            Some(verdict) => pipeline.collect_at_with_message_disposition(
+                &dispatch.event,
+                &dispatch.observed_at,
+                verdict.funnel,
+            ),
+            None => pipeline.collect_at(
+                &dispatch.event,
+                &dispatch.observed_at,
+                two_bot_discord::MessageEligibility::default(),
+            ),
+        };
+        // Voice after the cache update, so snapshots are complete.
+        // Handling never blocks (actor inbox). A transport loss seen
+        // at reception after this dispatch must still win over any
+        // snapshot it just published.
+        if let Some(voice) = worker_voice.as_ref() {
+            voice.handle(&dispatch.event, pipeline.cache());
+            if generation.load(Ordering::Acquire) != observed_generation {
+                voice.disconnect();
+            }
+        }
+        // Detached spawn from the blocking worker needs the runtime. A create
+        // refused by the trigger gate records only prefix-candidate telemetry.
+        let _guard = handle.enter();
+        dispatch_or_record_prefix_trigger(
+            command_runtime.as_ref(),
+            disposition,
+            &dispatch.event,
+            automod_enabled,
+        );
+        if !requests.is_empty() {
+            let drain_outcome =
+                handle.block_on(checkpoint_io(worker_state, generation, deadline, async {
+                    pipeline.drain(requests).await.map(drop).map_err(|error| {
+                        // Runtime Display is sanitized; never
+                        // log its SQL/HTTP source.
+                        tracing::warn!(
+                            error = %error,
+                            "gateway leveling dispatch failed"
+                        );
+                        leveling_dispatch_failure()
+                    })
+                }));
+            if drain_outcome.is_err() {
+                // A failed drain or its checkpoint deadline
+                // holds the cursor via `dispatch_error`
+                // instead of panicking away accepted work.
+                dispatch_error = Some(leveling_dispatch_failure());
+            }
+        }
+        // Community facts: drain buffered voice_session_started/ended,
+        // message_created and rules_accepted writes on every dispatch, even
+        // when no XP award queued — bots, webhooks and staff automation
+        // capture facts but never awards, and a move's end+start pair
+        // buffers two rows for one frame, so gating on `requests` would leak
+        // the buffer. A failed write never stalls the worker (audit
+        // precedent): warn and continue; the scorecard fails closed on
+        // missing coverage.
+        let drained = handle.block_on(tokio::time::timeout(deadline, pipeline.drain_facts()));
+        count_community_facts_drain_failure(two_bot_core::metrics::global(), &drained);
+        match drained {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::warn!(
+                error = %error,
+                "gateway community facts dispatch failed"
+            ),
+            Err(_) => {
+                tracing::warn!("gateway community facts dispatch timed out");
+            }
+        }
+        // A Blocked receipt-callback exhaustion leaves the command
+        // never-acknowledged: hold the cursor instead of
+        // silently passing it. The error path below releases
+        // a cold-resume wait and records the fence.
+        acknowledgement_held = if let Some(completion) = dispatch.completion {
+            match handle.block_on(await_interaction_completion(completion)) {
+                Ok(completed) => !completed,
+                Err(error) => {
+                    // A dropped ticket holds the cursor via
+                    // `dispatch_error` instead of panicking
+                    // away accepted commands.
+                    if dispatch_error.is_none() {
+                        dispatch_error = Some(error);
+                    }
+                    false
+                }
+            }
+        } else {
+            false
+        };
+    }
+    if !audit_events.is_empty() {
+        let pending = std::mem::take(&mut audit_events);
+        handle.block_on(crate::audit_gateway::record_all(&pending));
+    }
+    let durable_job = match onboarding_job
+        .as_ref()
+        .map(|job| {
+            job.durable_payload().map(|payload| GatewayJob {
+                payload,
+                occurred_at_ms: checkpoint.updated_at_ms,
+            })
+        })
+        .transpose()
+    {
+        Ok(job) => job,
+        Err(error) => {
+            // Serializing a worker-built job cannot fail on
+            // external input; record it if it ever does
+            // instead of panicking away accepted commands.
+            tracing::warn!(error = %error, "gateway onboarding job invalid");
+            if dispatch_error.is_none() {
+                dispatch_error = Some(invalid_onboarding_job_failure());
+            }
+            None
+        }
+    };
+    let (checkpoint_result, checkpoint_stage) = if let Some(error) = dispatch_error {
+        (Err(error), "pre_commit")
+    } else if acknowledgement_held {
+        (
+            Err(sqlx::Error::InvalidArgument(
+                "interaction acknowledgement failed; checkpoint unchanged".into(),
+            )),
+            "pre_commit",
+        )
+    } else {
+        (
+            handle.block_on(checkpoint_io(
+                worker_state,
+                generation,
+                deadline,
+                store.commit_dispatch_with_job(
+                    &checkpoint,
+                    pipeline.handlers().store().take_batch(),
+                    durable_job,
+                ),
+            )),
+            "commit",
+        )
+    };
+    // A failed checkpoint is recorded on `operation` (the
+    // worker stops and accepted RSVP drains) instead of
+    // panicking away accepted commands.
+    match checkpoint_result {
+        Ok((_, job_id)) => {
+            timer.committed();
+            // Reception admits the ingress ticket under the
+            // same pure `accepts_interaction` predicate the
+            // worker captures with, so a committed
+            // interaction job without one is unreachable.
+            // If the two ever diverge, record it instead
+            // of panicking: the commit already holds the
+            // durable job for bounded restart recovery.
+            let mut ticket_error: Option<sqlx::Error> = None;
+            if let Some(id) = job_id {
+                if let Some(OnboardingJob::Interaction(interaction)) = onboarding_job {
+                    match acknowledgement {
+                        Some(ticket) => {
+                            writer_live
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(
+                                    id,
+                                    LiveInteraction {
+                                        interaction,
+                                        ticket,
+                                        generation: observed_generation,
+                                    },
+                                );
+                        }
+                        None => {
+                            ticket_error = Some(missing_ingress_ticket_failure());
+                        }
+                    }
+                }
+                writer_signal.notify_one();
+            }
+            if let Some(msg) = connected {
+                let mut state = handle.block_on(worker_state.write());
+                if *state != GatewayState::Draining
+                    && generation.load(Ordering::Acquire) == observed_generation
+                {
+                    *state = GatewayState::Connected;
+                    info!(
+                        msg,
+                        sequence = checkpoint.sequence,
+                        shard = ?ShardId::ONE,
+                        "gateway ready; checkpoint committed"
+                    );
+                }
+            }
+            if let Some(committed) = committed {
+                let _ = committed.send(());
+            }
+            match ticket_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+        Err(error) => {
+            // Every failed checkpoint stops the worker; count it for the M2.1
+            // alert hook alongside the sibling failure surfaces. The stage is
+            // bounded (`pre_commit` when the commit was skipped, `commit` when
+            // the store write failed); causes are never labels.
+            two_bot_core::metrics::global().checkpoint_failure(checkpoint_stage);
+            if let Some(committed) = committed {
+                let _ = committed.send(());
+            }
+            Err(error)
+        }
     }
 }
 
@@ -729,17 +1197,19 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             (Some(runtime), Some(ReceivedDispatch { event: Event::InteractionCreate(interaction), .. }))
                                 if runtime.accepts_interaction(&interaction.0) =>
                             {
-                                if in_flight_acks.fetch_add(1, Ordering::AcqRel) >= ACK_LIMIT {
-                                    in_flight_acks.fetch_sub(1, Ordering::AcqRel);
-                                    return Err(sqlx::Error::InvalidArgument("gateway ingress capacity exhausted".into()));
-                                }
+                                // The permit is a drop guard held by the spawned
+                                // task: a panicking `acknowledge` releases it
+                                // during unwind instead of leaking capacity.
+                                let permit = match AckPermit::try_acquire(&in_flight_acks) {
+                                    Some(permit) => permit,
+                                    None => return Err(ingress_capacity_failure()),
+                                };
                                 let (send, receive) = tokio::sync::oneshot::channel();
                                 let runtime = Arc::clone(runtime);
                                 let interaction = interaction.0.clone();
-                                let in_flight = Arc::clone(&in_flight_acks);
                                 tokio::spawn(async move {
+                                    let _permit = permit;
                                     let confirmed = runtime.acknowledge(&interaction, received_at).await;
-                                    in_flight.fetch_sub(1, Ordering::AcqRel);
                                     let _ = send.send(confirmed);
                                 });
                                 Some(receive)
@@ -821,222 +1291,54 @@ pub async fn run_shard<I: InviteSource + 'static>(
             if worker_failed.load(Ordering::Acquire) {
                 return;
             }
-            let operation =
-                match work {
-                    ReceivedWork::Clear(deadline) => handle.block_on(checkpoint_io(
+            let operation = match work {
+                ReceivedWork::Clear(deadline) => {
+                    let cleared = handle.block_on(checkpoint_io(
                         &worker_state,
                         &generation,
                         deadline,
                         store.clear(),
-                    )),
-                    ReceivedWork::Failed(error) => Err(error),
-                    ReceivedWork::Dispatch {
-                        dispatch,
-                        edit,
-                        checkpoint,
-                        deadline,
-                        generation: observed_generation,
-                        acknowledgement,
-                        committed,
-                    } => {
-                        let timer = crate::gateway_metrics::DispatchTimer::start();
-                        let mut connected: Option<&str> = None;
-                        let mut onboarding_job = None;
-                        // Automod decides first, in gateway order, once per delivery.
-                        let disposition = automod.as_ref().and_then(|automod| {
-                            let (delivery, at) = match (edit, dispatch.as_deref()) {
-                                (Some(edit), _) => *edit,
-                                (None, Some(dispatch)) => (
-                                    two_bot_discord::automod::event_to_automod(
-                                        &dispatch.event,
-                                        crate::automod_gateway::receipt_ms(&dispatch.observed_at),
-                                    )?,
-                                    dispatch.observed_at.clone(),
-                                ),
-                                (None, None) => return None,
-                            };
-                            Some(
-                                handle.block_on(crate::automod_gateway::process(
-                                    automod, delivery, &at,
-                                )),
-                            )
-                        });
-                        let mut acknowledgement_held = false;
-                        // Staff audit rows: translated pre-update (member deltas and
-                        // voice boundaries need the rows the funnel is about to
-                        // mutate), stored before the checkpoint commits. The store
-                        // write is idempotent, so a crash between the two replays
-                        // safely; a failed write never stalls this worker.
-                        let mut audit_events = Vec::new();
-                        if let Some(dispatch) = dispatch {
-                            // A cold voice RESUME is followed by IDENTIFY; READY connects.
-                            connected = match &dispatch.event {
-                                Event::Ready(_) if committed.is_none() => Some("ready"),
-                                Event::Resumed if committed.is_none() => Some("gateway_resumed"),
-                                _ => None,
-                            };
-                            // Capture member state before the cache pipeline mutates it.
-                            onboarding_job = writer_onboarding
-                                .as_ref()
-                                .and_then(|runtime| runtime.capture(&dispatch.event, &pipeline));
-                            audit_events = crate::audit_gateway::translate(
-                                &dispatch.event,
-                                pipeline.cache(),
-                                &dispatch.observed_at,
-                                checkpoint.sequence,
-                            );
-                            // Exactly one funnel call per dispatch, then drain deferred
-                            // XP awards through the leveling runtime under the
-                            // checkpoint deadline before the cursor commits. Without a
-                            // leveling runtime the drain is a no-op.
-                            let requests = match disposition {
-                                Some(disposition) => pipeline.collect_at_with_message_disposition(
-                                    &dispatch.event,
-                                    &dispatch.observed_at,
-                                    disposition,
-                                ),
-                                None => pipeline.collect_at(
-                                    &dispatch.event,
-                                    &dispatch.observed_at,
-                                    two_bot_discord::MessageEligibility::default(),
-                                ),
-                            };
-                            // Voice after the cache update, so snapshots are complete.
-                            // Handling never blocks (actor inbox). A transport loss seen
-                            // at reception after this dispatch must still win over any
-                            // snapshot it just published.
-                            if let Some(voice) = worker_voice.as_ref() {
-                                voice.handle(&dispatch.event, pipeline.cache());
-                                if generation.load(Ordering::Acquire) != observed_generation {
-                                    voice.disconnect();
-                                }
-                            }
-                            if automod_enabled
-                                && matches!(dispatch.event, Event::MessageCreate(_))
-                                && crate::automod_gateway::runs_text_automations(disposition)
-                            {
-                                if let Some(runtime) = command_runtime.as_ref() {
-                                    // Detached spawn from the blocking worker needs the runtime.
-                                    let _guard = handle.enter();
-                                    runtime.dispatch(&dispatch.event);
-                                }
-                            }
-                            if !requests.is_empty() {
-                                handle
-                            .block_on(checkpoint_io(&worker_state, &generation, deadline, async {
-                                pipeline.drain(requests).await.map(drop).map_err(|error| {
-                                    // Runtime Display is sanitized; never
-                                    // log its SQL/HTTP source.
-                                    tracing::warn!(
-                                        error = %error,
-                                        "gateway leveling dispatch failed"
-                                    );
-                                    sqlx::Error::InvalidArgument(
-                                        "leveling gateway dispatch failed".into(),
-                                    )
-                                })
-                            }))
-                            .unwrap_or_else(|_| {
-                                panic!("gateway leveling dispatch failed; checkpoint unchanged")
-                            });
-                            }
-                            // A Blocked receipt-callback exhaustion leaves the command
-                            // never-acknowledged: hold the cursor instead of
-                            // silently passing it. The error path below releases
-                            // a cold-resume wait and records the fence.
-                            acknowledgement_held = if let Some(completion) = dispatch.completion {
-                                !handle.block_on(completion).unwrap_or_else(|_| {
-                                    panic!("interaction drain failed; checkpoint unchanged")
-                                })
-                            } else {
-                                false
-                            };
-                        }
-                        if !audit_events.is_empty() {
-                            let pending = std::mem::take(&mut audit_events);
-                            handle.block_on(crate::audit_gateway::record_all(&pending));
-                        }
-                        let durable_job = onboarding_job
-                            .as_ref()
-                            .map(|job| {
-                                job.durable_payload().map(|payload| GatewayJob {
-                                    payload,
-                                    occurred_at_ms: checkpoint.updated_at_ms,
-                                })
-                            })
-                            .transpose()
-                            .unwrap_or_else(|_| panic!("invalid onboarding job"));
-                        let checkpoint_result = if acknowledgement_held {
-                            Err(sqlx::Error::InvalidArgument(
-                                "interaction acknowledgement failed; checkpoint unchanged".into(),
-                            ))
-                        } else {
-                            handle.block_on(checkpoint_io(
-                                &worker_state,
-                                &generation,
-                                deadline,
-                                store.commit_dispatch_with_job(
-                                    &checkpoint,
-                                    pipeline.handlers().store().take_batch(),
-                                    durable_job,
-                                ),
-                            ))
-                        };
-                        // A failed checkpoint is recorded on `operation` (the
-                        // worker stops and accepted RSVP drains) instead of
-                        // panicking away accepted commands.
-                        match checkpoint_result {
-                            Ok((_, job_id)) => {
-                                timer.committed();
-                                if let Some(id) = job_id {
-                                    if let Some(OnboardingJob::Interaction(interaction)) =
-                                        onboarding_job
-                                    {
-                                        let ticket = acknowledgement.unwrap_or_else(|| {
-                                            panic!("onboarding interaction missing ingress ticket")
-                                        });
-                                        writer_live
-                                            .lock()
-                                            .unwrap_or_else(|e| e.into_inner())
-                                            .insert(
-                                                id,
-                                                LiveInteraction {
-                                                    interaction,
-                                                    ticket,
-                                                    generation: observed_generation,
-                                                },
-                                            );
-                                    }
-                                    writer_signal.notify_one();
-                                }
-                                if let Some(msg) = connected {
-                                    let mut state = handle.block_on(worker_state.write());
-                                    if *state != GatewayState::Draining
-                                        && generation.load(Ordering::Acquire) == observed_generation
-                                    {
-                                        *state = GatewayState::Connected;
-                                        info!(
-                                            msg,
-                                            sequence = checkpoint.sequence,
-                                            shard = ?ShardId::ONE,
-                                            "gateway ready; checkpoint committed"
-                                        );
-                                    }
-                                }
-                                if let Some(committed) = committed {
-                                    let _ = committed.send(());
-                                }
-                                Ok(())
-                            }
-                            Err(error) => {
-                                if let Some(committed) = committed {
-                                    let _ = committed.send(());
-                                }
-                                Err(error)
-                            }
-                        }
+                    ));
+                    if cleared.is_err() {
+                        // A failed checkpoint clear stops the worker like any
+                        // other failed commit; count it for the M2.1 alert
+                        // hook under the `commit` stage (a durable store
+                        // write failing).
+                        two_bot_core::metrics::global().checkpoint_failure("commit");
                     }
-                };
+                    cleared
+                }
+                ReceivedWork::Failed(error) => Err(error),
+                ReceivedWork::Dispatch {
+                    dispatch,
+                    edit,
+                    checkpoint,
+                    deadline,
+                    generation: observed_generation,
+                    acknowledgement,
+                    committed,
+                } => apply_dispatch(
+                    &handle,
+                    &worker_state,
+                    &generation,
+                    &pipeline,
+                    &store,
+                    automod.clone(),
+                    command_runtime.clone(),
+                    worker_voice.clone(),
+                    writer_onboarding.clone(),
+                    Arc::clone(&writer_live),
+                    Arc::clone(&writer_signal),
+                    dispatch,
+                    edit,
+                    checkpoint,
+                    deadline,
+                    observed_generation,
+                    acknowledgement,
+                    committed,
+                ),
+            };
+
             if let Err(error) = operation {
                 // Retain the original error without panicking away accepted
                 // commands or allowing a later checkpoint to leap past failure.
@@ -1060,7 +1362,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
             futures_util::pin_mut!(queue_worker);
             tokio::select! {
                 result = dispatch => {
-                    let result = result.map_err(|reason| sqlx::Error::InvalidArgument(reason.into()));
+                    let result = result.map_err(bounded_runner_reason);
                     if result.is_ok() && error.lock().expect("gateway error lock").is_none() {
                         // Cooperative end with a healthy writer: the last
                         // commit may have raced the drain return before the
@@ -1093,9 +1395,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                 }
             }
         }
-        None => dispatch
-            .await
-            .map_err(|reason| sqlx::Error::InvalidArgument(reason.into())),
+        None => dispatch.await.map_err(bounded_runner_reason),
     };
     // Reception does not restart in this runner. Keep Draining sticky through
     // both successful shutdown and fatal exit, including any remaining writer.
@@ -1928,5 +2228,1048 @@ mod tests {
             !effect.load(std::sync::atomic::Ordering::Acquire),
             "released lock must not start new effects after cancellation"
         );
+    }
+
+    /// A failed leveling drain is a typed recorded error holding the cursor,
+    /// never a bare worker panic: the message carries the checkpoint contract.
+    #[test]
+    fn gateway_leveling_drain_failure_holds_checkpoint_as_typed_error() {
+        match leveling_dispatch_failure() {
+            sqlx::Error::InvalidArgument(message) => assert_eq!(
+                message,
+                "leveling gateway dispatch failed; checkpoint unchanged"
+            ),
+            error => panic!("leveling failure must stay typed, got {error:?}"),
+        }
+    }
+
+    /// A dropped interaction completion is a typed recorded error holding the
+    /// cursor, never a worker panic that discards accepted commands.
+    #[tokio::test]
+    async fn gateway_dropped_interaction_completion_holds_checkpoint_as_typed_error() {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        drop(send);
+        match await_interaction_completion(receive).await {
+            Err(sqlx::Error::InvalidArgument(message)) => {
+                assert_eq!(message, "interaction drain failed; checkpoint unchanged");
+            }
+            outcome => panic!("dropped completion must stay typed, got {outcome:?}"),
+        }
+        for (sent, expected) in [(true, true), (false, false)] {
+            let (send, receive) = tokio::sync::oneshot::channel();
+            send.send(sent).unwrap();
+            assert_eq!(
+                await_interaction_completion(receive).await.unwrap(),
+                expected,
+                "delivered completion must pass through"
+            );
+        }
+    }
+
+    /// The worker itself — not just the error constructors — records a
+    /// dropped interaction completion as a typed error and skips the
+    /// checkpoint commit. This feeds a failing dispatch through the blocking
+    /// worker's per-dispatch step, so restoring a `panic!` at the completion
+    /// site fails here instead of slipping through constructor-only coverage.
+    /// A `RESUMED` event keeps the funnel drain empty, isolating the
+    /// completion site; the lazy pool below can never connect, so any commit
+    /// attempt surfaces as a different error and fails this test outright.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_worker_dropped_completion_records_typed_error_without_commit() {
+        let pipeline = build_pipeline(vec![], None);
+        let state = RwLock::new(GatewayState::Armed);
+        let generation = AtomicU64::new(0);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        let store = GatewaySessionStore::new(pool, "test-guild".to_owned(), 1);
+        let (completion_send, completion) = tokio::sync::oneshot::channel();
+        drop(completion_send);
+        let mut dispatch = ReceivedDispatch::new(Event::Resumed);
+        dispatch.completion = Some(completion);
+        let checkpoint = GatewaySession {
+            session_id: "test-session".to_owned(),
+            sequence: 7,
+            resume_url: "ws://127.0.0.1:1".to_owned(),
+            updated_at_ms: two_bot_core::funnel::now_millis_for_test(),
+        };
+        // The worker step blocks on completion tickets: run it the way the
+        // dispatch worker does, on a blocking thread.
+        let outcome = tokio::task::block_in_place(|| {
+            apply_dispatch(
+                &tokio::runtime::Handle::current(),
+                &state,
+                &generation,
+                &pipeline,
+                &store,
+                None,
+                None,
+                None,
+                None,
+                LiveInteractions::default(),
+                Arc::new(tokio::sync::Notify::new()),
+                Some(Box::new(dispatch)),
+                None,
+                checkpoint,
+                CHECKPOINT_IO_MAX,
+                0,
+                None,
+                None,
+            )
+        });
+        match outcome {
+            Err(sqlx::Error::InvalidArgument(message)) => {
+                assert_eq!(message, "interaction drain failed; checkpoint unchanged")
+            }
+            outcome => panic!("worker must record a typed error, got {outcome:?}"),
+        }
+        assert_eq!(
+            *state.read().await,
+            GatewayState::Armed,
+            "a failed dispatch must leave the checkpoint where it was"
+        );
+    }
+
+    /// `PRESENCE_UPDATE` reaches the voice sink in gateway order on the
+    /// dispatch worker and never commits: the lazy pool below can never
+    /// connect, so any checkpoint attempt would surface as an error here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_worker_applies_presence_without_a_checkpoint_commit() {
+        struct Presences(std::sync::Mutex<Vec<u64>>);
+        impl VoiceEventSink for Presences {
+            fn handle(&self, _: &Event, _: &twilight_cache_inmemory::DefaultInMemoryCache) {
+                panic!("presence must not take the full voice handler path");
+            }
+            fn presence(
+                &self,
+                update: &twilight_model::gateway::payload::incoming::PresenceUpdate,
+            ) {
+                let id = match &update.0.user {
+                    twilight_model::gateway::presence::UserOrId::User(user) => user.id.get(),
+                    twilight_model::gateway::presence::UserOrId::UserId { id } => id.get(),
+                };
+                self.0.lock().unwrap().push(id);
+            }
+            fn disconnect(&self) {}
+            fn needs_bootstrap(&self, _: &twilight_cache_inmemory::DefaultInMemoryCache) -> bool {
+                false
+            }
+        }
+        let pipeline = build_pipeline(vec![], None);
+        let state = RwLock::new(GatewayState::Armed);
+        let generation = AtomicU64::new(0);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        let store = GatewaySessionStore::new(pool, "test-guild".to_owned(), 1);
+        let sink = Arc::new(Presences(std::sync::Mutex::new(Vec::new())));
+        let update: twilight_model::gateway::payload::incoming::PresenceUpdate =
+            serde_json::from_value(serde_json::json!({
+                "user": {"id": "42"},
+                "guild_id": "22",
+                "status": "online",
+                "activities": [{"type": 0, "name": "Apex Legends"}],
+                "client_status": {"desktop": "online"}
+            }))
+            .expect("presence");
+        let dispatch = ReceivedDispatch::new(Event::PresenceUpdate(Box::new(update)));
+        let checkpoint = GatewaySession {
+            session_id: "test-session".to_owned(),
+            sequence: 8,
+            resume_url: "ws://127.0.0.1:1".to_owned(),
+            updated_at_ms: two_bot_core::funnel::now_millis_for_test(),
+        };
+        let voice: Arc<dyn VoiceEventSink> = sink.clone();
+        let outcome = tokio::task::block_in_place(|| {
+            apply_dispatch(
+                &tokio::runtime::Handle::current(),
+                &state,
+                &generation,
+                &pipeline,
+                &store,
+                None,
+                None,
+                Some(voice),
+                None,
+                LiveInteractions::default(),
+                Arc::new(tokio::sync::Notify::new()),
+                Some(Box::new(dispatch)),
+                None,
+                checkpoint,
+                CHECKPOINT_IO_MAX,
+                0,
+                None,
+                None,
+            )
+        });
+        assert!(
+            outcome.is_ok(),
+            "presence must not attempt a commit: {outcome:?}"
+        );
+        assert_eq!(*sink.0.lock().unwrap(), [42]);
+    }
+
+    /// The worker itself — not just the error constructor — records a failed
+    /// leveling drain as a typed error and skips the checkpoint commit. A
+    /// message that queues a leveling award drains through a runtime whose
+    /// store is unreachable, so restoring a `panic!` at the leveling site
+    /// fails here instead of slipping through constructor-only coverage.
+    /// The lazy pool below can never connect, so any commit attempt surfaces
+    /// as a different error and fails this test outright.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_worker_leveling_drain_failure_records_typed_error_without_commit() {
+        let message = || {
+            Event::MessageCreate(Box::new(
+                serde_json::from_value(serde_json::json!({
+                    "id": "4000000000000000001",
+                    "guild_id": "22",
+                    "channel_id": "66",
+                    "author": {"id": "44", "username": "member", "discriminator": "0", "bot": false},
+                    "content": "hello",
+                    "timestamp": "2026-09-28T00:00:00.000000+00:00",
+                    "edited_timestamp": null,
+                    "tts": false,
+                    "mention_everyone": false,
+                    "mentions": [],
+                    "mention_roles": [],
+                    "attachments": [],
+                    "embeds": [],
+                    "pinned": false,
+                    "type": 0,
+                    "components": []
+                }))
+                .unwrap(),
+            ))
+        };
+        // Pin the fixture precondition explicitly: the message must queue a
+        // leveling award, or this test would exercise the commit path instead
+        // of the drain-failure site.
+        assert!(
+            !build_pipeline(vec![], None)
+                .collect_at(
+                    &message(),
+                    &two_bot_core::now_iso(),
+                    two_bot_discord::MessageEligibility::default(),
+                )
+                .is_empty(),
+            "fixture message must queue a leveling award"
+        );
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        let executor = two_bot_discord::ActionExecutor::with_proxy(
+            "mock-token".into(),
+            Some("http://127.0.0.1:1".into()),
+        )
+        .expect("test executor");
+        let pipeline = build_pipeline(
+            vec![],
+            Some(LevelingRuntime::new(
+                pool.clone(),
+                std::sync::Arc::new(executor),
+                22,
+                two_bot_core::OnboardingGates {
+                    mode: two_bot_core::OnboardingMode::Legacy,
+                    dry_run: true,
+                },
+            )),
+        );
+        let state = RwLock::new(GatewayState::Armed);
+        let generation = AtomicU64::new(0);
+        let store = GatewaySessionStore::new(pool, "22".to_owned(), 1);
+        let checkpoint = GatewaySession {
+            session_id: "test-session".to_owned(),
+            sequence: 7,
+            resume_url: "ws://127.0.0.1:1".to_owned(),
+            updated_at_ms: two_bot_core::funnel::now_millis_for_test(),
+        };
+        // The worker step blocks on the drain: run it the way the dispatch
+        // worker does, on a blocking thread.
+        let outcome = tokio::task::block_in_place(|| {
+            apply_dispatch(
+                &tokio::runtime::Handle::current(),
+                &state,
+                &generation,
+                &pipeline,
+                &store,
+                None,
+                None,
+                None,
+                None,
+                LiveInteractions::default(),
+                Arc::new(tokio::sync::Notify::new()),
+                Some(Box::new(ReceivedDispatch::new(message()))),
+                None,
+                checkpoint,
+                CHECKPOINT_IO_MAX,
+                0,
+                None,
+                None,
+            )
+        });
+        match outcome {
+            Err(sqlx::Error::InvalidArgument(message)) => {
+                assert_eq!(
+                    message,
+                    "leveling gateway dispatch failed; checkpoint unchanged"
+                )
+            }
+            outcome => panic!("worker must record a typed error, got {outcome:?}"),
+        }
+        assert_eq!(
+            *state.read().await,
+            GatewayState::Armed,
+            "a failed dispatch must leave the checkpoint where it was"
+        );
+    }
+
+    /// M2.22: the worker's trigger gate (the exact `worker_prefix_trigger`
+    /// call site above) posts no sticky automation for a Bypassed create while
+    /// an inspected Accept through the same path still dispatches. Both verdicts
+    /// come from the real worker function `automod_gateway::process` (not
+    /// hand-built `Activation`s): the Bypassed guild sits outside the staging
+    /// fence so no claim or REST happens, and the clean in-scope create inspects
+    /// to `Accept` through a succeeding in-memory ledger. The Bypassed funnel
+    /// stays `Accept` (the old gate would dispatch) while its trigger is
+    /// capture-only (the new gate refuses). The second fence
+    /// (`acceptance_for_verdict`) agrees. Actual Discord POSTs for dispatched
+    /// sticky work are covered by the existing `command_runtime_tests` sticky
+    /// suite; here admission (`true`/`false` from the call site) plus no spawned
+    /// message-lane work proves a Bypassed create never reaches `on_message`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_worker_trigger_gate_posts_no_sticky_for_bypassed_while_accept_dispatches() {
+        use two_bot_core::automod_runtime::{
+            AutomodClaimLedger, AutomodMatch, AutomodRuntime, AutomodScope, DeliveryKey,
+            FunnelDisposition, LedgerClaim, MessageDelivery, MessageDeliveryKind, MessageSubject,
+            StoredOutcome, TargetFacts, ViolationRecord, STAGING_GUILD_ID,
+        };
+        use two_bot_core::router::RouterGates;
+        use two_bot_core::{AutomodConfig, AutomodFilter};
+        use two_bot_discord::automod_activation::{
+            AutomodActivation, AutomodFacts, FetchedMessage,
+        };
+        use two_bot_discord::ActionExecutor;
+
+        ensure_crypto_provider();
+        let _series_guard = crate::gateway_commands::PREFIX_REFUSED_SERIES_GUARD
+            .lock()
+            .await;
+        fn refused_verdict_total() -> u64 {
+            two_bot_core::metrics::global()
+                .render(None)
+                .lines()
+                .find(|line| {
+                    line.starts_with(
+                        "two_bot_gateway_prefix_trigger_refused_total{reason=\"verdict\"} ",
+                    )
+                })
+                .expect("refused series")
+                .rsplit_once(' ')
+                .expect("sample")
+                .1
+                .parse()
+                .expect("counter value")
+        }
+
+        struct AcceptLedger;
+        struct UnitClaim;
+        impl AutomodClaimLedger for AcceptLedger {
+            type Claim = UnitClaim;
+            type Error = String;
+            async fn ledger_claim(
+                &self,
+                _: &DeliveryKey,
+            ) -> Result<LedgerClaim<UnitClaim>, String> {
+                Ok(LedgerClaim::Acquired(UnitClaim))
+            }
+            async fn ledger_preserve(
+                &self,
+                _: &UnitClaim,
+                _: &AutomodMatch,
+            ) -> Result<bool, String> {
+                Ok(false)
+            }
+            async fn ledger_mark_started(&self, _: &UnitClaim) -> Result<bool, String> {
+                Ok(true)
+            }
+            async fn ledger_complete(
+                &self,
+                _: &UnitClaim,
+                _: &StoredOutcome,
+            ) -> Result<bool, String> {
+                Ok(true)
+            }
+            async fn ledger_release(&self, _: &UnitClaim) -> Result<bool, String> {
+                Ok(true)
+            }
+            async fn ledger_record(
+                &self,
+                _: &UnitClaim,
+                _: &MessageSubject,
+                _: AutomodFilter,
+                _: &str,
+            ) -> Result<ViolationRecord, String> {
+                Err("unused".to_owned())
+            }
+        }
+
+        struct NeverFacts;
+        impl AutomodFacts for NeverFacts {
+            async fn fetch_message(&self, _: &str, _: &str, _: &str) -> Option<FetchedMessage> {
+                None
+            }
+            async fn target_facts(&self, _: &MessageSubject) -> Option<TargetFacts> {
+                None
+            }
+        }
+
+        const AT: &str = "2026-10-02T00:00:00.000Z";
+        let vars: HashMap<String, String> =
+            HashMap::from([("TWO_AUTOMOD".to_owned(), "1".to_owned())]);
+        let config = AutomodConfig::from_map(&vars).expect("test automod config");
+        let scope = AutomodScope {
+            guild_id: STAGING_GUILD_ID.to_owned(),
+            live_approved: false,
+        };
+        let executor = ActionExecutor::with_proxy(
+            "mock-token".to_owned(),
+            Some("http://127.0.0.1:1".to_owned()),
+        )
+        .expect("test executor");
+
+        // Bypassed: outside the fence, so the worker never claims or reads.
+        let bypassed_delivery = MessageDelivery {
+            kind: MessageDeliveryKind::Create,
+            guild_id: Some("42".to_owned()),
+            channel_id: "8".to_owned(),
+            message_id: "9".to_owned(),
+            snapshot: None,
+            create_pending_roles: None,
+            edited_timestamp_ms: None,
+            observed_timestamp_ms: 1,
+        };
+        let bypassed_activation = AutomodActivation::new(
+            AutomodRuntime::new(config.clone(), scope.clone()),
+            AcceptLedger,
+            NeverFacts,
+            executor.clone(),
+        );
+        let bypassed_verdict =
+            crate::automod_gateway::process(&bypassed_activation, bypassed_delivery, AT).await;
+        assert_eq!(
+            bypassed_verdict,
+            crate::automod_gateway::WorkerVerdict {
+                funnel: FunnelDisposition::Accept,
+                trigger: FunnelDisposition::CaptureOnly,
+            },
+            "uninspected create keeps funnel-Accept with a capture-only trigger"
+        );
+
+        // Inspected Accept: clean in-scope create with a snapshot, so enrichment
+        // needs no fetch and inspection accepts without target facts.
+        let snapshot = two_bot_core::automod::AutomodMessage {
+            guild_id: STAGING_GUILD_ID.to_owned(),
+            channel_id: "8".to_owned(),
+            message_id: "10".to_owned(),
+            author_id: "44".to_owned(),
+            author_is_bot: false,
+            role_ids: Vec::new(),
+            content: "hello".to_owned(),
+            mentioned_user_ids: Vec::new(),
+            attachment_names: Vec::new(),
+            observed_timestamp_ms: 1,
+        };
+        let accept_delivery = MessageDelivery {
+            kind: MessageDeliveryKind::Create,
+            guild_id: Some(STAGING_GUILD_ID.to_owned()),
+            channel_id: "8".to_owned(),
+            message_id: "10".to_owned(),
+            snapshot: Some(snapshot),
+            create_pending_roles: None,
+            edited_timestamp_ms: None,
+            observed_timestamp_ms: 1,
+        };
+        struct NeverFactsAgain;
+        impl AutomodFacts for NeverFactsAgain {
+            async fn fetch_message(&self, _: &str, _: &str, _: &str) -> Option<FetchedMessage> {
+                None
+            }
+            async fn target_facts(&self, _: &MessageSubject) -> Option<TargetFacts> {
+                None
+            }
+        }
+        let accept_activation = AutomodActivation::new(
+            AutomodRuntime::new(config, scope),
+            AcceptLedger,
+            NeverFactsAgain,
+            executor,
+        );
+        let accept_verdict =
+            crate::automod_gateway::process(&accept_activation, accept_delivery, AT).await;
+        assert_eq!(
+            accept_verdict,
+            crate::automod_gateway::WorkerVerdict {
+                funnel: FunnelDisposition::Accept,
+                trigger: FunnelDisposition::Accept,
+            },
+            "inspected clean create hands Accept to triggers"
+        );
+
+        // The gate split: the old funnel gate would dispatch Bypassed, the new
+        // trigger gate refuses it, and the prefix-trigger fence agrees.
+        assert!(
+            crate::automod_gateway::runs_text_automations(Some(bypassed_verdict.funnel)),
+            "funnel-Accept would have dispatched under the old gate"
+        );
+        assert!(
+            !crate::automod_gateway::runs_text_automations(Some(bypassed_verdict.trigger)),
+            "trigger capture-only refuses under the worker gate"
+        );
+        assert!(
+            crate::automod_gateway::runs_text_automations(Some(accept_verdict.trigger)),
+            "inspected Accept still passes the worker gate"
+        );
+        assert!(
+            !crate::gateway_commands::acceptance_for_verdict(Some(bypassed_verdict.trigger))
+                .permits_automations(),
+            "Bypassed trigger denies prefix automations at the second fence"
+        );
+        assert!(
+            crate::gateway_commands::acceptance_for_verdict(Some(accept_verdict.trigger))
+                .permits_automations(),
+            "Accept trigger permits prefix automations at the second fence"
+        );
+
+        // The exact worker call site: Bypassed never dispatches (so `on_message`
+        // never runs and no sticky post is possible); Accept still dispatches.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        let runtime_executor = ActionExecutor::with_proxy(
+            "mock-token".to_owned(),
+            Some("http://127.0.0.1:1".to_owned()),
+        )
+        .expect("test executor");
+        let gates = RouterGates {
+            configured_guild: Some(42),
+            scorecard: false,
+            automations: true,
+            announcements: false,
+            moderation: false,
+            voice: false,
+            voice_assistant: false,
+            tickets: false,
+            self_roles: false,
+            onboarding_picker: false,
+            session_picker: false,
+        };
+        let runtime = crate::command_runtime::CommandRuntime::new(
+            pool,
+            runtime_executor,
+            crate::command_runtime::router_with_commands(gates),
+            42,
+            true,
+        );
+        let command_vars = HashMap::from([
+            ("TWO_AUTOMATIONS".to_owned(), "1".to_owned()),
+            ("TWO_TEXT_COMMANDS".to_owned(), "1".to_owned()),
+            ("TWO_AUTOMOD".to_owned(), "1".to_owned()),
+        ]);
+        let command_config =
+            crate::gateway_commands::GatewayCommandConfig::from_map(42, &command_vars)
+                .expect("test command config");
+        runtime.initialize_custom_commands_for_test(command_config);
+        let handle = tokio::runtime::Handle::current();
+        let message_event = |id: &str, guild: &str| {
+            Event::MessageCreate(Box::new(
+                serde_json::from_value(serde_json::json!({
+                    "id": id,
+                    "guild_id": guild,
+                    "channel_id": "66",
+                    "author": {"id": "44", "username": "member", "discriminator": "0", "bot": false},
+                    "content": "!faq",
+                    "timestamp": "2026-09-28T00:00:00.000000+00:00",
+                    "edited_timestamp": null,
+                    "tts": false,
+                    "mention_everyone": false,
+                    "mentions": [],
+                    "mention_roles": [],
+                    "attachments": [],
+                    "embeds": [],
+                    "pinned": false,
+                    "type": 0,
+                    "components": []
+                }))
+                .unwrap(),
+            ))
+        };
+        // The exact worker path: Bypassed records an in-scope prefix candidate
+        // without dispatching; inspected Accept still dispatches as before.
+        let bypassed_event = message_event("4000000000000000001", "42");
+        assert!(
+            worker_prefix_trigger(Some(bypassed_verdict), &bypassed_event, true).is_none(),
+            "Bypassed create must not dispatch text automations"
+        );
+        let before = refused_verdict_total();
+        let _guard = handle.enter();
+        assert!(
+            !dispatch_or_record_prefix_trigger(
+                Some(&runtime),
+                Some(bypassed_verdict),
+                &bypassed_event,
+                true,
+            ),
+            "CaptureOnly is recorded without dispatch"
+        );
+        assert_eq!(
+            refused_verdict_total(),
+            before + 1,
+            "CaptureOnly prefix candidate is counted by the worker path"
+        );
+        assert_eq!(
+            runtime.lane_in_flight(crate::command_runtime::LANE_MESSAGES),
+            0,
+            "refused prefix telemetry starts no message-lane work"
+        );
+        let accept_event = message_event("4000000000000000002", STAGING_GUILD_ID);
+        assert_eq!(
+            worker_prefix_trigger(Some(accept_verdict), &accept_event, true),
+            Some(Some(FunnelDisposition::Accept)),
+            "the worker forwards the trigger verdict, not the funnel"
+        );
+        assert!(
+            dispatch_or_record_prefix_trigger(
+                Some(&runtime),
+                Some(accept_verdict),
+                &accept_event,
+                true,
+            ),
+            "inspected Accept still dispatches through the worker path"
+        );
+    }
+
+    fn community_facts_drain_failures(reason: &str) -> u64 {
+        let prefix =
+            format!("two_bot_community_facts_drain_failures_total{{reason=\"{reason}\"}} ");
+        two_bot_core::metrics::global()
+            .render(None)
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix.as_str()))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn community_facts_drain_counts_failures_and_stays_silent_on_success() {
+        let metrics = two_bot_core::metrics::Metrics::default();
+        let committed: Result<Result<usize, ()>, tokio::time::error::Elapsed> = Ok(Ok(2));
+        let failed: Result<Result<usize, ()>, tokio::time::error::Elapsed> = Ok(Err(()));
+        let timed_out = tokio::time::timeout(
+            std::time::Duration::ZERO,
+            std::future::pending::<Result<usize, ()>>(),
+        )
+        .await;
+        count_community_facts_drain_failure(&metrics, &committed);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_community_facts_drain_failures_total{reason=\"error\"} 0\n"));
+        assert!(
+            text.contains("two_bot_community_facts_drain_failures_total{reason=\"timeout\"} 0\n")
+        );
+        count_community_facts_drain_failure(&metrics, &failed);
+        count_community_facts_drain_failure(&metrics, &timed_out);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_community_facts_drain_failures_total{reason=\"error\"} 1\n"));
+        assert!(
+            text.contains("two_bot_community_facts_drain_failures_total{reason=\"timeout\"} 1\n")
+        );
+    }
+
+    /// A failed community-facts drain never stalls serial dispatch: the worker
+    /// warns and still commits the cursor. The facts writer is broken here
+    /// with an unconnectable pool (short acquire timeout) while the session
+    /// store stays healthy, so a gate-clearing dispatch must return `Ok` with
+    /// the checkpoint committed and a `gateway community facts dispatch
+    /// failed` warn — no panic and no held cursor. Needs a migrated test
+    /// database; skips without one (CI supplies `TWO_TEST_DATABASE_URL`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_worker_community_facts_drain_failure_warns_and_commits() {
+        let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+            assert!(
+                std::env::var("GITHUB_ACTIONS").is_err(),
+                "CI must supply the guarded test database"
+            );
+            eprintln!("SKIP gateway_worker_community_facts_drain_failure_warns_and_commits: TWO_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let db = two_bot_testsupport::TestDatabase::create(
+            &url,
+            &sqlx::migrate!("../cutover/migrations"),
+        )
+        .await
+        .expect("create migrated agent-testdb fixture");
+        let pool = db.pool().clone();
+        // Facts writer only: unconnectable with a short acquire timeout so
+        // the drain hits the write-failure arm (`dispatch failed`) inside
+        // the dispatch deadline instead of the timeout arm, without
+        // touching the healthy session store below.
+        let broken = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+            .expect("lazy pool");
+        let pipeline = build_pipeline(vec![], None);
+        pipeline.enable_community_facts(broken);
+        // Gate-clearing join: `pending: false` buffers two facts, one
+        // `member_joined` via `on_join` plus one `rules_accepted` via
+        // `on_gate_cleared`, so the drain has work to fail on. A
+        // `RESUMED` event would drain nothing and prove nothing.
+        let join = || {
+            use std::str::FromStr as _;
+            let stamp = twilight_model::util::Timestamp::from_str("2026-09-28T00:00:00.000+00:00")
+                .expect("fixture stamp");
+            Event::MemberAdd(Box::new(
+                twilight_model::gateway::payload::incoming::MemberAdd {
+                    guild_id: twilight_model::id::Id::new(22),
+                    member: twilight_model::guild::Member {
+                        avatar: None,
+                        avatar_decoration_data: None,
+                        banner: None,
+                        communication_disabled_until: None,
+                        deaf: false,
+                        flags: twilight_model::guild::MemberFlags::empty(),
+                        joined_at: Some(stamp),
+                        mute: false,
+                        nick: None,
+                        pending: false,
+                        premium_since: None,
+                        roles: vec![],
+                        user: twilight_model::user::User {
+                            accent_color: None,
+                            avatar: None,
+                            avatar_decoration: None,
+                            avatar_decoration_data: None,
+                            banner: None,
+                            bot: false,
+                            discriminator: 0,
+                            email: None,
+                            flags: None,
+                            global_name: None,
+                            id: twilight_model::id::Id::new(44),
+                            locale: None,
+                            mfa_enabled: None,
+                            name: "member".to_owned(),
+                            premium_type: None,
+                            primary_guild: None,
+                            public_flags: None,
+                            system: None,
+                            verified: None,
+                        },
+                    },
+                },
+            ))
+        };
+        // Pin the fixture precondition explicitly: the join must buffer both
+        // facts (`member_joined` via `on_join` plus `rules_accepted` via
+        // `on_gate_cleared`), or this test would exercise the empty-drain
+        // path instead of the failure site.
+        {
+            let scratch = build_pipeline(vec![], None);
+            scratch.enable_community_facts(pool.clone());
+            scratch.collect_at(
+                &join(),
+                &two_bot_core::now_iso(),
+                two_bot_discord::MessageEligibility::default(),
+            );
+            assert_eq!(
+                scratch.drain_facts().await.expect("scratch drain"),
+                2,
+                "fixture join must buffer member_joined plus rules_accepted"
+            );
+        }
+        #[derive(Clone)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let capture = Capture(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let failures_before = community_facts_drain_failures("error");
+        let state = RwLock::new(GatewayState::Armed);
+        let generation = AtomicU64::new(0);
+        let store = GatewaySessionStore::new(pool, "22".to_owned(), 1);
+        let checkpoint = GatewaySession {
+            session_id: "test-session".to_owned(),
+            sequence: 7,
+            resume_url: "ws://127.0.0.1:1".to_owned(),
+            updated_at_ms: two_bot_core::funnel::now_millis_for_test(),
+        };
+        // The worker step blocks on the drain: run it the way the dispatch
+        // worker does, on a blocking thread.
+        let outcome = tokio::task::block_in_place(|| {
+            apply_dispatch(
+                &tokio::runtime::Handle::current(),
+                &state,
+                &generation,
+                &pipeline,
+                &store,
+                None,
+                None,
+                None,
+                None,
+                LiveInteractions::default(),
+                Arc::new(tokio::sync::Notify::new()),
+                Some(Box::new(ReceivedDispatch::new(join()))),
+                None,
+                checkpoint,
+                CHECKPOINT_IO_MAX,
+                0,
+                None,
+                None,
+            )
+        });
+        assert!(
+            outcome.is_ok(),
+            "facts drain failure must warn and continue, got {outcome:?}"
+        );
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("gateway community facts dispatch failed"),
+            "failed facts drain must warn, got: {output}"
+        );
+        assert!(
+            community_facts_drain_failures("error") > failures_before,
+            "failed facts drain must increment the drain-failure counter"
+        );
+        assert_eq!(
+            store.load().await.expect("load").expect("session").sequence,
+            7,
+            "failed facts drain must still commit the cursor"
+        );
+    }
+
+    /// The worker itself records a committed interaction job without an
+    /// ingress ticket as a typed error. The commit already holds the durable
+    /// job for bounded restart recovery, so the message says the checkpoint
+    /// was committed rather than unchanged. Restoring a `panic!` at the
+    /// ticket site fails here. Needs a migrated test database; skips without
+    /// one (CI supplies `TWO_TEST_DATABASE_URL`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_worker_missing_ingress_ticket_records_typed_error_after_commit() {
+        let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+            assert!(
+                std::env::var("GITHUB_ACTIONS").is_err(),
+                "CI must supply the guarded test database"
+            );
+            eprintln!("SKIP gateway_worker_missing_ingress_ticket_records_typed_error_after_commit: TWO_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let db = two_bot_testsupport::TestDatabase::create(
+            &url,
+            &sqlx::migrate!("../cutover/migrations"),
+        )
+        .await
+        .expect("create migrated agent-testdb fixture");
+        let pool = db.pool().clone();
+        let executor = two_bot_discord::ActionExecutor::with_proxy(
+            "mock-token".into(),
+            Some("http://127.0.0.1:1".into()),
+        )
+        .expect("test executor");
+        let onboarding = std::sync::Arc::new(
+            crate::onboarding::OnboardingRuntime::new(
+                pool.clone(),
+                executor,
+                &std::collections::HashMap::from([
+                    ("DISCORD_GUILD_ID".to_owned(), "22".to_owned()),
+                    ("TWO_ONBOARDING_MODE".to_owned(), "session".to_owned()),
+                    ("TWO_ONBOARDING_DRY_RUN".to_owned(), "0".to_owned()),
+                    ("DISCORD_LANDING_CHANNEL_IDS".to_owned(), "12".to_owned()),
+                    ("DISCORD_GOODBYE_CHANNEL_IDS".to_owned(), "13".to_owned()),
+                    (
+                        "DISCORD_ANCHOR_WELCOME_CHANNEL_ID".to_owned(),
+                        "14".to_owned(),
+                    ),
+                    (
+                        "DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID".to_owned(),
+                        "10".to_owned(),
+                    ),
+                    (
+                        "DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID".to_owned(),
+                        "11".to_owned(),
+                    ),
+                ]),
+                22,
+                999,
+            )
+            .expect("test onboarding runtime"),
+        );
+        let interaction: twilight_model::application::interaction::Interaction =
+            serde_json::from_value(serde_json::json!({
+                "application_id": "111",
+                "authorizing_integration_owners": {"0": "22"},
+                "id": "333",
+                "token": "mock-callback",
+                "type": 3,
+                "version": 1,
+                "guild_id": "22",
+                "member": {"user": {"id": "44", "username": "member", "discriminator": "0"},
+                           "roles": [], "deaf": false, "mute": false, "flags": 0},
+                "data": {"custom_id": "two:onboarding:session", "component_type": 3,
+                          "values": ["find-players"]}
+            }))
+            .unwrap();
+        let event = Event::InteractionCreate(Box::new(
+            twilight_model::gateway::payload::incoming::InteractionCreate(interaction),
+        ));
+        let pipeline = build_pipeline(vec![], None);
+        assert!(
+            onboarding.capture(&event, &pipeline).is_some(),
+            "fixture interaction must capture an onboarding job"
+        );
+        let state = RwLock::new(GatewayState::Armed);
+        let generation = AtomicU64::new(0);
+        let store = GatewaySessionStore::new(pool, "22".to_owned(), 1);
+        let checkpoint = GatewaySession {
+            session_id: "test-session".to_owned(),
+            sequence: 7,
+            resume_url: "ws://127.0.0.1:1".to_owned(),
+            updated_at_ms: two_bot_core::funnel::now_millis_for_test(),
+        };
+        // No acknowledgement ticket: reception never admitted one, so the
+        // committed interaction job reaches the missing-ticket site.
+        let outcome = tokio::task::block_in_place(|| {
+            apply_dispatch(
+                &tokio::runtime::Handle::current(),
+                &state,
+                &generation,
+                &pipeline,
+                &store,
+                None,
+                None,
+                None,
+                Some(onboarding),
+                LiveInteractions::default(),
+                Arc::new(tokio::sync::Notify::new()),
+                Some(Box::new(ReceivedDispatch::new(event))),
+                None,
+                checkpoint,
+                CHECKPOINT_IO_MAX,
+                0,
+                None,
+                None,
+            )
+        });
+        match outcome {
+            Err(sqlx::Error::InvalidArgument(message)) => assert_eq!(
+                message,
+                "onboarding interaction missing ingress ticket; checkpoint committed"
+            ),
+            outcome => panic!("worker must record a typed error, got {outcome:?}"),
+        }
+    }
+
+    /// The ACK permit is a drop guard: a panicking acknowledgement releases its
+    /// slot during unwind, so repeated panics never trip ingress capacity.
+    #[tokio::test]
+    async fn gateway_ack_permit_releases_on_panicking_acknowledge() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        for _ in 0..ACK_LIMIT + 1 {
+            let permit = AckPermit::try_acquire(&in_flight).expect("permit must release on panic");
+            assert_eq!(permit.in_flight(), 1);
+            let waiter = tokio::spawn(async move {
+                let _permit = permit;
+                panic!("fixture ack panic");
+            });
+            assert!(waiter.await.unwrap_err().is_panic());
+            assert_eq!(in_flight.load(Ordering::Acquire), 0);
+        }
+        assert!(
+            AckPermit::try_acquire(&in_flight).is_some(),
+            "33 panicking acknowledgements must not exhaust ingress capacity"
+        );
+    }
+
+    /// At capacity, admission refuses with the typed ingress error instead of
+    /// queueing unbounded acknowledgement work.
+    #[test]
+    fn gateway_ack_permit_refuses_past_capacity() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let held: Vec<_> = (0..ACK_LIMIT)
+            .map(|_| AckPermit::try_acquire(&in_flight).expect("capacity must admit 32"))
+            .collect();
+        assert!(AckPermit::try_acquire(&in_flight).is_none());
+        drop(held);
+        assert!(AckPermit::try_acquire(&in_flight).is_some());
+        match ingress_capacity_failure() {
+            sqlx::Error::InvalidArgument(message) => {
+                assert_eq!(message, "gateway ingress capacity exhausted");
+            }
+            error => panic!("capacity refusal must stay typed, got {error:?}"),
+        }
+    }
+
+    /// Every dispatch-worker failure site surfaces its own typed message, so an
+    /// operator can tell the failing stage apart without a bare worker panic.
+    #[test]
+    fn gateway_dispatch_worker_failures_are_distinct_typed_errors() {
+        let messages = [
+            leveling_dispatch_failure(),
+            interaction_drain_failure(),
+            invalid_onboarding_job_failure(),
+            missing_ingress_ticket_failure(),
+        ]
+        .map(|error| match error {
+            sqlx::Error::InvalidArgument(message) => message,
+            error => panic!("worker failure must stay typed, got {error:?}"),
+        });
+        assert_eq!(
+            messages,
+            [
+                "leveling gateway dispatch failed; checkpoint unchanged",
+                "interaction drain failed; checkpoint unchanged",
+                "invalid onboarding job; checkpoint unchanged",
+                "onboarding interaction missing ingress ticket; checkpoint committed",
+            ]
+        );
+    }
+
+    /// Fatal-runner reason fence: an oversized payload is truncated to
+    /// `RUNNER_REASON_MAX_CHARS`, while short reasons pass through unchanged
+    /// so the #659 typed errors keep their exact text.
+    #[test]
+    fn gateway_runner_reason_is_bounded() {
+        match bounded_runner_reason("dispatch backlog full") {
+            sqlx::Error::InvalidArgument(message) => {
+                assert_eq!(message, "dispatch backlog full");
+            }
+            error => panic!("runner reason must stay typed, got {error:?}"),
+        }
+        let oversized = "x".repeat(RUNNER_REASON_MAX_CHARS + 10_000);
+        match bounded_runner_reason(&oversized) {
+            sqlx::Error::InvalidArgument(message) => {
+                assert_eq!(message.len(), RUNNER_REASON_MAX_CHARS);
+                assert_eq!(message, "x".repeat(RUNNER_REASON_MAX_CHARS));
+            }
+            error => panic!("oversized reason must stay typed, got {error:?}"),
+        }
+        // Multi-byte chars truncate on a char boundary, never mid-codepoint.
+        let emoji = "🦀".repeat(RUNNER_REASON_MAX_CHARS + 10);
+        match bounded_runner_reason(&emoji) {
+            sqlx::Error::InvalidArgument(message) => {
+                assert_eq!(message.chars().count(), RUNNER_REASON_MAX_CHARS);
+            }
+            error => panic!("oversized reason must stay typed, got {error:?}"),
+        }
     }
 }

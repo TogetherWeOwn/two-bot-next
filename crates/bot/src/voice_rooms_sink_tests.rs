@@ -78,11 +78,12 @@ impl RoomPersistence for Arc<Store> {
         &self,
         guild: u64,
         user: u64,
+        leaving: &[u64],
         config: &CreateAdmissionConfig,
         now_secs: i64,
     ) -> Result<CreateClaim, StoreError> {
         self.as_ref()
-            .claim_create(guild, user, config, now_secs)
+            .claim_create(guild, user, leaving, config, now_secs)
             .await
     }
     async fn bind_create_channel(
@@ -578,4 +579,86 @@ async fn bot_member_role_assignment_resumes_room_and_removal_revokes_access() {
     assert!(!can_manage_room(
         actor.live.inner.read().unwrap().permissions(GUILD, CREATOR)
     ));
+}
+
+#[tokio::test]
+async fn poisoned_live_lock_does_not_restart_the_gateway() {
+    let (store, http, _) = fixture();
+    let runtime = runtime(store, http);
+    let pipeline = MemPipeline::for_replay();
+    bootstrap(&runtime, &pipeline, &[]);
+    let actor = runtime.live_actor(GUILD).unwrap();
+    // Poison the room lock from another thread: panic while holding the
+    // write guard, as a crashed holder would.
+    let live = actor.live.clone();
+    std::thread::spawn(move || {
+        let _guard = live.write_state();
+        panic!("poison the live voice lock for test");
+    })
+    .join()
+    .expect_err("poisoning thread must panic");
+    // The dispatch worker (`gateway.rs` `voice.handle(...)`) still returns.
+    feed(&runtime, &pipeline, voice_event(MEMBER, Some(CREATOR)));
+    feed(&runtime, &pipeline, voice_event(MEMBER, None));
+    // The recovered lock still serves reads and writes.
+    assert!(actor.live.read_state().ready);
+    actor.live.disconnect();
+    assert!(!actor.live.read_state().ready);
+    status(&runtime).await;
+}
+
+#[tokio::test]
+async fn actor_load_failure_bumps_counter_and_arms_warn_throttle() {
+    let series = "two_bot_db_errors_total{op=\"other\"} ";
+    let before = global_series(series);
+    observe_voice_actor_load_failure(GUILD, &StoreError::Unavailable);
+    observe_voice_actor_load_failure(GUILD, &StoreError::Unavailable);
+    // Global counters are monotonic and shared with parallel tests, so assert
+    // a lower bound, not an exact value (see `global_series` convention).
+    assert!(
+        global_series(series) >= before + 2,
+        "two load failures bump the `other` counter"
+    );
+    // The first failure arms the throttle timestamp; the immediate second
+    // call stays silent. (Warn text itself is covered by the observability
+    // event catalog and its conformance allowlist entry.)
+    assert_ne!(
+        super::super::VOICE_ACTOR_LOAD_WARN_LAST_SECS.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "first failure arms the warn throttle"
+    );
+}
+
+#[tokio::test]
+async fn guild_create_seeds_display_names_for_restarted_rooms() {
+    let (store, http, _) = fixture();
+    let runtime = runtime(store, http);
+    let pipeline = MemPipeline::for_replay();
+    feed(&runtime, &pipeline, ready_event());
+    let mut guild: serde_json::Value =
+        serde_json::from_str(include_str!("../tests/fixtures/voice_guild.json")).unwrap();
+    guild["roles"][0]["permissions"] = json!(permissions().bits().to_string());
+    guild["members"].as_array_mut().unwrap().push(json!({
+        "user": {"id": MEMBER.to_string(), "username": "alex", "global_name": "Alex", "discriminator": "0"},
+        "roles": [], "deaf": false, "mute": false, "flags": 0, "joined_at": NOW
+    }));
+    // Without the presence intent Discord's GuildCreate carries the members
+    // in voice together with their voice states.
+    guild["voice_states"] = json!([{
+        "channel_id": CREATOR.to_string(), "user_id": MEMBER.to_string(), "session_id": "voice",
+        "deaf": false, "mute": false, "self_deaf": false, "self_mute": false,
+        "self_video": false, "suppress": false
+    }]);
+    feed(
+        &runtime,
+        &pipeline,
+        Event::GuildCreate(Box::new(GuildCreate::Available(
+            serde_json::from_value(guild).unwrap(),
+        ))),
+    );
+    let (_, directory) = tokio::time::timeout(Duration::from_secs(5), runtime.naming_probe(GUILD))
+        .await
+        .expect("probe deadline")
+        .expect("actor exists");
+    assert!(directory.knows(MEMBER));
 }

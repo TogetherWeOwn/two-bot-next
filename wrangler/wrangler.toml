@@ -22,8 +22,9 @@ binding = "CF_VERSION_METADATA"
 
 # Default-environment bindings. Named environments do NOT inherit these —
 # every [env.*] below repeats the full Container/DO wiring explicitly.
-# Verified against wrangler 4.147.0 (`deploy --dry-run --env <name>` warns on
-# any omission); enforced in CI by scripts/check-env-bindings.py.
+# Verified against wrangler 4.148.0 (`deploy --dry-run --env <name>` warns on
+# any omission); enforced in CI by scripts/check-env-bindings.py, which also
+# requires both [env.staging] and [env.production] to be declared.
 [[containers]]
 class_name = "TwoBotContainer"
 image = "../Dockerfile"
@@ -140,6 +141,10 @@ DISCORD_APPLICATION_ID = "1469137636663758888"
 # Never top-level and never production: scripts/check-env-bindings.py fails
 # either. Rollback: delete the line, redeploy.
 TWO_VOICE = "1"
+# Staging-only: request GUILD_PRESENCES so room names show games and streams
+# (docs/voice-presence.md). The staging app's Presence Intent is on
+# (GATEWAY_PRESENCE_LIMITED, 2026-10-10). Rollback: delete the line, redeploy.
+TWO_VOICE_PRESENCE = "1"
 
 [env.production.version_metadata]
 binding = "CF_VERSION_METADATA"

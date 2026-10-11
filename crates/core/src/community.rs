@@ -39,6 +39,55 @@ pub const COMMUNITY_FACT_TYPES: [&str; 6] = [
     "rules_accepted",
 ];
 
+/// Streams with a live production writer: the only streams `scorecard_once`
+/// may mark covered. That is `event_attended` (host check-in via
+/// `rsvp_store::record_checkin`), `voice_session_started` /
+/// `voice_session_ended` (gateway voice frames via
+/// `community_store::record_voice_started_fact` /
+/// `community_store::record_voice_ended_fact`), `message_created`
+/// (gateway `MessageCreate` via `community_store::record_message_fact`),
+/// `rules_accepted` (gate-clear drain via the community-facts sink) and
+/// `member_joined` (gateway joins via `handlers::on_join`, buffered in the
+/// community-facts sink and persisted with `community_store::member_join_fact` +
+/// `record_fact`). This must
+/// always equal the `Some` rows of [`STREAM_WRITERS`]; the
+/// `captured_streams_match_live_writers` guard fails otherwise.
+pub const CAPTURED_STREAMS: [&str; 6] = [
+    "event_attended",
+    "voice_session_started",
+    "voice_session_ended",
+    "message_created",
+    "rules_accepted",
+    "member_joined",
+];
+
+/// Capture registry: every fact stream with the production writer that appends
+/// it, or `None` while no live path writes it. Single source of truth for both
+/// directions of the guard: a stream in [`CAPTURED_STREAMS`] whose row is
+/// `None` has no writer, and a `Some` row missing from [`CAPTURED_STREAMS`]
+/// is a writer the scorecard does not claim. Landing a writer flips its row
+/// and grows [`CAPTURED_STREAMS`] in the same PR.
+pub const STREAM_WRITERS: [(&str, Option<&str>); 6] = [
+    (
+        "message_created",
+        Some("community_store::record_message_fact"),
+    ),
+    (
+        "voice_session_started",
+        Some("community_store::record_voice_started_fact"),
+    ),
+    (
+        "voice_session_ended",
+        Some("community_store::record_voice_ended_fact"),
+    ),
+    ("member_joined", Some("handlers::on_join")),
+    ("event_attended", Some("rsvp_store::record_checkin")),
+    (
+        "rules_accepted",
+        Some("leveling_runtime::DeferredCommunityFacts::drain"),
+    ),
+];
+
 /// Exclusion buckets (legacy `COMMUNITY_CLASSIFICATIONS`). Contract
 /// precedence is deliberate: a Discord bot posting through a webhook is a bot
 /// bucket, not two exclusions, so reconciliation remains exact.
@@ -1116,6 +1165,31 @@ mod tests {
         assert!(!is_scorecard_run_time(ms("2026-09-07T07:00:00.000Z")));
         assert!(!is_scorecard_run_time(ms("2026-09-08T06:15:00.000Z")));
         assert!(!is_scorecard_run_time(ms("2026-09-06T06:15:00.000Z")));
+    }
+
+    #[test]
+    fn captured_streams_match_live_writers() {
+        // The scorecard claims exactly the streams the runtime captures: a
+        // stream in `CAPTURED_STREAMS` with no writer would invent coverage,
+        // and a writer missing from the list would leave its stream unmarked.
+        let registry: Vec<&str> = STREAM_WRITERS.iter().map(|(s, _)| *s).collect();
+        assert_eq!(registry.len(), COMMUNITY_FACT_TYPES.len());
+        for stream in COMMUNITY_FACT_TYPES {
+            assert!(registry.contains(&stream), "{stream} has no registry row");
+        }
+        let claimed: HashSet<&str> = CAPTURED_STREAMS.iter().copied().collect();
+        assert_eq!(
+            claimed.len(),
+            CAPTURED_STREAMS.len(),
+            "CAPTURED_STREAMS lists a stream twice"
+        );
+        for (stream, writer) in STREAM_WRITERS {
+            assert_eq!(
+                claimed.contains(stream),
+                writer.is_some(),
+                "stream {stream}: claimed without a writer, or written without a claim"
+            );
+        }
     }
 
     #[test]

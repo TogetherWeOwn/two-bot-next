@@ -32,7 +32,7 @@ use two_bot_core::{
     bot_floor_due, decide_probe_cycle, decide_probe_lease, format_iso_millis, inactivity_store,
     now_iso, parse_inactivity_days, parse_iso_millis, presence_store, previous_closed_week,
     release_probe_lease, sanitize_presence_count, scorecard_tick, ClassifierConfig, ProbeLease,
-    ProbeLeaseDecision, ScorecardGates, BOT_FLOOR_MAX_AGE_MS, COMMUNITY_FACT_TYPES,
+    ProbeLeaseDecision, ScorecardGates, BOT_FLOOR_MAX_AGE_MS, CAPTURED_STREAMS,
     INACTIVITY_SWEEP_INTERVAL_MS, PRESENCE_PROBE_INTERVAL_MS, PRESENCE_PROBE_LEASE_MS,
     SCORECARD_TICK_INTERVAL_MS,
 };
@@ -431,10 +431,11 @@ async fn scorecard_once(
     let (week_start, week_end) = previous_closed_week(now_ms);
     let generated_at = format_iso_millis(now_ms);
     // A Monday boot captured none of the closed week. Do not insert an
-    // inverted coverage interval or invent coverage: the builder fails closed
-    // on missing heartbeats while retaining any honestly persisted coverage.
+    // inverted coverage interval or invent coverage: only streams with a live
+    // writer (`CAPTURED_STREAMS`) are marked, and the builder fails closed on
+    // the unmarked remainder while retaining honestly persisted coverage.
     if state.capture_started_at <= week_end {
-        for stream in COMMUNITY_FACT_TYPES {
+        for stream in CAPTURED_STREAMS {
             mark_stream_coverage(
                 pool,
                 guild,

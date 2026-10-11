@@ -30,6 +30,8 @@ use crate::funnel::Snowflake;
 pub const MAX_CHANNEL_NAME_LEN: u32 = 100;
 /// Largest voice user limit (`/limit`, 0 = unlimited, max 99).
 pub const MAX_USER_LIMIT: i64 = 99;
+/// Longest `/inheritpermissions` source choice (`category`).
+pub const MAX_PERMISSION_SOURCE_CHARS: u32 = 8;
 /// Largest first room number (`/position first-number`): the V11 export codec
 /// stores it as `u32`, so anything above `u32::MAX` breaks `/export` and
 /// `/import` with "Could not read the voice configuration" and can overflow
@@ -44,6 +46,10 @@ pub const RENAME_MIN_INTERVAL_MS: u64 = 300_000;
 /// A queued action is dead-lettered after this many failed attempts; the
 /// `/setup` panel surfaces dead letters as recent failures (V10).
 pub const QUEUE_MAX_ATTEMPTS: u32 = 10;
+/// Newest dead letters kept per queue; older entries drop and count toward
+/// [`ActionQueue::failed_dropped`]. Bounds `/setup` recent-failures memory
+/// when a guild-wide outage dead-letters every write.
+pub const MAX_FAILED_ACTIONS: usize = 100;
 
 // --- creator channels -------------------------------------------------------
 
@@ -699,6 +705,20 @@ impl RenameCoalescer {
     pub fn pending_count(&self) -> usize {
         self.inner.lock().expect("coalescer lock").pending.len()
     }
+
+    /// The still-queued rename for one channel, if any. The folded-duplicate
+    /// guard (legacy 38041a1) counts only renames that are really pending —
+    /// coalescer, queued, in-flight or retry — never a stale last-proposed
+    /// name, so a diverged entry cannot hold a name forever.
+    #[must_use]
+    pub fn pending_for(&self, channel_id: Snowflake) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("coalescer lock")
+            .pending
+            .get(&channel_id)
+            .map(|pending| pending.name.clone())
+    }
 }
 
 // --- action queue -----------------------------------------------------------
@@ -970,6 +990,9 @@ struct QueueInner {
     /// (guild, channel) pairs with lost access: actions touching them wait.
     suspended: HashSet<(Snowflake, Snowflake)>,
     failed: Vec<FailedAction>,
+    /// Dead letters evicted by the [`MAX_FAILED_ACTIONS`] cap (oldest first).
+    /// Monotonic; `clear_failed` leaves it set.
+    failed_dropped: u64,
 }
 
 impl QueueInner {
@@ -1165,6 +1188,11 @@ impl ActionQueue {
                 reason,
                 failed_at_ms: now_ms,
             });
+            if inner.failed.len() > MAX_FAILED_ACTIONS {
+                let excess = inner.failed.len() - MAX_FAILED_ACTIONS;
+                inner.failed.drain(..excess);
+                inner.failed_dropped = inner.failed_dropped.saturating_add(excess as u64);
+            }
             return true;
         }
         inner.requeue(QueuedAction {
@@ -1173,6 +1201,46 @@ impl ActionQueue {
             ..action
         });
         true
+    }
+
+    /// True while a room-scoped kick enforcement for this vote is still queued
+    /// (either lane, including backed-off, suspended or not-yet-due entries).
+    /// The worker keeps the vote's initiator until the enforcement audit runs,
+    /// so pruning past the retention horizon never drops an unresolved
+    /// enforcement fence (VK-03). An action being dispatched cannot coincide
+    /// with this read: the single-threaded actor holds the worker mutably
+    /// across the whole dispatch, so in-flight needs no fence of its own.
+    #[must_use]
+    pub fn has_queued_kick(&self, vote_id: Snowflake) -> bool {
+        let inner = self.inner.lock().expect("queue lock");
+        [&inner.urgent, &inner.deferred].iter().any(|lanes| {
+            lanes.values().any(|queue| {
+                queue.iter().any(|queued| {
+                    matches!(
+                        queued.action,
+                        RoomAction::KickMember { vote_id: id, .. } if id == vote_id
+                    )
+                })
+            })
+        })
+    }
+
+    /// The still-queued rename for one room channel, if any (deferred lane
+    /// only; renames never ride the urgent lane). Part of the really-pending
+    /// set the folded-duplicate guard counts: a rename drained from the
+    /// coalescer but not yet dispatched still blocks a folded duplicate.
+    #[must_use]
+    pub fn queued_rename_for(&self, guild_id: Snowflake, channel_id: Snowflake) -> Option<String> {
+        let inner = self.inner.lock().expect("queue lock");
+        inner.deferred.get(&guild_id).and_then(|queue| {
+            queue.iter().find_map(|queued| match &queued.action {
+                RoomAction::RenameRoom {
+                    channel_id: id,
+                    name,
+                } if *id == channel_id => Some(name.clone()),
+                _ => None,
+            })
+        })
     }
 
     /// Access lost on a room (spec V1): its actions wait, nothing retries.
@@ -1236,6 +1304,17 @@ impl ActionQueue {
         self.drain_for_channel(guild_id, channel_id).len()
     }
 
+    /// Whether the guild is waiting out a Discord rate limit.
+    #[must_use]
+    pub fn backed_off(&self, guild_id: Snowflake, now_ms: u64) -> bool {
+        self.inner
+            .lock()
+            .expect("queue lock")
+            .guild_not_before_ms
+            .get(&guild_id)
+            .is_some_and(|t| now_ms < *t)
+    }
+
     /// Pending (urgent, deferred) counts for the guild. Diagnostics/tests.
     #[must_use]
     pub fn pending_counts(&self, guild_id: Snowflake) -> (usize, usize) {
@@ -1246,13 +1325,22 @@ impl ActionQueue {
         (len(&inner.urgent), len(&inner.deferred))
     }
 
-    /// Dead-lettered writes for `/setup` recent failures (V10).
+    /// Dead-lettered writes for `/setup` recent failures (V10): the newest
+    /// [`MAX_FAILED_ACTIONS`] entries, oldest dropped (see
+    /// [`Self::failed_dropped`]).
     #[must_use]
     pub fn failed(&self) -> Vec<FailedAction> {
         self.inner.lock().expect("queue lock").failed.clone()
     }
 
-    /// Clear dead letters (after `/setup` shows them, V10).
+    /// Dead letters evicted by the cap so far; `clear_failed` does not reset it.
+    #[must_use]
+    pub fn failed_dropped(&self) -> u64 {
+        self.inner.lock().expect("queue lock").failed_dropped
+    }
+
+    /// Clear dead letters (after `/setup` shows them, V10). Keeps
+    /// [`Self::failed_dropped`] so the eviction total survives the clear.
     pub fn clear_failed(&self) {
         self.inner.lock().expect("queue lock").failed.clear();
     }
@@ -1537,6 +1625,7 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
                 CommandOptionType::String,
             )
             .required()
+            .max_length(MAX_PERMISSION_SOURCE_CHARS)
             .choices(vec![
                 CommandChoice {
                     name: "Creator".to_owned(),
@@ -2065,6 +2154,63 @@ mod tests {
         assert_eq!(fail_backoff_ms(100), 60_000);
         q.clear_failed();
         assert!(q.failed().is_empty());
+    }
+
+    #[test]
+    fn dead_letter_list_caps_at_10k_oldest_drop() {
+        const TOTAL: u64 = 10_000;
+        let q = ActionQueue::new();
+        for i in 0..TOTAL {
+            q.enqueue(
+                GUILD,
+                RoomAction::DeleteRoom {
+                    channel_id: 1_000_000 + i,
+                },
+            );
+            let mut action = q.pop_due(GUILD, u64::MAX).expect("due");
+            for step in 1..=QUEUE_MAX_ATTEMPTS {
+                if step < QUEUE_MAX_ATTEMPTS {
+                    let now = action.not_before_ms;
+                    assert!(q.mark_failed(action.clone(), format!("boom-{i}"), now));
+                    let due = now.saturating_add(fail_backoff_ms(step));
+                    action = q.pop_due(GUILD, due).expect("retry exactly when due");
+                    assert_eq!(action.attempts, step);
+                } else {
+                    assert!(q.mark_failed(action.clone(), format!("boom-{i}"), i));
+                }
+            }
+        }
+        let failed = q.failed();
+        assert_eq!(failed.len(), MAX_FAILED_ACTIONS, "cap holds at 10k entries");
+        let dropped = TOTAL - MAX_FAILED_ACTIONS as u64;
+        assert_eq!(q.failed_dropped(), dropped);
+        assert!(
+            failed
+                .windows(2)
+                .all(|w| w[0].failed_at_ms < w[1].failed_at_ms),
+            "newest entries retained in order"
+        );
+        assert_eq!(
+            failed.first().expect("capped").reason,
+            format!("boom-{dropped}")
+        );
+        assert_eq!(
+            failed.last().expect("capped").reason,
+            format!("boom-{}", TOTAL - 1)
+        );
+        assert!(
+            failed
+                .iter()
+                .all(|f| f.action.attempts == QUEUE_MAX_ATTEMPTS),
+            "only exhausted writes are dead-lettered"
+        );
+        q.clear_failed();
+        assert!(q.failed().is_empty());
+        assert_eq!(
+            q.failed_dropped(),
+            dropped,
+            "clear keeps the eviction total"
+        );
     }
 
     #[test]
@@ -2748,6 +2894,7 @@ mod tests {
             ["channel", "source", "source-channel"]
         );
         assert!(inherit.options[1].required == Some(true));
+        assert_eq!(inherit.options[1].max_length, Some(8));
         // `/defaultlimit` bounds match the import validation (0-99).
         let limit = defs.iter().find(|def| def.name == "defaultlimit").unwrap();
         assert_eq!(limit.options[1].min_value, Some(0));

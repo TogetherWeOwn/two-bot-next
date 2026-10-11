@@ -202,6 +202,25 @@ impl AutomodRuntime {
         self.config.dry_run
     }
 
+    /// Hot-reload the content policy without a restart (TOG-19027): the live
+    /// settings snapshot rebuilds the policy and the enforce flag, while the
+    /// boot-time `enabled` gate, guild scope and repeat history are preserved.
+    /// Returns true when anything observable changed.
+    pub fn apply_live_config(&mut self, config: &AutomodConfig) -> bool {
+        if self.config.policy == config.policy && self.config.dry_run == config.dry_run {
+            return false;
+        }
+        self.config.policy = config.policy.clone();
+        self.config.dry_run = config.dry_run;
+        true
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    pub fn policy(&self) -> &crate::automod::AutomodPolicy {
+        &self.config.policy
+    }
+
     /// Activation fence applied BEFORE any claim, fetch or inspection: a
     /// guild delivery inside the approved scope with automod enabled. DMs,
     /// other guilds and a disabled config take the ordinary funnel path.

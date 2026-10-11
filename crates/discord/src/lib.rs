@@ -54,14 +54,17 @@ mod test_clock;
 pub mod voice_rooms;
 
 #[cfg(feature = "db")]
-pub use leveling_runtime::{LevelingRuntime, OrderedLevelingPipeline};
+pub use leveling_runtime::{
+    CommunityFactsError, DeferredCommunityFacts, LevelingRuntime, OrderedLevelingPipeline,
+    RulesAcceptedWrite,
+};
 
 pub use adapter::event_to_core;
 pub use executor::{
-    lockdown_masks, pace_delay_ms, paced_step, throw_for_status, timeout_until_iso, unlock_masks,
-    ActionExecutor, ChannelCall, ChannelCallOutcome, DiscordCall, DiscordError, EveryoneOverwrite,
-    PacedStep, RawResponse, KICK_INTERVAL_MS, MAX_AUDIT_REASON_CHARS, MAX_MESSAGE_CHARS,
-    MODERATION_TIMEOUT_MS, PACE_INTERVAL_MS,
+    is_definitive_rejection, lockdown_masks, pace_delay_ms, paced_step, throw_for_status,
+    timeout_until_iso, unlock_masks, ActionExecutor, ChannelCall, ChannelCallOutcome, DiscordCall,
+    DiscordError, EveryoneOverwrite, PacedStep, RawResponse, KICK_INTERVAL_MS,
+    MAX_AUDIT_REASON_CHARS, MAX_MESSAGE_CHARS, MODERATION_TIMEOUT_MS, PACE_INTERVAL_MS,
 };
 pub use intents::{cache_resource_types, gateway_intents, needs_message_content};
 pub use interactions::{

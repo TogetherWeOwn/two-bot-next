@@ -112,6 +112,190 @@ pub(crate) fn accepts_busy_reply(interaction: &Interaction) -> bool {
 mod tests {
     use super::*;
 
+    #[allow(deprecated)]
+    fn command_interaction(name: &str) -> Interaction {
+        use twilight_model::{
+            application::{command::CommandType, interaction::application_command::CommandData},
+            guild::{MemberFlags, PartialMember, Permissions},
+            id::{marker::ApplicationMarker, AnonymizableId, Id},
+            oauth::ApplicationIntegrationMap,
+        };
+
+        Interaction {
+            app_permissions: None,
+            application_id: Id::<ApplicationMarker>::new(1),
+            authorizing_integration_owners: ApplicationIntegrationMap {
+                guild: Some(AnonymizableId::Id(Id::new(1))),
+                user: None,
+            },
+            channel: None,
+            channel_id: None,
+            context: None,
+            data: Some(InteractionData::ApplicationCommand(Box::new(CommandData {
+                guild_id: None,
+                id: Id::new(2),
+                name: name.to_owned(),
+                kind: CommandType::ChatInput,
+                options: Vec::new(),
+                resolved: None,
+                target_id: None,
+            }))),
+            entitlements: Vec::new(),
+            guild: None,
+            guild_id: None,
+            guild_locale: None,
+            id: Id::new(3),
+            kind: InteractionType::ApplicationCommand,
+            locale: None,
+            member: Some(PartialMember {
+                avatar: None,
+                avatar_decoration_data: None,
+                banner: None,
+                communication_disabled_until: None,
+                deaf: false,
+                flags: MemberFlags::empty(),
+                joined_at: None,
+                mute: false,
+                nick: None,
+                permissions: Some(Permissions::empty()),
+                premium_since: None,
+                roles: Vec::new(),
+                user: None,
+            }),
+            message: None,
+            token: String::new(),
+            user: None,
+        }
+    }
+
+    #[test]
+    fn privileged_classifier_refuses_every_non_builtin_or_incomplete_shape() {
+        use twilight_model::{
+            application::interaction::message_component::MessageComponentInteractionData,
+            channel::message::component::ComponentType, guild::Permissions,
+        };
+
+        let mut wrong_kind = command_interaction("ban");
+        wrong_kind.kind = InteractionType::Ping;
+        wrong_kind.member.as_mut().unwrap().permissions = Some(Permissions::all());
+
+        let mut mismatched_data = command_interaction("ban");
+        mismatched_data.data = Some(InteractionData::MessageComponent(Box::new(
+            MessageComponentInteractionData {
+                custom_id: "test".to_owned(),
+                component_type: ComponentType::Button,
+                resolved: None,
+                values: Vec::new(),
+            },
+        )));
+
+        let mut absent_member = command_interaction("ban");
+        absent_member.member = None;
+
+        let mut absent_permissions = command_interaction("ban");
+        absent_permissions.member.as_mut().unwrap().permissions = None;
+
+        let mut unrelated_permissions = command_interaction("ban");
+        unrelated_permissions.member.as_mut().unwrap().permissions =
+            Some(Permissions::SEND_MESSAGES);
+
+        let mut open_builtin_admin = command_interaction("help");
+        open_builtin_admin.member.as_mut().unwrap().permissions = Some(Permissions::ADMINISTRATOR);
+
+        let mut administrator_without_required_bits = command_interaction("ban");
+        administrator_without_required_bits
+            .member
+            .as_mut()
+            .unwrap()
+            .permissions = Some(Permissions::ADMINISTRATOR);
+
+        let mut missing_data = command_interaction("ban");
+        missing_data.data = None;
+
+        let unknown_name = command_interaction("custom-command");
+
+        let cases = [
+            ("wrong interaction kind", wrong_kind, false),
+            ("missing data", missing_data, false),
+            ("mismatched data", mismatched_data, false),
+            ("unknown or custom name", unknown_name, false),
+            ("absent member", absent_member, false),
+            ("absent permissions", absent_permissions, false),
+            ("unrelated permissions", unrelated_permissions, false),
+            (
+                "open builtin despite administrator",
+                open_builtin_admin,
+                false,
+            ),
+            (
+                "administrator without required bits",
+                administrator_without_required_bits,
+                false,
+            ),
+        ];
+
+        for (label, interaction, expected) in cases {
+            assert_eq!(is_privileged(&interaction), expected, "{label}");
+        }
+    }
+
+    #[test]
+    fn privileged_classifier_uses_compiled_builtin_permission_rows_exactly() {
+        use twilight_model::guild::Permissions;
+        use two_bot_core::command_permissions::{CommandSurface, COMMAND_PERMISSIONS};
+
+        for row in COMMAND_PERMISSIONS.iter().filter(|row| {
+            row.surface == CommandSurface::BuiltinSlash && row.required_permissions != 0
+        }) {
+            let mut interaction = command_interaction(row.command);
+            interaction.member.as_mut().unwrap().permissions =
+                Some(Permissions::from_bits_retain(row.required_permissions));
+            assert!(
+                is_privileged(&interaction),
+                "{} requires its exact row bits",
+                row.command
+            );
+
+            interaction.member.as_mut().unwrap().permissions = Some(Permissions::ADMINISTRATOR);
+            assert_eq!(
+                is_privileged(&interaction),
+                row.allows(Some(Permissions::ADMINISTRATOR.bits()))
+                    && row.required_permissions != 0,
+                "{} preserves resolved-bit table semantics for administrators",
+                row.command
+            );
+        }
+    }
+
+    #[test]
+    fn open_builtin_is_not_privileged_even_with_all_permissions() {
+        use twilight_model::guild::Permissions;
+
+        let mut interaction = command_interaction("help");
+        interaction.member.as_mut().unwrap().permissions = Some(Permissions::all());
+        assert!(!is_privileged(&interaction));
+    }
+
+    #[test]
+    fn busy_reply_classifier_accepts_only_callback_compatible_kinds() {
+        let mut interaction = command_interaction("help");
+        for kind in [
+            InteractionType::ApplicationCommand,
+            InteractionType::MessageComponent,
+            InteractionType::ModalSubmit,
+        ] {
+            interaction.kind = kind;
+            assert!(accepts_busy_reply(&interaction), "{kind:?}");
+        }
+        for kind in [
+            InteractionType::Ping,
+            InteractionType::ApplicationCommandAutocomplete,
+        ] {
+            interaction.kind = kind;
+            assert!(!accepts_busy_reply(&interaction), "{kind:?}");
+        }
+    }
+
     #[test]
     fn member_cap_holds_until_a_slot_is_released() {
         let slots = UserSlots::default();

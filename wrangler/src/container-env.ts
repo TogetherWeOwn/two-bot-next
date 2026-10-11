@@ -79,6 +79,9 @@ export const FORWARDED_FLAGS = [
   "TWO_ANTI_NUKE_TRUSTED_USER_IDS",
   // Temporary voice rooms.
   "TWO_VOICE",
+  // Privileged GUILD_PRESENCES for room-name game/stream facts
+  // (docs/voice-presence.md); needs the app's Presence Intent grant first.
+  "TWO_VOICE_PRESENCE",
   "TWO_TEMP_VOICE",
   "TWO_TEMP_VOICE_CATEGORY_ID",
   "TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS",
@@ -90,6 +93,8 @@ export const FORWARDED_FLAGS = [
   "TWO_TEMP_VOICE_NAME_TEMPLATE",
   "TWO_TEMP_VOICE_PANEL_CHANNEL_ID",
   "TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS",
+  // Staging-only synthetic voice test identities (docs/voice-synthetic.md).
+  "TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS",
   "TWO_TEMP_VOICE_SWEEP_SECONDS",
   // Template assistant (V12): non-secret endpoint URL + model name; the
   // endpoint credential (if any) travels as its own Container secret, never
@@ -102,6 +107,130 @@ export type ForwardedFlag = (typeof FORWARDED_FLAGS)[number];
 
 /** Optional Worker vars, one per forwarded flag (mixed into `Env`). */
 export type ForwardedFlagEnv = { [K in ForwardedFlag]?: string };
+
+/**
+ * Non-secret `DISCORD_*` snowflake IDs the Rust loaders read from the process
+ * environment (TOG-19025, roadmap M3.6). Explicit names only — never a prefix
+ * wildcard, never a secret (`DISCORD_TOKEN`, keys and URLs stay on their own
+ * explicit `containerEnvVars` lines or are never forwarded).
+ *
+ * Readers: `crates/bot/src/audit_runtime.rs` (audit/voice/moderation log
+ * channels), raid/join-risk/containment (staff alert channel),
+ * `crates/bot/src/ticket_runtime.rs` + `preflight.rs` (ticket
+ * category/panel/staff role), `crates/discord/src/onboarding_config.rs` +
+ * `crates/bot/src/onboarding.rs` (landing/goodbye/anchor-welcome, session
+ * lobby/looking-to-play).
+ */
+export const FORWARDED_DISCORD_IDS = [
+  // Audit mirror destinations (audit_runtime.rs CHANNEL_KEYS).
+  "DISCORD_AUDIT_LOG_CHANNEL_ID",
+  "DISCORD_VOICE_LOG_CHANNEL_ID",
+  "DISCORD_MODERATION_LOG_CHANNEL_ID",
+  // Staff alert channel (raid/join-risk/containment CHANNEL_KEY).
+  "DISCORD_STAFF_ALERT_CHANNEL_ID",
+  // Ticket triple (ticket_runtime.rs + preflight ticket_complete gate).
+  "DISCORD_TICKET_CATEGORY_ID",
+  "DISCORD_TICKET_PANEL_CHANNEL_ID",
+  "DISCORD_TICKET_STAFF_ROLE_ID",
+  // Onboarding destinations (onboarding_config.rs + preflight Targets).
+  "DISCORD_LANDING_CHANNEL_IDS",
+  "DISCORD_GOODBYE_CHANNEL_IDS",
+  "DISCORD_ANCHOR_WELCOME_CHANNEL_ID",
+  // Session onboarding pair (onboarding_config.rs Session mode).
+  "DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID",
+  "DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID",
+] as const;
+
+export type ForwardedDiscordId = (typeof FORWARDED_DISCORD_IDS)[number];
+
+/** Optional Worker vars, one per forwarded Discord ID (mixed into `Env`). */
+export type ForwardedDiscordIdEnv = { [K in ForwardedDiscordId]?: string };
+
+/** Comma-separated ID lists (every non-empty segment is one snowflake). */
+const DISCORD_ID_LISTS: ReadonlySet<string> = new Set([
+  "DISCORD_LANDING_CHANNEL_IDS",
+  "DISCORD_GOODBYE_CHANNEL_IDS",
+]);
+
+const MAX_U64 = (1n << 64n) - 1n;
+
+/**
+ * A nonzero Discord snowflake as the Rust loaders accept it: trimmed ASCII
+ * digits parsing to a `u64` in `1..=u64::MAX` (onboarding_config.rs `id`,
+ * preflight.rs `snowflake`). Leading zeros are accepted — Rust's
+ * `parse::<u64>` accepts them — and forwarding stays verbatim so each Rust
+ * reader keeps its own strictness (audit_runtime.rs stays canonical-only).
+ */
+export function isSnowflake(value: string): boolean {
+  const trimmed = value.trim();
+  if (trimmed === "" || !/^[0-9]+$/.test(trimmed)) return false;
+  try {
+    const id = BigInt(trimmed);
+    return id !== 0n && id <= MAX_U64;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A comma-separated snowflake list as `channel_ids` accepts it: every
+ * non-empty comma segment (after trimming) is a snowflake; segments that are
+ * empty after trimming are ignored. All-empty means "no IDs".
+ */
+export function isSnowflakeList(value: string): boolean {
+  const parts = value
+    .split(",")
+    .map((part) => part.trim())
+    .filter((part) => part !== "");
+  return parts.every(isSnowflake);
+}
+
+/** True when `value` is a forwardable payload for `name`. */
+function isForwardableDiscordId(name: string, value: string): boolean {
+  if (value.trim() === "") return false;
+  if (DISCORD_ID_LISTS.has(name)) {
+    // An all-empty list carries no IDs; drop it so Rust sees "unset".
+    const parts = value
+      .split(",")
+      .map((part) => part.trim())
+      .filter((part) => part !== "");
+    return parts.length > 0 && parts.every(isSnowflake);
+  }
+  return isSnowflake(value);
+}
+
+/**
+ * Copy the allowlisted Discord IDs that the Worker env defines as valid
+ * snowflakes, verbatim (an invalid, empty or whitespace-only value is
+ * dropped: the Rust readers treat it as unset/disabled, never as a secret).
+ * Unlisted names and non-string bindings are dropped.
+ *
+ * A present-but-invalid value is dropped loudly: the Worker logs the variable
+ * name (never the value) so a typo surfaces in Worker logs instead of
+ * silently disabling the destination while Rust reports it as unset.
+ */
+export function forwardedDiscordIdVars(env: object): Record<string, string> {
+  const source = env as Readonly<Record<string, unknown>>;
+  const vars: Record<string, string> = {};
+  for (const name of FORWARDED_DISCORD_IDS) {
+    const value = source[name];
+    if (typeof value !== "string" || value.trim() === "") continue;
+    // An all-empty list carries no IDs; keep dropping it silently so Rust
+    // sees "unset", as before.
+    if (
+      DISCORD_ID_LISTS.has(name) &&
+      value.split(",").every((part) => part.trim() === "")
+    ) {
+      continue;
+    }
+    if (isForwardableDiscordId(name, value)) {
+      vars[name] = value;
+    } else {
+      console.warn(`[container-env] ignoring ${name}: not a Discord snowflake ID`);
+    }
+  }
+  return vars;
+}
 
 const SECRET = "secret; a Container secret needs its own explicit containerEnvVars line";
 const TEST = "test-only: CI service containers or a test fixture name";
@@ -124,6 +253,8 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_STAGING_DATABASE_URL: SECRET,
   TWO_BOT_STAGING_MIGRATOR_DATABASE_URL: SECRET,
   TWO_BOT_STAGING_PLAN_DATABASE_URL: SECRET,
+  TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL: SECRET,
+  TWO_BOT_PRODUCTION_PLAN_DATABASE_URL: SECRET,
   TWO_RESTORE_URL: SECRET,
   TWO_MODERATION_AUDIT_SECRET: SECRET,
   TWO_ONBOARDING_ROTA_PSEUDONYM_KEY: SECRET,

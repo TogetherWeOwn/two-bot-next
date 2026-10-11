@@ -8,9 +8,12 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
+import { readFileSync } from "node:fs";
 import { setImmediate } from "node:timers/promises";
 import worker, { TwoBotContainer, type Env } from "../src/index.ts";
 import { OWNER_KEY, AUDIT_PREFIX, DEPLOYMENT_HEADER, CONTROL_PATH } from "../src/ownership.ts";
+import { EMPTY_STATE, type MetricsAlertState } from "../src/alert-rules.ts";
+import { metricsBody, metricsLines } from "./fixtures/metrics.ts";
 
 const ID = "deployment-A";
 const CONTROL_TOKEN = "synthetic-control-token-not-a-secret-12345";
@@ -533,6 +536,64 @@ test("keepalive ignores a gateway failure in a non-bot (text) probe answer", asy
   assert.deepEqual(gatewayFailureLogs(h.logs), []);
 });
 
+test("keepalive treats oversize /readyz as a failed probe without logging the body", async (t) => {
+  const h = await harness(t);
+  const oversizeMarker = `synthetic-readyz-oversize-${"m".repeat(64)}`;
+  const oversizeBody = `${JSON.stringify({ ready: true, marker: oversizeMarker })}\n${"m 1\n".repeat(20000)}`;
+  assert.ok(new TextEncoder().encode(oversizeBody).byteLength > 64 * 1024);
+  // A 200 with a huge body would be ready if the cap were removed (buffered
+  // parse), so this tick only passes when the bounded reader rejects it.
+  // Mock containerFetch to bypass the SDK proxy pipe: cancelling the pipe's
+  // destination readable rejects its internal pipeTo (unhandled in the test
+  // runtime), while the mocked Response exercises the same bounded reader.
+  t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
+    const path = new URL(typeof input === "string" ? input : input.url).pathname;
+    if (path === "/metrics") return new Response(null, { status: 503 });
+    return new Response(oversizeBody, {
+      status: 200, headers: { "content-type": "application/json" },
+    });
+  });
+  await tickKeepalive(h.bot);
+  assert.equal(h.values.get("two-bot:readiness")?.lastStatus, null);
+  assert.equal(h.values.get("two-bot:readiness")?.failures, 1);
+  assert.deepEqual(gatewayFailureLogs(h.logs), []);
+  assert.ok(h.logs.every((line) => !line.includes(oversizeMarker)), "no raw probe body in logs");
+  assert.ok(h.logs.every((line) => !line.includes("m 1\nm 1")), "no probe bytes in logs");
+});
+
+test("public probe discards oversize non-bot body without buffering it", async (t) => {
+  const h = await harness(t);
+  const marker = `synthetic-probe-discard-${"d".repeat(64)}`;
+  const encoder = new TextEncoder();
+  const firstChunk = encoder.encode(marker + "x".repeat(8192));
+  const chunk = encoder.encode("x".repeat(8192));
+  const totalChunks = 32; // ~256 KiB streamed, well over the 64 KiB cap
+  let pulls = 0;
+  let cancelled = 0;
+  // Mock containerFetch to bypass the SDK proxy pipe: cancelling the pipe's
+  // destination readable rejects its internal pipeTo (unhandled in the test
+  // runtime), while the mocked Response exercises the same bounded reader.
+  t.mock.method(h.bot, "containerFetch", async () => new Response(new ReadableStream({
+    pull(controller) {
+      pulls++;
+      if (pulls <= totalChunks) controller.enqueue(pulls === 1 ? firstChunk : chunk);
+      else controller.close();
+    },
+    cancel() { cancelled++; },
+  }, { highWaterMark: 0 }), {
+    status: 500, headers: { "content-type": "text/plain" },
+  }));
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/readyz"));
+  assert.equal(response.status, 500);
+  assert.deepEqual(await response.json(), { ready: false, error_class: "container_unavailable" });
+  // Bounded: the reader cancels after ~64 KiB instead of draining ~256 KiB.
+  // The old unbounded arrayBuffer() drain pulls every chunk and never cancels.
+  assert.equal(cancelled, 1, "oversize non-bot probe body must be cancelled");
+  assert.ok(pulls < totalChunks, `expected early cancel, pulled ${pulls}/${totalChunks} chunks`);
+  assert.ok(pulls * 8192 <= 96 * 1024, `expected ~64 KiB discard, pulled ~${pulls * 8} KiB`);
+  assert.ok(h.logs.every((line) => !line.includes(marker)), "no raw probe body in logs");
+});
+
 for (const path of ["/health", "/readyz", "keepalive", "start", "startAndWaitForPorts"]) {
   test(`${path} startup forwards only allowlisted publication settings`, async (t) => {
     const h = await harness(t, PUBLICATION_WORKER_ENV);
@@ -802,9 +863,17 @@ function controlRequest(body?: object, token = CONTROL_TOKEN): Request {
 }
 
 test("authenticated takeover is CAS audited, tears down first and never auto-starts", async (t) => {
-  const h = await harness(t);
-  await h.bot.fetch(probeRequest("https://worker.invalid/health"));
-  const result = await h.bot.fetch(controlRequest({ action: "takeover", expectedEpoch: 1, actor: "fixture-operator" }));
+  // A same-owner exact-epoch repeat is a no-op, so the commit path is
+  // exercised by a fresh deployment at the fresh epoch.
+  const h = await harness(t, { ...WORKER_ENV, CF_VERSION_METADATA: { id: "deployment-B" } }, { running: true });
+  // Reconstruction already tore down the previous owner's live process
+  // (destroys is 1); the takeover below must not start a replacement.
+  const asB = (body?: object) => {
+    const request = controlRequest(body);
+    request.headers.set(DEPLOYMENT_HEADER, "deployment-B");
+    return request;
+  };
+  const result = await h.bot.fetch(asB({ action: "takeover", expectedEpoch: 1, actor: "fixture-operator" }));
   assert.equal(result.status, 200);
   const state = await result.json();
   assert.equal(state.owner.epoch, 2);
@@ -813,13 +882,89 @@ test("authenticated takeover is CAS audited, tears down first and never auto-sta
   assert.ok(Number.isFinite(Date.parse(state.owner.timestamp)));
   assert.equal(state.running, false);
   assert.equal(h.runtime.destroys, 1);
-  assert.equal(h.starts.length, 1, "control must not start replacement");
+  assert.equal(h.starts.length, 0, "control must not start replacement");
   assert.deepEqual(h.values.get(`${AUDIT_PREFIX}2:active`), state.owner);
-  assert.equal((await h.bot.fetch(controlRequest({ action: "takeover", expectedEpoch: 1, actor: "fixture-operator" }))).status, 409);
+  assert.equal((await h.bot.fetch(asB({ action: "takeover", expectedEpoch: 1, actor: "fixture-operator" }))).status, 409);
   await h.bot.keepalive(KEEPALIVE, { taskId: "stale-task" });
-  assert.equal(h.starts.length, 1, "old epoch is harmless even on the same deployment");
+  assert.equal(h.starts.length, 0, "old epoch is harmless even on the same deployment");
+  const probe = probeRequest("https://worker.invalid/health");
+  probe.headers.set(DEPLOYMENT_HEADER, "deployment-B");
+  await h.bot.fetch(probe);
+  assert.equal(h.starts.length, 1);
+});
+
+test("same-owner exact-epoch takeover repeat is a read-only no-op", async (t) => {
+  const h = await harness(t);
   await h.bot.fetch(probeRequest("https://worker.invalid/health"));
-  assert.equal(h.starts.length, 2);
+  const destroys = h.runtime.destroys;
+  const logMark = h.logs.length;
+  // The harness presets deployment-A active at epoch 1, so this is a repeat.
+  const repeat = await h.bot.fetch(controlRequest({ action: "takeover", expectedEpoch: 1, actor: "fixture-operator" }));
+  assert.equal(repeat.status, 200);
+  const state = await repeat.json();
+  assert.equal(state.owner.epoch, 1);
+  assert.equal(state.owner.deploymentId, "deployment-A");
+  assert.equal(state.owner.phase, "active");
+  assert.equal(h.runtime.destroys, destroys, "no-op must not tear down");
+  assert.ok([...h.values.keys()].every((key) => !String(key).startsWith(AUDIT_PREFIX)), "no-op writes no audit row");
+  const fresh = h.logs.slice(logMark).join("\n");
+  assert.ok(fresh.includes("two-bot ownership takeover already applied at epoch 1"));
+  assert.ok(!fresh.includes("two-bot ownership change:"), "no-op must not log a change that never happened");
+  assert.equal((await h.bot.fetch(probeRequest("https://worker.invalid/health"))).status, 200);
+});
+
+test("same-owner exact-epoch takeover while recoveryFailed still destroys and clears", async (t) => {
+  const epoch2 = { ...ACTIVE_OWNER, epoch: 2, oldEpoch: 1 };
+  const h = await harness(t, WORKER_ENV, { owner: epoch2 });
+  await h.bot.fetch(probeRequest("https://worker.invalid/health"));
+  // Simulate an unconfirmed teardown: the repeat must re-run the full
+  // sequence, never silently clear the flag without tearing down.
+  (h.bot as unknown as { recoveryFailed: boolean }).recoveryFailed = true;
+  const destroys = h.runtime.destroys;
+  const logMark = h.logs.length;
+  const repeat = await h.bot.fetch(controlRequest({ action: "takeover", expectedEpoch: 2, actor: "fixture-operator" }));
+  assert.equal(repeat.status, 200);
+  const state = await repeat.json();
+  assert.equal(state.owner.epoch, 3);
+  assert.equal(h.runtime.destroys, destroys + 1, "recovery must actually tear down");
+  assert.deepEqual(h.values.get(`${AUDIT_PREFIX}3:active`), state.owner);
+  assert.equal((h.bot as unknown as { recoveryFailed: boolean }).recoveryFailed, false);
+  assert.ok(h.logs.slice(logMark).join("\n").includes("two-bot ownership change:"));
+  const again = await h.bot.fetch(controlRequest({ action: "takeover", expectedEpoch: 3, actor: "fixture-operator" }));
+  assert.equal(again.status, 200);
+  assert.equal((await again.json()).owner.epoch, 3, "flag clear restores the no-op");
+  assert.equal(h.runtime.destroys, destroys + 1);
+});
+
+test("same-owner exact-epoch takeover while recoveryFailed refuses an unconfirmed teardown", async (t) => {
+  const epoch2 = { ...ACTIVE_OWNER, epoch: 2, oldEpoch: 1 };
+  const h = await harness(t, WORKER_ENV, { owner: epoch2, stopError: true });
+  await h.bot.fetch(probeRequest("https://worker.invalid/health"));
+  (h.bot as unknown as { recoveryFailed: boolean }).recoveryFailed = true;
+  const starts = h.starts.length;
+  const repeat = await h.bot.fetch(controlRequest({ action: "takeover", expectedEpoch: 2, actor: "fixture-operator" }));
+  assert.equal(repeat.status, 503, "a repeat must not report success over an unconfirmed teardown");
+  assert.equal((h.bot as unknown as { recoveryFailed: boolean }).recoveryFailed, true);
+  assert.equal((h.values.get(OWNER_KEY) as { phase: string }).phase, "fenced");
+  assert.equal((await h.bot.fetch(probeRequest("https://worker.invalid/health"))).status, 503);
+  assert.equal(h.starts.length, starts);
+});
+
+test("different-deployment takeover at the fresh epoch still commits", async (t) => {
+  const h = await harness(t, { ...WORKER_ENV, CF_VERSION_METADATA: { id: "deployment-B" } });
+  const asB = (body?: object) => {
+    const request = controlRequest(body);
+    request.headers.set(DEPLOYMENT_HEADER, "deployment-B");
+    return request;
+  };
+  assert.equal((await h.bot.fetch(asB())).status, 200);
+  const result = await h.bot.fetch(asB({ action: "takeover", expectedEpoch: 1, actor: "fixture-operator" }));
+  assert.equal(result.status, 200);
+  const state = await result.json();
+  assert.equal(state.owner.epoch, 2);
+  assert.equal(state.owner.deploymentId, "deployment-B");
+  assert.equal(state.owner.phase, "active");
+  assert.equal(h.runtime.destroys, 0);
 });
 
 test("shutdown failure retains durable revocation and refuses warm proxying", async (t) => {
@@ -880,6 +1025,99 @@ for (const path of ["/INTERNAL/OWNERSHIP", "/internal/%6fwnership", "//internal/
   });
 }
 
+test("DO /ops/metrics: hung container fetch aborts within the bound (504, generic body)", async (t) => {
+  const h = await harness(t);
+  // Prove the 6 s bound without sleeping through it: the runner cancels
+  // live waits near ~5 s, so shrink only the timer and assert the production
+  // code requested the full bound. The SDK resolves aborts as a 500
+  // Response (never a rejection), so the fixture mirrors that shape.
+  const realTimeout = AbortSignal.timeout;
+  const timeout = t.mock.method(AbortSignal, "timeout", (ms: number) =>
+    realTimeout(ms === 6000 ? 50 : ms));
+  t.mock.method(h.bot, "containerFetch", (...args: Parameters<TwoBotContainer["containerFetch"]>) => {
+    const init = args[1] as RequestInit | undefined;
+    return new Promise<Response>((resolve) => {
+      const sdkAbortBody = (message: string) =>
+        resolve(new Response(`Error proxying request to container: ${message}`, { status: 500 }));
+      if (init?.signal?.aborted) sdkAbortBody("fixture already aborted");
+      else init?.signal?.addEventListener("abort", () => sdkAbortBody("The operation was aborted due to timeout"));
+    });
+  });
+  const started = Date.now();
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/ops/metrics"));
+  const elapsed = Date.now() - started;
+  assert.equal(response.status, 504);
+  assert.equal(await response.text(), "metrics unavailable\n");
+  assert.ok(
+    timeout.mock.calls.some((call) => call.arguments[0] === 6000),
+    "container fetch must request the 6 s abort bound",
+  );
+  assert.ok(elapsed < 5000, `hung fetch must return well within the bound, took ${elapsed}ms`);
+});
+
+test("DO /ops/metrics: rejected container fetch still returns 504 with a generic body", async (t) => {
+  const h = await harness(t);
+  t.mock.method(h.bot, "containerFetch", async () => { throw new Error("fixture transport failure"); });
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/ops/metrics"));
+  assert.equal(response.status, 504);
+  assert.equal(await response.text(), "metrics unavailable\n");
+});
+
+test("DO /ops/metrics: oversized body returns 502 with a generic body", async (t) => {
+  const h = await harness(t);
+  t.mock.method(h.bot, "containerFetch", async () => new Response("m 1\n".repeat(20000)));
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/ops/metrics"));
+  assert.equal(response.status, 502);
+  assert.equal(await response.text(), "metrics unavailable\n");
+});
+
+test("DO /ops/metrics: small body proxies status with the exposition content type", async (t) => {
+  const h = await harness(t);
+  t.mock.method(h.bot, "containerFetch", async () => new Response("# HELP x\n", { status: 200 }));
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/ops/metrics"));
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "text/plain; version=0.0.4; charset=utf-8");
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.equal(await response.text(), "# HELP x\n");
+});
+
+test("Worker and DO private scrape preserve the bounded REST guard fixture", async (t) => {
+  const body = readFileSync(new URL("../../crates/core/tests/fixtures/rest_guard_metrics.prom", import.meta.url), "utf8");
+  const samples = body.split("\n").filter(line => line.startsWith("two_bot_rest_guard_"));
+  assert.equal(samples.length, 11);
+  assert.equal(new Set(samples.map(line => line.split(" ")[0])).size, 11);
+  assert.ok(samples.every(line => !line.includes("{") && Number.isFinite(Number(line.split(" ")[1]))));
+  assert.ok(Buffer.byteLength(body) < 65_536);
+  const token = "synthetic-rest-guard-scrape-token-0123456789";
+  const h = await harness(t, { METRICS_SCRAPE_TOKEN: token });
+  const upstream = t.mock.method(h.bot, "containerFetch", async () => new Response(body));
+  const env = {
+    ...WORKER_ENV,
+    METRICS_SCRAPE_TOKEN: token,
+    CF_VERSION_METADATA: { id: ID },
+    TWO_BOT: { getByName: () => ({ fetch: (request: Request) => h.bot.fetch(request) }) },
+  } as unknown as Env;
+  const ctx = { waitUntil: () => {} } as ExecutionContext;
+  for (const [path, auth, expected] of [
+    ["/metrics", `Bearer ${token}`, 404],
+    ["/ops/metrics", "", 401],
+    ["/ops/metrics", `Bearer ${token}`, 200],
+  ] as const) {
+    const response = await worker.fetch(new Request(`https://worker.invalid${path}`, {
+      headers: auth ? { authorization: auth } : {},
+    }), env, ctx);
+    assert.equal(response.status, expected);
+    if (expected === 200) {
+      assert.equal(await response.text(), body);
+      assert.equal(response.headers.get("content-type"), "text/plain; version=0.0.4; charset=utf-8");
+      assert.equal(response.headers.get("cache-control"), "no-store");
+    } else {
+      assert.equal(upstream.mock.callCount(), 0, "public/unauthenticated calls never reach the container");
+    }
+  }
+  assert.equal(upstream.mock.callCount(), 1);
+});
+
 // Readiness monitoring uses synthetic responses only. Global fetch is stubbed
 // in every alert test: no configured webhook, Worker or database is contacted.
 async function alertHarness(t: TestContext, env: Partial<Env> = {}, values?: Map<string, unknown>) {
@@ -912,6 +1150,64 @@ const ALERT_ENV = {
   OPS_ALERT_FORWARDING: "on",
 };
 
+for (const failure of ["http", "fetch", "body", "missing", "invalid"] as const) {
+  test(`DO dispatch tickets survive ${failure} scrape failure without a false clear`, async (t) => {
+    const h = await alertHarness(t, ALERT_ENV);
+    let count = 20;
+    let failed = false;
+    // Complete scrapes: the background validator rejects partial bodies, so the
+    // streak grows from full exposition with only the reactions lane rising.
+    const reactions = (value: string) => metricsBody().replace(
+      'two_bot_dispatch_drops_total{lane="reactions"} 0',
+      `two_bot_dispatch_drops_total{lane="reactions"} ${value}`,
+    );
+    t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
+      const path = new URL(typeof input === "string" ? input : input.url).pathname;
+      if (path !== "/metrics") return new Response(null, { status: 200 });
+      if (failed) {
+        if (failure === "fetch") throw new Error("synthetic metrics transport failure");
+        if (failure === "http") return new Response(null, { status: 503 });
+        if (failure === "missing") return new Response("");
+        if (failure === "invalid") return new Response(reactions("NaN"));
+        return new Response(new ReadableStream({ start(controller) {
+          controller.error(new Error("synthetic metrics body failure"));
+        } }));
+      }
+      return new Response(reactions(String(count)));
+    });
+    for (const n of [20, 21, 22]) {
+      count = n;
+      await h.tick();
+      assert.equal(h.posts.length, 0);
+    }
+    failed = true;
+    await h.tick();
+    failed = false;
+    count = 23;
+    await h.tick();
+    assert.equal(h.posts.length, 0, "failure interrupted the two-rise streak; return is only a baseline");
+    for (const n of [24, 25, 26]) {
+      count = n;
+      await h.tick();
+    }
+    assert.equal(h.posts.length, 1);
+    const content = JSON.parse(h.posts[0]!.init.body as string).content;
+    assert.match(content, /ALERT dispatch_drops:reactions \(ticket\):/);
+    assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, ["dispatch_drops:reactions"]);
+    failed = true;
+    await h.tick();
+    assert.equal(h.posts.length, 1, "missing evidence must not send RESOLVED");
+    assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, ["dispatch_drops:reactions"]);
+    failed = false;
+    count = 27;
+    await h.tick();
+    await h.tick();
+    assert.equal(h.posts.length, 2, "only the second valid (flat) sample proves recovery");
+    assert.equal(JSON.parse(h.posts[1]!.init.body as string).content, "two-bot-next RESOLVED dispatch_drops:reactions.");
+    assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, []);
+  });
+}
+
 type AlertSender = "readiness" | "metrics";
 async function senderHarness(t: TestContext, sender: AlertSender, env: Partial<Env>, values?: Map<string, unknown>) {
   const h = await alertHarness(t, { UNREADY_ALERT_FAILURES: "1", ...env }, values);
@@ -919,8 +1215,9 @@ async function senderHarness(t: TestContext, sender: AlertSender, env: Partial<E
   t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
     const path = new URL(typeof input === "string" ? input : input.url).pathname;
     if (path === "/metrics") {
-      return new Response(sender === "metrics"
-        ? `two_bot_job_consecutive_failures{job="rank"} ${failing ? 3 : 0}\n` : "");
+      if (sender !== "metrics") return new Response("");
+      const rankClass = `two_bot_job_last_error_class{job="rank",class="database"} ${failing ? 1 : 0}`;
+      return new Response(metricsBody(failing ? 3 : 0).replace('two_bot_job_last_error_class{job="rank",class="database"} 0', rankClass));
     }
     return new Response(null, { status: sender === "readiness" && failing ? 503 : 200 });
   });
@@ -935,6 +1232,7 @@ function assertAlertRecorded(h: Awaited<ReturnType<typeof senderHarness>>, sende
     assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, ["job_consecutive_failures:rank"]);
     assert.equal(h.events()[0].event, "metrics_alert");
     assert.match(h.events()[0].content, /ALERT job_consecutive_failures:rank/);
+    assert.match(h.events()[0].content, /last error class: database/);
   }
 }
 
@@ -1331,7 +1629,10 @@ for (const sender of ["readiness", "metrics"] as const) {
         ? ["container_unready_alert", "container_unready_recovery"] : ["metrics_alert", "metrics_alert"]);
       assert.equal(h.values.get("two-bot:readiness")?.alerted, false);
       assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, []);
-      if (sender === "metrics") assert.match(h.events()[1].content, /RESOLVED job_consecutive_failures:rank/);
+      if (sender === "metrics") {
+        assert.match(h.events()[1].content, /RESOLVED job_consecutive_failures:rank/);
+        assert.match(h.events()[1].content, /last error class: database/);
+      }
       assert.equal(h.schedules.mock.callCount(), 4);
       assert.ok(h.logs.every((line) => !line.includes(ALERT_ENV.OPS_ALERT_WEBHOOK_URL)));
     });
@@ -1392,7 +1693,7 @@ test("keepalive pulls /metrics, alerts once on a failing job and resolves", asyn
   let failures = 3;
   t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
     const path = new URL(typeof input === "string" ? input : input.url).pathname;
-    if (path === "/metrics") return new Response(`two_bot_job_consecutive_failures{job="rank"} ${failures}\n`);
+    if (path === "/metrics") return new Response(metricsBody(failures));
     return new Response(null, { status: 200 });
   });
   await h.tick();
@@ -1403,4 +1704,208 @@ test("keepalive pulls /metrics, alerts once on a failing job and resolves", asyn
   failures = 0;
   await h.tick();
   assert.equal(h.posts.filter((p) => String(p.init.body).includes("RESOLVED job_consecutive_failures:rank")).length, 1);
+});
+
+const METRICS_KEY = "two-bot:metrics-alerts";
+const SCRAPE_FAILURE = "two-bot metrics scrape failed";
+const PRIOR_METRICS: MetricsAlertState = {
+  ...EMPTY_STATE, firing: ["job_consecutive_failures:rank"],
+  rest429: 12, restTotal: 100, poolStreak: 2, dbErrors: 7,
+  sendBlocked: 8, sendBlockedStreak: 2, voiceOps: 40, voiceFailures: 2,
+  voiceDeadLetters: 1, voiceOrphans: 1, gatewayMissed: 4, gatewayMissedSeen: true,
+  receiverRefusals: { membership: 8 }, receiverRefusalsSeen: true,
+  receiverRefusalStreaks: { membership: 2 },
+  dispatchDrops: { reactions: 5 }, dispatchDropStreaks: { reactions: 2 },
+};
+
+async function backgroundMetricsHarness(t: TestContext) {
+  const h = await alertHarness(t, ALERT_ENV);
+  const previous = structuredClone(PRIOR_METRICS);
+  h.values.set(METRICS_KEY, previous);
+  const puts = t.mock.method(h.ctx.storage, "put");
+  let response = (_signal: AbortSignal): Promise<Response> => Promise.resolve(new Response(metricsBody()));
+  t.mock.method(h.bot, "containerFetch", async (input: string | Request, init?: RequestInit) => {
+    const path = new URL(typeof input === "string" ? input : input.url).pathname;
+    return path === "/metrics" ? response(init!.signal!) : new Response(null, { status: 200 });
+  });
+  return {
+    ...h, previous, puts,
+    setMetricsResponse: (next: typeof response) => { response = next; },
+    assertInterrupted: () => {
+      // A failed scrape preserves firing keys and every baseline/streak except
+      // the dispatch-drop window, which resets without resolving anything.
+      const writes = puts.mock.calls.filter((call) => call.arguments[0] === METRICS_KEY);
+      assert.equal(writes.length, 1, "one dispatch-interrupt write");
+      assert.deepEqual(writes[0]!.arguments[1], { ...previous, dispatchDrops: {}, dispatchDropStreaks: {} });
+      assert.deepEqual(previous, PRIOR_METRICS, "no in-place baseline/streak/firing mutation");
+      assert.deepEqual(h.values.get(METRICS_KEY), { ...PRIOR_METRICS, dispatchDrops: {}, dispatchDropStreaks: {} });
+      assert.equal(h.posts.length, 0, "no false RESOLVED notification");
+      assert.equal(h.events().length, 0, "no false transition logs");
+      assert.deepEqual(h.logs.filter((line) => line !== "two-bot container started"), [SCRAPE_FAILURE]);
+      assert.equal(h.schedules.mock.callCount(), 1, "failure still rearms keepalive");
+    },
+  };
+}
+
+function paddedMetrics(bytes: number): Uint8Array {
+  const body = metricsBody();
+  return new TextEncoder().encode(body + "#" + "x".repeat(bytes - body.length - 2) + "\n");
+}
+
+for (const bytes of [64 * 1024, 64 * 1024 + 1]) {
+  test(`background metrics: streaming ${bytes} bytes respects the cap and cancels oversize`, async (t) => {
+    const h = await backgroundMetricsHarness(t);
+    let cancelled = 0;
+    let pulls = 0;
+    const chunks = [paddedMetrics(64 * 1024), ...(bytes > 64 * 1024 ? [new Uint8Array([32])] : [])];
+    h.setMetricsResponse(async () => new Response(new ReadableStream({
+      pull(controller) {
+        pulls++;
+        if (chunks.length) controller.enqueue(chunks.shift()!);
+        else if (bytes === 64 * 1024) controller.close();
+        else throw new Error("must cancel before a third read");
+      },
+      cancel() { cancelled++; return new Promise<void>(() => {}); },
+    }, { highWaterMark: 0 })));
+    await h.tick();
+    if (bytes > 64 * 1024) {
+      h.assertInterrupted();
+      assert.equal(cancelled, 1, "cancel hook does not need to finish");
+      assert.equal(pulls, 2);
+    } else {
+      assert.equal(cancelled, 0);
+      assert.equal(pulls, 2);
+      assert.deepEqual(h.values.get(METRICS_KEY)?.firing, []);
+      assert.equal(h.posts.length, 1, "valid exact-cap scrape resolves");
+    }
+  });
+}
+
+for (const cancel of ["normal", "reject", "stall"] as const) {
+  test(`background metrics: huge non-OK body is cancelled without reading (${cancel})`, async (t) => {
+    const h = await backgroundMetricsHarness(t);
+    let cancelled = 0;
+    let pulls = 0;
+    h.setMetricsResponse(async () => new Response(new ReadableStream({
+      pull(controller) { pulls++; controller.enqueue(new Uint8Array(1024 * 1024)); },
+      cancel() {
+        cancelled++;
+        if (cancel === "reject") return Promise.reject(new Error("synthetic-secret-body-marker"));
+        if (cancel === "stall") return new Promise<void>(() => {});
+      },
+    }, { highWaterMark: 0 }), { status: 500 }));
+    await h.tick();
+    h.assertInterrupted();
+    assert.equal(pulls, 0, "no error-body buffering or draining");
+    assert.equal(cancelled, 1);
+  });
+}
+
+for (const [name, body] of Object.entries({
+  empty: "", nonExposition: "<html>synthetic-secret-body-marker</html>",
+  commentsOnly: "# HELP x synthetic-secret-body-marker\n",
+  partial: 'two_bot_job_consecutive_failures{job="rank"} 0\n',
+  malformed: `${metricsBody()}synthetic-secret-body-marker\n`,
+  malformedLabel: metricsBody().replace('{job="rank"}', '{job=rank}'),
+  missingSeries: metricsLines().slice(1).join("\n"),
+  nonfinite: metricsBody().replace("two_bot_gateway_missed_events_total 0", "two_bot_gateway_missed_events_total NaN"),
+  negative: metricsBody().replace("two_bot_db_pool_connections 0", "two_bot_db_pool_connections -1"),
+  duplicate: `${metricsBody()}two_bot_gateway_missed_events_total 0\n`,
+})) {
+  test(`background metrics: invalid 200 preserves all previous alert state (${name})`, async (t) => {
+    const h = await backgroundMetricsHarness(t);
+    h.setMetricsResponse(async () => new Response(body));
+    await h.tick();
+    h.assertInterrupted();
+  });
+}
+
+test("background metrics: interrupted stream after a valid prefix never commits or leaks details", async (t) => {
+  const h = await backgroundMetricsHarness(t);
+  let pulls = 0;
+  h.setMetricsResponse(async () => new Response(new ReadableStream({
+    pull(controller) {
+      if (pulls++ === 0) controller.enqueue(new TextEncoder().encode(metricsBody()));
+      else controller.error(new Error("synthetic-secret-stream-marker"));
+    },
+  }, { highWaterMark: 0 })));
+  await h.tick();
+  h.assertInterrupted();
+  assert.equal(pulls, 2);
+});
+
+for (const failure of ["fetch stall", "late response", "body stall", "abort response"] as const) {
+  test(`background metrics: one six-second request/body deadline bounds ${failure}`, async (t) => {
+    const h = await backgroundMetricsHarness(t);
+    let cancelled = 0;
+    let release: (() => void) | undefined;
+    let signal: AbortSignal | undefined;
+    const realTimeout = AbortSignal.timeout;
+    const timeout = t.mock.method(AbortSignal, "timeout", (ms: number) => realTimeout(ms === 6000 ? 30 : ms));
+    const stream = () => new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(new TextEncoder().encode(metricsBody()));
+        return new Promise<void>(() => {});
+      },
+      cancel() { cancelled++; return new Promise<void>(() => {}); },
+    }, { highWaterMark: 0 });
+    h.setMetricsResponse((nextSignal) => {
+      signal = nextSignal;
+      if (failure === "body stall") return Promise.resolve(new Response(stream()));
+      if (failure === "abort response") return new Promise((resolve) => {
+        nextSignal.addEventListener("abort", () => resolve(new Response(stream())), { once: true });
+      });
+      return new Promise((resolve) => { release = () => resolve(new Response(stream())); });
+    });
+    // Keep node alive: AbortSignal.timeout is an unref'ed timer. The guard
+    // also fails a regression rather than leaving the test runner hanging.
+    const guard = setTimeout(() => {}, 1000);
+    try {
+      await h.tick();
+      h.assertInterrupted();
+      assert.ok(signal?.aborted);
+      assert.ok(timeout.mock.calls.some((call) => call.arguments[0] === 6000));
+      if (failure === "late response") { release!(); await setImmediate(); }
+      assert.equal(cancelled, failure === "fetch stall" ? 0 : 1);
+    } finally { clearTimeout(guard); }
+  });
+}
+
+test("background metrics: transport rejection is bounded and never throws", async (t) => {
+  const h = await backgroundMetricsHarness(t);
+  h.setMetricsResponse(async () => { throw new Error("synthetic-secret-fetch-marker"); });
+  await h.tick();
+  h.assertInterrupted();
+});
+
+test("background metrics: valid scrape persists before resolving, notifies once and supports extra series", async (t) => {
+  const h = await backgroundMetricsHarness(t);
+  h.setMetricsResponse(async () => new Response(metricsBody()
+    + 'new_metric{version="future"} 1\nnew_histogram_bucket{le="+Inf"} 0\n'));
+  const webhook = t.mock.method(globalThis, "fetch", async () => {
+    assert.deepEqual(h.values.get(METRICS_KEY)?.firing, [], "persisted before notifying");
+    return new Response(null, { status: 204 });
+  });
+  await h.tick();
+  await h.tick();
+  assert.equal(webhook.mock.callCount(), 1);
+  assert.equal(h.events().length, 1);
+  assert.match(h.events()[0].content, /RESOLVED job_consecutive_failures:rank/);
+  assert.ok(!h.logs.includes(SCRAPE_FAILURE));
+});
+
+test("background metrics: metrics storage failure cannot notify and retains the old state", async (t) => {
+  const h = await backgroundMetricsHarness(t);
+  const put = h.ctx.storage.put;
+  t.mock.method(h.ctx.storage, "put", async (...args: Parameters<typeof put>) => {
+    if (args[0] === METRICS_KEY) throw new Error("synthetic-secret-storage-marker");
+    return put(...args);
+  });
+  await h.tick();
+  assert.equal(h.values.get(METRICS_KEY), h.previous);
+  assert.deepEqual(h.previous, PRIOR_METRICS);
+  assert.equal(h.posts.length, 0);
+  assert.equal(h.events().length, 0);
+  assert.ok(h.logs.includes(SCRAPE_FAILURE));
+  assert.equal(h.schedules.mock.callCount(), 1);
 });

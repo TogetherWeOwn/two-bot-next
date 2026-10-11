@@ -383,9 +383,42 @@ async fn twilight_posts_exact_mapped_route_and_mention_safe_payload() {
 async fn refuses_bad_inputs_missing_mapping_and_every_other_core_verb_without_http() {
     let mock = MockDiscord::start(Reply::success()).await;
     let executor = mock.executor(keys());
-    assert_eq!(SUPPORTED_ACTIONS, ["announcement.post"]);
+    assert_eq!(
+        SUPPORTED_ACTIONS,
+        [
+            "announcement.post",
+            "event.upsert",
+            "event.cancel",
+            "settings.get",
+            "settings.set"
+        ]
+    );
+    // The two event verbs have a wired mutation path behind the receiver's
+    // claim, but never through the announcement adapter.
+    for action in ["event.upsert", "event.cancel"] {
+        assert!(supports_event_mutation(action));
+        assert!(!AnnouncementExecutor::supports(action));
+    }
+    assert!(!supports_event_mutation("announcement.post"));
+    assert!(!supports_event_mutation("event.read"));
     for action in two_bot_core::internal_actions::IMPLEMENTED_ACTIONS {
-        if action == "announcement.post" {
+        if matches!(
+            action,
+            "announcement.post" | "event.upsert" | "event.cancel" | "settings.get" | "settings.set"
+        ) {
+            // Only the announcement verb runs through this transport; the
+            // event and settings verbs are wired at the receiver and execute
+            // elsewhere, so routing them here must refuse.
+            assert_eq!(
+                AnnouncementExecutor::supports(action),
+                action == "announcement.post"
+            );
+            if action != "announcement.post" {
+                assert_eq!(
+                    run_action(&executor, action, &announcement("ok")).await,
+                    ExecutionOutcome::NoEffect(Refusal::ActionNotAllowed)
+                );
+            }
             continue;
         }
         assert!(!AnnouncementExecutor::supports(action));

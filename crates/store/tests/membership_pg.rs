@@ -21,6 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Pool, Postgres};
+use two_bot_core::membership::{normalize_timestamp, MembershipStore};
+use two_bot_core::{EventType, FunnelEvent};
 use two_bot_store::{migrate, PgFunnelStore, DB_POOL_MAX};
 
 #[path = "../../core/tests/support/membership_contract.rs"]
@@ -156,5 +158,108 @@ fn sqlx_membership_chronology_contract() {
 fn sqlx_membership_chronology_contract_non_utc_session() {
     let f = SchemaFixture::new(true);
     contract::run(|| f.make());
+    f.finish();
+}
+
+/// Real parallel-writer compare-and-swap proof for the deferred
+/// `docs/membership-contract.md` row (`membership-replay.test.ts:217`): two
+/// writers race duplicate reconfirmations of the same once-per-member join
+/// row behind a barrier, so both transactions overlap on the event-row lock.
+/// The store serializes on `SELECT … FOR UPDATE` and converges on the newest
+/// hint; a stale duplicate reconfirmation through the store then leaves the
+/// maximum intact, failing loudly (assert) instead of losing the update.
+#[test]
+#[ignore = "requires authorized TEST_DATABASE_URL"]
+fn sqlx_membership_parallel_writer_cas() {
+    const GUILD: u64 = 1;
+    const MEMBER: u64 = 2;
+    const OCCURRED: &str = "2026-09-29T00:00:00.000Z";
+    const SEED_HINT: &str = "2026-09-30T01:00:00.000010Z";
+    const HINT_A: &str = "2026-09-30T01:00:00.000020Z";
+    const HINT_B: &str = "2026-09-30T01:00:00.000030Z";
+    const STALE_HINT: &str = "2026-09-30T01:00:00.000001Z";
+
+    fn join() -> FunnelEvent {
+        FunnelEvent {
+            guild_id: GUILD,
+            member_id: Some(MEMBER),
+            event_type: EventType::MemberJoin,
+            occurred_at: OCCURRED.into(),
+            source: "invite:original".into(),
+            metadata: None,
+            dedupe_token: None,
+        }
+    }
+    fn duplicate() -> FunnelEvent {
+        FunnelEvent {
+            source: "unknown".into(),
+            ..join()
+        }
+    }
+    fn observed(metadata: &Option<serde_json::Value>) -> Option<String> {
+        metadata
+            .as_ref()
+            .and_then(|v| v.get("membershipObservedAt"))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    }
+
+    let f = SchemaFixture::new(false);
+    let s = f.make();
+    // Seed the contested row: the once-per-member join key is shared by every
+    // reconfirmation below, so both writers update the same events row.
+    assert!(s.record_observed(join(), Some(SEED_HINT)).inserted);
+
+    let barrier = std::sync::Barrier::new(2);
+    let (a_inserted, b_inserted) = std::thread::scope(|scope| {
+        let a = scope.spawn(|| {
+            barrier.wait();
+            s.record_observed(duplicate(), Some(HINT_A))
+        });
+        let b = scope.spawn(|| {
+            barrier.wait();
+            s.record_observed(duplicate(), Some(HINT_B))
+        });
+        (
+            a.join().expect("writer A").inserted,
+            b.join().expect("writer B").inserted,
+        )
+    });
+    assert!(
+        !a_inserted && !b_inserted,
+        "racing reconfirmations are duplicates, not inserts"
+    );
+
+    // Newest hint wins; occurrence, source and identity stay with the seed.
+    let rows = s.membership_rows(GUILD, MEMBER);
+    assert_eq!(rows.len(), 1, "one join row, raced in place");
+    assert_eq!(rows[0].event_type, EventType::MemberJoin);
+    assert_eq!(rows[0].source, "invite:original");
+    assert_eq!(
+        normalize_timestamp(&rows[0].occurred_at).expect("row timestamp"),
+        normalize_timestamp(OCCURRED).expect("fixture timestamp"),
+        "occurrence never moves on reconfirmation"
+    );
+    assert_eq!(
+        observed(&rows[0].metadata).as_deref(),
+        Some(HINT_B),
+        "parallel writers converge on the newest hint"
+    );
+
+    // A stale duplicate through the store cannot overwrite the converged
+    // maximum: the reconfirmation takes the same `advance_duplicate` path as
+    // the racing writers (row lock plus the `IS NOT DISTINCT FROM` revision
+    // check), the older hint loses the maximum comparison, and the asserts
+    // fail loudly on a lost update.
+    assert!(
+        !s.record_observed(duplicate(), Some(STALE_HINT)).inserted,
+        "stale reconfirmation is a duplicate, not an insert"
+    );
+    let rows = s.membership_rows(GUILD, MEMBER);
+    assert_eq!(
+        observed(&rows[0].metadata).as_deref(),
+        Some(HINT_B),
+        "stale writer left the converged maximum intact"
+    );
     f.finish();
 }

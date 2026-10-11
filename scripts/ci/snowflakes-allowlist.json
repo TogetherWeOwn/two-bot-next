@@ -258,12 +258,6 @@
   "reason": "Raid-runtime acceptance tests (PR #377) use reserved-example Discord snowflakes as synthetic staff-channel IDs against the mock Discord double; not real entities, test-only, never sent to Discord."
  },
  {
-  "path": "crates/bot/src/raid_runtime_tests.rs",
-  "value": "123456789012345678",
-  "source": "Some(\"123456789012345678\"),",
-  "reason": "Raid-runtime acceptance tests (PR #377) use reserved-example Discord snowflakes as synthetic staff-channel IDs against the mock Discord double; not real entities, test-only, never sent to Discord."
- },
- {
   "path": "crates/bot/src/join_risk_runtime_tests.rs",
   "value": "123456789012345678",
   "source": "(\"DISCORD_STAFF_ALERT_CHANNEL_ID\", \"123456789012345678\"),",
@@ -286,5 +280,29 @@
   "value": "123456789012345678",
   "source": "assert_eq!(set.staff_channel.as_deref(), Some(\"123456789012345678\"));",
   "reason": "Containment runtime acceptance tests use reserved-example Discord snowflakes as synthetic staff-channel IDs against the mock Discord double; not real entities, test-only, never sent to Discord."
- }
+ },
+  {
+    "path": "crates/bot/src/raid_runtime_tests.rs",
+    "value": "999999999999999999",
+    "source": "Some(\"999999999999999999\"),",
+    "reason": "Raid-runtime live-channel tests use reserved-example Discord snowflakes as synthetic staff-channel IDs against the mock Discord double; not real entities, test-only, never sent to Discord."
+  },
+  {
+    "path": "crates/bot/src/raid_runtime_tests.rs",
+    "value": "123456789012345678",
+    "source": "assert_eq!(back.staff_channel.as_deref(), Some(\"123456789012345678\"));",
+    "reason": "Raid-runtime live-channel tests use reserved-example Discord snowflakes as synthetic staff-channel IDs against the mock Discord double; not real entities, test-only, never sent to Discord."
+  },
+  {
+    "path": "crates/bot/src/settings_jobs_tests.rs",
+    "value": "123456789012345678",
+    "source": ".map(|key| row(\"g1\", key, json!(\"123456789012345678\")))",
+    "reason": "Settings live-reload tests publish reserved-example Discord snowflakes as synthetic destination values through the in-process live channel; not real entities, test-only, never sent to Discord."
+  },
+  {
+    "path": "crates/bot/src/settings_jobs_tests.rs",
+    "value": "123456789012345678",
+    "source": ".is_some_and(|value| value == json!(\"123456789012345678\")),",
+    "reason": "Settings live-reload tests publish reserved-example Discord snowflakes as synthetic destination values through the in-process live channel; not real entities, test-only, never sent to Discord."
+  }
 ]

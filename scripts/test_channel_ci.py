@@ -54,11 +54,13 @@ class ChannelCiTests(unittest.TestCase):
             self.assertIn("--include-ignored", guarded)
             self.assertNotIn("--skip", guarded)
 
-    def selected_jobs(self, event, result="", exit_code="0", base="base", head="head"):
+    def selected_jobs(self, event, result="", exit_code="0", base="base", head="head", diff="", diff_fails=False):
         selector = step(self.workflow, "Select affected jobs or run the full nightly suite")
         script = textwrap.dedent(re.split(r"\n  (?=\S)", selector.split("        run: |\n", 1)[1], maxsplit=1)[0])
-        mock = 'python3() { printf "%s\\n" "$SELECTOR_RESULT"; return "$SELECTOR_EXIT"; }\n'
-        env = dict(os.environ, EVENT_NAME=event, BASE_SHA=base, HEAD_SHA=head,
+        mock = ('python3() { printf "%s\\n" "$SELECTOR_RESULT"; return "$SELECTOR_EXIT"; }\n'
+                'git() { [ -z "$GIT_FAILS" ] || return 128; printf "%s\\0" $CHANGED_FILES; }\n')
+        env = dict(os.environ, EVENT_NAME=event, BASE_SHA=base, HEAD_SHA=head, CHANGED_FILES=diff,
+                   GIT_FAILS="1" if diff_fails else "",
                    SELECTOR_RESULT=result, SELECTOR_EXIT=exit_code, GITHUB_OUTPUT="/dev/stdout")
         run = subprocess.run(["bash", "-c", mock + script], env=env,
                              check=True, capture_output=True, text=True)
@@ -100,18 +102,39 @@ class ChannelCiTests(unittest.TestCase):
         old = "needs.changes.outputs.rust != 'false'"
         self.assertFalse(self.runs(old, "", selector_failed=True))
 
-    def test_nightly_pr_selection_respects_the_shared_classifier(self):
-        self.assertEqual(self.selected_jobs("pull_request", "rust=false\nsupply=false"),
-                         {"rust": "false", "supply": "false"})
-        self.assertEqual(self.selected_jobs("pull_request", "rust=true\nsupply=true"),
-                         {"rust": "true", "supply": "true"})
+    def test_nightly_skips_pull_requests_unless_the_nightly_wiring_changes(self):
+        # The nightly suite runs on its schedule; the required `check` matrix covers
+        # affected suites per PR. A Rust or dependency change alone no longer runs it.
+        skip = {"rust": "false", "supply": "false"}
+        full = {"rust": "true", "supply": "true"}
+        self.assertEqual(self.selected_jobs("pull_request", "rust=true\nsupply=true",
+                                            diff="crates/bot/src/lib.rs crates/core/src/x.rs"), skip)
+        # Rust source alone skips; nightly wiring and CI-standard Rule 4 full-run inputs run it.
+        self.assertEqual(self.selected_jobs("pull_request", diff="crates/core/src/lib.rs"), skip)
+        for wiring in [".github/workflows/nightly.yml", ".github/workflows/pipeline-benchmark.yml",
+                       ".github/workflows/check.yml", "scripts/job-inputs.py", "scripts/test_nightly_routing.py",
+                       "Cargo.lock", "Cargo.toml", "crates/bot/Cargo.toml", "rust-toolchain.toml",
+                       ".cargo/config.toml", "deny.toml"]:
+            self.assertEqual(self.selected_jobs("pull_request", diff=f"README.md {wiring}"), full, wiring)
+        # A path that merely contains a wiring name does not count.
+        self.assertEqual(self.selected_jobs("pull_request", diff="docs/.github/workflows/nightly.yml.md"), skip)
+        # A failing diff never reports an empty successful change set: it runs the full suite.
+        self.assertEqual(self.selected_jobs("pull_request", diff_fails=True), full)
+
+    def test_pr_check_keeps_nightly_coupled_guards(self):
+        # The nightly sweep no longer runs per PR, so its PR-time guards live in check.yml:
+        # the guarded-fixture routing check and rustdoc -D warnings.
+        check = (ROOT / ".github/workflows/check.yml").read_text()
+        self.assertIn("-p 'test_nightly_routing.py'", check)
+        doc = step(check, "cargo doc -D warnings")
+        self.assertIn("needs.job-inputs.outputs.rust != 'false'", doc)
+        self.assertIn("RUSTDOCFLAGS: -D warnings", doc)
+        self.assertIn("cargo doc --workspace --all-features --no-deps --locked", doc)
 
     def test_nightly_selection_defaults_to_full_coverage(self):
         full = {"rust": "true", "supply": "true"}
         for event in ["schedule", "workflow_dispatch", "push"]:
             self.assertEqual(self.selected_jobs(event, "rust=false\nsupply=false"), full)
-        self.assertEqual(self.selected_jobs("pull_request", exit_code="1"), full)
-        self.assertEqual(self.selected_jobs("pull_request"), full)
         self.assertEqual(self.selected_jobs("pull_request", base=""), full)
         self.assertEqual(self.selected_jobs("pull_request", head=""), full)
 

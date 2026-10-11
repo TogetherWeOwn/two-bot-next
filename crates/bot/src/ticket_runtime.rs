@@ -2,6 +2,7 @@
 //! No transcript body is logged, audited, or returned in an interaction reply.
 
 use std::{
+    collections::HashMap,
     future::Future,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -18,7 +19,7 @@ use tokio::{
     time::{Instant, MissedTickBehavior},
 };
 use twilight_model::{application::interaction::Interaction, guild::Permissions};
-use two_bot_core::{funnel::now_millis_for_test, tickets::*};
+use two_bot_core::{funnel::now_millis_for_test, settings::LiveSettings, tickets::*};
 use two_bot_cutover::tickets::{OpenResult, StoreError, TicketStore};
 use two_bot_discord::{
     executor::{ChannelPresence, TicketChannelRequest, TicketMessage},
@@ -166,7 +167,34 @@ async fn maintenance_loop(
     }
 }
 
-#[derive(Clone)]
+/// Destination keys served from the live settings snapshot. The cooldown stays
+/// cold (boot-time): only destinations move without a restart.
+pub(crate) const LIVE_KEYS: [&str; 3] = [
+    "DISCORD_TICKET_CATEGORY_ID",
+    "DISCORD_TICKET_PANEL_CHANNEL_ID",
+    "DISCORD_TICKET_STAFF_ROLE_ID",
+];
+
+/// Layer the live snapshot over the boot deployment (store-first, like the
+/// raid/join-risk/containment runtimes): stored rows win, deleted rows fall
+/// back to the boot value. Only the three destinations are read.
+pub(crate) fn layered_vars(
+    deployment: &HashMap<String, String>,
+    guild_id: &str,
+    live: Option<&LiveSettings>,
+) -> HashMap<String, String> {
+    let mut vars = deployment.clone();
+    if let Some(live) = live {
+        vars.extend(
+            live.env_snapshot(Some(guild_id))
+                .into_iter()
+                .filter(|(key, _)| LIVE_KEYS.contains(&key.as_str())),
+        );
+    }
+    vars
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TicketConfig {
     pub guild_id: String,
     pub category_id: String,
@@ -177,14 +205,7 @@ pub(crate) struct TicketConfig {
 
 impl TicketConfig {
     pub fn from_env(guild_id: u64) -> Option<Self> {
-        let setting = |key| std::env::var(key).ok().filter(|v| valid_id(v).is_ok());
-        let category_id = setting("DISCORD_TICKET_CATEGORY_ID")?;
-        let panel_channel_id = setting("DISCORD_TICKET_PANEL_CHANNEL_ID")?;
-        let staff_role_id = setting("DISCORD_TICKET_STAFF_ROLE_ID")?;
-        if staff_role_id == guild_id.to_string() || category_id == panel_channel_id {
-            tracing::warn!("invalid ticket configuration; tickets disabled");
-            return None;
-        }
+        let vars: HashMap<String, String> = std::env::vars().collect();
         let cooldown_seconds = match std::env::var("TWO_TICKET_COOLDOWN_SECONDS") {
             Ok(value) => match value.parse() {
                 Ok(value) => value,
@@ -196,6 +217,29 @@ impl TicketConfig {
             Err(std::env::VarError::NotPresent) => COOLDOWN_SECONDS,
             Err(_) => return None,
         };
+        let config = Self::from_vars(&vars, guild_id, cooldown_seconds);
+        if config.is_none() && LIVE_KEYS.iter().all(|key| vars.contains_key(*key)) {
+            tracing::warn!("invalid ticket configuration; tickets disabled");
+        }
+        config
+    }
+
+    /// Pure constructor over layered vars: destinations resolve, the staff
+    /// role must not be the guild id, and category and panel must differ. A
+    /// malformed stored row returns `None` so the caller keeps the last good
+    /// config rather than disabling tickets. Silent by design: callers log.
+    pub(crate) fn from_vars(
+        vars: &HashMap<String, String>,
+        guild_id: u64,
+        cooldown_seconds: u64,
+    ) -> Option<Self> {
+        let setting = |key: &str| vars.get(key).cloned().filter(|v| valid_id(v).is_ok());
+        let category_id = setting("DISCORD_TICKET_CATEGORY_ID")?;
+        let panel_channel_id = setting("DISCORD_TICKET_PANEL_CHANNEL_ID")?;
+        let staff_role_id = setting("DISCORD_TICKET_STAFF_ROLE_ID")?;
+        if staff_role_id == guild_id.to_string() || category_id == panel_channel_id {
+            return None;
+        }
         Some(Self {
             guild_id: guild_id.to_string(),
             category_id,
@@ -209,7 +253,15 @@ impl TicketConfig {
 pub(crate) struct TicketRuntime {
     store: TicketStore,
     executor: ActionExecutor,
-    config: TicketConfig,
+    /// Current destinations (boot, then live). The cooldown inside stays the
+    /// boot value; only the three destination keys move on refresh.
+    config: TaskMutex<TicketConfig>,
+    /// Boot deployment values for the three destinations; the live snapshot
+    /// layers over these on every refresh.
+    deployment: HashMap<String, String>,
+    /// Published snapshot revision the destinations were last resolved from;
+    /// `None` before any live reader exists.
+    live_revision: TaskMutex<Option<i64>>,
     bot_id: AtomicU64,
     // Ready, buttons and recovery share this lane. Purge has its own lane so
     // slow Discord I/O cannot postpone the privacy ceiling.
@@ -264,11 +316,14 @@ impl TicketRuntime {
         pool: PgPool,
         executor: ActionExecutor,
         config: TicketConfig,
+        deployment: HashMap<String, String>,
     ) -> std::result::Result<Self, StoreError> {
         Ok(Self {
             store: TicketStore::new(pool, config.guild_id.clone())?,
             executor,
-            config,
+            config: TaskMutex::new(config),
+            deployment,
+            live_revision: TaskMutex::new(None),
             bot_id: AtomicU64::new(0),
             lane: Mutex::new(()),
             purge_lane: Mutex::new(()),
@@ -351,6 +406,47 @@ impl TicketRuntime {
         self.bot_id.store(id, Ordering::Release);
     }
 
+    /// Re-resolve destinations when the published snapshot moved. A malformed
+    /// stored row keeps the last good config rather than disabling tickets.
+    /// Pure apart from the process-wide live reader; production passes the
+    /// poller's snapshot, tests pass an explicit pair.
+    pub(crate) fn refresh_config_with(&self, live: Option<&LiveSettings>) {
+        let revision = live.map(LiveSettings::revision);
+        if *self.live_revision.lock().expect("ticket live revision") == revision {
+            return;
+        }
+        *self.live_revision.lock().expect("ticket live revision") = revision;
+        let current = self.config.lock().expect("ticket config").clone();
+        let Ok(guild_id) = current.guild_id.parse::<u64>() else {
+            return;
+        };
+        let vars = layered_vars(&self.deployment, &current.guild_id, live);
+        match TicketConfig::from_vars(&vars, guild_id, current.cooldown_seconds) {
+            Some(next) if next != current => {
+                tracing::info!("setting_changed: ticket destinations");
+                *self.config.lock().expect("ticket config") = next;
+            }
+            Some(_) => {}
+            None => {
+                tracing::warn!("ticket destinations unusable; keeping the last good");
+            }
+        }
+    }
+
+    /// Destinations for this operation: refresh from the live snapshot, then
+    /// clone the current config. Revision-gated, so steady-state calls cost
+    /// two mutex reads.
+    fn live_config(&self) -> TicketConfig {
+        self.refresh_config_with(crate::settings_jobs::live().as_ref());
+        self.config.lock().expect("ticket config").clone()
+    }
+
+    /// Destinations for tests without a poller.
+    #[cfg(test)]
+    pub(crate) fn config_for_test(&self) -> TicketConfig {
+        self.config.lock().expect("ticket config").clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn readiness_for_test(&self) -> (u64, u64) {
         (self.bot_id.load(Ordering::Acquire), *self.ready.borrow())
@@ -369,6 +465,7 @@ impl TicketRuntime {
         interaction: &Interaction,
         action: TicketAction,
     ) -> std::result::Result<(), TicketError> {
+        let config = self.live_config();
         let guild = interaction.guild_id.map(|id| id.get().to_string());
         let roles: Vec<String> = interaction
             .member
@@ -388,11 +485,11 @@ impl TicketRuntime {
             .map_or(0, |permissions| permissions.bits());
         authorize(
             guild.as_deref(),
-            &self.config.guild_id,
+            &config.guild_id,
             action,
             &roles,
             permissions,
-            &self.config.staff_role_id,
+            &config.staff_role_id,
         )
     }
 
@@ -448,26 +545,20 @@ impl TicketRuntime {
     }
 
     async fn open(&self, opener: &str, username: &str) -> Result<String> {
+        let config = self.live_config();
         let bot_id = self.bot_id()?;
         let category = self
             .executor
-            .fetch_ticket_channel(&self.config.category_id)
+            .fetch_ticket_channel(&config.category_id)
             .await?;
         match category {
-            ChannelPresence::Present(doc) => {
-                self.validate_channel(&doc, &self.config.category_id, 4)?
-            }
+            ChannelPresence::Present(doc) => self.validate_channel(&doc, &config.category_id, 4)?,
             ChannelPresence::Absent => return Err(Failure::InvalidEvidence),
         }
         let id = hex::encode(rand::random::<[u8; 16]>());
         let ticket = match self
             .store
-            .reserve(
-                &id,
-                opener,
-                now_millis_for_test(),
-                self.config.cooldown_seconds,
-            )
+            .reserve(&id, opener, now_millis_for_test(), config.cooldown_seconds)
             .await?
         {
             OpenResult::Created(ticket) => ticket,
@@ -484,9 +575,9 @@ impl TicketRuntime {
         let channel = match self
             .executor
             .create_ticket_channel(&TicketChannelRequest {
-                guild_id: &self.config.guild_id,
-                category_id: &self.config.category_id,
-                staff_role_id: &self.config.staff_role_id,
+                guild_id: &config.guild_id,
+                category_id: &config.category_id,
+                staff_role_id: &config.staff_role_id,
                 bot_id: &bot_id,
                 opener_id: opener,
                 username,
@@ -556,7 +647,8 @@ impl TicketRuntime {
     }
 
     fn validate_channel(&self, doc: &Value, id: &str, kind: u64) -> Result<()> {
-        if doc["guild_id"].as_str() != Some(&self.config.guild_id)
+        let config = self.live_config();
+        if doc["guild_id"].as_str() != Some(&config.guild_id)
             || doc["id"].as_str() != Some(id)
             || doc["type"].as_u64() != Some(kind)
         {
@@ -679,6 +771,7 @@ impl TicketRuntime {
     }
 
     async fn recover_ticket(&self, ticket: &Ticket) -> Result<()> {
+        let config = self.live_config();
         let saved = self.store.transcript_exists(&ticket.id).await?;
         match recovery_action(ticket, now_millis_for_test(), saved) {
             RecoveryAction::None => {}
@@ -688,7 +781,7 @@ impl TicketRuntime {
             RecoveryAction::FindCreatingChannel { topic } => {
                 let channels = self
                     .executor
-                    .fetch_ticket_guild_channels(&self.config.guild_id)
+                    .fetch_ticket_guild_channels(&config.guild_id)
                     .await?;
                 let mut matches = Vec::new();
                 for doc in channels {
@@ -700,7 +793,7 @@ impl TicketRuntime {
                     }
                     if doc
                         .get("guild_id")
-                        .is_some_and(|guild| guild.as_str() != Some(&self.config.guild_id))
+                        .is_some_and(|guild| guild.as_str() != Some(&config.guild_id))
                     {
                         return Err(Failure::InvalidEvidence);
                     }
@@ -771,6 +864,7 @@ impl TicketRuntime {
     }
 
     async fn ensure_controls(&self, ticket: &Ticket, channel: &str) -> Result<()> {
+        let config = self.live_config();
         let doc = match self.executor.fetch_ticket_channel(channel).await? {
             ChannelPresence::Present(doc) => {
                 self.validate_channel(&doc, channel, 0)?;
@@ -785,7 +879,7 @@ impl TicketRuntime {
         };
         if !self
             .executor
-            .ticket_history_readable(&self.config.guild_id, &self.bot_id()?, &doc)
+            .ticket_history_readable(&config.guild_id, &self.bot_id()?, &doc)
             .await?
         {
             return Err(Failure::InvalidEvidence);
@@ -814,21 +908,22 @@ impl TicketRuntime {
     }
 
     async fn ensure_panel(&self) -> Result<()> {
-        let doc = self.channel_document(&self.config.panel_channel_id).await?;
+        let config = self.live_config();
+        let doc = self.channel_document(&config.panel_channel_id).await?;
         if !self
             .executor
-            .ticket_history_readable(&self.config.guild_id, &self.bot_id()?, &doc)
+            .ticket_history_readable(&config.guild_id, &self.bot_id()?, &doc)
             .await?
         {
             return Err(Failure::InvalidEvidence);
         }
         let messages = self
             .executor
-            .fetch_channel_messages(&self.config.panel_channel_id, None, 50)
+            .fetch_channel_messages(&config.panel_channel_id, None, 50)
             .await?;
         if panel_needed(&self.bot_id()?, &panels(messages)?) {
             self.executor
-                .post_ticket_message(&self.config.panel_channel_id, TicketMessage::Panel)
+                .post_ticket_message(&config.panel_channel_id, TicketMessage::Panel)
                 .await?;
         }
         Ok(())
@@ -838,6 +933,7 @@ impl TicketRuntime {
         let Ok(_guard) = self.purge_lane.try_lock() else {
             return Ok(());
         };
+        self.refresh_config_with(crate::settings_jobs::live().as_ref());
         self.store
             .purge_expired(now_millis_for_test())
             .await

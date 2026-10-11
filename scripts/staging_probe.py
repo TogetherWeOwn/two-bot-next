@@ -21,6 +21,13 @@ change, never a flag.
         --report staging-probe.json
 
 Exit status: 0 PASS, 1 FAIL, 2 refused (fence or invalid arguments).
+
+Body-cap refusal contract: the transport reads at most MAX_BODY_BYTES+1
+bytes so a hidden suffix is detected. Any body longer than MAX_BODY_BYTES
+(64 KiB) is refused before decoding/parsing with the fixed message
+"<METHOD> <path>: answered over the body cap"; exact-cap valid input passes,
+and the extra byte never reaches a successful JSON path. Refusals never echo
+the body, headers, URL or parse exceptions.
 """
 
 from __future__ import annotations
@@ -55,6 +62,10 @@ INVITE_CODE = re.compile(r"[A-Za-z0-9-]{1,64}")
 INVITE_URL = re.compile(r"https://discord\.gg/([A-Za-z0-9-]{1,64})")
 COMPONENT_STATES = frozenset({"ready", "starting", "down"})
 REQUIRED_COMPONENTS = ("process", "gateway")
+# Per-surface allowlist: required process/gateway plus legitimate optional
+# database/token_invalid from the container's full breakdown. Anything else
+# is refused with fixed vocabulary naming no component data.
+ALLOWED_COMPONENTS = frozenset({"process", "gateway", "database", "token_invalid"})
 
 # Aliases and subpaths of the reserved internal slugs (redirect.ts
 # RESERVED_SLUGS). Each must 404 with no Location: never a campaign lookup,
@@ -121,6 +132,10 @@ class Reply:
     body: str
 
 
+class BodyTooLarge(ValueError):
+    """A response body exceeds MAX_BODY_BYTES (fixed vocabulary only)."""
+
+
 Fetch = Callable[[str, str], Reply]
 
 
@@ -140,7 +155,9 @@ def make_fetch(origin: str, timeout: float = 20.0) -> Fetch:
         try:
             conn.request(method, path, headers={"user-agent": USER_AGENT, "accept": "*/*"})
             response = conn.getresponse()
-            raw = response.read(MAX_BODY_BYTES)
+            raw = response.read(MAX_BODY_BYTES + 1)
+            if len(raw) > MAX_BODY_BYTES:
+                raise BodyTooLarge("response body over the size cap")
             headers = {name.lower(): value for name, value in response.getheaders()}
             return Reply(response.status, headers, raw.decode("utf-8", "replace"))
         finally:
@@ -163,10 +180,23 @@ class Probe:
     def request(self, method: str, path: str) -> Reply | None:
         try:
             reply = self._fetch(method, path)
+        except BodyTooLarge:
+            # Fixed refusal: no body, headers, URL or exception text echoed.
+            self.requests.append({"method": method, "path": path, "status": None,
+                                  "error": "BodyTooLarge"})
+            self.fail(f"{method} {path}: answered over the body cap")
+            return None
         except (OSError, http.client.HTTPException) as exc:
             # Type only: exception text can echo hosts, headers or bodies.
             self.requests.append({"method": method, "path": path, "status": None, "error": type(exc).__name__})
             self.fail(f"{method} {path}: no response ({type(exc).__name__})")
+            return None
+        if len(reply.body.encode("utf-8")) > MAX_BODY_BYTES:
+            # Injected-transport oversize (test doubles bypass make_fetch):
+            # refuse before parsing, without echoing body/headers or recording
+            # a Location value, and without adding to the error-text scan.
+            self.requests.append({"method": method, "path": path, "status": reply.status})
+            self.fail(f"{method} {path}: answered over the body cap")
             return None
         entry: dict[str, object] = {"method": method, "path": path, "status": reply.status}
         if "location" in reply.headers:
@@ -201,7 +231,9 @@ class Probe:
 def parse_json(reply: Reply) -> object:
     try:
         return json.loads(reply.body)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # Deeply nested in-cap JSON exhausts the decoder recursion limit;
+        # refuse it as malformed, same as any other unparseable body.
         return None
 
 
@@ -226,12 +258,22 @@ def probe_readyz(p: Probe, require_ready: bool) -> None:
         isinstance(components, list)
         and len(components) > 0
         and all(
-            isinstance(c, list) and len(c) == 2 and isinstance(c[0], str) and c[1] in COMPONENT_STATES
+            isinstance(c, list) and len(c) == 2 and isinstance(c[0], str)
+            and isinstance(c[1], str) and c[1] in COMPONENT_STATES
             for c in components
         )
     )
     if not well_formed:
         p.fail("GET /readyz: body is not a JSON component breakdown")
+        return
+    # Reject duplicates before any readiness math: last-wins would let a
+    # later ready mask an earlier down.
+    names = [name for name, _ in components]
+    if len(set(names)) != len(names):
+        p.fail("GET /readyz: repeats a component name")
+        return
+    if any(name not in ALLOWED_COMPONENTS for name in names):
+        p.fail("GET /readyz: carries an unknown component name")
         return
     states = {name: state for name, state in components}
     ready = all(state == "ready" for state in states.values())

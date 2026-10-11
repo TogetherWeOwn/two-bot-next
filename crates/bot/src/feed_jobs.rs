@@ -161,6 +161,9 @@ impl Drop for ScheduleRun {
     }
 }
 
+/// Fixed-cadence constructor, kept for unit tests; production registers the
+/// live-aware [`scheduled_job_live`] through [`register_fenced`].
+#[cfg(test)]
 pub(crate) fn scheduled_job(seconds: u64, action: JobAction) -> Result<Job, ErrorClass> {
     let schedule = Arc::new(Mutex::new(
         FeedPollSchedule::new(seconds).map_err(|_| ErrorClass::Configuration)?,
@@ -188,8 +191,86 @@ pub(crate) fn scheduled_job(seconds: u64, action: JobAction) -> Result<Job, Erro
     })
 }
 
+/// The feed interval key served from the live settings snapshot (TOG-19027).
+pub(crate) const INTERVAL_KEY: &str = "TWO_FEED_POLL_SECONDS";
+
+/// Effective poll interval: the live snapshot wins over the boot value, an
+/// absent/unparsable/out-of-range live value falls back (store-first, like the
+/// raid/join-risk/containment runtimes). Pure for tests via `live`.
+pub(crate) fn live_poll_seconds_with(
+    guild: &str,
+    fallback: u64,
+    live: Option<&two_bot_core::settings::LiveSettings>,
+) -> u64 {
+    let Some(live) = live else {
+        return fallback;
+    };
+    let Some(value) = live.get(guild, INTERVAL_KEY) else {
+        return fallback;
+    };
+    let raw = match &value {
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => s.clone(),
+        _ => return fallback,
+    };
+    raw.parse::<u64>()
+        .ok()
+        .filter(|n| (60..=86400).contains(n))
+        .unwrap_or(fallback)
+}
+
+/// Production reader: the poller-published snapshot, if any.
+pub(crate) fn live_poll_seconds(guild: &str, fallback: u64) -> u64 {
+    live_poll_seconds_with(guild, fallback, crate::settings_jobs::live().as_ref())
+}
+
+/// Live-aware job: the supervisor still wakes on the boot value, while the
+/// non-overlapping schedule gate re-reads the live interval before every
+/// tick. A stored change takes effect no earlier than the previously
+/// scheduled slot, and the effective interval is the stored value rounded up
+/// to a multiple of the boot cadence; only a restart re-baselines the
+/// supervisor cadence (dynamic-cadence follow-up).
+pub(crate) fn scheduled_job_live(
+    seconds: u64,
+    action: JobAction,
+    guild: String,
+) -> Result<Job, ErrorClass> {
+    let schedule = Arc::new(Mutex::new(
+        FeedPollSchedule::new(live_poll_seconds(&guild, seconds))
+            .map_err(|_| ErrorClass::Configuration)?,
+    ));
+    let origin = tokio::time::Instant::now();
+    Ok(Job {
+        name: NAME,
+        cadence: Duration::from_secs(seconds),
+        startup_jitter: Duration::ZERO,
+        timeout: JOB_TIMEOUT,
+        action: Arc::new(move || {
+            let action = action.clone();
+            let schedule = schedule.clone();
+            let guild = guild.clone();
+            let now = origin.elapsed().as_millis().min(i64::MAX as u128) as i64;
+            Box::pin(async move {
+                {
+                    let mut schedule = schedule.lock().expect("feed schedule");
+                    let live_seconds = live_poll_seconds(&guild, seconds);
+                    schedule.set_interval_seconds(live_seconds);
+                    if !schedule.begin(now) {
+                        return Ok(());
+                    }
+                }
+                let _run = ScheduleRun(schedule);
+                action().await
+            })
+        }),
+    })
+}
+
 /// The feed poller, or `None` while `TWO_ANNOUNCEMENTS` is off or the boot
 /// identity does not permit announcements (the live-identity fence, TOG-15758).
+/// The poll interval reads the live settings snapshot (TOG-19027): the boot
+/// value sets the supervisor cadence, the per-tick schedule gate re-reads the
+/// stored value so a changed interval applies without a restart.
 pub(crate) fn register(context: Arc<Context>, activation: &BootActivation) -> Option<Job> {
     let gates = match FeatureGates::from_env() {
         Ok(gates) => gates,
@@ -202,24 +283,22 @@ pub(crate) fn register(context: Arc<Context>, activation: &BootActivation) -> Op
         }
     };
     let poller = Arc::new(FeedPoller::default());
-    register_fenced(
-        gates,
-        activation,
-        Arc::new(move || {
-            let context = context.clone();
-            let poller = poller.clone();
-            Box::pin(async move {
-                poller
-                    .run_once(
-                        context.pool().await?,
-                        &context.rest,
-                        &context.guild,
-                        &PublicFeedFetch,
-                    )
-                    .await
-            })
-        }),
-    )
+    let guild = context.guild.clone();
+    let action: JobAction = Arc::new(move || {
+        let context = context.clone();
+        let poller = poller.clone();
+        Box::pin(async move {
+            poller
+                .run_once(
+                    context.pool().await?,
+                    &context.rest,
+                    &context.guild,
+                    &PublicFeedFetch,
+                )
+                .await
+        })
+    });
+    register_fenced(gates, activation, action, guild)
 }
 
 /// Identity can only narrow the env gate: the poller posts under the token's
@@ -228,6 +307,7 @@ pub(crate) fn register_fenced(
     gates: FeatureGates,
     activation: &BootActivation,
     action: JobAction,
+    guild: String,
 ) -> Option<Job> {
     let fenced = activation.constrain_features(gates);
     if gates.announcements && !fenced.announcements {
@@ -237,14 +317,14 @@ pub(crate) fn register_fenced(
             "feed poller parked: live activation refused"
         );
     }
-    register_gated(fenced, action)
+    register_gated(fenced, action, guild)
 }
 
-fn register_gated(gates: FeatureGates, action: JobAction) -> Option<Job> {
+fn register_gated(gates: FeatureGates, action: JobAction, guild: String) -> Option<Job> {
     if !gates.announcements {
         return None;
     }
-    scheduled_job(gates.feed_poll_seconds, action).ok()
+    scheduled_job_live(gates.feed_poll_seconds, action, guild).ok()
 }
 
 #[derive(Default)]

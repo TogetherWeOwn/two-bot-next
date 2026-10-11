@@ -154,10 +154,12 @@ after the restart.
 
 ## 6. DB-error counter
 
-Source: `two_bot_db_errors_total{op}` (storage-layer failures, not pool
-pressure). The `op` label is `admission` (send-admission SQL:
-admit/extend/complete) or `other` (every other store until its operation
-joins the allowlist; stays zero until then). Fixed cardinality: two series.
+Source: `two_bot_db_errors_total{op}` (recorded storage-layer failures, not
+pool pressure or a database-wide total). Current producers are send-admission
+SQL (admit/extend/complete, `op="admission"`) and failed voice actor store
+loads (`op="other"`). Other stores need explicit instrumentation; an unknown
+instrumented operation falls back to `other`.
+Fixed cardinality: two series.
 Unknown operations collapse to `other`; no error text, query, or identifier
 is retained. Series contract: [metrics](metrics.md).
 
@@ -178,7 +180,8 @@ the window was quiet.
 Alert-threshold sketch (not a threshold): the paging rule fires at 3 or more
 storage failures between two keepalive samples, and a restart reset skips
 the window rather than firing. A slow trickle below that burst stays silent
-here and surfaces instead through `two_bot_job_consecutive_failures`. When
+here; `two_bot_job_consecutive_failures` covers failed jobs, not every
+storage path. When
 this sketch disagrees with the runbook or the budgets in
 [production-deploy](production-deploy.md#signal-thresholds-budgets-and-rollback-triggers),
 those win. Runbook: [runbook](runbook.md) (DB errors section).
@@ -252,6 +255,81 @@ same window: count `gateway reconnect failed; Twilight will retry` and
 with no disconnect means the gap predates this instrumentation or the
 process restarted mid-window (counters reset to zero on restart, so a
 reset is not a quiet window — re-baseline both scrapes after it).
+
+Alert rule: the Worker `gateway_missed_events` rule implements the zero
+threshold above — it fires on any increase of
+`two_bot_gateway_missed_events_total` between two keepalive samples (the
+first sample and counter resets skip the window rather than firing).
+Runbook: [runbook](runbook.md#alert-gateway-missed-events).
+
+Alert rule: the Worker `gateway_unpaired_disconnect` rule implements the
+disconnect-pairing query above — it pages when disconnects have no RESUMED
+or fresh READY for 3 consecutive keepalive samples, and any recovery growth
+clears it at once (the first sample and counter resets re-baseline rather
+than firing).
+Runbook: [runbook](runbook.md#alert-gateway-unpaired-disconnect).
+
+## 9. Ticker staleness
+
+Source: `two_bot_job_last_success_timestamp_seconds{job}` for the 15 s
+tickers `scheduled_messages` and `settings`. A wedged ticker never fails:
+skipped busy deadlines count neither as success nor failure, so the
+timestamp stops advancing while the failure streak stays flat. Series
+contract: [metrics](metrics.md).
+
+```promql
+time() - max by (job) (two_bot_job_last_success_timestamp_seconds{job=~"scheduled_messages|settings"} > 0)
+```
+
+The `> 0` filter drops never-succeeded series before subtraction, so boot
+and parked tickers are absent from the result instead of reading as
+billions of seconds stale — matching the Worker `ticker_stale` rule,
+which requires a positive timestamp before comparing age.
+
+A zero timestamp means the ticker never succeeded since start (boot) or
+was never registered (parked: `DATABASE_URL` unset, or the automations
+gate off) — not a wedge. Alert rule: the Worker `ticker_stale` rule pages
+when either ticker has no success for more than 10 minutes (40 missed
+ticks; boot and parked stay silent). Runbook:
+[runbook](runbook.md#alert-ticker-stale).
+
+## 10. Website-action receiver refusals
+
+Source: `two_bot_internal_actions_total{family,outcome}` (signed
+website-action receiver executions by bounded family and outcome).
+`family` is one of `announcement`, `event`, `settings`, `moderation`,
+`membership` or `other`; `outcome` is `executed` or the refusal class
+(`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`,
+`rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`,
+`conflict`, `upstream` or `internal`). Every request counts once; replays
+count on each serve. Series contract: [metrics](metrics.md).
+
+```promql
+sum by (family) (increase(two_bot_internal_actions_total{outcome!="executed"}[48h]))
+sum by (family, outcome) (increase(two_bot_internal_actions_total{outcome!="executed"}[1h]))
+sum by (family) (increase(two_bot_internal_actions_total{outcome="executed"}[48h]))
+```
+
+Read the `family` label before acting: a rising `moderation` or
+`membership` refusal share points at website-action abuse or a caller
+misconfiguration, not at Discord or the database. A rising `executed`
+count next to refusals means the receiver is still serving legitimate
+traffic while refusing the surge. Correlate with the container logs for
+`internal action refused` warn lines (sampled summaries keyed by
+`kind`/`class`/`key`/`action`) and for `msg=internal_action_unknown_state_persist_failed`
+error lines before acting. Those lines mean a best-effort unknown-state write failed after the
+claim was committed; the claim is never released or resent. Read the `persist_class` before
+acting: `storage_unavailable` leaves the claim `in_flight`, so repeats answer `in_progress`
+until it goes stale. `transition_refused` means the row had already moved on (for example to a
+stored terminal response), so a repeat may replay that response instead. A counter that reset to
+zero between scrapes means the process restarted; it does not mean the
+window was quiet.
+
+Alert rule: the Worker `receiver_refusals:<family>` rule implements the
+streak above — it fires after refused outcomes rise in 3 consecutive
+keepalive samples per family (the first sample and counter resets clear
+the streak rather than firing), so one forged pre-auth probe in `other`
+stays silent. Runbook: [runbook](runbook.md#alert-receiver-refusals).
 
 ## What this pack does not do
 
