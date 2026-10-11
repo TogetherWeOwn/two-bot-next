@@ -14,6 +14,7 @@ import socket
 import threading
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import container_stdout_read as reader  # noqa: E402
@@ -248,6 +249,7 @@ class RedactionTests(unittest.TestCase):
         for message in ("Discord refused the bot token; REST disabled until restart",
                         "create failed: bot lacks View/Send permission",
                         "Bearer authentication failed", "Basic checks passed",
+                        "usage: two-bot guild-config-restore --snapshot FILE",
                         "gateway reconnect failed; Twilight will retry"):
             with self.subTest(message=message):
                 packet = self.packet_for(message)
@@ -259,6 +261,28 @@ class RedactionTests(unittest.TestCase):
             with self.subTest(header=header[:14]):
                 packet = self.packet_for("sent " + header)
                 self.assertNotRegex(json.dumps(packet), r"qqqq|Ab1Ab1|dXNlcjpwYXNz")
+                self.assertGreaterEqual(packet["redactions"], 1)
+
+    def test_keyed_auth_values_hide_the_credential_not_just_the_scheme(self):
+        b64 = "dXNlcjpwYXNzd29yZDEyMzQ1Ng=="
+        for fragment, secret in (("authorization: basic " + b64, b64),
+                                 ("Authorization: BEARER " + "x9" * 15, "x9x9"),
+                                 ("authorization: BOT " + "k7" * 15, "k7k7"),
+                                 ("Authorization: Bearer shorttok", "shorttok"),
+                                 ("sent bot " + "Ab1" * 10, "Ab1Ab1")):
+            with self.subTest(fragment=fragment[:24]):
+                packet = self.packet_for(fragment)
+                self.assertNotIn(secret, packet["events"][0]["message"])
+                self.assertGreaterEqual(packet["redactions"], 1)
+
+    def test_long_key_names_and_escaped_quote_json_are_redacted(self):
+        for fragment, secret in (("very_long_prefix_name_for_the_gateway_token=abc123", "abc123"),
+                                 ("a" * 40 + "_token=hunter2", "hunter2"),
+                                 ('{\\"token\\":\\"abc123\\"}', "abc123"),
+                                 ('{\\"password\\": \\"hunter2\\"}', "hunter2")):
+            with self.subTest(fragment=fragment[:30]):
+                packet = self.packet_for("event " + fragment)
+                self.assertNotIn(secret, packet["events"][0]["message"])
                 self.assertGreaterEqual(packet["redactions"], 1)
 
     def test_json_quoted_key_names_are_redacted(self):
@@ -278,6 +302,19 @@ class RedactionTests(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 5.0, unit)
             self.assertLessEqual(len(packet["events"][0]["message"]), reader.MAX_VALUE_CHARS + 3)
         self.assertEqual(self.packet_for("a" * 5000)["events"][0]["message"], "...")
+
+    def test_redaction_never_sees_more_than_the_bound(self):
+        seen = []
+        real = reader.redact
+
+        def spy(text):
+            seen.append(len(text))
+            return real(text)
+
+        with mock.patch.object(reader, "redact", spy):
+            self.packet_for("a-" * 20000)
+        self.assertEqual(len(seen), 2)  # the level, then the message
+        self.assertLessEqual(max(seen), reader.MAX_REDACT_CHARS)
 
     def test_a_secret_cut_by_the_redaction_bound_leaves_no_fragment(self):
         fragment = "A1" * 30

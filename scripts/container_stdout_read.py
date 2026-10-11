@@ -98,13 +98,13 @@ FIELD_KEYS = (
 _URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+")
 # An auth scheme only counts when a credential-length value follows, so prose such as
 # "Discord refused the bot token" or "bot lacks View/Send" stays readable.
-_BEARER = re.compile(r"\b(?:[Bb]earer|Bot|Basic)\s+[A-Za-z0-9._~+/=-]{20,}")
+_BEARER = re.compile(r"(?<![\w-])(?:bearer|bot|basic)\s+[A-Za-z0-9._~+/=-]{20,}", re.IGNORECASE)
 _JWT_LIKE = re.compile(r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{20,}\b")
 _KEYED = re.compile(
     r"""(?ix)
-    \b([\w.-]{0,32}?(?:token|secret|passw(?:or)?d|authorization|api[_-]?key|credential|dsn|cookie)[\w.-]{0,32})
-    (["']?\s*[=:]\s*)
-    ("[^"]*"|'[^']*'|\S+)
+    \b([\w.-]{0,64}?(?:token|secret|passw(?:or)?d|authorization|api[_-]?key|credential|dsn|cookie)[\w.-]{0,64})
+    (\\?["']?\s*[=:]\s*)
+    ((?:(?:bearer|basic|bot)\s+)?(?:\\?"[^"]*"|'[^']*'|\S+))
     """
 )
 _OPAQUE = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{32,}={0,2}(?![A-Za-z0-9+/_-])")
