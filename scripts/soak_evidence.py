@@ -28,6 +28,13 @@ Any unrecognised ``event`` value or malformed line is preserved as an UNKNOWN
 interval so the live run in TOG-10955 must explain it instead of inheriting a
 silent skip.
 
+Connect, resume and dispatch events require a nonempty string ``session``
+identity. Any other, missing or empty identity is preserved as a fixed
+UNKNOWN interval (``"<event> with invalid session"``) without touching
+counters, sequence state or reconnect gaps, and later valid records are
+still summarized. Disconnect and explicit unknown events keep their
+existing semantics.
+
 Usage:
 
     python3 scripts/soak_evidence.py scripts/fixtures/soak_evidence_sample.jsonl
@@ -78,6 +85,11 @@ def _too_deeply_nested(record, limit=MAX_RECORD_DEPTH):
                 if isinstance(value, (dict, list)):
                     stack.append((value, depth + 1))
     return False
+
+
+def _valid_session(value):
+    """True only for a nonempty string session identity."""
+    return isinstance(value, str) and value != ""
 
 
 def parse_ts(value):
@@ -157,6 +169,11 @@ def summarize(lines):
         # only decoder-level backstop is the json.loads handler above.
         event = record.get("event")
         session = record.get("session")
+
+        if event in ("connect", "resume", "dispatch"):
+            if not _valid_session(session):
+                note_unknown(ts, ts, f"{event} with invalid session")
+                continue
 
         if event == "connect":
             connects += 1
