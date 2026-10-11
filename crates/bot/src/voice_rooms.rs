@@ -780,16 +780,6 @@ pub trait RoomWrites: Send + Sync {
         member: Snowflake,
         guard: WriteGuard,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
-    /// Replace one tracked room's overwrites after an ownership handoff.
-    fn update_overwrites(
-        &self,
-        channel: Snowflake,
-        overwrites: &[PermissionOverwrite],
-        guard: WriteGuard,
-    ) -> impl Future<Output = Result<Channel, RoomHttpError>> + Send {
-        let _ = (channel, overwrites, guard);
-        async { Err(RoomHttpError::InvalidRequest) }
-    }
     fn delete(
         &self,
         channel: Snowflake,
@@ -988,16 +978,6 @@ impl RoomWrites for RoomHttp {
         guard: WriteGuard,
     ) -> Result<(), RoomHttpError> {
         self.deny_member_connect(channel, member, move || guard())
-            .await
-    }
-
-    async fn update_overwrites(
-        &self,
-        channel: Snowflake,
-        overwrites: &[PermissionOverwrite],
-        guard: WriteGuard,
-    ) -> Result<Channel, RoomHttpError> {
-        self.update_room_overwrites(channel, overwrites, move || guard())
             .await
     }
 
@@ -1924,24 +1904,64 @@ impl LiveGuild {
         live.empty_since.remove(&channel);
     }
 
-    /// REST completion must never roll back gateway evidence or resurrect a
-    /// deleted channel, even after an identical-looking reconnect snapshot.
-    fn publish_owner_overwrites(&self, channel: Channel, generation: u64, revision: u64) -> bool {
+    /// Guard one step of an owner-overwrite sequence. The exact overwrite
+    /// snapshot fences unrelated gateway changes while allowing a successful
+    /// step's own CHANNEL_UPDATE echo to advance the channel revision.
+    fn owner_overwrite_guard(
+        &self,
+        channel_id: Snowflake,
+        generation: u64,
+        expected: Vec<PermissionOverwrite>,
+    ) -> WriteGuard {
+        let live = self.clone();
+        Arc::new(move || {
+            let state = live.read_state();
+            state.ready
+                && state.generation == generation
+                && state.channels.get(&channel_id).is_some_and(|channel| {
+                    channel
+                        .permission_overwrites
+                        .as_deref()
+                        .is_some_and(|current| same_owner_overwrite_snapshot(current, &expected))
+                })
+                && state
+                    .permissions(live.guild_id, channel_id)
+                    .is_some_and(|p| {
+                        p.contains(Permissions::VIEW_CHANNEL | Permissions::MANAGE_ROLES)
+                    })
+        })
+    }
+
+    /// Advance the cached snapshot after a successful target write. Discord
+    /// may have echoed the write already; accept either the prior or resulting
+    /// overwrite set, but never overwrite a different gateway observation.
+    fn advance_owner_overwrites(
+        &self,
+        channel_id: Snowflake,
+        generation: u64,
+        before: &[PermissionOverwrite],
+        after: &[PermissionOverwrite],
+    ) -> bool {
         let mut live = self.write_state();
-        let id = channel.id.get();
-        if !live.ready
-            || live.generation != generation
-            || live.channel_revisions.get(&id) != Some(&revision)
-        {
+        if !live.ready || live.generation != generation {
             return false;
         }
-        let Some(current) = live.channels.get_mut(&id) else {
+        let Some(channel) = live.channels.get_mut(&channel_id) else {
             return false;
         };
-        current.permission_overwrites = channel.permission_overwrites;
+        let Some(current) = channel.permission_overwrites.as_deref() else {
+            return false;
+        };
+        if same_owner_overwrite_snapshot(current, after) {
+            return true;
+        }
+        if !same_owner_overwrite_snapshot(current, before) {
+            return false;
+        }
+        channel.permission_overwrites = Some(after.to_vec());
         live.next_channel_revision += 1;
         let revision = live.next_channel_revision;
-        live.channel_revisions.insert(id, revision);
+        live.channel_revisions.insert(channel_id, revision);
         true
     }
 
@@ -2044,10 +2064,97 @@ fn health_overwrites(guild_id: Snowflake, channel: &Channel) -> Vec<HealthOverwr
         .collect()
 }
 
+fn same_owner_overwrite_snapshot(
+    left: &[PermissionOverwrite],
+    right: &[PermissionOverwrite],
+) -> bool {
+    left.len() == right.len() && left.iter().all(|overwrite| right.contains(overwrite))
+}
+
+/// Return the per-target operations that transform one overwrite snapshot into
+/// another. Revokes precede grants, and role overwrites are never deleted
+/// through the member-only DELETE endpoint.
+fn owner_overwrite_delta(
+    before: &[PermissionOverwrite],
+    after: &[PermissionOverwrite],
+    owner_id: Snowflake,
+) -> (Vec<Snowflake>, Vec<PermissionOverwrite>) {
+    let deletes = before
+        .iter()
+        .filter(|old| {
+            old.kind == PermissionOverwriteType::Member
+                && !after
+                    .iter()
+                    .any(|new| new.kind == old.kind && new.id == old.id)
+        })
+        .map(|old| old.id.get())
+        .collect();
+    let mut puts: Vec<_> = after
+        .iter()
+        .filter(|new| {
+            before
+                .iter()
+                .find(|old| old.kind == new.kind && old.id == new.id)
+                != Some(*new)
+        })
+        .cloned()
+        .collect();
+    puts.sort_by_key(|overwrite| {
+        overwrite.kind == PermissionOverwriteType::Member && overwrite.id.get() == owner_id
+    });
+    (deletes, puts)
+}
+
+async fn write_owner_overwrite_delta<H: RoomWrites>(
+    http: &H,
+    live: &LiveGuild,
+    channel: Snowflake,
+    generation: u64,
+    before: &[PermissionOverwrite],
+    after: &[PermissionOverwrite],
+    owner_id: Snowflake,
+) -> Result<(), RoomHttpError> {
+    let (deletes, puts) = owner_overwrite_delta(before, after, owner_id);
+    let mut current = before.to_vec();
+    for member in deletes {
+        let mut next = current.clone();
+        next.retain(|overwrite| {
+            !(overwrite.kind == PermissionOverwriteType::Member && overwrite.id.get() == member)
+        });
+        let guard = live.owner_overwrite_guard(channel, generation, current.clone());
+        http.delete_overwrite(channel, member, guard).await?;
+        if !live.advance_owner_overwrites(channel, generation, &current, &next) {
+            return Err(RoomHttpError::Cancelled);
+        }
+        current = next;
+    }
+    for overwrite in puts {
+        let mut next = current.clone();
+        if let Some(existing) = next
+            .iter_mut()
+            .find(|existing| existing.kind == overwrite.kind && existing.id == overwrite.id)
+        {
+            *existing = overwrite;
+        } else {
+            next.push(overwrite);
+        }
+        let guard = live.owner_overwrite_guard(channel, generation, current.clone());
+        http.put_overwrite(channel, overwrite, guard).await?;
+        if !live.advance_owner_overwrites(channel, generation, &current, &next) {
+            return Err(RoomHttpError::Cancelled);
+        }
+        current = next;
+    }
+    if !same_owner_overwrite_snapshot(&current, after) {
+        return Err(RoomHttpError::Cancelled);
+    }
+    Ok(())
+}
+
 /// Revoke-only owner overwrites for the 403 fallback: strip previously issued
 /// owner bits without granting the new owner. Returns `None` when nothing
-/// would change, so the caller can return the original denial without a
-/// second PATCH.
+/// would change, so the caller can return the original denial without another
+/// overwrite write.
 fn revoke_only_owner_overwrites(
     current: &[PermissionOverwrite],
     issued_members: &[Snowflake],
@@ -2199,7 +2306,7 @@ pub struct GuildRoomWorker<S, H> {
     /// ownership action per room is queued; exhausted cohorts wait a minute.
     ownership_repairs: HashMap<Snowflake, u64>,
     ownership_queued: HashSet<Snowflake>,
-    /// Channels whose revoke-only fallback PATCH succeeded while the
+    /// Channels whose revoke-only fallback write succeeded while the
     /// new-owner grant is still owed. A revoked-but-ungranted room looks
     /// identical to a category-synced room in the cache (the current owner
     /// has no owner-mask grant in both), so the `!can_write` path consults
@@ -3180,7 +3287,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         issued_members: &[Snowflake],
         owner_id: Snowflake,
     ) -> Result<(), RoomHttpError> {
-        let (overwrites, changed, expected_overwrites, generation, revision) = {
+        let (overwrites, changed, expected_overwrites, generation) = {
             let live = self.live.read_state();
             if !live.ready {
                 return Err(RoomHttpError::Cancelled);
@@ -3191,10 +3298,6 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 .channels
                 .get(&channel_id)
                 .ok_or(RoomHttpError::NotFound)?;
-            let revision = *live
-                .channel_revisions
-                .get(&channel_id)
-                .ok_or(RoomHttpError::Cancelled)?;
             let current = channel
                 .permission_overwrites
                 .as_deref()
@@ -3267,13 +3370,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 });
             }
             let changed = overwrites != current;
-            (
-                overwrites,
-                changed,
-                current.to_vec(),
-                live.generation,
-                revision,
-            )
+            (overwrites, changed, current.to_vec(), live.generation)
         };
         if !changed {
             // The overwrites already converge: no grant is owed, even if this
@@ -3284,32 +3381,22 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 .remove(&channel_id);
             return Ok(());
         }
-        let live = self.live.clone();
-        let guard: WriteGuard = Arc::new(move || {
-            let state = live.read_state();
-            state.ready
-                && state.generation == generation
-                && state.channel_revisions.get(&channel_id) == Some(&revision)
-                && state.channels.get(&channel_id).is_some_and(|channel| {
-                    channel.permission_overwrites.as_deref() == Some(expected_overwrites.as_slice())
-                })
-                && state
-                    .permissions(live.guild_id, channel_id)
-                    .is_some_and(|p| {
-                        p.contains(Permissions::VIEW_CHANNEL | Permissions::MANAGE_ROLES)
-                    })
-        });
-        let channel = match self
-            .http
-            .update_overwrites(channel_id, &overwrites, guard)
-            .await
+        match write_owner_overwrite_delta(
+            &self.http,
+            &self.live,
+            channel_id,
+            generation,
+            &expected_overwrites,
+            &overwrites,
+            owner_id,
+        )
+        .await
         {
-            Ok(channel) => channel,
+            Ok(()) => {}
             Err(RoomHttpError::AccessDenied) => {
-                // Build the revoke-only list from the current cache, not the
-                // pre-send snapshot, so a gateway change that landed during
-                // the denied PATCH is preserved rather than clobbered.
-                let live = self.live.clone();
+                // Recompute from the current cache, not the pre-send snapshot,
+                // so a gateway change that landed during the denied write is
+                // preserved rather than clobbered.
                 let expected = self
                     .live
                     .read_state()
@@ -3320,71 +3407,70 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 let Some(revoke_only) =
                     revoke_only_owner_overwrites(&expected, issued_members, owner_id)
                 else {
+                    let owner_mask = Permissions::from_bits_retain(OWNER_ALLOW_BITS);
+                    if !expected.iter().any(|overwrite| {
+                        overwrite.kind == PermissionOverwriteType::Member
+                            && overwrite.id.get() == owner_id
+                            && overwrite.allow.intersects(owner_mask)
+                    }) {
+                        self.grants_owed
+                            .lock()
+                            .expect("grant-owed marker")
+                            .insert(channel_id);
+                    }
                     return Err(RoomHttpError::AccessDenied);
                 };
-                let fallback_guard: WriteGuard = Arc::new(move || {
-                    let state = live.read_state();
-                    state.ready
-                        && state.generation == generation
-                        && state.channel_revisions.get(&channel_id) == Some(&revision)
-                        && state.channels.get(&channel_id).is_some_and(|channel| {
-                            channel.permission_overwrites.as_deref() == Some(expected.as_slice())
-                        })
-                        && state
-                            .permissions(live.guild_id, channel_id)
-                            .is_some_and(|p| {
-                                p.contains(Permissions::VIEW_CHANNEL | Permissions::MANAGE_ROLES)
-                            })
-                });
-                match self
-                    .http
-                    .update_overwrites(channel_id, &revoke_only, fallback_guard)
-                    .await
+                match write_owner_overwrite_delta(
+                    &self.http,
+                    &self.live,
+                    channel_id,
+                    generation,
+                    &expected,
+                    &revoke_only,
+                    owner_id,
+                )
+                .await
                 {
-                    Ok(revoked) => {
-                        if revoked.id.get() != channel_id
-                            || revoked.guild_id.map(Id::get) != Some(self.live.guild_id)
-                        {
-                            return Err(RoomHttpError::AccessDenied);
-                        }
-                        // Publish the revocation so the stranded grant is gone
-                        // from the cache, then report the original denial so
-                        // the new-owner grant retries with the journal pending.
-                        // Mark the grant as owed: the cache now looks exactly
-                        // like a category-synced room, so the `!can_write`
-                        // path needs this marker to keep the handoff pending
-                        // instead of closing it without the new-owner grant.
-                        let _ = self
-                            .live
-                            .publish_owner_overwrites(revoked, generation, revision);
+                    Ok(()) => {
+                        // The grant is still owed: keep the journal pending
+                        // until the new-owner overwrite can be written.
                         self.grants_owed
                             .lock()
                             .expect("grant-owed marker")
                             .insert(channel_id);
                         return Err(RoomHttpError::AccessDenied);
                     }
-                    Err(fallback_error) => match fallback_error {
-                        RoomHttpError::AccessDenied
-                        | RoomHttpError::Cancelled
-                        | RoomHttpError::NotFound => {
-                            return Err(RoomHttpError::AccessDenied);
+                    Err(fallback_error) => {
+                        let owner_mask = Permissions::from_bits_retain(OWNER_ALLOW_BITS);
+                        let owner_granted = self
+                            .live
+                            .read_state()
+                            .channels
+                            .get(&channel_id)
+                            .and_then(|channel| channel.permission_overwrites.as_deref())
+                            .is_some_and(|overwrites| {
+                                overwrites.iter().any(|overwrite| {
+                                    overwrite.kind == PermissionOverwriteType::Member
+                                        && overwrite.id.get() == owner_id
+                                        && overwrite.allow.intersects(owner_mask)
+                                })
+                            });
+                        if !owner_granted {
+                            self.grants_owed
+                                .lock()
+                                .expect("grant-owed marker")
+                                .insert(channel_id);
                         }
-                        other => return Err(other),
-                    },
+                        return Err(match fallback_error {
+                            RoomHttpError::AccessDenied
+                            | RoomHttpError::Cancelled
+                            | RoomHttpError::NotFound => RoomHttpError::AccessDenied,
+                            other => other,
+                        });
+                    }
                 }
             }
             Err(error) => return Err(error),
-        };
-        if channel.id.get() != channel_id
-            || channel.guild_id.map(Id::get) != Some(self.live.guild_id)
-        {
-            return Err(RoomHttpError::UnknownOutcome);
-        }
-        if !self
-            .live
-            .publish_owner_overwrites(channel, generation, revision)
-        {
-            return Err(RoomHttpError::Cancelled);
         }
         // The grant landed: nothing is owed anymore, even if an earlier
         // fallback marked this channel.

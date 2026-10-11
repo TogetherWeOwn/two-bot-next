@@ -24,6 +24,7 @@ const MEMBER: u64 = 300;
 const NOW: &str = "2026-09-30T00:00:00.000000+00:00";
 type Trace = Arc<Mutex<Vec<String>>>;
 type Hook = Arc<dyn Fn() + Send + Sync>;
+type OverwriteHook = Arc<dyn Fn(u64, u64, Option<PermissionOverwrite>) + Send + Sync>;
 
 fn permissions() -> Permissions {
     Permissions::VIEW_CHANNEL
@@ -683,6 +684,8 @@ struct Http {
     /// Scripted failures for the V4 enforcement's Connect deny.
     kick_errors: Mutex<VecDeque<RoomHttpError>>,
     overwrite_errors: Mutex<VecDeque<RoomHttpError>>,
+    put_overwrite_errors: Mutex<VecDeque<RoomHttpError>>,
+    after_overwrite: Option<OverwriteHook>,
     join_errors: Mutex<VecDeque<RoomHttpError>>,
     written_overwrites: Mutex<Vec<(u64, PermissionOverwrite)>>,
     notices: Mutex<Vec<(NoticeTarget, String, Option<u64>)>>,
@@ -735,6 +738,8 @@ impl Http {
             view_errors: Mutex::new(VecDeque::new()),
             kick_errors: Mutex::new(VecDeque::new()),
             overwrite_errors: Mutex::new(VecDeque::new()),
+            put_overwrite_errors: Mutex::new(VecDeque::new()),
+            after_overwrite: None,
             join_errors: Mutex::new(VecDeque::new()),
             written_overwrites: Mutex::new(Vec::new()),
             notices: Mutex::new(Vec::new()),
@@ -803,30 +808,6 @@ impl RoomWrites for Http {
             hook();
         }
         Ok(result)
-    }
-    async fn update_overwrites(
-        &self,
-        channel_id: u64,
-        overwrites: &[PermissionOverwrite],
-        guard: WriteGuard,
-    ) -> Result<Channel, RoomHttpError> {
-        if !guard() {
-            return Err(RoomHttpError::Cancelled);
-        }
-        self.trace
-            .lock()
-            .unwrap()
-            .push(format!("overwrites:{channel_id}"));
-        if let Some(error) = self.view_errors.lock().unwrap().pop_front() {
-            return Err(error);
-        }
-        let mut updated = channel(channel_id, 2, Some(CATEGORY));
-        updated.permission_overwrites = Some(overwrites.to_vec());
-        if let Some(gate) = &self.overwrites_gate {
-            gate.sent.notify_one();
-            gate.release.notified().await;
-        }
-        Ok(updated)
     }
     async fn move_member(
         &self,
@@ -1080,13 +1061,26 @@ impl RoomWrites for Http {
             overwrite.id.get(),
             overwrite.kind
         ));
-        if let Some(error) = self.overwrite_errors.lock().unwrap().pop_front() {
+        if let Some(gate) = &self.overwrites_gate {
+            gate.sent.notify_one();
+            gate.release.notified().await;
+        }
+        if let Some(error) = self
+            .put_overwrite_errors
+            .lock()
+            .unwrap()
+            .pop_front()
+            .or_else(|| self.overwrite_errors.lock().unwrap().pop_front())
+        {
             return Err(error);
         }
         self.written_overwrites
             .lock()
             .unwrap()
             .push((channel, overwrite));
+        if let Some(hook) = &self.after_overwrite {
+            hook(channel, overwrite.id.get(), Some(overwrite));
+        }
         Ok(())
     }
     async fn create_join_channel(
@@ -1130,10 +1124,17 @@ impl RoomWrites for Http {
             .lock()
             .unwrap()
             .push(format!("delete_overwrite:{channel}:{member}"));
-        match self.overwrite_errors.lock().unwrap().pop_front() {
-            Some(error) => Err(error),
-            None => Ok(()),
+        if let Some(gate) = &self.overwrites_gate {
+            gate.sent.notify_one();
+            gate.release.notified().await;
         }
+        if let Some(error) = self.overwrite_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        if let Some(hook) = &self.after_overwrite {
+            hook(channel, member, None);
+        }
+        Ok(())
     }
     async fn send_component_message(
         &self,
@@ -1988,7 +1989,7 @@ fn owner_overwrite(member: u64) -> PermissionOverwrite {
 
 #[tokio::test]
 async fn transfer_rewrites_only_this_rooms_owner_grants_before_persistence() {
-    let (live, store, http, trace) = owned_room();
+    let (live, store, mut http, trace) = owned_room();
     let unrelated = PermissionOverwrite {
         id: Id::new(701),
         kind: PermissionOverwriteType::Role,
@@ -2003,6 +2004,23 @@ async fn transfer_rewrites_only_this_rooms_owner_grants_before_persistence() {
     live.upsert_channel(room_channel);
     let untouched = channel(501, 2, Some(CATEGORY));
     live.upsert_channel(untouched.clone());
+    let echo_live = live.clone();
+    http.after_overwrite = Some(Arc::new(move |channel_id, member_id, overwrite| {
+        let mut echoed = echo_live
+            .read_state()
+            .channels
+            .get(&channel_id)
+            .cloned()
+            .expect("echoed channel exists");
+        let overwrites = echoed.permission_overwrites.as_mut().unwrap();
+        overwrites.retain(|existing| {
+            !(existing.kind == PermissionOverwriteType::Member && existing.id.get() == member_id)
+        });
+        if let Some(overwrite) = overwrite {
+            overwrites.push(overwrite);
+        }
+        echo_live.upsert_channel(echoed);
+    }));
     let mut worker = GuildRoomWorker::load(live.clone(), store, http)
         .await
         .unwrap();
@@ -2020,8 +2038,84 @@ async fn transfer_rewrites_only_this_rooms_owner_grants_before_persistence() {
     assert_eq!(state.channels[&501], untouched);
     assert_eq!(
         *trace.lock().unwrap(),
-        ["overwrites:500", "update_ownership:500:301"]
+        [
+            format!("overwrite:500:{MEMBER}:Member"),
+            "overwrite:500:301:Member".to_owned(),
+            "update_ownership:500:301".to_owned(),
+        ]
     );
+}
+
+#[test]
+fn owner_overwrite_delta_orders_trimmed_grants_before_the_incoming_owner() {
+    let mut former_owner = owner_overwrite(MEMBER);
+    former_owner.allow |= Permissions::EMBED_LINKS;
+    let mut incoming_owner = PermissionOverwrite {
+        id: Id::new(301),
+        kind: PermissionOverwriteType::Member,
+        allow: Permissions::SEND_MESSAGES,
+        deny: Permissions::empty(),
+    };
+    let before = vec![incoming_owner, former_owner];
+    former_owner.allow = Permissions::EMBED_LINKS;
+    incoming_owner.allow |= Permissions::from_bits_retain(OWNER_ALLOW_BITS);
+    let after = vec![incoming_owner, former_owner];
+
+    let (deletes, puts) = owner_overwrite_delta(&before, &after, 301);
+
+    assert!(deletes.is_empty());
+    assert_eq!(
+        puts.iter()
+            .map(|overwrite| overwrite.id.get())
+            .collect::<Vec<_>>(),
+        [MEMBER, 301],
+        "revoke the former owner's bits before granting the incoming owner"
+    );
+}
+
+#[tokio::test]
+async fn denied_incoming_grant_after_successful_revoke_remains_owed_without_access() {
+    let (live, store, http, _) = owned_room();
+    let mut room_channel = channel(500, 2, Some(CATEGORY));
+    room_channel.permission_overwrites = Some(vec![owner_overwrite(MEMBER)]);
+    live.upsert_channel(room_channel);
+    http.put_overwrite_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    let worker = GuildRoomWorker::load(live.clone(), store, http)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        worker.rewrite_owner_grant(500, &[MEMBER], 301).await,
+        Err(RoomHttpError::AccessDenied)
+    );
+    let access = live.inner.read().unwrap().bot.clone().unwrap();
+    let mut without_manage_roles = access.clone();
+    for role in &mut without_manage_roles.roles {
+        role.permissions &= !Permissions::MANAGE_ROLES;
+    }
+    live.refresh_bot(without_manage_roles);
+
+    assert_eq!(
+        worker.rewrite_owner_grant(500, &[MEMBER], 301).await,
+        Err(RoomHttpError::AccessDenied),
+        "the denied grant must not let the ownership journal close"
+    );
+    assert!(worker.grants_owed.lock().unwrap().contains(&500));
+    let state = live.inner.read().unwrap();
+    let overwrites = state.channels[&500].permission_overwrites.as_ref().unwrap();
+    assert!(!overwrites
+        .iter()
+        .any(|overwrite| overwrite.id.get() == MEMBER
+            && overwrite
+                .allow
+                .intersects(Permissions::from_bits_retain(OWNER_ALLOW_BITS))));
+    assert!(!overwrites.iter().any(|overwrite| overwrite.id.get() == 301
+        && overwrite
+            .allow
+            .intersects(Permissions::from_bits_retain(OWNER_ALLOW_BITS))));
 }
 
 #[tokio::test]
@@ -2032,7 +2126,7 @@ async fn denied_handoff_falls_back_to_revoke_only_then_retries_the_grant() {
     live.upsert_channel(room_channel);
     // The combined revoke+grant PATCH is refused; the revoke-only fallback
     // must still clear the former owner's bits and defer the grant.
-    http.view_errors
+    http.overwrite_errors
         .lock()
         .unwrap()
         .push_back(RoomHttpError::AccessDenied);
@@ -2065,7 +2159,7 @@ async fn denied_handoff_falls_back_to_revoke_only_then_retries_the_grant() {
             .lock()
             .unwrap()
             .iter()
-            .filter(|call| call.as_str() == "overwrites:500")
+            .filter(|call| call.as_str() == format!("delete_overwrite:500:{MEMBER}"))
             .count(),
         2,
         "combined attempt plus the revoke-only fallback"
@@ -2092,7 +2186,7 @@ async fn revoked_fallback_keeps_handoff_pending_until_access_returns() {
     live.upsert_channel(room_channel);
     // The combined revoke+grant PATCH is refused; the revoke-only fallback
     // clears the former owner and defers the new-owner grant.
-    http.view_errors
+    http.overwrite_errors
         .lock()
         .unwrap()
         .push_back(RoomHttpError::AccessDenied);
@@ -2213,11 +2307,14 @@ async fn fallback_patch_propagates_rate_limit_and_unauthorized() {
         let mut room_channel = channel(500, 2, Some(CATEGORY));
         room_channel.permission_overwrites = Some(vec![owner_overwrite(MEMBER)]);
         live.upsert_channel(room_channel);
-        http.view_errors
+        http.overwrite_errors
             .lock()
             .unwrap()
             .push_back(RoomHttpError::AccessDenied);
-        http.view_errors.lock().unwrap().push_back(fallback_error);
+        http.overwrite_errors
+            .lock()
+            .unwrap()
+            .push_back(fallback_error);
         let worker = GuildRoomWorker::load(live.clone(), store, http)
             .await
             .unwrap();
@@ -2474,7 +2571,7 @@ async fn exhausted_owner_cleanup_is_retained_and_recovers_after_access_restorati
 #[tokio::test]
 async fn owner_grant_rewrite_rate_limit_retries_before_saving_the_handoff() {
     let (live, store, http, trace) = owned_room();
-    http.view_errors
+    http.overwrite_errors
         .lock()
         .unwrap()
         .push_back(RoomHttpError::RateLimited {
