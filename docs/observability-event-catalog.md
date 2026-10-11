@@ -104,7 +104,6 @@ Scalar gateway series pair with the labels above:
 | `two_bot_gateway_missed_events_total` | Sequence gaps inside one session; any nonzero increase fails the zero-missed-events acceptance |
 | `two_bot_gateway_latency_seconds` | Last heartbeat ACK round-trip; `NaN` until measured |
 | `two_bot_gateway_prefix_trigger_refused_total{reason="verdict"}` | In-scope prefix candidates refused by the automod verdict; the worker records candidates even when its capture-only gate prevents detached dispatch. Unmatched content, scope mismatches, bot/webhook messages and disabled text-command gates never increment it |
-| `two_bot_audit_delivery_halt` | Audit mirror delivery-halt state; 1 while the persistent kill switch is engaged, 0 once cleared. Set once per readable `audit_retry` sweep (`audit_runtime.rs` `sweep` via `set_audit_delivery_halt` in `metrics.rs`); an unreadable halt keeps the last reported state. Manual check for staleness evaluation, not an alert input (introduced by #810) |
 
 ## Scheduled job labels
 
@@ -118,7 +117,7 @@ staleness tickets via `job_unknown_stale` below instead of `job_stale`.
 
 | Job label | Producer (stable anchor) | Meaning |
 | --- | --- | --- |
-| `feeds` | `feed_jobs.rs` (`scheduled_job` via `register`) | Feed poller sweep on the boot-configured interval with a live inner polling gate; gated skips return success and reset the streak |
+| `feeds` | `feed_jobs.rs` (`scheduled_job_live` via `register` / `register_fenced`) | Feed poller sweep on the boot-configured interval with a live inner polling gate; gated skips return success and reset the streak |
 | `self_role_recovery` | `self_role_handlers.rs` (`recovery_job`) | Self-role repair sweep every 30 s; a successful sweep need not settle every pending repair; failure-only alerting, no `job_stale` paging |
 | `member_unban_sweep` | `member_runtime.rs` (`sweep_job`) | Member unban sweep every 30 s with an attempt timeout that may outlive its cadence; a successful sweep need not complete any unban; failure-only alerting |
 | `automod_expiry` | `automod_gateway.rs` (`expiry_job`) | Automod repeat-history expiry tick every 60 s; a gateway without built activation is a no-op success, and real expiry work runs only with the automod gate on; failure-only alerting |
