@@ -145,6 +145,9 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_ANTI_NUKE_TRUSTED_USER_IDS", SettingClass::EnvOnly),
     // A filesystem path chosen by a web form is a write primitive.
     ("TWO_ANTI_NUKE_SNAPSHOT_PATH", SettingClass::EnvOnly),
+    // Test-only reach boundary: which bot accounts the voice runtime treats as
+    // human occupants. A dashboard must never widen it.
+    ("TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS", SettingClass::EnvOnly),
     // --- cold: read once at boot ---
     ("TWO_AUTOMOD", SettingClass::Cold),
     ("TWO_ANNOUNCEMENTS", SettingClass::Cold),
@@ -946,6 +949,7 @@ mod tests {
         "TWO_STAGING_DATABASE_URL",
         "TWO_STAGING_RESTART_CONTAINMENT",
         "TWO_STAGING_RESTART_SYNTHETIC_ACTORS",
+        "TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS",
     ];
 
     #[test]
@@ -960,7 +964,7 @@ mod tests {
             assert_eq!(classify_key(key), Some(SettingClass::EnvOnly), "{key}");
         }
         let expected_total = EXPECTED_HOT.len() + EXPECTED_COLD.len() + EXPECTED_ENV_ONLY.len();
-        assert_eq!(expected_total, 122, "tripwire lists must stay complete");
+        assert_eq!(expected_total, 123, "tripwire lists must stay complete");
         assert_eq!(
             SETTING_CLASSES.len(),
             expected_total,
