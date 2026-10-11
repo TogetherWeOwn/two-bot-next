@@ -3,14 +3,23 @@ import { readFileSync } from "node:fs";
 const rust = readFileSync(new URL("../../../crates/core/src/metrics.rs", import.meta.url), "utf8");
 
 export function rustLabels(name: string): string[] {
-  const list = new RegExp(`pub const ${name}: &\\[&str\\] = &\\[([\\s\\S]*?)\\];`).exec(rust);
+  const list = new RegExp(`pub const ${name}: &\\[.*?\\] = &\\[([\\s\\S]*?)\\];`).exec(rust);
   if (!list) throw new Error(`missing Rust metric dimension ${name}`);
-  return [...list[1]!.matchAll(/"([^"]+)"/g)].map((m) => m[1]!);
+  const quoted = [...list[1]!.matchAll(/"([^"]+)"/g)].map((m) => m[1]!);
+  if (quoted.length > 0) return quoted;
+  // Enum-variant dimensions (e.g. JOB_ERROR_CLASSES) carry no quoted
+  // strings; derive snake_case labels from the variant names instead.
+  const variants = [...list[1]!.matchAll(/JobErrorClass::([A-Za-z]+)/g)].map((m) => m[1]!);
+  if (variants.length > 0) {
+    return variants.map((v) => v.replace(/([a-z])([A-Z])/g, "$1_$2").toLowerCase());
+  }
+  throw new Error(`no parseable labels in Rust metric dimension ${name}`);
 }
 
 export const RUST_ALERT_AXES: Record<string, Record<string, string>> = {
   two_bot_job_last_success_timestamp_seconds: { job: "JOBS" },
   two_bot_job_consecutive_failures: { job: "JOBS" },
+  two_bot_job_last_error_class: { job: "JOBS", class: "JOB_ERROR_CLASSES" },
   two_bot_rest_requests_total: { route: "REST_ROUTES", result: "RESULTS" },
   two_bot_db_pool_configured: {},
   two_bot_db_pool_connections: {},

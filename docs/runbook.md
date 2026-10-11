@@ -21,7 +21,7 @@ separate authorization.
    returning success alone does not prove recovery.
 
 All npm commands below run **from the repository root** and use the pinned
-Wrangler 4.147.0 through `wrangler/package.json`. Use only the already-authorized
+Wrangler 4.148.0 through `wrangler/package.json`. Use only the already-authorized
 Cloudflare connection. An authentication/permission failure is a stop: report
 it, do not try another credential, elevate access, or use a personal token.
 Examples target `staging`; do not substitute `production` without its own gate.
@@ -112,7 +112,7 @@ invocation, unsampled; production traces are off (`wrangler/wrangler.toml`).
 
 `logs` is **Worker/DO tail**, not Rust stdout. Stop it when the bounded incident
 observation is complete. For Rust stdout/stderr, use the affected container's
-logs in the Cloudflare dashboard. Wrangler 4.147.0 has no `containers logs`
+logs in the Cloudflare dashboard. Wrangler 4.148.0 has no `containers logs`
 subcommand; do not invent one. Container inspection may list account-wide
 resources: match the affected environment/application before taking any action.
 No Cloudflare API reaches container stdout either, so voice-event emission has
@@ -193,9 +193,23 @@ the logs show the job loop is wedged, per the [restart semantics](#restart-seman
 
 #### Alert: job failures
 
-A job failed three completions in a row. Read `periodic job failed` logs (error
-class only; payloads are never logged). Usual causes: database unreachable,
-Discord REST failing. Fix the dependency; the streak clears on the next success.
+A job failed three completions in a row. The page includes the latest failure
+class when the `two_bot_job_last_error_class` series is available. If it is
+missing (for example, on an older build), the page still fires without a class;
+use sanitized `periodic job failed` logs instead. Error classes are fixed enum
+names, never error text or payloads. Take the first action for the reported class:
+
+| Class | First action |
+|---|---|
+| `database` | Check the database dependency and expected schema/grant state through its authorized owner; do not run SQL probes or widen grants. |
+| `rest` | Check Discord status and REST metrics for 429, 5xx or transport failures; honor `retry-after` and do not replay uncertain writes. |
+| `configuration` | Compare non-secret binding names and feature gates with the reviewed deployment; do not dump values or substitute credentials. |
+| `timeout` | Check the job status and pool-pressure metrics to locate the bounded operation before considering a restart. |
+| `panic` | Correlate the sanitized failure log with the deployed revision; the panic payload is intentionally unavailable. |
+| `feed` | Check the configured feed source's availability and recent fetch status through authorized diagnostics; do not copy response bodies. |
+| `recovery_required` | Preserve feed cursor and pending recovery state; follow the established recovery path before any manual replay or cursor change. |
+
+The streak clears on the next successful completion.
 
 #### Alert: REST 429
 
@@ -765,7 +779,7 @@ npm --prefix wrangler run deployments -- list --env staging
 ```
 
 Read the interactive target and confirm the incident's known-good version.
-Do not add `--yes` or override warnings. Wrangler 4.147 updates Durable Object
+Do not add `--yes` or override warnings. Wrangler 4.148 updates Durable Object
 code with `deferred` mode and a 300 s maximum delay by default, so a bare
 rollback can leave the old code serving for up to five minutes. For a manual
 incident rollback add `--durable-objects-code-update-mode immediate`, and expect
