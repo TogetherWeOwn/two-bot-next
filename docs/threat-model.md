@@ -36,9 +36,9 @@ ingress "staging-only, dark by default" (`wrangler/src/index.ts:882-883`).
 The historical contract has **18 actions**. The current core allowlist has
 **19** (rechecked 2026-10-10): those 18 plus `event.read`
 (`crates/core/src/internal_actions.rs:653`; nine moderation verbs at `:703`,
-14 idempotency-bound at `:680`). All 19 are assessed below. Note drift:
-`docs/parity.md:221` still describes the website→bot row as 18 actions and
-omits `event.read` and settings compare-and-set; the core constants above are
+14 idempotency-bound at `:680`). All 19 are assessed below. `docs/parity.md:221`
+records the same 19 actions with `event.read` and the `settings.set`
+compare-and-set (`expected_version`); the core constants above are
 authoritative. The legacy `docs/INTERNAL_ACTIONS.md` is not in this checkout;
 the ported core, [parity inventory](parity.md) and
 [durable-store contract](internal-action-store.md) are the source evidence here.
