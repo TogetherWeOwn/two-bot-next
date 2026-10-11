@@ -117,15 +117,17 @@ This change keeps fixtures/tests/docs only; runtime wiring is out of scope.
 ### Runtime proof map
 
 Each deferred family maps to a real-adapter/store test by file:line. The
-deferred corpus cases stay as preserved legacy expectations; the tests below
-prove the same behavior through the real runtime, store or gateway.
+deferred corpus cases stay as preserved legacy expectations. The tests below
+cover each family through the real runtime, store or gateway and prove the
+same behavior, except where a row names an intentional divergence from the
+legacy expectation.
 
 | Case family | Real-adapter/store proof |
 | --- | --- |
 | Raw leading-dot extension policy | `crates/core/tests/automod_runtime.rs:467` normalizes `.exe,.JS` through `AutomodConfig::from_map` to `["exe","js"]` and matches `Setup.EXE` via the real runtime; normalization itself is `crates/core/src/automod.rs:836-837`. The raw direct-policy divergence stays deferred by design. |
 | Service ladder and audit | `crates/core/tests/automod_runtime.rs:114` plans delete/warn/timeout-600; `crates/discord/tests/automod_activation.rs:514` deletes then warns then times out over the mock REST double; `crates/discord/tests/automod_activation.rs:564` replays with no second mutation; `crates/core/tests/automod_store.rs:56` proves 20-way contention, five processed messages, final violation count five and zero content columns. |
 | Dry-run ledger separation | `crates/core/tests/automod_runtime.rs:90` needs no resolver and emits no effects; `crates/discord/tests/automod_activation.rs:467` sends nothing with no target fetch or count; `crates/core/tests/automod_store.rs:56` fences dry-run preserve/mark/count at persistence and keeps the enforce claim distinct; `crates/discord/tests/automod_activation.rs:695` funnels a dry-run then enforce message once. |
-| Retry/failure semantics | `crates/discord/tests/automod_activation.rs:741` retains uncertain delete, `:777` retains uncertain timeout, `:803` settles rejected delete, `:832` retains fence refusal, `:855` releases unavailable target then replays the preserved decision, `:564` blocks in-flight duplicates; `crates/core/tests/automod_store.rs:56` covers safe release, counted-claim reconciliation and preserved-decision replay; `crates/core/tests/automod_runtime.rs:808` reproduces a pre-count retry after window advance. |
+| Retry/failure semantics | `crates/discord/tests/automod_activation.rs:741` retains uncertain delete, `:777` retains uncertain timeout, `:803` settles a rejected delete as `SanctionRefused` with no release or retry (**intentional divergence** from the legacy definite-delete-failure release-and-retry expectation, `docs/automod-runtime.md:170`; the legacy `known-delete-refusal-retry` case stays deferred, not proven), `:832` retains fence refusal, `:855` releases unavailable target then replays the preserved decision, `:564` blocks in-flight duplicates; `crates/core/tests/automod_store.rs:56` covers safe release, counted-claim reconciliation and preserved-decision replay; `crates/core/tests/automod_runtime.rs:811` reproduces a pre-count retry after window advance. |
 | Protection before delete | `crates/core/tests/automod_runtime.rs:166` leaves every protected target untouched on rungs 1-3, `:227` keeps exact deletion on hierarchy/permission refusal, `:202` fails closed before delete; `crates/discord/tests/automod_activation.rs:495` counts but touches nothing for protected targets. |
 | Gateway/activation | `crates/core/tests/automod_runtime.rs:76` routes matches to capture-only, `:263` fetches partial edits with no funnel or XP, `:315` fences staging/live/DM scope; `crates/discord/tests/automod_activation.rs:893` bypasses out-of-scope guilds claim-free, `:935` fetches and reinspects edits without award, `:992` stays unavailable without a snapshot; `crates/bot/src/automod_gateway_tests.rs:35` rejects boot without owner config, `:54` keeps owner/protection off the enforce flag, `:480` pins every outcome verdict, `:373` times out to capture-only. |
 

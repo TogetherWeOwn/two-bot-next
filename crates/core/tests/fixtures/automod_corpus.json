@@ -2813,7 +2813,7 @@
       "env": {},
       "kind": "deferred",
       "issue": "/TOG/issues/TOG-10089",
-      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "reason": "Preserved legacy inventory: the corpus runner does not execute service/gateway assertions; the real runtime, store and gateway proof is mapped in docs/automod-corpus.md (Runtime proof map).",
       "legacy_expected": {
         "setup": {
           "messages": [
@@ -2858,7 +2858,7 @@
       "env": {},
       "kind": "deferred",
       "issue": "/TOG/issues/TOG-10089",
-      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "reason": "Preserved legacy inventory: the corpus runner does not execute service/gateway assertions; the real runtime, store and gateway proof is mapped in docs/automod-corpus.md (Runtime proof map).",
       "legacy_expected": {
         "setup": {
           "mode_sequence": [
@@ -2892,7 +2892,7 @@
       "env": {},
       "kind": "deferred",
       "issue": "/TOG/issues/TOG-10089",
-      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "reason": "Preserved legacy inventory: the corpus runner does not execute service/gateway assertions; the real runtime, store and gateway proof is mapped in docs/automod-corpus.md (Runtime proof map).",
       "legacy_expected": {
         "setup": {
           "delete_outcomes": [
@@ -2919,7 +2919,7 @@
       "env": {},
       "kind": "deferred",
       "issue": "/TOG/issues/TOG-10089",
-      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "reason": "Preserved legacy inventory: the corpus runner does not execute service/gateway assertions; the real runtime, store and gateway proof is mapped in docs/automod-corpus.md (Runtime proof map).",
       "legacy_expected": {
         "setup": {
           "record_violation_ids": [
@@ -2944,7 +2944,7 @@
       "env": {},
       "kind": "deferred",
       "issue": "/TOG/issues/TOG-10089",
-      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "reason": "Preserved legacy inventory: the corpus runner does not execute service/gateway assertions; the real runtime, store and gateway proof is mapped in docs/automod-corpus.md (Runtime proof map).",
       "legacy_expected": {
         "setup": {
           "preclaimed": true,
@@ -2967,7 +2967,7 @@
       "env": {},
       "kind": "deferred",
       "issue": "/TOG/issues/TOG-10089",
-      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "reason": "Preserved legacy inventory: the corpus runner does not execute service/gateway assertions; the real runtime, store and gateway proof is mapped in docs/automod-corpus.md (Runtime proof map).",
       "legacy_expected": {
         "setup": {
           "delete": "success",
@@ -2992,7 +2992,7 @@
       "env": {},
       "kind": "deferred",
       "issue": "/TOG/issues/TOG-10089",
-      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "reason": "Preserved legacy inventory: the corpus runner does not execute service/gateway assertions; the real runtime, store and gateway proof is mapped in docs/automod-corpus.md (Runtime proof map).",
       "legacy_expected": {
         "setup": {
           "first_three_inputs": [
@@ -3033,7 +3033,7 @@
       "env": {},
       "kind": "deferred",
       "issue": "/TOG/issues/TOG-10089",
-      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "reason": "Preserved legacy inventory: the corpus runner does not execute service/gateway assertions; the real runtime, store and gateway proof is mapped in docs/automod-corpus.md (Runtime proof map).",
       "legacy_expected": {
         "setup": {
           "target": "staff",
@@ -3083,7 +3083,7 @@
       "env": {},
       "kind": "deferred",
       "issue": "/TOG/issues/TOG-10089",
-      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "reason": "Preserved legacy inventory: the corpus runner does not execute service/gateway assertions; the real runtime, store and gateway proof is mapped in docs/automod-corpus.md (Runtime proof map).",
       "legacy_expected": {
         "setup": {
           "target": {
@@ -3148,7 +3148,7 @@
       "env": {},
       "kind": "deferred",
       "issue": "/TOG/issues/TOG-10089",
-      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "reason": "Preserved legacy inventory: the corpus runner does not execute service/gateway assertions; the real runtime, store and gateway proof is mapped in docs/automod-corpus.md (Runtime proof map).",
       "legacy_expected": {
         "setup": {
           "target": "owner",
@@ -3192,7 +3192,7 @@
       "env": {},
       "kind": "deferred",
       "issue": "/TOG/issues/TOG-10089",
-      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "reason": "Preserved legacy inventory: the corpus runner does not execute service/gateway assertions; the real runtime, store and gateway proof is mapped in docs/automod-corpus.md (Runtime proof map).",
       "legacy_expected": {
         "setup": {
           "target": "staff",
@@ -3234,7 +3234,7 @@
       "env": {},
       "kind": "deferred",
       "issue": "/TOG/issues/TOG-10089",
-      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "reason": "Preserved legacy inventory: the corpus runner does not execute service/gateway assertions; the real runtime, store and gateway proof is mapped in docs/automod-corpus.md (Runtime proof map).",
       "legacy_expected": {
         "setup": {
           "target": {
@@ -3298,7 +3298,7 @@
       },
       "kind": "deferred",
       "issue": "/TOG/issues/TOG-10089",
-      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "reason": "Preserved legacy inventory: the corpus runner does not execute service/gateway assertions; the real runtime, store and gateway proof is mapped in docs/automod-corpus.md (Runtime proof map).",
       "legacy_expected": {
         "setup": {
           "dry_run": false,
@@ -3335,7 +3335,7 @@
       },
       "kind": "deferred",
       "issue": "/TOG/issues/TOG-10089",
-      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "reason": "Preserved legacy inventory: the corpus runner does not execute service/gateway assertions; the real runtime, store and gateway proof is mapped in docs/automod-corpus.md (Runtime proof map).",
       "legacy_expected": {
         "setup": {
           "dry_run": false,
@@ -3389,7 +3389,7 @@
       "env": {},
       "kind": "deferred",
       "issue": "/TOG/issues/TOG-10261",
-      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "reason": "Preserved legacy inventory: the corpus runner does not execute service/gateway assertions; the real runtime, store and gateway proof is mapped in docs/automod-corpus.md (Runtime proof map).",
       "legacy_expected": {
         "setup": {
           "message_create": [
@@ -3418,7 +3418,7 @@
       "env": {},
       "kind": "deferred",
       "issue": "/TOG/issues/TOG-10261",
-      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "reason": "Preserved legacy inventory: the corpus runner does not execute service/gateway assertions; the real runtime, store and gateway proof is mapped in docs/automod-corpus.md (Runtime proof map).",
       "legacy_expected": {
         "setup": {
           "failure": "claim",
@@ -3443,7 +3443,7 @@
       },
       "kind": "deferred",
       "issue": "/TOG/issues/TOG-10261",
-      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "reason": "Preserved legacy inventory: the corpus runner does not execute service/gateway assertions; the real runtime, store and gateway proof is mapped in docs/automod-corpus.md (Runtime proof map).",
       "legacy_expected": {
         "setup": {
           "failure": "release",
@@ -3526,7 +3526,7 @@
       "env": {},
       "kind": "deferred",
       "issue": "/TOG/issues/TOG-10261",
-      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "reason": "Preserved legacy inventory: the corpus runner does not execute service/gateway assertions; the real runtime, store and gateway proof is mapped in docs/automod-corpus.md (Runtime proof map).",
       "legacy_expected": {
         "setup": {
           "target": "protected staff",
@@ -3554,7 +3554,7 @@
       "env": {},
       "kind": "deferred",
       "issue": "/TOG/issues/TOG-10261",
-      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "reason": "Preserved legacy inventory: the corpus runner does not execute service/gateway assertions; the real runtime, store and gateway proof is mapped in docs/automod-corpus.md (Runtime proof map).",
       "legacy_expected": {
         "setup": {
           "clock_ms": 2000,
@@ -3609,7 +3609,7 @@
       "env": {},
       "kind": "deferred",
       "issue": "/TOG/issues/TOG-10261",
-      "reason": "The core has no automod service/store or gateway adapter; these side effects remain unexecuted until the linked runtime slice lands.",
+      "reason": "Preserved legacy inventory: the corpus runner does not execute service/gateway assertions; the real runtime, store and gateway proof is mapped in docs/automod-corpus.md (Runtime proof map).",
       "legacy_expected": {
         "setup": {
           "guild": "other-fixture",
