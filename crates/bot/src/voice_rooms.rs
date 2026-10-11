@@ -3441,17 +3441,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 let Some(revoke_only) =
                     revoke_only_owner_overwrites(&expected, issued_members, owner_id)
                 else {
-                    let owner_mask = Permissions::from_bits_retain(OWNER_ALLOW_BITS);
-                    if !expected.iter().any(|overwrite| {
-                        overwrite.kind == PermissionOverwriteType::Member
-                            && overwrite.id.get() == owner_id
-                            && overwrite.allow.intersects(owner_mask)
-                    }) {
-                        self.grants_owed
-                            .lock()
-                            .expect("grant-owed marker")
-                            .insert(channel_id);
-                    }
+                    self.mark_grant_owed_unless_granted(channel_id, owner_id);
                     return Err(RoomHttpError::AccessDenied);
                 };
                 match write_owner_overwrite_delta(
@@ -3468,33 +3458,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     Ok(()) => {
                         // The grant is still owed: keep the journal pending
                         // until the new-owner overwrite can be written.
-                        self.grants_owed
-                            .lock()
-                            .expect("grant-owed marker")
-                            .insert(channel_id);
+                        self.mark_grant_owed_unless_granted(channel_id, owner_id);
                         return Err(RoomHttpError::AccessDenied);
                     }
                     Err(fallback_error) => {
-                        let owner_mask = Permissions::from_bits_retain(OWNER_ALLOW_BITS);
-                        let owner_granted = self
-                            .live
-                            .read_state()
-                            .channels
-                            .get(&channel_id)
-                            .and_then(|channel| channel.permission_overwrites.as_deref())
-                            .is_some_and(|overwrites| {
-                                overwrites.iter().any(|overwrite| {
-                                    overwrite.kind == PermissionOverwriteType::Member
-                                        && overwrite.id.get() == owner_id
-                                        && overwrite.allow.intersects(owner_mask)
-                                })
-                            });
-                        if !owner_granted {
-                            self.grants_owed
-                                .lock()
-                                .expect("grant-owed marker")
-                                .insert(channel_id);
-                        }
+                        self.mark_grant_owed_unless_granted(channel_id, owner_id);
                         return Err(match fallback_error {
                             RoomHttpError::AccessDenied
                             | RoomHttpError::Cancelled
@@ -3504,7 +3472,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     }
                 }
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                // The per-target sequence is not atomic: an earlier step may
+                // have revoked the former owner before this one failed. If the
+                // incoming owner holds no grant, keep the handoff pending even
+                // if bot access is lost before the retry.
+                self.mark_grant_owed_unless_granted(channel_id, owner_id);
+                return Err(error);
+            }
         }
         // The grant landed: nothing is owed anymore, even if an earlier
         // fallback marked this channel.
@@ -3513,6 +3488,31 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .expect("grant-owed marker")
             .remove(&channel_id);
         Ok(())
+    }
+
+    /// Record that the incoming owner's grant is still owed unless the cache
+    /// already shows an owner-mask grant for them.
+    fn mark_grant_owed_unless_granted(&self, channel_id: Snowflake, owner_id: Snowflake) {
+        let owner_mask = Permissions::from_bits_retain(OWNER_ALLOW_BITS);
+        let granted = self
+            .live
+            .read_state()
+            .channels
+            .get(&channel_id)
+            .and_then(|channel| channel.permission_overwrites.as_deref())
+            .is_some_and(|overwrites| {
+                overwrites.iter().any(|overwrite| {
+                    overwrite.kind == PermissionOverwriteType::Member
+                        && overwrite.id.get() == owner_id
+                        && overwrite.allow.intersects(owner_mask)
+                })
+            });
+        if !granted {
+            self.grants_owed
+                .lock()
+                .expect("grant-owed marker")
+                .insert(channel_id);
+        }
     }
 
     pub fn propose_name(

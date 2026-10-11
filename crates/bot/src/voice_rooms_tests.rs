@@ -2124,6 +2124,41 @@ async fn denied_incoming_grant_after_successful_revoke_remains_owed_without_acce
 }
 
 #[tokio::test]
+async fn transient_grant_failure_after_revoke_remains_owed_without_access() {
+    let (live, store, http, _) = owned_room();
+    let mut room_channel = channel(500, 2, Some(CATEGORY));
+    room_channel.permission_overwrites = Some(vec![owner_overwrite(MEMBER)]);
+    live.upsert_channel(room_channel);
+    // The former owner's revoke succeeds; the incoming owner's PUT hits a
+    // transient failure, not a 403.
+    http.put_overwrite_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::UnknownOutcome);
+    let worker = GuildRoomWorker::load(live.clone(), store, http)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        worker.rewrite_owner_grant(500, &[MEMBER], 301).await,
+        Err(RoomHttpError::UnknownOutcome)
+    );
+    let access = live.inner.read().unwrap().bot.clone().unwrap();
+    let mut without_manage_roles = access.clone();
+    for role in &mut without_manage_roles.roles {
+        role.permissions &= !Permissions::MANAGE_ROLES;
+    }
+    live.refresh_bot(without_manage_roles);
+
+    assert_eq!(
+        worker.rewrite_owner_grant(500, &[MEMBER], 301).await,
+        Err(RoomHttpError::AccessDenied),
+        "a half-applied handoff must not close the journal without the grant"
+    );
+    assert!(worker.grants_owed.lock().unwrap().contains(&500));
+}
+
+#[tokio::test]
 async fn denied_handoff_falls_back_to_revoke_only_then_retries_the_grant() {
     let (live, store, http, trace) = owned_room();
     let mut room_channel = channel(500, 2, Some(CATEGORY));
