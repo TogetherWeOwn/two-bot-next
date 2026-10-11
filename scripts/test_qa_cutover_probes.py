@@ -273,6 +273,167 @@ class DuplicateComponentTest(unittest.TestCase):
         self.assertIn("repeats a component name", out)
 
 
+class DuplicateJsonKeysTest(unittest.TestCase):
+    """Wire-object duplicate JSON keys refuse before any grading.
+
+    Plain json.loads keeps the last duplicate, so a repeated top-level
+    ``components`` can mask gateway=down as ready. Every object at any
+    depth is strict: identical repeats and both conflicting orders fail
+    closed with fixed vocabulary, never echoing keys or values.
+    """
+
+    READY_PAIR = '[["process", "ready"], ["gateway", "ready"]]'
+    DOWN_PAIR = '[["process", "ready"], ["gateway", "down"]]'
+
+    def test_top_level_components_down_then_ready_refused(self):
+        raw = ('{"components": ' + self.DOWN_PAIR
+               + ', "jobs": {"counter": {"parked": true, "running": false}}, '
+               + '"build_revision": "r", "build_id": "b", '
+               + '"components": ' + self.READY_PAIR + '}').encode()
+        with self.assertRaisesRegex(probe.ProbeError, "duplicate JSON object key"):
+            probe.check_readyz_shape(200, raw)
+
+    def test_top_level_components_ready_then_down_refused(self):
+        raw = ('{"components": ' + self.READY_PAIR
+               + ', "jobs": {"counter": {"parked": true, "running": false}}, '
+               + '"build_revision": "r", "build_id": "b", '
+               + '"components": ' + self.DOWN_PAIR + '}').encode()
+        with self.assertRaisesRegex(probe.ProbeError, "duplicate JSON object key"):
+            probe.check_readyz_shape(503, raw)
+
+    def test_top_level_components_identical_repeat_refused(self):
+        raw = ('{"components": ' + self.READY_PAIR
+               + ', "jobs": {"counter": {"parked": true, "running": false}}, '
+               + '"build_revision": "r", "build_id": "b", '
+               + '"components": ' + self.READY_PAIR + '}').encode()
+        with self.assertRaisesRegex(probe.ProbeError, "duplicate JSON object key"):
+            probe.check_readyz_shape(200, raw)
+
+    def test_top_level_components_duplicate_fails_closed_end_to_end(self):
+        raw = ('{"components": ' + self.DOWN_PAIR
+               + ', "jobs": {"counter": {"parked": true, "running": false}}, '
+               + '"build_revision": "r", "build_id": "b", '
+               + '"components": ' + self.READY_PAIR + '}').encode()
+        code, out = run(double({"/health": HEALTH, "/readyz": (200, raw)}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL readiness-shape:", out)
+        self.assertIn("duplicate JSON object key", out)
+        self.assertIn("FAIL gateway-state:", out)
+        self.assertIn("FAIL jobs-map:", out)
+        self.assertNotIn("gateway=ready", out)
+
+    def test_health_status_identical_repeat_refused(self):
+        raw = b'{"status": "ok", "status": "ok"}'
+        with self.assertRaisesRegex(probe.ProbeError, "duplicate JSON object key"):
+            probe.check_liveness(200, raw)
+
+    def test_health_status_conflicting_orders_refused(self):
+        for raw in (b'{"status": "bad", "status": "ok"}',
+                    b'{"status": "ok", "status": "bad"}'):
+            with self.subTest(raw=raw):
+                with self.assertRaisesRegex(probe.ProbeError,
+                                            "duplicate JSON object key"):
+                    probe.check_liveness(200, raw)
+
+    def test_health_duplicate_fails_liveness_end_to_end(self):
+        raw = b'{"status": "bad", "status": "ok"}'
+        code, out = run(double({"/health": (200, raw), "/readyz": PARKED}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL liveness:", out)
+        self.assertIn("duplicate JSON object key", out)
+        self.assertNotIn("bad", out)
+
+    def test_health_unique_still_passes(self):
+        code, out = run(double({"/health": HEALTH, "/readyz": PARKED}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS liveness:", out)
+
+    def test_nested_job_name_duplicate_both_orders_refused(self):
+        fresh = '{"parked": false, "running": true}'
+        parked = '{"parked": true, "running": false}'
+        for jobs in (f'{{"counter": {fresh}, "counter": {parked}}}',
+                     f'{{"counter": {parked}, "counter": {fresh}}}'):
+            raw = ('{"components": ' + self.READY_PAIR + ', "jobs": ' + jobs
+                   + ', "build_revision": "r", "build_id": "b"}').encode()
+            with self.subTest(jobs=jobs):
+                with self.assertRaisesRegex(probe.ProbeError,
+                                            "duplicate JSON object key"):
+                    probe.check_readyz_shape(200, raw)
+
+    def test_nested_job_name_identical_repeat_refused(self):
+        jobs = '{"counter": {"parked": true, "running": false}, "counter": {"parked": true, "running": false}}'
+        raw = ('{"components": ' + self.READY_PAIR + ', "jobs": ' + jobs
+               + ', "build_revision": "r", "build_id": "b"}').encode()
+        with self.assertRaisesRegex(probe.ProbeError, "duplicate JSON object key"):
+            probe.check_readyz_shape(200, raw)
+
+    def test_nested_job_field_duplicate_both_orders_refused(self):
+        for entry in ('{"parked": false, "running": true, "parked": true}',
+                      '{"parked": true, "running": true, "parked": false}',
+                      '{"parked": false, "parked": false, "running": true}'):
+            raw = ('{"components": ' + self.READY_PAIR
+                   + ', "jobs": {"counter": ' + entry + '}, '
+                   + '"build_revision": "r", "build_id": "b"}').encode()
+            with self.subTest(entry=entry):
+                with self.assertRaisesRegex(probe.ProbeError,
+                                            "duplicate JSON object key"):
+                    probe.check_readyz_shape(200, raw)
+
+    def test_nested_job_duplicate_fails_readiness_before_job_grading(self):
+        jobs = '{"counter": {"parked": false, "running": true}, "counter": {"parked": true, "running": false}}'
+        raw = ('{"components": ' + self.READY_PAIR + ', "jobs": ' + jobs
+               + ', "build_revision": "r", "build_id": "b"}').encode()
+        code, out = run(double({"/health": HEALTH, "/readyz": (200, raw)}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL readiness-shape:", out)
+        self.assertIn("duplicate JSON object key", out)
+
+    def test_unique_nested_objects_still_parse(self):
+        _, raw = (200, json.dumps({
+            "components": [["process", "ready"], ["gateway", "ready"]],
+            "jobs": {"counter": {"parked": False, "running": True}},
+            "build_revision": "r", "build_id": "b",
+        }).encode())
+        state, _ = probe.check_readyz_shape(200, raw)
+        self.assertEqual(state["gateway"], "ready")
+
+    def test_escaped_key_spelling_counts_as_duplicate(self):
+        raw = b'{"status": "ok", "\\u0073tatus": "ok"}'
+        with self.assertRaisesRegex(probe.ProbeError, "duplicate JSON object key"):
+            probe.check_liveness(200, raw)
+
+    def test_diagnostic_echoes_no_key_or_value(self):
+        sentinel = "SENTINEL_dupkey_cutover_abc123"
+        raw = ('{"components": ' + self.READY_PAIR
+               + ', "jobs": {"counter": {"parked": true, "running": false}}, '
+               + '"build_revision": "r", "build_id": "b", '
+               + json.dumps(sentinel) + ': 1, ' + json.dumps(sentinel) + ': 2}').encode()
+        with self.assertRaises(probe.ProbeError) as ctx:
+            probe.check_readyz_shape(200, raw)
+        self.assertIn("duplicate JSON object key", str(ctx.exception))
+        self.assertNotIn(sentinel, str(ctx.exception))
+        code, out = run(double({"/health": HEALTH, "/readyz": (200, raw)}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1, out)
+        self.assertNotIn(sentinel, out)
+
+    def test_duplicate_writes_no_receipt(self):
+        raw = ('{"components": ' + self.DOWN_PAIR
+               + ', "jobs": {"counter": {"parked": true, "running": false}}, '
+               + '"build_revision": "r", "build_id": "b", '
+               + '"components": ' + self.READY_PAIR + '}').encode()
+        with mock.patch("builtins.open") as handle:
+            code, _ = run(double({"/health": HEALTH, "/readyz": (200, raw)}),
+                          "--base-url", "http://h/",
+                          "--evidence", "receipt.json")
+        self.assertEqual(code, 1)
+        handle.assert_not_called()
+
+
 class UnknownComponentTest(unittest.TestCase):
     def unknown_body(self, extra, status=200):
         pairs = [("process", "ready"), ("gateway", "ready"), extra]
