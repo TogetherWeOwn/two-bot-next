@@ -4,6 +4,11 @@
 TOML with absolute paths and the two non-secret build arguments (`image_vars`)
 that /readyz reports as `build_revision` and `build_id`. `readyz` decides whether
 one /readyz answer proves the revision the workflow deployed or rolled back to.
+
+`readyz` refuses ambiguous or unsafe evidence before grading: duplicate JSON
+object keys, nesting past the depth bound, and remote revision/build-ID
+shapes outside `unknown`/40-hex/bounded digits-digits yield a fixed
+single-line nonzero refusal that echoes no remote value.
 """
 
 import argparse
@@ -16,6 +21,63 @@ from pathlib import Path
 SHA = re.compile(r"[0-9a-f]{40}")
 DIGITS = re.compile(r"[0-9]+")
 UNSTAMPED = "unknown"
+
+# Well below CPython's default recursion limit (1000): any report deeper
+# than this is refused up front with an explicit stack instead of recursing.
+MAX_READYZ_DEPTH = 100
+# Remote build IDs are `<run id>-<attempt>` (digits-digits); bound both the
+# total and each half so an overlong value never reaches diagnostics.
+MAX_BUILD_ID_LEN = 64
+MAX_BUILD_ID_PART_LEN = 20
+
+
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
+def _too_deeply_nested(record, limit=MAX_READYZ_DEPTH):
+    """Iterative depth check; True when nesting exceeds limit."""
+    stack = [(record, 1)]
+    while stack:
+        obj, depth = stack.pop()
+        if depth > limit:
+            return True
+        if isinstance(obj, dict):
+            for value in obj.values():
+                if isinstance(value, (dict, list)):
+                    stack.append((value, depth + 1))
+        elif isinstance(obj, list):
+            for value in obj:
+                if isinstance(value, (dict, list)):
+                    stack.append((value, depth + 1))
+    return False
+
+
+def _is_build_id_shape(value):
+    """Digits-digits run shape, bounded so overlong never reaches output."""
+    if not isinstance(value, str) or len(value) > MAX_BUILD_ID_LEN:
+        return False
+    parts = value.split("-")
+    return (
+        len(parts) == 2
+        and all(part and len(part) <= MAX_BUILD_ID_PART_LEN and DIGITS.fullmatch(part)
+                for part in parts)
+    )
 
 
 def render(args):
@@ -50,14 +112,35 @@ def readyz(args):
     if args.status not in ("200", "503"):
         return reject(f"/readyz answered {args.status}")
     try:
-        report = json.loads(Path(args.body).read_text())
+        report = json.loads(
+            Path(args.body).read_text(), object_pairs_hook=_reject_duplicate_keys
+        )
+    except DuplicateKeyError:
+        return reject("/readyz carries duplicate JSON object keys")
+    except RecursionError:
+        # Decoder-level backstop: input deeper than the C decoder's own
+        # stack raises here before _too_deeply_nested ever sees it.
+        return reject("/readyz JSON is too deeply nested")
     except (OSError, ValueError):
         return reject("/readyz did not return JSON")
     if not isinstance(report, dict):
         return reject("/readyz JSON is not an object")
+    if _too_deeply_nested(report):
+        return reject("/readyz JSON is too deeply nested")
     revision, build_id = report.get("build_revision"), report.get("build_id")
     if not isinstance(revision, str) or not isinstance(build_id, str):
         return reject("/readyz has no build_revision and build_id")
+    # Remote shapes are validated before any value enters diagnostics: only
+    # the unstamped marker, a 40-char hex revision, or a bounded
+    # digits-digits build ID can appear in output. Anything else (newline,
+    # pipe, control, overlong, secret-shaped) yields a fixed refusal with no
+    # echo, so a hostile answer cannot forge log/summary lines or leak into
+    # evidence. The explicit unstamped rollback exception below is preserved,
+    # as are valid historical numeric run-attempt build IDs.
+    if revision != UNSTAMPED and not SHA.fullmatch(revision):
+        return reject("/readyz build_revision has an unexpected shape")
+    if build_id != UNSTAMPED and not _is_build_id_shape(build_id):
+        return reject("/readyz build_id has an unexpected shape")
     if revision == args.sha:
         if args.mode == "deploy" and build_id != args.build_id:
             return reject(

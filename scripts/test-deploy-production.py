@@ -1213,6 +1213,94 @@ class ReadyzVerdictTests(unittest.TestCase):
         # not this run's, and the gate must still pass on the revision.
         self.assertEqual(self.judge("200", report(build_id="999-1"), mode="rollback")[0], 0)
 
+    def test_duplicate_build_revision_keys_are_refused_before_grading(self):
+        # Last-wins would accept the second (correct) revision with exit 0;
+        # the gate must refuse the ambiguity with a fixed single-line reason.
+        wrong = "f" * 40
+        bodies = (
+            '{"build_revision": "%s", "build_revision": "%s", "build_id": "%s"}'
+            % (wrong, SHA, BUILD_ID),
+            '{"build_revision": "%s", "build_revision": "%s", "build_id": "%s"}'
+            % (SHA, wrong, BUILD_ID),
+            '{"build_revision": "%s", "build_id": "%s", "build_id": "%s"}'
+            % (SHA, BUILD_ID, BUILD_ID),
+        )
+        for body in bodies:
+            with self.subTest(body=body[:40]):
+                for mode in ("deploy", "rollback"):
+                    code, message = self.judge("200", body, mode=mode)
+                    self.assertEqual(code, 1, message)
+                    self.assertIn("duplicate", message)
+                    self.assertNotIn("\n", message)
+
+    def test_excessive_nesting_is_refused_with_a_bounded_message(self):
+        # Iterative depth refusal: valid identity buried under deep junk
+        # must not certify, and the refusal echoes no payload bytes.
+        nested = "[" * 500 + "]" * 500
+        body = ('{"build_revision": "%s", "build_id": "%s", "payload": %s}'
+                % (SHA, BUILD_ID, nested))
+        for mode in ("deploy", "rollback"):
+            code, message = self.judge("200", body, mode=mode)
+            self.assertEqual(code, 1, message)
+            self.assertIn("deeply nested", message)
+            self.assertNotIn("\n", message)
+            self.assertNotIn("payload", message)
+
+    def test_decoder_overflow_is_refused_without_a_traceback(self):
+        # Deep enough to overflow the C JSON decoder itself, so json.loads
+        # raises RecursionError before the iterative depth check is reached.
+        body = "[" * 100000
+        for mode in ("deploy", "rollback"):
+            code, message = self.judge("200", body, mode=mode)
+            self.assertEqual(code, 1, message)
+            self.assertIn("deeply nested", message)
+            self.assertNotIn("\n", message)
+            self.assertNotIn("Traceback", message)
+
+    def test_hostile_remote_identity_never_reaches_diagnostics(self):
+        # Runtime-built marker: it cannot match a literal in the script, so
+        # its absence proves the remote value never reached the output.
+        marker = "sg%s%s%d" % ("ni", "p", id(object()))
+        evils = [
+            {"revision": SHA, "build_id": "700-1\nEXTRA LINE " + marker},
+            {"revision": SHA, "build_id": "700-1|" + marker},
+            {"revision": SHA, "build_id": "700-1\x00" + marker},
+            {"revision": SHA, "build_id": "700-1\x1b" + marker},
+            {"revision": SHA, "build_id": "1" * 40 + "-" + "1" * 40 + marker},
+            {"revision": SHA, "build_id": "ghp_" + marker + "A" * 16},
+            {"revision": SHA, "build_id": "xoxb-" + marker},
+            {"revision": "ab|cd\nef" + marker, "build_id": BUILD_ID},
+            {"revision": "ghp_" + marker + "A" * 16, "build_id": BUILD_ID},
+            {"revision": "A" * 36 + marker[:4], "build_id": BUILD_ID},
+            {"revision": SHA[:39] + "|", "build_id": BUILD_ID},
+            {"revision": SHA, "build_id": "run-1"},
+        ]
+        for evil in evils:
+            with self.subTest(revision=evil["revision"][:12], build_id=evil["build_id"][:12]):
+                body = report(revision=evil["revision"], build_id=evil["build_id"])
+                for mode in ("deploy", "rollback"):
+                    code, message = self.judge("200", body, mode=mode)
+                    self.assertEqual(code, 1, message)
+                    self.assertIn("unexpected shape", message)
+                    self.assertNotIn("\n", message)
+                    self.assertNotIn(marker, message)
+                    self.assertNotIn("|", message.split("unexpected shape")[0].split(":")[-1]
+                                     if "unexpected shape" in message else message)
+
+    def test_valid_deploy_rollback_and_unstamped_controls_still_pass(self):
+        # Shape-valid identity keeps the exact-sha/same-run, rollback and
+        # pre-stamp semantics unchanged after the hardening.
+        code, message = self.judge("200", report())
+        self.assertEqual(code, 0)
+        self.assertIn("gateway ready", message)
+        self.assertIn(BUILD_ID, message)
+        code, _ = self.judge("200", report(build_id="999-1"), mode="rollback")
+        self.assertEqual(code, 0)
+        code, message = self.judge(
+            "200", report(revision="unknown", build_id="unknown"), mode="rollback")
+        self.assertEqual(code, 0)
+        self.assertIn("pre-stamp version", message)
+
 
 if __name__ == "__main__":
     unittest.main()
