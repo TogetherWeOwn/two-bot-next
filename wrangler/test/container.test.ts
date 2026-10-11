@@ -11,6 +11,8 @@ import { DatabaseSync } from "node:sqlite";
 import { setImmediate } from "node:timers/promises";
 import worker, { TwoBotContainer, type Env } from "../src/index.ts";
 import { OWNER_KEY, AUDIT_PREFIX, DEPLOYMENT_HEADER, CONTROL_PATH } from "../src/ownership.ts";
+import { EMPTY_STATE, type MetricsAlertState } from "../src/alert-rules.ts";
+import { metricsBody, metricsLines } from "./fixtures/metrics.ts";
 
 const ID = "deployment-A";
 const CONTROL_TOKEN = "synthetic-control-token-not-a-secret-12345";
@@ -1057,6 +1059,12 @@ for (const failure of ["http", "fetch", "body", "missing", "invalid"] as const) 
     const h = await alertHarness(t, ALERT_ENV);
     let count = 20;
     let failed = false;
+    // Complete scrapes: the background validator rejects partial bodies, so the
+    // streak grows from full exposition with only the reactions lane rising.
+    const reactions = (value: string) => metricsBody().replace(
+      'two_bot_dispatch_drops_total{lane="reactions"} 0',
+      `two_bot_dispatch_drops_total{lane="reactions"} ${value}`,
+    );
     t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
       const path = new URL(typeof input === "string" ? input : input.url).pathname;
       if (path !== "/metrics") return new Response(null, { status: 200 });
@@ -1064,12 +1072,12 @@ for (const failure of ["http", "fetch", "body", "missing", "invalid"] as const) 
         if (failure === "fetch") throw new Error("synthetic metrics transport failure");
         if (failure === "http") return new Response(null, { status: 503 });
         if (failure === "missing") return new Response("");
-        if (failure === "invalid") return new Response('two_bot_dispatch_drops_total{lane="reactions"} NaN\n');
-        const response = new Response("");
-        t.mock.method(response, "text", async () => { throw new Error("synthetic metrics body failure"); });
-        return response;
+        if (failure === "invalid") return new Response(reactions("NaN"));
+        return new Response(new ReadableStream({ start(controller) {
+          controller.error(new Error("synthetic metrics body failure"));
+        } }));
       }
-      return new Response(`two_bot_dispatch_drops_total{lane="reactions"} ${count}\n`);
+      return new Response(reactions(String(count)));
     });
     for (const n of [20, 21, 22]) {
       count = n;
@@ -1111,8 +1119,7 @@ async function senderHarness(t: TestContext, sender: AlertSender, env: Partial<E
   t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
     const path = new URL(typeof input === "string" ? input : input.url).pathname;
     if (path === "/metrics") {
-      return new Response(sender === "metrics"
-        ? `two_bot_job_consecutive_failures{job="rank"} ${failing ? 3 : 0}\n` : "");
+      return new Response(metricsBody(sender === "metrics" && failing ? 3 : 0));
     }
     return new Response(null, { status: sender === "readiness" && failing ? 503 : 200 });
   });
@@ -1584,7 +1591,7 @@ test("keepalive pulls /metrics, alerts once on a failing job and resolves", asyn
   let failures = 3;
   t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
     const path = new URL(typeof input === "string" ? input : input.url).pathname;
-    if (path === "/metrics") return new Response(`two_bot_job_consecutive_failures{job="rank"} ${failures}\n`);
+    if (path === "/metrics") return new Response(metricsBody(failures));
     return new Response(null, { status: 200 });
   });
   await h.tick();
@@ -1595,4 +1602,208 @@ test("keepalive pulls /metrics, alerts once on a failing job and resolves", asyn
   failures = 0;
   await h.tick();
   assert.equal(h.posts.filter((p) => String(p.init.body).includes("RESOLVED job_consecutive_failures:rank")).length, 1);
+});
+
+const METRICS_KEY = "two-bot:metrics-alerts";
+const SCRAPE_FAILURE = "two-bot metrics scrape failed";
+const PRIOR_METRICS: MetricsAlertState = {
+  ...EMPTY_STATE, firing: ["job_consecutive_failures:rank"],
+  rest429: 12, restTotal: 100, poolStreak: 2, dbErrors: 7,
+  sendBlocked: 8, sendBlockedStreak: 2, voiceOps: 40, voiceFailures: 2,
+  voiceDeadLetters: 1, voiceOrphans: 1, gatewayMissed: 4, gatewayMissedSeen: true,
+  receiverRefusals: { membership: 8 }, receiverRefusalsSeen: true,
+  receiverRefusalStreaks: { membership: 2 },
+  dispatchDrops: { reactions: 5 }, dispatchDropStreaks: { reactions: 2 },
+};
+
+async function backgroundMetricsHarness(t: TestContext) {
+  const h = await alertHarness(t, ALERT_ENV);
+  const previous = structuredClone(PRIOR_METRICS);
+  h.values.set(METRICS_KEY, previous);
+  const puts = t.mock.method(h.ctx.storage, "put");
+  let response = (_signal: AbortSignal): Promise<Response> => Promise.resolve(new Response(metricsBody()));
+  t.mock.method(h.bot, "containerFetch", async (input: string | Request, init?: RequestInit) => {
+    const path = new URL(typeof input === "string" ? input : input.url).pathname;
+    return path === "/metrics" ? response(init!.signal!) : new Response(null, { status: 200 });
+  });
+  return {
+    ...h, previous, puts,
+    setMetricsResponse: (next: typeof response) => { response = next; },
+    assertInterrupted: () => {
+      // A failed scrape preserves firing keys and every baseline/streak except
+      // the dispatch-drop window, which resets without resolving anything.
+      const writes = puts.mock.calls.filter((call) => call.arguments[0] === METRICS_KEY);
+      assert.equal(writes.length, 1, "one dispatch-interrupt write");
+      assert.deepEqual(writes[0]!.arguments[1], { ...previous, dispatchDrops: {}, dispatchDropStreaks: {} });
+      assert.deepEqual(previous, PRIOR_METRICS, "no in-place baseline/streak/firing mutation");
+      assert.deepEqual(h.values.get(METRICS_KEY), { ...PRIOR_METRICS, dispatchDrops: {}, dispatchDropStreaks: {} });
+      assert.equal(h.posts.length, 0, "no false RESOLVED notification");
+      assert.equal(h.events().length, 0, "no false transition logs");
+      assert.deepEqual(h.logs.filter((line) => line !== "two-bot container started"), [SCRAPE_FAILURE]);
+      assert.equal(h.schedules.mock.callCount(), 1, "failure still rearms keepalive");
+    },
+  };
+}
+
+function paddedMetrics(bytes: number): Uint8Array {
+  const body = metricsBody();
+  return new TextEncoder().encode(body + "#" + "x".repeat(bytes - body.length - 2) + "\n");
+}
+
+for (const bytes of [64 * 1024, 64 * 1024 + 1]) {
+  test(`background metrics: streaming ${bytes} bytes respects the cap and cancels oversize`, async (t) => {
+    const h = await backgroundMetricsHarness(t);
+    let cancelled = 0;
+    let pulls = 0;
+    const chunks = [paddedMetrics(64 * 1024), ...(bytes > 64 * 1024 ? [new Uint8Array([32])] : [])];
+    h.setMetricsResponse(async () => new Response(new ReadableStream({
+      pull(controller) {
+        pulls++;
+        if (chunks.length) controller.enqueue(chunks.shift()!);
+        else if (bytes === 64 * 1024) controller.close();
+        else throw new Error("must cancel before a third read");
+      },
+      cancel() { cancelled++; return new Promise<void>(() => {}); },
+    }, { highWaterMark: 0 })));
+    await h.tick();
+    if (bytes > 64 * 1024) {
+      h.assertInterrupted();
+      assert.equal(cancelled, 1, "cancel hook does not need to finish");
+      assert.equal(pulls, 2);
+    } else {
+      assert.equal(cancelled, 0);
+      assert.equal(pulls, 2);
+      assert.deepEqual(h.values.get(METRICS_KEY)?.firing, []);
+      assert.equal(h.posts.length, 1, "valid exact-cap scrape resolves");
+    }
+  });
+}
+
+for (const cancel of ["normal", "reject", "stall"] as const) {
+  test(`background metrics: huge non-OK body is cancelled without reading (${cancel})`, async (t) => {
+    const h = await backgroundMetricsHarness(t);
+    let cancelled = 0;
+    let pulls = 0;
+    h.setMetricsResponse(async () => new Response(new ReadableStream({
+      pull(controller) { pulls++; controller.enqueue(new Uint8Array(1024 * 1024)); },
+      cancel() {
+        cancelled++;
+        if (cancel === "reject") return Promise.reject(new Error("synthetic-secret-body-marker"));
+        if (cancel === "stall") return new Promise<void>(() => {});
+      },
+    }, { highWaterMark: 0 }), { status: 500 }));
+    await h.tick();
+    h.assertInterrupted();
+    assert.equal(pulls, 0, "no error-body buffering or draining");
+    assert.equal(cancelled, 1);
+  });
+}
+
+for (const [name, body] of Object.entries({
+  empty: "", nonExposition: "<html>synthetic-secret-body-marker</html>",
+  commentsOnly: "# HELP x synthetic-secret-body-marker\n",
+  partial: 'two_bot_job_consecutive_failures{job="rank"} 0\n',
+  malformed: `${metricsBody()}synthetic-secret-body-marker\n`,
+  malformedLabel: metricsBody().replace('{job="rank"}', '{job=rank}'),
+  missingSeries: metricsLines().slice(1).join("\n"),
+  nonfinite: metricsBody().replace("two_bot_gateway_missed_events_total 0", "two_bot_gateway_missed_events_total NaN"),
+  negative: metricsBody().replace("two_bot_db_pool_connections 0", "two_bot_db_pool_connections -1"),
+  duplicate: `${metricsBody()}two_bot_gateway_missed_events_total 0\n`,
+})) {
+  test(`background metrics: invalid 200 preserves all previous alert state (${name})`, async (t) => {
+    const h = await backgroundMetricsHarness(t);
+    h.setMetricsResponse(async () => new Response(body));
+    await h.tick();
+    h.assertInterrupted();
+  });
+}
+
+test("background metrics: interrupted stream after a valid prefix never commits or leaks details", async (t) => {
+  const h = await backgroundMetricsHarness(t);
+  let pulls = 0;
+  h.setMetricsResponse(async () => new Response(new ReadableStream({
+    pull(controller) {
+      if (pulls++ === 0) controller.enqueue(new TextEncoder().encode(metricsBody()));
+      else controller.error(new Error("synthetic-secret-stream-marker"));
+    },
+  }, { highWaterMark: 0 })));
+  await h.tick();
+  h.assertInterrupted();
+  assert.equal(pulls, 2);
+});
+
+for (const failure of ["fetch stall", "late response", "body stall", "abort response"] as const) {
+  test(`background metrics: one six-second request/body deadline bounds ${failure}`, async (t) => {
+    const h = await backgroundMetricsHarness(t);
+    let cancelled = 0;
+    let release: (() => void) | undefined;
+    let signal: AbortSignal | undefined;
+    const realTimeout = AbortSignal.timeout;
+    const timeout = t.mock.method(AbortSignal, "timeout", (ms: number) => realTimeout(ms === 6000 ? 30 : ms));
+    const stream = () => new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(new TextEncoder().encode(metricsBody()));
+        return new Promise<void>(() => {});
+      },
+      cancel() { cancelled++; return new Promise<void>(() => {}); },
+    }, { highWaterMark: 0 });
+    h.setMetricsResponse((nextSignal) => {
+      signal = nextSignal;
+      if (failure === "body stall") return Promise.resolve(new Response(stream()));
+      if (failure === "abort response") return new Promise((resolve) => {
+        nextSignal.addEventListener("abort", () => resolve(new Response(stream())), { once: true });
+      });
+      return new Promise((resolve) => { release = () => resolve(new Response(stream())); });
+    });
+    // Keep node alive: AbortSignal.timeout is an unref'ed timer. The guard
+    // also fails a regression rather than leaving the test runner hanging.
+    const guard = setTimeout(() => {}, 1000);
+    try {
+      await h.tick();
+      h.assertInterrupted();
+      assert.ok(signal?.aborted);
+      assert.ok(timeout.mock.calls.some((call) => call.arguments[0] === 6000));
+      if (failure === "late response") { release!(); await setImmediate(); }
+      assert.equal(cancelled, failure === "fetch stall" ? 0 : 1);
+    } finally { clearTimeout(guard); }
+  });
+}
+
+test("background metrics: transport rejection is bounded and never throws", async (t) => {
+  const h = await backgroundMetricsHarness(t);
+  h.setMetricsResponse(async () => { throw new Error("synthetic-secret-fetch-marker"); });
+  await h.tick();
+  h.assertInterrupted();
+});
+
+test("background metrics: valid scrape persists before resolving, notifies once and supports extra series", async (t) => {
+  const h = await backgroundMetricsHarness(t);
+  h.setMetricsResponse(async () => new Response(metricsBody()
+    + 'new_metric{version="future"} 1\nnew_histogram_bucket{le="+Inf"} 0\n'));
+  const webhook = t.mock.method(globalThis, "fetch", async () => {
+    assert.deepEqual(h.values.get(METRICS_KEY)?.firing, [], "persisted before notifying");
+    return new Response(null, { status: 204 });
+  });
+  await h.tick();
+  await h.tick();
+  assert.equal(webhook.mock.callCount(), 1);
+  assert.equal(h.events().length, 1);
+  assert.match(h.events()[0].content, /RESOLVED job_consecutive_failures:rank/);
+  assert.ok(!h.logs.includes(SCRAPE_FAILURE));
+});
+
+test("background metrics: metrics storage failure cannot notify and retains the old state", async (t) => {
+  const h = await backgroundMetricsHarness(t);
+  const put = h.ctx.storage.put;
+  t.mock.method(h.ctx.storage, "put", async (...args: Parameters<typeof put>) => {
+    if (args[0] === METRICS_KEY) throw new Error("synthetic-secret-storage-marker");
+    return put(...args);
+  });
+  await h.tick();
+  assert.equal(h.values.get(METRICS_KEY), h.previous);
+  assert.deepEqual(h.previous, PRIOR_METRICS);
+  assert.equal(h.posts.length, 0);
+  assert.equal(h.events().length, 0);
+  assert.ok(h.logs.includes(SCRAPE_FAILURE));
+  assert.equal(h.schedules.mock.callCount(), 1);
 });
