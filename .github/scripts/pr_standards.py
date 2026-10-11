@@ -39,20 +39,12 @@ LIGHT_TYPES = {"docs", "chore", "build", "ci", "style", "test", "revert"}
 
 REQUIRED_SECTIONS = [
     # (heading, minimum real items, skipped for LIGHT_TYPES)
-    ("Thinking Path", 3, False),
+    # Pipeline review 2026-10-10: only what a reviewer or a deterministic gate needs. The tracked card or
+    # issue, and the test evidence. Thinking Path, What Changed, Risks, Model Used and the checklist ticks
+    # are optional prose; the Paperclip Review reads the diff itself.
     ("Linked Issues or Issue Description", 1, True),
-    ("What Changed", 1, False),
     ("Verification", 1, False),
-    ("Risks", 1, False),
-    ("Model Used", 1, False),
 ]
-
-MODEL_PLACEHOLDERS = ("provider, model id", "your model", "<model>", "[provider")
-
-DEDUP_CHECKBOX = re.compile(
-    r"^\s*[-*]\s*\[\s*([ xX])\s*\][^\n]*search(?:ed)?[^\n]*(?:similar|duplicate|prior|related)[^\n]*\bprs?\b",
-    re.I | re.M,
-)
 
 COMMENT = re.compile(r"<!--.*?-->", re.S)
 
@@ -164,8 +156,8 @@ def check_pull_request(env):
 
     plain = strip_comments(body)
     if len(re.sub(r"\s", "", plain)) < 40:
-        out.append(Finding("error", "PR body", "The description is empty. Fill in the PR template: thinking path, "
-                           "what changed, how it was verified, risks and the model used."))
+        out.append(Finding("error", "PR body", "The description is empty. Fill in the PR template: the linked card or issue and "
+                           "how it was verified."))
     elif not generated:
         ptype = pr_type(title)
         light = ptype in LIGHT_TYPES
@@ -177,17 +169,9 @@ def check_pull_request(env):
             if content is None:
                 out.append(Finding(mode, "PR template", f"Missing section '## {heading}'."))
                 continue
-            if heading == "Model Used" and any(p in content.lower() for p in MODEL_PLACEHOLDERS):
-                out.append(Finding(mode, "PR template", "'## Model Used' still holds placeholder text. Name the "
-                                   "model and version, or write 'None - human-authored'."))
-            elif real_items(content) < minimum:
+            if real_items(content) < minimum:
                 need = f"at least {minimum} items" if minimum > 1 else "real content"
                 out.append(Finding(mode, "PR template", f"'## {heading}' needs {need}."))
-        if ptype and ptype not in LIGHT_TYPES:
-            m = DEDUP_CHECKBOX.search(plain)
-            if not m or m.group(1) == " ":
-                out.append(Finding(mode, "Duplicate search", "Tick the checklist line saying you searched for "
-                                   "duplicate or related PRs, and link any you found."))
 
     if private:
         if not generated and not re.search(r"\bTOG-\d+\b", body):
@@ -218,10 +202,22 @@ def check_commits(env):
         if subject.startswith(("Merge ", 'Revert "')):
             continue
         short = (c.get("id") or "")[:10]
+        author_obj = c.get("author") or {}
+        author = ""
+        if isinstance(author_obj, dict):
+            author = str(author_obj.get("username") or author_obj.get("login")
+                         or author_obj.get("name") or "")
+        elif isinstance(author_obj, str):
+            author = author_obj
+        is_bot = author.endswith("[bot]") and author.startswith(("dependabot", "renovate"))
         errs = header_errors(subject)
         if errs:
-            out.append(Finding("error", "Commit on main", f"{short} '{subject}': {'; '.join(errs)}. Merge PRs with "
-                               "squash and the PR title as the commit title."))
+            if is_bot:
+                out.append(Finding("warning", "Commit on main", f"{short} '{subject}': {'; '.join(errs)}. "
+                                   "Bot commit; set commit-message.prefix (e.g. chore(deps)) in the bot config."))
+            else:
+                out.append(Finding("error", "Commit on main", f"{short} '{subject}': {'; '.join(errs)}. Merge PRs with "
+                                   "squash and the PR title as the commit title."))
         if not private:
             hits = internal_hits(message, prefixes)
             if hits:

@@ -27,8 +27,13 @@ instead of failing the whole snapshot (see `website_store` tick recipe):
   exclusions are named in `excluded_member_ids`, holder/highest counts stay
   mutually exclusive, and `ranked_member_count <= human_member_count`.
 - A higher rank without every lower rung still builds with `nested: false`;
-  the publish layer maps that to `RankSkip::RanksNotNested` (writes
-  nothing) instead of publishing a broken ladder.
+  the rank tick self-heals it first (`plan_rank_heal`: grant the missing
+  lower rungs with an audit reason, bounded at 25 grants per tick and
+  fenced below the bot's highest role, then rebuild and re-verify) and
+  publishes the healed snapshot with a repair alert naming the members
+  and roles. A ladder that is still bad afterwards, or an unhealable one
+  (over bound, hierarchy refusal), maps to `RankSkip::RanksNotNested`
+  (writes nothing) instead of publishing a broken ladder.
 - `JobGate` is single-flight: a second `try_acquire` while a tick holds
   the guard returns `None` (skip, do not queue); the gate releases on
   guard drop.

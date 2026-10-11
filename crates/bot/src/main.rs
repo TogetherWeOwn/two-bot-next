@@ -468,7 +468,7 @@ async fn run(cli_args: &[String]) {
                                 step_failure(FailureClass::MilestonesLoadFailed, error)
                             })?,
                     );
-                    // Community message capture (TOG-19603): arm the Postgres
+                    // Community voice + message capture: arm the Postgres
                     // facts sink only when the scorecard job is enabled, so a
                     // staging-gated rollout captures exactly while it scores.
                     if std::env::var("TWO_COMMUNITY_SCORECARD").is_ok_and(|v| v == "1") {
@@ -614,12 +614,16 @@ async fn run(cli_args: &[String]) {
             match failed {
                 None => Ok(()),
                 Some(failed) => {
+                    // Only a running-gateway failure lingers 75 s so a
+                    // keepalive scrape sees the checkpoint counter; startup
+                    // failures keep the short 15 s linger.
+                    let linger = shutdown::failure_linger(failed.class);
                     publish_gateway_failure(
                         &state,
                         &failure_slot,
                         failed.class,
                         linger_stop,
-                        shutdown::FAILURE_LINGER,
+                        linger,
                     )
                     .await;
                     Err(failed.error)

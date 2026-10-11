@@ -32,8 +32,12 @@ names a missing Environment makes GitHub create it with no protection, so the
 guard checks before the deploy job can run. This repository is public, so
 required reviewers work on every plan; no Enterprise plan is needed.
 
-**Deploy.** Dispatch with `sha` set to a full 40-character commit that is on
-`main`. That commit needs successful, completed `ci-ok` and `worker check`
+**Deploy.** Leave `sha` empty to promote the commit of the latest successful
+`deploy-staging` run on `main` (the normal case: merges keep superseding pending
+staging runs, so the newest `main` commit is often not staged). The guard then
+applies every rule below to that commit and refuses it if its `ci-ok` or
+`worker check` has not finished green. To deploy a specific commit, dispatch
+with `sha` set to a full 40-character commit that is on `main`. That commit needs successful, completed `ci-ok` and `worker check`
 runs from GitHub Actions and a successful `deploy-staging` run. `ci-ok` is the
 full verdict over lint, worker checks and every selected Rust/DB test lane;
 a green lint-only `check` job is not enough. The guard enumerates `check.yml`
@@ -47,7 +51,7 @@ pagination and a run/attempt change during validation fail closed. If a partial
 rerun omits a required job from the current attempt, rerun **all jobs**; do not
 reuse the earlier attempt's receipt. The summary records the admitted run/attempt.
 Staging runs queue in a single concurrency group, so an intermediate commit may
-never stage. Pick one that did. A push to `main` that touches only docs, root
+never stage; the empty-`sha` promotion picks the latest one that did. A push to `main` that touches only docs, root
 markdown or repository chrome (the `paths-ignore` list in `deploy-staging.yml`)
 starts no staging run either, so the newest `main` commit may have no
 `deploy-staging` run: pin the latest commit that changes runtime inputs, or
@@ -62,7 +66,10 @@ After the reviewer approves (or the automated approval passes), the job:
 4. gates on `/health` 200 and on `/readyz` reporting this SHA (see
    [Build identity and the `/readyz` gate](#build-identity-and-the-readyz-gate)).
 
-**Roll back.** This dispatch is the single production rollback method.
+**Roll back.** This dispatch is the single production rollback method. A rollback,
+and a redeploy of a prior good commit, must always set `sha` explicitly: an empty
+`sha` promotes the latest staged commit, which during an incident is usually the
+build that just broke production (the guard refuses a rollback without `sha`).
 Dispatch again with `rollback` set to the previous version ID
 from the failed run's summary and `takeover: true`. Set `sha` to the commit that version was built
 from. It is recorded as the rollback message, and the `/readyz` gate after the
@@ -104,7 +111,7 @@ render` reads the checked-in `wrangler/wrangler.toml`, makes its paths absolute
 because the rendered file lives outside `wrangler/`, and sets `image_vars` on the
 single production container. Nothing else changes, and
 `scripts/test-deploy-production.py` pins that diff. The lockfile's Wrangler
-(4.147.0) runs the deploy: `wrangler-action` uses the installed version when
+(4.148.0) runs the deploy: `wrangler-action` uses the installed version when
 `wranglerVersion` is omitted, and the job runs `npm ci` first.
 
 The gate polls `/readyz` every 10 seconds for up to 30 attempts. In deploy
@@ -165,9 +172,14 @@ signal.
    refuses the takeover when traffic is split or unreadable.
 3. P2 `Read production ownership state without starting`: authenticated GET
    against the production Worker URL. It confirms the serving deployment is
-   the recorded `NEW_VERSION` with `running=false`; any mismatch is NO-GO
-   and the run stops before any POST. The full response is tee'd to the run
-   log as the P2 receipt.
+   the recorded `NEW_VERSION` with `running=false`. For about 330 s (34 reads,
+   10 s apart) it waits out the version change: a `503 deployment_mismatch` or
+   an answer still naming the previous version is read again, because the
+   ownership Durable Object keeps running the previous code until
+   Cloudflare's deferred update reaches it (up to about 300 s, observed on
+   2026-10-10 after both a deploy and a secret change). A mismatch that outlasts the window, and every other refusal or a
+   running container, is NO-GO and the run stops before any POST. The full
+   response is tee'd to the run log as the P2 receipt.
 4. P3 `Take over production ownership at the read epoch`: one POST with
    exactly `{"action":"takeover","expectedEpoch":<P2 epoch>,"actor":...}`.
    The actor is `github-actions:<run id>:<guarded SHA>` (audit label only;
@@ -333,13 +345,67 @@ acceptance.
 | REST 5xx and action latency | Single-attempt calls keep their 5 s body-read deadline; 429 `retry-after + 250 ms` honored, 5xx backoff 500…8000 ms across the bounded retry budget; moderation uses one timed attempt | Any uncertain send without a recorded disposition, or a route whose `job_consecutive_failures` reaches 3: freeze that writer and reconcile; roll back if the failing path shipped in this revision | [rest-guard.md](rest-guard.md); [pacing-backoff-acceptance.md](pacing-backoff-acceptance.md); [metrics.md](metrics.md#off-container-scrape-and-alert-rules) |
 | Bot token | Zero 401s on bot-authenticated endpoints | First latched `token_invalid`: stop retries, freeze writers; no rollback until provisioning is corrected through the governed path | [rest-guard.md](rest-guard.md) |
 | Unban queue | Sweep every 30 s (`UNBAN_SWEEP_INTERVAL_SECONDS`), at most 25 jobs claimed per sweep; no due unban left pending across sweeps without a named disposition | Any overdue sanction without a named disposition is a finding; zero unexplained overdue is required for GO at each checkpoint | [member-moderation.md](member-moderation.md); [cutover.md](cutover.md) §§T-minus, 48-hour watch |
-| Scheduled jobs | Last success within twice the job cadence; fewer than 3 consecutive failures | `job_stale` or 3 consecutive failures on a watch-critical job (unban sweep, session checkpoint): freeze the consumer, fix the dependency; roll back if the regression shipped in this revision | [metrics.md](metrics.md#off-container-scrape-and-alert-rules) |
+| Scheduled jobs | Scheduled jobs: last success within twice the cadence; fewer than 3 consecutive failures. Unban sweep, automod expiry and event-driven session checkpoint: manual checks below | Installed `job_stale` covers only registered cadences, `ticker_stale` covers the two 15 s tickers, `job_consecutive_failures` covers labelled failed completions per job (including `member_unban_sweep` and `automod_expiry` on their own labels), and the coarse `job_unknown_stale` ticket covers a stale nonzero success on any label without a cadence entry. `session_checkpoint` is stale-exempt and records successes only in these job series. A manual failure/stall finding has the same response: freeze the consumer, fix the dependency; roll back if the regression shipped in this revision | [metrics.md](metrics.md#off-container-scrape-and-alert-rules); [manual checks](#scheduled-job-manual-checkpoints) |
 | DB pool | Idle connections above zero, below max | Pool at max with zero idle for 3 consecutive keepalive samples: do not restart to free it; freeze writers, fix the holder; roll back if a new query path holds checkouts | [metrics.md](metrics.md#off-container-scrape-and-alert-rules); [runbook.md](runbook.md) Alert: DB pool |
 | `db_errors` | Fewer than 3 storage failures between keepalive samples; a counter reset (process restart) skips the window, not proof of health; sustained low-rate failures surface through `job_consecutive_failures` | 3 or more storage failures between samples: correlate the `op` label and recent deploys; do not run SQL probes or restart to clear errors; escalate repeated bursts per the runbook, evaluate rollback if this revision introduced the failing writes | [metrics.md](metrics.md#off-container-scrape-and-alert-rules); [runbook.md](runbook.md#alert-db-errors) |
 | `send_admission_blocked` | Fewer than 3 consecutive keepalive samples with new admission refusals; a sample with no new refusals breaks the streak; admission SQL failures count in `db_errors`, not refusals | New admission refusals in 3 consecutive samples: investigate cooldowns and held lanes; do not replay uncertain sends or restart to free the lane; escalate persistent refusals per the runbook, evaluate rollback if this revision introduced the regression | [metrics.md](metrics.md#off-container-scrape-and-alert-rules); [runbook.md](runbook.md#alert-send-admission-blocked) |
 | RSS and placement | RSS near the B1 soak-measured floor (~140 MiB, under the ~200 MiB `lite` gate signal) on the shipped `basic` placement; image/binary sizes inside the B1 ceilings (25% image and 40% binary headroom policy) | Sustained RSS growth versus the B1 floor with no attribution, sustained use pressing the placement cap, or any OOM-kill: freeze writers, investigate or roll back | [b1-baseline.md](b1-baseline.md) (`basic` verdict, ceilings); [cutover.md](cutover.md) §48-hour watch; this is a separate production-watch signal, not B2's numeric RSS acceptance |
 | Event continuity | Zero unexplained gaps or duplicated effects versus independent moderator observations | Any unexplained gap or duplicated execution is a stop condition: freeze writers, evaluate rollback | [cutover.md](cutover.md) §48-hour watch; [staging-soak.md](staging-soak.md) acceptance |
 | Shutdown drain | SIGTERM drain completes inside 35 s (`SHUTDOWN_TIMEOUT_SECONDS` default) | `shutdown_deadline_exceeded` (exit 1): the restart reads the last committed checkpoint; repeated misses block GO until investigated | [configuration.md](configuration.md) |
+
+### Scheduled-job manual checkpoints
+
+At +15 min, +1 h, +6 h, +24 h and +48 h, inspect the current checkpoint's
+container logs with these exact JSON-field filters (not the `msg` envelope):
+
+```text
+message = "periodic job failed" AND job = "member_unban_sweep"
+message = "member unban sweep completed jobs"
+```
+
+Keep each failure's timestamp and bounded `error_class`; the completion line carries
+`completed` only when work was actually done. Do not copy guild/member IDs into
+the watch log. Zero-work successes emit no completion line, and a stalled
+attempt emits no failure until it finishes or times out, so **no matching log
+line is not success**. Inspect the saved `/readyz` response too:
+
+```sh
+jq '.jobs.member_unban_sweep | {running, parked, last_success, consecutive_failures}' readyz.json
+```
+
+`last_success` is Unix **milliseconds** (unlike metric timestamps). Compare it
+with the read timestamp and prior checkpoint: a parked/missing job is not an
+accepted sweep; three failures or no recent success needs a disposition. The
+30 s cadence is not an attempt deadline: a sweep may run for up to 180 s, so
+investigate a >60 s age with `running`/logs before declaring it stalled.
+`job="member_unban_sweep"` is valid per-sweep evidence: `job_consecutive_failures`
+fires at 3 on its own label and a stale nonzero success tickets via the coarse
+`job_unknown_stale` fallback. `job="other"` remains the shared unknown-name
+catch-all, never per-sweep evidence.
+
+For automod expiry, inspect the saved `/readyz` response (there is no
+completion log line: the 60 s tick is a no-op success until the gateway builds
+the activation, and it only does real expiry work when `TWO_AUTOMOD=1`):
+
+```sh
+jq '.jobs.automod_expiry | {running, parked, last_success, consecutive_failures}' readyz.json
+```
+
+When `TWO_AUTOMOD` is not `1` the job is not registered and the entry is
+absent: record the checkpoint as not-applicable, never green. Otherwise compare
+`last_success` (Unix **milliseconds**) with the read timestamp and prior
+checkpoint like the unban sweep: three failures or no recent success needs a
+disposition. `job_consecutive_failures` fires at 3 on the `automod_expiry`
+label and a stale nonzero success tickets via the coarse `job_unknown_stale`
+fallback.
+
+For the event-driven session checkpoint, use the
+[manual checkpoint queries](voice-cutover-rollback-triggers.md#manual-checkpoint-queries)
+for success age, commit traffic and commit failures; there is no periodic
+"two cadences" stale rule. For uninstalled multi-window burn alerts, evaluate
+[the manual burn windows](error-budget-alerts.md#manual-checkpoint-evaluation)
+at each checkpoint. Record missing history or signals as unknown, never green
+because an alert stayed silent.
 
 ## Deploy-timer mapping (parity §4)
 

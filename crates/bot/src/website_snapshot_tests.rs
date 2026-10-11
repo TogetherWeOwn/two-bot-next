@@ -102,7 +102,8 @@ async fn malformed_event_elements_and_optionals_never_reach_storage() {
                 &executor(&mock),
                 "2222",
                 &Mutex::new(()),
-                &shutdown
+                &shutdown,
+                false
             )
             .await,
             Err(ErrorClass::Rest),
@@ -157,7 +158,16 @@ async fn stopped_or_closed_attempts_and_queued_observations_do_no_io() {
                 drop(stop);
             }
             assert_eq!(
-                run_once(kind, &pool, &rest, "2222", &Mutex::new(()), &shutdown).await,
+                run_once(
+                    kind,
+                    &pool,
+                    &rest,
+                    "2222",
+                    &Mutex::new(()),
+                    &shutdown,
+                    false
+                )
+                .await,
                 Ok(())
             );
         }
@@ -166,7 +176,7 @@ async fn stopped_or_closed_attempts_and_queued_observations_do_no_io() {
         let observation = Mutex::new(());
         let held = observation.lock().await;
         let (stop, shutdown) = watch::channel(false);
-        let attempt = run_once(kind, &pool, &rest, "2222", &observation, &shutdown);
+        let attempt = run_once(kind, &pool, &rest, "2222", &observation, &shutdown, false);
         tokio::pin!(attempt);
         assert!(
             tokio::time::timeout(Duration::from_millis(20), &mut attempt)
@@ -257,7 +267,16 @@ async fn malformed_responses_preserve_full_mirror_and_valid_replacement_is_atomi
     let rest = executor(&mock);
     for snapshot in &snapshots {
         assert_eq!(
-            run_once(Kind::Events, pool, &rest, "2222", &observation, &shutdown).await,
+            run_once(
+                Kind::Events,
+                pool,
+                &rest,
+                "2222",
+                &observation,
+                &shutdown,
+                false
+            )
+            .await,
             Err(ErrorClass::Rest),
             "{snapshot}"
         );
@@ -317,7 +336,16 @@ async fn malformed_responses_preserve_full_mirror_and_valid_replacement_is_atomi
     .await;
     let rest = executor(&mock);
     assert_eq!(
-        run_once(Kind::Events, pool, &rest, "2222", &observation, &shutdown).await,
+        run_once(
+            Kind::Events,
+            pool,
+            &rest,
+            "2222",
+            &observation,
+            &shutdown,
+            false
+        )
+        .await,
         Err(ErrorClass::Database)
     );
     assert_eq!(
@@ -325,9 +353,17 @@ async fn malformed_responses_preserve_full_mirror_and_valid_replacement_is_atomi
         before,
         "failed replacement was not atomic"
     );
-    run_once(Kind::Events, pool, &rest, "2222", &observation, &shutdown)
-        .await
-        .unwrap();
+    run_once(
+        Kind::Events,
+        pool,
+        &rest,
+        "2222",
+        &observation,
+        &shutdown,
+        false,
+    )
+    .await
+    .unwrap();
     type EventRow = (String, Option<String>, Option<String>, String, String);
     let rows: Vec<EventRow> = sqlx::query_as(
         "SELECT event_id, channel_id, description, starts_at, updated_at FROM scheduled_events WHERE guild_id='2222' ORDER BY event_id"
@@ -346,9 +382,17 @@ async fn malformed_responses_preserve_full_mirror_and_valid_replacement_is_atomi
             .await
             .unwrap();
     assert_eq!(pin, "2222");
-    run_once(Kind::Events, pool, &rest, "2222", &observation, &shutdown)
-        .await
-        .unwrap();
+    run_once(
+        Kind::Events,
+        pool,
+        &rest,
+        "2222",
+        &observation,
+        &shutdown,
+        false,
+    )
+    .await
+    .unwrap();
     let remaining: Vec<String> =
         sqlx::query_scalar("SELECT guild_id FROM scheduled_events ORDER BY guild_id")
             .fetch_all(pool)
@@ -399,6 +443,7 @@ async fn stop_during_fetch_discards_snapshot_results_without_post_shutdown_publi
             "2222",
             &observation,
             &shutdown,
+            false,
         )
         .await
         .unwrap();
@@ -451,7 +496,7 @@ async fn stop_during_fetch_discards_snapshot_results_without_post_shutdown_publi
             let rest = executor(&mock);
             let observation = observation.clone();
             tokio::spawn(async move {
-                run_once(kind, &pool, &rest, "2222", &observation, &shutdown).await
+                run_once(kind, &pool, &rest, "2222", &observation, &shutdown, false).await
             })
         };
         tokio::time::timeout(Duration::from_secs(5), gate.wait_for_request())
@@ -484,6 +529,7 @@ async fn stop_during_fetch_discards_snapshot_results_without_post_shutdown_publi
             "2222",
             &observation,
             &stop.subscribe(),
+            false,
         )
         .await;
         assert_eq!(next, Ok(()));

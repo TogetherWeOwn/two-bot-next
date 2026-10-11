@@ -152,12 +152,34 @@ pub fn filter_channel_name(
     policy: &AutomodPolicy,
     context: &NameFilterContext,
 ) -> Result<String, NameError> {
+    filter_text(raw, policy, context, MAX_CHANNEL_NAME_CHARS)
+}
+
+/// Longest voice channel status Discord accepts.
+pub const MAX_VOICE_STATUS_CHARS: usize = 500;
+
+/// [`filter_channel_name`] for a voice status line: the same sanitizer and
+/// automod checks with Discord's 500-character status bound.
+pub fn filter_voice_status(
+    raw: &str,
+    policy: &AutomodPolicy,
+    context: &NameFilterContext,
+) -> Result<String, NameError> {
+    filter_text(raw, policy, context, MAX_VOICE_STATUS_CHARS)
+}
+
+fn filter_text(
+    raw: &str,
+    policy: &AutomodPolicy,
+    context: &NameFilterContext,
+    max_chars: usize,
+) -> Result<String, NameError> {
     let name = sanitize_channel_name(raw);
     if name.is_empty() {
         return Err(NameError::Empty);
     }
     let len = name.chars().count();
-    if len > MAX_CHANNEL_NAME_CHARS {
+    if len > max_chars {
         return Err(NameError::TooLong { len });
     }
     // `match_automod` returns the FIRST filter that fires, so the inapplicable

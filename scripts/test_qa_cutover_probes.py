@@ -5,6 +5,7 @@ import io
 import json
 import sys
 import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -223,6 +224,116 @@ class FenceTest(unittest.TestCase):
         self.assertIn("FAIL jobs-map:", out)
 
 
+class DuplicateComponentTest(unittest.TestCase):
+    def dup_body(self, pairs, status):
+        return (status, json.dumps({
+            "components": [[name, value] for name, value in pairs],
+            "jobs": {"counter": {"parked": True, "running": False}},
+            "build_revision": "r", "build_id": "b",
+        }).encode())
+
+    def assert_rejected(self, pairs, status):
+        _, raw = self.dup_body(pairs, status)
+        with self.assertRaisesRegex(probe.ProbeError, "repeats a component name"):
+            probe.check_readyz_shape(status, raw)
+
+    def test_down_then_ready_rejected(self):
+        self.assert_rejected([("process", "ready"), ("gateway", "down"),
+                              ("gateway", "ready")], 200)
+
+    def test_ready_then_down_rejected(self):
+        self.assert_rejected([("process", "ready"), ("gateway", "ready"),
+                              ("gateway", "down")], 503)
+
+    def test_same_value_repeat_rejected(self):
+        self.assert_rejected([("process", "ready"), ("gateway", "ready"),
+                              ("process", "ready")], 200)
+
+    def test_distinct_components_still_parse(self):
+        _, raw = self.dup_body([("process", "ready"), ("gateway", "ready")], 200)
+        state, _ = probe.check_readyz_shape(200, raw)
+        self.assertEqual(state["gateway"], "ready")
+
+    def test_diagnostic_echoes_no_component_data(self):
+        sentinel = "SENTINEL_dup_cutover_abc123"
+        _, raw = self.dup_body([("process", "ready"), ("gateway", "ready"),
+                                (sentinel, "ready"), (sentinel, "down")], 503)
+        with self.assertRaises(probe.ProbeError) as ctx:
+            probe.check_readyz_shape(503, raw)
+        self.assertIn("repeats a component name", str(ctx.exception))
+        self.assertNotIn(sentinel, str(ctx.exception))
+
+    def test_duplicate_fails_readiness_shape_end_to_end(self):
+        body = self.dup_body([("process", "ready"), ("gateway", "down"),
+                              ("gateway", "ready")], 200)
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL readiness-shape:", out)
+        self.assertIn("repeats a component name", out)
+
+
+class UnknownComponentTest(unittest.TestCase):
+    def unknown_body(self, extra, status=200):
+        pairs = [("process", "ready"), ("gateway", "ready"), extra]
+        return (status, json.dumps({
+            "components": [[name, value] for name, value in pairs],
+            "jobs": {"counter": {"parked": True, "running": False}},
+            "build_revision": "r", "build_id": "b",
+        }).encode())
+
+    def test_unknown_ready_refused(self):
+        _, raw = self.unknown_body(("voice", "ready"), status=200)
+        with self.assertRaisesRegex(probe.ProbeError, "unknown component name"):
+            probe.check_readyz_shape(200, raw)
+
+    def test_unknown_down_refused(self):
+        _, raw = self.unknown_body(("voice", "down"), status=503)
+        with self.assertRaisesRegex(probe.ProbeError, "unknown component name"):
+            probe.check_readyz_shape(503, raw)
+
+    def test_unknown_starting_refused(self):
+        _, raw = self.unknown_body(("voice", "starting"), status=503)
+        with self.assertRaisesRegex(probe.ProbeError, "unknown component name"):
+            probe.check_readyz_shape(503, raw)
+
+    def test_diagnostic_echoes_no_component_data(self):
+        sentinel = "SENTINEL_unknown_cutover_abc123"
+        _, raw = self.unknown_body((sentinel, "ready"), status=200)
+        with self.assertRaises(probe.ProbeError) as ctx:
+            probe.check_readyz_shape(200, raw)
+        self.assertIn("unknown component name", str(ctx.exception))
+        self.assertNotIn(sentinel, str(ctx.exception))
+
+    def test_legitimate_optional_components_still_parse(self):
+        for pairs, status in (
+            ([("process", "ready"), ("gateway", "ready")], 200),
+            ([("process", "ready"), ("gateway", "ready"),
+              ("database", "ready")], 200),
+            ([("process", "ready"), ("gateway", "ready"),
+              ("database", "ready"), ("token_invalid", "ready")], 200),
+            ([("process", "ready"), ("gateway", "down"),
+              ("database", "down"), ("token_invalid", "ready")], 503),
+        ):
+            with self.subTest(pairs=pairs):
+                _, raw = (status, json.dumps({
+                    "components": [[n, v] for n, v in pairs],
+                    "jobs": {"counter": {"parked": True, "running": False}},
+                    "build_revision": "r", "build_id": "b",
+                }).encode())
+                state, _ = probe.check_readyz_shape(status, raw)
+                self.assertEqual(set(state), {n for n, _ in pairs})
+
+    def test_unknown_fails_readiness_shape_end_to_end(self):
+        body = self.unknown_body(("voice", "ready"), status=200)
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL readiness-shape:", out)
+        self.assertIn("unknown component name", out)
+        self.assertNotIn("voice", out)
+
+
 class EvidenceTest(unittest.TestCase):
     def test_pass_writes_receipt_with_sources(self):
         with mock.patch("builtins.open", mock.mock_open()) as handle:
@@ -267,6 +378,349 @@ class UserAgentTests(unittest.TestCase):
             probe.fetch("https://two-bot-next-staging.example-sub.workers.dev/readyz", 10)
         self.assertEqual(seen, [probe.USER_AGENT])
         self.assertFalse(seen[0].startswith("Python-urllib"))
+
+
+def readyz_with_jobs(jobs, status=200):
+    """Build a /readyz double from {name: (parked, age_seconds_or_None)}.
+
+    age None omits last_success (a job with no success recorded yet). A
+    3-tuple (parked, age, extra_dict) merges extra status fields such as
+    consecutive_failures, last_error_class or last_start into the entry.
+    """
+    now_ms = int(time.time() * 1000)
+    payload = {
+        "components": [["process", "ready"], ["gateway", "ready"]],
+        "jobs": {},
+        "build_revision": "r", "build_id": "b",
+    }
+    for name, spec in jobs.items():
+        parked, age = spec[0], spec[1]
+        extra = spec[2] if len(spec) > 2 else {}
+        entry = {"parked": parked, "running": not parked}
+        if age is not None:
+            entry["last_success"] = now_ms - age * 1000
+        for key, value in extra.items():
+            if key == "start_age" and value is not None:
+                entry["last_start"] = now_ms - value * 1000
+            else:
+                entry[key] = value
+        payload["jobs"][name] = entry
+    return (status, json.dumps(payload).encode())
+
+
+class CadenceTest(unittest.TestCase):
+    def test_one_stale_job_fails_and_names_it(self):
+        body = readyz_with_jobs({
+            "counter": (False, 10),
+            "rank": (False, 1400),  # fail line is 1320 s (2x600 + 120)
+        })
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL jobs-map:", out)
+        self.assertIn("rank=", out)
+        self.assertIn("stale", out)
+
+    def test_healthy_sample_just_inside_cadence_passes(self):
+        # Every graded job sampled at 0.95x its real cadence (plus no
+        # runtime yet) must PASS: bands sit above 1x cadence + timeout.
+        jobs = {name: (False, int(0.95 * cadence))
+                for name, cadence in probe.JOB_CADENCE_SECONDS.items()}
+        body = readyz_with_jobs(jobs)
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+
+    def test_tabletop_baseline_passes(self):
+        body = readyz_with_jobs({
+            "counter": (False, 50),
+            "member_unban_sweep": (False, 50),
+            "scheduled_messages": (False, 50),
+            "settings": (False, 10),
+            "rank": (False, 350),
+            "scheduled_events": (False, 350),
+            "inactivity": (False, 3300),
+            "presence_probe": (False, 3300),
+        })
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+
+    def test_env_configured_feeds_is_not_graded(self):
+        # feeds cadence is env-configured (TWO_FEED_POLL_SECONDS), so even
+        # an ancient sample must not fail the probe.
+        body = readyz_with_jobs({
+            "feeds": (False, 10 ** 6),
+        })
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+
+    def test_warn_band_stays_green_but_is_named(self):
+        body = readyz_with_jobs({
+            "rank": (False, 800),  # warn 720 s, fail 1320 s
+        })
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+        self.assertIn("warn", out)
+        self.assertIn("rank=", out)
+
+    def test_never_succeeded_with_failures_fails_and_names_it(self):
+        body = readyz_with_jobs({
+            "counter": (False, None, {"consecutive_failures": 40,
+                                      "last_error_class": "database"}),
+        })
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL jobs-map:", out)
+        self.assertIn("counter", out)
+        self.assertIn("consecutive failures", out)
+
+    def test_never_succeeded_without_attempts_passes(self):
+        now_ms = int(time.time() * 1000)
+        body = (200, json.dumps({
+            "components": [["process", "ready"], ["gateway", "ready"]],
+            "jobs": {"counter": {"parked": False, "running": True,
+                                 "consecutive_failures": 0,
+                                 "last_start": now_ms - 5_000}},
+            "build_revision": "r", "build_id": "b",
+        }).encode())
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+
+    def test_stale_last_start_without_success_fails(self):
+        body = readyz_with_jobs({
+            # counter fail line is 165 s; started 1000 s ago, never succeeded
+            "counter": (False, None, {"consecutive_failures": 0,
+                                      "start_age": 1000}),
+        })
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL jobs-map:", out)
+        self.assertIn("counter", out)
+        self.assertIn("last_start", out)
+
+    def test_parked_job_with_ancient_success_passes(self):
+        body = readyz_with_jobs({
+            "inactivity": (True, 10 ** 6),
+        })
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+
+    def test_unknown_job_is_not_graded(self):
+        body = readyz_with_jobs({
+            "brand_new_job": (False, 10 ** 6),
+        })
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+
+    def test_missing_last_success_is_not_evidence(self):
+        body = readyz_with_jobs({
+            "counter": (False, None),
+        })
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+
+    def test_future_timestamp_clamps_to_zero(self):
+        now_ms = int(time.time() * 1000)
+        body = (200, json.dumps({
+            "components": [["process", "ready"], ["gateway", "ready"]],
+            "jobs": {"counter": {"parked": False, "running": True,
+                                 "last_success": now_ms + 60_000}},
+            "build_revision": "r", "build_id": "b",
+        }).encode())
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+
+    def test_degraded_503_with_failing_jobs_stays_green(self):
+        # Truthful 503 (database down) without --expect-ready grades
+        # truthfulness, not scheduler progress: failing jobs stay green.
+        now_ms = int(time.time() * 1000)
+        body = (503, json.dumps({
+            "components": [["process", "ready"], ["gateway", "ready"],
+                           ["database", "down"]],
+            "jobs": {"counter": {"parked": False, "running": True,
+                                 "consecutive_failures": 3,
+                                 "last_error_class": "database",
+                                 "last_start": now_ms - 5_000}},
+            "build_revision": "r", "build_id": "b",
+        }).encode())
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+        self.assertIn("freshness not graded", out)
+
+    def test_degraded_503_with_failing_jobs_fails_expect_ready(self):
+        # The strict gate grades freshness too: the same degraded report
+        # fails jobs-map once --expect-ready is set.
+        now_ms = int(time.time() * 1000)
+        body = (503, json.dumps({
+            "components": [["process", "ready"], ["gateway", "ready"],
+                           ["database", "down"]],
+            "jobs": {"counter": {"parked": False, "running": True,
+                                 "consecutive_failures": 3,
+                                 "last_error_class": "database",
+                                 "last_start": now_ms - 5_000}},
+            "build_revision": "r", "build_id": "b",
+        }).encode())
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/", "--expect-ready")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL jobs-map:", out)
+        self.assertIn("counter", out)
+
+    def test_mixed_report_counts_are_honest(self):
+        # Only jobs graded against a fresh last_success count as fresh;
+        # ungraded (feeds/unknown) and not-yet-run jobs are reported
+        # separately, and the receipt must not overstate verification.
+        body = readyz_with_jobs({
+            "feeds": (False, 10 ** 6),
+            "brand_new_job": (False, 10 ** 6),
+            "counter": (False, None),
+            "rank": (False, 10),
+            "inactivity": (True, 10 ** 6),
+        })
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+        self.assertIn("1 jobs fresh within cadence", out)
+        self.assertIn("2 ungraded (brand_new_job, feeds)", out)
+        self.assertIn("1 not yet run", out)
+        self.assertIn("1 parked", out)
+        self.assertNotIn("4 jobs fresh", out)
+
+
+class BodyCapRefusalTests(unittest.TestCase):
+    """Oversized bodies are refused before JSON parsing (M4.42)."""
+
+    def padded(self, value, size):
+        raw = json.dumps(value).encode()
+        self.assertLessEqual(len(raw), size, "fixture must fit the target size")
+        return raw + b" " * (size - len(raw))
+
+    def test_exact_cap_valid_input_passes(self):
+        health = self.padded({"status": "ok"}, probe.BODY_CAP)
+        self.assertEqual(len(health), probe.BODY_CAP)
+        code, out = run(double({"/health": (200, health), "/readyz": PARKED}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS liveness:", out)
+        self.assertIn("PASS readiness-shape:", out)
+
+    def test_valid_json_padded_past_cap_refuses_before_parsing(self):
+        sentinel = "SENTINEL_BODY_cutover_padded"
+        base = json.dumps({"status": "ok", "note": sentinel}).encode()
+        health = base + b" " * (probe.BODY_CAP + 1 - len(base))
+        self.assertEqual(len(health), probe.BODY_CAP + 1)
+        self.assertEqual(json.loads(health)["note"], sentinel)
+        code, out = run(double({"/health": (200, health), "/readyz": PARKED}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL liveness:", out)
+        self.assertIn("/health answered over the body cap", out)
+        self.assertNotIn(sentinel, out)
+
+    def test_cap_length_valid_prefix_with_hidden_tail_refuses(self):
+        prefix = self.padded({"status": "ok"}, probe.BODY_CAP)
+        self.assertEqual(json.loads(prefix), {"status": "ok"})
+        code, out = run(double({"/health": (200, prefix + b"X"), "/readyz": PARKED}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL liveness:", out)
+        self.assertIn("/health answered over the body cap", out)
+
+    def test_readyz_oversize_never_reaches_json_and_reports_no_breakdown(self):
+        sentinel = "SENTINEL_BODY_readyz_oversize"
+        payload = {"components": [["process", "ready"], ["gateway", "ready"]],
+                   "jobs": {"counter": {"parked": True, "running": False}},
+                   "build_revision": "r", "build_id": "b", "note": sentinel}
+        base = json.dumps(payload).encode()
+        big = base + b" " * (probe.BODY_CAP + 1 - len(base))
+        self.assertEqual(json.loads(big)["note"], sentinel)
+        code, out = run(double({"/health": HEALTH, "/readyz": (200, big)}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL readiness-shape:", out)
+        self.assertIn("/readyz answered over the body cap", out)
+        self.assertIn("FAIL gateway-state:", out)
+        self.assertIn("no truthful breakdown to read gateway from", out)
+        self.assertIn("FAIL jobs-map:", out)
+        self.assertIn("FAIL fence-watch:", out)
+        self.assertNotIn(sentinel, out)
+
+    def test_httperror_oversize_enforces_the_same_bound(self):
+        # The real fetch converts an HTTPError into (status, body); an
+        # oversized 503 body must still refuse with the cap message, never a
+        # breakdown verdict computed from parsed JSON.
+        payload = {"components": [["process", "ready"], ["gateway", "ready"]],
+                   "jobs": {"counter": {"parked": True, "running": False}},
+                   "build_revision": "r", "build_id": "b"}
+        big = self.padded(payload, probe.BODY_CAP + 1)
+        self.assertEqual(len(big), probe.BODY_CAP + 1)
+        code, out = run(double({"/health": HEALTH, "/readyz": (503, big)}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1, out)
+        self.assertIn("/readyz answered over the body cap", out)
+
+    def test_transport_reads_bounded_cap_plus_one_both_paths(self):
+        import urllib.error
+        seen = []
+
+        class Response(io.BytesIO):
+            status = 200
+
+            def __init__(self, payload):
+                super().__init__(payload)
+
+            def read(self, n=-1):
+                seen.append(n)
+                return super().read(n)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class OkOpener:
+            def open(self, request, timeout=None):
+                return Response(b"{}")
+
+        with mock.patch.object(probe.urllib.request, "build_opener", return_value=OkOpener()):
+            probe.fetch("http://h/health", 5)
+        self.assertEqual(seen, [probe.BODY_CAP + 1])
+        seen.clear()
+
+        class ErrorOpener:
+            def open(self, request, timeout=None):
+                fp = Response(b"x")
+                raise urllib.error.HTTPError(request.full_url, 503,
+                                             "Service Unavailable", {}, fp)
+
+        with mock.patch.object(probe.urllib.request, "build_opener",
+                               return_value=ErrorOpener()):
+            status, _ = probe.fetch("http://h/readyz", 5)
+        self.assertEqual(status, 503)
+        self.assertEqual(seen, [probe.BODY_CAP + 1])
 
 
 if __name__ == "__main__":

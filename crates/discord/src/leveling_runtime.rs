@@ -20,7 +20,7 @@ use two_bot_core::{
     classify,
     community_store::{
         member_join_fact, member_join_metadata, message_fact, record_fact, rules_accepted_fact,
-        CommunityStoreError, FactWrite,
+        voice_ended_fact, voice_started_fact, CommunityStoreError, FactWrite,
     },
     leveling::{
         leaderboard_reply, plan_reward_roles, rank_reply, XpAward, LEADERBOARD_DEFAULT_LIMIT,
@@ -160,20 +160,22 @@ pub struct MemberJoinWrite {
     pub inviter_id: Option<Snowflake>,
 }
 
-/// Buffered `message_created`, `rules_accepted` and `member_joined` capture.
-/// The synchronous [`FactsSink`] hook only classifies and buffers; the serial
+/// Buffered `voice_session_started` / `voice_session_ended`,
+/// `message_created`, `rules_accepted` and `member_joined` capture. The
+/// synchronous [`FactsSink`] hook only classifies and buffers; the serial
 /// checkpoint writer drains via [`OrderedLevelingPipeline::drain_facts`],
 /// which persists through `community_store::record_fact`. Mirrors
 /// [`DeferredLeveling`]: no `block_on`, no detached tasks, no mutex held over
 /// an await.
 ///
-/// The three streams buffer differently by construction. Messages classify at
-/// record time and are dropped while unarmed (no pool), so a staging-gated
-/// rollout captures exactly while it scores. Gate-clearings and joins buffer
-/// raw even while unarmed — they are tiny, classified at drain with the same
-/// boot config, and the unarmed drain drops them — so funnel replay tests can
-/// assert the buffer without a database. Either way, disabled (no pool)
-/// persists nothing, exactly like [`two_bot_core::NoopFacts`].
+/// Voice and message facts classify at record time and are dropped while
+/// unarmed (no pool), so a staging-gated rollout captures exactly while it
+/// scores. Gate-clearings and joins buffer raw even while unarmed — they are
+/// tiny, classified at drain with the same boot config, and the unarmed drain
+/// drops them — so funnel replay tests can assert the buffer without a
+/// database. Either way, disabled (no pool) persists nothing, exactly like
+/// [`two_bot_core::NoopFacts`]. A move's end+start pair buffers two rows for
+/// one frame.
 #[derive(Debug, Clone, Default)]
 pub struct DeferredCommunityFacts(Arc<Mutex<CommunityFactsState>>);
 
@@ -300,6 +302,26 @@ impl DeferredCommunityFacts {
     }
 }
 
+fn voice_classify(
+    config: &ClassifierConfig,
+    guild_id: u64,
+    member_id: u64,
+    is_bot: bool,
+) -> (ClassifyInput, two_bot_core::Classification) {
+    let input = ClassifyInput {
+        guild_id: guild_id.to_string(),
+        actor_id: member_id.to_string(),
+        is_bot,
+        webhook_id: None,
+        is_staff_automation: false,
+        is_raid: false,
+        is_staging: false,
+        is_test: false,
+    };
+    let verdict = classify(config, &input);
+    (input, verdict)
+}
+
 impl FactsSink for DeferredCommunityFacts {
     fn record_member_join(&self, fact: MemberJoinFact<'_>) {
         self.0
@@ -364,11 +386,50 @@ impl FactsSink for DeferredCommunityFacts {
         ));
     }
 
-    fn record_voice_started(&self, _fact: VoiceStartedFact<'_>) -> Option<String> {
-        None
+    fn record_voice_started(&self, fact: VoiceStartedFact<'_>) -> Option<String> {
+        let mut state = self.0.lock().expect("community facts lock");
+        state.pool.as_ref()?;
+        // Bots are classified and captured here; the funnel gate in
+        // `on_voice_join` already keeps them out of the XP/activity counts,
+        // so this sink never filters. The durable session key is generated
+        // now (guild:member:stamp:channel) so the tracker stores it before
+        // any database write; a redelivered join reuses the key and dedupes.
+        let (input, verdict) =
+            voice_classify(&state.config, fact.guild_id, fact.member_id, fact.is_bot);
+        let (key, write) = voice_started_fact(
+            &input.guild_id,
+            &input,
+            &fact.channel_id.to_string(),
+            fact.occurred_at,
+            None,
+            verdict,
+        );
+        state.pending.push(write);
+        Some(key)
     }
 
-    fn record_voice_ended(&self, _fact: VoiceEndedFact<'_>) {}
+    fn record_voice_ended(&self, fact: VoiceEndedFact<'_>) {
+        let mut state = self.0.lock().expect("community facts lock");
+        if state.pool.is_none() {
+            return;
+        }
+        // End-without-start stays honest: the handler supplies
+        // `started_at: None` / `duration: None` with an `unknown-start`
+        // session key, and `voice_ended_fact` records `startKnown: false`
+        // with nulls — never a fabricated start.
+        let (input, verdict) =
+            voice_classify(&state.config, fact.guild_id, fact.member_id, fact.is_bot);
+        state.pending.push(voice_ended_fact(
+            &input.guild_id,
+            &input,
+            &fact.session_key,
+            &fact.channel_id.to_string(),
+            fact.occurred_at,
+            fact.started_at,
+            fact.duration_seconds,
+            verdict,
+        ));
+    }
 }
 
 /// Award/reply slice of the shared command runtime; no private router or client.
@@ -583,16 +644,17 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
         self.pipeline.handlers()
     }
 
-    /// Arm Postgres community-facts capture for both streams. Called once at boot when `TWO_COMMUNITY_SCORECARD=1`; without
+    /// Arm Postgres community-facts capture for all live streams. Called once at boot when `TWO_COMMUNITY_SCORECARD=1`; without
     /// it the sink drops every fact, exactly like the previous no-op seam.
     pub fn enable_community_facts(&self, pool: PgPool) {
         self.facts.enable(pool);
     }
 
-    /// Persist buffered community facts without holding the async dispatch
-    /// lock. The caller owns ordering (the serial checkpoint writer); call on
-    /// every dispatch, even when no award queued — bots, webhooks and staff
-    /// automation capture facts but never awards.
+    /// Persist buffered community facts without holding the async
+    /// dispatch lock. The caller owns ordering (the serial checkpoint
+    /// writer); call on every dispatch, even when no award queued — bots,
+    /// webhooks and staff automation capture facts but never awards, and a
+    /// move's end+start pair buffers two rows for one frame.
     pub async fn drain_facts(&self) -> Result<usize, CommunityFactsError> {
         self.facts.drain().await
     }

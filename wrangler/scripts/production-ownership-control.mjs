@@ -114,7 +114,7 @@ function validDeploymentId(value) {
   return typeof value === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(value);
 }
 
-export async function control({ action, url, productionUrl = process.env.PRODUCTION_WORKER_URL ?? "", stagingUrl = process.env.STAGING_WORKER_URL ?? "", token, actor, expectedEpoch, expectedDeploymentId, releaseFence = false, takeoverAttempts = 34, takeoverRetryDelayMs = 10000, takeoverWindowMs = 330000 }, send = fetch, wait = sleep) {
+export async function control({ action, url, productionUrl = process.env.PRODUCTION_WORKER_URL ?? "", stagingUrl = process.env.STAGING_WORKER_URL ?? "", token, actor, expectedEpoch, expectedDeploymentId, releaseFence = false, takeoverAttempts = 34, takeoverRetryDelayMs = 10000, takeoverWindowMs = 330000, statusAttempts = 34, statusRetryDelayMs = 10000 }, send = fetch, wait = sleep) {
   const origin = checkOrigin(url, productionUrl, stagingUrl);
   if (!token || token.length < 32) throw new ControlError("OWNERSHIP_CONTROL_TOKEN is missing or invalid; stop before deployment");
   if (!["preflight", "status", "takeover", "fence"].includes(action)) throw new ControlError("Unknown action");
@@ -195,7 +195,27 @@ export async function control({ action, url, productionUrl = process.env.PRODUCT
     }
     return result;
   };
-  if (action === "status") return readState();
+  if (action === "status") {
+    // After a version change the ownership Durable Object keeps running the
+    // previous code until Cloudflare's deferred update reaches it (up to
+    // about 300 s), and the edge can still route to the old version: the read
+    // answers 503 deployment_mismatch, or a 200 naming the old deployment.
+    // Both are propagation, not a NO-GO, so the P2 read waits for the new
+    // version (34 reads, 10 s apart, the takeover window) before refusing.
+    // Every other refusal stops at once.
+    for (let attempt = 1; ; attempt++) {
+      attempts = attempt;
+      try {
+        return await readState();
+      } catch (error) {
+        const propagating = expectedDeploymentId !== undefined && (
+          (error instanceof HttpFailure && error.status === 503 && error.reason === "deployment_mismatch") ||
+          (!(error instanceof HttpFailure) && /^Production deployment mismatch/.test(error.message)));
+        if (!propagating || attempt >= statusAttempts) throw error;
+        await wait(statusRetryDelayMs);
+      }
+    }
+  }
   let earlier;
   let first = true;
   for (let attempt = 1; ; attempt++) {

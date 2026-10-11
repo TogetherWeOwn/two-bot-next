@@ -14,6 +14,7 @@ use twilight_http::{
 };
 use twilight_model::{
     channel::{Channel, ChannelType},
+    gateway::connection_info::BotConnectionInfo,
     guild::{invite::Invite, Member, Permissions, Role},
     id::Id,
     oauth::{Application, ApplicationFlags},
@@ -39,6 +40,14 @@ pub const USAGE: &str = "\
       Exit 0: PASS/WARN only; 1: FAIL; 2: invalid CLI/configuration.
       See docs/preflight.md for coverage and interpretation.
 ";
+
+// A cutover spends at least one session start on the forced IDENTIFY, plus
+// more on reconnect retries if the first connect fails. Discord's
+// session-start budget is a hard daily limit, so preflight fails closed with
+// margin above a single start and warns earlier at 10% of Discord's usual
+// 1000-start daily budget.
+const SESSION_START_FAIL_FLOOR: u32 = 10;
+const SESSION_START_WARN_THRESHOLD: u32 = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -437,6 +446,33 @@ async fn check_discord(
     for (status, name, detail) in intent_checks(intents, flags) {
         report.add(status, name, detail);
     }
+    // The cutover's forced IDENTIFY spends one session start against a hard
+    // Discord daily limit, so the budget is read here through the same
+    // governed GET path: lane held, no retry, and any failed, timed-out or
+    // malformed read fails closed like every other check. Counts only; the
+    // token is never part of the detail.
+    let budget: BotConnectionInfo = read_discord(
+        transport,
+        "session start budget",
+        client.gateway().authed().try_into_request(),
+    )
+    .await?;
+    let limit = &budget.session_start_limit;
+    let status = if limit.remaining < SESSION_START_FAIL_FLOOR {
+        Status::Fail
+    } else if limit.remaining < SESSION_START_WARN_THRESHOLD {
+        Status::Warn
+    } else {
+        Status::Pass
+    };
+    report.add(
+        status,
+        "session start budget",
+        format!(
+            "remaining={} total={} reset_after_ms={} max_concurrency={}",
+            limit.remaining, limit.total, limit.reset_after, limit.max_concurrency
+        ),
+    );
     let guild_id = Id::new(targets.guild_id);
     let member: Member = read_discord(
         transport,

@@ -184,9 +184,10 @@ async fn import_applies_mee6_payload_and_refuses_live_collisions() {
     assert!(
         facts
             .iter()
-            .any(|(id, action, outcome, _)| id == "import-one#summary"
+            .any(|(id, action, outcome, reason)| id == "import-one#summary"
                 && action == "automations.import"
-                && outcome == "imported:3,skipped:1,conflicts:1"),
+                && outcome == "imported:3,skipped:1,conflicts:1"
+                && reason.as_deref() == Some("[\"faq\"]")),
         "summary audit recorded: {facts:?}"
     );
     pool.close().await;

@@ -271,11 +271,14 @@ fn starting_limit_comes_from_the_creator_default_else_the_creator_channel() {
 #[test]
 fn placement_takes_the_slot_next_to_the_creator() {
     let mut world = World::new(full());
-    // Above the creator (position 2): it takes the creator's slot.
-    assert_eq!(world.plan().unwrap().position, Some(2));
-    // Below the creator: it takes the slot of the channel that follows.
+    // Above the creator (position 2): the free position above it.
+    assert_eq!(world.plan().unwrap().position, Some(0));
+    // Below the creator: the free position under it, never the next
+    // channel's (Discord shifts nothing, and a tie renders unreliably).
     world.settings.position = RoomPosition::Below;
-    assert_eq!(world.plan().unwrap().position, Some(5));
+    let plan = world.plan().unwrap();
+    assert_eq!(plan.position, Some(3));
+    assert!(plan.respace.is_empty());
 }
 
 #[test]
@@ -308,9 +311,9 @@ fn rooms_and_other_categories_do_not_change_the_creators_slot() {
         .channels
         .insert(900, channel(900, 2, Some(901), 0, &[]));
     world.settings.position = RoomPosition::Below;
-    // Existing rooms are never moved: the new room sits directly below the
-    // creator and pushes room 510 (position 3) down.
-    assert_eq!(world.plan().unwrap().position, Some(3));
+    // The creator's block is [creator, 510]: the new room joins its end
+    // (oldest first, like Auto-Voice) at the free position under 510.
+    assert_eq!(world.plan().unwrap().position, Some(4));
 }
 
 #[test]
@@ -319,22 +322,30 @@ fn grouped_rooms_keep_a_contiguous_block_at_the_block_edge() {
     world.settings.group_by_category = true;
     world.add_room(510, 3);
     world.add_room(511, 4);
-    // Below: after the last group room, taking channel 500's slot (5) and
-    // leaving [creator, 510, 511, new] contiguous.
+    // Below: after the last group room. 511 (4) and 500 (5) leave no free
+    // position, so the category is re-spaced first: [creator, 510, 511, new,
+    // 500] at 16, 32, 48, 64, 80.
     world.settings.position = RoomPosition::Below;
-    assert_eq!(world.plan().unwrap().position, Some(5));
-    // Above: before the first group room, taking room 510's slot (3).
+    let plan = world.plan().unwrap();
+    assert_eq!(plan.position, Some(64));
+    assert_eq!(plan.fallback_position, Some(4));
+    let mut respace = plan.respace.clone();
+    respace.sort_unstable();
+    assert_eq!(respace, [(CREATOR, 16), (500, 80), (510, 32), (511, 48)]);
+    // Above: before the first group room, again with no free position.
     world.settings.position = RoomPosition::Above;
-    assert_eq!(world.plan().unwrap().position, Some(3));
+    let plan = world.plan().unwrap();
+    assert_eq!(plan.position, Some(32));
+    assert_eq!(plan.fallback_position, Some(2));
 }
 
 #[test]
 fn grouped_without_rooms_starts_the_block_next_to_the_creator() {
     let mut world = World::new(full());
     world.settings.group_by_category = true;
-    assert_eq!(world.plan().unwrap().position, Some(2));
+    assert_eq!(world.plan().unwrap().position, Some(0));
     world.settings.position = RoomPosition::Below;
-    assert_eq!(world.plan().unwrap().position, Some(5));
+    assert_eq!(world.plan().unwrap().position, Some(3));
 }
 
 #[test]
@@ -376,9 +387,10 @@ fn the_group_set_covers_only_live_rooms_in_the_category() {
         category_room_ids(&creator, &world.channels, &world.rooms),
         vec![510]
     );
-    // ... so planning still lands at the block edge, not past the strangers.
+    // ... so planning still lands at the block edge (the free position
+    // under room 510), not past the strangers.
     world.settings.position = RoomPosition::Below;
-    assert_eq!(world.plan().unwrap().position, Some(5));
+    assert_eq!(world.plan().unwrap().position, Some(4));
 }
 
 #[test]
@@ -437,4 +449,41 @@ fn a_zero_id_override_is_refused_at_conversion() {
         }]),
         Err(RoomHttpError::InvalidRequest)
     );
+}
+
+#[test]
+fn a_room_lands_directly_below_its_creator_in_the_production_layout() {
+    // Production 2026-10-10: "Create a Lobby" at 16, another creator at 32,
+    // AFK at 64, plus a text channel. The room used to be created at 32 and
+    // render after the other creator.
+    let mut world = World::new(full());
+    world.channels.remove(&500);
+    world.channels.get_mut(&CREATOR).unwrap().position = Some(16);
+    world
+        .channels
+        .insert(600, channel(600, 2, Some(CATEGORY), 32, &[]));
+    world.creators.insert(600, CreatorChannel::new(GUILD, 600));
+    world
+        .channels
+        .insert(700, channel(700, 2, Some(CATEGORY), 64, &[]));
+    world
+        .channels
+        .insert(800, channel(800, 0, Some(CATEGORY), 17, &[]));
+    world.settings.position = RoomPosition::Below;
+    let plan = world.plan().unwrap();
+    assert_eq!(plan.position, Some(17));
+    assert!(plan.respace.is_empty());
+}
+
+#[test]
+fn consecutive_positions_are_respaced_before_the_create() {
+    let mut world = World::new(full());
+    world.channels.get_mut(&500).unwrap().position = Some(3);
+    world.settings.position = RoomPosition::Below;
+    let plan = world.plan().unwrap();
+    assert_eq!(plan.position, Some(32));
+    let mut respace = plan.respace.clone();
+    respace.sort_unstable();
+    assert_eq!(respace, [(CREATOR, 16), (500, 48)]);
+    assert_eq!(plan.fallback_position, Some(2));
 }

@@ -916,3 +916,25 @@ fn command_roles_accept_only_restrictable_voice_commands() {
     *value.pointer_mut("/settings/command_roles").unwrap() = Value::Array(roles);
     import_value(&value, &inventory).unwrap();
 }
+
+#[test]
+fn imports_refuse_a_new_unsupported_time_zone_but_keep_a_stored_one() {
+    use two_bot_core::voice_config::{export_configuration, validate_time_zone_change};
+    let (mut config, inventory) = fixture();
+    config.settings.time_zone = "America/New_York".to_owned();
+    assert!(validate_time_zone_change("UTC", &config).is_ok());
+    for zone in ["Mars/Olympus", "UTC+15"] {
+        config.settings.time_zone = zone.to_owned();
+        assert!(
+            matches!(
+                validate_time_zone_change("UTC", &config),
+                Err(VoiceConfigError::Invalid { .. })
+            ),
+            "{zone}"
+        );
+    }
+    // A zone stored before the check existed still exports and re-imports.
+    config.settings.time_zone = "US/Eastern".to_owned();
+    assert!(validate_time_zone_change("US/Eastern", &config).is_ok());
+    assert!(export_configuration(&config, &inventory).is_ok());
+}

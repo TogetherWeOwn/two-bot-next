@@ -371,6 +371,50 @@
       ]
     },
     {
+      "id": "token:@@daypart@@",
+      "literal": "@@daypart@@",
+      "section": "V5",
+      "case_ids": [
+        "daypart-morning",
+        "daypart-afternoon",
+        "daypart-evening",
+        "daypart-night",
+        "daypart-late-night"
+      ]
+    },
+    {
+      "id": "token:@@room_minutes@@",
+      "literal": "@@room_minutes@@",
+      "section": "V5",
+      "case_ids": [
+        "room-minutes-zero"
+      ]
+    },
+    {
+      "id": "token:@@room_tier@@",
+      "literal": "@@room_tier@@",
+      "section": "V5",
+      "case_ids": [
+        "room-tier-zero"
+      ]
+    },
+    {
+      "id": "token:@@game_minutes@@",
+      "literal": "@@game_minutes@@",
+      "section": "V5",
+      "case_ids": [
+        "game-minutes-zero"
+      ]
+    },
+    {
+      "id": "token:@@game_tier@@",
+      "literal": "@@game_tier@@",
+      "section": "V5",
+      "case_ids": [
+        "game-tier-zero"
+      ]
+    },
+    {
       "id": "plural:members",
       "literal": "<<singular/plural>>",
       "section": "V5",
@@ -632,6 +676,51 @@
       "section": "V6",
       "case_ids": [
         "condition-unresolved-MONTH"
+      ]
+    },
+    {
+      "id": "condition:MORNING",
+      "literal": "MORNING",
+      "section": "V6",
+      "case_ids": [
+        "morning-true",
+        "morning-false"
+      ]
+    },
+    {
+      "id": "condition:AFTERNOON",
+      "literal": "AFTERNOON",
+      "section": "V6",
+      "case_ids": [
+        "afternoon-true",
+        "afternoon-false"
+      ]
+    },
+    {
+      "id": "condition:EVENING",
+      "literal": "EVENING",
+      "section": "V6",
+      "case_ids": [
+        "evening-true",
+        "evening-false"
+      ]
+    },
+    {
+      "id": "condition:NIGHT",
+      "literal": "NIGHT",
+      "section": "V6",
+      "case_ids": [
+        "night-true",
+        "night-false"
+      ]
+    },
+    {
+      "id": "condition:LATE_NIGHT",
+      "literal": "LATE_NIGHT",
+      "section": "V6",
+      "case_ids": [
+        "late-night-true",
+        "late-night-false"
       ]
     },
     {

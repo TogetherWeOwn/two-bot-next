@@ -144,7 +144,7 @@ struct JobCap {
 
 /// One row per `metrics::JOBS` entry, in the same order. The hourly
 /// presence probe parks first; the durable checkpoint marker never sheds.
-const JOB_CAPS: [JobCap; 12] = [
+const JOB_CAPS: [JobCap; 16] = [
     JobCap {
         job: "invite_snapshot",
         shed_order: None,
@@ -190,6 +190,22 @@ const JOB_CAPS: [JobCap; 12] = [
         shed_order: Some(5),
     },
     JobCap {
+        job: "feeds",
+        shed_order: None,
+    },
+    JobCap {
+        job: "self_role_recovery",
+        shed_order: None,
+    },
+    JobCap {
+        job: "member_unban_sweep",
+        shed_order: None,
+    },
+    JobCap {
+        job: "automod_expiry",
+        shed_order: None,
+    },
+    JobCap {
         job: "other",
         shed_order: None,
     },
@@ -201,6 +217,7 @@ const JOB_CAPS: [JobCap; 12] = [
 /// refused admits are counted, never silently dropped.
 const DB_ERROR_CAP_OPS: [&str; 2] = ["admission", "other"];
 const SEND_ADMISSION_CAP_OUTCOMES: [&str; 4] = ["admitted", "blocked", "storage_error", "other"];
+const PREFIX_TRIGGER_REFUSED_CAP_REASONS: [&str; 2] = ["verdict", "other"];
 /// One row per `metrics::DISPATCH_LANES` entry, in the same order. A new
 /// dispatch lane fails here until it gets a budget row in the guard doc.
 const DISPATCH_LANE_CAPS: [&str; 6] = [
@@ -210,6 +227,37 @@ const DISPATCH_LANE_CAPS: [&str; 6] = [
     "privileged",
     "busy",
     "reactions",
+];
+/// One row per `metrics::VOICE_VOTE_KICK_OUTCOMES` entry, in the same order.
+/// A new vote-kick outcome fails here until it gets a budget row in the guard
+/// doc.
+const VOTE_KICK_CAP_OUTCOMES: [&str; 26] = [
+    "started",
+    "evidence_unavailable",
+    "not_a_room",
+    "initiator_not_occupant",
+    "target_not_occupant",
+    "self_target",
+    "protected_target",
+    "privileged_target",
+    "authority_unavailable",
+    "active_vote_exists",
+    "cooldown",
+    "initiator_limited",
+    "reused_vote_id",
+    "unknown_vote",
+    "wrong_vote_boundary",
+    "ineligible_voter",
+    "repeated_vote",
+    "invalid_time",
+    "connect_denied_and_disconnected",
+    "connect_denied_target_absent",
+    "skipped_room_gone",
+    "skipped_target_protected",
+    "permission_missing",
+    "discord_error",
+    "gave_up",
+    "other",
 ];
 /// One row per `metrics::INTERNAL_ACTION_FAMILIES` entry, in the same order.
 /// A new receiver family fails here until it gets a budget row in the guard
@@ -254,9 +302,19 @@ fn storage_and_send_gate_labels_match_their_caps() {
         "SEND_ADMISSION_OUTCOMES grew without a budget row; update docs/log-volume-guard.md"
     );
     assert_eq!(
+        metrics::PREFIX_TRIGGER_REFUSED_REASONS,
+        &PREFIX_TRIGGER_REFUSED_CAP_REASONS[..],
+        "PREFIX_TRIGGER_REFUSED_REASONS grew without a budget row; update docs/log-volume-guard.md"
+    );
+    assert_eq!(
         metrics::DISPATCH_LANES,
         &DISPATCH_LANE_CAPS[..],
         "DISPATCH_LANES grew without a budget row; update docs/log-volume-guard.md"
+    );
+    assert_eq!(
+        metrics::VOICE_VOTE_KICK_OUTCOMES,
+        &VOTE_KICK_CAP_OUTCOMES[..],
+        "VOICE_VOTE_KICK_OUTCOMES grew without a budget row; update docs/log-volume-guard.md"
     );
     assert_eq!(
         metrics::INTERNAL_ACTION_FAMILIES,
@@ -470,6 +528,10 @@ fn job_caps_cover_every_job_label_and_presence_sheds_first() {
                         | "rank"
                         | "scheduled_events"
                         | "settings"
+                        | "feeds"
+                        | "self_role_recovery"
+                        | "member_unban_sweep"
+                        | "automod_expiry"
                         | "other"
                 ),
                 "{} never sheds; shed it only through its feature flag, not the log guard",
@@ -509,9 +571,19 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
         "send-admission family grew; update the cardinality budget and the guard doc"
     );
     assert_eq!(
+        metrics::PREFIX_TRIGGER_REFUSED_REASONS.len(),
+        2,
+        "prefix-refused family grew; update the cardinality budget and the guard doc"
+    );
+    assert_eq!(
         metrics::DISPATCH_LANES.len(),
         6,
         "dispatch-lane family grew; update the cardinality budget and the guard doc"
+    );
+    assert_eq!(
+        metrics::VOICE_VOTE_KICK_OUTCOMES.len(),
+        26,
+        "vote-kick outcome family grew; update the cardinality budget and the guard doc"
     );
     assert_eq!(
         metrics::CHECKPOINT_FAILURE_STAGES.len(),
@@ -528,6 +600,11 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
         12,
         "internal-action outcome family grew; update the cardinality budget and the guard doc"
     );
+    assert_eq!(
+        metrics::COMMUNITY_FACTS_DRAIN_REASONS.len(),
+        3,
+        "community-facts drain-reason family grew; update the cardinality budget and the guard doc"
+    );
     for (allowlist, name) in [
         (metrics::EVENTS, "EVENTS"),
         (metrics::REST_ROUTES, "routes"),
@@ -535,9 +612,19 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
         (metrics::VOICE_DEAD_ACTIONS, "dead-letter"),
         (metrics::DB_ERROR_OPS, "db-errors"),
         (metrics::SEND_ADMISSION_OUTCOMES, "send-admissions"),
+        (metrics::VOICE_VOTE_KICK_OUTCOMES, "vote-kick"),
+        (metrics::VOICE_NAME_OUTCOMES, "voice-names"),
+        (
+            metrics::PREFIX_TRIGGER_REFUSED_REASONS,
+            "prefix-trigger-refused",
+        ),
         (
             metrics::INTERNAL_ACTION_FAMILIES,
             "internal-action families",
+        ),
+        (
+            metrics::COMMUNITY_FACTS_DRAIN_REASONS,
+            "community-facts drain reasons",
         ),
     ] {
         assert_eq!(
@@ -560,21 +647,36 @@ fn exposition_series_count_matches_the_cardinality_budget() {
     assert_eq!(metrics::EVENTS.len(), 21, "event family changed the budget");
     assert_eq!(
         metrics::REST_ROUTES.len(),
-        26,
+        29,
         "route family changed the budget"
     );
-    assert_eq!(metrics::JOBS.len(), 12, "job family changed the budget");
+    assert_eq!(metrics::JOBS.len(), 16, "job family changed the budget");
+    assert_eq!(
+        metrics::PREFIX_TRIGGER_REFUSED_REASONS.len(),
+        2,
+        "prefix-refused family changed the budget"
+    );
     assert_eq!(
         metrics::DISPATCH_LANES.len(),
         6,
         "dispatch-lane family changed the budget"
     );
     let text = metrics::Metrics::default().render(None);
+    let help_headers = text
+        .lines()
+        .filter(|line| line.starts_with("# HELP "))
+        .count();
+    let type_headers = text
+        .lines()
+        .filter(|line| line.starts_with("# TYPE "))
+        .count();
+    assert_eq!(help_headers, 42, "rendered HELP family count changed");
+    assert_eq!(type_headers, 42, "rendered TYPE family count changed");
     let series = text.lines().filter(|line| !line.starts_with('#')).count();
     assert_eq!(
-        series, 362,
-        "exposition grew past the 362-sample budget (21 events + 4 scalars + 1 latency \
-         + 11 histogram + 156 rest + 48 jobs + 31 voice + 2 db-errors + 4 send-admissions + 6 dispatch-drops + 2 checkpoint-failures + 72 internal-actions + 4 pool); \
+        series, 563,
+        "exposition grew past the 563-sample budget (21 events + 4 scalars + 1 latency \
+         + 11 histogram + 174 rest + 11 REST guard + 64 jobs + 112 job-last-error-class + 31 voice + 26 vote-kick + 13 voice-names + 2 db-errors + 4 send-admissions + 2 prefix-refused + 6 dispatch-drops + 2 checkpoint-failures + 72 internal-actions + 3 facts-drain + 4 pool); \
          update docs/log-volume-guard.md with the new series"
     );
 }

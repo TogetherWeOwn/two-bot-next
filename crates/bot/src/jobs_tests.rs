@@ -341,6 +341,9 @@ async fn shutdown_while_waiting_for_status_lock_never_starts_an_attempt() {
     }
 }
 
+/// Covers every registered supervisor name with an independent metrics label:
+/// website/community, audit, scheduled-message, feed, self-role recovery,
+/// the member unban sweep and automod expiry.
 #[tokio::test(start_paused = true)]
 async fn every_registered_job_reports_success_in_seconds() {
     let names: Vec<_> = crate::website_jobs::NAMES
@@ -348,6 +351,12 @@ async fn every_registered_job_reports_success_in_seconds() {
         .chain(crate::community_jobs::NAMES)
         .chain(crate::audit_runtime::NAMES)
         .chain(crate::scheduled_jobs::NAMES)
+        .chain([
+            crate::feed_jobs::NAME,
+            crate::self_role_handlers::RECOVERY_JOB_NAME,
+        ])
+        .chain(crate::member_runtime::NAMES)
+        .chain([crate::automod_gateway::JOB_NAME])
         .collect();
     let status = statuses(&names, false);
     let metrics = Arc::new(Metrics::default());

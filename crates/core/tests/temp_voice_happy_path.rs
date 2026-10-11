@@ -76,6 +76,8 @@ fn ctx() -> RoomContext {
         members_playing: 0,
         parties: Vec::new(),
         timestamp: 1_790_683_200,
+        room_minutes: 0,
+        game_minutes: 0,
         tz_offset_minutes: 0,
         seed: 42,
         named_lists: HashMap::new(),

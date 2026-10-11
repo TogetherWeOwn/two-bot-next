@@ -705,6 +705,20 @@ impl RenameCoalescer {
     pub fn pending_count(&self) -> usize {
         self.inner.lock().expect("coalescer lock").pending.len()
     }
+
+    /// The still-queued rename for one channel, if any. The folded-duplicate
+    /// guard (legacy 38041a1) counts only renames that are really pending —
+    /// coalescer, queued, in-flight or retry — never a stale last-proposed
+    /// name, so a diverged entry cannot hold a name forever.
+    #[must_use]
+    pub fn pending_for(&self, channel_id: Snowflake) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("coalescer lock")
+            .pending
+            .get(&channel_id)
+            .map(|pending| pending.name.clone())
+    }
 }
 
 // --- action queue -----------------------------------------------------------
@@ -1211,6 +1225,24 @@ impl ActionQueue {
         })
     }
 
+    /// The still-queued rename for one room channel, if any (deferred lane
+    /// only; renames never ride the urgent lane). Part of the really-pending
+    /// set the folded-duplicate guard counts: a rename drained from the
+    /// coalescer but not yet dispatched still blocks a folded duplicate.
+    #[must_use]
+    pub fn queued_rename_for(&self, guild_id: Snowflake, channel_id: Snowflake) -> Option<String> {
+        let inner = self.inner.lock().expect("queue lock");
+        inner.deferred.get(&guild_id).and_then(|queue| {
+            queue.iter().find_map(|queued| match &queued.action {
+                RoomAction::RenameRoom {
+                    channel_id: id,
+                    name,
+                } if *id == channel_id => Some(name.clone()),
+                _ => None,
+            })
+        })
+    }
+
     /// Access lost on a room (spec V1): its actions wait, nothing retries.
     pub fn suspend(&self, guild_id: Snowflake, channel_id: Snowflake) {
         self.inner
@@ -1270,6 +1302,17 @@ impl ActionQueue {
     /// or forgotten by reconcile). Returns the dropped count.
     pub fn drop_for_channel(&self, guild_id: Snowflake, channel_id: Snowflake) -> usize {
         self.drain_for_channel(guild_id, channel_id).len()
+    }
+
+    /// Whether the guild is waiting out a Discord rate limit.
+    #[must_use]
+    pub fn backed_off(&self, guild_id: Snowflake, now_ms: u64) -> bool {
+        self.inner
+            .lock()
+            .expect("queue lock")
+            .guild_not_before_ms
+            .get(&guild_id)
+            .is_some_and(|t| now_ms < *t)
     }
 
     /// Pending (urgent, deferred) counts for the guild. Diagnostics/tests.

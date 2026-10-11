@@ -597,3 +597,28 @@ fn position_for_index_never_goes_negative() {
     // Appending still lands one past the clamped last position.
     assert_eq!(position_for_index(&order, 2), 1);
 }
+
+#[test]
+fn create_slot_never_ties_downwards_at_the_top_of_a_category() {
+    use two_bot_core::voice_placement::create_slot;
+    let order = [
+        CategoryChannel {
+            id: 10,
+            position: 0,
+            kind: CategoryEntryKind::Creator,
+        },
+        CategoryChannel {
+            id: 11,
+            position: 1,
+            kind: CategoryEntryKind::Other,
+        },
+    ];
+    // Above the creator at 0: no free position and nothing above the slot.
+    let slot = create_slot(&order, 0);
+    assert_eq!(slot.position, 16);
+    assert_eq!(slot.respace, [(10, 32), (11, 48)]);
+    assert_eq!(slot.fallback, None);
+    // Below the creator: the fallback ties with the creator itself.
+    let slot = create_slot(&order, 1);
+    assert_eq!(slot.fallback, Some(0));
+}

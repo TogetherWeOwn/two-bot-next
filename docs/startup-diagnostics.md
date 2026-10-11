@@ -51,9 +51,10 @@ no free-form text can reach the field. After a failure `/readyz` adds
 {"gateway_failure":{"phase":"durable_gateway","class":"checkpoint_load_failed"}}
 ```
 
-(omitted while there is none) and keeps serving for 15 seconds
-(`shutdown::FAILURE_LINGER`) before the drain and exit-1 restart. A shutdown
-signal ends the linger at once. Readers:
+(omitted while there is none) and keeps serving for 15 seconds after a
+startup failure (`shutdown::FAILURE_LINGER`) or 75 seconds after a
+running-gateway failure (`shutdown::RUNTIME_FAILURE_LINGER`) before the drain
+and exit-1 restart. A shutdown signal ends the linger at once. Readers:
 
 - Worker keepalive: one `console.warn` JSON line
   `{"event":"container_gateway_failure","phase":…,"class":…}` per tick, only when
