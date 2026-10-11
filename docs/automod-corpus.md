@@ -104,10 +104,30 @@ not executed service/gateway checks.
 | Gateway/activation | Blocked creates suppress funnel/downstream work; claim/release failures remain blocked; cached and fetched-partial edits use edit timestamps without a second funnel event; other guild is not inspected; boot rejects unapproved activation identities. | [TOG-10261](/TOG/issues/TOG-10261) |
 | Native Discord rule | Scrubbed native rule has threshold 20, raid protection, enabled block action and empty exemptions. It is **not** the custom matcher default of 5 or the unit policy limit of 3; native raid detection is not executable in this core suite. | [TOG-10261](/TOG/issues/TOG-10261) |
 
-The base next revision does not yet expose an automod service/store or gateway
-wiring to these core integration tests. Completing the linked runtime work must
-promote the deferred expectations to tests of the **real** adapter/store. This
-PR changes only fixtures, tests and documentation; runtime wiring is out of scope.
+The next revision exposes an automod service/store and gateway wiring to
+real-adapter integration tests: `AutomodRuntime`
+(`crates/core/src/automod_runtime.rs`), `AutomodStore`
+(`crates/core/src/automod_store.rs`), `AutomodActivation`
+(`crates/discord/src/automod_activation.rs`) and the shared loop wiring
+(`crates/bot/src/automod_gateway.rs`). The deferred records above remain
+source-fidelity inventory for the legacy direct-policy/service/wiring
+assertions; runtime verification lives in the real-adapter tests mapped below.
+This change keeps fixtures/tests/docs only; runtime wiring is out of scope.
+
+### Runtime proof map
+
+Each deferred family maps to a real-adapter/store test by file:line. The
+deferred corpus cases stay as preserved legacy expectations; the tests below
+prove the same behavior through the real runtime, store or gateway.
+
+| Case family | Real-adapter/store proof |
+| --- | --- |
+| Raw leading-dot extension policy | `crates/core/tests/automod_runtime.rs:467` normalizes `.exe,.JS` through `AutomodConfig::from_map` to `["exe","js"]` and matches `Setup.EXE` via the real runtime; normalization itself is `crates/core/src/automod.rs:836-837`. The raw direct-policy divergence stays deferred by design. |
+| Service ladder and audit | `crates/core/tests/automod_runtime.rs:114` plans delete/warn/timeout-600; `crates/discord/tests/automod_activation.rs:514` deletes then warns then times out over the mock REST double; `crates/discord/tests/automod_activation.rs:564` replays with no second mutation; `crates/core/tests/automod_store.rs:56` proves 20-way contention, five processed messages, final violation count five and zero content columns. |
+| Dry-run ledger separation | `crates/core/tests/automod_runtime.rs:90` needs no resolver and emits no effects; `crates/discord/tests/automod_activation.rs:467` sends nothing with no target fetch or count; `crates/core/tests/automod_store.rs:56` fences dry-run preserve/mark/count at persistence and keeps the enforce claim distinct; `crates/discord/tests/automod_activation.rs:695` funnels a dry-run then enforce message once. |
+| Retry/failure semantics | `crates/discord/tests/automod_activation.rs:741` retains uncertain delete, `:777` retains uncertain timeout, `:803` settles rejected delete, `:832` retains fence refusal, `:855` releases unavailable target then replays the preserved decision, `:564` blocks in-flight duplicates; `crates/core/tests/automod_store.rs:56` covers safe release, counted-claim reconciliation and preserved-decision replay; `crates/core/tests/automod_runtime.rs:808` reproduces a pre-count retry after window advance. |
+| Protection before delete | `crates/core/tests/automod_runtime.rs:166` leaves every protected target untouched on rungs 1-3, `:227` keeps exact deletion on hierarchy/permission refusal, `:202` fails closed before delete; `crates/discord/tests/automod_activation.rs:495` counts but touches nothing for protected targets. |
+| Gateway/activation | `crates/core/tests/automod_runtime.rs:76` routes matches to capture-only, `:263` fetches partial edits with no funnel or XP, `:315` fences staging/live/DM scope; `crates/discord/tests/automod_activation.rs:893` bypasses out-of-scope guilds claim-free, `:935` fetches and reinspects edits without award, `:992` stays unavailable without a snapshot; `crates/bot/src/automod_gateway_tests.rs:35` rejects boot without owner config, `:54` keeps owner/protection off the enforce flag, `:480` pins every outcome verdict, `:373` times out to capture-only. |
 
 ## Scrubbed staging-artifact mapping
 
