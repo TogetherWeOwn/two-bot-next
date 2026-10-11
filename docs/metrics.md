@@ -366,6 +366,7 @@ exposition proxy, and ownership and bearer controls are unchanged.
 | `ticker_stale:<job>` | 15 s ticker with no success for more than 10 minutes (never-succeeded is ignored) | [ticker stale](runbook.md#alert-ticker-stale) |
 | `receiver_refusals:<family>` | refused `two_bot_internal_actions_total` outcomes rising in 3 consecutive samples per family (first sample and restarts clear the streak) | [receiver refusals](runbook.md#alert-receiver-refusals) |
 | `dispatch_drops:<lane>` | **ticket**, not page: `two_bot_dispatch_drops_total{lane}` grows in 3 consecutive completed sample windows per bounded lane; first sample is baseline, flat/reset clears, missing/invalid retains active alerts | [dispatch drops](runbook.md#alert-dispatch-drops) |
+| `job_unknown_stale:<job>` | **ticket**, not page: job without a cadence entry with no success for more than 2 hours (never-succeeded is ignored) | [job unknown stale](runbook.md#alert-job-unknown-stale) |
 
 `dispatch_drops` covers `messages`, `interactions`, `registry`, `privileged`,
 `busy` and `reactions` independently (the Worker allowlist is pinned to Rust).
@@ -391,10 +392,15 @@ Rust `*_INTERVAL_MS / 1000`. The 15 s tickers (`scheduled_messages`,
 window instead: at two intervals a 15 s cadence would flap on a single slow
 scrape, and skipped busy deadlines are neither success nor failure, so
 `job_stale` and `job_consecutive_failures` cannot see a wedged ticker.
-`invite_snapshot`, `session_checkpoint` and `other` have no cadence and are
-exempt; `audit_retry` stays exempt with its parked/halt reason.
+`invite_snapshot`, `session_checkpoint`, `other` and `audit_retry` have no
+cadence entry; a stale nonzero success timestamp on any of them — or on any
+future label the scrape accepts before the catalog maps it — raises the
+`job_unknown_stale` ticket above (`UNKNOWN_JOB_STALE_SECONDS`, 7200) instead
+of staying silent. `audit_retry` keeps its parked/halt reason in the catalog;
+a halted sweep still records success, so only a truly wedged sweep tickets.
 `wrangler/test/alert-job-catalog.test.ts` fails when a `JOBS` label has
-neither a matching cadence, ticker_stale coverage, nor a reasoned exemption.
+neither a matching cadence, ticker_stale coverage, nor a reasoned
+unknown-stale entry.
 
 Packet identity (TOG-12100): rule ids above are the single shared spelling
 used on both sides of the B2 soak evidence seam. The Rust canonical list is
