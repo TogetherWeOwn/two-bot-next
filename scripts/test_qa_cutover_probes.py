@@ -609,6 +609,91 @@ class CadenceTest(unittest.TestCase):
         self.assertNotIn("4 jobs fresh", out)
 
 
+class FixedCadenceJobGradingTest(unittest.TestCase):
+    """self_role_recovery (30 s cadence, 25 s timeout) and automod_expiry
+    (60 s cadence, 5 s timeout) have fixed cadences, so they are graded with
+    the same cadence+timeout / 2x cadence+timeout bands as their siblings."""
+
+    # name: (warn line, max line), pinned from the Rust constants.
+    BANDS = {
+        "self_role_recovery": (55, 85),
+        "automod_expiry": (65, 125),
+    }
+
+    def probe(self, jobs):
+        return run(double({"/health": HEALTH, "/readyz": readyz_with_jobs(jobs)}),
+                   "--base-url", "http://h/")
+
+    def test_bands_derive_from_cadence_and_timeout(self):
+        for name, (warn, limit) in self.BANDS.items():
+            self.assertEqual(probe.WARN_LAST_SUCCESS_AGE_SECONDS[name], warn, name)
+            self.assertEqual(probe.MAX_LAST_SUCCESS_AGE_SECONDS[name], limit, name)
+
+    def test_cadence_and_timeout_maps_cover_the_same_jobs(self):
+        self.assertEqual(set(probe.JOB_CADENCE_SECONDS),
+                         set(probe.JOB_TIMEOUT_SECONDS))
+
+    def test_fresh_samples_pass_without_a_warning(self):
+        code, out = self.probe({name: (False, 10) for name in self.BANDS})
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+        self.assertIn("2 jobs fresh within cadence", out)
+        self.assertNotIn("ungraded", out)
+        self.assertNotIn("warn", out)
+
+    def test_between_warn_and_max_stays_green_but_is_named(self):
+        for name, (warn, limit) in self.BANDS.items():
+            with self.subTest(name=name):
+                code, out = self.probe({name: (False, warn + 10)})
+                self.assertEqual(code, 0, out)
+                self.assertIn("PASS jobs-map:", out)
+                self.assertIn(f"[warn: {name}=", out)
+
+    def test_past_max_fails_and_names_the_job_and_limit(self):
+        for name, (warn, limit) in self.BANDS.items():
+            with self.subTest(name=name):
+                code, out = self.probe({"counter": (False, 10),
+                                        name: (False, limit + 10)})
+                self.assertEqual(code, 1, out)
+                self.assertIn("FAIL jobs-map:", out)
+                self.assertIn(f"{name}=", out)
+                self.assertIn(f"> {limit}s", out)
+                self.assertNotIn("counter=", out)
+
+    def test_never_succeeded_with_failures_fails_and_names_the_job(self):
+        for name in self.BANDS:
+            with self.subTest(name=name):
+                code, out = self.probe({name: (False, None, {
+                    "consecutive_failures": 4, "last_error_class": "database"})})
+                self.assertEqual(code, 1, out)
+                self.assertIn(f"{name}=no-success 4 consecutive failures", out)
+
+    def test_stale_last_start_without_success_fails(self):
+        for name, (warn, limit) in self.BANDS.items():
+            with self.subTest(name=name):
+                code, out = self.probe({name: (False, None, {
+                    "consecutive_failures": 0, "start_age": limit + 60})})
+                self.assertEqual(code, 1, out)
+                self.assertIn(f"{name}=last_start", out)
+
+    def test_never_run_yet_is_not_evidence(self):
+        code, out = self.probe({name: (False, None) for name in self.BANDS})
+        self.assertEqual(code, 0, out)
+        self.assertIn("2 not yet run", out)
+
+    def test_parked_with_ancient_success_passes(self):
+        code, out = self.probe({name: (True, 10 ** 6) for name in self.BANDS})
+        self.assertEqual(code, 0, out)
+        self.assertIn("2 parked", out)
+
+    def test_absent_from_the_map_is_not_a_failure(self):
+        # Absence (an older build, or the job not registered) is unchanged:
+        # the probe grades only what /readyz reports.
+        code, out = self.probe({"counter": (False, 10)})
+        self.assertEqual(code, 0, out)
+        self.assertIn("1 jobs fresh within cadence", out)
+
+
 class BodyCapRefusalTests(unittest.TestCase):
     """Oversized bodies are refused before JSON parsing (M4.42)."""
 
