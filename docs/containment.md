@@ -41,7 +41,10 @@ occurrence time and audit ID, and finds the maximum sliding heat at endpoints at
 or after the trigger. An exact-window separation is excluded. This supports
 reverse delivery without summing two adjacent windows together. Defaults are a
 60s window and heat threshold 5. Policy durations are explicit integer
-milliseconds; environment parsing is not implemented in this slice.
+milliseconds. The bot loader (`ContainmentSettings::from_vars` in
+`crates/bot/src/containment_runtime.rs`) converts `TWO_ANTI_NUKE_*_SECONDS` to
+whole positive milliseconds; a sub-millisecond, overflowing or non-finite value
+uses the shipped default with a warning.
 
 `incident_candidate` proposes an incident with the triggering audit ID, state
 `Containing`, and cooldown measured from **processing time**, not occurrence
