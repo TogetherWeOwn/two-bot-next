@@ -4,6 +4,7 @@ from collections import Counter
 import copy
 import json
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import textwrap
@@ -558,8 +559,11 @@ class ScriptReferenceTests(unittest.TestCase):
         check_script_refs({"id": "fixture", "action": "Read `.github/scripts/release-on-promote.cjs`."})
 
     def test_missing_live_script_fails(self):
-        with self.assertRaisesRegex(ValueError, r"^fixture: missing script scripts/missing-check\.cjs"):
-            check_script_refs({"id": "fixture", "action": "Run `scripts/missing-check.cjs`."})
+        for path in ("scripts/missing-check.cjs", "./scripts/missing-check.sh",
+                     "../scripts/missing-check.py", "scripts/fixtures/missing-check.json"):
+            with self.subTest(path=path):
+                with self.assertRaisesRegex(ValueError, rf"^fixture: missing script {re.escape(path)} "):
+                    check_script_refs({"id": "fixture", "action": f"Run `{path}`."})
 
     def test_named_historical_script_passes(self):
         check_script_refs({

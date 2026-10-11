@@ -20,7 +20,7 @@ DISPOSITION_HEADERS = ("Disposition", "Next boundary / disposition")
 LEDGER_HEADER = ("Legacy commit", "Area", "Change", "Status", "Disposition")
 LEDGER_STATUSES = ("ported", "carded", "gap", "dropped")
 CARD = re.compile(r"\bTOG-\d+\b")
-SCRIPT_REF = re.compile(r"(?<![\w./-])((?:\.github/)?scripts/[\w./-]+\.(?:cjs|mjs|js|py|sh|ts))\b")
+SCRIPT_REF = re.compile(r"(?<![\w/.-])((?:\.{1,2}/)?(?:\.github/)?scripts/[\w./-]+\.\w+)")
 # Automated rows run Cargo through the controller cache wrapper only.
 WRAPPER = ("python3", "scripts/cargo_cache.py", "run", "--")
 CARGO_VALUE_OPTIONS = ("-p", "--package", "--test", "-F", "--features", "--target",
@@ -442,6 +442,12 @@ def strings(value):
                 yield from strings(item)
 
 
+def script_exists(path, root):
+    """True when a cited script path is a file inside the repository."""
+    target = (root / path).resolve()
+    return target.is_file() and target.is_relative_to(root.resolve())
+
+
 def check_script_refs(entry, root=ROOT):
     """Offline guard: operative script paths in an entry must exist unless marked historical."""
     exempt = {}
@@ -451,10 +457,10 @@ def check_script_refs(entry, root=ROOT):
         exempt[item["path"]] = item["reason"]
     cited = {path for text in strings(entry) for path in SCRIPT_REF.findall(text)}
     for path in sorted(exempt):
-        if path not in cited or (root / path).is_file():
+        if path not in cited or script_exists(path, root):
             raise ValueError(f"{entry['id']}: stale historical exemption {path}")
     for path in sorted(cited - set(exempt)):
-        if not (root / path).is_file():
+        if not script_exists(path, root):
             raise ValueError(f"{entry['id']}: missing script {path} is cited as operative")
 
 
