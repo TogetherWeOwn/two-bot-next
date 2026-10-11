@@ -216,7 +216,7 @@ test("recognized refusal reasons print as themselves and anything else prints as
     assert.match(await refusal(JSON.stringify({ error: "ownership_fenced", reason })), new RegExp(`reason=${reason} attempts=1 `));
   }
   const leak = `synthetic_leak_${"q".repeat(40)}`;
-  for (const reason of ["NOT_OWNER", " not_owner", "stop_failed", leak, "__proto__", ["not_owner"]]) {
+  for (const reason of ["NOT_OWNER", " not_owner", "not_owner ", `not_owner${leak}`, "stop_failed", leak, "__proto__", ["not_owner"]]) {
     assert.match(await refusal(JSON.stringify({ error: "ownership_fenced", reason })), /reason=unrecognized attempts=1 /);
   }
   assert.match(await refusal("not json"), /reason=unrecognized attempts=1 /);
