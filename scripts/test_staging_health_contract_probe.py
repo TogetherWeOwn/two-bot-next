@@ -398,9 +398,11 @@ class BodyCapRefusalTests(unittest.TestCase):
     def test_readyz_httperror_oversize_enforces_the_same_bound(self):
         import urllib.error
         sentinel = "SENTINEL_BODY_readyz_httperror"
-        base = json.dumps(dict(READY)).encode()
+        base = json.dumps(dict(READY, note=sentinel)).encode()
         big = base + b" " * (probe.BODY_CAP + 1 - len(base))
+        self.assertEqual(len(big), probe.BODY_CAP + 1)
         self.assertEqual(json.loads(big)["build_revision"], "abc123")
+        self.assertEqual(json.loads(big)["note"], sentinel)
         routes = {STAGING + "/health": body({"status": "ok"}),
                   STAGING + "/readyz": (503, {}, big)}
         code, results, _ = self.drive(routes)
@@ -410,16 +412,13 @@ class BodyCapRefusalTests(unittest.TestCase):
         # The urllib HTTPError transport also reads a bounded amount.
         seen = []
 
-        class Response:
+        class Response(io.BytesIO):
             status = 200
             headers = {}
 
-            def read(self, n):
+            def read(self, n=-1):
                 seen.append(n)
-                return b"{}"
-
-            def close(self):
-                pass
+                return super().read(n)
 
             def __enter__(self):
                 return self
@@ -427,13 +426,26 @@ class BodyCapRefusalTests(unittest.TestCase):
             def __exit__(self, *exc):
                 return False
 
-        class Opener:
+        class OkOpener:
             def open(self, request, timeout=None):
-                return Response()
+                return Response(b"{}")
 
         with mock.patch.object(probe.urllib.request, "build_opener",
-                               return_value=Opener()):
+                               return_value=OkOpener()):
             probe.fetch(STAGING + "/health")
+        self.assertEqual(seen, [probe.BODY_CAP + 1])
+        seen.clear()
+
+        class ErrorOpener:
+            def open(self, request, timeout=None):
+                fp = Response(b"x")
+                raise urllib.error.HTTPError(request.full_url, 503,
+                                             "Service Unavailable", {}, fp)
+
+        with mock.patch.object(probe.urllib.request, "build_opener",
+                               return_value=ErrorOpener()):
+            status, _, _ = probe.fetch(STAGING + "/readyz")
+        self.assertEqual(status, 503)
         self.assertEqual(seen, [probe.BODY_CAP + 1])
 
 
