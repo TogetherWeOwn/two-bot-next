@@ -172,7 +172,7 @@ per attempt, so read the `route` label first and confirm no deploy is in
 progress before acting. 5xx/transport shares are informational — no rule
 covers them. Counter resets skip the window.
 
-Guard and token state (logs + `/readyz`, no metric series):
+Guard and token state (private `/metrics` `two_bot_rest_guard_*` + logs + `/readyz`):
 
 - `discord_breaker_open` — rolling 401/403/429 count reached 5000 per 600 s;
   non-essential REST refuses pre-wire while open. Stop the offending workload,
@@ -182,6 +182,14 @@ Guard and token state (logs + `/readyz`, no metric series):
 - `discord_token_invalid` — a bot-authenticated 401 latched `token_invalid`;
   `/readyz` adds the component at `down` (503). Stop retries; provisioning is
   a governed path, not a rollback. Contract: [REST guard](rest-guard.md).
+
+Private scrape series: `two_bot_rest_guard_breaker_open`,
+`two_bot_rest_guard_token_invalid`, `two_bot_rest_guard_global_paused`, plus
+`two_bot_rest_guard_rejected_requests_total` and
+`two_bot_rest_guard_invalid_requests_total` (full list:
+[REST admission guard](metrics.md#rest-admission-guard)). A zero
+`two_bot_rest_guard_global_pause_remaining_seconds` does not mean admission is
+open while `two_bot_rest_guard_pending_global_responses` is nonzero.
 
 Admission lane state (durable gate in `public.discord_send_admission`: one row
 per credential fingerprint, 60 s self-heal lease on `in_flight`, no

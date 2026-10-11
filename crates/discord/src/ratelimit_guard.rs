@@ -60,6 +60,23 @@ pub struct GuardSnapshot {
     pub pending_global_responses: usize,
 }
 
+impl From<GuardSnapshot> for two_bot_core::metrics::RestGuardSnapshot {
+    fn from(snapshot: GuardSnapshot) -> Self {
+        Self {
+            invalid_requests_in_window: snapshot.invalid_requests_in_window,
+            invalid_requests_total: snapshot.invalid_requests_total,
+            rejected_requests_total: snapshot.rejected_requests_total,
+            breaker_opens_total: snapshot.breaker_opens_total,
+            breaker_closes_total: snapshot.breaker_closes_total,
+            global_pauses_total: snapshot.global_pauses_total,
+            breaker_open: snapshot.breaker_open,
+            token_invalid: snapshot.token_invalid,
+            global_pause_remaining: snapshot.global_pause_remaining,
+            pending_global_responses: snapshot.pending_global_responses,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct State {
     invalid: VecDeque<Instant>,
@@ -404,6 +421,39 @@ impl Drop for ResponseAccounting<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_response_snapshot_renders_paused_even_after_deadline() {
+        let guard = RateLimitGuard::new(GuardConfig::default()).unwrap();
+        let headers = http::HeaderMap::from_iter([
+            (
+                http::header::HeaderName::from_static("x-ratelimit-global"),
+                http::HeaderValue::from_static("true"),
+            ),
+            (
+                http::header::RETRY_AFTER,
+                http::HeaderValue::from_static("0"),
+            ),
+        ]);
+        let accounting = ResponseAccounting::new(&guard, 429, &headers, true);
+        tokio::time::advance(Duration::from_millis(250)).await;
+        let metrics = two_bot_core::metrics::Metrics::default();
+        let pending = metrics.render_with_rest_guard(None, guard.snapshot().into());
+        for sample in [
+            "two_bot_rest_guard_pending_global_responses 1\n",
+            "two_bot_rest_guard_global_pause_remaining_seconds 0\n",
+            "two_bot_rest_guard_global_paused 1\n",
+            "two_bot_rest_guard_invalid_requests_total 1\n",
+            "two_bot_rest_guard_global_pauses_total 1\n",
+        ] {
+            assert!(pending.contains(sample), "missing {sample}");
+        }
+        drop(accounting);
+        let settled = metrics.render_with_rest_guard(None, guard.snapshot().into());
+        assert!(settled.contains("two_bot_rest_guard_pending_global_responses 0\n"));
+        assert!(settled.contains("two_bot_rest_guard_global_paused 0\n"));
+        assert!(settled.contains("two_bot_rest_guard_global_pauses_total 1\n"));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn rolling_window_and_bounded_accounting() {
