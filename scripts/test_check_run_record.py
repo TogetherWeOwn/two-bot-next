@@ -33,6 +33,32 @@ def fresh_record(**overrides):
     return record
 
 
+def as_bytes(document):
+    return document if isinstance(document, bytes) else document.encode("utf-8")
+
+
+def nested_arrays(levels):
+    document = []
+    for _ in range(levels - 1):
+        document = [document]
+    return document
+
+
+def nested_dicts(levels):
+    document = {}
+    for _ in range(levels - 1):
+        document = {"a": document}
+    return document
+
+
+def nested_array_text(levels):
+    return "[" * levels + "]" * levels
+
+
+def nested_object_text(levels):
+    return '{"a":' * (levels - 1) + "{}" + "}" * (levels - 1)
+
+
 class RunRecordValidatorTests(unittest.TestCase):
     def test_mock_fixture_valid_with_allow_mock(self):
         self.assertEqual(checker.validate(MOCK, SCHEMA, allow_mock=True), [])
@@ -169,13 +195,13 @@ class RunRecordValidatorTests(unittest.TestCase):
     def cli(self, record_text, schema_text=None, allow_mock=True):
         with tempfile.TemporaryDirectory(dir=os.getenv("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
             record = Path(tmp) / "record.json"
-            record.write_text(record_text, encoding="utf-8")
+            record.write_bytes(as_bytes(record_text))
             argv = ["--record", str(record)]
             if allow_mock:
                 argv.append("--allow-mock")
             if schema_text is not None:
                 schema = Path(tmp) / "schema.json"
-                schema.write_text(schema_text, encoding="utf-8")
+                schema.write_bytes(as_bytes(schema_text))
                 argv.extend(["--schema", str(schema)])
             out, err = io.StringIO(), io.StringIO()
             with redirect_stdout(out), redirect_stderr(err):
@@ -589,6 +615,105 @@ class RunRecordValidatorTests(unittest.TestCase):
             ROOT / "scripts" / "fixtures" / "staging_e2e_run_record_mock.json"
         )
         self.assertEqual(checker.main(["--record", str(fixture)]), 1)
+
+    def test_nesting_budget_admits_limit_and_refuses_one_deeper(self):
+        limit = checker.MAX_NESTING_DEPTH
+        for text_for, document_for in (
+            (nested_array_text, nested_arrays),
+            (nested_object_text, nested_dicts),
+        ):
+            with self.subTest(kind=text_for.__name__):
+                self.assertEqual(
+                    checker.load_json(text_for(limit)), document_for(limit)
+                )
+                with self.assertRaises(checker.DecoderLimitError) as caught:
+                    checker.load_json(text_for(limit + 1))
+                self.assertEqual(str(caught.exception), checker.NESTING_MESSAGE)
+
+    def test_decoder_recursion_overflow_refused_as_nesting_limit(self):
+        for text in (nested_array_text(100_000), nested_object_text(100_000)):
+            with self.subTest(prefix=text[:6]):
+                with self.assertRaises(checker.DecoderLimitError) as caught:
+                    checker.load_json(text)
+                self.assertEqual(str(caught.exception), checker.NESTING_MESSAGE)
+
+    def test_oversized_integer_literal_refused_without_echoing_digits(self):
+        with self.assertRaises(checker.DecoderLimitError) as caught:
+            checker.load_json('{"x": ' + "9" * 5000 + "}")
+        self.assertEqual(str(caught.exception), checker.DECODER_DIGITS_MESSAGE)
+        self.assertNotIn("9999", str(caught.exception))
+
+    def test_validator_refuses_directly_supplied_deep_structures(self):
+        expected = [f"$: {checker.NESTING_MESSAGE}"]
+        self.assertEqual(checker.validate(nested_arrays(100_000), {}), expected)
+        self.assertEqual(checker.validate(nested_dicts(100_000), {}), expected)
+        self.assertEqual(checker.validate(MOCK, nested_dicts(100_000)), expected)
+
+    def test_validator_accepts_structures_at_nesting_limit(self):
+        limit = checker.MAX_NESTING_DEPTH
+        self.assertEqual(checker.validate(nested_arrays(limit), {}), [])
+        self.assertEqual(checker.validate(nested_dicts(limit), {}), [])
+        self.assertEqual(
+            checker.validate(nested_dicts(limit + 1), {}),
+            [f"$: {checker.NESTING_MESSAGE}"],
+        )
+
+    def test_duplicate_key_at_nesting_limit_still_refused(self):
+        limit = checker.MAX_NESTING_DEPTH
+        text = '{"a":' * (limit - 1) + '{"k":1,"k":2}' + "}" * (limit - 1)
+        with self.assertRaises(checker.DuplicateKeyError) as caught:
+            checker.load_json(text)
+        self.assertTrue(str(caught.exception).endswith(".k: duplicate object key"))
+
+    def test_cli_refuses_deep_record_and_schema_without_traceback(self):
+        for name, text in (
+            ("array", nested_array_text(100_000)),
+            ("object", nested_object_text(100_000)),
+        ):
+            with self.subTest(record=name):
+                code, out, err = self.cli(text)
+                self.assertEqual(code, 1)
+                self.assertTrue(out.rstrip().endswith(
+                    f"cannot load record: {checker.NESTING_MESSAGE}"))
+                self.assertEqual(err, "")
+        code, out, err = self.cli(json.dumps(MOCK), nested_array_text(100_000))
+        self.assertEqual(code, 1)
+        self.assertTrue(out.rstrip().endswith(
+            f"cannot load schema: {checker.NESTING_MESSAGE}"))
+        self.assertEqual(err, "")
+
+    def test_cli_refuses_oversized_integer_without_traceback(self):
+        code, out, err = self.cli('{"x": ' + "9" * 5000 + "}")
+        self.assertEqual(code, 1)
+        self.assertTrue(out.rstrip().endswith(
+            f"cannot load record: {checker.DECODER_DIGITS_MESSAGE}"))
+        self.assertEqual(err, "")
+
+    def test_cli_refuses_invalid_utf8_record_without_echoing_bytes(self):
+        sentinel = "gh" + "p_" + "SyntheticPayloadNeverEcho42"
+        record_bytes = b'{"notes": "' + sentinel.encode("ascii") + b'\xff"}'
+        offset = record_bytes.index(b"\xff")
+        code, out, err = self.cli(record_bytes)
+        self.assertEqual(code, 1)
+        self.assertTrue(out.rstrip().endswith(
+            f"cannot load record: invalid UTF-8 at byte offset {offset}"))
+        self.assert_no_sentinel(sentinel, out, err)
+        self.assertNotIn("\\xff", out)
+        self.assertEqual(err, "")
+
+    def test_cli_refuses_invalid_utf8_schema_without_traceback(self):
+        schema_bytes = b'{"type": "object", "description": "caf\xc3"}'
+        offset = schema_bytes.index(b"\xc3")
+        code, out, err = self.cli(json.dumps(MOCK), schema_bytes)
+        self.assertEqual(code, 1)
+        self.assertTrue(out.rstrip().endswith(
+            f"cannot load schema: invalid UTF-8 at byte offset {offset}"))
+        self.assertEqual(err, "")
+
+    def test_valid_utf8_non_ascii_still_loads(self):
+        code, out, err = self.cli(json.dumps({"café": 1}).encode("utf-8"))
+        self.assertNotIn("cannot load", out)
+        self.assertEqual(err, "")
 
 
 if __name__ == "__main__":
