@@ -162,3 +162,6 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/voice-synthetic.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
+    # By name, not `inherit`: only the test bot token crosses the boundary.
+    secrets:
+      TWO_VOICE_SYNTHETIC_BOT_TOKEN: ${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}

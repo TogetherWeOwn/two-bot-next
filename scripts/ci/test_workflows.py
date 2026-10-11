@@ -867,8 +867,15 @@ def voice_synthetic_errors(workflow):
     on = workflow.get("on") or {}
     if set(on) != {"workflow_call", "schedule", "workflow_dispatch"}:
         errors.append(f"{name}: triggers must be exactly workflow_call, schedule and workflow_dispatch")
-    if on.get("workflow_call") or on.get("workflow_dispatch"):
-        errors.append(f"{name}: workflow_call/workflow_dispatch must take no inputs or secrets")
+    call = on.get("workflow_call") or {}
+    if on.get("workflow_dispatch") or set(call) - {"secrets"} or (
+        call.get("secrets") is not None
+        and call["secrets"] != {"TWO_VOICE_SYNTHETIC_BOT_TOKEN": {"required": "false"}}
+    ):
+        errors.append(
+            f"{name}: workflow_call takes only the optional TWO_VOICE_SYNTHETIC_BOT_TOKEN secret; "
+            "workflow_dispatch takes no inputs"
+        )
     if workflow.get("permissions") != {}:
         errors.append(f"{name}: top-level permissions must stay empty")
     if workflow.get("concurrency") != {"group": "voice-synthetic", "cancel-in-progress": "false"}:
@@ -994,6 +1001,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(job.get("needs"), "deploy")
         self.assertEqual(job.get("uses"), "./.github/workflows/voice-synthetic.yml")
         self.assertNotIn("if", job)
+        # An environment secret is empty in a called workflow unless the caller
+        # passes it; pass exactly the test bot token, never `inherit`.
+        self.assertEqual(
+            job.get("secrets"),
+            {"TWO_VOICE_SYNTHETIC_BOT_TOKEN": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"},
+        )
 
     def test_staging_runs_unconditionally_for_push_and_dispatch(self):
         staging = self.workflows["deploy-staging.yml"]
