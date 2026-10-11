@@ -212,6 +212,12 @@ The staging-migrate gate refuses-or-fails loudly by this contract:
    on any of these paths.
 2. **Failure with evidence (exit 1):** migration execution errors and
    incomplete ledgers after apply, with `ledger_after_failure` on stdout.
+   When the ledger cannot be read after the run, the evidence field
+   (`ledger_after_failure`, or `ledger_after` on the incomplete-ledger path)
+   is the fixed string `"unknown: ledger unreadable"`, never `[]`. A failed
+   read-back never replaces the original migration error, and the run is
+   not retried. If the apply itself succeeded, stderr reads
+   `staging-migrate failed: ledger unreadable after apply` instead.
 3. **CI amplification (the #406 lesson):** both `plan` and `apply` Run
    steps use `shell: bash` plus `set -o pipefail`, so a piped refusal or
    failure fails the job instead of reporting green through `tee`. Pinned
