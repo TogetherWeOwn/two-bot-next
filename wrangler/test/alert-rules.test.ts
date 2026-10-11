@@ -184,7 +184,7 @@ test("gateway checkpoint failures fire on any increase, never on the first sampl
 test("gateway checkpoint failure pages on the pre-exit scrape and resolves after the restart", () => {
   // Models the linger-then-exit lifecycle: `shutdown::RUNTIME_FAILURE_LINGER`
   // (75 s) outlasts one 60 s keepalive tick plus two 6 s probe timeouts with
-  // about 9 s of margin (pinned in checkpoint-linger.test.ts), so the
+  // about 3 s of margin (pinned in checkpoint-linger.test.ts), so the
   // incremented counter is scraped before the process exits and the restart
   // resets it to zero.
   const baseline = ev([`two_bot_gateway_checkpoint_failures_total{stage="commit"} 0`]);

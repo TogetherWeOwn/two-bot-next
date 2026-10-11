@@ -89,7 +89,7 @@ page immediately rather than consuming budget:
   `two_bot_gateway_checkpoint_failures_total` summed over every `stage`
   between two keepalive samples pages at once (zero threshold), because
   every checkpoint failure stops the dispatch worker. The 75 s runtime
-  linger leaves ~9 s margin over a 60 s tick plus two 6 s probes for a scrape
+  linger leaves ~3 s margin over a 60 s tick plus two 6 s probes for a scrape
   to land before the restart resets the counter.
   Runbook: [runbook](runbook.md#alert-checkpoint-failures).
 

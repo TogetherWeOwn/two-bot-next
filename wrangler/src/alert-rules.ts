@@ -272,11 +272,12 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   // Gateway checkpoint commit failures (every failure stops the dispatch
   // worker, so there is no benign singleton): any increase between two
   // samples pages. The first sample only stores the baseline and never
-  // fires. The failing process lingers past one full keepalive tick
-  // (`shutdown::FAILURE_LINGER`), so the increase is always scraped before
-  // the exit resets the counter; the post-restart reset sample resolves
-  // rather than firing. `??` covers DO storage written before these fields
-  // existed.
+  // fires. A runtime failure lingers 75 s (`shutdown::RUNTIME_FAILURE_LINGER`,
+  // pinned against the keepalive tick plus probe timeouts in
+  // checkpoint-linger.test.ts) past one full keepalive tick, so the increase
+  // is normally scraped before the exit resets the counter; the post-restart
+  // reset sample resolves rather than firing. `??` covers DO storage written
+  // before these fields existed.
   let checkpointFailures = 0;
   for (const s of gauge("two_bot_gateway_checkpoint_failures_total")) checkpointFailures += s.value;
   const prevCheckpointFailures = prev.checkpointFailures ?? 0;

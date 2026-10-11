@@ -410,7 +410,7 @@ samples. Every checkpoint failure stops the dispatch worker, so there is no
 benign singleton: a single increase pages. The first sample after monitoring
 arms only stores the baseline and never fires. A running-gateway failure
 lingers 75 s before it exits (startup failures still linger 15 s), which
-leaves about 9 s of margin over one 60 s keepalive tick plus two 6 s probe
+leaves about 3 s of margin over one 60 s keepalive tick plus two 6 s probe
 timeouts for a scrape to see the increase; the post-restart reset sample
 resolves the alert rather than firing.
 
