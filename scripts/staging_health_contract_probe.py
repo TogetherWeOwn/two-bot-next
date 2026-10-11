@@ -58,6 +58,11 @@ TIMEOUT_SECONDS = 10
 USER_AGENT = "two-bot-next-staging-health-contract-probe/1.0 (read-only E2E)"
 
 REQUIRED_COMPONENTS = ("process", "gateway", "database", "token_invalid")
+# Per-surface allowlist: exactly the four components the container serves
+# (crates/bot/src/server.rs readiness_report + with_token_state). No
+# optionals on this surface; anything else is refused with fixed vocabulary
+# naming no component data.
+ALLOWED_COMPONENTS = frozenset({"process", "gateway", "database", "token_invalid"})
 STATUSES = ("ready", "starting", "down")
 FAILURE_PHASE = "durable_gateway"
 FAILURE_CLASSES = frozenset({
@@ -190,6 +195,8 @@ def parse_readyz(status, value):
     names = [row[0] for row in components]
     if len(set(names)) != len(names):
         raise ProbeError(f"readyz {status} repeats a component name")
+    if any(name not in ALLOWED_COMPONENTS for name in names):
+        raise ProbeError(f"readyz {status} carries an unknown component name")
     state = dict(components)
     missing = [name for name in REQUIRED_COMPONENTS if name not in state]
     if missing:

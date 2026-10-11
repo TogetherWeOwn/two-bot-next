@@ -180,8 +180,6 @@ class RollbackReadinessProbeTests(unittest.TestCase):
         process, gateway = ("process", "ready"), ("gateway", "ready")
         database, token = ("database", "ready"), ("token_invalid", "ready")
         accepted = {
-            "200 with an unknown ready component": (200, readyz_body(process, gateway, database, token,
-                                                                     ("voice", "ready"))),
             "503 with gateway starting": (503, readyz_body(process, ("gateway", "starting"), database, token)),
             "503 with gateway down": (503, readyz_body(process, ("gateway", "down"), database, token)),
         }
@@ -194,9 +192,12 @@ class RollbackReadinessProbeTests(unittest.TestCase):
                                        "unexpected components"),
             "200 with token invalid down": (200, readyz_body(process, gateway, database, ("token_invalid", "down")),
                                             "unexpected components"),
+            "200 with an unknown ready component": (200, readyz_body(process, gateway, database, token,
+                                                                    ("voice", "ready")),
+                                                   "carries an unknown component name"),
             "200 with an unknown component down": (200, readyz_body(process, gateway, database, token,
                                                                     ("voice", "down")),
-                                                   "unexpected components"),
+                                                   "carries an unknown component name"),
             "500 with a complete body": (500, readyz_body(process, gateway, database, token),
                                          "/readyz 500 with unexpected"),
             "503 with every component ready": (503, readyz_body(process, gateway, database, token),
@@ -205,7 +206,10 @@ class RollbackReadinessProbeTests(unittest.TestCase):
                                       "unexpected components"),
             "503 with an unknown component down": (503, readyz_body(process, ("gateway", "starting"), database,
                                                                     token, ("voice", "down")),
-                                                   "unexpected components"),
+                                                   "carries an unknown component name"),
+            "503 with an unknown ready component": (503, readyz_body(process, gateway, database, token,
+                                                                    ("voice", "ready")),
+                                                   "carries an unknown component name"),
             "503 with gateway starting and token invalid down": (503, readyz_body(
                 process, ("gateway", "starting"), database, ("token_invalid", "down")), "unexpected components"),
             "503 with gateway and database down": (503, readyz_body(
@@ -234,6 +238,20 @@ class RollbackReadinessProbeTests(unittest.TestCase):
                 line = self.readyz(status, body)
                 self.assertTrue(line.startswith("FAIL readyz"), line)
                 self.assertIn(reason, line)
+
+    def test_unknown_component_refused_without_echoing_data(self):
+        sentinel = "SENTINEL_unknown_rollback_abc123"
+        for status, extra in ((200, (sentinel, "ready")),
+                              (503, (sentinel, "down")),
+                              (200, (sentinel, "starting"))):
+            with self.subTest(status=status, extra=extra):
+                body = readyz_body(("process", "ready"), ("gateway", "ready"),
+                                   ("database", "ready"), ("token_invalid", "ready"),
+                                   extra)
+                line = self.readyz(status, body)
+                self.assertTrue(line.startswith("FAIL readyz"), line)
+                self.assertIn("carries an unknown component name", line)
+                self.assertNotIn(sentinel, line)
 
     def test_newest_archive_by_mtime_skips_decoys(self):
         self.fx.write_archive("two-funnel-zz-older.ndjson.gz", [b"not json"], mtime=1_000_000_000)

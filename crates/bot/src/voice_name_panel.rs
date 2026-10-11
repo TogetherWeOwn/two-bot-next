@@ -1023,18 +1023,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             fallback,
             filter,
             game_players: 0,
-            other_names: live
-                .channels
-                .values()
-                .filter(|channel| {
-                    channel.id.get() != room.channel_id
-                        && matches!(
-                            channel.kind,
-                            ChannelType::GuildVoice | ChannelType::GuildStageVoice
-                        )
-                })
-                .filter_map(|channel| channel.name.clone())
-                .collect(),
+            // Queued-but-unlanded renames from other tracked rooms count as
+            // held names (legacy 38041a1 siblingNames applies
+            // throttle.pending): a folded duplicate of a pending rename is
+            // refused at submit instead of landing a second channel. Shares
+            // the flush-time helper so only really-pending renames count.
+            // Pass the already-held live state: re-locking here would
+            // deadlock behind a waiting writer (see `read_state`).
+            other_names: self.held_rename_names_in(&live, room.channel_id),
         };
         // Game and stream tokens/conditions from gateway presences (empty
         // without TWO_VOICE_PRESENCE, which leaves the no-game label).
