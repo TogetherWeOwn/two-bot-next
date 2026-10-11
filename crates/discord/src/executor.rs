@@ -1589,9 +1589,11 @@ impl ActionExecutor {
         .map_err(|e| e.to_string())
     }
 
-    /// Paced GET: 110 ms lane, 403/404 → `None`, 429 parks (same attempt),
-    /// 5xx/transport backs off ≤4, other statuses → `None` (legacy
-    /// `DiscordRest::get`). Supported paths cover the parity §6 reads —
+    /// Paced GET: 110 ms lane, 403/404 → `None`, 429 waits (`retry-after +
+    /// 250 ms`; a global 429 rides the shared pause at next admission) and
+    /// retries within the same 5-try budget as 5xx/transport, other statuses
+    /// → `None` (legacy `DiscordRest::get`). Supported paths cover the
+    /// parity §6 reads —
     /// guild, guild members (+`after`/`limit`), guild scheduled-events
     /// (+`with_user_count`), single channel and the channel-messages list
     /// (+`after`/`around`/`before`/`limit`). Anything else is a caller bug and
@@ -1641,9 +1643,18 @@ impl ActionExecutor {
                         .map(|data| (data, observed_at)));
                 }
                 429 => {
+                    // Every 429 spends one read attempt, like 5xx/transport:
+                    // a steady 429 stream exhausts the budget instead of
+                    // parking the read until a separate guard refuses it. A
+                    // global 429 installs the shared pause at next admission,
+                    // so only route-local 429s sleep here.
+                    if attempt >= MAX_HTTP_TRIES - 1 {
+                        return Ok(None);
+                    }
                     if !global {
                         tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
                     }
+                    attempt += 1;
                 }
                 403 | 404 => return Ok(None),
                 500..=599 => {
@@ -1731,9 +1742,23 @@ impl ActionExecutor {
                     };
                 }
                 429 => {
+                    // Same finite budget as the observed read: each 429
+                    // spends one attempt, so persistent rate limiting ends in
+                    // the fixed transient-exhaustion error for checked reads
+                    // (absence for unchecked ones), never an open-ended park.
+                    // Global pauses apply at next admission; only
+                    // route-local 429s sleep here.
+                    if attempt >= MAX_HTTP_TRIES - 1 {
+                        return if checked {
+                            Err("Discord evidence unavailable".to_owned())
+                        } else {
+                            Ok(None)
+                        };
+                    }
                     if !global {
                         tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
                     }
+                    attempt += 1;
                 }
                 403 | 404 => return Ok(None),
                 500..=599 => {
