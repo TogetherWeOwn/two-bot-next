@@ -312,6 +312,33 @@ test("ticker stale fires past 10 minutes, ignores boot, parked and fresh tickers
   assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="rank"} ${NOW - 3600}`]).firing.filter((k) => k.startsWith("ticker_stale")), []);
 });
 
+test("unknown-cadence jobs ticket past the fallback window, never on fresh or never-succeeded", () => {
+  // Boot (never succeeded) and parked (never registered) stay zero: silent.
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="audit_retry"} 0`]).firing, []);
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="other"} 0`]).firing, []);
+  // Fresh successes are silent, up to and including the 2-hour fallback edge.
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="audit_retry"} ${NOW - 7200}`]).firing, []);
+  // A stale success timestamp tickets (never pages) with the job subject.
+  const firing = ev([`two_bot_job_last_success_timestamp_seconds{job="audit_retry"} ${NOW - 7201}`]).firing;
+  assert.deepEqual(firing, ["job_unknown_stale:audit_retry"]);
+  assert.equal(ruleFor("job_unknown_stale:audit_retry")?.severity, "ticket");
+  // Future labels the scrape accepts fail closed the same way, with no catalog entry.
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="unban_sweep"} ${NOW - 7201}`]).firing, ["job_unknown_stale:unban_sweep"]);
+  // Event-driven session_checkpoint never tickets however stale: idle guilds
+  // (no dispatches for 2+ hours) are healthy, not wedged.
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="session_checkpoint"} 0`]).firing, []);
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="session_checkpoint"} ${NOW - 7200}`]).firing, []);
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="session_checkpoint"} ${NOW - 7201}`]).firing, []);
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="session_checkpoint"} ${NOW - 86400}`]).firing, []);
+  // Mapped jobs never take this path, however stale: rank keeps its exact
+  // job_stale key and tickers keep ticker_stale.
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="rank"} ${NOW - 7201}`]).firing, ["job_stale:rank"]);
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="scheduled_messages"} ${NOW - 7201}`]).firing, ["ticker_stale:scheduled_messages"]);
+  // Recovery: a fresh success after a stale window stops firing.
+  const stale = ev([`two_bot_job_last_success_timestamp_seconds{job="other"} ${NOW - 7201}`]);
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="other"} ${NOW - 1}`], stale.state).firing, []);
+});
+
 test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   const window = "2026-10-09T20-11-06Z";
   // Single shared spelling with the Rust canonical list (ALERT_RULE_IDS in
@@ -328,6 +355,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "ticker_stale",
     "receiver_refusals",
     "dispatch_drops",
+    "job_unknown_stale",
     "gateway_checkpoint_failures",
   ]);
   assert.equal(packetFilename("job_stale:rank", window), `evidence-job_stale-${window}.json`);
@@ -341,6 +369,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("ticker_stale:scheduled_messages", window), `evidence-ticker_stale-${window}.json`);
   assert.equal(packetFilename("receiver_refusals:moderation", window), `evidence-receiver_refusals-${window}.json`);
   assert.equal(packetFilename("dispatch_drops:reactions", window), `evidence-dispatch_drops-${window}.json`);
+  assert.equal(packetFilename("job_unknown_stale:audit_retry", window), `evidence-job_unknown_stale-${window}.json`);
   assert.equal(packetFilename("gateway_checkpoint_failures", window), `evidence-gateway_checkpoint_failures-${window}.json`);
   // Unknown keys get no filename rather than a misleading one; hostile
   // window stamps stay filename-safe.
@@ -421,6 +450,7 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
   }
   firing.push(...dropped.firing);
   firing.push(
+    ...ev([`two_bot_job_last_success_timestamp_seconds{job="audit_retry"} ${NOW - 7201}`]).firing,
     ...ev(
       [`two_bot_gateway_checkpoint_failures_total{stage="commit"} 1`],
       ev([`two_bot_gateway_checkpoint_failures_total{stage="commit"} 0`]).state,
