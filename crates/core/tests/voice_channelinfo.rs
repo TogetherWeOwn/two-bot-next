@@ -34,6 +34,8 @@ fn room() -> RoomContext {
             details: "map".to_string(),
         }],
         timestamp: 1_790_683_200, // 2026-09-29 12:00:00 UTC (a Tuesday).
+        room_minutes: 0,
+        game_minutes: 0,
         tz_offset_minutes: 0,
         seed: 42,
         named_lists: HashMap::new(),
@@ -338,6 +340,8 @@ impl Gen {
                 members_playing: self.below(6) as u32,
                 parties: Vec::new(),
                 timestamp: self.next() as i64,
+                room_minutes: 0,
+                game_minutes: 0,
                 tz_offset_minutes: [-780, -720, 0, 180][self.below(4)],
                 seed: self.next(),
                 named_lists: HashMap::new(),

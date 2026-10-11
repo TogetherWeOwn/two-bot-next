@@ -48,10 +48,12 @@ test("status reads without starting and refuses deployment or running mismatches
   assert.equal(state.owner.epoch, 3);
   assert.equal(s.calls.length, 1);
   assert.equal(s.calls[0]!.redirect, "error");
-  // Serving version is not the deployed one: NO-GO, no POST.
+  // Serving version is still not the deployed one after the propagation
+  // window: NO-GO, no POST.
   const moved = sender({ epoch: 3, deploymentId: "B", phase: "active" }, "C");
-  await assert.rejects(control({ ...args, action: "status" }, moved.send), /deployment mismatch/);
-  assert.equal(moved.calls.length, 1);
+  await assert.rejects(control({ ...args, action: "status" }, moved.send, async () => {}), /deployment mismatch/);
+  assert.equal(moved.calls.length, 34);
+  assert.ok(moved.calls.every((call) => call.method === "GET"));
   // Container already running before takeover: NO-GO.
   const running = sender({ epoch: 3, deploymentId: "B", phase: "active" }, "B", true);
   await assert.rejects(control({ ...args, action: "status" }, running.send), /not confirmed/);
@@ -153,4 +155,40 @@ test("client refuses unconfirmed transitions and never reflects response bodies"
     assert.doesNotMatch(message, new RegExp(leak));
   }
   await assert.rejects(control({ ...args, action: "status", expectedDeploymentId: "not valid!!" }, sender(null).send), /Expected deployment id is invalid/);
+});
+
+test("status waits out deploy propagation, then reads the new version", async () => {
+  const owner = { epoch: 3, deploymentId: "A", phase: "active" };
+  const answers = [
+    () => Response.json({ error: "ownership_fenced", reason: "deployment_mismatch" }, { status: 503 }),
+    () => Response.json({ deploymentId: "A", owner, running: true }),
+    () => Response.json({ deploymentId: "B", owner, running: false }),
+  ];
+  const calls: RequestInit[] = [];
+  const waits: number[] = [];
+  const state = await control({ ...args, action: "status" }, async (_url: URL, init: RequestInit) => {
+    calls.push(init);
+    return answers.shift()!();
+  }, async (ms: number) => { waits.push(ms); });
+  assert.equal(state.deploymentId, "B");
+  assert.equal(calls.length, 3);
+  assert.deepEqual(waits, [10000, 10000]);
+});
+
+test("status never retries other refusals", async () => {
+  for (const [status, reason] of [[503, "storage_unavailable"], [401, "deployment_mismatch"], [409, "epoch_conflict"]] as const) {
+    let calls = 0;
+    await assert.rejects(control({ ...args, action: "status" }, async () => {
+      calls += 1;
+      return Response.json({ reason }, { status });
+    }, async () => {}), /Ownership control failed/);
+    assert.equal(calls, 1, `${status} ${reason}`);
+  }
+  // A running container on the new version is a NO-GO, not propagation.
+  let calls = 0;
+  await assert.rejects(control({ ...args, action: "status" }, async () => {
+    calls += 1;
+    return Response.json({ deploymentId: "B", owner: null, running: true });
+  }, async () => {}), /not confirmed/);
+  assert.equal(calls, 1);
 });

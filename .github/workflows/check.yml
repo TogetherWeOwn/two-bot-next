@@ -22,13 +22,11 @@ on:
   # SBOM/vulnerability scan runs on dependency-affecting PRs, every push to
   # main, and here weekly. Non-PR events fail closed to full jobs in the
   # selectors below, so this run covers the whole matrix. Off the hour to
-  # avoid the busiest scheduled-run window (UTC); Mondays to sit apart from
-  # the release workflow's own weekly schedule.
+  # avoid the busiest scheduled-run window (UTC).
   schedule:
     - cron: '9 4 * * 1'
-  # Dispatched by the release workflow (TOG-10035) on release-please branches:
-  # PRs opened with GITHUB_TOKEN trigger no workflows, so the required `check`
-  # / `worker check` would never run on the release PR without this path.
+  # Manual runs (e.g. single-core flake validation). Releases no longer
+  # dispatch it: there is no release PR (docs/releases.md).
   workflow_dispatch:
     inputs:
       single_core_tests:
@@ -184,6 +182,19 @@ jobs:
         # Offline static audits need no GitHub credentials or security-events writes.
         run: '"$RUNNER_TEMP/zizmor/bin/zizmor" --offline --strict-collection --no-progress .github/workflows'
 
+      # Tier 0 (pipeline review 2026-10-10): workflow logic was the largest class of review
+      # findings a linter catches; zizmor covers security, actionlint covers syntax/expressions.
+      - name: Lint GitHub Actions workflows (actionlint)
+        # The check job runs in a container whose default shell is sh (no pipefail).
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/actionlint.tgz" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz
+          echo "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757  $RUNNER_TEMP/actionlint.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/actionlint.tgz" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -shellcheck= -pyflakes=
+
       - name: offline build-cache safety regressions
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
@@ -216,6 +227,11 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_watch_checkpoint_doc_conformance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_voice_config_apply_doc_conformance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_sanitize_evidence_rows.py' -v
+
+      - name: cutover rollback-readiness probe and freeze drill (offline)
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_rollback_readiness_probe.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cutover_freeze_drill.py' -v
 
       - name: staging E2E run-record template (offline)
         run: |
@@ -728,10 +744,10 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot-discord --features db --locked --test leveling_runtime -- --ignored --test-threads=1
 
-      - name: community message fact capture (CI service only)
+      - name: community voice fact round trip (CI service only)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test -p two-bot-discord --features db --locked --test leveling_runtime community_message_fact_capture_round_trip -- --ignored --test-threads=1
+        run: cargo test -p two-bot-core --features db --locked --lib community_store::tests::voice_session_start_end_round_trip_is_idempotent -- --ignored
 
       - name: community message fact round trip (CI service only)
         env:
@@ -745,11 +761,6 @@ jobs:
         env:
           AUTOMOD_CI_TESTDB: '1'
         run: cargo test -p two-bot-core --features db --locked --test automod_store --test automod_preserved_replay -- --ignored
-
-      - name: leveling Postgres parity tests
-        env:
-          TWO_LEVELING_TEST_CI: '1'
-        run: cargo test -p two-bot-core --features db --locked --test leveling_store -- --ignored
 
       - name: Store Postgres integration (isolated CI schemas)
         env:
@@ -1580,9 +1591,6 @@ jobs:
       - name: Verify production deploy guards
         if: needs.job-inputs.outputs.worker != 'false'
         run: python3 ../scripts/test-deploy-production.py
-      - name: Verify release reconciliation retries
-        if: needs.job-inputs.outputs.worker != 'false'
-        run: python3 ../scripts/test-release-retry.py
       # Always runs, even on docs/asset-only fast-pass: the offline suite
       # pins this step with no `if:` (test_required_worker_ci_runs_this_offline_suite).
       - name: Verify staging rollout provenance (offline fixtures)
@@ -1614,19 +1622,24 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_events_read.py -v
       - name: Verify cutover acceptance probes (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_qa_cutover_probes.py -v
+      - name: Verify cutover freeze drill (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_cutover_freeze_drill.py -v
       - name: Verify cutover watch checkpoint (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_cutover_watch_checkpoint.py -v
       - name: Verify runner routing for every workflow job
         if: needs.job-inputs.outputs.worker != 'false'
         run: python3 ../scripts/test-runner-routing.py
-      - name: Verify offline release lifecycle
+      - name: Verify offline release on promote
         if: needs.job-inputs.outputs.worker != 'false'
-        # Match the library bundled by the pinned release action, in an isolated
-        # API-double fixture with lifecycle scripts disabled and no write token.
-        run: | # zizmor: ignore[adhoc-packages] pinned offline release fixture only
+        # Version bumps, notes, rollback guard and off-main refusal against a
+        # throwaway git repository (no network, no token).
+        run: node ../scripts/test-release-on-promote.cjs
+      - name: Verify the commit-parse guard
+        if: needs.job-inputs.outputs.worker != 'false'
+        # The PR-side guard uses release-please's pinned conventional-commit
+        # parser, in an isolated install with lifecycle scripts disabled.
+        run: | # zizmor: ignore[adhoc-packages] pinned commit parser fixture only
           npm install --prefix "$RUNNER_TEMP/release-fixture" --ignore-scripts --no-audit --no-fund release-please@17.6.0
-          NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release.cjs
-          NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-release-publication.cjs
           NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-commit-parse-guard.cjs
 
   # Single always-run aggregator for the path-filtered matrix. GitHub counts

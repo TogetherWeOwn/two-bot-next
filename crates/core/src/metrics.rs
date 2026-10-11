@@ -160,6 +160,25 @@ pub const SEND_ADMISSION_OUTCOMES: &[&str] = &["admitted", "blocked", "storage_e
 /// production reason today; unknown reasons collapse to `other`. Unmatched
 /// content (no trigger) never increments this family.
 pub const PREFIX_TRIGGER_REFUSED_REASONS: &[&str] = &["verdict", "other"];
+/// Automatic room-name decisions for `two_bot_voice_names_total{outcome}`:
+/// a room created already carrying its template name; each template render
+/// (`proposed`, `unchanged`, `waiting_for_name`, `blocked`, `channel_unseen`);
+/// and each queued rename at dispatch (`rename_sent`, or why it was dropped
+/// or held). Unknown outcomes collapse to `other`.
+pub const VOICE_NAME_OUTCOMES: &[&str] = &[
+    "created_with_template",
+    "proposed",
+    "unchanged",
+    "waiting_for_name",
+    "blocked",
+    "channel_unseen",
+    "rename_sent",
+    "rename_stale",
+    "rename_unseen",
+    "rename_no_access",
+    "rename_held",
+    "other",
+];
 /// Vote-kick outcomes for `two_bot_voice_vote_kick_total{outcome}` (M4.30):
 /// one `started` per successful `kick_start`, one refusal code per refused
 /// `kick_start` (the worker-level `evidence_unavailable` / `not_a_room` plus
@@ -346,6 +365,7 @@ struct Values {
     voice_compensation: u64,
     voice_orphans: u64,
     voice_vote_kick: [u64; VOICE_VOTE_KICK_OUTCOMES.len()],
+    voice_names: [u64; VOICE_NAME_OUTCOMES.len()],
     db_errors: [u64; DB_ERROR_OPS.len()],
     send_admissions: [u64; SEND_ADMISSION_OUTCOMES.len()],
     prefix_trigger_refused: [u64; PREFIX_TRIGGER_REFUSED_REASONS.len()],
@@ -534,6 +554,16 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let counter = &mut values.voice_vote_kick[bounded_index(outcome, VOICE_VOTE_KICK_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One automatic room-name decision (see [`VOICE_NAME_OUTCOMES`]).
+    pub fn voice_name(&self, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.voice_names[bounded_index(outcome, VOICE_NAME_OUTCOMES)];
         *counter = counter.saturating_add(1);
     }
 
@@ -845,6 +875,19 @@ impl Metrics {
             writeln!(
                 out,
                 "two_bot_voice_vote_kick_total{{outcome=\"{outcome}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_voice_names_total",
+            "counter",
+            "Automatic room-name decisions: created with the template name, template renders by outcome, and queued renames sent or dropped at dispatch.",
+        );
+        for (outcome, count) in VOICE_NAME_OUTCOMES.iter().zip(values.voice_names) {
+            writeln!(
+                out,
+                "two_bot_voice_names_total{{outcome=\"{outcome}\"}} {count}"
             )
             .unwrap();
         }

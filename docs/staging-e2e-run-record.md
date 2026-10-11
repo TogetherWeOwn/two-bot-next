@@ -92,7 +92,11 @@ Rules the validator enforces: `revision` is 40 lowercase hex characters;
 `deploy_staging_run_id` is digits; every command has a non-negative
 `duration_ms`; every `fail` row carries a `failure_signature`; records with
 `"mock": true` are rejected as real evidence (the mock example is the only
-file allowed to carry it).
+file allowed to carry it). Duplicate object keys at any depth are rejected in
+both the record and schema, before a repeated field can hide a value or override
+the mock label. Public-safety failures report only the JSON path and marker
+pattern, never the matched value; they stop validation before schema diagnostics
+can echo the same value. Secret-shaped path keys are redacted too.
 
 ## Collection bounds
 

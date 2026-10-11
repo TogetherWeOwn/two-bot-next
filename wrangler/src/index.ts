@@ -72,6 +72,7 @@ import {
 import {
   EMPTY_STATE,
   evaluateMetrics,
+  interruptDispatchDrops,
   parseExposition,
   transitionMessages,
   type MetricsAlertState,
@@ -762,13 +763,21 @@ export class TwoBotContainer extends Container<Env> {
   /** Pull /metrics, evaluate rules, notify on transitions. Never throws. */
   private async evaluateMetricsAlerts(): Promise<void> {
     try {
-      const res = await this.containerFetch("http://c/metrics", { signal: AbortSignal.timeout(6000) });
-      if (!res.ok) {
-        await res.arrayBuffer();
+      const previous = (await this.ctx.storage.get<MetricsAlertState>(METRICS_ALERT_KEY)) ?? EMPTY_STATE;
+      let samples;
+      try {
+        const res = await this.containerFetch("http://c/metrics", { signal: AbortSignal.timeout(6000) });
+        if (res.ok) samples = parseExposition(await res.text());
+        else await res.arrayBuffer();
+      } catch {
+        console.warn("two-bot metrics scrape failed");
+      }
+      if (!samples) {
+        // A failed scrape is not recovery, nor part of a consecutive growth
+        // window. Preserve all firing keys and other rules' existing state.
+        await this.ctx.storage.put(METRICS_ALERT_KEY, interruptDispatchDrops(previous));
         return;
       }
-      const samples = parseExposition(await res.text());
-      const previous = (await this.ctx.storage.get<MetricsAlertState>(METRICS_ALERT_KEY)) ?? EMPTY_STATE;
       const { firing, state } = evaluateMetrics(samples, previous, Date.now() / 1000);
       // Persist before notifying: at most one attempt per transition.
       await this.ctx.storage.put(METRICS_ALERT_KEY, state);

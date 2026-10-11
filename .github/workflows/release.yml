@@ -1,249 +1,73 @@
 name: release
 
-# release-please (TOG-9865, TOG-10035): one root rust release strategy,
-# synchronized workspace versions, Common Changelog and flat vX.Y.Z tags.
-# Stay 0.x until production cutover. No App keys or PATs in Actions.
-# GITHUB_TOKEN-created PRs need explicit required-check workflow dispatch.
-# TOG-12931: only `schedule` and `workflow_dispatch` (re)generate the release
-# PR. A `push` to main runs release-please with skip-github-pull-request, so it
-# still publishes the tag/release when the release PR merges but never rewrites
-# the PR head or starts a ~20 min `check` on it. See docs/releases.md for the
-# freeze -> dispatch -> merge -> unfreeze procedure.
+# Release on production promote (replaces the release-please release PR).
+# deploy-production dispatches this after a successful production deploy with
+# the exact deployed SHA, as its own run, so the deploy run (the production
+# rollback path) never waits for the tag + SBOM chain. The `tag` job tags that commit vX.Y.Z and publishes a
+# GitHub Release whose notes come from the Conventional Commit subjects since
+# the previous tag (.github/scripts/release-on-promote.cjs). Bump rules and
+# note sections stay in release-please-config.json, so versions continue the
+# existing tag line. No release PR: nothing new needs CI or review, nothing
+# goes stale, and main never needs a freeze (docs/releases.md).
+# Dispatch inputs: `sha` tags and publishes a deployed commit (deploy-production,
+# or a manual repair); `dry_run` / `release_tag` keep the SBOM dry-run and
+# repair paths.
 on:
-  push:
-    branches: [main]
-  schedule:
-    # Off the hour to avoid the busiest scheduled-run window (UTC); weekly,
-    # because the normal cut is an operator dispatch (docs/releases.md).
-    - cron: '23 4 * * 1'
   workflow_dispatch:
     inputs:
+      sha:
+        description: Full 40-hex commit on main that is live in production (tags and publishes it)
+        type: string
+        default: ''
       dry_run:
-        description: Generate and scan SBOMs without release-please or asset publication
+        description: Generate and scan SBOMs without tagging or asset publication
         type: boolean
         default: false
       release_tag:
-        description: Existing vX.Y.Z release to repair SBOM assets (skip release-please)
+        description: Existing vX.Y.Z release to repair SBOM assets (skip tagging)
         type: string
         default: ''
 
 permissions: {}
 
-concurrency:
-  group: release
-  cancel-in-progress: false
-
 jobs:
-  release-please:
-    name: release-please
+  tag:
+    name: tag-release
     permissions:
-      contents: write # Publish releases and reconcile the release/notes branches.
-      pull-requests: write # Create and reconcile the release PR.
-    # The dry_run/release_tag inputs keep the SBOM repair path live: those
-    # downstream jobs consume inputs.dry_run, inputs.release_tag and this
-    # job's release_created/tag_name outputs.
-    if: github.ref == 'refs/heads/main' && inputs.dry_run != true && (inputs.release_tag == '' || github.event_name != 'workflow_dispatch')
+      contents: write # Create the tag and its GitHub Release.
+    # The dry_run/release_tag dispatch paths skip tagging; the SBOM jobs below
+    # still consume inputs.dry_run, inputs.release_tag and this job's outputs.
+    if: inputs.sha != '' && inputs.dry_run != true && inputs.release_tag == ''
     # Runner routing: see the note on `check` in check.yml.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'release-please') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'tag') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 10
+    # One release at a time; a queued promote waits instead of racing the tag.
+    concurrency:
+      group: release
+      cancel-in-progress: false
     outputs:
-      pr_available: ${{ steps.select.outputs.pr_available }}
-      pr: ${{ steps.select.outputs.pr }}
-      release_created: ${{ steps.release.outputs.release_created }}
+      released: ${{ steps.release.outputs.released }}
       tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: main
+          # Full history and tags: the version and notes come from the commits
+          # since the previous vX.Y.Z tag.
+          fetch-depth: 0
+          fetch-tags: true
           persist-credentials: false
-          # The parse guard reads the commits since the last release tag.
-          fetch-depth: ${{ github.event_name == 'push' && 1 || 0 }}
-      # release-please drops a commit its strict parser rejects and still
-      # succeeds, so notes lose a change with no signal. A failure here skips
-      # only the release PR regeneration; the action still publishes a merged
-      # release and the last step fails the job, so dispatch-checks never
-      # starts. See docs/releases.md, "Unparseable commits".
-      - name: Check that release-please can parse every commit
-        id: parse_guard
-        if: github.event_name != 'push'
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-        run: | # zizmor: ignore[adhoc-packages] pinned release-please parser only
-          npm install --prefix "$RUNNER_TEMP/release-parse" --ignore-scripts --no-audit --no-fund release-please@17.6.0
-          NODE_PATH="$RUNNER_TEMP/release-parse/node_modules" node .github/scripts/commit-parse-guard.cjs range
-      - name: Inspect existing release PR
-        id: plan
-        # A push never regenerates the PR, so it has no reuse decision to make.
-        if: github.event_name != 'push'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-        run: node scripts/release-pr-state.cjs plan
-
-      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+      - name: Tag the deployed commit and publish its release
         id: release
-        with:
-          config-file: release-please-config.json
-          manifest-file: .release-please-manifest.json
-          # Keep publication enabled on every event. A push never regenerates
-          # the PR; schedule/dispatch skip it only when its branch already
-          # includes this main snapshot, including our migrated notes, or when
-          # the parse guard failed (a stale PR must not be rebuilt from commits
-          # whose notes would silently drop).
-          skip-github-pull-request: ${{ github.event_name == 'push' || steps.parse_guard.outcome == 'failure' || steps.plan.outputs.reuse_pr == 'true' }}
-
-      # Query independently of prs_created: a failed migration can leave an
-      # unchanged native PR, so action outputs alone cannot drive recovery.
-      - name: Select open release PR
-        id: select
         env:
+          RELEASE_SHA: ${{ inputs.sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-        run: node scripts/release-pr-state.cjs select
-
-      # Reconciliation and its checkout only follow a regeneration, never a push
-      # and never a run whose parse guard failed (nothing was regenerated).
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event_name != 'push' && steps.parse_guard.outcome != 'failure' && steps.select.outputs.pr_available == 'true'
-        with:
-          persist-credentials: false
-          ref: ${{ fromJSON(steps.select.outputs.pr).headBranchName }}
-      # Env expressions are evaluated even on a skipped step. Selection emits
-      # valid {} JSON when publication leaves no open PR; the guard stays false.
-      - name: Preserve bootstrap release notes
-        if: github.event_name != 'push' && steps.parse_guard.outcome != 'failure' && steps.select.outputs.pr_available == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ fromJSON(steps.select.outputs.pr).number }}
-          HEAD_BRANCH: ${{ fromJSON(steps.select.outputs.pr).headBranchName }}
-        run: |
-          set -euo pipefail
-          BODY_FILE="$RUNNER_TEMP/release-pr-body.md"
-          NOTES_FILE="$RUNNER_TEMP/release-notes.md"
-          NOTES_BRANCH="$HEAD_BRANCH--release-notes"
-          gh api "repos/$GH_REPO/pulls/$PR_NUMBER" --jq .body > "$BODY_FILE"
-          cp "$BODY_FILE" "$BODY_FILE.before"
-          # Native overflow stores oversized full notes in release-notes.md on
-          # a derived notes branch (`$HEAD_BRANCH--release-notes`) and leaves
-          # only a single-line link in the visible PR body (see native
-          # FilePullRequestOverflowHandler). Reconcile the stored notes (the
-          # Release-notes source of truth) only when the visible body IS that
-          # link: a stale notes branch alongside a normal body is left alone,
-          # and a dangling link fails closed here before any push or dispatch.
-          NOTES_ARG=()
-          if node -e "process.exit(require('./scripts/migrate-release-notes.cjs').parseOverflowLink(require('node:fs').readFileSync(process.argv[1], 'utf8')) ? 0 : 1)" "$BODY_FILE"; then
-            # Documented Contents boundary (docs.github.com/rest/repos/contents):
-            # object bodies above 1 MiB arrive as content "" / encoding "none",
-            # so a --jq .content read silently resolves empty notes at that
-            # size. Read the authenticated raw representation instead, which
-            # carries the bytes at any size; an empty body fails closed before
-            # any push, PUT or dispatch.
-            gh api "repos/$GH_REPO/contents/release-notes.md?ref=$NOTES_BRANCH" -H "Accept: application/vnd.github.raw" > "$NOTES_FILE"
-            python3 -c 'import pathlib, sys; assert pathlib.Path(sys.argv[1]).read_text().strip(), "Missing stored release notes"' "$NOTES_FILE"
-            cp "$NOTES_FILE" "$NOTES_FILE.before"
-            NOTES_ARG=("$NOTES_FILE")
-          fi
-          node scripts/migrate-release-notes.cjs CHANGELOG.md "$BODY_FILE" "${NOTES_ARG[@]}"
-          if ! git diff --quiet -- CHANGELOG.md; then
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git add CHANGELOG.md
-            git commit -m 'chore(release): preserve bootstrap release notes' -m 'Co-Authored-By: Paperclip <noreply@paperclip.ing>'
-            # Authenticate only this push via GH_TOKEN; write no credential config.
-            GIT_CONFIG_COUNT=2 \
-              GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0= \
-              GIT_CONFIG_KEY_1=credential.https://github.com.helper \
-              GIT_CONFIG_VALUE_1='!gh auth git-credential' \
-              git push origin HEAD
-          fi
-          # Body reconciliation is independent of the file diff: a retry after
-          # a successful push but failed PATCH must still repair Release notes.
-          if [ "${#NOTES_ARG[@]}" -gt 0 ]; then
-            # Overflow: restore the native stored-body representation through
-            # its own branch so the link keeps resolving; the PR body link is
-            # native-owned and never PATCHed.
-            if ! cmp -s "$NOTES_FILE.before" "$NOTES_FILE"; then
-              # The Contents API reads the branch from the JSON payload: with
-              # --input, gh puts -f field flags into the URL query instead, so
-              # the branch MUST be part of the payload (gh api --help).
-              NOTES_BRANCH="$NOTES_BRANCH" python3 -c 'import base64, json, os, pathlib, sys; print(json.dumps({"message": "chore(release): preserve bootstrap release notes", "content": base64.b64encode(pathlib.Path(sys.argv[1]).read_bytes()).decode(), "branch": os.environ["NOTES_BRANCH"]}))' "$NOTES_FILE" > "$NOTES_FILE.json"
-              NOTES_SHA=$(gh api "repos/$GH_REPO/contents/release-notes.md?ref=$NOTES_BRANCH" --jq .sha)
-              python3 -c 'import json, pathlib, sys; payload = json.loads(pathlib.Path(sys.argv[1]).read_text()); payload["sha"] = sys.argv[2]; pathlib.Path(sys.argv[1]).write_text(json.dumps(payload))' "$NOTES_FILE.json" "$NOTES_SHA"
-              gh api --method PUT "repos/$GH_REPO/contents/release-notes.md" --input "$NOTES_FILE.json" --silent
-            fi
-          elif ! cmp -s "$BODY_FILE.before" "$BODY_FILE"; then
-            # Migration can grow a large normal body past the native PR-body
-            # limit; GitHub would reject that PATCH, and retries would repeat
-            # the same request indefinitely. Route the reconciled output through
-            # the same overflow representation native uses: full notes in
-            # release-notes.md on the derived notes branch, visible body as the
-            # single-line link (which the next run resolves like a native
-            # overflow).
-            if [ "$(node -e "process.stdout.write(require('./scripts/migrate-release-notes.cjs').selectBodyWrite(require('node:fs').readFileSync(process.argv[1], 'utf8')))" "$BODY_FILE")" = "overflow" ]; then
-              # Migration-created overflow: native emitted a normal body, so the
-              # derived notes branch does not exist yet and the Contents API
-              # cannot create a file on a missing ref. Mirror native forkBranch
-              # (createFileOnNewBranch): create the notes branch from the
-              # default branch, reusing it when a retried run already created
-              # it. Either step failing fails the run here, before any PUT or
-              # check dispatch.
-              BASE_SHA=$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq .object.sha)
-              if ! gh api --method POST "repos/$GH_REPO/git/refs" -f ref="refs/heads/$NOTES_BRANCH" -f sha="$BASE_SHA" --silent 2>/dev/null; then
-                gh api "repos/$GH_REPO/git/ref/heads/$NOTES_BRANCH" --jq .object.sha > /dev/null
-              fi
-              # The file may not exist yet, so the sha lookup tolerates
-              # a missing file and the payload carries a sha only on update.
-              NOTES_SHA=$(gh api "repos/$GH_REPO/contents/release-notes.md?ref=$NOTES_BRANCH" --jq .sha 2>/dev/null || true)
-              NOTES_BRANCH="$NOTES_BRANCH" NOTES_SHA="$NOTES_SHA" python3 -c 'import base64, json, os, pathlib, sys; payload = {"message": "chore(release): preserve bootstrap release notes", "content": base64.b64encode(pathlib.Path(sys.argv[1]).read_bytes()).decode(), "branch": os.environ["NOTES_BRANCH"]}; sha = os.environ["NOTES_SHA"]; print(json.dumps({**payload, **({"sha": sha} if sha else {})}))' "$BODY_FILE" > "$NOTES_FILE.json"
-              gh api --method PUT "repos/$GH_REPO/contents/release-notes.md" --input "$NOTES_FILE.json" --silent
-              NOTES_BRANCH="$NOTES_BRANCH" node -e "require('node:fs').writeFileSync(process.argv[1], require('./scripts/migrate-release-notes.cjs').buildOverflowBody(process.env.GH_REPO, process.env.NOTES_BRANCH) + '\n')" "$BODY_FILE"
-            fi
-            python3 -c 'import json, pathlib, sys; print(json.dumps({"body": pathlib.Path(sys.argv[1]).read_text()}))' "$BODY_FILE" > "$BODY_FILE.json"
-            gh api --method PATCH "repos/$GH_REPO/pulls/$PR_NUMBER" --input "$BODY_FILE.json" --silent
-          fi
-
-      # Last, so publication above is never blocked. Failing the job keeps
-      # dispatch-checks (default success() gate) from running on a stale PR.
-      - name: Fail the run when release-please could not parse every commit
-        if: ${{ !cancelled() && steps.parse_guard.outcome == 'failure' }}
-        run: |
-          echo "::error title=Release PR not regenerated::A commit since the last release tag cannot be parsed by release-please. Publication ran; the release PR was left as it was. Fix the commit's PR body as docs/releases.md (Unparseable commits) says, then dispatch again."
-          exit 1
-
-  dispatch-checks:
-    name: dispatch-checks
-    permissions:
-      actions: write # Dispatch required checks for GITHUB_TOKEN-created release PRs.
-    needs: release-please
-    # Never on a push: it did not regenerate the PR, so there is no new head.
-    if: github.event_name != 'push' && needs.release-please.outputs.pr_available == 'true'
-    # Runner routing: see the note on `check` in check.yml.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'dispatch-checks') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
-    timeout-minutes: 5
-    steps:
-      - env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # No checkout in this job: gh needs the repo named explicitly.
-          GH_REPO: ${{ github.repository }}
-          PR_JSON: ${{ needs.release-please.outputs.pr }}
-        run: |
-          set -euo pipefail
-          read -r PR_NUMBER HEAD_BRANCH < <(python3 -c "
-          import json, os
-          pr = json.loads(os.environ['PR_JSON'])
-          print(pr['number'], pr['headBranchName'])
-          ")
-          echo "Release PR #$PR_NUMBER on branch $HEAD_BRANCH; dispatching required checks."
-          gh workflow run check.yml --ref "$HEAD_BRANCH"
-          # TOG-11810: pr-lint and gitleaks are folded into supply-chain.yml,
-          # whose dispatch form keeps the pr_number input for the lint job.
-          gh workflow run supply-chain.yml --ref "$HEAD_BRANCH" -f pr_number="$PR_NUMBER"
+        run: node .github/scripts/release-on-promote.cjs
 
   sbom-target:
-    needs: release-please
-    if: ${{ !cancelled() && (inputs.dry_run == true || inputs.release_tag != '' || needs.release-please.outputs.release_created == 'true') }}
+    needs: tag
+    if: ${{ !cancelled() && (inputs.dry_run == true || inputs.release_tag != '' || needs.tag.outputs.released == 'true') }}
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'sbom-target') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     permissions:
@@ -259,7 +83,7 @@ jobs:
         id: target
         env:
           DRY_RUN: ${{ inputs.dry_run }}
-          RELEASE_TAG: ${{ inputs.release_tag || needs.release-please.outputs.tag_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || needs.tag.outputs.tag_name }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: python3 scripts/release-sbom-target.py

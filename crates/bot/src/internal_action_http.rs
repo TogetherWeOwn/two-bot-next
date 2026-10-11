@@ -1,5 +1,5 @@
-//! Private internal-action receiver (announcement, event read, settings, moderation).
-//! Never merge this router into the health socket. Authentication and a
+//! Private internal-action receiver (announcement, event read, settings, moderation,
+//! automations). Never merge this router into the health socket. Authentication and a
 //! committed nonce precede JSON; a committed intent precedes the effect (except
 //! keyless reads). Cancellation leaves durable ownership, never a new execution
 //! lease.
@@ -7,10 +7,11 @@
 //! Wired effects: `announcement.post` (single-attempt send), `event.read`
 //! (keyless mapped GET), `event.upsert`/`event.cancel` (Guild Scheduled Event
 //! mutations through the shared event executor), `settings.get`/`settings.set`
-//! (settings executors), the restrictive member verbs `moderation.ban`,
-//! `moderation.tempban`, `moderation.kick`, `moderation.warn` and
-//! `moderation.timeout` (member moderation through the shared moderation
-//! service), `role.assign` (allowlisted role-key assignment) and
+//! (settings executors), `automations.export` (keyless redacted read) /
+//! `automations.import` (claimed transactional import), the restrictive member
+//! verbs `moderation.ban`, `moderation.tempban`, `moderation.kick`,
+//! `moderation.warn` and `moderation.timeout` (member moderation through the shared
+//! moderation service), `role.assign` (allowlisted role-key assignment) and
 //! `guild.add_member` (OAuth-backed join with a transient token), and the
 //! channel-moderation verbs (`moderation.purge`, `moderation.slowmode`,
 //! `moderation.lockdown`, `moderation.unlock`) through the shared
@@ -36,12 +37,19 @@ use futures_util::future::BoxFuture;
 use serde_json::{json, Map, Value};
 use tokio::{net::TcpListener, sync::Semaphore};
 use two_bot_core::{
+    automation_transfer::{
+        diff_import, export_document, max_import_entries, parse_import_document, ImportOutcome,
+        ImportParseError,
+    },
     channel_moderation_store::ChannelModerationStore,
     clock_guard::ClockGuard,
     commands::{
         PERM_BAN_MEMBERS, PERM_KICK_MEMBERS, PERM_MANAGE_CHANNELS, PERM_MANAGE_MESSAGES,
         PERM_MODERATE_MEMBERS,
     },
+    custom_command_service::{self, ImportServiceError},
+    custom_command_store,
+    custom_commands::reserved_command_names,
     format_iso_millis,
     internal_action_config::InternalActionConfig,
     internal_action_store::{
@@ -49,10 +57,11 @@ use two_bot_core::{
         TerminalFailure, TerminalResponse,
     },
     internal_actions::{
-        new_request_id, require_field_str, unmapped_event_key, validate_announcement,
-        validate_event_input, validate_event_key, validate_idempotency_key, ActionError,
-        AuthDecision, AuthHeaders, AuthenticatedRequest, ErrorCode, GuildAddMemberRequest,
-        InternalFlags, RoleAssignRequest, TokenBuckets, ACTIONS_PATH, MAX_BODY_BYTES, SKEW_SECONDS,
+        new_request_id, require_field_str, require_snowflake, unmapped_event_key,
+        validate_announcement, validate_event_input, validate_event_key, validate_idempotency_key,
+        ActionError, AuthDecision, AuthHeaders, AuthenticatedRequest, ErrorCode,
+        GuildAddMemberRequest, InternalFlags, RoleAssignRequest, TokenBuckets, ACTIONS_PATH,
+        MAX_BODY_BYTES, SKEW_SECONDS,
     },
     internal_settings::SettingsCommand,
     member_moderation_store::PgMemberModerationStore,
@@ -1356,10 +1365,26 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
     if decision.action == "settings.set" {
         return write_setting(state, &decision, headers.idempotency, &raw, id, key, action).await;
     }
-    // Family 1 (settings, M3.10) plus the five wired restrictive-moderation
-    // verbs. Every other verb without an adapter stays refused below, even
-    // when the flag gate authorizes it — shipping an implementation must
-    // never widen the allowlist by itself.
+    if decision.action == "automations.export" {
+        return export_automations(state, &decision, id, key, action).await;
+    }
+    if decision.action == "automations.import" {
+        return import_automations(
+            state,
+            &decision,
+            &raw,
+            headers.idempotency,
+            flags.allow_automation_overwrite,
+            id,
+            key,
+            action,
+        )
+        .await;
+    }
+    // Family 1 (settings, M3.10), the automations pair (M3.10) plus the five
+    // wired restrictive-moderation verbs. Every other verb without an adapter
+    // stays refused below, even when the flag gate authorizes it — shipping an
+    // implementation must never widen the allowlist by itself.
     if matches!(
         decision.action.as_str(),
         "moderation.ban"
@@ -2524,6 +2549,356 @@ fn settings_write_response(result: Value, version: i64, id: &str, replayed: bool
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     wire
 }
+/// Keyless `automations.export`: read the guild's stored custom commands and
+/// return the versioned redacted document (`version`, `commands` with only
+/// `name`/`description`/`template`/`text_trigger`). The flag gate already ran
+/// in `authorize`; the committed nonce above is the replay guard, so no
+/// idempotency claim is taken. Reads perform no writes, so retries cannot
+/// double-apply. `export_document` carries no guild, creator, timestamp,
+/// enabled or audit material — redaction is structural, not a field filter.
+async fn export_automations(
+    state: &ReceiverState,
+    _decision: &AuthDecision,
+    id: &str,
+    key: KeyLabel,
+    action: ActionLabel,
+) -> Response {
+    let reject = |failure| state.reject(failure, key.clone(), action, id);
+    let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+    let rows = match custom_command_store::list_commands(state.store.pool(), guild_id).await {
+        Ok(rows) => rows,
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    let document = export_document(&rows);
+    let result = match serde_json::to_value(&document) {
+        Ok(result) => result,
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    let mut wire = (
+        StatusCode::OK,
+        Json(json!({"ok": true, "result": result, "request_id": id})),
+    )
+        .into_response();
+    wire.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    wire
+}
+
+/// Map an import-envelope refusal to a fixed `malformed` error. Messages are
+/// the stable contract strings from `automation_transfer` (no entry content);
+/// `log_reason` stays a scalar class so no request text reaches the logs.
+fn import_parse_error(error: ImportParseError) -> ActionError {
+    let (message, reason) = match &error {
+        ImportParseError::NotAnImportDocument => (
+            "import document must be an array or an object with a commands array",
+            "automation_import_not_a_document",
+        ),
+        ImportParseError::EntriesNotArray => (
+            "\"commands\" must be an array of command objects",
+            "automation_import_entries_not_array",
+        ),
+        ImportParseError::TooManyEntries { .. } => (
+            "import holds more entries than the guild budget allows",
+            "automation_import_too_many_entries",
+        ),
+        ImportParseError::BadOverwrite => (
+            "\"overwrite\" must be a boolean",
+            "automation_import_bad_overwrite",
+        ),
+        ImportParseError::UnsupportedVersion(_) => (
+            "unsupported import version, expected 1",
+            "automation_import_unsupported_version",
+        ),
+        ImportParseError::SchedulesNotSupported => (
+            "scheduled-message import is not supported yet; remove schedules and import commands only",
+            "automation_import_schedules_not_supported",
+        ),
+    };
+    ActionError::new(ErrorCode::Malformed, message, reason)
+}
+
+/// `automations.import`: decode + lint + strictly validate the import envelope
+/// before any effect, then claim the outer durable idempotency key before the
+/// transactional apply. Replaying the stored terminal returns the first
+/// `{imported,skipped,conflicts}` result without a second apply, audit row or
+/// command rewrite. Destructive `overwrite` needs the separately configured
+/// overwrite capability on top of the base automations flag; without it the
+/// request refuses as `action_not_allowed` before any claim or audit row.
+#[allow(clippy::too_many_arguments)]
+async fn import_automations(
+    state: &ReceiverState,
+    decision: &AuthDecision,
+    raw: &[u8],
+    idempotency_header: Option<&str>,
+    overwrite_allowed: bool,
+    id: &str,
+    key: KeyLabel,
+    action: ActionLabel,
+) -> Response {
+    let reject = |failure| state.reject(failure, key.clone(), action, id);
+    let idempotency = match validate_idempotency_key(idempotency_header, &decision.action) {
+        Ok(key) => key.to_owned(),
+        Err(error) => return reject(Failure::from_action(error)),
+    };
+    let actor = match require_snowflake(&decision.body, "actor_id") {
+        Ok(actor) => actor.to_owned(),
+        Err(error) => return reject(Failure::from_action(error)),
+    };
+    // The import document rides top-level alongside `action`/`actor_id`:
+    // `{action, actor_id, commands, version?, schedules?, overwrite?}`.
+    // `parse_import_document` reads only the document fields, so routing keys
+    // are ignored without a second parser. Bare-array MEE6 travels as an
+    // object with a `commands` array.
+    let parsed =
+        match parse_import_document(&Value::Object(decision.body.clone()), max_import_entries()) {
+            Ok(parsed) => parsed,
+            Err(error) => return reject(Failure::from_action(import_parse_error(error))),
+        };
+    if parsed.overwrite && !overwrite_allowed {
+        return reject(Failure::from_action(ActionError::new(
+            ErrorCode::ActionNotAllowed,
+            "Destructive automation imports are not enabled on this bot",
+            "automation_overwrite_not_allowed",
+        )));
+    }
+    let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+    let subject = AuditSubject {
+        guild_id: Some(DiscordId::new(guild_id).expect("staging guild ID")),
+        actor_id: Some(DiscordId::new(&actor).expect("validated actor ID")),
+        ..AuditSubject::default()
+    };
+    let Some(caller) = state.config.caller_for(&decision.key_id) else {
+        return reject(Failure::code(ErrorCode::Internal));
+    };
+    let caller = caller.to_owned();
+    let identity = match RequestIdentity::new(&caller, &idempotency, &decision.action, raw) {
+        Ok(identity) => identity,
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    let audit_id = format!("internal:automations.import:{idempotency}");
+    let claim = match state.store.claim(&identity, &subject).await {
+        Ok(InternalClaim::Claimed(claim)) => claim,
+        Ok(InternalClaim::Replay(response)) => {
+            return replay_import(state, &decision.body, &audit_id, response, id, key, action)
+                .await;
+        }
+        Ok(InternalClaim::Mismatch) => return reject(Failure::code(ErrorCode::VersionConflict)),
+        Ok(InternalClaim::InFlight) => return reject(Failure::code(ErrorCode::InProgress)),
+        Ok(InternalClaim::NeedsReconciliation) => return reject(Failure::reconciliation()),
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    let at = format_iso_millis(now_ms() as i64);
+    match custom_command_service::import(
+        state.store.pool(),
+        guild_id,
+        &actor,
+        &parsed,
+        overwrite_allowed,
+        &audit_id,
+        &at,
+    )
+    .await
+    {
+        Ok(outcome) => {
+            let affected = u32::try_from(outcome.imported).unwrap_or(u32::MAX);
+            let terminal = TerminalResponse::Success {
+                resource_id: None,
+                affected,
+                outcome: None,
+            };
+            if state.store.finish(&claim, &terminal).await.is_err() {
+                let _ = state.store.mark_unknown(&claim).await;
+                return reject(Failure::reconciliation());
+            }
+            import_success_response(&outcome, id, false)
+        }
+        Err(ImportServiceError::OverwriteNotAllowed) => {
+            let terminal = TerminalResponse::Failure(TerminalFailure::ActionNotAllowed);
+            if state.store.finish(&claim, &terminal).await.is_err() {
+                let _ = state.store.mark_unknown(&claim).await;
+                return reject(Failure::reconciliation());
+            }
+            reject(Failure::code(ErrorCode::ActionNotAllowed))
+        }
+        Err(
+            ImportServiceError::Parse(_)
+            | ImportServiceError::OverCapacity(_)
+            | ImportServiceError::Validation(_),
+        ) => {
+            let terminal = TerminalResponse::Failure(TerminalFailure::Malformed);
+            if state.store.finish(&claim, &terminal).await.is_err() {
+                let _ = state.store.mark_unknown(&claim).await;
+                return reject(Failure::reconciliation());
+            }
+            reject(Failure::code(ErrorCode::Malformed))
+        }
+        Err(ImportServiceError::Storage(_)) => {
+            let _ = state.store.mark_unknown(&claim).await;
+            reject(Failure::reconciliation())
+        }
+    }
+}
+
+/// Replay a stored `automations.import` terminal without re-executing the
+/// apply. Success returns the first `{imported,skipped,conflicts}` result
+/// verbatim from the `{audit_id}#summary` audit row the first apply
+/// committed (no writes, no new audit rows): a blind retry after a lost
+/// response sees exactly what the first call reported, even when an admin
+/// edited a command out of band between the two calls. When the summary row
+/// is missing or unparseable (a receipt predating the conflict-names edge),
+/// the result rebuilds from a read-only diff instead. Failures reuse the
+/// generic terminal envelope with the replay marker.
+async fn replay_import(
+    state: &ReceiverState,
+    body: &Map<String, Value>,
+    audit_id: &str,
+    response: TerminalResponse,
+    id: &str,
+    key: KeyLabel,
+    action: ActionLabel,
+) -> Response {
+    match response {
+        TerminalResponse::Success { affected, .. } => {
+            let imported = usize::try_from(affected).unwrap_or(usize::MAX);
+            let stored =
+                stored_import_outcome(state, &format!("{audit_id}#summary"), imported).await;
+            let rebuilt = match stored {
+                Some(outcome) => outcome,
+                None => rebuilt_import_outcome(state, body, imported).await,
+            };
+            import_success_response(&rebuilt, id, true)
+        }
+        TerminalResponse::Failure(_) => state.terminal(response, true, id, key, action),
+    }
+}
+
+/// Load the first `{imported,skipped,conflicts}` result from the summary audit
+/// row. Read-only; `None` on any miss or mismatch so the caller falls back to
+/// the diff rebuild.
+async fn stored_import_outcome(
+    state: &ReceiverState,
+    summary_id: &str,
+    imported: usize,
+) -> Option<ImportOutcome> {
+    let (outcome, reason) = custom_command_store::load_audit(state.store.pool(), summary_id)
+        .await
+        .ok()??;
+    parse_stored_import_outcome(&outcome, reason.as_deref(), imported)
+}
+
+/// Parse a summary row back into the first result. The outcome string keeps
+/// the stable `imported:N,skipped:S,conflicts:C` shape and `reason` carries
+/// the conflict names as a JSON array; anything else (including a count/name
+/// mismatch or an `imported` that disagrees with the stored receipt) is `None`.
+fn parse_stored_import_outcome(
+    outcome: &str,
+    reason: Option<&str>,
+    imported: usize,
+) -> Option<ImportOutcome> {
+    let (counts, rest) = outcome.split_once("imported:")?;
+    if !counts.is_empty() {
+        return None;
+    }
+    let (imported_raw, rest) = rest.split_once(",skipped:")?;
+    let (skipped_raw, rest) = rest.split_once(",conflicts:")?;
+    if rest.contains(',') {
+        return None;
+    }
+    let stored_imported: usize = imported_raw.parse().ok()?;
+    let skipped: usize = skipped_raw.parse().ok()?;
+    let conflict_count: usize = rest.parse().ok()?;
+    if stored_imported != imported {
+        return None;
+    }
+    let conflicts: Vec<String> = match reason {
+        Some(names) => serde_json::from_str(names).ok()?,
+        // Rows predating the conflict-names edge carry no reason; with a
+        // zero count the empty list is still the verbatim first result.
+        None if conflict_count == 0 => Vec::new(),
+        None => return None,
+    };
+    if conflicts.len() != conflict_count {
+        return None;
+    }
+    Some(ImportOutcome {
+        imported,
+        skipped,
+        conflicts,
+    })
+}
+
+/// Read-only rebuild of an import result for replay, used only when the
+/// summary audit row is missing or unparseable (see [`stored_import_outcome`]).
+/// Never writes. Falls back to the stored `imported` count with empty
+/// `skipped`/`conflicts` when the claimed body no longer parses or the store
+/// is unavailable — still no second apply.
+async fn rebuilt_import_outcome(
+    state: &ReceiverState,
+    body: &Map<String, Value>,
+    imported: usize,
+) -> ImportOutcome {
+    let fallback = || ImportOutcome {
+        imported,
+        skipped: 0,
+        conflicts: Vec::new(),
+    };
+    let Ok(parsed) = parse_import_document(&Value::Object(body.clone()), max_import_entries())
+    else {
+        return fallback();
+    };
+    let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+    let Ok(rows) = custom_command_store::list_commands(state.store.pool(), guild_id).await else {
+        return fallback();
+    };
+    let Ok(diff) = diff_import(&rows, &parsed, &reserved_command_names(), parsed.overwrite) else {
+        return fallback();
+    };
+    let mut conflicts = parsed.translation_conflicts.clone();
+    conflicts.extend(
+        diff.rejected
+            .iter()
+            .filter(|rejection| {
+                matches!(
+                    rejection.code.as_str(),
+                    "would_overwrite" | "trigger_in_use"
+                )
+            })
+            .map(|rejection| rejection.name.clone()),
+    );
+    ImportOutcome {
+        imported,
+        skipped: parsed.invalid_entries + diff.rejected.len(),
+        conflicts,
+    }
+}
+
+/// Successful imports carry the transactional counts on the wire. The stored
+/// receipt keeps only `affected = imported`; `skipped`/`conflicts` replay
+/// from the summary audit row without a second apply, rebuilding from a
+/// read-only diff only as a fallback (see [`replay_import`]).
+fn import_success_response(outcome: &ImportOutcome, id: &str, replayed: bool) -> Response {
+    let mut wire = (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "result": {
+                "imported": outcome.imported,
+                "skipped": outcome.skipped,
+                "conflicts": outcome.conflicts,
+            },
+            "request_id": id,
+        })),
+    )
+        .into_response();
+    if replayed {
+        wire.headers_mut()
+            .insert("idempotent-replay", HeaderValue::from_static("true"));
+    }
+    wire.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    wire
+}
+
 struct WireHeaders<'a> {
     auth: AuthHeaders<'a>,
     idempotency: Option<&'a str>,
