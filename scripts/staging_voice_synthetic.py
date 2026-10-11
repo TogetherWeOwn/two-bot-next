@@ -145,7 +145,9 @@ def counter(text, outcome):
 class WebSocket:
     def __init__(self, host, path, timeout=30):
         raw = socket.create_connection((host, 443), timeout=timeout)
-        self.sock = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+        context = ssl.create_default_context()
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        self.sock = context.wrap_socket(raw, server_hostname=host)
         key = base64.b64encode(os.urandom(16)).decode()
         self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
                            f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"

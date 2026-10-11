@@ -10828,6 +10828,7 @@ fn synthetic_human_config_takes_up_to_four_snowflakes_and_refuses_garbage() {
         configured_synthetic_humans(Some("1,2,3,4")),
         Ok(HashSet::from([1, 2, 3, 4]))
     );
+    let overflow = format!("{}0", u64::MAX);
     for bad in [
         "1,2,3,4,5",
         "0",
@@ -10835,7 +10836,7 @@ fn synthetic_human_config_takes_up_to_four_snowflakes_and_refuses_garbage() {
         "+5",
         "12a",
         "1;2",
-        "18446744073709551616",
+        overflow.as_str(),
     ] {
         assert_eq!(
             configured_synthetic_humans(Some(bad)),
@@ -10903,9 +10904,7 @@ async fn without_synthetic_humans_a_bot_only_room_is_still_empty() {
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     tokio::time::advance(EMPTY_ROOM_GRACE).await;
     worker.reconcile();
-    for time in 0..2 {
-        dispatch(&mut worker, time).await;
-    }
+    dispatch(&mut worker, 0).await;
     assert!(trace.lock().unwrap().contains(&"delete:500".to_owned()));
 }
 
