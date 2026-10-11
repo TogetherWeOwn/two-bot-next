@@ -16,6 +16,8 @@ mod name;
 mod private;
 #[path = "voice_rooms_sink_tests.rs"]
 mod sink;
+#[path = "../../core/tests/support/tracing_capture.rs"]
+mod tracing_capture;
 
 const GUILD: u64 = 100;
 const CREATOR: u64 = 200;
@@ -10155,8 +10157,104 @@ async fn terminal_queue_failure_dead_letters_exactly_once_per_family() {
     assert_eq!(worker.queue.failed()[0].action.attempts, QUEUE_MAX_ATTEMPTS);
 }
 
+fn reconcile_signals(worker: &mut GuildRoomWorker<Store, Http>) -> Vec<String> {
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || worker.reconcile());
+    capture
+        .text()
+        .lines()
+        .filter(|line| line.contains("voice_event=\"voice_reconcile\""))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn assert_reconcile_signal(signals: &[String], counts: [u64; 4]) {
+    assert_eq!(signals.len(), 1, "{signals:?}");
+    for (name, count) in [
+        "delete_enqueued",
+        "suspended",
+        "resumed",
+        "succession_enqueued",
+    ]
+    .into_iter()
+    .zip(counts)
+    {
+        assert!(
+            signals[0].contains(&format!(" {name}={count}")),
+            "{signals:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reconcile_reports_access_transitions_once_and_keeps_stable_rooms_quiet() {
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live.clone(), store, http)
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        assert!(reconcile_signals(&mut worker).is_empty());
+    }
+
+    live.refresh_bot(BotAccess {
+        roles: vec![role(Permissions::empty())],
+        ..snapshot(&[], vec![]).bot
+    });
+    let suspended_before =
+        global_series("two_bot_voice_reconcile_actions_total{action=\"suspended\"}");
+    assert_reconcile_signal(&reconcile_signals(&mut worker), [0, 1, 0, 0]);
+    assert!(worker.queue.is_suspended(GUILD, 500));
+    assert!(
+        global_series("two_bot_voice_reconcile_actions_total{action=\"suspended\"}")
+            > suspended_before
+    );
+    for _ in 0..3 {
+        assert!(reconcile_signals(&mut worker).is_empty());
+    }
+
+    live.refresh_bot(snapshot(&[], vec![]).bot);
+    let resumed_before = global_series("two_bot_voice_reconcile_actions_total{action=\"resumed\"}");
+    assert_reconcile_signal(&reconcile_signals(&mut worker), [0, 0, 1, 0]);
+    assert!(!worker.queue.is_suspended(GUILD, 500));
+    assert!(
+        global_series("two_bot_voice_reconcile_actions_total{action=\"resumed\"}") > resumed_before
+    );
+    for _ in 0..3 {
+        assert!(reconcile_signals(&mut worker).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn reconcile_missing_room_only_resumes_a_suspended_lane() {
+    for was_suspended in [false, true] {
+        let (live, store, http, _) = fixture();
+        store.rooms.lock().unwrap().insert(500, room(500));
+        let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        if was_suspended {
+            worker.queue.suspend(GUILD, 500);
+        }
+        assert_reconcile_signal(
+            &reconcile_signals(&mut worker),
+            [1, 0, u64::from(was_suspended), 0],
+        );
+        assert!(!worker.queue.is_suspended(GUILD, 500));
+        assert!(reconcile_signals(&mut worker).is_empty());
+        assert_eq!(worker.queue.pending_counts(GUILD), (1, 0));
+    }
+}
+
+#[tokio::test]
+async fn reconcile_still_reports_succession_without_an_access_transition() {
+    let (live, store, http, _) = owned_room();
+    live.voice_update(MEMBER, None, Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    assert_reconcile_signal(&reconcile_signals(&mut worker), [0, 0, 0, 1]);
+    assert_eq!(worker.tracked()[&500].owner_id, 301);
+    assert!(reconcile_signals(&mut worker).is_empty());
+}
+
 #[tokio::test(start_paused = true)]
-async fn reconcile_pass_reports_its_plan_sizes() {
+async fn reconcile_reports_only_new_delete_enqueues() {
     let (live, store, http, _) = fixture();
     store.rooms.lock().unwrap().insert(500, room(500));
     store.rooms.lock().unwrap().insert(501, room(501));
@@ -10164,20 +10262,16 @@ async fn reconcile_pass_reports_its_plan_sizes() {
     live.upsert_channel(channel(501, 2, Some(CATEGORY)));
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     tokio::time::advance(EMPTY_ROOM_GRACE).await;
-    let resumed_before = global_series("two_bot_voice_reconcile_actions_total{action=\"resumed\"}");
     let enqueued_before =
         global_series("two_bot_voice_reconcile_actions_total{action=\"delete_enqueued\"}");
-    worker.reconcile();
-    // Both tracked rooms are present, accessible and empty: each pass
-    // resumes its lane and enqueues its delete.
-    assert!(
-        global_series("two_bot_voice_reconcile_actions_total{action=\"resumed\"}")
-            >= resumed_before + 2
-    );
+    // Both rooms are accessible and empty, but neither lane was suspended.
+    assert_reconcile_signal(&reconcile_signals(&mut worker), [2, 0, 0, 0]);
     assert!(
         global_series("two_bot_voice_reconcile_actions_total{action=\"delete_enqueued\"}")
             >= enqueued_before + 2
     );
+    assert!(reconcile_signals(&mut worker).is_empty());
+    assert_eq!(worker.queue.pending_counts(GUILD), (2, 0));
 }
 
 #[tokio::test]

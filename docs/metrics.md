@@ -48,7 +48,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_job_consecutive_failures{job}` | Failed completions since the last success; resets to zero on success |
 | `two_bot_job_last_error_class{job,class}` | One-hot class of the last failed completion; clears on success; fixed 16 × 7 = 112 series |
 | `two_bot_voice_operations_total{op,outcome}` | Finished room create/move/delete outcomes; `op` is `create`, `move` or `delete`, `outcome` is `success`, `category_full`, `discord`, `persistence`, `cancelled` or `refused` (create admission refused: cap or rolling burst); retries and 429 backoffs are not outcomes |
-| `two_bot_voice_reconcile_actions_total{action}` | Reconcile plan sizes; `action` is `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued` |
+| `two_bot_voice_reconcile_actions_total{action}` | Reconcile changes: newly queued deletes/ownership handoffs and actual access-state transitions; `action` is `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued`. Repeated unchanged passes do not increment these counters |
 | `two_bot_voice_dead_letters_total{action}` | Queue writes that exhausted `QUEUE_MAX_ATTEMPTS` (10); `action` is `create`, `move`, `delete`, `companion`, `ownership`, `kick`, `rename`, `limit` or `other` |
 | `two_bot_voice_tracked_rooms` | Rooms tracked in memory; compare with live Discord channels for ghosts |
 | `two_bot_voice_compensation_pending` | Tracked rooms awaiting compensating delete after a failed write |
@@ -219,6 +219,10 @@ as dynamic labels.
   labels; all store variants share `persistence`.
 - `two_bot_voice_reconcile_actions_total{action}` — `action` is
   `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued`.
+  `suspended` counts active-to-suspended transitions and `resumed` counts
+  suspended-to-active transitions, including a suspended room found absent.
+  Delete and succession counts include only newly queued work. A stable room
+  contributes zero; `voice_reconcile` stays quiet when all four counts are zero.
 - `two_bot_voice_dead_letters_total{action}` — `action` is `create`, `move`,
   `delete`, `companion`, `ownership`, `kick`, `rename`, `limit` or `other`.
 - `two_bot_voice_names_total{outcome}` — `outcome` is `created_with_template`, `proposed`, `unchanged`, `waiting_for_name`, `blocked`, `channel_unseen`, `rename_sent`, `rename_stale`, `rename_unseen`, `rename_no_access`, `rename_held`, `rename_duplicate` or `other`
