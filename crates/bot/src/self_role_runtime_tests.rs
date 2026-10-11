@@ -329,6 +329,30 @@ async fn exercise(pool: &PgPool) -> TestResult {
     Ok(())
 }
 
+/// Pins the five discarded-release sites (settle, settle_dry_run, park,
+/// recover_terminal, failed admission in prepare) to the logging helper, so a
+/// refactor or conflict resolution cannot silently restore `let _ = ...`.
+#[test]
+fn discarded_panel_claim_releases_stay_logged() {
+    let source: String = include_str!("self_role_runtime.rs")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert!(
+        !source.contains("let_=store_io(self.store.release_panel_claim"),
+        "a panel claim release is discarded again; use release_lane_or_warn"
+    );
+    assert!(
+        !source.contains("let_=store.release_panel_claim"),
+        "a panel claim release is discarded again; use release_lane_or_warn"
+    );
+    assert_eq!(
+        source.matches("release_lane_or_warn(&").count(),
+        5,
+        "expected exactly the five logged release sites"
+    );
+}
+
 #[test]
 fn effect_snapshots_do_not_invent_unattempted_changes_or_erase_history() {
     let mut effects = AuditEffects::default();
@@ -3941,7 +3965,10 @@ async fn lost_panel_lane_release_is_logged(pool: &PgPool) -> TestResult {
         .with_subscriber(capture.clone())
         .await;
     let logs = capture.text();
-    assert!(logs.contains("self-role panel claim release"), "{logs}");
+    assert!(
+        logs.contains("self-role panel claim release matched no current claim"),
+        "{logs}"
+    );
     assert!(logs.contains("lost-lane-release-event"), "{logs}");
     let closed = PgPoolOptions::new().connect_lazy_with((*pool.connect_options()).clone());
     closed.close().await;
