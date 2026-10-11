@@ -86,7 +86,7 @@
           "type": "string"
         },
         "first_readyz_utc": {
-          "description": "UTC timestamp of the first /readyz 200 after this deployment (redeploy-gap measurement).",
+          "description": "UTC timestamp of the first /readyz 200 after this deployment (redeploy-gap measurement). Must end with Z or an explicit zero offset (+00:00); -00:00 normalizes to UTC.",
           "type": "string",
           "format": "date-time"
         }
@@ -111,10 +111,12 @@
       "additionalProperties": false,
       "properties": {
         "start_utc": {
+          "description": "Window start; must end with Z or an explicit zero offset (+00:00); -00:00 normalizes to UTC.",
           "type": "string",
           "format": "date-time"
         },
         "end_utc": {
+          "description": "Window end; must end with Z or an explicit zero offset (+00:00); -00:00 normalizes to UTC.",
           "type": "string",
           "format": "date-time"
         }
@@ -135,6 +137,7 @@
             "minLength": 1
           },
           "started_utc": {
+            "description": "Invocation time; must end with Z or an explicit zero offset (+00:00); -00:00 normalizes to UTC.",
             "type": "string",
             "format": "date-time"
           },

@@ -448,7 +448,11 @@ class RunRecordValidatorTests(unittest.TestCase):
             any("$.commands[0].started_utc" in error for error in errors),
             f"naive command start must fail safely: {errors}",
         )
-        self.assertNotIn("2026-10-04T00:12:03", "\n".join(errors))
+        window_errors = [e for e in errors if "window ordering" in e]
+        self.assertTrue(window_errors, f"window ordering must report: {errors}")
+        self.assertNotIn(
+            "2026-10-04T00:12:03", "\n".join(window_errors)
+        )
 
     def test_first_readyz_may_predate_or_follow_window(self):
         for first_readyz in ("2026-10-03T23:59:00Z", "2026-10-04T00:20:00Z"):
@@ -467,6 +471,102 @@ class RunRecordValidatorTests(unittest.TestCase):
         code, out, err = self.cli(json.dumps(record))
         self.assertEqual(code, 1)
         self.assertIn("$.window.end_utc", out)
+        self.assertEqual(err, "")
+
+    def test_utc_fields_require_timezone_aware_utc(self):
+        # *_utc fields accept Z or an explicit zero offset (negative zero
+        # normalizes to UTC); naive, nonzero-offset and impossible dates fail.
+        # Bases stay inside the mock execution window so the window-ordering
+        # rule (PR #856) does not mask the UTC-representation rule: window
+        # 00:12:00Z-00:18:30Z, first command at 00:12:03Z.
+        suffixes = [
+            "Z",
+            "+00:00",
+            "-00:00",
+            ".123Z",
+            ".123456+00:00",
+            "+0000",
+            "-0000",
+        ]
+        bases = {
+            "window.start_utc": "2026-10-04T00:12:00",
+            "window.end_utc": "2026-10-04T00:18:30",
+            "commands.started_utc": "2026-10-04T00:12:03",
+            "deployment.first_readyz_utc": "2026-10-04T00:00:41",
+        }
+        valid_by_field = {
+            field: [base + suffix for suffix in suffixes]
+            for field, base in bases.items()
+        }
+        valid = [
+            "2026-10-11T00:00:00Z",
+            "2026-10-11T00:00:00+00:00",
+            "2026-10-11T00:00:00-00:00",
+            "2026-10-11T00:00:00.123Z",
+            "2026-10-11T00:00:00.123456+00:00",
+            "2026-10-11T00:00:00+0000",
+            "2026-10-11T00:00:00-0000",
+        ]
+        invalid = [
+            "2026-10-11T00:00:00",
+            "2026-10-11T00:00:00.123",
+            "2026-10-11T00:00:00+03:00",
+            "2026-10-11T00:00:00-05:00",
+            "2026-10-11T00:00:00+00:30",
+            "2026-02-30T00:00:00Z",
+            "2026-13-01T00:00:00Z",
+            "not-a-timestamp",
+        ]
+
+        def set_field(record, field, value):
+            if field == "window.start_utc":
+                record["window"]["start_utc"] = value
+            elif field == "window.end_utc":
+                record["window"]["end_utc"] = value
+            elif field == "commands.started_utc":
+                record["commands"][0]["started_utc"] = value
+            elif field == "deployment.first_readyz_utc":
+                record["deployment"]["first_readyz_utc"] = value
+            else:
+                raise AssertionError(f"unknown field {field}")
+
+        def json_path(field):
+            return {
+                "window.start_utc": "$.window.start_utc",
+                "window.end_utc": "$.window.end_utc",
+                "commands.started_utc": "$.commands[0].started_utc",
+                "deployment.first_readyz_utc": "$.deployment.first_readyz_utc",
+            }[field]
+
+        fields = (
+            "window.start_utc",
+            "window.end_utc",
+            "commands.started_utc",
+            "deployment.first_readyz_utc",
+        )
+        for field in fields:
+            for stamp in valid_by_field[field]:
+                with self.subTest(field=field, stamp=stamp, kind="valid"):
+                    record = fresh_record(mock=False)
+                    set_field(record, field, stamp)
+                    errors = checker.validate(record, SCHEMA)
+                    self.assertEqual(errors, [], f"{field} {stamp} must validate: {errors}")
+            for stamp in invalid:
+                with self.subTest(field=field, stamp=stamp, kind="invalid"):
+                    record = fresh_record(mock=False)
+                    set_field(record, field, stamp)
+                    errors = checker.validate(record, SCHEMA, allow_mock=True)
+                    self.assertTrue(
+                        any(json_path(field) in error for error in errors),
+                        f"{field} {stamp} must fail at {json_path(field)}: {errors}",
+                    )
+
+    def test_cli_rejects_naive_utc_timestamp(self):
+        record = fresh_record(mock=False)
+        record["window"]["start_utc"] = "2026-10-11T00:00:00"
+        code, out, err = self.cli(json.dumps(record))
+        self.assertEqual(code, 1)
+        self.assertIn("$.window.start_utc", out)
         self.assertEqual(err, "")
 
     def test_cli_accepts_mock_with_flag(self):

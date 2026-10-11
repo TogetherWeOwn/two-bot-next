@@ -27,6 +27,15 @@ Two record-specific rules live here, not in the schema:
 * public-safety scan: no internal tracker IDs (`TOG-`, `PAP-`) and no
   high-confidence secret markers in any string value. This repo is public.
 
+Timestamp policy for fields named `*_utc` (`window.start_utc`,
+`window.end_utc`, `commands[].started_utc`, `deployment.first_readyz_utc`):
+they must be timezone-aware UTC: a trailing `Z` or an explicit zero offset
+(`+00:00`, `+0000`). Negative zero (`-00:00`, `-0000`) is accepted and
+normalized to UTC, matching `datetime.fromisoformat` and RFC 3339's
+`-00:00` (unknown local offset, same UTC instant). Timezone-naive values
+(no suffix) and nonzero offsets (for example `+03:00`, `+00:30`) are
+rejected, as are impossible calendar dates.
+
 Timestamp-precision policy: instants compare as exact parsed datetimes, so
 fractional seconds are preserved. The producer emits second-precision
 `window` bounds (`%Y-%m-%dT%H:%M:%SZ`), truncating the true clock. A
@@ -67,6 +76,15 @@ DATETIME_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
     r"(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?$"
 )
+
+UTC_OFFSET_RE = re.compile(r"([+-])(\d{2}):?(\d{2})$")
+
+
+def is_utc_field(path):
+    """True when the JSON path names a `*_utc` timestamp field."""
+    field = path.rsplit(".", 1)[-1]
+    field = re.sub(r"\[.*\]$", "", field)
+    return field.endswith("_utc")
 
 FRACTION_RE = re.compile(r"\.\d+")
 
@@ -130,6 +148,33 @@ def check_format(value, fmt, path, errors):
             datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
             errors.append(f"{path}: invalid calendar date-time: {value!r}")
+            return
+        if is_utc_field(path):
+            check_utc_suffix(value, path, errors)
+
+
+def check_utc_suffix(value, path, errors):
+    """Require a timezone-aware UTC suffix on `*_utc` fields.
+
+    Accepts `Z` and explicit zero offsets; negative zero normalizes to
+    UTC. Rejects naive timestamps and nonzero offsets with field-level
+    diagnostics. Callers must run the public-safety scan first, so echoing
+    the offending value here cannot leak a secret-shaped string.
+    """
+    if value.endswith("Z"):
+        return
+    match = UTC_OFFSET_RE.search(value)
+    if match is None:
+        errors.append(
+            f"{path}: naive timestamp without timezone: {value!r}; "
+            "*_utc fields require Z or an explicit zero offset (+00:00)"
+        )
+        return
+    if match.group(2) != "00" or match.group(3) != "00":
+        errors.append(
+            f"{path}: non-UTC offset {match.group(0)!r} in {value!r}; "
+            "*_utc fields require Z or an explicit zero offset (+00:00)"
+        )
 
 
 def condition_holds(instance, condition):

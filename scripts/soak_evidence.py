@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Offline soak-evidence parser: gateway event log (JSONL) -> soak summary (JSON).
 
-Tooling for TOG-10955's live 7-day collection. This script never touches
-staging or production; it only reads a committed or piped JSONL fixture and
-prints the summary shape required by docs/staging-soak.md:
+Offline parser only: it never touches staging or production, only reads a
+committed JSONL fixture and prints the summary shape required by
+docs/staging-soak.md. An offline PASS here verifies offline reconciliation
+only; it makes no claim of live staging coverage or four-hour soak
+acceptance:
 
 - connects / disconnects / resumes counts,
 - missed-sequence windows (dispatch seq gaps within one session),
 - UNKNOWN intervals, preserved verbatim, never silently dropped.
 
 Log format (one JSON object per line):
-
     {"ts": "2026-09-20T00:00:01Z", "event": "connect", "session": "a1"}
     {"ts": "...", "event": "dispatch", "session": "a1", "seq": 42}
     {"ts": "...", "event": "disconnect", "session": "a1", "code": 4007}
@@ -18,11 +19,14 @@ Log format (one JSON object per line):
     {"ts": "...", "event": "unknown", "start": "...", "end": "...",
      "reason": "log gap: supervisor restart"}
 
-A new session id resets the sequence baseline (Discord sequences are
-per-session; see docs/gateway-recovery.md). A repeated or older seq in the
-same session is a duplicate delivery, not a missed event. Any unrecognised
-``event`` value or malformed line is preserved as an UNKNOWN interval so the
-live run in TOG-10955 must explain it instead of inheriting a silent skip.
+Input records must be in nondecreasing timestamp order; equal timestamps
+are accepted. A regressed event becomes UNKNOWN and is not applied to outage,
+session, or sequence state. A new session id resets the sequence baseline
+(Discord sequences are per-session; see docs/gateway-recovery.md). A repeated
+or older seq in the same session is a duplicate delivery, not a missed event.
+Any unrecognised ``event`` value or malformed line is preserved as an UNKNOWN
+interval so the live run in TOG-10955 must explain it instead of inheriting a
+silent skip.
 
 Usage:
 
@@ -92,7 +96,7 @@ def summarize(lines):
     connects = disconnects = resumes = dispatches = 0
     missed = []
     unknowns = []
-    first_ts = last_ts = None
+    first_ts = last_ts = last_event_ts = None
     last_seq = {}  # session -> highest committed dispatch seq
     down_since = None  # ts of latest disconnect awaiting reconnect
     gaps = []  # disconnect->connect/resume durations in seconds
@@ -141,6 +145,10 @@ def summarize(lines):
         except ValueError:
             note_unknown(None, None, f"malformed line {lineno}: bad ts")
             continue
+        if last_event_ts is not None and ts < last_event_ts:
+            note_unknown(ts, ts, f"timestamp regression on line {lineno}")
+            continue
+        last_event_ts = ts
         first_ts = ts if first_ts is None else min(first_ts, ts)
         last_ts = ts if last_ts is None else max(last_ts, ts)
         # No RecursionError guard here or around parse_ts above: the record
@@ -213,7 +221,14 @@ def summarize(lines):
     missed_events = sum(window["count"] for window in missed)
     max_gap = max(gaps) if gaps else None
     within_budget = (max_gap is None or max_gap < REDEPLOY_GAP_BUDGET_S)
-    verdict = "PASS" if (missed_events == 0 and not unknowns
+    # Empty, blank-only, or dispatch-free input leaves no evidence of live
+    # traffic. That is missing evidence, not a clean run (per
+    # docs/staging-soak.md missing evidence remains UNKNOWN), so it must not
+    # PASS. Keep the honest null window/zero counts; fail closed via verdict.
+    # missed_events derives only from dispatch seq gaps, so zero dispatches
+    # makes "0 missed" vacuous; require at least one dispatch as evidence.
+    has_evidence = first_ts is not None and dispatches > 0
+    verdict = "PASS" if (has_evidence and missed_events == 0 and not unknowns
                           and within_budget) else "NEEDS WORK"
     return {
         "schema_version": SCHEMA_VERSION,

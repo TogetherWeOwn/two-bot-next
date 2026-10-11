@@ -94,7 +94,12 @@ Rules the validator enforces: `revision` is 40 lowercase hex characters;
 any `fail` row and a `PASS` verdict is rejected (a run with a failed command
 must be `NEEDS WORK`); records with
 `"mock": true` are rejected as real evidence (the mock example is the only
-file allowed to carry it). Duplicate object keys at any depth are rejected in
+file allowed to carry it). Every `*_utc` timestamp (`window.start_utc`,
+`window.end_utc`, `commands[].started_utc`, `deployment.first_readyz_utc`)
+must be timezone-aware UTC: a trailing `Z` or an explicit zero offset
+(`+00:00`, `+0000`); negative zero (`-00:00`, `-0000`) is accepted and
+normalizes to UTC. Naive timestamps (no suffix), nonzero offsets and
+impossible calendar dates fail. Duplicate object keys at any depth are rejected in
 both the record and schema, before a repeated field can hide a value or override
 the mock label. Public-safety failures report only the JSON path and marker
 pattern, never the matched value; they stop validation before schema diagnostics
