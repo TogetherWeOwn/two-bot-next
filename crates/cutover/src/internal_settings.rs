@@ -53,6 +53,13 @@ fn action_error(error: SettingsWriteError) -> ActionError {
                         "settings_value_nul",
                     );
                 }
+                WriteRefusal::InvalidGateValue(_) => {
+                    return ActionError::new(
+                        ErrorCode::Malformed,
+                        "\"value\" must be a boolean, 0 or 1 for this setting",
+                        "settings_value_invalid",
+                    );
+                }
             };
             ActionError::new(
                 ErrorCode::ActionNotAllowed,

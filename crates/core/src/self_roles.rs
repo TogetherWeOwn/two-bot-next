@@ -783,19 +783,24 @@ impl SelfRoleGates {
             .get("TWO_SELF_ROLE_PANELS")
             .map(String::as_str)
             .unwrap_or("");
-        let dry_run = match vars.get("TWO_SELF_ROLE_DRY_RUN").map(String::as_str) {
-            None | Some("0") => false,
-            Some("1") => true,
-            Some(_) => {
-                return Err(SelfRoleConfigError::new(
-                    "TWO_SELF_ROLE_DRY_RUN must be \"0\" or \"1\" when set.",
-                ))
-            }
-        };
         Ok(Self {
             panels: parse_self_role_panels(raw)?,
-            dry_run,
+            dry_run: parse_self_role_dry_run(vars)?,
         })
+    }
+}
+
+/// `TWO_SELF_ROLE_DRY_RUN`: unset or `0` is live, `1` is dry run, anything else
+/// is refused without echoing the value.
+pub fn parse_self_role_dry_run(
+    vars: &HashMap<String, String>,
+) -> Result<bool, SelfRoleConfigError> {
+    match vars.get("TWO_SELF_ROLE_DRY_RUN").map(String::as_str) {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(_) => Err(SelfRoleConfigError::new(
+            "TWO_SELF_ROLE_DRY_RUN must be \"0\" or \"1\" when set.",
+        )),
     }
 }
 
