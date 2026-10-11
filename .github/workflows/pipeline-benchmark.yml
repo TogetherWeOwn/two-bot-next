@@ -53,7 +53,7 @@ jobs:
           apt-get install -y -qq --no-install-recommends python3 >/dev/null
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
-          toolchain: stable
+          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
