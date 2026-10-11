@@ -151,6 +151,7 @@ pub mod voice_style;
 pub mod voice_template;
 pub mod voice_template_lint;
 pub mod voice_text_channel;
+pub mod voice_time_zone;
 pub mod voice_utilities;
 pub mod voice_vote_kick;
 pub mod voice_vote_kick_audit;
