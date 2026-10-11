@@ -496,6 +496,97 @@ class UserAgentTests(unittest.TestCase):
         self.assertFalse(seen[0].startswith("Python-urllib"))
 
 
+class DeepNestingRefusalTests(unittest.TestCase):
+    """Excessively nested JSON fails closed, never aborting the probe.
+
+    Fixtures stay under READYZ_BODY_CAP so the byte cap cannot mask the
+    decoder backstop; shallow valid/malformed controls prove the decode
+    entry points still classify ordinary input.
+    """
+
+    ARRAY_DEPTH = 10000
+    OBJECT_DEPTH = 10000
+
+    def setUp(self):
+        guard = mock.patch.object(probe.urllib.request.OpenerDirector, "open",
+                                  side_effect=AssertionError("network access in a unit test"))
+        guard.start()
+        self.addCleanup(guard.stop)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.fx = Fixture(tmp.name)
+        self.requested = []
+
+    def deep_array(self, depth=ARRAY_DEPTH):
+        body = b"[" * depth + b"]" * depth
+        self.assertLessEqual(len(body), probe.READYZ_BODY_CAP)
+        return body
+
+    def deep_object(self, depth=OBJECT_DEPTH):
+        body = b'{"a":' * depth + b"0" + b"}" * depth
+        self.assertLessEqual(len(body), probe.READYZ_BODY_CAP)
+        return body
+
+    def fetch(self, response):
+        def fake(url):
+            self.requested.append(url)
+            if isinstance(response, Exception):
+                raise response
+            return response
+        return fake
+
+    def test_readyz_state_refuses_deeply_nested_array_and_object(self):
+        for body in (self.deep_array(), self.deep_object()):
+            with self.subTest(length=len(body)):
+                with self.assertRaises(probe.ProbeError) as caught:
+                    probe.readyz_state(200, body)
+                self.assertIn("without the bot's component breakdown", str(caught.exception))
+
+    def test_shallow_valid_and_malformed_readyz_controls(self):
+        self.assertEqual(
+            probe.readyz_state(*READY),
+            {"process": "ready", "gateway": "ready",
+             "database": "ready", "token_invalid": "ready"})
+        with self.assertRaises(probe.ProbeError):
+            probe.readyz_state(200, b"{not json")
+
+    def test_manifest_line_overflow_refuses_as_not_json(self):
+        deep = self.deep_array()
+        self.fx.write_archive("two-funnel-20261002T041700Z.ndjson.gz",
+                              [deep, *archive_lines(manifest())[1:]])
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.read_manifest(self.fx.backups / "two-funnel-20261002T041700Z.ndjson.gz")
+        self.assertIn("manifest line is not JSON", str(caught.exception))
+
+    def test_end_marker_overflow_refuses_as_truncated(self):
+        deep = self.deep_array()
+        lines = [*archive_lines(manifest())[:-1], deep]
+        self.fx.write_archive("two-funnel-20261002T041700Z.ndjson.gz", lines)
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.read_manifest(self.fx.backups / "two-funnel-20261002T041700Z.ndjson.gz")
+        self.assertIn("has no end marker", str(caught.exception))
+
+    def test_live_sequences_overflow_refuses_as_not_json(self):
+        deep = self.deep_array()
+        self.fx.sequences.write_bytes(deep)
+        with self.assertRaises(probe.ProbeError) as caught:
+            probe.load_live_sequences(str(self.fx.sequences))
+        self.assertIn("is not JSON", str(caught.exception))
+
+    def test_probe_main_with_deeply_nested_readyz_fails_closed_without_traceback(self):
+        deep = self.deep_array()
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(out):
+            code = probe.main(self.fx.argv(), fetch_fn=self.fetch((200, deep)))
+        text = out.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL readyz: /readyz 200 without the bot's component breakdown", text)
+        self.assertIn("rollback readiness: 3/4 checks passed", text)
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("[[[[[", text)
+        self.assertEqual(self.requested, [STAGING + "/readyz"])
+
+
 class BodyCapRefusalTests(unittest.TestCase):
     """Oversized /readyz bodies are refused before JSON parsing (M4.42)."""
 

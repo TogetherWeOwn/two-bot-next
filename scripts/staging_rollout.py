@@ -177,7 +177,9 @@ class Client:
 def decode(body):
     try:
         return json.loads(body)
-    except (ValueError, UnicodeError):
+    except (ValueError, UnicodeError, RecursionError):
+        # Excessively nested input exhausts the decoder's recursion budget
+        # below MAX_BODY; classify it as invalid_json like any malformed body.
         raise GateError("invalid_json") from None
 
 
