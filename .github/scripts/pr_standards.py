@@ -202,10 +202,22 @@ def check_commits(env):
         if subject.startswith(("Merge ", 'Revert "')):
             continue
         short = (c.get("id") or "")[:10]
+        author_obj = c.get("author") or {}
+        author = ""
+        if isinstance(author_obj, dict):
+            author = str(author_obj.get("username") or author_obj.get("login")
+                         or author_obj.get("name") or "")
+        elif isinstance(author_obj, str):
+            author = author_obj
+        is_bot = author.endswith("[bot]") and author.startswith(("dependabot", "renovate"))
         errs = header_errors(subject)
         if errs:
-            out.append(Finding("error", "Commit on main", f"{short} '{subject}': {'; '.join(errs)}. Merge PRs with "
-                               "squash and the PR title as the commit title."))
+            if is_bot:
+                out.append(Finding("warning", "Commit on main", f"{short} '{subject}': {'; '.join(errs)}. "
+                                   "Bot commit; set commit-message.prefix (e.g. chore(deps)) in the bot config."))
+            else:
+                out.append(Finding("error", "Commit on main", f"{short} '{subject}': {'; '.join(errs)}. Merge PRs with "
+                                   "squash and the PR title as the commit title."))
         if not private:
             hits = internal_hits(message, prefixes)
             if hits:

@@ -1,11 +1,27 @@
 //! Fixed-cardinality, process-local metrics; no background task or retained payloads.
 //! Text format: <https://prometheus.io/docs/instrumenting/exposition_formats/#text-format-details>
 
+use serde::Serialize;
 use std::{
     fmt::Write,
     sync::{Mutex, OnceLock},
     time::Duration,
 };
+
+/// Scrape-time input, not a second retained guard or counter registry.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RestGuardSnapshot {
+    pub invalid_requests_in_window: usize,
+    pub invalid_requests_total: u64,
+    pub rejected_requests_total: u64,
+    pub breaker_opens_total: u64,
+    pub breaker_closes_total: u64,
+    pub global_pauses_total: u64,
+    pub breaker_open: bool,
+    pub token_invalid: bool,
+    pub global_pause_remaining: Duration,
+    pub pending_global_responses: usize,
+}
 
 pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 pub const EVENTS: &[&str] = &[
@@ -75,9 +91,51 @@ pub const JOBS: &[&str] = &[
     "inactivity",
     "audit_retry",
     "scheduled_messages",
+    "feeds",
+    "self_role_recovery",
+    "member_unban_sweep",
+    "automod_expiry",
     "other",
 ];
 pub const JOB_OUTCOMES: &[&str] = &["success", "failure"];
+
+/// Fixed, payload-free classes for the last completed job failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobErrorClass {
+    Database,
+    Rest,
+    Configuration,
+    Timeout,
+    Panic,
+    Feed,
+    RecoveryRequired,
+}
+
+impl JobErrorClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Database => "database",
+            Self::Rest => "rest",
+            Self::Configuration => "configuration",
+            Self::Timeout => "timeout",
+            Self::Panic => "panic",
+            Self::Feed => "feed",
+            Self::RecoveryRequired => "recovery_required",
+        }
+    }
+}
+
+/// Complete error-class allowlist. With `JOBS`, this yields 112 fixed series.
+pub const JOB_ERROR_CLASSES: &[JobErrorClass] = &[
+    JobErrorClass::Database,
+    JobErrorClass::Rest,
+    JobErrorClass::Configuration,
+    JobErrorClass::Timeout,
+    JobErrorClass::Panic,
+    JobErrorClass::Feed,
+    JobErrorClass::RecoveryRequired,
+];
 /// Room lifecycle operations (TOG-13543): creator-channel create/move/delete
 /// outcomes only. Retries (429/backoff) are not outcomes.
 pub const VOICE_OPERATIONS: &[&str] = &["create", "move", "delete"];
@@ -128,7 +186,8 @@ pub const PREFIX_TRIGGER_REFUSED_REASONS: &[&str] = &["verdict", "other"];
 /// a room created already carrying its template name; each template render
 /// (`proposed`, `unchanged`, `waiting_for_name`, `blocked`, `channel_unseen`);
 /// and each queued rename at dispatch (`rename_sent`, or why it was dropped
-/// or held). Unknown outcomes collapse to `other`.
+/// or held, including `rename_duplicate` for a flush-time folded duplicate).
+/// Unknown outcomes collapse to `other`.
 pub const VOICE_NAME_OUTCOMES: &[&str] = &[
     "created_with_template",
     "proposed",
@@ -141,6 +200,7 @@ pub const VOICE_NAME_OUTCOMES: &[&str] = &[
     "rename_unseen",
     "rename_no_access",
     "rename_held",
+    "rename_duplicate",
     "other",
 ];
 /// Vote-kick outcomes for `two_bot_voice_vote_kick_total{outcome}` (M4.30):
@@ -312,6 +372,7 @@ struct JobMetrics {
     runs: [u64; JOB_OUTCOMES.len()],
     last_success: u64,
     consecutive_failures: u64,
+    last_error_class: Option<JobErrorClass>,
 }
 
 #[derive(Default)]
@@ -449,10 +510,11 @@ impl Metrics {
         current.runs[0] = current.runs[0].saturating_add(1);
         current.last_success = unix_seconds;
         current.consecutive_failures = 0;
+        current.last_error_class = None;
     }
 
     /// A completed failed attempt, including a timeout or isolated panic.
-    pub fn job_failure(&self, job: &str) {
+    pub fn job_failure(&self, job: &str, error_class: JobErrorClass) {
         let mut values = self
             .0
             .lock()
@@ -460,6 +522,7 @@ impl Metrics {
         let current = &mut values.jobs[bounded_index(job, JOBS)];
         current.runs[1] = current.runs[1].saturating_add(1);
         current.consecutive_failures = current.consecutive_failures.saturating_add(1);
+        current.last_error_class = Some(error_class);
     }
 
     /// One finished room lifecycle outcome (TOG-13543). Call once per
@@ -661,7 +724,17 @@ impl Metrics {
     }
 
     /// Pool samples are supplied at scrape time; this function never opens a DB connection.
+    /// No supplied guard means a fresh/unconfigured zero snapshot.
     pub fn render(&self, pool: Option<(u32, usize, u32)>) -> String {
+        self.render_with_rest_guard(pool, RestGuardSnapshot::default())
+    }
+
+    /// Pool and guard samples are supplied at scrape time; no network I/O.
+    pub fn render_with_rest_guard(
+        &self,
+        pool: Option<(u32, usize, u32)>,
+        guard: RestGuardSnapshot,
+    ) -> String {
         let values = self
             .0
             .lock()
@@ -779,6 +852,23 @@ impl Metrics {
                 current.consecutive_failures
             )
             .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_job_last_error_class",
+            "gauge",
+            "One-hot last failed-completion class by bounded job; zero before failure and after success.",
+        );
+        for (job, current) in JOBS.iter().zip(&values.jobs) {
+            for class in JOB_ERROR_CLASSES {
+                writeln!(
+                    out,
+                    "two_bot_job_last_error_class{{job=\"{job}\",class=\"{}\"}} {}",
+                    class.as_str(),
+                    u8::from(current.last_error_class == Some(*class))
+                )
+                .unwrap();
+            }
         }
         header(
             &mut out,
@@ -982,6 +1072,69 @@ impl Metrics {
             values.audit_delivery_halt
         )
         .unwrap();
+        for (name, count) in [
+            (
+                "two_bot_rest_guard_invalid_requests_total",
+                guard.invalid_requests_total,
+            ),
+            (
+                "two_bot_rest_guard_rejected_requests_total",
+                guard.rejected_requests_total,
+            ),
+            (
+                "two_bot_rest_guard_breaker_opens_total",
+                guard.breaker_opens_total,
+            ),
+            (
+                "two_bot_rest_guard_breaker_closes_total",
+                guard.breaker_closes_total,
+            ),
+            (
+                "two_bot_rest_guard_global_pauses_total",
+                guard.global_pauses_total,
+            ),
+        ] {
+            scalar(&mut out, name, "counter", count);
+        }
+        for (name, value) in [
+            (
+                "two_bot_rest_guard_invalid_requests_in_window",
+                guard.invalid_requests_in_window as u64,
+            ),
+            (
+                "two_bot_rest_guard_breaker_open",
+                u64::from(guard.breaker_open),
+            ),
+            (
+                "two_bot_rest_guard_token_invalid",
+                u64::from(guard.token_invalid),
+            ),
+            (
+                "two_bot_rest_guard_pending_global_responses",
+                guard.pending_global_responses as u64,
+            ),
+            (
+                "two_bot_rest_guard_global_paused",
+                u64::from(
+                    !guard.global_pause_remaining.is_zero() || guard.pending_global_responses > 0,
+                ),
+            ),
+        ] {
+            scalar(&mut out, name, "gauge", value);
+        }
+        header(
+            &mut out,
+            "two_bot_rest_guard_global_pause_remaining_seconds",
+            "gauge",
+            "Remaining global cooldown; pending response bodies may still hold admission at zero.",
+        );
+        // Duration is nonnegative and its entire u64-seconds range is finite in f64.
+        writeln!(
+            out,
+            "two_bot_rest_guard_global_pause_remaining_seconds {}",
+            guard.global_pause_remaining.as_secs_f64()
+        )
+        .unwrap();
         let (size, idle, max) = pool.unwrap_or_default();
         scalar(
             &mut out,
@@ -1025,6 +1178,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rest_guard_snapshot_is_fixed_size_label_free_and_finite() {
+        let metrics = Metrics::default();
+        let empty = metrics.render(None);
+        let snapshot = RestGuardSnapshot {
+            invalid_requests_in_window: usize::MAX,
+            invalid_requests_total: u64::MAX,
+            rejected_requests_total: u64::MAX,
+            breaker_opens_total: u64::MAX,
+            breaker_closes_total: u64::MAX,
+            global_pauses_total: u64::MAX,
+            breaker_open: true,
+            token_invalid: true,
+            global_pause_remaining: Duration::MAX,
+            pending_global_responses: usize::MAX,
+        };
+        let full = metrics.render_with_rest_guard(None, snapshot);
+        let samples = |text: &str| -> std::collections::BTreeMap<String, f64> {
+            text.lines()
+                .filter(|line| line.starts_with("two_bot_rest_guard_"))
+                .map(|line| {
+                    let (name, value) = line.split_once(' ').unwrap();
+                    assert!(!name.contains('{'), "guard metrics must have no labels");
+                    (name.to_owned(), value.parse::<f64>().unwrap())
+                })
+                .collect()
+        };
+        let zeros = samples(&empty);
+        let maxima = samples(&full);
+        assert_eq!(zeros.len(), 11);
+        assert_eq!(
+            zeros.keys().collect::<Vec<_>>(),
+            maxima.keys().collect::<Vec<_>>()
+        );
+        assert!(zeros.values().all(|value| *value == 0.0));
+        assert!(maxima
+            .values()
+            .all(|value| value.is_finite() && *value >= 0.0));
+        assert_eq!(full.lines().count(), empty.lines().count());
+        assert!(full.len() < 65_536, "must fit the Worker scrape body cap");
+        let pending = metrics.render_with_rest_guard(
+            None,
+            RestGuardSnapshot {
+                pending_global_responses: 1,
+                ..Default::default()
+            },
+        );
+        assert!(pending.contains("two_bot_rest_guard_global_paused 1\n"));
+        assert!(pending.contains("two_bot_rest_guard_global_pause_remaining_seconds 0\n"));
+        let fractional = metrics.render_with_rest_guard(
+            None,
+            RestGuardSnapshot {
+                global_pause_remaining: Duration::from_millis(1250),
+                ..Default::default()
+            },
+        );
+        assert!(fractional.contains("two_bot_rest_guard_global_pause_remaining_seconds 1.25\n"));
+        assert!(fractional.contains("two_bot_rest_guard_global_paused 1\n"));
+    }
+
+    #[test]
     fn exposition_has_cumulative_histogram_and_unique_series() {
         let metrics = Metrics::default();
         metrics.handler_duration(Duration::from_millis(5));
@@ -1032,6 +1245,7 @@ mod tests {
         metrics.gateway_event("RESUMED");
         metrics.gateway_latency(Duration::from_millis(12));
         metrics.job_success("invite_snapshot", 123);
+        metrics.job_failure("rank", JobErrorClass::Configuration);
         let text = metrics.render(Some((3, 1, 5)));
         assert!(text.ends_with('\n'));
         assert!(text.contains("# TYPE two_bot_handler_duration_seconds histogram\n"));
@@ -1043,6 +1257,14 @@ mod tests {
         assert!(text.contains("two_bot_gateway_latency_seconds 0.012\n"));
         assert!(text.contains("two_bot_gateway_resumes_total 1\n"));
         assert!(text.contains("two_bot_db_pool_idle_connections 1\n"));
+        assert!(text.contains("# TYPE two_bot_job_last_error_class gauge\n"));
+        assert!(
+            text.contains("two_bot_job_last_error_class{job=\"rank\",class=\"configuration\"} 1\n")
+        );
+        assert!(text.contains("two_bot_job_last_error_class{job=\"rank\",class=\"database\"} 0\n"));
+        assert!(text.contains(
+            "two_bot_job_last_error_class{job=\"invite_snapshot\",class=\"configuration\"} 0\n"
+        ));
         let mut series = std::collections::HashSet::new();
         for line in text.lines().filter(|line| !line.starts_with('#')) {
             let (key, value) = line.rsplit_once(' ').unwrap();
@@ -1060,7 +1282,7 @@ mod tests {
             metrics.gateway_event(&hostile);
             metrics.rest_response(&hostile, Some(429));
             metrics.job_success(&hostile, 123);
-            metrics.job_failure(&hostile);
+            metrics.job_failure(&hostile, JobErrorClass::Database);
             metrics.db_error(&hostile);
             metrics.send_admission(&hostile);
             metrics.prefix_trigger_refused(&hostile);
@@ -1084,6 +1306,118 @@ mod tests {
         }
         assert!(text.contains("two_bot_job_last_success_timestamp_seconds{job=\"other\"} 123\n"));
         assert!(text.contains("two_bot_job_consecutive_failures{job=\"other\"} 1\n"));
+        assert!(text.contains("two_bot_job_last_error_class{job=\"other\",class=\"database\"} 1\n"));
+    }
+
+    #[test]
+    fn feeds_and_self_role_recovery_have_independent_job_series() {
+        for (succeeded, failed) in [
+            ("feeds", "self_role_recovery"),
+            ("self_role_recovery", "feeds"),
+        ] {
+            let metrics = Metrics::default();
+            metrics.job_success(failed, 123);
+            metrics.job_failure(failed, JobErrorClass::Database);
+            metrics.job_failure(failed, JobErrorClass::Database);
+            metrics.job_success("unknown_job", 234);
+            metrics.job_failure("another_unknown_job", JobErrorClass::Database);
+            metrics.job_failure(succeeded, JobErrorClass::Database);
+            metrics.job_success(succeeded, 456);
+            let text = metrics.render(None);
+            for (job, success, failure, last_success, streak) in [
+                (succeeded, 1, 1, 456, 0),
+                (failed, 1, 2, 123, 2),
+                ("other", 1, 1, 234, 1),
+            ] {
+                for (outcome, count) in [("success", success), ("failure", failure)] {
+                    assert!(text.contains(&format!(
+                        "two_bot_job_runs_total{{job=\"{job}\",outcome=\"{outcome}\"}} {count}\n"
+                    )));
+                }
+                assert!(text.contains(&format!(
+                    "two_bot_job_last_success_timestamp_seconds{{job=\"{job}\"}} {last_success}\n"
+                )));
+                assert!(text.contains(&format!(
+                    "two_bot_job_consecutive_failures{{job=\"{job}\"}} {streak}\n"
+                )));
+            }
+            for (name, count) in [
+                ("two_bot_job_runs_total", JOBS.len() * JOB_OUTCOMES.len()),
+                ("two_bot_job_last_success_timestamp_seconds", JOBS.len()),
+                ("two_bot_job_consecutive_failures", JOBS.len()),
+            ] {
+                assert_eq!(
+                    text.lines().filter(|line| line.starts_with(name)).count(),
+                    count
+                );
+            }
+            assert_eq!(JOBS.len(), 16);
+            assert!(!text.contains("unknown_job"));
+        }
+    }
+
+    #[test]
+    fn unban_sweep_and_automod_expiry_have_independent_job_series() {
+        for (succeeded, failed) in [
+            ("member_unban_sweep", "automod_expiry"),
+            ("automod_expiry", "member_unban_sweep"),
+        ] {
+            let metrics = Metrics::default();
+            metrics.job_success(failed, 123);
+            metrics.job_failure(failed, JobErrorClass::Database);
+            metrics.job_failure(failed, JobErrorClass::Database);
+            metrics.job_success("unknown_job", 234);
+            metrics.job_failure("another_unknown_job", JobErrorClass::Database);
+            metrics.job_failure(succeeded, JobErrorClass::Database);
+            metrics.job_success(succeeded, 456);
+            let text = metrics.render(None);
+            for (job, success, failure, last_success, streak) in [
+                (succeeded, 1, 1, 456, 0),
+                (failed, 1, 2, 123, 2),
+                ("other", 1, 1, 234, 1),
+            ] {
+                for (outcome, count) in [("success", success), ("failure", failure)] {
+                    assert!(text.contains(&format!(
+                        "two_bot_job_runs_total{{job=\"{job}\",outcome=\"{outcome}\"}} {count}\n"
+                    )));
+                }
+                assert!(text.contains(&format!(
+                    "two_bot_job_last_success_timestamp_seconds{{job=\"{job}\"}} {last_success}\n"
+                )));
+                assert!(text.contains(&format!(
+                    "two_bot_job_consecutive_failures{{job=\"{job}\"}} {streak}\n"
+                )));
+            }
+            for (name, count) in [
+                ("two_bot_job_runs_total", JOBS.len() * JOB_OUTCOMES.len()),
+                ("two_bot_job_last_success_timestamp_seconds", JOBS.len()),
+                ("two_bot_job_consecutive_failures", JOBS.len()),
+            ] {
+                assert_eq!(
+                    text.lines().filter(|line| line.starts_with(name)).count(),
+                    count
+                );
+            }
+            assert_eq!(JOBS.len(), 16);
+            assert!(!text.contains("unknown_job"));
+        }
+    }
+
+    #[test]
+    fn automod_success_cannot_clear_a_failing_unban_streak() {
+        let metrics = Metrics::default();
+        metrics.job_failure("member_unban_sweep", JobErrorClass::Database);
+        metrics.job_failure("member_unban_sweep", JobErrorClass::Rest);
+        metrics.job_success("automod_expiry", 456);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_job_consecutive_failures{job=\"member_unban_sweep\"} 2\n"));
+        assert!(text.contains("two_bot_job_consecutive_failures{job=\"automod_expiry\"} 0\n"));
+        assert!(text
+            .contains("two_bot_job_last_success_timestamp_seconds{job=\"automod_expiry\"} 456\n"));
+        assert!(text.contains(
+            "two_bot_job_last_success_timestamp_seconds{job=\"member_unban_sweep\"} 0\n"
+        ));
+        assert!(text.contains("two_bot_job_consecutive_failures{job=\"other\"} 0\n"));
     }
 
     #[test]
@@ -1095,11 +1429,14 @@ mod tests {
             current.runs = [u64::MAX; JOB_OUTCOMES.len()];
             current.consecutive_failures = u64::MAX;
         }
-        metrics.job_failure("rank");
+        metrics.job_failure("rank", JobErrorClass::RecoveryRequired);
         assert!(metrics.render(None).contains(&format!(
             "two_bot_job_consecutive_failures{{job=\"rank\"}} {}\n",
             u64::MAX
         )));
+        assert!(metrics.render(None).contains(
+            "two_bot_job_last_error_class{job=\"rank\",class=\"recovery_required\"} 1\n"
+        ));
         metrics.job_success("rank", 456);
         let text = metrics.render(None);
         for outcome in JOB_OUTCOMES {
@@ -1110,6 +1447,23 @@ mod tests {
         }
         assert!(text.contains("two_bot_job_last_success_timestamp_seconds{job=\"rank\"} 456\n"));
         assert!(text.contains("two_bot_job_consecutive_failures{job=\"rank\"} 0\n"));
+        for class in JOB_ERROR_CLASSES {
+            assert!(text.contains(&format!(
+                "two_bot_job_last_error_class{{job=\"rank\",class=\"{}\"}} 0\n",
+                class.as_str()
+            )));
+        }
+    }
+
+    #[test]
+    fn a_later_failure_replaces_the_last_error_class() {
+        let metrics = Metrics::default();
+        metrics.job_failure("rank", JobErrorClass::Database);
+        metrics.job_failure("rank", JobErrorClass::Rest);
+
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_job_last_error_class{job=\"rank\",class=\"database\"} 0\n"));
+        assert!(text.contains("two_bot_job_last_error_class{job=\"rank\",class=\"rest\"} 1\n"));
     }
 
     #[test]

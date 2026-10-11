@@ -8,6 +8,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
+import { readFileSync } from "node:fs";
 import { setImmediate } from "node:timers/promises";
 import worker, { TwoBotContainer, type Env } from "../src/index.ts";
 import { OWNER_KEY, AUDIT_PREFIX, DEPLOYMENT_HEADER, CONTROL_PATH } from "../src/ownership.ts";
@@ -1022,6 +1023,43 @@ test("DO /ops/metrics: small body proxies status with the exposition content typ
   assert.equal(await response.text(), "# HELP x\n");
 });
 
+test("Worker and DO private scrape preserve the bounded REST guard fixture", async (t) => {
+  const body = readFileSync(new URL("../../crates/core/tests/fixtures/rest_guard_metrics.prom", import.meta.url), "utf8");
+  const samples = body.split("\n").filter(line => line.startsWith("two_bot_rest_guard_"));
+  assert.equal(samples.length, 11);
+  assert.equal(new Set(samples.map(line => line.split(" ")[0])).size, 11);
+  assert.ok(samples.every(line => !line.includes("{") && Number.isFinite(Number(line.split(" ")[1]))));
+  assert.ok(Buffer.byteLength(body) < 65_536);
+  const token = "synthetic-rest-guard-scrape-token-0123456789";
+  const h = await harness(t, { METRICS_SCRAPE_TOKEN: token });
+  const upstream = t.mock.method(h.bot, "containerFetch", async () => new Response(body));
+  const env = {
+    ...WORKER_ENV,
+    METRICS_SCRAPE_TOKEN: token,
+    CF_VERSION_METADATA: { id: ID },
+    TWO_BOT: { getByName: () => ({ fetch: (request: Request) => h.bot.fetch(request) }) },
+  } as unknown as Env;
+  const ctx = { waitUntil: () => {} } as ExecutionContext;
+  for (const [path, auth, expected] of [
+    ["/metrics", `Bearer ${token}`, 404],
+    ["/ops/metrics", "", 401],
+    ["/ops/metrics", `Bearer ${token}`, 200],
+  ] as const) {
+    const response = await worker.fetch(new Request(`https://worker.invalid${path}`, {
+      headers: auth ? { authorization: auth } : {},
+    }), env, ctx);
+    assert.equal(response.status, expected);
+    if (expected === 200) {
+      assert.equal(await response.text(), body);
+      assert.equal(response.headers.get("content-type"), "text/plain; version=0.0.4; charset=utf-8");
+      assert.equal(response.headers.get("cache-control"), "no-store");
+    } else {
+      assert.equal(upstream.mock.callCount(), 0, "public/unauthenticated calls never reach the container");
+    }
+  }
+  assert.equal(upstream.mock.callCount(), 1);
+});
+
 // Readiness monitoring uses synthetic responses only. Global fetch is stubbed
 // in every alert test: no configured webhook, Worker or database is contacted.
 async function alertHarness(t: TestContext, env: Partial<Env> = {}, values?: Map<string, unknown>) {
@@ -1119,7 +1157,9 @@ async function senderHarness(t: TestContext, sender: AlertSender, env: Partial<E
   t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
     const path = new URL(typeof input === "string" ? input : input.url).pathname;
     if (path === "/metrics") {
-      return new Response(metricsBody(sender === "metrics" && failing ? 3 : 0));
+      if (sender !== "metrics") return new Response("");
+      const rankClass = `two_bot_job_last_error_class{job="rank",class="database"} ${failing ? 1 : 0}`;
+      return new Response(metricsBody(failing ? 3 : 0).replace('two_bot_job_last_error_class{job="rank",class="database"} 0', rankClass));
     }
     return new Response(null, { status: sender === "readiness" && failing ? 503 : 200 });
   });
@@ -1134,6 +1174,7 @@ function assertAlertRecorded(h: Awaited<ReturnType<typeof senderHarness>>, sende
     assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, ["job_consecutive_failures:rank"]);
     assert.equal(h.events()[0].event, "metrics_alert");
     assert.match(h.events()[0].content, /ALERT job_consecutive_failures:rank/);
+    assert.match(h.events()[0].content, /last error class: database/);
   }
 }
 
@@ -1530,7 +1571,10 @@ for (const sender of ["readiness", "metrics"] as const) {
         ? ["container_unready_alert", "container_unready_recovery"] : ["metrics_alert", "metrics_alert"]);
       assert.equal(h.values.get("two-bot:readiness")?.alerted, false);
       assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, []);
-      if (sender === "metrics") assert.match(h.events()[1].content, /RESOLVED job_consecutive_failures:rank/);
+      if (sender === "metrics") {
+        assert.match(h.events()[1].content, /RESOLVED job_consecutive_failures:rank/);
+        assert.match(h.events()[1].content, /last error class: database/);
+      }
       assert.equal(h.schedules.mock.callCount(), 4);
       assert.ok(h.logs.every((line) => !line.includes(ALERT_ENV.OPS_ALERT_WEBHOOK_URL)));
     });

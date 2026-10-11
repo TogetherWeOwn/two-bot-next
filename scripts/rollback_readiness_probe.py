@@ -23,6 +23,13 @@ a redirect, is refused before or instead of being followed. This is a screen,
 not a restore verification: `two-bot restore --dry-run` remains the full
 archive inspection (docs/backup.md).
 
+Body-cap refusal contract: the transport reads at most READYZ_BODY_CAP+1
+bytes on both the normal and HTTPError paths so a hidden suffix is detected.
+Any body longer than READYZ_BODY_CAP (64 KiB) is refused before JSON parsing
+with the fixed message "/readyz answered over the body cap"; exact-cap valid
+input passes, and the extra byte never reaches a successful JSON path.
+Refusals never echo the body, headers, URL or parse exceptions.
+
 Usage:
   python3 scripts/rollback_readiness_probe.py --backup-dir DIR \\
       --sequences live-sequences.json [--staging-url URL] [--config wrangler.toml]
@@ -64,8 +71,11 @@ READYZ_BODY_CAP = 64 << 10
 # (error 1010), so an explicit agent is required for the probe to reach the Worker.
 USER_AGENT = "two-bot-next-staging-rollout/1.0"
 # Component names from crates/bot/src/server.rs; the drift test pins them to the source.
+# Per-surface allowlist: exactly the four components the container serves.
+# Anything else is refused with fixed vocabulary naming no component data.
 READYZ_STATES = ("ready", "starting", "down")
 READYZ_REQUIRED = ("process", "gateway", "database", "token_invalid")
+READYZ_ALLOWED = frozenset({"process", "gateway", "database", "token_invalid"})
 # Only the gateway parks: a 503 is accepted only with it starting or down. A database ping failure or a
 # latched bot token is a fault for this process (docs/runbook.md, docs/rest-guard.md), never parked.
 READYZ_PARKED = {"gateway": ("down", "starting")}
@@ -287,12 +297,14 @@ def fetch(url):
         with opener.open(urllib.request.Request(url, headers={"User-Agent": USER_AGENT},
                                                method="GET"),
                          timeout=READYZ_TIMEOUT_SECONDS) as response:
-            return response.status, response.read(READYZ_BODY_CAP)
+            return response.status, response.read(READYZ_BODY_CAP + 1)
     except urllib.error.HTTPError as e:
-        return e.code, e.read(READYZ_BODY_CAP)
+        return e.code, e.read(READYZ_BODY_CAP + 1)
 
 
 def readyz_state(status, body):
+    if len(body) > READYZ_BODY_CAP:
+        raise ProbeError("/readyz answered over the body cap")
     try:
         report = json.loads(body)
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -306,6 +318,8 @@ def readyz_state(status, body):
     state = dict(components)
     if len(state) != len(components):
         raise ProbeError(f"/readyz {status} repeats a component name")
+    if any(name not in READYZ_ALLOWED for name in state):
+        raise ProbeError(f"/readyz {status} carries an unknown component name")
     missing = [name for name in READYZ_REQUIRED if name not in state]
     if missing:
         raise ProbeError(f"/readyz {status} lacks {', '.join(missing)}")

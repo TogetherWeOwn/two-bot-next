@@ -65,7 +65,7 @@ Use synthetic fixtures only, never production credentials or databases.
 
 ## Feature wiring gates
 
-Runtime wiring for vote-kick, `/templateassistant`, RSVP and attendance must
+Runtime wiring for vote-kick, `/templateassistant`, RSVP and attendance, and slash-command input handling (`/lfg`, `/command`, `/schedule*`, `/sticky`, `/feed*`), must
 supply exact-head code and regression-test evidence for the applicable
 [command wiring security requirements](docs/command-wiring-security.md).
 Publication, core-only tests and documentation alone do not satisfy those gates.

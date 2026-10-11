@@ -215,6 +215,20 @@ class Push(unittest.TestCase):
     def test_garbage_commits_json_does_not_crash(self):
         self.assertEqual([], ps.evaluate(env(EVENT="push", COMMITS="not json")))
 
+    def test_bot_long_title_is_a_warning_not_an_error(self):
+        long_title = ("ci(deps): bump dtolnay/rust-toolchain from "
+                      "7e38f4b43b4db5c8dd498af069a4f6196df1d067 to "
+                      "e2a55d2ffb04f378e9626c28d38b36d230d1e12f (#808)")
+        self.assertGreater(len(long_title), 100)
+        commits = json.dumps([{"id": "0" * 40, "message": long_title,
+                               "author": {"username": "dependabot[bot]", "name": "dependabot[bot]"}}])
+        f = ps.evaluate(env(EVENT="push", COMMITS=commits))
+        self.assertEqual([("warning", "Commit on main")], levels(f))
+        # Same long title from a human is still an error.
+        commits = json.dumps([{"id": "0" * 40, "message": long_title}])
+        f = ps.evaluate(env(EVENT="push", COMMITS=commits))
+        self.assertEqual([("error", "Commit on main")], levels(f))
+
 
 class Template(unittest.TestCase):
     """The shipped template and the gate must not drift apart."""

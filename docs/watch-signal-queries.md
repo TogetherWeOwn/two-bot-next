@@ -154,10 +154,11 @@ after the restart.
 
 ## 6. DB-error counter
 
-Source: `two_bot_db_errors_total{op}` (storage-layer failures, not pool
-pressure). The `op` label is `admission` (send-admission SQL:
-admit/extend/complete) or `other` (failed voice actor store loads, plus
-every other store until its operation joins the allowlist).
+Source: `two_bot_db_errors_total{op}` (recorded storage-layer failures, not
+pool pressure or a database-wide total). Current producers are send-admission
+SQL (admit/extend/complete, `op="admission"`) and failed voice actor store
+loads (`op="other"`). Other stores need explicit instrumentation; an unknown
+instrumented operation falls back to `other`.
 Fixed cardinality: two series.
 Unknown operations collapse to `other`; no error text, query, or identifier
 is retained. Series contract: [metrics](metrics.md).
@@ -179,7 +180,8 @@ the window was quiet.
 Alert-threshold sketch (not a threshold): the paging rule fires at 3 or more
 storage failures between two keepalive samples, and a restart reset skips
 the window rather than firing. A slow trickle below that burst stays silent
-here and surfaces instead through `two_bot_job_consecutive_failures`. When
+here; `two_bot_job_consecutive_failures` covers failed jobs, not every
+storage path. When
 this sketch disagrees with the runbook or the budgets in
 [production-deploy](production-deploy.md#signal-thresholds-budgets-and-rollback-triggers),
 those win. Runbook: [runbook](runbook.md) (DB errors section).
@@ -259,6 +261,13 @@ threshold above — it fires on any increase of
 `two_bot_gateway_missed_events_total` between two keepalive samples (the
 first sample and counter resets skip the window rather than firing).
 Runbook: [runbook](runbook.md#alert-gateway-missed-events).
+
+Alert rule: the Worker `gateway_unpaired_disconnect` rule implements the
+disconnect-pairing query above — it pages when disconnects have no RESUMED
+or fresh READY for 3 consecutive keepalive samples, and any recovery growth
+clears it at once (the first sample and counter resets re-baseline rather
+than firing).
+Runbook: [runbook](runbook.md#alert-gateway-unpaired-disconnect).
 
 ## 9. Ticker staleness
 

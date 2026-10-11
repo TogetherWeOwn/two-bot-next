@@ -144,7 +144,7 @@ struct JobCap {
 
 /// One row per `metrics::JOBS` entry, in the same order. The hourly
 /// presence probe parks first; the durable checkpoint marker never sheds.
-const JOB_CAPS: [JobCap; 12] = [
+const JOB_CAPS: [JobCap; 16] = [
     JobCap {
         job: "invite_snapshot",
         shed_order: None,
@@ -188,6 +188,22 @@ const JOB_CAPS: [JobCap; 12] = [
     JobCap {
         job: "scheduled_messages",
         shed_order: Some(5),
+    },
+    JobCap {
+        job: "feeds",
+        shed_order: None,
+    },
+    JobCap {
+        job: "self_role_recovery",
+        shed_order: None,
+    },
+    JobCap {
+        job: "member_unban_sweep",
+        shed_order: None,
+    },
+    JobCap {
+        job: "automod_expiry",
+        shed_order: None,
     },
     JobCap {
         job: "other",
@@ -512,6 +528,10 @@ fn job_caps_cover_every_job_label_and_presence_sheds_first() {
                         | "rank"
                         | "scheduled_events"
                         | "settings"
+                        | "feeds"
+                        | "self_role_recovery"
+                        | "member_unban_sweep"
+                        | "automod_expiry"
                         | "other"
                 ),
                 "{} never sheds; shed it only through its feature flag, not the log guard",
@@ -630,7 +650,7 @@ fn exposition_series_count_matches_the_cardinality_budget() {
         29,
         "route family changed the budget"
     );
-    assert_eq!(metrics::JOBS.len(), 12, "job family changed the budget");
+    assert_eq!(metrics::JOBS.len(), 16, "job family changed the budget");
     assert_eq!(
         metrics::PREFIX_TRIGGER_REFUSED_REASONS.len(),
         2,
@@ -650,13 +670,13 @@ fn exposition_series_count_matches_the_cardinality_budget() {
         .lines()
         .filter(|line| line.starts_with("# TYPE "))
         .count();
-    assert_eq!(help_headers, 31, "rendered HELP family count changed");
-    assert_eq!(type_headers, 31, "rendered TYPE family count changed");
+    assert_eq!(help_headers, 43, "rendered HELP family count changed");
+    assert_eq!(type_headers, 43, "rendered TYPE family count changed");
     let series = text.lines().filter(|line| !line.starts_with('#')).count();
     assert_eq!(
-        series, 424,
-        "exposition grew past the 424-sample budget (21 events + 4 scalars + 1 latency \
-         + 11 histogram + 174 rest + 48 jobs + 31 voice + 26 vote-kick + 12 voice-names + 2 db-errors + 4 send-admissions + 2 prefix-refused + 6 dispatch-drops + 2 checkpoint-failures + 72 internal-actions + 3 facts-drain + 4 pool + 1 audit-halt); \
+        series, 564,
+        "exposition grew past the 564-sample budget (21 events + 4 scalars + 1 latency \
+         + 11 histogram + 174 rest + 11 REST guard + 64 jobs + 112 job-last-error-class + 31 voice + 26 vote-kick + 13 voice-names + 2 db-errors + 4 send-admissions + 2 prefix-refused + 6 dispatch-drops + 2 checkpoint-failures + 72 internal-actions + 3 facts-drain + 4 pool + 1 audit-halt); \
          update docs/log-volume-guard.md with the new series"
     );
 }

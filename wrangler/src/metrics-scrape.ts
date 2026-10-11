@@ -1,11 +1,11 @@
 import type { Sample } from "./alert-rules.ts";
 
-/** Always-emitted inputs consumed by alert rules; pinned to metrics.rs in tests. */
+/** Required inputs consumed by alert rules; pinned to metrics.rs in tests. */
 export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]>> = {
-  two_bot_job_last_success_timestamp_seconds: { job: ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "other"] },
-  two_bot_job_consecutive_failures: { job: ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "other"] },
+  two_bot_job_last_success_timestamp_seconds: { job: ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"] },
+  two_bot_job_consecutive_failures: { job: ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"] },
   two_bot_rest_requests_total: {
-    route: ["GET /channels/:channel", "GET /channels/:channel/messages", "GET /guilds/:guild", "GET /guilds/:guild/members", "GET /guilds/:guild/scheduled-events", "DELETE /guilds/:guild/bans/:member", "DELETE /channels/:channel/permissions/:overwrite", "PUT /applications/:application/commands", "PUT /applications/:application/guilds/:guild/commands", "POST /interactions/:interaction/:token/callback", "POST /channels/:channel/messages", "DELETE /channels/:channel/messages/:message", "DELETE /guilds/:guild/members/:member", "PUT /guilds/:guild/bans/:member", "PATCH /guilds/:guild/members/:member", "PATCH /channels/:channel", "PUT /channels/:channel/permissions/:overwrite", "POST /channels/:channel/messages/bulk-delete", "PUT /guilds/:guild/members/:member/roles/:role", "DELETE /guilds/:guild/members/:member/roles/:role", "POST /guilds/:guild/scheduled-events", "PATCH /guilds/:guild/scheduled-events/:event", "DELETE /guilds/:guild/scheduled-events/:event", "POST /guilds/:guild/channels", "DELETE /channels/:channel", "other"],
+    route: ["GET /channels/:channel", "GET /channels/:channel/messages", "GET /guilds/:guild", "GET /guilds/:guild/members", "GET /guilds/:guild/scheduled-events", "DELETE /guilds/:guild/bans/:member", "DELETE /channels/:channel/permissions/:overwrite", "PUT /applications/:application/commands", "PUT /applications/:application/guilds/:guild/commands", "POST /interactions/:interaction/:token/callback", "POST /channels/:channel/messages", "DELETE /channels/:channel/messages/:message", "DELETE /guilds/:guild/members/:member", "PUT /guilds/:guild/bans/:member", "PATCH /guilds/:guild/members/:member", "PATCH /channels/:channel", "PUT /channels/:channel/permissions/:overwrite", "POST /channels/:channel/messages/bulk-delete", "PUT /guilds/:guild/members/:member/roles/:role", "DELETE /guilds/:guild/members/:member/roles/:role", "POST /guilds/:guild/scheduled-events", "PATCH /guilds/:guild/scheduled-events/:event", "DELETE /guilds/:guild/scheduled-events/:event", "POST /guilds/:guild/channels", "DELETE /channels/:channel", "GET /guilds/:guild/members/:member", "GET /users/@me", "PATCH /webhooks/:application/:token/messages/@original", "other"],
     result: ["2xx", "3xx", "4xx", "429", "5xx", "transport"],
   },
   two_bot_db_pool_configured: {},
@@ -18,11 +18,31 @@ export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]
   two_bot_voice_dead_letters_total: { action: ["create", "move", "delete", "companion", "ownership", "kick", "rename", "limit", "other"] },
   two_bot_voice_orphans_total: {},
   two_bot_gateway_missed_events_total: {},
+  two_bot_gateway_disconnects_total: {},
+  two_bot_gateway_resumes_total: {},
+  two_bot_gateway_events_total: { event: ["READY", "RESUMED", "GUILD_CREATE", "GUILD_DELETE", "GUILD_UPDATE", "GUILD_MEMBER_ADD", "GUILD_MEMBER_REMOVE", "GUILD_MEMBER_UPDATE", "MESSAGE_CREATE", "MESSAGE_UPDATE", "MESSAGE_DELETE", "MESSAGE_REACTION_ADD", "MESSAGE_REACTION_REMOVE", "VOICE_STATE_UPDATE", "PRESENCE_UPDATE", "INVITE_CREATE", "INVITE_DELETE", "INTERACTION_CREATE", "HEARTBEAT_ACK", "GATEWAY_CLOSE", "other"] },
+  two_bot_gateway_checkpoint_failures_total: { stage: ["pre_commit", "commit"] },
   two_bot_dispatch_drops_total: { lane: ["messages", "interactions", "registry", "privileged", "busy", "reactions"] },
   two_bot_internal_actions_total: {
     family: ["announcement", "event", "settings", "moderation", "membership", "other"],
     outcome: ["executed", "auth_failure", "unknown_key", "clock_skew", "nonce_replay", "rate_limit", "unknown_action", "action_disabled", "malformed_body", "conflict", "upstream", "internal"],
   },
+};
+
+/**
+ * Optional inputs validated when present but never required. The job error-class
+ * gauge postdates older containers: requiring it would turn a valid older
+ * exposition into a failed scrape (no page at all) instead of the documented
+ * classless page. The evaluator already tolerates its absence.
+ */
+export const ALERT_OPTIONAL_INPUT_LABELS: Record<string, Record<string, readonly string[]>> = {
+  two_bot_job_last_error_class: { job: ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"], class: ["database", "rest", "configuration", "timeout", "panic", "feed", "recovery_required"] },
+};
+
+/** Every series the validator checks: required plus optional-when-present. */
+const VALIDATED_INPUT_LABELS: Record<string, Record<string, readonly string[]>> = {
+  ...ALERT_INPUT_LABELS,
+  ...ALERT_OPTIONAL_INPUT_LABELS,
 };
 
 function identity(name: string, labels: Record<string, string>): string {
@@ -70,8 +90,8 @@ export function parseAlertScrape(text: string): Sample[] | null {
     const key = identity(name, labels);
     if (seen.has(key)) return null;
     seen.add(key);
-    if (Object.hasOwn(ALERT_INPUT_LABELS, name)) {
-      const axes = ALERT_INPUT_LABELS[name]!;
+    if (Object.hasOwn(VALIDATED_INPUT_LABELS, name)) {
+      const axes = VALIDATED_INPUT_LABELS[name]!;
       if (Object.keys(labels).length !== Object.keys(axes).length
         || Object.keys(axes).some((axis) => !labels[axis])
         || !Number.isFinite(value) || !Number.isInteger(value) || value < 0 || value > 18446744073709551615

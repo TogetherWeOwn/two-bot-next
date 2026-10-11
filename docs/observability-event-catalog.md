@@ -1,7 +1,8 @@
 # Observability event catalog (gateway/session path)
 
 Read-only extract of the structured log event names and metric labels
-emitted on the gateway cutover path. This file renames nothing and changes
+emitted on the gateway cutover path and the scheduled-job / alert-rule
+path. This file renames nothing and changes
 no emit site; it records the current spellings so watch queries, scrapers
 and alert rules can match them exactly.
 
@@ -9,9 +10,15 @@ Method: offline code search over `crates/bot/src/gateway.rs`,
 `crates/bot/src/main.rs`, `crates/bot/src/server.rs`,
 `crates/bot/src/shutdown.rs`, `crates/bot/src/gateway_metrics.rs`,
 `crates/bot/src/gateway_failure.rs`, `crates/core/src/metrics.rs` and
-`crates/bot/src/voice_rooms.rs`. Callsites name the file and the enclosing
+`crates/bot/src/voice_rooms.rs`, plus the scheduled-job producers
+(`feed_jobs.rs`, `self_role_handlers.rs`, `member_runtime.rs`,
+`automod_gateway.rs`), the job allowlist and render in `metrics.rs`
+(`JOBS`, `render_with_rest_guard`), and the Worker alert sources
+(`metrics-scrape.ts` `ALERT_INPUT_LABELS`, `alert-rules.ts` `RULES` and
+`evaluateMetrics`). Rust callsites name the file and the enclosing
 item (function or method), never a line number: line numbers drift as the
 code moves, so re-run the search before quoting a line in an incident.
+Worker rule rows name the file and function for the same reason.
 
 ## Gateway lifecycle log lines
 
@@ -98,6 +105,35 @@ Scalar gateway series pair with the labels above:
 | `two_bot_gateway_latency_seconds` | Last heartbeat ACK round-trip; `NaN` until measured |
 | `two_bot_gateway_prefix_trigger_refused_total{reason="verdict"}` | In-scope prefix candidates refused by the automod verdict; the worker records candidates even when its capture-only gate prevents detached dispatch. Unmatched content, scope mismatches, bot/webhook messages and disabled text-command gates never increment it |
 
+## Scheduled job labels
+
+Each label owns independent `two_bot_job_runs_total{job,outcome}`,
+`two_bot_job_last_success_timestamp_seconds{job}`,
+`two_bot_job_consecutive_failures{job}` and
+`two_bot_job_last_error_class{job,class}` series (see the job allowlist
+`JOBS` in `metrics.rs`). Success in one label never clears another label's
+streak. None of these four has a `JOB_INTERVAL_SECONDS` cadence entry, so
+staleness tickets via `job_unknown_stale` below instead of `job_stale`.
+
+| Job label | Producer (stable anchor) | Meaning |
+| --- | --- | --- |
+| `feeds` | `feed_jobs.rs` (`scheduled_job_live` via `register` / `register_fenced`) | Feed poller sweep on the boot-configured interval with a live inner polling gate; gated skips return success and reset the streak |
+| `self_role_recovery` | `self_role_handlers.rs` (`recovery_job`) | Self-role repair sweep every 30 s; a successful sweep need not settle every pending repair; failure-only alerting, no `job_stale` paging |
+| `member_unban_sweep` | `member_runtime.rs` (`sweep_job`) | Member unban sweep every 30 s with an attempt timeout that may outlive its cadence; a successful sweep need not complete any unban; failure-only alerting |
+| `automod_expiry` | `automod_gateway.rs` (`expiry_job`) | Automod repeat-history expiry tick every 60 s; a gateway without built activation is a no-op success, and real expiry work runs only with the automod gate on; failure-only alerting |
+
+## Alert rules
+
+Rule ids evaluated in `alert-rules.ts` (`evaluateMetrics`) against the
+scrape inputs pinned in `metrics-scrape.ts` (`ALERT_INPUT_LABELS`). The id
+is the single shared spelling also pinned in `evidence.rs`
+(`ALERT_RULE_IDS`), so soak evidence packets attribute correctly.
+
+| Rule | Input series | Meaning |
+| --- | --- | --- |
+| `job_unknown_stale` | `two_bot_job_last_success_timestamp_seconds{job}` for labels outside `JOB_INTERVAL_SECONDS`, `TICKER_STALE_JOBS` and `UNKNOWN_STALE_EXCLUDED` | Ticket when a job without a cadence entry has a nonzero success timestamp older than 2 hours; never-succeeded stays silent; `session_checkpoint` is event-driven and excluded |
+| `gateway_unpaired_disconnect` | `two_bot_gateway_disconnects_total` against `two_bot_gateway_resumes_total` plus fresh `two_bot_gateway_events_total{event="READY"}` | Pages after 3 consecutive samples with disconnect growth and no RESUMED or fresh READY growth (pairing in `pairGatewayDisconnects`); any recovery growth clears at once; the disconnect counter increments in `gateway.rs` (`transport_disconnected`) |
+
 ## Gateway failure classes (`/readyz` `gateway_failure`)
 
 `FailureClass` enum in `crates/bot/src/gateway_failure.rs`
@@ -169,3 +205,9 @@ are dropped until then.
 - `crates/bot/src/gateway_failure.rs`, `docs/startup-diagnostics.md`
 - `docs/metrics.md`, `docs/watch-signal-queries.md`,
   `docs/gateway-recovery.md`
+- Job producers: `crates/bot/src/feed_jobs.rs`,
+  `crates/bot/src/self_role_handlers.rs`, `crates/bot/src/member_runtime.rs`,
+  `crates/bot/src/automod_gateway.rs`
+- Alert sources: `wrangler/src/alert-rules.ts`,
+  `wrangler/src/metrics-scrape.ts`, `crates/core/src/evidence.rs`,
+  `docs/runbook.md`

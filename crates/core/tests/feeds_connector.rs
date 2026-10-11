@@ -48,6 +48,14 @@ fn fast() -> FetchOptions {
     options(5_000)
 }
 
+/// Decompression-cap proofs need headroom: debug `miniz_oxide` on a loaded
+/// CI runner can take longer than 5 s to inflate multi-megabyte bombs, and
+/// the wall-clock deadline would then mask the `TooLarge` policy refusal
+/// the test is proving. 30 s keeps the cap deterministically first.
+fn generous() -> FetchOptions {
+    options(30_000)
+}
+
 fn policy(err: &FeedConnectError) -> FetchError {
     match err {
         FeedConnectError::Policy(err) => err.clone(),
@@ -603,7 +611,7 @@ async fn oversized_concatenated_gzip_is_capped_in_aggregate() {
     let connector = MockConnector::scripted(vec![Step::Respond(
         Canned::xml(multi_gzip(&[&half, &half])).header("content-encoding", "gzip"),
     )]);
-    let err = fetch_feed_with(&resolver, &connector, SOURCE, &fast())
+    let err = fetch_feed_with(&resolver, &connector, SOURCE, &generous())
         .await
         .unwrap_err();
     assert_eq!(policy(&err), FetchError::TooLarge);
@@ -782,7 +790,7 @@ async fn a_decompression_bomb_is_capped_before_the_parser() {
     let connector = MockConnector::scripted(vec![Step::Respond(
         Canned::xml(bomb).header("content-encoding", "gzip"),
     )]);
-    let err = fetch_feed_with(&resolver, &connector, SOURCE, &fast())
+    let err = fetch_feed_with(&resolver, &connector, SOURCE, &generous())
         .await
         .unwrap_err();
     assert_eq!(policy(&err), FetchError::TooLarge);

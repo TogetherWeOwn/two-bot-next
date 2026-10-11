@@ -123,7 +123,7 @@ gates (`feature_commands.rs`), moderation (`moderation.rs`), onboarding
 (`onboarding.rs`), automod (`automod.rs`), scorecard and classifier
 (`community.rs`). An empty ID list never contains a live ID.
 
-Catalog entries: 122.
+Catalog entries: 123.
 
 | Key | Class | Parsed default | Application | Description |
 | --- | --- | --- | --- | --- |
@@ -184,7 +184,7 @@ Catalog entries: 122.
 | `TWO_COMMUNITY_HUMAN_CHANNEL_IDS` | hot | Not specified in Next | stored unwired | Channels considered for human community activity. |
 | `TWO_COMMUNITY_RAID_ACTOR_IDS` | hot | `[]` | stored unwired | Known raid actors excluded from human activity classification. |
 | `TWO_COMMUNITY_RECOMMENDATIONS` | cold | `true` | stored unwired | Permit scorecard recommendations unless explicitly disabled with 0. |
-| `TWO_COMMUNITY_SCORECARD` | cold | `false` | stored unwired | Enable the weekly scorecard job. Live fact capture is event attendance, message creation and rules acceptance only. |
+| `TWO_COMMUNITY_SCORECARD` | cold | `false` | stored unwired | Enable the weekly scorecard job. Live fact capture covers event_attended, voice_session_started, voice_session_ended, message_created, rules_accepted and member_joined. |
 | `TWO_COMMUNITY_STAGING_ACTOR_IDS` | hot | `[]` | stored unwired | Staging actors excluded from human community activity. |
 | `TWO_COMMUNITY_STAGING_GUILD_IDS` | hot | `[]` | stored unwired | Staging guilds excluded from human community activity. |
 | `TWO_COMMUNITY_TEST_ACTOR_IDS` | hot | `[]` | stored unwired | Test actors excluded from human community activity. |
@@ -247,5 +247,6 @@ Catalog entries: 122.
 | `TWO_TEMP_VOICE_PANEL_CHANNEL_ID` | cold | Not specified in Next | stored unwired | Destination for temporary-room control panels. |
 | `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS` | cold | Not specified in Next | env at boot; stored unwired | Channels temporary-room cleanup may not remove. |
 | `TWO_TEMP_VOICE_SWEEP_SECONDS` | cold | Not specified in Next | stored unwired | Temporary-room cleanup sweep interval. |
+| `TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS` | env_only | Not specified in Next | environment only | Staging synthetic voice-test bots counted as human occupants; ignored for the live guild. |
 | `TWO_TEXT_COMMANDS` | cold | `false` | env at boot; stored unwired | Enable optional text triggers only while automations are enabled. |
 | `TWO_TICKET_COOLDOWN_SECONDS` | cold | Not specified in Next | stored unwired | Cooldown between ticket openings. |

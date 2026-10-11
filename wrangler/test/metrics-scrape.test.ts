@@ -1,34 +1,42 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { ALERT_INPUT_LABELS, parseAlertScrape } from "../src/metrics-scrape.ts";
+import { ALERT_INPUT_LABELS, ALERT_OPTIONAL_INPUT_LABELS, parseAlertScrape } from "../src/metrics-scrape.ts";
 import { metricsBody, metricsLines, RUST_ALERT_AXES, rustLabels } from "./fixtures/metrics.ts";
 
 const valid = metricsBody();
+const validatedLabels = { ...ALERT_INPUT_LABELS, ...ALERT_OPTIONAL_INPUT_LABELS };
 
 test("alert input dimensions match the Rust always-emitted scrape contract", () => {
-  assert.deepEqual(Object.keys(ALERT_INPUT_LABELS).sort(), Object.keys(RUST_ALERT_AXES).sort());
+  assert.deepEqual(Object.keys(validatedLabels).sort(), Object.keys(RUST_ALERT_AXES).sort());
   for (const [name, axes] of Object.entries(RUST_ALERT_AXES)) {
     const expected = Object.fromEntries(Object.entries(axes).map(([key, dimension]) => [key, rustLabels(dimension)]));
-    assert.deepEqual(ALERT_INPUT_LABELS[name], expected, name);
+    assert.deepEqual(validatedLabels[name], expected, name);
   }
   // New consumed families cannot silently bypass validation.
   const rules = readFileSync(new URL("../src/alert-rules.ts", import.meta.url), "utf8");
   const consumed = [...rules.matchAll(/gauge\("([^"]+)"\)/g)].map((m) => m[1]!);
-  assert.deepEqual([...new Set(consumed)].sort(), Object.keys(ALERT_INPUT_LABELS).sort());
+  assert.deepEqual([...new Set(consumed)].sort(), Object.keys(validatedLabels).sort());
   assert.ok(parseAlertScrape(valid));
 });
 
-test("every current label combination is required, not merely one row per family", () => {
-  const lines = metricsLines();
+test("every current required label combination is required, not merely one row per family", () => {
+  const lines = metricsLines().filter((line) => !line.startsWith("two_bot_job_last_error_class"));
   for (let i = 0; i < lines.length; i++) {
     assert.equal(parseAlertScrape(lines.filter((_, j) => j !== i).join("\n")), null, lines[i]);
   }
 });
 
+test("older exposition without the optional error-class gauge still parses", () => {
+  const older = metricsBody(3).split("\n").filter((line) => !line.startsWith("two_bot_job_last_error_class")).join("\n");
+  const samples = parseAlertScrape(older);
+  assert.ok(samples);
+  assert.equal(samples.find((s) => s.name === "two_bot_job_consecutive_failures" && s.labels.job === "rank")?.value, 3);
+});
+
 test("every consumed series rejects nonfinite, negative, fractional and nonnumeric inputs", () => {
   const lines = metricsLines();
-  for (const name of Object.keys(ALERT_INPUT_LABELS)) {
+  for (const name of Object.keys(validatedLabels)) {
     const index = lines.findIndex((line) => line.startsWith(`${name}{`) || line.startsWith(`${name} `));
     for (const value of ["NaN", "+Inf", "-Inf", "Infinity", "1e999", "-1", "0.5", "0x10", "garbage", "1e20"]) {
       const bad = [...lines];
@@ -37,6 +45,19 @@ test("every consumed series rejects nonfinite, negative, fractional and nonnumer
     }
   }
   assert.equal(parseAlertScrape(valid.replace("two_bot_db_pool_configured 0", "two_bot_db_pool_configured 2")), null);
+});
+
+test("gateway pairing inputs fail the scrape when renamed, missing or malformed", () => {
+  // A Rust-side rename must fail loudly, never silently hold the unpaired
+  // rule off: the required resumes row is absent under its new name.
+  assert.equal(parseAlertScrape(valid.replaceAll("two_bot_gateway_resumes_total", "two_bot_gateway_resumes_renamed_total")), null);
+  assert.equal(parseAlertScrape(valid.replaceAll("two_bot_gateway_disconnects_total", "two_bot_gateway_disconnects_renamed_total")), null);
+  // Absent gateway rows are a failed scrape, not a quiet rule.
+  assert.equal(parseAlertScrape(metricsLines().filter((line) => !line.startsWith("two_bot_gateway_")).join("\n")), null);
+  // Fractional, negative and nonfinite disconnects never reach the rule.
+  for (const value of ["0.5", "-1", "NaN", "1e20"]) {
+    assert.equal(parseAlertScrape(valid.replace("two_bot_gateway_disconnects_total 0", `two_bot_gateway_disconnects_total ${value}`)), null, value);
+  }
 });
 
 for (const [name, body] of Object.entries({
