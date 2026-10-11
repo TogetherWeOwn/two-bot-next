@@ -31,6 +31,7 @@ const ACTOR: &str = "111111111111111111";
 const TARGET: &str = "333333333333333333";
 const STAFF_ROLE: &str = "444444444444444444";
 const OWEN_ID: &str = "123456789012345678";
+const BOT_ID: &str = "555555555555555555";
 // Fixed clock: 2023-11-14T22:13:20.000Z, so expiries assert exactly.
 const NOW_MS: i64 = 1_700_000_000_000;
 const NOW_ISO: &str = "2023-11-14T22:13:20.000Z";
@@ -388,7 +389,7 @@ async fn tempban_schedules_unban_and_sweep_dispatches_it() {
     // REST double here because the sweep path is service-owned.
     let discord = MockMemberDiscord::new();
     let sweep_policy = ModerationPolicy {
-        bot_user_id: Some("555555555555555555".to_owned()),
+        bot_user_id: Some(BOT_ID.to_owned()),
         ..policy()
     };
     let sweep =
@@ -840,13 +841,24 @@ async fn postgres_tempban_schedules_pending_unban_with_exact_expiry() {
     assert_eq!(NOW_ISO, format_iso_millis(NOW_MS));
     // The sweep owns dispatch: once due, the queued expiry completes.
     let discord = MockMemberDiscord::new();
+    let sweep_policy = ModerationPolicy {
+        bot_user_id: Some(BOT_ID.to_owned()),
+        ..policy()
+    };
     let sweep = MemberModerationService::new(
         discord,
         PgMemberModerationStore::new(db.fixture.pool().clone(), GUILD),
-        policy(),
+        sweep_policy,
         move || NOW_MS + 3_600_000 + 1_000,
     );
     assert_eq!(sweep.run_due_unbans(GUILD).await.unwrap(), 1);
+    let audit_actor: (String,) =
+        sqlx::query_as("SELECT actor_id FROM moderation_audit WHERE request_id = $1")
+            .bind("pg-tempban:unban")
+            .fetch_one(db.fixture.pool())
+            .await
+            .unwrap();
+    assert_eq!(audit_actor, (BOT_ID.to_owned(),));
     mock.shutdown().await;
     db.cleanup().await;
 }
