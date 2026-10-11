@@ -637,7 +637,7 @@ fn exposition_series_count_matches_the_cardinality_budget() {
     assert_eq!(metrics::EVENTS.len(), 21, "event family changed the budget");
     assert_eq!(
         metrics::REST_ROUTES.len(),
-        26,
+        29,
         "route family changed the budget"
     );
     assert_eq!(metrics::JOBS.len(), 14, "job family changed the budget");
@@ -664,9 +664,9 @@ fn exposition_series_count_matches_the_cardinality_budget() {
     assert_eq!(type_headers, 30, "rendered TYPE family count changed");
     let series = text.lines().filter(|line| !line.starts_with('#')).count();
     assert_eq!(
-        series, 413,
-        "exposition grew past the 413-sample budget (21 events + 4 scalars + 1 latency \
-         + 11 histogram + 156 rest + 56 jobs + 31 voice + 26 vote-kick + 12 voice-names + 2 db-errors + 4 send-admissions + 2 prefix-refused + 6 dispatch-drops + 2 checkpoint-failures + 72 internal-actions + 3 facts-drain + 4 pool); \
+        series, 431,
+        "exposition grew past the 431-sample budget (21 events + 4 scalars + 1 latency \
+         + 11 histogram + 174 rest + 56 jobs + 31 voice + 26 vote-kick + 12 voice-names + 2 db-errors + 4 send-admissions + 2 prefix-refused + 6 dispatch-drops + 2 checkpoint-failures + 72 internal-actions + 3 facts-drain + 4 pool); \
          update docs/log-volume-guard.md with the new series"
     );
 }
