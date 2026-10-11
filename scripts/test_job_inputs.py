@@ -620,10 +620,17 @@ class WorkflowSurfaceTests(unittest.TestCase):
     # Always-on gates that only touch the checkout and the `agent-testdb`
     # service; they never need the toolchain or the CI database.
     ALWAYS_ON = ("Job-container prerequisites",)
+    # Name-pinned exemption from the guard above (deterministic quality
+    # gates): the deny action ships its own toolchain and reads only the
+    # lockfile plus the advisory DB, so its advisories run on every PR,
+    # including docs-only, with no repo toolchain or database. Any other step
+    # mentioning cargo still needs the guard.
+    SELF_CONTAINED = ("cargo-deny",)
 
     def unguarded(self, text, job):
         return [name for name, body in self.job_steps(text, job)
                 if not name.startswith(self.ALWAYS_ON)
+                and name not in self.SELF_CONTAINED
                 and self.NEEDS_RUST.search(body)
                 and not re.search(r"(?m)^\s+if:.*needs\.job-inputs\.outputs\.rust != 'false'", body)]
 
@@ -633,6 +640,14 @@ class WorkflowSurfaceTests(unittest.TestCase):
         self.assertEqual(self.unguarded(self.text, "check"), [],
                          "needs the Rust toolchain or the CI database but is not "
                          "guarded by the rust selector")
+
+    def test_cargo_deny_runs_ungated_on_every_pr(self):
+        # Deterministic quality gates: advisories run on every PR, so the
+        # self-contained deny step carries no selector guard. The exemption
+        # stays name-pinned to this one step.
+        self.assertEqual(self.SELF_CONTAINED, ("cargo-deny",))
+        body = dict(self.job_steps(self.text, "check"))["cargo-deny"]
+        self.assertNotIn("needs.job-inputs.outputs.rust", body)
 
     def test_rust_test_lanes_skip_at_the_job_level(self):
         # No Rust inputs (docs-only, worker-UI-only): the lanes never start,

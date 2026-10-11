@@ -249,8 +249,11 @@ jobs:
       # Runs before the toolchain install and every compile/link step
       # (TOG-12134): the deny image ships its own toolchain and rustup-syncs
       # the pinned one, so it must run while the disk is at its freest.
+      # Ungated on purpose (deterministic quality gates): `check all`
+      # includes the advisory scan, and the deny image carries its own
+      # toolchain, so this also reports advisories on docs-only PRs for the
+      # cost of one advisory-DB fetch. Advisory findings fail the PR (HARD).
       - name: cargo-deny
-        if: needs.job-inputs.outputs.rust != 'false'
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check all
@@ -331,6 +334,95 @@ jobs:
 
       # NOTE: cargo-deny runs before the toolchain install and every compile
       # step (disk hygiene); do not re-add it later in this job.
+
+      # Deterministic quality gates (docs/quality-gates.md). Steps, not jobs:
+      # they reuse this lane's runner, container and toolchain, so no new
+      # runner minutes beyond the step itself, and ci-ok already covers them.
+      # WARN gates annotate but never fail on findings; a broken gate step
+      # still fails so blindness cannot hide. The inventory gate is HARD and
+      # always on (pure Python, milliseconds); the rest are gated on the rust
+      # selector like the other heavy steps.
+      - name: CI test-target inventory
+        run: python3 scripts/ci/check-test-inventory.py
+
+      # Floor guard (CONSTRAINTS.md floor, HARD): pure Python over the PR
+      # diff, milliseconds. Ungated on purpose like the inventory gate: a
+      # docs-only PR can still weaken CONSTRAINTS.md, so this must see it.
+      - name: Floor guard (HARD, CONSTRAINTS.md floor)
+        env:
+          FLOOR_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
+          FLOOR_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 scripts/ci/check-floor-guard.py --base-ref "$FLOOR_BASE" --head-ref "$FLOOR_HEAD"
+
+      - name: Patch coverage (WARN, 80% of added lines)
+        if: needs.job-inputs.outputs.rust != 'false'
+        # The check job runs in a container whose default shell is sh (no pipefail).
+        shell: bash
+        env:
+          QUALITY_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
+          QUALITY_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          rustup component add llvm-tools-preview
+          archive="$RUNNER_TEMP/cargo-llvm-cov.tar.gz"
+          for attempt in 1 2 3; do
+            curl -fsSL -o "$archive" \
+              https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.9.1/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz && break
+            [ "$attempt" -lt 3 ] || exit 1
+            sleep 5
+          done
+          echo "b3f68e625481fed9b16444174f3fa5ebcdbde4a1878803a35eabe2dcefcdc41a  $archive" | sha256sum --check -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" cargo-llvm-cov
+          # WARN measurement only: unit-test failures are owned HARD by the
+          # rust-tests lane, so a failed measurement run warns here instead of
+          # failing this lane (for example DB-backed lib tests behave
+          # differently without the lane's database service).
+          if "$RUNNER_TEMP/cargo-llvm-cov" llvm-cov --workspace --lib --locked --lcov \
+            --output-path "$RUNNER_TEMP/lcov.info"; then
+            python3 scripts/ci/check-patch-coverage.py --lcov "$RUNNER_TEMP/lcov.info" \
+              --base-ref "$QUALITY_BASE" --head-ref "$QUALITY_HEAD"
+          else
+            echo "::warning::patch coverage measurement did not complete; see the rust-tests lane for the authoritative unit-test result"
+          fi
+
+      - name: Unwrap in request paths (WARN)
+        if: needs.job-inputs.outputs.rust != 'false'
+        shell: bash
+        env:
+          QUALITY_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
+          QUALITY_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/ast-grep.zip"
+          for attempt in 1 2 3; do
+            curl -fsSL -o "$archive" \
+              https://github.com/ast-grep/ast-grep/releases/download/0.50.0/app-x86_64-unknown-linux-gnu.zip && break
+            [ "$attempt" -lt 3 ] || exit 1
+            sleep 5
+          done
+          echo "0fd3f489639abb8465a914b74b8779171577582318d8a940d00399f59dba81c5  $archive" | sha256sum --check -
+          rm -rf "$RUNNER_TEMP/ast-grep" && mkdir -p "$RUNNER_TEMP/ast-grep"
+          ARCHIVE="$archive" DEST="$RUNNER_TEMP/ast-grep" python3 -c \
+            "import os, zipfile; zipfile.ZipFile(os.environ['ARCHIVE']).extractall(os.environ['DEST'])"
+          chmod 0755 "$RUNNER_TEMP/ast-grep/ast-grep"
+          PATH="$RUNNER_TEMP/ast-grep:$PATH" \
+            python3 scripts/ci/check-unwrap-request-paths.py \
+            --base-ref "$QUALITY_BASE" --head-ref "$QUALITY_HEAD"
+
+      - name: Semgrep Rust rules (WARN)
+        if: needs.job-inputs.outputs.rust != 'false'
+        shell: bash
+        env:
+          QUALITY_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
+          QUALITY_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          python3 -m pip --isolated --disable-pip-version-check --no-cache-dir install \
+            --target "$RUNNER_TEMP/semgrep" 'semgrep==1.180.0'
+          export PATH="$RUNNER_TEMP/semgrep/bin:$PATH"
+          export PYTHONPATH="$RUNNER_TEMP/semgrep${PYTHONPATH:+:$PYTHONPATH}"
+          python3 scripts/ci/check-semgrep-warn.py \
+            --base-ref "$QUALITY_BASE" --head-ref "$QUALITY_HEAD" --semgrep semgrep
 
   rust-tests:
     name: rust tests
