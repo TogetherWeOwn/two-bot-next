@@ -287,12 +287,11 @@ where
                     // Keep polling the handler while acquiring/sending the ACK:
                     // an early handler reply may itself hold the session lock.
                     // Wait for an in-flight defer before completing its edit.
-                    let defer_fut = session.defer(ephemeral);
-                    let (defer_res, handler_res) = tokio::join!(defer_fut, future);
-                    match defer_res {
-                        Ok(_) => handler_res,
-                        Err(e) => return Err(e),
-                    }
+                    let (_, result) = tokio::try_join!(
+                        session.defer(ephemeral),
+                        async { Ok::<_, ReplyError<T::Error>>(future.await) },
+                    )?;
+                    result
                 }
             }
         }
