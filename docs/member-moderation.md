@@ -230,7 +230,14 @@ before both normal and failed completion writes. Audit loss is logged and
 cannot cause a duplicate mutation. A completion-write failure keeps the
 destructive claim uncertain. A definite pre-dispatch transaction rollback or
 no-write result releases the idempotency key for retry; ambiguous commit or
-post-dispatch failures never do.
+post-dispatch failures never do. If that release write itself fails, the caller
+still gets the original refusal and nothing is retried: the row stays
+`in_flight`, so a retry answers `in_progress` instead of repeating the
+mutation. The service logs one `moderation_idempotency_release_failed` error
+with only a fixed `action` and `cause` (`discord_rejected` or
+`store_rolled_back`), never the key, an id or the raw store error. Such a line
+means one caller-supplied key will keep answering `in_progress`; the signal does
+not name it, and no code expires or takes over the row.
 
 ## Verification
 
