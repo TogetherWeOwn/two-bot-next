@@ -276,6 +276,24 @@ mod tests {
     }
 
     #[test]
+    fn a_new_unsupported_time_zone_is_refused() {
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&empty_document(GUILD)).unwrap();
+        document["settings"]["time_zone"] = serde_json::json!("Mars/Olympus");
+        let bytes = serde_json::to_vec(&document).unwrap();
+        assert!(matches!(
+            plan_apply(&empty_config(), &bytes, &inventory()),
+            ApplyPlan::Refuse { message } if message.contains("settings.time_zone")
+        ));
+        document["settings"]["time_zone"] = serde_json::json!("America/New_York");
+        let bytes = serde_json::to_vec(&document).unwrap();
+        assert!(!matches!(
+            plan_apply(&empty_config(), &bytes, &inventory()),
+            ApplyPlan::Refuse { .. }
+        ));
+    }
+
+    #[test]
     fn oversized_file_is_refused_before_decoding() {
         let bytes = vec![b' '; MAX_IMPORT_BYTES + 1];
         assert!(matches!(

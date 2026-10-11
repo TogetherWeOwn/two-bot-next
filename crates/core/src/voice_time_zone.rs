@@ -132,6 +132,9 @@ fn fixed_offset(zone: &str) -> Option<i32> {
         .strip_prefix("UTC")
         .or_else(|| upper.strip_prefix("GMT"))
         .unwrap_or(&upper);
+    if !rest.is_ascii() {
+        return None;
+    }
     let (sign, digits) = match rest.as_bytes().first()? {
         b'+' => (1, &rest[1..]),
         b'-' => (-1, &rest[1..]),
@@ -262,6 +265,9 @@ mod tests {
             ("UTC+15", None),
             ("UTC+3:60", None),
             ("Mars/Olympus", None),
+            ("+é1", None),
+            ("UTC+é1", None),
+            ("UTC+1é", None),
             ("", None),
         ] {
             assert_eq!(offset_minutes(zone, 0), expected, "{zone}");

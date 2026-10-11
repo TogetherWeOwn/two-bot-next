@@ -11029,3 +11029,34 @@ fn name_settings_carry_the_configured_time_zone() {
         "Europe/Berlin"
     );
 }
+
+#[test]
+fn import_preview_and_confirm_refuse_a_new_unsupported_time_zone() {
+    let mut config = full_config();
+    config.settings.time_zone = "Mars/Olympus".to_owned();
+    let bytes = serde_json::to_vec(&config).unwrap();
+    match plan_import_preview(&empty_config(), &bytes, &config_inventory()) {
+        ImportDecision::Refuse { message } => {
+            assert!(message.contains("settings.time_zone"), "{message}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    match plan_import_confirm(
+        &empty_config(),
+        &config,
+        &config_inventory(),
+        "0000000000000000",
+    ) {
+        ImportDecision::Refuse { message } => {
+            assert!(message.contains("settings.time_zone"), "{message}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    // The zone already stored is kept as is, so a guild can re-import its export.
+    let mut current = empty_config();
+    current.settings.time_zone = "Mars/Olympus".to_owned();
+    assert!(!matches!(
+        plan_import_preview(&current, &bytes, &config_inventory()),
+        ImportDecision::Refuse { .. }
+    ));
+}
