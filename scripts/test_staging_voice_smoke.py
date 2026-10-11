@@ -22,6 +22,10 @@ STAGING_APP = "1469137636663758888"
 OTHER_APP = "1111111111111111111"
 TOKEN = "RAW_SECRET_SENTINEL_never_disclose_bot_token"
 WORKER_URL = "https://two-bot-next-staging.5150.workers.dev"
+# Both bodies fit BODY_CAP, so the decoder, not the size cap, must refuse them.
+DEEP_ARRAY = b"[" * 32768 + b"]" * 32768
+DEEP_OBJECT = b'{"a":' * 10000 + b"{}" + b"}" * 10000
+HEALTH_OK = json.dumps({"status": "ok"}).encode()
 
 
 def entry(index, name, **overrides):
@@ -249,6 +253,42 @@ class VoiceSmokeTests(unittest.TestCase):
         raw = Path(self.evidence).read_text()
         for token in ("Bot ", "Bearer", "BEGIN ", "DISCORD_STAGING_BOT_TOKEN", TOKEN):
             self.assertNotIn(token, raw)
+
+    def assert_one_refusal(self, code, out, body, line):
+        self.assertEqual(code, 1)
+        self.assertNotIn("Traceback", out)
+        self.assertNotIn(body[:8].decode(), out)
+        self.assertNotIn(TOKEN, out)
+        self.assertEqual([row for row in out.splitlines() if row.startswith("FAIL ")], [line])
+
+    def test_deep_json_at_identity_refuses_without_traceback(self):
+        for body in (DEEP_ARRAY, DEEP_OBJECT):
+            with self.subTest(opener=body[:1]):
+                code, out = self.run_main(["--guild-id", STAGING_GUILD],
+                                          {f"{smoke.API}/users/@me": (200, body)})
+                self.assert_one_refusal(
+                    code, out, body,
+                    "FAIL interactions: interactions endpoint answered 200 with invalid JSON")
+
+    def test_deep_json_at_worker_health_refuses_without_traceback(self):
+        for body in (DEEP_ARRAY, DEEP_OBJECT):
+            with self.subTest(opener=body[:1]), mock.patch.object(
+                    smoke, "fetch_worker", return_value=(200, body)):
+                code, out = self.run_main(
+                    ["--guild-id", STAGING_GUILD, "--staging-url", WORKER_URL], {})
+                self.assert_one_refusal(code, out, body,
+                                        "FAIL worker-health: GET /health answered without JSON")
+
+    def test_deep_json_at_worker_readyz_refuses_without_traceback(self):
+        for body in (DEEP_ARRAY, DEEP_OBJECT):
+            def fake_fetch_worker(url, body=body):
+                return (200, HEALTH_OK) if url.endswith("/health") else (200, body)
+            with self.subTest(opener=body[:1]), mock.patch.object(
+                    smoke, "fetch_worker", side_effect=fake_fetch_worker):
+                code, out = self.run_main(
+                    ["--guild-id", STAGING_GUILD, "--staging-url", WORKER_URL], {})
+                self.assert_one_refusal(code, out, body,
+                                        "FAIL worker-readyz: GET /readyz answered without JSON")
 
 
 class WorkerReadyzDuplicateTests(unittest.TestCase):

@@ -220,7 +220,7 @@ def get_json(fetch_fn, url):
         raise SmokeError("interactions endpoint answered over the body cap")
     try:
         return json.loads(body)
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
         raise SmokeError("interactions endpoint answered 200 with invalid JSON")
 
 
@@ -318,7 +318,7 @@ def check_worker(origin):
         return [Result("worker-health", "fail", "GET /health answered over the body cap")], None
     try:
         health = json.loads(body)
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
         return [Result("worker-health", "fail", "GET /health answered without JSON")], None
     results = []
     if status == 200 and health == {"status": "ok"}:
@@ -338,7 +338,7 @@ def check_worker(origin):
         return results, None
     try:
         report = json.loads(body)
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
         results.append(Result("worker-readyz", "fail", "GET /readyz answered without JSON"))
         return results, None
     try:
