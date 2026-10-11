@@ -739,20 +739,10 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot-discord --features db --locked --test leveling_runtime -- --ignored --test-threads=1
 
-      - name: community voice fact capture (CI service only)
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test -p two-bot-discord --features db --locked --test leveling_runtime community_voice_fact_capture_round_trip -- --ignored --test-threads=1
-
       - name: community voice fact round trip (CI service only)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot-core --features db --locked --lib community_store::tests::voice_session_start_end_round_trip_is_idempotent -- --ignored
-
-      - name: community message fact capture (CI service only)
-        env:
-          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
-        run: cargo test -p two-bot-discord --features db --locked --test leveling_runtime community_message_fact_capture_round_trip -- --ignored --test-threads=1
 
       - name: community message fact round trip (CI service only)
         env:
@@ -766,11 +756,6 @@ jobs:
         env:
           AUTOMOD_CI_TESTDB: '1'
         run: cargo test -p two-bot-core --features db --locked --test automod_store --test automod_preserved_replay -- --ignored
-
-      - name: leveling Postgres parity tests
-        env:
-          TWO_LEVELING_TEST_CI: '1'
-        run: cargo test -p two-bot-core --features db --locked --test leveling_store -- --ignored
 
       - name: Store Postgres integration (isolated CI schemas)
         env:

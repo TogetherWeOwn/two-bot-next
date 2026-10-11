@@ -119,7 +119,7 @@ python3 scripts/cargo_cache.py run -- test -p two-bot --locked command_runtime_t
 Controller compilation must use the bounded cache wrapper; a missing/refused pool
 is not permission to compile directly. Hosted CI uses its ephemeral Cargo cache.
 The store command executes all 15 leveling tests (none are ignored); the runtime
-command explicitly activates the six ignored integration proofs. Both use the shared
+command explicitly activates the eight ignored integration proofs. Both use the shared
 `two-bot-testsupport` fixture, which connects only to `agent-testdb:5432`, uses the
 passwordless `agent_test` principal, and creates a unique migrated database per
 test. The bootstrap is never migrated, reset or dropped. It never reads
