@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { control } from "../scripts/production-ownership-control.mjs";
+import { readdirSync, readFileSync } from "node:fs";
+import { control, REFUSAL_REASONS } from "../scripts/production-ownership-control.mjs";
 
 const PRODUCTION = "https://two-bot-next-production.fixture.workers.dev/";
 const STAGING = "https://two-bot-next-staging.fixture.workers.dev/";
@@ -191,4 +192,32 @@ test("status never retries other refusals", async () => {
     return Response.json({ deploymentId: "B", owner: null, running: true });
   }, async () => {}), /not confirmed/);
   assert.equal(calls, 1);
+});
+
+test("production refusal vocabulary equals the Worker OwnershipRefused set and the staging client set", async () => {
+  const srcDir = new URL("../src/", import.meta.url);
+  const sources = readdirSync(srcDir, { recursive: true }).filter((name) => name.endsWith(".ts"))
+    .map((name) => readFileSync(new URL(name, srcDir), "utf8"));
+  const fallback = sources.join("\n").match(/instanceof OwnershipRefused \? error\.reason : "([a-z_]+)"/)?.[1];
+  assert.ok(fallback, "refused() fallback reason missing");
+  const thrown = sources.flatMap((source) => [...source.matchAll(/new OwnershipRefused\("([a-z_]+)"\)/g)].map((match) => match[1]));
+  const constructed = sources.reduce((count, source) => count + (source.match(/new OwnershipRefused\(/g) ?? []).length, 0);
+  assert.equal(constructed, thrown.length, "every OwnershipRefused construction needs a literal reason");
+  const worker = [...new Set([...thrown, fallback])].sort();
+  const { REFUSAL_REASONS: STAGING_REFUSAL_REASONS } = await import("../scripts/ownership-control.mjs");
+  assert.deepEqual([...REFUSAL_REASONS].sort(), worker, "production refusal set diverged from the Worker");
+  assert.deepEqual([...STAGING_REFUSAL_REASONS].sort(), worker, "staging refusal set diverged from the Worker");
+});
+
+test("recognized refusal reasons print as themselves and anything else prints as unrecognized", async () => {
+  const refusal = (body: string) => control({ ...args, action: "status", statusAttempts: 1 }, async () =>
+    new Response(body, { status: 503 }), async () => {}).then(() => assert.fail("expected rejection"), (error: Error) => error.message);
+  for (const reason of REFUSAL_REASONS) {
+    assert.match(await refusal(JSON.stringify({ error: "ownership_fenced", reason })), new RegExp(`reason=${reason} attempts=1 `));
+  }
+  const leak = `synthetic_leak_${"q".repeat(40)}`;
+  for (const reason of ["NOT_OWNER", " not_owner", "stop_failed", leak, "__proto__", ["not_owner"]]) {
+    assert.match(await refusal(JSON.stringify({ error: "ownership_fenced", reason })), /reason=unrecognized attempts=1 /);
+  }
+  assert.match(await refusal("not json"), /reason=unrecognized attempts=1 /);
 });
