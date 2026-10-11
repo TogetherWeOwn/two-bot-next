@@ -93,7 +93,7 @@ def check_build_identity(body, expected_sha, expected_build_id):
     """
     try:
         report = json.loads(body)
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (ValueError, RecursionError):
         report = None
     if not isinstance(report, dict):
         raise CheckpointError("/readyz did not return a JSON object (no build identity to match)")

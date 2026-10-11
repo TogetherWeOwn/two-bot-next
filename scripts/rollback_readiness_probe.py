@@ -202,13 +202,12 @@ def read_manifest(path):
         raise
     except (OSError, EOFError, zlib.error) as e:
         raise ProbeError(f"{path.name} is not a complete gzip archive ({e.__class__.__name__})")
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
-        # Excessively nested input exhausts the decoder's recursion budget;
-        # refuse it as non-JSON like any malformed manifest line.
+    except (ValueError, RecursionError):
+        # ValueError also carries bad UTF-8 and the int-digit cap; refuse all as non-JSON.
         raise ProbeError(f"{path.name} manifest line is not JSON")
     try:
         end = json.loads(last) if last else None
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+    except (ValueError, RecursionError):
         end = None
     if not isinstance(end, dict) or end.get("kind") != "end" or not is_int(end.get("rows"), high=(1 << 64) - 1):
         raise ProbeError(f"{path.name} has no end marker: truncated, treat it as lost")
@@ -230,7 +229,7 @@ def load_live_sequences(path):
         rows = json.loads(Path(path).read_text())
     except OSError as e:
         raise ProbeError(f"cannot read {path} ({e.__class__.__name__})")
-    except (json.JSONDecodeError, RecursionError):
+    except (ValueError, RecursionError):
         # Excessively nested input exhausts the decoder's recursion budget.
         raise ProbeError(f"{path} is not JSON; expected the SEQUENCES_QUERY result")
     if not isinstance(rows, list):
@@ -310,7 +309,7 @@ def readyz_state(status, body):
         raise ProbeError("/readyz answered over the body cap")
     try:
         report = json.loads(body)
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+    except (ValueError, RecursionError):
         # Excessively nested input exhausts the decoder's recursion budget
         # below READYZ_BODY_CAP; grade it as no breakdown, never a crash.
         report = None
@@ -355,7 +354,8 @@ def check_deploy_config(config, envs, extra_keys):
             cfg = tomllib.load(f)
     except OSError as e:
         raise ProbeError(f"cannot read {config} ({e.__class__.__name__})")
-    except tomllib.TOMLDecodeError:
+    except (ValueError, RecursionError):
+        # tomllib raises a plain ValueError for integers past the digit cap.
         raise ProbeError(f"{config} is not valid TOML")
     required = sorted(set(REQUIRED_TWO_KEYS) | set(extra_keys)
                       | {k for k in cfg.get("vars", {}) if k.startswith("TWO_")})
