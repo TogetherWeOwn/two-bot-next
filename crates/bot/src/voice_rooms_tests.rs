@@ -7197,6 +7197,33 @@ async fn gateway_sink_routes_setup_without_blocking_and_ignores_other_commands()
     assert!(response_text(&replies.completed.lock().unwrap()[0]).contains("Voice rooms"));
 }
 
+/// Production wires `VoiceResponder`, not the bare runtime: a presence fed
+/// to the responder must reach the live guild's naming facts.
+#[tokio::test]
+async fn gateway_responder_forwards_presence_to_the_runtime() {
+    let trace = Trace::default();
+    let runtime = Arc::new(test_runtime(trace.clone()));
+    assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
+    let replies = Arc::new(Replies::new(trace));
+    let sink = VoiceResponder::new(Arc::clone(&runtime), replies);
+    let update: twilight_model::gateway::payload::incoming::PresenceUpdate =
+        serde_json::from_value(serde_json::json!({
+            "user": {"id": MEMBER.to_string()},
+            "guild_id": GUILD.to_string(),
+            "status": "online",
+            "activities": [{"type": 0, "name": "Apex Legends"}],
+            "client_status": {"desktop": "online"}
+        }))
+        .expect("presence");
+    VoiceEventSink::presence(&sink, &update);
+    let actor = runtime.live_actor(GUILD).expect("live actor");
+    let live = actor.live.read_state();
+    assert!(
+        live.presences.contains_key(&MEMBER),
+        "the responder dropped the presence update"
+    );
+}
+
 #[tokio::test]
 async fn disabled_gateway_responder_does_not_acknowledge() {
     use twilight_model::gateway::payload::incoming::InteractionCreate;

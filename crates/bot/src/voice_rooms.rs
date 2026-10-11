@@ -5670,7 +5670,9 @@ pub trait VoiceEventSink: Send + Sync {
     /// One `PRESENCE_UPDATE` (`TWO_VOICE_PRESENCE`), fed by the dispatch worker
     /// in gateway order (after any earlier `GUILD_CREATE` snapshot) without a
     /// checkpoint commit: it only updates in-memory room-name facts.
-    fn presence(&self, _update: &twilight_model::gateway::payload::incoming::PresenceUpdate) {}
+    /// Required, not defaulted: a wrapping sink that forgot to forward it
+    /// silently dropped every presence in production (game names never applied).
+    fn presence(&self, update: &twilight_model::gateway::payload::incoming::PresenceUpdate);
     /// Invalidate occupancy immediately on connection loss, including while an
     /// actor is awaiting SQL, HTTP or token-global rate-limit backoff.
     fn disconnect(&self);
@@ -10411,6 +10413,10 @@ where
         identities: two_bot_discord::command_identity::CommandIdentities,
     ) {
         self.runtime.set_command_identities(identities);
+    }
+
+    fn presence(&self, update: &twilight_model::gateway::payload::incoming::PresenceUpdate) {
+        self.runtime.presence(update);
     }
 
     fn handle(&self, event: &Event, cache: &DefaultInMemoryCache) {

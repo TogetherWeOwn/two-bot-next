@@ -100,6 +100,9 @@ impl VoiceEventSink for RecordingVoice {
         }
         self.runtime.handle(event, cache);
     }
+    fn presence(&self, update: &twilight_model::gateway::payload::incoming::PresenceUpdate) {
+        self.runtime.presence(update);
+    }
     fn disconnect(&self) {
         self.disconnects.fetch_add(1, Ordering::Relaxed);
         self.runtime.disconnect();
