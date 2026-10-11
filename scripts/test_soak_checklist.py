@@ -9,8 +9,8 @@ import tempfile
 import textwrap
 import unittest
 
-from check_soak_checklist import (check_verification, delta_rows, parity_rows, render,
-                                  libtest_names, validate)
+from check_soak_checklist import (check_script_refs, check_verification, delta_rows, parity_rows,
+                                  render, libtest_names, validate)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -544,6 +544,52 @@ class DeltaChecklistTests(unittest.TestCase):
         self.assertIn("\n## 13. ", output)
         self.assertIn("\n### s13-f114c44: f114c44 — TOG-3052: temp-voice generator", output)
         self.assertIn("- **Owner:** [TOG-11145](/TOG/issues/TOG-11145)\n", output)
+
+
+class ScriptReferenceTests(unittest.TestCase):
+    """Operative script paths in checklist evidence resolve unless marked historical."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.parity = (ROOT / "docs/parity.md").read_text()
+        cls.checklist = json.loads((ROOT / "docs/soak-checklist.json").read_text())
+
+    def test_live_script_citation_resolves(self):
+        check_script_refs({"id": "fixture", "action": "Read `.github/scripts/release-on-promote.cjs`."})
+
+    def test_missing_live_script_fails(self):
+        with self.assertRaisesRegex(ValueError, r"^fixture: missing script scripts/missing-check\.cjs"):
+            check_script_refs({"id": "fixture", "action": "Run `scripts/missing-check.cjs`."})
+
+    def test_named_historical_script_passes(self):
+        check_script_refs({
+            "id": "fixture",
+            "action": "Historical only: `scripts/missing-check.cjs`.",
+            "historical": [{"path": "scripts/missing-check.cjs", "reason": "Removed; history only."}],
+        })
+
+    def test_historical_exemption_needs_reason_and_a_missing_citation(self):
+        cited = "Historical only: `scripts/missing-check.cjs`."
+        live = "Read `.github/scripts/release-on-promote.cjs`."
+        for action, historical, error in (
+            (cited, [{"path": "scripts/missing-check.cjs", "reason": " "}], "requires path and reason"),
+            (cited, [{"path": "scripts/missing-check.cjs"}], "requires path and reason"),
+            ("No citation.", [{"path": "scripts/missing-check.cjs", "reason": "Removed."}], "stale historical exemption"),
+            (live, [{"path": ".github/scripts/release-on-promote.cjs", "reason": "Live."}], "stale historical exemption"),
+        ):
+            with self.subTest(action=action, historical=historical):
+                with self.assertRaisesRegex(ValueError, error):
+                    check_script_refs({"id": "fixture", "action": action, "historical": historical})
+
+    def test_runnable_deleted_script_citation_fails(self):
+        data = copy.deepcopy(self.checklist)
+        entry = next(e for e in data["entries"] if e["id"] == "s12-16")
+        entry.pop("historical")
+        with self.assertRaisesRegex(ValueError, r"^s12-16: missing script scripts/migrate-release-notes\.cjs"):
+            validate(self.parity, data)
+
+    def test_historical_exemption_renders(self):
+        self.assertIn("- **Historical:** `scripts/migrate-release-notes.cjs` — ", render(self.checklist))
 
 
 if __name__ == "__main__":

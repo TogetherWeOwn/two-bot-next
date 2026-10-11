@@ -30,7 +30,7 @@
     "",
     "JSON is authoritative; each `parity.section` + `parity.row` copies every source table cell except Map. Repeated ClientReady, attendance and member-event surfaces remain separate. Only DROP-prefixed Maps without an S/B/NEW slice or TOG owner are excluded; mixed mapped/DROP rows remain covered in either order, including mapped replacement work. §7 is prose: one explicit catalogue entry covers env_only/cold/hot. Adding a table there also requires entries. §12 copies every cell of its addition and Redirect tables except the disposition, under the same DROP rule. §13 covers each `ported`/`carded`/`gap` ledger row (commit link, area, change and status); `dropped` rows, including every history-rewrite replay, are excluded because their features stay mapped in §§1–8. Each §12/§13 entry lists `owner`: exactly the TOG cards its disposition names, in order (a `ported` row without a card names its owning slice); a changed status, row or owner card is stale until the entry is updated.",
     "",
-    "Run `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py` and `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v`. CI runs both offline before Cargo. After editing JSON, regenerate Markdown with `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py --render > docs/soak-checklist.md`. Source drift, missing/stale/duplicate rows, missing or stale owner cards, empty steps/evidence, invalid statuses, waivers missing reason or approver, missing automated commands, automated Cargo commands naming an unknown `-p` package, a missing test target or no matching test (read offline from source, never run), missing voice links or Markdown drift fail the gate.",
+    "Run `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py` and `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v`. CI runs both offline before Cargo. After editing JSON, regenerate Markdown with `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py --render > docs/soak-checklist.md`. Source drift, missing/stale/duplicate rows, missing or stale owner cards, empty steps/evidence, invalid statuses, waivers missing reason or approver, missing automated commands, automated Cargo commands naming an unknown `-p` package, a missing test target or no matching test (read offline from source, never run), operative `scripts/` paths in checklist evidence that do not exist (unless the entry lists them under `historical` with a reason), missing voice links or Markdown drift fail the gate.",
     "",
     "## Existing fixture entry points",
     "",
@@ -2022,17 +2022,23 @@
       "parity": {
         "section": 12,
         "row": [
-          "Bootstrap migration accepts the `Security` release-notes section in `migrate-release-notes`",
-          "`scripts/migrate-release-notes.cjs`, [releases.md](releases.md) (#329)"
+          "Historical, retired and no longer runnable: bootstrap migration that accepted the `Security` release-notes section in `migrate-release-notes`",
+          "Historical only: `scripts/migrate-release-notes.cjs` (removed in `6032fc72a`), [releases.md](releases.md) (#329)"
         ]
       },
       "owner": [
         "TOG-12801"
       ],
       "status": "waived",
-      "action": "Run the `migrate-release-notes` bootstrap fixture with a hand-written `Security` section in Unreleased: confirm the migration preserves the Security tail, removes Unreleased, and stays idempotent; confirm any other section still fails closed.",
-      "expected": "`Security` migrates alongside Added/Fixed/Changed/Notes; unknown sections fail closed; later releases do not repeat the bootstrap tail.",
-      "evidence": "Attach the owning slice’s exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no live fault injection, staging/production SQL or credentials.",
+      "action": "Historical only, not runnable: `scripts/migrate-release-notes.cjs` and its bootstrap fixture were removed in `6032fc72a`, so no fixture runs for this row and no check replaces it. Do not read the current promote-time release path as satisfying it; that path is documented in [releases.md](releases.md).",
+      "expected": "Historical record of the retired bootstrap contract only: `Security` migrated alongside Added/Fixed/Changed/Notes, unknown sections failed closed, and later releases did not repeat the bootstrap tail. No current check asserts this.",
+      "evidence": "Historical record only: the fixture receipt cannot be reproduced because the script is gone, so none is attached. The original evidence stays in [releases.md](releases.md) (#329); the removal is commit `6032fc72a`. Waiver decision and approver stay on [TOG-9699](/TOG/issues/TOG-9699); this checklist records no PASS.",
+      "historical": [
+        {
+          "path": "scripts/migrate-release-notes.cjs",
+          "reason": "Removed in 6032fc72a; cited only as the retired bootstrap's historical evidence, not as a runnable check."
+        }
+      ],
       "reason": "Proposed staging-execution waiver: this failure, timing or signed-call path is reproducible only with local mock fixtures under the safety contract (no live fault injection, clock change or credential handling); the owning slice’s exact-head fixture receipt substitutes for a deployed effect. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.",
       "approver": "pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)"
     },
