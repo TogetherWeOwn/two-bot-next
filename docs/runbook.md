@@ -142,6 +142,7 @@ Look for these literal messages:
 - `durable gateway failed; checkpoint unchanged, readiness unavailable` — fatal
   initialization failure; underlying SQL error deliberately not logged. Its
   `error_class` is also on `/readyz` as `gateway_failure` for 15 s before exit
+  (startup failures linger 15 s; only a running-gateway failure lingers 75 s)
   and in Workers Logs as `container_gateway_failure` (see
   [startup-diagnostics.md](startup-diagnostics.md)).
 - `container service failed` / `SIGTERM received; draining`.
@@ -407,22 +408,24 @@ on-call engineer, not another redeploy.
 `two_bot_gateway_checkpoint_failures_total` increased between two keepalive
 samples. Every checkpoint failure stops the dispatch worker, so there is no
 benign singleton: a single increase pages. The first sample after monitoring
-arms only stores the baseline and never fires. The failing process lingers
-75 s before it exits, so at least one keepalive scrape sees the increase
-before the restart resets the counter; the post-restart reset sample resolves
-the alert rather than firing.
+arms only stores the baseline and never fires. A running-gateway failure
+lingers 75 s before it exits (startup failures still linger 15 s), which
+leaves about 9 s of margin over one 60 s keepalive tick plus two 6 s probe
+timeouts for a scrape to see the increase; the post-restart reset sample
+resolves the alert rather than firing.
 
-First response: read the `stage` label on
-`two_bot_gateway_checkpoint_failures_total` via the authorized
-`/ops/metrics` scrape — `pre_commit` means the commit was skipped after a
-funnel, leveling or acknowledgement failure, while `commit` means the
-durable store write itself failed. If the process already restarted, the
-counter and stage are gone from the scrape: read them from the Worker logs
-instead, where the keepalive re-emits each linger tick as
-`{"event":"container_gateway_failure","phase":…,"class":…}`. Then check the
-`gateway` component on `/readyz` and the Neon status for the staging branch:
-a `commit` failure next to DB-error or pool alerts points at the database,
-not the gateway. Do not restart manually: the process exits on its own after
+First response: if the failing process is still up (within the linger), read
+the `stage` label on `two_bot_gateway_checkpoint_failures_total` via the
+authorized `/ops/metrics` scrape — `pre_commit` means the commit was skipped
+after a funnel, leveling or acknowledgement failure, while `commit` means the
+durable store write itself failed. Once the process has restarted, the stage
+is not recoverable: the counter resets to zero and the Worker log line
+(`{"event":"container_gateway_failure","phase":…,"class":…}`) carries only
+`phase` and `class` — both stages map to `gateway_runtime_failed` — never
+the `stage`. Do not wait for the stage then; check the `gateway` component on
+`/readyz` and the Neon status for the staging branch instead: a `commit`
+failure next to DB-error or pool alerts points at the database, not the
+gateway. Do not restart manually: the process exits on its own after
 the linger and the supervisor restarts from the committed checkpoint — verify
 the replacement is healthy per the
 [restart semantics](#restart-semantics-durable-resume-not-full-state-recovery).

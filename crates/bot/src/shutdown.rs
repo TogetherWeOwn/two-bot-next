@@ -10,15 +10,32 @@ pub(crate) const TIMEOUT_ENV: &str = "SHUTDOWN_TIMEOUT_SECONDS";
 /// Cloudflare Containers allow a 15 minute grace period before SIGKILL.
 const MAX_SECONDS: u64 = 900;
 
-/// After the gateway task fails, `/readyz` keeps serving (with `gateway_failure`)
-/// this long before the process drains and exits: longer than one 60 s
-/// keepalive tick plus the 6 s probe timeout (see `wrangler/wrangler.toml`
-/// `KEEPALIVE_SECONDS` and the keepalive probes in `wrangler/src/index.ts`),
-/// so at least one keepalive scrape always sees the incremented
-/// `two_bot_gateway_checkpoint_failures_total` counter and the `/readyz`
-/// failure class before the restart resets the counter — still far below the
-/// Container's SIGTERM-to-SIGKILL grace period. A shutdown signal cuts it short.
-pub(crate) const FAILURE_LINGER: Duration = Duration::from_secs(75);
+/// After a startup failure, `/readyz` keeps serving (with `gateway_failure`)
+/// this long before the process drains and exits: long enough for the rollout
+/// gate's 5 s poll to land in it, far below the Container's
+/// SIGTERM-to-SIGKILL grace period. A shutdown signal cuts it short.
+pub(crate) const FAILURE_LINGER: Duration = Duration::from_secs(15);
+
+/// After a running-gateway failure (`GatewayRuntimeFailed`, the class a
+/// worker-stopping checkpoint failure maps to), `/readyz` keeps serving this
+/// long instead: longer than one 60 s keepalive tick plus two 6 s probe
+/// timeouts (see `wrangler/wrangler.toml` `KEEPALIVE_SECONDS` and the
+/// `AbortSignal.timeout(6000)` keepalive probes in `wrangler/src/index.ts`),
+/// so at least one keepalive scrape sees the incremented
+/// `two_bot_gateway_checkpoint_failures_total` counter before the restart
+/// resets it — still far below the grace period. Only the runtime class gets
+/// the long linger; every startup class keeps `FAILURE_LINGER` so failed
+/// starts restart without added delay.
+pub(crate) const RUNTIME_FAILURE_LINGER: Duration = Duration::from_secs(75);
+
+/// Linger for a gateway failure class: the long linger only for a failure of
+/// the running gateway, the short linger for every startup failure.
+pub(crate) fn failure_linger(class: crate::gateway_failure::FailureClass) -> Duration {
+    match class {
+        crate::gateway_failure::FailureClass::GatewayRuntimeFailed => RUNTIME_FAILURE_LINGER,
+        _ => FAILURE_LINGER,
+    }
+}
 
 /// Accepted dispatches get `DISPATCH_DRAIN_MAX` to commit their checkpoint; the
 /// extra margin covers HTTP and job cleanup.
@@ -95,21 +112,68 @@ mod tests {
         assert_eq!(deadline_from(Some("1")), Duration::from_secs(1));
     }
 
+    /// Max `KEEPALIVE_SECONDS` across the environments in
+    /// `wrangler/wrangler.toml`, read from the real file so raising the tick
+    /// without raising the runtime linger fails this test instead of silently
+    /// re-opening the missed-checkpoint window.
+    fn max_keepalive_seconds() -> u64 {
+        let toml = include_str!("../../../wrangler/wrangler.toml");
+        let mut max = 0;
+        for line in toml.lines() {
+            let line = line.trim();
+            if !line.starts_with("KEEPALIVE_SECONDS") {
+                continue;
+            }
+            let digits: String = line.chars().filter(|c| c.is_ascii_digit()).collect();
+            if let Ok(value) = digits.parse::<u64>() {
+                max = max.max(value);
+            }
+        }
+        max
+    }
+
     #[test]
-    fn failure_linger_covers_a_keepalive_tick() {
-        // Pinned against `wrangler/wrangler.toml` KEEPALIVE_SECONDS (60) and
-        // the 6 s keepalive probe timeout in `wrangler/src/index.ts`: a
-        // checkpoint failure must stay scrapable for at least one full
-        // keepalive tick, or the `gateway_checkpoint_failures` rule never sees
-        // the increase before the restart resets the counter. Keep the bound
-        // far below the container grace period.
-        const KEEPALIVE_SECONDS: u64 = 60;
+    fn runtime_linger_covers_a_keepalive_tick() {
+        // A checkpoint failure must stay scrapable for at least one full
+        // keepalive tick plus the probe timeout on each side (the
+        // `AbortSignal.timeout(6000)` keepalive probes in
+        // `wrangler/src/index.ts`), or the `gateway_checkpoint_failures` rule
+        // never sees the increase before the restart resets the counter. Keep
+        // the bound far below the container grace period.
         const PROBE_TIMEOUT_SECONDS: u64 = 6;
+        let keepalive = max_keepalive_seconds();
+        assert!(keepalive > 0, "wrangler.toml must define KEEPALIVE_SECONDS");
         assert!(
-            FAILURE_LINGER.as_secs() > KEEPALIVE_SECONDS + PROBE_TIMEOUT_SECONDS,
-            "linger {:?} must outlast one keepalive tick plus the probe timeout",
-            FAILURE_LINGER
+            RUNTIME_FAILURE_LINGER.as_secs() > keepalive + 2 * PROBE_TIMEOUT_SECONDS,
+            "runtime linger {:?} must outlast the {keepalive} s keepalive tick plus two probe timeouts",
+            RUNTIME_FAILURE_LINGER
         );
-        assert!(FAILURE_LINGER.as_secs() < MAX_SECONDS);
+        assert!(RUNTIME_FAILURE_LINGER.as_secs() < MAX_SECONDS);
+    }
+
+    #[test]
+    fn startup_linger_stays_short() {
+        // Failed starts must not pay the runtime linger: each failed start
+        // adds its linger without a gateway, against the rollout gate's
+        // 300 s verify deadline.
+        assert_eq!(FAILURE_LINGER, Duration::from_secs(15));
+        assert!(FAILURE_LINGER < RUNTIME_FAILURE_LINGER);
+    }
+
+    #[test]
+    fn linger_dispatches_on_failure_class() {
+        use crate::gateway_failure::FailureClass;
+        assert_eq!(
+            failure_linger(FailureClass::GatewayRuntimeFailed),
+            RUNTIME_FAILURE_LINGER
+        );
+        for class in [
+            FailureClass::StoreUnavailable,
+            FailureClass::GatewayPoolConnectFailed,
+            FailureClass::CheckpointLoadFailed,
+            FailureClass::GatewayTaskPanicked,
+        ] {
+            assert_eq!(failure_linger(class), FAILURE_LINGER, "{class:?}");
+        }
     }
 }

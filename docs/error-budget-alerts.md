@@ -88,8 +88,9 @@ page immediately rather than consuming budget:
 - `gateway_checkpoint_failures`: any increase of
   `two_bot_gateway_checkpoint_failures_total` summed over every `stage`
   between two keepalive samples pages at once (zero threshold), because
-  every checkpoint failure stops the dispatch worker. The 75 s failure
-  linger guarantees a scrape lands before the restart resets the counter.
+  every checkpoint failure stops the dispatch worker. The 75 s runtime
+  linger leaves ~9 s margin over a 60 s tick plus two 6 s probes for a scrape
+  to land before the restart resets the counter.
   Runbook: [runbook](runbook.md#alert-checkpoint-failures).
 
 None of these rules changes the burn thresholds, windows or budget above.

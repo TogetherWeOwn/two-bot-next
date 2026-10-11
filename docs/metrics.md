@@ -346,7 +346,7 @@ No Prometheus server, no new infrastructure.
 | `ticker_stale:<job>` | 15 s ticker with no success for more than 10 minutes (never-succeeded is ignored) | [ticker stale](runbook.md#alert-ticker-stale) |
 | `receiver_refusals:<family>` | refused `two_bot_internal_actions_total` outcomes rising in 3 consecutive samples per family (first sample and restarts clear the streak) | [receiver refusals](runbook.md#alert-receiver-refusals) |
 | `dispatch_drops:<lane>` | **ticket**, not page: `two_bot_dispatch_drops_total{lane}` grows in 3 consecutive completed sample windows per bounded lane; first sample is baseline, flat/reset clears, missing/invalid retains active alerts | [dispatch drops](runbook.md#alert-dispatch-drops) |
-| `gateway_checkpoint_failures` | any increase of `two_bot_gateway_checkpoint_failures_total` summed over every `stage` between samples (first sample is baseline-only; the 75 s linger guarantees a pre-exit scrape, the post-restart reset resolves) | [checkpoint failures](runbook.md#alert-checkpoint-failures) |
+| `gateway_checkpoint_failures` | any increase of `two_bot_gateway_checkpoint_failures_total` summed over every `stage` between samples (first sample is baseline-only; the 75 s runtime linger leaves ~9 s margin over a 60 s tick plus two 6 s probes for a pre-exit scrape, the post-restart reset resolves) | [checkpoint failures](runbook.md#alert-checkpoint-failures) |
 
 `dispatch_drops` covers `messages`, `interactions`, `registry`, `privileged`,
 `busy` and `reactions` independently (the Worker allowlist is pinned to Rust).
