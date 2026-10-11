@@ -1433,9 +1433,11 @@ async fn refused_creation_plan_records_a_failure_before_any_channel_is_created()
     assert!(trace.lock().unwrap().is_empty());
     assert!(worker.http.created_attributes.lock().unwrap().is_empty());
 
-    // An overwrite deny on the bot survives the grant, so the room is refused
-    // instead of created unmanageable: the guild grant holds Connect, but the
-    // creator-channel overwrite removes it before any `create` call.
+    // A creator-channel overwrite denying the bot Connect refuses the room at
+    // the creator-channel guard, before any `create` call: `prepare` checks
+    // the bot's channel permissions first, so the plan (and its grant) never
+    // runs for this fixture. The guild grant holds Connect, but the
+    // creator-channel overwrite removes it at the guard.
     let (live, store, http, trace) = fixture();
     live.upsert_channel(channel_with_overwrites(
         CREATOR,
