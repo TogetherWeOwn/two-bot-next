@@ -402,7 +402,6 @@ def run_live(args, token):
                                if e["t"] == "VOICE_CHANNEL_STATUS_UPDATE" and e["d"].get("id") == room_id]
             # Hop from our own room straight back into the creator: a member
             # doing this must get a new room, not stay in the lobby.
-            mark = len(s.events)
             s.voice(args.guild, args.creator)
             again = s.pump(landed((room_id,)), time.monotonic() + args.create_within)
             obs["rejoin_room_id"] = again["d"]["channel_id"] if again else None

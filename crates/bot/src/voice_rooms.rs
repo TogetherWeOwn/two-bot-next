@@ -611,8 +611,6 @@ impl RoomPersistence for PgRoomStore {
     }
 }
 
-/// Wall clock in Unix seconds for the durable create admission; a clock
-/// before the epoch reads as 0.
 /// Temp-voice create admission (Auto-Voice parity): one room per member
 /// (rooms the member just left do not count, see
 /// `GuildRoomWorker::rooms_left_by`), 40 per guild, no cooldown. The rolling
@@ -623,6 +621,8 @@ fn temp_voice_admission() -> CreateAdmissionConfig {
     CreateAdmissionConfig::new(1, 40, 0).expect("temp-voice admission limits are in range")
 }
 
+/// Wall clock in Unix seconds for the durable create admission; a clock
+/// before the epoch reads as 0.
 fn unix_now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2682,8 +2682,6 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         true
     }
 
-    /// Replace the caps and cooldown used by the durable create admission
-    /// (legacy defaults: 1 room per member, 40 per guild, 30 s cooldown).
     /// The member's tracked rooms that hold no human and expect no move: the
     /// rooms they just left for a creator, about to be deleted. Claims pass
     /// them so a member hopping from their own room back into the creator gets
@@ -2704,6 +2702,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         rooms
     }
 
+    /// Replace the caps and cooldown used by the durable create admission
+    /// (legacy defaults: 1 room per member, 40 per guild, 30 s cooldown).
     pub fn set_admission_config(&mut self, config: CreateAdmissionConfig) {
         self.admission = config;
     }

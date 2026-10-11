@@ -11,12 +11,14 @@ creator) and asserts:
 
 | Check | Pass condition |
 |---|---|
-| create | a new room appears in the creator's category and the test bot is moved in |
+| create | a new room appears in the creator's category |
+| moved | the test bot lands in that new room after joining the creator |
 | name | the room is created already carrying a template name, not the `<display>'s room` fallback |
 | position | the room is directly below its creator, or below the creator's existing rooms when some are open (matching the placement planner) |
 | owner | the room has a member overwrite for the joiner allowing View, Connect and Manage Channels |
 | status | a voice-channel status line is set on the room |
-| delete | after the test bot leaves, the room is deleted within the empty grace |
+| rejoin | the test bot hops from that room straight back into the creator, and a second new room appears and it is moved into that room (a member must never stay in the lobby) |
+| delete | after the test bot leaves, every room it was moved into (the first room and the rejoin room) is deleted within the empty grace |
 | metrics | optional: `two_bot_voice_names_total{outcome="created_with_template"}` grows (SKIP without a metrics token) |
 
 The script refuses (exit 2, no request sent) unless the guild is TWO Staging

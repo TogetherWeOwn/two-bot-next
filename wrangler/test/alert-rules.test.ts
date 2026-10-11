@@ -183,6 +183,23 @@ test("voice failures fire on the lifecycle-drill failure exposition, silent on h
   assert.deepEqual(ev(healthy).firing, []);
 });
 
+test("admission refusals never page voice failures, but a real failure storm still does", () => {
+  const base = ev([`two_bot_voice_operations_total{op="create",outcome="success"} 3`]);
+  // One member hopping between their room and the creator: three more creates
+  // succeed while ten admission refusals land in the same window.
+  const hopping = ev([
+    `two_bot_voice_operations_total{op="create",outcome="success"} 6`,
+    `two_bot_voice_operations_total{op="create",outcome="refused"} 10`,
+  ], base.state);
+  assert.deepEqual(hopping.firing, []);
+  const storm = ev([
+    `two_bot_voice_operations_total{op="create",outcome="success"} 6`,
+    `two_bot_voice_operations_total{op="create",outcome="discord"} 7`,
+    `two_bot_voice_operations_total{op="create",outcome="refused"} 10`,
+  ], base.state);
+  assert.deepEqual(storm.firing, ["voice_failures"]);
+});
+
 test("voice failures ignore trickles and restarts, fire on lone dead-letters/orphans", () => {
   const base = ev([`two_bot_voice_operations_total{op="create",outcome="success"} 42`]);
   // One failure in 43 ops (2.3%) is a trickle, not a storm.
