@@ -4,15 +4,17 @@
 
 The container source integrates an opt-in private `POST /internal/actions`
 listener with the durable store, announcement executor, event-read,
-event-mutation, settings, moderation, membership and channel-moderation
-executors, nonce-commit authentication capability and strict receiver
-configuration. It supports `announcement.post`, the keyless `event.read`
+event-mutation, settings, automations, moderation, membership and
+channel-moderation executors, nonce-commit authentication capability and strict
+receiver configuration. It supports `announcement.post`, the keyless `event.read`
 (behind `TWO_INTERNAL_ALLOW_EVENT_READ`), `event.upsert` and `event.cancel`
-(cancel behind `TWO_INTERNAL_ALLOW_EVENT_CANCEL`),
-`settings.get`/`settings.set` (behind `TWO_INTERNAL_ALLOW_SETTINGS`), the
-restrictive member verbs `moderation.ban`, `moderation.tempban`,
-`moderation.kick`, `moderation.warn` and `moderation.timeout`, the membership
-pair (`role.assign` through the allowlisted role-key map, `guild.add_member`
+(cancel behind `TWO_INTERNAL_ALLOW_EVENT_CANCEL`), `settings.get`/`settings.set`
+(behind `TWO_INTERNAL_ALLOW_SETTINGS`), the automations pair
+`automations.export` (keyless redacted read) / `automations.import` (claimed
+transactional import), the restrictive member verbs `moderation.ban`,
+`moderation.tempban`, `moderation.kick`, `moderation.warn` and
+`moderation.timeout`, the membership pair (`role.assign` through the
+allowlisted role-key map, `guild.add_member`
 behind its own allowlist flag with a transient OAuth token), and the
 channel-moderation verbs (`moderation.purge`, `moderation.slowmode`,
 `moderation.lockdown`, `moderation.unlock`), regardless of the core action

@@ -17,8 +17,9 @@ name: deploy-staging
 # `deploy-staging` is not a required check, so a workflow-level filter cannot
 # strand a PR. scripts/ci/test_workflows.py pins this list against sample
 # runtime paths; the same non-runtime set is vetted in scripts/container-inputs.py.
-# Consequence: `deploy-production` needs a green run on its exact SHA, so pin
-# the latest runtime-affecting commit, or dispatch this workflow for a docs head.
+# Consequence: `deploy-production` needs a green run on its exact SHA. With an
+# empty `sha` it promotes the latest successful run's commit automatically; to
+# deploy a docs-only head, dispatch this workflow for it first.
 on:
   push:
     branches: [main]

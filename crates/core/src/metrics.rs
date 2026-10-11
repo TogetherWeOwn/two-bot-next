@@ -116,6 +116,30 @@ pub const DB_ERROR_OPS: &[&str] = &["admission", "other"];
 /// `other`. Failed `complete()`/`extend()` storage writes count only in
 /// db_errors: the admit decision was already recorded.
 pub const SEND_ADMISSION_OUTCOMES: &[&str] = &["admitted", "blocked", "storage_error", "other"];
+/// Verdict-refused prefix triggers (TOG-19932): a prefix candidate refused by
+/// the automod verdict before any trigger lookup. `verdict` is the only
+/// production reason today; unknown reasons collapse to `other`. Unmatched
+/// content (no trigger) never increments this family.
+pub const PREFIX_TRIGGER_REFUSED_REASONS: &[&str] = &["verdict", "other"];
+/// Automatic room-name decisions for `two_bot_voice_names_total{outcome}`:
+/// a room created already carrying its template name; each template render
+/// (`proposed`, `unchanged`, `waiting_for_name`, `blocked`, `channel_unseen`);
+/// and each queued rename at dispatch (`rename_sent`, or why it was dropped
+/// or held). Unknown outcomes collapse to `other`.
+pub const VOICE_NAME_OUTCOMES: &[&str] = &[
+    "created_with_template",
+    "proposed",
+    "unchanged",
+    "waiting_for_name",
+    "blocked",
+    "channel_unseen",
+    "rename_sent",
+    "rename_stale",
+    "rename_unseen",
+    "rename_no_access",
+    "rename_held",
+    "other",
+];
 /// Vote-kick outcomes for `two_bot_voice_vote_kick_total{outcome}` (M4.30):
 /// one `started` per successful `kick_start`, one refusal code per refused
 /// `kick_start` (the worker-level `evidence_unavailable` / `not_a_room` plus
@@ -301,8 +325,10 @@ struct Values {
     voice_compensation: u64,
     voice_orphans: u64,
     voice_vote_kick: [u64; VOICE_VOTE_KICK_OUTCOMES.len()],
+    voice_names: [u64; VOICE_NAME_OUTCOMES.len()],
     db_errors: [u64; DB_ERROR_OPS.len()],
     send_admissions: [u64; SEND_ADMISSION_OUTCOMES.len()],
+    prefix_trigger_refused: [u64; PREFIX_TRIGGER_REFUSED_REASONS.len()],
     dispatch_drops: [u64; DISPATCH_LANES.len()],
     checkpoint_failures: [u64; CHECKPOINT_FAILURE_STAGES.len()],
     internal_actions: [[u64; INTERNAL_ACTION_OUTCOMES.len()]; INTERNAL_ACTION_FAMILIES.len()],
@@ -489,6 +515,16 @@ impl Metrics {
         *counter = counter.saturating_add(1);
     }
 
+    /// One automatic room-name decision (see [`VOICE_NAME_OUTCOMES`]).
+    pub fn voice_name(&self, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.voice_names[bounded_index(outcome, VOICE_NAME_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
     /// One untracked creator-channel orphan needing manual deletion after
     /// failed `/create` compensation (TOG-13543). No channel ID is retained.
     pub fn voice_orphan(&self) {
@@ -519,6 +555,20 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let counter = &mut values.send_admissions[bounded_index(outcome, SEND_ADMISSION_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One verdict-refused prefix trigger (TOG-19932). Call once on the
+    /// refusal arm only: the automod verdict refused the create before any
+    /// trigger lookup. Unmatched content (no trigger) never calls this.
+    /// Unknown reasons collapse to `other`.
+    pub fn prefix_trigger_refused(&self, reason: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.prefix_trigger_refused
+            [bounded_index(reason, PREFIX_TRIGGER_REFUSED_REASONS)];
         *counter = counter.saturating_add(1);
     }
 
@@ -771,6 +821,19 @@ impl Metrics {
         }
         header(
             &mut out,
+            "two_bot_voice_names_total",
+            "counter",
+            "Automatic room-name decisions: created with the template name, template renders by outcome, and queued renames sent or dropped at dispatch.",
+        );
+        for (outcome, count) in VOICE_NAME_OUTCOMES.iter().zip(values.voice_names) {
+            writeln!(
+                out,
+                "two_bot_voice_names_total{{outcome=\"{outcome}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
             "two_bot_db_errors_total",
             "counter",
             "Storage-layer failures by bounded operation; pool gauges are pressure, this is errors.",
@@ -788,6 +851,22 @@ impl Metrics {
             writeln!(
                 out,
                 "two_bot_send_admissions_total{{outcome=\"{outcome}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_gateway_prefix_trigger_refused_total",
+            "counter",
+            "Prefix candidates refused by the automod verdict before any trigger lookup, by bounded reason.",
+        );
+        for (reason, count) in PREFIX_TRIGGER_REFUSED_REASONS
+            .iter()
+            .zip(values.prefix_trigger_refused)
+        {
+            writeln!(
+                out,
+                "two_bot_gateway_prefix_trigger_refused_total{{reason=\"{reason}\"}} {count}"
             )
             .unwrap();
         }
@@ -916,6 +995,7 @@ mod tests {
             metrics.job_failure(&hostile);
             metrics.db_error(&hostile);
             metrics.send_admission(&hostile);
+            metrics.prefix_trigger_refused(&hostile);
             metrics.dispatch_drop(&hostile);
             metrics.voice_vote_kick(&hostile);
             metrics.checkpoint_failure(&hostile);
@@ -1080,6 +1160,47 @@ mod tests {
         assert!(text.contains("two_bot_send_admissions_total{outcome=\"storage_error\"} 1\n"));
         assert!(text.contains("two_bot_send_admissions_total{outcome=\"other\"} 0\n"));
         // Fixed cardinality: 2 db-error ops + 4 admission outcomes.
+        let mut series = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, value) = line.rsplit_once(' ').unwrap();
+            assert!(series.insert(key), "duplicate series: {key}");
+            assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
+    }
+
+    #[test]
+    fn prefix_trigger_refusals_stay_bounded_and_saturate() {
+        // TOG-19932: verdict refusals count separately from unmatched content.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(
+            text.contains("two_bot_gateway_prefix_trigger_refused_total{reason=\"verdict\"} 0\n")
+        );
+        assert!(text.contains("two_bot_gateway_prefix_trigger_refused_total{reason=\"other\"} 0\n"));
+        metrics.prefix_trigger_refused("verdict");
+        metrics.prefix_trigger_refused("verdict");
+        metrics.prefix_trigger_refused("hostile\"\\\nlabel");
+        let text = metrics.render(None);
+        assert!(
+            text.contains("two_bot_gateway_prefix_trigger_refused_total{reason=\"verdict\"} 2\n")
+        );
+        assert!(text.contains("two_bot_gateway_prefix_trigger_refused_total{reason=\"other\"} 1\n"));
+        assert!(!text.contains("hostile"));
+        {
+            let mut values = metrics.0.lock().unwrap();
+            values.prefix_trigger_refused = [u64::MAX, u64::MAX];
+        }
+        metrics.prefix_trigger_refused("verdict");
+        metrics.prefix_trigger_refused("other");
+        let text = metrics.render(None);
+        assert!(text.contains(&format!(
+            "two_bot_gateway_prefix_trigger_refused_total{{reason=\"verdict\"}} {}\n",
+            u64::MAX
+        )));
+        assert!(text.contains(&format!(
+            "two_bot_gateway_prefix_trigger_refused_total{{reason=\"other\"}} {}\n",
+            u64::MAX
+        )));
         let mut series = std::collections::HashSet::new();
         for line in text.lines().filter(|line| !line.starts_with('#')) {
             let (key, value) = line.rsplit_once(' ').unwrap();

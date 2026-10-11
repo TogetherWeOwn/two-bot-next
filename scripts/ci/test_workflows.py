@@ -20,12 +20,11 @@ JOB_INVENTORY = {
                   "rust-tests", "ignored-db-stores", "ignored-db-runtime",
                   # Compile-only libFuzzer build, gated by ci-ok like the Rust lanes.
                   "fuzz-compile"},
-    "deploy-production.yml": {"guard", "production"},
+    "deploy-production.yml": {"guard", "production", "release"},
     "deploy-staging.yml": {"deploy"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
-    "release.yml": {"release-please", "dispatch-checks", "sbom-target", "release-sbom",
-                    "attach-sbom"},
+    "release.yml": {"tag", "sbom-target", "release-sbom", "attach-sbom"},
     "staging-migrate.yml": {"plan", "claim", "apply"},
     "production-migrate.yml": {"plan", "claim", "apply"},
     # TOG-14008: manual staging-only Worker rollback drill; pinned shape below.
@@ -1638,9 +1637,11 @@ class WorkflowTests(unittest.TestCase):
                         expected = {"contents": "read", "actions": "read"}
                     elif (name, job_id) == ("deploy-production.yml", "guard"):
                         expected = {"contents": "read", "actions": "read", "checks": "read"}
-                    elif (name, job_id) == ("release.yml", "release-please"):
-                        expected = {"contents": "write", "pull-requests": "write"}
-                    elif (name, job_id) == ("release.yml", "dispatch-checks"):
+                    elif (name, job_id) == ("release.yml", "tag"):
+                        # Tags the promoted commit and publishes its release.
+                        expected = {"contents": "write"}
+                    elif (name, job_id) == ("deploy-production.yml", "release"):
+                        # Only dispatches release.yml for the deployed SHA.
                         expected = {"actions": "write"}
                     elif (name, job_id) == ("release.yml", "attach-sbom"):
                         # TOG-10893: uploads verified SBOMs to the published tag.

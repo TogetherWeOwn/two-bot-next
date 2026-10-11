@@ -6,7 +6,8 @@
 
 use std::{hint::black_box, time::Duration};
 use two_bot_core::metrics::{
-    Metrics, DB_ERROR_OPS, EVENTS, JOBS, REST_ROUTES, SEND_ADMISSION_OUTCOMES,
+    Metrics, DB_ERROR_OPS, EVENTS, JOBS, PREFIX_TRIGGER_REFUSED_REASONS, REST_ROUTES,
+    SEND_ADMISSION_OUTCOMES,
 };
 
 fn rss_bytes() -> u64 {
@@ -44,6 +45,9 @@ fn main() {
     for outcome in SEND_ADMISSION_OUTCOMES {
         metrics.send_admission(outcome);
     }
+    for reason in PREFIX_TRIGGER_REFUSED_REASONS {
+        metrics.prefix_trigger_refused(reason);
+    }
     metrics.gateway_latency(Duration::from_millis(20));
     for id in 0..100_000 {
         let unknown = format!("unbounded-{id}");
@@ -53,6 +57,7 @@ fn main() {
         metrics.job_failure(&unknown);
         metrics.db_error(&unknown);
         metrics.send_admission(&unknown);
+        metrics.prefix_trigger_refused(&unknown);
         metrics.handler_duration(Duration::from_millis(id % 1000));
     }
     let mut peak = rss_bytes();

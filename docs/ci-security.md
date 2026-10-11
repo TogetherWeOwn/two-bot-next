@@ -213,9 +213,8 @@ branch protection. The existing advisory ownership policy is unchanged.
 
 ## Static audit exceptions
 
-The existing `release-please@17.6.0` API-double fixture install has one inline
-`adhoc-packages` suppression. The direct package is pinned to the release
-Action's bundled library; lifecycle scripts are disabled and its check job has
+The `release-please@17.6.0` commit-parser fixture install (commit-parse guard)
+has one inline `adhoc-packages` suppression. The direct package is pinned; lifecycle scripts are disabled and its check job has
 no write grant. Transitive dependencies remain unlocked. A future fixture
 lockfile can remove this exception; it is not an exception for deployment
 package installation.
