@@ -12,6 +12,9 @@ Two record-specific rules live here, not in the schema:
 
 * records carrying `"mock": true` are worked examples, never evidence. They
   validate only with `--allow-mock`; without it they fail closed.
+* verdict consistency: a record with any `commands[].result == "fail"` and
+  `verdict.disposition == "PASS"` is rejected. A run with a failed command
+  must be `NEEDS WORK`.
 * public-safety scan: no internal tracker IDs (`TOG-`, `PAP-`) and no
   high-confidence secret markers in any string value. This repo is public.
 
@@ -214,7 +217,36 @@ def validate(record, schema, allow_mock=False):
             "$.mock: worked example labelled mock:true is not evidence; "
             "re-run with --allow-mock only to check the template shape"
         )
+    check_verdict_consistency(record, errors)
     return errors
+
+
+def check_verdict_consistency(record, errors):
+    """Reject PASS verdicts over runs containing a failed command.
+
+    Reports paths and counts only, never command values, so a failing
+    verdict can never echo a secret-shaped field.
+    """
+    if not isinstance(record, dict):
+        return
+    verdict = record.get("verdict")
+    commands = record.get("commands")
+    if not isinstance(verdict, dict) or not isinstance(commands, list):
+        return
+    if verdict.get("disposition") != "PASS":
+        return
+    failed = [
+        index for index, command in enumerate(commands)
+        if isinstance(command, dict) and command.get("result") == "fail"
+    ]
+    if failed:
+        first = failed[0]
+        errors.append(
+            "$.verdict.disposition: PASS contradicts "
+            f"{len(failed)} failed command(s) "
+            f"(first at $.commands[{first}].result); "
+            "a run with any result=fail must be NEEDS WORK"
+        )
 
 
 def main(argv=None):
