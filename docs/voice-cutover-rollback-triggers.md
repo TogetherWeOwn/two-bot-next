@@ -240,8 +240,7 @@ The staging-migrate gate refuses-or-fails loudly by this contract:
   Operator/CEO-governed dispatch; agents cannot dispatch it).
 - Live staging practice of the §4 create/move/delete probes (blocked on
   staging returning to healthy; owned by the rehearsal follow-up).
-- Voice lifecycle outcome signals (`feat/voice-lifecycle-signals`, not on
-  main) and the rehearsal doc (`docs/voice-cutover-rehearsal`, not on
-  main) are sibling-branch work; the budgets above consume their signals
-  but do not depend on their merge.
+- Voice lifecycle outcome signals (PR #414, merged as `8b3a0b3fc`) and the
+  rehearsal doc (`docs/voice-cutover-rehearsal.md`, PR #413, merged as
+  `95172f712`) are on `main`; the budgets above consume their signals.
 - Production authorization and sequencing live on the cutover card, not here.

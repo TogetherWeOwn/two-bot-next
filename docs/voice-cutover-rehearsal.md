@@ -285,7 +285,7 @@ The staging Worker binds `TWO_VOICE = "1"` under `[env.staging.vars]` in
 `wrangler/wrangler.toml`. The var is forwarded into the container
 (`FORWARDED_FLAGS`, `wrangler/src/container-env.ts`) and `build_voice_runtime`
 attaches the voice sink to the gateway only when it is exactly `1`.
-`scripts/check-env-bindings.py` fails a top-level or production declaration,
+`wrangler/scripts/check-env-bindings.py` fails a top-level or production declaration,
 so production voice stays an Operator-approved binding.
 
 - **Order matters.** The voice store reads the migrated voice tables, so the

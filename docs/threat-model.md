@@ -447,7 +447,7 @@ approved version transition.
   The marker is a
   Worker-set deployment claim, not a verified proof, so it must never come
   from Operator input or `wrangler.toml` (rejected by
-  `scripts/check-env-bindings.py`). No private listener or network ACL was
+  `wrangler/scripts/check-env-bindings.py`). No private listener or network ACL was
   verified. The
   current Worker intentionally forwards `LISTEN_ADDR=0.0.0.0:<port>` **for
   probes only** (`wrangler/src/index.ts:105`); a public Worker proxy would still
@@ -461,7 +461,7 @@ approved version transition.
   without exactly that marker. It is dark unless the staging-only var
   `INTERNAL_ACTIONS_INGRESS` and
   the Operator secret `TWO_INTERNAL_ACTIONS` are both `1`;
-  `scripts/check-env-bindings.py` denies the var in production. The Worker bounds
+  `wrangler/scripts/check-env-bindings.py` denies the var in production. The Worker bounds
   method, path, query, content type, 2 MiB body, timeouts, header allowlist,
   per-IP and in-flight caps before the Container is touched, forwards bytes
   unchanged inside the ownership fence, and never relays Container error text or
