@@ -1,5 +1,6 @@
 """Offline cutover freeze-drill harness checks; stdlib only, no network access."""
 
+import http.server
 import io
 import json
 import os
@@ -296,7 +297,7 @@ class LiveTransportTests(unittest.TestCase):
                             call(op, **kwargs)
                         self.assertEqual(
                             str(caught.exception),
-                            f"refusing: discord answered a redirect ({status}) on {method}")
+                            "refusing: authenticated Discord request answered a redirect (not followed)")
                         self.assertEqual([(m, p) for m, p, _ in self.origin.hits],
                                          [(method, path)])
                         self.assertEqual(self.origin.hits[0][2], f"Bot {TOKEN}")
@@ -364,6 +365,123 @@ class LiveTransportTests(unittest.TestCase):
         blob = out.getvalue() + json.dumps(receipt)
         self.assertNotIn(TOKEN, blob)
         self.assertNotIn(REMOTE_SENTINEL, blob)
+
+
+class _Loopback:
+    """Isolated server that records the method, path and Authorization header."""
+
+    def __init__(self, handler_for):
+        self.hits = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def respond(self):
+                outer.hits.append((self.command, self.path, self.headers.get("Authorization")))
+                status, headers, body = handler_for(self.command, self.path)
+                self.send_response(status)
+                for key, value in headers.items():
+                    self.send_header(key, value)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_GET = do_POST = do_PATCH = do_PUT = do_DELETE = respond
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class RedirectTransportTests(unittest.TestCase):
+    """Real urllib opener and loopback transport; no Discord or Worker calls."""
+
+    def setUp(self):
+        env = mock.patch.dict(os.environ, {"NO_PROXY": "*", "no_proxy": "*",
+                                       "HTTP_PROXY": "", "http_proxy": "",
+                                       "ALL_PROXY": "", "all_proxy": ""})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def serve(self, handler_for):
+        server = _Loopback(handler_for)
+        self.addCleanup(server.close)
+        return server
+
+    def test_get_redirects_refuse_same_and_cross_origin_without_followup(self):
+        destination = self.serve(lambda method, path: (200, {}, b"DESTINATION_BODY"))
+        for status in (301, 302, 303, 307, 308):
+            for cross_origin in (False, True):
+                with self.subTest(status=status, cross_origin=cross_origin):
+                    target = destination.base + "/second" if cross_origin else "/second"
+                    origin = self.serve(lambda method, path, status=status, target=target:
+                                        (status, {"Location": target}, b"REDIRECT_BODY"))
+                    with mock.patch.object(drill, "API", origin.base):
+                        with self.assertRaises(drill.DrillError) as raised:
+                            drill.live_transport(TOKEN)("get_channel", channel_id="first")
+                    self.assertEqual(origin.hits, [("GET", "/channels/first", "Bot " + TOKEN)])
+                    self.assertEqual(destination.hits, [])
+                    self.assertEqual(str(raised.exception),
+                                     "refusing: authenticated Discord request answered a redirect (not followed)")
+                    for secret in (TOKEN, "REDIRECT_BODY", "/second", "127.0.0.1"):
+                        self.assertNotIn(secret, str(raised.exception))
+
+    def test_post_redirects_refuse_without_replaying_token_or_body(self):
+        destination = self.serve(lambda method, path: (200, {}, b"DESTINATION_BODY"))
+        for status in (301, 302, 303, 307, 308):
+            for cross_origin in (False, True):
+                with self.subTest(status=status, cross_origin=cross_origin):
+                    destination.hits.clear()
+                    target = destination.base + "/second" if cross_origin else "/second"
+                    origin = self.serve(lambda method, path, status=status, target=target:
+                                        (status, {"Location": target}, b"REDIRECT_BODY"))
+                    with mock.patch.object(drill, "API", origin.base):
+                        with self.assertRaises(drill.DrillError) as raised:
+                            drill.live_transport(TOKEN)("post_notice", channel_id="first",
+                                                        content="fixture")
+                    self.assertEqual(origin.hits,
+                                     [("POST", "/channels/first/messages", "Bot " + TOKEN)])
+                    self.assertEqual(destination.hits, [])
+                    self.assertEqual(str(raised.exception),
+                                     "refusing: authenticated Discord request answered a redirect (not followed)")
+
+    def test_other_writes_refuse_redirects_without_followup(self):
+        destination = self.serve(lambda method, path: (200, {}, b"DESTINATION_BODY"))
+        cases = (("PATCH", "patch_slowmode", {"channel_id": "first", "seconds": 30}),
+                 ("PUT", "patch_overwrite", {"channel_id": "first", "guild_id": STAGING_GUILD,
+                                              "allow": "0", "deny": "2048"}),
+                 ("DELETE", "delete_notice", {"channel_id": "first", "notice_id": "fixture"}))
+        for method, op, kwargs in cases:
+            with self.subTest(method=method):
+                origin = self.serve(lambda request_method, path:
+                                    (302, {"Location": destination.base + "/second"},
+                                     b"REDIRECT_BODY"))
+                with mock.patch.object(drill, "API", origin.base):
+                    with self.assertRaises(drill.DrillError) as raised:
+                        drill.live_transport(TOKEN)(op, **kwargs)
+                self.assertEqual(len(origin.hits), 1)
+                self.assertEqual(origin.hits[0][0], method)
+                self.assertEqual(origin.hits[0][2], "Bot " + TOKEN)
+                self.assertEqual(destination.hits, [])
+                self.assertEqual(str(raised.exception),
+                                 "refusing: authenticated Discord request answered a redirect (not followed)")
+
+    def test_healthy_and_auth_denied_controls(self):
+        origin = self.serve(lambda method, path: (401, {}, b"denied") if path.endswith("denied")
+                            else (200, {}, b'{"ok": true}'))
+        with mock.patch.object(drill, "API", origin.base):
+            call = drill.live_transport(TOKEN)
+            self.assertEqual(call("get_channel", channel_id="healthy"), {"ok": True})
+            with self.assertRaises(drill.DrillError) as raised:
+                call("get_channel", channel_id="denied")
+        self.assertEqual(str(raised.exception), "discord answered 401 on GET")
+        self.assertEqual([auth for _, _, auth in origin.hits], ["Bot " + TOKEN] * 2)
 
 
 if __name__ == "__main__":

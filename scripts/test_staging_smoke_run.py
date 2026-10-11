@@ -7,7 +7,7 @@ import re
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -62,7 +62,7 @@ class SmokeRunTests(unittest.TestCase):
             self.addCleanup(guard.stop)
         self.health_requested = []
         self.discord_requested = []
-        tmp = tempfile.TemporaryDirectory()
+        tmp = tempfile.TemporaryDirectory(dir=os.getenv("PAPERCLIP_RUN_SCRATCH_DIR"))
         self.addCleanup(tmp.cleanup)
         self.record = Path(tmp.name) / "record.json"
 
@@ -252,15 +252,62 @@ class SmokeRunTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(self.rows(self.written())["GET /readyz"]["result"], "fail")
 
-    def test_db_behind_binary_has_its_own_signature(self):
-        behind = dict(READY, components=[["process", "ready"], ["gateway", "down"],
-                                         ["database", "ready"], ["token_invalid", "ready"]],
-                      gateway_failure={"phase": "durable_gateway",
-                                       "class": "checkpoint_load_failed"})
-        code, _ = self.drive(health=self.health_fetch(readyz=(503, {}, json.dumps(behind).encode())))
+    def test_checkpoint_read_failure_has_an_observed_step_signature(self):
+        failed_read = dict(READY, components=[["process", "ready"], ["gateway", "down"],
+                                              ["database", "ready"], ["token_invalid", "ready"]],
+                           gateway_failure={"phase": "durable_gateway",
+                                            "class": "checkpoint_load_failed"})
+        code, out = self.drive(health=self.health_fetch(
+            readyz=(503, {}, json.dumps(failed_read).encode())))
         self.assertEqual(code, 1)
-        self.assertEqual(self.rows(self.written())["GET /readyz"]["failure_signature"],
-                         smoke.SIGNATURE_DB_BEHIND)
+        record = self.written()
+        row = self.rows(record)["GET /readyz"]
+        self.assertEqual(record["verdict"]["disposition"], "NEEDS WORK")
+        self.assertEqual(row["failure_signature"], smoke.SIGNATURE_CHECKPOINT_READ)
+        self.assertIn("checkpoint read failed", row["actual"])
+        self.assertIn("root cause unverified", row["actual"])
+        for text in (out, json.dumps(record)):
+            self.assertNotIn("db-behind-binary", text)
+            self.assertNotIn("SMOKE-READYZ-DB-BEHIND", text)
+            self.assertNotIn("migrate before", text)
+
+    def test_contradictory_checkpoint_class_keeps_the_generic_signature(self):
+        for status, gateway, expected in ((200, "down", 503), (503, "ready", 200)):
+            with self.subTest(status=status, gateway=gateway):
+                contradictory = dict(
+                    READY, components=[["process", "ready"], ["gateway", gateway],
+                                       ["database", "ready"], ["token_invalid", "ready"]],
+                    gateway_failure={"phase": "durable_gateway",
+                                     "class": "checkpoint_load_failed",
+                                     "detail": "sensitive-fixture-detail"})
+                code, out = self.drive(health=self.health_fetch(
+                    readyz=(status, {}, json.dumps(contradictory).encode())))
+                self.assertEqual(code, 1)
+                record = self.written()
+                row = self.rows(record)["GET /readyz"]
+                self.assertEqual(record["verdict"]["disposition"], "NEEDS WORK")
+                self.assertEqual(row["result"], "fail")
+                self.assertEqual(row["failure_signature"], smoke.SIGNATURE_READYZ)
+                self.assertIn(f"contradicts the component breakdown (expected {expected})",
+                              row["actual"])
+                self.assertEqual(self.rows(record)["readyz build identity"]["result"], "pass")
+                for text in (out, json.dumps(record)):
+                    self.assertNotIn(smoke.SIGNATURE_CHECKPOINT_READ, text)
+                    self.assertNotIn("checkpoint read failed", text)
+                    self.assertNotIn("root cause unverified", text)
+                    self.assertNotIn("sensitive-fixture-detail", text)
+
+    def test_ready_checkpoint_class_does_not_create_a_failure_signature(self):
+        ready = dict(READY, gateway_failure={"phase": "durable_gateway",
+                                            "class": "checkpoint_load_failed"})
+        code, _ = self.drive(health=self.health_fetch(
+            readyz=(200, {}, json.dumps(ready).encode())))
+        self.assertEqual(code, 0)
+        record = self.written()
+        self.assertEqual(record["verdict"]["disposition"], "PASS")
+        row = self.rows(record)["GET /readyz"]
+        self.assertEqual(row["result"], "pass")
+        self.assertNotIn("failure_signature", row)
 
     def test_build_revision_mismatch_fails(self):
         code, _ = self.drive(extra=("--expected-sha", OTHER_SHA, "--deploy-run-id", "42"))
@@ -349,6 +396,45 @@ class SmokeRunTests(unittest.TestCase):
                 self.assertNotIn(TOKEN, out)
                 if self.record.exists():
                     self.assertNotIn(TOKEN, self.record.read_text(encoding="utf-8"))
+
+    def test_invalid_record_never_echoes_secret_shaped_tester(self):
+        for prefix in ("gh" + "p_", "xox" + "b-", "BEGIN " + "PRIVATE KEY "):
+            with self.subTest(kind=prefix.split()[0]):
+                sentinel = prefix + "SyntheticPayloadNeverEcho42"
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    code, out = self.drive(extra=("--tester", sentinel))
+                self.assertEqual(code, 1)
+                self.assertIn("record invalid: $.tester.identity: public-safety scan hit ", out)
+                for text in (out, err.getvalue()):
+                    self.assertFalse(sentinel in text, "secret-shaped sentinel leaked")
+                    self.assertFalse("SyntheticPayloadNeverEcho42" in text, "secret payload leaked")
+                self.assertFalse(self.record.exists())
+                record = smoke.build_record(smoke.parse_args([
+                    "--guild-id", STAGING_GUILD, "--tester", sentinel,
+                    "--expected-sha", SHA, "--deploy-run-id", "42",
+                ]), smoke.Run(), smoke.utc(), smoke.utc())
+                errors = smoke.validate_record(record)
+                self.assertFalse(sentinel in "\n".join(errors), "returned errors leaked sentinel")
+
+    def test_duplicate_schema_fails_without_echo_or_record_write(self):
+        sentinel = "gh" + "p_" + "SyntheticPayloadNeverEcho42"
+        schema = self.record.with_name("schema.json")
+        schema.write_text('{"properties":{"notes":{"type":' + json.dumps(sentinel)
+                          + ',"type":"string"}}}', encoding="utf-8")
+        err = io.StringIO()
+        with mock.patch.object(check_run_record, "DEFAULT_SCHEMA", schema), redirect_stderr(err):
+            errors = smoke.validate_record({})
+            code, out = self.drive()
+        self.assertEqual(errors, [
+            "cannot load schema: $.properties.notes.type: duplicate object key",
+        ])
+        self.assertEqual(code, 1)
+        self.assertIn("record invalid: " + errors[0], out)
+        for text in (out, err.getvalue(), "\n".join(errors)):
+            self.assertFalse(sentinel in text, "secret-shaped sentinel leaked")
+            self.assertFalse("SyntheticPayloadNeverEcho42" in text, "secret payload leaked")
+        self.assertFalse(self.record.exists())
 
     def test_record_is_public_safe(self):
         self.drive(extra=("--expected-sha", SHA))
