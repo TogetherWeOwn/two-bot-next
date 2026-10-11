@@ -61,8 +61,10 @@ first run. A zero success timestamp does not distinguish a parked, never-started
 still-running or always-failing job; use `/readyz` job status for that distinction.
 
 Starts, skipped busy deadlines and shutdown cancellation are not completed
-outcomes. A returned `Ok(())` is a success even when the job is a gated/no-op tick;
-these counters measure scheduler health, not business events or changed rows.
+outcomes. A returned `Ok(())` is a success even when the job is a gated/no-op tick,
+including a feed inner poll skipped by the live interval gate; each such success
+resets that job's consecutive-failure streak. These counters measure scheduler
+health, not business events or changed rows.
 Failures preserve the previous success timestamp. The supervisor's `/readyz`
 status uses milliseconds; metrics convert the same completion sample to seconds.
 Errors and panic payloads are never labels.
@@ -73,19 +75,26 @@ The fixed job allowlist also retains `session_checkpoint`, `invite_snapshot` and
 not a scheduled-job count and its failures are not instrumented here.
 `invite_snapshot` remains zero until a real caller records a completion. Unknown
 job names share the `other` counters, timestamp and failure streak; an unknown
-success resets that shared streak. `feeds` and `self_role_recovery` have independent
-counters, timestamps and streaks: success in either cannot clear failures or change
-last-success in the other or in `other`. Add new scheduled names to the compile-time
-allowlist, never to a dynamic label map. The supervisor fixture checks the current
-website/community, audit, scheduled-message, feed and self-role recovery names
-against that allowlist.
+success resets that shared streak. Two known registered jobs still share `other`
+as a deferred follow-up: `member_unban_sweep` (30 s) and `automod_expiry` (60 s,
+only when `TWO_AUTOMOD=1`); either success resets the shared `other` streak until
+#788 lands, so `other` is not an unknown-name-only fallback in this slice.
+`feeds` and `self_role_recovery` have independent counters, timestamps and streaks:
+success in either cannot clear failures or change last-success in the other or in
+`other`. Add new scheduled names to the compile-time allowlist, never to a dynamic
+label map. The supervisor fixture checks the current website/community, audit,
+scheduled-message, feed and self-role recovery names against that allowlist.
 
 No scheduler or registration gate changes are implied by these labels. Feed
 supervisor cadence is the boot-configured interval (default 300 s, range
 60–86,400 s); live interval changes gate polling inside those fixed opportunities.
-A skipped inner poll returns success. Self-role recovery runs every 30 s with
-0–5 s startup jitter and a 25 s timeout; a successful sweep need not settle every
-pending repair. Neither job's last-success timestamp is business-delivery proof.
+A skipped inner poll returns success and resets the `feeds` consecutive-failure
+streak, so `job_consecutive_failures:feeds` is reliable only while the live
+interval is at most the boot cadence; with a live interval at least twice the boot
+cadence each failed real poll is followed by a skipped tick that zeroes the streak
+before it can reach 3. Self-role recovery runs every 30 s with 0–5 s startup jitter
+and a 25 s timeout; a successful sweep need not settle every pending repair. Neither
+job's last-success timestamp is business-delivery proof.
 Executor calls already record REST metrics wherever the executor is used; other
 REST clients are not silently claimed as covered.
 
@@ -398,13 +407,18 @@ Rust `*_INTERVAL_MS / 1000`. The 15 s tickers (`scheduled_messages`,
 window instead: at two intervals a 15 s cadence would flap on a single slow
 scrape, and skipped busy deadlines are neither success nor failure, so
 `job_stale` and `job_consecutive_failures` cannot see a wedged ticker.
-`invite_snapshot`, `session_checkpoint` and `other` have no cadence and are
-exempt; `audit_retry` stays exempt with its parked/halt reason. `feeds` is exempt
-because its cadence is configurable and successful gated ticks are not polling
-freshness. `self_role_recovery` retains failure-only alerting: twice its 30 s
-cadence is too close to the ~60 s scrape interval for safe `job_stale` paging,
-and this label-isolation change adds no ticker-staleness policy. Both new labels
-still trigger `job_consecutive_failures` independently at three completed failures.
+`invite_snapshot` and `session_checkpoint` have no cadence and are exempt;
+`other` is exempt but currently also covers two known deferred jobs
+(`member_unban_sweep` at 30 s and `automod_expiry` at 60 s), so it has no single
+cadence until #788 gives them independent labels. `audit_retry` stays exempt with
+its parked/halt reason. `feeds` is exempt because its cadence is configurable and
+successful gated ticks are not polling freshness; its failure alerting is reliable
+only while the live interval is at most the boot cadence, since skipped gated ticks
+return success and reset the streak. `self_role_recovery` retains failure-only
+alerting: twice its 30 s cadence is too close to the ~60 s scrape interval for safe
+`job_stale` paging, and this label-isolation change adds no ticker-staleness policy.
+`self_role_recovery` triggers `job_consecutive_failures` independently at three
+completed failures; `feeds` does the same within its live-interval limit above.
 A wedged sweep with no completions remains a staleness-coverage gap.
 `wrangler/test/alert-job-catalog.test.ts` checks website/community cadence catalogs
 and direct feed/self-role job producers. It fails when a registered producer is

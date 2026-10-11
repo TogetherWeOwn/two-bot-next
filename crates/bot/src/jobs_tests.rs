@@ -341,6 +341,9 @@ async fn shutdown_while_waiting_for_status_lock_never_starts_an_attempt() {
     }
 }
 
+/// Deferred: `member_unban_sweep` and `automod_expiry` still share `other` until
+/// #788 gives them independent labels; this fixture covers this slice's
+/// website/community, audit, scheduled-message, feed and self-role names only.
 #[tokio::test(start_paused = true)]
 async fn every_registered_job_reports_success_in_seconds() {
     let names: Vec<_> = crate::website_jobs::NAMES

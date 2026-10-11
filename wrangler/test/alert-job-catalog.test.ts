@@ -25,8 +25,8 @@ const metricsMd = read("docs/metrics.md");
 const STALE_EXEMPT = new Map<string, string>([
   ["invite_snapshot", "no periodic caller; stays zero until a real caller records a completion"],
   ["session_checkpoint", "event-driven: one success per durable gateway commit, not a scheduled tick"],
-  ["other", "catch-all for unknown job names; unrelated jobs share it, so no single cadence exists"],
-  ["feeds", "boot-configured supervisor cadence (60–86400 s) with a live-configurable inner polling gate; skipped polls return success, so neither a fixed Worker cadence nor a last-success timestamp measures feed delivery freshness"],
+  ["other", "bounded fallback; currently also covers two known deferred jobs (member_unban_sweep, automod_expiry) until #788, so no single cadence exists"],
+  ["feeds", "boot-configured supervisor cadence (60–86400 s) with a live-configurable inner polling gate; skipped polls return success and reset the consecutive-failure streak, so failure alerting is reliable only while the live interval is at most the boot cadence; neither a fixed Worker cadence nor a last-success timestamp measures feed delivery freshness"],
   ["self_role_recovery", "30 s recovery sweep with 0–5 s jitter and a 25 s timeout; two intervals are too close to the ~60 s scrape cadence for safe job_stale paging. This label-only slice retains failure-only alerting rather than adding ticker_stale policy; a successful sweep need not settle every repair"],
   ["audit_retry", "stays exempt from ticker_stale: 30 s supervisor sweep with parked/halt reporting in audit_runtime.rs (parked when unconfigured, halt claims nothing); a wedged sweep that keeps failing surfaces via job_consecutive_failures, and a halted sweep is intentional, not a wedge; not registered through the website/community schedulers this catalog parses"],
 ]);
