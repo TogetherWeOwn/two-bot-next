@@ -22,6 +22,30 @@ creator) and asserts:
 The script refuses (exit 2, no request sent) unless the guild is TWO Staging
 and the creator is the staging Create a Lobby channel.
 
+## Response size cap
+
+Every HTTP response the script reads is bounded at `MAX_BODY_BYTES` (64 KiB,
+the same cap as `scripts/staging_probe.py`). That covers the Discord REST reads
+(`rest`) and the staging `/ops/metrics` read (`metrics_value`), on success and
+on HTTP error status alike. The gateway WebSocket is not an HTTP body and is
+outside this cap.
+
+- Each read takes at most `MAX_BODY_BYTES + 1` bytes, so one extra byte exposes
+  a hidden suffix without buffering an unbounded body.
+- A body of exactly 64 KiB passes. Anything longer is refused before it is
+  decoded or parsed, so the extra byte never reaches a successful JSON path.
+- The refusal is a `BodyTooLarge` error with a fixed message: `Discord REST read
+  answered over the body cap` or `metrics read answered over the body cap`. It
+  never echoes the body, headers, URL or a parse exception.
+- A refused read fails the run: the `run` check reports `FAIL` with that fixed
+  message, the evidence JSON still uploads, and the script exits 1. The
+  workflow's single retry applies as for any other failure.
+- A metrics read that answers an in-cap error status stays optional (`metrics`
+  reports SKIP). Only an over-cap body is a failure.
+
+The offline suite (`scripts/test_staging_voice_synthetic.py`) pins the cap, the
+exact-cap pass, the cap-plus-one refusal on both paths and the fixed messages.
+
 ## When it runs
 
 - After every `deploy-staging` run (job `voice-synthetic`). A failure fails the
