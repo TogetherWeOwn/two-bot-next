@@ -20,7 +20,7 @@ high-rate event without a cap row fails the suite.
   guild/member/channel ID, token, query string, body or message content ever
   becomes a label or a log field.
 
-## Cardinality budget: 423 samples
+## Cardinality budget: 431 samples
 
 `GET /metrics` renders this many non-comment samples from process start,
 before any traffic. Adding any series fails the pinned count until this
@@ -33,7 +33,7 @@ table and the test are updated together.
 | `two_bot_gateway_latency_seconds` | 1 | gauge, `NaN` until measured |
 | `two_bot_handler_duration_seconds` | 11 | 8 buckets + `+Inf` + sum + count |
 | `two_bot_rest_requests_total{route,result}` | 174 | 29 route templates x 6 results |
-| job runs, timestamps, failure streaks | 48 | 12 jobs x (2 outcomes + timestamp + streak) |
+| job runs, timestamps, failure streaks | 56 | 14 jobs x (2 outcomes + timestamp + streak) |
 | voice ops, reconcile, dead-letters, state | 31 | 3x5 ops + 4 reconcile + 9 dead-letter + tracked + compensation + orphans |
 | pool gauges | 4 | configured, size, idle, max |
 | `two_bot_db_errors_total{op}` | 2 | `admission`, `other` |
@@ -103,7 +103,9 @@ So shedding means doing less work per dispatch, in this order:
    volume.
 5. Voice reconcile detail (plan counts only; outcomes stay counted).
 6. Never shed: session lifecycle lines, checkpoint commits, disconnect and
-   missed-events counters, failure classes, or the `other` catchall.
+   missed-events counters, failure classes, or the `other` catchall. `feeds`
+   and `self_role_recovery` completion metrics also never shed; park these
+   jobs only through their existing feature configuration, not the log guard.
 
 The send-admission `blocked` counter is the pipeline's own shed meter:
 refused admits are counted per bounded outcome, never silently dropped,
