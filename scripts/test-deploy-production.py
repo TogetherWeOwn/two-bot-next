@@ -313,6 +313,11 @@ class StaticGuardTests(unittest.TestCase):
             self.assertNotIn("secrets.", text)
             self.assertNotIn("token", text.lower())
 
+    def test_gate_prints_remote_bodies_only_as_escaped_excerpts(self):
+        for name in ("health", "readyz"):
+            self.assertNotIn(f'cat "${name}"', GATE)
+            self.assertIn(f'production_deploy.py excerpt --body "${name}"', GATE)
+
     def test_takeover_steps_run_only_when_requested_with_production_bindings(self):
         names = [step[0].strip() for step in steps(JOBS["production"])]
         preflight = "- name: Require production ownership-control configuration"
@@ -985,13 +990,14 @@ class ShellStepTests(unittest.TestCase):
                 ["bash", "--noprofile", "--norc", "-eo", "pipefail", str(step)],
                 cwd=cwd, env=run_env, capture_output=True, text=True, timeout=120,
             )
-            return result.returncode, summary.read_text() if summary.exists() else ""
+            return (result.returncode, summary.read_text() if summary.exists() else "",
+                    result.stdout + result.stderr)
 
     def gate(self, routes, mode="deploy", sha=SHA, run_id="700", attempt="1"):
         with ScriptedWorker(routes) as worker:
-            code, summary = self.bash(GATE, cwd=WRANGLER_DIR, PRODUCTION_URL=worker.url,
-                                      MODE=mode, SHA=sha,
-                                      GITHUB_RUN_ID=run_id, GITHUB_RUN_ATTEMPT=attempt)
+            code, summary, _ = self.bash(GATE, cwd=WRANGLER_DIR, PRODUCTION_URL=worker.url,
+                                         MODE=mode, SHA=sha,
+                                         GITHUB_RUN_ID=run_id, GITHUB_RUN_ATTEMPT=attempt)
         return code, summary, worker
 
     def test_matching_revision_passes_ready_or_truthfully_parked(self):
@@ -1069,6 +1075,18 @@ class ShellStepTests(unittest.TestCase):
         self.assertEqual(worker.count("/readyz"), 0)
         self.assertIn("never 200", summary)
 
+    def test_hostile_readyz_body_cannot_forge_workflow_commands_in_the_log(self):
+        # A non-JSON 200 whose lines look like runner commands: the step log is
+        # stdout+stderr, and no line of it may start a workflow command.
+        body = "ok\n::error::forged by remote\n::add-mask::remote-value\n" + "B" * 4096
+        with ScriptedWorker({"/health": [(200, "{}")], "/readyz": [(200, body)]}) as worker:
+            code, summary, log = self.bash(GATE, cwd=WRANGLER_DIR, PRODUCTION_URL=worker.url,
+                                           MODE="deploy", SHA=SHA,
+                                           GITHUB_RUN_ID="700", GITHUB_RUN_ATTEMPT="1")
+        self.assertEqual(code, 1)
+        self.assertIn("roll back", summary)
+        self.assertEqual([line for line in log.splitlines() if line.startswith("::")], [], log[:400])
+
     def test_rollback_passes_the_supplied_revision_or_a_pre_stamp_target_only(self):
         cases = (
             (report(), "gateway ready", 0),
@@ -1088,7 +1106,7 @@ class ShellStepTests(unittest.TestCase):
         for url, ok in (("", False), ("http://prod.example.workers.dev", False), (staging, False),
                         (staging + "/", False), ("https://prod.example.workers.dev", True)):
             with self.subTest(url=url):
-                code, _ = self.bash(URL_CHECK, PRODUCTION_URL=url, STAGING_URL=staging)
+                code, _, _ = self.bash(URL_CHECK, PRODUCTION_URL=url, STAGING_URL=staging)
                 self.assertEqual(code == 0, ok)
 
 
@@ -1212,6 +1230,117 @@ class ReadyzVerdictTests(unittest.TestCase):
         # The rolled-back version was built by an older run: its build id is
         # not this run's, and the gate must still pass on the revision.
         self.assertEqual(self.judge("200", report(build_id="999-1"), mode="rollback")[0], 0)
+
+    def test_duplicate_build_revision_keys_are_refused_before_grading(self):
+        # Last-wins would accept the second (correct) revision with exit 0;
+        # the gate must refuse the ambiguity with a fixed single-line reason.
+        wrong = "f" * 40
+        bodies = (
+            '{"build_revision": "%s", "build_revision": "%s", "build_id": "%s"}'
+            % (wrong, SHA, BUILD_ID),
+            '{"build_revision": "%s", "build_revision": "%s", "build_id": "%s"}'
+            % (SHA, wrong, BUILD_ID),
+            '{"build_revision": "%s", "build_id": "%s", "build_id": "%s"}'
+            % (SHA, BUILD_ID, BUILD_ID),
+        )
+        for body in bodies:
+            with self.subTest(body=body[:40]):
+                for mode in ("deploy", "rollback"):
+                    code, message = self.judge("200", body, mode=mode)
+                    self.assertEqual(code, 1, message)
+                    self.assertIn("duplicate", message)
+                    self.assertNotIn("\n", message)
+
+    def test_excessive_nesting_is_refused_with_a_bounded_message(self):
+        # Iterative depth refusal: valid identity buried under deep junk
+        # must not certify, and the refusal echoes no payload bytes.
+        nested = "[" * 500 + "]" * 500
+        body = ('{"build_revision": "%s", "build_id": "%s", "payload": %s}'
+                % (SHA, BUILD_ID, nested))
+        for mode in ("deploy", "rollback"):
+            code, message = self.judge("200", body, mode=mode)
+            self.assertEqual(code, 1, message)
+            self.assertIn("deeply nested", message)
+            self.assertNotIn("\n", message)
+            self.assertNotIn("payload", message)
+
+    def test_decoder_overflow_is_refused_without_a_traceback(self):
+        # Deep enough to overflow the C JSON decoder itself, so json.loads
+        # raises RecursionError before the iterative depth check is reached.
+        body = "[" * 100000
+        for mode in ("deploy", "rollback"):
+            code, message = self.judge("200", body, mode=mode)
+            self.assertEqual(code, 1, message)
+            self.assertIn("deeply nested", message)
+            self.assertNotIn("\n", message)
+            self.assertNotIn("Traceback", message)
+
+    def test_hostile_remote_identity_never_reaches_diagnostics(self):
+        # Runtime-built marker: it cannot match a literal in the script, so
+        # its absence proves the remote value never reached the output.
+        marker = "sg%s%s%d" % ("ni", "p", id(object()))
+        evils = [
+            {"revision": SHA, "build_id": "700-1\nEXTRA LINE " + marker},
+            {"revision": SHA, "build_id": "700-1|" + marker},
+            {"revision": SHA, "build_id": "700-1\x00" + marker},
+            {"revision": SHA, "build_id": "700-1\x1b" + marker},
+            {"revision": SHA, "build_id": "1" * 40 + "-" + "1" * 40 + marker},
+            {"revision": SHA, "build_id": "ghp_" + marker + "A" * 16},
+            {"revision": SHA, "build_id": "xoxb-" + marker},
+            {"revision": "ab|cd\nef" + marker, "build_id": BUILD_ID},
+            {"revision": "ghp_" + marker + "A" * 16, "build_id": BUILD_ID},
+            {"revision": "A" * 36 + marker[:4], "build_id": BUILD_ID},
+            {"revision": SHA[:39] + "|", "build_id": BUILD_ID},
+            {"revision": SHA, "build_id": "run-1"},
+        ]
+        for evil in evils:
+            with self.subTest(revision=evil["revision"][:12], build_id=evil["build_id"][:12]):
+                body = report(revision=evil["revision"], build_id=evil["build_id"])
+                for mode in ("deploy", "rollback"):
+                    code, message = self.judge("200", body, mode=mode)
+                    self.assertEqual(code, 1, message)
+                    self.assertIn("unexpected shape", message)
+                    self.assertNotIn("\n", message)
+                    self.assertNotIn(marker, message)
+                    self.assertNotIn("|", message.split("unexpected shape")[0].split(":")[-1]
+                                     if "unexpected shape" in message else message)
+
+    def test_raw_bodies_print_as_one_bounded_escaped_line(self):
+        hostile = '{"x": "ok\n::error::forged\n::add-mask::secret\r\x1b' + "A" * 5000
+        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
+            path = Path(tmp) / "readyz.json"
+            path.write_text(hostile)
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "excerpt", "--body", str(path)],
+                capture_output=True, text=True, timeout=60,
+            )
+            missing = subprocess.run(
+                [sys.executable, str(SCRIPT), "excerpt", "--body", str(Path(tmp) / "absent.json")],
+                capture_output=True, text=True, timeout=60,
+            )
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        lines = result.stdout.splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertFalse(lines[0].startswith("::"))
+        self.assertIn("truncated", lines[0])
+        self.assertLess(len(lines[0]), 2 * 2048 + 64)
+        self.assertEqual((missing.returncode, missing.stderr), (0, ""))
+        self.assertIn("no body", missing.stdout)
+        self.assertNotIn("Traceback", missing.stdout)
+
+    def test_valid_deploy_rollback_and_unstamped_controls_still_pass(self):
+        # Shape-valid identity keeps the exact-sha/same-run, rollback and
+        # pre-stamp semantics unchanged after the hardening.
+        code, message = self.judge("200", report())
+        self.assertEqual(code, 0)
+        self.assertIn("gateway ready", message)
+        self.assertIn(BUILD_ID, message)
+        code, _ = self.judge("200", report(build_id="999-1"), mode="rollback")
+        self.assertEqual(code, 0)
+        code, message = self.judge(
+            "200", report(revision="unknown", build_id="unknown"), mode="rollback")
+        self.assertEqual(code, 0)
+        self.assertIn("pre-stamp version", message)
 
 
 if __name__ == "__main__":
