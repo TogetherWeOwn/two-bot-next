@@ -123,7 +123,7 @@ gates (`feature_commands.rs`), moderation (`moderation.rs`), onboarding
 (`onboarding.rs`), automod (`automod.rs`), scorecard and classifier
 (`community.rs`). An empty ID list never contains a live ID.
 
-Catalog entries: 122.
+Catalog entries: 123.
 
 | Key | Class | Parsed default | Application | Description |
 | --- | --- | --- | --- | --- |
