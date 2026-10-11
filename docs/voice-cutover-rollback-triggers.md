@@ -132,10 +132,12 @@ if the scraper uses Prometheus's default `honor_labels: false`, select
   counts include replays; zero sequence gaps do not certify no lost effects
   or duplicate command execution.
 
-- **Voice-route REST failures:** inspect bounded routes shared with voice:
+- **Voice-route REST failures:** inspect bounded routes shared with voice,
+  including the overwrite and channel-update routes voice rooms use for
+  private-room enforcement, renames and user limits:
 
   ```promql
-  sum by (route, result) (increase(two_bot_rest_requests_total{route=~"POST /guilds/:guild/channels|PATCH /guilds/:guild/members/:member|DELETE /channels/:channel",result=~"5xx|transport"}[15m]))
+  sum by (route, result) (increase(two_bot_rest_requests_total{route=~"POST /guilds/:guild/channels|PATCH /guilds/:guild/members/:member|DELETE /channels/:channel|PATCH /channels/:channel|PUT /channels/:channel/permissions/:overwrite|DELETE /channels/:channel/permissions/:overwrite",result=~"5xx|transport"}[15m]))
   ```
 
   Correlate with `voice_event = "voice_operation" AND outcome = "discord"`
