@@ -372,5 +372,122 @@ class HealthContractProbeTests(unittest.TestCase):
         self.assert_readyz_unreadable("repeats a component name", code, results)
 
 
+class BodyCapRefusalTests(unittest.TestCase):
+    """Oversized bodies are refused before JSON parsing (M4.42)."""
+
+    def setUp(self):
+        guard = mock.patch.object(probe.urllib.request.OpenerDirector, "open",
+                                  side_effect=AssertionError("network access in a unit test"))
+        guard.start()
+        self.addCleanup(guard.stop)
+        self.requested = []
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.evidence = str(Path(tmp.name) / "evidence.json")
+
+    def fetch(self, routes):
+        def fake(url):
+            self.requested.append(url)
+            if url not in routes:
+                raise AssertionError(f"unexpected offline fixture route: {url}")
+            response = routes[url]
+            if isinstance(response, Exception):
+                raise response
+            return response
+        return fake
+
+    def drive(self, routes, *extra, env=None):
+        out = io.StringIO()
+        argv = ["--staging-url", STAGING, "--evidence", self.evidence, *extra]
+        with mock.patch.dict(os.environ, env or {}, clear=True), \
+                redirect_stdout(out):
+            code = probe.main(argv, fetch_fn=self.fetch(routes))
+        lines = out.getvalue().splitlines()
+        named = {}
+        for line in lines[:-1]:
+            head, _, _ = line.partition(":")
+            named[head] = line
+        return code, named, lines[-1]
+
+    def padded(self, value, size):
+        raw = json.dumps(value).encode()
+        self.assertLessEqual(len(raw), size, "fixture must fit the target size")
+        return raw + b" " * (size - len(raw))
+
+    def test_exact_cap_valid_input_passes(self):
+        health = self.padded({"status": "ok"}, probe.BODY_CAP)
+        self.assertEqual(len(health), probe.BODY_CAP)
+        self.assertEqual(json.loads(health), {"status": "ok"})
+        routes = {STAGING + "/health": (200, {}, health),
+                  STAGING + "/readyz": (200, {}, json.dumps(dict(READY)).encode())}
+        code, results, _ = self.drive(routes)
+        self.assertEqual(code, 0, results)
+        self.assertEqual(set(results), {"PASS health", "PASS readyz", "PASS build"})
+
+    def test_valid_json_padded_past_cap_refuses_before_parsing(self):
+        sentinel = "SENTINEL_BODY_health_padded"
+        base = json.dumps({"status": "ok", "note": sentinel}).encode()
+        health = base + b" " * (probe.BODY_CAP + 1 - len(base))
+        self.assertEqual(len(health), probe.BODY_CAP + 1)
+        self.assertEqual(json.loads(health)["note"], sentinel)
+        routes = {STAGING + "/health": (200, {}, health),
+                  STAGING + "/readyz": (200, {}, json.dumps(dict(READY)).encode())}
+        code, results, _ = self.drive(routes)
+        self.assertEqual(code, 1, results)
+        self.assertIn("health probe answered over the body cap", results["FAIL health"])
+        self.assertNotIn(sentinel, results["FAIL health"])
+        self.assertNotIn(STAGING, results["FAIL health"])
+
+    def test_cap_length_valid_prefix_with_hidden_tail_refuses(self):
+        prefix = self.padded({"status": "ok"}, probe.BODY_CAP)
+        self.assertEqual(json.loads(prefix), {"status": "ok"})
+        routes = {STAGING + "/health": (200, {}, prefix + b"X"),
+                  STAGING + "/readyz": (200, {}, json.dumps(dict(READY)).encode())}
+        code, results, _ = self.drive(routes)
+        self.assertEqual(code, 1, results)
+        self.assertIn("health probe answered over the body cap", results["FAIL health"])
+
+    def test_readyz_httperror_oversize_enforces_the_same_bound(self):
+        import urllib.error
+        sentinel = "SENTINEL_BODY_readyz_httperror"
+        base = json.dumps(dict(READY)).encode()
+        big = base + b" " * (probe.BODY_CAP + 1 - len(base))
+        self.assertEqual(json.loads(big)["build_revision"], "abc123")
+        routes = {STAGING + "/health": body({"status": "ok"}),
+                  STAGING + "/readyz": (503, {}, big)}
+        code, results, _ = self.drive(routes)
+        self.assertEqual(code, 1, results)
+        self.assertIn("readyz probe answered over the body cap", results["FAIL readyz"])
+        self.assertNotIn(sentinel, results["FAIL readyz"])
+        # The urllib HTTPError transport also reads a bounded amount.
+        seen = []
+
+        class Response:
+            status = 200
+            headers = {}
+
+            def read(self, n):
+                seen.append(n)
+                return b"{}"
+
+            def close(self):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class Opener:
+            def open(self, request, timeout=None):
+                return Response()
+
+        with mock.patch.object(probe.urllib.request, "build_opener",
+                               return_value=Opener()):
+            probe.fetch(STAGING + "/health")
+        self.assertEqual(seen, [probe.BODY_CAP + 1])
+
+
 if __name__ == "__main__":
     unittest.main()

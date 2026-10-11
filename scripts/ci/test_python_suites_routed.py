@@ -102,7 +102,15 @@ class PythonSuiteRoutingTests(unittest.TestCase):
             workflow = fixture / ".github/workflows/check.yml"
             text = workflow.read_text()
             self.assertIn("-p 'test_rollback_readiness_probe.py'", text)
-            workflow.write_text(text.replace("-p 'test_rollback_readiness_probe.py'", "-p 'test_other.py'"))
+            # The probe is dual-routed: a discover step in the check job and a
+            # direct `python3 ../scripts/...` step in the worker job. Removing
+            # only one routing must not report it as unrouted.
+            unrouted_text = (
+                text.replace("-p 'test_rollback_readiness_probe.py'", "-p 'test_other.py'")
+                .replace("scripts/test_rollback_readiness_probe.py",
+                         "scripts/test_other.py")
+            )
+            workflow.write_text(unrouted_text)
             self.assertEqual(unrouted_suites(fixture), ["scripts/test_rollback_readiness_probe.py"])
 
 

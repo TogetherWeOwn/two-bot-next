@@ -23,6 +23,13 @@ No probe may apply a migration or test production. This probe never writes,
 follows no redirects, and sends no credentials. The only network calls
 are the two staging GETs above.
 
+Body-cap refusal contract: the transport reads at most BODY_CAP+1 bytes on
+both the normal and HTTPError paths so a hidden suffix is detected. Any body
+longer than BODY_CAP (64 KiB) is refused before JSON parsing with the fixed
+message "<name> probe answered over the body cap"; exact-cap valid input
+passes, and the extra byte never reaches a successful JSON path. Refusals
+never echo the body, headers, URL or parse exceptions.
+
 Origin fence (fail-closed, before any request): only an
 https://two-bot-next-staging.<sub>.workers.dev origin (no port, userinfo,
 path, query or fragment) is fetched; anything else -- including the
@@ -146,6 +153,8 @@ def get_json(fetch_fn, url, name):
         status, headers, body = fetch_fn(url)
     except (OSError, http.client.HTTPException) as error:
         raise ProbeError(f"{name} probe did not respond ({error.__class__.__name__})")
+    if len(body) > BODY_CAP:
+        raise ProbeError(f"{name} probe answered over the body cap")
     try:
         value = json.loads(body)
     except (ValueError, UnicodeDecodeError):
