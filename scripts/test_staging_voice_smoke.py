@@ -251,6 +251,81 @@ class VoiceSmokeTests(unittest.TestCase):
             self.assertNotIn(token, raw)
 
 
+class WorkerReadyzDuplicateTests(unittest.TestCase):
+    def report(self, *pairs):
+        return {"components": [[name, value] for name, value in pairs]}
+
+    def assert_rejected(self, status, pairs):
+        with self.assertRaisesRegex(smoke.SmokeError, "repeats a component name"):
+            smoke.parse_worker_readyz(status, self.report(*pairs))
+
+    def test_down_then_ready_rejected(self):
+        self.assert_rejected(200, [("process", "ready"), ("gateway", "down"),
+                                   ("gateway", "ready")])
+
+    def test_ready_then_down_rejected(self):
+        self.assert_rejected(503, [("process", "ready"), ("gateway", "ready"),
+                                   ("gateway", "down")])
+
+    def test_same_value_repeat_rejected(self):
+        self.assert_rejected(200, [("process", "ready"), ("gateway", "ready"),
+                                   ("process", "ready")])
+
+    def test_distinct_components_still_parse(self):
+        state = smoke.parse_worker_readyz(
+            200, self.report(("process", "ready"), ("gateway", "ready")))
+        self.assertEqual(state["gateway"], "ready")
+
+    def test_diagnostic_echoes_no_component_data(self):
+        sentinel = "SENTINEL_dup_voice_abc123"
+        with self.assertRaises(smoke.SmokeError) as ctx:
+            smoke.parse_worker_readyz(
+                503, self.report(("process", "ready"), ("gateway", "ready"),
+                                 (sentinel, "ready"), (sentinel, "down")))
+        self.assertIn("repeats a component name", str(ctx.exception))
+        self.assertNotIn(sentinel, str(ctx.exception))
+
+    def test_check_worker_rejects_duplicate_via_fetch_worker(self):
+        dup = {"components": [["process", "ready"], ["gateway", "down"],
+                              ["gateway", "ready"]]}
+        health_body = json.dumps({"status": "ok"}).encode()
+        readyz_body = json.dumps(dup).encode()
+
+        def fake_fetch_worker(url):
+            if url.endswith("/health"):
+                return 200, health_body
+            if url.endswith("/readyz"):
+                return 200, readyz_body
+            raise AssertionError(f"unexpected Worker GET {url}")
+
+        with mock.patch.object(smoke, "fetch_worker", side_effect=fake_fetch_worker):
+            results, info = smoke.check_worker("https://two-bot-next-staging.5150.workers.dev")
+        self.assertIsNone(info)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0].verdict, "pass")
+        self.assertEqual(results[1].verdict, "fail")
+        self.assertIn("repeats a component name", results[1].reason)
+        self.assertNotIn("SENTINEL", results[1].reason)
+
+    def test_check_worker_accepts_distinct_via_fetch_worker(self):
+        ok = {"components": [["process", "ready"], ["gateway", "ready"]],
+              "build_revision": "abc123"}
+        health_body = json.dumps({"status": "ok"}).encode()
+        readyz_body = json.dumps(ok).encode()
+
+        def fake_fetch_worker(url):
+            if url.endswith("/health"):
+                return 200, health_body
+            if url.endswith("/readyz"):
+                return 200, readyz_body
+            raise AssertionError(f"unexpected Worker GET {url}")
+
+        with mock.patch.object(smoke, "fetch_worker", side_effect=fake_fetch_worker):
+            results, info = smoke.check_worker("https://two-bot-next-staging.5150.workers.dev")
+        self.assertIsNotNone(info)
+        self.assertTrue(all(r.verdict == "pass" for r in results))
+
+
 class _Loopback:
     """Isolated 127.0.0.1 server that records every request it receives."""
 
