@@ -97,3 +97,17 @@ path = "fuzz_targets/slash_input_bounds.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "cutover_parse"
+path = "fuzz_targets/cutover_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lfg_select"
+path = "fuzz_targets/lfg_select.rs"
+test = false
+doc = false
+bench = false

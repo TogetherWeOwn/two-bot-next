@@ -792,6 +792,23 @@ impl PgRoomStore {
         config: &CreateAdmissionConfig,
         now_secs: i64,
     ) -> Result<CreateClaim, sqlx::Error> {
+        self.claim_create_excluding(guild_id, user_id, &[], config, now_secs)
+            .await
+    }
+
+    /// [`Self::claim_create`] with `leaving`: rooms the worker sees empty and
+    /// about to be deleted (the member just left them for the creator). They
+    /// do not count toward either cap, so hopping from your own room back into
+    /// the creator gets a new room instead of a silent `user_cap` refusal.
+    /// Burst and cooldown history is unaffected.
+    pub async fn claim_create_excluding(
+        &self,
+        guild_id: Snowflake,
+        user_id: Snowflake,
+        leaving: &[Snowflake],
+        config: &CreateAdmissionConfig,
+        now_secs: i64,
+    ) -> Result<CreateClaim, sqlx::Error> {
         if guild_id == 0 {
             return Err(invalid_argument("guild id must be nonzero"));
         }
@@ -802,12 +819,15 @@ impl PgRoomStore {
             .bind(format!("voice_create:{guild}"))
             .execute(&mut *tx)
             .await?;
+        let leaving: Vec<String> = leaving.iter().map(ToString::to_string).collect();
         let counts = sqlx::query(
             "SELECT
-               (SELECT COUNT(*) FROM voice_rooms WHERE guild_id = $1)
+               (SELECT COUNT(*) FROM voice_rooms
+                 WHERE guild_id = $1 AND channel_id <> ALL($3::text[]))
                  + (SELECT COUNT(*) FROM voice_create_reservations
                      WHERE guild_id = $1 AND settled_at IS NULL) AS rooms_in_guild,
-               (SELECT COUNT(*) FROM voice_rooms WHERE guild_id = $1 AND owner_id = $2)
+               (SELECT COUNT(*) FROM voice_rooms
+                 WHERE guild_id = $1 AND owner_id = $2 AND channel_id <> ALL($3::text[]))
                  + (SELECT COUNT(*) FROM voice_create_reservations
                      WHERE guild_id = $1 AND user_id = $2 AND settled_at IS NULL) AS owned_by_user,
                (SELECT floor(extract(epoch FROM max(created_at)))::bigint
@@ -816,6 +836,7 @@ impl PgRoomStore {
         )
         .bind(&guild)
         .bind(&user)
+        .bind(&leaving)
         .fetch_one(&mut *tx)
         .await?;
         let history = sqlx::query(

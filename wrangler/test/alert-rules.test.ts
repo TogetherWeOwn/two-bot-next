@@ -13,11 +13,15 @@ function body(extra: string[]): string {
 }
 const ev = (lines: string[], prev = EMPTY_STATE) => evaluateMetrics(parseExposition(body(lines)), prev, NOW);
 
+/** GitHub-style heading slugs for a doc's text; literal underscores survive. */
+function headingAnchors(text: string): Set<string> {
+  return new Set([...text.matchAll(/^#+ (.+)$/gm)].map((m) =>
+    m[1]!.toLowerCase().replace(/[^a-z0-9 _-]/g, "").replace(/ /g, "-")));
+}
+
 /** Heading-slug index for one checked-in doc (single definition reused below). */
 function docAnchors(doc: string): Set<string> {
-  const text = readFileSync(new URL(`../../docs/${doc}`, import.meta.url), "utf8");
-  return new Set([...text.matchAll(/^#+ (.+)$/gm)].map((m) =>
-    m[1]!.toLowerCase().replace(/[^a-z0-9 -]/g, "").replace(/ /g, "-")));
+  return headingAnchors(readFileSync(new URL(`../../docs/${doc}`, import.meta.url), "utf8"));
 }
 
 test("job stale fires only past two intervals and ignores never-succeeded", () => {
@@ -181,6 +185,25 @@ test("voice failures fire on the lifecycle-drill failure exposition, silent on h
   assert.deepEqual(ev(failing).firing, ["voice_failures"]);
   const healthy = [`two_bot_voice_operations_total{op="create",outcome="success"} 42`];
   assert.deepEqual(ev(healthy).firing, []);
+});
+
+test("admission refusals never page voice failures or dilute a real failure ratio", () => {
+  const base = ev([`two_bot_voice_operations_total{op="create",outcome="success"} 3`]);
+  // One member hopping between their room and the creator: ten creates succeed
+  // while ten admission refusals land in the same window.
+  const hopping = ev([
+    `two_bot_voice_operations_total{op="create",outcome="success"} 13`,
+    `two_bot_voice_operations_total{op="create",outcome="refused"} 10`,
+  ], base.state);
+  assert.deepEqual(hopping.firing, []);
+  // One failure in ten admitted operations is 10%: the same refusals must not
+  // dilute it below the 5% line.
+  const diluted = ev([
+    `two_bot_voice_operations_total{op="create",outcome="success"} 12`,
+    `two_bot_voice_operations_total{op="create",outcome="discord"} 1`,
+    `two_bot_voice_operations_total{op="create",outcome="refused"} 10`,
+  ], base.state);
+  assert.deepEqual(diluted.firing, ["voice_failures"]);
 });
 
 test("voice failures ignore trickles and restarts, fire on lone dead-letters/orphans", () => {
@@ -557,6 +580,11 @@ test("every rule links to an existing runbook heading", () => {
     const anchor = rule.runbook.split("#")[1]!;
     assert.ok(slugs.has(anchor), `${rule.id}: missing runbook heading for #${anchor}`);
   }
+});
+
+test("heading anchors keep literal underscores from inline-code headings", () => {
+  const slugs = headingAnchors("## Self-diagnosing gateway failures (`/readyz` `gateway_failure`)\n");
+  assert.deepEqual([...slugs], ["self-diagnosing-gateway-failures-readyz-gateway_failure"]);
 });
 
 test("job failure runbook has a first action for every fixed error class", () => {

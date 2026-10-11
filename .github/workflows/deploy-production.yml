@@ -497,13 +497,13 @@ jobs:
             code=$(curl -s --max-time 10 -H "User-Agent: $agent" -o "$health" -w '%{http_code}' "$url/health" || true)
             if [ "$code" = "200" ]; then
               echo "health 200 after ~$((i * 10))s"
-              cat "$health"
+              python3 ../scripts/production_deploy.py excerpt --body "$health"
               break
             fi
             echo "attempt $i: /health -> $code; waiting 10s"
             if [ "$i" = "30" ]; then
               echo "health never returned 200 (bindings still broken?)"
-              cat "$health" || true
+              python3 ../scripts/production_deploy.py excerpt --body "$health"
               echo "- /health: never 200; roll back" >> "$GITHUB_STEP_SUMMARY"
               exit 1
             fi
@@ -518,14 +518,14 @@ jobs:
             fi
             echo "attempt $i: /readyz -> $code; $state; waiting 10s"
             if [ "$i" = "30" ]; then
-              cat "$readyz" || true
+              python3 ../scripts/production_deploy.py excerpt --body "$readyz"
               echo "- /health 200, /readyz $code ($state); roll back" >> "$GITHUB_STEP_SUMMARY"
               exit 1
             fi
             sleep 10
           done
           echo "readyz -> $code"
-          cat "$readyz" || true
+          python3 ../scripts/production_deploy.py excerpt --body "$readyz"
           echo "$state"
           echo "- /health 200, /readyz $code ($state)" >> "$GITHUB_STEP_SUMMARY"
       # P4 (docs/cutover-production-takeover-design.md): re-read the

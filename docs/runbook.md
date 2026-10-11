@@ -115,9 +115,14 @@ observation is complete. For Rust stdout/stderr, use the affected container's
 logs in the Cloudflare dashboard. Wrangler 4.148.0 has no `containers logs`
 subcommand; do not invent one. Container inspection may list account-wide
 resources: match the affected environment/application before taking any action.
-No Cloudflare API reaches container stdout either, so voice-event emission has
-no CI read path; follow [staging voice-event verification](staging-voice-event-verification.md)
-for the dashboard procedure.
+Container stdout is also in the Workers Observability `containers` dataset, which a
+read-only `CLOUDFLARE_API_TOKEN` can query without starting the container:
+`python3 scripts/container_stdout_read.py --service <container-application-id>`
+(see [Reading container stdout](startup-diagnostics.md#reading-container-stdout)).
+That script keeps each line's message and a fixed allowlist of fields that excludes
+`voice_event`; it can find a voice line by message, and the
+[staging voice-event verification](staging-voice-event-verification.md) dashboard procedure
+reads the `voice_event` field.
 
 Rust uses JSON `tracing` logs, configured by `RUST_LOG`, fallback
 `error,two_bot={LOG_LEVEL:-info}` (dependency crates stay ERROR-only unless
@@ -275,9 +280,10 @@ series. Source: [`metrics.rs`](../crates/core/src/metrics.rs),
 
 The SQLx pool sat at its maximum with zero idle connections for three
 consecutive keepalive samples. This is pool exhaustion, a proxy for DB trouble;
-there is no DB error counter yet. It means every checkout is held — new queries
-wait rather than fail fast — not proof that the database itself is down (pool
-gauges sample SQLx bookkeeping, not DB reachability).
+recorded storage failures have a separate [DB-error alert](#alert-db-errors).
+It means every checkout is held — new queries wait rather than fail fast —
+not proof that the database itself is down (pool gauges
+sample SQLx bookkeeping, not DB reachability).
 
 First response: check the affected provider's status (PlanetScale for
 production, Neon for staging) before touching the bot; then look at recent
@@ -296,20 +302,26 @@ redeploy.
 
 #### Alert: DB errors
 
-Three or more storage-layer failures arrived between two keepalive samples
-(`two_bot_db_errors_total`, currently counting send-admission SQL; other
-stores adopt the counter incrementally). Unlike the pool rule above, this is
-errors, not pressure: queries already failed, they are not merely waiting.
-A counter reset (process restart) skips the window rather than firing, and a
-slow trickle below threshold stays silent — sustained low-rate failures
-surface instead through `job_consecutive_failures`.
+Three or more storage-layer failures arrived between two keepalive samples.
+`two_bot_db_errors_total` counts send-admission SQL failures (`op="admission"`)
+and voice actor load failures (`op="other"`); other stores adopt the counter
+incrementally, so this is not a database-wide total. Unlike the pool rule
+above, this is errors, not pressure: queries already failed, they are not
+merely waiting. A counter reset (process restart) skips the window rather
+than firing, and a slow trickle below threshold stays silent. Failed jobs
+may also surface through `job_consecutive_failures`; that rule does not
+cover every storage path.
 
 First response: check the affected provider's status (PlanetScale for
 production, Neon for staging) before touching the bot; then correlate with
 the `op` label and recent deploys (a new query path or migration can explain
-a fresh error burst). Do not run SQL probes against staging or production,
-add grants, or restart the container to "clear" the errors; a replacement
-restarts the shard without fixing the failing writes.
+a fresh error burst). For voice actor load failures, read `voice actor load
+failed; actor respawns on the next guild snapshot` in container stdout.
+Every failure increments the counter, but that warn is throttled
+process-wide to once per 300 s; its absence in a short window does not
+prove the actor loaded. Do not run SQL probes against staging or
+production, add grants, or restart the container to "clear" the errors;
+a replacement restarts the shard without fixing the failing storage path.
 
 Escalate when the burst repeats across windows, when it coincides with pool
 saturation or job-failure alerts, or when the affected provider's dashboard
@@ -351,8 +363,13 @@ orphan (an untracked creator-channel orphan needing manual deletion)
 appears — so a low-volume stranded-member failure still pages. Any outcome
 other than `success` (`category_full`, `discord`, `persistence`,
 `cancelled`) counts as a failure: the join did not place a room, or the
-move/delete did not complete. A counter reset (process restart) skips the
-window rather than firing, and a slow trickle below threshold stays silent.
+move/delete did not complete. `refused` (a room cap or create burst, per
+member or per guild) is admission policy working as designed, so it never
+pages. No installed rule watches it: read it from
+`two_bot_voice_operations_total{outcome="refused"}`, and if joins stop placing
+rooms while it climbs, look for a stuck cap (an unsettled reservation holding a
+slot). A counter reset (process restart) skips the window rather than firing,
+and a slow trickle below threshold stays silent.
 
 First response: scope the failing operation from the `op`/`outcome` labels
 on `two_bot_voice_operations_total` via the authorized `/ops/metrics`
@@ -379,10 +396,12 @@ monitoring arms only stores the baseline and never fires, and a counter
 reset (process restart) skips the window rather than firing.
 
 First response: read the paired `two_bot_gateway_disconnects_total` counter
-via the authorized `/ops/metrics` scrape — a missed-events increase with no
-disconnect means the gap predates this instrumentation or the process
-restarted mid-window (re-baseline both scrapes after it); a rise next to
-disconnects means transport loss with sequence gaps. Correlate with recent
+via the authorized `/ops/metrics` scrape. A missed-events increase without
+a disconnect increase is an unexplained same-session sequence gap, not
+proof that instrumentation predates the gap or that the process restarted.
+A rise next to disconnects warrants investigating transport loss with
+sequence gaps. Re-baseline both scrapes after a confirmed restart.
+Correlate with recent
 deploys (a fresh deploy restarts the process and resets the counter) and
 the container logs for `gateway reconnect failed; Twilight will retry` and
 `gateway ready; checkpoint committed`. Do not restart the container to

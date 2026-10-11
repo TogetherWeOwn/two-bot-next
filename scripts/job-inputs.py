@@ -149,13 +149,12 @@ PARITY_DOCS = frozenset({
     "docs/parity.md",
     "docs/parity-baseline.json",
 })
-# Docs read by both Rust tests and the worker suite: docs/metrics.md is
-# pinned by the Rust exposition-conformance test
-# (crates/core/tests/metrics_docs.rs) and by the worker event/alert catalog
-# tests (wrangler/test/event-catalog.test.ts,
-# wrangler/test/alert-job-catalog.test.ts), so its edits select both jobs.
+# Docs read by both Rust and worker code: docs/metrics.md is pinned by Rust
+# and worker tests, and startup-diagnostics.md is embedded by the Rust gateway
+# failure test and read by the worker docs listing assertion. Edits select both.
 RUST_WORKER_DOCS = frozenset({
     "docs/metrics.md",
+    "docs/startup-diagnostics.md",
 })
 WORKER_DOCS = frozenset({
     "docs/runbook.md",
@@ -195,6 +194,10 @@ WORKER_EXACT = frozenset({
     "release-please-config.json",
     ".release-please-manifest.json",
     "CONTRIBUTING.md",
+})
+# The Rust shutdown test embeds the live Wrangler config; its edits also run
+# the worker job that validates that config.
+RUST_WORKER_EXACT = frozenset({
     "wrangler/wrangler.toml",
 })
 
@@ -265,10 +268,10 @@ def classify(path):
         if PARITY_SCRIPT_MARKER in Path(path).name:
             jobs.add(PARITY)
         return frozenset(jobs)
+    if path in RUST_WORKER_DOCS or path in RUST_WORKER_EXACT:
+        return frozenset({RUST, WORKER})
     if path.startswith(WORKER_PREFIX):
         return frozenset({WORKER})
-    if path in RUST_WORKER_DOCS:
-        return frozenset({RUST, WORKER})
     if path in RUST_DOCS:
         jobs = {RUST}
         if path in PARITY_DOCS:
@@ -306,11 +309,18 @@ def classify(path):
 # Paths whose change can alter temp-voice behaviour or the voice synthetic
 # itself (owner policy 2026-10-11: the synthetic runs on PRs only when these
 # change; always after deploy-staging and every 6 h).
+# crates/discord + crates/cutover use narrow voice_rooms prefixes (not broad
+# voice): voice_rooms.rs is the Discord-write adapter / room persistence that
+# the synthetic lifecycle exercises, plus its http test and future splits;
+# sibling voice_config_*/voice_ghosts/voice_reconcile are read-only or
+# config-only and never change live rooms.
 VOICE_PREFIXES = (
     "crates/bot/src/voice",
     "crates/core/src/voice",
     "crates/bot/src/gateway",
     "crates/bot/src/presence",
+    "crates/discord/src/voice_rooms",
+    "crates/cutover/src/voice_rooms",
     "tests/voice_templates/",
 )
 VOICE_EXACT = frozenset({

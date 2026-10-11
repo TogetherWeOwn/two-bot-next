@@ -61,29 +61,155 @@ fn get_env(env: &dyn Fn(&str) -> Option<String>, name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// Host part of an endpoint already checked to start with `http://`,
-/// lowercased, without port or brackets.
-fn loopback_host_of_http_endpoint(endpoint: &str) -> &str {
-    let rest = endpoint.strip_prefix("http://").unwrap_or(endpoint);
-    let authority = rest.split('/').next().unwrap_or("");
-    // Strip one trailing-dot FQDN marker (`localhost.`), then split the port.
-    let authority = authority.strip_suffix('.').unwrap_or(authority);
-    // IPv6 loopback arrives bracketed (`[::1]:9000`); bare `::1` has no port.
-    if let Some(bracketed) = authority.strip_prefix('[') {
-        return bracketed.split(']').next().unwrap_or("");
+/// Constant diagnostics: every refusal names the variable, never the input.
+/// Echoing the endpoint could leak userinfo credentials into logs.
+const ERR_SCHEME: &str = "TWO_BACKUP_S3_ENDPOINT must start with https:// or http://.";
+const ERR_HOST: &str = "TWO_BACKUP_S3_ENDPOINT must contain a host.";
+const ERR_USERINFO: &str = "TWO_BACKUP_S3_ENDPOINT must not contain userinfo.";
+const ERR_QUERY: &str = "TWO_BACKUP_S3_ENDPOINT must not contain a query string.";
+const ERR_FRAGMENT: &str = "TWO_BACKUP_S3_ENDPOINT must not contain a fragment.";
+const ERR_PORT: &str = "TWO_BACKUP_S3_ENDPOINT contains an invalid port.";
+const ERR_BRACKETS: &str = "TWO_BACKUP_S3_ENDPOINT contains a malformed bracketed authority.";
+const ERR_AUTHORITY: &str = "TWO_BACKUP_S3_ENDPOINT is not a valid URL.";
+const ERR_HTTP: &str = "TWO_BACKUP_S3_ENDPOINT must be https:// for a remote host. \
+     Plain http would send the dump and its credentials in clear text.";
+
+struct ParsedEndpoint {
+    scheme: String,
+    /// Bare host plus explicit port, brackets kept for IPv6 (`[::1]:9000`).
+    host_header: String,
+    /// Lowercased host without port or brackets, for the loopback allowlist.
+    loopback_host: String,
+    /// Path prefix without a trailing slash (`""` for `/`).
+    prefix: String,
+}
+
+fn authority_of(endpoint: &str) -> &str {
+    let rest = endpoint
+        .strip_prefix("https://")
+        .or_else(|| endpoint.strip_prefix("http://"))
+        .unwrap_or(endpoint);
+    rest.split(['/', '?', '#']).next().unwrap_or("")
+}
+
+/// Parse the endpoint structurally before signing. Refuses absent host,
+/// userinfo, query, fragment, invalid port and malformed bracketed authority.
+/// Valid HTTPS origins, valid explicit ports and path prefixes pass through;
+/// diagnostics are constants that never echo the input.
+fn parse_endpoint(endpoint: &str) -> Result<ParsedEndpoint, S3ConfigError> {
+    if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
+        return Err(S3ConfigError(ERR_SCHEME.to_owned()));
     }
-    authority.split(':').next().unwrap_or("")
+    // `https:///prefix` parses but has no authority at all: no destination.
+    if authority_of(endpoint).is_empty() {
+        return Err(S3ConfigError(ERR_HOST.to_owned()));
+    }
+    let url = match url::Url::parse(endpoint) {
+        Ok(url) => url,
+        Err(url::ParseError::InvalidPort) => return Err(S3ConfigError(ERR_PORT.to_owned())),
+        Err(url::ParseError::EmptyHost) => return Err(S3ConfigError(ERR_HOST.to_owned())),
+        Err(e) if authority_of(endpoint).contains(['[', ']']) => {
+            let _ = e;
+            return Err(S3ConfigError(ERR_BRACKETS.to_owned()));
+        }
+        Err(_) => return Err(S3ConfigError(ERR_AUTHORITY.to_owned())),
+    };
+    // A parse that succeeds without a host (e.g. `https:///prefix`) has no
+    // destination; signing it would put the bucket where the host belongs.
+    let host = url
+        .host()
+        .ok_or_else(|| S3ConfigError(ERR_HOST.to_owned()))?;
+    if url.host_str().unwrap_or("").is_empty() {
+        return Err(S3ConfigError(ERR_HOST.to_owned()));
+    }
+    // Userinfo in the authority would be signed as part of the host by a
+    // naive splitter (`http://localhost:9000@remote.invalid` reads as
+    // `localhost`), shipping the dump and its credential to the wrong host.
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(S3ConfigError(ERR_USERINFO.to_owned()));
+    }
+    if authority_of(endpoint).contains('@') {
+        return Err(S3ConfigError(ERR_USERINFO.to_owned()));
+    }
+    // Signing assumes an empty query; query/fragment text signed as pathname
+    // 403s at best and misroutes at worst.
+    if url.query().is_some() {
+        return Err(S3ConfigError(ERR_QUERY.to_owned()));
+    }
+    if url.fragment().is_some() {
+        return Err(S3ConfigError(ERR_FRAGMENT.to_owned()));
+    }
+    if url.port() == Some(0) {
+        return Err(S3ConfigError(ERR_PORT.to_owned()));
+    }
+    if authority_of(endpoint).ends_with(':') {
+        return Err(S3ConfigError(ERR_PORT.to_owned()));
+    }
+    // Brackets are only valid around an IPv6 literal; anything else is a
+    // malformed authority that the splitter would mangle.
+    let raw_authority = authority_of(endpoint);
+    if raw_authority.contains(['[', ']']) && !matches!(host, url::Host::Ipv6(_)) {
+        return Err(S3ConfigError(ERR_BRACKETS.to_owned()));
+    }
+
+    let host_part = match &host {
+        url::Host::Domain(d) => d.to_ascii_lowercase(),
+        url::Host::Ipv4(ip) => ip.to_string(),
+        url::Host::Ipv6(ip) => format!("[{ip}]"),
+    };
+    let host_header = match url.port() {
+        Some(port) => format!("{host_part}:{port}"),
+        None => host_part.clone(),
+    };
+    // Strip one trailing-dot FQDN marker (`localhost.`) for the allowlist.
+    let loopback_host = host_part
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    // The prefix is the raw endpoint text after the authority, not
+    // `url.path()`: the parsed path is already percent-encoded and
+    // dot-normalised, so encoding it again signs `%2520` for a typed space
+    // and resolves `/a/../b` to `/b` — a write to a different place than
+    // restore expects. Raw text is encoded exactly once by `canonical_path`
+    // at the signing seam. Query/fragment cannot be present here: both are
+    // refused above.
+    let raw_path = endpoint
+        .strip_prefix("https://")
+        .or_else(|| endpoint.strip_prefix("http://"))
+        .unwrap_or(endpoint)
+        .split_at(authority_of(endpoint).len())
+        .1;
+    let prefix = if raw_path.is_empty() || raw_path == "/" {
+        String::new()
+    } else {
+        raw_path.trim_end_matches('/').to_owned()
+    };
+    Ok(ParsedEndpoint {
+        scheme: url.scheme().to_owned(),
+        host_header,
+        loopback_host,
+        prefix,
+    })
 }
 
 /// True when an `http://` endpoint points at this machine. The host is
 /// compared exactly — a `starts_with` check would accept
 /// `http://localhost.evil.com` and ship the dump plus its signing
 /// credential in clear text to an attacker (PR #11 review).
+/// Structurally invalid endpoints (userinfo, query, fragment, bad port or
+/// brackets) are never loopback, so they stay refused.
 #[must_use]
 pub fn is_loopback_endpoint(endpoint: &str) -> bool {
-    let lowered = endpoint.to_ascii_lowercase();
-    let host = loopback_host_of_http_endpoint(&lowered);
-    host == "localhost" || host == "127.0.0.1" || host == "::1"
+    let Ok(parsed) = parse_endpoint(endpoint) else {
+        return false;
+    };
+    if parsed.scheme != "http" {
+        return false;
+    }
+    parsed.loopback_host == "localhost"
+        || parsed.loopback_host == "127.0.0.1"
+        || parsed.loopback_host == "::1"
 }
 
 /// Read the off-box destination out of the environment.
@@ -107,11 +233,10 @@ pub fn load_s3_target(env: &dyn Fn(&str) -> Option<String>) -> Result<S3Target, 
     }
 
     let endpoint = get_env(env, "TWO_BACKUP_S3_ENDPOINT").unwrap_or_default();
-    if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
-        return Err(S3ConfigError(
-            "TWO_BACKUP_S3_ENDPOINT must start with https:// or http://.".to_owned(),
-        ));
-    }
+    // Structural validation before signing: absent host, userinfo, query,
+    // fragment, invalid port and malformed brackets are refused here, so no
+    // invalid endpoint reaches the signing/transport seam.
+    let parsed = parse_endpoint(&endpoint)?;
     // http:// to anything but a local test server would ship the funnel log,
     // and the credential signing it, in clear text across the internet.
     // The host is compared exactly: a prefix match would accept
@@ -119,12 +244,8 @@ pub fn load_s3_target(env: &dyn Fn(&str) -> Option<String>) -> Result<S3Target, 
     // `s3Config.ts` (`/^http:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/`), plus
     // `::1`, which `http::check_url` and the guild-config seams also treat
     // as loopback.
-    if endpoint.starts_with("http://") && !is_loopback_endpoint(&endpoint) {
-        return Err(S3ConfigError(
-            "TWO_BACKUP_S3_ENDPOINT must be https:// for a remote host. \
-             Plain http would send the dump and its credentials in clear text."
-                .to_owned(),
-        ));
+    if parsed.scheme == "http" && !is_loopback_endpoint(&endpoint) {
+        return Err(S3ConfigError(ERR_HTTP.to_owned()));
     }
 
     let bucket = get_env(env, "TWO_BACKUP_S3_BUCKET").unwrap_or_default();
@@ -306,22 +427,20 @@ pub fn sign_put(
     amz_date: &str,
     date_stamp: &str,
 ) -> SignedRequest {
-    let endpoint = target.endpoint.expose().trim_end_matches('/');
-    let without_scheme = endpoint
-        .trim_start_matches("https://")
-        .trim_start_matches("http://");
-    let host = without_scheme.split('/').next().unwrap_or("");
+    // Structural gate at the signing seam: `load_s3_target` already refused
+    // invalid endpoints, but tests construct `S3Target` directly, so an
+    // invalid endpoint here is a programming error that must fail loudly
+    // rather than sign query/fragment/userinfo text as pathname.
+    let parsed = parse_endpoint(target.endpoint.expose().trim_end_matches('/'))
+        .expect("S3 endpoint was validated at configuration load");
+    let host = parsed.host_header;
+    let scheme = parsed.scheme;
     // An endpoint may carry a path prefix (a reverse proxy, a MinIO
     // sub-path, a test fake mounted under `/s3`): that prefix is part of
     // the request-target S3 signs, so it must be part of BOTH the signed
     // path and the URL. Dropping it signs one thing and sends another —
     // a 403 at best, a write to the wrong place at worst (PR #11 review).
-    let endpoint_prefix = without_scheme.split_at(host.len()).1.trim_end_matches('/');
-    let scheme = if target.endpoint.expose().starts_with("http://") {
-        "http"
-    } else {
-        "https"
-    };
+    let endpoint_prefix = parsed.prefix;
     let service = "s3";
 
     let payload_hash = sha256_hex(body);
@@ -697,6 +816,54 @@ mod tests {
     }
 
     #[test]
+    fn sign_put_encodes_an_endpoint_prefix_once() {
+        // Regression: `parse_endpoint` kept `url.path()` (already
+        // percent-encoded) and `sign_put` encoded it again, so a space in
+        // the prefix signed `/my%2520prefix/...` while restore expected
+        // `/my%20prefix/...` — a write to the wrong place.
+        for (endpoint, encoded_prefix) in [
+            ("https://proxy.example.com/my prefix", "/my%20prefix"),
+            ("https://proxy.example.com/café", "/caf%C3%A9"),
+        ] {
+            let mut prefixed = target();
+            prefixed.endpoint = Secret::new(endpoint.to_owned());
+            let req = sign_put(
+                &prefixed,
+                "two-bot/f.gz",
+                b"data",
+                "20260903T041700Z",
+                "20260903",
+            );
+            assert_eq!(
+                req.url.expose(),
+                &format!(
+                    "https://proxy.example.com{encoded_prefix}/paperclip-backups/two-bot/f.gz"
+                ),
+                "endpoint {endpoint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sign_put_keeps_endpoint_dot_segments_literal() {
+        // Dot segments must not be silently resolved: `/a/../b` signs and
+        // sends literally, the same string restore and operators see.
+        let mut prefixed = target();
+        prefixed.endpoint = Secret::new("https://proxy.example.com/a/../b".to_owned());
+        let req = sign_put(
+            &prefixed,
+            "two-bot/f.gz",
+            b"data",
+            "20260903T041700Z",
+            "20260903",
+        );
+        assert_eq!(
+            req.url.expose(),
+            "https://proxy.example.com/a/../b/paperclip-backups/two-bot/f.gz"
+        );
+    }
+
+    #[test]
     fn upload_argv_appends_the_file_last() {
         assert_eq!(build_upload_argv(None, "f"), None);
         assert_eq!(build_upload_argv(Some("  "), "f"), None);
@@ -714,6 +881,97 @@ mod tests {
                     "a.gz".to_owned()
                 ]
             ))
+        );
+    }
+
+    #[test]
+    fn config_refuses_structurally_invalid_endpoints_before_signing() {
+        // Structural refusal: absent host, userinfo, query, fragment, invalid
+        // port and malformed brackets must never reach the signing seam.
+        // Diagnostics name the variable, never the input (sentinel absence).
+        let invalid = [
+            "https://",
+            "https:///s3-prefix",
+            "https://user@acct.r2.cloudflarestorage.com/",
+            "https://user:pass@acct.r2.cloudflarestorage.com/",
+            "https://acct.r2.cloudflarestorage.com?x=1",
+            "https://acct.r2.cloudflarestorage.com/s3-prefix?x=1",
+            "https://acct.r2.cloudflarestorage.com#frag",
+            "https://acct.r2.cloudflarestorage.com/s3-prefix#frag",
+            "https://acct.r2.cloudflarestorage.com:abc/",
+            "https://acct.r2.cloudflarestorage.com:99999/",
+            "https://acct.r2.cloudflarestorage.com:/",
+            "https://acct.r2.cloudflarestorage.com:0/",
+            "https://[::1",
+            "https://[::1]extra/",
+            "https://[]/",
+            "https://[zzz]/",
+            "http://localhost:9000@remote.invalid/",
+            "http://127.0.0.1:9000?x=1",
+            "http://[::1]:9000#frag",
+        ];
+        for endpoint in invalid {
+            let vars = env_of(&[
+                ("TWO_BACKUP_S3_ENDPOINT", endpoint),
+                ("TWO_BACKUP_S3_BUCKET", "paperclip-backups"),
+                ("TWO_BACKUP_S3_ACCESS_KEY_ID", "id"),
+                ("TWO_BACKUP_S3_SECRET_ACCESS_KEY", "secret"),
+            ]);
+            let err = load_s3_target(&|k| vars.get(k).cloned())
+                .expect_err(&format!("must refuse {endpoint:?}"));
+            assert!(
+                err.0.contains("TWO_BACKUP_S3_ENDPOINT"),
+                "diagnostic names the variable: {err}"
+            );
+            assert!(
+                !err.0.contains(endpoint),
+                "diagnostic must not echo the endpoint: {err}"
+            );
+            for sentinel in [
+                "@", "?x=1", "#frag", ":abc", ":99999", ":/", ":0/", "[::1", "[]", "[zzz]",
+            ] {
+                if endpoint.contains(sentinel) {
+                    assert!(
+                        !err.0.contains(sentinel),
+                        "diagnostic must not echo {sentinel:?}: {err}"
+                    );
+                }
+            }
+        }
+
+        // Valid origins, explicit ports and path prefixes still load.
+        for endpoint in [
+            "https://acct.r2.cloudflarestorage.com",
+            "https://acct.r2.cloudflarestorage.com:8443",
+            "https://proxy.example.com/s3-prefix",
+            "https://proxy.example.com:8443/s3-prefix",
+            "http://127.0.0.1:9000",
+            "http://localhost:9000",
+            "http://localhost/minio",
+            "http://[::1]:9000",
+        ] {
+            let vars = env_of(&[
+                ("TWO_BACKUP_S3_ENDPOINT", endpoint),
+                ("TWO_BACKUP_S3_BUCKET", "paperclip-backups"),
+                ("TWO_BACKUP_S3_ACCESS_KEY_ID", "id"),
+                ("TWO_BACKUP_S3_SECRET_ACCESS_KEY", "secret"),
+            ]);
+            load_s3_target(&|k| vars.get(k).cloned())
+                .unwrap_or_else(|_| panic!("must keep {endpoint:?}"));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "S3 endpoint was validated at configuration load")]
+    fn sign_put_refuses_an_invalid_endpoint_at_the_seam() {
+        let mut invalid = target();
+        invalid.endpoint = Secret::new("https://acct.r2.cloudflarestorage.com?x=1".to_owned());
+        let _ = sign_put(
+            &invalid,
+            "two-bot/f.gz",
+            b"data",
+            "20260903T041700Z",
+            "20260903",
         );
     }
 }

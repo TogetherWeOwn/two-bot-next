@@ -78,11 +78,12 @@ impl RoomPersistence for Arc<Store> {
         &self,
         guild: u64,
         user: u64,
+        leaving: &[u64],
         config: &CreateAdmissionConfig,
         now_secs: i64,
     ) -> Result<CreateClaim, StoreError> {
         self.as_ref()
-            .claim_create(guild, user, config, now_secs)
+            .claim_create(guild, user, leaving, config, now_secs)
             .await
     }
     async fn bind_create_channel(

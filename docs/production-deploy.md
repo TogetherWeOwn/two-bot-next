@@ -131,7 +131,17 @@ only, because the serving version was built by an older run.
 | `build_revision` and `build_id` are both `unknown` (not stamped) | Deploy: keep polling; fail at the end. Rollback: recorded as a pre-stamp version, not a failure |
 | `build_revision` is `unknown` and `build_id` is not | Keep polling; fail at the end |
 | `build_revision` or `build_id` is missing or not a string, or the body is not a JSON object | Keep polling; fail at the end |
+| JSON repeats an object key, nests past the depth bound, or `build_revision`/`build_id` has an unexpected shape | Keep polling; fail at the end with a fixed single-line reason that echoes no remote value |
 | Any other status, including `000` (no answer) | Keep polling; fail at the end |
+
+Remote identity shapes are validated before any value enters diagnostics:
+only `unknown`, a 40-character hex revision, or a bounded digits-digits
+build ID can appear in output. Newline, pipe, control, overlong and
+secret-shaped values yield the fixed unexpected-shape refusal above. The
+raw `/health` and `/readyz` bodies reach the log only through
+`production_deploy.py excerpt`, which prints the first 2048 body bytes as
+one escaped line (escaping can make that line longer), so a hostile answer
+cannot forge log or summary lines.
 
 Polling matters because a replaced container can keep answering with the
 previous revision — or, on a same-SHA redeploy, the previous build — for a
@@ -310,8 +320,8 @@ whole watch so the rollback dispatch never has to hunt for it.
   `gateway_pool_connect_failed`, `checkpoint_load_failed`,
   `onboarding_gates_invalid`, `onboarding_init_failed`,
   `custom_commands_init_failed`, `milestones_load_failed`, `automod_config_invalid`,
-  `automod_executor_failed`, `gateway_runtime_failed`,
-  `gateway_task_panicked`,
+  `automod_executor_failed`, `raid_executor_failed`,
+  `gateway_runtime_failed`, `gateway_task_panicked`,
   `container_service_failed`, `container_lifecycle_failed`,
   `container_unavailable`. Never paste raw messages, URLs, credentials or
   backup paths into the log.

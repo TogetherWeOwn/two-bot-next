@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline fixtures for scripts/staging_voice_synthetic.py (no network, no token)."""
 
+import io
 import json
 import os
 import socket
@@ -8,6 +9,7 @@ import struct
 import sys
 import threading
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -23,6 +25,8 @@ def obs(**over):
         "me": ME,
         "creator": {"id": CREATOR, "parent_id": CAT},
         "room_id": ROOM,
+        "moved_to": ROOM,
+        "rejoin_room_id": "99",
         "room_created": {"id": ROOM, "parent_id": CAT, "name": "🍄 Synthetic’s workshop",
                          "permission_overwrites": [{"id": ME, "type": 1, "allow": OWNER_ALLOW}]},
         "channels": [
@@ -96,6 +100,15 @@ class EvaluateTest(unittest.TestCase):
 
     def test_room_left_behind_fails_delete(self):
         self.assertEqual(verdicts(obs(deleted=False))["delete"], "FAIL")
+
+    def test_joiner_not_moved_into_the_room_fails_moved(self):
+        self.assertEqual(verdicts(obs(moved_to=None))["moved"], "FAIL")
+        self.assertEqual(verdicts(obs(moved_to=OTHER))["moved"], "FAIL")
+
+    def test_hop_back_into_the_creator_without_a_new_room_fails_rejoin(self):
+        self.assertEqual(verdicts(obs(rejoin_room_id=None))["rejoin"], "FAIL")
+        self.assertEqual(verdicts(obs(rejoin_room_id=ROOM))["rejoin"], "FAIL")
+        self.assertEqual(verdicts(obs(rejoin_room_id=CREATOR))["rejoin"], "FAIL")
 
     def test_no_room_fails_create(self):
         result = verdicts(obs(room_id=None, room_created=None))
@@ -186,6 +199,149 @@ class WebSocketFrameTest(unittest.TestCase):
         self.assertEqual(json.loads(body), {"op": 1, "d": None})
         ours.close()
         theirs.close()
+
+
+class BodyCapTest(unittest.TestCase):
+    EXPECTED_UA = "two-bot-voice-synthetic (staging)"
+
+    def padded(self, value, size):
+        raw = json.dumps(value).encode()
+        self.assertLessEqual(len(raw), size, "fixture must fit the target size")
+        return raw + b" " * (size - len(raw))
+
+    def response(self, payload, seen):
+        class _Resp:
+            def read(self, n):
+                seen.append(n)
+                return payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        return _Resp()
+
+    def http_error(self, payload, seen, code=500):
+        err = urllib.error.HTTPError("https://discord.com/api/v10/x", code,
+                                     "Server Error", {}, io.BytesIO(b""))
+        def _read(n, _payload=payload):
+            seen.append(n)
+            return _payload
+        err.read = _read
+        return err
+
+    def test_cap_matches_the_reference_probes(self):
+        self.assertEqual(synth.MAX_BODY_BYTES, 64 * 1024)
+        self.assertEqual(synth.BODY_CAP, synth.MAX_BODY_BYTES)
+        import staging_probe
+        self.assertEqual(synth.MAX_BODY_BYTES, staging_probe.MAX_BODY_BYTES)
+
+    def test_rest_exact_cap_valid_input_passes(self):
+        seen = []
+        body = self.padded({"id": ROOM}, synth.MAX_BODY_BYTES)
+        self.assertEqual(len(body), synth.MAX_BODY_BYTES)
+        with mock.patch.object(synth.urllib.request, "urlopen",
+                               return_value=self.response(body, seen)):
+            self.assertEqual(synth.rest("t", f"/channels/{ROOM}")["id"], ROOM)
+        self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
+
+    def test_rest_over_cap_refuses_before_parsing(self):
+        sentinel = "SENTINEL_BODY_voice_synthetic_padded"
+        base = json.dumps({"id": ROOM, "note": sentinel}).encode()
+        body = base + b" " * (synth.MAX_BODY_BYTES + 1 - len(base))
+        self.assertEqual(len(body), synth.MAX_BODY_BYTES + 1)
+        # Still valid JSON (trailing whitespace): the old parser would accept.
+        self.assertEqual(json.loads(body)["note"], sentinel)
+        seen = []
+        with mock.patch.object(synth.urllib.request, "urlopen",
+                               return_value=self.response(body, seen)):
+            with self.assertRaises(synth.BodyTooLarge) as ctx:
+                synth.rest("t", f"/channels/{ROOM}")
+        self.assertEqual(str(ctx.exception), "Discord REST read answered over the body cap")
+        self.assertNotIn(sentinel, str(ctx.exception))
+        self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
+
+    def test_rest_hidden_tail_past_a_valid_prefix_refuses(self):
+        prefix = self.padded({"id": ROOM}, synth.MAX_BODY_BYTES)
+        self.assertEqual(json.loads(prefix)["id"], ROOM)
+        seen = []
+        with mock.patch.object(synth.urllib.request, "urlopen",
+                               return_value=self.response(prefix + b"X", seen)):
+            with self.assertRaises(synth.BodyTooLarge) as ctx:
+                synth.rest("t", f"/channels/{ROOM}")
+        self.assertEqual(str(ctx.exception), "Discord REST read answered over the body cap")
+        self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
+
+    def test_rest_http_error_path_is_bounded(self):
+        seen = []
+        big = b"y" * (synth.MAX_BODY_BYTES + 1)
+        with mock.patch.object(synth.urllib.request, "urlopen",
+                               side_effect=self.http_error(big, seen)):
+            with self.assertRaises(synth.BodyTooLarge) as ctx:
+                synth.rest("t", f"/channels/{ROOM}")
+        self.assertEqual(str(ctx.exception), "Discord REST read answered over the body cap")
+        self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
+        seen.clear()
+        with mock.patch.object(synth.urllib.request, "urlopen",
+                               side_effect=self.http_error(b"{}", seen)):
+            with self.assertRaises(urllib.error.HTTPError):
+                synth.rest("t", f"/channels/{ROOM}")
+        self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
+
+    def test_metrics_exact_cap_passes(self):
+        seen = []
+        line = 'two_bot_voice_names_total{outcome="created_with_template"} 4\n'
+        body = line.encode() + b"# pad\n" * 10
+        body = body + b" " * (synth.MAX_BODY_BYTES - len(body))
+        self.assertEqual(len(body), synth.MAX_BODY_BYTES)
+        with mock.patch.object(synth.urllib.request, "urlopen",
+                               return_value=self.response(body, seen)):
+            self.assertEqual(synth.metrics_value("https://two-bot-next-staging.x", "tok"), 4)
+        self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
+
+    def test_metrics_over_cap_refuses_instead_of_silent_skip(self):
+        sentinel = "SENTINEL_BODY_voice_metrics_padded"
+        base = (f'# {sentinel}\ntwo_bot_voice_names_total{{outcome="created_with_template"}} 9\n').encode()
+        body = base + b" " * (synth.MAX_BODY_BYTES + 1 - len(base))
+        self.assertEqual(len(body), synth.MAX_BODY_BYTES + 1)
+        seen = []
+        with mock.patch.object(synth.urllib.request, "urlopen",
+                               return_value=self.response(body, seen)):
+            with self.assertRaises(synth.BodyTooLarge) as ctx:
+                synth.metrics_value("https://two-bot-next-staging.x", "tok")
+        self.assertEqual(str(ctx.exception), "metrics read answered over the body cap")
+        self.assertNotIn(sentinel, str(ctx.exception))
+        self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
+
+    def test_metrics_http_error_path_is_bounded(self):
+        seen = []
+        big = b"z" * (synth.MAX_BODY_BYTES + 1)
+        with mock.patch.object(synth.urllib.request, "urlopen",
+                               side_effect=self.http_error(big, seen)):
+            with self.assertRaises(synth.BodyTooLarge):
+                synth.metrics_value("https://two-bot-next-staging.x", "tok")
+        self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
+        seen.clear()
+        with mock.patch.object(synth.urllib.request, "urlopen",
+                               side_effect=self.http_error(b"oops", seen)):
+            self.assertIsNone(synth.metrics_value("https://two-bot-next-staging.x", "tok"))
+        self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
+
+    def test_user_agent_pins_are_unchanged(self):
+        requests = []
+
+        def fake_open(req, timeout=None):
+            requests.append(req)
+            return self.response(b"{}", [])
+
+        with mock.patch.object(synth.urllib.request, "urlopen", side_effect=fake_open):
+            synth.rest("t", f"/channels/{ROOM}")
+            synth.metrics_value("https://two-bot-next-staging.x", "tok")
+        self.assertEqual(len(requests), 2)
+        for req in requests:
+            self.assertEqual(req.get_header("User-agent"), self.EXPECTED_UA)
 
 
 if __name__ == "__main__":

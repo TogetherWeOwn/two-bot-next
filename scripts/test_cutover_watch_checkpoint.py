@@ -90,6 +90,37 @@ class CutoverWatchCheckpointTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("does not match the deployed SHA", row)
         self.assertTrue(row.endswith("| EXTEND |"), row)
+        self.assertNotIn("\n", row)
+        self.assertEqual(row.count("|"), 6, row)
+
+    def test_malformed_remote_identity_is_fixed_extend_without_echo(self):
+        # Runtime-built marker: it cannot match a literal in the script, so its
+        # absence proves the remote value never reached the row.
+        marker = "sg%s%s%d" % ("ni", "p", id(object()))
+        evils = [
+            {"revision": "ab|cd\nef" + marker, "build_id": BUILD_ID},
+            {"revision": "line1\nline2|" + marker, "build_id": BUILD_ID},
+            {"revision": "ghp_" + marker + "A" * 32, "build_id": BUILD_ID},
+            {"revision": "github_pat_" + marker, "build_id": BUILD_ID},
+            {"revision": SHA, "build_id": "1|2\n" + marker},
+            {"revision": SHA, "build_id": "xoxb-" + marker},
+            {"revision": "A" * 36 + marker[:4], "build_id": BUILD_ID},
+            {"revision": SHA[:39] + "|", "build_id": BUILD_ID},
+            {"revision": SHA, "build_id": "run-1"},
+        ]
+        for evil in evils:
+            with self.subTest(revision=evil["revision"][:12], build_id=evil["build_id"][:12]):
+                body = readyz_body(("process", "ready"), ("gateway", "ready"),
+                                   ("database", "ready"), ("token_invalid", "ready"),
+                                   **evil)
+                code, row, _ = self.run_checkpoint((200, body))
+                self.assertEqual(code, 1, row)
+                self.assertTrue(row.endswith("| EXTEND |"), row)
+                self.assertIn("unexpected shape", row)
+                # One intact row: no injected columns or line breaks, no echo.
+                self.assertNotIn("\n", row)
+                self.assertEqual(row.count("|"), 6, row)
+                self.assertNotIn(marker, row)
 
     def test_stale_build_of_the_same_sha_is_extend(self):
         body = readyz_body(("process", "ready"), ("gateway", "ready"),
@@ -99,6 +130,8 @@ class CutoverWatchCheckpointTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("is not this run's build", row)
         self.assertTrue(row.endswith("| EXTEND |"), row)
+        self.assertNotIn("\n", row)
+        self.assertEqual(row.count("|"), 6, row)
 
     def test_unstamped_build_is_extend(self):
         body = readyz_body(("process", "ready"), ("gateway", "ready"),
@@ -136,6 +169,16 @@ class CutoverWatchCheckpointTests(unittest.TestCase):
                 code, row, _ = self.run_checkpoint((status, body))
                 self.assertEqual(code, 1, row)
                 self.assertTrue(row.endswith("| EXTEND |"), row)
+
+    def test_int_digit_overflow_is_extend_not_a_traceback(self):
+        body = b'{"components":[],"n":' + b"1" * 4301 + b"}"
+        code, row, requested = self.run_checkpoint((200, body))
+        self.assertEqual(code, 1)
+        self.assertIn("without the bot's component breakdown", row)
+        self.assertTrue(row.endswith("| EXTEND |"), row)
+        self.assertNotIn("\n", row)
+        self.assertEqual(row.count("|"), 6, row)
+        self.assertEqual(requested, [PRODUCTION + "/readyz"])
 
     def test_refuses_non_production_origins_without_a_request(self):
         for url in ("http://two-bot-next-production.example.workers.dev",

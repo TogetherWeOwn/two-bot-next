@@ -90,13 +90,42 @@ it:
 
 Rules the validator enforces: `revision` is 40 lowercase hex characters;
 `deploy_staging_run_id` is digits; every command has a non-negative
-`duration_ms`; every `fail` row carries a `failure_signature`; records with
+`duration_ms`; every `fail` row carries a `failure_signature`; a record with
+any `fail` row and a `PASS` verdict is rejected (a run with a failed command
+must be `NEEDS WORK`); records with
 `"mock": true` are rejected as real evidence (the mock example is the only
-file allowed to carry it). Duplicate object keys at any depth are rejected in
+file allowed to carry it). Every `*_utc` timestamp (`window.start_utc`,
+`window.end_utc`, `commands[].started_utc`, `deployment.first_readyz_utc`)
+must be timezone-aware UTC: a trailing `Z` or an explicit zero offset
+(`+00:00`, `+0000`); negative zero (`-00:00`, `-0000`) is accepted and
+normalizes to UTC. Naive timestamps (no suffix), nonzero offsets and
+impossible calendar dates fail. Duplicate object keys at any depth are rejected in
 both the record and schema, before a repeated field can hide a value or override
 the mock label. Public-safety failures report only the JSON path and marker
 pattern, never the matched value; they stop validation before schema diagnostics
 can echo the same value. Secret-shaped path keys are redacted too.
+
+Input limits: a record or schema may nest at most 32 container levels
+(`MAX_NESTING_DEPTH` in the validator). Deeper input, and input the decoder
+refuses (a recursion overflow or an oversized integer literal), is refused
+with a fixed diagnostic. Bytes that are not UTF-8 are refused with their byte
+offset. None of these diagnostics echo raw bytes or values.
+
+Execution window: `window.end_utc` must not precede `window.start_utc`.
+Every `commands[].started_utc` must fall within `[start, end]`, and its
+completion (`started_utc` + `duration_ms`) must not exceed the window end.
+`deployment.first_readyz_utc` is not ordered against the window: a
+deployment may predate command execution. Malformed or incomparable
+timestamps fail safely with path-only diagnostics (no values echoed); this
+ordering check does not define which suffixes count as UTC — that is the
+separate UTC-representation rule.
+
+Timestamp-precision policy: instants compare exactly as parsed, preserving
+fractional seconds. The producer emits second-precision window bounds, so a
+completion less than one second past a fractionless end is truncation
+allowance, not an impossible window. A completion at or past end + 1s, or
+any overrun past a fractional end, is rejected. Command starts have no
+allowance.
 
 ## Collection bounds
 

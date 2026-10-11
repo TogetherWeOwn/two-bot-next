@@ -76,25 +76,44 @@ def production_readyz_url(url):
     return f"https://{parts.hostname}/readyz"
 
 
+def is_build_id_shape(value):
+    """Digits-digits run shape, shared by CLI validation and remote checks."""
+    parts = value.split("-")
+    return len(parts) == 2 and all(DIGITS.fullmatch(p) for p in parts)
+
+
 def check_build_identity(body, expected_sha, expected_build_id):
-    """Match the compiled revision/build ID per the production-deploy watch rows."""
+    """Match the compiled revision/build ID per the production-deploy watch rows.
+
+    Remote identity shapes are validated before any value enters diagnostics:
+    only the unstamped marker, a 40-char hex revision, or a digits-digits
+    build ID can appear in output. Anything else is a fixed EXTEND reason, so
+    a newline, pipe, or secret-shaped remote string can neither break the
+    single checkpoint row nor leak into evidence.
+    """
     try:
         report = json.loads(body)
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (ValueError, RecursionError):
         report = None
     if not isinstance(report, dict):
         raise CheckpointError("/readyz did not return a JSON object (no build identity to match)")
     revision, build_id = report.get("build_revision"), report.get("build_id")
     if not isinstance(revision, str) or not isinstance(build_id, str):
         raise CheckpointError("/readyz has no build_revision and build_id strings")
+    if revision == UNSTAMPED:
+        raise CheckpointError("build_revision is unknown: this build was not stamped")
+    if not SHA.fullmatch(revision):
+        raise CheckpointError("build_revision has an unexpected shape: "
+                              "expected a 40-character hex commit")
     if revision != expected_sha:
-        if revision == UNSTAMPED:
-            raise CheckpointError("build_revision is unknown: this build was not stamped")
-        raise CheckpointError(f"build_revision {revision:.40} does not match the deployed SHA")
+        raise CheckpointError(f"build_revision {revision} does not match the deployed SHA")
+    if not is_build_id_shape(build_id):
+        raise CheckpointError("build_id has an unexpected shape: "
+                              "expected <run-id>-<attempt> (digits-digits)")
     if build_id != expected_build_id:
-        raise CheckpointError(f"build_id {build_id:.40} is not this run's build "
+        raise CheckpointError(f"build_id {build_id} is not this run's build "
                               f"({expected_build_id}): a previous container still serves this SHA")
-    return f"revision matches the SHA, build {build_id}"
+    return f"revision matches the SHA, build {expected_build_id}"
 
 
 def check_checkpoint(status, body, expected_sha, expected_build_id):
@@ -122,8 +141,7 @@ def valid_sha(value):
 
 
 def valid_build_id(value):
-    parts = value.split("-")
-    if len(parts) != 2 or not all(DIGITS.fullmatch(p) for p in parts):
+    if not is_build_id_shape(value):
         raise argparse.ArgumentTypeError("expected-build-id must be <run-id>-<attempt> (digits-digits)")
     return value
 

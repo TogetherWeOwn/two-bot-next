@@ -154,10 +154,11 @@ after the restart.
 
 ## 6. DB-error counter
 
-Source: `two_bot_db_errors_total{op}` (storage-layer failures, not pool
-pressure). The `op` label is `admission` (send-admission SQL:
-admit/extend/complete) or `other` (failed voice actor store loads, plus
-every other store until its operation joins the allowlist).
+Source: `two_bot_db_errors_total{op}` (recorded storage-layer failures, not
+pool pressure or a database-wide total). Current producers are send-admission
+SQL (admit/extend/complete, `op="admission"`) and failed voice actor store
+loads (`op="other"`). Other stores need explicit instrumentation; an unknown
+instrumented operation falls back to `other`.
 Fixed cardinality: two series.
 Unknown operations collapse to `other`; no error text, query, or identifier
 is retained. Series contract: [metrics](metrics.md).
@@ -179,7 +180,8 @@ the window was quiet.
 Alert-threshold sketch (not a threshold): the paging rule fires at 3 or more
 storage failures between two keepalive samples, and a restart reset skips
 the window rather than firing. A slow trickle below that burst stays silent
-here and surfaces instead through `two_bot_job_consecutive_failures`. When
+here; `two_bot_job_consecutive_failures` covers failed jobs, not every
+storage path. When
 this sketch disagrees with the runbook or the budgets in
 [production-deploy](production-deploy.md#signal-thresholds-budgets-and-rollback-triggers),
 those win. Runbook: [runbook](runbook.md) (DB errors section).
@@ -314,7 +316,12 @@ misconfiguration, not at Discord or the database. A rising `executed`
 count next to refusals means the receiver is still serving legitimate
 traffic while refusing the surge. Correlate with the container logs for
 `internal action refused` warn lines (sampled summaries keyed by
-`kind`/`class`/`key`/`action`) before acting. A counter that reset to
+`kind`/`class`/`key`/`action`) and for `msg=internal_action_unknown_state_persist_failed`
+error lines before acting. Those lines mean a best-effort unknown-state write failed after the
+claim was committed; the claim is never released or resent. Read the `persist_class` before
+acting: `storage_unavailable` leaves the claim `in_flight`, so repeats answer `in_progress`
+until it goes stale. `transition_refused` means the row had already moved on (for example to a
+stored terminal response), so a repeat may replay that response instead. A counter that reset to
 zero between scrapes means the process restarted; it does not mean the
 window was quiet.
 

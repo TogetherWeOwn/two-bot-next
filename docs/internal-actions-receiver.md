@@ -37,7 +37,7 @@ Production has no ingress, route, variable or secret for this receiver.
 
 | Layer | Behavior |
 | --- | --- |
-| Gate | Worker var `INTERNAL_ACTIONS_INGRESS = "1"`, declared only under `[env.staging.vars]`, **and** the Operator's Worker secret `TWO_INTERNAL_ACTIONS` exactly `1`. Either one missing, or any other value, leaves the route absent: today's response, no container contact. `scripts/check-env-bindings.py` fails a top-level or production declaration and any `TWO_INTERNAL_*` var in `wrangler.toml`. |
+| Gate | Worker var `INTERNAL_ACTIONS_INGRESS = "1"`, declared only under `[env.staging.vars]`, **and** the Operator's Worker secret `TWO_INTERNAL_ACTIONS` exactly `1`. Either one missing, or any other value, leaves the route absent: today's response, no container contact. `wrangler/scripts/check-env-bindings.py` fails a top-level or production declaration and any `TWO_INTERNAL_*` var in `wrangler.toml`. |
 | Route | Exactly `POST /internal/actions`, no query string, no trailing slash. Everything else, including other methods, is today's behavior (404). |
 | Request bounds | `application/json` (optionally `; charset=utf-8`), no `Content-Encoding`, body 1 byte to 2 MiB (413 over, declared or streamed), body read within 5 s (408), whole request within 20 s (504). Per-IP token bucket (burst 20, 1/s) and 8 concurrent requests per isolate answer 429 before the container is touched. |
 | Headers | Only `X-TWO-Key-Id`, `X-TWO-Timestamp`, `X-TWO-Nonce`, `X-TWO-Signature` (required), `Idempotency-Key` and `Content-Type` reach the container, each a single printable token within the receiver's own length caps. `Authorization`, `Cookie`, `X-Forwarded-*` and any caller-supplied deployment header are dropped. The Worker stamps the deployment id itself. |

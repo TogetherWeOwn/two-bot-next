@@ -273,6 +273,193 @@ class DuplicateComponentTest(unittest.TestCase):
         self.assertIn("repeats a component name", out)
 
 
+class DuplicateJsonKeysTest(unittest.TestCase):
+    """Wire-object duplicate JSON keys refuse before any grading.
+
+    Plain json.loads keeps the last duplicate, so a repeated top-level
+    ``components`` can mask gateway=down as ready. Every object at any
+    depth is strict: identical repeats and both conflicting orders fail
+    closed with fixed vocabulary, never echoing keys or values.
+    """
+
+    READY_PAIR = '[["process", "ready"], ["gateway", "ready"]]'
+    DOWN_PAIR = '[["process", "ready"], ["gateway", "down"]]'
+
+    def test_top_level_components_down_then_ready_refused(self):
+        raw = ('{"components": ' + self.DOWN_PAIR
+               + ', "jobs": {"counter": {"parked": true, "running": false}}, '
+               + '"build_revision": "r", "build_id": "b", '
+               + '"components": ' + self.READY_PAIR + '}').encode()
+        with self.assertRaises(probe.ProbeError) as ctx:
+            probe.check_readyz_shape(200, raw)
+        self.assertEqual(str(ctx.exception),
+                         "/readyz 200 carries duplicate JSON object keys")
+
+    def test_top_level_components_ready_then_down_refused(self):
+        raw = ('{"components": ' + self.READY_PAIR
+               + ', "jobs": {"counter": {"parked": true, "running": false}}, '
+               + '"build_revision": "r", "build_id": "b", '
+               + '"components": ' + self.DOWN_PAIR + '}').encode()
+        with self.assertRaises(probe.ProbeError) as ctx:
+            probe.check_readyz_shape(503, raw)
+        self.assertEqual(str(ctx.exception),
+                         "/readyz 503 carries duplicate JSON object keys")
+
+    def test_top_level_components_identical_repeat_refused(self):
+        raw = ('{"components": ' + self.READY_PAIR
+               + ', "jobs": {"counter": {"parked": true, "running": false}}, '
+               + '"build_revision": "r", "build_id": "b", '
+               + '"components": ' + self.READY_PAIR + '}').encode()
+        with self.assertRaises(probe.ProbeError) as ctx:
+            probe.check_readyz_shape(200, raw)
+        self.assertEqual(str(ctx.exception),
+                         "/readyz 200 carries duplicate JSON object keys")
+
+    def test_top_level_components_duplicate_fails_closed_end_to_end(self):
+        raw = ('{"components": ' + self.DOWN_PAIR
+               + ', "jobs": {"counter": {"parked": true, "running": false}}, '
+               + '"build_revision": "r", "build_id": "b", '
+               + '"components": ' + self.READY_PAIR + '}').encode()
+        code, out = run(double({"/health": HEALTH, "/readyz": (200, raw)}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL readiness-shape:", out)
+        self.assertIn("/readyz 200 carries duplicate JSON object keys", out)
+        self.assertIn("FAIL gateway-state:", out)
+        self.assertIn("FAIL jobs-map:", out)
+        self.assertNotIn("gateway=ready", out)
+
+    def test_health_status_identical_repeat_refused(self):
+        raw = b'{"status": "ok", "status": "ok"}'
+        with self.assertRaises(probe.ProbeError) as ctx:
+            probe.check_liveness(200, raw)
+        self.assertEqual(str(ctx.exception),
+                         "/health carries duplicate JSON object keys")
+
+    def test_health_status_conflicting_orders_refused(self):
+        for raw in (b'{"status": "bad", "status": "ok"}',
+                    b'{"status": "ok", "status": "bad"}'):
+            with self.subTest(raw=raw):
+                with self.assertRaises(probe.ProbeError) as ctx:
+                    probe.check_liveness(200, raw)
+                self.assertEqual(str(ctx.exception),
+                                 "/health carries duplicate JSON object keys")
+
+    def test_health_duplicate_fails_liveness_end_to_end(self):
+        raw = b'{"status": "bad", "status": "ok"}'
+        code, out = run(double({"/health": (200, raw), "/readyz": PARKED}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL liveness:", out)
+        self.assertIn("/health carries duplicate JSON object keys", out)
+        self.assertNotIn("bad", out)
+
+    def test_health_unique_still_passes(self):
+        code, out = run(double({"/health": HEALTH, "/readyz": PARKED}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS liveness:", out)
+
+    def test_nested_job_name_duplicate_both_orders_refused(self):
+        fresh = '{"parked": false, "running": true}'
+        parked = '{"parked": true, "running": false}'
+        for jobs in (f'{{"counter": {fresh}, "counter": {parked}}}',
+                     f'{{"counter": {parked}, "counter": {fresh}}}'):
+            raw = ('{"components": ' + self.READY_PAIR + ', "jobs": ' + jobs
+                   + ', "build_revision": "r", "build_id": "b"}').encode()
+            with self.subTest(jobs=jobs):
+                with self.assertRaises(probe.ProbeError) as ctx:
+                    probe.check_readyz_shape(200, raw)
+                self.assertEqual(str(ctx.exception),
+                                 "/readyz 200 carries duplicate JSON object keys")
+
+    def test_nested_job_name_identical_repeat_refused(self):
+        jobs = '{"counter": {"parked": true, "running": false}, "counter": {"parked": true, "running": false}}'
+        raw = ('{"components": ' + self.READY_PAIR + ', "jobs": ' + jobs
+               + ', "build_revision": "r", "build_id": "b"}').encode()
+        with self.assertRaises(probe.ProbeError) as ctx:
+            probe.check_readyz_shape(200, raw)
+        self.assertEqual(str(ctx.exception),
+                         "/readyz 200 carries duplicate JSON object keys")
+
+    def test_nested_job_field_duplicate_both_orders_refused(self):
+        for entry in ('{"parked": false, "running": true, "parked": true}',
+                      '{"parked": true, "running": true, "parked": false}',
+                      '{"parked": false, "parked": false, "running": true}'):
+            raw = ('{"components": ' + self.READY_PAIR
+                   + ', "jobs": {"counter": ' + entry + '}, '
+                   + '"build_revision": "r", "build_id": "b"}').encode()
+            with self.subTest(entry=entry):
+                with self.assertRaises(probe.ProbeError) as ctx:
+                    probe.check_readyz_shape(200, raw)
+                self.assertEqual(str(ctx.exception),
+                                 "/readyz 200 carries duplicate JSON object keys")
+
+    def test_nested_job_duplicate_fails_readiness_before_job_grading(self):
+        jobs = '{"counter": {"parked": false, "running": true}, "counter": {"parked": true, "running": false}}'
+        raw = ('{"components": ' + self.READY_PAIR + ', "jobs": ' + jobs
+               + ', "build_revision": "r", "build_id": "b"}').encode()
+        code, out = run(double({"/health": HEALTH, "/readyz": (200, raw)}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL readiness-shape:", out)
+        self.assertIn("/readyz 200 carries duplicate JSON object keys", out)
+
+    def test_unique_nested_objects_still_parse(self):
+        _, raw = (200, json.dumps({
+            "components": [["process", "ready"], ["gateway", "ready"]],
+            "jobs": {"counter": {"parked": False, "running": True}},
+            "build_revision": "r", "build_id": "b",
+        }).encode())
+        state, _ = probe.check_readyz_shape(200, raw)
+        self.assertEqual(state["gateway"], "ready")
+
+    def test_escaped_key_spelling_counts_as_duplicate(self):
+        raw = b'{"status": "ok", "\\u0073tatus": "ok"}'
+        with self.assertRaises(probe.ProbeError) as ctx:
+            probe.check_liveness(200, raw)
+        self.assertEqual(str(ctx.exception),
+                         "/health carries duplicate JSON object keys")
+
+    def test_diagnostic_echoes_no_key_or_value(self):
+        sentinel = "SENTINEL_dupkey_cutover_abc123"
+        raw = ('{"components": ' + self.READY_PAIR
+               + ', "jobs": {"counter": {"parked": true, "running": false}}, '
+               + '"build_revision": "r", "build_id": "b", '
+               + json.dumps(sentinel) + ': 1, ' + json.dumps(sentinel) + ': 2}').encode()
+        with self.assertRaises(probe.ProbeError) as ctx:
+            probe.check_readyz_shape(200, raw)
+        self.assertEqual(str(ctx.exception),
+                         "/readyz 200 carries duplicate JSON object keys")
+        self.assertNotIn(sentinel, str(ctx.exception))
+        code, out = run(double({"/health": HEALTH, "/readyz": (200, raw)}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1, out)
+        self.assertNotIn(sentinel, out)
+
+    def test_duplicate_writes_no_receipt(self):
+        raw = ('{"components": ' + self.DOWN_PAIR
+               + ', "jobs": {"counter": {"parked": true, "running": false}}, '
+               + '"build_revision": "r", "build_id": "b", '
+               + '"components": ' + self.READY_PAIR + '}').encode()
+        with mock.patch("builtins.open") as handle:
+            code, _ = run(double({"/health": HEALTH, "/readyz": (200, raw)}),
+                          "--base-url", "http://h/",
+                          "--evidence", "receipt.json")
+        self.assertEqual(code, 1)
+        handle.assert_not_called()
+
+    def test_health_duplicate_writes_no_receipt(self):
+        raw = b'{"status": "ok", "status": "ok"}'
+        with mock.patch("builtins.open") as handle:
+            code, out = run(double({"/health": (200, raw), "/readyz": PARKED}),
+                            "--base-url", "http://h/",
+                            "--evidence", "receipt.json")
+        self.assertEqual(code, 1, out)
+        self.assertIn("/health carries duplicate JSON object keys", out)
+        handle.assert_not_called()
+
+
 class UnknownComponentTest(unittest.TestCase):
     def unknown_body(self, extra, status=200):
         pairs = [("process", "ready"), ("gateway", "ready"), extra]
@@ -607,6 +794,248 @@ class CadenceTest(unittest.TestCase):
         self.assertIn("1 not yet run", out)
         self.assertIn("1 parked", out)
         self.assertNotIn("4 jobs fresh", out)
+
+
+class NonfiniteJobFieldTest(unittest.TestCase):
+    """Nonfinite numeric job fields fail as structured jobs-map FAILs.
+
+    Raw NaN/Infinity tokens and overflowing exponents (which decode to
+    Infinity) must never traceback nor count as verified fresh; they fail
+    the jobs-map check with bounded diagnostics naming the job and field.
+    """
+
+    def raw_body(self, counter_entry_raw):
+        return (200, (
+            '{"components": [["process", "ready"], ["gateway", "ready"]],'
+            '"jobs": {"counter": ' + counter_entry_raw + '},'
+            '"build_revision": "r", "build_id": "b"}').encode())
+
+    def assert_structured_fail(self, counter_entry_raw, field):
+        body = self.raw_body(counter_entry_raw)
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL jobs-map:", out)
+        self.assertIn("counter", out)
+        self.assertIn("nonfinite", out.lower())
+        self.assertIn(field, out)
+        self.assertNotIn("Traceback", out)
+        self.assertNotIn("jobs fresh within cadence", out)
+        return out
+
+    def test_nan_last_success_fails(self):
+        self.assert_structured_fail(
+            '{"parked": false, "running": true, "last_success": NaN}',
+            "last_success")
+
+    def test_infinity_last_success_fails(self):
+        self.assert_structured_fail(
+            '{"parked": false, "running": true, "last_success": Infinity}',
+            "last_success")
+
+    def test_negative_infinity_last_success_fails(self):
+        self.assert_structured_fail(
+            '{"parked": false, "running": true, "last_success": -Infinity}',
+            "last_success")
+
+    def test_overflow_exponent_last_success_fails(self):
+        self.assert_structured_fail(
+            '{"parked": false, "running": true, "last_success": 1e10000}',
+            "last_success")
+
+    def test_nan_last_start_without_success_fails(self):
+        self.assert_structured_fail(
+            '{"parked": false, "running": true, '
+            '"consecutive_failures": 0, "last_start": NaN}',
+            "last_start")
+
+    def test_infinity_last_start_without_success_fails(self):
+        self.assert_structured_fail(
+            '{"parked": false, "running": true, '
+            '"consecutive_failures": 0, "last_start": Infinity}',
+            "last_start")
+
+    def test_nan_consecutive_failures_fails(self):
+        self.assert_structured_fail(
+            '{"parked": false, "running": true, '
+            '"consecutive_failures": NaN}',
+            "consecutive_failures")
+
+    def test_infinity_consecutive_failures_fails(self):
+        self.assert_structured_fail(
+            '{"parked": false, "running": true, '
+            '"consecutive_failures": Infinity}',
+            "consecutive_failures")
+
+    def test_overflow_exponent_consecutive_failures_fails(self):
+        self.assert_structured_fail(
+            '{"parked": false, "running": true, '
+            '"consecutive_failures": 1e10000}',
+            "consecutive_failures")
+
+    def test_nonfinite_failures_with_fresh_success_still_fails(self):
+        now_ms = int(time.time() * 1000)
+        entry = ('{"parked": false, "running": true, '
+                 '"last_success": %d, "consecutive_failures": NaN}' % now_ms)
+        self.assert_structured_fail(entry, "consecutive_failures")
+
+    def test_nonfinite_leaves_no_receipt(self):
+        body = self.raw_body(
+            '{"parked": false, "running": true, "last_success": NaN}')
+        with mock.patch("builtins.open") as handle:
+            code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                            "--base-url", "http://h/",
+                            "--evidence", "receipt.json")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL jobs-map:", out)
+        handle.assert_not_called()
+
+    def test_parked_job_with_nonfinite_stays_green(self):
+        body = self.raw_body(
+            '{"parked": true, "running": false, "last_success": NaN}')
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+
+    def test_ungraded_feeds_with_nonfinite_stays_green(self):
+        body = (200, (
+            '{"components": [["process", "ready"], ["gateway", "ready"]],'
+            '"jobs": {"feeds": {"parked": false, "running": true, '
+            '"last_success": NaN}},'
+            '"build_revision": "r", "build_id": "b"}').encode())
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+
+    def test_ungraded_unknown_job_with_nonfinite_stays_green(self):
+        body = (200, (
+            '{"components": [["process", "ready"], ["gateway", "ready"]],'
+            '"jobs": {"brand_new_job": {"parked": false, "running": true, '
+            '"consecutive_failures": Infinity}},'
+            '"build_revision": "r", "build_id": "b"}').encode())
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+
+    def test_degraded_503_with_nonfinite_stays_green(self):
+        body = (503, (
+            '{"components": [["process", "ready"], ["gateway", "ready"], '
+            '["database", "down"]],'
+            '"jobs": {"counter": {"parked": false, "running": true, '
+            '"last_success": NaN}},'
+            '"build_revision": "r", "build_id": "b"}').encode())
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+        self.assertIn("freshness not graded", out)
+
+    def test_fresh_success_with_nonfinite_last_start_still_fails(self):
+        now_ms = int(time.time() * 1000)
+        entry = ('{"parked": false, "running": true, '
+                 '"last_success": %d, "last_start": NaN}' % now_ms)
+        self.assert_structured_fail(entry, "last_start")
+
+    def test_helpers_reject_nonfinite_directly(self):
+        now_ms = int(time.time() * 1000)
+        for field in ("last_success", "last_start"):
+            for value in (float("nan"), float("inf"), float("-inf")):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaisesRegex(probe.ProbeError,
+                                                f"nonfinite {field}"):
+                        probe._field_age_seconds({field: value}, field, now_ms)
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(probe.ProbeError,
+                                            "nonfinite consecutive_failures"):
+                    probe.consecutive_failures({"consecutive_failures": value})
+
+class FixedCadenceJobGradingTest(unittest.TestCase):
+    """self_role_recovery (30 s cadence, 25 s timeout) and automod_expiry
+    (60 s cadence, 5 s timeout) have fixed cadences, so they are graded with
+    the same cadence+timeout / 2x cadence+timeout bands as their siblings."""
+
+    # name: (warn line, max line), pinned from the Rust constants.
+    BANDS = {
+        "self_role_recovery": (55, 85),
+        "automod_expiry": (65, 125),
+    }
+
+    def probe(self, jobs):
+        return run(double({"/health": HEALTH, "/readyz": readyz_with_jobs(jobs)}),
+                   "--base-url", "http://h/")
+
+    def test_bands_derive_from_cadence_and_timeout(self):
+        for name, (warn, limit) in self.BANDS.items():
+            self.assertEqual(probe.WARN_LAST_SUCCESS_AGE_SECONDS[name], warn, name)
+            self.assertEqual(probe.MAX_LAST_SUCCESS_AGE_SECONDS[name], limit, name)
+
+    def test_cadence_and_timeout_maps_cover_the_same_jobs(self):
+        self.assertEqual(set(probe.JOB_CADENCE_SECONDS),
+                         set(probe.JOB_TIMEOUT_SECONDS))
+
+    def test_fresh_samples_pass_without_a_warning(self):
+        code, out = self.probe({name: (False, 10) for name in self.BANDS})
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+        self.assertIn("2 jobs fresh within cadence", out)
+        self.assertNotIn("ungraded", out)
+        self.assertNotIn("warn", out)
+
+    def test_between_warn_and_max_stays_green_but_is_named(self):
+        for name, (warn, limit) in self.BANDS.items():
+            with self.subTest(name=name):
+                code, out = self.probe({name: (False, warn + 10)})
+                self.assertEqual(code, 0, out)
+                self.assertIn("PASS jobs-map:", out)
+                self.assertIn(f"[warn: {name}=", out)
+
+    def test_past_max_fails_and_names_the_job_and_limit(self):
+        for name, (warn, limit) in self.BANDS.items():
+            with self.subTest(name=name):
+                code, out = self.probe({"counter": (False, 10),
+                                        name: (False, limit + 10)})
+                self.assertEqual(code, 1, out)
+                self.assertIn("FAIL jobs-map:", out)
+                self.assertIn(f"{name}=", out)
+                self.assertIn(f"> {limit}s", out)
+                self.assertNotIn("counter=", out)
+
+    def test_never_succeeded_with_failures_fails_and_names_the_job(self):
+        for name in self.BANDS:
+            with self.subTest(name=name):
+                code, out = self.probe({name: (False, None, {
+                    "consecutive_failures": 4, "last_error_class": "database"})})
+                self.assertEqual(code, 1, out)
+                self.assertIn(f"{name}=no-success 4 consecutive failures", out)
+
+    def test_stale_last_start_without_success_fails(self):
+        for name, (warn, limit) in self.BANDS.items():
+            with self.subTest(name=name):
+                code, out = self.probe({name: (False, None, {
+                    "consecutive_failures": 0, "start_age": limit + 60})})
+                self.assertEqual(code, 1, out)
+                self.assertIn(f"{name}=last_start", out)
+
+    def test_never_run_yet_is_not_evidence(self):
+        code, out = self.probe({name: (False, None) for name in self.BANDS})
+        self.assertEqual(code, 0, out)
+        self.assertIn("2 not yet run", out)
+
+    def test_parked_with_ancient_success_passes(self):
+        code, out = self.probe({name: (True, 10 ** 6) for name in self.BANDS})
+        self.assertEqual(code, 0, out)
+        self.assertIn("2 parked", out)
+
+    def test_absent_from_the_map_is_not_a_failure(self):
+        # Absence (an older build, or the job not registered) is unchanged:
+        # the probe grades only what /readyz reports.
+        code, out = self.probe({"counter": (False, 10)})
+        self.assertEqual(code, 0, out)
+        self.assertIn("1 jobs fresh within cadence", out)
 
 
 class BodyCapRefusalTests(unittest.TestCase):

@@ -30,7 +30,7 @@ and the Worker (`packetFilename` in `wrangler/src/alert-rules.ts`).
 | `job_consecutive_failures:<job>` | 3 failed completions in a row; page includes the latest fixed error class when available | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-job-failures) |
 | `rest_429_rate` | 429s above 10% of REST requests between samples (min 10 requests; restarts skip the window) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-rest-429) |
 | `db_pool_saturated` | pool at max with zero idle for 3 consecutive samples | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-db-pool) |
-| `db_errors` | 3 or more storage-layer errors between samples (restarts skip the window; currently counts send-admission SQL) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-db-errors) |
+| `db_errors` | 3 or more storage-layer errors between samples (restarts skip the window; send-admission SQL `op="admission"` plus voice actor load `op="other"`) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-db-errors) |
 | `send_admission_blocked` | new send-admission refusals in 3 consecutive windows | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-send-admission-blocked) |
 | `voice_failures` | room-op failures > 5% of >= 10 ops between samples, or any new dead-letter/orphan | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-voice-failures) |
 | `gateway_missed_events` | any increase of `two_bot_gateway_missed_events_total` between samples (first sample and restarts skip the window) | `/ops/metrics` scrape | [runbook.md](runbook.md#alert-gateway-missed-events) |
@@ -59,11 +59,18 @@ only, never staging/production), and restart counts. See the query pack.
   reachable only by the Container DO, never publicly.
 - Worker/DO logs: `wrangler logs` tail (7-day retention, unsampled) for
   `container_unready_alert`, `container_unready_recovery`,
-  `container_keepalive_arm_failed`, `container_unready_webhook_failed`
-  and `two-bot container started|stopped`.
+  `container_keepalive_arm_failed`, `container_unready_webhook_failed`,
+  `metrics_alert`, `metrics_alert_webhook_failed`
+  and `two-bot container started|stopped`. A `metrics_alert` line carries
+  the ALERT or RESOLVED transition in `content`; with forwarding off it
+  is the only metrics-alert delivery.
 - Rust stdout/stderr: the affected container's logs in the Cloudflare
   dashboard (`listening`, `gateway shard loop started`, `periodic job
-  failed`, fatal `error_class` lines). Worker tail is not Rust stdout.
+  failed`, fatal `error_class` lines). For DB errors with `op="other"`,
+  correlate with `voice actor load failed; actor respawns on the next guild
+  snapshot`: the warn is throttled process-wide to once per 300 s, while
+  every load failure increments `two_bot_db_errors_total`. Worker tail is
+  not Rust stdout.
 - Watch checkpoints: +15 min, +1 h, +6 h, +24 h, +48 h from `T_0`,
   one GO / EXTEND / ROLLBACK row each on the execution card.
 
@@ -75,7 +82,8 @@ only, never staging/production), and restart counts. See the query pack.
 2. It evaluates the rules in `wrangler/src/alert-rules.ts` against the new
    sample and the previous one, and persists the new alert state in DO
    storage **before** notifying (at most once per transition).
-3. Each transition emits one structured log line and, only when the
+3. Each transition emits one structured log line (`metrics_alert` for a
+   metrics rule) and, only when `OPS_ALERT_FORWARDING = "on"` **and** the
    per-environment webhook secret is provisioned, one Discord-compatible
    webhook POST with an empty `allowed_mentions.parse`:
    `two-bot-next ALERT <rule> [(last error class: <class>)]: <summary>. Runbook: <deep link>` or
@@ -87,22 +95,31 @@ only, never staging/production), and restart counts. See the query pack.
    finding on the watch log, and confirms `container_unready_recovery`
    (or the RESOLVED line) before closing the incident.
 
-Delivery limits the watch lead must plan around: without the webhook
-secret, monitoring is log-only; a failed/timed-out webhook is not
-retried; a crash between persistence and notification can lose that
-notification (the structured log line is the primary signal); this
-monitor covers a running keepalive loop, not a missing Worker/alarm or
-a total monitoring outage — separate external uptime checks are still
-needed for those failure modes.
+The checked-in `wrangler/wrangler.toml` sets `OPS_ALERT_FORWARDING = "off"`
+in every environment, including production. This is a config-file fact,
+not verification of deployed private bindings or overrides. When forwarding
+is off, the `metrics_alert` log event is the only metrics-alert delivery,
+even if a webhook secret exists; a secret alone does not enable paging.
+
+Delivery limits the watch lead must plan around: without forwarding on and
+the webhook secret, monitoring is log-only; a failed/timed-out metrics
+webhook emits `metrics_alert_webhook_failed` and is not retried. A crash
+between persistence and notification can lose that notification (the
+structured log line is the primary signal); this monitor covers a running
+keepalive loop, not a missing Worker/alarm or a total monitoring outage —
+separate external uptime checks are still needed for those failure modes.
 
 ## 4. Pre-watch provisioning check (names only, never values)
 
 Before `T_0`, the operator confirms each item by name with its
 provisioner and records the receipt on the execution card:
 
-- [ ] Webhook secret provisioned in the production Worker environment
-  (Discord-compatible HTTPS URL, no userinfo, never in `wrangler.toml`,
-  a PR or a log).
+- [ ] Delivery mode confirmed by the operator: log-only, or forwarding
+  explicitly enabled through the governed operator path. This sheet does
+  not turn `OPS_ALERT_FORWARDING` on.
+- [ ] For webhook paging, webhook secret provisioned in the production
+  Worker environment (Discord-compatible HTTPS URL, no userinfo, never in
+  `wrangler.toml`, a PR or a log); forwarding must also be on.
 - [ ] Scrape token provisioned as the production Worker secret backing
   `GET /ops/metrics`; an off-container scrape returns exposition.
 - [ ] Readiness threshold confirmed: default (≈10 min) or the
@@ -148,12 +165,11 @@ cutover execution thread, not blockers on this sheet.
   the live page needs the governed operator path.
 - No external uptime check covers a missing Worker/alarm or a total
   monitoring outage; the keepalive only watches a running loop.
-- The DB-error counter and send-admission series now page (`db_errors`,
-  `send_admission_blocked`); residual: only send-admission SQL reports
-  `db_errors` so far, other stores adopt the counter incrementally, and a
-  slow error trickle below threshold stays silent by design (job-failure
-  rules cover it).
+- The DB-error, send-admission and voice lifecycle rules ship on main
+  (`db_errors`, `send_admission_blocked`, `voice_failures`); delivery follows
+  §3, not an assumed webhook page. DB-error producers are send-admission
+  SQL plus voice actor load; other stores adopt the counter incrementally.
+  A slow error trickle below threshold stays silent by design; job-failure
+  rules cover failed jobs, not every storage path.
 - Webhook delivery is at most once per transition with no retry; a
   crash between persistence and notification loses that page.
-- Voice room-operation budgets consume lifecycle outcome signals that
-  live on a sibling branch, not on the main line yet.

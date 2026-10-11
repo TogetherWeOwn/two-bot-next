@@ -1086,6 +1086,64 @@ mod tests {
         assert_eq!(absent.audit.target_key.as_deref(), Some(expected.as_str()));
     }
 
+    fn successful_audits_expecting_target(
+        name: &str,
+        target: &str,
+    ) -> [(&'static str, AuditRecord, AuditRecord); 5] {
+        let expect = |action: &str, outcome: &str, reason: Option<&str>| AuditRecord {
+            guild_id: GUILD.to_owned(),
+            actor_id: Some(ACTOR.to_owned()),
+            action: action.to_owned(),
+            target_key: Some(target.to_owned()),
+            outcome: outcome.to_owned(),
+            reason: reason.map(str::to_owned),
+        };
+        [
+            (
+                "put created",
+                adjudicate_put(GUILD, ACTOR, name, None).audit,
+                expect("command.create", "ok", None),
+            ),
+            (
+                "put updated",
+                adjudicate_put(GUILD, ACTOR, name, Some(&stored("faq"))).audit,
+                expect("command.update", "ok", None),
+            ),
+            (
+                "delete ok",
+                adjudicate_delete(GUILD, ACTOR, name, true).audit,
+                expect("command.delete", "ok", None),
+            ),
+            (
+                "run ok",
+                AuditRecord::run(GUILD, ACTOR, name, true, None),
+                expect("command.run", "ok", None),
+            ),
+            (
+                "run failed",
+                AuditRecord::run(GUILD, ACTOR, name, false, Some("delivery_failed")),
+                expect("command.run", "failed", Some("delivery_failed")),
+            ),
+        ]
+    }
+
+    #[test]
+    fn successful_audits_bound_target_key_by_characters_at_the_name_limit() {
+        let bound = MAX_COMMAND_NAME_CHARS;
+        for (input_chars, kept_chars) in [
+            (bound - 1, bound - 1),
+            (bound, bound),
+            (bound + 1, bound),
+            (bound + 17, bound),
+        ] {
+            let name = "😀".repeat(input_chars);
+            let target = "😀".repeat(kept_chars);
+            for (label, audit, expected) in successful_audits_expecting_target(&name, &target) {
+                assert_eq!(audit, expected, "{label} with {input_chars} characters");
+            }
+        }
+    }
+
     #[test]
     fn run_audit_marks_ok_and_failed() {
         let ok = AuditRecord::run(GUILD, ACTOR, "faq", true, None);

@@ -159,6 +159,8 @@ struct Store {
     /// Every claim as `(user, now_secs)`, and every settle as
     /// `(reservation, bound channel)`.
     claims: Mutex<Vec<(u64, i64)>>,
+    /// The `leaving` list each claim carried.
+    claim_leaving: Mutex<Vec<Vec<u64>>>,
     settled: Mutex<Vec<(String, Option<u64>)>>,
     settle_errors: Mutex<VecDeque<StoreError>>,
     /// Claims bound to the channel Discord returned, as `(reservation, channel)`
@@ -211,6 +213,7 @@ impl Store {
             save_config_error: None,
             claim_script: Mutex::new(VecDeque::new()),
             claims: Mutex::new(Vec::new()),
+            claim_leaving: Mutex::new(Vec::new()),
             settled: Mutex::new(Vec::new()),
             settle_errors: Mutex::new(VecDeque::new()),
             bound: Mutex::new(Vec::new()),
@@ -428,9 +431,11 @@ impl RoomPersistence for Store {
         &self,
         _: u64,
         user: u64,
+        leaving: &[u64],
         _: &CreateAdmissionConfig,
         now_secs: i64,
     ) -> Result<CreateClaim, StoreError> {
+        self.claim_leaving.lock().unwrap().push(leaving.to_vec());
         if self.trace_claims {
             self.trace.lock().unwrap().push("claim".to_owned());
         }
@@ -3047,6 +3052,9 @@ async fn admission_refusal_records_the_stable_code_and_never_calls_discord() {
             .unwrap()
             .push_back(Ok(CreateClaim::Refused(reason)));
         let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        // The legacy limits, so every refusal text (incl. the 30 s cooldown)
+        // stays pinned; the temp-voice default has no cooldown.
+        worker.set_admission_config(CreateAdmissionConfig::default());
         join(&mut worker, MEMBER);
         dispatch(&mut worker, 0).await;
         assert!(trace.lock().unwrap().is_empty(), "{code}: no Discord call");
@@ -11391,4 +11399,29 @@ fn import_preview_and_confirm_refuse_a_new_unsupported_time_zone() {
         plan_import_preview(&current, &bytes, &config_inventory()),
         ImportDecision::Refuse { .. }
     ));
+}
+
+#[tokio::test]
+async fn a_member_hopping_from_their_own_room_to_the_creator_claims_without_it() {
+    let (live, store, http, _) = fixture();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    store.rooms.lock().unwrap().insert(501, room(501));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.upsert_channel(channel(501, 2, Some(CATEGORY)));
+    // Room 501 (also the member's) still has someone in it; 500 is the room
+    // they are leaving.
+    live.voice_update(OTHER_MEMBER, Some(501), Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    assert_eq!(worker.rooms[&500].owner_id, MEMBER);
+    assert_eq!(worker.rooms[&501].owner_id, MEMBER);
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(*worker.store.claim_leaving.lock().unwrap(), vec![vec![500]]);
+}
+
+#[test]
+fn temp_voice_admission_has_no_cooldown() {
+    let config = temp_voice_admission();
+    assert_eq!(config.max_per_user(), 1);
+    assert_eq!(config.cooldown_secs(), 0);
 }

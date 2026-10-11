@@ -69,7 +69,7 @@ halves, and the reconcile pass (tracked-vs-live room comparison).
 
 | Budget | Window | Rollback trigger | Coverage today |
 |---|---|---|---|
-| Room create/move/delete failures | 15 min rolling | > 5% of creator joins fail to place a room, or any member stranded (joined a creator and landed nowhere) | **Manual checkpoint** for joins/stranding. Installed `voice_failures` measures terminal room-operation failure share between keepalive samples (>5%, minimum 10 operations), not a 15 min creator-join ratio |
+| Room create/move/delete failures | 15 min rolling | > 5% of creator joins fail to place a room, or any member stranded (joined a creator and landed nowhere) | **Manual checkpoint** for joins/stranding. Installed `voice_failures` measures terminal room-operation failure share between keepalive samples (>5%, minimum 10 operations), not a 15 min creator-join ratio. It excludes `refused` admissions (per-member or per-guild caps and create bursts), so no installed rule pages on a stuck cap that refuses every join; the manual checkpoint query below counts refused joins as not placed |
 | Ghost channels | per reconcile pass | tracked-but-orphaned rooms grow across two consecutive passes, or any untracked channel is deleted by the bot (never allowed) | **Manual checkpoint**; no installed rule reads `two_bot_voice_compensation_pending`. Installed `voice_failures` catches new dead-letters/orphans, not pending-compensation growth or wrong deletion |
 | Vote-kick ballots | per ballot | any ballot executes against the wrong member/channel, or duplicate ballot side effects from a retried interaction | **Manual checkpoint**; no installed identity/duplicate-side-effect rule |
 | Gateway event gap | 5 min rolling | any unexplained gap in join/message/voice receipts vs independent moderator observation, or duplicated command execution from a replay | **Manual checkpoint** for observation/effects. Installed `gateway_missed_events` catches received-session sequence gaps, not all missing/duplicate effects |
@@ -240,8 +240,7 @@ The staging-migrate gate refuses-or-fails loudly by this contract:
   Operator/CEO-governed dispatch; agents cannot dispatch it).
 - Live staging practice of the §4 create/move/delete probes (blocked on
   staging returning to healthy; owned by the rehearsal follow-up).
-- Voice lifecycle outcome signals (`feat/voice-lifecycle-signals`, not on
-  main) and the rehearsal doc (`docs/voice-cutover-rehearsal`, not on
-  main) are sibling-branch work; the budgets above consume their signals
-  but do not depend on their merge.
+- Voice lifecycle outcome signals (PR #414, merged as `8b3a0b3fc`) and the
+  rehearsal doc (`docs/voice-cutover-rehearsal.md`, PR #413, merged as
+  `95172f712`) are on `main`; the budgets above consume their signals.
 - Production authorization and sequencing live on the cutover card, not here.

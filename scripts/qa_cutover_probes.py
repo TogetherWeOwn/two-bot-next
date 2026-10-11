@@ -34,10 +34,16 @@ Probes and the code path each one checks:
                    its max_last_success_age_seconds (2x cadence + timeout)
                    fails and is named; a job with no success but failed
                    attempts (consecutive_failures > 0, or a last_start older
-                   than the fail line) fails and is named. While degraded
-                   without --expect-ready the jobs map stays informational so
-                   a truthful parked 503 stays green. feeds is ungraded (its
-                   cadence is env-configured), as is any unknown job name.
+                   than the fail line) fails and is named. A nonfinite
+                   last_success, last_start or consecutive_failures (JSON
+                   NaN/Infinity, including an overflowing exponent decoded
+                   to Infinity) fails and is named with bounded diagnostics,
+                   never a traceback and never a verified-fresh count.
+                   While degraded without --expect-ready the jobs map stays
+                   informational so a truthful parked 503 stays green. feeds
+                   is ungraded (its cadence is env-configured), as is any
+                   unknown job name. Parked and ungraded entries skip numeric
+                   grading entirely.
                    Source: crates/bot/src/jobs.rs statuses,
                    crates/bot/src/server.rs failing_jobs test.
   fence-watch      the /readyz body is the container's breakdown, never a
@@ -60,6 +66,15 @@ body cap"; exact-cap valid input passes, and the extra byte never reaches a
 successful JSON path. Refusals never echo the body, headers, URL or parse
 exceptions.
 
+Duplicate-key refusal contract: every JSON object on both routes is decoded
+with duplicate keys refused instead of last-wins, at any depth and after
+escape decoding. A repeated key is refused before liveness, readiness-shape,
+gateway, jobs or fence grading with the fixed message "/health carries
+duplicate JSON object keys" or "/readyz <status> carries duplicate JSON
+object keys"; identical repeats and both conflicting orders fail closed, and
+unique objects still parse. Refusals leave no receipt and never echo keys,
+values, paths or parse exceptions.
+
 Usage:
   python3 scripts/qa_cutover_probes.py --base-url URL [--expect-ready]
       [--timeout SECONDS] [--evidence FILE]
@@ -68,6 +83,7 @@ Usage:
 import argparse
 import http.client
 import json
+import math
 import os
 import sys
 import time
@@ -99,6 +115,10 @@ KNOWN_COMPONENTS = frozenset({"process", "gateway", "database", "token_invalid"}
 #   member_unban_sweep: 30s cadence (UNBAN_SWEEP_INTERVAL_SECONDS,
 #     member_moderation.rs:69) + 180s timeout (SWEEP_TIMEOUT,
 #     member_runtime.rs:57) -> warn 210, max 240
+#   self_role_recovery: 30s cadence + 25s timeout (recovery_job,
+#     self_role_handlers.rs:303-310) -> warn 55, max 85
+#   automod_expiry: 60s cadence (EXPIRY_CADENCE, automod_gateway.rs:44) + 5s
+#     timeout (expiry_job, automod_gateway.rs:308-313) -> warn 65, max 125
 #   scheduled_messages: 15s cadence (SCHEDULER_TICK_MS, scheduled.rs:49)
 #     + 120s timeout (scheduled_jobs.rs) -> warn 135, max 150
 #   settings: 15s cadence (POLL_SECONDS, settings.rs:47) + 10s timeout
@@ -117,6 +137,8 @@ KNOWN_COMPONENTS = frozenset({"process", "gateway", "database", "token_invalid"}
 JOB_CADENCE_SECONDS = {
     "counter": 60,
     "member_unban_sweep": 30,
+    "self_role_recovery": 30,
+    "automod_expiry": 60,
     "scheduled_messages": 15,
     "settings": 15,
     "rank": 600,
@@ -127,6 +149,8 @@ JOB_CADENCE_SECONDS = {
 JOB_TIMEOUT_SECONDS = {
     "counter": 45,
     "member_unban_sweep": 180,
+    "self_role_recovery": 25,
+    "automod_expiry": 5,
     "scheduled_messages": 120,
     "settings": 10,
     "rank": 120,
@@ -146,6 +170,30 @@ MAX_LAST_SUCCESS_AGE_SECONDS = {
 
 class ProbeError(Exception):
     """A check's one-line failure reason."""
+
+
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
+def decode_strict(body):
+    """Decode JSON while refusing duplicate object keys at any depth."""
+    return json.loads(body, object_pairs_hook=_reject_duplicate_keys)
 
 
 @dataclass(frozen=True)
@@ -210,7 +258,9 @@ def fetch(url, timeout):
 
 def decode(body):
     try:
-        return json.loads(body)
+        return decode_strict(body)
+    except DuplicateKeyError:
+        raise
     except (ValueError, UnicodeDecodeError):
         return None
 
@@ -220,7 +270,11 @@ def check_liveness(status, body):
         raise ProbeError(f"/health answered {status}, expected 200")
     if len(body) > BODY_CAP:
         raise ProbeError("/health answered over the body cap")
-    if decode(body) != {"status": "ok"}:
+    try:
+        parsed = decode(body)
+    except DuplicateKeyError:
+        raise ProbeError("/health carries duplicate JSON object keys")
+    if parsed != {"status": "ok"}:
         raise ProbeError("/health 200 without {\"status\": \"ok\"}")
     return "/health 200 {\"status\": \"ok\"}: process answers HTTP"
 
@@ -228,7 +282,10 @@ def check_liveness(status, body):
 def check_readyz_shape(status, body):
     if len(body) > BODY_CAP:
         raise ProbeError("/readyz answered over the body cap")
-    report = decode(body)
+    try:
+        report = decode(body)
+    except DuplicateKeyError:
+        raise ProbeError(f"/readyz {status} carries duplicate JSON object keys")
     if isinstance(report, dict) and report.get("error"):
         raise ProbeError(f"/readyz refused with error {report.get('error')!r:.40} "
                          "(ownership fence or proxy refusal, not the container breakdown)")
@@ -289,11 +346,17 @@ def check_gateway(state, status, expect_ready):
 def _field_age_seconds(entry, field, now_ms):
     """Seconds since the entry's field, or None when absent/non-numeric.
 
-    A timestamp ahead of this clock clamps to 0, never negative.
+    A timestamp ahead of this clock clamps to 0, never negative. A
+    nonfinite float (JSON NaN/Infinity, including an overflowing exponent
+    decoded to Infinity) raises ProbeError: freshness is unassessable,
+    never fresh and never a traceback.
     """
     last = entry.get(field)
     if isinstance(last, bool) or not isinstance(last, (int, float)):
         return None
+    if isinstance(last, float) and not math.isfinite(last):
+        raise ProbeError(f"nonfinite {field} (refusing to grade freshness "
+                         f"from NaN/Infinity)")
     return max(0, int(now_ms - last) // 1000)
 
 
@@ -308,10 +371,18 @@ def job_age_seconds(entry, now_ms):
 
 
 def consecutive_failures(entry):
-    """Non-negative failure count, tolerating absent/malformed values."""
+    """Non-negative failure count, tolerating absent/malformed values.
+
+    A nonfinite float (JSON NaN/Infinity, including an overflowing
+    exponent decoded to Infinity) raises ProbeError: the count is
+    unassessable, never zero and never a traceback.
+    """
     failures = entry.get("consecutive_failures")
     if isinstance(failures, bool) or not isinstance(failures, (int, float)):
         return 0
+    if isinstance(failures, float) and not math.isfinite(failures):
+        raise ProbeError("nonfinite consecutive_failures (refusing to grade "
+                         "freshness from NaN/Infinity)")
     return max(0, int(failures))
 
 
@@ -349,6 +420,21 @@ def check_jobs(report, now_ms=None, enforce_freshness=True):
             # feeds (env-configured cadence) or a newer build's unknown job:
             # not ours to grade, and never counted as verified fresh.
             ungraded.append(name)
+            continue
+        # Nonfinite floats (JSON NaN/Infinity, including overflowing
+        # exponents decoded to Infinity) are unassessable freshness: fail
+        # the job with bounded diagnostics naming the job and field, never
+        # a traceback and never a verified-fresh count. Parked and ungraded
+        # jobs above stay exempt; absent and finite values flow below.
+        nonfinite_field = None
+        for field in ("last_success", "last_start", "consecutive_failures"):
+            value = entry.get(field)
+            if isinstance(value, float) and not math.isfinite(value):
+                nonfinite_field = field
+                break
+        if nonfinite_field is not None:
+            stale.append(f"{name} has nonfinite {nonfinite_field} "
+                         f"(unassessable freshness)")
             continue
         age = job_age_seconds(entry, now_ms)
         if age is None:
@@ -438,7 +524,12 @@ def run(args, fetch_fn=None):
                               "no truthful breakdown to rule out a fence refusal",
                               SRC_FENCE))
         return None, results
-    report = decode(readyz_body)
+    try:
+        report = decode(readyz_body)
+    except DuplicateKeyError:
+        # No last-wins breakdown survives: grading sees no report, the
+        # refusal below fails closed, and no receipt is written.
+        report = None
     try:
         state, shape_reason = check_readyz_shape(readyz_status, readyz_body)
     except ProbeError as e:

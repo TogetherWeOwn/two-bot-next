@@ -404,15 +404,20 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   // docs/voice-cutover-rollback-triggers.md): any outcome other than
   // `success` (`category_full`, `discord`, `persistence`, `cancelled`)
   // counts as a failure — the join did not place a room, or the move/delete
-  // did not complete. A new dead-letter (a queue write that exhausted 10
-  // attempts) or orphan (an untracked creator-channel orphan needing manual
-  // deletion) fires on its own, so a low-volume stranded-member failure
-  // still pages when the operation window is too small for the ratio.
+  // did not complete. `refused` is admission policy (a member at their cap or
+  // burst limit, working as designed), so it is neither an operation nor a
+  // failure here; it stays on the counter for the manual checkpoint. A new
+  // dead-letter (a queue write that exhausted 10 attempts) or orphan (an
+  // untracked creator-channel orphan needing manual deletion) fires on its
+  // own, so a low-volume stranded-member failure still pages when the
+  // operation window is too small for the ratio.
   let voiceOps = 0;
   let voiceFailures = 0;
   for (const s of gauge("two_bot_voice_operations_total")) {
+    const outcome = s.labels["outcome"];
+    if (outcome === "refused") continue;
     voiceOps += s.value;
-    if (s.labels["outcome"] !== "success") voiceFailures += s.value;
+    if (outcome !== "success") voiceFailures += s.value;
   }
   let voiceDeadLetters = 0;
   for (const s of gauge("two_bot_voice_dead_letters_total")) voiceDeadLetters += s.value;

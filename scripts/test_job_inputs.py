@@ -190,7 +190,7 @@ class SelectionTests(unittest.TestCase):
     def test_worker_tree_selects_worker_only(self):
         for path in ["wrangler/src/index.ts",
                      "wrangler/test/container-env.test.ts",
-                     "wrangler/package.json", "wrangler/wrangler.toml",
+                     "wrangler/package.json",
                      "wrangler/scripts/check-env-bindings.py"]:
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {WORKER}, path)
@@ -221,6 +221,20 @@ class SelectionTests(unittest.TestCase):
             jobs(["docs/metrics.md"]),
             {RUST: True, WORKER: True, PARITY: False,
              SUPPLY: True, DOCS: True})
+
+    def test_embedded_rust_inputs_select_rust_and_worker(self):
+        self.assertEqual(inputs.classify("docs/startup-diagnostics.md"),
+                         {RUST, WORKER})
+        self.assertEqual(inputs.classify("wrangler/wrangler.toml"),
+                         {RUST, WORKER})
+        self.assertEqual(
+            jobs(["docs/startup-diagnostics.md"]),
+            {RUST: True, WORKER: True, PARITY: False,
+             SUPPLY: True, DOCS: True})
+        self.assertEqual(
+            jobs(["wrangler/wrangler.toml"]),
+            {RUST: True, WORKER: True, PARITY: False,
+             SUPPLY: True, DOCS: False})
 
     def test_runbook_docs_select_worker_only(self):
         for path in ["docs/runbook.md", "docs/container-readiness.md"]:
@@ -368,11 +382,11 @@ class SelectionTests(unittest.TestCase):
 
 
 class ReaderCoverageTests(unittest.TestCase):
-    """Every doc-literal reader must agree with the classifier.
+    """Every repo-owned literal content reader must agree with the classifier.
 
-    If a new docs/ read lands in Rust/scripts/wrangler code, this suite
-    forces the RUST_DOCS/RUST_WORKER_DOCS/WORKER_DOCS/PARITY_DOCS sets to
-    follow it.
+    Rust literal include_str! paths resolve from their source file; dynamic
+    macro arguments are intentionally outside this scan. The existence-only
+    docs policy remains separate from content-reader classification.
     """
 
     # Docs the preconditions binary checks by existence only (is_file, never
@@ -386,20 +400,26 @@ class ReaderCoverageTests(unittest.TestCase):
         "docs/runbook.md",
     })
 
-    def test_rust_doc_literals_are_classified_rust(self):
-        literals = set()
-        for path in list((ROOT / "crates").rglob("*.rs")) + (
-                [ROOT / "src/lib.rs"] if (ROOT / "src/lib.rs").exists() else []):
-            for line in path.read_text().splitlines():
-                if line.strip().startswith("//"):
-                    continue
-                literals.update(
-                    re.findall(r'"(docs/[A-Za-z0-9_./-]+\.md)"', line))
-        self.assertTrue(literals, "expected Rust doc literals")
+    def test_rust_content_readers_are_classified_rust(self):
+        content_readers = set()
+        rust_sources = list((ROOT / "crates").rglob("*.rs")) + (
+            [ROOT / "src/lib.rs"] if (ROOT / "src/lib.rs").exists() else [])
+        for source in rust_sources:
+            source_text = "\n".join(
+                line for line in source.read_text().splitlines()
+                if not line.strip().startswith("//"))
+            content_readers.update(re.findall(
+                r'"(docs/[A-Za-z0-9_./-]+\.(?:md|json))"', source_text))
+            for include_path in re.findall(
+                    r'include_str!\(\s*"([A-Za-z0-9_./-]+)"\s*\)', source_text):
+                resolved = (source.parent / include_path).resolve()
+                if resolved.is_file() and resolved.is_relative_to(ROOT):
+                    content_readers.add(resolved.relative_to(ROOT).as_posix())
+        self.assertTrue(content_readers, "expected Rust content readers")
         for doc in self.EXISTENCE_ONLY_DOCS:
-            self.assertIn(doc, literals, f"{doc} left Rust sources")
-        for literal in sorted(literals):
-            with self.subTest(doc=literal):
+            self.assertIn(doc, content_readers, f"{doc} left Rust sources")
+        for literal in sorted(content_readers):
+            with self.subTest(path=literal):
                 if literal in self.EXISTENCE_ONLY_DOCS:
                     self.assertNotIn(RUST, inputs.classify(literal), literal)
                 else:
@@ -696,6 +716,10 @@ class VoiceSelectionTest(unittest.TestCase):
             "crates/bot/src/voice_rooms/join_requests.rs",
             "crates/core/src/voice_name_filter.rs",
             "crates/bot/src/gateway.rs",
+            "crates/discord/src/voice_rooms.rs",
+            "crates/cutover/src/voice_rooms.rs",
+            "crates/discord/src/voice_rooms_http_tests.rs",
+            "./crates/cutover/src/voice_rooms.rs",
             "tests/voice_templates/corpus.json",
             "Cargo.lock",
             "scripts/staging_voice_synthetic.py",
@@ -708,6 +732,11 @@ class VoiceSelectionTest(unittest.TestCase):
         for path in (
             "crates/bot/src/tickets.rs",
             "crates/core/src/settings.rs",
+            "crates/discord/src/automod.rs",
+            "crates/cutover/src/tickets.rs",
+            "crates/cutover/src/voice_config_store.rs",
+            "crates/cutover/src/voice_ghosts.rs",
+            "crates/cutover/src/voice_reconcile.rs",
             "docs/voice-rooms.md",
             "wrangler/src/index.ts",
             "README.md",
@@ -717,6 +746,11 @@ class VoiceSelectionTest(unittest.TestCase):
 
     def test_any_deletion_selects_the_synthetic(self):
         self.assertTrue(inputs.voice_selected([], ["docs/old.md"]))
+        for path in (
+            "crates/discord/src/voice_rooms.rs",
+            "crates/cutover/src/voice_rooms.rs",
+        ):
+            self.assertTrue(inputs.voice_selected([], [path]), path)
 
     def test_voice_is_never_a_ci_job(self):
         self.assertNotIn(inputs.VOICE, inputs.ALL_JOBS)

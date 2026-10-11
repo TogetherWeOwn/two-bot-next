@@ -9,7 +9,9 @@
 //! `drain_pending` call, which surfaces at most `MAX_PENDING_ROWS` (25) rows.
 //! While the persistent halt is engaged the sweep claims nothing; a halt that
 //! lands mid-sweep is honored per row by the service, which releases held
-//! claims unattempted. Cancellation (timeout or shutdown) mid-row is safe: the
+//! claims unattempted. Every readable halt also sets the label-free
+//! `two_bot_audit_delivery_halt` gauge (1 engaged, 0 cleared) for staleness
+//! evaluation. Cancellation (timeout or shutdown) mid-row is safe: the
 //! boundary is persisted before any POST, so the next owner reconciles.
 //!
 //! With none of `DISCORD_AUDIT_LOG_CHANNEL_ID`, `DISCORD_VOICE_LOG_CHANNEL_ID`
@@ -35,6 +37,7 @@ use two_bot_core::audit_service::{
     AuditMirrorService, DeliverOutcome, DrainReport, MirrorConfig, RecordOutcome,
 };
 use two_bot_core::audit_store::AuditStore;
+use two_bot_core::metrics::Metrics;
 use two_bot_core::settings::LiveSettings;
 use two_bot_discord::executor::ActionExecutor;
 
@@ -269,6 +272,9 @@ pub(crate) struct AuditRuntime<M: AuditMirror> {
     /// Halt state seen by the previous sweep, for transition logs only —
     /// every sweep reads the store.
     halted: Mutex<Option<bool>>,
+    /// Sink for `two_bot_audit_delivery_halt`: the process-global registry in
+    /// production, an isolated registry in tests so sweeps pin exact values.
+    metrics: &'static Metrics,
 }
 
 impl<M: AuditMirror + Clone> AuditRuntime<M> {
@@ -276,6 +282,15 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
         deployment: HashMap<String, String>,
         guild: String,
         connect: Connect<M>,
+    ) -> Result<Self, &'static str> {
+        Self::with_metrics(deployment, guild, connect, two_bot_core::metrics::global())
+    }
+
+    pub(crate) fn with_metrics(
+        deployment: HashMap<String, String>,
+        guild: String,
+        connect: Connect<M>,
+        metrics: &'static Metrics,
     ) -> Result<Self, &'static str> {
         let channels = resolve_channels(&layered_vars(
             &deployment,
@@ -290,6 +305,7 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
             live_revision: Mutex::new(None),
             wired: AsyncMutex::new(None),
             halted: Mutex::new(None),
+            metrics,
         })
     }
 
@@ -333,6 +349,15 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
     #[cfg(test)]
     pub(crate) fn channels_for_test(&self) -> AuditChannelIds {
         self.channels.lock().unwrap().clone()
+    }
+
+    /// Halt memory for tests: the state the previous sweep reported, `None`
+    /// before the first sweep. The `/metrics` gauge mirrors these same
+    /// transitions through the runtime's metrics sink (the process-global
+    /// registry in production).
+    #[cfg(test)]
+    pub(crate) fn halted_for_test(&self) -> Option<bool> {
+        *self.halted.lock().unwrap()
     }
 
     fn build_wired(
@@ -418,12 +443,17 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
     }
 
     /// One retry sweep: read the halt, then drain at most one bounded batch.
+    /// Every readable halt also sets `two_bot_audit_delivery_halt` (1 while
+    /// engaged, 0 once cleared) so the kill-switch state is visible to
+    /// staleness evaluation; an unreadable halt keeps the last reported
+    /// state instead of fabricating a clear.
     pub(crate) async fn sweep(&self) -> Result<Sweep, ErrorClass> {
         let wired = self.wired().await?;
         let Ok(halt) = wired.store.delivery_halt().await else {
             tracing::warn!(job = JOB, "audit_retry_halt_unreadable");
             return Err(ErrorClass::Database);
         };
+        self.metrics.set_audit_delivery_halt(halt.is_some());
         if self.note_halt(halt.is_some()) {
             tracing::debug!(job = JOB, "audit_retry_halted");
             return Ok(Sweep::Halted);

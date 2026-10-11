@@ -199,8 +199,9 @@ class SmokeRunTests(unittest.TestCase):
         self.drive()
         self.assertEqual(self.health_requested, [ORIGIN + "/health", ORIGIN + "/readyz"])
         self.assertEqual(self.discord_requested[:2], [f"{API}/users/@me", LIST_URL])
-        # One resource read per core surface, nothing for the gated rows.
-        self.assertEqual(len(self.discord_requested), 2 + len(smoke.CORE_SURFACES))
+        # One resource read per present builtin (core plus every gated row);
+        # the fakes only serve GET routes, so any non-GET or off-API fetch fails.
+        self.assertEqual(len(self.discord_requested), 2 + len(PUBLISHED))
         self.assertTrue(all(url.startswith(API) for url in self.discord_requested))
 
     def test_explicit_deploy_run_id_overrides_the_build_id_prefix(self):
@@ -222,6 +223,48 @@ class SmokeRunTests(unittest.TestCase):
     def test_extra_live_commands_do_not_fail_the_run(self):
         code, _ = self.drive(discord=self.discord_fetch(names=[*PUBLISHED, "faq"]))
         self.assertEqual(code, 0)
+
+    def test_present_gated_command_passes_on_detail_match(self):
+        code, _ = self.drive()
+        self.assertEqual(code, 0)
+        record = self.written()
+        row = self.rows(record)["/attendance (registry read)"]
+        self.assertEqual(row["result"], "pass")
+        self.assertNotIn("failure_signature", row)
+        self.assertIn("registered in the staging guild", row["actual"])
+        self.assertEqual(record["verdict"]["disposition"], "PASS")
+
+    def test_present_gated_detail_mismatch_fails_with_safe_signature(self):
+        detail = {"attendance": json_body(command("leaderboard", 99))}
+        code, _ = self.drive(discord=self.discord_fetch(detail=detail))
+        self.assertEqual(code, 1)
+        record = self.written()
+        self.assertEqual(record["verdict"]["disposition"], "NEEDS WORK")
+        row = self.rows(record)["/attendance (registry read)"]
+        self.assertEqual(row["result"], "fail")
+        self.assertEqual(row["failure_signature"], smoke.SIGNATURE_DETAIL)
+        self.assertNotIn(TOKEN, json.dumps(record))
+
+    def test_present_gated_detail_refusal_fails_with_safe_signature(self):
+        detail = {"attendance": OSError("unreachable")}
+        code, out = self.drive(discord=self.discord_fetch(detail=detail))
+        self.assertEqual(code, 1)
+        record = self.written()
+        self.assertEqual(record["verdict"]["disposition"], "NEEDS WORK")
+        row = self.rows(record)["/attendance (registry read)"]
+        self.assertEqual(row["result"], "fail")
+        self.assertEqual(row["failure_signature"], smoke.SIGNATURE_DISCORD)
+        self.assertNotIn(TOKEN, out)
+        self.assertNotIn(TOKEN, json.dumps(record))
+
+    def test_absent_gated_command_stays_skipped_with_detail_checked_present(self):
+        names = [name for name in PUBLISHED if name != "attendance"]
+        code, _ = self.drive(discord=self.discord_fetch(names=names))
+        self.assertEqual(code, 0)
+        record = self.written()
+        self.assertEqual(self.rows(record)["/attendance (registry read)"]["result"], "skipped")
+        self.assertEqual(self.rows(record)["/ban (registry read)"]["result"], "pass")
+        self.assertEqual(record["verdict"]["disposition"], "PASS")
 
     # -- failures are loud ---------------------------------------------------
 

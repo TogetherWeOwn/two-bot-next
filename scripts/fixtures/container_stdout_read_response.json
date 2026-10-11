@@ -1,0 +1,61 @@
+{
+  "success": true,
+  "errors": [],
+  "messages": [],
+  "result": {
+    "run": {"id": "fixture"},
+    "statistics": {"elapsed": 1},
+    "events": {
+      "count": 4,
+      "fields": [{"type": "string", "key": "msg"}],
+      "series": [],
+      "events": [
+        {
+          "dataset": "containers",
+          "timestamp": 1791721180000,
+          "source": {
+            "msg": "ready", "level": "info", "target": "two_bot::gateway",
+            "run_id": "1791721100000000000-1", "ts": "2026-10-11T12:19:40.000000Z",
+            "$cf": {"colo": "ORD"}, "message": "gateway ready; checkpoint committed"
+          },
+          "$containers": {"applicationId": "11111111-2222-4333-8444-555555555555", "hostname": "localhost"},
+          "$metadata": {"id": "01FIXTURE0000000000000004", "service": "11111111-2222-4333-8444-555555555555",
+                        "level": "info", "type": "cf-container",
+                        "message": "gateway ready; checkpoint committed"}
+        },
+        {
+          "dataset": "containers",
+          "timestamp": 1791721150000,
+          "source": {
+            "msg": "durable_gateway_failed", "level": "error", "target": "two_bot::gateway",
+            "run_id": "1791721100000000000-1", "error_class": "checkpoint_load_failed",
+            "startup_phase": "durable_gateway", "internal_detail": "dropped: not an allowed field",
+            "spans": [{"name": "run", "run_id": "1791721100000000000-1"}],
+            "message": "durable gateway failed; checkpoint unchanged, readiness unavailable"
+          },
+          "$metadata": {"id": "01FIXTURE0000000000000003", "service": "11111111-2222-4333-8444-555555555555",
+                        "level": "error", "type": "cf-container",
+                        "message": "durable gateway failed; checkpoint unchanged, readiness unavailable"}
+        },
+        {
+          "dataset": "containers",
+          "timestamp": 1791721110000,
+          "source": {
+            "msg": "listening", "level": "info", "target": "two_bot::server",
+            "run_id": "1791721100000000000-1", "code": 8080, "message": "listening"
+          },
+          "$metadata": {"id": "01FIXTURE0000000000000002", "service": "11111111-2222-4333-8444-555555555555",
+                        "level": "info", "type": "cf-container", "message": "listening"}
+        },
+        {
+          "dataset": "containers",
+          "timestamp": 1791721100000,
+          "source": {"message": "\u001b[2m2026-10-11T12:18:20Z\u001b[0m legacy text line before JSON logging"},
+          "$metadata": {"id": "01FIXTURE0000000000000001", "service": "11111111-2222-4333-8444-555555555555",
+                        "level": "info", "type": "cf-container",
+                        "message": "\u001b[2m2026-10-11T12:18:20Z\u001b[0m legacy text line before JSON logging"}
+        }
+      ]
+    }
+  }
+}

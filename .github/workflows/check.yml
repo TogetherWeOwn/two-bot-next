@@ -227,6 +227,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_watch_checkpoint_doc_conformance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_voice_config_apply_doc_conformance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_sanitize_evidence_rows.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_container_stdout_read.py' -v
 
       - name: cutover rollback-readiness probe and freeze drill (offline)
         run: |
@@ -1577,7 +1578,7 @@ jobs:
       - name: Fetch pinned fuzz dependencies (locked)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fetch --locked
-      # Compile-only: builds all eleven libFuzzer targets without executing them.
+      # Compile-only: builds all thirteen libFuzzer targets without executing them.
       # No execution, no corpus output, no schedule; the bounded
       # vote_kick smoke stays a manual non-controller step (see fuzz/README.md).
       # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the
@@ -1630,6 +1631,8 @@ jobs:
         if: needs.job-inputs.outputs.worker != 'false'
       # TOG-9907: named envs do not inherit bindings; fail if any [env.*]
       # omits the Container/DO/exports/vars wiring (staging HTTP 1101).
+      # Both [env.staging] and [env.production] must be present; a missing
+      # environment or an unreadable/invalid TOML fails with a fixed diagnostic.
       - name: check env bindings are explicit
         if: needs.job-inputs.outputs.worker != 'false'
         run: |

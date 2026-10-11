@@ -200,6 +200,58 @@ mod tests {
         }
     }
 
+    /// `docs/startup-diagnostics.md`, read at compile time so the suite stays offline.
+    const STARTUP_DIAGNOSTICS: &str = include_str!("../../../docs/startup-diagnostics.md");
+
+    /// Variants deliberately absent from the doc's error-class table, each with
+    /// the reason. Empty: every class has a row.
+    const TABLE_EXEMPTIONS: [(FailureClass, &str); 0] = [];
+
+    /// The `Error class` cell of every row in the doc's fatal-diagnostics table.
+    /// Panics when the table is missing or reshaped, so a rewrite of it fails
+    /// closed instead of passing with nothing to compare.
+    fn documented_error_classes(doc: &str) -> Vec<&str> {
+        let mut lines = doc.lines();
+        assert!(
+            lines.any(|line| line.trim() == "| Boundary | Error class |"),
+            "docs/startup-diagnostics.md lost its `| Boundary | Error class |` table"
+        );
+        let classes: Vec<&str> = lines
+            .skip(1) // the `| --- | --- |` separator
+            .take_while(|line| line.starts_with('|'))
+            .map(|line| {
+                let cell = line
+                    .trim_end_matches('|')
+                    .rsplit('|')
+                    .next()
+                    .unwrap_or_default()
+                    .trim();
+                cell.strip_prefix('`')
+                    .and_then(|cell| cell.strip_suffix('`'))
+                    .unwrap_or_else(|| panic!("error class cell is not a code span: {line}"))
+            })
+            .collect();
+        assert!(!classes.is_empty(), "the error-class table has no rows");
+        classes
+    }
+
+    #[test]
+    fn every_class_has_a_startup_diagnostics_row_or_an_exemption() {
+        let documented = documented_error_classes(STARTUP_DIAGNOSTICS);
+        let missing: Vec<&str> = FailureClass::ALL
+            .into_iter()
+            .filter(|class| !TABLE_EXEMPTIONS.iter().any(|(exempt, _)| exempt == class))
+            .map(FailureClass::as_str)
+            .filter(|token| !documented.contains(token))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "FailureClass variants with no row in the docs/startup-diagnostics.md error-class \
+             table: {missing:?}. Add a `| <boundary> | `<class>` |` row, or list the variant in \
+             TABLE_EXEMPTIONS with the reason."
+        );
+    }
+
     #[test]
     fn slot_keeps_the_last_failure() {
         let slot = FailureSlot::default();

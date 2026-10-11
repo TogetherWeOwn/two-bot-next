@@ -50,10 +50,11 @@ fn config_and_direct_fields_redact_entire_urls() {
 
 #[test]
 fn s3_target_and_signed_request_hide_keys_and_authorization() {
+    // Userinfo endpoints are refused before signing; redaction of the refused
+    // form is pinned by `invalid_s3_endpoint_never_echoes_its_credential`.
+    // Signing redaction therefore uses a structurally valid endpoint.
     let target = s3::S3Target {
-        endpoint: Secret::new(
-            "https://fixture-user:fixture-password@s3.invalid/private".to_owned(),
-        ),
+        endpoint: Secret::new("https://s3.invalid/private".to_owned()),
         region: "auto".to_owned(),
         bucket: "fixture-backups".to_owned(),
         access_key_id: Secret::new("fixture-access-id".to_owned()),
@@ -78,8 +79,6 @@ fn s3_target_and_signed_request_hide_keys_and_authorization() {
     let secrets = [
         "fixture-access-id",
         "fixture-s3-key-material",
-        "fixture-user",
-        "fixture-password",
         auth,
         signature,
     ];
@@ -88,6 +87,22 @@ fn s3_target_and_signed_request_hide_keys_and_authorization() {
     assert_redacted(&request.headers, &secrets);
     assert_redacted(&request.url, &secrets);
     assert!(auth.contains("Credential=fixture-access-id/"));
+    // A userinfo-bearing target still redacts wholesale in Debug, even though
+    // it can never reach signing.
+    let userinfo_target = s3::S3Target {
+        endpoint: Secret::new(
+            "https://fixture-user:fixture-password@s3.invalid/private".to_owned(),
+        ),
+        region: "auto".to_owned(),
+        bucket: "fixture-backups".to_owned(),
+        access_key_id: Secret::new("fixture-access-id".to_owned()),
+        secret_access_key: Secret::new("fixture-s3-key-material".to_owned()),
+        prefix: None,
+    };
+    assert_redacted(
+        &userinfo_target,
+        &["fixture-user", "fixture-password", "fixture-access-id"],
+    );
 }
 
 #[test]

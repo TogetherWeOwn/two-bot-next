@@ -33,7 +33,7 @@ Port-written row cells are strings/nulls. Frozen legacy v3 dumps have no
 `column_types` and carry native numbers/booleans; these decode to bound
 PostgreSQL input using the target's type, never silently to NULL. JSON-looking
 TEXT stays unchanged, and native JSON cells serialize for JSON/JSONB targets.
-Unsupported composite cells refuse; see `tests/fixtures/README.md` for scope
+Unsupported composite cells refuse; see `crates/core/tests/fixtures/README.md` for scope
 and actual frozen-writer fixture provenance.
 
 Input is streamed with separate caps: 1 GiB compressed **and decoded**,
@@ -239,7 +239,7 @@ and a loopback verifier that rejects noncanonical order before re-deriving HMAC.
 
 | Variable | Required | Meaning |
 |---|---|---|
-| `TWO_BACKUP_S3_ENDPOINT` | yes | `https://…` (plain `http` only to loopback, else refused) |
+| `TWO_BACKUP_S3_ENDPOINT` | yes | `https://…` with a host, no userinfo/query/fragment, valid port (plain `http` only to loopback, path prefixes kept, else refused) |
 | `TWO_BACKUP_S3_BUCKET` | yes | validated bucket name (a stray slash would retarget the write) |
 | `TWO_BACKUP_S3_ACCESS_KEY_ID` | yes | — |
 | `TWO_BACKUP_S3_SECRET_ACCESS_KEY` | yes | never logged; only `bucket/key` + etag reach the journal |

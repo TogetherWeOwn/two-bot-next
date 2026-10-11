@@ -2377,5 +2377,104 @@ class UserAgentTests(unittest.TestCase):
         self.assertFalse(seen[0].startswith("Python-urllib"))
 
 
+class DeepNestingTests(OfflineTestCase):
+    """Excessively nested JSON fails closed as invalid_json, never RecursionError.
+
+    Fixtures stay under MAX_BODY so the byte cap cannot mask the decoder
+    backstop; shallow valid/malformed controls prove the shared decode path
+    still classifies ordinary input.
+    """
+
+    ARRAY_DEPTH = 10000
+    OBJECT_DEPTH = 10000
+
+    def deep_array(self, depth=ARRAY_DEPTH):
+        body = b"[" * depth + b"]" * depth
+        self.assertLessEqual(len(body), rollout.MAX_BODY)
+        return body
+
+    def deep_object(self, depth=OBJECT_DEPTH):
+        body = b'{"a":' * depth + b"0" + b"}" * depth
+        self.assertLessEqual(len(body), rollout.MAX_BODY)
+        return body
+
+    def test_decode_refuses_deeply_nested_array_and_object(self):
+        for body in (self.deep_array(), self.deep_object()):
+            with self.subTest(length=len(body)):
+                self.assert_gate("invalid_json", rollout.decode, body)
+
+    def test_shallow_valid_and_malformed_controls(self):
+        self.assertEqual(rollout.decode(b'{"success": true}'), {"success": True})
+        self.assert_gate("invalid_json", rollout.decode, b"{not json")
+
+    def test_api_refuses_deeply_nested_envelope(self):
+        client = rollout.Client(ACCOUNT, SENTINEL)
+        with patch.object(client, "request", return_value=(200, {}, self.deep_array())):
+            self.assert_gate("invalid_json", client.api, "/containers/applications")
+
+    def test_runtime_ready_and_observation_refuse_deep_body_without_echo(self):
+        status, headers, _ = ready_response()
+        for body in (self.deep_array(), self.deep_object()):
+            with self.subTest(length=len(body)):
+                self.assert_gate("invalid_json", rollout.runtime_ready,
+                                 status, headers, body, VERSION, REVISION, BUILD_ID)
+                observed = rollout.runtime_observation(
+                    status, headers, body, VERSION, REVISION, BUILD_ID)
+                self.assertIn("body=unreadable", observed)
+                self.assertNotIn("Traceback", observed)
+                self.assertNotIn("[[[[[", observed)
+
+
+class DeepNestingVerifyTests(OfflineTestCase):
+    """Fake-transport verify with decoder overflow: nonzero CLI, no receipt."""
+
+    ARRAY_DEPTH = DeepNestingTests.ARRAY_DEPTH
+
+    def setUp(self):
+        super().setUp()
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.config = self.root / "wrangler" / "wrangler.toml"
+        self.config.parent.mkdir()
+        self.config.write_text(CONFIG)
+        self.args = argparse.Namespace(
+            config=str(self.config), deploy_config=str(self.root / "deploy.json"),
+            receipt=str(self.root / "baseline.json"), output=str(self.root / "deploy.ndjson"),
+            evidence=str(self.root / "evidence.json"),
+        )
+        self.clock = FakeClock()
+        self.enterContext(patch.dict(os.environ, ENVIRONMENT, clear=True))
+        self.enterContext(patch.object(rollout.time, "time", return_value=STARTED))
+        self.enterContext(patch.object(rollout.time, "monotonic", side_effect=self.clock.monotonic))
+        self.enterContext(patch.object(rollout.time, "sleep", side_effect=self.clock.sleep))
+        self.stdout = self.enterContext(contextlib.redirect_stdout(io.StringIO()))
+        self.stderr = self.enterContext(contextlib.redirect_stderr(io.StringIO()))
+        self.enterContext(patch.object(rollout, "docker_image", return_value=IMAGE))
+
+    def prepare_baseline(self):
+        client = FakeClient({APP_PATH: [[app(OLD_IMAGE)]], ROWS_PATH: [[old_row()]]})
+        rollout.prepare(self.args, client)
+
+    def write_deploy_output(self, records=None):
+        records = receipts() if records is None else records
+        Path(self.args.output).write_text("\n" + "\n\n".join(json.dumps(row) for row in records) + "\n")
+
+    def test_verify_with_deeply_nested_readyz_fails_closed_without_receipt(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        deep = b"[" * self.ARRAY_DEPTH + b"]" * self.ARRAY_DEPTH
+        self.assertLessEqual(len(deep), rollout.MAX_BODY)
+        client = verify_client()
+        client.request_routes[URL + "/readyz"] = [(200, {"x-two-worker-version": VERSION}, deep)]
+        argv = ["staging_rollout.py", "verify", "--receipt", self.args.receipt,
+                "--output", self.args.output, "--evidence", self.args.evidence]
+        with patch.object(sys, "argv", argv), patch.object(rollout, "Client", return_value=client):
+            self.assertEqual(rollout.main(), 1)
+        out = self.stdout.getvalue() + self.stderr.getvalue()
+        self.assertIn("staging rollout gate failed: invalid_json", out)
+        self.assertNotIn("Traceback", out)
+        self.assertNotIn("[[[[[", out)
+        self.assertFalse(Path(self.args.evidence).exists())
+
+
 if __name__ == "__main__":
     unittest.main()

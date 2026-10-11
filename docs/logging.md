@@ -101,6 +101,7 @@ draining state is observable via `/readyz` and `shutdown_started/completed`.
 | `shutdown_started` | Signal received; `signal=SIGTERM|SIGINT`, before HTTP drain |
 | `shutdown_completed` | HTTP graceful drain completed successfully |
 | `shutdown_failed` | Service/supervisor failed; process exits nonzero |
+| `internal_action_unknown_state_persist_failed` | Receiver's best-effort unknown-state write refused or failed after the claim was committed; `action`, `persist_class` (`storage_unavailable` or `transition_refused`; `invalid_input` cannot occur from this write today). The claim is never released or resent |
 | `tracing_event` | Uncataloged/free-form tracing diagnostic; inspect `target`/`message` |
 
 ### Reserved job names

@@ -79,6 +79,9 @@ urllib agent is refused by the edge with HTTP 403/1010, which is not an outage.
 2. **No agent path reads container stdout.** Wrangler 4.147.0 has no
    `containers logs`, and `tail` shows only Worker/DO events. The Rust log
    literals the playbooks cite are verified by source tests, not by a live line.
+   Update 2026-10-11: `scripts/container_stdout_read.py` now reads them from the
+   Workers Observability `containers` dataset (read-only token, no start); see
+   [Reading container stdout](startup-diagnostics.md#reading-container-stdout).
 3. **`/ops/metrics` was not used.** It needs the metrics scrape token, may start
    the container, and is not a no-start readback. The metric names are verified
    against the registry by source test only; no live scrape was compared.

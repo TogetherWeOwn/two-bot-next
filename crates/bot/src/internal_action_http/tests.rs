@@ -939,22 +939,90 @@ async fn missing_nonce_or_claim_storage_prevents_any_effect() {
     db.close().await.unwrap();
 }
 
+fn unknown_persist_failures(start: usize) -> Vec<String> {
+    crate::tracing_capture::global().text()[start..]
+        .lines()
+        .filter(|line| line.contains(r#"msg="internal_action_unknown_state_persist_failed""#))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn unknown_persist_class_is_a_fixed_vocabulary() {
+    assert_eq!(
+        unknown_persist_class(InternalStoreError::InvalidInput),
+        "invalid_input"
+    );
+    assert_eq!(
+        unknown_persist_class(InternalStoreError::Unavailable),
+        "storage_unavailable"
+    );
+    assert_eq!(
+        unknown_persist_class(InternalStoreError::TransitionRefused),
+        "transition_refused"
+    );
+}
+
 #[tokio::test]
 async fn finish_failure_after_effect_is_not_success_or_permission_to_resend() {
     let Some(db) = database().await else { return };
+    let start = crate::tracing_capture::global().text().len();
     let mut mock = MockEffect::new(MockOutcome::Success);
     mock.break_finish = Some(db.pool().clone());
     let effect = Arc::new(mock);
     let app = router(state(db.pool().clone(), effect.clone()));
     let (_, _, first) = answer(app.clone(), signed(payload(), "old", "intent-fixture")).await;
     assert_eq!(first["error"]["code"], "needs_reconciliation");
+    let failures = unknown_persist_failures(start);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(failures[0].contains(r#"persist_class="storage_unavailable""#));
+    assert!(failures[0].contains(r#"action="announcement.post""#));
+    for secret in [
+        first["request_id"].as_str().unwrap(),
+        "intent-fixture",
+        "fixture announcement",
+    ] {
+        assert!(!failures[0].contains(secret));
+    }
     sqlx::query("ALTER TABLE receiver_hidden_audit RENAME TO internal_action_log")
         .execute(db.pool())
         .await
         .unwrap();
-    let (_, _, second) = answer(app, signed(payload(), "old", "intent-fixture")).await;
+    let (_, _, second) = answer(app.clone(), signed(payload(), "old", "intent-fixture")).await;
     assert_eq!(second["error"]["code"], "in_progress");
     assert_eq!(effect.calls(), 1);
+    assert_eq!(unknown_persist_failures(start).len(), 1);
+
+    let healthy = Arc::new(MockEffect::new(MockOutcome::Unknown));
+    let healthy_app = router(state(db.pool().clone(), healthy.clone()));
+    let (_, _, marked) = answer(
+        healthy_app.clone(),
+        signed(payload(), "old", "intent-marked"),
+    )
+    .await;
+    assert_eq!(marked["error"]["code"], "needs_reconciliation");
+    let (_, _, repeat) = answer(healthy_app, signed(payload(), "old", "intent-marked")).await;
+    assert_eq!(repeat["error"]["code"], "needs_reconciliation");
+    assert_eq!(healthy.calls(), 1);
+    assert_eq!(unknown_persist_failures(start).len(), 1);
+
+    let mut hidden = MockEffect::new(MockOutcome::Unknown);
+    hidden.break_finish = Some(db.pool().clone());
+    let hidden = Arc::new(hidden);
+    let hidden_app = router(state(db.pool().clone(), hidden.clone()));
+    let (_, _, unknown_failed) = answer(
+        hidden_app,
+        signed(payload(), "old", "intent-unknown-failed"),
+    )
+    .await;
+    assert_eq!(unknown_failed["error"]["code"], "needs_reconciliation");
+    sqlx::query("ALTER TABLE receiver_hidden_audit RENAME TO internal_action_log")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let failures = unknown_persist_failures(start);
+    assert_eq!(failures.len(), 2, "{failures:?}");
+    assert!(failures.iter().all(|line| !line.contains("intent-")));
     db.close().await.unwrap();
 }
 

@@ -40,14 +40,14 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_db_pool_connections` | Current pool size |
 | `two_bot_db_pool_idle_connections` | Current idle connections |
 | `two_bot_db_pool_max_connections` | Configured maximum |
-| `two_bot_db_errors_total{op}` | Storage-layer failures; `op` is `admission` (send-admission SQL) or `other` (every other store until its op joins the allowlist) |
+| `two_bot_db_errors_total{op}` | Recorded storage-layer failures: send-admission SQL uses `op="admission"`, voice actor load uses `op="other"`; unknown instrumented operations also collapse to `other`. Not a database-wide total |
 | `two_bot_send_admissions_total{outcome}` | Send-admission `admit()` decisions; `outcome` is `admitted`, `blocked`, `storage_error` (also counted in `two_bot_db_errors_total{op="admission"}`) or `other` |
 | `two_bot_gateway_prefix_trigger_refused_total{reason}` | In-scope prefix candidates refused by the automod verdict before any trigger lookup; `reason` is `verdict` (contained, timed-out, uninspected, unrecorded or missing verdict) or `other`. The worker records candidates even when its capture-only gate prevents detached dispatch. Unmatched content (no trigger), scope mismatches, bot/webhook messages and disabled text-command gates never increment this family |
 | `two_bot_job_runs_total{job,outcome}` | Completed attempts; outcome is `success` or `failure` (including returned errors, timeouts and isolated panics) |
 | `two_bot_job_last_success_timestamp_seconds{job}` | Last successful completion time in Unix seconds; zero means no success recorded |
 | `two_bot_job_consecutive_failures{job}` | Failed completions since the last success; resets to zero on success |
 | `two_bot_job_last_error_class{job,class}` | One-hot class of the last failed completion; clears on success; fixed 16 × 7 = 112 series |
-| `two_bot_voice_operations_total{op,outcome}` | Finished room create/move/delete outcomes; `op` is `create`, `move` or `delete`, `outcome` is `success`, `category_full`, `discord`, `persistence` or `cancelled`; retries and 429 backoffs are not outcomes |
+| `two_bot_voice_operations_total{op,outcome}` | Finished room create/move/delete outcomes; `op` is `create`, `move` or `delete`, `outcome` is `success`, `category_full`, `discord`, `persistence`, `cancelled` or `refused` (create admission refused: cap or rolling burst); retries and 429 backoffs are not outcomes |
 | `two_bot_voice_reconcile_actions_total{action}` | Reconcile plan sizes; `action` is `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued` |
 | `two_bot_voice_dead_letters_total{action}` | Queue writes that exhausted `QUEUE_MAX_ATTEMPTS` (10); `action` is `create`, `move`, `delete`, `companion`, `ownership`, `kick`, `rename`, `limit` or `other` |
 | `two_bot_voice_tracked_rooms` | Rooms tracked in memory; compare with live Discord channels for ghosts |
@@ -59,6 +59,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_gateway_checkpoint_failures_total{stage}` | Failed gateway checkpoint commits from `apply_dispatch` and failed checkpoint clears: every failure stops the dispatch worker and is recorded on `operation`. `stage` is `pre_commit` (commit skipped after a funnel/leveling/acknowledgement failure) or `commit` (the durable store write itself failed); failure causes are never labels. Alert rule `gateway_checkpoint_failures` fires on any increase summed over every `stage` between consecutive keepalive samples (the first sample is baseline-only; the failing process lingers 75 s so a scrape lands before the restart resets the counter); unlike bursty dispatch drops, a single checkpoint failure stops the worker, so there is no benign-singleton case |
 | `two_bot_internal_actions_total{family,outcome}` | Signed website-action receiver executions by bounded family and outcome. `family` is one of `announcement`, `event`, `settings`, `moderation`, `membership` or `other` (see label allowlists below). `outcome` is `executed` or the refusal class (`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`, `conflict`, `upstream` or `internal`). Every request counts once; replays count on each serve. Refusal warn-summaries stay sampled; this counter is the alertable signal. Alert rule `receiver_refusals:<family>` fires when a family's refused outcomes rise in 3 consecutive keepalive samples (first sample and restarts clear the streak; one forged pre-auth probe in `other` stays silent) |
 | `two_bot_community_facts_drain_failures_total{reason}` | Warn-and-continue community-facts drain failures in the gateway dispatch worker. `reason` is `error` (the facts writer returned an error) or `timeout` (the drain missed the dispatch deadline), or `other` (see label allowlists below). Each failed dispatch counts once; a committed drain counts nothing. The worker never stalls on this, and the scorecard fails closed on missing coverage. Alert-threshold hook for M2.1: alert when the counter increases across consecutive scrapes; a single failed drain is not paging |
+| `two_bot_audit_delivery_halt` | Audit mirror delivery-halt state for staleness evaluation: `1` while the persistent kill switch is engaged, `0` once cleared. Label-free gauge set once per readable `audit_retry` sweep from the store's `delivery_halt` read; an unreadable halt keeps the last reported state, and a halted sweep still counts as a job `success` (the sweep ran; it claimed nothing by design). Manual check, not an alert input: no alert rule consumes this series and production alert forwarding stays off. No actor ID, timestamp, error text or row content ever reaches exposition |
 
 ## REST admission guard
 
@@ -214,7 +215,7 @@ as dynamic labels.
   names fold into `other`; class labels are fixed enum names, never error text.
 - `two_bot_voice_operations_total{op,outcome}` — `op` is `create`, `move`
   or `delete`; `outcome` is `success`, `category_full`, `discord`,
-  `persistence` or `cancelled`. `Rejected` status/code values never become
+  `persistence`, `cancelled` or `refused` (create admission refused the join). `Rejected` status/code values never become
   labels; all store variants share `persistence`.
 - `two_bot_voice_reconcile_actions_total{action}` — `action` is
   `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued`.
@@ -306,7 +307,7 @@ as dynamic labels.
   `gateway_runtime_failed` or `gateway_task_panicked` (every `FailureClass`
   variant in `crates/bot/src/gateway_failure.rs`). Only `[a-z0-9_]{1,32}`
   tokens are ever logged; anything else is dropped. See
-  [startup diagnostics](startup-diagnostics.md#self-diagnosing-gateway-failures-readyz-gatewayfailure).
+  [startup diagnostics](startup-diagnostics.md#self-diagnosing-gateway-failures-readyz-gateway_failure).
 - `two_bot_handler_duration_seconds` histogram buckets (`le`, seconds):
   `0.001`, `0.005`, `0.01`, `0.05`, `0.1`, `0.5`, `1`, `5`, `+Inf`, plus
   `_sum` and `_count`.
@@ -479,7 +480,10 @@ is the catch-all for unknown job names only, so it has no single cadence.
 so idle guilds go stale while healthy) and is excluded from the fallback via
 `UNKNOWN_STALE_EXCLUDED` in `wrangler/src/alert-rules.ts`: it never tickets.
 `audit_retry` keeps its parked/halt reason in the catalog; a halted sweep still
-records success, so only a truly wedged sweep tickets. `feeds` is covered by
+records success, so only a truly wedged sweep tickets — check
+`two_bot_audit_delivery_halt` (`1` engaged, `0` cleared) to confirm a halted
+sweep is intentional before treating flat audit deliveries as a wedged job.
+`feeds` is covered by
 the coarse fallback, not a precise cadence, because its cadence is
 boot-configured (60–86400 s) with a live-configurable inner polling gate and
 successful gated ticks are not polling freshness; its failure alerting is
@@ -514,11 +518,15 @@ is named `evidence-{ruleId}-{window}.json` (soak-ledger packets stamp the
 attribute packets when several rules fire in one window. Both sides pin every
 spelling with tests; the payload shape is unchanged.
 
-Known gaps: the DB error counter currently records only send-admission SQL,
-so non-admission stores still surface only through the pool proxy and the
-job-failure rules; adopt `Metrics::db_error` per store incrementally. A
-slow trickle of DB errors below the burst threshold likewise surfaces only
-through `job_consecutive_failures`.
+DB-error coverage: `two_bot_db_errors_total` counts send-admission SQL
+failures (`op="admission"`) and voice actor load failures (`op="other"`);
+other stores adopt `Metrics::db_error` incrementally, so this is not a
+database-wide total. Correlate voice load failures with `voice actor load
+failed; actor respawns on the next guild snapshot` in container stdout.
+Every load failure increments the counter, but that warn is throttled
+process-wide to once per 300 s. A slow trickle below the burst threshold
+stays silent in `db_errors`; job-failure rules cover failed jobs, not every
+storage path.
 A forced job failure on staging (three failures) raises
 `job_consecutive_failures:<job>` within about one keepalive tick. Counter resets
 (process restart) skip the 429 window. Alert state is persisted in DO storage
