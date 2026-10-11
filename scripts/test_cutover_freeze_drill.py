@@ -9,6 +9,7 @@ import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -195,6 +196,175 @@ class DrillTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("live guild", out)
         self.assertFalse(Path(self.evidence).exists())
+
+
+CHANNEL = "1000000000000000002"
+CHANNEL_PATH = f"/api/v10/channels/{CHANNEL}"
+MESSAGES_PATH = f"{CHANNEL_PATH}/messages"
+OVERWRITE_PATH = f"{CHANNEL_PATH}/permissions/{STAGING_GUILD}"
+NOTICE_ID = "9000000000000000001"
+NOTICE_PATH = f"{MESSAGES_PATH}/{NOTICE_ID}"
+COMMANDS_PATH = (f"/api/v10/applications/{drill.STAGING_APPLICATION_ID}"
+                 f"/guilds/{STAGING_GUILD}/commands")
+CHANNEL_JSON = {"id": CHANNEL, "guild_id": STAGING_GUILD, "name": "cutover-drill",
+                "rate_limit_per_user": 0, "permission_overwrites": []}
+REMOTE_SENTINEL = "REMOTE_BODY_SENTINEL"
+
+
+def discord_routes(overrides):
+    routes = {
+        ("GET", CHANNEL_PATH): (200, {}, json.dumps(CHANNEL_JSON).encode()),
+        ("POST", MESSAGES_PATH): (200, {}, json.dumps({"id": NOTICE_ID}).encode()),
+        ("PATCH", CHANNEL_PATH): (200, {}, json.dumps(CHANNEL_JSON).encode()),
+        ("PUT", OVERWRITE_PATH): (204, {}, b""),
+        ("DELETE", OVERWRITE_PATH): (204, {}, b""),
+        ("DELETE", NOTICE_PATH): (204, {}, b""),
+        ("GET", COMMANDS_PATH): (200, {}, json.dumps([{"id": "1", "name": "ping"}]).encode()),
+    }
+    routes.update(overrides)
+    return routes
+
+
+class LoopbackDiscord:
+    """127.0.0.1 stand-in for Discord: canned replies per (method, path), every hit recorded."""
+
+    def __init__(self):
+        self.routes = {}
+        self.hits = []
+        fixture = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def serve(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                if length:
+                    self.rfile.read(length)
+                fixture.hits.append((self.command, self.path, self.headers.get("Authorization")))
+                status, headers, body = fixture.routes.get(
+                    (self.command, self.path), (404, {}, b""))
+                self.send_response(status)
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = serve
+
+            def log_message(self, *args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class LiveTransportTests(unittest.TestCase):
+    def setUp(self):
+        self.origin = LoopbackDiscord()
+        self.elsewhere = LoopbackDiscord()
+        self.addCleanup(self.origin.close)
+        self.addCleanup(self.elsewhere.close)
+        self.origin.routes = discord_routes({})
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.evidence = str(Path(tmp.name) / "evidence.json")
+        for patcher in (mock.patch.dict(os.environ, {"no_proxy": "127.0.0.1"}),
+                        mock.patch.object(drill, "API", self.origin.base + "/api/v10")):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_every_redirect_status_stops_at_the_first_reply(self):
+        call = drill.live_transport(TOKEN)
+        ops = (("get_channel", {"channel_id": CHANNEL}, "GET", CHANNEL_PATH),
+               ("post_notice", {"channel_id": CHANNEL, "content": "x"}, "POST", MESSAGES_PATH),
+               ("patch_overwrite", {"channel_id": CHANNEL, "guild_id": STAGING_GUILD,
+                                    "allow": "0", "deny": "0"}, "PUT", OVERWRITE_PATH))
+        for op, kwargs, method, path in ops:
+            for status in drill.REDIRECT_STATUSES:
+                for same_origin in (False, True):
+                    with self.subTest(op=op, status=status, same_origin=same_origin):
+                        location = (f"{self.origin.base}/api/v10/elsewhere" if same_origin
+                                    else f"{self.elsewhere.base}/stolen")
+                        self.origin.routes = {(method, path): (
+                            status, {"Location": location}, REMOTE_SENTINEL.encode())}
+                        self.origin.hits.clear()
+                        self.elsewhere.hits.clear()
+                        with self.assertRaises(drill.DrillError) as caught:
+                            call(op, **kwargs)
+                        self.assertEqual(
+                            str(caught.exception),
+                            "refusing: authenticated Discord request answered a redirect (not followed)")
+                        self.assertEqual([(m, p) for m, p, _ in self.origin.hits],
+                                         [(method, path)])
+                        self.assertEqual(self.origin.hits[0][2], f"Bot {TOKEN}")
+                        self.assertEqual(self.elsewhere.hits, [])
+
+    def test_malformed_2xx_replies_become_drill_errors_and_restore_runs(self):
+        cases = (
+            ("notice-not-json", {("POST", MESSAGES_PATH): (200, {}, b"<html>REMOTE_BODY_SENTINEL")},
+             "discord answered a non-JSON body on POST"),
+            ("notice-not-object", {("POST", MESSAGES_PATH): (200, {}, b"[]")},
+             "discord answered an unexpected body shape on POST"),
+            ("notice-without-id", {("POST", MESSAGES_PATH): (200, {}, b"{}")},
+             "discord notice reply carried no message id"),
+            ("commands-not-json", {("GET", COMMANDS_PATH): (200, {}, b"\x80REMOTE_BODY_SENTINEL")},
+             "discord answered a non-JSON body on GET"),
+            ("commands-not-list", {("GET", COMMANDS_PATH): (200, {}, b'{"commands": []}')},
+             "discord answered an unexpected body shape on GET"),
+            ("slowmode-not-json", {("PATCH", CHANNEL_PATH): (200, {}, b"REMOTE_BODY_SENTINEL")},
+             "discord answered a non-JSON body on PATCH"),
+        )
+        call = drill.live_transport(TOKEN)
+        for name, overrides, reason in cases:
+            with self.subTest(case=name):
+                self.origin.routes = discord_routes(overrides)
+                self.origin.hits.clear()
+                outcome = drill.run_drill(STAGING_GUILD, CHANNEL, REASON, call)
+                self.assertEqual(outcome["result"], "fail")
+                failed = [s for s in outcome["steps"] if s["result"] == "fail"]
+                self.assertEqual(failed[0]["detail"], reason)
+                names = [s["name"] for s in outcome["steps"]]
+                for restore in ("restore-slowmode", "restore-unlock", "restore-notice-delete"):
+                    self.assertIn(restore, names)
+                blob = json.dumps(outcome)
+                self.assertNotIn(TOKEN, blob)
+                self.assertNotIn(REMOTE_SENTINEL, blob)
+
+    def test_surface_failure_sends_every_restore_request(self):
+        self.origin.routes = discord_routes(
+            {("GET", COMMANDS_PATH): (200, {}, b'{"commands": []}')})
+        outcome = drill.run_drill(STAGING_GUILD, CHANNEL, REASON, drill.live_transport(TOKEN))
+        self.assertEqual(outcome["result"], "fail")
+        self.assertEqual(outcome["restore"]["restored"], False)
+        requested = {(m, p) for m, p, _ in self.origin.hits}
+        self.assertLessEqual({("PATCH", CHANNEL_PATH), ("DELETE", OVERWRITE_PATH),
+                              ("DELETE", NOTICE_PATH)}, requested)
+        restore_rows = {s["name"]: s["result"] for s in outcome["steps"]
+                        if s["name"].startswith("restore-")}
+        self.assertEqual(restore_rows, {"restore-slowmode": "pass", "restore-unlock": "pass",
+                                        "restore-notice-delete": "pass"})
+
+    def test_cli_live_run_with_malformed_reply_still_writes_evidence(self):
+        self.origin.routes = discord_routes(
+            {("GET", COMMANDS_PATH): (200, {}, b"\x80REMOTE_BODY_SENTINEL")})
+        with mock.patch.dict(os.environ, {"DISCORD_STAGING_BOT_TOKEN": TOKEN}, clear=True):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = drill.main(["--live", "--confirm-staging", "--guild-id", STAGING_GUILD,
+                                   "--channel-id", CHANNEL, "--reason", REASON,
+                                   "--evidence", self.evidence])
+        self.assertEqual(code, 1)
+        receipt = json.loads(Path(self.evidence).read_text())
+        self.assertEqual(receipt["result"], "fail")
+        self.assertEqual(receipt["transport"], drill.LIVE_TRANSPORT)
+        self.assertIn("restore-notice-delete", [s["name"] for s in receipt["steps"]])
+        blob = out.getvalue() + json.dumps(receipt)
+        self.assertNotIn(TOKEN, blob)
+        self.assertNotIn(REMOTE_SENTINEL, blob)
 
 
 class _Loopback:

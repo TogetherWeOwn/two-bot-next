@@ -663,14 +663,19 @@ def generate_deploy_config(path, image, wrangler_dir):
     Path(path).write_text(json.dumps(config, indent=2) + "\n")
 
 
-def wrangler_deploy(wrangler_bin, wrangler_dir):
+# Wrangler gets PATH, HOME and its Cloudflare deploy credentials only; never the ownership token.
+WRANGLER_ENV_KEYS = ("PATH", "HOME", "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID")
+
+
+def wrangler_deploy(wrangler_bin, wrangler_dir, environ):
     """Deploy closure: pinned wrangler binary, discarded output, exit code only."""
+    child_env = {key: environ[key] for key in WRANGLER_ENV_KEYS if key in environ}
 
     def deploy(config_path):
         try:
             result = subprocess.run(
                 [wrangler_bin, "deploy", "--config", config_path, "--env", "staging"],
-                cwd=wrangler_dir, capture_output=True,
+                cwd=wrangler_dir, env=child_env, capture_output=True,
                 timeout=WRANGLER_TIMEOUT_SECONDS)
         except (OSError, subprocess.SubprocessError):
             raise GateError("deploy_unavailable") from None
@@ -760,7 +765,7 @@ def main(argv=None, *, environ=None, make_control=ownership_control,
                                 env.get("CLOUDFLARE_API_TOKEN"))
         drill = Drill(client, make_control(token, url, actor), url, run_id,
                       (args.deploy_config,
-                       deploy_factory(args.wrangler_bin, wrangler_dir),
+                       deploy_factory(args.wrangler_bin, wrangler_dir, env),
                        wrangler_dir),
                       log=print)
         failures = drill.run(pin, attestation)
