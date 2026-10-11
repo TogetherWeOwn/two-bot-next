@@ -37,14 +37,15 @@ sample image named under Measured sample image.
 |---|---|---|---|
 | R1 | `FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792…` | 21 base layers, 29,128,192 bytes (27.78 MiB) as saved-tar blobs | Debian trust bundle plus 14 documented OS packages; no shell, package manager, or OpenSSL CLI |
 | R2 | `LABEL org.opencontainers.image.revision`, `com.togetherweown.build-id` | Metadata only | Non-secret build provenance; zero bytes |
-| R3 | `USER 65532:65532`, `WORKDIR /home/nonroot` | One small layer, 1,024 bytes as saved-tar blob; `USER` is config-only | Config plus the workdir directory entry |
+| R3 | `USER 65532:65532`, `WORKDIR /home/nonroot` | One empty layer (no tar entries), 1,024 bytes as saved-tar blob; `USER` is config-only | Config; the layer is empty because `/home/nonroot` already exists in base layer 7 |
 | R4 | `COPY --from=builder --chown=65532:65532 /app/target/release/two-bot ./two-bot` | Yes, one file layer, 16,065,536 bytes (15.32 MiB) as saved-tar blob; file itself 16,062,800 bytes (15.32 MiB) | The only added file content: the stripped release binary (`opt-level=z`, LTO, stripped). Budget: 16 MiB per `scripts/container-smoke.py` |
 | R5 | `EXPOSE 8080`, `ENV LISTEN_ADDR=0.0.0.0:8080 LOG_FORMAT=json` | Metadata only | Liveness/readiness port, bind address and JSON log format |
 | R6 | `HEALTHCHECK CMD ["/home/nonroot/two-bot", "--healthcheck"]` | Metadata only | Exec-form probe; needs no shell |
 | R7 | `ENTRYPOINT ["/home/nonroot/two-bot"]` | Metadata only | Exec form so PID 1 receives SIGTERM |
 
-Effective layer delta over the distroless base: two layers, the `WORKDIR`
-directory entry (R3, 1,024 bytes) and the binary (R4, one file layer).
+Effective layer delta over the distroless base: two layers, an empty
+`WORKDIR` layer (R3, 1,024 bytes, no tar entries) and the binary (R4, one
+file layer).
 Builder-only steps (`COPY` manifests, `cargo fetch`, `COPY . .`,
 `cargo build --release --locked`) affect build cache, not the shipped layer
 count. Size gate for the whole runtime image: 112 MiB per
