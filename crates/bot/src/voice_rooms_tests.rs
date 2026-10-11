@@ -10816,6 +10816,98 @@ fn empty_grace_config_accepts_zero_to_ten_minutes_and_refuses_garbage() {
     assert_eq!(configured_empty_grace(Some("1m")), Err(InvalidEmptyGrace));
 }
 
+#[test]
+fn synthetic_human_config_takes_up_to_four_snowflakes_and_refuses_garbage() {
+    assert_eq!(configured_synthetic_humans(None), Ok(HashSet::new()));
+    assert_eq!(configured_synthetic_humans(Some(" ")), Ok(HashSet::new()));
+    assert_eq!(
+        configured_synthetic_humans(Some(" 301, 302 ,")),
+        Ok(HashSet::from([301, 302]))
+    );
+    assert_eq!(
+        configured_synthetic_humans(Some("1,2,3,4")),
+        Ok(HashSet::from([1, 2, 3, 4]))
+    );
+    let overflow = format!("{}0", u64::MAX);
+    for bad in [
+        "1,2,3,4,5",
+        "0",
+        "-1",
+        "+5",
+        "12a",
+        "1;2",
+        overflow.as_str(),
+    ] {
+        assert_eq!(
+            configured_synthetic_humans(Some(bad)),
+            Err(InvalidSyntheticHumans),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn synthetic_humans_never_reach_the_live_guild() {
+    let ids = HashSet::from([301]);
+    let live_guild: Snowflake = two_bot_core::backup::guild_config::LIVE_GUILD_ID
+        .parse()
+        .unwrap();
+    assert!(synthetic_humans_for(live_guild, &ids).is_empty());
+    assert_eq!(synthetic_humans_for(GUILD, &ids), ids);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_synthetic_human_bot_keeps_its_room_while_other_bots_leave_rooms_empty() {
+    let (live, store, http, trace) = fixture();
+    live.set_synthetic_humans(HashSet::from([301]));
+    for id in [500, 502] {
+        store.rooms.lock().unwrap().insert(id, room(id));
+    }
+    live.publish(snapshot(
+        &[500, 502],
+        vec![
+            VoiceMember {
+                member_id: 301,
+                channel_id: 500,
+                bot: Some(true),
+            },
+            VoiceMember {
+                member_id: 304,
+                channel_id: 502,
+                bot: Some(true),
+            },
+        ],
+    ));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
+    worker.reconcile();
+    for time in 0..2 {
+        dispatch(&mut worker, time).await;
+    }
+    let calls = trace.lock().unwrap();
+    assert!(!calls.contains(&"delete:500".to_owned()));
+    assert!(calls.contains(&"delete:502".to_owned()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn without_synthetic_humans_a_bot_only_room_is_still_empty() {
+    let (live, store, http, trace) = fixture();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.publish(snapshot(
+        &[500],
+        vec![VoiceMember {
+            member_id: 301,
+            channel_id: 500,
+            bot: Some(true),
+        }],
+    ));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
+    worker.reconcile();
+    dispatch(&mut worker, 0).await;
+    assert!(trace.lock().unwrap().contains(&"delete:500".to_owned()));
+}
+
 fn two_creator_worker_parts(a_position: i32, b_position: i32) -> (LiveGuild, Store, Http, Trace) {
     let (live, store, http, trace) = fixture();
     {
