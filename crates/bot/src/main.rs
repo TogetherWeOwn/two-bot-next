@@ -44,6 +44,8 @@ mod interaction_admission;
 #[cfg(test)]
 mod interaction_composition_tests;
 mod internal_action_http;
+#[cfg(test)]
+mod job_emission_conformance_tests;
 mod jobs;
 mod join_risk_runtime;
 #[cfg(test)]
