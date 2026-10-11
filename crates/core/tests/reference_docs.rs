@@ -47,7 +47,7 @@ a required value or an implemented consumer. Secret defaults are never rendered.
   (`crates/bot/src/website_jobs.rs:152`) publishing through\n\
   `settings_jobs::live` (`crates/bot/src/settings_jobs.rs:53`). Message-path\n\
   automod refreshes its lists, thresholds and enforce flag from that snapshot\n\
-  on every delivery (`automod_gateway.rs:192-203`, `:273`); the feed poller\n\
+  on every delivery (`automod_gateway.rs:211-222`, `:292`); the feed poller\n\
   re-reads its interval from the snapshot before every tick\n\
   (`feed_jobs.rs:232-259`). Other stored reads happen through per-runtime\n\
   store refreshes (`raid_runtime.rs:136`,\n\
@@ -73,7 +73,7 @@ instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECON
 `CONFIG_KEYS` from the snapshot on each relevant\n\
 event (`crates/bot/src/onboarding.rs:21-30`, `:175-182`); message-path automod\n\
 applies its ten live lists, thresholds and the enforce flag from the snapshot\n\
-on every delivery (`crates/bot/src/automod_gateway.rs:192-203`, `:273`);\n\
+on every delivery (`crates/bot/src/automod_gateway.rs:211-222`, `:292`);\n\
 the feed poller applies `TWO_FEED_POLL_SECONDS` from the snapshot before\n\
 every tick (`crates/bot/src/feed_jobs.rs:232-259`); the audit mirror applies\n\
 `DISCORD_AUDIT_LOG_CHANNEL_ID`, `DISCORD_VOICE_LOG_CHANNEL_ID` and\n\
@@ -172,7 +172,7 @@ const BOOT_ENV: &[&str] = &[
 /// (`join_risk_runtime.rs:66-70`, `:238`), raid (`raid_runtime.rs:45-46`,
 /// `:170`), onboarding's per-event `CONFIG_KEYS` merge
 /// (`onboarding.rs:21-30`, `:175-182`), message-path automod's per-delivery
-/// live refresh (`automod_gateway.rs:192-203`, `:273`) and the feed poller's
+/// live refresh (`automod_gateway.rs:211-222`, `:292`) and the feed poller's
 /// per-tick schedule gate (`feed_jobs.rs:232-259`). These rows say “applied
 /// live by runtime refresh” in the table below; every other storable key
 /// keeps the legacy `HOT_WIRED`/boot-env labels.
