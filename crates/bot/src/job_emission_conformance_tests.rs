@@ -39,7 +39,7 @@ const EMITTER_SOURCES: [(&str, &str); 10] = [
 
 /// Every scrape job with a supervised emitter, paired with the file that
 /// schedules it. The file must name the job and keep the framework marker.
-const LIVE_JOB_EMITTERS: [(&str, &str); 9] = [
+const LIVE_JOB_EMITTERS: [(&str, &str); 13] = [
     ("counter", "website_jobs.rs"),
     ("rank", "website_jobs.rs"),
     ("scheduled_events", "website_jobs.rs"),
@@ -49,6 +49,10 @@ const LIVE_JOB_EMITTERS: [(&str, &str); 9] = [
     ("inactivity", "community_jobs.rs"),
     ("audit_retry", "audit_runtime.rs"),
     ("scheduled_messages", "scheduled_jobs.rs"),
+    ("feeds", "feed_jobs.rs"),
+    ("member_unban_sweep", "member_runtime.rs"),
+    ("self_role_recovery", "self_role_handlers.rs"),
+    ("automod_expiry", "automod_gateway.rs"),
 ];
 
 /// Direct emission outside the supervisor. `session_checkpoint` is the dispatch
@@ -70,13 +74,10 @@ const PARKED_EXEMPTIONS: [(&str, &str); 1] = [(
 
 /// Supervisor jobs that intentionally share the trailing collapse label so the
 /// cardinality budget holds. Each must appear in its emitter source and must
-/// not grow the job allowlist.
-const OTHER_COLLAPSED: [(&str, &str); 4] = [
-    ("feeds", "feed_jobs.rs"),
-    ("member_unban_sweep", "member_runtime.rs"),
-    ("self_role_recovery", "self_role_handlers.rs"),
-    ("automod_expiry", "automod_gateway.rs"),
-];
+/// not grow the job allowlist. Empty right now: the former collapsed jobs
+/// earned their own allowlist rows and moved to [`LIVE_JOB_EMITTERS`]. The
+/// seam stays so a future collapse lands here instead of passing silently.
+const OTHER_COLLAPSED: [(&str, &str); 0] = [];
 
 /// Every `job="..."` label in `two_bot_job_*` exposition lines, in first-seen
 /// order deduplicated. Parses the scrape text, not the allowlist, so a dropped
