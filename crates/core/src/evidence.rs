@@ -57,7 +57,7 @@ pub const SOAK_LEDGER_RULE_ID: &str = "soak_expected_committed";
 /// derives its fired-packet names from the same spellings via `ruleFor`, so
 /// this list must stay identical to `RULES` in `wrangler/src/alert-rules.ts`;
 /// the table test below and the Worker test both pin every spelling.
-pub const ALERT_RULE_IDS: [&str; 13] = [
+pub const ALERT_RULE_IDS: [&str; 14] = [
     "job_stale",
     "job_consecutive_failures",
     "rest_429_rate",
@@ -66,6 +66,7 @@ pub const ALERT_RULE_IDS: [&str; 13] = [
     "send_admission_blocked",
     "voice_failures",
     "gateway_missed_events",
+    "gateway_unpaired_disconnect",
     "ticker_stale",
     "receiver_refusals",
     "dispatch_drops",
@@ -944,6 +945,7 @@ mod tests {
                 "send_admission_blocked",
                 "voice_failures",
                 "gateway_missed_events",
+                "gateway_unpaired_disconnect",
                 "ticker_stale",
                 "receiver_refusals",
                 "dispatch_drops",

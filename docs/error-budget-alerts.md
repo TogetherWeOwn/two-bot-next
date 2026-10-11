@@ -137,7 +137,7 @@ identity-paired evidence leaves the combined budget unknown.
 
 ## Related immediate alerts (not burn)
 
-Unlike the uninstalled fast/slow burn alerts above, these four **installed
+Unlike the uninstalled fast/slow burn alerts above, these five **installed
 Worker rules** evaluate keepalive samples independently of the burn math.
 They fire on their own conditions; notification additionally requires the
 configured [alert-forwarding path](metrics.md#off-container-scrape-and-alert-rules).
@@ -164,6 +164,11 @@ An installed rule is not proof that a page was delivered:
   linger leaves ~3 s margin over a 60 s tick plus two 6 s probes for a scrape
   to land before the restart resets the counter.
   Runbook: [runbook](runbook.md#alert-checkpoint-failures).
+- `gateway_unpaired_disconnect`: `two_bot_gateway_disconnects_total` grew
+  with no RESUMED or fresh READY growth for 3 consecutive keepalive samples,
+  because a disconnect that never pairs with a session recovery means the
+  gateway is stuck off-session. Any recovery growth clears it at once.
+  Runbook: [runbook](runbook.md#alert-gateway-unpaired-disconnect).
 
 None of these rules changes the burn thresholds, windows or budget above.
 

@@ -18,6 +18,9 @@ export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]
   two_bot_voice_dead_letters_total: { action: ["create", "move", "delete", "companion", "ownership", "kick", "rename", "limit", "other"] },
   two_bot_voice_orphans_total: {},
   two_bot_gateway_missed_events_total: {},
+  two_bot_gateway_disconnects_total: {},
+  two_bot_gateway_resumes_total: {},
+  two_bot_gateway_events_total: { event: ["READY", "RESUMED", "GUILD_CREATE", "GUILD_DELETE", "GUILD_UPDATE", "GUILD_MEMBER_ADD", "GUILD_MEMBER_REMOVE", "GUILD_MEMBER_UPDATE", "MESSAGE_CREATE", "MESSAGE_UPDATE", "MESSAGE_DELETE", "MESSAGE_REACTION_ADD", "MESSAGE_REACTION_REMOVE", "VOICE_STATE_UPDATE", "PRESENCE_UPDATE", "INVITE_CREATE", "INVITE_DELETE", "INTERACTION_CREATE", "HEARTBEAT_ACK", "GATEWAY_CLOSE", "other"] },
   two_bot_gateway_checkpoint_failures_total: { stage: ["pre_commit", "commit"] },
   two_bot_dispatch_drops_total: { lane: ["messages", "interactions", "registry", "privileged", "busy", "reactions"] },
   two_bot_internal_actions_total: {
