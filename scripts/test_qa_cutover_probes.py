@@ -609,6 +609,109 @@ class CadenceTest(unittest.TestCase):
         self.assertNotIn("4 jobs fresh", out)
 
 
+class NonfiniteJobFieldTest(unittest.TestCase):
+    """Nonfinite numeric job fields fail as structured jobs-map FAILs.
+
+    Raw NaN/Infinity tokens and overflowing exponents (which decode to
+    Infinity) must never traceback nor count as verified fresh; they fail
+    the jobs-map check with bounded diagnostics naming the job and field.
+    """
+
+    def raw_body(self, counter_entry_raw):
+        return (200, (
+            '{"components": [["process", "ready"], ["gateway", "ready"]],'
+            '"jobs": {"counter": ' + counter_entry_raw + '},'
+            '"build_revision": "r", "build_id": "b"}').encode())
+
+    def assert_structured_fail(self, counter_entry_raw, field):
+        body = self.raw_body(counter_entry_raw)
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL jobs-map:", out)
+        self.assertIn("counter", out)
+        self.assertIn("nonfinite", out.lower())
+        self.assertIn(field, out)
+        self.assertNotIn("Traceback", out)
+        self.assertNotIn("jobs fresh within cadence", out)
+        return out
+
+    def test_nan_last_success_fails(self):
+        self.assert_structured_fail(
+            '{"parked": false, "running": true, "last_success": NaN}',
+            "last_success")
+
+    def test_infinity_last_success_fails(self):
+        self.assert_structured_fail(
+            '{"parked": false, "running": true, "last_success": Infinity}',
+            "last_success")
+
+    def test_negative_infinity_last_success_fails(self):
+        self.assert_structured_fail(
+            '{"parked": false, "running": true, "last_success": -Infinity}',
+            "last_success")
+
+    def test_overflow_exponent_last_success_fails(self):
+        self.assert_structured_fail(
+            '{"parked": false, "running": true, "last_success": 1e10000}',
+            "last_success")
+
+    def test_nan_last_start_without_success_fails(self):
+        self.assert_structured_fail(
+            '{"parked": false, "running": true, '
+            '"consecutive_failures": 0, "last_start": NaN}',
+            "last_start")
+
+    def test_infinity_last_start_without_success_fails(self):
+        self.assert_structured_fail(
+            '{"parked": false, "running": true, '
+            '"consecutive_failures": 0, "last_start": Infinity}',
+            "last_start")
+
+    def test_nan_consecutive_failures_fails(self):
+        self.assert_structured_fail(
+            '{"parked": false, "running": true, '
+            '"consecutive_failures": NaN}',
+            "consecutive_failures")
+
+    def test_infinity_consecutive_failures_fails(self):
+        self.assert_structured_fail(
+            '{"parked": false, "running": true, '
+            '"consecutive_failures": Infinity}',
+            "consecutive_failures")
+
+    def test_overflow_exponent_consecutive_failures_fails(self):
+        self.assert_structured_fail(
+            '{"parked": false, "running": true, '
+            '"consecutive_failures": 1e10000}',
+            "consecutive_failures")
+
+    def test_nonfinite_failures_with_fresh_success_still_fails(self):
+        now_ms = int(time.time() * 1000)
+        entry = ('{"parked": false, "running": true, '
+                 '"last_success": %d, "consecutive_failures": NaN}' % now_ms)
+        self.assert_structured_fail(entry, "consecutive_failures")
+
+    def test_nonfinite_leaves_no_receipt(self):
+        body = self.raw_body(
+            '{"parked": false, "running": true, "last_success": NaN}')
+        with mock.patch("builtins.open") as handle:
+            code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                            "--base-url", "http://h/",
+                            "--evidence", "receipt.json")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL jobs-map:", out)
+        handle.assert_not_called()
+
+    def test_parked_job_with_nonfinite_stays_green(self):
+        body = self.raw_body(
+            '{"parked": true, "running": false, "last_success": NaN}')
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+
+
 class FixedCadenceJobGradingTest(unittest.TestCase):
     """self_role_recovery (30 s cadence, 25 s timeout) and automod_expiry
     (60 s cadence, 5 s timeout) have fixed cadences, so they are graded with
