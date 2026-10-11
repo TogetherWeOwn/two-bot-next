@@ -281,7 +281,7 @@ function isBotProbeResponse(response: Response): boolean {
 // Workers Logs, so the keepalive re-emits those two tokens as a structured
 // warn. Strict tokens only: nothing else from the probe body is ever logged.
 const FAILURE_TOKEN = /^[a-z0-9_]{1,32}$/;
-const MAX_PROBE_BODY_BYTES = 64 * 1024;
+export const MAX_PROBE_BODY_BYTES = 64 * 1024;
 
 /**
  * Read at most `limit` bytes as text. Returns null when the body is larger
@@ -309,10 +309,10 @@ export async function readBoundedText(response: Response, limit: number): Promis
   return new TextDecoder().decode(bytes);
 }
 
-function gatewayFailure(body: ArrayBuffer): { phase: string; class: string } | null {
-  if (body.byteLength > MAX_PROBE_BODY_BYTES) return null;
+function gatewayFailure(body: string): { phase: string; class: string } | null {
+  if (new TextEncoder().encode(body).byteLength > MAX_PROBE_BODY_BYTES) return null;
   try {
-    const report: unknown = JSON.parse(new TextDecoder().decode(body));
+    const report: unknown = JSON.parse(body);
     const field = (report as { gateway_failure?: unknown } | null)?.gateway_failure;
     if (typeof field !== "object" || field === null) return null;
     const { phase, class: errorClass } = field as Record<string, unknown>;
@@ -515,9 +515,10 @@ export class TwoBotContainer extends Container<Env> {
         try {
           const response = await this.containerFetch(probe);
           // SDK startup failures arrive as responses rather than rejections.
-          // Drop any other body without exposing its error message.
+          // Bound the discard like the keepalive read: small error text drains
+          // so the SDK proxy pipe settles, oversize cancels via the reader.
           if (!isBotProbeResponse(response)) {
-            await response.arrayBuffer();
+            await readBoundedText(response, MAX_PROBE_BODY_BYTES).catch(() => null);
             return containerUnavailable();
           }
           await this.armKeepalive();
@@ -675,13 +676,21 @@ export class TwoBotContainer extends Container<Env> {
             const res = await this.containerFetch("http://c/readyz", { signal: AbortSignal.timeout(6000) });
             status = res.status;
             if (!res.ok) console.warn(`two-bot /readyz unhealthy: ${status}`);
-            // Drain rather than cancel the SDK 0.3.7 proxy response pipe.
-            const body = await res.arrayBuffer();
-            const failure = isBotProbeResponse(res) ? gatewayFailure(body) : null;
-            if (failure) {
-              console.warn(JSON.stringify({
-                event: "container_gateway_failure", phase: failure.phase, class: failure.class,
-              }));
+            // Cap the keepalive /readyz read like the metrics scrape: a
+            // compromised container controls this body, so an oversized answer
+            // is a failed probe, never a buffered parse. Small bodies still
+            // drain fully, so the SDK 0.3.7 proxy pipe settles cleanly.
+            const body = await readBoundedText(res, MAX_PROBE_BODY_BYTES);
+            if (body === null) {
+              status = null;
+              console.warn("two-bot keepalive probe failed");
+            } else {
+              const failure = isBotProbeResponse(res) ? gatewayFailure(body) : null;
+              if (failure) {
+                console.warn(JSON.stringify({
+                  event: "container_gateway_failure", phase: failure.phase, class: failure.class,
+                }));
+              }
             }
           } catch (error) {
             if (error instanceof OwnershipRefused) {
@@ -954,9 +963,10 @@ export default {
         });
         const upstream = await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
         // SDK startup failures arrive as responses rather than rejections.
-        // Drop any other body without exposing its error message.
+        // Cancel without reading: a huge non-bot body must not bypass the
+        // probe cap by being drained here.
         if (!isBotProbeResponse(upstream)) {
-          await upstream.arrayBuffer();
+          await upstream.body?.cancel().catch(() => {});
           response = containerUnavailable();
         } else {
           response = upstream;

@@ -9,7 +9,7 @@ import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { setImmediate } from "node:timers/promises";
-import worker, { MAX_METRICS_BODY_BYTES, TwoBotContainer, readBoundedText, type Env } from "../src/index.ts";
+import worker, { MAX_METRICS_BODY_BYTES, MAX_PROBE_BODY_BYTES, TwoBotContainer, readBoundedText, type Env } from "../src/index.ts";
 import { OWNER_KEY, AUDIT_PREFIX, DEPLOYMENT_HEADER, CONTROL_PATH } from "../src/ownership.ts";
 
 const ID = "deployment-A";
@@ -531,6 +531,31 @@ test("keepalive ignores a gateway failure in a non-bot (text) probe answer", asy
   ));
   await tickKeepalive(h.bot);
   assert.deepEqual(gatewayFailureLogs(h.logs), []);
+});
+
+test("keepalive treats oversize /readyz as a failed probe without logging the body", async (t) => {
+  const h = await harness(t);
+  const oversizeMarker = `synthetic-readyz-oversize-${"m".repeat(64)}`;
+  const oversizeBody = `${JSON.stringify({ ready: true, marker: oversizeMarker })}\n${"m 1\n".repeat(20000)}`;
+  assert.ok(new TextEncoder().encode(oversizeBody).byteLength > MAX_PROBE_BODY_BYTES);
+  // A 200 with a huge body would be ready if the cap were removed (buffered
+  // parse), so this tick only passes when the bounded reader rejects it.
+  // Mock containerFetch to bypass the SDK proxy pipe: cancelling the pipe's
+  // destination readable rejects its internal pipeTo (unhandled in the test
+  // runtime), while the mocked Response exercises the same bounded reader.
+  t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
+    const path = new URL(typeof input === "string" ? input : input.url).pathname;
+    if (path === "/metrics") return new Response(null, { status: 503 });
+    return new Response(oversizeBody, {
+      status: 200, headers: { "content-type": "application/json" },
+    });
+  });
+  await tickKeepalive(h.bot);
+  assert.equal(h.values.get("two-bot:readiness")?.lastStatus, null);
+  assert.equal(h.values.get("two-bot:readiness")?.failures, 1);
+  assert.deepEqual(gatewayFailureLogs(h.logs), []);
+  assert.ok(h.logs.every((line) => !line.includes(oversizeMarker)), "no raw probe body in logs");
+  assert.ok(h.logs.every((line) => !line.includes("m 1\nm 1")), "no probe bytes in logs");
 });
 
 for (const path of ["/health", "/readyz", "keepalive", "start", "startAndWaitForPorts"]) {
