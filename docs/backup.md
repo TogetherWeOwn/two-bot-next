@@ -219,7 +219,11 @@ regressions remain in `backup_roundtrip` and `backup_dump_publication`.
 3. Prune to the newest `TWO_BACKUP_KEEP` files (by mtime).
 4. Run `TWO_BACKUP_UPLOAD_CMD` with the file path as its **last** argument
    (the `uploadCmd` contract: suits `cp -t DIR FILE`; point wrapper-needing
-   tools at a one-line script). Unset → warn, not fail.
+   tools at a one-line script). Unset → warn, not fail. The helper runs
+   under a 30-minute deadline: on expiry the bot terminates and reaps the
+   direct child it spawned and fails the run (exit 1) without deleting the
+   archive. The deadline covers that direct child only, not grandchildren
+   a helper may detach (no process-group kill).
 
 ```bash
 sudo cp deploy/two-bot-next-backup.{service,timer} /etc/systemd/system/
@@ -260,7 +264,10 @@ guild is TWO Staging, capture roles/channels/overwrites/settings/emoji
 write snapshot + drift report atomically (fsync + rename, `0600`), re-read
 and re-verify hash + seal, then upload **both** via
 `TWO_GUILD_CONFIG_UPLOAD_CMD` (or `TWO_BACKUP_UPLOAD_CMD`). A local-only
-snapshot is an error, not success.
+snapshot is an error, not success. Each upload shares the 30-minute
+bounded-helper contract from the nightly backup above: a hung helper is
+terminated and reaped (direct child only), the run fails, and both files
+stay on disk.
 
 Both guild-config commands first read `CREDENTIALS_DIRECTORY/discord_staging_token`
 (the service's `LoadCredential` contract). Only an absent credential/no configured

@@ -280,6 +280,84 @@ pub async fn dispatch(args: &[String]) -> i32 {
 // backup
 // ---------------------------------------------------------------------------
 
+/// Finite budget for one external upload-helper invocation, shared by the
+/// `backup` and `guild-config-snapshot` paths. Thirty minutes fits the
+/// nightly timer window while still bounding a hung helper.
+const UPLOAD_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Outcome of one bounded external upload-helper invocation. The failure
+/// lines built by [`upload_failure_message`] name only the program and the
+/// budget: argv (which may carry credentials) and the child's own output
+/// are never echoed.
+#[derive(Debug)]
+enum UploadOutcome {
+    Success,
+    ExitNonzero(std::process::ExitStatus),
+    SpawnFailed(String),
+    WaitFailed(String),
+    TimedOut,
+}
+
+/// Render the stderr line for a failed upload, or `None` on success.
+/// `scope` is the caller's fixed prefix (`backup`, `guild-config-snapshot`);
+/// `cmd` is the program name only, never the argument vector.
+fn upload_failure_message(
+    scope: &str,
+    cmd: &str,
+    outcome: &UploadOutcome,
+    budget: std::time::Duration,
+) -> Option<String> {
+    match outcome {
+        UploadOutcome::Success => None,
+        UploadOutcome::ExitNonzero(status) => {
+            Some(format!("{scope}: upload failed: {cmd} exited {status}"))
+        }
+        UploadOutcome::SpawnFailed(err) => {
+            Some(format!("{scope}: upload failed to start ({cmd}): {err}"))
+        }
+        UploadOutcome::WaitFailed(err) => {
+            Some(format!("{scope}: upload wait failed ({cmd}): {err}"))
+        }
+        UploadOutcome::TimedOut => Some(format!(
+            "{scope}: upload timed out after {budget:?}; terminated upload child ({cmd})"
+        )),
+    }
+}
+
+/// Run one external upload helper to completion within `deadline`.
+///
+/// On timeout the direct child this invocation spawned is terminated
+/// (`start_kill`) and reaped (`wait`) before returning [`UploadOutcome::TimedOut`],
+/// so no owned child outlives the call. The deadline covers that direct
+/// child only: a helper that detaches grandchildren is outside this
+/// guarantee (no process-group policy; killing by name or group would risk
+/// unrelated processes). Stdio is inherited, never captured, so remote
+/// output cannot leak through the returned outcome.
+async fn run_upload_command(
+    cmd: &str,
+    args: &[String],
+    deadline: std::time::Duration,
+) -> UploadOutcome {
+    let mut child = match tokio::process::Command::new(cmd)
+        .args(args)
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => return UploadOutcome::SpawnFailed(err.to_string()),
+    };
+    match tokio::time::timeout(deadline, child.wait()).await {
+        Ok(Ok(status)) if status.success() => UploadOutcome::Success,
+        Ok(Ok(status)) => UploadOutcome::ExitNonzero(status),
+        Ok(Err(err)) => UploadOutcome::WaitFailed(err.to_string()),
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            UploadOutcome::TimedOut
+        }
+    }
+}
+
 async fn cmd_backup() -> i32 {
     let url = match env_var("TWO_DATABASE_URL") {
         Some(url) if url.starts_with("postgres://") || url.starts_with("postgresql://") => url,
@@ -381,18 +459,14 @@ async fn cmd_backup() -> i32 {
         &out.to_string_lossy(),
     ) {
         Some((cmd, upload_args)) => {
-            match tokio::process::Command::new(&cmd)
-                .args(&upload_args)
-                .status()
-                .await
-            {
-                Ok(status) if status.success() => println!("backup: uploaded via {cmd}"),
-                Ok(status) => {
-                    eprintln!("backup: upload failed: {cmd} exited {status}");
-                    return 1;
-                }
-                Err(err) => {
-                    eprintln!("backup: upload failed to start ({cmd}): {err}");
+            match run_upload_command(&cmd, &upload_args, UPLOAD_COMMAND_TIMEOUT).await {
+                UploadOutcome::Success => println!("backup: uploaded via {cmd}"),
+                outcome => {
+                    if let Some(message) =
+                        upload_failure_message("backup", &cmd, &outcome, UPLOAD_COMMAND_TIMEOUT)
+                    {
+                        eprintln!("{message}");
+                    }
                     return 1;
                 }
             }
@@ -1007,32 +1081,28 @@ async fn cmd_guild_config_snapshot() -> i32 {
 
     let upload_raw =
         env_var("TWO_GUILD_CONFIG_UPLOAD_CMD").or_else(|| env_var("TWO_BACKUP_UPLOAD_CMD"));
-    let Some((cmd, upload_args)) =
-        s3::build_upload_argv(upload_raw.as_deref(), &snapshot_path.to_string_lossy())
-    else {
+    if s3::build_upload_argv(upload_raw.as_deref(), &snapshot_path.to_string_lossy()).is_none() {
         eprintln!("guild-config-snapshot: TWO_GUILD_CONFIG_UPLOAD_CMD (or TWO_BACKUP_UPLOAD_CMD) is required; refusing a local-only snapshot");
         return 2;
-    };
+    }
     for path in [&snapshot_path, &drift_path] {
         let (cmd, upload_args) =
             s3::build_upload_argv(upload_raw.as_deref(), &path.to_string_lossy()).expect("checked");
-        match tokio::process::Command::new(&cmd)
-            .args(&upload_args)
-            .status()
-            .await
-        {
-            Ok(status) if status.success() => {}
-            Ok(status) => {
-                eprintln!("guild-config-snapshot: upload failed with exit {status}");
-                return 1;
-            }
-            Err(err) => {
-                eprintln!("guild-config-snapshot: upload failed to start: {err}");
+        match run_upload_command(&cmd, &upload_args, UPLOAD_COMMAND_TIMEOUT).await {
+            UploadOutcome::Success => {}
+            outcome => {
+                if let Some(message) = upload_failure_message(
+                    "guild-config-snapshot",
+                    &cmd,
+                    &outcome,
+                    UPLOAD_COMMAND_TIMEOUT,
+                ) {
+                    eprintln!("{message}");
+                }
                 return 1;
             }
         }
     }
-    let _ = (cmd, upload_args);
     println!("guild-config-snapshot: snapshot and drift report uploaded");
     0
 }
@@ -1645,5 +1715,207 @@ mod tests {
         for name in interrupted {
             assert_eq!(std::fs::read(dir.0.join(name)).unwrap(), b"partial output");
         }
+    }
+
+    /// Task-owned temporary executable fixtures for the bounded upload
+    /// helper. Paths are baked into the scripts so tests never mutate
+    /// process-global environment (the parallel suite shares it).
+    #[cfg(unix)]
+    fn write_upload_fixture(dir: &Credentials, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.0.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    const UPLOAD_SECRET_MARKER: &str = "fixture-credential-marker";
+    #[cfg(unix)]
+    const UPLOAD_REMOTE_MARKER: &str = "fixture-remote-output-marker";
+
+    #[cfg(unix)]
+    fn secret_argv(file: &str) -> Vec<String> {
+        vec![
+            "--token".to_owned(),
+            UPLOAD_SECRET_MARKER.to_owned(),
+            file.to_owned(),
+        ]
+    }
+
+    #[test]
+    fn upload_helper_default_budget_is_thirty_minutes() {
+        assert_eq!(
+            super::UPLOAD_COMMAND_TIMEOUT,
+            std::time::Duration::from_secs(30 * 60)
+        );
+    }
+
+    /// Prompt success stays success and produces no failure line.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_helper_success_reports_no_failure() {
+        let dir = Credentials::new();
+        let helper = write_upload_fixture(
+            &dir,
+            "upload-ok.sh",
+            "#!/bin/sh\necho fixture-remote-output-marker\nexit 0\n",
+        );
+        let outcome = super::run_upload_command(
+            &helper.to_string_lossy(),
+            &secret_argv("archive.ndjson.gz"),
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        assert!(matches!(outcome, super::UploadOutcome::Success));
+        assert_eq!(
+            super::upload_failure_message(
+                "backup",
+                "upload-ok.sh",
+                &outcome,
+                std::time::Duration::from_secs(30),
+            ),
+            None
+        );
+    }
+
+    /// A nonzero exit keeps its status and never echoes argv or the child's
+    /// own stdout back through the failure line.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_helper_nonzero_exit_reports_status_without_args() {
+        let dir = Credentials::new();
+        let helper = write_upload_fixture(
+            &dir,
+            "upload-fail.sh",
+            "#!/bin/sh\necho fixture-remote-output-marker\nexit 3\n",
+        );
+        let outcome = super::run_upload_command(
+            &helper.to_string_lossy(),
+            &secret_argv("archive.ndjson.gz"),
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        let super::UploadOutcome::ExitNonzero(status) = &outcome else {
+            panic!("nonzero helper must report ExitNonzero, got {outcome:?}");
+        };
+        assert_eq!(status.code(), Some(3));
+        let message = super::upload_failure_message(
+            "backup",
+            "upload-fail.sh",
+            &outcome,
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(message.contains("3"), "failure must name the status");
+        for leaked in [
+            UPLOAD_SECRET_MARKER,
+            UPLOAD_REMOTE_MARKER,
+            "archive.ndjson.gz",
+        ] {
+            assert!(
+                !message.contains(leaked),
+                "failure line must not echo argv or remote output: {message}"
+            );
+        }
+    }
+
+    /// An unstartable command stays a spawn failure with no argv echo.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_helper_spawn_failure_reports_without_args() {
+        let outcome = super::run_upload_command(
+            "/nonexistent-fixture-upload-helper",
+            &secret_argv("archive.ndjson.gz"),
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        let super::UploadOutcome::SpawnFailed(_) = &outcome else {
+            panic!("missing helper must report SpawnFailed, got {outcome:?}");
+        };
+        let message = super::upload_failure_message(
+            "backup",
+            "nonexistent-fixture-upload-helper",
+            &outcome,
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        for leaked in [
+            UPLOAD_SECRET_MARKER,
+            "/nonexistent-fixture-upload-helper",
+            "archive.ndjson.gz",
+        ] {
+            assert!(
+                !message.contains(leaked),
+                "spawn failure must not echo the command path or argv: {message}"
+            );
+        }
+    }
+
+    /// A hung helper is terminated and reaped within the injected deadline:
+    /// the fixture records its own PID, `exec`s into `sleep` so the recorded
+    /// PID *is* the owned direct child, and the test proves that PID no
+    /// longer runs afterwards (a leaked zombie would still own a `/proc`
+    /// entry until reaped).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_helper_timeout_terminates_and_reaps_owned_child() {
+        let dir = Credentials::new();
+        let pidfile = dir.0.join("hung.pid");
+        let helper = write_upload_fixture(
+            &dir,
+            "upload-hang.sh",
+            &format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+                pidfile.to_string_lossy()
+            ),
+        );
+        let outcome = super::run_upload_command(
+            &helper.to_string_lossy(),
+            &secret_argv("archive.ndjson.gz"),
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+        assert!(
+            matches!(outcome, super::UploadOutcome::TimedOut),
+            "hung helper must report TimedOut, got {outcome:?}"
+        );
+        let message = super::upload_failure_message(
+            "backup",
+            "upload-hang.sh",
+            &outcome,
+            std::time::Duration::from_millis(300),
+        )
+        .unwrap();
+        assert!(
+            message.contains("timed out"),
+            "timeout must say so: {message}"
+        );
+        assert!(
+            message.contains("300ms"),
+            "timeout must name the injected budget: {message}"
+        );
+        for leaked in [
+            UPLOAD_SECRET_MARKER,
+            UPLOAD_REMOTE_MARKER,
+            "archive.ndjson.gz",
+        ] {
+            assert!(
+                !message.contains(leaked),
+                "timeout line must not echo argv or remote output: {message}"
+            );
+        }
+        let pid = std::fs::read_to_string(&pidfile).unwrap();
+        let pid = pid.trim().to_owned();
+        assert!(!pid.is_empty(), "hung fixture must record its PID");
+        let proc = PathBuf::from(format!("/proc/{pid}"));
+        let quiet_until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while proc.exists() && std::time::Instant::now() < quiet_until {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            !proc.exists(),
+            "timed-out upload child {pid} must be terminated and reaped"
+        );
     }
 }
