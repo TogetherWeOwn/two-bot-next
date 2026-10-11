@@ -243,7 +243,7 @@ const MIN_SCRAPE_TOKEN_LENGTH = 32;
 const METRICS_FETCH_TIMEOUT_MS = 6000;
 // Prometheus exposition is small; cap the proxied body so a compromised or
 // wedged container cannot exhaust the isolate reading it.
-const MAX_METRICS_BODY_BYTES = 64 * 1024;
+export const MAX_METRICS_BODY_BYTES = 64 * 1024;
 
 /** Compare via digests so length/prefix timing does not leak the token. */
 async function tokenMatches(provided: string, expected: string): Promise<boolean> {
@@ -285,10 +285,10 @@ const MAX_PROBE_BODY_BYTES = 64 * 1024;
 
 /**
  * Read at most `limit` bytes as text. Returns null when the body is larger
- * (drained first so the SDK proxy pipe is not left hanging), so an oversized
+ * (cancelled first so the SDK proxy pipe is not left hanging), so an oversized
  * container response can be refused without buffering it.
  */
-async function readBoundedText(response: Response, limit: number): Promise<string | null> {
+export async function readBoundedText(response: Response, limit: number): Promise<string | null> {
   const reader = response.body?.getReader();
   if (!reader) return "";
   const chunks: Uint8Array[] = [];
@@ -767,8 +767,16 @@ export class TwoBotContainer extends Container<Env> {
       let samples;
       try {
         const res = await this.containerFetch("http://c/metrics", { signal: AbortSignal.timeout(6000) });
-        if (res.ok) samples = parseExposition(await res.text());
-        else await res.arrayBuffer();
+        if (res.ok) {
+          // Cap the alert scrape like the /ops/metrics proxy: an oversized
+          // body is a failed scrape, never a buffered parse.
+          const body = await readBoundedText(res, MAX_METRICS_BODY_BYTES);
+          if (body !== null) samples = parseExposition(body);
+        } else {
+          // Cancel without reading: a huge non-2xx body must not bypass
+          // the 64 KiB cap by being drained here.
+          await res.body?.cancel().catch(() => {});
+        }
       } catch {
         console.warn("two-bot metrics scrape failed");
       }
