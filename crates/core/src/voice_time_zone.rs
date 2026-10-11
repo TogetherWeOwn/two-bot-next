@@ -18,6 +18,9 @@ enum Rule {
     UnitedStates,
     /// Last Sunday of March to the last Sunday of October, 01:00 UTC.
     Europe,
+    /// [`Rule::UnitedStates`] until the 2026-11-01 change, then permanent
+    /// daylight time (British Columbia and Alberta, tzdata 2026c).
+    UnitedStatesThenPermanentDaylight,
     /// First Sunday of October 02:00 standard to the first Sunday of April
     /// 03:00 daylight (southern hemisphere).
     Australia,
@@ -34,10 +37,18 @@ const ZONES: &[(&str, i32, Rule)] = &[
     ("America/Chicago", -360, Rule::UnitedStates),
     ("America/Winnipeg", -360, Rule::UnitedStates),
     ("America/Denver", -420, Rule::UnitedStates),
-    ("America/Edmonton", -420, Rule::UnitedStates),
+    (
+        "America/Edmonton",
+        -420,
+        Rule::UnitedStatesThenPermanentDaylight,
+    ),
     ("America/Phoenix", -420, Rule::Fixed),
     ("America/Los_Angeles", -480, Rule::UnitedStates),
-    ("America/Vancouver", -480, Rule::UnitedStates),
+    (
+        "America/Vancouver",
+        -480,
+        Rule::UnitedStatesThenPermanentDaylight,
+    ),
     ("America/Anchorage", -540, Rule::UnitedStates),
     ("America/Halifax", -240, Rule::UnitedStates),
     ("America/Sao_Paulo", -180, Rule::Fixed),
@@ -153,10 +164,11 @@ fn in_daylight(rule: Rule, standard: i32, unix_seconds: i64) -> bool {
     let standard = i64::from(standard);
     match rule {
         Rule::Fixed => false,
-        Rule::UnitedStates => {
-            let start = at(nth_sunday(year, 3, 2), 120 - standard);
-            let end = at(nth_sunday(year, 11, 1), 120 - (standard + 60));
-            (start..end).contains(&unix_seconds)
+        Rule::UnitedStates => united_states(year, standard, unix_seconds),
+        Rule::UnitedStatesThenPermanentDaylight => {
+            // The 2026-11-01 02:00 local change that would have ended DST.
+            let permanent = at(nth_sunday(2026, 11, 1), 120 - (standard + 60));
+            unix_seconds >= permanent || united_states(year, standard, unix_seconds)
         }
         Rule::Europe => {
             let start = at(last_sunday(year, 3), 60);
@@ -174,6 +186,12 @@ fn in_daylight(rule: Rule, standard: i32, unix_seconds: i64) -> bool {
             unix_seconds < end || unix_seconds >= start
         }
     }
+}
+
+fn united_states(year: i64, standard: i64, unix_seconds: i64) -> bool {
+    let start = nth_sunday(year, 3, 2) * 86_400 + (120 - standard) * 60;
+    let end = nth_sunday(year, 11, 1) * 86_400 + (120 - (standard + 60)) * 60;
+    (start..end).contains(&unix_seconds)
 }
 
 /// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant).
@@ -263,6 +281,34 @@ mod tests {
         assert_eq!(
             offset_minutes("America/Phoenix", utc(2026, 7, 1, 0, 0)),
             Some(-420)
+        );
+    }
+
+    #[test]
+    fn british_columbia_and_alberta_stay_on_daylight_time_from_november_2026() {
+        let vancouver = "America/Vancouver";
+        assert_eq!(
+            offset_minutes(vancouver, utc(2026, 3, 8, 9, 59)),
+            Some(-480)
+        );
+        assert_eq!(offset_minutes(vancouver, utc(2026, 7, 1, 0, 0)), Some(-420));
+        // 2026-11-01 02:00 PDT (09:00Z) no longer falls back.
+        assert_eq!(
+            offset_minutes(vancouver, utc(2026, 11, 1, 9, 0)),
+            Some(-420)
+        );
+        assert_eq!(
+            offset_minutes(vancouver, utc(2027, 1, 15, 0, 0)),
+            Some(-420)
+        );
+        assert_eq!(
+            offset_minutes("America/Edmonton", utc(2027, 1, 15, 0, 0)),
+            Some(-360)
+        );
+        // Seattle (US rule) still falls back.
+        assert_eq!(
+            offset_minutes("America/Los_Angeles", utc(2027, 1, 15, 0, 0)),
+            Some(-480)
         );
     }
 

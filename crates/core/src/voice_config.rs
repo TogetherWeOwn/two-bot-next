@@ -134,7 +134,9 @@ pub struct GuildSettings {
     pub no_game_label: String,
     pub force_single_game: bool,
     pub count_members_without_activity: bool,
-    /// IANA name interpretation is deferred to the runtime's timezone provider.
+    /// Guild time zone for the name time tokens; see
+    /// [`crate::voice_time_zone`] for the accepted values. Imports refuse a new
+    /// unsupported value ([`validate_time_zone_change`]).
     pub time_zone: String,
     pub text_channel_name: String,
     #[serde(deserialize_with = "Option::deserialize")]
@@ -219,6 +221,25 @@ pub fn import_configuration(
     let config = decode_configuration(json)?;
     validate_configuration(&config, inventory)?;
     Ok(config)
+}
+
+/// Import-time time-zone rule: a new `settings.time_zone` must be one
+/// [`crate::voice_time_zone::offset_minutes`] understands. A value equal to
+/// the one already stored is accepted as is, so a guild whose earlier zone is
+/// unsupported (its names render in UTC) can still re-import its own export.
+/// Not part of [`validate_configuration`], which `/export` also runs.
+pub fn validate_time_zone_change(
+    previous: &str,
+    candidate: &VoiceConfiguration,
+) -> Result<(), VoiceConfigError> {
+    let zone = &candidate.settings.time_zone;
+    if zone.trim() == previous.trim() || crate::voice_time_zone::is_known(zone) {
+        return Ok(());
+    }
+    Err(invalid(
+        "settings.time_zone",
+        "must be UTC, a fixed offset such as UTC-5, or a supported IANA zone such as America/New_York",
+    ))
 }
 
 /// Strict decode only: size cap, an object at the document and every nested
@@ -390,12 +411,6 @@ pub fn validate_configuration(
     literal_name(&settings.no_game_label, "settings.no_game_label")?;
     literal_name(&settings.text_channel_name, "settings.text_channel_name")?;
     nonempty(&settings.time_zone, "settings.time_zone")?;
-    if !crate::voice_time_zone::is_known(&settings.time_zone) {
-        return Err(invalid(
-            "settings.time_zone",
-            "must be UTC, a fixed offset such as UTC-5, or a supported IANA zone such as America/New_York",
-        ));
-    }
     for (field, id) in [
         (
             "settings.text_viewer_role_id",

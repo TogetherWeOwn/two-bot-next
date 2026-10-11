@@ -58,9 +58,9 @@ use two_bot_core::{
         AccessControls, AccessDecision, AccessDenyReason, AccessMember,
     },
     voice_config::{
-        decode_configuration, export_configuration, validate_configuration, ChannelKind,
-        ChannelReference, GuildInventory, VoiceConfigError, VoiceConfiguration, MAX_IMPORT_BYTES,
-        VOICE_CONFIG_VERSION,
+        decode_configuration, export_configuration, validate_configuration,
+        validate_time_zone_change, ChannelKind, ChannelReference, GuildInventory, VoiceConfigError,
+        VoiceConfiguration, MAX_IMPORT_BYTES, VOICE_CONFIG_VERSION,
     },
     voice_config_diff::{
         diff_configuration, diff_content_hash, render_preview, skip_unknown_channels,
@@ -7342,7 +7342,9 @@ pub fn plan_import_preview(
         }
     };
     let (remaining, _) = skip_unknown_channels(&incoming, inventory);
-    if let Err(error) = validate_configuration(&remaining, inventory) {
+    if let Err(error) = validate_configuration(&remaining, inventory)
+        .and_then(|()| validate_time_zone_change(&current.settings.time_zone, &remaining))
+    {
         return ImportDecision::Refuse {
             message: format!("Could not import that file: {error} Nothing was changed."),
         };
@@ -7377,7 +7379,9 @@ pub fn plan_import_confirm(
 ) -> ImportDecision {
     debug_assert_eq!(DIFF_HASH_CHARS, IMPORT_HASH_CHARS);
     let (remaining, _) = skip_unknown_channels(candidate, inventory);
-    if let Err(error) = validate_configuration(&remaining, inventory) {
+    if let Err(error) = validate_configuration(&remaining, inventory)
+        .and_then(|()| validate_time_zone_change(&current.settings.time_zone, &remaining))
+    {
         return ImportDecision::Refuse {
             message: format!(
                 "That preview no longer applies cleanly: {error} Nothing was changed. Upload the file again for a fresh preview.",

@@ -1005,7 +1005,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 game_name: if label.is_empty() { "General" } else { label }.to_owned(),
                 seed: room.name_seed,
                 timestamp: i64::try_from(wall_ms / 1000).unwrap_or(0),
-                // An unknown zone (never stored: `/import` refuses it) is UTC.
+                // A zone stored before imports checked it, and unsupported, is UTC.
                 tz_offset_minutes: two_bot_core::voice_time_zone::offset_minutes(
                     &command.settings.time_zone,
                     i64::try_from(wall_ms / 1000).unwrap_or(0),
