@@ -36,6 +36,22 @@ BINARY_MAX_BYTES = 16 * MIB
 # docker cp archives from a never-started container instead of exec helpers.
 BINARY = "/home/nonroot/two-bot"
 CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
+# Body-cap refusal contract (same shape as staging_probe.py MAX_BODY_BYTES and
+# the contract probe BODY_CAP): every response read takes at most
+# MAX_BODY_BYTES+1 bytes so a hidden suffix is detected. Any body longer than
+# MAX_BODY_BYTES (64 KiB) is refused before parsing with a fixed message;
+# exact-cap valid input passes, and the extra byte never reaches the JSON
+# path. The refusal never echoes the body, headers, URL or parse exceptions.
+MAX_BODY_BYTES = 64 * 1024
+USER_AGENT = "two-bot-next-container-smoke/1.0 (loopback)"
+
+
+class BodyTooLarge(RuntimeError):
+    """A loopback response body exceeds MAX_BODY_BYTES (fixed vocabulary only).
+
+    A RuntimeError so main() reports it as a smoke failure, and not a
+    transport miss the caller would retry until its deadline.
+    """
 
 
 def require(condition, message):
@@ -85,10 +101,15 @@ def http_response(url):
     parts = urlsplit(url)
     connection = http.client.HTTPConnection(parts.hostname, parts.port, timeout=2)
     try:
-        connection.request("GET", parts.path or "/")
+        connection.request("GET", parts.path or "/", headers={"User-Agent": USER_AGENT})
         response = connection.getresponse()
+        # Bounded read: a status line alone is an answer, a body past the cap
+        # is a refusal raised before any decoding (not caught below).
+        raw = response.read(MAX_BODY_BYTES + 1)
+        if len(raw) > MAX_BODY_BYTES:
+            raise BodyTooLarge("loopback response body exceeds the 64 KiB cap")
         try:
-            return response.status, json.loads(response.read())
+            return response.status, json.loads(raw)
         except ValueError:
             # A status with no JSON body (e.g. a bare 3xx) is still an
             # answer; the caller's exact status/body assertions reject it.
