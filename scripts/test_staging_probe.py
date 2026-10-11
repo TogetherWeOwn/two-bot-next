@@ -338,6 +338,80 @@ class ProbeTests(unittest.TestCase):
         self.assertTrue(any("worker_exception" in f for f in failures))
         self.assertNotIn("hunter2", json.dumps(results))
 
+    def nested_array_body(self, depth=30000):
+        raw = "[" * depth + "]" * depth
+        self.assertLess(len(raw.encode()), staging_probe.MAX_BODY_BYTES,
+                        "deeply nested fixture must fit the body cap")
+        return raw
+
+    def nested_object_body(self, depth=10000):
+        raw = '{"a":' * depth + "1" + "}" * depth
+        self.assertLess(len(raw.encode()), staging_probe.MAX_BODY_BYTES,
+                        "deeply nested fixture must fit the body cap")
+        return raw
+
+    def reply(self, body, status=200):
+        return staging_probe.Reply(status, {}, body)
+
+    def run_with_overrides(self, health=None, readyz=None):
+        def fetch(method, path):
+            if path == "/health" and health is not None:
+                return self.reply(health)
+            if path == "/readyz" and readyz is not None:
+                return self.reply(readyz, status=200)
+            live = make_fetch(self.fixture.origin, timeout=5)
+            return live(method, path)
+        return {r["name"]: r for r in run_probes(fetch, unknown_slug=SLUG)}
+
+    def test_deeply_nested_array_readyz_refuses_as_malformed(self):
+        results = self.run_with_overrides(readyz=self.nested_array_body())
+        self.assertEqual(results["readyz"]["verdict"], "FAIL")
+        failures = json.dumps(results["readyz"]["failures"])
+        self.assertIn("body is not a JSON component breakdown", failures)
+        self.assertNotIn("Traceback", json.dumps(results))
+        self.assertNotIn("[[[[[", json.dumps(results))
+        self.assertNotIn("RecursionError", json.dumps(results))
+
+    def test_deeply_nested_object_readyz_refuses_as_malformed(self):
+        results = self.run_with_overrides(readyz=self.nested_object_body())
+        self.assertEqual(results["readyz"]["verdict"], "FAIL")
+        failures = json.dumps(results["readyz"]["failures"])
+        self.assertIn("body is not a JSON component breakdown", failures)
+        self.assertNotIn("Traceback", json.dumps(results))
+        self.assertNotIn('{"a":{"a"', json.dumps(results))
+        self.assertNotIn("RecursionError", json.dumps(results))
+
+    def test_deeply_nested_health_refuses_without_echo(self):
+        results = self.run_with_overrides(health=self.nested_array_body())
+        self.assertEqual(results["health"]["verdict"], "FAIL")
+        failures = results["health"]["failures"]
+        self.assertTrue(any('body is not {"status":"ok"}' in f for f in failures),
+                        failures)
+        self.assertNotIn("Traceback", json.dumps(results))
+        self.assertNotIn("[[[[[", json.dumps(results))
+        self.assertNotIn("RecursionError", json.dumps(results))
+
+    def test_malformed_readyz_refuses_as_malformed(self):
+        results = self.run_with_overrides(readyz="not json{")
+        self.assertEqual(results["readyz"]["verdict"], "FAIL")
+        self.assertIn("body is not a JSON component breakdown",
+                      json.dumps(results["readyz"]["failures"]))
+
+    def test_unhashable_component_state_refuses_as_malformed(self):
+        for state in (["ready"], {"ready": True}):
+            with self.subTest(state=state):
+                readyz = json.dumps({"components": [["process", state], ["gateway", "ready"]]})
+                results = self.run_with_overrides(readyz=readyz)
+                self.assertEqual(results["readyz"]["verdict"], "FAIL")
+                self.assertIn("body is not a JSON component breakdown",
+                              json.dumps(results["readyz"]["failures"]))
+                self.assertNotIn("Traceback", json.dumps(results))
+
+    def test_shallow_nested_json_still_parses(self):
+        self.assertEqual(staging_probe.parse_json(self.reply('[1, [2, [3]]]')), [1, [2, [3]]])
+        self.assertEqual(staging_probe.parse_json(self.reply('{"x": {"y": [1]}}')),
+                         {"x": {"y": [1]}})
+
     def test_unreachable_target_fails_cleanly(self):
         fetch = make_fetch("http://127.0.0.1:9", timeout=2)
         results = {r["name"]: r for r in run_probes(fetch, unknown_slug=SLUG)}

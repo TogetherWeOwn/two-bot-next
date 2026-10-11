@@ -13,8 +13,8 @@ CI; the live run is manual-dispatch only.
 | Check | Probe | Pass shape |
 | --- | --- | --- |
 | `health` | `GET /health` | Exact 200 with `{"status":"ok"}` and no redirect target. Process liveness only: a 200 never claims readiness. |
-| `readyz` | `GET /readyz` | 200 or 503 with the bot's component breakdown (`process`, `gateway`, `database`, `token_invalid`, each `ready`/`starting`/`down`), the informational `jobs` object, an optional `gateway_failure` in the fixed `durable_gateway` + 12-class vocabulary, and non-empty compiled `build_revision`/`build_id`. The code must equal 200 iff every component is ready. A shape-correct 503 is still a probe FAIL: a truthful parked process is never E2E approval. |
-| `build` | readyz body | `build_revision`/`build_id` present; when `--expected-sha` (or `$EXPECTED_SHA`) is given, the revision must equal the deployed commit SHA from the `deploy-staging` receipt. |
+| `readyz` | `GET /readyz` | 200 or 503 with the bot's component breakdown (`process`, `gateway`, `database`, `token_invalid`, each `ready`/`starting`/`down`), the informational `jobs` object, an optional `gateway_failure` in the fixed `durable_gateway` + 12-class vocabulary, and compiled `build_revision`/`build_id` as non-empty printable ASCII strings. The code must equal 200 iff every component is ready. A shape-correct 503 is still a probe FAIL: a truthful parked process is never E2E approval. |
+| `build` | readyz body | `build_revision`/`build_id` present as printable ASCII strings (anything else is refused without echo); when `--expected-sha` (or `$EXPECTED_SHA`) is given, the revision must equal the deployed commit SHA from the `deploy-staging` receipt. |
 
 `/healthz` at the staging origin is the Worker's redirect probe (`ok`),
 covered by the redirect smoke — not this probe.
@@ -78,8 +78,10 @@ failure classes refused without echoing details; both contradictory
 status/breakdown directions carrying the checkpoint class without a failed-read
 classification; an all-ready 200 with that class and no cause assertion;
 ownership refusals, short breakdowns and non-JSON bodies as
-not-the-bot; health 503 as not-liveness; transport failures by class;
-redirects observed, never followed.
+not-the-bot; deeply nested bodies refused as malformed without a traceback;
+unhashable gateway-failure classes and non-string build identity refused
+without a traceback or echo; health 503 as not-liveness; transport failures by
+class; redirects observed, never followed.
 
 ## Not covered here
 
