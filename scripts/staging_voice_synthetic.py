@@ -61,9 +61,23 @@ OWNER_BITS = VIEW | CONNECT | MANAGE
 VOICE_TYPES = (2, 13)
 FALLBACK = re.compile(r"^.+['’]s room$")
 
+# Body-cap refusal contract (same shape as staging_probe.py MAX_BODY_BYTES and
+# the contract probe BODY_CAP): every response read takes at most
+# MAX_BODY_BYTES+1 bytes so a hidden suffix is detected. Any body longer than
+# MAX_BODY_BYTES (64 KiB) is refused before decoding/parsing with a fixed
+# message; exact-cap valid input passes, and the extra byte never reaches a
+# successful JSON path. Refusals never echo the body, headers, URL or parse
+# exceptions.
+MAX_BODY_BYTES = 64 * 1024
+BODY_CAP = MAX_BODY_BYTES
+
 
 class Refusal(Exception):
     pass
+
+
+class BodyTooLarge(ValueError):
+    """A response body exceeds MAX_BODY_BYTES (fixed vocabulary only)."""
 
 
 # --------------------------------------------------------------------------
@@ -251,8 +265,17 @@ class WebSocket:
 def rest(token, path, timeout=20):
     req = urllib.request.Request(f"{API}{path}", headers={
         "Authorization": f"Bot {token}", "User-Agent": "two-bot-voice-synthetic (staging)"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read(MAX_BODY_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(MAX_BODY_BYTES + 1)
+        if len(raw) > MAX_BODY_BYTES:
+            raise BodyTooLarge("Discord REST read answered over the body cap") from None
+        raise
+    if len(raw) > MAX_BODY_BYTES:
+        raise BodyTooLarge("Discord REST read answered over the body cap")
+    return json.loads(raw)
 
 
 def metrics_value(staging_url, token):
@@ -262,9 +285,17 @@ def metrics_value(staging_url, token):
         "Authorization": f"Bearer {token}", "User-Agent": "two-bot-voice-synthetic (staging)"})
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
-            return counter(resp.read().decode(), "created_with_template")
+            raw = resp.read(MAX_BODY_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(MAX_BODY_BYTES + 1)
+        if len(raw) > MAX_BODY_BYTES:
+            raise BodyTooLarge("metrics read answered over the body cap") from None
+        return None
     except (urllib.error.URLError, OSError):
         return None
+    if len(raw) > MAX_BODY_BYTES:
+        raise BodyTooLarge("metrics read answered over the body cap")
+    return counter(raw.decode(), "created_with_template")
 
 
 class Session:
