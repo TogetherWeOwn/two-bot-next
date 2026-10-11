@@ -76,6 +76,80 @@ class SoakEvidenceTests(unittest.TestCase):
         self.assertIsNone(summary["unknown_intervals"][0]["end"])
         self.assertEqual(summary["verdict"], "NEEDS WORK")
 
+    def test_duplicate_event_refused_both_orders(self):
+        lines = [
+            '{"ts": "2026-09-20T00:00:01Z", "event": "connect", '
+            '"session": "a", "event": "dispatch", "seq": 1}\n',
+            '{"ts": "2026-09-20T00:00:01Z", "event": "dispatch", "seq": 1, '
+            '"session": "a", "event": "connect"}\n',
+        ]
+        for text in lines:
+            summary = run(text)
+            self.assertEqual(len(summary["unknown_intervals"]), 1)
+            reason = summary["unknown_intervals"][0]["reason"]
+            self.assertEqual(reason, "malformed line 1: duplicate field")
+            self.assertNotIn("connect", reason)
+            self.assertNotIn("dispatch", reason)
+            # Refused instead of last-wins: neither side is counted.
+            self.assertEqual(summary["connects"], 0)
+            self.assertEqual(summary["dispatches"], 0)
+            self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_duplicate_identity_and_time_refused_both_orders(self):
+        cases = [
+            # duplicate identity (session) in both orders
+            ('{"ts": "2026-09-20T00:00:01Z", "event": "connect", '
+             '"session": "sess-AAA-111", "session": "sess-BBB-222"}\n',
+             "sess-AAA-111", "sess-BBB-222"),
+            ('{"ts": "2026-09-20T00:00:01Z", "event": "connect", '
+             '"session": "sess-BBB-222", "session": "sess-AAA-111"}\n',
+             "sess-AAA-111", "sess-BBB-222"),
+            # duplicate time (ts) in both orders
+            ('{"ts": "2026-09-20T00:00:01Z", "event": "connect", '
+             '"session": "sess-AAA-111", "ts": "2026-09-20T00:00:02Z"}\n',
+             "2026-09-20T00:00:01Z", "2026-09-20T00:00:02Z"),
+            ('{"ts": "2026-09-20T00:00:02Z", "event": "connect", '
+             '"session": "sess-AAA-111", "ts": "2026-09-20T00:00:01Z"}\n',
+             "2026-09-20T00:00:01Z", "2026-09-20T00:00:02Z"),
+        ]
+        for text, first, second in cases:
+            summary = run(text)
+            self.assertEqual(len(summary["unknown_intervals"]), 1)
+            reason = summary["unknown_intervals"][0]["reason"]
+            self.assertEqual(reason, "malformed line 1: duplicate field")
+            self.assertNotIn(first, reason)
+            self.assertNotIn(second, reason)
+            self.assertEqual(summary["connects"], 0)
+            self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_deeply_nested_record_becomes_unknown_then_continues(self):
+        nested = "[" * 500 + "]" * 500
+        bad = (
+            '{"ts": "2026-09-20T00:00:01Z", "event": "connect", '
+            f'"session": "a", "payload": {nested}}}\n'
+        )
+        good = (
+            '{"ts": "2026-09-20T00:00:02Z", "event": "connect", '
+            '"session": "a"}\n'
+        )
+        # Must not raise (no traceback); the bad line is UNKNOWN and the
+        # good line still counts.
+        summary = run(bad + good)
+        self.assertEqual(len(summary["unknown_intervals"]), 1)
+        reason = summary["unknown_intervals"][0]["reason"]
+        self.assertEqual(reason, "malformed line 1: too deeply nested")
+        self.assertNotIn(nested, reason)
+        self.assertNotIn("payload", reason)
+        self.assertEqual(summary["connects"], 1)
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+        self.assertEqual(summary["window"]["start"],
+                         "2026-09-20T00:00:02+00:00")
+        self.assertEqual(summary["window"]["end"],
+                         "2026-09-20T00:00:02+00:00")
+        dumped = json.dumps(summary)
+        self.assertNotIn(nested, dumped)
+        self.assertNotIn("Traceback", dumped)
+
 
 if __name__ == "__main__":
     unittest.main()
