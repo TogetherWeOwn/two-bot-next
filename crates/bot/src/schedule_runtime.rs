@@ -36,7 +36,7 @@ use two_bot_core::{
 use two_bot_discord::ActionExecutor;
 
 use crate::command_runtime::{actor_id, new_id};
-use crate::db_log::{db_class, quota_write_class};
+use crate::db_log::{db_class, discord_class, quota_write_class};
 
 /// Safe reply when the store fails — never leak sqlx internals to Discord.
 const STORE_FAILURE_REPLY: &str = "Schedule command failed; try again.";
@@ -357,7 +357,7 @@ async fn finish(executor: &ActionExecutor, interaction: &Interaction, content: i
         )
         .await
     {
-        tracing::warn!(interaction_id = %interaction.id.get(), reason = err.cause(), "schedule reply edit failed");
+        tracing::warn!(interaction_id = %interaction.id.get(), reason = discord_class(&err), "schedule reply edit failed");
     }
 }
 

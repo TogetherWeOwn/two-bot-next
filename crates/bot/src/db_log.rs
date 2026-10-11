@@ -11,9 +11,10 @@
 //!   classify the store wrappers that embed one;
 //! - [`channel_response_class`] classifies the channel responder's fixed
 //!   three-variant error;
-//! - Discord failures use the existing fixed vocabulary
-//!   (`DiscordError::cause`); config/gate failures already render as fixed
-//!   strings and are logged under `reason`, never `error`.
+//! - [`discord_class`] classifies a Discord executor failure (the fixed
+//!   `DiscordError::cause` vocabulary plus send-admission refusals);
+//! - config/gate failures render as authored strings with no secret and are
+//!   logged under `reason`, never `error`.
 //!
 //! `scripts/ci/test_db_error_lints.py` rejects new raw-error-field log
 //! sites in the four in-scope files, so add new failure logs with one of
@@ -22,9 +23,11 @@
 use sqlx::error::ErrorKind;
 use two_bot_core::{
     automation_quota::QuotaWriteError, feeds_store::FeedStoreError,
-    leveling_store::LevelingStoreError,
+    leveling_store::LevelingStoreError, send_admission::AdmissionError,
 };
-use two_bot_discord::{leveling_runtime::LevelingRuntimeError, ChannelResponseError};
+use two_bot_discord::{
+    executor::DiscordError, leveling_runtime::LevelingRuntimeError, ChannelResponseError,
+};
 
 /// Fixed token naming a database failure without its internals.
 ///
@@ -77,17 +80,43 @@ pub(crate) fn quota_write_class(error: &QuotaWriteError) -> &'static str {
 }
 
 /// [`LevelingRuntimeError`] without its SQLx or Discord detail. Database
-/// halves classify through [`db_class`]; Discord halves reuse the fixed
-/// `cause` vocabulary; malformed input is one token.
+/// halves classify through [`db_class`]; Discord halves through
+/// [`discord_class`]; malformed input is one token.
 #[must_use]
 pub(crate) fn leveling_class(error: &LevelingRuntimeError) -> &'static str {
     match error {
         LevelingRuntimeError::Store(LevelingStoreError::Db(inner)) => db_class(inner),
         LevelingRuntimeError::Store(LevelingStoreError::InvalidTimestamp(_)) => "invalid_timestamp",
         LevelingRuntimeError::Store(LevelingStoreError::InvalidRewards(_)) => "invalid_rewards",
-        LevelingRuntimeError::Discord(discord) => discord.cause(),
+        LevelingRuntimeError::Discord(discord) => discord_class(discord),
         LevelingRuntimeError::InvalidInteraction => "invalid_interaction",
     }
+}
+
+/// [`DiscordError`] as a fixed token. `Unavailable` can carry transport
+/// detail and `Rejected` provider text, so neither is rendered. The transport
+/// stringifies send-admission refusals into `Unavailable`; matching the typed
+/// [`AdmissionError`] displays recovers them, so a storage failure still reads
+/// differently from a Discord outage (the 2026-10-05 boot crash loop needed
+/// exactly that). Everything else is [`DiscordError::cause`], which already
+/// names `admission_blocked`.
+#[must_use]
+pub(crate) fn discord_class(error: &DiscordError) -> &'static str {
+    if let DiscordError::Unavailable(detail) = error {
+        for (admission, token) in [
+            (AdmissionError::Storage, "admission_storage_unavailable"),
+            (
+                AdmissionError::Configuration,
+                "admission_configuration_invalid",
+            ),
+            (AdmissionError::StaleClaim, "admission_stale_claim"),
+        ] {
+            if detail == &admission.to_string() {
+                return token;
+            }
+        }
+    }
+    error.cause()
 }
 
 /// [`ChannelResponseError`] as a fixed token. All three variants render as
@@ -281,6 +310,41 @@ mod tests {
             leveling_class(&LevelingRuntimeError::InvalidInteraction),
             "invalid_interaction"
         );
+    }
+
+    #[test]
+    fn discord_class_keeps_admission_refusals_and_drops_transport_text() {
+        for (error, token) in [
+            (
+                DiscordError::Unavailable(AdmissionError::Storage.to_string()),
+                "admission_storage_unavailable",
+            ),
+            (
+                DiscordError::Unavailable(AdmissionError::Configuration.to_string()),
+                "admission_configuration_invalid",
+            ),
+            (
+                DiscordError::Unavailable(AdmissionError::StaleClaim.to_string()),
+                "admission_stale_claim",
+            ),
+            (
+                DiscordError::Unavailable(AdmissionError::Blocked.to_string()),
+                "admission_blocked",
+            ),
+            (
+                DiscordError::Unavailable(
+                    "error sending request for url (https://user:secret@example.invalid/)".into(),
+                ),
+                "unavailable",
+            ),
+            (
+                DiscordError::Rejected("provider text with secret".into()),
+                "rejected",
+            ),
+            (DiscordError::Timeout, "timeout"),
+        ] {
+            assert_eq!(discord_class(&error), token, "{error:?}");
+        }
     }
 
     #[test]

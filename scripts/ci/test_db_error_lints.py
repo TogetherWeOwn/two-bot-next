@@ -7,6 +7,10 @@ several store wrappers embed one (`feed store database error: {0}`).
 token; this lint rejects new `error = %err`-style sites (and the `%error`
 shorthand) in the four converted files so the next failure log reaches for
 a helper instead of formatting the error.
+
+It is a name-based tripwire, not a proof: it matches the field and variable
+names a failure log reaches for, not every way to render an error value.
+`reason` is reserved for helper tokens and authored, secret-free text.
 """
 
 from pathlib import Path
@@ -29,9 +33,9 @@ SCOPED_FILES = [
 # `error = %err`, `error=%error`, `error = ?err` — any raw error value in the
 # structured `error` field.
 RAW_ERROR_FIELD = re.compile(r"\berror\s*=\s*[?%]")
-# `warn!(..., %error, ...)` / `?err` — the shorthand that records the value
-# under its own name. `reason = %err` and `?error.class()` stay legal.
-RAW_ERROR_SHORTHAND = re.compile(r"[(,]\s*[%?](?:err|error)\s*[,)]")
+# `warn!(..., %error, ...)` / `?err` / `%e` — the shorthand that records the
+# value under its own name. `reason = %err` and `?error.class()` stay legal.
+RAW_ERROR_SHORTHAND = re.compile(r"[(,]\s*[%?](?:e|err|error)\s*[,)]")
 
 
 class DbErrorLintTests(unittest.TestCase):
@@ -41,6 +45,7 @@ class DbErrorLintTests(unittest.TestCase):
             'warn!(error=?error, "x");',
             'warn!(id = 1, %error, "x");',
             'warn!(?err, "x");',
+            'warn!(%e, "x");',
         ]
         classified = [
             'warn!(reason = db_class(&err), "x");',
@@ -80,6 +85,7 @@ class DbErrorLintTests(unittest.TestCase):
             "pub(crate) fn quota_write_class",
             "pub(crate) fn leveling_class",
             "pub(crate) fn channel_response_class",
+            "pub(crate) fn discord_class",
         ]:
             with self.subTest(helper=helper):
                 self.assertIn(helper, source)
@@ -91,8 +97,13 @@ class DbErrorLintTests(unittest.TestCase):
                 "feed_store_class",
                 "leveling_class",
                 "channel_response_class",
+                "discord_class",
             ],
-            "crates/bot/src/schedule_runtime.rs": ["db_class", "quota_write_class"],
+            "crates/bot/src/schedule_runtime.rs": [
+                "db_class",
+                "quota_write_class",
+                "discord_class",
+            ],
             "crates/bot/src/scheduled_jobs.rs": ["db_class"],
         }
         for rel, helpers in expectations.items():

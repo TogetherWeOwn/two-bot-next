@@ -10,7 +10,7 @@ use two_bot_core::commands::CommandDefinition;
 use two_bot_core::feature_commands::FeatureGates;
 use two_bot_core::moderation::ModerationGates;
 use two_bot_core::router::{InteractionRouter, RouterGates, SurfaceFlags};
-use two_bot_core::send_admission::{is_loopback_http, AdmissionError, PgSendAdmission};
+use two_bot_core::send_admission::{is_loopback_http, PgSendAdmission};
 use two_bot_core::voice_assistant::AssistantConfig;
 use two_bot_core::voice_rooms::VoiceGates;
 use two_bot_discord::executor::DiscordError;
@@ -233,36 +233,13 @@ pub async fn dispatch(args: &[String]) -> i32 {
 /// send-admission storage failure looks identical to a Discord outage). The
 /// `tracing::error!` call site keeps its exact message so the observability
 /// catalog still matches; the cause rides in the `reason` field as a fixed
-/// token ([`boot_sync_cause`]), never the executor's error text.
+/// token ([`discord_class`](crate::db_log::discord_class)), never the
+/// executor's error text.
 fn boot_sync_error(source: &DiscordError) -> String {
     format!(
         "boot command registry synchronization failed: {}",
-        boot_sync_cause(source)
+        crate::db_log::discord_class(source)
     )
-}
-
-/// Fixed token for a boot-sync failure. `Unavailable` can carry transport
-/// detail and `Rejected` provider text, so neither is rendered. The transport
-/// stringifies send-admission refusals into `Unavailable`; matching the typed
-/// [`AdmissionError`] displays recovers them, so a storage failure still reads
-/// differently from a Discord outage. Everything else is
-/// [`DiscordError::cause`].
-fn boot_sync_cause(source: &DiscordError) -> &'static str {
-    if let DiscordError::Unavailable(detail) = source {
-        for (admission, token) in [
-            (AdmissionError::Storage, "admission_storage_unavailable"),
-            (
-                AdmissionError::Configuration,
-                "admission_configuration_invalid",
-            ),
-            (AdmissionError::StaleClaim, "admission_stale_claim"),
-        ] {
-            if detail == &admission.to_string() {
-                return token;
-            }
-        }
-    }
-    source.cause()
 }
 
 /// Publication did not previously run on boot. Keep it opt-in while the shared
@@ -300,6 +277,7 @@ pub async fn publish_on_boot(token: &str, guild: u64) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use two_bot_core::send_admission::AdmissionError;
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|s| (*s).to_owned()).collect()

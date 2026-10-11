@@ -88,7 +88,9 @@ use two_bot_discord::{
 };
 
 use crate::activation::BootActivation;
-use crate::db_log::{channel_response_class, db_class, feed_store_class, leveling_class};
+use crate::db_log::{
+    channel_response_class, db_class, discord_class, feed_store_class, leveling_class,
+};
 use crate::interaction_admission::{
     accepts_busy_reply, is_privileged, UserSlots, BUSY_REPLY, PER_USER_IN_FLIGHT,
 };
@@ -803,7 +805,7 @@ impl CommandRuntime {
             {
                 warn!(
                     interaction_id = target.interaction_id.to_string(),
-                    reason = error.cause(),
+                    reason = discord_class(&error),
                     "busy reply failed"
                 );
             }
@@ -1970,7 +1972,7 @@ impl CommandRuntime {
         {
             Ok(()) => true,
             Err(err) => {
-                warn!(interaction_id = %interaction.id.get(), command, reason = err.cause(), "command defer failed");
+                warn!(interaction_id = %interaction.id.get(), command, reason = discord_class(&err), "command defer failed");
                 false
             }
         }
@@ -1986,7 +1988,7 @@ impl CommandRuntime {
             )
             .await
         {
-            warn!(interaction_id = %interaction.id.get(), reason = err.cause(), "sticky reply failed");
+            warn!(interaction_id = %interaction.id.get(), reason = discord_class(&err), "sticky reply failed");
         }
     }
 
@@ -2001,7 +2003,7 @@ impl CommandRuntime {
             )
             .await
         {
-            warn!(interaction_id = %interaction.id.get(), reason = err.cause(), "sticky reply edit failed");
+            warn!(interaction_id = %interaction.id.get(), reason = discord_class(&err), "sticky reply edit failed");
         }
     }
 
@@ -2014,7 +2016,7 @@ impl CommandRuntime {
             .await
         {
             warn!(
-                reason = err.cause(),
+                reason = discord_class(&err),
                 "sticky cleanup delete failed; continuing"
             );
         }
