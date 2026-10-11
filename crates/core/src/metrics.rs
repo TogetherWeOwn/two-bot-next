@@ -1282,11 +1282,11 @@ mod tests {
         ] {
             let metrics = Metrics::default();
             metrics.job_success(failed, 123);
-            metrics.job_failure(failed);
-            metrics.job_failure(failed);
+            metrics.job_failure(failed, JobErrorClass::Database);
+            metrics.job_failure(failed, JobErrorClass::Database);
             metrics.job_success("unknown_job", 234);
-            metrics.job_failure("another_unknown_job");
-            metrics.job_failure(succeeded);
+            metrics.job_failure("another_unknown_job", JobErrorClass::Database);
+            metrics.job_failure(succeeded, JobErrorClass::Database);
             metrics.job_success(succeeded, 456);
             let text = metrics.render(None);
             for (job, success, failure, last_success, streak) in [
