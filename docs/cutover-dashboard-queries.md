@@ -139,7 +139,8 @@ curl --silent --show-error --max-time 10 "${WORKER_URL}/readyz" | jq .gateway_fa
 `store_unavailable`, `gateway_pool_connect_failed`, and
 `checkpoint_load_failed` are the DB-side classes; each is also logged once as
 `durable gateway failed; checkpoint unchanged, readiness unavailable` and kept
-for 15 s on `/readyz` plus Worker-side `container_gateway_failure`. Full
+for 15 s on `/readyz` (the startup linger; a running-gateway failure lingers
+75 s) plus Worker-side `container_gateway_failure`. Full
 vocabulary: [startup diagnostics](startup-diagnostics.md), [runbook](runbook.md#logs-and-keepalive).
 
 | Level | Condition | Action |

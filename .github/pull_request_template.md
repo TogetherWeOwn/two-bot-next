@@ -35,4 +35,4 @@ Full rules: CONTRIBUTING.md, "Pull request standards".
 
 <!-- Risks, follow-ups, or anything the reviewer should look at first. -->
 
-- For vote-kick, template assistant or RSVP/attendance wiring: the applicable [security requirement IDs](https://github.com/TogetherWeOwn/two-bot-next/blob/main/docs/command-wiring-security.md) and exact-head regression tests.
+- For vote-kick, template assistant, RSVP/attendance or slash-command input-handling wiring: the applicable [security requirement IDs](https://github.com/TogetherWeOwn/two-bot-next/blob/main/docs/command-wiring-security.md) and exact-head regression tests.

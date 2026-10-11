@@ -1432,6 +1432,37 @@ async fn refused_creation_plan_records_a_failure_before_any_channel_is_created()
     assert!(!worker.dispatch_one(1).await);
     assert!(trace.lock().unwrap().is_empty());
     assert!(worker.http.created_attributes.lock().unwrap().is_empty());
+
+    // A creator-channel overwrite denying the bot Connect refuses the room at
+    // the creator-channel guard, before any `create` call: `prepare` checks
+    // the bot's channel permissions first, so the plan (and its grant) never
+    // runs for this fixture. The guild grant holds Connect, but the
+    // creator-channel overwrite removes it at the guard.
+    let (live, store, http, trace) = fixture();
+    live.upsert_channel(channel_with_overwrites(
+        CREATOR,
+        2,
+        Some(CATEGORY),
+        json!([bot_overwrite(Permissions::empty(), Permissions::CONNECT)]),
+    ));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert!(matches!(
+        worker.failures().back(),
+        Some(LifecycleFailure::MissingPermission {
+            write: RefusedWrite::Create,
+            channel_id: CREATOR,
+            findings,
+        }) if findings.iter().any(|finding| finding.permission == VoicePermission::Connect
+            && finding.scope == VoicePermissionScope::Channel
+            && finding.channel_id == Some(CREATOR))
+    ));
+    assert!(worker.creations.is_empty());
+    assert!(worker.tracked().is_empty());
+    assert!(!worker.dispatch_one(1).await);
+    assert!(trace.lock().unwrap().is_empty());
+    assert!(worker.http.created_attributes.lock().unwrap().is_empty());
 }
 
 /// A failed compensation delete must keep the room (and its provenance)
@@ -10995,4 +11026,68 @@ async fn a_refused_respace_ties_upwards_and_an_unknown_one_takes_no_position() {
     }
     // Unknown outcome: the reorder may have landed, so no stale position.
     assert_eq!(created_positions(&worker)[1], None);
+}
+
+#[tokio::test]
+async fn time_tokens_follow_the_guild_time_zone() {
+    // 2026-10-11 02:30 UTC is 22:30 the previous evening in New York (EDT).
+    let wall =
+        two_bot_core::funnel::parse_iso_millis("2026-10-11T02:30:00.000000+00:00").unwrap() as u64;
+    let (live, store, http, _) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "@@hour@@ @@daypart@@".to_owned();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER, Some(500), Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.wall_clock = test_wall_clock;
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    TEST_WALL_MS.set(wall);
+    worker.name_settings.time_zone = "America/New_York".to_owned();
+    worker.refresh_template_names(0);
+    assert_eq!(worker.desired_names[&500], "22 night");
+    // UTC (the default) renders the UTC hour.
+    worker.name_settings.time_zone = "UTC".to_owned();
+    worker.refresh_template_names(1);
+    assert_eq!(worker.desired_names[&500], "2 late night");
+}
+
+#[test]
+fn name_settings_carry_the_configured_time_zone() {
+    let mut config = empty_config();
+    config.settings.time_zone = "Europe/Berlin".to_owned();
+    assert_eq!(
+        NameSettings::from_config(&config).time_zone,
+        "Europe/Berlin"
+    );
+}
+
+#[test]
+fn import_preview_and_confirm_refuse_a_new_unsupported_time_zone() {
+    let mut config = full_config();
+    config.settings.time_zone = "Mars/Olympus".to_owned();
+    let bytes = serde_json::to_vec(&config).unwrap();
+    match plan_import_preview(&empty_config(), &bytes, &config_inventory()) {
+        ImportDecision::Refuse { message } => {
+            assert!(message.contains("settings.time_zone"), "{message}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    match plan_import_confirm(
+        &empty_config(),
+        &config,
+        &config_inventory(),
+        "0000000000000000",
+    ) {
+        ImportDecision::Refuse { message } => {
+            assert!(message.contains("settings.time_zone"), "{message}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    // The zone already stored is kept as is, so a guild can re-import its export.
+    let mut current = empty_config();
+    current.settings.time_zone = "Mars/Olympus".to_owned();
+    assert!(!matches!(
+        plan_import_preview(&current, &bytes, &config_inventory()),
+        ImportDecision::Refuse { .. }
+    ));
 }

@@ -46,7 +46,7 @@ Proposed rule id (mirrors `job_stale:<job>`): `gateway_failure:<class>`
 | Item | Copy |
 | --- | --- |
 | Fires when | at least one `event="container_gateway_failure"` line with that `class` in the trailing window `max(5 minutes, 3 x KEEPALIVE_SECONDS)` (15 minutes at the default 60 s tick covers a missed tick or two) |
-| Severity | critical (page): the gateway task is fatal, the process exits 1 after a 15 s linger, and the guild has no gateway until supervision restarts it |
+| Severity | critical (page): the gateway task is fatal, the process exits 1 after a 15 s linger on startup failures (75 s on a running-gateway failure), and the guild has no gateway until supervision restarts it |
 | Runbook | proposed `runbook.md#alert-gateway-failure` (installer adds the section); until then follow [logs and keepalive](runbook.md#logs-and-keepalive), [sustained-unready alerts](runbook.md#sustained-unready-alerts), and [startup diagnostics](startup-diagnostics.md#self-diagnosing-gateway-failures-readyz-gatewayfailure) |
 | Fire message | `two-bot-next ALERT gateway_failure:<class>: gateway task failed (<phase>:<class>). Runbook: <full runbook URL>` |
 | Resolve message | `two-bot-next RESOLVED gateway_failure:<class>.` |
@@ -57,8 +57,10 @@ Delivery notes for the installer (matches the existing readiness monitor):
   per incident, no re-fire while the key is firing.
 - Resolve when the window holds zero matching lines; confirm with one
   `/readyz` 200 before calling the incident recovered.
-- A single line fires the rule: the 15 s linger is shorter than the 60 s
-  tick, so a typical incident emits exactly one line.
+- A startup failure typically emits exactly one line: the 15 s linger is
+  shorter than the 60 s tick. A running-gateway failure lingers 75 s, so one
+  or two keepalive ticks land in it and each re-emits the line; the dedupe is
+  by firing key, so the incident still pages once.
 - A short streak that clears below the window still paged once; that is
   intended, because the process already restarted.
 - Class changes the diagnosis, not the severity. First checks:

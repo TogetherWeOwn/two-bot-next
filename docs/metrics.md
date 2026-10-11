@@ -56,7 +56,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_voice_names_total{outcome}` | Automatic room-name decisions: a room created with its template name, each template render, and each queued rename sent or dropped at dispatch; `outcome` is `created_with_template`, `proposed`, `unchanged`, `waiting_for_name`, `blocked`, `channel_unseen`, `rename_sent`, `rename_stale`, `rename_unseen`, `rename_no_access`, `rename_held` or `other` |
 | `two_bot_voice_vote_kick_total{outcome}` | Vote-kick starts, refusals and terminal enforcements; `outcome` is `started`, a refusal code (`evidence_unavailable`, `not_a_room`, `initiator_not_occupant`, `target_not_occupant`, `self_target`, `protected_target`, `privileged_target`, `authority_unavailable`, `active_vote_exists`, `cooldown`, `initiator_limited`, `reused_vote_id`, `unknown_vote`, `wrong_vote_boundary`, `ineligible_voter`, `repeated_vote`, `invalid_time`), an enforcement code (`connect_denied_and_disconnected`, `connect_denied_target_absent`, `skipped_room_gone`, `skipped_target_protected`, `permission_missing`, `discord_error`, `gave_up`) or `other`; vote results (`passed`/`expired`/`cancelled`) are audit-only and never counted |
 | `two_bot_dispatch_drops_total{lane}` | Dispatch-lane saturation drops: every event refused because every attempted lane was full. `lane` is one of `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` (see label allowlists below). The `reactions` lane additionally counts per-member fairness refusals: a reaction refused because its member already holds `PER_USER_IN_FLIGHT` reaction slots, even while the lane has free slots. A single-lane refusal counts its lane once; a privileged spill refused by both lanes counts both. Logs sample the first drop per 60 s per runtime, so bursts are O(1) lines with N counter increments. `dispatch_drops:<lane>` raises a ticket after growth in 3 consecutive completed keepalive sample windows; the first valid sample only establishes a baseline. A flat sample or counter reset clears the streak; missing/invalid samples break growth but never falsely resolve an active ticket. A single burst never pages. `reactions`-lane growth can reflect per-member fairness rather than an undersized lane. Dispatch refusals are not proof of gateway packet loss |
-| `two_bot_gateway_checkpoint_failures_total{stage}` | Failed gateway checkpoint commits from `apply_dispatch` and failed checkpoint clears: every failure stops the dispatch worker and is recorded on `operation`. `stage` is `pre_commit` (commit skipped after a funnel/leveling/acknowledgement failure) or `commit` (the durable store write itself failed); failure causes are never labels. Alert-threshold hook for M2.1 (lands once TOG-18943 unblocks): alert on any increase across consecutive keepalive samples; unlike bursty dispatch drops, a single checkpoint failure stops the worker, so there is no benign-singleton case |
+| `two_bot_gateway_checkpoint_failures_total{stage}` | Failed gateway checkpoint commits from `apply_dispatch` and failed checkpoint clears: every failure stops the dispatch worker and is recorded on `operation`. `stage` is `pre_commit` (commit skipped after a funnel/leveling/acknowledgement failure) or `commit` (the durable store write itself failed); failure causes are never labels. Alert rule `gateway_checkpoint_failures` fires on any increase summed over every `stage` between consecutive keepalive samples (the first sample is baseline-only; the failing process lingers 75 s so a scrape lands before the restart resets the counter); unlike bursty dispatch drops, a single checkpoint failure stops the worker, so there is no benign-singleton case |
 | `two_bot_internal_actions_total{family,outcome}` | Signed website-action receiver executions by bounded family and outcome. `family` is one of `announcement`, `event`, `settings`, `moderation`, `membership` or `other` (see label allowlists below). `outcome` is `executed` or the refusal class (`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`, `conflict`, `upstream` or `internal`). Every request counts once; replays count on each serve. Refusal warn-summaries stay sampled; this counter is the alertable signal. Alert rule `receiver_refusals:<family>` fires when a family's refused outcomes rise in 3 consecutive keepalive samples (first sample and restarts clear the streak; one forged pre-auth probe in `other` stays silent) |
 | `two_bot_community_facts_drain_failures_total{reason}` | Warn-and-continue community-facts drain failures in the gateway dispatch worker. `reason` is `error` (the facts writer returned an error) or `timeout` (the drain missed the dispatch deadline), or `other` (see label allowlists below). Each failed dispatch counts once; a committed drain counts nothing. The worker never stalls on this, and the scorecard fails closed on missing coverage. Alert-threshold hook for M2.1: alert when the counter increases across consecutive scrapes; a single failed drain is not paging |
 
@@ -254,7 +254,13 @@ as dynamic labels.
   clear on the `ReceivedWork::Clear` path: `pre_commit` when the commit was
   skipped after a funnel/leveling/acknowledgement failure, `commit` when the
   durable store write itself failed (including a failed clear). Failure
-  causes are never labels.
+  causes are never labels. Alert rule `gateway_checkpoint_failures` fires
+  on any increase summed over every `stage` between consecutive keepalive
+  samples (the first sample is baseline-only; the failing process lingers
+  75 s so a scrape lands before the restart resets the counter, and the
+  post-restart reset sample resolves); unlike bursty
+  dispatch drops, a single checkpoint failure stops the worker, so there is
+  no benign-singleton case.
 - `two_bot_internal_actions_total{family,outcome}` — `family` is one of
   `announcement`, `event`, `settings`, `moderation`, `membership` or
   `other`, mapped from the signed `action` verb in
@@ -426,6 +432,8 @@ exposition proxy, and ownership and bearer controls are unchanged.
 | `ticker_stale:<job>` | 15 s ticker with no success for more than 10 minutes (never-succeeded is ignored) | [ticker stale](runbook.md#alert-ticker-stale) |
 | `receiver_refusals:<family>` | refused `two_bot_internal_actions_total` outcomes rising in 3 consecutive samples per family (first sample and restarts clear the streak) | [receiver refusals](runbook.md#alert-receiver-refusals) |
 | `dispatch_drops:<lane>` | **ticket**, not page: `two_bot_dispatch_drops_total{lane}` grows in 3 consecutive completed sample windows per bounded lane; first sample is baseline, flat/reset clears, missing/invalid retains active alerts | [dispatch drops](runbook.md#alert-dispatch-drops) |
+| `job_unknown_stale:<job>` | **ticket**, not page: job without a cadence entry with no success for more than 2 hours (never-succeeded is ignored) | [job unknown stale](runbook.md#alert-job-unknown-stale) |
+| `gateway_checkpoint_failures` | any increase of `two_bot_gateway_checkpoint_failures_total` summed over every `stage` between samples (first sample is baseline-only; the 75 s runtime linger leaves ~3 s margin over a 60 s tick plus two 6 s probes for a pre-exit scrape, the post-restart reset resolves) | [checkpoint failures](runbook.md#alert-checkpoint-failures) |
 
 `dispatch_drops` covers `messages`, `interactions`, `registry`, `privileged`,
 `busy` and `reactions` independently (the Worker allowlist is pinned to Rust).
@@ -451,23 +459,37 @@ Rust `*_INTERVAL_MS / 1000`. The 15 s tickers (`scheduled_messages`,
 window instead: at two intervals a 15 s cadence would flap on a single slow
 scrape, and skipped busy deadlines are neither success nor failure, so
 `job_stale` and `job_consecutive_failures` cannot see a wedged ticker.
-`invite_snapshot` and `session_checkpoint` have no cadence and are exempt;
-`other` is exempt but currently also covers two known deferred jobs
-(`member_unban_sweep` at 30 s and `automod_expiry` at 60 s), so it has no single
-cadence until #788 gives them independent labels. `audit_retry` stays exempt with
-its parked/halt reason. `feeds` is exempt because its cadence is configurable and
-successful gated ticks are not polling freshness; its failure alerting is reliable
-only while the live interval is at most the boot cadence, since skipped gated ticks
-return success and reset the streak. `self_role_recovery` retains failure-only
-alerting: twice its 30 s cadence is too close to the ~60 s scrape interval for safe
-`job_stale` paging, and this label-isolation change adds no ticker-staleness policy.
-`self_role_recovery` triggers `job_consecutive_failures` independently at three
-completed failures; `feeds` does the same within its live-interval limit above.
-A wedged sweep with no completions remains a staleness-coverage gap.
-`wrangler/test/alert-job-catalog.test.ts` checks website/community cadence catalogs
-and direct feed/self-role job producers. It fails when a registered producer is
-absent from `JOBS` or a `JOBS` label has neither a matching cadence,
-ticker_stale coverage, nor a reasoned exemption.
+`invite_snapshot`, `other`, `audit_retry`, `feeds` and `self_role_recovery`
+have no cadence entry; a stale nonzero success timestamp on any of them — or
+on any future label the scrape accepts before the catalog maps it — raises
+the `job_unknown_stale` ticket above (`UNKNOWN_JOB_STALE_SECONDS`, 7200)
+instead of staying silent. `other` is the catch-all for unknown job names and
+currently also covers two known deferred jobs (`member_unban_sweep` at 30 s
+and `automod_expiry` at 60 s), so it has no single cadence until #788 gives
+them independent labels. `session_checkpoint` is event-driven (one success per
+durable gateway commit, so idle guilds go stale while healthy) and is excluded
+from the fallback via `UNKNOWN_STALE_EXCLUDED` in
+`wrangler/src/alert-rules.ts`: it never tickets. `audit_retry` keeps its
+parked/halt reason in the catalog; a halted sweep still records success, so
+only a truly wedged sweep tickets. `feeds` is covered by the coarse fallback,
+not a precise cadence, because its cadence is boot-configured (60–86400 s)
+with a live-configurable inner polling gate and successful gated ticks are
+not polling freshness; its failure alerting is reliable only while the live
+interval is at most the boot cadence, since skipped gated ticks return success
+and reset the streak. `self_role_recovery` keeps failure-only alerting: twice
+its 30 s cadence is too close to the ~60 s scrape interval for safe
+`job_stale` paging, and this label-isolation change adds no ticker-staleness
+policy. `self_role_recovery` triggers `job_consecutive_failures` independently
+at three completed failures; `feeds` does the same within its live-interval
+limit above. A sweep with no completions is covered only by the coarse 2-hour
+fallback, not a precise cadence.
+`wrangler/test/alert-job-catalog.test.ts` checks website/community cadence
+catalogs and direct feed/self-role job producers. It fails when a registered
+producer is absent from `JOBS` or a `JOBS` label has neither a matching
+cadence, ticker_stale coverage, nor a reasoned unknown-stale entry. Only a
+cadence, ticker coverage, or event-driven exclusion in
+`wrangler/src/alert-rules.ts` retires the fallback; a reasoned note alone does
+not.
 
 Packet identity (TOG-12100): rule ids above are the single shared spelling
 used on both sides of the B2 soak evidence seam. The Rust canonical list is
