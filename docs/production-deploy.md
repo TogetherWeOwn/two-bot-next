@@ -383,6 +383,22 @@ fires at 3 on its own label and a stale nonzero success tickets via the coarse
 `job_unknown_stale` fallback. `job="other"` remains the shared unknown-name
 catch-all, never per-sweep evidence.
 
+For automod expiry, inspect the saved `/readyz` response (there is no
+completion log line: the 60 s tick is a no-op success until the gateway builds
+the activation, and it only does real expiry work when `TWO_AUTOMOD=1`):
+
+```sh
+jq '.jobs.automod_expiry | {running, parked, last_success, consecutive_failures}' readyz.json
+```
+
+When `TWO_AUTOMOD` is not `1` the job is not registered and the entry is
+absent: record the checkpoint as not-applicable, never green. Otherwise compare
+`last_success` (Unix **milliseconds**) with the read timestamp and prior
+checkpoint like the unban sweep: three failures or no recent success needs a
+disposition. `job_consecutive_failures` fires at 3 on the `automod_expiry`
+label and a stale nonzero success tickets via the coarse `job_unknown_stale`
+fallback.
+
 For the event-driven session checkpoint, use the
 [manual checkpoint queries](voice-cutover-rollback-triggers.md#manual-checkpoint-queries)
 for success age, commit traffic and commit failures; there is no periodic
