@@ -240,6 +240,42 @@ class ProbeTests(unittest.TestCase):
         self.assertVerdicts(results)
         self.assertEqual(results["readyz"]["observed"]["components"]["gateway"], "ready")
 
+    def test_unknown_components_refused_without_echoing_data(self):
+        for extra_status, http_status in (("ready", 200), ("down", 503), ("starting", 503)):
+            with self.subTest(extra_status=extra_status):
+                body = {"components": [["process", "ready"], ["gateway", "ready"],
+                                        ["database", "ready"], ["voice", extra_status]]}
+                self.server.readyz = (http_status, body)
+                results = self.run_probes()
+                self.assertVerdicts(results, failing={"readyz"})
+                failures = results["readyz"]["failures"]
+                self.assertTrue(any("unknown component name" in f for f in failures),
+                                failures)
+                self.assertNotIn("voice", json.dumps(results))
+
+    def test_unknown_sentinel_echoes_no_component_data(self):
+        sentinel = "SENTINEL_unknown_staging_abc123"
+        body = {"components": [["process", "ready"], ["gateway", "ready"],
+                                [sentinel, "ready"]]}
+        self.server.readyz = (200, body)
+        results = self.run_probes()
+        self.assertVerdicts(results, failing={"readyz"})
+        self.assertNotIn(sentinel, json.dumps(results))
+
+    def test_legitimate_optional_components_still_pass(self):
+        for body, status in (
+            ({"components": [["process", "ready"], ["gateway", "ready"]]}, 200),
+            ({"components": [["process", "ready"], ["gateway", "ready"],
+                              ["database", "ready"]]}, 200),
+            ({"components": [["process", "ready"], ["gateway", "ready"],
+                              ["database", "ready"], ["token_invalid", "ready"]]}, 200),
+            ({"components": [["process", "ready"], ["gateway", "starting"],
+                              ["database", "ready"], ["token_invalid", "ready"]]}, 503),
+        ):
+            with self.subTest(body=body):
+                self.server.readyz = (status, body)
+                self.assertVerdicts(self.run_probes())
+
     def test_configured_fallback(self):
         self.server.fallback = "twoInvite"
         results = self.run_probes(expect_fallback_code="twoInvite")

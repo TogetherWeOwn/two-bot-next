@@ -371,6 +371,39 @@ class HealthContractProbeTests(unittest.TestCase):
         code, results, _ = self.drive(routes)
         self.assert_readyz_unreadable("repeats a component name", code, results)
 
+    def test_unknown_ready_down_starting_refused(self):
+        for extra_status, http_status in (("ready", 200), ("down", 503), ("starting", 503)):
+            with self.subTest(extra_status=extra_status):
+                _, value = self.dup_value((("process", "ready"), ("gateway", "ready"),
+                                           ("database", "ready"), ("token_invalid", "ready"),
+                                           (("voice", extra_status))), status=http_status)
+                with self.assertRaisesRegex(probe.ProbeError, "unknown component name"):
+                    probe.parse_readyz(http_status, value)
+
+    def test_unknown_diagnostic_echoes_no_component_data(self):
+        sentinel = "SENTINEL_unknown_health_abc123"
+        _, value = self.dup_value((("process", "ready"), ("gateway", "ready"),
+                                   ("database", "ready"), ("token_invalid", "ready"),
+                                   ((sentinel, "ready"))), status=200)
+        with self.assertRaises(probe.ProbeError) as ctx:
+            probe.parse_readyz(200, value)
+        self.assertIn("unknown component name", str(ctx.exception))
+        self.assertNotIn(sentinel, str(ctx.exception))
+
+    def test_unknown_readyz_fails_closed_end_to_end(self):
+        for extra_status, http_status in (("ready", 200), ("down", 503)):
+            with self.subTest(extra_status=extra_status):
+                unknown = dict(READY)
+                unknown["components"] = components(
+                    ("process", "ready"), ("gateway", "ready"),
+                    ("database", "ready"), ("token_invalid", "ready"),
+                    ("voice", extra_status))
+                routes = {STAGING + "/health": body({"status": "ok"}),
+                          STAGING + "/readyz": body(unknown, status=http_status)}
+                code, results, _ = self.drive(routes)
+                self.assert_readyz_unreadable("unknown component name", code, results)
+                self.assertNotIn("voice", "\n".join(results.values()))
+
 
 if __name__ == "__main__":
     unittest.main()

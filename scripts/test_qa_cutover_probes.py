@@ -273,6 +273,67 @@ class DuplicateComponentTest(unittest.TestCase):
         self.assertIn("repeats a component name", out)
 
 
+class UnknownComponentTest(unittest.TestCase):
+    def unknown_body(self, extra, status=200):
+        pairs = [("process", "ready"), ("gateway", "ready"), extra]
+        return (status, json.dumps({
+            "components": [[name, value] for name, value in pairs],
+            "jobs": {"counter": {"parked": True, "running": False}},
+            "build_revision": "r", "build_id": "b",
+        }).encode())
+
+    def test_unknown_ready_refused(self):
+        _, raw = self.unknown_body(("voice", "ready"), status=200)
+        with self.assertRaisesRegex(probe.ProbeError, "unknown component name"):
+            probe.check_readyz_shape(200, raw)
+
+    def test_unknown_down_refused(self):
+        _, raw = self.unknown_body(("voice", "down"), status=503)
+        with self.assertRaisesRegex(probe.ProbeError, "unknown component name"):
+            probe.check_readyz_shape(503, raw)
+
+    def test_unknown_starting_refused(self):
+        _, raw = self.unknown_body(("voice", "starting"), status=503)
+        with self.assertRaisesRegex(probe.ProbeError, "unknown component name"):
+            probe.check_readyz_shape(503, raw)
+
+    def test_diagnostic_echoes_no_component_data(self):
+        sentinel = "SENTINEL_unknown_cutover_abc123"
+        _, raw = self.unknown_body((sentinel, "ready"), status=200)
+        with self.assertRaises(probe.ProbeError) as ctx:
+            probe.check_readyz_shape(200, raw)
+        self.assertIn("unknown component name", str(ctx.exception))
+        self.assertNotIn(sentinel, str(ctx.exception))
+
+    def test_legitimate_optional_components_still_parse(self):
+        for pairs, status in (
+            ([("process", "ready"), ("gateway", "ready")], 200),
+            ([("process", "ready"), ("gateway", "ready"),
+              ("database", "ready")], 200),
+            ([("process", "ready"), ("gateway", "ready"),
+              ("database", "ready"), ("token_invalid", "ready")], 200),
+            ([("process", "ready"), ("gateway", "down"),
+              ("database", "down"), ("token_invalid", "ready")], 503),
+        ):
+            with self.subTest(pairs=pairs):
+                _, raw = (status, json.dumps({
+                    "components": [[n, v] for n, v in pairs],
+                    "jobs": {"counter": {"parked": True, "running": False}},
+                    "build_revision": "r", "build_id": "b",
+                }).encode())
+                state, _ = probe.check_readyz_shape(status, raw)
+                self.assertEqual(set(state), {n for n, _ in pairs})
+
+    def test_unknown_fails_readiness_shape_end_to_end(self):
+        body = self.unknown_body(("voice", "ready"), status=200)
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL readiness-shape:", out)
+        self.assertIn("unknown component name", out)
+        self.assertNotIn("voice", out)
+
+
 class EvidenceTest(unittest.TestCase):
     def test_pass_writes_receipt_with_sources(self):
         with mock.patch("builtins.open", mock.mock_open()) as handle:

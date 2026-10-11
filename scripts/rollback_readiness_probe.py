@@ -64,8 +64,11 @@ READYZ_BODY_CAP = 64 << 10
 # (error 1010), so an explicit agent is required for the probe to reach the Worker.
 USER_AGENT = "two-bot-next-staging-rollout/1.0"
 # Component names from crates/bot/src/server.rs; the drift test pins them to the source.
+# Per-surface allowlist: exactly the four components the container serves.
+# Anything else is refused with fixed vocabulary naming no component data.
 READYZ_STATES = ("ready", "starting", "down")
 READYZ_REQUIRED = ("process", "gateway", "database", "token_invalid")
+READYZ_ALLOWED = frozenset({"process", "gateway", "database", "token_invalid"})
 # Only the gateway parks: a 503 is accepted only with it starting or down. A database ping failure or a
 # latched bot token is a fault for this process (docs/runbook.md, docs/rest-guard.md), never parked.
 READYZ_PARKED = {"gateway": ("down", "starting")}
@@ -306,6 +309,8 @@ def readyz_state(status, body):
     state = dict(components)
     if len(state) != len(components):
         raise ProbeError(f"/readyz {status} repeats a component name")
+    if any(name not in READYZ_ALLOWED for name in state):
+        raise ProbeError(f"/readyz {status} carries an unknown component name")
     missing = [name for name in READYZ_REQUIRED if name not in state]
     if missing:
         raise ProbeError(f"/readyz {status} lacks {', '.join(missing)}")

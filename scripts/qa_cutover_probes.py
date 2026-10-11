@@ -75,6 +75,11 @@ DEFAULT_TIMEOUT_SECONDS = 10
 USER_AGENT = "two-bot-next-staging-rollout/1.0"
 KNOWN_STATUSES = ("ready", "starting", "down")
 REQUIRED_COMPONENTS = ("process", "gateway")
+# Per-surface allowlist for this probe: the container's full breakdown is
+# process/gateway (required here) plus database/token_invalid (legitimate
+# optional; older fixtures may omit them). Anything else is refused with a
+# fixed-vocabulary error that names no component data.
+KNOWN_COMPONENTS = frozenset({"process", "gateway", "database", "token_invalid"})
 # Per-job last_success freshness bands, in seconds, derived from the jobs'
 # real cadences plus their per-attempt timeouts (a healthy sample's age runs
 # up to about one cadence plus runtime; last_success only advances on success,
@@ -229,6 +234,8 @@ def check_readyz_shape(status, body):
     names = [c[0] for c in components]
     if len(set(names)) != len(names):
         raise ProbeError(f"/readyz {status} repeats a component name")
+    if any(name not in KNOWN_COMPONENTS for name in names):
+        raise ProbeError(f"/readyz {status} carries an unknown component name")
     state = dict(components)
     missing = [name for name in REQUIRED_COMPONENTS if name not in state]
     if missing:
