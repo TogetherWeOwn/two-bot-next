@@ -163,11 +163,26 @@ pub fn redirect_target(current: &Url, location: &str, hops: usize) -> Result<Url
 }
 
 pub fn validate_content_type(content_type: Option<&str>) -> Result<(), FetchError> {
-    let kind = content_type.unwrap_or("").trim().to_ascii_lowercase();
-    if kind.is_empty() || kind.contains("xml") || kind.contains("rss") || kind.contains("atom") {
-        Ok(())
-    } else {
-        Err(FetchError::UnsupportedContentType)
+    let raw = content_type.unwrap_or("").trim();
+    if raw.is_empty() {
+        return Ok(());
+    }
+    // Media type only: parameters (e.g. `; charset=utf-8`) never grant
+    // acceptance. A substring in a parameter (`text/html; foo=atom`) must
+    // not read as a feed type.
+    let media = raw
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match media.as_str() {
+        "application/rss+xml"
+        | "application/atom+xml"
+        | "application/rdf+xml"
+        | "application/xml"
+        | "text/xml" => Ok(()),
+        _ => Err(FetchError::UnsupportedContentType),
     }
 }
 
