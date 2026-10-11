@@ -50,6 +50,20 @@ export const STALE_INTERVALS = 2;
 export const TICKER_STALE_SECONDS = 600;
 /** Jobs covered by `ticker_stale` instead of `job_stale`. */
 export const TICKER_STALE_JOBS: readonly string[] = ["scheduled_messages", "settings"];
+/**
+ * Fail-closed staleness window for jobs without a cadence entry
+ * (`invite_snapshot`, `session_checkpoint`, `audit_retry`, `other`, and any
+ * future label the scrape accepts before the catalog maps it). Two hours is
+ * twice the longest mapped cadence (`presence_probe`/`inactivity`, 3600 s),
+ * so the fallback never fires sooner than the slowest mapped `job_stale`
+ * while still catching a wedged unmapped job the same watch shift. A zero
+ * success timestamp suppresses both boot (never succeeded) and parked (never
+ * registered), exactly like `job_stale` and `ticker_stale`. The firing rule
+ * is a ticket, never a page: without a mapped cadence the monitor cannot
+ * tell a slow-but-healthy schedule from a wedge, so it nags for an explicit
+ * catalog entry instead of paging.
+ */
+export const UNKNOWN_JOB_STALE_SECONDS = 7200;
 export const FAILURE_THRESHOLD = 3;
 /** 429s must exceed this share of REST requests between two samples... */
 export const REST_429_RATIO = 0.1;
@@ -84,6 +98,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "ticker_stale", summary: `15 s ticker has no success for more than ${TICKER_STALE_SECONDS / 60} minutes`, runbook: "runbook.md#alert-ticker-stale" },
   { id: "receiver_refusals", summary: `website-action receiver refusals for ${RECEIVER_REFUSAL_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-receiver-refusals" },
   { id: "dispatch_drops", summary: `dispatch-lane drops grew for ${DISPATCH_DROP_SAMPLES} consecutive sample windows (reactions include fairness refusals; not proof of gateway packet loss)`, runbook: "runbook.md#alert-dispatch-drops", severity: "ticket" },
+  { id: "job_unknown_stale", summary: `job without a cadence entry has no success for more than ${UNKNOWN_JOB_STALE_SECONDS / 3600} hours`, runbook: "runbook.md#alert-job-unknown-stale", severity: "ticket" },
 ];
 
 /**
@@ -177,6 +192,21 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     // (parked: DATABASE_URL unset, or the automations gate off): not stale.
     if (TICKER_STALE_JOBS.includes(job) && s.value > 0 && nowSeconds - s.value > TICKER_STALE_SECONDS) {
       firing.push(`ticker_stale:${job}`);
+    }
+  }
+  for (const s of gauge("two_bot_job_last_success_timestamp_seconds")) {
+    const job = s.labels["job"] ?? "";
+    // Fail-closed staleness for jobs without a cadence entry: mapped jobs use
+    // job_stale above and 15 s tickers use ticker_stale, so any other label
+    // (today invite_snapshot, session_checkpoint, audit_retry and other;
+    // tomorrow any new series the scrape accepts before the catalog maps it)
+    // would otherwise stay silent however stale. A stale nonzero success
+    // timestamp raises a ticket until the job gets an explicit cadence,
+    // ticker coverage or a reasoned catalog entry. Zero means never succeeded
+    // since start (boot) or never registered (parked): not stale.
+    if (job !== "" && JOB_INTERVAL_SECONDS[job] === undefined && !TICKER_STALE_JOBS.includes(job)
+      && s.value > 0 && nowSeconds - s.value > UNKNOWN_JOB_STALE_SECONDS) {
+      firing.push(`job_unknown_stale:${job}`);
     }
   }
 

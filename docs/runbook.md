@@ -191,6 +191,28 @@ succeeded since start (timestamp zero) is not reported here. If the Container
 restarted the series resets; wait one cadence before acting. Restart only after
 the logs show the job loop is wedged, per the [restart semantics](#restart-semantics-durable-resume-not-full-state-recovery).
 
+#### Alert: job unknown stale
+
+A job without a staleness cadence entry recorded no successful completion for
+more than 2 hours (`two_bot_job_last_success_timestamp_seconds{job}`). This is
+a **ticket, not a page**: without a mapped cadence the monitor cannot tell a
+slow-but-healthy schedule from a wedge, so it fails closed and nags for an
+explicit catalog entry instead of staying silent. A job that never succeeded
+since start (timestamp zero) is not reported here: that covers both boot and
+parked jobs.
+
+First response: check the `jobs` map on `/readyz` for the job's `parked`,
+`last_success` and `consecutive_failures` fields, then read the
+Worker/container logs for `periodic job failed`. A parked job with a zero
+timestamp is configuration, not a wedge. The standing fix is an explicit
+catalog entry for the job (cadence, ticker coverage or reason) — until then
+this ticket re-fires while the timestamp stays stale. Restart only after the
+logs show the job loop is wedged, per the [restart semantics](#restart-semantics-durable-resume-not-full-state-recovery).
+
+Escalate when staleness persists after the suspect deploy or dependency is
+identified, or when it coincides with pool-saturation or DB-error alerts —
+the fix then belongs to the on-call engineer, not another redeploy.
+
 #### Alert: job failures
 
 A job failed three completions in a row. Read `periodic job failed` logs (error
