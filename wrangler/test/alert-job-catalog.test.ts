@@ -23,20 +23,25 @@ const websiteJobsRs = read("crates/bot/src/website_jobs.rs");
 const communityJobsRs = read("crates/bot/src/community_jobs.rs");
 const feedJobsRs = read("crates/bot/src/feed_jobs.rs");
 const selfRoleHandlersRs = read("crates/bot/src/self_role_handlers.rs");
+const memberRuntimeRs = read("crates/bot/src/member_runtime.rs");
+const automodGatewayRs = read("crates/bot/src/automod_gateway.rs");
 const metricsMd = read("docs/metrics.md");
 
 /** Labels with no fixed Worker cadence. `invite_snapshot`, `other`,
- * `audit_retry`, `feeds` and `self_role_recovery` are covered by the
- * fail-closed `job_unknown_stale` ticket (`UNKNOWN_JOB_STALE_SECONDS`)
- * instead of `job_stale`/`ticker_stale`; `session_checkpoint` is event-driven
- * and excluded from the fallback via `UNKNOWN_STALE_EXCLUDED` (still listed
- * here with its reason so the catalog stays explicit). */
+ * `audit_retry`, `feeds`, `self_role_recovery`, `member_unban_sweep` and
+ * `automod_expiry` are covered by the fail-closed `job_unknown_stale`
+ * ticket (`UNKNOWN_JOB_STALE_SECONDS`) instead of `job_stale`/`ticker_stale`;
+ * `session_checkpoint` is event-driven and excluded from the fallback via
+ * `UNKNOWN_STALE_EXCLUDED` (still listed here with its reason so the catalog
+ * stays explicit). */
 const UNKNOWN_STALE_JOBS = new Map<string, string>([
   ["invite_snapshot", "no periodic caller; stays zero until a real caller records a completion"],
   ["session_checkpoint", "event-driven: one success per durable gateway commit, not a scheduled tick"],
-  ["other", "catch-all for unknown job names; currently also covers two known deferred jobs (member_unban_sweep at 30 s and automod_expiry at 60 s) until #788 gives them independent labels, so no single cadence exists"],
+  ["other", "catch-all for unknown job names only; every registered producer now has its own label, so this slot has no single cadence"],
   ["feeds", "covered by job_unknown_stale, not job_stale: boot-configured supervisor cadence (60–86400 s) with a live-configurable inner polling gate; skipped polls return success and reset the consecutive-failure streak, so failure alerting is reliable only while the live interval is at most the boot cadence; neither a fixed Worker cadence nor a last-success timestamp measures feed delivery freshness"],
   ["self_role_recovery", "covered by job_unknown_stale, not job_stale: 30 s recovery sweep with 0–5 s jitter and a 25 s timeout; two intervals are too close to the ~60 s scrape cadence for safe job_stale paging. This label-only slice retains failure-only alerting rather than adding ticker_stale policy; a successful sweep need not settle every repair"],
+  ["member_unban_sweep", "covered by job_unknown_stale, not job_stale: 30 s unban sweep (UNBAN_SWEEP_INTERVAL_SECONDS) with startup jitter and a 180 s attempt timeout; two intervals are too close to the ~60 s scrape cadence for safe job_stale paging, and one attempt may outlive its cadence. Failure alerting is per-label job_consecutive_failures at 3; a sweep with no completions is covered only by the coarse 2-hour fallback"],
+  ["automod_expiry", "covered by job_unknown_stale, not job_stale: 60 s repeat-history expiry tick (EXPIRY_CADENCE) with startup jitter and a 5 s timeout; a gateway without built activation is a no-op success, and the job only does real work when TWO_AUTOMOD=1. Failure alerting is per-label job_consecutive_failures at 3; staleness uses the coarse 2-hour fallback, not a precise cadence"],
   ["audit_retry", "covered by job_unknown_stale, not ticker_stale: 30 s supervisor sweep with parked/halt reporting in audit_runtime.rs (parked when unconfigured, halted sweeps still record success); a wedged sweep that keeps failing surfaces via job_consecutive_failures, and only a truly wedged sweep tickets here; not registered through the website/community schedulers this catalog parses"],
 ]);
 /** 15 s tickers covered by `ticker_stale` (TICKER_STALE_SECONDS window), not `job_stale`. */
@@ -109,19 +114,38 @@ function rustCadenceSeconds(): Map<string, number> {
   return out;
 }
 
-/** Direct Job producers outside the website/community cadence catalogs. */
+/** Direct Job producers outside the website/community cadence catalogs.
+ * Understands `name: "literal"`, `name: SOME_CONST` and the one
+ * `name: NAMES[0]` indirection used by `member_runtime.rs`
+ * (`NAMES = [SWEEP_JOB_NAME]`). */
 function directJobNames(source: string, file: string): string[] {
   const constants = new Map([...source.matchAll(/\bconst ([A-Z_]+): &str = "([^"]+)";/g)]
     .map((m) => [m[1]!, m[2]!]));
+  const arrays = new Map([...source.matchAll(/\bconst ([A-Z_]+): \[&str; \d+\] = \[([^\]]*)\];/g)]
+    .map((m) => [m[1]!, m[2]!.split(",").map((s) => s.trim()).filter(Boolean)]));
   const bodies = source.replace(/->\s*Job\s*\{/g, "");
-  const producers = [...bodies.matchAll(/\bJob\s*\{\s*name:\s*("[^"]+"|[A-Z_]+)\s*,/g)];
+  const producers = [...bodies.matchAll(/\bJob\s*\{\s*name:\s*("[^"]+"|[A-Z_]+(?:\[\d+\])?)\s*,/g)];
   assert.ok(producers.length > 0, `${file}: no direct Job producers found`);
   assert.equal(producers.length, [...bodies.matchAll(/\bJob\s*\{/g)].length,
     `${file}: unsupported Job producer; extend the catalog parser`);
   return producers.map((m) => {
-    const name = m[1]!.startsWith('"') ? m[1]!.slice(1, -1) : constants.get(m[1]!);
-    assert.ok(name, `${file}: unresolved job name ${m[1]}`);
-    return name;
+    const raw = m[1]!;
+    if (raw.startsWith('"')) return raw.slice(1, -1);
+    const indexed = /^([A-Z_]+)\[(\d+)\]$/.exec(raw);
+    if (indexed) {
+      const entries = arrays.get(indexed[1]!);
+      assert.ok(entries, `${file}: unresolved job array ${indexed[1]}`);
+      const element = entries![Number(indexed[2]!)];
+      assert.ok(element, `${file}: unresolved job index ${raw}`);
+      const resolved = element!.startsWith('"')
+        ? element!.slice(1, -1)
+        : constants.get(element!);
+      assert.ok(resolved, `${file}: unresolved job name ${raw}`);
+      return resolved!;
+    }
+    const name = constants.get(raw);
+    assert.ok(name, `${file}: unresolved job name ${raw}`);
+    return name!;
   });
 }
 
@@ -170,6 +194,8 @@ const RUST = rustCadenceSeconds();
 const REGISTERED = [...new Set([
   ...directJobNames(feedJobsRs, "feed_jobs.rs"),
   ...directJobNames(selfRoleHandlersRs, "self_role_handlers.rs"),
+  ...directJobNames(memberRuntimeRs, "member_runtime.rs"),
+  ...directJobNames(automodGatewayRs, "automod_gateway.rs"),
 ])];
 const real: Catalog = { jobs: JOBS, registered: REGISTERED, rust: RUST, worker: JOB_INTERVAL_SECONDS, ticker: TICKER_COVERED, exempt: UNKNOWN_STALE_JOBS };
 
@@ -177,7 +203,7 @@ test("parses the full Rust job allowlist and every registered cadence", () => {
   assert.deepEqual(JOBS, [
     "invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events",
     "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages",
-    "feeds", "self_role_recovery", "other",
+    "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other",
   ]);
   // Rust *_INTERVAL_MS / 1000: community_snapshots.rs:45,47, scheduled_events.rs:26,
   // presence.rs:36, community.rs:61, inactivity.rs:27.
@@ -188,10 +214,25 @@ test("parses the full Rust job allowlist and every registered cadence", () => {
 });
 
 test("feed and self-role producers retain their real cadence and explicit unknown-stale entries", () => {
-  assert.deepEqual(REGISTERED, ["feeds", "self_role_recovery"]);
+  for (const job of ["feeds", "self_role_recovery"]) {
+    assert.ok(REGISTERED.includes(job), `${job}: missing from REGISTERED`);
+  }
   assert.match(feedJobsRs, /cadence: Duration::from_secs\(seconds\)/);
   assert.match(selfRoleHandlersRs, /let cadence = Duration::from_secs\(30\);\s*Job\s*\{\s*name: RECOVERY_JOB_NAME,\s*cadence,/);
-  for (const job of REGISTERED) {
+  for (const job of ["feeds", "self_role_recovery"]) {
+    assert.ok(UNKNOWN_STALE_JOBS.get(job)?.trim(), `${job}: missing reasoned unknown-stale entry`);
+    assert.ok(!Object.hasOwn(JOB_INTERVAL_SECONDS, job));
+    assert.ok(!TICKER_STALE_JOBS.includes(job));
+  }
+});
+
+test("unban sweep and automod expiry producers retain their real cadence and explicit unknown-stale entries", () => {
+  assert.deepEqual(REGISTERED, ["feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry"]);
+  assert.match(memberRuntimeRs, /UNBAN_SWEEP_INTERVAL_SECONDS/);
+  assert.match(memberRuntimeRs, /Job\s*\{\s*name:\s*NAMES\[0\],\s*cadence,/);
+  assert.match(automodGatewayRs, /const EXPIRY_CADENCE: Duration = Duration::from_secs\(60\);/);
+  assert.match(automodGatewayRs, /Job\s*\{\s*name:\s*JOB_NAME,\s*cadence:\s*EXPIRY_CADENCE,/);
+  for (const job of ["member_unban_sweep", "automod_expiry"]) {
     assert.ok(UNKNOWN_STALE_JOBS.get(job)?.trim(), `${job}: missing reasoned unknown-stale entry`);
     assert.ok(!Object.hasOwn(JOB_INTERVAL_SECONDS, job));
     assert.ok(!TICKER_STALE_JOBS.includes(job));
@@ -199,7 +240,7 @@ test("feed and self-role producers retain their real cadence and explicit unknow
 });
 
 test("a registered direct producer absent from JOBS fails the catalog", () => {
-  for (const [source, file] of [[feedJobsRs, "feed_jobs.rs"], [selfRoleHandlersRs, "self_role_handlers.rs"]]) {
+  for (const [source, file] of [[feedJobsRs, "feed_jobs.rs"], [selfRoleHandlersRs, "self_role_handlers.rs"], [memberRuntimeRs, "member_runtime.rs"], [automodGatewayRs, "automod_gateway.rs"]]) {
     const mutated = source + '\nfn fixture() -> Job { Job { name: "fake_producer", cadence: Duration::from_secs(30), } }';
     const registered = directJobNames(mutated, file!);
     assert.ok(registered.includes("fake_producer"), "fixture did not inject a registered producer");

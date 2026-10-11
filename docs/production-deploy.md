@@ -345,7 +345,7 @@ acceptance.
 | REST 5xx and action latency | Single-attempt calls keep their 5 s body-read deadline; 429 `retry-after + 250 ms` honored, 5xx backoff 500…8000 ms across the bounded retry budget; moderation uses one timed attempt | Any uncertain send without a recorded disposition, or a route whose `job_consecutive_failures` reaches 3: freeze that writer and reconcile; roll back if the failing path shipped in this revision | [rest-guard.md](rest-guard.md); [pacing-backoff-acceptance.md](pacing-backoff-acceptance.md); [metrics.md](metrics.md#off-container-scrape-and-alert-rules) |
 | Bot token | Zero 401s on bot-authenticated endpoints | First latched `token_invalid`: stop retries, freeze writers; no rollback until provisioning is corrected through the governed path | [rest-guard.md](rest-guard.md) |
 | Unban queue | Sweep every 30 s (`UNBAN_SWEEP_INTERVAL_SECONDS`), at most 25 jobs claimed per sweep; no due unban left pending across sweeps without a named disposition | Any overdue sanction without a named disposition is a finding; zero unexplained overdue is required for GO at each checkpoint | [member-moderation.md](member-moderation.md); [cutover.md](cutover.md) §§T-minus, 48-hour watch |
-| Scheduled jobs | Scheduled jobs: last success within twice the cadence; fewer than 3 consecutive failures. Unban sweep and event-driven session checkpoint: manual checks below | Installed `job_stale` covers only registered cadences, `ticker_stale` covers the two 15 s tickers, and `job_consecutive_failures` covers labelled failed completions. **Unban sweep gap:** it shares `other`, which has no stale rule and a shared failure streak; no reliable per-sweep alert exists until the [job-label follow-up](https://github.com/TogetherWeOwn/two-bot-next/issues/788) lands. `session_checkpoint` is stale-exempt and records successes only in these job series. A manual failure/stall finding has the same response: freeze the consumer, fix the dependency; roll back if the regression shipped in this revision | [metrics.md](metrics.md#off-container-scrape-and-alert-rules); [manual checks](#scheduled-job-manual-checkpoints) |
+| Scheduled jobs | Scheduled jobs: last success within twice the cadence; fewer than 3 consecutive failures. Unban sweep, automod expiry and event-driven session checkpoint: manual checks below | Installed `job_stale` covers only registered cadences, `ticker_stale` covers the two 15 s tickers, `job_consecutive_failures` covers labelled failed completions per job (including `member_unban_sweep` and `automod_expiry` on their own labels), and the coarse `job_unknown_stale` ticket covers a stale nonzero success on any label without a cadence entry. `session_checkpoint` is stale-exempt and records successes only in these job series. A manual failure/stall finding has the same response: freeze the consumer, fix the dependency; roll back if the regression shipped in this revision | [metrics.md](metrics.md#off-container-scrape-and-alert-rules); [manual checks](#scheduled-job-manual-checkpoints) |
 | DB pool | Idle connections above zero, below max | Pool at max with zero idle for 3 consecutive keepalive samples: do not restart to free it; freeze writers, fix the holder; roll back if a new query path holds checkouts | [metrics.md](metrics.md#off-container-scrape-and-alert-rules); [runbook.md](runbook.md) Alert: DB pool |
 | `db_errors` | Fewer than 3 storage failures between keepalive samples; a counter reset (process restart) skips the window, not proof of health; sustained low-rate failures surface through `job_consecutive_failures` | 3 or more storage failures between samples: correlate the `op` label and recent deploys; do not run SQL probes or restart to clear errors; escalate repeated bursts per the runbook, evaluate rollback if this revision introduced the failing writes | [metrics.md](metrics.md#off-container-scrape-and-alert-rules); [runbook.md](runbook.md#alert-db-errors) |
 | `send_admission_blocked` | Fewer than 3 consecutive keepalive samples with new admission refusals; a sample with no new refusals breaks the streak; admission SQL failures count in `db_errors`, not refusals | New admission refusals in 3 consecutive samples: investigate cooldowns and held lanes; do not replay uncertain sends or restart to free the lane; escalate persistent refusals per the runbook, evaluate rollback if this revision introduced the regression | [metrics.md](metrics.md#off-container-scrape-and-alert-rules); [runbook.md](runbook.md#alert-send-admission-blocked) |
@@ -377,10 +377,27 @@ jq '.jobs.member_unban_sweep | {running, parked, last_success, consecutive_failu
 with the read timestamp and prior checkpoint: a parked/missing job is not an
 accepted sweep; three failures or no recent success needs a disposition. The
 30 s cadence is not an attempt deadline: a sweep may run for up to 180 s, so
-investigate a >60 s age with `running`/logs before declaring it stalled. Neither
-`job="member_unban_sweep"` (absent today) nor `job="other"` (shared with other
-producers) is valid per-sweep evidence. Once [the job-label follow-up](https://github.com/TogetherWeOwn/two-bot-next/issues/788)
-merges with proven rule coverage, replace this gap with the per-job alert.
+investigate a >60 s age with `running`/logs before declaring it stalled.
+`job="member_unban_sweep"` is valid per-sweep evidence: `job_consecutive_failures`
+fires at 3 on its own label and a stale nonzero success tickets via the coarse
+`job_unknown_stale` fallback. `job="other"` remains the shared unknown-name
+catch-all, never per-sweep evidence.
+
+For automod expiry, inspect the saved `/readyz` response (there is no
+completion log line: the 60 s tick is a no-op success until the gateway builds
+the activation, and it only does real expiry work when `TWO_AUTOMOD=1`):
+
+```sh
+jq '.jobs.automod_expiry | {running, parked, last_success, consecutive_failures}' readyz.json
+```
+
+When `TWO_AUTOMOD` is not `1` the job is not registered and the entry is
+absent: record the checkpoint as not-applicable, never green. Otherwise compare
+`last_success` (Unix **milliseconds**) with the read timestamp and prior
+checkpoint like the unban sweep: three failures or no recent success needs a
+disposition. `job_consecutive_failures` fires at 3 on the `automod_expiry`
+label and a stale nonzero success tickets via the coarse `job_unknown_stale`
+fallback.
 
 For the event-driven session checkpoint, use the
 [manual checkpoint queries](voice-cutover-rollback-triggers.md#manual-checkpoint-queries)

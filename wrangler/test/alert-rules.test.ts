@@ -93,6 +93,29 @@ test("feed and self-role failures alert and resolve independently without a fixe
   }
 });
 
+test("unban sweep and automod expiry failures alert and resolve independently without a fixed stale policy", () => {
+  const jobs = ["member_unban_sweep", "automod_expiry"];
+  // Fresh timestamps (within the 2-hour job_unknown_stale window) so the
+  // coarse fallback stays silent and this test proves consecutive-failure
+  // independence alone; staleness coverage is pinned by the catalog guard.
+  // In particular, an automod success must not clear a failing unban streak.
+  const failing = ev(jobs.flatMap((job) => [
+    `two_bot_job_consecutive_failures{job="${job}"} 3`,
+    `two_bot_job_last_success_timestamp_seconds{job="${job}"} ${NOW - 60}`,
+  ]));
+  assert.deepEqual(failing.firing, jobs.map((job) => `job_consecutive_failures:${job}`));
+  for (const recovered of jobs) {
+    const remaining = jobs.find((job) => job !== recovered)!;
+    const result = ev(jobs.map((job) =>
+      `two_bot_job_consecutive_failures{job="${job}"} ${job === recovered ? 0 : 3}`), failing.state);
+    assert.deepEqual(result.firing, [`job_consecutive_failures:${remaining}`]);
+    const messages = transitionMessages(failing.firing, result.firing);
+    assert.equal(messages.length, 1);
+    assert.match(messages[0]!, /RESOLVED/);
+    assert.ok(messages[0]!.includes(`job_consecutive_failures:${recovered}`));
+  }
+});
+
 test("429 rate uses the delta, ignores resets and tiny windows", () => {
   const first = ev([`two_bot_rest_requests_total{route="other",result="2xx"} 100`, `two_bot_rest_requests_total{route="other",result="429"} 0`]);
   const hot = ev([`two_bot_rest_requests_total{route="other",result="2xx"} 180`, `two_bot_rest_requests_total{route="other",result="429"} 20`], first.state);
