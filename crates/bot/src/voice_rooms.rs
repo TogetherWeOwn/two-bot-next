@@ -1500,6 +1500,11 @@ impl LiveGuild {
     /// panicking the gateway dispatch worker. A poisoned lock means a
     /// previous holder panicked mid-write; the recovered state is the last
     /// committed one, which the gateway keeps treating as evidence.
+    /// Callers must not call `read_state` again while holding the guard:
+    /// `std::sync::RwLock::read` may deadlock when the current thread
+    /// already holds it (and blocks behind a waiting writer). Helpers that
+    /// need live channels take `&LiveState` instead (see
+    /// `held_rename_names_in`).
     pub(crate) fn read_state(&self) -> std::sync::RwLockReadGuard<'_, LiveState> {
         self.inner
             .read()
@@ -3272,9 +3277,15 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// Only really-pending renames count — coalescer, queued action,
     /// in-flight or scheduled retry — so a stale last-proposed entry or an
     /// externally diverged channel never holds a name. Submit time
-    /// (`name_facts`) and flush time share this one helper.
+    /// (`name_facts`) and flush time share this one helper via
+    /// `held_rename_names_in`; pass the already-held `LiveState` instead of
+    /// re-locking (see `LiveGuild::read_state`).
     fn held_rename_names(&self, except: Snowflake) -> Vec<String> {
         let live = self.live.read_state();
+        self.held_rename_names_in(&live, except)
+    }
+
+    fn held_rename_names_in(&self, live: &LiveState, except: Snowflake) -> Vec<String> {
         let mut held: Vec<String> = live
             .channels
             .values()
@@ -4952,7 +4963,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     if !literal || !self.name_settings.unique_names {
                         false
                     } else {
-                        let held = self.held_rename_names(channel_id);
+                        let live = self.live.read_state();
+                        let held = self.held_rename_names_in(&live, channel_id);
                         name_conflicts(&name, &held, true)
                     }
                 };

@@ -1019,7 +1019,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             // throttle.pending): a folded duplicate of a pending rename is
             // refused at submit instead of landing a second channel. Shares
             // the flush-time helper so only really-pending renames count.
-            other_names: self.held_rename_names(room.channel_id),
+            // Pass the already-held live state: re-locking here would
+            // deadlock behind a waiting writer (see `read_state`).
+            other_names: self.held_rename_names_in(&live, room.channel_id),
         };
         // Game and stream tokens/conditions from gateway presences (empty
         // without TWO_VOICE_PRESENCE, which leaves the no-game label).

@@ -652,6 +652,171 @@ async fn flush_recheck_drops_now_duplicate_rename_and_clears_override() {
 }
 
 #[tokio::test]
+async fn stale_last_proposed_entry_never_holds_a_name() {
+    // A landed rename that later diverges externally (gateway shows
+    // Moderated while desired still says Squad) must not block a folded
+    // duplicate from another room: only really-pending renames hold names.
+    const SECOND_ROOM: u64 = 501;
+    let trace = Trace::default();
+    let live = LiveGuild::new(GUILD);
+    live.publish(snapshot(
+        &[ROOM, SECOND_ROOM],
+        vec![occupant(OWNER, ROOM), occupant(GUEST, SECOND_ROOM)],
+    ));
+    live.upsert_channel(named_channel(ROOM, "Alpha"));
+    live.upsert_channel(named_channel(SECOND_ROOM, "Beta"));
+    let store = Store::new(trace.clone());
+    store.rooms.lock().unwrap().insert(ROOM, room(ROOM));
+    let mut second = room(SECOND_ROOM);
+    second.owner_id = GUEST;
+    store.rooms.lock().unwrap().insert(SECOND_ROOM, second);
+    let mut worker = GuildRoomWorker::load(live, store, Http::new(trace.clone()))
+        .await
+        .unwrap();
+    worker.name_settings.unique_names = true;
+
+    let mut first = command(OWNER, false, submit("Squad"));
+    first.settings.unique_names = true;
+    applied(worker.apply_name(first, 0));
+    drain(&mut worker).await;
+    assert_eq!(channel_name(&worker, ROOM).as_deref(), Some("Squad"));
+
+    // An external rename diverges the landed channel from the last proposal.
+    worker.live.upsert_channel(named_channel(ROOM, "Moderated"));
+
+    let mut clash = command(
+        GUEST,
+        false,
+        NameInteraction::Submit {
+            room_id: SECOND_ROOM,
+            text: "squad".to_owned(),
+        },
+    );
+    clash.settings.unique_names = true;
+    applied(worker.apply_name(clash, 0));
+}
+
+#[tokio::test]
+async fn queued_rename_holds_folded_name_before_dispatch() {
+    // A rename drained from the coalescer but still queued behind the rate
+    // limit blocks a folded duplicate at submit.
+    const SECOND_ROOM: u64 = 501;
+    let trace = Trace::default();
+    let live = LiveGuild::new(GUILD);
+    live.publish(snapshot(
+        &[ROOM, SECOND_ROOM],
+        vec![occupant(OWNER, ROOM), occupant(GUEST, SECOND_ROOM)],
+    ));
+    live.upsert_channel(named_channel(ROOM, "Alpha"));
+    live.upsert_channel(named_channel(SECOND_ROOM, "Beta"));
+    let store = Store::new(trace.clone());
+    store.rooms.lock().unwrap().insert(ROOM, room(ROOM));
+    let mut second = room(SECOND_ROOM);
+    second.owner_id = GUEST;
+    store.rooms.lock().unwrap().insert(SECOND_ROOM, second);
+    let mut worker = GuildRoomWorker::load(live, store, Http::new(trace.clone()))
+        .await
+        .unwrap();
+    worker.name_settings.unique_names = true;
+
+    worker.queue.enqueue(
+        GUILD,
+        two_bot_core::voice_rooms::RoomAction::RenameRoom {
+            channel_id: ROOM,
+            name: "Squad".to_owned(),
+        },
+    );
+
+    let mut clash = command(
+        GUEST,
+        false,
+        NameInteraction::Submit {
+            room_id: SECOND_ROOM,
+            text: "squad".to_owned(),
+        },
+    );
+    clash.settings.unique_names = true;
+    let reply = refused(worker.apply_name(clash, 0));
+    assert_eq!(reply, NameRefusal::Taken.to_string(), "{reply}");
+}
+
+#[tokio::test]
+async fn in_flight_rename_holds_folded_name() {
+    // A rename still running on its own task blocks a folded duplicate.
+    const SECOND_ROOM: u64 = 501;
+    let trace = Trace::default();
+    let live = LiveGuild::new(GUILD);
+    live.publish(snapshot(
+        &[ROOM, SECOND_ROOM],
+        vec![occupant(OWNER, ROOM), occupant(GUEST, SECOND_ROOM)],
+    ));
+    live.upsert_channel(named_channel(ROOM, "Alpha"));
+    live.upsert_channel(named_channel(SECOND_ROOM, "Beta"));
+    let store = Store::new(trace.clone());
+    store.rooms.lock().unwrap().insert(ROOM, room(ROOM));
+    let mut second = room(SECOND_ROOM);
+    second.owner_id = GUEST;
+    store.rooms.lock().unwrap().insert(SECOND_ROOM, second);
+    let mut worker = GuildRoomWorker::load(live, store, Http::new(trace.clone()))
+        .await
+        .unwrap();
+    worker.name_settings.unique_names = true;
+
+    worker.renames_in_flight.insert(ROOM, "Squad".to_owned());
+
+    let mut clash = command(
+        GUEST,
+        false,
+        NameInteraction::Submit {
+            room_id: SECOND_ROOM,
+            text: "squad".to_owned(),
+        },
+    );
+    clash.settings.unique_names = true;
+    let reply = refused(worker.apply_name(clash, 0));
+    assert_eq!(reply, NameRefusal::Taken.to_string(), "{reply}");
+}
+
+#[tokio::test]
+async fn scheduled_retry_holds_folded_name() {
+    // A rename waiting for its retry slot blocks a folded duplicate.
+    const SECOND_ROOM: u64 = 501;
+    let trace = Trace::default();
+    let live = LiveGuild::new(GUILD);
+    live.publish(snapshot(
+        &[ROOM, SECOND_ROOM],
+        vec![occupant(OWNER, ROOM), occupant(GUEST, SECOND_ROOM)],
+    ));
+    live.upsert_channel(named_channel(ROOM, "Alpha"));
+    live.upsert_channel(named_channel(SECOND_ROOM, "Beta"));
+    let store = Store::new(trace.clone());
+    store.rooms.lock().unwrap().insert(ROOM, room(ROOM));
+    let mut second = room(SECOND_ROOM);
+    second.owner_id = GUEST;
+    store.rooms.lock().unwrap().insert(SECOND_ROOM, second);
+    let mut worker = GuildRoomWorker::load(live, store, Http::new(trace.clone()))
+        .await
+        .unwrap();
+    worker.name_settings.unique_names = true;
+
+    worker
+        .rename_retries
+        .insert(ROOM, ("Squad".to_owned(), 999_999));
+
+    let mut clash = command(
+        GUEST,
+        false,
+        NameInteraction::Submit {
+            room_id: SECOND_ROOM,
+            text: "squad".to_owned(),
+        },
+    );
+    clash.settings.unique_names = true;
+    let reply = refused(worker.apply_name(clash, 0));
+    assert_eq!(reply, NameRefusal::Taken.to_string(), "{reply}");
+}
+
+#[tokio::test]
 async fn an_unseen_channel_changes_nothing() {
     let (mut worker, trace) = setup().await;
     worker.live.remove_channel(ROOM);
