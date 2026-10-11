@@ -24,7 +24,7 @@ TOKEN = "RAW_SECRET_SENTINEL_never_disclose_bot_token"
 WORKER_URL = "https://two-bot-next-staging.5150.workers.dev"
 # Both bodies fit BODY_CAP, so the decoder, not the size cap, must refuse them.
 DEEP_ARRAY = b"[" * 32768 + b"]" * 32768
-DEEP_OBJECT = b'{"a":' * 10000 + b"{}" + b"}" * 10000
+DEEP_OBJECT = b'{"":' * 13000 + b"{}" + b"}" * 13000
 HEALTH_OK = json.dumps({"status": "ok"}).encode()
 
 
