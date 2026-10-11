@@ -23,6 +23,13 @@ a redirect, is refused before or instead of being followed. This is a screen,
 not a restore verification: `two-bot restore --dry-run` remains the full
 archive inspection (docs/backup.md).
 
+Body-cap refusal contract: the transport reads at most READYZ_BODY_CAP+1
+bytes on both the normal and HTTPError paths so a hidden suffix is detected.
+Any body longer than READYZ_BODY_CAP (64 KiB) is refused before JSON parsing
+with the fixed message "/readyz answered over the body cap"; exact-cap valid
+input passes, and the extra byte never reaches a successful JSON path.
+Refusals never echo the body, headers, URL or parse exceptions.
+
 Usage:
   python3 scripts/rollback_readiness_probe.py --backup-dir DIR \\
       --sequences live-sequences.json [--staging-url URL] [--config wrangler.toml]
@@ -287,12 +294,14 @@ def fetch(url):
         with opener.open(urllib.request.Request(url, headers={"User-Agent": USER_AGENT},
                                                method="GET"),
                          timeout=READYZ_TIMEOUT_SECONDS) as response:
-            return response.status, response.read(READYZ_BODY_CAP)
+            return response.status, response.read(READYZ_BODY_CAP + 1)
     except urllib.error.HTTPError as e:
-        return e.code, e.read(READYZ_BODY_CAP)
+        return e.code, e.read(READYZ_BODY_CAP + 1)
 
 
 def readyz_state(status, body):
+    if len(body) > READYZ_BODY_CAP:
+        raise ProbeError("/readyz answered over the body cap")
     try:
         report = json.loads(body)
     except (UnicodeDecodeError, json.JSONDecodeError):
