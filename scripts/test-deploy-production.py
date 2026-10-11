@@ -313,6 +313,11 @@ class StaticGuardTests(unittest.TestCase):
             self.assertNotIn("secrets.", text)
             self.assertNotIn("token", text.lower())
 
+    def test_gate_prints_remote_bodies_only_as_escaped_excerpts(self):
+        for name in ("health", "readyz"):
+            self.assertNotIn(f'cat "${name}"', GATE)
+            self.assertIn(f'production_deploy.py excerpt --body "${name}"', GATE)
+
     def test_takeover_steps_run_only_when_requested_with_production_bindings(self):
         names = [step[0].strip() for step in steps(JOBS["production"])]
         preflight = "- name: Require production ownership-control configuration"
@@ -985,13 +990,14 @@ class ShellStepTests(unittest.TestCase):
                 ["bash", "--noprofile", "--norc", "-eo", "pipefail", str(step)],
                 cwd=cwd, env=run_env, capture_output=True, text=True, timeout=120,
             )
-            return result.returncode, summary.read_text() if summary.exists() else ""
+            return (result.returncode, summary.read_text() if summary.exists() else "",
+                    result.stdout + result.stderr)
 
     def gate(self, routes, mode="deploy", sha=SHA, run_id="700", attempt="1"):
         with ScriptedWorker(routes) as worker:
-            code, summary = self.bash(GATE, cwd=WRANGLER_DIR, PRODUCTION_URL=worker.url,
-                                      MODE=mode, SHA=sha,
-                                      GITHUB_RUN_ID=run_id, GITHUB_RUN_ATTEMPT=attempt)
+            code, summary, _ = self.bash(GATE, cwd=WRANGLER_DIR, PRODUCTION_URL=worker.url,
+                                         MODE=mode, SHA=sha,
+                                         GITHUB_RUN_ID=run_id, GITHUB_RUN_ATTEMPT=attempt)
         return code, summary, worker
 
     def test_matching_revision_passes_ready_or_truthfully_parked(self):
@@ -1069,6 +1075,18 @@ class ShellStepTests(unittest.TestCase):
         self.assertEqual(worker.count("/readyz"), 0)
         self.assertIn("never 200", summary)
 
+    def test_hostile_readyz_body_cannot_forge_workflow_commands_in_the_log(self):
+        # A non-JSON 200 whose lines look like runner commands: the step log is
+        # stdout+stderr, and no line of it may start a workflow command.
+        body = "ok\n::error::forged by remote\n::add-mask::remote-value\n" + "B" * 4096
+        with ScriptedWorker({"/health": [(200, "{}")], "/readyz": [(200, body)]}) as worker:
+            code, summary, log = self.bash(GATE, cwd=WRANGLER_DIR, PRODUCTION_URL=worker.url,
+                                           MODE="deploy", SHA=SHA,
+                                           GITHUB_RUN_ID="700", GITHUB_RUN_ATTEMPT="1")
+        self.assertEqual(code, 1)
+        self.assertIn("roll back", summary)
+        self.assertEqual([line for line in log.splitlines() if line.startswith("::")], [], log[:400])
+
     def test_rollback_passes_the_supplied_revision_or_a_pre_stamp_target_only(self):
         cases = (
             (report(), "gateway ready", 0),
@@ -1088,7 +1106,7 @@ class ShellStepTests(unittest.TestCase):
         for url, ok in (("", False), ("http://prod.example.workers.dev", False), (staging, False),
                         (staging + "/", False), ("https://prod.example.workers.dev", True)):
             with self.subTest(url=url):
-                code, _ = self.bash(URL_CHECK, PRODUCTION_URL=url, STAGING_URL=staging)
+                code, _, _ = self.bash(URL_CHECK, PRODUCTION_URL=url, STAGING_URL=staging)
                 self.assertEqual(code == 0, ok)
 
 
@@ -1286,6 +1304,29 @@ class ReadyzVerdictTests(unittest.TestCase):
                     self.assertNotIn(marker, message)
                     self.assertNotIn("|", message.split("unexpected shape")[0].split(":")[-1]
                                      if "unexpected shape" in message else message)
+
+    def test_raw_bodies_print_as_one_bounded_escaped_line(self):
+        hostile = '{"x": "ok\n::error::forged\n::add-mask::secret\r\x1b' + "A" * 5000
+        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
+            path = Path(tmp) / "readyz.json"
+            path.write_text(hostile)
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "excerpt", "--body", str(path)],
+                capture_output=True, text=True, timeout=60,
+            )
+            missing = subprocess.run(
+                [sys.executable, str(SCRIPT), "excerpt", "--body", str(Path(tmp) / "absent.json")],
+                capture_output=True, text=True, timeout=60,
+            )
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        lines = result.stdout.splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertFalse(lines[0].startswith("::"))
+        self.assertIn("truncated", lines[0])
+        self.assertLess(len(lines[0]), 2 * 2048 + 64)
+        self.assertEqual((missing.returncode, missing.stderr), (0, ""))
+        self.assertIn("no body", missing.stdout)
+        self.assertNotIn("Traceback", missing.stdout)
 
     def test_valid_deploy_rollback_and_unstamped_controls_still_pass(self):
         # Shape-valid identity keeps the exact-sha/same-run, rollback and

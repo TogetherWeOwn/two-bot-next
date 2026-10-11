@@ -21,6 +21,7 @@ from pathlib import Path
 SHA = re.compile(r"[0-9a-f]{40}")
 DIGITS = re.compile(r"[0-9]+")
 UNSTAMPED = "unknown"
+EXCERPT_BYTES = 2048
 
 # Well below CPython's default recursion limit (1000): any report deeper
 # than this is refused up front with an explicit stack instead of recursing.
@@ -158,6 +159,19 @@ def readyz(args):
     return reject("build_revision does not match the SHA")
 
 
+def excerpt(args):
+    try:
+        with open(args.body, "rb") as handle:
+            head = handle.read(EXCERPT_BYTES + 1)
+    except OSError:
+        print("no body was written")
+        return 0
+    suffix = " ...(truncated)" if len(head) > EXCERPT_BYTES else ""
+    # repr escapes newlines and control bytes, so a remote body stays one log line.
+    print(repr(head[:EXCERPT_BYTES]) + suffix)
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     commands = parser.add_subparsers(dest="command", required=True)
@@ -179,9 +193,14 @@ def main(argv=None):
     # same-SHA redeploy cannot pass on the previous container's answer.
     readyz_cmd.add_argument("--build-id", required=True)
 
+    excerpt_cmd = commands.add_parser("excerpt", help="print a remote body as one bounded escaped line")
+    excerpt_cmd.add_argument("--body", required=True)
+
     args = parser.parse_args(argv)
     if args.command == "render":
         return render(args)
+    if args.command == "excerpt":
+        return excerpt(args)
     return readyz(args)
 
 
