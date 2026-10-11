@@ -561,6 +561,39 @@ test("keepalive treats oversize /readyz as a failed probe without logging the bo
   assert.ok(h.logs.every((line) => !line.includes("m 1\nm 1")), "no probe bytes in logs");
 });
 
+test("public probe discards oversize non-bot body without buffering it", async (t) => {
+  const h = await harness(t);
+  const marker = `synthetic-probe-discard-${"d".repeat(64)}`;
+  const encoder = new TextEncoder();
+  const firstChunk = encoder.encode(marker + "x".repeat(8192));
+  const chunk = encoder.encode("x".repeat(8192));
+  const totalChunks = 32; // ~256 KiB streamed, well over the 64 KiB cap
+  let pulls = 0;
+  let cancelled = 0;
+  // Mock containerFetch to bypass the SDK proxy pipe: cancelling the pipe's
+  // destination readable rejects its internal pipeTo (unhandled in the test
+  // runtime), while the mocked Response exercises the same bounded reader.
+  t.mock.method(h.bot, "containerFetch", async () => new Response(new ReadableStream({
+    pull(controller) {
+      pulls++;
+      if (pulls <= totalChunks) controller.enqueue(pulls === 1 ? firstChunk : chunk);
+      else controller.close();
+    },
+    cancel() { cancelled++; },
+  }, { highWaterMark: 0 }), {
+    status: 500, headers: { "content-type": "text/plain" },
+  }));
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/readyz"));
+  assert.equal(response.status, 500);
+  assert.deepEqual(await response.json(), { ready: false, error_class: "container_unavailable" });
+  // Bounded: the reader cancels after ~64 KiB instead of draining ~256 KiB.
+  // The old unbounded arrayBuffer() drain pulls every chunk and never cancels.
+  assert.equal(cancelled, 1, "oversize non-bot probe body must be cancelled");
+  assert.ok(pulls < totalChunks, `expected early cancel, pulled ${pulls}/${totalChunks} chunks`);
+  assert.ok(pulls * 8192 <= 96 * 1024, `expected ~64 KiB discard, pulled ~${pulls * 8} KiB`);
+  assert.ok(h.logs.every((line) => !line.includes(marker)), "no raw probe body in logs");
+});
+
 for (const path of ["/health", "/readyz", "keepalive", "start", "startAndWaitForPorts"]) {
   test(`${path} startup forwards only allowlisted publication settings`, async (t) => {
     const h = await harness(t, PUBLICATION_WORKER_ENV);
