@@ -27,7 +27,7 @@ REQUIRED_DO_BINDING = "TWO_BOT"
 # environments are allowed and receive the same per-binding checks.
 REQUIRED_ENVS = ("staging", "production")
 # Fixed diagnostics: never echo TOML content or values, only these strings.
-INVALID_TOML_ERROR = "invalid Wrangler config: TOML does not parse (expected valid TOML)"
+INVALID_TOML_ERROR = "invalid Wrangler config: TOML does not parse or has the wrong shape"
 UNREADABLE_CONFIG_ERROR = "unreadable Wrangler config: file cannot be read"
 
 
@@ -80,7 +80,17 @@ def check(path: Path) -> list[str]:
         return [UNREADABLE_CONFIG_ERROR]
     except (tomllib.TOMLDecodeError, ValueError):
         return [INVALID_TOML_ERROR]
+    try:
+        return _collect_errors(cfg)
+    except (AttributeError, TypeError):
+        # Valid TOML with the wrong shape (for example `env = "x"` or
+        # `[env]` with scalar values): fail closed with the fixed
+        # diagnostic. Every attribute access below runs on TOML-supplied
+        # values, so these errors mean a misshapen config, never a traceback.
+        return [INVALID_TOML_ERROR]
 
+
+def _collect_errors(cfg: dict) -> list[str]:
     errors: list[str] = []
     # Every top-level var must be repeated in each named env (values may
     # differ, e.g. TWO_GUILD_NAME). This auto-covers future additions — the

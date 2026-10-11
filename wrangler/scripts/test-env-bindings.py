@@ -188,6 +188,16 @@ def drop_env(content, env):
     return "".join(out)
 
 
+def top_level_prefix(content):
+    """Lines before the first [env.*] section (top-level config only)."""
+    out = []
+    for line in content.splitlines(keepends=True):
+        if line.lstrip().startswith(("[env.", "[[env.")):
+            break
+        out.append(line)
+    return "".join(out)
+
+
 class RequiredEnvironmentTests(unittest.TestCase):
     def check_config(self, content):
         with tempfile.TemporaryDirectory() as directory:
@@ -255,6 +265,23 @@ class RequiredEnvironmentTests(unittest.TestCase):
         self.assertIn("unreadable Wrangler config", errors[0])
         self.assertNotEqual(proc.returncode, 0)
         self.assertNotIn("Traceback", proc.stdout + proc.stderr)
+
+    def test_duplicate_table_never_echoes_names(self):
+        # tomllib quotes the offending table name ("Cannot declare ..."),
+        # so this pins that the diagnostic discards the parser error.
+        marker = "SYNTHETIC_DUP_MARKER_XYZ"
+        errors = self.check_config(f"[{marker}]\n[{marker}]\n")
+        self.assertEqual(errors, [checker.INVALID_TOML_ERROR])
+
+    def test_non_table_env_is_controlled(self):
+        config = 'env = "not-a-table"\n' + top_level_prefix(BASE)
+        errors = self.check_config(config)
+        self.assertEqual(errors, [checker.INVALID_TOML_ERROR])
+
+    def test_wrong_shape_tables_are_controlled(self):
+        config = top_level_prefix(BASE) + "[env]\nstaging = 1\nproduction = 2\n"
+        errors = self.check_config(config)
+        self.assertEqual(errors, [checker.INVALID_TOML_ERROR])
 
 
 if __name__ == "__main__":
