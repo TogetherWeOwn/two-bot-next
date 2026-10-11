@@ -100,7 +100,7 @@ pub(crate) fn router_with_guard(
 }
 
 /// Routes the public listener serves; the only paths a span may record.
-/// Keep in sync with `router_with_guard` and `metrics_http::router`.
+/// Keep in sync with `router_with_guard` and `metrics_http::router_with_guard`.
 const TRACED_PATHS: [&str; 4] = ["/health", "/healthz", "/readyz", "/metrics"];
 
 /// Recorded for every path that is not an exact `TRACED_PATHS` entry.
