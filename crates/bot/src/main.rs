@@ -26,6 +26,7 @@ mod containment_runtime;
 #[cfg(test)]
 mod containment_runtime_tests;
 mod database_roles_cli;
+mod db_log;
 #[cfg(test)]
 #[allow(dead_code)]
 #[path = "../../discord/tests/common/mod.rs"]
@@ -155,7 +156,7 @@ async fn run(cli_args: &[String]) {
             );
             std::process::exit(1);
         }
-        tracing::warn!(msg = "config_invalid", error = %err, "config invalid; continuing with safe defaults");
+        tracing::warn!(msg = "config_invalid", reason = %err, "config invalid; continuing with safe defaults");
         Config {
             discord_token: None,
             database_url: None,
@@ -216,7 +217,10 @@ async fn run(cli_args: &[String]) {
     // no-op and preserves existing server behavior.
     if let Ok((token, _, guild_id)) = gateway_prerequisites(&config) {
         if let Err(error) = commands_cli::publish_on_boot(token, guild_id).await {
-            tracing::error!(error = %error, "boot command registry synchronization failed");
+            tracing::error!(
+                reason = boot_publish_class(&error),
+                "boot command registry synchronization failed"
+            );
             std::process::exit(1);
         }
     }
@@ -673,7 +677,7 @@ fn build_interaction_runtime(
     let features = match two_bot_core::FeatureGates::from_env() {
         Ok(features) => features,
         Err(err) => {
-            tracing::warn!(error = %err, "feature gates invalid; ordered interaction surface parked");
+            tracing::warn!(reason = %err, "feature gates invalid; ordered interaction surface parked");
             return None;
         }
     };
@@ -684,7 +688,7 @@ fn build_interaction_runtime(
         match two_bot_core::ModerationGates::from_env() {
             Ok(moderation) => moderation,
             Err(err) => {
-                tracing::warn!(error = %err, "moderation gates invalid; ordered interaction surface parked");
+                tracing::warn!(reason = %err, "moderation gates invalid; ordered interaction surface parked");
                 return None;
             }
         }
@@ -718,6 +722,38 @@ fn build_interaction_runtime(
             two_bot_core::ClassifierConfig::from_env(),
         ),
     ))
+}
+
+/// Fixed class for a boot command-registry sync failure string. The strings
+/// `publish_on_boot` returns are authored constants (snowflake refusal, REST
+/// client setup, sync wrapper) plus `publish_set` text; none carries a
+/// connection URL, but the full string is still never logged.
+fn boot_publish_class(error: &str) -> &'static str {
+    if error.contains("Refusing live guild") {
+        "live_guild_refused"
+    } else if error.contains("cannot configure command REST client") {
+        "rest_client_failed"
+    } else if error.contains("boot command registry synchronization failed") {
+        "registry_sync_failed"
+    } else if error.contains("must be a nonzero Discord snowflake")
+        || error.contains("requires TWO_OWEN_USER_ID")
+        || error.contains("must contain Discord role ids")
+        || error.contains("must be an integer between")
+    {
+        "invalid_boot_config"
+    } else if error.contains("set TWO_DATABASE_URL")
+        || error.contains("TWO_DATABASE_URL is set but empty")
+        || error.contains("cannot configure send-admission Postgres")
+        || error.contains("shared durable Discord send admission required")
+        || error.contains("DISCORD_TOKEN is required")
+        || error.contains("Discord API override")
+        || error.contains("tls provider unavailable")
+        || error.contains("Discord send admission")
+    {
+        "registry_prerequisites_failed"
+    } else {
+        "registry_sync_failed"
+    }
 }
 
 /// This receiver slice is staging-only, not authority to enable production.

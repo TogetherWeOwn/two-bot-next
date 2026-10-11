@@ -35,6 +35,7 @@ use two_bot_core::{
 use two_bot_discord::ActionExecutor;
 
 use crate::command_runtime::{actor_id, new_id};
+use crate::db_log::{db_class, quota_write_class};
 
 /// Safe reply when the store fails — never leak sqlx internals to Discord.
 const STORE_FAILURE_REPLY: &str = "Schedule command failed; try again.";
@@ -96,7 +97,7 @@ pub(crate) async fn schedule_create(
     let existing = match get_scheduled(pool, guild_id, &id).await {
         Ok(existing) => existing,
         Err(err) => {
-            tracing::warn!(error = %err, "schedule read failed");
+            tracing::warn!(reason = db_class(&err), "schedule read failed");
             finish(executor, interaction, STORE_FAILURE_REPLY).await;
             return;
         }
@@ -173,7 +174,7 @@ pub(crate) async fn schedule_create(
             finish(executor, interaction, quota.to_string()).await;
         }
         Err(err) => {
-            tracing::warn!(error = %err, "schedule put failed");
+            tracing::warn!(reason = quota_write_class(&err), "schedule put failed");
             finish(executor, interaction, STORE_FAILURE_REPLY).await;
         }
     }
@@ -193,7 +194,7 @@ pub(crate) async fn schedule_remove(
     let resolved = match resolve_scheduled_id_store(pool, guild_id, &prefix).await {
         Ok(resolved) => resolved,
         Err(err) => {
-            tracing::warn!(error = %err, "schedule resolve failed");
+            tracing::warn!(reason = db_class(&err), "schedule resolve failed");
             finish(executor, interaction, STORE_FAILURE_REPLY).await;
             return;
         }
@@ -235,7 +236,7 @@ pub(crate) async fn schedule_remove(
             finish(executor, interaction, no_such_schedule_text(&id)).await;
         }
         Err(err) => {
-            tracing::warn!(error = %err, "schedule delete failed");
+            tracing::warn!(reason = db_class(&err), "schedule delete failed");
             finish(executor, interaction, STORE_FAILURE_REPLY).await;
         }
     }
@@ -271,7 +272,7 @@ pub(crate) async fn schedule_list(
             .await;
         }
         Err(err) => {
-            tracing::warn!(error = %err, "schedule list failed");
+            tracing::warn!(reason = db_class(&err), "schedule list failed");
             finish(executor, interaction, STORE_FAILURE_REPLY).await;
         }
     }
@@ -318,7 +319,12 @@ async fn audit(
         reason: reason.map(str::to_owned),
     };
     if let Err(err) = audit_scheduled(pool, &input, now_iso, &new_id()).await {
-        tracing::warn!(action, outcome, error = %err, "schedule audit write failed");
+        tracing::warn!(
+            action,
+            outcome,
+            reason = db_class(&err),
+            "schedule audit write failed"
+        );
     }
 }
 
@@ -332,7 +338,7 @@ async fn finish(executor: &ActionExecutor, interaction: &Interaction, content: i
         )
         .await
     {
-        tracing::warn!(interaction_id = %interaction.id.get(), error = %err, "schedule reply edit failed");
+        tracing::warn!(interaction_id = %interaction.id.get(), reason = err.cause(), "schedule reply edit failed");
     }
 }
 

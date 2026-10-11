@@ -127,7 +127,9 @@ binding names, allowlisted identifiers, counts, status codes, and bounded reason
 Do not add `%error`/`?error` for SQL/HTTP/provider failures: their display/debug
 chains can contain URLs. HTTP tracing records only the method and a redacted path. Existing settings
 reports log only catalog-approved hot-key values; never add env-only/secret values
-to those reports. Database URL query keys are validated before SQLx parses them:
+to those reports. The command surface classifies database failures with
+`crates/bot/src/db_log.rs` (`db_class` and wrappers, logged under `reason`),
+enforced by `scripts/ci/test_db_error_lints.py`. Database URL query keys are validated before SQLx parses them:
 unsupported keys (including `sslpassword`) are rejected without logging keys or
 values. Parse-scoped passfile diagnostics are suppressed by the existing core
 `database_url` helper; do not bypass that helper with direct SQLx URL parsing.
