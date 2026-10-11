@@ -215,6 +215,12 @@ test("unknown-cadence jobs ticket past the fallback window, never on fresh or ne
   assert.equal(ruleFor("job_unknown_stale:audit_retry")?.severity, "ticket");
   // Future labels the scrape accepts fail closed the same way, with no catalog entry.
   assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="unban_sweep"} ${NOW - 7201}`]).firing, ["job_unknown_stale:unban_sweep"]);
+  // Event-driven session_checkpoint never tickets however stale: idle guilds
+  // (no dispatches for 2+ hours) are healthy, not wedged.
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="session_checkpoint"} 0`]).firing, []);
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="session_checkpoint"} ${NOW - 7200}`]).firing, []);
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="session_checkpoint"} ${NOW - 7201}`]).firing, []);
+  assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="session_checkpoint"} ${NOW - 86400}`]).firing, []);
   // Mapped jobs never take this path, however stale: rank keeps its exact
   // job_stale key and tickers keep ticker_stale.
   assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="rank"} ${NOW - 7201}`]).firing, ["job_stale:rank"]);

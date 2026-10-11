@@ -197,16 +197,20 @@ A job without a staleness cadence entry recorded no successful completion for
 more than 2 hours (`two_bot_job_last_success_timestamp_seconds{job}`). This is
 a **ticket, not a page**: without a mapped cadence the monitor cannot tell a
 slow-but-healthy schedule from a wedge, so it fails closed and nags for an
-explicit catalog entry instead of staying silent. A job that never succeeded
-since start (timestamp zero) is not reported here: that covers both boot and
-parked jobs.
+explicit cadence, ticker coverage, or event-driven exclusion instead of
+staying silent. `session_checkpoint` is event-driven (one success per durable
+gateway commit) and is excluded from this rule in
+`UNKNOWN_STALE_EXCLUDED` (`wrangler/src/alert-rules.ts`): it never tickets
+however stale. A job that never succeeded since start (timestamp zero) is not
+reported here: that covers both boot and parked jobs.
 
 First response: check the `jobs` map on `/readyz` for the job's `parked`,
 `last_success` and `consecutive_failures` fields, then read the
 Worker/container logs for `periodic job failed`. A parked job with a zero
 timestamp is configuration, not a wedge. The standing fix is an explicit
-catalog entry for the job (cadence, ticker coverage or reason) — until then
-this ticket re-fires while the timestamp stays stale. Restart only after the
+cadence entry, ticker coverage, or event-driven exclusion for the job — a
+reasoned catalog note alone does not stop the ticket — until then this ticket
+re-fires while the timestamp stays stale. Restart only after the
 logs show the job loop is wedged, per the [restart semantics](#restart-semantics-durable-resume-not-full-state-recovery).
 
 Escalate when staleness persists after the suspect deploy or dependency is

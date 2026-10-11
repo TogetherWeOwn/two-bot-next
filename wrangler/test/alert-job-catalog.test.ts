@@ -1,19 +1,20 @@
 /** Job-catalog drift guard (TOG-12376). `evaluateMetrics` covers jobs without
- * an entry in `JOB_INTERVAL_SECONDS` and outside `TICKER_STALE_JOBS` through
- * the fail-closed `job_unknown_stale` ticket (a coarse 2-hour fallback, never
- * a precise cadence), so every label in the Rust `JOBS` allowlist
- * (`crates/core/src/metrics.rs`) must still have a cadence equal to its
- * registered Rust `*_INTERVAL_MS / 1000`, ticker_stale coverage with a
- * reason, or an explicit, reasoned unknown-stale entry, and `docs/metrics.md`
- * must list every label. The explicit entry is what retires the coarse
- * fallback for that job; unlisted future labels ticket rather than staying
- * silent in the meantime.
+ * an entry in `JOB_INTERVAL_SECONDS`, outside `TICKER_STALE_JOBS`, and outside
+ * `UNKNOWN_STALE_EXCLUDED` through the fail-closed `job_unknown_stale` ticket
+ * (a coarse 2-hour fallback, never a precise cadence), so every label in the
+ * Rust `JOBS` allowlist (`crates/core/src/metrics.rs`) must still have a
+ * cadence equal to its registered Rust `*_INTERVAL_MS / 1000`, ticker_stale
+ * coverage with a reason, or an explicit, reasoned unknown-stale entry, and
+ * `docs/metrics.md` must list every label. Only a cadence, ticker coverage,
+ * or event-driven exclusion in `src/alert-rules.ts` retires the coarse
+ * fallback; a reasoned unknown-stale note alone does not. Unlisted future
+ * labels ticket rather than staying silent in the meantime.
  * Reads the Rust sources as text; never compiles or runs anything.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
-import { JOB_INTERVAL_SECONDS, TICKER_STALE_JOBS, TICKER_STALE_SECONDS } from "../src/alert-rules.ts";
+import { JOB_INTERVAL_SECONDS, TICKER_STALE_JOBS, TICKER_STALE_SECONDS, UNKNOWN_STALE_EXCLUDED } from "../src/alert-rules.ts";
 
 const root = new URL("../../", import.meta.url);
 const read = (path: string) => readFileSync(new URL(path, root), "utf8");
@@ -22,8 +23,12 @@ const websiteJobsRs = read("crates/bot/src/website_jobs.rs");
 const communityJobsRs = read("crates/bot/src/community_jobs.rs");
 const metricsMd = read("docs/metrics.md");
 
-/** Labels with no fixed cadence, covered by the fail-closed `job_unknown_stale`
- * ticket (`UNKNOWN_JOB_STALE_SECONDS`) instead of `job_stale`/`ticker_stale`. */
+/** Labels with no fixed cadence. `invite_snapshot`, `other` and `audit_retry`
+ * are covered by the fail-closed `job_unknown_stale` ticket
+ * (`UNKNOWN_JOB_STALE_SECONDS`) instead of `job_stale`/`ticker_stale`;
+ * `session_checkpoint` is event-driven and excluded from the fallback via
+ * `UNKNOWN_STALE_EXCLUDED` (still listed here with its reason so the catalog
+ * stays explicit). */
 const UNKNOWN_STALE_JOBS = new Map<string, string>([
   ["invite_snapshot", "no periodic caller; stays zero until a real caller records a completion"],
   ["session_checkpoint", "event-driven: one success per durable gateway commit, not a scheduled tick"],
@@ -170,6 +175,16 @@ test("the 15 s tickers are covered by ticker_stale with an explicit 10-minute wi
     assert.ok(!UNKNOWN_STALE_JOBS.has(job), `${job}: covered by both ticker_stale and an unknown-stale entry`);
   }
   assert.ok(UNKNOWN_STALE_JOBS.has("audit_retry"), "audit_retry keeps its reasoned unknown-stale entry");
+});
+
+test("event-driven exclusions stay inside the Rust allowlist and never overlap cadence or ticker coverage", () => {
+  assert.deepEqual([...UNKNOWN_STALE_EXCLUDED].sort(), ["session_checkpoint"]);
+  for (const job of UNKNOWN_STALE_EXCLUDED) {
+    assert.ok(JOBS.includes(job), `${job}: excluded label outside Rust JOBS`);
+    assert.ok(!Object.hasOwn(JOB_INTERVAL_SECONDS, job), `${job}: excluded and in JOB_INTERVAL_SECONDS`);
+    assert.ok(!TICKER_STALE_JOBS.includes(job), `${job}: excluded and covered by ticker_stale`);
+    assert.ok(UNKNOWN_STALE_JOBS.has(job), `${job}: excluded without a reasoned unknown-stale entry`);
+  }
 });
 
 test("a new Rust job without a cadence fails the catalog", () => {
