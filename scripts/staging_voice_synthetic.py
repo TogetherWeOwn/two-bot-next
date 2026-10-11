@@ -118,7 +118,10 @@ def evaluate(obs):
     """Checks for one synthetic run. ``obs`` keys:
 
     me, creator (channel dict), room_id, room_created (CHANNEL_CREATE payload or
-    None), channels (guild channels after the move), statuses (room status
+    None), moved_to (the channel the joiner's own voice state landed in after
+    joining the creator), rejoin_room_id (the room created when the joiner hopped
+    from their room back into the creator, or None), channels (guild channels
+    after the move), statuses (room status
     strings seen), deleted (bool), delete_seconds, grace_seconds, metrics_delta
     (int or None when unavailable), channels_before (guild channels before the
     join; the creator's existing rooms move the expected slot to their end).
@@ -128,6 +131,11 @@ def evaluate(obs):
     created = obs.get("room_created") or {}
     out.append(check("create", bool(room_id) and created.get("parent_id") == creator.get("parent_id"),
                      f"room={room_id} parent={created.get('parent_id')} creator_parent={creator.get('parent_id')}"))
+    out.append(check("moved", bool(room_id) and obs.get("moved_to") == room_id,
+                     f"joiner landed in {obs.get('moved_to')} (room {room_id})"))
+    rejoin = obs.get("rejoin_room_id")
+    out.append(check("rejoin", bool(rejoin) and rejoin not in (room_id, creator.get("id")),
+                     f"hop from room {room_id} back into the creator -> {rejoin} (None = left in the lobby)"))
     name = created.get("name", "")
     out.append(check("name", bool(name) and not FALLBACK.match(name),
                      f"created name {name!r} (fallback pattern <display>'s room must not match)"))
@@ -365,12 +373,25 @@ def run_live(args, token):
         obs["channels_before"] = rest(token, f"/guilds/{args.guild}/channels")
         s.voice(args.guild, args.creator)
         joined = True
-        moved = s.pump(lambda e: e["t"] == "VOICE_STATE_UPDATE" and e["d"].get("user_id") == s.me
-                       and e["d"].get("channel_id") not in (None, args.creator), time.monotonic() + args.create_within)
-        room_id = moved["d"]["channel_id"] if moved else None
+        mark = len(s.events)
+        parent = creator.get("parent_id")
+
+        def created_room(after):
+            # The room the bot created for us: a voice channel in the creator's
+            # category that appeared after `after` (the create can arrive before
+            # or after our own move).
+            return next((e["d"] for e in s.events[after:] if e["t"] == "CHANNEL_CREATE"
+                         and e["d"].get("type") == 2 and e["d"].get("parent_id") == parent), None)
+
+        def landed(exclude):
+            return lambda e: (e["t"] == "VOICE_STATE_UPDATE" and e["d"].get("user_id") == s.me
+                              and e["d"].get("channel_id") not in (None, args.creator, *exclude))
+
+        moved = s.pump(landed(()), time.monotonic() + args.create_within)
+        obs["moved_to"] = moved["d"]["channel_id"] if moved else None
+        obs["room_created"] = created_room(mark)
+        room_id = (obs["room_created"] or {}).get("id") or obs["moved_to"]
         obs["room_id"] = room_id
-        obs["room_created"] = next((e["d"] for e in s.events
-                                    if e["t"] == "CHANNEL_CREATE" and e["d"]["id"] == room_id), None)
         if room_id:
             # Let the status line and any follow-up writes land, collecting events.
             s.pump(lambda e: False, time.monotonic() + args.settle)
@@ -379,13 +400,23 @@ def run_live(args, token):
             obs["channels"] = rest(token, f"/guilds/{args.guild}/channels")
             obs["statuses"] = [e["d"].get("status") for e in s.events
                                if e["t"] == "VOICE_CHANNEL_STATUS_UPDATE" and e["d"].get("id") == room_id]
+            # Hop from our own room straight back into the creator: a member
+            # doing this must get a new room, not stay in the lobby.
+            mark = len(s.events)
+            s.voice(args.guild, args.creator)
+            again = s.pump(landed((room_id,)), time.monotonic() + args.create_within)
+            obs["rejoin_room_id"] = again["d"]["channel_id"] if again else None
+        rooms = [r for r in (room_id, obs.get("rejoin_room_id")) if r]
         s.voice(args.guild, None)
         joined = False
         left = time.monotonic()
-        if room_id:
-            gone = s.pump(lambda e: e["t"] == "CHANNEL_DELETE" and e["d"]["id"] == room_id,
-                          time.monotonic() + args.grace + args.delete_slack)
-            obs["deleted"] = gone is not None
+        if rooms:
+            gone = set()
+            s.pump(lambda e: e["t"] == "CHANNEL_DELETE" and e["d"]["id"] in rooms
+                   and (gone.add(e["d"]["id"]) or gone >= set(rooms)),
+                   time.monotonic() + args.grace + args.delete_slack)
+            gone |= {e["d"]["id"] for e in s.events if e["t"] == "CHANNEL_DELETE"}
+            obs["deleted"] = set(rooms) <= gone
             obs["delete_seconds"] = round(time.monotonic() - left, 1)
     finally:
         if joined:

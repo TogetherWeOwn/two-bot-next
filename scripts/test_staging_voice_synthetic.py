@@ -25,6 +25,8 @@ def obs(**over):
         "me": ME,
         "creator": {"id": CREATOR, "parent_id": CAT},
         "room_id": ROOM,
+        "moved_to": ROOM,
+        "rejoin_room_id": "99",
         "room_created": {"id": ROOM, "parent_id": CAT, "name": "🍄 Synthetic’s workshop",
                          "permission_overwrites": [{"id": ME, "type": 1, "allow": OWNER_ALLOW}]},
         "channels": [
@@ -98,6 +100,15 @@ class EvaluateTest(unittest.TestCase):
 
     def test_room_left_behind_fails_delete(self):
         self.assertEqual(verdicts(obs(deleted=False))["delete"], "FAIL")
+
+    def test_joiner_not_moved_into_the_room_fails_moved(self):
+        self.assertEqual(verdicts(obs(moved_to=None))["moved"], "FAIL")
+        self.assertEqual(verdicts(obs(moved_to=OTHER))["moved"], "FAIL")
+
+    def test_hop_back_into_the_creator_without_a_new_room_fails_rejoin(self):
+        self.assertEqual(verdicts(obs(rejoin_room_id=None))["rejoin"], "FAIL")
+        self.assertEqual(verdicts(obs(rejoin_room_id=ROOM))["rejoin"], "FAIL")
+        self.assertEqual(verdicts(obs(rejoin_room_id=CREATOR))["rejoin"], "FAIL")
 
     def test_no_room_fails_create(self):
         result = verdicts(obs(room_id=None, room_created=None))

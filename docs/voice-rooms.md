@@ -50,6 +50,13 @@ library code with no Discord dependency and can start immediately.
   the next tick after its last human leaves, matching the interim voice bot.
 - If the member can't be moved in (missing Move Members, or they left first), the
   bot deletes the room immediately.
+- Create admission (Auto-Voice parity): one room per member, 40 per guild, no
+  cooldown, and the rolling bursts (3 creates per member and 10 per guild in any
+  60 seconds). Rooms the member just left for the creator (no human left in
+  them, no move pending) do not count toward the caps, so hopping from your own
+  room back into the creator gets a new room. A refused join records
+  `two_bot_voice_operations_total{op="create",outcome="refused"}` and a recent
+  failure line with the reason.
 - If the bot loses access to a room (View Channel, Connect, Manage Channels or Move
   Members), it stops managing it without retry storms and resumes once access
   comes back.
@@ -60,6 +67,8 @@ library code with no Discord dependency and can start immediately.
 - **Accept when:**
   - Each join produces exactly one room, the member ends up in it, and the room is
     deleted within a timer tick of the configured empty grace expiring.
+  - A member who leaves their own room for the creator gets a new room and is
+    moved into it (the voice synthetic's `rejoin` check).
   - Two members joining at the same moment get two rooms.
   - After a restart, the bot reconciles tracked rooms against the channels that
     actually exist and cleans up the empty ones.

@@ -402,7 +402,8 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
 
   // Voice lifecycle failures (T3 room create/move/delete budget in
   // docs/voice-cutover-rollback-triggers.md): any outcome other than
-  // `success` (`category_full`, `discord`, `persistence`, `cancelled`)
+  // `success` (`category_full`, `discord`, `persistence`, `cancelled`,
+  // `refused`)
   // counts as a failure — the join did not place a room, or the move/delete
   // did not complete. A new dead-letter (a queue write that exhausted 10
   // attempts) or orphan (an untracked creator-channel orphan needing manual

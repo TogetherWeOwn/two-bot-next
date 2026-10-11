@@ -482,3 +482,48 @@ async fn zero_ids_are_refused_before_any_write() -> TestResult {
     db.close().await?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires TWO_TEST_DATABASE_URL on agent-testdb"]
+async fn a_member_leaving_their_own_room_for_the_creator_is_not_capped_by_it() -> TestResult {
+    let db = database().await;
+    let store = PgRoomStore::new(db.pool().clone());
+    // One room per member, no cooldown: the member owns room 610 and has just
+    // left it for the creator, so 610 is empty and about to be deleted.
+    let one = config(1, 40, 0);
+    let first = admitted(&store, 600, &one, T0).await?;
+    store.persist_create(&first, &room(600, 610)).await?;
+    // Without the discount the room they are leaving still holds their slot.
+    assert_eq!(
+        refused(&store, 600, &one, T0 + 5).await?,
+        RefusalReason::UserCap
+    );
+    // The worker passes the member's empty rooms; they no longer count.
+    match store
+        .claim_create_excluding(GUILD, 600, &[610], &one, T0 + 5)
+        .await?
+    {
+        CreateClaim::Admitted { .. } => {}
+        CreateClaim::Refused(reason) => {
+            return Err(format!(
+                "refused with the leaving room discounted: {}",
+                reason.code()
+            )
+            .into())
+        }
+    }
+    // A discount only covers the listed rooms: an unrelated occupied room of the
+    // same member still counts (the in-flight claim above now holds the slot too).
+    assert_eq!(
+        match store
+            .claim_create_excluding(GUILD, 600, &[999], &one, T0 + 6)
+            .await?
+        {
+            CreateClaim::Refused(reason) => reason,
+            CreateClaim::Admitted { .. } => return Err("unlisted room was discounted".into()),
+        },
+        RefusalReason::UserCap
+    );
+    db.close().await?;
+    Ok(())
+}

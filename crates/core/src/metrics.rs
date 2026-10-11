@@ -144,6 +144,8 @@ pub const VOICE_OUTCOMES: &[&str] = &[
     "category_full",
     "discord",
     "persistence",
+    "refused",
+    // Last: unknown outcomes fold here (bounded_index).
     "cancelled",
 ];
 /// Reconcile plan actions (TOG-13543): what one `reconcile` pass enqueued.
@@ -386,7 +388,7 @@ struct Values {
     missed_events: u64,
     latency_micros: Option<u64>,
     handler: Histogram,
-    voice_ops: [[u64; 5]; 3],
+    voice_ops: [[u64; 6]; 3],
     voice_reconcile: [u64; 4],
     voice_dead: [u64; 9],
     voice_tracked: u64,

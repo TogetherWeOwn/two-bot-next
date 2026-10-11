@@ -362,7 +362,7 @@ or when any new dead-letter (a queue write that exhausted 10 attempts) or
 orphan (an untracked creator-channel orphan needing manual deletion)
 appears — so a low-volume stranded-member failure still pages. Any outcome
 other than `success` (`category_full`, `discord`, `persistence`,
-`cancelled`) counts as a failure: the join did not place a room, or the
+`cancelled`, `refused`) counts as a failure: the join did not place a room, or the
 move/delete did not complete. A counter reset (process restart) skips the
 window rather than firing, and a slow trickle below threshold stays silent.
 
