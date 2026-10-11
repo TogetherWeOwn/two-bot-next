@@ -40,7 +40,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_db_pool_connections` | Current pool size |
 | `two_bot_db_pool_idle_connections` | Current idle connections |
 | `two_bot_db_pool_max_connections` | Configured maximum |
-| `two_bot_db_errors_total{op}` | Storage-layer failures; `op` is `admission` (send-admission SQL) or `other` (every other store until its op joins the allowlist) |
+| `two_bot_db_errors_total{op}` | Recorded storage-layer failures: send-admission SQL uses `op="admission"`, voice actor load uses `op="other"`; unknown instrumented operations also collapse to `other`. Not a database-wide total |
 | `two_bot_send_admissions_total{outcome}` | Send-admission `admit()` decisions; `outcome` is `admitted`, `blocked`, `storage_error` (also counted in `two_bot_db_errors_total{op="admission"}`) or `other` |
 | `two_bot_gateway_prefix_trigger_refused_total{reason}` | In-scope prefix candidates refused by the automod verdict before any trigger lookup; `reason` is `verdict` (contained, timed-out, uninspected, unrecorded or missing verdict) or `other`. The worker records candidates even when its capture-only gate prevents detached dispatch. Unmatched content (no trigger), scope mismatches, bot/webhook messages and disabled text-command gates never increment this family |
 | `two_bot_job_runs_total{job,outcome}` | Completed attempts; outcome is `success` or `failure` (including returned errors, timeouts and isolated panics) |
@@ -514,11 +514,15 @@ is named `evidence-{ruleId}-{window}.json` (soak-ledger packets stamp the
 attribute packets when several rules fire in one window. Both sides pin every
 spelling with tests; the payload shape is unchanged.
 
-Known gaps: the DB error counter currently records only send-admission SQL,
-so non-admission stores still surface only through the pool proxy and the
-job-failure rules; adopt `Metrics::db_error` per store incrementally. A
-slow trickle of DB errors below the burst threshold likewise surfaces only
-through `job_consecutive_failures`.
+DB-error coverage: `two_bot_db_errors_total` counts send-admission SQL
+failures (`op="admission"`) and voice actor load failures (`op="other"`);
+other stores adopt `Metrics::db_error` incrementally, so this is not a
+database-wide total. Correlate voice load failures with `voice actor load
+failed; actor respawns on the next guild snapshot` in container stdout.
+Every load failure increments the counter, but that warn is throttled
+process-wide to once per 300 s. A slow trickle below the burst threshold
+stays silent in `db_errors`; job-failure rules cover failed jobs, not every
+storage path.
 A forced job failure on staging (three failures) raises
 `job_consecutive_failures:<job>` within about one keepalive tick. Counter resets
 (process restart) skip the 429 window. Alert state is persisted in DO storage
