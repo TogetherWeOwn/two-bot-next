@@ -440,6 +440,128 @@ async fn redirect_hops_are_bounded_at_three_follows() {
     assert_eq!(connector.calls().len(), 4);
 }
 
+// --- ambiguous policy headers ----------------------------------------------------
+
+#[tokio::test]
+async fn repeated_location_headers_are_refused_before_redirect() {
+    // Any second Location — identical, conflicting, or mixed-case key — is
+    // ambiguous: reading only the first would silently ignore the other.
+    for locations in [
+        vec![("location", "/next"), ("location", "/next")],
+        vec![("location", "/next"), ("location", "/other")],
+        vec![("location", "/next"), ("Location", "/next")],
+        vec![("location", "/next"), ("LOCATION", "/other")],
+    ] {
+        let mut canned = Canned {
+            status: StatusCode::FOUND,
+            headers: Vec::new(),
+            chunks: Vec::new(),
+        };
+        for (name, value) in &locations {
+            canned
+                .headers
+                .push(((*name).to_owned(), (*value).to_owned()));
+        }
+        let resolver = MockResolver::scripted(vec![MockResolver::addrs(&[PUBLIC_A])]);
+        let connector = MockConnector::scripted(vec![Step::Respond(canned)]);
+        let err = fetch_feed_with(&resolver, &connector, SOURCE, &fast())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            policy(&err),
+            FetchError::RedirectRefused,
+            "locations {locations:?} must be refused, got {err:?}"
+        );
+        assert_eq!(
+            connector.calls().len(),
+            1,
+            "refused redirect must not dial again"
+        );
+    }
+
+    // Single-header control: one unambiguous Location still redirects, even
+    // with a mixed-case key.
+    for key in ["location", "Location", "LOCATION"] {
+        let resolver = MockResolver::scripted(vec![
+            MockResolver::addrs(&[PUBLIC_A]),
+            MockResolver::addrs(&[PUBLIC_A]),
+        ]);
+        let connector = MockConnector::scripted(vec![
+            Step::Respond(Canned {
+                status: StatusCode::FOUND,
+                headers: vec![(key.to_owned(), "/next".to_owned())],
+                chunks: Vec::new(),
+            }),
+            Step::Respond(Canned::xml("<rss/>")),
+        ]);
+        let feed = fetch_feed_with(&resolver, &connector, SOURCE, &fast())
+            .await
+            .unwrap();
+        assert_eq!(feed.url.as_str(), "https://feeds.example.org/next");
+        assert_eq!(connector.calls().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn repeated_content_type_headers_are_refused_before_body() {
+    // Any second Content-Type — identical, conflicting, or mixed-case key —
+    // is ambiguous: reading only the first would silently ignore the other.
+    for content_types in [
+        vec![
+            ("content-type", "application/rss+xml"),
+            ("content-type", "application/rss+xml"),
+        ],
+        vec![
+            ("content-type", "application/rss+xml"),
+            ("content-type", "application/atom+xml"),
+        ],
+        vec![
+            ("content-type", "application/rss+xml"),
+            ("Content-Type", "application/rss+xml"),
+        ],
+        vec![
+            ("content-type", "application/rss+xml"),
+            ("CONTENT-TYPE", "text/html"),
+        ],
+    ] {
+        let mut canned = Canned {
+            status: StatusCode::OK,
+            headers: Vec::new(),
+            chunks: vec![Bytes::from_static(b"<rss/>")],
+        };
+        for (name, value) in &content_types {
+            canned
+                .headers
+                .push(((*name).to_owned(), (*value).to_owned()));
+        }
+        let resolver = MockResolver::scripted(vec![MockResolver::addrs(&[PUBLIC_A])]);
+        let connector = MockConnector::scripted(vec![Step::Respond(canned)]);
+        let err = fetch_feed_with(&resolver, &connector, SOURCE, &fast())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            policy(&err),
+            FetchError::UnsupportedContentType,
+            "content-types {content_types:?} must be refused, got {err:?}"
+        );
+    }
+
+    // Single-header control: one unambiguous Content-Type still succeeds,
+    // even with a mixed-case key.
+    for key in ["content-type", "Content-Type", "CONTENT-TYPE"] {
+        let resolver = MockResolver::scripted(vec![MockResolver::addrs(&[PUBLIC_A])]);
+        let connector = MockConnector::scripted(vec![Step::Respond(Canned {
+            status: StatusCode::OK,
+            headers: vec![(key.to_owned(), "application/rss+xml".to_owned())],
+            chunks: vec![Bytes::from_static(b"<rss/>")],
+        })]);
+        let feed = fetch_feed_with(&resolver, &connector, SOURCE, &fast())
+            .await
+            .unwrap();
+        assert_eq!(feed.body, "<rss/>");
+    }
+}
+
 // --- deadline ----------------------------------------------------------------
 
 #[tokio::test]
