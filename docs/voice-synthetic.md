@@ -24,11 +24,13 @@ and the creator is the staging Create a Lobby channel.
 
 ## Response size cap
 
-Every HTTP response the script reads is bounded at `MAX_BODY_BYTES` (64 KiB,
-the same cap as `scripts/staging_probe.py`). That covers the Discord REST reads
-(`rest`) and the staging `/ops/metrics` read (`metrics_value`), on success and
-on HTTP error status alike. The gateway WebSocket is not an HTTP body and is
-outside this cap.
+The final HTTP response body the script reads is bounded at `MAX_BODY_BYTES`
+(64 KiB, the same value as `scripts/staging_probe.py`). That covers the Discord
+REST reads (`rest`) and the staging `/ops/metrics` read (`metrics_value`), on
+success and on HTTP error status alike. Intermediate redirect bodies are drained
+by urllib's redirect handler before the final response and are not capped,
+unlike `scripts/staging_probe.py`, which never follows redirects. The gateway
+WebSocket is not an HTTP body and is outside this cap.
 
 - Each read takes at most `MAX_BODY_BYTES + 1` bytes, so one extra byte exposes
   a hidden suffix without buffering an unbounded body.
