@@ -1432,6 +1432,35 @@ async fn refused_creation_plan_records_a_failure_before_any_channel_is_created()
     assert!(!worker.dispatch_one(1).await);
     assert!(trace.lock().unwrap().is_empty());
     assert!(worker.http.created_attributes.lock().unwrap().is_empty());
+
+    // An overwrite deny on the bot survives the grant, so the room is refused
+    // instead of created unmanageable: the guild grant holds Connect, but the
+    // creator-channel overwrite removes it before any `create` call.
+    let (live, store, http, trace) = fixture();
+    live.upsert_channel(channel_with_overwrites(
+        CREATOR,
+        2,
+        Some(CATEGORY),
+        json!([bot_overwrite(Permissions::empty(), Permissions::CONNECT)]),
+    ));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert!(matches!(
+        worker.failures().back(),
+        Some(LifecycleFailure::MissingPermission {
+            write: RefusedWrite::Create,
+            channel_id: CREATOR,
+            findings,
+        }) if findings.iter().any(|finding| finding.permission == VoicePermission::Connect
+            && finding.scope == VoicePermissionScope::Channel
+            && finding.channel_id == Some(CREATOR))
+    ));
+    assert!(worker.creations.is_empty());
+    assert!(worker.tracked().is_empty());
+    assert!(!worker.dispatch_one(1).await);
+    assert!(trace.lock().unwrap().is_empty());
+    assert!(worker.http.created_attributes.lock().unwrap().is_empty());
 }
 
 /// A failed compensation delete must keep the room (and its provenance)
