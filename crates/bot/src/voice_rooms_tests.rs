@@ -1520,16 +1520,15 @@ async fn failed_rollback_keeps_the_room_tracked_until_a_later_sweep_removes_it()
     assert!(!worker.deletes.contains(&500));
 }
 
-/// Pending acceptance for the durable half of "retain provenance after a
-/// failed rollback": the exact channel must outlive the worker that created
-/// it. Today the failed persist writes nothing, so the only record is the
-/// creating worker's in-memory `rooms`/`compensation`, and a worker rebuilt
-/// from persisted state cannot rediscover the channel. Run it with
-/// `--ignored` to see the gap; enable it, unedited, once a durable witness
-/// exists. The parity row for the legacy rollback commit stays `carded` until
-/// then.
+/// Cross-restart provenance for "retain provenance after a failed rollback" is
+/// proven by the disposable-database test
+/// `crates/cutover/tests/voice_create_admission_store.rs::bound_channel_witness_survives_restart_and_holds_the_slot_until_settled`,
+/// which binds the channel to its claim before any room row and rediscovers it
+/// on a fresh pool. This in-memory fixture stays ignored: only `rooms` crosses
+/// its simulated restart and a failed persist writes no room, so the `bound`
+/// witness cannot cross here and the test cannot pass unedited.
 #[tokio::test]
-#[ignore = "pending: no durable witness survives a failed persist plus a refused rollback"]
+#[ignore = "fixture gap: bound witness does not cross the simulated restart; durable proof is bound_channel_witness_survives_restart_and_holds_the_slot_until_settled"]
 async fn a_restarted_worker_rediscovers_a_channel_whose_rollback_failed() {
     let (live, mut store, http, _) = fixture();
     store.persist_error = Some(StoreError::Unavailable);
