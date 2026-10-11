@@ -2,7 +2,9 @@ name: deploy-production
 
 # Production deploy and rollback for the B4 cutover (TOG-9699). Dispatch only:
 # never runs on push, pull_request, schedule or another workflow's completion.
-# The guard job refuses a SHA that is not on main with a successful full
+# With no sha input it promotes the commit of the latest successful
+# deploy-staging run on main (merges supersede pending staging deploys, so the
+# newest main SHA is rarely staged). The guard job refuses a SHA that is not on main with a successful full
 # `ci-ok` verdict and `worker check` from the latest check.yml run/current
 # attempt, plus a successful deploy-staging run. It also refuses
 # when the `production` Environment is missing or unprotected: a job that
@@ -12,9 +14,10 @@ on:
   workflow_dispatch:
     inputs:
       sha:
-        description: "Full 40-hex commit on main with green ci-ok and worker check in the latest CI attempt, plus deploy-staging"
-        required: true
+        description: "Full 40-hex commit on main with green ci-ok and worker check in the latest CI attempt, plus deploy-staging. Empty promotes the commit of the latest successful deploy-staging run on main"
+        required: false
         type: string
+        default: ""
       rollback:
         description: "Worker version ID to roll back to; empty deploys the SHA"
         required: false
@@ -87,6 +90,18 @@ jobs:
               except (subprocess.CalledProcessError, ValueError):
                   refuse(f"could not read {what} from the GitHub API; failing closed")
 
+          if not sha and not version:
+              # Promote what staging last verified: merges keep landing on main
+              # and supersede pending staging deploys, so "the newest main SHA"
+              # is rarely staged. Every gate below still applies to this SHA.
+              staged = api(
+                  f"repos/{repo}/actions/workflows/deploy-staging.yml/runs", "the latest staging deploy",
+                  branch="main", status="success", per_page="1",
+              ).get("workflow_runs") or []
+              if not staged or not isinstance(staged[0].get("head_sha"), str):
+                  refuse("no successful deploy-staging run on main to promote")
+              sha = staged[0]["head_sha"].strip().lower()
+              print(f"Promoting the latest successful staging deploy: {sha}")
           if not re.fullmatch(r"[0-9a-f]{40}", sha):
               refuse("sha must be a full 40-character hex commit SHA")
           if version and not re.fullmatch(
@@ -548,3 +563,25 @@ jobs:
               sys.exit(1)
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write(f"- Takeover confirmed: `{expected}` still serves 100% after the owned probes\n")
+
+  release:
+    name: release
+    # Start the release for the commit that is now live as a SEPARATE release.yml
+    # run. This run, and its deploy-production group (the single production
+    # rollback path), ends here instead of waiting for the tag + SBOM chain.
+    # A rollback serves an older version, so it is never released.
+    needs: [guard, production]
+    if: needs.guard.outputs.mode == 'deploy'
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'release') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 5
+    permissions:
+      actions: write # Dispatch release.yml for the deployed SHA (GITHUB_TOKEN dispatches do start runs).
+    steps:
+      - name: Start the release run for the deployed SHA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No checkout in this job: gh needs the repo named explicitly.
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ needs.guard.outputs.sha }}
+        run: gh workflow run release.yml --ref main -f sha="$SHA"

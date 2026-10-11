@@ -137,6 +137,13 @@ pub struct RoomChannelAttributes {
     pub user_limit: u16,
     /// Create-time sorting position (V8 placement); `None` lets Discord append.
     pub position: Option<u64>,
+    /// Bulk reorder of the category's channels the caller applies first,
+    /// opening a free `position` (empty when it is free already). Not sent
+    /// by `create_room`.
+    pub respace: Vec<(Snowflake, u64)>,
+    /// Position the caller uses instead of `position` when that reorder is
+    /// refused (`None`: create without a position).
+    pub fallback_position: Option<u64>,
     /// Empty means "include no overrides": the room syncs to its category.
     pub overwrites: Vec<PermissionOverwrite>,
 }
@@ -171,6 +178,8 @@ impl RoomChannelAttributes {
             nsfw: channel.nsfw.unwrap_or(false),
             user_limit,
             position: None,
+            respace: Vec::new(),
+            fallback_position: None,
             overwrites,
         })
     }
@@ -249,6 +258,16 @@ pub fn companion_view_grant(member_id: Snowflake) -> Option<PermissionOverwrite>
 }
 
 /// Sanitized errors: never surface HTTP bodies/tokens/member data in diagnostics.
+/// Upper bound for one rename request (admission plus Discord round trip).
+pub const RENAME_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Upper bound for one voice-status request (send admission plus the
+/// Discord round trip).
+pub const VOICE_STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Discord's voice channel status limit.
+pub const MAX_VOICE_STATUS_CHARS: usize = 500;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RoomHttpError {
     #[error("Discord rate limit; retry after {retry_after_ms}ms")]
@@ -571,6 +590,31 @@ impl RoomHttp {
         let request = request.try_into_request().map_err(classify_http_error)?;
         let body = self.send(request, still_in_creator).await?;
         serde_json::from_slice(&body).map_err(|_| RoomHttpError::UnknownOutcome)
+    }
+
+    /// Discord's bulk `PATCH /guilds/{guild.id}/channels`: set each listed
+    /// channel's position in one request (Manage Channels).
+    pub async fn reorder_channels(
+        &self,
+        guild_id: Snowflake,
+        positions: &[(Snowflake, u64)],
+    ) -> Result<(), RoomHttpError> {
+        if guild_id == 0 || positions.iter().any(|(id, _)| *id == 0) {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let body: Vec<serde_json::Value> = positions
+            .iter()
+            .map(|(id, position)| serde_json::json!({ "id": id.to_string(), "position": position }))
+            .collect();
+        let request = twilight_http::request::RequestBuilder::raw(
+            twilight_http::request::Method::Patch,
+            format!("guilds/{guild_id}/channels"),
+        )
+        .json(&body)
+        .build()
+        .map_err(|_| RoomHttpError::InvalidRequest)?;
+        self.send(request, || true).await?;
+        Ok(())
     }
 
     // Source: https://docs.rs/twilight-http/0.17.1/twilight_http/request/guild/member/struct.UpdateGuildMember.html
@@ -968,6 +1012,30 @@ impl RoomHttp {
         serde_json::from_slice(&body).map_err(|_| RoomHttpError::UnknownOutcome)
     }
 
+    /// Set (or clear with `""`) a voice channel's status line: Discord's
+    /// `PUT /channels/{channel.id}/voice-status`, which needs Set Voice Channel
+    /// Status. Bounded like renames; the caller keeps only the latest text.
+    pub async fn set_room_voice_status(
+        &self,
+        channel_id: Snowflake,
+        status: &str,
+    ) -> Result<(), RoomHttpError> {
+        if channel_id == 0 || status.chars().count() > MAX_VOICE_STATUS_CHARS {
+            return Err(RoomHttpError::InvalidRequest);
+        }
+        let request = twilight_http::request::RequestBuilder::raw(
+            twilight_http::request::Method::Put,
+            format!("channels/{channel_id}/voice-status"),
+        )
+        .json(&serde_json::json!({ "status": status }))
+        .build()
+        .map_err(|_| RoomHttpError::InvalidRequest)?;
+        tokio::time::timeout(VOICE_STATUS_REQUEST_TIMEOUT, self.send(request, || true))
+            .await
+            .map_err(|_| RoomHttpError::RenameDeferred)??;
+        Ok(())
+    }
+
     pub async fn rename_room(
         &self,
         channel_id: Snowflake,
@@ -984,7 +1052,10 @@ impl RoomHttp {
             .map_err(classify_http_error)?;
         // Bounded even for a stalled transport: rename budgets are charged on
         // attempt, including an unknown outcome. The queue keeps its latest name.
-        tokio::time::timeout(Duration::from_secs(1), self.send(request, || true))
+        // The bound covers durable send admission plus the Discord round trip,
+        // which together exceed one second in production. The guild actor
+        // waits at most one second of it; the rest runs on its own task.
+        tokio::time::timeout(RENAME_REQUEST_TIMEOUT, self.send(request, || true))
             .await
             .map_err(|_| RoomHttpError::RenameDeferred)??;
         Ok(())
@@ -1146,6 +1217,8 @@ mod tests {
                 nsfw: true,
                 user_limit: 8,
                 position: None,
+                respace: Vec::new(),
+                fallback_position: None,
                 overwrites: overrides,
             }
         );

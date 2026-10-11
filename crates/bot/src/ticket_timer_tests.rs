@@ -192,6 +192,7 @@ async fn gateway_scope_starts_once_joins_buttons_and_rejects_work_after_stop() {
                 staff_role_id: "300".into(),
                 cooldown_seconds: COOLDOWN_SECONDS,
             },
+            std::collections::HashMap::new(),
         )
         .unwrap(),
     );
