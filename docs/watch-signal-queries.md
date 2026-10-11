@@ -260,6 +260,13 @@ threshold above — it fires on any increase of
 first sample and counter resets skip the window rather than firing).
 Runbook: [runbook](runbook.md#alert-gateway-missed-events).
 
+Alert rule: the Worker `gateway_unpaired_disconnect` rule implements the
+disconnect-pairing query above — it pages when disconnects have no RESUMED
+or fresh READY for 3 consecutive keepalive samples, and any recovery growth
+clears it at once (the first sample and counter resets re-baseline rather
+than firing).
+Runbook: [runbook](runbook.md#alert-gateway-unpaired-disconnect).
+
 ## 9. Ticker staleness
 
 Source: `two_bot_job_last_success_timestamp_seconds{job}` for the 15 s

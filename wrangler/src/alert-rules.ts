@@ -101,6 +101,8 @@ export const DB_ERROR_MIN_ERRORS = 3;
 export const SEND_BLOCKED_SAMPLES = 3;
 /** Website-action receiver refusals must appear in this many consecutive samples. */
 export const RECEIVER_REFUSAL_SAMPLES = 3;
+/** Consecutive unpaired gateway samples before the page; bound justified in the runbook. */
+export const GATEWAY_UNPAIRED_SAMPLES = 3;
 /** Voice failures must exceed this share of room operations between two samples... */
 export const VOICE_FAILURE_RATIO = 0.05;
 /** ...and the window must hold at least this many operations. */
@@ -119,6 +121,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "send_admission_blocked", summary: `Discord sends refused admission for ${SEND_BLOCKED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-send-admission-blocked" },
   { id: "voice_failures", summary: `voice room lifecycle failures exceed ${VOICE_FAILURE_RATIO * 100}% of operations (min ${VOICE_FAILURE_MIN_OPS} ops), or new dead-letters/orphans`, runbook: "runbook.md#alert-voice-failures" },
   { id: "gateway_missed_events", summary: `gateway missed events increased between samples`, runbook: "runbook.md#alert-gateway-missed-events" },
+  { id: "gateway_unpaired_disconnect", summary: `gateway disconnect with no RESUMED or fresh READY for ${GATEWAY_UNPAIRED_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-gateway-unpaired-disconnect" },
   { id: "ticker_stale", summary: `15 s ticker has no success for more than ${TICKER_STALE_SECONDS / 60} minutes`, runbook: "runbook.md#alert-ticker-stale" },
   { id: "receiver_refusals", summary: `website-action receiver refusals for ${RECEIVER_REFUSAL_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-receiver-refusals" },
   { id: "dispatch_drops", summary: `dispatch-lane drops grew for ${DISPATCH_DROP_SAMPLES} consecutive sample windows (reactions include fairness refusals; not proof of gateway packet loss)`, runbook: "runbook.md#alert-dispatch-drops", severity: "ticket" },
@@ -165,13 +168,23 @@ export interface MetricsAlertState {
   receiverRefusalsSeen: boolean;
   /** Per-family consecutive windows with new refusals (sustained surge, not one probe). */
   receiverRefusalStreaks: Record<string, number>;
+  /** Gateway disconnect counter at the last valid baseline or window. */
+  gatewayDisconnects: number;
+  /** RESUMED plus fresh READY counters at the last valid baseline or window. */
+  gatewayRecoveries: number;
+  /** False until a valid sample stores the gateway baseline: the first sample never fires. */
+  gatewayUnpairedSeen: boolean;
+  /** Disconnect outstanding with no RESUMED or fresh READY since (0 or 1). */
+  gatewayUnpaired: number;
+  /** Consecutive completed samples with an unpaired disconnect outstanding. */
+  gatewayUnpairedStreak: number;
   /** Per-lane baseline; absent after a missing/invalid sample or in legacy storage. */
   dispatchDrops?: Record<string, number>;
   /** Consecutive positive deltas, capped at DISPATCH_DROP_SAMPLES. */
   dispatchDropStreaks?: Record<string, number>;
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, dispatchDrops: {}, dispatchDropStreaks: {} };
+export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {} };
 
 /** An unsuccessful scrape breaks the dispatch streak, never an existing alert. */
 export function interruptDispatchDrops(state: MetricsAlertState): MetricsAlertState {
@@ -191,6 +204,97 @@ export function parseExposition(text: string): Sample[] {
     samples.push({ name: m[1]!, labels, value: Number(m[3]) });
   }
   return samples;
+}
+
+const GATEWAY_UNPAIRED_RULE = "gateway_unpaired_disconnect";
+
+type GatewayPairingFields = Pick<
+  MetricsAlertState,
+  "gatewayDisconnects" | "gatewayRecoveries" | "gatewayUnpairedSeen" | "gatewayUnpaired" | "gatewayUnpairedStreak"
+>;
+
+/**
+ * One counter series value, or undefined when absent, duplicated, or not a
+ * count. Takes the per-series pre-filter from the gauge helper below, so the
+ * scrape-validation guard ("New consumed families cannot silently bypass
+ * validation") covers these series: a Rust rename or malformed value fails
+ * the scrape instead of silently holding the rule off. The
+ * finite/nonnegative/single-row checks stay as a backstop for direct
+ * `evaluateMetrics` callers.
+ */
+function gatewayCounter(matches: Sample[], event?: string): number | undefined {
+  const scoped = event === undefined ? matches : matches.filter((s) => s.labels["event"] === event);
+  if (scoped.length !== 1) return undefined;
+  const value = scoped[0]!.value;
+  return Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+/** Pairs disconnects with RESUMED plus fresh READY; invalid samples hold, restarts re-baseline. */
+function pairGatewayDisconnects(samples: Sample[], prev: MetricsAlertState): { firing: boolean; fields: GatewayPairingFields } {
+  const carried: GatewayPairingFields = {
+    gatewayDisconnects: prev.gatewayDisconnects ?? 0,
+    gatewayRecoveries: prev.gatewayRecoveries ?? 0,
+    gatewayUnpairedSeen: prev.gatewayUnpairedSeen ?? false,
+    gatewayUnpaired: prev.gatewayUnpaired ?? 0,
+    gatewayUnpairedStreak: prev.gatewayUnpairedStreak ?? 0,
+  };
+  const wasFiring = prev.firing.includes(GATEWAY_UNPAIRED_RULE);
+  const gauge = (name: string) => samples.filter((s) => s.name === name);
+  const disconnects = gatewayCounter(gauge("two_bot_gateway_disconnects_total"));
+  const resumes = gatewayCounter(gauge("two_bot_gateway_resumes_total"));
+  const ready = gatewayCounter(gauge("two_bot_gateway_events_total"), "READY");
+  if (disconnects === undefined || resumes === undefined || ready === undefined) {
+    return { firing: wasFiring, fields: carried };
+  }
+  const recoveries = resumes + ready;
+  const baseline: GatewayPairingFields = {
+    gatewayDisconnects: disconnects,
+    gatewayRecoveries: recoveries,
+    gatewayUnpairedSeen: true,
+    gatewayUnpaired: 0,
+    gatewayUnpairedStreak: 0,
+  };
+  if (!carried.gatewayUnpairedSeen) return { firing: false, fields: baseline };
+  if (disconnects < carried.gatewayDisconnects || recoveries < carried.gatewayRecoveries) {
+    return { firing: wasFiring, fields: baseline };
+  }
+  // Any recovery growth means the gateway came back: a RESUMED or fresh READY
+  // landed since the previous sample. It always clears the outstanding loss,
+  // even when the same window also added disconnects. The disconnect series
+  // counts every failed Twilight retry, close frame, op 9 invalid session and
+  // cold-resume IDENTIFY (`transport_disconnected` in crates/bot/src/gateway.rs),
+  // so one recovered outage routinely adds N disconnects against a single
+  // recovery; subtracting the growths would leave a permanent N-1 remainder
+  // that pages forever (docs/cutover-dashboard-queries.md forbids exactly this
+  // subtraction). Presence, not arithmetic, pairs each loss with its recovery.
+  if (recoveries > carried.gatewayRecoveries) {
+    return {
+      firing: false,
+      fields: {
+        gatewayDisconnects: disconnects,
+        gatewayRecoveries: recoveries,
+        gatewayUnpairedSeen: true,
+        gatewayUnpaired: 0,
+        gatewayUnpairedStreak: 0,
+      },
+    };
+  }
+  // No recovery since the previous sample: new disconnect growth opens an
+  // outstanding loss, and flat counters keep it outstanding. Only consecutive
+  // outstanding samples count toward the bound. `> 0` (not `=== 1`) also
+  // retires balances stored by older Worker versions that carried a count.
+  const outstanding = disconnects > carried.gatewayDisconnects || carried.gatewayUnpaired > 0;
+  const streak = outstanding ? carried.gatewayUnpairedStreak + 1 : 0;
+  return {
+    firing: outstanding && (streak >= GATEWAY_UNPAIRED_SAMPLES || wasFiring),
+    fields: {
+      gatewayDisconnects: disconnects,
+      gatewayRecoveries: recoveries,
+      gatewayUnpairedSeen: true,
+      gatewayUnpaired: outstanding ? 1 : 0,
+      gatewayUnpairedStreak: streak,
+    },
+  };
 }
 
 export interface Evaluation {
@@ -342,6 +446,9 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   const gatewayReset = gatewayMissed < prevGatewayMissed;
   if (gatewaySeen && !gatewayReset && gatewayMissed > prevGatewayMissed) firing.push("gateway_missed_events");
 
+  const unpaired = pairGatewayDisconnects(samples, prev);
+  if (unpaired.firing) firing.push(GATEWAY_UNPAIRED_RULE);
+
   // Gateway checkpoint commit failures (every failure stops the dispatch
   // worker, so there is no benign singleton): any increase between two
   // samples pages. The first sample only stores the baseline and never
@@ -443,7 +550,7 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     if (grew && (wasFiring || streak >= DISPATCH_DROP_SAMPLES)) firing.push(key);
   }
 
-  return { firing, state: { firing, jobErrorClasses, rest429, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, dispatchDrops, dispatchDropStreaks } };
+  return { firing, state: { firing, jobErrorClasses, rest429, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, dispatchDrops, dispatchDropStreaks } };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {

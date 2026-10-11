@@ -97,9 +97,11 @@ window. Match each loss to its recovery by timestamps in the container logs,
 not by counts. `two_bot_gateway_missed_events_total` counts
 dispatches Discord assigned but this process never received (sequence gaps
 inside one session); any increase over the window fails the zero-missed-events
-acceptance and the checked-in `gateway_missed_events` rule fires on it. Until
-a live unpaired-disconnect rule lands, pair disconnects by hand against the
-RESUME/READY counts in the same window.
+acceptance and the checked-in `gateway_missed_events` rule fires on it. The
+live `gateway_unpaired_disconnect` Worker rule now pages when disconnects
+have no RESUMED or fresh READY for 3 consecutive keepalive samples (runbook:
+[runbook](runbook.md#alert-gateway-unpaired-disconnect)); this hand query
+remains as the cross-check, and where they disagree the live rule wins.
 
 Cross-check with one log filter over the same window (container stdout in the
 dashboard; Worker tail is not Rust stdout): count `gateway shard loop started`
