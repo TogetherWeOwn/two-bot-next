@@ -85,6 +85,8 @@ use two_bot_core::{
     },
     voice_permissions::OWNER_ALLOW_BITS,
     voice_private::{MemberId, PrivacyRecord, PrivateRoom},
+    voice_room_controls::name_conflicts,
+    voice_room_name::is_literal_name,
     voice_rooms::{
         category_full_message, is_usable_channel_name, voice_commands, ActionQueue, CreatorChannel,
         NewRoomSpec, PermissionSource, ProposeOutcome, QueuedAction, RenameCoalescer, RoomAction,
@@ -4618,6 +4620,56 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         && can_manage_room(live.permissions(self.live.guild_id, channel_id))
                 };
                 if !valid {
+                    self.queue.mark_succeeded(&action);
+                    return true;
+                }
+                // Flush-time uniqueness recheck (legacy 38041a1 drops a
+                // throttled rename that would now duplicate): a literal
+                // custom rename refused when the folded name is held by a
+                // landed channel or another room's still-queued rename.
+                // Template restores stay exempt, matching submit time.
+                let duplicate = {
+                    let literal = self
+                        .custom_names
+                        .get(&channel_id)
+                        .is_some_and(|text| is_literal_name(text));
+                    if !literal || !self.name_settings.unique_names {
+                        false
+                    } else {
+                        let live = self.live.read_state();
+                        let mut held: Vec<String> = live
+                            .channels
+                            .values()
+                            .filter(|channel| {
+                                channel.id.get() != channel_id
+                                    && matches!(
+                                        channel.kind,
+                                        ChannelType::GuildVoice | ChannelType::GuildStageVoice
+                                    )
+                            })
+                            .filter_map(|channel| channel.name.clone())
+                            .collect();
+                        for (other_id, pending) in &self.desired_names {
+                            if *other_id == channel_id
+                                || !self.rooms.contains_key(other_id)
+                                || held.iter().any(|held| held == pending)
+                            {
+                                continue;
+                            }
+                            let landed = live
+                                .channels
+                                .get(other_id)
+                                .and_then(|channel| channel.name.clone())
+                                .unwrap_or_default();
+                            if pending != &landed {
+                                held.push(pending.clone());
+                            }
+                        }
+                        name_conflicts(&name, &held, true)
+                    }
+                };
+                if duplicate {
+                    self.desired_names.remove(&channel_id);
                     self.queue.mark_succeeded(&action);
                     return true;
                 }

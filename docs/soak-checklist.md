@@ -1230,11 +1230,11 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s13-984175d: 984175d — TOG-3471: serialize and journal temp-voice ownership changes
 
 - **Method:** `automated` (not an execution verdict).
-- **Action:** Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Transfer room ownership with the panel/`/voice` controls, then let the owner leave; attempt a transfer from a non-owner and confirm rollback to the prior owner.
-- **Expected:** Ownership changes are serialized and journaled; a failed transfer rolls back to the prior owner.
+- **Action:** Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Transfer room ownership with the panel/`/voice` controls, then let the owner leave; attempt a transfer from a non-owner and confirm refusal (NotOwner, ownership unchanged).
+- **Expected:** Ownership changes are serialized and journaled; a failed grant or commit is retried forward - the persisted owner stays the prior owner until the commit lands and a reload revokes uncommitted grants.
 - **Evidence:** Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference. Fixture half: the offline `verification` command at the exact head; the staging half above is unchanged.
 - **Owner:** [TOG-10119](/TOG/issues/TOG-10119)
-- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- transfer_hands_room_to_occupant_and_remembers_creator owner_leave_hands_room_to_earliest_joiner_and_persists owner_grants_are_never_issued_after_failed_journal_preparation
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- transfer_hands_room_to_occupant_and_remembers_creator owner_leave_hands_room_to_earliest_joiner_and_persists failed_owner_commit_reload_and_later_transfer_revoke_every_issued_recipient
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-0495e7d: 0495e7d — TOG-3186: one live-activation allowlist replacing five divergent staging fences
@@ -1628,11 +1628,11 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s13-38041a1: 38041a1 — fix(temp-voice): refuse renames that collide with a sibling channel name (#361)
 
 - **Method:** `automated` (not an execution verdict).
-- **Action:** Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Rename a room to the name of a sibling channel in the same category, then to a unique name.
-- **Expected:** The colliding rename is refused; the unique name is applied.
+- **Action:** Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Rename a room to the name of a sibling channel in the same category, then to a unique name; a folded duplicate of a still-queued rename from another room is refused.
+- **Expected:** The colliding rename is refused; a folded duplicate of a queued-but-unlanded rename is refused and a rename that would now duplicate at flush is dropped; the unique name is applied.
 - **Evidence:** Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference. Fixture half: the offline `verification` command at the exact head; the staging half above is unchanged.
 - **Owner:** [TOG-10119](/TOG/issues/TOG-10119)
-- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- unique_names_conflict_only_when_the_setting_is_on && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_name_collision
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- unique_names_conflict_only_when_the_setting_is_on queued_rename_blocks_folded_duplicate_before_it_lands && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_name_collision
 - **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s13-a40d4a5: a40d4a5 — fix(onboarding): plan session picks in catalog order (#258)

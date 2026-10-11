@@ -691,18 +691,41 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             },
             fallback,
             filter,
-            other_names: live
-                .channels
-                .values()
-                .filter(|channel| {
-                    channel.id.get() != room.channel_id
-                        && matches!(
-                            channel.kind,
-                            ChannelType::GuildVoice | ChannelType::GuildStageVoice
-                        )
-                })
-                .filter_map(|channel| channel.name.clone())
-                .collect(),
+            other_names: {
+                let mut names: Vec<String> = live
+                    .channels
+                    .values()
+                    .filter(|channel| {
+                        channel.id.get() != room.channel_id
+                            && matches!(
+                                channel.kind,
+                                ChannelType::GuildVoice | ChannelType::GuildStageVoice
+                            )
+                    })
+                    .filter_map(|channel| channel.name.clone())
+                    .collect();
+                // Queued-but-unlanded renames from other tracked rooms count
+                // as held names (legacy 38041a1 siblingNames applies
+                // throttle.pending): a folded duplicate of a pending rename
+                // is refused at submit instead of landing a second channel.
+                for (other_id, pending) in &self.desired_names {
+                    if *other_id == room.channel_id
+                        || !self.rooms.contains_key(other_id)
+                        || names.iter().any(|name| name == pending)
+                    {
+                        continue;
+                    }
+                    let landed = live
+                        .channels
+                        .get(other_id)
+                        .and_then(|channel| channel.name.clone())
+                        .unwrap_or_default();
+                    if pending != &landed {
+                        names.push(pending.clone());
+                    }
+                }
+                names
+            },
         };
         // Game and stream tokens/conditions from gateway presences (empty
         // without TWO_VOICE_PRESENCE, which leaves the no-game label).
