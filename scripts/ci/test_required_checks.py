@@ -75,7 +75,7 @@ class RequiredChecksReportTests(unittest.TestCase):
         for job in ("job-inputs", "container-inputs", "supply-chain", "check", "rust-tests",
                     "ignored-db-stores", "ignored-db-runtime", "worker",
                     "parity-docs", "self-role-store", "community-db",
-                    "feeds-db", "tickets-postgres", "moderation-db"):
+                    "feeds-db", "tickets-postgres", "moderation-db", "fuzz-compile"):
             self.assertIn(job, agg["needs"], job)
         # Advisory image smoke remains off the image-build critical path.
         self.assertNotIn("container", agg["needs"])
@@ -86,7 +86,8 @@ class RequiredChecksReportTests(unittest.TestCase):
                        "SELF_ROLE_RESULT", "COMMUNITY_DB_RESULT",
                        "FEEDS_DB_RESULT", "TICKETS_RESULT",
                        "MODERATION_DB_RESULT", "RUST_TESTS_RESULT",
-                       "IGNORED_DB_STORES_RESULT", "IGNORED_DB_RUNTIME_RESULT"):
+                       "IGNORED_DB_STORES_RESULT", "IGNORED_DB_RUNTIME_RESULT",
+                       "FUZZ_COMPILE_RESULT"):
             self.assertIn(marker, body, marker)
 
     def test_legacy_duplicate_aggregate_is_removed(self):
@@ -96,6 +97,39 @@ class RequiredChecksReportTests(unittest.TestCase):
         source = (ROOT / ".github/workflows/check.yml").read_text()
         block = re.search(r"(?ms)^  container:\n(.*?)(?=^  [a-z][a-z-]*:|\Z)", source)[1]
         self.assertRegex(block, r"(?m)^    # ci-ok: exempt \S.+")
+
+    def test_fuzz_compile_is_required_and_compile_only(self):
+        job = self.workflows["check.yml"]["jobs"]["fuzz-compile"]
+        self.assertEqual(job.get("name"), "fuzz compile")
+        self.assertEqual(job.get("permissions"), {"contents": "read"})
+        self.assertIn("job-inputs", job.get("needs", []))
+        self.assertIn("needs.job-inputs.outputs.rust != 'false'", job.get("if", ""))
+        self.assertIn("fuzz-compile", job.get("runs-on", ""))
+        self.assertNotIn("schedule", self.workflows["check.yml"].get("on", {}).get("pull_request", {}))
+        text = str(job)
+        self.assertIn("cargo-fuzz --version 0.13.2 --locked", text)
+        self.assertIn("nightly-2026-10-01", text)
+        self.assertIn("cargo +nightly-2026-10-01 fuzz build", text)
+        self.assertNotIn("fuzz run", text)
+        self.assertNotIn("max_total_time", text)
+        # Separate workspace: the build runs inside fuzz/, never the root lockfile.
+        build = [step for step in job.get("steps", []) if "fuzz build" in str(step.get("run", ""))]
+        self.assertEqual(len(build), 1)
+        self.assertEqual(build[0].get("working-directory"), "fuzz")
+        # The `+nightly` selector is load-bearing: rustup resolves the toolchain
+        # from the repo-root rust-toolchain.toml (stable), so a bare
+        # `cargo fuzz build` runs under stable and fails on `-Zsanitizer`.
+        self.assertIn("cargo +nightly-2026-10-01 fuzz build", build[0].get("run", ""))
+        # Pinned dependencies: the committed fuzz/Cargo.lock is the gate's
+        # version inventory. `--locked` fails the required job instead of
+        # silently resolving fresh crates.io versions on every run.
+        fetch = [step for step in job.get("steps", []) if "fetch --locked" in str(step.get("run", ""))]
+        self.assertEqual(len(fetch), 1)
+        self.assertEqual(fetch[0].get("working-directory"), "fuzz")
+        self.assertIn("cargo +nightly-2026-10-01 fetch --locked", fetch[0].get("run", ""))
+        agg = self.workflows["check.yml"]["jobs"]["ci-ok"]
+        self.assertIn("fuzz-compile", agg["needs"])
+        self.assertIn("FUZZ_COMPILE_RESULT", "\n".join(step.get("run", "") for step in agg["steps"]))
 
     def aggregator(self, name):
         job = self.workflows["check.yml"]["jobs"][name]
@@ -158,7 +192,7 @@ class RequiredChecksReportTests(unittest.TestCase):
         # lint still pass. Docs changes continue to select the worker lane.
         gated = {"rust-tests", "ignored-db-stores", "ignored-db-runtime", "self-role-store",
                  "community-db", "feeds-db", "tickets-postgres", "moderation-db",
-                 "parity-docs", "supply-chain"}
+                 "parity-docs", "supply-chain", "fuzz-compile"}
         for name in AGGREGATORS:
             with self.subTest(aggregator=name):
                 skipped = {job: "skipped" for job in gated}
