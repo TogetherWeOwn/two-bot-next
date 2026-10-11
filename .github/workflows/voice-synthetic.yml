@@ -1,0 +1,82 @@
+name: voice-synthetic
+
+# Live staging voice synthetic (docs/voice-synthetic.md): a dedicated test bot
+# joins the staging "Create a Lobby" creator and scripts/staging_voice_synthetic.py
+# asserts the room lifecycle (template name at create, position below the
+# creator, owner grants, status line, delete after leaving), so no human has to
+# join to verify temp voice. Staging only; the script refuses any other guild.
+#
+# When it runs (owner policy 2026-10-11):
+#   - after every deploy-staging (called from deploy-staging.yml, so a failing
+#     synthetic fails the staging deploy and blocks promotion to production);
+#   - every 6 hours to catch drift;
+#   - by hand.
+# On pull requests only the offline suite runs, and only when voice inputs
+# change (check.yml, job-inputs `voice`): a PR's code is not on staging yet.
+#
+# Its only binding is the `voice-synthetic` environment secret
+# TWO_VOICE_SYNTHETIC_BOT_TOKEN (main-only deployment branches, no reviewer:
+# the test bot can only join voice and read channels in the staging guild).
+# Until that bot exists the run reports "not configured" and passes, unless the
+# repo variable VOICE_SYNTHETIC_REQUIRED is `true`, which makes a missing token
+# a failure (set it after the first green run).
+on:
+  workflow_call:
+  schedule:
+    - cron: '41 */6 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: voice-synthetic
+  cancel-in-progress: false
+
+jobs:
+  synthetic:
+    name: staging voice synthetic
+    permissions:
+      contents: read
+    if: github.ref == 'refs/heads/main'
+    environment: voice-synthetic
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'synthetic') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Run the staging voice synthetic
+        env:
+          TWO_VOICE_SYNTHETIC_BOT_TOKEN: ${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}
+          VOICE_SYNTHETIC_REQUIRED: ${{ vars.VOICE_SYNTHETIC_REQUIRED }}
+          TWO_STAGING_EMPTY_GRACE_SECONDS: ${{ vars.STAGING_EMPTY_GRACE_SECONDS || '60' }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TWO_VOICE_SYNTHETIC_BOT_TOKEN:-}" ]; then
+            if [ "${VOICE_SYNTHETIC_REQUIRED:-}" = "true" ]; then
+              echo "::error::TWO_VOICE_SYNTHETIC_BOT_TOKEN missing while VOICE_SYNTHETIC_REQUIRED=true"
+              exit 1
+            fi
+            echo "::notice::voice synthetic not configured yet (no test bot token); see docs/voice-synthetic.md"
+            exit 0
+          fi
+          # One retry absorbs a transient gateway/REST hiccup; two failures fail the run.
+          for attempt in 1 2; do
+            if python3 scripts/staging_voice_synthetic.py --evidence "voice-synthetic-$RUN_ID-$attempt.json"; then
+              exit 0
+            fi
+            echo "::warning::voice synthetic attempt $attempt failed"
+            [ "$attempt" = 2 ] || sleep 30
+          done
+          exit 1
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: voice-synthetic-${{ github.run_id }}
+          path: voice-synthetic-${{ github.run_id }}-*.json
+          if-no-files-found: ignore
+          retention-days: 14

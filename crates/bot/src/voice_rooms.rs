@@ -1233,6 +1233,11 @@ pub(crate) struct LiveState {
     /// Override of [`EMPTY_ROOM_GRACE`] (`TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS`
     /// in production, shorter values in fixtures).
     empty_grace: Option<Duration>,
+    /// Staging-only synthetic test identities (`TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS`)
+    /// that count as human occupants although Discord marks them as bots, so
+    /// an automated voice test can own a room and empty it by leaving. Always
+    /// empty for the live guild (see [`VoiceRuntime::with_synthetic_humans`]).
+    synthetic_humans: HashSet<Snowflake>,
     /// Game/stream facts per member for room-name tokens. Only non-empty
     /// entries are kept, at most [`MAX_TRACKED_PRESENCES`]; empty without
     /// the `TWO_VOICE_PRESENCE` gateway intent.
@@ -1343,10 +1348,18 @@ impl LiveState {
         admin_view_roles(guild, &roles)
     }
 
+    /// Unknown identity counts as human; a known bot only when it is a
+    /// configured staging synthetic test identity.
+    fn counts_as_human(&self, member_id: Snowflake, bot: Option<bool>) -> bool {
+        bot != Some(true) || self.synthetic_humans.contains(&member_id)
+    }
+
     fn humans(&self, channel: Snowflake) -> usize {
         self.members
-            .values()
-            .filter(|member| member.channel_id == Some(channel) && member.bot != Some(true))
+            .iter()
+            .filter(|(id, member)| {
+                member.channel_id == Some(channel) && self.counts_as_human(**id, member.bot)
+            })
             .count()
     }
 
@@ -1355,7 +1368,9 @@ impl LiveState {
         let mut ids: Vec<Snowflake> = self
             .members
             .iter()
-            .filter(|(_, member)| member.channel_id == Some(channel) && member.bot != Some(true))
+            .filter(|(id, member)| {
+                member.channel_id == Some(channel) && self.counts_as_human(**id, member.bot)
+            })
             .map(|(id, _)| *id)
             .collect();
         ids.sort_unstable();
@@ -1420,7 +1435,7 @@ impl LiveState {
             .map(|(member_id, member)| RoomMember {
                 member_id: *member_id,
                 joined_at_ms: member.joined_at_ms,
-                is_bot: member.bot == Some(true),
+                is_bot: !self.counts_as_human(*member_id, member.bot),
             })
             .collect();
         members.sort_by_key(|member| member.member_id);
@@ -1507,6 +1522,12 @@ impl LiveGuild {
     /// unrelated lifecycle races. Production keeps the 60 s default.
     pub fn set_empty_grace(&self, grace: Duration) {
         self.write_state().empty_grace = Some(grace);
+    }
+
+    /// Install the staging synthetic test identities (see
+    /// [`VoiceRuntime::with_synthetic_humans`]).
+    pub fn set_synthetic_humans(&self, ids: HashSet<Snowflake>) {
+        self.write_state().synthetic_humans = ids;
     }
 
     pub fn publish(&self, snapshot: GuildSnapshot) -> bool {
@@ -2677,7 +2698,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         let occupants: Vec<Snowflake> = live
             .members
             .iter()
-            .filter(|(_, member)| member.channel_id == Some(channel_id) && member.bot != Some(true))
+            .filter(|(member_id, member)| {
+                member.channel_id == Some(channel_id)
+                    && live.counts_as_human(**member_id, member.bot)
+            })
             .map(|(member_id, _)| *member_id)
             .collect();
         // Manage Channels admins ride `Role` View allows, resolved live so a
@@ -2802,8 +2826,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             let current: Vec<Snowflake> = live
                 .members
                 .iter()
-                .filter(|(_, member)| {
-                    member.channel_id == Some(channel) && member.bot != Some(true)
+                .filter(|(member_id, member)| {
+                    member.channel_id == Some(channel)
+                        && live.counts_as_human(**member_id, member.bot)
                 })
                 .map(|(member_id, _)| *member_id)
                 .collect();
@@ -5524,6 +5549,7 @@ pub struct VoiceRuntime<S, H> {
     enabled: bool,
     protected_channels: HashSet<Snowflake>,
     empty_grace: Option<Duration>,
+    synthetic_humans: HashSet<Snowflake>,
     seeds: AtomicU64,
     actors: Mutex<HashMap<Snowflake, GuildActor>>,
     /// Serializes `/access` read-modify-write cycles so two admins cannot
@@ -5557,6 +5583,7 @@ where
             enabled,
             protected_channels: HashSet::new(),
             empty_grace: None,
+            synthetic_humans: HashSet::new(),
             seeds: AtomicU64::new(initial_seed()),
             actors: Mutex::new(HashMap::new()),
             access_lock: tokio::sync::Mutex::new(()),
@@ -5583,6 +5610,14 @@ where
     /// production; fixtures shorten it for unrelated lifecycle races).
     pub fn with_empty_grace(mut self, grace: Duration) -> Self {
         self.empty_grace = Some(grace);
+        self
+    }
+
+    /// Staging synthetic test identities that count as human occupants
+    /// (`TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS`). Never applied to the live guild,
+    /// whatever the configuration says.
+    pub fn with_synthetic_humans(mut self, ids: HashSet<Snowflake>) -> Self {
+        self.synthetic_humans = ids;
         self
     }
 
@@ -5673,6 +5708,10 @@ where
             .protect_channels(self.protected_channels.iter().copied());
         if let Some(grace) = self.empty_grace {
             actor.live.set_empty_grace(grace);
+        }
+        let synthetic = synthetic_humans_for(guild, &self.synthetic_humans);
+        if !synthetic.is_empty() {
+            actor.live.set_synthetic_humans(synthetic);
         }
         let live = actor.live.clone();
         let make = Arc::clone(&self.make);
@@ -6409,6 +6448,12 @@ pub fn build_production_runtime(
             .as_deref(),
     )
     .map_err(|_| RoomHttpError::InvalidRequest)?;
+    let synthetic_humans = configured_synthetic_humans(
+        std::env::var("TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS")
+            .ok()
+            .as_deref(),
+    )
+    .map_err(|_| RoomHttpError::InvalidRequest)?;
     let replies = RoomHttp::new(token.to_owned())?;
     let http = replies.clone();
     let store = PgRoomStore::new(pool);
@@ -6421,6 +6466,7 @@ pub fn build_production_runtime(
             )
             .with_protected_channels(protected)
             .with_empty_grace(empty_grace)
+            .with_synthetic_humans(synthetic_humans)
             .with_name_policy(name_policy),
         ),
         Arc::new(replies),
@@ -6450,6 +6496,51 @@ pub fn configured_empty_grace(value: Option<&str>) -> Result<Duration, InvalidEm
 /// `0..=600`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidEmptyGrace;
+
+/// The synthetic test identities a guild's actor may use: none for the live
+/// guild, whatever `TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS` says.
+fn synthetic_humans_for(guild: Snowflake, ids: &HashSet<Snowflake>) -> HashSet<Snowflake> {
+    if guild.to_string() == two_bot_core::backup::guild_config::LIVE_GUILD_ID {
+        HashSet::new()
+    } else {
+        ids.clone()
+    }
+}
+
+/// Most synthetic test identities one deployment may configure.
+const MAX_SYNTHETIC_HUMANS: usize = 4;
+
+/// `TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS`: comma-separated Discord user IDs of
+/// staging synthetic test bots that count as human voice occupants, so the
+/// automated staging voice test can own a room and empty it by leaving. Unset
+/// or empty keeps every bot non-human. At most four IDs; anything that is not
+/// a non-zero snowflake refuses the runtime rather than guessing. Production
+/// never sets it, and the runtime ignores it for the live guild regardless.
+pub fn configured_synthetic_humans(
+    value: Option<&str>,
+) -> Result<HashSet<Snowflake>, InvalidSyntheticHumans> {
+    let mut ids = HashSet::new();
+    for raw in value.unwrap_or_default().split(',').map(str::trim) {
+        if raw.is_empty() {
+            continue;
+        }
+        match raw.parse::<Snowflake>() {
+            Ok(id) if id > 0 && raw.bytes().all(|byte| byte.is_ascii_digit()) => {
+                ids.insert(id);
+            }
+            _ => return Err(InvalidSyntheticHumans),
+        }
+    }
+    if ids.len() > MAX_SYNTHETIC_HUMANS {
+        return Err(InvalidSyntheticHumans);
+    }
+    Ok(ids)
+}
+
+/// `TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS` held something other than up to four
+/// comma-separated non-zero snowflakes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidSyntheticHumans;
 
 /// Complete guild snapshot from the post-update cache. Returns None until the
 /// cache holds the guild, the bot user and the voice states — never publish a

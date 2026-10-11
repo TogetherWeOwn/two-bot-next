@@ -247,5 +247,6 @@ Catalog entries: 122.
 | `TWO_TEMP_VOICE_PANEL_CHANNEL_ID` | cold | Not specified in Next | stored unwired | Destination for temporary-room control panels. |
 | `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS` | cold | Not specified in Next | env at boot; stored unwired | Channels temporary-room cleanup may not remove. |
 | `TWO_TEMP_VOICE_SWEEP_SECONDS` | cold | Not specified in Next | stored unwired | Temporary-room cleanup sweep interval. |
+| `TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS` | env_only | Not specified in Next | environment only | Staging synthetic voice-test bots counted as human occupants; ignored for the live guild. |
 | `TWO_TEXT_COMMANDS` | cold | `false` | env at boot; stored unwired | Enable optional text triggers only while automations are enabled. |
 | `TWO_TICKET_COOLDOWN_SECONDS` | cold | Not specified in Next | stored unwired | Cooldown between ticket openings. |

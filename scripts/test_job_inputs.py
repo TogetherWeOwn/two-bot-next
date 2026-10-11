@@ -659,6 +659,40 @@ class WorkflowSurfaceTests(unittest.TestCase):
         self.assertIn("pull_request", self.selector)
         self.assertIn("rust=true", self.selector)
 
+class VoiceSelectionTest(unittest.TestCase):
+    """Owner policy 2026-10-11: the voice synthetic runs on PRs only for voice inputs."""
+
+    def test_voice_inputs_select_the_synthetic(self):
+        for path in (
+            "crates/bot/src/voice_rooms.rs",
+            "crates/bot/src/voice_rooms/join_requests.rs",
+            "crates/core/src/voice_name_filter.rs",
+            "crates/bot/src/gateway.rs",
+            "tests/voice_templates/corpus.json",
+            "Cargo.lock",
+            "scripts/staging_voice_synthetic.py",
+            ".github/workflows/voice-synthetic.yml",
+            "./crates/bot/src/voice_room_plan.rs",
+        ):
+            self.assertTrue(inputs.voice_selected([path]), path)
+
+    def test_unrelated_changes_skip_the_synthetic(self):
+        for path in (
+            "crates/bot/src/tickets.rs",
+            "crates/core/src/settings.rs",
+            "docs/voice-rooms.md",
+            "wrangler/src/index.ts",
+            "README.md",
+        ):
+            self.assertFalse(inputs.voice_selected([path]), path)
+        self.assertFalse(inputs.voice_selected([]))
+
+    def test_any_deletion_selects_the_synthetic(self):
+        self.assertTrue(inputs.voice_selected([], ["docs/old.md"]))
+
+    def test_voice_is_never_a_ci_job(self):
+        self.assertNotIn(inputs.VOICE, inputs.ALL_JOBS)
+
 
 if __name__ == "__main__":
     unittest.main()
