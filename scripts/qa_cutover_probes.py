@@ -394,37 +394,33 @@ def check_jobs(report, now_ms=None, enforce_freshness=True):
             stale.append(f"{name} has nonfinite {nonfinite_field} "
                          f"(unassessable freshness)")
             continue
-        try:
-            age = job_age_seconds(entry, now_ms)
-            if age is None:
-                # No success recorded yet. A fresh boot (no attempts yet) is not
-                # evidence of stuck, but attempts that all failed are: a failed
-                # attempt leaves last_success unchanged (jobs.rs), and cutover
-                # runs right after a deploy, exactly when last_success is null.
-                failures = consecutive_failures(entry)
-                if failures > 0:
-                    detail = f"{name}=no-success {failures} consecutive failures"
-                    error = entry.get("last_error_class")
-                    if isinstance(error, str) and error:
-                        detail += f" (last error {error})"
-                    stale.append(detail)
-                    continue
-                started = _field_age_seconds(entry, "last_start", now_ms)
-                if started is not None and started > limit:
-                    stale.append(f"{name}=last_start {started}s ago with no "
-                                 f"success (>{limit}s)")
-                    continue
-                not_yet += 1
-                continue  # never ran yet; not evidence of stuck
-            if age > limit:
-                stale.append(f"{name}={age}s > {limit}s")
-            else:
-                fresh += 1
-                if age > WARN_LAST_SUCCESS_AGE_SECONDS[name]:
-                    warns.append(f"{name}={age}s")
-        except ProbeError as exc:
-            stale.append(f"{name} has {exc}")
-            continue
+        age = job_age_seconds(entry, now_ms)
+        if age is None:
+            # No success recorded yet. A fresh boot (no attempts yet) is not
+            # evidence of stuck, but attempts that all failed are: a failed
+            # attempt leaves last_success unchanged (jobs.rs), and cutover
+            # runs right after a deploy, exactly when last_success is null.
+            failures = consecutive_failures(entry)
+            if failures > 0:
+                detail = f"{name}=no-success {failures} consecutive failures"
+                error = entry.get("last_error_class")
+                if isinstance(error, str) and error:
+                    detail += f" (last error {error})"
+                stale.append(detail)
+                continue
+            started = _field_age_seconds(entry, "last_start", now_ms)
+            if started is not None and started > limit:
+                stale.append(f"{name}=last_start {started}s ago with no "
+                             f"success (>{limit}s)")
+                continue
+            not_yet += 1
+            continue  # never ran yet; not evidence of stuck
+        if age > limit:
+            stale.append(f"{name}={age}s > {limit}s")
+        else:
+            fresh += 1
+            if age > WARN_LAST_SUCCESS_AGE_SECONDS[name]:
+                warns.append(f"{name}={age}s")
     if stale:
         shown = ", ".join(stale)
         raise ProbeError(f"stale jobs past max_last_success_age_seconds or "
