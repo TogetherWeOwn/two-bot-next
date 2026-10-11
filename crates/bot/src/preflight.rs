@@ -205,7 +205,8 @@ impl Targets {
         };
         let guild_id =
             snowflake(&guild).map_err(|_| "GUILD_ID must be a nonzero Discord snowflake")?;
-        let gates = OnboardingGates::from_map(vars).map_err(|_| "invalid TWO_ONBOARDING_MODE")?;
+        let gates = OnboardingGates::from_map(vars)
+            .map_err(|_| "invalid TWO_ONBOARDING_MODE or TWO_ONBOARDING_DRY_RUN")?;
         let role_writes = level_role_writes_allowed(gates.mode) && !gates.dry_run;
         let ticket_keys = [
             "DISCORD_TICKET_CATEGORY_ID",

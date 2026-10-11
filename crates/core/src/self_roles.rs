@@ -783,9 +783,18 @@ impl SelfRoleGates {
             .get("TWO_SELF_ROLE_PANELS")
             .map(String::as_str)
             .unwrap_or("");
+        let dry_run = match vars.get("TWO_SELF_ROLE_DRY_RUN").map(String::as_str) {
+            None | Some("0") => false,
+            Some("1") => true,
+            Some(_) => {
+                return Err(SelfRoleConfigError::new(
+                    "TWO_SELF_ROLE_DRY_RUN must be \"0\" or \"1\" when set.",
+                ))
+            }
+        };
         Ok(Self {
             panels: parse_self_role_panels(raw)?,
-            dry_run: vars.get("TWO_SELF_ROLE_DRY_RUN").is_some_and(|v| v == "1"),
+            dry_run,
         })
     }
 }
@@ -2067,6 +2076,25 @@ mod tests {
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect();
         assert!(SelfRoleGates::from_map(&vars).expect("parses").dry_run);
+    }
+
+    #[test]
+    fn dry_run_accepts_only_absent_zero_or_one() {
+        let parse = |raw: &str| {
+            SelfRoleGates::from_map(&HashMap::from([(
+                "TWO_SELF_ROLE_DRY_RUN".to_owned(),
+                raw.to_owned(),
+            )]))
+        };
+        assert!(!parse("0").expect("0 parses").dry_run);
+        for raw in ["true", "yes", "on", "TRUE", "", "01", " 1"] {
+            let err = parse(raw).expect_err(raw);
+            assert_eq!(
+                err.message(),
+                "TWO_SELF_ROLE_DRY_RUN must be \"0\" or \"1\" when set.",
+                "{raw:?}"
+            );
+        }
     }
 
     #[test]
