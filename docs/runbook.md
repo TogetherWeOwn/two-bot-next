@@ -363,11 +363,13 @@ orphan (an untracked creator-channel orphan needing manual deletion)
 appears — so a low-volume stranded-member failure still pages. Any outcome
 other than `success` (`category_full`, `discord`, `persistence`,
 `cancelled`) counts as a failure: the join did not place a room, or the
-move/delete did not complete. `refused` (a member at their room cap or burst
-limit) is admission policy working as designed, so it never pages; read it
-from `two_bot_voice_operations_total{outcome="refused"}`. A counter reset
-(process restart) skips the window rather than firing, and a slow trickle
-below threshold stays silent.
+move/delete did not complete. `refused` (a room cap or create burst, per
+member or per guild) is admission policy working as designed, so it never
+pages. No installed rule watches it: read it from
+`two_bot_voice_operations_total{outcome="refused"}`, and if joins stop placing
+rooms while it climbs, look for a stuck cap (an unsettled reservation holding a
+slot). A counter reset (process restart) skips the window rather than firing,
+and a slow trickle below threshold stays silent.
 
 First response: scope the failing operation from the `op`/`outcome` labels
 on `two_bot_voice_operations_total` via the authorized `/ops/metrics`

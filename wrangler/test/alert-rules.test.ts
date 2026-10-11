@@ -183,21 +183,23 @@ test("voice failures fire on the lifecycle-drill failure exposition, silent on h
   assert.deepEqual(ev(healthy).firing, []);
 });
 
-test("admission refusals never page voice failures, but a real failure storm still does", () => {
+test("admission refusals never page voice failures or dilute a real failure ratio", () => {
   const base = ev([`two_bot_voice_operations_total{op="create",outcome="success"} 3`]);
-  // One member hopping between their room and the creator: three more creates
-  // succeed while ten admission refusals land in the same window.
+  // One member hopping between their room and the creator: ten creates succeed
+  // while ten admission refusals land in the same window.
   const hopping = ev([
-    `two_bot_voice_operations_total{op="create",outcome="success"} 6`,
+    `two_bot_voice_operations_total{op="create",outcome="success"} 13`,
     `two_bot_voice_operations_total{op="create",outcome="refused"} 10`,
   ], base.state);
   assert.deepEqual(hopping.firing, []);
-  const storm = ev([
-    `two_bot_voice_operations_total{op="create",outcome="success"} 6`,
-    `two_bot_voice_operations_total{op="create",outcome="discord"} 7`,
+  // One failure in ten admitted operations is 10%: the same refusals must not
+  // dilute it below the 5% line.
+  const diluted = ev([
+    `two_bot_voice_operations_total{op="create",outcome="success"} 12`,
+    `two_bot_voice_operations_total{op="create",outcome="discord"} 1`,
     `two_bot_voice_operations_total{op="create",outcome="refused"} 10`,
   ], base.state);
-  assert.deepEqual(storm.firing, ["voice_failures"]);
+  assert.deepEqual(diluted.firing, ["voice_failures"]);
 });
 
 test("voice failures ignore trickles and restarts, fire on lone dead-letters/orphans", () => {
