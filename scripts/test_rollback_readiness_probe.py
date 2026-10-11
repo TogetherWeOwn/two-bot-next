@@ -327,6 +327,9 @@ class RollbackReadinessProbeTests(unittest.TestCase):
             "int-digit overflow in wrangler config": (
                 lambda: self.fx.config.write_text(CONFIG.replace("[vars]\n", "[vars]\nDIGITS = " + "1" * 4301 + "\n")),
                 {}, "deploy-config", "is not valid TOML"),
+            "deeply nested wrangler config": (
+                lambda: self.fx.config.write_text("a = " + "[" * 1000 + "]" * 1000 + "\n"),
+                {}, "deploy-config", "is not valid TOML"),
         }
         for label, (arrange, opts, name, reason) in cases.items():
             with self.subTest(label):
