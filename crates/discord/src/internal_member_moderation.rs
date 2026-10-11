@@ -365,9 +365,8 @@ fn member_error(error: MemberError) -> ActionError {
         MemberError::Discord(MemberDiscordError::RateLimited) => {
             (ErrorCode::RateLimited, error.to_string())
         }
-        MemberError::Discord(MemberDiscordError::Unavailable(_)) => {
-            (ErrorCode::DiscordUnavailable, error.to_string())
-        }
+        MemberError::Discord(MemberDiscordError::Unavailable(_))
+        | MemberError::BotIdentityUnknown => (ErrorCode::DiscordUnavailable, error.to_string()),
         MemberError::Store(_) => (
             ErrorCode::Internal,
             "moderation persistence failed; do not repeat an uncertain effect".to_owned(),
