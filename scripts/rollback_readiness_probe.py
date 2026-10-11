@@ -354,7 +354,8 @@ def check_deploy_config(config, envs, extra_keys):
             cfg = tomllib.load(f)
     except OSError as e:
         raise ProbeError(f"cannot read {config} ({e.__class__.__name__})")
-    except tomllib.TOMLDecodeError:
+    except ValueError:
+        # tomllib raises a plain ValueError for integers past the digit cap.
         raise ProbeError(f"{config} is not valid TOML")
     required = sorted(set(REQUIRED_TWO_KEYS) | set(extra_keys)
                       | {k for k in cfg.get("vars", {}) if k.startswith("TWO_")})

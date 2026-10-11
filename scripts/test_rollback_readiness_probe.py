@@ -324,6 +324,9 @@ class RollbackReadinessProbeTests(unittest.TestCase):
             "extra required key": (
                 lambda: None, {"argv": ("--require", "TWO_MODERATION")},
                 "deploy-config", "lacks TWO_MODERATION"),
+            "int-digit overflow in wrangler config": (
+                lambda: self.fx.config.write_text(CONFIG.replace("[vars]\n", "[vars]\nDIGITS = " + "1" * 4301 + "\n")),
+                {}, "deploy-config", "is not valid TOML"),
         }
         for label, (arrange, opts, name, reason) in cases.items():
             with self.subTest(label):
