@@ -46,6 +46,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_dispatch_drops_total{lane}` | Dispatch-lane saturation drops: every event refused because every attempted lane was full. `lane` is one of `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` (see label allowlists below). The `reactions` lane additionally counts per-member fairness refusals: a reaction refused because its member already holds `PER_USER_IN_FLIGHT` reaction slots, even while the lane has free slots. A single-lane refusal counts its lane once; a privileged spill refused by both lanes counts both. Logs sample the first drop per 60 s per runtime, so bursts are O(1) lines with N counter increments. `dispatch_drops:<lane>` raises a ticket after growth in 3 consecutive completed keepalive sample windows; the first valid sample only establishes a baseline. A flat sample or counter reset clears the streak; missing/invalid samples break growth but never falsely resolve an active ticket. A single burst never pages. `reactions`-lane growth can reflect per-member fairness rather than an undersized lane. Dispatch refusals are not proof of gateway packet loss |
 | `two_bot_gateway_checkpoint_failures_total{stage}` | Failed gateway checkpoint commits from `apply_dispatch` and failed checkpoint clears: every failure stops the dispatch worker and is recorded on `operation`. `stage` is `pre_commit` (commit skipped after a funnel/leveling/acknowledgement failure) or `commit` (the durable store write itself failed); failure causes are never labels. Alert-threshold hook for M2.1 (lands once TOG-18943 unblocks): alert on any increase across consecutive keepalive samples; unlike bursty dispatch drops, a single checkpoint failure stops the worker, so there is no benign-singleton case |
 | `two_bot_internal_actions_total{family,outcome}` | Signed website-action receiver executions by bounded family and outcome. `family` is one of `announcement`, `event`, `settings`, `moderation`, `membership` or `other` (see label allowlists below). `outcome` is `executed` or the refusal class (`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`, `conflict`, `upstream` or `internal`). Every request counts once; replays count on each serve. Refusal warn-summaries stay sampled; this counter is the alertable signal. Alert rule `receiver_refusals:<family>` fires when a family's refused outcomes rise in 3 consecutive keepalive samples (first sample and restarts clear the streak; one forged pre-auth probe in `other` stays silent) |
+| `two_bot_community_facts_drain_failures_total{reason}` | Warn-and-continue community-facts drain failures in the gateway dispatch worker. `reason` is `error` (the facts writer returned an error) or `timeout` (the drain missed the dispatch deadline), or `other` (see label allowlists below). Each failed dispatch counts once; a committed drain counts nothing. The worker never stalls on this, and the scorecard fails closed on missing coverage. Alert-threshold hook for M2.1: alert when the counter increases across consecutive scrapes; a single failed drain is not paging |
 
 ## Job coverage and outcomes
 
@@ -130,7 +131,9 @@ as dynamic labels.
   `POST /guilds/:guild/scheduled-events`,
   `PATCH /guilds/:guild/scheduled-events/:event`,
   `DELETE /guilds/:guild/scheduled-events/:event`,
-  `POST /guilds/:guild/channels`, `DELETE /channels/:channel`, `other`).
+  `POST /guilds/:guild/channels`, `DELETE /channels/:channel`,
+  `GET /guilds/:guild/members/:member`, `GET /users/@me`,
+  `PATCH /webhooks/:application/:token/messages/@original`, `other`).
 - `two_bot_job_runs_total{job,outcome}`,
   `two_bot_job_last_success_timestamp_seconds{job}` and
   `two_bot_job_consecutive_failures{job}` — `job` is one of
@@ -207,6 +210,11 @@ as dynamic labels.
   `ReceiverState::terminal` plus the keyless-read and settings/moderation
   success envelopes for executions); no key id, token, body or request bytes
   ever become labels.
+- `two_bot_community_facts_drain_failures_total{reason}` — `reason` is `error`,
+  `timeout` or `other`. Recorded once per failed community-facts drain in
+  `crates/bot/src/gateway.rs` (`apply_dispatch`), in both warn-and-continue
+  arms; the existing warn log lines are unchanged. No error text, SQL or
+  identifier becomes a label.
 - Log fields (coordinated with blocked structured-log work, which owns JSON
   formatting): `voice_event="voice_operation"` with `op`/`outcome`,
   `voice_event="voice_reconcile"` with plan counts,
@@ -300,6 +308,24 @@ webhook requires exactly `OPS_ALERT_FORWARDING = "on"`; the default is `"off"`.
 Both readiness and metrics share the [Discord-only destination validator and
 non-destructive disable switch](container-readiness.md#threshold-and-notifications).
 No Prometheus server, no new infrastructure.
+
+Background alert scrapes share the streaming 64 KiB body cap and a single
+six-second request/body deadline. Non-OK bodies are cancelled without buffering;
+oversize or stalled bodies are cancelled too, without waiting on a cancellation
+hook. Failed scrapes log only `two-bot metrics scrape failed`: no response body,
+exception detail, token or URL. Empty/non-exposition, malformed or interrupted
+bodies, timeouts, and missing/duplicate/invalid alert inputs keep the previous
+firing set, counter baselines and streaks, and emit no `RESOLVED` — except the
+dispatch-drop baselines and streaks, which reset without resolving active
+tickets (a failed scrape invalidates all dispatch baselines).
+The validator requires every always-emitted series consumed by the rules,
+including all current label combinations from `crates/core/src/metrics.rs`,
+with finite nonnegative integer inputs (pool-configured is 0 or 1). Additional
+series are accepted, including new label values with the same consumed schema;
+unrelated `NaN` latency and histogram `+Inf` remain valid Prometheus values.
+A complete valid scrape still persists state before notifying. This validation
+is only for background evaluation; the authenticated pull remains a bounded
+exposition proxy, and ownership and bearer controls are unchanged.
 
 - Authenticated pull: `GET /ops/metrics` on the Worker with
   `Authorization: Bearer <METRICS_SCRAPE_TOKEN>`. The token is an optional
