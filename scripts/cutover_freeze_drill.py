@@ -235,9 +235,6 @@ def live_transport(token):
         except urllib.error.HTTPError as error:
             code = error.code
             error.close()
-            if code in REDIRECT_STATUSES:
-                raise DrillError(
-                    f"refusing: discord answered a redirect ({code}) on {method}")
             raise DrillError(f"discord answered {code} on {method}")
         except Exception as error:
             raise DrillError(f"discord did not respond ({error.__class__.__name__})")

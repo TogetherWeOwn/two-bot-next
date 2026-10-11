@@ -317,6 +317,8 @@ class LiveTransportTests(unittest.TestCase):
              "discord answered an unexpected body shape on GET"),
             ("slowmode-not-json", {("PATCH", CHANNEL_PATH): (200, {}, b"REMOTE_BODY_SENTINEL")},
              "discord answered a non-JSON body on PATCH"),
+            ("slowmode-too-deep", {("PATCH", CHANNEL_PATH): (200, {}, b"[" * 65536)},
+             "discord answered a non-JSON body on PATCH"),
         )
         call = drill.live_transport(TOKEN)
         for name, overrides, reason in cases:
