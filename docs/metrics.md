@@ -59,6 +59,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_gateway_checkpoint_failures_total{stage}` | Failed gateway checkpoint commits from `apply_dispatch` and failed checkpoint clears: every failure stops the dispatch worker and is recorded on `operation`. `stage` is `pre_commit` (commit skipped after a funnel/leveling/acknowledgement failure) or `commit` (the durable store write itself failed); failure causes are never labels. Alert rule `gateway_checkpoint_failures` fires on any increase summed over every `stage` between consecutive keepalive samples (the first sample is baseline-only; the failing process lingers 75 s so a scrape lands before the restart resets the counter); unlike bursty dispatch drops, a single checkpoint failure stops the worker, so there is no benign-singleton case |
 | `two_bot_internal_actions_total{family,outcome}` | Signed website-action receiver executions by bounded family and outcome. `family` is one of `announcement`, `event`, `settings`, `moderation`, `membership` or `other` (see label allowlists below). `outcome` is `executed` or the refusal class (`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`, `conflict`, `upstream` or `internal`). Every request counts once; replays count on each serve. Refusal warn-summaries stay sampled; this counter is the alertable signal. Alert rule `receiver_refusals:<family>` fires when a family's refused outcomes rise in 3 consecutive keepalive samples (first sample and restarts clear the streak; one forged pre-auth probe in `other` stays silent) |
 | `two_bot_community_facts_drain_failures_total{reason}` | Warn-and-continue community-facts drain failures in the gateway dispatch worker. `reason` is `error` (the facts writer returned an error) or `timeout` (the drain missed the dispatch deadline), or `other` (see label allowlists below). Each failed dispatch counts once; a committed drain counts nothing. The worker never stalls on this, and the scorecard fails closed on missing coverage. Alert-threshold hook for M2.1: alert when the counter increases across consecutive scrapes; a single failed drain is not paging |
+| `two_bot_audit_delivery_halt` | Audit mirror delivery-halt state for staleness evaluation: `1` while the persistent kill switch is engaged, `0` once cleared. Label-free gauge set once per readable `audit_retry` sweep from the store's `delivery_halt` read; an unreadable halt keeps the last reported state, and a halted sweep still counts as a job `success` (the sweep ran; it claimed nothing by design). Manual check, not an alert input: no alert rule consumes this series and production alert forwarding stays off. No actor ID, timestamp, error text or row content ever reaches exposition |
 
 ## REST admission guard
 
@@ -479,7 +480,10 @@ is the catch-all for unknown job names only, so it has no single cadence.
 so idle guilds go stale while healthy) and is excluded from the fallback via
 `UNKNOWN_STALE_EXCLUDED` in `wrangler/src/alert-rules.ts`: it never tickets.
 `audit_retry` keeps its parked/halt reason in the catalog; a halted sweep still
-records success, so only a truly wedged sweep tickets. `feeds` is covered by
+records success, so only a truly wedged sweep tickets — check
+`two_bot_audit_delivery_halt` (`1` engaged, `0` cleared) to confirm a halted
+sweep is intentional before treating flat audit deliveries as a wedged job.
+`feeds` is covered by
 the coarse fallback, not a precise cadence, because its cadence is
 boot-configured (60–86400 s) with a live-configurable inner polling gate and
 successful gated ticks are not polling freshness; its failure alerting is

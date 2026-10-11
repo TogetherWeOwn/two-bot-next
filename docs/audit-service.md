@@ -123,7 +123,9 @@ the raw value is never logged.
   released unattempted. Rows whose store write failed fail the run
   (`database`); every per-row Discord outcome counts as success. Outcomes
   reach `/metrics` through the supervisor's `two_bot_job_*{job="audit_retry"}`
-  series.
+  series, and the halt itself through the label-free
+  `two_bot_audit_delivery_halt` gauge (`1` engaged, `0` cleared; an
+  unreadable halt keeps the last reported state).
 - `audit_runtime::handle()` exposes the same runtime to recorders;
   `AuditRuntime::record` routes and stores one event for the next sweep.
 - Logs carry counts and entry IDs only: `audit_retry_swept` (per-outcome
