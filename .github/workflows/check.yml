@@ -349,8 +349,8 @@ jobs:
       # docs-only PR can still weaken CONSTRAINTS.md, so this must see it.
       - name: Floor guard (HARD, CONSTRAINTS.md floor)
         env:
-          FLOOR_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
-          FLOOR_HEAD: ${{ github.event.pull_request.head.sha || 'HEAD' }}
+          FLOOR_BASE: ${{ github.event.pull_request && format('{0}^1', github.sha) || github.event.before || 'origin/main' }}
+          FLOOR_HEAD: ${{ github.sha }}
         run: python3 scripts/ci/check-floor-guard.py --base-ref "$FLOOR_BASE" --head-ref "$FLOOR_HEAD"
 
       - name: Patch coverage (WARN, 80% of added lines)
@@ -358,8 +358,8 @@ jobs:
         # The check job runs in a container whose default shell is sh (no pipefail).
         shell: bash
         env:
-          QUALITY_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
-          QUALITY_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          QUALITY_BASE: ${{ github.event.pull_request && format('{0}^1', github.sha) || github.event.before || 'origin/main' }}
+          QUALITY_HEAD: ${{ github.sha }}
         run: |
           set -euo pipefail
           rustup component add llvm-tools-preview
@@ -388,8 +388,8 @@ jobs:
         if: needs.job-inputs.outputs.rust != 'false'
         shell: bash
         env:
-          QUALITY_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
-          QUALITY_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          QUALITY_BASE: ${{ github.event.pull_request && format('{0}^1', github.sha) || github.event.before || 'origin/main' }}
+          QUALITY_HEAD: ${{ github.sha }}
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/ast-grep.zip"
@@ -413,12 +413,13 @@ jobs:
         if: needs.job-inputs.outputs.rust != 'false'
         shell: bash
         env:
-          QUALITY_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
-          QUALITY_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          QUALITY_BASE: ${{ github.event.pull_request && format('{0}^1', github.sha) || github.event.before || 'origin/main' }}
+          QUALITY_HEAD: ${{ github.sha }}
         run: |
           set -euo pipefail
           python3 -m pip --isolated --disable-pip-version-check --no-cache-dir install \
-            --target "$RUNNER_TEMP/semgrep" 'semgrep==1.180.0'
+            --only-binary=:all: --require-hashes --requirement scripts/ci/semgrep-requirements.txt \
+            --target "$RUNNER_TEMP/semgrep"
           export PATH="$RUNNER_TEMP/semgrep/bin:$PATH"
           export PYTHONPATH="$RUNNER_TEMP/semgrep${PYTHONPATH:+:$PYTHONPATH}"
           python3 scripts/ci/check-semgrep-warn.py \

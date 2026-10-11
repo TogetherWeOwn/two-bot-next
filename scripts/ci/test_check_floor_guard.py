@@ -111,6 +111,18 @@ class ScanTests(unittest.TestCase):
         )
         self.assertTrue(any("test-made-easier" in e for e in errors), errors)
 
+    def test_rust_iterator_skip_is_not_a_test_skip(self):
+        errors = gate.scan(
+            added("crates/core/src/store.rs", "items.iter().skip(1).collect()"),
+            [],
+            [],
+        )
+        self.assertEqual(errors, [])
+
+    def test_ignore_attribute_outside_test_path_is_not_a_test_skip(self):
+        errors = gate.scan(added("crates/core/src/store.rs", "#[ignore]"), [], [])
+        self.assertEqual(errors, [])
+
     def test_exit_call_is_not_a_skip(self):
         errors = gate.scan(
             added("scripts/ci/check-x.py", "    raise SystemExit(main())"),
@@ -144,6 +156,14 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("assertion-removed", errors[0])
 
+    def test_replacing_an_assertion_does_not_count_as_stripping_one(self):
+        errors = gate.scan(
+            added("crates/core/tests/store.rs", "    assert_eq!(got, expected);"),
+            [("crates/core/tests/store.rs", "    assert_eq!(got, want);")],
+            [],
+        )
+        self.assertEqual(errors, [])
+
     def test_removed_ordinary_line_passes(self):
         errors = gate.scan(
             [],
@@ -176,6 +196,26 @@ class ScanTests(unittest.TestCase):
             [],
         )
         self.assertEqual(errors, [])
+
+    def test_review_date_change_is_not_a_lowered_threshold(self):
+        errors = gate.scan(
+            added("CONSTRAINTS.md", "Last reviewed: 2026-11-02."),
+            [("CONSTRAINTS.md", "Last reviewed: 2026-10-11.")],
+            [],
+        )
+        self.assertEqual(errors, [])
+
+    def test_removed_constraint_row_fails(self):
+        errors = gate.scan(
+            [],
+            [("CONSTRAINTS.md", "| Coverage | Changed lines >= 80% covered |")],
+            [],
+        )
+        self.assertTrue(any("threshold-lowered" in error for error in errors), errors)
+
+    def test_deleted_constraints_file_fails(self):
+        errors = gate.scan([], [], ["CONSTRAINTS.md"])
+        self.assertTrue(any("threshold-lowered" in error for error in errors), errors)
 
     def test_numbers_outside_constraints_are_not_thresholds(self):
         errors = gate.scan(
@@ -304,11 +344,19 @@ class GitPlumbingTests(unittest.TestCase):
             git("commit", "-m", "unrelated base change", cwd=root, env=commit_env)
             git("merge", "--no-ff", "pr", "-m", "PR merge", cwd=root, env=commit_env)
 
-            merge_errors = gate.check(root, base)
+            merge_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=root, text=True
+            ).strip()
+            merge_parent = subprocess.check_output(
+                ["git", "rev-parse", "HEAD^1"], cwd=root, text=True
+            ).strip()
+            merge_errors = gate.check(root, base, merge_sha)
+            first_parent_errors = gate.check(root, merge_parent, merge_sha)
             pr_errors = gate.check(root, base, pr_head)
         finally:
             tmp.cleanup()
         self.assertTrue(any("silenced-checker" in error for error in merge_errors))
+        self.assertEqual(first_parent_errors, [])
         self.assertEqual(pr_errors, [])
 
 

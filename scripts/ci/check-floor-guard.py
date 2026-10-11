@@ -58,32 +58,49 @@ INLINE_SUPPRESSIONS = re.compile(
     )
 )
 
-# Focused-test markers that take effect mid-line. The bare-name markers carry
-# a lookbehind so words that merely contain them (SystemExit, process::exit)
-# never match: only a real focused-test call counts.
-SKIP_CALLS = re.compile(
-    "|".join(
-        [
-            r"\." + r"skip\s*\(",
-            r"\." + r"todo\s*\(",
-            r"(?<!\w)x" + r"it\s*\(",
-            r"(?<!\w)x" + r"describe\s*\(",
-            r"pytest\.mark\." + "skip",
-            r"t\." + r"Skip\s*\(",
-        ]
-    )
+# Focused-test markers are language-specific: Rust's ordinary iterator
+# .skip() is not a test directive, while the same suffix in JS test runners is.
+JS_TEST_SKIP = re.compile(
+    r"\.(?:skip|todo)\s*\(|(?<!\w)x(?:it|describe)\s*\("
 )
+PYTHON_TEST_SKIP = re.compile(r"pytest\.mark\.skip")
+GO_TEST_SKIP = re.compile(r"t\.Skip\s*\(")
 
 TEST_PATH = re.compile(r"\.test\.|_test\.|/tests?/|test_")
 ASSERTS = re.compile(r"\bassert(_\w+)?!?|\bexpect\s*\(|\bshould\b")
 
 
 def _numbers(line):
-    return [float(n) for n in re.findall(r"\d+(?:\.\d+)?", line)]
+    without_dates = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", "", line)
+    return [float(n) for n in re.findall(r"\d+(?:\.\d+)?", without_dates)]
+
+
+def _constraint_key(line):
+    cells = line.strip().split("|")
+    if len(cells) < 3:
+        return None
+    key = cells[1].strip()
+    if not key or set(key) <= {"-", ":"} or key.lower() == "dimension":
+        return None
+    return key
 
 
 def _is_markdown(path):
     return path.endswith(".md")
+
+
+def _is_test_skip(path, line):
+    if not TEST_PATH.search(path):
+        return False
+    if path.endswith(".rs"):
+        return bool(ATTR_IGNORE.match(line))
+    if path.endswith((".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts")):
+        return bool(JS_TEST_SKIP.search(line))
+    if path.endswith(".py"):
+        return bool(PYTHON_TEST_SKIP.search(line))
+    if path.endswith(".go"):
+        return bool(GO_TEST_SKIP.search(line))
+    return False
 
 
 def _is_constraints(path):
@@ -104,30 +121,46 @@ def scan(added, removed, deleted):
             errors.append(f"silenced-checker: waiver added in {path}: {line.strip()[:120]}")
         elif INLINE_SUPPRESSIONS.search(line):
             errors.append(f"silenced-checker: waiver added in {path}: {line.strip()[:120]}")
-        if ATTR_IGNORE.match(line) or SKIP_CALLS.search(line):
+        if _is_test_skip(path, line):
             errors.append(f"test-made-easier: skip added in {path}: {line.strip()[:120]}")
 
     for path in deleted:
         if TEST_PATH.search(path):
             errors.append(f"deleted-test: test file removed: {path}")
+        if _is_constraints(path):
+            errors.append("threshold-lowered: CONSTRAINTS.md deleted")
 
+    removed_assertions = {}
+    added_assertions = {}
     for path, line in removed:
         if TEST_PATH.search(path) and ASSERTS.search(line):
-            errors.append(
-                f"assertion-removed: assertion dropped from {path}: {line.strip()[:120]}"
-            )
+            removed_assertions[path] = removed_assertions.get(path, 0) + 1
+    for path, line in added:
+        if TEST_PATH.search(path) and ASSERTS.search(line):
+            added_assertions[path] = added_assertions.get(path, 0) + 1
+    for path, count in removed_assertions.items():
+        if count > added_assertions.get(path, 0):
+            errors.append(f"assertion-removed: assertion dropped from {path}")
 
-    removed_limits = [line for path, line in removed if _is_constraints(path)]
-    added_limits = [line for path, line in added if _is_constraints(path)]
-    for old, new in zip(removed_limits, added_limits):
-        old_nums, new_nums = _numbers(old), _numbers(new)
-        for i, n in enumerate(new_nums):
-            if i < len(old_nums) and n < old_nums[i]:
-                errors.append(
-                    f"threshold-lowered: CONSTRAINTS.md weakened: "
-                    f"{old.strip()[:80]} -> {new.strip()[:80]}"
-                )
-                break
+    removed_limits = {}
+    added_limits = {}
+    for path, line in removed:
+        key = _constraint_key(line) if _is_constraints(path) else None
+        if key:
+            removed_limits[key] = line
+    for path, line in added:
+        key = _constraint_key(line) if _is_constraints(path) else None
+        if key:
+            added_limits[key] = line
+    for key, old in removed_limits.items():
+        new = added_limits.get(key)
+        old_nums = _numbers(old)
+        new_nums = _numbers(new) if new is not None else []
+        if new is None or len(new_nums) < len(old_nums) or any(
+            new_nums[i] < number for i, number in enumerate(old_nums)
+        ):
+            changed = f"{old.strip()[:80]} -> {new.strip()[:80]}" if new else old.strip()[:80]
+            errors.append(f"threshold-lowered: CONSTRAINTS.md weakened: {changed}")
 
     return errors
 
