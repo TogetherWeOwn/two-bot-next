@@ -85,6 +85,20 @@ differs:
                "orderBy":{"value":"timestamp","order":"desc"}}}
 ```
 
+`scripts/container_stdout_read.py` runs that query for you, read-only: it needs only
+`CLOUDFLARE_API_TOKEN`, sends nothing but the accounts list and this query (so it
+cannot start the container; the observability API stores the query run itself),
+and prints the newest lines oldest-first as JSON with
+secret-like values redacted and only a short allowlist of structured fields kept:
+
+```sh
+python3 scripts/container_stdout_read.py --service <container-application-id> \
+    --minutes 5 [--end 2026-10-11T12:00:00Z] [--contains "durable gateway failed"]
+```
+
+Zero events means "not observed in this window". Offline fixtures
+(`scripts/test_container_stdout_read.py`) pin the request body to the example above.
+
 Structured fields are filterable by key (`error_class exists`, `startup_phase exists`);
 the message is `$metadata.message`. Each process start logs `listening` first, with a
 fresh `run_id`, so one run's events share a `run_id` and a start-to-ready time is

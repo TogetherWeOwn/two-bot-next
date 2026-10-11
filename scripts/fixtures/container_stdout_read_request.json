@@ -1,0 +1,16 @@
+{
+  "queryId": "00000000-0000-4000-8000-000000000001",
+  "timeframe": {"from": 1791720900000, "to": 1791721200000},
+  "view": "events",
+  "limit": 100,
+  "parameters": {
+    "datasets": ["containers"],
+    "filters": [
+      {"key": "$metadata.service", "type": "string", "operation": "eq",
+       "value": "11111111-2222-4333-8444-555555555555"}
+    ],
+    "calculations": [],
+    "groupBys": [],
+    "orderBy": {"value": "timestamp", "order": "desc"}
+  }
+}
