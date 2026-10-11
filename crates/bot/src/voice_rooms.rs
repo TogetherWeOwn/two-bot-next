@@ -4199,6 +4199,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .collect();
         for channel_id in retries {
             if let Some((name, _)) = self.rename_retries.remove(&channel_id) {
+                // A detached completion can lag a newer proposal. Never let
+                // that old retry replace work already on the deferred lane.
+                if self.desired_names.get(&channel_id) != Some(&name)
+                    || self
+                        .queue
+                        .queued_rename_for(self.live.guild_id, channel_id)
+                        .is_some()
+                {
+                    continue;
+                }
                 self.queue.enqueue(
                     self.live.guild_id,
                     RoomAction::RenameRoom { channel_id, name },
@@ -5105,14 +5115,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 let skip = {
                     let live = self.live.read_state();
                     match live.channels.get(&channel_id) {
-                        _ if !self.rooms.contains_key(&channel_id)
-                            || self.desired_names.get(&channel_id) != Some(&name) =>
-                        {
-                            Some("rename_stale")
+                        _ if !self.rooms.contains_key(&channel_id) => Some("rename_room_gone"),
+                        _ if self.desired_names.get(&channel_id) != Some(&name) => {
+                            Some("rename_superseded")
                         }
                         None => Some("rename_unseen"),
                         Some(channel) if channel.name.as_deref() == Some(&name) => {
-                            Some("rename_stale")
+                            Some("rename_already_applied")
                         }
                         Some(_)
                             if !can_manage_room(
@@ -6624,7 +6633,7 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             worker.name_directory.insert(member_id, display);
         }
         ActorCommand::NameSettingsChanged(settings) => {
-            worker.name_settings = settings;
+            worker.update_name_settings(settings);
             worker.name_settings_loaded = true;
             worker.name_settings_read_ms = Some(now_ms);
         }
@@ -6644,7 +6653,11 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
         }
         ActorCommand::CreatorAdded(creator) => {
             worker.live.protect_channels([creator.channel_id]);
-            worker.creators.insert(creator.channel_id, creator);
+            if worker.creators.get(&creator.channel_id) != Some(&creator) {
+                worker.creators.insert(creator.channel_id, creator);
+                worker.name_signatures.clear();
+                worker.name_inputs = None;
+            }
             worker.reconcile();
         }
         ActorCommand::AccessChanged(controls) => worker.access = controls,
