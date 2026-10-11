@@ -52,6 +52,14 @@ needs the service itself ready (200, gateway ready); then a
 parked-but-truthful server fails gateway-state and stale/failing jobs fail
 jobs-map.
 
+Body-cap refusal contract: the transport reads at most BODY_CAP+1 bytes on
+both the normal and HTTPError paths so a hidden suffix is detected. Any body
+longer than BODY_CAP (64 KiB) is refused before JSON parsing with the fixed
+message "/health answered over the body cap" or "/readyz answered over the
+body cap"; exact-cap valid input passes, and the extra byte never reaches a
+successful JSON path. Refusals never echo the body, headers, URL or parse
+exceptions.
+
 Usage:
   python3 scripts/qa_cutover_probes.py --base-url URL [--expect-ready]
       [--timeout SECONDS] [--evidence FILE]
@@ -75,6 +83,11 @@ DEFAULT_TIMEOUT_SECONDS = 10
 USER_AGENT = "two-bot-next-staging-rollout/1.0"
 KNOWN_STATUSES = ("ready", "starting", "down")
 REQUIRED_COMPONENTS = ("process", "gateway")
+# Per-surface allowlist for this probe: the container's full breakdown is
+# process/gateway (required here) plus database/token_invalid (legitimate
+# optional; older fixtures may omit them). Anything else is refused with a
+# fixed-vocabulary error that names no component data.
+KNOWN_COMPONENTS = frozenset({"process", "gateway", "database", "token_invalid"})
 # Per-job last_success freshness bands, in seconds, derived from the jobs'
 # real cadences plus their per-attempt timeouts (a healthy sample's age runs
 # up to about one cadence plus runtime; last_success only advances on success,
@@ -205,12 +218,16 @@ def decode(body):
 def check_liveness(status, body):
     if status != 200:
         raise ProbeError(f"/health answered {status}, expected 200")
+    if len(body) > BODY_CAP:
+        raise ProbeError("/health answered over the body cap")
     if decode(body) != {"status": "ok"}:
         raise ProbeError("/health 200 without {\"status\": \"ok\"}")
     return "/health 200 {\"status\": \"ok\"}: process answers HTTP"
 
 
 def check_readyz_shape(status, body):
+    if len(body) > BODY_CAP:
+        raise ProbeError("/readyz answered over the body cap")
     report = decode(body)
     if isinstance(report, dict) and report.get("error"):
         raise ProbeError(f"/readyz refused with error {report.get('error')!r:.40} "
@@ -224,6 +241,13 @@ def check_readyz_shape(status, body):
                        and c[1] in KNOWN_STATUSES for c in components)):
         raise ProbeError(f"/readyz {status} without the components breakdown "
                          "(expected [[name, ready|starting|down], ...])")
+    # Reject duplicates before any readiness math: last-wins would let a
+    # later ready mask an earlier down.
+    names = [c[0] for c in components]
+    if len(set(names)) != len(names):
+        raise ProbeError(f"/readyz {status} repeats a component name")
+    if any(name not in KNOWN_COMPONENTS for name in names):
+        raise ProbeError(f"/readyz {status} carries an unknown component name")
     state = dict(components)
     missing = [name for name in REQUIRED_COMPONENTS if name not in state]
     if missing:
@@ -401,6 +425,19 @@ def run(args, fetch_fn=None):
     # Liveness first: it is independent of the readyz body.
     record("liveness", SRC_SERVER, check_liveness, health_status, health_body)
 
+    if len(readyz_body) > BODY_CAP:
+        # Refuse before any JSON parsing: the extra byte never reaches decode.
+        oversize = "/readyz answered over the body cap"
+        results.append(Result("readiness-shape", False, oversize,
+                              f"{SRC_SERVER}, {SRC_HEALTH}"))
+        results.append(Result("gateway-state", False,
+                              "no truthful breakdown to read gateway from", SRC_GATEWAY))
+        results.append(Result("jobs-map", False,
+                              "no truthful breakdown to read jobs from", SRC_JOBS))
+        results.append(Result("fence-watch", False,
+                              "no truthful breakdown to rule out a fence refusal",
+                              SRC_FENCE))
+        return None, results
     report = decode(readyz_body)
     try:
         state, shape_reason = check_readyz_shape(readyz_status, readyz_body)

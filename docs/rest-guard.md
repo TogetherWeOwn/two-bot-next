@@ -130,7 +130,10 @@ bodies, or credentials are included. `RateLimitGuard::snapshot()` exposes the
 rolling invalid count, lifetime invalid/refused/open/close/global-pause counters,
 open/fatal flags, remaining global cooldown and `pending_global_responses` for
 the metrics exporter. A pending global body still blocks admission when its
-provisional remaining time is zero. No metrics endpoint exists in this base slice; no new public endpoint is added.
+provisional remaining time is zero. The private `/metrics` scrape exposes the
+snapshot as eleven `two_bot_rest_guard_*` series; see
+[REST admission guard](metrics.md#rest-admission-guard). No new public endpoint
+is added.
 
 Local fixtures only:
 

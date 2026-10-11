@@ -614,12 +614,16 @@ async fn run(cli_args: &[String]) {
             match failed {
                 None => Ok(()),
                 Some(failed) => {
+                    // Only a running-gateway failure lingers 75 s so a
+                    // keepalive scrape sees the checkpoint counter; startup
+                    // failures keep the short 15 s linger.
+                    let linger = shutdown::failure_linger(failed.class);
                     publish_gateway_failure(
                         &state,
                         &failure_slot,
                         failed.class,
                         linger_stop,
-                        shutdown::FAILURE_LINGER,
+                        linger,
                     )
                     .await;
                     Err(failed.error)

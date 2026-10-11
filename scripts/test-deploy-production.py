@@ -204,7 +204,7 @@ class StaticGuardTests(unittest.TestCase):
 
     def test_every_job_uses_the_shared_runner_routing(self):
         # scripts/test-runner-routing.py pins the full expression (TOG-12339).
-        self.assertEqual(list(JOBS), ["guard", "production"])
+        self.assertEqual(list(JOBS), ["guard", "production", "release"])
         for name, job in JOBS.items():
             runs_on = value(children(job[1:], 4)["runs-on"])
             self.assertTrue(runs_on.startswith("${{ fromJSON((!github.event.repository.private && "), name)
@@ -218,6 +218,17 @@ class StaticGuardTests(unittest.TestCase):
                 for key, block in children(children(job[1:], 4)["permissions"][1:], 6).items()
             }
             self.assertTrue(granted, name)
+            if name == "release":
+                # Only dispatches release.yml: the tag + SBOM chain runs outside this run's
+                # deploy-production group, so a rollback never queues behind it.
+                self.assertEqual(granted, {"actions": "write"})
+                release = "\n".join(JOBS["release"])
+                self.assertIn("needs: [guard, production]", release)
+                self.assertIn("if: needs.guard.outputs.mode == 'deploy'", release)
+                self.assertIn('run: gh workflow run release.yml --ref main -f sha="$SHA"', release)
+                self.assertIn("SHA: ${{ needs.guard.outputs.sha }}", release)
+                self.assertNotIn("uses:", release)
+                continue
             self.assertEqual(set(granted.values()), {"read"}, name)
         self.assertEqual(
             set(children(children(JOBS["production"][1:], 4)["permissions"][1:], 6)), {"contents"}

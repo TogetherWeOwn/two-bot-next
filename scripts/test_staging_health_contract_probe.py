@@ -127,6 +127,7 @@ class HealthContractProbeTests(unittest.TestCase):
         self.assertEqual(receipt["build_revision"], "abc123")
         self.assertEqual(receipt["build_id"], "1-1")
         self.assertIsNone(receipt["gateway_failure_class"])
+        self.assertIsNone(receipt["gateway_failure_root_cause"])
         self.assertEqual([(check["check"], check["verdict"]) for check in receipt["checks"]],
                          [("health", "pass"), ("readyz", "pass"), ("build", "pass")])
 
@@ -148,19 +149,86 @@ class HealthContractProbeTests(unittest.TestCase):
         self.assert_only_failure("readyz", "truthful, not E2E approval", code, results)
         receipt = json.loads(Path(self.evidence).read_text())
         self.assertEqual(receipt["result"], "fail")
+        self.assertIsNone(receipt["gateway_failure_root_cause"])
 
-    def test_db_behind_binary_names_the_migration_signature(self):
-        lagging = dict(READY)
-        lagging["components"] = components(("process", "ready"), ("gateway", "starting"),
-                                           ("database", "ready"), ("token_invalid", "ready"))
-        lagging["gateway_failure"] = {"phase": "durable_gateway",
-                                      "class": "checkpoint_load_failed"}
+    def test_other_known_failure_keeps_the_parked_verdict_and_redaction(self):
+        parked = dict(READY)
+        parked["components"] = components(("process", "ready"), ("gateway", "down"),
+                                          ("database", "ready"), ("token_invalid", "ready"))
+        sentinel = "sensitive-fixture-detail"
+        parked["gateway_failure"] = {"phase": "durable_gateway",
+                                     "class": "gateway_runtime_failed", "detail": sentinel}
         routes = {STAGING + "/health": body({"status": "ok"}),
-                  STAGING + "/readyz": body(lagging, status=503)}
+                  STAGING + "/readyz": body(parked, status=503)}
         code, results, _ = self.drive(routes)
-        self.assert_only_failure("readyz", "db-behind-binary signature", code, results)
+        self.assert_only_failure("readyz", "truthful, not E2E approval", code, results)
         receipt = json.loads(Path(self.evidence).read_text())
+        self.assertEqual(receipt["gateway_failure_class"], "gateway_runtime_failed")
+        self.assertIsNone(receipt["gateway_failure_root_cause"])
+        self.assertNotIn(sentinel, "\n".join(results.values()))
+        self.assertNotIn(sentinel, json.dumps(receipt))
+
+    def test_checkpoint_read_failure_does_not_infer_a_root_cause(self):
+        failed_read = dict(READY)
+        failed_read["components"] = components(("process", "ready"), ("gateway", "starting"),
+                                               ("database", "ready"), ("token_invalid", "ready"))
+        failed_read["gateway_failure"] = {"phase": "durable_gateway",
+                                          "class": "checkpoint_load_failed"}
+        routes = {STAGING + "/health": body({"status": "ok"}),
+                  STAGING + "/readyz": body(failed_read, status=503)}
+        code, results, _ = self.drive(routes)
+        self.assert_only_failure("readyz", "checkpoint read failed", code, results)
+        self.assertIn("separate reviewed schema/ACL/connectivity evidence",
+                      results["FAIL readyz"])
+        receipt = json.loads(Path(self.evidence).read_text())
+        self.assertEqual(receipt["result"], "fail")
         self.assertEqual(receipt["gateway_failure_class"], "checkpoint_load_failed")
+        self.assertEqual(receipt["gateway_failure_root_cause"], "unverified")
+        self.assertEqual([(check["check"], check["verdict"]) for check in receipt["checks"]],
+                         [("health", "pass"), ("readyz", "fail"), ("build", "pass")])
+        for text in ("\n".join(results.values()), json.dumps(receipt)):
+            self.assertNotIn("db-behind-binary", text)
+            self.assertNotIn("migration-lag", text)
+            self.assertNotIn("migrate before", text)
+        self.assertEqual(self.requested, [STAGING + "/health", STAGING + "/readyz"])
+
+    def test_checkpoint_failure_drops_unreviewed_cause_and_details(self):
+        failed_read = dict(READY)
+        failed_read["components"] = components(("process", "ready"), ("gateway", "down"),
+                                               ("database", "ready"), ("token_invalid", "ready"))
+        sentinel = "sensitive-fixture-detail"
+        for claimed_cause in ("schema", "acl", "connectivity"):
+            with self.subTest(claimed_cause=claimed_cause):
+                failed_read["gateway_failure"] = {
+                    "phase": "durable_gateway", "class": "checkpoint_load_failed",
+                    "root_cause": claimed_cause, "detail": sentinel,
+                }
+                routes = {STAGING + "/health": body({"status": "ok"}),
+                          STAGING + "/readyz": body(failed_read, status=503)}
+                code, results, _ = self.drive(routes)
+                self.assert_only_failure("readyz", "checkpoint read failed", code, results)
+                receipt = json.loads(Path(self.evidence).read_text())
+                self.assertEqual(receipt["gateway_failure_root_cause"], "unverified")
+                self.assertNotIn(sentinel, "\n".join(results.values()))
+                self.assertNotIn(sentinel, json.dumps(receipt))
+
+    def test_unknown_failure_class_refuses_without_echoing_details(self):
+        unknown = dict(READY)
+        unknown["components"] = components(("process", "ready"), ("gateway", "down"),
+                                           ("database", "ready"), ("token_invalid", "ready"))
+        sentinel = "sensitive-fixture-detail"
+        unknown["gateway_failure"] = {"phase": "durable_gateway", "class": sentinel,
+                                      "detail": sentinel}
+        routes = {STAGING + "/health": body({"status": "ok"}),
+                  STAGING + "/readyz": body(unknown, status=503)}
+        code, results, _ = self.drive(routes)
+        self.assert_readyz_unreadable("outside the fixed vocabulary", code, results)
+        receipt = json.loads(Path(self.evidence).read_text())
+        self.assertEqual(receipt["result"], "fail")
+        self.assertIsNone(receipt["gateway_failure_class"])
+        self.assertIsNone(receipt["gateway_failure_root_cause"])
+        self.assertNotIn(sentinel, "\n".join(results.values()))
+        self.assertNotIn(sentinel, json.dumps(receipt))
 
     def test_readyz_200_with_down_component_contradicts_the_breakdown(self):
         lying = dict(READY)
@@ -170,6 +238,45 @@ class HealthContractProbeTests(unittest.TestCase):
                   STAGING + "/readyz": body(lying, status=200)}
         code, results, _ = self.drive(routes)
         self.assert_only_failure("readyz", "contradicts the component breakdown", code, results)
+
+    def test_contradictory_checkpoint_class_does_not_classify_a_failed_read(self):
+        for status, gateway, expected in ((200, "down", 503), (503, "ready", 200)):
+            with self.subTest(status=status, gateway=gateway):
+                contradictory = dict(READY)
+                contradictory["components"] = components(
+                    ("process", "ready"), ("gateway", gateway),
+                    ("database", "ready"), ("token_invalid", "ready"))
+                contradictory["gateway_failure"] = {
+                    "phase": "durable_gateway", "class": "checkpoint_load_failed",
+                    "root_cause": "schema", "detail": "sensitive-fixture-detail",
+                }
+                routes = {STAGING + "/health": body({"status": "ok"}),
+                          STAGING + "/readyz": body(contradictory, status=status)}
+                code, results, _ = self.drive(routes)
+                self.assert_only_failure(
+                    "readyz", f"contradicts the component breakdown (expected {expected})",
+                    code, results)
+                receipt = json.loads(Path(self.evidence).read_text())
+                self.assertEqual(receipt["result"], "fail")
+                self.assertEqual(receipt["gateway_failure_class"], "checkpoint_load_failed")
+                self.assertIsNone(receipt["gateway_failure_root_cause"])
+                for text in ("\n".join(results.values()), json.dumps(receipt)):
+                    self.assertNotIn("checkpoint read failed", text)
+                    self.assertNotIn("root cause unverified", text)
+                    self.assertNotIn("sensitive-fixture-detail", text)
+
+    def test_ready_checkpoint_class_does_not_classify_a_failed_read(self):
+        ready = dict(READY, gateway_failure={"phase": "durable_gateway",
+                                            "class": "checkpoint_load_failed"})
+        routes = {STAGING + "/health": body({"status": "ok"}),
+                  STAGING + "/readyz": body(ready)}
+        code, results, _ = self.drive(routes)
+        self.assertEqual(code, 0)
+        self.assertEqual(set(results), {"PASS health", "PASS readyz", "PASS build"})
+        receipt = json.loads(Path(self.evidence).read_text())
+        self.assertEqual(receipt["result"], "pass")
+        self.assertEqual(receipt["gateway_failure_class"], "checkpoint_load_failed")
+        self.assertIsNone(receipt["gateway_failure_root_cause"])
 
     def test_ownership_refusal_is_not_the_bot_breakdown(self):
         routes = {STAGING + "/health": body({"status": "ok"}),
@@ -211,6 +318,220 @@ class HealthContractProbeTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("FAIL readyz", set(results))
         self.assertEqual(self.requested, [STAGING + "/health", STAGING + "/readyz"])
+
+    def dup_value(self, pairs, status=200):
+        value = dict(READY)
+        value["components"] = components(*pairs)
+        return status, value
+
+    def test_duplicate_down_then_ready_rejected_before_verdict(self):
+        _, value = self.dup_value((("process", "ready"), ("gateway", "down"),
+                                   ("database", "ready"), ("token_invalid", "ready"),
+                                   ("gateway", "ready")))
+        with self.assertRaisesRegex(probe.ProbeError, "repeats a component name"):
+            probe.parse_readyz(200, value)
+
+    def test_duplicate_ready_then_down_rejected_before_verdict(self):
+        _, value = self.dup_value((("process", "ready"), ("gateway", "ready"),
+                                   ("database", "ready"), ("token_invalid", "ready"),
+                                   ("gateway", "down")), status=503)
+        with self.assertRaisesRegex(probe.ProbeError, "repeats a component name"):
+            probe.parse_readyz(503, value)
+
+    def test_duplicate_same_value_rejected(self):
+        _, value = self.dup_value((("process", "ready"), ("gateway", "ready"),
+                                   ("database", "ready"), ("token_invalid", "ready"),
+                                   ("process", "ready")))
+        with self.assertRaisesRegex(probe.ProbeError, "repeats a component name"):
+            probe.parse_readyz(200, value)
+
+    def test_distinct_components_still_parse(self):
+        _, value = self.dup_value((("process", "ready"), ("gateway", "ready"),
+                                   ("database", "ready"), ("token_invalid", "ready")))
+        state, _ = probe.parse_readyz(200, value)
+        self.assertEqual(state["gateway"], "ready")
+
+    def test_duplicate_diagnostic_echoes_no_component_data(self):
+        sentinel = "SENTINEL_dup_health_abc123"
+        _, value = self.dup_value((("process", "ready"), ("gateway", "ready"),
+                                   ("database", "ready"), ("token_invalid", "ready"),
+                                   (sentinel, "ready"), (sentinel, "down")), status=503)
+        with self.assertRaises(probe.ProbeError) as ctx:
+            probe.parse_readyz(503, value)
+        self.assertIn("repeats a component name", str(ctx.exception))
+        self.assertNotIn(sentinel, str(ctx.exception))
+
+    def test_duplicate_readyz_fails_closed_end_to_end(self):
+        dup = dict(READY)
+        dup["components"] = components(("process", "ready"), ("gateway", "down"),
+                                       ("database", "ready"), ("token_invalid", "ready"),
+                                       ("gateway", "ready"))
+        routes = {STAGING + "/health": body({"status": "ok"}),
+                  STAGING + "/readyz": body(dup, status=200)}
+        code, results, _ = self.drive(routes)
+        self.assert_readyz_unreadable("repeats a component name", code, results)
+
+    def test_unknown_ready_down_starting_refused(self):
+        for extra_status, http_status in (("ready", 200), ("down", 503), ("starting", 503)):
+            with self.subTest(extra_status=extra_status):
+                _, value = self.dup_value((("process", "ready"), ("gateway", "ready"),
+                                           ("database", "ready"), ("token_invalid", "ready"),
+                                           (("voice", extra_status))), status=http_status)
+                with self.assertRaisesRegex(probe.ProbeError, "unknown component name"):
+                    probe.parse_readyz(http_status, value)
+
+    def test_unknown_diagnostic_echoes_no_component_data(self):
+        sentinel = "SENTINEL_unknown_health_abc123"
+        _, value = self.dup_value((("process", "ready"), ("gateway", "ready"),
+                                   ("database", "ready"), ("token_invalid", "ready"),
+                                   ((sentinel, "ready"))), status=200)
+        with self.assertRaises(probe.ProbeError) as ctx:
+            probe.parse_readyz(200, value)
+        self.assertIn("unknown component name", str(ctx.exception))
+        self.assertNotIn(sentinel, str(ctx.exception))
+
+    def test_unknown_readyz_fails_closed_end_to_end(self):
+        for extra_status, http_status in (("ready", 200), ("down", 503)):
+            with self.subTest(extra_status=extra_status):
+                unknown = dict(READY)
+                unknown["components"] = components(
+                    ("process", "ready"), ("gateway", "ready"),
+                    ("database", "ready"), ("token_invalid", "ready"),
+                    ("voice", extra_status))
+                routes = {STAGING + "/health": body({"status": "ok"}),
+                          STAGING + "/readyz": body(unknown, status=http_status)}
+                code, results, _ = self.drive(routes)
+                self.assert_readyz_unreadable("unknown component name", code, results)
+                self.assertNotIn("voice", "\n".join(results.values()))
+
+
+class BodyCapRefusalTests(unittest.TestCase):
+    """Oversized bodies are refused before JSON parsing (M4.42)."""
+
+    def setUp(self):
+        guard = mock.patch.object(probe.urllib.request.OpenerDirector, "open",
+                                  side_effect=AssertionError("network access in a unit test"))
+        guard.start()
+        self.addCleanup(guard.stop)
+        self.requested = []
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.evidence = str(Path(tmp.name) / "evidence.json")
+
+    def fetch(self, routes):
+        def fake(url):
+            self.requested.append(url)
+            if url not in routes:
+                raise AssertionError(f"unexpected offline fixture route: {url}")
+            response = routes[url]
+            if isinstance(response, Exception):
+                raise response
+            return response
+        return fake
+
+    def drive(self, routes, *extra, env=None):
+        out = io.StringIO()
+        argv = ["--staging-url", STAGING, "--evidence", self.evidence, *extra]
+        with mock.patch.dict(os.environ, env or {}, clear=True), \
+                redirect_stdout(out):
+            code = probe.main(argv, fetch_fn=self.fetch(routes))
+        lines = out.getvalue().splitlines()
+        named = {}
+        for line in lines[:-1]:
+            head, _, _ = line.partition(":")
+            named[head] = line
+        return code, named, lines[-1]
+
+    def padded(self, value, size):
+        raw = json.dumps(value).encode()
+        self.assertLessEqual(len(raw), size, "fixture must fit the target size")
+        return raw + b" " * (size - len(raw))
+
+    def test_exact_cap_valid_input_passes(self):
+        health = self.padded({"status": "ok"}, probe.BODY_CAP)
+        self.assertEqual(len(health), probe.BODY_CAP)
+        self.assertEqual(json.loads(health), {"status": "ok"})
+        routes = {STAGING + "/health": (200, {}, health),
+                  STAGING + "/readyz": (200, {}, json.dumps(dict(READY)).encode())}
+        code, results, _ = self.drive(routes)
+        self.assertEqual(code, 0, results)
+        self.assertEqual(set(results), {"PASS health", "PASS readyz", "PASS build"})
+
+    def test_valid_json_padded_past_cap_refuses_before_parsing(self):
+        sentinel = "SENTINEL_BODY_health_padded"
+        base = json.dumps({"status": "ok", "note": sentinel}).encode()
+        health = base + b" " * (probe.BODY_CAP + 1 - len(base))
+        self.assertEqual(len(health), probe.BODY_CAP + 1)
+        self.assertEqual(json.loads(health)["note"], sentinel)
+        routes = {STAGING + "/health": (200, {}, health),
+                  STAGING + "/readyz": (200, {}, json.dumps(dict(READY)).encode())}
+        code, results, _ = self.drive(routes)
+        self.assertEqual(code, 1, results)
+        self.assertIn("health probe answered over the body cap", results["FAIL health"])
+        self.assertNotIn(sentinel, results["FAIL health"])
+        self.assertNotIn(STAGING, results["FAIL health"])
+
+    def test_cap_length_valid_prefix_with_hidden_tail_refuses(self):
+        prefix = self.padded({"status": "ok"}, probe.BODY_CAP)
+        self.assertEqual(json.loads(prefix), {"status": "ok"})
+        routes = {STAGING + "/health": (200, {}, prefix + b"X"),
+                  STAGING + "/readyz": (200, {}, json.dumps(dict(READY)).encode())}
+        code, results, _ = self.drive(routes)
+        self.assertEqual(code, 1, results)
+        self.assertIn("health probe answered over the body cap", results["FAIL health"])
+
+    def test_readyz_httperror_oversize_enforces_the_same_bound(self):
+        import urllib.error
+        sentinel = "SENTINEL_BODY_readyz_httperror"
+        base = json.dumps(dict(READY, note=sentinel)).encode()
+        big = base + b" " * (probe.BODY_CAP + 1 - len(base))
+        self.assertEqual(len(big), probe.BODY_CAP + 1)
+        self.assertEqual(json.loads(big)["build_revision"], "abc123")
+        self.assertEqual(json.loads(big)["note"], sentinel)
+        routes = {STAGING + "/health": body({"status": "ok"}),
+                  STAGING + "/readyz": (503, {}, big)}
+        code, results, _ = self.drive(routes)
+        self.assertEqual(code, 1, results)
+        self.assertIn("readyz probe answered over the body cap", results["FAIL readyz"])
+        self.assertNotIn(sentinel, results["FAIL readyz"])
+        # The urllib HTTPError transport also reads a bounded amount.
+        seen = []
+
+        class Response(io.BytesIO):
+            status = 200
+            headers = {}
+
+            def read(self, n=-1):
+                seen.append(n)
+                return super().read(n)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class OkOpener:
+            def open(self, request, timeout=None):
+                return Response(b"{}")
+
+        with mock.patch.object(probe.urllib.request, "build_opener",
+                               return_value=OkOpener()):
+            probe.fetch(STAGING + "/health")
+        self.assertEqual(seen, [probe.BODY_CAP + 1])
+        seen.clear()
+
+        class ErrorOpener:
+            def open(self, request, timeout=None):
+                fp = Response(b"x")
+                raise urllib.error.HTTPError(request.full_url, 503,
+                                             "Service Unavailable", {}, fp)
+
+        with mock.patch.object(probe.urllib.request, "build_opener",
+                               return_value=ErrorOpener()):
+            status, _, _ = probe.fetch(STAGING + "/readyz")
+        self.assertEqual(status, 503)
+        self.assertEqual(seen, [probe.BODY_CAP + 1])
 
 
 if __name__ == "__main__":

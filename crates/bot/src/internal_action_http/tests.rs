@@ -13,6 +13,7 @@ use two_bot_discord::executor::member::MemberOutcome;
 use two_bot_testsupport::TestDatabase;
 
 mod adapter;
+mod automations;
 mod settings;
 
 /// Stored `internal_idempotency` receipt row: action, state, response code,

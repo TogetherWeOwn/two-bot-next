@@ -1,5 +1,8 @@
 # Changelog
 
+Releases after v0.4.0 are published on the GitHub Releases page by each
+production promote (see docs/releases.md); this file keeps the earlier history.
+
 ## [0.4.0](https://github.com/TogetherWeOwn/two-bot-next/compare/v0.3.0...v0.4.0) (2026-10-10)
 
 

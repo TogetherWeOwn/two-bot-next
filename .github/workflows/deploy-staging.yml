@@ -75,7 +75,7 @@ jobs:
           rollout_dir="$RUNNER_TEMP/two-bot-staging-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           echo "ROLLOUT_DIR=$rollout_dir" >> "$GITHUB_ENV"
           echo "WRANGLER_OUTPUT_FILE_PATH=$rollout_dir/wrangler-output.ndjson" >> "$GITHUB_ENV"
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           # Deploys must not consume caches populated by untrusted PR checks.
@@ -107,7 +107,7 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           environment: staging
-          wranglerVersion: "4.147.0"
+          wranglerVersion: "4.148.0"
           command: deploy --config ${{ env.ROLLOUT_DIR }}/staging-deploy.json --env staging
       # Ordering (TOG-12939): ownership must not move to a deploy whose Wrangler
       # receipt is not valid, fresh and pinned, so that part of the gate runs
@@ -152,3 +152,13 @@ jobs:
           # Evidence contains only allowlisted version/digest/build IDs + statuses.
           # No raw Wrangler sessions, CF configs, env values or HTTP error bodies.
           python3 -c 'import json, os; print(json.dumps(json.load(open(os.environ["ROLLOUT_DIR"] + "/evidence.json")), sort_keys=True))'
+
+  # Live voice synthetic against the deployed staging bot (docs/voice-synthetic.md).
+  # A failure fails this workflow run, and deploy-production only promotes a
+  # commit whose latest deploy-staging run succeeded, so a broken temp-voice
+  # lifecycle cannot reach production.
+  voice-synthetic:
+    needs: deploy
+    permissions:
+      contents: read
+    uses: ./.github/workflows/voice-synthetic.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows

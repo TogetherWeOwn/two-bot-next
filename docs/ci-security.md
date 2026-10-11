@@ -89,7 +89,7 @@ Cloudflare deployment request, hands ownership to it, times the first `/readyz`
 The deployment request never sends `force`, so a target whose secrets changed
 since it was deployed is refused; Wrangler's non-interactive rollback would
 answer yes to that prompt. The request sets `code_update_strategy` to
-`immediate` because Wrangler 4.147's default is `deferred` with a 300 s maximum
+`immediate` because Wrangler 4.148's default is `deferred` with a 300 s maximum
 delay, which would keep the old Durable Object code serving for up to five
 minutes. A 401/403 stops the run and skips the restore; it never retries with
 another credential. Recovery then is a `deploy-staging` dispatch with
@@ -213,9 +213,8 @@ branch protection. The existing advisory ownership policy is unchanged.
 
 ## Static audit exceptions
 
-The existing `release-please@17.6.0` API-double fixture install has one inline
-`adhoc-packages` suppression. The direct package is pinned to the release
-Action's bundled library; lifecycle scripts are disabled and its check job has
+The `release-please@17.6.0` commit-parser fixture install (commit-parse guard)
+has one inline `adhoc-packages` suppression. The direct package is pinned; lifecycle scripts are disabled and its check job has
 no write grant. Transitive dependencies remain unlocked. A future fixture
 lockfile can remove this exception; it is not an exception for deployment
 package installation.

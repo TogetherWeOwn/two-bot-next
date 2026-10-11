@@ -198,6 +198,84 @@ class ProbeTests(unittest.TestCase):
                 failing = {"readyz", "no_internal_error_text"} if status == 500 else {"readyz"}
                 self.assertVerdicts(self.run_probes(), failing=failing)
 
+    def dup_body(self, *pairs):
+        return {"components": [[name, value] for name, value in pairs]}
+
+    def test_duplicate_components_rejected_before_verdict(self):
+        cases = [
+            # down then ready: a later ready must not mask the earlier down.
+            (200, self.dup_body(("process", "ready"), ("gateway", "down"),
+                                ("gateway", "ready"))),
+            # ready then down: order must not matter.
+            (503, self.dup_body(("process", "ready"), ("gateway", "ready"),
+                                ("gateway", "down"))),
+            # identical values repeat just as loudly.
+            (200, self.dup_body(("process", "ready"), ("gateway", "ready"),
+                                ("process", "ready"))),
+        ]
+        for status, body in cases:
+            with self.subTest(status=status, body=body):
+                self.server.readyz = (status, body)
+                results = self.run_probes()
+                self.assertVerdicts(results, failing={"readyz"})
+                failures = results["readyz"]["failures"]
+                self.assertTrue(any("repeats a component name" in f for f in failures),
+                                failures)
+
+    def test_duplicate_diagnostic_echoes_no_component_data(self):
+        sentinel = "SENTINEL_dup_probe_abc123"
+        body = self.dup_body(("process", "ready"), ("gateway", "ready"),
+                             (sentinel, "ready"), (sentinel, "down"))
+        self.server.readyz = (503, body)
+        results = self.run_probes()
+        self.assertVerdicts(results, failing={"readyz"})
+        failures = results["readyz"]["failures"]
+        self.assertTrue(any("repeats a component name" in f for f in failures),
+                        failures)
+        self.assertNotIn(sentinel, json.dumps(results))
+
+    def test_distinct_components_still_pass(self):
+        self.server.readyz = (200, READY)
+        results = self.run_probes()
+        self.assertVerdicts(results)
+        self.assertEqual(results["readyz"]["observed"]["components"]["gateway"], "ready")
+
+    def test_unknown_components_refused_without_echoing_data(self):
+        for extra_status, http_status in (("ready", 200), ("down", 503), ("starting", 503)):
+            with self.subTest(extra_status=extra_status):
+                body = {"components": [["process", "ready"], ["gateway", "ready"],
+                                        ["database", "ready"], ["voice", extra_status]]}
+                self.server.readyz = (http_status, body)
+                results = self.run_probes()
+                self.assertVerdicts(results, failing={"readyz"})
+                failures = results["readyz"]["failures"]
+                self.assertTrue(any("unknown component name" in f for f in failures),
+                                failures)
+                self.assertNotIn("voice", json.dumps(results))
+
+    def test_unknown_sentinel_echoes_no_component_data(self):
+        sentinel = "SENTINEL_unknown_staging_abc123"
+        body = {"components": [["process", "ready"], ["gateway", "ready"],
+                                [sentinel, "ready"]]}
+        self.server.readyz = (200, body)
+        results = self.run_probes()
+        self.assertVerdicts(results, failing={"readyz"})
+        self.assertNotIn(sentinel, json.dumps(results))
+
+    def test_legitimate_optional_components_still_pass(self):
+        for body, status in (
+            ({"components": [["process", "ready"], ["gateway", "ready"]]}, 200),
+            ({"components": [["process", "ready"], ["gateway", "ready"],
+                              ["database", "ready"]]}, 200),
+            ({"components": [["process", "ready"], ["gateway", "ready"],
+                              ["database", "ready"], ["token_invalid", "ready"]]}, 200),
+            ({"components": [["process", "ready"], ["gateway", "starting"],
+                              ["database", "ready"], ["token_invalid", "ready"]]}, 503),
+        ):
+            with self.subTest(body=body):
+                self.server.readyz = (status, body)
+                self.assertVerdicts(self.run_probes())
+
     def test_configured_fallback(self):
         self.server.fallback = "twoInvite"
         results = self.run_probes(expect_fallback_code="twoInvite")
@@ -292,6 +370,152 @@ class ProbeTests(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(staging_probe.main(["--base-url", STAGING, "--worker-version", VERSION]), 1)
         self.assertEqual(json.loads(out.getvalue())["verdict"], "FAIL")
+
+
+class BodyCapRefusalTests(unittest.TestCase):
+    """Oversized bodies are refused before decoding/parsing (M4.42)."""
+
+    def setUp(self):
+        self.fixture = Fixture()
+        self.addCleanup(self.fixture.close)
+        self.server = self.fixture.server
+
+    def padded(self, value, size):
+        raw = json.dumps(value).encode().decode()
+        self.assertLessEqual(len(raw), size, "fixture must fit the target size")
+        return raw + " " * (size - len(raw))
+
+    def reply(self, body, status=200, headers=None):
+        return staging_probe.Reply(status, headers or {}, body)
+
+    def run_probes(self, fetch, **options):
+        results = run_probes(fetch, unknown_slug=SLUG, **options)
+        return {r["name"]: r for r in results}
+
+    def test_exact_cap_valid_input_passes(self):
+        health = self.padded({"status": "ok"}, staging_probe.MAX_BODY_BYTES)
+        self.assertEqual(len(health.encode()), staging_probe.MAX_BODY_BYTES)
+        self.assertEqual(json.loads(health), {"status": "ok"})
+        fetch = make_fetch(self.fixture.origin, timeout=5)
+        self.server.overrides["/health"] = (200, {"content-type": "application/json"}, health)
+        results = self.run_probes(fetch)
+        self.assertEqual(results["health"]["verdict"], "PASS", results["health"]["failures"])
+
+    def test_valid_json_padded_past_cap_refuses_before_parsing(self):
+        sentinel = "SENTINEL_BODY_probe_padded"
+        base = json.dumps({"status": "ok", "note": sentinel})
+        health = base + " " * (staging_probe.MAX_BODY_BYTES + 1 - len(base))
+        self.assertEqual(len(health.encode()), staging_probe.MAX_BODY_BYTES + 1)
+        self.assertEqual(json.loads(health)["note"], sentinel)
+        self.server.overrides["/health"] = (200, {"content-type": "application/json"}, health)
+        fetch = make_fetch(self.fixture.origin, timeout=5)
+        results = self.run_probes(fetch)
+        self.assertEqual(results["health"]["verdict"], "FAIL")
+        failures = json.dumps(results["health"]["failures"])
+        self.assertIn("answered over the body cap", failures)
+        self.assertNotIn(sentinel, json.dumps(results))
+
+    def test_cap_length_valid_prefix_with_hidden_tail_refuses(self):
+        prefix = self.padded({"status": "ok"}, staging_probe.MAX_BODY_BYTES)
+        self.assertEqual(json.loads(prefix), {"status": "ok"})
+        # Hidden tail: the first MAX bytes alone are valid JSON, so an
+        # exact-cap read would silently accept the prefix.
+        self.server.overrides["/health"] = (
+            200, {"content-type": "application/json"}, prefix + "X")
+        fetch = make_fetch(self.fixture.origin, timeout=5)
+        results = self.run_probes(fetch)
+        self.assertEqual(results["health"]["verdict"], "FAIL")
+        self.assertIn("answered over the body cap",
+                      json.dumps(results["health"]["failures"]))
+
+    def test_injected_oversize_reply_never_reaches_json(self):
+        sentinel = "SENTINEL_BODY_injected"
+        big = self.padded({"status": "ok", "note": sentinel},
+                           staging_probe.MAX_BODY_BYTES + 1)
+        seen_bodies = []
+
+        def fetch(method, path):
+            if path == "/health":
+                return self.reply(big)
+            if path == "/readyz":
+                status, body = self.server.readyz
+                return self.reply(json.dumps(body))
+            # Delegate the rest to the live fixture so the run stays green
+            # everywhere except the oversized health check.
+            live = make_fetch(self.fixture.origin, timeout=5)
+            reply = live(method, path)
+            seen_bodies.append(reply.body)
+            return reply
+
+        results = self.run_probes(fetch)
+        self.assertEqual(results["health"]["verdict"], "FAIL")
+        self.assertIn("answered over the body cap",
+                      json.dumps(results["health"]["failures"]))
+        self.assertNotIn(sentinel, json.dumps(results))
+        # The oversized body never reaches the error-text scan.
+        for failures in (r["failures"] for r in results.values()):
+            self.assertNotIn(sentinel, json.dumps(failures))
+
+    def test_readyz_oversize_fails_without_a_breakdown_verdict(self):
+        payload = dict(READY)
+        base = json.dumps(payload)
+        big = base + " " * (staging_probe.MAX_BODY_BYTES + 1 - len(base))
+        self.assertEqual(json.loads(big)["components"], READY["components"])
+
+        def fetch(method, path):
+            if path == "/readyz":
+                return self.reply(big)
+            live = make_fetch(self.fixture.origin, timeout=5)
+            return live(method, path)
+
+        results = self.run_probes(fetch)
+        self.assertEqual(results["readyz"]["verdict"], "FAIL")
+        self.assertIn("answered over the body cap",
+                      json.dumps(results["readyz"]["failures"]))
+
+    def test_transport_reads_bounded_cap_plus_one_and_raises(self):
+        seen = []
+
+        class FakeResponse:
+            status = 200
+
+            def __init__(self, payload):
+                self.payload = payload
+
+            def read(self, n):
+                seen.append(n)
+                return self.payload
+
+            def getheaders(self):
+                return []
+
+        class FakeConn:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def request(self, *args, **kwargs):
+                pass
+
+            def getresponse(self):
+                return FakeResponse(self.payload)
+
+            def close(self):
+                pass
+
+        with mock.patch.object(staging_probe.http.client, "HTTPSConnection",
+                               return_value=FakeConn(b"{}")):
+            reply = staging_probe.make_fetch("https://two-bot-next-staging.5150.workers.dev")( "GET", "/health")
+            self.assertEqual(reply.body, "{}")
+        self.assertEqual(seen, [staging_probe.MAX_BODY_BYTES + 1])
+        seen.clear()
+        big = b"x" * (staging_probe.MAX_BODY_BYTES + 1)
+        with mock.patch.object(staging_probe.http.client, "HTTPSConnection",
+                               return_value=FakeConn(big)):
+            with self.assertRaises(staging_probe.BodyTooLarge) as caught:
+                staging_probe.make_fetch("https://two-bot-next-staging.5150.workers.dev")("GET", "/health")
+        self.assertEqual(seen, [staging_probe.MAX_BODY_BYTES + 1])
+        self.assertEqual(str(caught.exception), "response body over the size cap")
+        self.assertNotIn("x" * 10, str(caught.exception))
 
 
 if __name__ == "__main__":
