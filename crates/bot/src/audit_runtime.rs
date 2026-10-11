@@ -9,7 +9,9 @@
 //! `drain_pending` call, which surfaces at most `MAX_PENDING_ROWS` (25) rows.
 //! While the persistent halt is engaged the sweep claims nothing; a halt that
 //! lands mid-sweep is honored per row by the service, which releases held
-//! claims unattempted. Cancellation (timeout or shutdown) mid-row is safe: the
+//! claims unattempted. Every readable halt also sets the label-free
+//! `two_bot_audit_delivery_halt` gauge (1 engaged, 0 cleared) for staleness
+//! evaluation. Cancellation (timeout or shutdown) mid-row is safe: the
 //! boundary is persisted before any POST, so the next owner reconciles.
 //!
 //! With none of `DISCORD_AUDIT_LOG_CHANNEL_ID`, `DISCORD_VOICE_LOG_CHANNEL_ID`
@@ -335,6 +337,14 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
         self.channels.lock().unwrap().clone()
     }
 
+    /// Halt memory for tests: the state the previous sweep reported, `None`
+    /// before the first sweep. The `/metrics` gauge mirrors these same
+    /// transitions through the process-global registry.
+    #[cfg(test)]
+    pub(crate) fn halted_for_test(&self) -> Option<bool> {
+        *self.halted.lock().unwrap()
+    }
+
     fn build_wired(
         pool: PgPool,
         mirror: M,
@@ -418,12 +428,17 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
     }
 
     /// One retry sweep: read the halt, then drain at most one bounded batch.
+    /// Every readable halt also sets `two_bot_audit_delivery_halt` (1 while
+    /// engaged, 0 once cleared) so the kill-switch state is visible to
+    /// staleness evaluation; an unreadable halt keeps the last reported
+    /// state instead of fabricating a clear.
     pub(crate) async fn sweep(&self) -> Result<Sweep, ErrorClass> {
         let wired = self.wired().await?;
         let Ok(halt) = wired.store.delivery_halt().await else {
             tracing::warn!(job = JOB, "audit_retry_halt_unreadable");
             return Err(ErrorClass::Database);
         };
+        two_bot_core::metrics::global().set_audit_delivery_halt(halt.is_some());
         if self.note_halt(halt.is_some()) {
             tracing::debug!(job = JOB, "audit_retry_halted");
             return Ok(Sweep::Halted);

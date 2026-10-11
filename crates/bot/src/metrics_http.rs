@@ -94,6 +94,7 @@ mod tests {
             "two_bot_rest_requests_total",
             "two_bot_db_pool_connections",
             "two_bot_job_last_success_timestamp_seconds",
+            "two_bot_audit_delivery_halt",
         ] {
             assert!(text.contains(&format!("# TYPE {name} ")), "missing {name}");
         }
@@ -160,6 +161,7 @@ mod tests {
             "two_bot_voice_vote_kick_total{outcome=\"other\"} ",
             "two_bot_gateway_checkpoint_failures_total{stage=\"pre_commit\"} ",
             "two_bot_gateway_checkpoint_failures_total{stage=\"commit\"} ",
+            "two_bot_audit_delivery_halt ",
         ] {
             assert!(text.contains(sample), "missing sample {sample}");
         }

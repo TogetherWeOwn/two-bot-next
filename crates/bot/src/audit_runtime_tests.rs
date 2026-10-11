@@ -408,6 +408,29 @@ fn delivered(entry: &str, message_id: &str) -> (String, DeliverOutcome) {
 
 // --------------------------------------------------------------- sweeping --
 
+#[test]
+fn halt_transitions_cover_engage_disengage_and_clear() {
+    // M4.48: the same booleans the sweep feeds to `two_bot_audit_delivery_halt`
+    // (1 engaged, 0 cleared) transition here. No database: the first clear
+    // from a fresh process reports clear with no edge, engage reports halted,
+    // a repeat reports the same state with no new edge, and disengage returns
+    // to clear.
+    let runtime = unconnected_runtime(all_vars());
+    assert_eq!(runtime.halted_for_test(), None);
+    assert!(!runtime.note_halt(false));
+    assert_eq!(runtime.halted_for_test(), Some(false));
+    assert!(runtime.note_halt(true));
+    assert_eq!(runtime.halted_for_test(), Some(true));
+    assert!(runtime.note_halt(true));
+    assert_eq!(runtime.halted_for_test(), Some(true));
+    assert!(!runtime.note_halt(false));
+    assert_eq!(runtime.halted_for_test(), Some(false));
+    assert!(!runtime.note_halt(false));
+    assert_eq!(runtime.halted_for_test(), Some(false));
+    assert!(runtime.note_halt(true));
+    assert_eq!(runtime.halted_for_test(), Some(true));
+}
+
 #[tokio::test]
 async fn pending_row_is_delivered_exactly_once() {
     let Some(db) = database("pending_row_is_delivered_exactly_once").await else {
@@ -447,6 +470,7 @@ async fn halt_skips_sends_and_releases_held_claims() {
     let runtime = runtime(db.pool(), &mirror);
     let operator = db.independent_pool().await.unwrap();
     record(&runtime, "halt-1").await;
+    assert_eq!(runtime.halted_for_test(), None);
 
     // The operator engages the halt after the claim, before the POST.
     *mirror.halt_on_document.lock().unwrap() = Some(operator.clone());
@@ -455,6 +479,9 @@ async fn halt_skips_sends_and_releases_held_claims() {
         [("halt-1".to_owned(), DeliverOutcome::Held)]
     );
     assert!(mirror.posts().is_empty());
+    // The sweep started unhalted, so the halt memory stays clear even though
+    // the service honored the mid-sweep halt per row.
+    assert_eq!(runtime.halted_for_test(), Some(false));
     let store = AuditStore::new(db.pool());
     let row = store.get("halt-1").await.unwrap().unwrap();
     assert_eq!(row.state, DeliveryState::Pending, "held claim released");
@@ -464,10 +491,26 @@ async fn halt_skips_sends_and_releases_held_claims() {
     let calls = mirror.calls();
     assert!(matches!(runtime.sweep().await.unwrap(), Sweep::Halted));
     assert_eq!(mirror.calls(), calls, "no mirror traffic while halted");
+    assert_eq!(runtime.halted_for_test(), Some(true));
+
+    // The gauge the sweep feeds for staleness evaluation is always present
+    // with a fixed 0/1 vocabulary and no labels. The exact global value is
+    // pinned by the core unit test; here the runtime-local transitions above
+    // prove the sweep drives the same engaged/cleared states.
+    let text = two_bot_core::metrics::global().render(None);
+    let gauge = text
+        .lines()
+        .find(|line| line.starts_with("two_bot_audit_delivery_halt "))
+        .expect("halt gauge in exposition");
+    assert!(
+        gauge == "two_bot_audit_delivery_halt 0" || gauge == "two_bot_audit_delivery_halt 1",
+        "fixed 0/1 vocabulary, got {gauge:?}"
+    );
 
     assert!(AuditStore::new(&operator).disengage_halt().await.unwrap());
     assert_eq!(drained(&runtime).await, [delivered("halt-1", "900000")]);
     assert_eq!(mirror.posts().len(), 1);
+    assert_eq!(runtime.halted_for_test(), Some(false));
     operator.close().await;
     db.close().await.unwrap();
 }
