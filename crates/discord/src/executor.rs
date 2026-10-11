@@ -1625,7 +1625,15 @@ impl ActionExecutor {
                 .await
                 .map_err(|error| error.to_string())?;
             let observed_at = two_bot_core::now_iso();
-            let (res, global) = match self.send_admitted(&request).await {
+            // Each attempt gets the moderation bound across headers and body,
+            // so a response that never answers cannot park the caller (the
+            // containment worker's roles snapshot). A timeout spends one read
+            // attempt like any transport failure; `observed_at` above still
+            // marks the request start, never the deadline.
+            let (res, global) = match self
+                .send_admitted_within(&request, self.inner.moderation_timeout)
+                .await
+            {
                 Ok(r) => r,
                 Err(detail) => {
                     if attempt >= MAX_HTTP_TRIES - 1 {

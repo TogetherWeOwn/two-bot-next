@@ -123,3 +123,50 @@ async fn failed_roster_page_has_no_evidence_and_ordinary_get_is_data_only() {
     );
     mock.shutdown().await;
 }
+
+/// A read whose headers never arrive must fail once its attempts each hit the
+/// moderation bound instead of parking its caller. The clock is paused so the
+/// bounds elapse without wall time; the mock's 600 s delay can never win.
+#[tokio::test(start_paused = true)]
+async fn observed_read_with_stalled_headers_times_out_each_attempt() {
+    let mock = MockRest::start(
+        vec![],
+        ScriptedResponse::json(200, serde_json::json!([])).delayed(Duration::from_secs(600)),
+    )
+    .await;
+    let exec = ActionExecutor::with_proxy("fixture-token".into(), Some(mock.origin())).unwrap();
+    let began = tokio::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        exec.get_json_observed("/guilds/2222/roles"),
+    )
+    .await
+    .expect("a stalled roles read must not outlive the moderation bound");
+    assert!(result.is_err(), "stall is an error, not absent: {result:?}");
+    let budget = u64::from(two_bot_core::MAX_HTTP_TRIES);
+    assert_eq!(
+        mock.requests().len() as u64,
+        budget,
+        "one bound per attempt"
+    );
+    assert!(began.elapsed() < Duration::from_secs(5 * budget + 10));
+    mock.shutdown().await;
+}
+
+/// Success control for the bound above: a prompt answer is unaffected.
+#[tokio::test]
+async fn observed_read_with_prompt_headers_still_returns_data() {
+    let mock = MockRest::start(
+        vec![],
+        ScriptedResponse::json(200, serde_json::json!([{"id":"1"}])),
+    )
+    .await;
+    let exec = ActionExecutor::with_proxy("fixture-token".into(), Some(mock.origin())).unwrap();
+    let (data, _) = exec
+        .get_json_observed("/guilds/2222/roles")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(data[0]["id"], "1");
+    mock.shutdown().await;
+}
