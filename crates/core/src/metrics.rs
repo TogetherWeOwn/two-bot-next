@@ -1,6 +1,7 @@
 //! Fixed-cardinality, process-local metrics; no background task or retained payloads.
 //! Text format: <https://prometheus.io/docs/instrumenting/exposition_formats/#text-format-details>
 
+use serde::Serialize;
 use std::{
     fmt::Write,
     sync::{Mutex, OnceLock},
@@ -78,6 +79,44 @@ pub const JOBS: &[&str] = &[
     "other",
 ];
 pub const JOB_OUTCOMES: &[&str] = &["success", "failure"];
+
+/// Fixed, payload-free classes for the last completed job failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobErrorClass {
+    Database,
+    Rest,
+    Configuration,
+    Timeout,
+    Panic,
+    Feed,
+    RecoveryRequired,
+}
+
+impl JobErrorClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Database => "database",
+            Self::Rest => "rest",
+            Self::Configuration => "configuration",
+            Self::Timeout => "timeout",
+            Self::Panic => "panic",
+            Self::Feed => "feed",
+            Self::RecoveryRequired => "recovery_required",
+        }
+    }
+}
+
+/// Complete error-class allowlist. With `JOBS`, this yields 84 fixed series.
+pub const JOB_ERROR_CLASSES: &[JobErrorClass] = &[
+    JobErrorClass::Database,
+    JobErrorClass::Rest,
+    JobErrorClass::Configuration,
+    JobErrorClass::Timeout,
+    JobErrorClass::Panic,
+    JobErrorClass::Feed,
+    JobErrorClass::RecoveryRequired,
+];
 /// Room lifecycle operations (TOG-13543): creator-channel create/move/delete
 /// outcomes only. Retries (429/backoff) are not outcomes.
 pub const VOICE_OPERATIONS: &[&str] = &["create", "move", "delete"];
@@ -312,6 +351,7 @@ struct JobMetrics {
     runs: [u64; JOB_OUTCOMES.len()],
     last_success: u64,
     consecutive_failures: u64,
+    last_error_class: Option<JobErrorClass>,
 }
 
 #[derive(Default)]
@@ -443,10 +483,11 @@ impl Metrics {
         current.runs[0] = current.runs[0].saturating_add(1);
         current.last_success = unix_seconds;
         current.consecutive_failures = 0;
+        current.last_error_class = None;
     }
 
     /// A completed failed attempt, including a timeout or isolated panic.
-    pub fn job_failure(&self, job: &str) {
+    pub fn job_failure(&self, job: &str, error_class: JobErrorClass) {
         let mut values = self
             .0
             .lock()
@@ -454,6 +495,7 @@ impl Metrics {
         let current = &mut values.jobs[bounded_index(job, JOBS)];
         current.runs[1] = current.runs[1].saturating_add(1);
         current.consecutive_failures = current.consecutive_failures.saturating_add(1);
+        current.last_error_class = Some(error_class);
     }
 
     /// One finished room lifecycle outcome (TOG-13543). Call once per
@@ -763,6 +805,23 @@ impl Metrics {
         }
         header(
             &mut out,
+            "two_bot_job_last_error_class",
+            "gauge",
+            "One-hot last failed-completion class by bounded job; zero before failure and after success.",
+        );
+        for (job, current) in JOBS.iter().zip(&values.jobs) {
+            for class in JOB_ERROR_CLASSES {
+                writeln!(
+                    out,
+                    "two_bot_job_last_error_class{{job=\"{job}\",class=\"{}\"}} {}",
+                    class.as_str(),
+                    u8::from(current.last_error_class == Some(*class))
+                )
+                .unwrap();
+            }
+        }
+        header(
+            &mut out,
             "two_bot_voice_operations_total",
             "counter",
             "Finished room lifecycle outcomes by bounded operation and outcome; retries are not outcomes.",
@@ -1001,6 +1060,7 @@ mod tests {
         metrics.gateway_event("RESUMED");
         metrics.gateway_latency(Duration::from_millis(12));
         metrics.job_success("invite_snapshot", 123);
+        metrics.job_failure("rank", JobErrorClass::Configuration);
         let text = metrics.render(Some((3, 1, 5)));
         assert!(text.ends_with('\n'));
         assert!(text.contains("# TYPE two_bot_handler_duration_seconds histogram\n"));
@@ -1012,6 +1072,14 @@ mod tests {
         assert!(text.contains("two_bot_gateway_latency_seconds 0.012\n"));
         assert!(text.contains("two_bot_gateway_resumes_total 1\n"));
         assert!(text.contains("two_bot_db_pool_idle_connections 1\n"));
+        assert!(text.contains("# TYPE two_bot_job_last_error_class gauge\n"));
+        assert!(
+            text.contains("two_bot_job_last_error_class{job=\"rank\",class=\"configuration\"} 1\n")
+        );
+        assert!(text.contains("two_bot_job_last_error_class{job=\"rank\",class=\"database\"} 0\n"));
+        assert!(text.contains(
+            "two_bot_job_last_error_class{job=\"invite_snapshot\",class=\"configuration\"} 0\n"
+        ));
         let mut series = std::collections::HashSet::new();
         for line in text.lines().filter(|line| !line.starts_with('#')) {
             let (key, value) = line.rsplit_once(' ').unwrap();
@@ -1029,7 +1097,7 @@ mod tests {
             metrics.gateway_event(&hostile);
             metrics.rest_response(&hostile, Some(429));
             metrics.job_success(&hostile, 123);
-            metrics.job_failure(&hostile);
+            metrics.job_failure(&hostile, JobErrorClass::Database);
             metrics.db_error(&hostile);
             metrics.send_admission(&hostile);
             metrics.prefix_trigger_refused(&hostile);
@@ -1053,6 +1121,7 @@ mod tests {
         }
         assert!(text.contains("two_bot_job_last_success_timestamp_seconds{job=\"other\"} 123\n"));
         assert!(text.contains("two_bot_job_consecutive_failures{job=\"other\"} 1\n"));
+        assert!(text.contains("two_bot_job_last_error_class{job=\"other\",class=\"database\"} 1\n"));
     }
 
     #[test]
@@ -1064,11 +1133,14 @@ mod tests {
             current.runs = [u64::MAX; JOB_OUTCOMES.len()];
             current.consecutive_failures = u64::MAX;
         }
-        metrics.job_failure("rank");
+        metrics.job_failure("rank", JobErrorClass::RecoveryRequired);
         assert!(metrics.render(None).contains(&format!(
             "two_bot_job_consecutive_failures{{job=\"rank\"}} {}\n",
             u64::MAX
         )));
+        assert!(metrics.render(None).contains(
+            "two_bot_job_last_error_class{job=\"rank\",class=\"recovery_required\"} 1\n"
+        ));
         metrics.job_success("rank", 456);
         let text = metrics.render(None);
         for outcome in JOB_OUTCOMES {
@@ -1079,6 +1151,23 @@ mod tests {
         }
         assert!(text.contains("two_bot_job_last_success_timestamp_seconds{job=\"rank\"} 456\n"));
         assert!(text.contains("two_bot_job_consecutive_failures{job=\"rank\"} 0\n"));
+        for class in JOB_ERROR_CLASSES {
+            assert!(text.contains(&format!(
+                "two_bot_job_last_error_class{{job=\"rank\",class=\"{}\"}} 0\n",
+                class.as_str()
+            )));
+        }
+    }
+
+    #[test]
+    fn a_later_failure_replaces_the_last_error_class() {
+        let metrics = Metrics::default();
+        metrics.job_failure("rank", JobErrorClass::Database);
+        metrics.job_failure("rank", JobErrorClass::Rest);
+
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_job_last_error_class{job=\"rank\",class=\"database\"} 0\n"));
+        assert!(text.contains("two_bot_job_last_error_class{job=\"rank\",class=\"rest\"} 1\n"));
     }
 
     #[test]

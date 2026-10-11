@@ -1,16 +1,17 @@
 //! Conformance: every counter row in `docs/metrics.md` renders in the
-//! `/metrics` exposition with its allowlisted labels, and every exposition
-//! counter has a doc row. Counters added by hand (e.g. the dispatch-drops
-//! counter) drift silently without this pin.
+//! `/metrics` exposition with its allowlisted labels, every exposition counter
+//! has a doc row, and the job error-class gauge matches its complete fixed
+//! label product. Counters added by hand (e.g. the dispatch-drops counter) drift
+//! silently without this pin.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use two_bot_core::metrics::{
     Metrics, CHECKPOINT_FAILURE_STAGES, COMMUNITY_FACTS_DRAIN_REASONS, DB_ERROR_OPS,
-    DISPATCH_LANES, EVENTS, INTERNAL_ACTION_FAMILIES, INTERNAL_ACTION_OUTCOMES, JOBS, JOB_OUTCOMES,
-    PREFIX_TRIGGER_REFUSED_REASONS, REST_ROUTES, RESULTS, SEND_ADMISSION_OUTCOMES,
-    VOICE_DEAD_ACTIONS, VOICE_NAME_OUTCOMES, VOICE_OPERATIONS, VOICE_OUTCOMES,
-    VOICE_RECONCILE_ACTIONS, VOICE_VOTE_KICK_OUTCOMES,
+    DISPATCH_LANES, EVENTS, INTERNAL_ACTION_FAMILIES, INTERNAL_ACTION_OUTCOMES, JOBS,
+    JOB_ERROR_CLASSES, JOB_OUTCOMES, PREFIX_TRIGGER_REFUSED_REASONS, REST_ROUTES, RESULTS,
+    SEND_ADMISSION_OUTCOMES, VOICE_DEAD_ACTIONS, VOICE_NAME_OUTCOMES, VOICE_OPERATIONS,
+    VOICE_OUTCOMES, VOICE_RECONCILE_ACTIONS, VOICE_VOTE_KICK_OUTCOMES,
 };
 
 fn repository_root() -> PathBuf {
@@ -285,6 +286,74 @@ fn committed_metrics_docs_match_exposition() {
     let doc = std::fs::read_to_string(repository_root().join("docs/metrics.md")).unwrap();
     let exposition = Metrics::default().render(None);
     check_docs_against_exposition(&doc, &exposition).unwrap();
+}
+
+#[test]
+fn job_error_class_docs_match_the_complete_fixed_gauge() {
+    let doc = std::fs::read_to_string(repository_root().join("docs/metrics.md")).unwrap();
+    let row = doc
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("| `two_bot_job_last_error_class"))
+        .expect("job error-class metric doc row");
+    assert_eq!(
+        row.split('|').nth(1).unwrap().trim(),
+        "`two_bot_job_last_error_class{job,class}`"
+    );
+    for class in JOB_ERROR_CLASSES {
+        assert!(
+            doc.contains(&format!("`{}`", class.as_str())),
+            "missing documented class {}",
+            class.as_str()
+        );
+    }
+
+    let exposition = Metrics::default().render(None);
+    assert!(exposition.contains("# TYPE two_bot_job_last_error_class gauge\n"));
+    let mut rendered = BTreeSet::new();
+    for line in exposition.lines() {
+        let Some(sample) = line.strip_prefix("two_bot_job_last_error_class{") else {
+            continue;
+        };
+        let (raw_labels, value) = sample.split_once('}').expect("job error-class labels");
+        let labels: Vec<&str> = raw_labels.split(',').collect();
+        let keys: Vec<&str> = labels
+            .iter()
+            .map(|label| label.split_once('=').expect("label value").0)
+            .collect();
+        assert_eq!(keys, vec!["job", "class"]);
+        let job = labels[0].split_once('=').unwrap().1.trim_matches('"');
+        let class = labels[1].split_once('=').unwrap().1.trim_matches('"');
+        assert!(JOBS.contains(&job), "unbounded job label {job}");
+        assert!(
+            JOB_ERROR_CLASSES
+                .iter()
+                .any(|allowed| allowed.as_str() == class),
+            "unbounded error-class label {class}"
+        );
+        assert_eq!(
+            value.trim(),
+            "0",
+            "new registry should render zeroed classes"
+        );
+        assert!(
+            rendered.insert((job.to_owned(), class.to_owned())),
+            "duplicate series {job}/{class}"
+        );
+    }
+
+    let expected: BTreeSet<(String, String)> = JOBS
+        .iter()
+        .flat_map(|job| {
+            JOB_ERROR_CLASSES
+                .iter()
+                .map(move |class| ((*job).to_owned(), class.as_str().to_owned()))
+        })
+        .collect();
+    assert_eq!(
+        rendered, expected,
+        "gauge must render exactly JOBS × ErrorClass"
+    );
 }
 
 #[test]

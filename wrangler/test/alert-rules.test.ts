@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import worker, { type Env } from "../src/index.ts";
 import {
-  EMPTY_STATE, RULES, RUNBOOK_BASE_URL, evaluateMetrics, packetFilename, parseExposition, ruleFor, runbookUrl, transitionMessages,
+  EMPTY_STATE, JOB_ERROR_CLASSES, RULES, RUNBOOK_BASE_URL, evaluateMetrics, packetFilename, parseExposition, ruleFor, runbookUrl, transitionMessages,
 } from "../src/alert-rules.ts";
 
 const NOW = 1_000_000;
@@ -25,9 +25,50 @@ test("job stale fires only past two intervals and ignores never-succeeded", () =
   assert.deepEqual(ev([`two_bot_job_last_success_timestamp_seconds{job="rank"} 0`]).firing, []);
 });
 
-test("consecutive failures fire at 3", () => {
+test("consecutive failures fire at 3 and retain classless messages for older exposition", () => {
   assert.deepEqual(ev([`two_bot_job_consecutive_failures{job="counter"} 2`]).firing, []);
-  assert.deepEqual(ev([`two_bot_job_consecutive_failures{job="counter"} 3`]).firing, ["job_consecutive_failures:counter"]);
+  const failed = ev([`two_bot_job_consecutive_failures{job="counter"} 3`]);
+  assert.deepEqual(failed.firing, ["job_consecutive_failures:counter"]);
+  assert.doesNotMatch(transitionMessages([], failed.firing)[0]!, /last error class/);
+});
+
+test("job failure alerts include only a fixed last error class and retain it through resolution", () => {
+  for (const errorClass of JOB_ERROR_CLASSES) {
+    const failing = ev([
+      `two_bot_job_consecutive_failures{job="counter"} 3`,
+      ...JOB_ERROR_CLASSES.map((candidate) =>
+        `two_bot_job_last_error_class{job="counter",class="${candidate}"} ${candidate === errorClass ? 1 : 0}`),
+    ]);
+    assert.deepEqual(failing.firing, ["job_consecutive_failures:counter"]);
+    assert.equal(failing.state.jobErrorClasses?.["counter"], errorClass);
+    const fired = transitionMessages([], failing.firing, {}, failing.state.jobErrorClasses)[0]!;
+    assert.ok(fired.includes(`job_consecutive_failures:counter (last error class: ${errorClass})`));
+
+    const resolved = ev([
+      `two_bot_job_consecutive_failures{job="counter"} 0`,
+      ...JOB_ERROR_CLASSES.map((candidate) =>
+        `two_bot_job_last_error_class{job="counter",class="${candidate}"} 0`),
+    ], failing.state);
+    assert.deepEqual(resolved.firing, []);
+    const resolution = transitionMessages(
+      failing.firing,
+      resolved.firing,
+      failing.state.jobErrorClasses,
+      resolved.state.jobErrorClasses,
+    )[0]!;
+    assert.ok(resolution.includes(`job_consecutive_failures:counter (last error class: ${errorClass})`));
+  }
+});
+
+test("unrecognized or ambiguous job error classes never enter alert messages", () => {
+  const failed = ev([
+    `two_bot_job_consecutive_failures{job="counter"} 3`,
+    `two_bot_job_last_error_class{job="counter",class="database"} 1`,
+    `two_bot_job_last_error_class{job="counter",class="https://example.invalid/member/123?body=synthetic"} 1`,
+  ]);
+  assert.equal(failed.state.jobErrorClasses?.["counter"], undefined);
+  const message = transitionMessages([], failed.firing, {}, failed.state.jobErrorClasses)[0]!;
+  assert.doesNotMatch(message, /example\.invalid|member\/123|body=synthetic/);
 });
 
 test("429 rate uses the delta, ignores resets and tiny windows", () => {
@@ -242,6 +283,17 @@ test("every rule links to an existing runbook heading", () => {
   for (const rule of RULES) {
     const anchor = rule.runbook.split("#")[1]!;
     assert.ok(slugs.has(anchor), `${rule.id}: missing runbook heading for #${anchor}`);
+  }
+});
+
+test("job failure runbook has a first action for every fixed error class", () => {
+  const text = readFileSync(new URL("../../docs/runbook.md", import.meta.url), "utf8");
+  const rows = new Map(text.split("\n").filter((line) => line.startsWith("| `")).map((line) => {
+    const cells = line.split("|");
+    return [cells[1]!.trim().replaceAll("`", ""), cells[2]!.trim()];
+  }));
+  for (const errorClass of JOB_ERROR_CLASSES) {
+    assert.ok(rows.get(errorClass), `missing first response for ${errorClass}`);
   }
 });
 

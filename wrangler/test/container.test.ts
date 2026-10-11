@@ -1119,7 +1119,9 @@ async function senderHarness(t: TestContext, sender: AlertSender, env: Partial<E
   t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
     const path = new URL(typeof input === "string" ? input : input.url).pathname;
     if (path === "/metrics") {
-      return new Response(metricsBody(sender === "metrics" && failing ? 3 : 0));
+      if (sender !== "metrics") return new Response("");
+      const rankClass = `two_bot_job_last_error_class{job="rank",class="database"} ${failing ? 1 : 0}`;
+      return new Response(metricsBody(failing ? 3 : 0).replace('two_bot_job_last_error_class{job="rank",class="database"} 0', rankClass));
     }
     return new Response(null, { status: sender === "readiness" && failing ? 503 : 200 });
   });
@@ -1134,6 +1136,7 @@ function assertAlertRecorded(h: Awaited<ReturnType<typeof senderHarness>>, sende
     assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, ["job_consecutive_failures:rank"]);
     assert.equal(h.events()[0].event, "metrics_alert");
     assert.match(h.events()[0].content, /ALERT job_consecutive_failures:rank/);
+    assert.match(h.events()[0].content, /last error class: database/);
   }
 }
 
@@ -1530,7 +1533,10 @@ for (const sender of ["readiness", "metrics"] as const) {
         ? ["container_unready_alert", "container_unready_recovery"] : ["metrics_alert", "metrics_alert"]);
       assert.equal(h.values.get("two-bot:readiness")?.alerted, false);
       assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, []);
-      if (sender === "metrics") assert.match(h.events()[1].content, /RESOLVED job_consecutive_failures:rank/);
+      if (sender === "metrics") {
+        assert.match(h.events()[1].content, /RESOLVED job_consecutive_failures:rank/);
+        assert.match(h.events()[1].content, /last error class: database/);
+      }
       assert.equal(h.schedules.mock.callCount(), 4);
       assert.ok(h.logs.every((line) => !line.includes(ALERT_ENV.OPS_ALERT_WEBHOOK_URL)));
     });

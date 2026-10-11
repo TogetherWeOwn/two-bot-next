@@ -811,7 +811,7 @@ export class TwoBotContainer extends Container<Env> {
       const { firing, state } = evaluateMetrics(samples, previous, Date.now() / 1000);
       // Persist before notifying: at most one attempt per transition.
       await this.ctx.storage.put(METRICS_ALERT_KEY, state);
-      for (const content of transitionMessages(previous.firing, firing)) {
+      for (const content of transitionMessages(previous.firing, firing, previous.jobErrorClasses, state.jobErrorClasses)) {
         console.warn(JSON.stringify({ event: "metrics_alert", service: "two-bot-next", content }));
         await this.postWebhookText(content);
       }
