@@ -139,8 +139,9 @@ only `unknown`, a 40-character hex revision, or a bounded digits-digits
 build ID can appear in output. Newline, pipe, control, overlong and
 secret-shaped values yield the fixed unexpected-shape refusal above. The
 raw `/health` and `/readyz` bodies reach the log only through
-`production_deploy.py excerpt`, which prints at most 2048 bytes as one
-escaped line, so a hostile answer cannot forge log or summary lines.
+`production_deploy.py excerpt`, which prints the first 2048 body bytes as
+one escaped line (escaping can make that line longer), so a hostile answer
+cannot forge log or summary lines.
 
 Polling matters because a replaced container can keep answering with the
 previous revision — or, on a same-SHA redeploy, the previous build — for a
