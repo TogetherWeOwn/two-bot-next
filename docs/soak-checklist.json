@@ -3299,10 +3299,10 @@
       ],
       "status": "automated",
       "action": "Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Rename a room to the name of a sibling channel in the same category, then to a unique name; a folded duplicate of a still-queued rename from another room is refused.",
-      "expected": "The colliding rename is refused; a folded duplicate of a queued-but-unlanded rename is refused and a rename that would now duplicate at flush is dropped; the unique name is applied.",
+      "expected": "The colliding rename is refused; a folded duplicate of a queued-but-unlanded rename is refused and a rename that would now duplicate at flush is dropped with its never-landed override cleared (the room keeps its template name, counted as rename_duplicate); the unique name is applied.",
       "evidence": "Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference. Fixture half: the offline `verification` command at the exact head; the staging half above is unchanged.",
       "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
-      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- unique_names_conflict_only_when_the_setting_is_on queued_rename_blocks_folded_duplicate_before_it_lands && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_name_collision"
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- unique_names_conflict_only_when_the_setting_is_on queued_rename_blocks_folded_duplicate_before_it_lands flush_recheck_drops_now_duplicate_rename_and_clears_override && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_name_collision"
     },
     {
       "id": "s13-a40d4a5",
@@ -3546,10 +3546,10 @@
         "TOG-10293"
       ],
       "status": "automated",
-      "action": "Run the LFG defer-before-I/O fixtures and the ordered-RSVP defer fixtures on disposable fixtures: LFG commands and the select defer before service I/O, and queued RSVPs defer within three seconds and drain in order.",
+      "action": "Run the LFG defer-before-I/O fixtures and the ordered-RSVP defer fixtures on disposable fixtures: LFG commands and the select defer before service I/O, and queued RSVPs defer within three seconds and drain in order. The ignored RSVP half needs TWO_GATEWAY_TEST_DATABASE_URL pointed at the disposable agent-testdb/CI service, never staging or production.",
       "expected": "Each interaction is deferred before service I/O, so no interaction-failed reply appears: one deferred callback first, one completion edit.",
       "evidence": "Attach the owning slice's exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion.",
-      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot lfg_sticky_and_feed_routes_coexist_without_db ordinary_member_lfg_select_reaches_the_feature_before_db && python3 scripts/cargo_cache.py run -- test -p two-bot queued_rsvp_is_deferred_within_three_seconds_and_drains_on_overflow sticky_and_feed_are_deferred_at_receipt_while_rsvp_is_pending -- --include-ignored"
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot -- lfg_sticky_and_feed_routes_coexist_without_db ordinary_member_lfg_select_reaches_the_feature_before_db && python3 scripts/cargo_cache.py run -- test -p two-bot -- queued_rsvp_is_deferred_within_three_seconds_and_drains_on_overflow sticky_and_feed_are_deferred_at_receipt_while_rsvp_is_pending --include-ignored"
     },
     {
       "id": "s13-f5edc70",

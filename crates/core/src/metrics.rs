@@ -128,7 +128,8 @@ pub const PREFIX_TRIGGER_REFUSED_REASONS: &[&str] = &["verdict", "other"];
 /// a room created already carrying its template name; each template render
 /// (`proposed`, `unchanged`, `waiting_for_name`, `blocked`, `channel_unseen`);
 /// and each queued rename at dispatch (`rename_sent`, or why it was dropped
-/// or held). Unknown outcomes collapse to `other`.
+/// or held, including `rename_duplicate` for a flush-time folded duplicate).
+/// Unknown outcomes collapse to `other`.
 pub const VOICE_NAME_OUTCOMES: &[&str] = &[
     "created_with_template",
     "proposed",
@@ -141,6 +142,7 @@ pub const VOICE_NAME_OUTCOMES: &[&str] = &[
     "rename_unseen",
     "rename_no_access",
     "rename_held",
+    "rename_duplicate",
     "other",
 ];
 /// Vote-kick outcomes for `two_bot_voice_vote_kick_total{outcome}` (M4.30):

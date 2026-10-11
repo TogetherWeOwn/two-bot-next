@@ -3241,6 +3241,63 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         Some(self.renames.propose(channel, current, name, now_ms))
     }
 
+    /// Names a folded-duplicate check must treat as held (legacy 38041a1
+    /// siblingNames plus throttle.pending): every other guild voice/stage
+    /// channel's landed name, plus other tracked rooms' still-queued renames.
+    /// Only really-pending renames count — coalescer, queued action,
+    /// in-flight or scheduled retry — so a stale last-proposed entry or an
+    /// externally diverged channel never holds a name. Submit time
+    /// (`name_facts`) and flush time share this one helper.
+    fn held_rename_names(&self, except: Snowflake) -> Vec<String> {
+        let live = self.live.read_state();
+        let mut held: Vec<String> = live
+            .channels
+            .values()
+            .filter(|channel| {
+                channel.id.get() != except
+                    && matches!(
+                        channel.kind,
+                        ChannelType::GuildVoice | ChannelType::GuildStageVoice
+                    )
+            })
+            .filter_map(|channel| channel.name.clone())
+            .collect();
+        let guild_id = self.live.guild_id;
+        let others: Vec<Snowflake> = self
+            .rooms
+            .keys()
+            .copied()
+            .filter(|id| *id != except)
+            .collect();
+        for other_id in others {
+            let pending = self
+                .renames
+                .pending_for(other_id)
+                .or_else(|| self.queue.queued_rename_for(guild_id, other_id))
+                .or_else(|| self.renames_in_flight.get(&other_id).cloned())
+                .or_else(|| {
+                    self.rename_retries
+                        .get(&other_id)
+                        .map(|(name, _)| name.clone())
+                });
+            let Some(pending) = pending else {
+                continue;
+            };
+            if held.iter().any(|held| held == &pending) {
+                continue;
+            }
+            let landed = live
+                .channels
+                .get(&other_id)
+                .and_then(|channel| channel.name.clone())
+                .unwrap_or_default();
+            if pending != landed {
+                held.push(pending);
+            }
+        }
+        held
+    }
+
     /// The tracked temporary room a member is currently in, if any. `None`
     /// while live evidence is not authoritative, when the member is not in
     /// voice, or when their channel is not a tracked room. The router claim
@@ -4859,8 +4916,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 }
                 // Flush-time uniqueness recheck (legacy 38041a1 drops a
                 // throttled rename that would now duplicate): a literal
-                // custom rename refused when the folded name is held by a
-                // landed channel or another room's still-queued rename.
+                // custom rename is dropped when the folded name is held by
+                // a landed channel or another room's still-queued rename.
                 // Template restores stay exempt, matching submit time.
                 let duplicate = {
                     let literal = self
@@ -4870,40 +4927,26 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     if !literal || !self.name_settings.unique_names {
                         false
                     } else {
-                        let live = self.live.read_state();
-                        let mut held: Vec<String> = live
-                            .channels
-                            .values()
-                            .filter(|channel| {
-                                channel.id.get() != channel_id
-                                    && matches!(
-                                        channel.kind,
-                                        ChannelType::GuildVoice | ChannelType::GuildStageVoice
-                                    )
-                            })
-                            .filter_map(|channel| channel.name.clone())
-                            .collect();
-                        for (other_id, pending) in &self.desired_names {
-                            if *other_id == channel_id
-                                || !self.rooms.contains_key(other_id)
-                                || held.iter().any(|held| held == pending)
-                            {
-                                continue;
-                            }
-                            let landed = live
-                                .channels
-                                .get(other_id)
-                                .and_then(|channel| channel.name.clone())
-                                .unwrap_or_default();
-                            if pending != &landed {
-                                held.push(pending.clone());
-                            }
-                        }
+                        let held = self.held_rename_names(channel_id);
                         name_conflicts(&name, &held, true)
                     }
                 };
                 if duplicate {
+                    metrics::global().voice_name("rename_duplicate");
                     self.desired_names.remove(&channel_id);
+                    // The override never landed: clear it (memory plus store)
+                    // so the room falls back to its template instead of
+                    // stranding a custom name the channel does not carry and
+                    // the template pass would keep skipping.
+                    if self.custom_names.remove(&channel_id).is_some() {
+                        self.queue.enqueue(
+                            self.live.guild_id,
+                            RoomAction::SetCustomName {
+                                channel_id,
+                                custom_name: None,
+                            },
+                        );
+                    }
                     self.queue.mark_succeeded(&action);
                     return true;
                 }
