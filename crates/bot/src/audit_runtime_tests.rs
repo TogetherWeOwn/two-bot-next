@@ -10,6 +10,7 @@ use serde_json::json;
 use two_bot_core::audit::{format_audit_event, AuditKind};
 use two_bot_core::audit_mirror::{MirrorChannel, MirrorError, MirrorMessage, MirrorOverwrite};
 use two_bot_core::audit_store::{DeliveryState, QuarantineReason};
+use two_bot_core::metrics::Metrics;
 use two_bot_testsupport::TestDatabase;
 
 use super::*;
@@ -372,6 +373,42 @@ fn runtime(pool: &PgPool, mirror: &ScriptMirror) -> Arc<AuditRuntime<ScriptMirro
     )
 }
 
+fn runtime_with_metrics(
+    pool: &PgPool,
+    mirror: &ScriptMirror,
+    metrics: &'static Metrics,
+) -> Arc<AuditRuntime<ScriptMirror>> {
+    let (pool, mirror) = (pool.clone(), mirror.clone());
+    Arc::new(
+        AuditRuntime::with_metrics(
+            all_vars(),
+            GUILD.to_owned(),
+            Box::new(move || {
+                let parts = Parts {
+                    pool: pool.clone(),
+                    mirror: mirror.clone(),
+                    bot_user_id: BOT.to_owned(),
+                };
+                Box::pin(async move { Ok(parts) })
+            }),
+            metrics,
+        )
+        .unwrap(),
+    )
+}
+
+/// The exact `two_bot_audit_delivery_halt` series from an isolated registry.
+/// Deleting the sweep's gauge write leaves the default 0, and inverting it
+/// flips every expectation, so these asserts fail either way.
+fn halt_gauge(metrics: &Metrics) -> String {
+    metrics
+        .render(None)
+        .lines()
+        .find(|line| line.starts_with("two_bot_audit_delivery_halt "))
+        .expect("halt gauge in exposition")
+        .to_owned()
+}
+
 async fn record(runtime: &AuditRuntime<ScriptMirror>, entry: &str) {
     assert_eq!(
         runtime.record(&event(entry)).await.unwrap(),
@@ -467,7 +504,8 @@ async fn halt_skips_sends_and_releases_held_claims() {
         return;
     };
     let mirror = ScriptMirror::default();
-    let runtime = runtime(db.pool(), &mirror);
+    let metrics: &'static Metrics = Box::leak(Box::new(Metrics::default()));
+    let runtime = runtime_with_metrics(db.pool(), &mirror, metrics);
     let operator = db.independent_pool().await.unwrap();
     record(&runtime, "halt-1").await;
     assert_eq!(runtime.halted_for_test(), None);
@@ -480,8 +518,10 @@ async fn halt_skips_sends_and_releases_held_claims() {
     );
     assert!(mirror.posts().is_empty());
     // The sweep started unhalted, so the halt memory stays clear even though
-    // the service honored the mid-sweep halt per row.
+    // the service honored the mid-sweep halt per row. The sweep read an
+    // unhalted store, so the gauge reports clear.
     assert_eq!(runtime.halted_for_test(), Some(false));
+    assert_eq!(halt_gauge(metrics), "two_bot_audit_delivery_halt 0");
     let store = AuditStore::new(db.pool());
     let row = store.get("halt-1").await.unwrap().unwrap();
     assert_eq!(row.state, DeliveryState::Pending, "held claim released");
@@ -492,25 +532,13 @@ async fn halt_skips_sends_and_releases_held_claims() {
     assert!(matches!(runtime.sweep().await.unwrap(), Sweep::Halted));
     assert_eq!(mirror.calls(), calls, "no mirror traffic while halted");
     assert_eq!(runtime.halted_for_test(), Some(true));
-
-    // The gauge the sweep feeds for staleness evaluation is always present
-    // with a fixed 0/1 vocabulary and no labels. The exact global value is
-    // pinned by the core unit test; here the runtime-local transitions above
-    // prove the sweep drives the same engaged/cleared states.
-    let text = two_bot_core::metrics::global().render(None);
-    let gauge = text
-        .lines()
-        .find(|line| line.starts_with("two_bot_audit_delivery_halt "))
-        .expect("halt gauge in exposition");
-    assert!(
-        gauge == "two_bot_audit_delivery_halt 0" || gauge == "two_bot_audit_delivery_halt 1",
-        "fixed 0/1 vocabulary, got {gauge:?}"
-    );
+    assert_eq!(halt_gauge(metrics), "two_bot_audit_delivery_halt 1");
 
     assert!(AuditStore::new(&operator).disengage_halt().await.unwrap());
     assert_eq!(drained(&runtime).await, [delivered("halt-1", "900000")]);
     assert_eq!(mirror.posts().len(), 1);
     assert_eq!(runtime.halted_for_test(), Some(false));
+    assert_eq!(halt_gauge(metrics), "two_bot_audit_delivery_halt 0");
     operator.close().await;
     db.close().await.unwrap();
 }

@@ -37,6 +37,7 @@ use two_bot_core::audit_service::{
     AuditMirrorService, DeliverOutcome, DrainReport, MirrorConfig, RecordOutcome,
 };
 use two_bot_core::audit_store::AuditStore;
+use two_bot_core::metrics::Metrics;
 use two_bot_core::settings::LiveSettings;
 use two_bot_discord::executor::ActionExecutor;
 
@@ -271,6 +272,9 @@ pub(crate) struct AuditRuntime<M: AuditMirror> {
     /// Halt state seen by the previous sweep, for transition logs only —
     /// every sweep reads the store.
     halted: Mutex<Option<bool>>,
+    /// Sink for `two_bot_audit_delivery_halt`: the process-global registry in
+    /// production, an isolated registry in tests so sweeps pin exact values.
+    metrics: &'static Metrics,
 }
 
 impl<M: AuditMirror + Clone> AuditRuntime<M> {
@@ -278,6 +282,15 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
         deployment: HashMap<String, String>,
         guild: String,
         connect: Connect<M>,
+    ) -> Result<Self, &'static str> {
+        Self::with_metrics(deployment, guild, connect, two_bot_core::metrics::global())
+    }
+
+    pub(crate) fn with_metrics(
+        deployment: HashMap<String, String>,
+        guild: String,
+        connect: Connect<M>,
+        metrics: &'static Metrics,
     ) -> Result<Self, &'static str> {
         let channels = resolve_channels(&layered_vars(
             &deployment,
@@ -292,6 +305,7 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
             live_revision: Mutex::new(None),
             wired: AsyncMutex::new(None),
             halted: Mutex::new(None),
+            metrics,
         })
     }
 
@@ -339,7 +353,8 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
 
     /// Halt memory for tests: the state the previous sweep reported, `None`
     /// before the first sweep. The `/metrics` gauge mirrors these same
-    /// transitions through the process-global registry.
+    /// transitions through the runtime's metrics sink (the process-global
+    /// registry in production).
     #[cfg(test)]
     pub(crate) fn halted_for_test(&self) -> Option<bool> {
         *self.halted.lock().unwrap()
@@ -438,7 +453,7 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
             tracing::warn!(job = JOB, "audit_retry_halt_unreadable");
             return Err(ErrorClass::Database);
         };
-        two_bot_core::metrics::global().set_audit_delivery_halt(halt.is_some());
+        self.metrics.set_audit_delivery_halt(halt.is_some());
         if self.note_halt(halt.is_some()) {
             tracing::debug!(job = JOB, "audit_retry_halted");
             return Ok(Sweep::Halted);
