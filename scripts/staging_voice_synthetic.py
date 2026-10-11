@@ -80,13 +80,34 @@ def voice_order(channels, parent_id):
     return sorted(rows, key=lambda c: (c.get("position", 0), int(c["id"])))
 
 
+def creator_block(channels_before, creator):
+    """The creator's existing rooms before the join, mirroring plan_placement:
+    a creator that already has rooms groups the new one at the end of that
+    block. A room is a voice channel carrying a member (type 1) overwrite that
+    grants Manage Channels (the owner grant); the block is the run of such
+    channels directly after the creator."""
+    order = voice_order(channels_before, creator.get("parent_id"))
+    ids = [c["id"] for c in order]
+    if creator["id"] not in ids:
+        return []
+    block = []
+    for channel in order[ids.index(creator["id"]) + 1:]:
+        owned = any(o.get("type") == 1 and int(o.get("allow", 0)) & MANAGE
+                    for o in channel.get("permission_overwrites", []))
+        if not owned:
+            break
+        block.append(channel["id"])
+    return block
+
+
 def evaluate(obs):
     """Checks for one synthetic run. ``obs`` keys:
 
     me, creator (channel dict), room_id, room_created (CHANNEL_CREATE payload or
     None), channels (guild channels after the move), statuses (room status
     strings seen), deleted (bool), delete_seconds, grace_seconds, metrics_delta
-    (int or None when unavailable).
+    (int or None when unavailable), channels_before (guild channels before the
+    join; the creator's existing rooms move the expected slot to their end).
     """
     out = []
     creator, room_id = obs["creator"], obs.get("room_id")
@@ -97,8 +118,11 @@ def evaluate(obs):
     out.append(check("name", bool(name) and not FALLBACK.match(name),
                      f"created name {name!r} (fallback pattern <display>'s room must not match)"))
     order = [c["id"] for c in voice_order(obs.get("channels", []), creator.get("parent_id"))]
-    ok = room_id in order and creator["id"] in order and order.index(room_id) == order.index(creator["id"]) + 1
-    out.append(check("position", ok, f"category voice order {order}; room must follow creator {creator['id']}"))
+    block = [r for r in creator_block(obs.get("channels_before", []), creator) if r != room_id]
+    after = block[-1] if block else creator["id"]
+    ok = room_id in order and after in order and order.index(room_id) == order.index(after) + 1
+    out.append(check("position", ok, f"category voice order {order}; room must follow {after} "
+                                     f"(creator {creator['id']}, its existing rooms {block})"))
     mine = [o for o in created.get("permission_overwrites", [])
             if o.get("type") == 1 and o.get("id") == obs["me"]]
     allow = int(mine[0]["allow"]) if mine else 0
@@ -307,6 +331,7 @@ def run_live(args, token):
         obs["me"] = s.me
         creator = rest(token, f"/channels/{args.creator}")
         obs["creator"] = creator
+        obs["channels_before"] = rest(token, f"/guilds/{args.guild}/channels")
         s.voice(args.guild, args.creator)
         joined = True
         moved = s.pump(lambda e: e["t"] == "VOICE_STATE_UPDATE" and e["d"].get("user_id") == s.me

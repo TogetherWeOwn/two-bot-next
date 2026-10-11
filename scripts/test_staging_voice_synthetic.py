@@ -64,6 +64,23 @@ class EvaluateTest(unittest.TestCase):
         channels[1]["position"] = 16  # ties with the creator; the smaller id sorts first, above it
         self.assertEqual(verdicts(obs(channels=channels))["position"], "FAIL")
 
+    def test_existing_creator_rooms_move_the_slot_to_the_end_of_the_block(self):
+        # A human's room (owner grant) already follows the creator: the planner
+        # groups the new room after it, so creator+1 would be a false failure.
+        human = {"id": "5003", "parent_id": CAT, "type": 2, "position": 17,
+                 "permission_overwrites": [{"id": "111", "type": 1, "allow": OWNER_ALLOW}]}
+        before = [obs()["channels"][0], human, obs()["channels"][2]]
+        after = [obs()["channels"][0], human, dict(obs()["channels"][1], position=18), obs()["channels"][2]]
+        self.assertEqual(verdicts(obs(channels_before=before, channels=after))["position"], "PASS")
+        wrong = [obs()["channels"][0], dict(obs()["channels"][1], position=17), dict(human, position=18),
+                 obs()["channels"][2]]
+        self.assertEqual(verdicts(obs(channels_before=before, channels=wrong))["position"], "FAIL")
+
+    def test_a_fixed_channel_after_the_creator_is_not_part_of_its_block(self):
+        fixed = {"id": "5004", "parent_id": CAT, "type": 2, "position": 20,
+                 "permission_overwrites": [{"id": "222", "type": 0, "allow": OWNER_ALLOW}]}
+        self.assertEqual(synth.creator_block([obs()["channels"][0], fixed], obs()["creator"]), [])
+
     def test_missing_owner_grant_fails(self):
         created = dict(obs()["room_created"], permission_overwrites=[
             {"id": ME, "type": 1, "allow": str(synth.VIEW | synth.CONNECT)}])

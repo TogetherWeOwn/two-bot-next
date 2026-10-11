@@ -13,7 +13,7 @@ creator) and asserts:
 |---|---|
 | create | a new room appears in the creator's category and the test bot is moved in |
 | name | the room is created already carrying a template name, not the `<display>'s room` fallback |
-| position | the room is directly below its creator among the category's voice channels |
+| position | the room is directly below its creator, or below the creator's existing rooms when some are open (matching the placement planner) |
 | owner | the room has a member overwrite for the joiner allowing View, Connect and Manage Channels |
 | status | a voice-channel status line is set on the room |
 | delete | after the test bot leaves, the room is deleted within the empty grace |
