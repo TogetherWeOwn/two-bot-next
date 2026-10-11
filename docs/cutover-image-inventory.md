@@ -1,9 +1,9 @@
 # Cutover container image inventory (measured)
 
 Read-only record of the cutover runtime image. No registry push, no deploy,
-no secret access. Static rows come from files at the baseline inventory
-commit; byte counts below are measured from a CI-built sample image of main
-head, described under Measured sample image.
+no secret access. Static rows come from the `Dockerfile` at sample source SHA
+`4d183937`; byte counts below are measured from a CI-built sample image of
+that main head, described under Measured sample image.
 
 - Baseline inventory commit: `7797b1e166d2aa7b28725cdddc1b8f0c097a5ed5` (2026-10-03)
 - Builder-row refresh (2026-10-04): [`Dockerfile:10` at `723663df9c74fd24734170a981cf59908aadd33a`](https://github.com/TogetherWeOwn/two-bot-next/blob/723663df9c74fd24734170a981cf59908aadd33a/Dockerfile#L10).
@@ -161,18 +161,19 @@ The numbers above come from sample run 38155009694 on main head, not from the
 pinned cutover candidate, and the sample artifacts expire (see Status above).
 Before the deployment digest is pinned:
 
-1. Build the cutover candidate in CI and record its immutable image ID and
-   source SHA.
+1. Build the merged cutover candidate in CI on a push to main, so the container
+   smoke job runs, and record its immutable image ID and source SHA.
 2. Download that run's `supply-chain` artifact; file the two `.cdx.json`
    names, `SHA256SUMS`, and both gate results under the Releases receipt of
    the B4 evidence manifest (`docs/cutover.md` B4). That receipt does not list
    SBOMs yet, so add them there.
-3. Re-measure R1, R4 and the budget metric on the candidate's image ID with
-   `docker history` / `docker inspect`, and confirm the 112 MiB / 16 MiB
+3. Re-measure on the candidate's image ID, and confirm the 112 MiB / 16 MiB
    budgets pass. CI keeps the candidate image only as the
    `sbom-partial-<run_id>-<attempt>` artifact (`image.tar`, 1-day retention),
-   so download it and `docker load` it within that window. Otherwise, read the
-   budget lines from the candidate's container-smoke job log, which measures
-   that job's own build of the candidate's source SHA, not the image ID.
-   Pinning the deployment digest is tracked separately and is not part of
-   this inventory note.
+   so download it within that window. R1 and R4 are saved-tar layer-blob
+   sizes: read them from the archive's `manifest.json` layers, not from
+   `docker history`. The budget metric is summed `docker history` layer bytes,
+   so `docker load` the archive for that. The container-smoke job log of the
+   same push-to-main run gives the budget lines, but for that job's own build,
+   not the image ID. Pinning the deployment digest is tracked separately and
+   is not part of this inventory note.
