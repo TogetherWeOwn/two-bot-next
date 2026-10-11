@@ -47,6 +47,7 @@ USER_AGENT = "Mozilla/5.0 (compatible; two-bot-next-staging-drill/1.0)"
 MOCK_TRANSPORT = "mock-local-fixtures"
 LIVE_TRANSPORT = "staging-discord-rest"
 BODY_CAP = 64 << 10
+REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 
 # Drill bounds mirror crates/core/src/channel_moderation.rs: slowmode
 # 0..=21600 (0 disables) and the lockdown bits: SEND_MESSAGES (2048) plus
@@ -204,27 +205,48 @@ def mock_transport(state=None):
     return call
 
 
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Stop before urllib can replay a bot token on a follow-up request."""
+
+    def http_error_301(self, req, fp, code, msg, headers):
+        fp.close()
+        raise DrillError("refusing: authenticated Discord request answered a redirect (not followed)")
+
+    http_error_302 = http_error_303 = http_error_307 = http_error_308 = http_error_301
+
+
 def live_transport(token):
     """Real Discord REST transport. Token stays in memory; never logged."""
     if not token:
         raise DrillError("refusing: no staging bot token in the environment")
+    opener = urllib.request.build_opener(_RefuseRedirect)
 
-    def request(method, url, payload=None):
+    def request(method, url, payload=None, expect=dict):
         data = json.dumps(payload).encode() if payload is not None else None
         req = urllib.request.Request(
             url, data=data, method=method,
             headers={"Authorization": f"Bot {token}", "User-Agent": USER_AGENT,
                      "Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with opener.open(req, timeout=20) as resp:
                 body = resp.read(BODY_CAP + 1)
+        except DrillError:
+            raise
         except urllib.error.HTTPError as error:
-            raise DrillError(f"discord answered {error.code} on {method}")
+            code = error.code
+            error.close()
+            raise DrillError(f"discord answered {code} on {method}")
         except Exception as error:
             raise DrillError(f"discord did not respond ({error.__class__.__name__})")
         if len(body) > BODY_CAP:
             raise DrillError("discord answered over the body cap")
-        return json.loads(body) if body else {}
+        try:
+            value = json.loads(body) if body else expect()
+        except (ValueError, RecursionError):
+            raise DrillError(f"discord answered a non-JSON body on {method}") from None
+        if not isinstance(value, expect):
+            raise DrillError(f"discord answered an unexpected body shape on {method}")
+        return value
 
     def call(op, **kw):
         if op == "get_channel":
@@ -248,7 +270,8 @@ def live_transport(token):
         if op == "get_commands":
             return request(
                 "GET",
-                f"{API}/applications/{STAGING_APPLICATION_ID}/guilds/{kw['guild_id']}/commands")
+                f"{API}/applications/{STAGING_APPLICATION_ID}/guilds/{kw['guild_id']}/commands",
+                expect=list)
         raise DrillError(f"live transport has no op {op}")
 
     return call
@@ -342,7 +365,10 @@ def _baseline_detail(state):
 
 def _post_notice(call, channel_id, applied):
     created = call("post_notice", channel_id=channel_id, content=freeze_notice_content())
-    applied["notice"] = created.get("id")
+    notice_id = created.get("id")
+    if not isinstance(notice_id, str) or not notice_id:
+        raise DrillError("discord notice reply carried no message id")
+    applied["notice"] = notice_id
     return "freeze notice posted"
 
 

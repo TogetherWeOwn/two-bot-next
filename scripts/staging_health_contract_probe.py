@@ -14,13 +14,21 @@ Two GETs against the staging Worker origin, each traced to the Rust contract
 
 The probe asserts the shape, the status-code mapping (200 if and only if
 every component is ready), and the build-identity fields. A gateway_failure
-class of checkpoint_load_failed is reported as the DB-behind-binary
-(migration-lag) signature, not a generic gateway outage
+class of checkpoint_load_failed reports only the failed checkpoint read;
+its root cause needs separate reviewed schema/ACL/connectivity evidence
 (docs/voice-cutover-rollback-triggers.md T1). A shape-correct 503 is still a
 FAIL: a truthful parked process is never E2E approval.
 
-The probe never writes, never touches production, follows no redirects, and
-sends no credentials. The only network calls are the two GETs above.
+No probe may apply a migration or test production. This probe never writes,
+follows no redirects, and sends no credentials. The only network calls
+are the two staging GETs above.
+
+Body-cap refusal contract: the transport reads at most BODY_CAP+1 bytes on
+both the normal and HTTPError paths so a hidden suffix is detected. Any body
+longer than BODY_CAP (64 KiB) is refused before JSON parsing with the fixed
+message "<name> probe answered over the body cap"; exact-cap valid input
+passes, and the extra byte never reaches a successful JSON path. Refusals
+never echo the body, headers, URL or parse exceptions.
 
 Origin fence (fail-closed, before any request): only an
 https://two-bot-next-staging.<sub>.workers.dev origin (no port, userinfo,
@@ -50,6 +58,11 @@ TIMEOUT_SECONDS = 10
 USER_AGENT = "two-bot-next-staging-health-contract-probe/1.0 (read-only E2E)"
 
 REQUIRED_COMPONENTS = ("process", "gateway", "database", "token_invalid")
+# Per-surface allowlist: exactly the four components the container serves
+# (crates/bot/src/server.rs readiness_report + with_token_state). No
+# optionals on this surface; anything else is refused with fixed vocabulary
+# naming no component data.
+ALLOWED_COMPONENTS = frozenset({"process", "gateway", "database", "token_invalid"})
 STATUSES = ("ready", "starting", "down")
 FAILURE_PHASE = "durable_gateway"
 FAILURE_CLASSES = frozenset({
@@ -66,10 +79,8 @@ FAILURE_CLASSES = frozenset({
     "gateway_runtime_failed",
     "gateway_task_panicked",
 })
-# The staging rollout-timeout lesson: the database lags the binary's
-# migration set, boot reads fail, the container crashloops. Surfaced here
-# as gateway_failure durable_gateway:checkpoint_load_failed.
-DB_BEHIND_CLASS = "checkpoint_load_failed"
+# This class records the failed read step, not its schema/ACL/connectivity cause.
+CHECKPOINT_READ_CLASS = "checkpoint_load_failed"
 
 
 class ProbeError(Exception):
@@ -81,6 +92,7 @@ class Result:
     name: str
     ok: bool
     reason: str
+    checkpoint_read_failed: bool = False
 
     def line(self):
         return f"{'PASS' if self.ok else 'FAIL'} {self.name}: {self.reason}"
@@ -146,6 +158,8 @@ def get_json(fetch_fn, url, name):
         status, headers, body = fetch_fn(url)
     except (OSError, http.client.HTTPException) as error:
         raise ProbeError(f"{name} probe did not respond ({error.__class__.__name__})")
+    if len(body) > BODY_CAP:
+        raise ProbeError(f"{name} probe answered over the body cap")
     try:
         value = json.loads(body)
     except (ValueError, UnicodeDecodeError):
@@ -176,6 +190,13 @@ def parse_readyz(status, value):
                        and row[1] in STATUSES for row in components)):
         raise ProbeError(f"readyz {status} without the bot's component breakdown "
                          "(ownership refusal or broken deploy)")
+    # Reject duplicates before any readiness math: last-wins would let a
+    # later ready mask an earlier down.
+    names = [row[0] for row in components]
+    if len(set(names)) != len(names):
+        raise ProbeError(f"readyz {status} repeats a component name")
+    if any(name not in ALLOWED_COMPONENTS for name in names):
+        raise ProbeError(f"readyz {status} carries an unknown component name")
     state = dict(components)
     missing = [name for name in REQUIRED_COMPONENTS if name not in state]
     if missing:
@@ -231,11 +252,13 @@ def run(args, fetch_fn=fetch):
         else:
             down = sorted(name for name, text in state.items() if text != "ready")
             failure = value.get("gateway_failure") or {}
-            if failure.get("class") == DB_BEHIND_CLASS:
+            if failure.get("class") == CHECKPOINT_READ_CLASS:
                 results.append(Result("readyz", False,
-                                      f"readyz 503: db-behind-binary signature "
-                                      f"(gateway_failure durable_gateway:{DB_BEHIND_CLASS}); "
-                                      "migrate before redeploying"))
+                                      "readyz 503: checkpoint read failed "
+                                      f"(gateway_failure durable_gateway:{CHECKPOINT_READ_CLASS}); "
+                                      "root cause unverified; require separate reviewed "
+                                      "schema/ACL/connectivity evidence",
+                                      checkpoint_read_failed=True))
             else:
                 results.append(Result("readyz", False,
                                       f"readyz 503: parked ({', '.join(down)} not ready); "
@@ -254,6 +277,10 @@ def evidence_shape(results, report, expected_sha):
             "build_revision": (report or {}).get("build_revision"),
             "build_id": (report or {}).get("build_id"),
             "gateway_failure_class": failure.get("class"),
+            "gateway_failure_root_cause": ("unverified"
+                                           if any(result.checkpoint_read_failed
+                                                  for result in results)
+                                           else None),
             "expected_sha": expected_sha}
 
 

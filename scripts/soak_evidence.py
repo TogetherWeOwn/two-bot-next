@@ -42,6 +42,40 @@ REDEPLOY_GAP_BUDGET_S = 60
 KNOWN_EVENTS = ("connect", "disconnect", "resume", "dispatch", "unknown")
 
 
+def _unique_object(pairs):
+    """object_pairs_hook refusing duplicate keys instead of last-wins."""
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise ValueError("duplicate field")
+        seen.add(key)
+    return dict(pairs)
+
+
+# Well below CPython's default recursion limit (1000): any record deeper
+# than this would raise RecursionError under recursive traversal/repr, so
+# it is refused up front with an explicit stack instead of recursing.
+MAX_RECORD_DEPTH = 100
+
+
+def _too_deeply_nested(record, limit=MAX_RECORD_DEPTH):
+    """Iterative depth check; True when nesting exceeds limit."""
+    stack = [(record, 1)]
+    while stack:
+        obj, depth = stack.pop()
+        if depth > limit:
+            return True
+        if isinstance(obj, dict):
+            for value in obj.values():
+                if isinstance(value, (dict, list)):
+                    stack.append((value, depth + 1))
+        elif isinstance(obj, list):
+            for value in obj:
+                if isinstance(value, (dict, list)):
+                    stack.append((value, depth + 1))
+    return False
+
+
 def parse_ts(value):
     """Parse an ISO-8601 UTC timestamp; raise ValueError when absent/garbled."""
     if not isinstance(value, str) or not value.strip():
@@ -75,9 +109,29 @@ def summarize(lines):
         if not line:
             continue
         try:
-            record = json.loads(line)
+            record = json.loads(line, object_pairs_hook=_unique_object)
+        except RecursionError:
+            # Decoder-level backstop: a line deeper than the C decoder's
+            # own stack raises here before _too_deeply_nested ever sees
+            # it. Pinned by
+            # test_decoder_recursion_overflow_becomes_unknown_then_continues;
+            # do not drop this branch as redundant.
+            note_unknown(None, None,
+                         f"malformed line {lineno}: too deeply nested")
+            continue
         except json.JSONDecodeError:
             note_unknown(None, None, f"malformed line {lineno}: not JSON")
+            continue
+        except ValueError as exc:
+            if "duplicate field" in str(exc):
+                note_unknown(None, None,
+                             f"malformed line {lineno}: duplicate field")
+                continue
+            note_unknown(None, None, f"malformed line {lineno}: not JSON")
+            continue
+        if _too_deeply_nested(record):
+            note_unknown(None, None,
+                         f"malformed line {lineno}: too deeply nested")
             continue
         if not isinstance(record, dict):
             note_unknown(None, None, f"malformed line {lineno}: not an object")
@@ -89,6 +143,10 @@ def summarize(lines):
             continue
         first_ts = ts if first_ts is None else min(first_ts, ts)
         last_ts = ts if last_ts is None else max(last_ts, ts)
+        # No RecursionError guard here or around parse_ts above: the record
+        # already passed the iterative _too_deeply_nested check, so this
+        # block performs no recursive traversal and cannot raise it. The
+        # only decoder-level backstop is the json.loads handler above.
         event = record.get("event")
         session = record.get("session")
 

@@ -180,8 +180,6 @@ class RollbackReadinessProbeTests(unittest.TestCase):
         process, gateway = ("process", "ready"), ("gateway", "ready")
         database, token = ("database", "ready"), ("token_invalid", "ready")
         accepted = {
-            "200 with an unknown ready component": (200, readyz_body(process, gateway, database, token,
-                                                                     ("voice", "ready"))),
             "503 with gateway starting": (503, readyz_body(process, ("gateway", "starting"), database, token)),
             "503 with gateway down": (503, readyz_body(process, ("gateway", "down"), database, token)),
         }
@@ -194,9 +192,12 @@ class RollbackReadinessProbeTests(unittest.TestCase):
                                        "unexpected components"),
             "200 with token invalid down": (200, readyz_body(process, gateway, database, ("token_invalid", "down")),
                                             "unexpected components"),
+            "200 with an unknown ready component": (200, readyz_body(process, gateway, database, token,
+                                                                    ("voice", "ready")),
+                                                   "carries an unknown component name"),
             "200 with an unknown component down": (200, readyz_body(process, gateway, database, token,
                                                                     ("voice", "down")),
-                                                   "unexpected components"),
+                                                   "carries an unknown component name"),
             "500 with a complete body": (500, readyz_body(process, gateway, database, token),
                                          "/readyz 500 with unexpected"),
             "503 with every component ready": (503, readyz_body(process, gateway, database, token),
@@ -205,7 +206,10 @@ class RollbackReadinessProbeTests(unittest.TestCase):
                                       "unexpected components"),
             "503 with an unknown component down": (503, readyz_body(process, ("gateway", "starting"), database,
                                                                     token, ("voice", "down")),
-                                                   "unexpected components"),
+                                                   "carries an unknown component name"),
+            "503 with an unknown ready component": (503, readyz_body(process, gateway, database, token,
+                                                                    ("voice", "ready")),
+                                                   "carries an unknown component name"),
             "503 with gateway starting and token invalid down": (503, readyz_body(
                 process, ("gateway", "starting"), database, ("token_invalid", "down")), "unexpected components"),
             "503 with gateway and database down": (503, readyz_body(
@@ -234,6 +238,20 @@ class RollbackReadinessProbeTests(unittest.TestCase):
                 line = self.readyz(status, body)
                 self.assertTrue(line.startswith("FAIL readyz"), line)
                 self.assertIn(reason, line)
+
+    def test_unknown_component_refused_without_echoing_data(self):
+        sentinel = "SENTINEL_unknown_rollback_abc123"
+        for status, extra in ((200, (sentinel, "ready")),
+                              (503, (sentinel, "down")),
+                              (200, (sentinel, "starting"))):
+            with self.subTest(status=status, extra=extra):
+                body = readyz_body(("process", "ready"), ("gateway", "ready"),
+                                   ("database", "ready"), ("token_invalid", "ready"),
+                                   extra)
+                line = self.readyz(status, body)
+                self.assertTrue(line.startswith("FAIL readyz"), line)
+                self.assertIn("carries an unknown component name", line)
+                self.assertNotIn(sentinel, line)
 
     def test_newest_archive_by_mtime_skips_decoys(self):
         self.fx.write_archive("two-funnel-zz-older.ndjson.gz", [b"not json"], mtime=1_000_000_000)
@@ -476,6 +494,120 @@ class UserAgentTests(unittest.TestCase):
             probe.fetch("https://two-bot-next-staging.example-sub.workers.dev/readyz")
         self.assertEqual(seen, [probe.USER_AGENT])
         self.assertFalse(seen[0].startswith("Python-urllib"))
+
+
+class BodyCapRefusalTests(unittest.TestCase):
+    """Oversized /readyz bodies are refused before JSON parsing (M4.42)."""
+
+    def setUp(self):
+        guard = mock.patch.object(probe.urllib.request.OpenerDirector, "open",
+                                  side_effect=AssertionError("network access in a unit test"))
+        guard.start()
+        self.addCleanup(guard.stop)
+        self.fresh()
+
+    def fresh(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.fx = Fixture(tmp.name)
+        self.requested = []
+
+    def fetch(self, response=READY):
+        def fake(url):
+            self.requested.append(url)
+            if isinstance(response, Exception):
+                raise response
+            return response
+        return fake
+
+    def probe(self, *extra, fetch=None, env=None):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env or {}, clear=True), contextlib.redirect_stdout(out):
+            code = probe.main(self.fx.argv(*extra), fetch_fn=fetch or self.fetch())
+        lines = out.getvalue().splitlines()
+        return code, {line.split(":", 1)[0]: line for line in lines[:-1]}, lines[-1]
+
+    def padded(self, value, size):
+        raw = json.dumps(value).encode()
+        self.assertLessEqual(len(raw), size, "fixture must fit the target size")
+        return raw + b" " * (size - len(raw))
+
+    def valid_readyz(self, **extra):
+        payload = {"components": [["process", "ready"], ["gateway", "ready"],
+                                  ["database", "ready"], ["token_invalid", "ready"]],
+                   "jobs": {}, "build_revision": "unknown", "build_id": "unknown"}
+        payload.update(extra)
+        return payload
+
+    def test_exact_cap_valid_input_passes(self):
+        body = self.padded(self.valid_readyz(), probe.READYZ_BODY_CAP)
+        self.assertEqual(len(body), probe.READYZ_BODY_CAP)
+        self.assertEqual(json.loads(body)["build_revision"], "unknown")
+        code, results, _ = self.probe(fetch=self.fetch((200, body)))
+        self.assertEqual(code, 0, results)
+        self.assertIn("PASS readyz", results)
+
+    def test_valid_json_padded_past_cap_refuses_before_parsing(self):
+        sentinel = "SENTINEL_BODY_rollback_padded"
+        body = self.padded(self.valid_readyz(note=sentinel), probe.READYZ_BODY_CAP + 1)
+        self.assertEqual(len(body), probe.READYZ_BODY_CAP + 1)
+        self.assertEqual(json.loads(body)["note"], sentinel)
+        code, results, _ = self.probe(fetch=self.fetch((200, body)))
+        self.assertEqual(code, 1, results)
+        self.assertIn("/readyz answered over the body cap", results["FAIL readyz"])
+        self.assertNotIn(sentinel, results["FAIL readyz"])
+
+    def test_cap_length_valid_prefix_with_hidden_tail_refuses(self):
+        prefix = self.padded(self.valid_readyz(), probe.READYZ_BODY_CAP)
+        self.assertEqual(json.loads(prefix)["build_revision"], "unknown")
+        code, results, _ = self.probe(fetch=self.fetch((200, prefix + b"X")))
+        self.assertEqual(code, 1, results)
+        self.assertIn("/readyz answered over the body cap", results["FAIL readyz"])
+
+    def test_httperror_oversize_enforces_the_same_bound(self):
+        body = self.padded(self.valid_readyz(), probe.READYZ_BODY_CAP + 1)
+        code, results, _ = self.probe(fetch=self.fetch((503, body)))
+        self.assertEqual(code, 1, results)
+        self.assertIn("/readyz answered over the body cap", results["FAIL readyz"])
+
+    def test_transport_reads_bounded_cap_plus_one_both_paths(self):
+        import urllib.error
+        seen = []
+
+        class Response(io.BytesIO):
+            status = 200
+
+            def read(self, n=-1):
+                seen.append(n)
+                return super().read(n)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class OkOpener:
+            def open(self, request, timeout=None):
+                return Response(b"{}")
+
+        with mock.patch.object(probe.urllib.request, "build_opener",
+                               return_value=OkOpener()):
+            probe.fetch(STAGING + "/readyz")
+        self.assertEqual(seen, [probe.READYZ_BODY_CAP + 1])
+        seen.clear()
+
+        class ErrorOpener:
+            def open(self, request, timeout=None):
+                fp = Response(b"x")
+                raise urllib.error.HTTPError(request.full_url, 503,
+                                             "Service Unavailable", {}, fp)
+
+        with mock.patch.object(probe.urllib.request, "build_opener",
+                               return_value=ErrorOpener()):
+            status, _ = probe.fetch(STAGING + "/readyz")
+        self.assertEqual(status, 503)
+        self.assertEqual(seen, [probe.READYZ_BODY_CAP + 1])
 
 
 if __name__ == "__main__":

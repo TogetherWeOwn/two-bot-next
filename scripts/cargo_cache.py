@@ -318,16 +318,22 @@ def process_references(proc_root):
     Scans cwd/exe/fd/maps plus cmdline argv tokens. Inodes are compared too,
     so container mount path spellings need not match the host. cmdline entries
     that no longer stat are kept as lexical-only references (dev/ino None);
-    any denied read aborts the whole scan.
+    any other denied read aborts the whole scan.
 
     Deleted entries are (path, device, inode, stat_backed): fd/cwd/exe
     devices come from stat and compare directly with slot stat devices;
     maps devices are kernel-printed superblock numbers, which need not equal
     the stat device for the same file (btrfs per-subvolume anon_dev,
-    pre-6.8 overlayfs), so maps entries must never prove non-aliasing by
-    device alone. Deleted paths that cannot be regular files at all
-    (is_non_file_reference: SYSV shm segments, /dev/zero) are excludable by
-    identity instead.
+    pre-6.8 overlayfs), so a maps entry must never prove non-aliasing by
+    device alone -- UNLESS its identity was re-grounded through
+    /proc/PID/map_files/<range> (a symlink to the mapped file itself, whose
+    fstat device/inode compare exactly like fd stat; stat_backed=True). A
+    missing or denied map_files stat keeps the kernel-printed identity
+    (stat_backed=False) instead of refusing the scan.
+    Deleted paths that cannot be regular files at all
+    (is_non_file_reference: SYSV shm segments, /dev/zero, memfd anonymous
+    files, bracketed anonymous kernel mappings such as [aio]/[heap]/[stack])
+    are excludable by identity instead.
     """
     references = []
     deleted = []
@@ -377,13 +383,38 @@ def process_references(proc_root):
                 fields = line.split(None, 5)
                 if len(fields) == 6 and fields[5].startswith('/'):
                     if fields[5].endswith(' (deleted)'):
-                        major, minor = fields[3].split(':')
-                        # Kernel-printed superblock device: incomparable with
-                        # stat devices on some filesystems, so never
-                        # device-excludable (stat_backed=False).
-                        deleted.append((fields[5].removesuffix(' (deleted)'),
-                                        os.makedev(int(major, 16), int(minor, 16)),
-                                        int(fields[4]), False))
+                        pathname = fields[5].removesuffix(' (deleted)')
+                        if is_non_file_reference(pathname):
+                            # Kernel object, not a file: no map_files proof
+                            # needed; identity exclusion applies downstream.
+                            # Device/inode kept for receipt attribution only.
+                            major, minor = fields[3].split(':')
+                            deleted.append((pathname,
+                                            os.makedev(int(major, 16), int(minor, 16)),
+                                            int(fields[4]), False))
+                            continue
+                        # File-backed mapping: re-ground identity through
+                        # /proc/PID/map_files/<start>-<end>, whose symlink
+                        # stat reports the mapped file's real device/inode
+                        # even when deleted. The kernel names these entries
+                        # unpadded, while maps zero-pads the range.
+                        start, end = fields[0].split('-')
+                        map_name = f'{int(start, 16):x}-{int(end, 16):x}'
+                        try:
+                            info = (entry / 'map_files' / map_name).stat()
+                        except OSError:
+                            # Missing entry (anonymous object, hidepid, exit or
+                            # munmap race) or denied read (needs CAP_SYS_ADMIN
+                            # or CAP_CHECKPOINT_RESTORE): keep the
+                            # kernel-printed superblock identity, which is
+                            # incomparable with stat devices on some
+                            # filesystems, so never device-excludable.
+                            major, minor = fields[3].split(':')
+                            deleted.append((pathname,
+                                            os.makedev(int(major, 16), int(minor, 16)),
+                                            int(fields[4]), False))
+                        else:
+                            deleted.append((pathname, info.st_dev, info.st_ino, True))
                     else:
                         major, minor = fields[3].split(':')
                         references.append((fields[5],
@@ -431,22 +462,39 @@ def within(path, root):
     return Path(path).is_relative_to(root)
 
 
-# Deleted maps paths that denote kernel objects which can never be regular
-# files, so they cannot alias slot build output: SYSV IPC shared memory
-# segments (no filesystem existence) and the zero device (fixed device-node
-# identity, never build output). PostgreSQL backends map both, shown as
-# `/SYSV<key> (deleted)` and `/dev/zero (deleted)`; without this rule those
-# ubiquitous shared-host mappings refuse every retention run. Anything else
-# -- including real tmpfs paths such as /dev/shm files, whose non-aliasing
-# cannot be proven without mount-namespace analysis -- stays fail-closed.
-NON_FILE_REFERENCE_EXACT = frozenset({'/dev/zero'})
-NON_FILE_REFERENCE_PREFIXES = ('/SYSV',)
+# Deleted paths that denote kernel objects which can never be regular
+# files, so they cannot alias slot build output. Kernel /proc docs name the
+# shape: an anonymous mapping has an empty pathname or a bracketed label
+# ([heap], [stack], named private/shared anonymous mappings), and map_files
+# holds symlinks only for real mapped files. Concrete shared-host instances:
+# SYSV IPC shared memory segments (no filesystem existence), the zero device
+# (fixed device-node identity, never build output), memfd anonymous RAM files
+# (shown as `/memfd:<name> (deleted)`), async-IO contexts (`[aio]`, seen with
+# a container `/` spelling as `/[aio]`), and anon_inode objects
+# (`anon_inode:[eventfd]`). PostgreSQL backends map the SYSV/zero pair, so
+# without this rule those ubiquitous shared-host mappings refuse every
+# retention run. The bracket catch-all only matches a path whose whole name
+# past an optional leading slash is bracketed; a real slot output always
+# carries an absolute path under a slot target/scratch directory (checked by
+# lexical attribution before identity exclusion ever applies), so no regular
+# file can match. Anything else -- including real tmpfs paths such as
+# /dev/shm files, whose non-aliasing cannot be proven without
+# mount-namespace analysis -- stays fail-closed.
+# Source: https://docs.kernel.org/filesystems/proc.html (/proc/PID/maps
+# columns and anonymous-mapping labels; map_files as symlinks "which
+# represent memory mapped files" for inode-number comparison).
+NON_FILE_REFERENCE_EXACT = frozenset({'/dev/zero', '/[aio]', '[aio]'})
+NON_FILE_REFERENCE_PREFIXES = ('/SYSV', '/memfd:', 'memfd:',
+                               'anon_inode:', '/anon_inode:')
 
 
 def is_non_file_reference(path):
     """True when a deleted reference path cannot be a regular file."""
-    return (path in NON_FILE_REFERENCE_EXACT
-            or path.startswith(NON_FILE_REFERENCE_PREFIXES))
+    if (path in NON_FILE_REFERENCE_EXACT
+            or path.startswith(NON_FILE_REFERENCE_PREFIXES)):
+        return True
+    base = path[1:] if path.startswith('/') else path
+    return base.startswith('[') and base.endswith(']')
 
 
 # Top-level entries Cargo itself creates in a target directory. A .gitignore
@@ -827,15 +875,17 @@ def shared_pool_retain(pool, inventory, proc_root='/proc', now=None, max_age=60,
         # inode, so an entry attributable to no held slot refuses the whole
         # run -- EXCEPT provable different-filesystem exclusion. One
         # filesystem's unlinked inode can never be another filesystem's file,
-        # so a stat-backed (fd/cwd/exe) deleted entry whose device appears in
-        # no held slot output is provably unable to reference slot output and
-        # is excluded (counted in the receipt, never silently dropped). Maps
-        # entries are never device-excluded: their kernel-printed superblock
-        # device need not equal the stat device for the same file (btrfs
-        # per-subvolume anon_dev, pre-6.8 overlayfs), so a "foreign" maps
-        # device proves nothing. The only maps exception is identity, not
-        # device: a deleted path that cannot be a regular file at all
-        # (is_non_file_reference: SYSV shm segments, /dev/zero) cannot alias
+        # so a stat-backed (fd/cwd/exe, or maps re-grounded through map_files)
+        # deleted entry whose device appears in no held slot output is
+        # provably unable to reference slot output and is excluded (counted
+        # in the receipt, never silently dropped). Maps entries WITHOUT a
+        # map_files stat are never device-excluded: their kernel-printed
+        # superblock device need not equal the stat device for the same file
+        # (btrfs per-subvolume anon_dev, pre-6.8 overlayfs), so a "foreign"
+        # maps device proves nothing. The other maps exception is identity,
+        # not device: a deleted path that cannot be a regular file at all
+        # (is_non_file_reference: SYSV shm segments, /dev/zero, memfd
+        # anonymous files, bracketed anonymous kernel mappings) cannot alias
         # slot output and is excluded by identity. Same-filesystem and device-unknown
         # unattributed entries still refuse: a deleted slot file held open
         # carries the slot's device with an inode already gone from the

@@ -119,6 +119,8 @@ fn attributes() -> RoomChannelAttributes {
         nsfw: true,
         user_limit: 8,
         position: None,
+        respace: Vec::new(),
+        fallback_position: None,
         overwrites: vec![PermissionOverwrite {
             id: Id::new(100),
             kind: PermissionOverwriteType::Role,

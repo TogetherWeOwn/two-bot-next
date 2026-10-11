@@ -1,16 +1,17 @@
 //! Conformance: every counter row in `docs/metrics.md` renders in the
-//! `/metrics` exposition with its allowlisted labels, and every exposition
-//! counter has a doc row. Counters added by hand (e.g. the dispatch-drops
-//! counter) drift silently without this pin.
+//! `/metrics` exposition with its allowlisted labels, every exposition counter
+//! has a doc row, and the job error-class gauge matches its complete fixed
+//! label product. Counters added by hand (e.g. the dispatch-drops counter) drift
+//! silently without this pin.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use two_bot_core::metrics::{
-    Metrics, CHECKPOINT_FAILURE_STAGES, DB_ERROR_OPS, DISPATCH_LANES, EVENTS,
-    INTERNAL_ACTION_FAMILIES, INTERNAL_ACTION_OUTCOMES, JOBS, JOB_OUTCOMES,
-    PREFIX_TRIGGER_REFUSED_REASONS, REST_ROUTES, RESULTS, SEND_ADMISSION_OUTCOMES,
-    VOICE_DEAD_ACTIONS, VOICE_OPERATIONS, VOICE_OUTCOMES, VOICE_RECONCILE_ACTIONS,
-    VOICE_VOTE_KICK_OUTCOMES,
+    Metrics, CHECKPOINT_FAILURE_STAGES, COMMUNITY_FACTS_DRAIN_REASONS, DB_ERROR_OPS,
+    DISPATCH_LANES, EVENTS, INTERNAL_ACTION_FAMILIES, INTERNAL_ACTION_OUTCOMES, JOBS,
+    JOB_ERROR_CLASSES, JOB_OUTCOMES, PREFIX_TRIGGER_REFUSED_REASONS, REST_ROUTES, RESULTS,
+    SEND_ADMISSION_OUTCOMES, VOICE_DEAD_ACTIONS, VOICE_NAME_OUTCOMES, VOICE_OPERATIONS,
+    VOICE_OUTCOMES, VOICE_RECONCILE_ACTIONS, VOICE_VOTE_KICK_OUTCOMES,
 };
 
 fn repository_root() -> PathBuf {
@@ -124,7 +125,9 @@ fn allowlisted_labels(name: &str) -> Vec<&'static str> {
         "two_bot_gateway_prefix_trigger_refused_total" => vec!["reason"],
         "two_bot_dispatch_drops_total" => vec!["lane"],
         "two_bot_voice_vote_kick_total" => vec!["outcome"],
+        "two_bot_voice_names_total" => vec!["outcome"],
         "two_bot_internal_actions_total" => vec!["family", "outcome"],
+        "two_bot_community_facts_drain_failures_total" => vec!["reason"],
         "two_bot_gateway_checkpoint_failures_total" => vec!["stage"],
         _ => Vec::new(),
     }
@@ -164,10 +167,14 @@ fn expected_values(name: &str) -> Vec<(&'static str, Vec<&'static str>)> {
         "two_bot_voice_vote_kick_total" => {
             vec![("outcome", VOICE_VOTE_KICK_OUTCOMES.to_vec())]
         }
+        "two_bot_voice_names_total" => vec![("outcome", VOICE_NAME_OUTCOMES.to_vec())],
         "two_bot_internal_actions_total" => vec![
             ("family", INTERNAL_ACTION_FAMILIES.to_vec()),
             ("outcome", INTERNAL_ACTION_OUTCOMES.to_vec()),
         ],
+        "two_bot_community_facts_drain_failures_total" => {
+            vec![("reason", COMMUNITY_FACTS_DRAIN_REASONS.to_vec())]
+        }
         "two_bot_gateway_checkpoint_failures_total" => {
             vec![("stage", CHECKPOINT_FAILURE_STAGES.to_vec())]
         }
@@ -185,17 +192,24 @@ const KNOWN_COUNTERS: &[&str] = &[
     "two_bot_gateway_disconnects_total",
     "two_bot_gateway_missed_events_total",
     "two_bot_rest_requests_total",
+    "two_bot_rest_guard_invalid_requests_total",
+    "two_bot_rest_guard_rejected_requests_total",
+    "two_bot_rest_guard_breaker_opens_total",
+    "two_bot_rest_guard_breaker_closes_total",
+    "two_bot_rest_guard_global_pauses_total",
     "two_bot_job_runs_total",
     "two_bot_voice_operations_total",
     "two_bot_voice_reconcile_actions_total",
     "two_bot_voice_dead_letters_total",
     "two_bot_voice_vote_kick_total",
+    "two_bot_voice_names_total",
     "two_bot_voice_orphans_total",
     "two_bot_db_errors_total",
     "two_bot_send_admissions_total",
     "two_bot_gateway_prefix_trigger_refused_total",
     "two_bot_dispatch_drops_total",
     "two_bot_internal_actions_total",
+    "two_bot_community_facts_drain_failures_total",
     "two_bot_gateway_checkpoint_failures_total",
 ];
 
@@ -276,6 +290,121 @@ fn check_docs_against_exposition(doc: &str, exposition: &str) -> Result<(), Stri
 fn committed_metrics_docs_match_exposition() {
     let doc = std::fs::read_to_string(repository_root().join("docs/metrics.md")).unwrap();
     let exposition = Metrics::default().render(None);
+    check_docs_against_exposition(&doc, &exposition).unwrap();
+}
+
+#[test]
+fn job_error_class_docs_match_the_complete_fixed_gauge() {
+    let doc = std::fs::read_to_string(repository_root().join("docs/metrics.md")).unwrap();
+    let row = doc
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("| `two_bot_job_last_error_class"))
+        .expect("job error-class metric doc row");
+    assert_eq!(
+        row.split('|').nth(1).unwrap().trim(),
+        "`two_bot_job_last_error_class{job,class}`"
+    );
+    for class in JOB_ERROR_CLASSES {
+        assert!(
+            doc.contains(&format!("`{}`", class.as_str())),
+            "missing documented class {}",
+            class.as_str()
+        );
+    }
+
+    let exposition = Metrics::default().render(None);
+    assert!(exposition.contains("# TYPE two_bot_job_last_error_class gauge\n"));
+    let mut rendered = BTreeSet::new();
+    for line in exposition.lines() {
+        let Some(sample) = line.strip_prefix("two_bot_job_last_error_class{") else {
+            continue;
+        };
+        let (raw_labels, value) = sample.split_once('}').expect("job error-class labels");
+        let labels: Vec<&str> = raw_labels.split(',').collect();
+        let keys: Vec<&str> = labels
+            .iter()
+            .map(|label| label.split_once('=').expect("label value").0)
+            .collect();
+        assert_eq!(keys, vec!["job", "class"]);
+        let job = labels[0].split_once('=').unwrap().1.trim_matches('"');
+        let class = labels[1].split_once('=').unwrap().1.trim_matches('"');
+        assert!(JOBS.contains(&job), "unbounded job label {job}");
+        assert!(
+            JOB_ERROR_CLASSES
+                .iter()
+                .any(|allowed| allowed.as_str() == class),
+            "unbounded error-class label {class}"
+        );
+        assert_eq!(
+            value.trim(),
+            "0",
+            "new registry should render zeroed classes"
+        );
+        assert!(
+            rendered.insert((job.to_owned(), class.to_owned())),
+            "duplicate series {job}/{class}"
+        );
+    }
+
+    let expected: BTreeSet<(String, String)> = JOBS
+        .iter()
+        .flat_map(|job| {
+            JOB_ERROR_CLASSES
+                .iter()
+                .map(move |class| ((*job).to_owned(), class.as_str().to_owned()))
+        })
+        .collect();
+    assert_eq!(
+        rendered, expected,
+        "gauge must render exactly JOBS × ErrorClass"
+    );
+}
+
+#[test]
+fn rest_guard_fixture_and_all_doc_rows_match_live_renderer() {
+    let doc = std::fs::read_to_string(repository_root().join("docs/metrics.md")).unwrap();
+    let exposition = Metrics::default().render_with_rest_guard(
+        None,
+        two_bot_core::metrics::RestGuardSnapshot {
+            invalid_requests_in_window: 3,
+            invalid_requests_total: 12,
+            rejected_requests_total: 4,
+            breaker_opens_total: 2,
+            breaker_closes_total: 1,
+            global_pauses_total: 3,
+            breaker_open: true,
+            token_invalid: true,
+            global_pause_remaining: std::time::Duration::from_millis(1250),
+            pending_global_responses: 2,
+        },
+    );
+    let guard_text = exposition
+        .lines()
+        .filter(|line| line.contains("two_bot_rest_guard_"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert_eq!(guard_text, include_str!("fixtures/rest_guard_metrics.prom"));
+    let families = parse_exposition(&guard_text);
+    assert_eq!(families.len(), 11);
+    let doc_names: BTreeSet<&str> = doc
+        .lines()
+        .filter(|line| line.starts_with("| `two_bot_rest_guard_"))
+        .map(|line| line.split('`').nth(1).unwrap())
+        .collect();
+    assert_eq!(doc_names, families.keys().map(String::as_str).collect());
+    for (name, family) in families {
+        assert!(family.label_keys.is_empty(), "no guard labels: {name}");
+        assert_eq!(
+            family.kind,
+            if name.ends_with("_total") {
+                "counter"
+            } else {
+                "gauge"
+            }
+        );
+    }
     check_docs_against_exposition(&doc, &exposition).unwrap();
 }
 

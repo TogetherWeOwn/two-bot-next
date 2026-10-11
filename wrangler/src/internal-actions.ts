@@ -46,7 +46,7 @@ export const BODY_TIMEOUT_MS = 5_000;
 export const REQUEST_TIMEOUT_MS = 20_000;
 /** Concurrent ingress requests per isolate; the receiver itself admits 32. */
 export const MAX_IN_FLIGHT = 8;
-const MAX_RESPONSE_BYTES = 64 * 1024;
+export const MAX_RESPONSE_BYTES = 64 * 1024;
 
 export interface IngressEnv {
   /** Staging-only var; absent or anything but "1" keeps the route dark. */
@@ -265,23 +265,82 @@ const RELAYED_RESPONSE_HEADERS = ["content-type", "idempotent-replay", "retry-af
  * 429/500/503 bodies from startup failures (raw `e.message`), and a wrong
  * listener could answer anything else; both become the fixed unavailable
  * envelope. Allowlisted headers only.
+ *
+ * The 64 KiB cap is enforced incrementally while reading: the reader is
+ * cancelled the moment the cap is crossed, so no tail past the cap is
+ * collected. Rejected shapes (wrong media, out-of-range status, bodyless) are
+ * cancelled without reading a byte. Read errors, oversize and cancel failures
+ * all resolve to the same fixed 503 envelope; no exception, wire body or
+ * header value ever leaves.
  */
 export async function relayReceiverResponse(upstream: Response): Promise<Response> {
   const media = upstream.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
   const bodyless = upstream.status === 204 || upstream.status === 205 || upstream.status === 304;
   if (media !== "application/json" || upstream.status < 200 || upstream.status > 599 || bodyless) {
-    await upstream.arrayBuffer().catch(() => undefined);
+    // Cancel without reading: a huge or never-ending rejected tail must not
+    // be drained here. A failed cancel still yields the fixed refusal.
+    if (upstream.body) {
+      try {
+        await upstream.body.cancel();
+      } catch {
+        // Ignore: the fixed refusal below stands.
+      }
+    }
     return refuse(503, "unavailable", true);
   }
-  const body = await upstream.arrayBuffer();
-  if (body.byteLength > MAX_RESPONSE_BYTES) return refuse(503, "unavailable", true);
+  const reader = upstream.body?.getReader();
+  if (!reader) {
+    const headers = relayHeaders(upstream.headers);
+    return new Response(new Uint8Array(), { status: upstream.status, headers });
+  }
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      let step: ReadableStreamReadResult<Uint8Array>;
+      try {
+        step = await reader.read();
+      } catch {
+        try {
+          await reader.cancel();
+        } catch {
+          // Ignore: the fixed refusal below stands.
+        }
+        return refuse(503, "unavailable", true);
+      }
+      if (step.done) break;
+      total += step.value.byteLength;
+      if (total > MAX_RESPONSE_BYTES) {
+        try {
+          await reader.cancel();
+        } catch {
+          // Ignore: the fixed refusal below stands.
+        }
+        return refuse(503, "unavailable", true);
+      }
+      chunks.push(step.value);
+    }
+  } catch {
+    return refuse(503, "unavailable", true);
+  }
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  const headers = relayHeaders(upstream.headers);
+  return new Response(body, { status: upstream.status, headers });
+}
+
+function relayHeaders(source: Headers): Headers {
   const headers = new Headers();
   for (const name of RELAYED_RESPONSE_HEADERS) {
-    const value = upstream.headers.get(name);
+    const value = source.get(name);
     if (value !== null) headers.set(name, value);
   }
   const retry = headers.get("retry-after");
   if (retry !== null && !/^\d{1,6}$/.test(retry)) headers.delete("retry-after");
   headers.set("cache-control", "no-store");
-  return new Response(body, { status: upstream.status, headers });
+  return headers;
 }
