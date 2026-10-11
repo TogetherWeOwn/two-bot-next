@@ -2,8 +2,8 @@
 //! `@@month@@`, `@@daypart@@` and the date and time-of-day conditions).
 //!
 //! `settings.time_zone` accepts `UTC`/`GMT`, a fixed offset (`UTC+3`,
-//! `GMT-5`, `+05:30`, `-0800`) or one of the IANA names in [`ZONES`]. Named
-//! zones follow their current daylight-saving rule (US, EU, Australian or
+//! `GMT-5`, `+05:30`, `-0800`) or one of the IANA names listed in this
+//! module's `ZONES` table. Named zones follow their current daylight-saving rule (US, EU, Australian or
 //! New Zealand); there is no historical tz database, so instants before a
 //! rule changed use today's rule. Anything else is `None`, and callers keep
 //! UTC.
