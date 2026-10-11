@@ -146,6 +146,26 @@ class FlakyHealthHandler(BaseHTTPRequestHandler):
         json_reply(self, 200, b'{"status": "ok"}')
 
 
+class TruncatedBodyHandler(BaseHTTPRequestHandler):
+    """Promises 16 body bytes, sends 8, then closes (dropped mid-body)."""
+
+    truncate = True
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        if type(self).truncate:
+            type(self).truncate = False
+            self.send_response(200)
+            self.send_header("Content-Length", "16")
+            self.end_headers()
+            self.wfile.write(b'{"statu')
+            self.connection.close()
+            return
+        json_reply(self, 200, b'{"status": "ok"}')
+
+
 class RedirectReadyzHandler(BaseHTTPRequestHandler):
     """/readyz 302 -> /other 503 with the expected JSON (the review repro)."""
 
@@ -219,6 +239,7 @@ class EndlessBodyHandler(BaseHTTPRequestHandler):
 class HttpHelperTests(unittest.TestCase):
     def tearDown(self):
         FlakyHealthHandler.unanswered = True
+        TruncatedBodyHandler.truncate = True
         SizedBodyHandler.user_agents = []
         EndlessBodyHandler.written = 0
         EndlessBodyHandler.ended.clear()
@@ -270,6 +291,7 @@ class HttpHelperTests(unittest.TestCase):
 
         class Response:
             status = 200
+            length = 0
 
             def read(self, amt=None):
                 reads.append(amt)
@@ -299,6 +321,16 @@ class HttpHelperTests(unittest.TestCase):
 
     def test_early_close_is_a_retryable_miss_not_a_crash(self):
         server = serve_in_thread(FlakyHealthHandler)
+        try:
+            url = server_url(server, "/health")
+            self.assertEqual(smoke.http_response(url), (None, None))
+            self.assertEqual(smoke.http_response(url), (200, {"status": "ok"}))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_body_cut_short_mid_stream_is_a_retryable_miss(self):
+        server = serve_in_thread(TruncatedBodyHandler)
         try:
             url = server_url(server, "/health")
             self.assertEqual(smoke.http_response(url), (None, None))

@@ -108,6 +108,11 @@ def http_response(url):
         raw = response.read(MAX_BODY_BYTES + 1)
         if len(raw) > MAX_BODY_BYTES:
             raise BodyTooLarge("loopback response body exceeds the 64 KiB cap")
+        if response.length:
+            # read(amt) returns a short Content-Length body without raising
+            # (unlike an unbounded read); a connection dropped mid-body is
+            # still a transport miss for the caller to retry.
+            raise http.client.IncompleteRead(raw, response.length)
         try:
             return response.status, json.loads(raw)
         except ValueError:
