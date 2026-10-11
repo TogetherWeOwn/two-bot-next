@@ -2157,6 +2157,47 @@ async fn revoked_fallback_keeps_handoff_pending_until_access_returns() {
 }
 
 #[tokio::test]
+async fn category_synced_transfer_commits_without_minting_overwrites_while_access_is_absent() {
+    // Rooms created without Manage Roles are category-synced and carry no
+    // bot-issued owner overwrite ("Do not invent one"). A transfer there
+    // while the bot still lacks Manage Roles must commit the owner change
+    // with no Discord write — the opposite of a revoked-but-ungranted room,
+    // which stays pending until the owed grant lands.
+    let (live, store, http, trace) = owned_room();
+    let mut room_channel = channel(500, 2, Some(CATEGORY));
+    room_channel.permission_overwrites = Some(vec![]);
+    live.upsert_channel(room_channel);
+    let full_access = live.inner.read().unwrap().bot.clone().unwrap();
+    let mut reduced = full_access.clone();
+    for role in &mut reduced.roles {
+        role.permissions &= !Permissions::MANAGE_ROLES;
+    }
+    live.refresh_bot(reduced);
+    let mut worker = GuildRoomWorker::load(live.clone(), store, http)
+        .await
+        .unwrap();
+    worker.apply_ownership(MEMBER, false, OwnershipCommand::Transfer { target_id: 301 });
+    dispatch(&mut worker, 0).await;
+    assert!(
+        trace
+            .lock()
+            .unwrap()
+            .contains(&"update_ownership:500:301".to_owned()),
+        "category-synced ownership change commits without access"
+    );
+    assert!(
+        !trace
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call == "overwrites:500"),
+        "no overwrite is minted for a category-synced room"
+    );
+    assert!(!worker.store.owner_pending.lock().unwrap().contains(&500));
+    assert_eq!(worker.store.rooms.lock().unwrap()[&500].owner_id, 301);
+}
+
+#[tokio::test]
 async fn fallback_patch_propagates_rate_limit_and_unauthorized() {
     let rate_limited = RoomHttpError::RateLimited {
         retry_after_ms: 100,
