@@ -27,8 +27,10 @@ IMAGE_MAX_BYTES = 112 * MIB
 # 15,734,960 bytes (15.01 MiB) vs main 15,712,080 bytes — each a few tens of
 # KiB over the old 15 MiB budget with no new dependencies. The settings
 # hot-reload head measured 15,730,600 bytes (15.00 MiB), also below this
-# limit. 16 MiB restores a working tripwire with headroom; revisit if the
-# binary approaches it.
+# limit. This branch's automation-only head measured 15,769,872 bytes
+# (15.04 MiB) before the event-executor merge; the combined-head
+# measurement comes from hosted CI on the merged head. 16 MiB restores a
+# working tripwire with headroom; revisit if the binary approaches it.
 BINARY_MAX_BYTES = 16 * MIB
 # The distroless runtime has no shell, coreutils or grep: file checks read
 # docker cp archives from a never-started container instead of exec helpers.

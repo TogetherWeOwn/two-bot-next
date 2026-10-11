@@ -204,10 +204,21 @@ def mock_transport(state=None):
     return call
 
 
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Stop before urllib can replay a bot token on a follow-up request."""
+
+    def http_error_301(self, req, fp, code, msg, headers):
+        fp.close()
+        raise DrillError("refusing: authenticated Discord request answered a redirect (not followed)")
+
+    http_error_302 = http_error_303 = http_error_307 = http_error_308 = http_error_301
+
+
 def live_transport(token):
     """Real Discord REST transport. Token stays in memory; never logged."""
     if not token:
         raise DrillError("refusing: no staging bot token in the environment")
+    opener = urllib.request.build_opener(_RefuseRedirect)
 
     def request(method, url, payload=None):
         data = json.dumps(payload).encode() if payload is not None else None
@@ -216,10 +227,14 @@ def live_transport(token):
             headers={"Authorization": f"Bot {token}", "User-Agent": USER_AGENT,
                      "Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with opener.open(req, timeout=20) as resp:
                 body = resp.read(BODY_CAP + 1)
+        except DrillError:
+            raise
         except urllib.error.HTTPError as error:
-            raise DrillError(f"discord answered {error.code} on {method}")
+            code = error.code
+            error.close()
+            raise DrillError(f"discord answered {code} on {method}")
         except Exception as error:
             raise DrillError(f"discord did not respond ({error.__class__.__name__})")
         if len(body) > BODY_CAP:

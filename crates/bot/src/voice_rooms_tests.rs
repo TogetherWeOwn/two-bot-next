@@ -712,6 +712,12 @@ struct Http {
     slow_status: Mutex<Option<u64>>,
     /// Scripted failures for the next status writes.
     status_errors: Mutex<VecDeque<RoomHttpError>>,
+    /// Scripted outcomes for bulk channel reorders, oldest first, and the
+    /// reorders sent (sorted by channel id).
+    reorder_errors: Mutex<VecDeque<RoomHttpError>>,
+    reorders: Mutex<Vec<Vec<(u64, u64)>>>,
+    /// When set, a created channel reports the position it was created at.
+    echo_positions: Mutex<bool>,
 }
 
 impl Http {
@@ -746,6 +752,9 @@ impl Http {
             before_limit: None,
             overwrites_gate: None,
             limit_gate: None,
+            reorder_errors: Mutex::new(VecDeque::new()),
+            reorders: Mutex::new(Vec::new()),
+            echo_positions: Mutex::new(false),
             slow_renames: Mutex::new(None),
             slow_status: Mutex::new(None),
             status_errors: Mutex::new(VecDeque::new()),
@@ -785,6 +794,10 @@ impl RoomWrites for Http {
             .unwrap()
             .push(attributes.clone());
         let mut result = channel(id, 2, attributes.parent_id);
+        result.name = Some(name.to_owned());
+        if *self.echo_positions.lock().unwrap() {
+            result.position = attributes.position.and_then(|p| i32::try_from(p).ok());
+        }
         result.permission_overwrites = Some(attributes.overwrites.clone());
         if let Some(hook) = &self.after_create {
             hook();
@@ -916,6 +929,19 @@ impl RoomWrites for Http {
         }))
     }
 
+    async fn reorder_channels(
+        &self,
+        _: u64,
+        positions: &[(u64, u64)],
+    ) -> Result<(), RoomHttpError> {
+        let mut sorted = positions.to_vec();
+        sorted.sort_unstable();
+        self.reorders.lock().unwrap().push(sorted);
+        match self.reorder_errors.lock().unwrap().pop_front() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
     async fn rename(&self, channel: u64, name: &str) -> Result<(), RoomHttpError> {
         self.trace
             .lock()
@@ -3551,6 +3577,21 @@ fn fixture_policy(words: &[&str]) -> AutomodPolicy {
     AutomodPolicy {
         bad_words: words.iter().map(ToString::to_string).collect(),
         ..AutomodPolicy::default()
+    }
+}
+
+#[test]
+fn possessive_matches_auto_voice_for_names_ending_in_s() {
+    // Auto-Voice renders a literal `'s` (`@@owner@@'s room`) whatever the
+    // name ends with, so "PisnRzrs" is "PisnRzrs's room" there too.
+    let policy = AutomodPolicy::default();
+    for (display, expected) in [("PisnRzrs", "PisnRzrs's room"), ("JAMES", "JAMES's room")] {
+        assert_eq!(
+            resolve_room_name(display, &policy, &name_context())
+                .unwrap()
+                .name,
+            expected
+        );
     }
 }
 
@@ -9916,23 +9957,245 @@ async fn failed_create_compensation_orphan_is_counted_without_a_channel_id() {
 }
 
 #[tokio::test]
-async fn a_new_room_is_renamed_from_its_creator_template() {
+async fn a_new_room_is_created_with_its_template_name_and_never_renamed() {
     let (live, store, http, trace) = fixture();
-    store.creators.lock().unwrap()[0].name_template = "@@owner@@'s den ##".to_owned();
+    store.creators.lock().unwrap()[0].name_template = "@@owner@@'s den".to_owned();
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     join(&mut worker, MEMBER);
     dispatch(&mut worker, 0).await;
     dispatch(&mut worker, 1).await;
-    worker.refresh_template_names(2);
-    dispatch(&mut worker, 3).await;
+    worker.live.voice_update(MEMBER, Some(500), Some(false));
+    for now in 2..6 {
+        worker.refresh_template_names(now);
+        worker.dispatch_one(now).await;
+    }
+    assert_eq!(
+        *worker.http.created_names.lock().unwrap(),
+        ["new room's den"]
+    );
     assert_eq!(
         *trace.lock().unwrap(),
-        [
-            "create",
-            "persist:500",
-            "move:300:500",
-            "rename:500:new room's den #1"
-        ]
+        ["create", "persist:500", "move:300:500"]
+    );
+}
+
+#[tokio::test]
+async fn a_blank_template_creates_the_room_with_its_v1_name() {
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(
+        *worker.http.created_names.lock().unwrap(),
+        ["new room's room"]
+    );
+}
+
+#[test]
+fn room_playtime_adds_up_member_minutes_per_game() {
+    let minute = 60_000;
+    let mut playtime = name_panel::RoomPlaytime::default();
+    playtime.observe(Some("Apex"), 2, 0);
+    assert_eq!(playtime.minutes("Apex", 10 * minute), 20);
+    playtime.observe(None, 0, 10 * minute);
+    assert_eq!(playtime.minutes("Apex", 60 * minute), 20);
+    playtime.observe(Some("Apex"), 1, 60 * minute);
+    assert_eq!(playtime.minutes("Apex", 70 * minute), 30);
+    assert_eq!(playtime.minutes("Valorant", 70 * minute), 0);
+}
+
+thread_local! {
+    static TEST_WALL_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn test_wall_clock() -> u64 {
+    TEST_WALL_MS.get()
+}
+
+async fn playtime_worker(template: &str, games: &[&str]) -> GuildRoomWorker<Store, Http> {
+    TEST_WALL_MS.set(0);
+    let (live, store, http, _) = fixture();
+    store.creators.lock().unwrap()[0].name_template = template.to_owned();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    for (index, game) in games.iter().enumerate() {
+        let member = MEMBER + index as u64;
+        live.voice_update(member, Some(500), Some(false));
+        live.set_presence(
+            member,
+            MemberPresence {
+                game: Some((*game).to_owned()),
+                ..Default::default()
+            },
+        );
+    }
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.wall_clock = test_wall_clock;
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    worker
+}
+
+#[tokio::test]
+async fn room_playtime_counts_only_players_of_the_selected_games() {
+    let template = "@@game_name@@ @@game_minutes@@ @@game_tier@@";
+    for (games, alias, force_single, shown, expected) in [
+        (vec!["Apex", "Apex", "Valorant"], false, false, "Apex", 20),
+        (
+            vec!["Apex Legends", "apex legends", "Valorant"],
+            true,
+            false,
+            "Apex",
+            20,
+        ),
+        (
+            vec!["Apex", "Apex", "Valorant", "Valorant", "Chess"],
+            false,
+            false,
+            "Apex & Valorant",
+            40,
+        ),
+        (
+            vec!["Apex", "Valorant", "Valorant"],
+            false,
+            true,
+            "Apex",
+            10,
+        ),
+    ] {
+        let mut worker = playtime_worker(template, &games).await;
+        if alias {
+            worker
+                .name_settings
+                .aliases
+                .push(("Apex Legends".to_owned(), "Apex".to_owned()));
+        }
+        worker.name_settings.force_single_game = force_single;
+        worker.refresh_template_names(0);
+        TEST_WALL_MS.set(10 * 60_000);
+        worker.refresh_template_names(1);
+        assert_eq!(
+            worker.playtime[&500].minutes(shown, test_wall_clock()),
+            expected
+        );
+        if !force_single {
+            let tier = two_bot_core::voice_naming::minutes_tier(expected);
+            assert_eq!(
+                worker.desired_names[&500],
+                format!("{shown} {expected} {tier}")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn room_playtime_keeps_tracking_when_automatic_names_are_skipped() {
+    let template = "@@game_name@@ @@game_minutes@@ @@game_tier@@";
+    for skip in ["override", "blank", "name wait"] {
+        let mut worker = playtime_worker(template, &["Apex", "Apex"]).await;
+        worker.refresh_template_names(0);
+        TEST_WALL_MS.set(3 * 60_000);
+        worker.refresh_template_names(1);
+        match skip {
+            "override" => {
+                worker.custom_names.insert(500, "custom".to_owned());
+            }
+            "blank" => worker
+                .creators
+                .get_mut(&CREATOR)
+                .unwrap()
+                .name_template
+                .clear(),
+            _ => worker.name_directory = NameDirectory::default(),
+        }
+        TEST_WALL_MS.set(4 * 60_000);
+        worker.live.set_presence(MEMBER, MemberPresence::default());
+        worker
+            .live
+            .set_presence(MEMBER + 1, MemberPresence::default());
+        worker.refresh_template_names(2);
+        TEST_WALL_MS.set(124 * 60_000);
+        worker.refresh_template_names(3);
+        assert_eq!(
+            worker.playtime[&500].minutes("Apex", test_wall_clock()),
+            8,
+            "{skip}"
+        );
+        worker.custom_names.remove(&500);
+        worker.creators.get_mut(&CREATOR).unwrap().name_template = template.to_owned();
+        worker.name_directory.insert(MEMBER, "Alex".to_owned());
+        worker.live.set_presence(
+            MEMBER,
+            MemberPresence {
+                game: Some("Apex".to_owned()),
+                ..Default::default()
+            },
+        );
+        worker.refresh_template_names(4);
+        TEST_WALL_MS.set(127 * 60_000);
+        worker.refresh_template_names(5);
+        assert_eq!(
+            worker.playtime[&500].minutes("Apex", test_wall_clock()),
+            11,
+            "{skip}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn room_playtime_discards_unobserved_gateway_and_halt_gaps() {
+    for gap in ["halt", "gateway", "reconnect between passes"] {
+        let mut worker = playtime_worker("@@game_minutes@@ @@game_tier@@", &["Apex"]).await;
+        worker.refresh_template_names(0);
+        TEST_WALL_MS.set(10 * 60_000);
+        worker.refresh_template_names(1);
+        TEST_WALL_MS.set(11 * 60_000);
+        if gap == "halt" {
+            worker.halted = true;
+        } else {
+            worker.live.disconnect();
+        }
+        if gap != "reconnect between passes" {
+            worker.refresh_template_names(2);
+        }
+        TEST_WALL_MS.set(131 * 60_000);
+        worker.halted = false;
+        worker.live.write_state().ready = true;
+        worker.refresh_template_names(3);
+        assert_eq!(worker.playtime[&500].minutes("Apex", test_wall_clock()), 10);
+        TEST_WALL_MS.set(137 * 60_000);
+        worker.refresh_template_names(4);
+        assert_eq!(worker.desired_names[&500], "16 1");
+        assert_eq!(worker.playtime[&500].minutes("Apex", test_wall_clock()), 16);
+    }
+}
+
+#[tokio::test]
+async fn a_room_tier_change_renames_the_room_once() {
+    let created = two_bot_core::funnel::parse_iso_millis(NOW).unwrap() as u64;
+    let minute = 60_000;
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template =
+        "{{@@room_tier@@ >= 1 ?? veterans // fresh}}".to_owned();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER, Some(500), Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.wall_clock = test_wall_clock;
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    TEST_WALL_MS.set(created + minute);
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    // Minutes pass inside the tier: no new name.
+    TEST_WALL_MS.set(created + 10 * minute);
+    worker.refresh_template_names(1);
+    assert!(!worker.dispatch_one(1).await);
+    TEST_WALL_MS.set(created + 16 * minute);
+    worker.refresh_template_names(2);
+    assert_eq!(worker.desired_names[&500], "veterans");
+    dispatch(&mut worker, 600_000).await;
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["rename:500:fresh", "rename:500:veterans"]
     );
 }
 
@@ -10551,4 +10814,93 @@ fn empty_grace_config_accepts_zero_to_ten_minutes_and_refuses_garbage() {
     assert_eq!(configured_empty_grace(Some("601")), Err(InvalidEmptyGrace));
     assert_eq!(configured_empty_grace(Some("-1")), Err(InvalidEmptyGrace));
     assert_eq!(configured_empty_grace(Some("1m")), Err(InvalidEmptyGrace));
+}
+
+fn two_creator_worker_parts(a_position: i32, b_position: i32) -> (LiveGuild, Store, Http, Trace) {
+    let (live, store, http, trace) = fixture();
+    {
+        let mut creators = store.creators.lock().unwrap();
+        creators.push(CreatorChannel::new(GUILD, 210));
+        for creator in creators.iter_mut() {
+            creator.position = two_bot_core::voice_rooms::RoomPosition::Below;
+        }
+    }
+    let mut a = channel(CREATOR, 2, Some(CATEGORY));
+    a.position = Some(a_position);
+    live.upsert_channel(a);
+    let mut b = channel(210, 2, Some(CATEGORY));
+    b.position = Some(b_position);
+    live.upsert_channel(b);
+    *http.echo_positions.lock().unwrap() = true;
+    (live, store, http, trace)
+}
+
+fn join_creator(worker: &mut GuildRoomWorker<Store, Http>, member: u64, creator: u64) {
+    let ticket = worker
+        .live
+        .voice_update(member, Some(creator), Some(false))
+        .unwrap();
+    assert!(worker.accept_join(ticket, "new room", 7, NOW.to_owned()));
+}
+
+fn created_positions(worker: &GuildRoomWorker<Store, Http>) -> Vec<Option<u64>> {
+    worker
+        .http
+        .created_attributes
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|attributes| attributes.position)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_respace_reaches_the_snapshot_before_the_next_create_is_planned() {
+    // Creators at 2 and 3: the first room needs a re-space (A 16, room 32,
+    // B 48). The second join, on the other creator, comes before any
+    // CHANNEL_UPDATE and must plan from the re-spaced positions.
+    let (live, store, http, _) = two_creator_worker_parts(2, 3);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join_creator(&mut worker, MEMBER, CREATOR);
+    dispatch(&mut worker, 0).await;
+    join_creator(&mut worker, MEMBER + 1, 210);
+    for now in 1..4 {
+        worker.dispatch_one(now).await;
+    }
+    assert_eq!(
+        worker.http.reorders.lock().unwrap()[0],
+        [(CREATOR, 16), (210, 48)]
+    );
+    assert_eq!(created_positions(&worker), [Some(32), Some(49)]);
+}
+
+#[tokio::test]
+async fn a_refused_respace_ties_upwards_and_an_unknown_one_takes_no_position() {
+    let (live, store, http, _) = two_creator_worker_parts(2, 3);
+    http.reorder_errors.lock().unwrap().extend([
+        RoomHttpError::Rejected {
+            status: 403,
+            code: 50013,
+        },
+        RoomHttpError::UnknownOutcome,
+    ]);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join_creator(&mut worker, MEMBER, CREATOR);
+    dispatch(&mut worker, 0).await;
+    // Refused: nothing moved, so the room ties with its creator (2) and,
+    // being newer, renders directly below it.
+    assert_eq!(created_positions(&worker), [Some(2)]);
+    // The second creator's block again has no free position below it.
+    let mut room = worker.live.read_state().channels[&500].clone();
+    room.position = Some(4);
+    worker.live.upsert_channel(room);
+    let mut b = channel(210, 2, Some(CATEGORY));
+    b.position = Some(3);
+    worker.live.upsert_channel(b);
+    join_creator(&mut worker, MEMBER + 1, 210);
+    for now in 1..4 {
+        worker.dispatch_one(now).await;
+    }
+    // Unknown outcome: the reorder may have landed, so no stale position.
+    assert_eq!(created_positions(&worker)[1], None);
 }

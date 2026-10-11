@@ -1,10 +1,12 @@
 """Offline staging voice-smoke fixtures; stdlib only, no network access."""
 
+import http.server
 import io
 import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -322,6 +324,95 @@ class WorkerReadyzDuplicateTests(unittest.TestCase):
             results, info = smoke.check_worker("https://two-bot-next-staging.5150.workers.dev")
         self.assertIsNotNone(info)
         self.assertTrue(all(r.verdict == "pass" for r in results))
+
+
+class _Loopback:
+    """Isolated 127.0.0.1 server that records every request it receives."""
+
+    def __init__(self, handler_for):
+        self.hits = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                outer.hits.append((self.path, self.headers.get("Authorization")))
+                status, headers, body = handler_for(self.path)
+                self.send_response(status)
+                for key, value in headers.items():
+                    self.send_header(key, value)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class RedirectTransportTests(unittest.TestCase):
+    """Real opener and handlers against loopback: no redirect is ever followed."""
+
+    def setUp(self):
+        env = mock.patch.dict(os.environ, {"NO_PROXY": "*", "no_proxy": "*"})
+        env.start()
+        self.addCleanup(env.stop)
+        for name in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+            os.environ.pop(name, None)
+
+    def serve(self, handler_for):
+        server = _Loopback(handler_for)
+        self.addCleanup(server.close)
+        return server
+
+    def test_every_redirect_status_is_refused_with_zero_follow_ups(self):
+        for status in (301, 302, 303, 307, 308):
+            for cross_origin in (False, True):
+                with self.subTest(status=status, cross_origin=cross_origin):
+                    destination = self.serve(lambda path: (200, {}, b"LEAKED_DESTINATION_BODY"))
+                    target = (destination.base if cross_origin else "") + "/second"
+                    origin = None
+
+                    def route(path, status=status, target=target):
+                        if path == "/first":
+                            return status, {"Location": origin.base + target
+                                            if not target.startswith("http") else target}, \
+                                b"REDIRECT_BODY_SENTINEL"
+                        return 200, {}, b"{}"
+
+                    origin = self.serve(route)
+                    with self.assertRaises(smoke.SmokeError) as raised:
+                        smoke.make_fetch(TOKEN)(origin.base + "/first")
+                    self.assertEqual([path for path, _ in origin.hits], ["/first"])
+                    self.assertEqual(destination.hits, [])
+                    text = str(raised.exception)
+                    self.assertEqual(
+                        text, "refusing: authenticated read answered a redirect (not followed)")
+                    for secret in (TOKEN, "REDIRECT_BODY_SENTINEL", "/second",
+                                   "127.0.0.1", "LEAKED_DESTINATION_BODY"):
+                        self.assertNotIn(secret, text)
+
+    def test_healthy_and_auth_denied_controls_keep_their_behavior(self):
+        server = self.serve(lambda path: (401, {}, b"denied") if path == "/denied"
+                            else (200, {}, b'{"ok": true}'))
+        fetch = smoke.make_fetch(TOKEN)
+        self.assertEqual(fetch(server.base + "/healthy"), (200, b'{"ok": true}'))
+        self.assertEqual(fetch(server.base + "/denied"), (401, b"denied"))
+        self.assertEqual([auth for _, auth in server.hits], ["Bot " + TOKEN] * 2)
+
+    def test_redirect_through_get_json_is_a_smoke_error_with_no_secret(self):
+        server = self.serve(lambda path: (302, {"Location": "/elsewhere"}, b"BODY_SENTINEL"))
+        with self.assertRaises(smoke.SmokeError) as raised:
+            smoke.get_json(smoke.make_fetch(TOKEN), server.base + "/x")
+        self.assertEqual(len(server.hits), 1)
+        self.assertNotIn(TOKEN, str(raised.exception))
+        self.assertNotIn("BODY_SENTINEL", str(raised.exception))
 
 
 if __name__ == "__main__":

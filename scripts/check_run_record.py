@@ -56,6 +56,44 @@ TYPE_NAMES = {
 }
 
 
+class DuplicateKeyError(ValueError):
+    """A JSON object has repeated keys; diagnostics never include its values."""
+
+
+class _ObjectPairs(list):
+    """Keep object pairs distinct from arrays until paths can be assigned."""
+
+
+def safe_key(key):
+    # Untrusted keys can themselves contain a secret; do not echo it in diagnostics.
+    if any(marker.search(key) for marker in SECRET_MARKERS):
+        return "[redacted-key]"
+    return key
+
+
+def child_path(path, key):
+    return f"{path}.{safe_key(key)}"
+
+
+def load_json(text):
+    """Decode JSON without losing duplicate keys, including in nested objects."""
+    def unique_objects(value, path):
+        if isinstance(value, _ObjectPairs):
+            result = {}
+            for key, item in value:
+                field_path = child_path(path, key)
+                if key in result:
+                    raise DuplicateKeyError(f"{field_path}: duplicate object key")
+                result[key] = unique_objects(item, field_path)
+            return result
+        if isinstance(value, list):
+            return [unique_objects(item, f"{path}[{index}]")
+                    for index, item in enumerate(value)]
+        return value
+
+    return unique_objects(json.loads(text, object_pairs_hook=_ObjectPairs), "$")
+
+
 def check_format(value, fmt, path, errors):
     if fmt == "date-time":
         if not isinstance(value, str) or not DATETIME_RE.match(value):
@@ -119,13 +157,13 @@ def check_instance(instance, schema, path, errors):
     if isinstance(instance, dict):
         for key in schema.get("required", []):
             if key not in instance:
-                errors.append(f"{path}: missing required field {key!r}")
+                errors.append(f"{path}: missing required field {safe_key(key)!r}")
         props = schema.get("properties", {})
         for key, value in instance.items():
             if key in props:
-                check_instance(value, props[key], f"{path}.{key}", errors)
+                check_instance(value, props[key], child_path(path, key), errors)
             elif schema.get("additionalProperties") is False:
-                errors.append(f"{path}: unexpected field {key!r}")
+                errors.append(f"{path}: unexpected field {safe_key(key)!r}")
     if isinstance(instance, list):
         if "minItems" in schema and len(instance) < schema["minItems"]:
             errors.append(f"{path}: fewer than minItems {schema['minItems']}")
@@ -151,12 +189,12 @@ def scan_public_safety(value, path, errors):
             if marker.search(value):
                 errors.append(
                     f"{path}: public-safety scan hit "
-                    f"{marker.pattern!r} in {value!r}"
+                    f"{marker.pattern!r}"
                 )
                 break
     elif isinstance(value, dict):
         for key, item in value.items():
-            scan_public_safety(item, f"{path}.{key}", errors)
+            scan_public_safety(item, child_path(path, key), errors)
     elif isinstance(value, list):
         for index, item in enumerate(value):
             scan_public_safety(item, f"{path}[{index}]", errors)
@@ -165,13 +203,17 @@ def scan_public_safety(value, path, errors):
 def validate(record, schema, allow_mock=False):
     """Return a list of error strings; empty means valid."""
     errors = []
+    scan_public_safety(record, "$", errors)
+    # Schema diagnostics can also echo values (enum, pattern, date-time).
+    # Refuse unsafe records first, so those diagnostics never see a secret.
+    if errors:
+        return errors
     check_instance(record, schema, "$", errors)
     if isinstance(record, dict) and record.get("mock") is True and not allow_mock:
         errors.append(
             "$.mock: worked example labelled mock:true is not evidence; "
             "re-run with --allow-mock only to check the template shape"
         )
-    scan_public_safety(record, "$", errors)
     return errors
 
 
@@ -192,13 +234,13 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
     try:
-        record = json.loads(Path(args.record).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        record = load_json(Path(args.record).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, DuplicateKeyError) as exc:
         print(f"{args.record}: cannot load record: {exc}")
         return 1
     try:
-        schema = json.loads(Path(args.schema).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        schema = load_json(Path(args.schema).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, DuplicateKeyError) as exc:
         print(f"{args.schema}: cannot load schema: {exc}")
         return 1
     errors = validate(record, schema, allow_mock=args.allow_mock)

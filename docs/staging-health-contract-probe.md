@@ -19,13 +19,34 @@ CI; the live run is manual-dispatch only.
 `/healthz` at the staging origin is the Worker's redirect probe (`ok`),
 covered by the redirect smoke — not this probe.
 
-## Migration-level assertion
+## Checkpoint-read assertion (not a root-cause diagnosis)
 
-The probe reads migration drift through the contract's own vocabulary, not
-through SQL: `gateway_failure durable_gateway:checkpoint_load_failed` is the
-DB-behind-binary (staging rollout-timeout) signature and fails with the
-`db-behind-binary` reason (`docs/voice-cutover-rollback-triggers.md` T1).
-The response is migrate-before-redeploy, never a blind re-run.
+`gateway_failure durable_gateway:checkpoint_load_failed` identifies only
+**the failed checkpoint read step** (`crates/bot/src/gateway_failure.rs`,
+`FailureClass::CheckpointLoadFailed`). It does not distinguish schema lag,
+ACL denial, or connectivity failure. Readiness stays FAIL; neither this
+class nor a rollout timeout proves the database is behind the binary.
+
+A root-cause claim requires an **independent, reviewed receipt** with
+schema/ledger, checkpoint-reader ACL, or connectivity evidence tied to the
+affected staging target and deployed build. Review those separate evidence
+sources before choosing remediation; do not recommend applying migrations
+solely from this failure class. See
+[`voice-cutover-rollback-triggers.md` T1](voice-cutover-rollback-triggers.md#t1-checkpoint-read-failure-staging-rollout-timeout-lesson).
+
+The allowlisted JSON evidence retains `gateway_failure_class` and the
+failing `readyz` check's observed-step reason. Its additive
+`gateway_failure_root_cause` field is `"unverified"` only when the probe
+classifies a status-consistent 503 with this class as a checkpoint-read
+failure. It is `null` otherwise, including a contradictory status/breakdown
+or an all-ready 200 carrying the class. The class remains an observed
+allowlisted token, not the classified verdict. The cause field is never
+copied from remote cause/error details. The probe cannot create the
+independent root-cause receipt.
+
+**No probe is allowed to apply a migration or test production.** Migration
+execution remains a separate reviewed, governed staging operation, not
+an action or recommendation inferred by this health probe.
 
 ## Live run (manual, staging only)
 
@@ -51,10 +72,14 @@ PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_staging_health_contract_probe.py 
 Fixtures cover: production/HTTP/credentialed/missing origins refusing
 before any request; the all-ready pass with build identity and evidence;
 `--expected-sha` match and mismatch; parked gateway as truthful-not-approval;
-the db-behind-binary signature; a 200 that contradicts its breakdown;
-ownership refusals, short breakdowns and non-JSON bodies as not-the-bot;
-health 503 as not-liveness; transport failures by class; redirects observed,
-never followed.
+checkpoint-read failure without a root-cause assertion or migration advice;
+unreviewed remote causes/details dropped from output and evidence; unknown
+failure classes refused without echoing details; both contradictory
+status/breakdown directions carrying the checkpoint class without a failed-read
+classification; an all-ready 200 with that class and no cause assertion;
+ownership refusals, short breakdowns and non-JSON bodies as
+not-the-bot; health 503 as not-liveness; transport failures by class;
+redirects observed, never followed.
 
 ## Not covered here
 
