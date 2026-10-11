@@ -231,7 +231,9 @@ class Probe:
 def parse_json(reply: Reply) -> object:
     try:
         return json.loads(reply.body)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # Deeply nested in-cap JSON exhausts the decoder recursion limit;
+        # refuse it as malformed, same as any other unparseable body.
         return None
 
 

@@ -304,6 +304,67 @@ class HealthContractProbeTests(unittest.TestCase):
         code, results, _ = self.drive(routes)
         self.assert_readyz_unreadable("without the bot's component breakdown", code, results)
 
+    def nested_array_body(self, depth=30000):
+        raw = ("[" * depth + "]" * depth).encode()
+        self.assertLess(len(raw), probe.BODY_CAP,
+                        "deeply nested fixture must fit the body cap")
+        return raw
+
+    def nested_object_body(self, depth=10000):
+        raw = ('{"a":' * depth + "1" + "}" * depth).encode()
+        self.assertLess(len(raw), probe.BODY_CAP,
+                        "deeply nested fixture must fit the body cap")
+        return raw
+
+    def test_deeply_nested_array_readyz_refuses_as_malformed(self):
+        raw = self.nested_array_body()
+        routes = {STAGING + "/health": body({"status": "ok"}),
+                  STAGING + "/readyz": (503, {}, raw)}
+        code, results, _ = self.drive(routes)
+        self.assert_readyz_unreadable("without the bot's component breakdown",
+                                      code, results)
+        text = "\n".join(results.values())
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("[[[[[", text)
+        self.assertNotIn("RecursionError", text)
+        receipt = json.loads(Path(self.evidence).read_text())
+        self.assertEqual(receipt["result"], "fail")
+        self.assertIsNone(receipt["gateway_failure_class"])
+
+    def test_deeply_nested_object_readyz_refuses_as_malformed(self):
+        raw = self.nested_object_body()
+        routes = {STAGING + "/health": body({"status": "ok"}),
+                  STAGING + "/readyz": (503, {}, raw)}
+        code, results, _ = self.drive(routes)
+        self.assert_readyz_unreadable("without the bot's component breakdown",
+                                      code, results)
+        text = "\n".join(results.values())
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn('{"a":{"a"', text)
+        self.assertNotIn("RecursionError", text)
+        receipt = json.loads(Path(self.evidence).read_text())
+        self.assertEqual(receipt["result"], "fail")
+
+    def test_deeply_nested_health_refuses_without_echo(self):
+        raw = self.nested_array_body()
+        routes = {STAGING + "/health": (200, {}, raw),
+                  STAGING + "/readyz": body(dict(READY))}
+        code, results, _ = self.drive(routes)
+        self.assert_only_failure("health", "without the exact status shape",
+                                 code, results)
+        text = "\n".join(results.values())
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("[[[[[", text)
+        self.assertNotIn("RecursionError", text)
+
+    def test_shallow_nested_json_still_parses(self):
+        # Direct decoder control: shallow nesting must still decode.
+        routes = {STAGING + "/x": (200, {}, b'{"x": [1, [2, [3]]]}')}
+        status, _, parsed = probe.get_json(self.fetch(routes),
+                                           STAGING + "/x", "x")
+        self.assertEqual(status, 200)
+        self.assertEqual(parsed["x"], [1, [2, [3]]])
+
     def test_unreachable_probe_reports_the_transport_class(self):
         routes = {STAGING + "/health": OSError("down"),
                   STAGING + "/readyz": body(dict(READY))}
