@@ -187,10 +187,11 @@ class ToolchainParityTests(unittest.TestCase):
             self.assertTrue(toolchain_parity_errors(root), "a looser channel must fail")
 
     def test_pinned_workflows_carry_the_match_comment(self):
+        channel = read_channel(ROOT)
         for name in WORKFLOWS:
             with self.subTest(workflow=name):
                 text = (ROOT / ".github/workflows" / name).read_text()
-                pinned = [line for line in text.splitlines() if 'toolchain: "1.98.1"' in line]
+                pinned = [line for line in text.splitlines() if f'toolchain: "{channel}"' in line]
                 self.assertTrue(pinned, f"{name} has no pinned toolchain line")
                 self.assertTrue(all(MATCH_COMMENT in line for line in pinned), f"{name} lost the match comment")
         self.assertNotIn("toolchain: stable", "\n".join(
