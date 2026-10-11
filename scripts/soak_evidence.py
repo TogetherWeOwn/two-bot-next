@@ -42,6 +42,40 @@ REDEPLOY_GAP_BUDGET_S = 60
 KNOWN_EVENTS = ("connect", "disconnect", "resume", "dispatch", "unknown")
 
 
+def _unique_object(pairs):
+    """object_pairs_hook refusing duplicate keys instead of last-wins."""
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise ValueError("duplicate field")
+        seen.add(key)
+    return dict(pairs)
+
+
+# Well below CPython's default recursion limit (1000): any record deeper
+# than this would raise RecursionError under recursive traversal/repr, so
+# it is refused up front with an explicit stack instead of recursing.
+MAX_RECORD_DEPTH = 100
+
+
+def _too_deeply_nested(record, limit=MAX_RECORD_DEPTH):
+    """Iterative depth check; True when nesting exceeds limit."""
+    stack = [(record, 1)]
+    while stack:
+        obj, depth = stack.pop()
+        if depth > limit:
+            return True
+        if isinstance(obj, dict):
+            for value in obj.values():
+                if isinstance(value, (dict, list)):
+                    stack.append((value, depth + 1))
+        elif isinstance(obj, list):
+            for value in obj:
+                if isinstance(value, (dict, list)):
+                    stack.append((value, depth + 1))
+    return False
+
+
 def parse_ts(value):
     """Parse an ISO-8601 UTC timestamp; raise ValueError when absent/garbled."""
     if not isinstance(value, str) or not value.strip():
@@ -75,77 +109,101 @@ def summarize(lines):
         if not line:
             continue
         try:
-            record = json.loads(line)
+            record = json.loads(line, object_pairs_hook=_unique_object)
+        except RecursionError:
+            note_unknown(None, None,
+                         f"malformed line {lineno}: too deeply nested")
+            continue
         except json.JSONDecodeError:
             note_unknown(None, None, f"malformed line {lineno}: not JSON")
+            continue
+        except ValueError as exc:
+            if "duplicate field" in str(exc):
+                note_unknown(None, None,
+                             f"malformed line {lineno}: duplicate field")
+                continue
+            note_unknown(None, None, f"malformed line {lineno}: not JSON")
+            continue
+        if _too_deeply_nested(record):
+            note_unknown(None, None,
+                         f"malformed line {lineno}: too deeply nested")
             continue
         if not isinstance(record, dict):
             note_unknown(None, None, f"malformed line {lineno}: not an object")
             continue
         try:
             ts = parse_ts(record.get("ts"))
+        except RecursionError:
+            note_unknown(None, None,
+                         f"malformed line {lineno}: too deeply nested")
+            continue
         except ValueError:
             note_unknown(None, None, f"malformed line {lineno}: bad ts")
             continue
         first_ts = ts if first_ts is None else min(first_ts, ts)
         last_ts = ts if last_ts is None else max(last_ts, ts)
-        event = record.get("event")
-        session = record.get("session")
+        try:
+            event = record.get("event")
+            session = record.get("session")
 
-        if event == "connect":
-            connects += 1
-            last_seq.pop(session, None)
-            if down_since is not None:
-                gaps.append((ts - down_since).total_seconds())
-                down_since = None
-        elif event == "disconnect":
-            disconnects += 1
-            if down_since is None:
-                down_since = ts
-        elif event == "resume":
-            resumes += 1
-            if down_since is not None:
-                gaps.append((ts - down_since).total_seconds())
-                down_since = None
-            if isinstance(record.get("seq"), int):
+            if event == "connect":
+                connects += 1
+                last_seq.pop(session, None)
+                if down_since is not None:
+                    gaps.append((ts - down_since).total_seconds())
+                    down_since = None
+            elif event == "disconnect":
+                disconnects += 1
+                if down_since is None:
+                    down_since = ts
+            elif event == "resume":
+                resumes += 1
+                if down_since is not None:
+                    gaps.append((ts - down_since).total_seconds())
+                    down_since = None
+                if isinstance(record.get("seq"), int):
+                    prev = last_seq.get(session)
+                    if prev is None or record["seq"] > prev:
+                        last_seq[session] = record["seq"]
+            elif event == "dispatch":
+                seq = record.get("seq")
+                if not isinstance(seq, int):
+                    note_unknown(ts, ts, "dispatch without integer seq")
+                    continue
+                dispatches += 1
                 prev = last_seq.get(session)
-                if prev is None or record["seq"] > prev:
-                    last_seq[session] = record["seq"]
-        elif event == "dispatch":
-            seq = record.get("seq")
-            if not isinstance(seq, int):
-                note_unknown(ts, ts, "dispatch without integer seq")
-                continue
-            dispatches += 1
-            prev = last_seq.get(session)
-            if prev is None:
-                last_seq[session] = seq
-            elif seq <= prev:
-                pass  # duplicate/redelivered dispatch, not a miss
+                if prev is None:
+                    last_seq[session] = seq
+                elif seq <= prev:
+                    pass  # duplicate/redelivered dispatch, not a miss
+                else:
+                    if seq > prev + 1:
+                        missed.append({
+                            "session": session,
+                            "expected_after": prev,
+                            "received": seq,
+                            "count": seq - prev - 1,
+                            "at": ts.isoformat(),
+                        })
+                    last_seq[session] = seq
+            elif event == "unknown":
+                start = end = None
+                try:
+                    if record.get("start"):
+                        start = parse_ts(record["start"])
+                    if record.get("end"):
+                        end = parse_ts(record["end"])
+                except ValueError:
+                    note_unknown(ts, ts, "unknown interval with bad start/end")
+                    continue
+                note_unknown(start or ts, end,
+                             str(record.get("reason", "unspecified")))
             else:
-                if seq > prev + 1:
-                    missed.append({
-                        "session": session,
-                        "expected_after": prev,
-                        "received": seq,
-                        "count": seq - prev - 1,
-                        "at": ts.isoformat(),
-                    })
-                last_seq[session] = seq
-        elif event == "unknown":
-            start = end = None
-            try:
-                if record.get("start"):
-                    start = parse_ts(record["start"])
-                if record.get("end"):
-                    end = parse_ts(record["end"])
-            except ValueError:
-                note_unknown(ts, ts, "unknown interval with bad start/end")
-                continue
-            note_unknown(start or ts, end,
-                         str(record.get("reason", "unspecified")))
-        else:
-            note_unknown(ts, ts, f"unrecognised event {event!r}")
+                note_unknown(ts, ts, f"unrecognised event {event!r}")
+        except RecursionError:
+            note_unknown(ts, ts,
+                         f"malformed line {lineno}: too deeply nested")
+            continue
 
     if down_since is not None:
         # Log ends while disconnected: the outage length is unbounded, so it
