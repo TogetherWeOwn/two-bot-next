@@ -9,8 +9,6 @@
 //! - [`db_class`] classifies a bare `sqlx::Error`;
 //! - [`feed_store_class`], [`quota_write_class`] and [`leveling_class`]
 //!   classify the store wrappers that embed one;
-//! - [`scheduled_store_class`] classifies the ticker's
-//!   [`ScheduledStoreError`](two_bot_core::scheduled_store::ScheduledStoreError);
 //! - [`channel_response_class`] classifies the channel responder's fixed
 //!   three-variant error;
 //! - Discord failures use the existing fixed vocabulary
@@ -21,10 +19,10 @@
 //! sites in the four in-scope files, so add new failure logs with one of
 //! these helpers instead of formatting the error.
 
-use sqlx::error::{DatabaseError, ErrorKind};
+use sqlx::error::ErrorKind;
 use two_bot_core::{
     automation_quota::QuotaWriteError, feeds_store::FeedStoreError,
-    leveling_store::LevelingStoreError, scheduled_store::ScheduledStoreError,
+    leveling_store::LevelingStoreError,
 };
 use two_bot_discord::{leveling_runtime::LevelingRuntimeError, ChannelResponseError};
 
@@ -92,17 +90,6 @@ pub(crate) fn leveling_class(error: &LevelingRuntimeError) -> &'static str {
     }
 }
 
-/// [`ScheduledStoreError`] without its SQLx detail. The corrupt-row variant
-/// names a hand-edited row (id and timestamp stay out of the log); the SQL
-/// half classifies through [`db_class`].
-#[must_use]
-pub(crate) fn scheduled_store_class(error: &ScheduledStoreError) -> &'static str {
-    match error {
-        ScheduledStoreError::CorruptNextRunAt { .. } => "corrupt_next_run_at",
-        ScheduledStoreError::Sql(inner) => db_class(inner),
-    }
-}
-
 /// [`ChannelResponseError`] as a fixed token. All three variants render as
 /// authored constants with no payload, but the token keeps the log surface
 /// stable if a payload is ever added.
@@ -118,6 +105,7 @@ pub(crate) fn channel_response_class(error: &ChannelResponseError) -> &'static s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::error::DatabaseError;
     use std::borrow::Cow;
     use std::fmt;
 
@@ -292,25 +280,6 @@ mod tests {
         assert_eq!(
             leveling_class(&LevelingRuntimeError::InvalidInteraction),
             "invalid_interaction"
-        );
-    }
-
-    #[test]
-    fn scheduled_wrapper_classifies_without_sqlx_detail() {
-        assert_eq!(
-            scheduled_store_class(
-                &two_bot_core::scheduled_store::ScheduledStoreError::CorruptNextRunAt {
-                    id: "abc".to_owned(),
-                    next_run_at: "not-a-timestamp".to_owned(),
-                }
-            ),
-            "corrupt_next_run_at"
-        );
-        assert_eq!(
-            scheduled_store_class(&two_bot_core::scheduled_store::ScheduledStoreError::Sql(
-                sqlx::Error::PoolTimedOut
-            )),
-            "pool_timeout"
         );
     }
 

@@ -27,7 +27,7 @@ use two_bot_discord::executor::{ActionExecutor, ChannelCall, ChannelCallOutcome,
 
 use crate::{
     activation::BootActivation,
-    db_log::{db_class, scheduled_store_class},
+    db_log::db_class,
     jobs::{self, ErrorClass, Job, JobAction},
     website_jobs::Context,
 };
@@ -406,5 +406,8 @@ fn discord_error_name(error: &DiscordError) -> &'static str {
 }
 
 fn store_error_name(error: &ScheduledStoreError) -> &'static str {
-    scheduled_store_class(error)
+    match error {
+        ScheduledStoreError::CorruptNextRunAt { .. } => "corrupt_next_run_at",
+        ScheduledStoreError::Sql(_) => "database",
+    }
 }

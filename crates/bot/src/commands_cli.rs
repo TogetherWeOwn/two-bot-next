@@ -10,9 +10,10 @@ use two_bot_core::commands::CommandDefinition;
 use two_bot_core::feature_commands::FeatureGates;
 use two_bot_core::moderation::ModerationGates;
 use two_bot_core::router::{InteractionRouter, RouterGates, SurfaceFlags};
-use two_bot_core::send_admission::{is_loopback_http, PgSendAdmission};
+use two_bot_core::send_admission::{is_loopback_http, AdmissionError, PgSendAdmission};
 use two_bot_core::voice_assistant::AssistantConfig;
 use two_bot_core::voice_rooms::VoiceGates;
+use two_bot_discord::executor::DiscordError;
 use two_bot_discord::{publish_commands, ActionExecutor};
 
 pub const USAGE: &str = "\
@@ -231,10 +232,37 @@ pub async fn dispatch(args: &[String]) -> i32 {
 /// loop of 2026-10-05 showed the bare line hides the decisive detail (a
 /// send-admission storage failure looks identical to a Discord outage). The
 /// `tracing::error!` call site keeps its exact message so the observability
-/// catalog still matches; the cause rides in the `error` field. The source
-/// is always a Discord executor error display string (status class, no secrets).
-fn boot_sync_error(source: &impl std::fmt::Display) -> String {
-    format!("boot command registry synchronization failed: {source}")
+/// catalog still matches; the cause rides in the `reason` field as a fixed
+/// token ([`boot_sync_cause`]), never the executor's error text.
+fn boot_sync_error(source: &DiscordError) -> String {
+    format!(
+        "boot command registry synchronization failed: {}",
+        boot_sync_cause(source)
+    )
+}
+
+/// Fixed token for a boot-sync failure. `Unavailable` can carry transport
+/// detail and `Rejected` provider text, so neither is rendered. The transport
+/// stringifies send-admission refusals into `Unavailable`; matching the typed
+/// [`AdmissionError`] displays recovers them, so a storage failure still reads
+/// differently from a Discord outage. Everything else is
+/// [`DiscordError::cause`].
+fn boot_sync_cause(source: &DiscordError) -> &'static str {
+    if let DiscordError::Unavailable(detail) = source {
+        for (admission, token) in [
+            (AdmissionError::Storage, "admission_storage_unavailable"),
+            (
+                AdmissionError::Configuration,
+                "admission_configuration_invalid",
+            ),
+            (AdmissionError::StaleClaim, "admission_stale_claim"),
+        ] {
+            if detail == &admission.to_string() {
+                return token;
+            }
+        }
+    }
+    source.cause()
 }
 
 /// Publication did not previously run on boot. Keep it opt-in while the shared
@@ -422,16 +450,42 @@ mod tests {
 
     #[test]
     fn boot_sync_failure_keeps_message_and_carries_cause() {
-        let rendered =
-            boot_sync_error(&"discord was unreachable: Discord send admission storage unavailable");
+        let rendered = boot_sync_error(&DiscordError::Unavailable(
+            AdmissionError::Storage.to_string(),
+        ));
         assert!(
             rendered.starts_with("boot command registry synchronization failed"),
             "catalog message preserved, got: {rendered}"
         );
         assert!(
-            rendered.contains("Discord send admission storage unavailable"),
+            rendered.ends_with(": admission_storage_unavailable"),
             "cause attached, got: {rendered}"
         );
+    }
+
+    #[test]
+    fn boot_sync_failure_never_renders_transport_or_provider_text() {
+        for (source, token) in [
+            (
+                DiscordError::Unavailable(
+                    "error sending request for url (https://user:secret@example.invalid/)".into(),
+                ),
+                "unavailable",
+            ),
+            (
+                DiscordError::Rejected("provider text with secret".into()),
+                "rejected",
+            ),
+            (
+                DiscordError::Unavailable(AdmissionError::Blocked.to_string()),
+                "admission_blocked",
+            ),
+            (DiscordError::Timeout, "timeout"),
+        ] {
+            let rendered = boot_sync_error(&source);
+            assert!(rendered.ends_with(&format!(": {token}")), "got: {rendered}");
+            assert!(!rendered.contains("secret"), "leaked: {rendered}");
+        }
     }
 
     #[test]

@@ -801,7 +801,11 @@ impl CommandRuntime {
                 .answer_interaction(target.interaction_id, &target.token, &ephemeral(BUSY_REPLY))
                 .await
             {
-                warn!(interaction_id = target.interaction_id.to_string(), %error, "busy reply failed");
+                warn!(
+                    interaction_id = target.interaction_id.to_string(),
+                    reason = error.cause(),
+                    "busy reply failed"
+                );
             }
         });
     }
