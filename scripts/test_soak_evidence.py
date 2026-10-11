@@ -172,6 +172,75 @@ class SoakEvidenceTests(unittest.TestCase):
         self.assertEqual(summary["window"]["end"],
                          "2026-09-20T00:00:02+00:00")
 
+    def test_invalid_session_identities_become_unknown_then_continues(self):
+        # State-bearing events require a nonempty string session. Array,
+        # object, null, missing and empty identities must not raise, must
+        # not touch counters/sequence/recovery state, and later valid
+        # records are still summarized. Reasons are fixed per event with
+        # no identity/value echo.
+        bad = (
+            '{"ts": "2026-09-20T00:00:01Z", "event": "connect", "session": []}\n'
+            '{"ts": "2026-09-20T00:00:02Z", "event": "dispatch", '
+            '"session": {}, "seq": 1}\n'
+            '{"ts": "2026-09-20T00:00:03Z", "event": "dispatch", "seq": 1}\n'
+            '{"ts": "2026-09-20T00:00:04Z", "event": "dispatch", '
+            '"session": null, "seq": 1}\n'
+            '{"ts": "2026-09-20T00:00:05Z", "event": "dispatch", '
+            '"session": "", "seq": 1}\n'
+            '{"ts": "2026-09-20T00:00:06Z", "event": "resume", '
+            '"session": [], "seq": 1}\n'
+        )
+        good = (
+            '{"ts": "2026-09-20T00:00:07Z", "event": "connect", "session": "a"}\n'
+            '{"ts": "2026-09-20T00:00:08Z", "event": "dispatch", '
+            '"session": "a", "seq": 1}\n'
+            '{"ts": "2026-09-20T00:00:09Z", "event": "dispatch", '
+            '"session": "a", "seq": 2}\n'
+        )
+        # Must not raise (no traceback); bad lines are UNKNOWN and the
+        # good lines still count.
+        summary = run(bad + good)
+        self.assertEqual(len(summary["unknown_intervals"]), 6)
+        reasons = [u["reason"] for u in summary["unknown_intervals"]]
+        self.assertEqual(reasons.count("connect with invalid session"), 1)
+        self.assertEqual(reasons.count("dispatch with invalid session"), 4)
+        self.assertEqual(reasons.count("resume with invalid session"), 1)
+        for reason in reasons:
+            self.assertNotIn("[]", reason)
+            self.assertNotIn("{}", reason)
+            self.assertNotIn("None", reason)
+            self.assertNotIn("null", reason)
+            self.assertNotIn("Traceback", reason)
+        # Invalid identities leave no counter, sequence or recovery trace.
+        self.assertEqual(summary["connects"], 1)
+        self.assertEqual(summary["dispatches"], 2)
+        self.assertEqual(summary["resumes"], 0)
+        self.assertEqual(summary["missed_sequence_windows"], [])
+        self.assertEqual(summary["missed_events"], 0)
+        self.assertEqual(summary["redeploy_gaps_s"], [])
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+        dumped = json.dumps(summary)
+        self.assertNotIn("Traceback", dumped)
+
+    def test_invalid_session_does_not_clear_reconnect_gap(self):
+        # A malformed connect/resume must not consume the pending
+        # disconnect: only the later valid connect closes the gap.
+        summary = run(
+            '{"ts": "2026-09-20T00:00:01Z", "event": "connect", "session": "a"}\n'
+            '{"ts": "2026-09-20T00:00:02Z", "event": "disconnect", "session": "a"}\n'
+            '{"ts": "2026-09-20T00:00:03Z", "event": "connect", "session": []}\n'
+            '{"ts": "2026-09-20T00:00:04Z", "event": "resume", "session": ""}\n'
+            '{"ts": "2026-09-20T00:00:12Z", "event": "connect", "session": "b"}\n'
+        )
+        reasons = [u["reason"] for u in summary["unknown_intervals"]]
+        self.assertIn("connect with invalid session", reasons)
+        self.assertIn("resume with invalid session", reasons)
+        self.assertEqual(summary["connects"], 2)
+        self.assertEqual(summary["resumes"], 0)
+        # Gap measured from the disconnect to the valid connect only.
+        self.assertEqual(summary["redeploy_gaps_s"], [10.0])
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+
 
 if __name__ == "__main__":
     unittest.main()
