@@ -40,6 +40,8 @@ executor merged.
   not in a bulk reservation before the first Discord await. A failure stops the
   sweep; a definite rejection is requeued under the member queue for the next
   tick, never retried within this sweep. Undispatched later jobs stay pending.
+  The policy must carry the resolved `bot_user_id`: without it the sweep returns
+  `BotIdentityUnknown` before claiming any job, so no unban runs unattributed.
 - Surface prepared/uncertain ban intents and `running` jobs for reconciliation.
   Never silently take them over. New permanent and temporary bans refuse while
   any prepared PUT or `running` DELETE exists for that guild/member. An unfinished
