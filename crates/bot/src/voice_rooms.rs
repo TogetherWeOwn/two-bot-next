@@ -2044,6 +2044,39 @@ fn health_overwrites(guild_id: Snowflake, channel: &Channel) -> Vec<HealthOverwr
         .collect()
 }
 
+/// Revoke-only owner overwrites for the 403 fallback: strip previously issued
+/// owner bits without granting the new owner. Returns `None` when nothing
+/// would change, so the caller can return the original denial without a
+/// second PATCH.
+fn revoke_only_owner_overwrites(
+    current: &[PermissionOverwrite],
+    issued_members: &[Snowflake],
+    owner_id: Snowflake,
+) -> Option<Vec<PermissionOverwrite>> {
+    let owner_mask = Permissions::from_bits_retain(OWNER_ALLOW_BITS);
+    let mut overwrites = current.to_vec();
+    for old in &mut overwrites {
+        if old.kind == PermissionOverwriteType::Member
+            && old.id.get() != owner_id
+            && issued_members.contains(&old.id.get())
+        {
+            old.allow &= !owner_mask;
+        }
+    }
+    overwrites.retain(|o| {
+        !(o.kind == PermissionOverwriteType::Member
+            && o.id.get() != owner_id
+            && issued_members.contains(&o.id.get())
+            && o.allow.is_empty()
+            && o.deny.is_empty())
+    });
+    if overwrites == current {
+        None
+    } else {
+        Some(overwrites)
+    }
+}
+
 fn permission_name(permission: VoicePermission) -> &'static str {
     match permission {
         VoicePermission::ManageChannels => "Manage Channels",
@@ -2166,6 +2199,13 @@ pub struct GuildRoomWorker<S, H> {
     /// ownership action per room is queued; exhausted cohorts wait a minute.
     ownership_repairs: HashMap<Snowflake, u64>,
     ownership_queued: HashSet<Snowflake>,
+    /// Channels whose revoke-only fallback PATCH succeeded while the
+    /// new-owner grant is still owed. A revoked-but-ungranted room looks
+    /// identical to a category-synced room in the cache (the current owner
+    /// has no owner-mask grant in both), so the `!can_write` path consults
+    /// this set instead of inferring from the cache: only marked channels
+    /// stay pending without access. Cleared after a successful rewrite.
+    grants_owed: Mutex<HashSet<Snowflake>>,
     renames: RenameCoalescer,
     desired_names: HashMap<Snowflake, String>,
     /// Callers waiting on a queued `/limit` write, by queue action id.
@@ -2479,6 +2519,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             queue: ActionQueue::new(),
             ownership_repairs,
             ownership_queued: HashSet::new(),
+            grants_owed: Mutex::new(HashSet::new()),
             renames: RenameCoalescer::new(),
             desired_names: HashMap::new(),
             limit_acks: HashMap::new(),
@@ -3163,14 +3204,33 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 .permissions(self.live.guild_id, channel_id)
                 .is_some_and(|p| p.contains(Permissions::VIEW_CHANNEL | Permissions::MANAGE_ROLES));
             if !can_write {
-                // Rooms created without Manage Roles are category-synced and
-                // have no bot-issued owner grant to move. Do not invent one.
+                // A stranded former-owner grant keeps the handoff pending
+                // until access returns.
                 if current.iter().any(|o| {
                     o.kind == PermissionOverwriteType::Member
                         && o.id.get() != owner_id
                         && issued_members.contains(&o.id.get())
                         && o.allow.intersects(owner_mask)
                 }) {
+                    return Err(RoomHttpError::AccessDenied);
+                }
+                // A revoke-only fallback may have cleared that grant without
+                // granting the new owner yet: the cache then looks exactly
+                // like a category-synced room with nothing to move, but
+                // closing here would drop the journal and leave the new owner
+                // without permissions permanently. Keep the handoff pending
+                // only for channels the fallback actually revoked. Rooms
+                // created without Manage Roles are category-synced and carry
+                // no bot-issued owner grant to move: return Ok for them
+                // ("Do not invent one"). The guard is scoped so it dies
+                // before any await, keeping this future `Send`.
+                let grant_owed = {
+                    self.grants_owed
+                        .lock()
+                        .expect("grant-owed marker")
+                        .contains(&channel_id)
+                };
+                if grant_owed {
                     return Err(RoomHttpError::AccessDenied);
                 }
                 return Ok(());
@@ -3216,6 +3276,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             )
         };
         if !changed {
+            // The overwrites already converge: no grant is owed, even if this
+            // channel was marked by an earlier fallback.
+            self.grants_owed
+                .lock()
+                .expect("grant-owed marker")
+                .remove(&channel_id);
             return Ok(());
         }
         let live = self.live.clone();
@@ -3233,10 +3299,82 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         p.contains(Permissions::VIEW_CHANNEL | Permissions::MANAGE_ROLES)
                     })
         });
-        let channel = self
+        let channel = match self
             .http
             .update_overwrites(channel_id, &overwrites, guard)
-            .await?;
+            .await
+        {
+            Ok(channel) => channel,
+            Err(RoomHttpError::AccessDenied) => {
+                // Build the revoke-only list from the current cache, not the
+                // pre-send snapshot, so a gateway change that landed during
+                // the denied PATCH is preserved rather than clobbered.
+                let live = self.live.clone();
+                let expected = self
+                    .live
+                    .read_state()
+                    .channels
+                    .get(&channel_id)
+                    .and_then(|channel| channel.permission_overwrites.clone())
+                    .unwrap_or_default();
+                let Some(revoke_only) =
+                    revoke_only_owner_overwrites(&expected, issued_members, owner_id)
+                else {
+                    return Err(RoomHttpError::AccessDenied);
+                };
+                let fallback_guard: WriteGuard = Arc::new(move || {
+                    let state = live.read_state();
+                    state.ready
+                        && state.generation == generation
+                        && state.channel_revisions.get(&channel_id) == Some(&revision)
+                        && state.channels.get(&channel_id).is_some_and(|channel| {
+                            channel.permission_overwrites.as_deref() == Some(expected.as_slice())
+                        })
+                        && state
+                            .permissions(live.guild_id, channel_id)
+                            .is_some_and(|p| {
+                                p.contains(Permissions::VIEW_CHANNEL | Permissions::MANAGE_ROLES)
+                            })
+                });
+                match self
+                    .http
+                    .update_overwrites(channel_id, &revoke_only, fallback_guard)
+                    .await
+                {
+                    Ok(revoked) => {
+                        if revoked.id.get() != channel_id
+                            || revoked.guild_id.map(Id::get) != Some(self.live.guild_id)
+                        {
+                            return Err(RoomHttpError::AccessDenied);
+                        }
+                        // Publish the revocation so the stranded grant is gone
+                        // from the cache, then report the original denial so
+                        // the new-owner grant retries with the journal pending.
+                        // Mark the grant as owed: the cache now looks exactly
+                        // like a category-synced room, so the `!can_write`
+                        // path needs this marker to keep the handoff pending
+                        // instead of closing it without the new-owner grant.
+                        let _ = self
+                            .live
+                            .publish_owner_overwrites(revoked, generation, revision);
+                        self.grants_owed
+                            .lock()
+                            .expect("grant-owed marker")
+                            .insert(channel_id);
+                        return Err(RoomHttpError::AccessDenied);
+                    }
+                    Err(fallback_error) => match fallback_error {
+                        RoomHttpError::AccessDenied
+                        | RoomHttpError::Cancelled
+                        | RoomHttpError::NotFound => {
+                            return Err(RoomHttpError::AccessDenied);
+                        }
+                        other => return Err(other),
+                    },
+                }
+            }
+            Err(error) => return Err(error),
+        };
         if channel.id.get() != channel_id
             || channel.guild_id.map(Id::get) != Some(self.live.guild_id)
         {
@@ -3248,6 +3386,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         {
             return Err(RoomHttpError::Cancelled);
         }
+        // The grant landed: nothing is owed anymore, even if an earlier
+        // fallback marked this channel.
+        self.grants_owed
+            .lock()
+            .expect("grant-owed marker")
+            .remove(&channel_id);
         Ok(())
     }
 
@@ -4686,6 +4830,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 let Some(room) = self.rooms.get(&channel_id).cloned() else {
                     self.ownership_queued.remove(&channel_id);
                     self.ownership_repairs.remove(&channel_id);
+                    self.grants_owed
+                        .lock()
+                        .expect("grant-owed marker")
+                        .remove(&channel_id);
                     self.queue.mark_succeeded(&action);
                     return true;
                 };
