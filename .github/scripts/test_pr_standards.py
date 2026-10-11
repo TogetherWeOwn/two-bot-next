@@ -84,48 +84,41 @@ class Body(unittest.TestCase):
             self.assertIn(("error", "PR body"), levels(f))
 
     def test_missing_section_follows_mode(self):
-        body = GOOD_BODY.replace("## Risks", "## Notes")
+        body = GOOD_BODY.replace("## Verification", "## Notes")
         self.assertIn(("error", "PR template"), levels(ps.evaluate(env(BODY=body))))
         self.assertIn(("warning", "PR template"), levels(ps.evaluate(env(BODY=body, PR_STANDARDS_MODE="warn"))))
         self.assertNotIn("PR template", [t for _, t in levels(ps.evaluate(env(BODY=GOOD_BODY)))])
 
-    def test_placeholder_thinking_path_does_not_count(self):
-        thin = GOOD_BODY.split("## Linked")[0]
-        placeholder = ("## Thinking Path\n\n> - This repo does a thing\n> - [Which subsystem is involved]\n"
-                       "> - [What problem exists]\n> - This pull request ...\n> - The benefit is ...\n\n")
-        body = GOOD_BODY.replace(thin, placeholder)
-        msgs = [f.message for f in ps.evaluate(env(BODY=body))]
-        self.assertTrue(any("Thinking Path" in m and "at least 3" in m for m in msgs), msgs)
+    def test_optional_prose_sections_are_not_required(self):
+        # Pipeline review 2026-10-10: only the linked card/issue and the test evidence are required.
+        body = ("## Linked Issues or Issue Description\n\nRefs: TOG-1234\n\n"
+                "## Verification\n\n- `npm test` passes: 41 passed, 0 failed\n")
+        self.assertEqual([], ps.evaluate(env(BODY=body)))
 
     def test_bare_dash_section_is_empty(self):
-        body = GOOD_BODY.replace("- Low risk. One extra key fetch on the failure path only.", "-")
+        body = GOOD_BODY.replace("- `npm test` passes: 41 passed, 0 failed", "-")
         msgs = [f.message for f in ps.evaluate(env(BODY=body))]
-        self.assertTrue(any("Risks" in m for m in msgs), msgs)
-
-    def test_model_placeholder_rejected_and_human_authored_accepted(self):
-        bad = GOOD_BODY.replace("- Example Model 1.0, 200k context, tool use", "- <model>")
-        self.assertTrue(any("Model Used" in f.message for f in ps.evaluate(env(BODY=bad))))
-        ok = GOOD_BODY.replace("- Example Model 1.0, 200k context, tool use", "- None - human-authored")
-        self.assertEqual([], ps.evaluate(env(BODY=ok)))
+        self.assertTrue(any("Verification" in m for m in msgs), msgs)
 
     def test_comment_blocks_do_not_satisfy_a_section(self):
-        body = GOOD_BODY.replace("- Refresh the signing key on a failed signature check",
-                                 "<!-- - Refresh the signing key on a failed signature check -->")
+        body = GOOD_BODY.replace("- `npm test` passes: 41 passed, 0 failed",
+                                 "<!-- - `npm test` passes: 41 passed, 0 failed -->")
         msgs = [f.message for f in ps.evaluate(env(BODY=body))]
-        self.assertTrue(any("What Changed" in m for m in msgs), msgs)
+        self.assertTrue(any("Verification" in m for m in msgs), msgs)
 
-    def test_light_types_skip_linked_issue_and_dedup_tick(self):
+    def test_light_types_skip_linked_issue(self):
         body = (GOOD_BODY.replace("## Linked Issues or Issue Description\n\nRefs: TOG-1234\n\n", "")
                 .replace("- [x] I searched for duplicate or related PRs and linked them above", "- [ ] done")
                 + "\nRefs: TOG-9\n")
         self.assertEqual([], ps.evaluate(env(TITLE="docs(readme): explain setup", BODY=body)))
         f = ps.evaluate(env(TITLE="fix(auth): refresh the key", BODY=body))
         self.assertIn(("error", "PR template"), levels(f))
-        self.assertIn(("error", "Duplicate search"), levels(f))
+        self.assertNotIn("Duplicate search", [t for _, t in levels(f)])
 
-    def test_unticked_dedup_box_fails_for_code_types(self):
+    def test_unticked_dedup_box_is_not_required(self):
+        # Pipeline review 2026-10-10: the duplicate-search tick is optional prose now.
         body = GOOD_BODY.replace("- [x] I searched", "- [ ] I searched")
-        self.assertIn(("error", "Duplicate search"), levels(ps.evaluate(env(BODY=body))))
+        self.assertEqual([], ps.evaluate(env(BODY=body)))
 
     def test_bots_and_generated_prs_are_exempt(self):
         f = ps.evaluate(env(AUTHOR="dependabot[bot]", TITLE="chore(deps): bump x", BODY="Bumps x."))
@@ -235,12 +228,9 @@ class Template(unittest.TestCase):
         for heading, _, _ in ps.REQUIRED_SECTIONS:
             self.assertIn(heading.lower(), sections, heading)
 
-    def test_template_carries_the_dedup_checkbox(self):
-        self.assertIsNotNone(ps.DEDUP_CHECKBOX.search(ps.strip_comments(self.text)))
-
     def test_unfilled_template_fails_in_error_mode(self):
         f = ps.evaluate(env(BODY=self.text, PR_STANDARDS_MODE="error"))
-        self.assertTrue(any(x.level == "error" and x.title in ("PR template", "Duplicate search") for x in f), f)
+        self.assertTrue(any(x.level == "error" and x.title == "PR template" for x in f), f)
 
     def test_template_has_no_internal_references_outside_comments(self):
         self.assertEqual([], ps.internal_hits(self.text, "TOG|PAP|PAPA"))
@@ -258,7 +248,7 @@ class Main(unittest.TestCase):
         rc, out = self.run_main(env(TITLE="nope"))
         self.assertEqual(1, rc)
         self.assertTrue(out.startswith("::error title=PR title::"), out)
-        rc, out = self.run_main(env(BODY=GOOD_BODY.replace("## Risks", "## Notes"), PR_STANDARDS_MODE="warn"))
+        rc, out = self.run_main(env(BODY=GOOD_BODY.replace("## Verification", "## Notes"), PR_STANDARDS_MODE="warn"))
         self.assertEqual(0, rc)
         self.assertIn("::warning title=PR template::", out)
 

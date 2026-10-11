@@ -44,6 +44,9 @@ pub(crate) fn route(request: &Request) -> &'static str {
         (Get, [Some("guilds"), Some(_), Some("members"), None, None, None]) => {
             "GET /guilds/:guild/members"
         }
+        (Get, [Some("guilds"), Some(_), Some("members"), Some(_), None, None]) => {
+            "GET /guilds/:guild/members/:member"
+        }
         (Get, [Some("guilds"), Some(_), Some("scheduled-events"), None, None, None]) => {
             "GET /guilds/:guild/scheduled-events"
         }
@@ -83,6 +86,11 @@ pub(crate) fn route(request: &Request) -> &'static str {
         (Post, [Some("interactions"), Some(_), Some(_), Some("callback"), None, None]) => {
             "POST /interactions/:interaction/:token/callback"
         }
+        (Get, [Some("users"), Some("@me"), None, None, None, None]) => "GET /users/@me",
+        (
+            Patch,
+            [Some("webhooks"), Some(_), Some(_), Some("messages"), Some("@original"), None],
+        ) => "PATCH /webhooks/:application/:token/messages/@original",
         (Post, [Some("guilds"), Some(_), Some("channels"), None, None, None]) => {
             "POST /guilds/:guild/channels"
         }
@@ -187,6 +195,97 @@ mod tests {
         assert!(metrics::REST_ROUTES.contains(&route(&request)));
     }
 
+    #[tokio::test]
+    async fn member_self_and_interaction_edits_classify_to_allowlisted_templates() {
+        use twilight_http::request::TryIntoRequest;
+        use twilight_model::id::marker::UserMarker;
+        // Real twilight builders: the exact requests member_role_ids,
+        // current_bot_user_id and edit_interaction_response send. Needs a
+        // Tokio context: Client::builder spawns the ratelimit actor.
+        let client = twilight_http::Client::builder().build();
+        for (guild, member) in [(100u64, 300u64), (987654321098765432, 123456789012345678)] {
+            let request = client
+                .guild_member(Id::<GuildMarker>::new(guild), Id::<UserMarker>::new(member))
+                .try_into_request()
+                .unwrap();
+            assert_eq!(request.method(), Method::Get);
+            assert_eq!(route(&request), "GET /guilds/:guild/members/:member");
+            assert!(metrics::REST_ROUTES.contains(&route(&request)));
+        }
+        let request = client.current_user().try_into_request().unwrap();
+        assert_eq!(request.method(), Method::Get);
+        assert_eq!(route(&request), "GET /users/@me");
+        assert!(metrics::REST_ROUTES.contains(&route(&request)));
+        for token in ["tok-abc", "a-much-longer-interaction-token-0123456789"] {
+            let request = client
+                .interaction(Id::<ApplicationMarker>::new(7))
+                .update_response(token)
+                .content(Some("done"))
+                .try_into_request()
+                .unwrap();
+            assert_eq!(request.method(), Method::Patch);
+            assert_eq!(
+                route(&request),
+                "PATCH /webhooks/:application/:token/messages/@original"
+            );
+            assert!(metrics::REST_ROUTES.contains(&route(&request)));
+        }
+        // Snowflakes, tokens and query parameters never appear in labels.
+        for (method, path, template) in [
+            (Method::Get, "users/@me?limit=100", "GET /users/@me"),
+            (
+                Method::Get,
+                "guilds/100/members/300?limit=1",
+                "GET /guilds/:guild/members/:member",
+            ),
+            (
+                Method::Patch,
+                "webhooks/7/tok-abc/messages/@original?wait=true",
+                "PATCH /webhooks/:application/:token/messages/@original",
+            ),
+        ] {
+            let request = RequestBuilder::raw(method, path.to_owned())
+                .build()
+                .unwrap();
+            assert_eq!(route(&request), template, "path: {path}");
+        }
+        // Unknown, wrong-method and extra/overlong shapes stay `other`: no
+        // dynamic registry, and followup/DM-adjacent shapes stay out of scope.
+        for (method, path) in [
+            (Method::Get, "users/123"),
+            (Method::Get, "users/@me/guilds"),
+            (Method::Post, "guilds/100/members/300"),
+            (Method::Get, "webhooks/7/tok-abc/messages/@original"),
+            (Method::Patch, "webhooks/7/tok-abc/messages/123"),
+            (Method::Patch, "webhooks/7/tok-abc/messages/@original/extra"),
+            (Method::Patch, "webhooks/7/tok-abc/messages/@original/a/b"),
+            (Method::Patch, "guilds/100/members"),
+            (Method::Get, "guilds/100/members/300/roles/400"),
+        ] {
+            let request = RequestBuilder::raw(method, path.to_owned())
+                .build()
+                .unwrap();
+            assert_eq!(route(&request), "other", "path: {path}");
+        }
+        // Representative 429/5xx counters render under the new templates.
+        let metrics = metrics::Metrics::default();
+        metrics.rest_response("GET /guilds/:guild/members/:member", Some(429));
+        metrics.rest_response("GET /users/@me", Some(503));
+        metrics.rest_response(
+            "PATCH /webhooks/:application/:token/messages/@original",
+            Some(429),
+        );
+        let text = metrics.render(None);
+        assert!(text.contains(
+            "two_bot_rest_requests_total{route=\"GET /guilds/:guild/members/:member\",result=\"429\"} 1\n"
+        ));
+        assert!(text
+            .contains("two_bot_rest_requests_total{route=\"GET /users/@me\",result=\"5xx\"} 1\n"));
+        assert!(text.contains(
+            "two_bot_rest_requests_total{route=\"PATCH /webhooks/:application/:token/messages/@original\",result=\"429\"} 1\n"
+        ));
+    }
+
     #[test]
     fn request_templates_drop_snowflakes_queries_and_tokens() {
         for id in 1..1000 {
@@ -274,6 +373,8 @@ mod tests {
             "applications/1/commands",
             "applications/1/guilds/2/commands",
             "interactions/1/secret/callback",
+            "users/@me",
+            "webhooks/1/secret/messages/@original",
             "unknown",
         ];
         for path in paths {

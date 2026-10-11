@@ -112,25 +112,40 @@ pub struct RsvpRecord {
 
 /// What one write changed (legacy `putRsvp` is a blind upsert; the read-back
 /// of the previous row is what makes going/interested/declined transitions
-/// observable to the router).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// observable to the router). `previous` and `previous_responded_at` are set
+/// together from the same locked read: both `Some` on a re-response, both
+/// `None` on a first response — so a refused re-response can restore the exact
+/// prior row instead of deleting it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RsvpTransition {
     pub previous: Option<RsvpStatus>,
+    pub previous_responded_at: Option<String>,
     pub current: RsvpStatus,
 }
 
 impl RsvpTransition {
     /// First response from this member for this event.
     #[must_use]
-    pub fn is_new(self) -> bool {
+    pub fn is_new(&self) -> bool {
         self.previous.is_none()
     }
 
     /// The member moved between responses (including re-selecting the same
     /// one — legacy still rewrites `responded_at` and audits every response).
     #[must_use]
-    pub fn changed(self) -> bool {
+    pub fn changed(&self) -> bool {
         self.previous.is_some_and(|p| p != self.current)
+    }
+
+    /// The exact prior response to restore when this write must be undone
+    /// (post-write fence refusal): status plus the timestamp the row carried
+    /// before this write. `None` on a first response (nothing to restore).
+    #[must_use]
+    pub fn previous_response(&self) -> Option<(RsvpStatus, &str)> {
+        match (self.previous, self.previous_responded_at.as_deref()) {
+            (Some(status), Some(responded_at)) => Some((status, responded_at)),
+            _ => None,
+        }
     }
 }
 
@@ -404,6 +419,56 @@ pub fn checkin_duplicate_text(member_id: &str, event_occurrence_id: &str) -> Str
 /// audited, including repeats).
 pub const RSVP_AUDIT_ACTION: &str = "event.rsvp";
 
+/// RA-03 admission bounds (TOG-19773): bursts cannot grow rows without bound.
+///
+/// * `MAX_RSVPS_PER_EVENT` caps distinct RSVP rows per scheduled event. One
+///   member still holds exactly one row (the `event_rsvps` primary key);
+///   repeat responses rewrite that row.
+/// * `MAX_CHECKINS_PER_OCCURRENCE` caps attendance facts per occurrence. One
+///   member still holds exactly one fact (the idempotency key on
+///   `community_facts`).
+/// * `MAX_RSVP_WRITES_PER_USER_PER_MINUTE` caps RSVP writes per member per
+///   guild per UTC minute, ledgered in `announcements_audit_log`. Genuine
+///   double-taps pass; spam bursts are refused before any row write.
+///
+/// The store enforces all three inside its write transactions (race-safe via
+/// the advisory locks there); the discord layer maps the refusals to replies.
+/// 1,000 keeps per-event totals and audit volume bounded while staying far
+/// above real event sizes on a single-shard bot; 20/minute absorbs client
+/// retries while capping one member's audit churn.
+pub const MAX_RSVPS_PER_EVENT: i64 = 1_000;
+pub const MAX_CHECKINS_PER_OCCURRENCE: i64 = 1_000;
+pub const MAX_RSVP_WRITES_PER_USER_PER_MINUTE: i64 = 20;
+
+/// RA-03 retention floors: history purges must never delete rows newer than
+/// these horizons, so live recovery state and the audit trail survive.
+/// RSVP rows back live events and recent totals; audit rows are the security
+/// audit trail, so the audit floor is the stricter of the two and governs
+/// joint purges (see `rsvp_store::prune_rsvp_history`).
+pub const RSVP_RETENTION_DAYS: i64 = 90;
+pub const AUDIT_RETENTION_DAYS: i64 = 365;
+
+/// RA-03 refusal replies (new behavior, no legacy text to match):
+/// capacity/rate refusals name the bound without echoing caller input.
+#[must_use]
+pub fn rsvp_event_full_text() -> String {
+    format!("This event has reached its RSVP limit ({MAX_RSVPS_PER_EVENT} responses).")
+}
+
+/// RA-03 refusal reply for a per-user RSVP burst.
+#[must_use]
+pub fn rsvp_rate_limited_text() -> String {
+    "You are responding too quickly. Wait a minute, then try again.".to_owned()
+}
+
+/// RA-03 refusal reply for a full occurrence.
+#[must_use]
+pub fn checkin_occurrence_full_text() -> String {
+    format!(
+        "This occurrence has reached its check-in limit ({MAX_CHECKINS_PER_OCCURRENCE} check-ins)."
+    )
+}
+
 /// One `announcements_audit_log` row (legacy `AnnouncementsAuditInput` plus
 /// the caller-supplied id and timestamp). The id is an input — not generated
 /// here — so this module stays free of randomness.
@@ -529,19 +594,27 @@ mod tests {
     fn transitions_distinguish_new_change_and_repeat() {
         let fresh = RsvpTransition {
             previous: None,
+            previous_responded_at: None,
             current: RsvpStatus::Going,
         };
         assert!(fresh.is_new());
         assert!(!fresh.changed());
+        assert_eq!(fresh.previous_response(), None);
         let moved = RsvpTransition {
             previous: Some(RsvpStatus::Going),
+            previous_responded_at: Some("2026-09-10T10:00:00.000Z".to_owned()),
             current: RsvpStatus::Interested,
         };
         assert!(!moved.is_new());
         assert!(moved.changed());
+        assert_eq!(
+            moved.previous_response(),
+            Some((RsvpStatus::Going, "2026-09-10T10:00:00.000Z"))
+        );
         // Re-selecting the same status still rewrites responded_at + audits.
         let repeat = RsvpTransition {
             previous: Some(RsvpStatus::Going),
+            previous_responded_at: Some("2026-09-10T10:00:00.000Z".to_owned()),
             current: RsvpStatus::Going,
         };
         assert!(!repeat.changed());
@@ -821,6 +894,42 @@ mod tests {
         assert_eq!(audit.outcome, "declined");
         assert_eq!(audit.reason, None);
         assert_eq!(audit.created_at, "2026-09-10T10:00:00.000Z");
+    }
+
+    #[test]
+    fn admission_bounds_and_retention_floors_are_pinned() {
+        // RA-03: every admission bound is a positive finite cap, and the
+        // audit floor governs joint purges (it is the stricter horizon).
+        // Const context: clippy `assertions_on_constants` rejects these as
+        // runtime asserts, and a bound edited to zero fails the build here.
+        const _: () = {
+            assert!(MAX_RSVPS_PER_EVENT > 0);
+            assert!(MAX_CHECKINS_PER_OCCURRENCE > 0);
+            assert!(MAX_RSVP_WRITES_PER_USER_PER_MINUTE > 0);
+            assert!(RSVP_RETENTION_DAYS > 0);
+            assert!(AUDIT_RETENTION_DAYS >= RSVP_RETENTION_DAYS);
+        };
+    }
+
+    #[test]
+    fn capacity_and_rate_refusals_name_the_bound_not_the_input() {
+        let oversized = "y".repeat(OCCURRENCE_ID_MAX_CHARS + 1);
+        for text in [
+            rsvp_event_full_text(),
+            rsvp_rate_limited_text(),
+            checkin_occurrence_full_text(),
+        ] {
+            assert!(!text.is_empty());
+            assert!(!text.contains(&oversized));
+        }
+        assert!(
+            rsvp_event_full_text().contains(&MAX_RSVPS_PER_EVENT.to_string()),
+            "capacity text pins the event bound"
+        );
+        assert!(
+            checkin_occurrence_full_text().contains(&MAX_CHECKINS_PER_OCCURRENCE.to_string()),
+            "capacity text pins the occurrence bound"
+        );
     }
 
     #[test]

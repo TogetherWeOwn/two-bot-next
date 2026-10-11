@@ -103,6 +103,17 @@ class SelectionTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {RUST}, path)
 
+    def test_fuzz_workspace_inputs_run_everything(self):
+        # The separate cargo-fuzz workspace resolves outside the root
+        # lockfile, so any of its inputs runs the full matrix (including the
+        # locked fuzz-compile gate) rather than silently skipping it. The
+        # fuzz README stays docs-only: it selects no job.
+        for path in ["fuzz/Cargo.toml", "fuzz/Cargo.lock",
+                     "fuzz/fuzz_targets/rsvp.rs"]:
+            with self.subTest(path=path):
+                self.assertEqual(inputs.classify(path), inputs.ALL_JOBS, path)
+        self.assertEqual(inputs.classify("fuzz/README.md"), set())
+
     def test_voice_template_assets_skip_heavy_jobs(self):
         # Coverage, validator tests and readme are validated by the check
         # job's hermetic offline step, which always runs. Only the corpus
@@ -120,7 +131,7 @@ class SelectionTests(unittest.TestCase):
         # Docs-only: skips Rust and supply, keeps worker (docs/ listing
         # assertion). `docs` is informational only and gates nothing.
         self.assertEqual(
-            jobs(["docs/metrics.md", "README.md"]),
+            jobs(["docs/gateway-recovery.md", "README.md"]),
             {RUST: False, WORKER: True, PARITY: False,
              SUPPLY: False, DOCS: True})
         # Asset-only: validator assets plus chrome select no job; the
@@ -136,7 +147,7 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(
             jobs(["tests/voice_templates/coverage.json",
                   "tests/voice_templates/README.md",
-                  "docs/metrics.md", "README.md"]),
+                  "docs/gateway-recovery.md", "README.md"]),
             {RUST: False, WORKER: True, PARITY: False,
              SUPPLY: False, DOCS: True})
         # Code: runs Rust, worker and supply (the scan inventories the
@@ -200,6 +211,17 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(inputs.classify("docs/parity-baseline.json"),
                          {PARITY})
 
+    def test_metrics_doc_selects_rust_and_worker(self):
+        # docs/metrics.md is read by both the Rust exposition-conformance
+        # test and the worker event/alert catalog tests, so its edits run
+        # the Rust matrix, the worker job and the supply scan (via rust).
+        self.assertEqual(inputs.classify("docs/metrics.md"),
+                         {RUST, WORKER})
+        self.assertEqual(
+            jobs(["docs/metrics.md"]),
+            {RUST: True, WORKER: True, PARITY: False,
+             SUPPLY: True, DOCS: True})
+
     def test_runbook_docs_select_worker_only(self):
         for path in ["docs/runbook.md", "docs/container-readiness.md"]:
             with self.subTest(path=path):
@@ -208,7 +230,7 @@ class SelectionTests(unittest.TestCase):
     def test_unrelated_docs_select_worker_only(self):
         # No file reader in PR-run code, but runbook.test.ts asserts on the
         # docs/ listing itself (case-collision + readiness links).
-        for path in ["docs/metrics.md", "docs/gateway-recovery.md",
+        for path in ["docs/gateway-recovery.md",
                      "docs/leveling-port.md", "docs/feeds-port.md",
                      "docs/distroless-evaluation.md", "docs/build-cache.md",
                      "docs/database-roles.md",
@@ -259,7 +281,7 @@ class SelectionTests(unittest.TestCase):
 
     def test_docs_only_pr_skips_rust_and_supply(self):
         self.assertEqual(
-            jobs(["docs/metrics.md", "docs/gateway-recovery.md",
+            jobs(["docs/leveling-port.md", "docs/gateway-recovery.md",
                   "README.md", ".github/CODEOWNERS"]),
             {RUST: False, WORKER: True, PARITY: False,
              SUPPLY: False, DOCS: True})
@@ -311,7 +333,8 @@ class SelectionTests(unittest.TestCase):
 
     def test_cli_job_flag_prints_single_value(self):
         with patch.object(inputs, "git_diff_names",
-                          side_effect=self.fake_diff(["docs/metrics.md"])):
+                          side_effect=self.fake_diff(
+                              ["docs/gateway-recovery.md"])):
             for job, want in ((RUST, "false"), (WORKER, "true"),
                               (PARITY, "false"), (SUPPLY, "false"),
                               (DOCS, "true")):
@@ -348,7 +371,8 @@ class ReaderCoverageTests(unittest.TestCase):
     """Every doc-literal reader must agree with the classifier.
 
     If a new docs/ read lands in Rust/scripts/wrangler code, this suite
-    forces the RUST_DOCS/WORKER_DOCS/PARITY_DOCS sets to follow it.
+    forces the RUST_DOCS/RUST_WORKER_DOCS/WORKER_DOCS/PARITY_DOCS sets to
+    follow it.
     """
 
     # Docs the preconditions binary checks by existence only (is_file, never
@@ -474,7 +498,8 @@ class WorkflowSurfaceTests(unittest.TestCase):
     def test_consumer_jobs_wait_on_selector(self):
         for job in ("check", "rust-tests", "ignored-db-stores",
                     "ignored-db-runtime", "community-db", "feeds-db",
-                    "tickets-postgres", "worker", "supply-chain", "ci-ok"):
+                    "tickets-postgres", "worker", "supply-chain", "ci-ok",
+                    "fuzz-compile"):
             head = self.text.split(f"\n  {job}:")[1].split("steps:", 1)[0]
             with self.subTest(job=job):
                 self.assertIn("job-inputs", head)
@@ -505,10 +530,11 @@ class WorkflowSurfaceTests(unittest.TestCase):
         for job in ("job-inputs", "container-inputs", "supply-chain", "check", "rust-tests",
                     "ignored-db-stores", "ignored-db-runtime", "worker",
                     "parity-docs", "self-role-store", "community-db",
-                    "feeds-db", "tickets-postgres", "moderation-db"):
+                    "feeds-db", "tickets-postgres", "moderation-db", "fuzz-compile"):
             self.assertIn(job, head)
         body = self.text.split("\n  ci-ok:")[1]
         self.assertIn("SUPPLY_SELECTED", body)
+        self.assertIn("FUZZ_COMPILE_RESULT", body)
         self.assertIn("ci-ok passed", body)
 
     def test_weekly_full_run_schedule_exists(self):
@@ -622,6 +648,21 @@ class WorkflowSurfaceTests(unittest.TestCase):
                         body, r"(?m)^\s+if:.*outputs\.rust",
                         f"{name!r}: the lane is already gated at the job level")
 
+    def test_fuzz_compile_lane_skips_at_the_job_level(self):
+        # Compile-only libFuzzer lane follows the same rust selector as the
+        # test lanes; ci-ok only accepts its skip when rust was deselected.
+        head = self.job_text(self.text, "fuzz-compile").split("\n    steps:\n", 1)[0]
+        self.assertIn(f"\n    {self.LANE_GUARD}\n", head)
+        self.assertIn("job-inputs", head)
+        body = self.job_text(self.text, "fuzz-compile")
+        self.assertIn("fuzz build", body)
+        # The `+nightly` selector is load-bearing: the repo-root
+        # rust-toolchain.toml (stable) otherwise wins over the installed
+        # nightly and `-Zsanitizer` fails.
+        self.assertIn("cargo +nightly-2026-10-01 fuzz build", body)
+        self.assertIn("cargo +nightly-2026-10-01 fetch --locked", body)
+        self.assertNotIn("cargo fuzz run", body)
+
     def test_guard_scan_flags_an_unguarded_db_step(self):
         # Self-test of the scan: dropping the guard on a step that needs the
         # toolchain must be caught, and the real step must satisfy it.
@@ -645,6 +686,40 @@ class WorkflowSurfaceTests(unittest.TestCase):
     def test_push_to_main_selects_everything(self):
         self.assertIn("pull_request", self.selector)
         self.assertIn("rust=true", self.selector)
+
+class VoiceSelectionTest(unittest.TestCase):
+    """Owner policy 2026-10-11: the voice synthetic runs on PRs only for voice inputs."""
+
+    def test_voice_inputs_select_the_synthetic(self):
+        for path in (
+            "crates/bot/src/voice_rooms.rs",
+            "crates/bot/src/voice_rooms/join_requests.rs",
+            "crates/core/src/voice_name_filter.rs",
+            "crates/bot/src/gateway.rs",
+            "tests/voice_templates/corpus.json",
+            "Cargo.lock",
+            "scripts/staging_voice_synthetic.py",
+            ".github/workflows/voice-synthetic.yml",
+            "./crates/bot/src/voice_room_plan.rs",
+        ):
+            self.assertTrue(inputs.voice_selected([path]), path)
+
+    def test_unrelated_changes_skip_the_synthetic(self):
+        for path in (
+            "crates/bot/src/tickets.rs",
+            "crates/core/src/settings.rs",
+            "docs/voice-rooms.md",
+            "wrangler/src/index.ts",
+            "README.md",
+        ):
+            self.assertFalse(inputs.voice_selected([path]), path)
+        self.assertFalse(inputs.voice_selected([]))
+
+    def test_any_deletion_selects_the_synthetic(self):
+        self.assertTrue(inputs.voice_selected([], ["docs/old.md"]))
+
+    def test_voice_is_never_a_ci_job(self):
+        self.assertNotIn(inputs.VOICE, inputs.ALL_JOBS)
 
 
 if __name__ == "__main__":

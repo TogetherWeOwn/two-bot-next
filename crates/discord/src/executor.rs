@@ -545,8 +545,10 @@ impl HyperTransport {
         // Reads cannot mutate; a complete failure may be retried independently.
         // Mutation success needs its caller's validated receipt. 5xx, redirects
         // and request-timeout responses remain uncertain even with a full body.
+        // Definitive rejections (see `is_definitive_rejection`) and 429 release
+        // the lane on receipt; everything else keeps the permit held.
         let complete_on_receipt =
-            request.method() == Method::Get || matches!(status, 400 | 401 | 403 | 404 | 405 | 429);
+            request.method() == Method::Get || status == 429 || is_definitive_rejection(status);
         Ok(PendingHeaders {
             response: Some(response),
             accounting: Some(accounting),
@@ -1767,6 +1769,36 @@ impl ActionExecutor {
         // Guard admission and pacing run inside the one bounded attempt.
         let (res, _) = self
             .send_with_timeout(&Request::from_route(&route), Some(false))
+            .await?;
+        match res.status {
+            200..=299 => serde_json::from_slice(&res.body)
+                .map(Some)
+                .map_err(|_| DiscordError::Unavailable("invalid JSON response".into())),
+            404 => Ok(None),
+            _ => Err(throw_for_status(&res)),
+        }
+    }
+
+    /// Membership-evidence read for the RSVP pre-write gate and post-write
+    /// fence. Same fail-closed mapping as [`Self::get_json_strict`] (only 404
+    /// is absence), but a provably pre-wire admission-Blocked attempt waits
+    /// out brief governed-lane occupancy inside the receipt budget instead of
+    /// refusing the command — the same posture as [`Self::get_scheduled_event`].
+    /// A Blocked attempt never reached the wire, so retrying it cannot
+    /// double-apply anything; every other error returns immediately.
+    pub async fn get_json_strict_with_blocked_retry(
+        &self,
+        path: &str,
+    ) -> Result<Option<serde_json::Value>, DiscordError> {
+        let route = raw_get_route(path).map_err(DiscordError::Rejected)?;
+        let request = Request::from_route(&route);
+        // Guard admission and pacing run inside bounded attempts. The
+        // timeout travels by value into the attempt future (the same shape
+        // as the receipt-callback retry), so no borrow outlives the call.
+        let (res, _) = self
+            .retry_admission_blocked(|timeout| {
+                self.send_with_timeout_for(&request, Some(false), timeout)
+            })
             .await?;
         match res.status {
             200..=299 => serde_json::from_slice(&res.body)
@@ -3393,13 +3425,25 @@ fn mutation_receipt_id(body: &[u8]) -> Result<String, DiscordError> {
     }
 }
 
+/// Definitive Discord rejections that prove no mutation happened, shared by
+/// every internal-action transport. 400/401/403/404/405 are the long-standing
+/// confirmed-rejection allowlist; 413 (payload too large), 415 (unsupported
+/// media type) and 422 (validation failed) are likewise terminal: Discord
+/// validates before applying the scheduled-event mutation, so none of them
+/// may retain the execution fence for reconciliation. 408, redirects, 409,
+/// 425 and 5xx stay uncertain. 429 is definitive separately (rate-limited).
+#[must_use]
+pub fn is_definitive_rejection(status: u16) -> bool {
+    matches!(status, 400 | 401 | 403 | 404 | 405 | 413 | 415 | 422)
+}
+
 /// Only documented no-effect rejections are retry-safe. An unexpected success,
 /// redirect, timeout status or other ambiguous response may follow a mutation.
 #[must_use]
 pub fn throw_for_status(res: &RawResponse) -> DiscordError {
     match res.status {
         429 => DiscordError::RateLimited,
-        400 | 401 | 403 | 404 | 405 => {
+        status if is_definitive_rejection(status) => {
             DiscordError::Rejected(format!("Discord refused the request with {}", res.status))
         }
         _ => DiscordError::Unavailable(format!("Discord returned {}", res.status)),
@@ -4016,13 +4060,16 @@ mod tests {
             throw_for_status(&down),
             DiscordError::Unavailable(_)
         ));
-        for status in [400, 401, 403, 404, 405] {
+        // Shared with the announcement transport: 404 proves absence and
+        // 413/415/422 prove Discord validated before mutating.
+        for status in [400, 401, 403, 404, 405, 413, 415, 422] {
             let no = RawResponse {
                 status,
                 retry_after_header: None,
                 body: Vec::new(),
                 completion: None,
             };
+            assert!(is_definitive_rejection(status), "{status}");
             assert!(throw_for_status(&no).is_safe_pre_mutation(), "{status}");
         }
         for status in [100, 200, 202, 204, 301, 302, 307, 408, 409, 425, 500, 503] {

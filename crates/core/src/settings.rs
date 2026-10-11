@@ -145,6 +145,9 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_ANTI_NUKE_TRUSTED_USER_IDS", SettingClass::EnvOnly),
     // A filesystem path chosen by a web form is a write primitive.
     ("TWO_ANTI_NUKE_SNAPSHOT_PATH", SettingClass::EnvOnly),
+    // Test-only reach boundary: which bot accounts the voice runtime treats as
+    // human occupants. A dashboard must never widen it.
+    ("TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS", SettingClass::EnvOnly),
     // --- cold: read once at boot ---
     ("TWO_AUTOMOD", SettingClass::Cold),
     ("TWO_ANNOUNCEMENTS", SettingClass::Cold),
@@ -234,6 +237,13 @@ pub const HOT_WIRED: &[&str] = &[
     "TWO_RAID_WINDOW_SECONDS",
     "DISCORD_LANDING_CHANNEL_IDS",
     "DISCORD_GOODBYE_CHANNEL_IDS",
+    "DISCORD_AUDIT_LOG_CHANNEL_ID",
+    "DISCORD_MODERATION_LOG_CHANNEL_ID",
+    "DISCORD_STAFF_ALERT_CHANNEL_ID",
+    "DISCORD_TICKET_CATEGORY_ID",
+    "DISCORD_TICKET_PANEL_CHANNEL_ID",
+    "DISCORD_TICKET_STAFF_ROLE_ID",
+    "DISCORD_VOICE_LOG_CHANNEL_ID",
     "TWO_AUTOMOD_REPEAT_COUNT",
     "TWO_AUTOMOD_ALLOWED_DOMAINS",
     "TWO_AUTOMOD_BAD_WORDS",
@@ -939,6 +949,7 @@ mod tests {
         "TWO_STAGING_DATABASE_URL",
         "TWO_STAGING_RESTART_CONTAINMENT",
         "TWO_STAGING_RESTART_SYNTHETIC_ACTORS",
+        "TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS",
     ];
 
     #[test]
@@ -953,7 +964,7 @@ mod tests {
             assert_eq!(classify_key(key), Some(SettingClass::EnvOnly), "{key}");
         }
         let expected_total = EXPECTED_HOT.len() + EXPECTED_COLD.len() + EXPECTED_ENV_ONLY.len();
-        assert_eq!(expected_total, 122, "tripwire lists must stay complete");
+        assert_eq!(expected_total, 123, "tripwire lists must stay complete");
         assert_eq!(
             SETTING_CLASSES.len(),
             expected_total,
@@ -995,7 +1006,7 @@ mod tests {
 
     #[test]
     fn hot_wired_is_a_hot_subset() {
-        assert_eq!(HOT_WIRED.len(), 15);
+        assert_eq!(HOT_WIRED.len(), 22);
         for key in HOT_WIRED {
             assert_eq!(classify_key(key), Some(SettingClass::Hot), "{key}");
         }

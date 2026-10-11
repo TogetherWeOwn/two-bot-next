@@ -70,6 +70,14 @@ also consumes mismatched attempts; do not undo a burn on later validation/error.
   audit. It never releases the claim.
 - `reconcile(&RequestIdentity, &TerminalResponse, ReconciliationEvidence)` accepts
   unknown/stale records only. It commits a proven terminal outcome, not a lease.
+- `list_unknown_event_intents(guild_id)` lists `unknown` event intents for one
+  guild oldest first, without hashes, keys or payloads. Read-only.
+- `resolve_event_intent(intent_id, action, guild_id, key_mapping, response, evidence)`
+  closes one exact unknown event intent in a single transaction. A confirmed
+  upsert effect registers its key mapping before the receipt commits; cancels
+  and no-effect resolutions never rewrite mappings. Only success/no-effect
+  responses are accepted; anything but an `unknown` event row in the named
+  guild refuses. Backs the `two-bot reconcile-event` operator CLI.
 - `claim_discord_event(stable_event_id) -> Result<bool, ...>` atomically burns the
   global event digest. Use a namespaced identity stable across redelivery; do not
   generate an ID per delivery. This is a dedup guard, not a retryable event queue.
@@ -79,10 +87,19 @@ also consumes mismatched attempts; do not undo a burn on later validation/error.
 committed intent/audit transaction before REST. Every later audit copies that
 original scalar, not a newly evaluated role map. Migration `0351` adds nullable
 columns; older intents remain NULL and must not be guessed from current config.
-`TerminalResponse` is `Success { resource_id: Option<DiscordId>, affected: u32 }`
-(HTTP 200) or `Failure(TerminalFailure)` with fixed codes/statuses:
-`Malformed`/400, `ActionNotAllowed`/403, `DiscordRejected`/422, `NoEffect`/502.
-Failure is definitive; timeout/transport uncertainty must use `mark_unknown`.
+`TerminalResponse` is `Success { resource_id: Option<DiscordId>, affected: u32,
+outcome: Option<EventOutcome> }` (HTTP 200) or `Failure(TerminalFailure)` with
+fixed codes/statuses: `Malformed`/400, `ActionNotAllowed`/403,
+`DiscordRejected`/422, `NoEffect`/502. `EventOutcome` is the closed legacy
+result word (`created`/`updated`/`cancelled`, migration `0424`): event intents
+always record one so replay returns the first result byte-identically, while
+announcement receipts stay `None` and render `message_id`. Failure is
+definitive; timeout/transport uncertainty must use `mark_unknown`.
+The terminal audit copies the receipt's `resource_id`, `affected` and
+`outcome` (migration `0425`), so an `event.upsert` create — claimed with the
+guild alone as its subject — still names its Discord event and result word in
+the audit trail. Intent-phase audits keep those columns NULL, exactly like the
+uncompleted receipt they mirror.
 The adapter persists the whole typed response. It intentionally accepts neither
 `serde_json::Value` nor `ActionError` (which contains free-text log details).
 Receiver/executor follow-ups must map these typed scalars to their wire envelopes

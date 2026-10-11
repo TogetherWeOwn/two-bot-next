@@ -69,6 +69,23 @@ come from [cutover.md](cutover.md) §§Registry swap and Rollback.
 - The ownership fence stays active throughout legacy ownership, across
   deployments and the retirement wait, until the lead hands Next back.
 
+## Production decision window
+
+This window is closed. A recorded host decision defined a 2-hour rollback
+decision window from `T_0` (first production ready, the same `T_0` as §3),
+closing about two hours later. After closure the recovery posture is forward-fix: fix the
+current system in place rather than reopening legacy. Reopening legacy
+remains subject to the zero-loss reconciliation gate in §6 plus separate
+reopening authority.
+
+That decision recorded that writes acknowledged inside the window would be
+treated as lost if a rollback occurred. That record does not relax this
+runbook: any reopening must still reconcile every acknowledged write (§4
+steps 3–5, §6) and step 8 still forbids silently accepting loss to restore
+availability. If reconciliation cannot prove zero loss, keep affected
+writes in maintenance, preserve both data sets and escalate a decision
+brief.
+
 ## 4. Ordered rollback steps
 
 1. Declare rollback with UTC time and reason. Freeze all Next and web
@@ -178,9 +195,20 @@ come from [cutover.md](cutover.md) §§Registry swap and Rollback.
   completion or claim state, including Next-created records with no
   legacy counterpart. An unsupported mapping blocks reopening; it never
   permits dropping those records.
-- **Maximum accepted loss: zero acknowledged committed writes** over the
-  whole Next window. Restoring to the freeze baseline alone loses that
-  window and is not an acceptable rollback.
+- **Maximum accepted loss (pre-cutover rule): zero acknowledged committed
+  writes** over the whole Next window. Restoring to the freeze baseline
+  alone loses that window and is not an acceptable rollback. Once the
+  cutover lead declares production live, Decision D5 below supersedes this
+  gate for rollback inside the 2-hour window.
+- **Decision D5 (live cutover, declared by the cutover lead in the
+  live-cutover declaration with its recorded reason and loss statement —
+  see §1 Decider):** the production cutover is live. Production
+  is the PlanetScale main database `two_bot`. Writes made during the Next
+  window are accepted as lost on rollback, bounded by a 2-hour rollback
+  decision window; during that window this decision supersedes the
+  zero-loss gate above. After that window it is forward-fix only, never
+  rollback. Mitigation is the pre-cutover PlanetScale backup plus the
+  untouched Coolify `twobot` database. See [cutover.md](cutover.md#rollback-preserve-next-window-writes-before-reopening-legacy).
 - **Allocator gate:** reconcile every imported generated-key allocator,
   including high-water marks, deleted IDs and sequence semantics, and
   prove the next allocation cannot collide before releasing any writer.

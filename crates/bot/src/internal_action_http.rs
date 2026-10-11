@@ -1,21 +1,23 @@
-//! Private internal-action receiver (announcement, event read, settings, moderation).
-//! Never merge this router into the health socket. Authentication and a
+//! Private internal-action receiver (announcement, event read, settings, moderation,
+//! automations). Never merge this router into the health socket. Authentication and a
 //! committed nonce precede JSON; a committed intent precedes the effect (except
 //! keyless reads). Cancellation leaves durable ownership, never a new execution
 //! lease.
 //!
 //! Wired effects: `announcement.post` (single-attempt send), `event.read`
-//! (keyless mapped GET), `settings.get`/`settings.set` (settings executors),
-//! the restrictive member verbs `moderation.ban`, `moderation.tempban`,
-//! `moderation.kick`, `moderation.warn` and `moderation.timeout` (member
-//! moderation through the shared moderation service), `role.assign`
-//! (allowlisted role-key assignment) and `guild.add_member` (OAuth-backed
-//! join with a transient token), and the channel-moderation verbs
-//! (`moderation.purge`, `moderation.slowmode`, `moderation.lockdown`,
-//! `moderation.unlock`) through the shared channel-moderation store and the
-//! existing purge/slowmode/lockdown planner paths. Every other verb stays
-//! refused by the per-effect fences below, even when the env-only flag gate
-//! authorizes it.
+//! (keyless mapped GET), `event.upsert`/`event.cancel` (Guild Scheduled Event
+//! mutations through the shared event executor), `settings.get`/`settings.set`
+//! (settings executors), `automations.export` (keyless redacted read) /
+//! `automations.import` (claimed transactional import), the restrictive member
+//! verbs `moderation.ban`, `moderation.tempban`, `moderation.kick`,
+//! `moderation.warn` and `moderation.timeout` (member moderation through the shared
+//! moderation service), `role.assign` (allowlisted role-key assignment) and
+//! `guild.add_member` (OAuth-backed join with a transient token), and the
+//! channel-moderation verbs (`moderation.purge`, `moderation.slowmode`,
+//! `moderation.lockdown`, `moderation.unlock`) through the shared
+//! channel-moderation store and the existing purge/slowmode/lockdown planner
+//! paths. Every other verb stays refused by the per-effect fences below, even
+//! when the env-only flag gate authorizes it.
 
 use std::{
     future::IntoFuture,
@@ -35,23 +37,31 @@ use futures_util::future::BoxFuture;
 use serde_json::{json, Map, Value};
 use tokio::{net::TcpListener, sync::Semaphore};
 use two_bot_core::{
+    automation_transfer::{
+        diff_import, export_document, max_import_entries, parse_import_document, ImportOutcome,
+        ImportParseError,
+    },
     channel_moderation_store::ChannelModerationStore,
     clock_guard::ClockGuard,
     commands::{
         PERM_BAN_MEMBERS, PERM_KICK_MEMBERS, PERM_MANAGE_CHANNELS, PERM_MANAGE_MESSAGES,
         PERM_MODERATE_MEMBERS,
     },
+    custom_command_service::{self, ImportServiceError},
+    custom_command_store,
+    custom_commands::reserved_command_names,
     format_iso_millis,
     internal_action_config::InternalActionConfig,
     internal_action_store::{
-        AuditSubject, DiscordId, InternalActionStore, InternalClaim, RequestIdentity,
+        AuditSubject, DiscordId, EventOutcome, InternalActionStore, InternalClaim, RequestIdentity,
         TerminalFailure, TerminalResponse,
     },
     internal_actions::{
-        new_request_id, require_field_str, unmapped_event_key, validate_announcement,
-        validate_event_key, validate_idempotency_key, ActionError, AuthDecision, AuthHeaders,
-        AuthenticatedRequest, ErrorCode, GuildAddMemberRequest, InternalFlags, RoleAssignRequest,
-        TokenBuckets, ACTIONS_PATH, MAX_BODY_BYTES, SKEW_SECONDS,
+        new_request_id, require_field_str, require_snowflake, unmapped_event_key,
+        validate_announcement, validate_event_input, validate_event_key, validate_idempotency_key,
+        ActionError, AuthDecision, AuthHeaders, AuthenticatedRequest, ErrorCode,
+        GuildAddMemberRequest, InternalFlags, RoleAssignRequest, TokenBuckets, ACTIONS_PATH,
+        MAX_BODY_BYTES, SKEW_SECONDS,
     },
     internal_settings::SettingsCommand,
     member_moderation_store::PgMemberModerationStore,
@@ -63,20 +73,25 @@ use two_bot_core::{
 };
 use two_bot_cutover::{internal_settings::execute_settings, settings::SettingsStore};
 use two_bot_discord::executor::member::MemberOutcome;
-use two_bot_discord::internal_actions::{AnnouncementExecutor, ExecutionOutcome, Refusal};
+use two_bot_discord::internal_actions::{
+    supports_event_mutation, AnnouncementExecutor, ExecutionOutcome, Refusal,
+};
 use two_bot_discord::internal_channel_moderation::{
     InternalChannelConfig, InternalChannelExecutor, InternalChannelRequest, InternalChannelResult,
 };
 use two_bot_discord::internal_member_moderation::{
     InternalMemberConfig, InternalMemberExecutor, InternalMemberRequest,
 };
-use two_bot_discord::{ActionExecutor, EventActionError, EventCall};
+use two_bot_discord::{ActionExecutor, DiscordError, EventActionError, EventCall};
 
 const MAX_HEADER_BYTES: usize = 8192;
 const MAX_HEADERS: usize = 64;
 const MAX_REQUESTS: usize = 32;
 const BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// Queued event work waits at most this long, then is refused `in_progress`
+/// before any claim.
+const EVENT_GATE_WAIT: Duration = Duration::from_secs(8);
 
 /// Bounded receiver family for `two_bot_internal_actions_total{family,outcome}`
 /// (TOG-20119). Maps the already-bounded [`ActionLabel`] to one of
@@ -139,6 +154,7 @@ impl ActionEffect for AnnouncementExecutor {
                     TerminalResponse::Success {
                         resource_id: Some(message_id),
                         affected: 1,
+                        outcome: None,
                     }
                 }
                 ExecutionOutcome::NoEffect(refusal) => TerminalResponse::Failure(match refusal {
@@ -330,6 +346,7 @@ impl ModerationEffect for ModerationExecutor {
                     Ok(TerminalResponse::Success {
                         resource_id: Some(target_id),
                         affected: 1,
+                        outcome: None,
                     })
                 }
                 Err(error) => match error.code {
@@ -745,7 +762,6 @@ trait EventReadEffect: Send + Sync {
         &'a self,
         guild_id: &'a str,
         event_id: &'a str,
-        observed_at: &'a str,
     ) -> BoxFuture<'a, Result<Value, EventActionError>>;
 }
 
@@ -769,7 +785,6 @@ impl EventReadEffect for EventReadExecutor {
         &'a self,
         guild_id: &'a str,
         event_id: &'a str,
-        observed_at: &'a str,
     ) -> BoxFuture<'a, Result<Value, EventActionError>> {
         Box::pin(async move {
             self.executor
@@ -779,8 +794,50 @@ impl EventReadEffect for EventReadExecutor {
                         event_id: event_id.to_owned(),
                     },
                     &self.mirror,
-                    observed_at,
+                    two_bot_core::now_iso,
                 )
+                .await
+        })
+    }
+}
+
+/// Mutating event effect: the receiver validates the body, enforces the
+/// env-only flag gate in `authorize`, commits the idempotency claim and
+/// resolves `event_key` to a trusted Discord id before invoking this. The call
+/// itself carries no website fields, only the trusted mapping result. Mirror
+/// writes are part of the mutation: a failed write after a Discord success is
+/// an unknown outcome, never a second attempt.
+trait EventMutateEffect: Send + Sync {
+    fn execute_mutation<'a>(
+        &'a self,
+        guild_id: &'a str,
+        call: &'a EventCall,
+    ) -> BoxFuture<'a, Result<Value, EventActionError>>;
+}
+
+/// Production mutation effect: the shared event executor against the Postgres
+/// mirror. Shares the token-wide send-admission lane with the read path.
+pub struct EventMutationExecutor {
+    executor: ActionExecutor,
+    mirror: sqlx::PgPool,
+}
+
+impl EventMutationExecutor {
+    #[must_use]
+    pub fn new(executor: ActionExecutor, mirror: sqlx::PgPool) -> Self {
+        Self { executor, mirror }
+    }
+}
+
+impl EventMutateEffect for EventMutationExecutor {
+    fn execute_mutation<'a>(
+        &'a self,
+        guild_id: &'a str,
+        call: &'a EventCall,
+    ) -> BoxFuture<'a, Result<Value, EventActionError>> {
+        Box::pin(async move {
+            self.executor
+                .execute_event(guild_id, call, &self.mirror, two_bot_core::now_iso)
                 .await
         })
     }
@@ -792,21 +849,26 @@ struct ReceiverState {
     effect: Arc<dyn ActionEffect>,
     member: Arc<dyn MemberEffect>,
     event_read: Arc<dyn EventReadEffect>,
+    event_mutate: Arc<dyn EventMutateEffect>,
     moderation: Arc<dyn ModerationEffect>,
     channel: Arc<dyn ChannelModerationEffect>,
     clock: Mutex<ClockGuard>,
     buckets: Mutex<TokenBuckets>,
     telemetry: Mutex<RejectionTelemetry>,
     capacity: Arc<Semaphore>,
+    event_gate: tokio::sync::Mutex<()>,
+    event_gate_wait: Duration,
 }
 
 impl ReceiverState {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         config: InternalActionConfig,
         pool: sqlx::PgPool,
         effect: Arc<dyn ActionEffect>,
         member: Arc<dyn MemberEffect>,
         event_read: Arc<dyn EventReadEffect>,
+        event_mutate: Arc<dyn EventMutateEffect>,
         moderation: Arc<dyn ModerationEffect>,
         channel: Arc<dyn ChannelModerationEffect>,
     ) -> Self {
@@ -816,12 +878,15 @@ impl ReceiverState {
             effect,
             member,
             event_read,
+            event_mutate,
             moderation,
             channel,
             clock: Mutex::new(ClockGuard::new()),
             buckets: Mutex::new(TokenBuckets::new()),
             telemetry: Mutex::new(RejectionTelemetry::default()),
             capacity: Arc::new(Semaphore::new(MAX_REQUESTS)),
+            event_gate: tokio::sync::Mutex::new(()),
+            event_gate_wait: EVENT_GATE_WAIT,
         }
     }
 
@@ -1090,7 +1155,8 @@ pub async fn bind(
             pool.clone(),
             Arc::new(executor),
             Arc::new(member),
-            Arc::new(EventReadExecutor::new(events, pool)),
+            Arc::new(EventReadExecutor::new(events.clone(), pool.clone())),
+            Arc::new(EventMutationExecutor::new(events, pool)),
             Arc::new(moderation),
             Arc::new(channel),
         )),
@@ -1156,8 +1222,8 @@ async fn handle(State(state): State<Arc<ReceiverState>>, request: Request) -> Re
     };
     match tokio::time::timeout(REQUEST_TIMEOUT, receive(&state, request, &id)).await {
         Ok(response) => response,
-        // If a claim was committed, dropping the future retains it. A fresh
-        // nonce with that intent can only see InFlight/NeedsReconciliation.
+        // Dropping the future retains an announcement claim (a fresh nonce sees
+        // InFlight or NeedsReconciliation); event mutations finish in their own task.
         Err(_) => state.reject(
             Failure::code(ErrorCode::UpstreamTimeout),
             KeyLabel::Invalid,
@@ -1167,7 +1233,7 @@ async fn handle(State(state): State<Arc<ReceiverState>>, request: Request) -> Re
     }
 }
 
-async fn receive(state: &ReceiverState, request: Request, id: &str) -> Response {
+async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Response {
     let reject_boundary =
         |failure| state.reject(failure, KeyLabel::Invalid, ActionLabel::Unknown, id);
     if request.uri().path_and_query().map(|path| path.as_str()) != Some(ACTIONS_PATH) {
@@ -1265,16 +1331,60 @@ async fn receive(state: &ReceiverState, request: Request, id: &str) -> Response 
     if decision.action == "event.read" {
         return read_event(state, &decision, id, key, action).await;
     }
+    // Mutating event verbs take the same durable claim/audit path as
+    // announcements below, with their own validation and key mapping.
+    if supports_event_mutation(&decision.action) {
+        // Runs to its receipt even if the client has gone: a claimed create that
+        // was dropped mid-flight must still register its key mapping.
+        let task_state = Arc::clone(state);
+        let task_decision = decision.clone();
+        let task_raw = raw.to_vec();
+        let task_idempotency = headers.idempotency.map(str::to_owned);
+        let task_id = id.to_owned();
+        let task_key = key.clone();
+        let task = tokio::spawn(async move {
+            mutate_event(
+                &task_state,
+                &task_decision,
+                &task_raw,
+                task_idempotency.as_deref(),
+                &task_id,
+                task_key,
+                action,
+            )
+            .await
+        });
+        return match task.await {
+            Ok(response) => response,
+            Err(_) => state.reject(Failure::reconciliation(), key, action, id),
+        };
+    }
     if decision.action == "settings.get" {
         return read_setting(state, &decision, id, key, action).await;
     }
     if decision.action == "settings.set" {
         return write_setting(state, &decision, headers.idempotency, &raw, id, key, action).await;
     }
-    // Family 1 (settings, M3.10) plus the five wired restrictive-moderation
-    // verbs. Every other verb without an adapter stays refused below, even
-    // when the flag gate authorizes it — shipping an implementation must
-    // never widen the allowlist by itself.
+    if decision.action == "automations.export" {
+        return export_automations(state, &decision, id, key, action).await;
+    }
+    if decision.action == "automations.import" {
+        return import_automations(
+            state,
+            &decision,
+            &raw,
+            headers.idempotency,
+            flags.allow_automation_overwrite,
+            id,
+            key,
+            action,
+        )
+        .await;
+    }
+    // Family 1 (settings, M3.10), the automations pair (M3.10) plus the five
+    // wired restrictive-moderation verbs. Every other verb without an adapter
+    // stays refused below, even when the flag gate authorizes it — shipping an
+    // implementation must never widen the allowlist by itself.
     if matches!(
         decision.action.as_str(),
         "moderation.ban"
@@ -1374,6 +1484,11 @@ async fn read_event(
         Ok(key) => key.to_owned(),
         Err(error) => return reject(Failure::from_action(error)),
     };
+    // Shares the mutation gate so a read's mirror write cannot overtake a cancel's.
+    let Ok(_gate) = tokio::time::timeout(state.event_gate_wait, state.event_gate.lock()).await
+    else {
+        return reject(Failure::code(ErrorCode::InProgress));
+    };
     let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
     let event_id = match state.store.event_id_for_key(guild_id, &event_key).await {
         Ok(Some(event_id)) => event_id,
@@ -1381,12 +1496,7 @@ async fn read_event(
         Ok(None) => return reject(Failure::from_action(unmapped_event_key(&event_key))),
         Err(_) => return reject(Failure::code(ErrorCode::Internal)),
     };
-    let observed_at = format_iso_millis(now_ms() as i64);
-    match state
-        .event_read
-        .execute_read(guild_id, &event_id, &observed_at)
-        .await
-    {
+    match state.event_read.execute_read(guild_id, &event_id).await {
         Ok(result) => {
             metrics::global().internal_action(internal_family(action), "executed");
             event_read_response(result, id)
@@ -1601,6 +1711,7 @@ async fn execute_member(
             let response = TerminalResponse::Success {
                 resource_id: None,
                 affected,
+                outcome: None,
             };
             if state.store.finish(&claim, &response).await.is_err() {
                 let _ = state.store.mark_unknown(&claim).await;
@@ -1925,6 +2036,7 @@ async fn moderate_channel(
             let response = TerminalResponse::Success {
                 resource_id: Some(channel_id),
                 affected: stored_affected,
+                outcome: None,
             };
             if state.store.finish(&claim, &response).await.is_err() {
                 let _ = state.store.mark_unknown(&claim).await;
@@ -2056,6 +2168,190 @@ fn event_read_response(result: Value, id: &str) -> Response {
     wire
 }
 
+/// Mutating `event.upsert` / `event.cancel`: validate the caller's `event_key`
+/// (plus the full event input for upserts) and resolve it in the staging guild
+/// before taking the durable claim — the same order as the announcement
+/// channel-key check. An unmapped cancel key refuses before any claim or
+/// Discord call; an unmapped upsert key creates. The committed outcome makes
+/// replay byte-identical, including `created` after its key was registered.
+async fn mutate_event(
+    state: &ReceiverState,
+    decision: &AuthDecision,
+    raw: &[u8],
+    idempotency_header: Option<&str>,
+    id: &str,
+    key: KeyLabel,
+    action: ActionLabel,
+) -> Response {
+    let reject = |failure| state.reject(failure, key.clone(), action, id);
+    let upsert = decision.action == "event.upsert";
+    let idempotency = match validate_idempotency_key(idempotency_header, &decision.action) {
+        Ok(key) => key,
+        Err(error) => return reject(Failure::from_action(error)),
+    };
+    let event_key = match validate_event_key(&decision.body) {
+        Ok(key) => key.to_owned(),
+        Err(error) => return reject(Failure::from_action(error)),
+    };
+    let input = if upsert {
+        match validate_event_input(&decision.body, state.config.channel_keys()) {
+            Ok(input) => Some(input),
+            Err(error) => return reject(Failure::from_action(error)),
+        }
+    } else {
+        None
+    };
+    let Ok(_gate) = tokio::time::timeout(state.event_gate_wait, state.event_gate.lock()).await
+    else {
+        return reject(Failure::code(ErrorCode::InProgress));
+    };
+    let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+    let mapped = match state.store.event_id_for_key(guild_id, &event_key).await {
+        Ok(mapped) => mapped,
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    // Cancel names a mapped key, never a raw Discord id: no mapping means no
+    // Discord call, exactly like the read path.
+    let event_id = match (upsert, mapped) {
+        (true, mapped) => mapped,
+        (false, Some(event_id)) => Some(event_id),
+        (false, None) => return reject(Failure::from_action(unmapped_event_key(&event_key))),
+    };
+    let target_id = match event_id.as_deref() {
+        // Creates name no event yet: the guild alone is the audit subject.
+        None => None,
+        Some(id) => match DiscordId::new(id) {
+            Ok(id) => Some(id),
+            Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+        },
+    };
+    let (call, outcome) = if upsert {
+        let created = event_id.is_none();
+        (
+            EventCall::Upsert {
+                event_id,
+                input: input.expect("upsert validated its event input"),
+            },
+            if created {
+                EventOutcome::Created
+            } else {
+                EventOutcome::Updated
+            },
+        )
+    } else {
+        (
+            EventCall::Cancel {
+                event_id: event_id.expect("cancel resolved a mapping"),
+            },
+            EventOutcome::Cancelled,
+        )
+    };
+    let subject = AuditSubject {
+        guild_id: Some(DiscordId::new(guild_id).expect("staging guild ID")),
+        target_id,
+        ..AuditSubject::default()
+    };
+    let Some(caller) = state.config.caller_for(&decision.key_id) else {
+        return reject(Failure::code(ErrorCode::Internal));
+    };
+    let identity = match RequestIdentity::new(caller, idempotency, &decision.action, raw) {
+        Ok(identity) => identity,
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    let claim = match state.store.claim(&identity, &subject).await {
+        Ok(InternalClaim::Claimed(claim)) => claim,
+        Ok(InternalClaim::Replay(response)) => {
+            return state.terminal(response, true, id, key.clone(), action);
+        }
+        Ok(InternalClaim::Mismatch) => return reject(Failure::code(ErrorCode::VersionConflict)),
+        Ok(InternalClaim::InFlight) => return reject(Failure::code(ErrorCode::InProgress)),
+        Ok(InternalClaim::NeedsReconciliation) => return reject(Failure::reconciliation()),
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    // No `observed_at` here: the executor stamps the mirror write after
+    // Discord returns, so a slow PATCH is never recorded under a pre-send
+    // instant and never loses last-observed-wins to a newer poller snapshot.
+    match state.event_mutate.execute_mutation(guild_id, &call).await {
+        Ok(result) => {
+            let event_id = match result
+                .get("event_id")
+                .and_then(Value::as_str)
+                .map(DiscordId::new)
+            {
+                Some(Ok(event_id)) => event_id,
+                // The executor only returns normalized mirror rows, so an
+                // unreadable id is an unknown outcome, never a receipt.
+                _ => {
+                    let _ = state.store.mark_unknown(&claim).await;
+                    return reject(Failure::reconciliation());
+                }
+            };
+            // Upsert registers (or re-points) the key only after Discord
+            // confirms; cancel retains the mapping so a later edit cannot
+            // silently recreate the event.
+            if upsert
+                && state
+                    .store
+                    .put_event_key(guild_id, &event_key, event_id.as_str())
+                    .await
+                    .is_err()
+            {
+                let _ = state.store.mark_unknown(&claim).await;
+                return reject(Failure::reconciliation());
+            }
+            let response = TerminalResponse::Success {
+                resource_id: Some(event_id),
+                affected: 1,
+                outcome: Some(outcome),
+            };
+            if state.store.finish(&claim, &response).await.is_err() {
+                // Do not return success before its audit/receipt is committed.
+                // An unavailable store leaves the existing claim occupied.
+                let _ = state.store.mark_unknown(&claim).await;
+                return reject(Failure::reconciliation());
+            }
+            state.terminal(response, false, id, key.clone(), action)
+        }
+        Err(error) => {
+            // A local admission refusal proves nothing was sent, so the claim
+            // is released and the same key may retry. An admission storage
+            // failure is typed the same way: `admit()` never issued a permit,
+            // so nothing reached the wire; the wire error stays `internal`
+            // (see `EventActionError::is_admission_storage`), never
+            // `discord_unavailable` and never `needs_reconciliation`. A 429
+            // proves no effect and, like announcements, is recorded as a
+            // refusal, never resent. Anything uncertain retains the fence for
+            // reconciliation.
+            if matches!(error, EventActionError::Discord(DiscordError::Guard(_)))
+                || error.is_admission_blocked()
+                || error.is_admission_storage()
+            {
+                let wire = error.action_error();
+                if state.store.release_proven_not_sent(claim).await.is_err() {
+                    return reject(Failure::code(ErrorCode::Internal));
+                }
+                return reject(Failure::from_action(wire));
+            }
+            match error {
+                EventActionError::Discord(
+                    DiscordError::RateLimited | DiscordError::Rejected(_),
+                ) => {
+                    let response = TerminalResponse::Failure(TerminalFailure::DiscordRejected);
+                    if state.store.finish(&claim, &response).await.is_err() {
+                        let _ = state.store.mark_unknown(&claim).await;
+                        return reject(Failure::reconciliation());
+                    }
+                    state.terminal(response, false, id, key.clone(), action)
+                }
+                _ => {
+                    let _ = state.store.mark_unknown(&claim).await;
+                    reject(Failure::reconciliation())
+                }
+            }
+        }
+    }
+}
+
 /// Keyless `settings.get`: read the guild's stored override only, never the
 /// process environment. The flag gate already ran in `authorize`; the committed
 /// nonce above is the replay guard, so no idempotency claim is taken.
@@ -2138,6 +2434,7 @@ async fn write_setting(
             let terminal = TerminalResponse::Success {
                 resource_id: None,
                 affected: u32::from(!deleted),
+                outcome: None,
             };
             if state.store.finish(&claim, &terminal).await.is_err() {
                 let _ = state.store.mark_unknown(&claim).await;
@@ -2242,6 +2539,355 @@ fn settings_write_response(result: Value, version: i64, id: &str, replayed: bool
     let mut wire = (
         StatusCode::OK,
         Json(json!({"ok": true, "result": result, "version": version, "request_id": id})),
+    )
+        .into_response();
+    if replayed {
+        wire.headers_mut()
+            .insert("idempotent-replay", HeaderValue::from_static("true"));
+    }
+    wire.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    wire
+}
+/// Keyless `automations.export`: read the guild's stored custom commands and
+/// return the versioned redacted document (`version`, `commands` with only
+/// `name`/`description`/`template`/`text_trigger`). The flag gate already ran
+/// in `authorize`; the committed nonce above is the replay guard, so no
+/// idempotency claim is taken. Reads perform no writes, so retries cannot
+/// double-apply. `export_document` carries no guild, creator, timestamp,
+/// enabled or audit material — redaction is structural, not a field filter.
+async fn export_automations(
+    state: &ReceiverState,
+    _decision: &AuthDecision,
+    id: &str,
+    key: KeyLabel,
+    action: ActionLabel,
+) -> Response {
+    let reject = |failure| state.reject(failure, key.clone(), action, id);
+    let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+    let rows = match custom_command_store::list_commands(state.store.pool(), guild_id).await {
+        Ok(rows) => rows,
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    let document = export_document(&rows);
+    let result = match serde_json::to_value(&document) {
+        Ok(result) => result,
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    let mut wire = (
+        StatusCode::OK,
+        Json(json!({"ok": true, "result": result, "request_id": id})),
+    )
+        .into_response();
+    wire.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    wire
+}
+
+/// Map an import-envelope refusal to a fixed `malformed` error. Messages are
+/// the stable contract strings from `automation_transfer` (no entry content);
+/// `log_reason` stays a scalar class so no request text reaches the logs.
+fn import_parse_error(error: ImportParseError) -> ActionError {
+    let (message, reason) = match &error {
+        ImportParseError::NotAnImportDocument => (
+            "import document must be an array or an object with a commands array",
+            "automation_import_not_a_document",
+        ),
+        ImportParseError::EntriesNotArray => (
+            "\"commands\" must be an array of command objects",
+            "automation_import_entries_not_array",
+        ),
+        ImportParseError::TooManyEntries { .. } => (
+            "import holds more entries than the guild budget allows",
+            "automation_import_too_many_entries",
+        ),
+        ImportParseError::BadOverwrite => (
+            "\"overwrite\" must be a boolean",
+            "automation_import_bad_overwrite",
+        ),
+        ImportParseError::UnsupportedVersion(_) => (
+            "unsupported import version, expected 1",
+            "automation_import_unsupported_version",
+        ),
+        ImportParseError::SchedulesNotSupported => (
+            "scheduled-message import is not supported yet; remove schedules and import commands only",
+            "automation_import_schedules_not_supported",
+        ),
+    };
+    ActionError::new(ErrorCode::Malformed, message, reason)
+}
+
+/// `automations.import`: decode + lint + strictly validate the import envelope
+/// before any effect, then claim the outer durable idempotency key before the
+/// transactional apply. Replaying the stored terminal returns the first
+/// `{imported,skipped,conflicts}` result without a second apply, audit row or
+/// command rewrite. Destructive `overwrite` needs the separately configured
+/// overwrite capability on top of the base automations flag; without it the
+/// request refuses as `action_not_allowed` before any claim or audit row.
+#[allow(clippy::too_many_arguments)]
+async fn import_automations(
+    state: &ReceiverState,
+    decision: &AuthDecision,
+    raw: &[u8],
+    idempotency_header: Option<&str>,
+    overwrite_allowed: bool,
+    id: &str,
+    key: KeyLabel,
+    action: ActionLabel,
+) -> Response {
+    let reject = |failure| state.reject(failure, key.clone(), action, id);
+    let idempotency = match validate_idempotency_key(idempotency_header, &decision.action) {
+        Ok(key) => key.to_owned(),
+        Err(error) => return reject(Failure::from_action(error)),
+    };
+    let actor = match require_snowflake(&decision.body, "actor_id") {
+        Ok(actor) => actor.to_owned(),
+        Err(error) => return reject(Failure::from_action(error)),
+    };
+    // The import document rides top-level alongside `action`/`actor_id`:
+    // `{action, actor_id, commands, version?, schedules?, overwrite?}`.
+    // `parse_import_document` reads only the document fields, so routing keys
+    // are ignored without a second parser. Bare-array MEE6 travels as an
+    // object with a `commands` array.
+    let parsed =
+        match parse_import_document(&Value::Object(decision.body.clone()), max_import_entries()) {
+            Ok(parsed) => parsed,
+            Err(error) => return reject(Failure::from_action(import_parse_error(error))),
+        };
+    if parsed.overwrite && !overwrite_allowed {
+        return reject(Failure::from_action(ActionError::new(
+            ErrorCode::ActionNotAllowed,
+            "Destructive automation imports are not enabled on this bot",
+            "automation_overwrite_not_allowed",
+        )));
+    }
+    let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+    let subject = AuditSubject {
+        guild_id: Some(DiscordId::new(guild_id).expect("staging guild ID")),
+        actor_id: Some(DiscordId::new(&actor).expect("validated actor ID")),
+        ..AuditSubject::default()
+    };
+    let Some(caller) = state.config.caller_for(&decision.key_id) else {
+        return reject(Failure::code(ErrorCode::Internal));
+    };
+    let caller = caller.to_owned();
+    let identity = match RequestIdentity::new(&caller, &idempotency, &decision.action, raw) {
+        Ok(identity) => identity,
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    let audit_id = format!("internal:automations.import:{idempotency}");
+    let claim = match state.store.claim(&identity, &subject).await {
+        Ok(InternalClaim::Claimed(claim)) => claim,
+        Ok(InternalClaim::Replay(response)) => {
+            return replay_import(state, &decision.body, &audit_id, response, id, key, action)
+                .await;
+        }
+        Ok(InternalClaim::Mismatch) => return reject(Failure::code(ErrorCode::VersionConflict)),
+        Ok(InternalClaim::InFlight) => return reject(Failure::code(ErrorCode::InProgress)),
+        Ok(InternalClaim::NeedsReconciliation) => return reject(Failure::reconciliation()),
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    let at = format_iso_millis(now_ms() as i64);
+    match custom_command_service::import(
+        state.store.pool(),
+        guild_id,
+        &actor,
+        &parsed,
+        overwrite_allowed,
+        &audit_id,
+        &at,
+    )
+    .await
+    {
+        Ok(outcome) => {
+            let affected = u32::try_from(outcome.imported).unwrap_or(u32::MAX);
+            let terminal = TerminalResponse::Success {
+                resource_id: None,
+                affected,
+                outcome: None,
+            };
+            if state.store.finish(&claim, &terminal).await.is_err() {
+                let _ = state.store.mark_unknown(&claim).await;
+                return reject(Failure::reconciliation());
+            }
+            import_success_response(&outcome, id, false)
+        }
+        Err(ImportServiceError::OverwriteNotAllowed) => {
+            let terminal = TerminalResponse::Failure(TerminalFailure::ActionNotAllowed);
+            if state.store.finish(&claim, &terminal).await.is_err() {
+                let _ = state.store.mark_unknown(&claim).await;
+                return reject(Failure::reconciliation());
+            }
+            reject(Failure::code(ErrorCode::ActionNotAllowed))
+        }
+        Err(
+            ImportServiceError::Parse(_)
+            | ImportServiceError::OverCapacity(_)
+            | ImportServiceError::Validation(_),
+        ) => {
+            let terminal = TerminalResponse::Failure(TerminalFailure::Malformed);
+            if state.store.finish(&claim, &terminal).await.is_err() {
+                let _ = state.store.mark_unknown(&claim).await;
+                return reject(Failure::reconciliation());
+            }
+            reject(Failure::code(ErrorCode::Malformed))
+        }
+        Err(ImportServiceError::Storage(_)) => {
+            let _ = state.store.mark_unknown(&claim).await;
+            reject(Failure::reconciliation())
+        }
+    }
+}
+
+/// Replay a stored `automations.import` terminal without re-executing the
+/// apply. Success returns the first `{imported,skipped,conflicts}` result
+/// verbatim from the `{audit_id}#summary` audit row the first apply
+/// committed (no writes, no new audit rows): a blind retry after a lost
+/// response sees exactly what the first call reported, even when an admin
+/// edited a command out of band between the two calls. When the summary row
+/// is missing or unparseable (a receipt predating the conflict-names edge),
+/// the result rebuilds from a read-only diff instead. Failures reuse the
+/// generic terminal envelope with the replay marker.
+async fn replay_import(
+    state: &ReceiverState,
+    body: &Map<String, Value>,
+    audit_id: &str,
+    response: TerminalResponse,
+    id: &str,
+    key: KeyLabel,
+    action: ActionLabel,
+) -> Response {
+    match response {
+        TerminalResponse::Success { affected, .. } => {
+            let imported = usize::try_from(affected).unwrap_or(usize::MAX);
+            let stored =
+                stored_import_outcome(state, &format!("{audit_id}#summary"), imported).await;
+            let rebuilt = match stored {
+                Some(outcome) => outcome,
+                None => rebuilt_import_outcome(state, body, imported).await,
+            };
+            import_success_response(&rebuilt, id, true)
+        }
+        TerminalResponse::Failure(_) => state.terminal(response, true, id, key, action),
+    }
+}
+
+/// Load the first `{imported,skipped,conflicts}` result from the summary audit
+/// row. Read-only; `None` on any miss or mismatch so the caller falls back to
+/// the diff rebuild.
+async fn stored_import_outcome(
+    state: &ReceiverState,
+    summary_id: &str,
+    imported: usize,
+) -> Option<ImportOutcome> {
+    let (outcome, reason) = custom_command_store::load_audit(state.store.pool(), summary_id)
+        .await
+        .ok()??;
+    parse_stored_import_outcome(&outcome, reason.as_deref(), imported)
+}
+
+/// Parse a summary row back into the first result. The outcome string keeps
+/// the stable `imported:N,skipped:S,conflicts:C` shape and `reason` carries
+/// the conflict names as a JSON array; anything else (including a count/name
+/// mismatch or an `imported` that disagrees with the stored receipt) is `None`.
+fn parse_stored_import_outcome(
+    outcome: &str,
+    reason: Option<&str>,
+    imported: usize,
+) -> Option<ImportOutcome> {
+    let (counts, rest) = outcome.split_once("imported:")?;
+    if !counts.is_empty() {
+        return None;
+    }
+    let (imported_raw, rest) = rest.split_once(",skipped:")?;
+    let (skipped_raw, rest) = rest.split_once(",conflicts:")?;
+    if rest.contains(',') {
+        return None;
+    }
+    let stored_imported: usize = imported_raw.parse().ok()?;
+    let skipped: usize = skipped_raw.parse().ok()?;
+    let conflict_count: usize = rest.parse().ok()?;
+    if stored_imported != imported {
+        return None;
+    }
+    let conflicts: Vec<String> = match reason {
+        Some(names) => serde_json::from_str(names).ok()?,
+        // Rows predating the conflict-names edge carry no reason; with a
+        // zero count the empty list is still the verbatim first result.
+        None if conflict_count == 0 => Vec::new(),
+        None => return None,
+    };
+    if conflicts.len() != conflict_count {
+        return None;
+    }
+    Some(ImportOutcome {
+        imported,
+        skipped,
+        conflicts,
+    })
+}
+
+/// Read-only rebuild of an import result for replay, used only when the
+/// summary audit row is missing or unparseable (see [`stored_import_outcome`]).
+/// Never writes. Falls back to the stored `imported` count with empty
+/// `skipped`/`conflicts` when the claimed body no longer parses or the store
+/// is unavailable — still no second apply.
+async fn rebuilt_import_outcome(
+    state: &ReceiverState,
+    body: &Map<String, Value>,
+    imported: usize,
+) -> ImportOutcome {
+    let fallback = || ImportOutcome {
+        imported,
+        skipped: 0,
+        conflicts: Vec::new(),
+    };
+    let Ok(parsed) = parse_import_document(&Value::Object(body.clone()), max_import_entries())
+    else {
+        return fallback();
+    };
+    let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+    let Ok(rows) = custom_command_store::list_commands(state.store.pool(), guild_id).await else {
+        return fallback();
+    };
+    let Ok(diff) = diff_import(&rows, &parsed, &reserved_command_names(), parsed.overwrite) else {
+        return fallback();
+    };
+    let mut conflicts = parsed.translation_conflicts.clone();
+    conflicts.extend(
+        diff.rejected
+            .iter()
+            .filter(|rejection| {
+                matches!(
+                    rejection.code.as_str(),
+                    "would_overwrite" | "trigger_in_use"
+                )
+            })
+            .map(|rejection| rejection.name.clone()),
+    );
+    ImportOutcome {
+        imported,
+        skipped: parsed.invalid_entries + diff.rejected.len(),
+        conflicts,
+    }
+}
+
+/// Successful imports carry the transactional counts on the wire. The stored
+/// receipt keeps only `affected = imported`; `skipped`/`conflicts` replay
+/// from the summary audit row without a second apply, rebuilding from a
+/// read-only diff only as a fallback (see [`replay_import`]).
+fn import_success_response(outcome: &ImportOutcome, id: &str, replayed: bool) -> Response {
+    let mut wire = (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "result": {
+                "imported": outcome.imported,
+                "skipped": outcome.skipped,
+                "conflicts": outcome.conflicts,
+            },
+            "request_id": id,
+        })),
     )
         .into_response();
     if replayed {
@@ -2418,8 +3064,19 @@ fn terminal_response(
         TerminalResponse::Success {
             resource_id: Some(message_id),
             affected: 1,
+            outcome: None,
         } => Json(json!({
             "ok": true, "result": {"message_id": message_id.as_str()}, "request_id": id,
+        }))
+        .into_response(),
+        TerminalResponse::Success {
+            resource_id: Some(event_id),
+            affected: 1,
+            outcome: Some(outcome),
+        } => Json(json!({
+            "ok": true,
+            "result": {"outcome": outcome.as_str(), "event_id": event_id.as_str()},
+            "request_id": id,
         }))
         .into_response(),
         // Membership receipts: `None` + `0/1` is the stored-member contract.
@@ -2429,6 +3086,7 @@ fn terminal_response(
         TerminalResponse::Success {
             resource_id: None,
             affected,
+            outcome: None,
         } => match (action.as_str(), affected) {
             ("role.assign", 1) => member_success("assigned", id),
             ("role.assign", 0) => member_success("already_held", id),

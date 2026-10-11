@@ -239,18 +239,33 @@ impl Vote {
     }
 }
 
-/// In-memory decision state, including finished IDs to reject command replay.
-/// Retain this core for the managed session; dropping it loses the replay ledger.
-/// Durable storage, restart reconciliation and retention belong to the parent.
+/// In-memory decision state, including finished IDs to reject command replay
+/// within the retention horizon. Retain this core for the managed session;
+/// dropping it loses the replay ledger. Durable storage, restart
+/// reconciliation and retention belong to the parent.
 ///
-/// The post-terminal cooldown is derived from terminal votes in `votes`; the
-/// per-initiator history keeps successful start times per guild + initiator and
-/// is pruned to [`VOTE_KICK_INITIATOR_WINDOW_MS`] on every start. Coordinated
-/// bounding of all retained state is VK-03 and out of scope here.
+/// Retention is bounded (VK-03): every public method first settles elapsed
+/// active votes (expiry backdated to the deadline), evicts terminal votes
+/// strictly past the [`VOTE_KICK_COOLDOWN_MS`] horizon, and drops initiator
+/// starts past [`VOTE_KICK_INITIATOR_WINDOW_MS`], removing keys left empty.
+/// Every eviction is reported to the parent: [`VoteKickCore::prune`] returns
+/// the evicted IDs, and evictions from `start`/`cast`/`refresh` wait in a
+/// buffer for [`VoteKickCore::drain_evicted`], so per-vote parent maps stay
+/// bounded no matter which entry point reaps. Call [`VoteKickCore::prune`]
+/// from the parent timer so expired entries are reaped even with no new
+/// starts. Sustained activity keeps memory proportional to the live window,
+/// not total history. A terminal vote's interaction ID is rejected as
+/// [`VoteKickError::ReusedVoteId`] while the vote is retained (through the
+/// cooldown horizon inclusive); after eviction the ID may start a new vote —
+/// see [`VoteKickCore::prune`] for why that horizon is safe.
 #[derive(Debug, Default)]
 pub struct VoteKickCore {
     votes: BTreeMap<Snowflake, Vote>,
     initiator_starts: BTreeMap<(Snowflake, Snowflake), Vec<u64>>,
+    /// Vote IDs evicted by `start`/`cast`/`refresh`/`prune` and not yet
+    /// collected. Each vote is evicted (and buffered) at most once: eviction
+    /// removes it from `votes`, so a later pass cannot report it again.
+    pending_evicted: Vec<Snowflake>,
 }
 
 impl VoteKickCore {
@@ -263,12 +278,87 @@ impl VoteKickCore {
     fn cooldown_holds(terminal_at_ms: u64, now_ms: u64) -> bool {
         now_ms < terminal_at_ms.saturating_add(VOTE_KICK_COOLDOWN_MS)
     }
+
+    /// A terminal vote is still retained at `now_ms`: active votes and
+    /// terminals through the cooldown horizon inclusive. Eviction runs
+    /// strictly past the horizon so cooldown refusal and replay rejection
+    /// hold for the full window, including exactly at its end.
+    fn vote_retained(status: VoteKickStatus, terminal_at_ms: Option<u64>, now_ms: u64) -> bool {
+        status == VoteKickStatus::Active
+            || terminal_at_ms
+                .is_none_or(|terminal| now_ms <= terminal.saturating_add(VOTE_KICK_COOLDOWN_MS))
+    }
+
+    /// Settle elapsed active votes, evict terminal votes past the retention
+    /// horizon, and drop initiator starts past the sliding window (with keys
+    /// left empty). Evicted vote IDs accumulate in the drain buffer for
+    /// [`Self::drain_evicted`]: the parent collects them after every call so
+    /// its own per-vote maps stay bounded whatever reaps.
+    ///
+    /// Eviction runs before settling so a vote that just elapsed on this call
+    /// survives until a later pass; its terminal transition is backdated to
+    /// the deadline either way, so the cooldown is unaffected.
+    fn prune_at(&mut self, now_ms: u64) {
+        let mut evicted = Vec::new();
+        self.votes.retain(|id, vote| {
+            let keep = Self::vote_retained(vote.status, vote.terminal_at_ms, now_ms);
+            if !keep {
+                evicted.push(*id);
+            }
+            keep
+        });
+        self.pending_evicted.extend(evicted);
+        // A new command must not be blocked by an elapsed vote when the timer
+        // has not refreshed it yet. No passing decision is made on this path,
+        // but the lazy expiry is a terminal transition and starts the cooldown.
+        for vote in self.votes.values_mut() {
+            if vote.status == VoteKickStatus::Active && now_ms >= vote.expires_at_ms {
+                vote.status = VoteKickStatus::Expired;
+                vote.terminal_at_ms = Some(vote.expires_at_ms);
+            }
+        }
+        self.initiator_starts.retain(|_, starts| {
+            starts.retain(|started| Self::initiator_start_counts(*started, now_ms));
+            !starts.is_empty()
+        });
+    }
 }
 
 impl VoteKickCore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Reap retained state that no live window needs, without starting a vote.
+    ///
+    /// The parent timer should call this even when no new vote starts: without
+    /// it, terminal votes and initiator history are only reaped on the next
+    /// `start`/`cast`/`refresh`. Returns every vote ID evicted since the last
+    /// drain — this pass's plus any buffered by earlier `start`/`cast`/`refresh`
+    /// calls — so the parent can drop its own per-vote maps in the same pass.
+    ///
+    /// Retention horizon: a terminal vote (and its replay rejection) is kept
+    /// through `terminal_at + VOTE_KICK_COOLDOWN_MS` inclusive. Past that, the
+    /// vote is forgotten and its interaction ID may start a new vote. That is
+    /// safe because Discord interaction IDs are unique per interaction: a
+    /// colliding reuse is a delayed duplicate delivery, and duplicate
+    /// deliveries arrive within seconds, never past the five-minute horizon.
+    /// Durable replay protection across restarts stays a parent obligation
+    /// (see the type docs).
+    pub fn prune(&mut self, clock: &impl VoteClock) -> Vec<Snowflake> {
+        self.prune_at(clock.now_ms());
+        self.drain_evicted()
+    }
+
+    /// Collect vote IDs evicted by `start`/`cast`/`refresh` since the last
+    /// drain, so the parent can drop its own per-vote maps for them. Call
+    /// after every core call: only the timer's [`Self::prune`] reports
+    /// evictions in its return value, while a command that arrives first may
+    /// have reaped other votes on its own pass. Each evicted ID is reported
+    /// exactly once; an empty buffer drains to an empty vec.
+    pub fn drain_evicted(&mut self) -> Vec<Snowflake> {
+        std::mem::take(&mut self.pending_evicted)
     }
 
     /// Starting does not cast a ballot: V4 says votes are cast with buttons.
@@ -280,6 +370,8 @@ impl VoteKickCore {
         target_id: Snowflake,
         clock: &impl VoteClock,
     ) -> Result<VoteKickUpdate, VoteKickError> {
+        let now_ms = clock.now_ms();
+        self.prune_at(now_ms);
         if self.votes.contains_key(&id) {
             return Err(VoteKickError::ReusedVoteId);
         }
@@ -303,19 +395,9 @@ impl VoteKickCore {
         if facts.privileged() {
             return Err(VoteKickError::PrivilegedTarget);
         }
-        let now_ms = clock.now_ms();
         let expires_at_ms = now_ms
             .checked_add(VOTE_KICK_TTL_MS)
             .ok_or(VoteKickError::InvalidTime)?;
-        // A new command must not be blocked by an elapsed vote when the timer
-        // has not refreshed it yet. No passing decision is made on this path,
-        // but the lazy expiry is a terminal transition and starts the cooldown.
-        for vote in self.votes.values_mut() {
-            if vote.status == VoteKickStatus::Active && now_ms >= vote.expires_at_ms {
-                vote.status = VoteKickStatus::Expired;
-                vote.terminal_at_ms = Some(vote.expires_at_ms);
-            }
-        }
         if self.votes.values().any(|vote| {
             vote.status == VoteKickStatus::Active
                 && vote.reference.guild_id == facts.guild_id
@@ -337,10 +419,11 @@ impl VoteKickCore {
         if in_cooldown {
             return Err(VoteKickError::Cooldown);
         }
+        // The window was pruned above, so this counts without creating a key:
+        // a refused start reserves no initiator history either.
         let key = (facts.guild_id, initiator_id);
-        let starts = self.initiator_starts.entry(key).or_default();
-        starts.retain(|started| Self::initiator_start_counts(*started, now_ms));
-        if starts.len() >= VOTE_KICK_INITIATOR_LIMIT {
+        let recent = self.initiator_starts.get(&key).map_or(0, Vec::len);
+        if recent >= VOTE_KICK_INITIATOR_LIMIT {
             return Err(VoteKickError::InitiatorLimited);
         }
         let total = facts.eligible(target_id).len();
@@ -399,6 +482,7 @@ impl VoteKickCore {
         clock: &impl VoteClock,
     ) -> Result<VoteKickUpdate, VoteKickError> {
         let now_ms = clock.now_ms();
+        self.prune_at(now_ms);
         let vote = self.vote_mut(reference, facts, now_ms)?;
         if vote.status != VoteKickStatus::Active {
             return Ok(vote.update(None));
@@ -429,6 +513,7 @@ impl VoteKickCore {
         clock: &impl VoteClock,
     ) -> Result<VoteKickUpdate, VoteKickError> {
         let now_ms = clock.now_ms();
+        self.prune_at(now_ms);
         let vote = self.vote_mut(reference, facts, now_ms)?;
         let kick = vote.advance(facts, now_ms);
         Ok(vote.update(kick))
@@ -1012,6 +1097,119 @@ mod tests {
                 .yes,
             0
         );
+    }
+
+    // ---- (VK-03) bounded retention ----
+
+    #[test]
+    fn expired_cooldown_entries_reaped_without_new_starts() {
+        let facts = room(&[2, 3, 4, 9]);
+        let clock = Clock::new();
+        let mut core = VoteKickCore::new();
+        let reference = start(&mut core, facts, &clock);
+        core.cast(reference, facts, 2, VoteBallot::Yes, &clock)
+            .unwrap();
+        let passed = core
+            .cast(reference, facts, 3, VoteBallot::Yes, &clock)
+            .unwrap();
+        assert_eq!(passed.status, VoteKickStatus::Passed);
+        // Through the horizon inclusive the vote (and its replay rejection)
+        // is still retained, even when a prune runs first.
+        clock.set(1_000 + VOTE_KICK_COOLDOWN_MS);
+        assert!(core.prune(&clock).is_empty());
+        assert_eq!(core.votes.len(), 1);
+        assert_eq!(
+            core.start(100, facts, 2, 9, &clock),
+            Err(VoteKickError::ReusedVoteId)
+        );
+        // Strictly past the horizon a timer prune reaps the vote with no new
+        // start, and reports the evicted ID for parent map cleanup.
+        clock.set(1_000 + VOTE_KICK_COOLDOWN_MS + 1);
+        assert_eq!(core.prune(&clock), vec![100]);
+        assert!(core.votes.is_empty());
+        // The 10-minute initiator window has not elapsed yet, so the
+        // initiator entry is still live: only the cooldown state was reaped.
+        assert_eq!(core.initiator_starts.len(), 1);
+        // A fresh interaction ID starts cleanly on the same target.
+        let fresh = core.start(101, facts, 2, 9, &clock).unwrap();
+        assert_eq!(fresh.status, VoteKickStatus::Active);
+        // Past the initiator window (measured from the fresh start, which
+        // refreshed it) a prune drops the key itself, leaving no empty
+        // history behind.
+        clock.set(1_000 + VOTE_KICK_COOLDOWN_MS + 1 + VOTE_KICK_INITIATOR_WINDOW_MS + 1);
+        core.prune(&clock);
+        assert!(core.initiator_starts.is_empty());
+    }
+
+    #[test]
+    fn retained_state_stays_bounded_across_sustained_churn() {
+        // Drive many start -> terminal cycles with distinct guilds, targets,
+        // initiators and IDs while the clock advances, pruning as the parent
+        // timer would. Retained maps must stay proportional to the live
+        // window (active TTL + cooldown; initiator window), not total history.
+        let clock = Clock::new();
+        let mut core = VoteKickCore::new();
+        let step_ms: u64 = 60_000;
+        let cycles: u64 = 50;
+        let mut total_evicted = 0usize;
+        for cycle in 0..cycles {
+            let now = 1_000 + cycle * step_ms;
+            clock.set(now);
+            let guild = 1 + (cycle % 5);
+            let target = 1_000 + cycle;
+            let initiator = 2_000 + cycle;
+            let occupants = [2, 3, initiator, target];
+            let facts = VoteRoomFacts {
+                guild_id: guild,
+                room_id: 10,
+                owner_id: 2,
+                original_creator_id: 3,
+                occupants: &occupants,
+                target_privileged: Some(false),
+            };
+            let id = 10_000 + cycle;
+            core.start(id, facts, initiator, target, &clock).unwrap();
+            // Settle terminal at the deadline, then prune as the timer would.
+            clock.set(now + VOTE_KICK_TTL_MS);
+            let reference = VoteKickRef {
+                id,
+                guild_id: guild,
+                room_id: 10,
+                target_id: target,
+            };
+            let settled = core.refresh(reference, facts, &clock).unwrap();
+            assert_eq!(settled.status, VoteKickStatus::Expired);
+            total_evicted += core.prune(&clock).len();
+            // No empty initiator history lingers.
+            assert!(core
+                .initiator_starts
+                .values()
+                .all(|starts| !starts.is_empty()));
+            if cycle > 15 {
+                // Live votes: terminals within the 5-minute cooldown horizon
+                // (~5 cycles at this step) plus the just-settled one.
+                assert!(
+                    core.votes.len() <= 8,
+                    "cycle {cycle}: {} votes retained",
+                    core.votes.len()
+                );
+                // Live initiator keys: starts within the 10-minute window.
+                assert!(
+                    core.initiator_starts.len() <= 12,
+                    "cycle {cycle}: {} initiator keys retained",
+                    core.initiator_starts.len()
+                );
+                // Reaping keeps pace: every cycle retires an old vote.
+                assert!(total_evicted > 0, "cycle {cycle}: nothing reaped yet");
+            }
+        }
+        // Past every horizon a final prune drains the remainder: nothing leaks.
+        clock.set(1_000 + cycles * step_ms + VOTE_KICK_INITIATOR_WINDOW_MS + 1);
+        total_evicted += core.prune(&clock).len();
+        assert_eq!(total_evicted as u64, cycles);
+        assert!(core.votes.is_empty());
+        assert!(core.initiator_starts.is_empty());
+        assert!(core.prune(&clock).is_empty());
     }
 
     #[test]

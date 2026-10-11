@@ -333,14 +333,100 @@ python3 scripts/cargo_cache.py retain \
   --evidence /RUN-SCRATCH/two-pool-retain-receipt.json
 ```
 
-Output is JSON with `retain: true` and a per-slot record
-(`eligible`, `before_bytes`/`after_bytes`/`reclaimed_bytes`,
-`lock_held_through_mutation`). The Operator holds TWO build/dispatch
+Output is JSON with `retain: true`, an `excluded_deleted_references` count,
+and a per-slot record (`eligible`, `before_bytes`/`after_bytes`/
+`reclaimed_bytes`, `lock_held_through_mutation`). The Operator holds TWO build/dispatch
 admission, re-exports a fresh inventory immediately before running, and
 retains the evidence receipt. Scratch has no Cargo-defined top-level names
 (temp files are arbitrary), so only protected directory/file/suffix vetoes
 apply there — but the attested classification is still required. Never turn
 this command into unattended cron cleanup.
+
+### Deleted-reference evidence model (multi-tenant host)
+
+Per-slot checks veto on positive attribution only: a lexical path inside the
+slot's `target`/`scratch`, or a `(device, inode)` identity in that slot's
+output. The whole-run check refuses a deleted entry attributable to no held
+slot, with two provable exceptions:
+
+- **Different-filesystem exclusion.** One filesystem's unlinked inode can
+  never be another filesystem's file, so a stat-backed deleted entry whose
+  device appears in no held slot output is provably unable to reference slot
+  output. fd/cwd/exe entries are stat-backed by construction. A file-backed
+  maps entry is re-grounded through `/proc/PID/map_files/<range>` — a symlink
+  to the mapped file itself whose fstat device/inode compare exactly like fd
+  stat — and becomes stat-backed too. Such entries are excluded and counted
+  in the receipt as `excluded_deleted_references` — never silently dropped.
+  The maps range is normalised to the unpadded name the kernel uses (maps
+  zero-pads it, for example `00400000-…`). Following a map_files link needs
+  CAP_SYS_ADMIN or CAP_CHECKPOINT_RESTORE; a denied read is not a scan
+  failure. Maps entries with no usable map_files stat (anonymous object,
+  hidepid, exit/munmap race, or denied without the capability) keep the
+  kernel-printed superblock device, which need not equal the stat device for
+  the same file (btrfs per-subvolume anon_dev, pre-6.8 overlayfs), so a
+  "foreign" maps device there proves nothing and stays fail-closed.
+- **Non-file identity exclusion.** A deleted path that cannot be a regular
+  file at all cannot alias slot output and is excluded by identity: SYSV IPC
+  shared-memory segments (`/SYSV<key>`), `/dev/zero`, memfd anonymous RAM
+  files (`/memfd:<name>`), async-IO contexts (`[aio]`, container-spelled
+  `/[aio]`), `anon_inode:` objects, and bracketed anonymous kernel mappings
+  (`[heap]`, `[stack]`, `[anon:…]`). Browsers, PostgreSQL backends, and
+  language runtimes map these ubiquitously, so without this rule shared-host
+  mappings refuse every run. The bracket rule only matches a path whose whole
+  name past an optional leading slash is bracketed; slot outputs always carry
+  absolute paths under slot target/scratch directories (checked by lexical
+  attribution first), so no regular file can match.
+
+Everything else stays fail-closed: same-filesystem unattributed entries (a
+deleted slot file held open is indistinguishable from an unrelated
+same-filesystem temp file), device-unknown entries, incomplete or denied
+process scans (denied fd, cwd, exe, maps, or cmdline reads), and any run where
+a held slot's output device is unreadable (then nothing is device-excluded).
+
+Limitations: unrelated deleted files on the *same* filesystem as slot output
+still refuse the whole run — as do maps deleted entries with no usable
+map_files stat that attribute to no slot (including real tmpfs paths such as
+`/dev/shm` files, whose non-aliasing cannot be proven without
+mount-namespace analysis) — quiesce writers or supply an independently
+verified exact-path process-reference receipt instead. Exclusion assumes no
+filesystem topology change under held slots during the bounded run (all locks
+are held throughout). The read-only legacy `audit` keeps the strict global
+rule except for the same non-file identity exclusion; only `retain`
+partitions by device.
+
+### Bounded TWO-only build/dispatch admission hold (and undo)
+
+Existing supported controls only: slot `lock` flocks, `timeout(1)`,
+read-only `policy.json`, and a fresh inventory. No service stop, no mass
+cancellation, no environment/roster change. Running workers keep their slots:
+the holder below uses non-blocking locks and never steals or kills.
+
+1. Record pre-hold state: `sha256sum policy.json`, lock inodes (`stat`), and
+   lease hashes. If `run` admission already refuses (wedged pool, no idle
+   below-budget slot), record that refusal as the hold evidence and skip to
+   step 4 — no holder process is needed.
+2. Otherwise start a bounded holder (e.g. `timeout 300`) that non-blocking
+   flocks each *free* slot lock and sleeps; locks held by running workers
+   fail `LOCK_NB` and are reported as preserved, never touched.
+3. Validate scope and quiescence: the holder reports held vs worker-held
+   slots; a re-probe shows no idle slot for new `run` admission. Export a
+   fresh complete host-scope inventory (≤60s): every row terminal with
+   `live_run: false` and `referenced: false`.
+4. Release the holder (kill its PID; expiry is the `timeout`) and run `retain`
+   immediately in the same shell with the fresh inventory and an evidence
+   path. The residual release-to-acquire race stays fail-closed: a new writer
+   holds its slot lock (slot skips, lease kept) and inventory revalidation
+   refuses a stale run with no mutation.
+5. Release/expiry: the holder always ends via kill or timeout; `retain` ends
+   by exiting. Verify the post-run inventory and the evidence receipt.
+
+Undo (retain never ran or aborted before mutation): release the holder,
+verify `policy.json` hash, lock inodes and lease files match the pre-hold
+record, and re-probe admission behavior. No receipt means no mutation
+occurred; running workers were never touched. If `retain` mutated some slots
+and then must be rolled back, regenerable output rebuilds through the
+repaired bounded pool; source, secrets, services and archives have no
+rollback change here.
 
 ## /home available-byte alarm
 

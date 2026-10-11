@@ -1,7 +1,7 @@
 //! Runtime adapters for the three existing website-contract domains, plus the
 //! `guild_settings` hot-reload poll registered alongside them (TOG-10898).
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use serde_json::Value;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -10,11 +10,12 @@ use tokio::sync::{watch, Mutex, OnceCell};
 use two_bot_core::{
     build_community_snapshot, build_counter_reading,
     database_tls::{self, TlsPolicy},
-    match_rank_roles, normalize_events, now_iso, read_raid_windows, replace_events, write_counter,
-    write_rank_snapshot, Config, RawScheduledEvent, RosterMember, WebsiteStoreError,
-    LIVE_COUNTER_INTERVAL_MS, RANK_SNAPSHOT_INTERVAL_MS, SCHEDULED_EVENTS_INTERVAL_MS,
+    match_rank_roles, normalize_events, now_iso, plan_rank_heal, read_raid_windows, replace_events,
+    write_counter, write_rank_snapshot, Config, RankHeal, RawScheduledEvent, RosterMember,
+    WebsiteStoreError, LIVE_COUNTER_INTERVAL_MS, RANK_SNAPSHOT_INTERVAL_MS,
+    SCHEDULED_EVENTS_INTERVAL_MS,
 };
-use two_bot_discord::executor::ActionExecutor;
+use two_bot_discord::executor::{ActionExecutor, DiscordError};
 
 use crate::{
     activation::BootActivation,
@@ -212,6 +213,13 @@ pub async fn serve(
                     guild: guild.to_string(),
                     observation: Mutex::new(()),
                 });
+                // The rank tick is the only website job with a Discord write
+                // path: the ladder self-heal grants roles under the bot
+                // identity. It obeys the same live-identity fence as the other
+                // posting jobs, resolved once at boot (the token never changes
+                // at runtime). A refused identity keeps the old non-nested
+                // refusal and never grants.
+                let rank_heal = activation.rank_heal_permitted();
                 for (name, kind) in NAMES
                     .into_iter()
                     .zip([Kind::Counter, Kind::Rank, Kind::Events])
@@ -219,6 +227,7 @@ pub async fn serve(
                     let context = context.clone();
                     let shutdown = shutdown.subscribe();
                     let cadence = cadence(kind);
+                    let rank_heal = rank_heal && matches!(kind, Kind::Rank);
                     registered.push(Job {
                         name,
                         cadence,
@@ -243,6 +252,7 @@ pub async fn serve(
                                             &context.guild,
                                             &context.observation,
                                             &shutdown,
+                                            rank_heal,
                                         ).await
                                     } => result,
                                 }
@@ -524,10 +534,135 @@ fn raw_event(value: &Value) -> Result<RawScheduledEvent, ErrorClass> {
     })
 }
 
+/// Cap on Discord role grants per rank tick. The cutover incident repaired 5
+/// members; above this the tick heals nothing and fails closed as
+/// [`ErrorClass::Configuration`], so a mass misconfiguration can never become
+/// a mass grant. Each member needs at most four grants (five rungs).
+pub(crate) const MAX_RANK_SELF_HEAL_GRANTS_PER_TICK: usize = 25;
+
+/// Audit-log reason on every rank self-heal grant (ASCII, far under the
+/// 512-char `X-Audit-Log-Reason` bound the executor enforces).
+pub(crate) const RANK_SELF_HEAL_AUDIT_REASON: &str =
+    "rank ladder self-heal: grant missing lower rank roles";
+
+/// Heal-phase Discord failures keep precise classes: a confirmed refusal
+/// (hierarchy, permissions, unknown role) proves the ladder cannot be healed
+/// and reads as [`ErrorClass::Configuration`]; wire uncertainty stays
+/// [`ErrorClass::Rest`] for the next tick. Nothing publishes either way.
+fn heal_error(error: DiscordError) -> ErrorClass {
+    match error {
+        DiscordError::Rejected(_) => ErrorClass::Configuration,
+        _ => ErrorClass::Rest,
+    }
+}
+
+/// Grant every missing lower rung in `plan`, then report whether the tick may
+/// publish (`true`) or stopped mid-heal (`false`: grants already applied stay
+/// applied — Discord has no rollback — and the next tick publishes them).
+/// Fails closed before any mutation when the plan is empty or over bound,
+/// when the guild roles carry no provable hierarchy, or when any target sits
+/// at or above the bot's highest role.
+async fn heal_rank_ladder(
+    rest: &ActionExecutor,
+    guild: &str,
+    guild_roles: &Value,
+    plan: &[RankHeal],
+    shutdown: &watch::Receiver<bool>,
+) -> Result<bool, ErrorClass> {
+    if plan.is_empty() {
+        tracing::warn!(
+            job = "rank",
+            "rank ladder not nested with no healable rungs; publication skipped"
+        );
+        return Err(ErrorClass::Configuration);
+    }
+    if plan.len() > MAX_RANK_SELF_HEAL_GRANTS_PER_TICK {
+        tracing::warn!(
+            job = "rank",
+            grants = plan.len(),
+            max = MAX_RANK_SELF_HEAL_GRANTS_PER_TICK,
+            "rank self-heal over bound; publication skipped"
+        );
+        return Err(ErrorClass::Configuration);
+    }
+    if publication_stopped(shutdown) {
+        return Ok(false);
+    }
+    // Hierarchy inputs come from the already-fetched guild object, so a
+    // nested ladder never pays for them. A role without a numeric id or
+    // position cannot be proven below the bot: fail closed.
+    let Some(roles_array) = guild_roles.as_array() else {
+        tracing::warn!(
+            job = "rank",
+            "rank self-heal cannot read guild roles; publication skipped"
+        );
+        return Err(ErrorClass::Configuration);
+    };
+    let mut positions = HashMap::new();
+    for role in roles_array {
+        let (Some(id), Some(position)) = (role["id"].as_str(), role["position"].as_i64()) else {
+            tracing::warn!(
+                job = "rank",
+                "rank self-heal cannot prove role hierarchy; publication skipped"
+            );
+            return Err(ErrorClass::Configuration);
+        };
+        positions.insert(id.to_owned(), position);
+    }
+    let bot_id = rest.current_bot_user_id().await.map_err(heal_error)?;
+    let guild_id: u64 = guild.parse().map_err(|_| ErrorClass::Configuration)?;
+    let bot_roles = rest
+        .member_role_ids(guild_id, bot_id)
+        .await
+        .map_err(heal_error)?;
+    let bot_highest = bot_roles
+        .iter()
+        .filter_map(|id| positions.get(id).copied())
+        .max();
+    let Some(bot_highest) = bot_highest else {
+        tracing::warn!(
+            job = "rank",
+            "rank self-heal cannot read the bot hierarchy; publication skipped"
+        );
+        return Err(ErrorClass::Configuration);
+    };
+    for grant in plan {
+        let position = positions.get(&grant.role_id).copied();
+        if position.is_none_or(|position| position >= bot_highest) {
+            tracing::warn!(
+                job = "rank",
+                member = grant.member_id.as_str(),
+                role = grant.key.label(),
+                "rank self-heal target at or above the bot; publication skipped"
+            );
+            return Err(ErrorClass::Configuration);
+        }
+    }
+    for grant in plan {
+        if publication_stopped(shutdown) {
+            return Ok(false);
+        }
+        rest.set_member_role(
+            guild,
+            &grant.member_id,
+            &grant.role_id,
+            true,
+            RANK_SELF_HEAL_AUDIT_REASON,
+        )
+        .await
+        .map_err(heal_error)?;
+    }
+    Ok(true)
+}
+
 /// Cancel queued/in-flight observations directly, without waiting for the job
 /// supervisor to abort us. Biased selection discards a simultaneously-ready REST
 /// result; publication fences also cover shutdown arriving during that poll.
 /// This cannot undo a database commit already submitted before shutdown.
+///
+/// `rank_heal` is the boot-resolved live-identity fence for the rank ladder
+/// self-heal: only the rank tick consults it, and only a permitted identity
+/// may grant roles. Every other kind ignores it.
 pub async fn run_once(
     kind: Kind,
     pool: &PgPool,
@@ -535,11 +670,12 @@ pub async fn run_once(
     guild: &str,
     observation: &Mutex<()>,
     shutdown: &watch::Receiver<bool>,
+    rank_heal: bool,
 ) -> Result<(), ErrorClass> {
     tokio::select! {
         biased;
         _ = server::shutdown_requested(shutdown.clone()) => Ok(()),
-        result = snapshot_once(kind, pool, rest, guild, observation, shutdown) => result,
+        result = snapshot_once(kind, pool, rest, guild, observation, shutdown, rank_heal) => result,
     }
 }
 
@@ -554,8 +690,14 @@ async fn snapshot_once(
     guild: &str,
     observation: &Mutex<()>,
     shutdown: &watch::Receiver<bool>,
+    rank_heal: bool,
 ) -> Result<(), ErrorClass> {
     if matches!(kind, Kind::Events) {
+        // Stamp the snapshot before the GET, not after: the mirror's
+        // last-observed-wins `updated_at` must describe when the observation
+        // began, so a mutation that lands while the GET is in flight keeps
+        // its newer row instead of being overwritten by this older fetch.
+        let fetched_at = now_iso();
         let response = get(
             rest,
             &format!("/guilds/{guild}/scheduled-events?with_user_count=true"),
@@ -571,7 +713,7 @@ async fn snapshot_once(
         if publication_stopped(shutdown) {
             return Ok(());
         }
-        return replace_events(pool, guild, &now_iso(), &events)
+        return replace_events(pool, guild, &fetched_at, &events)
             .await
             .map_err(|_| ErrorClass::Database);
     }
@@ -625,8 +767,67 @@ async fn snapshot_once(
             Ok((id.to_string(), name.to_owned()))
         })
         .collect::<Result<Vec<_>, ErrorClass>>()?;
+    // A missing or ambiguous ladder is genuinely invalid: fail closed.
     let ladder = match_rank_roles(&roles).ok_or(ErrorClass::Configuration)?;
-    let snapshot = build_community_snapshot(&members, &ladder, &windows).ok_or(ErrorClass::Rest)?;
+    let mut members = members;
+    let mut snapshot =
+        build_community_snapshot(&members, &ladder, &windows).ok_or(ErrorClass::Rest)?;
+    if !snapshot.nested {
+        // Non-cumulative members (hand-granted higher rank without the lower
+        // rungs) self-heal: grant the missing rungs with an audit reason,
+        // bounded and hierarchy-fenced, then rebuild and re-verify. The heal
+        // grants roles under the bot identity, so a refused identity keeps
+        // the old refusal and never touches the wire.
+        if !rank_heal {
+            tracing::warn!(
+                job = "rank",
+                "rank ladder not nested; self-heal refused for this identity; publication skipped"
+            );
+            return Err(ErrorClass::Configuration);
+        }
+        let plan = plan_rank_heal(&members, &ladder, &windows);
+        if !heal_rank_ladder(rest, guild, &guild_object["roles"], &plan, shutdown).await? {
+            return Ok(());
+        }
+        for grant in &plan {
+            if let Some(member) = members
+                .iter_mut()
+                .find(|member| member.user_id == grant.member_id)
+            {
+                if !member.roles.iter().any(|held| held == &grant.role_id) {
+                    member.roles.push(grant.role_id.clone());
+                }
+            }
+        }
+        snapshot = build_community_snapshot(&members, &ladder, &windows).ok_or(ErrorClass::Rest)?;
+        if !snapshot.nested {
+            tracing::warn!(
+                job = "rank",
+                "rank ladder still not nested after self-heal; publication skipped"
+            );
+            return Err(ErrorClass::Configuration);
+        }
+        let mut repaired: Vec<String> = plan
+            .iter()
+            .map(|grant| {
+                format!(
+                    "{}:{}({})",
+                    grant.member_id,
+                    grant.key.label(),
+                    grant.role_id
+                )
+            })
+            .collect();
+        repaired.sort();
+        repaired.dedup();
+        let repaired = repaired.join(",");
+        tracing::info!(
+            job = "rank",
+            grants = plan.len(),
+            repairs = repaired.as_str(),
+            "rank ladder self-healed: granted missing lower rungs"
+        );
+    }
     if publication_stopped(shutdown) {
         return Ok(());
     }

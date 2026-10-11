@@ -40,17 +40,22 @@ pub const COMMUNITY_FACT_TYPES: [&str; 6] = [
 ];
 
 /// Streams with a live production writer: the only streams `scorecard_once`
-/// may mark covered. Today that is `event_attended` (host check-in via
-/// `rsvp_store::record_checkin`), `message_created` (gateway `MessageCreate`
-/// via `community_store::record_message_fact`), `rules_accepted`
-/// (gate-clear drain via the community-facts sink) and `member_joined`
-/// (gateway joins via `handlers::on_join`, buffered in the community-facts
-/// sink and persisted with `community_store::member_join_fact` +
-/// `record_fact`); voice capture lands in later slices, one per stream.
-/// This must always equal the `Some` rows of [`STREAM_WRITERS`]; the
+/// may mark covered. That is `event_attended` (host check-in via
+/// `rsvp_store::record_checkin`), `voice_session_started` /
+/// `voice_session_ended` (gateway voice frames via
+/// `community_store::record_voice_started_fact` /
+/// `community_store::record_voice_ended_fact`), `message_created`
+/// (gateway `MessageCreate` via `community_store::record_message_fact`),
+/// `rules_accepted` (gate-clear drain via the community-facts sink) and
+/// `member_joined` (gateway joins via `handlers::on_join`, buffered in the
+/// community-facts sink and persisted with `community_store::member_join_fact` +
+/// `record_fact`). This must
+/// always equal the `Some` rows of [`STREAM_WRITERS`]; the
 /// `captured_streams_match_live_writers` guard fails otherwise.
-pub const CAPTURED_STREAMS: [&str; 4] = [
+pub const CAPTURED_STREAMS: [&str; 6] = [
     "event_attended",
+    "voice_session_started",
+    "voice_session_ended",
     "message_created",
     "rules_accepted",
     "member_joined",
@@ -67,8 +72,14 @@ pub const STREAM_WRITERS: [(&str, Option<&str>); 6] = [
         "message_created",
         Some("community_store::record_message_fact"),
     ),
-    ("voice_session_started", None),
-    ("voice_session_ended", None),
+    (
+        "voice_session_started",
+        Some("community_store::record_voice_started_fact"),
+    ),
+    (
+        "voice_session_ended",
+        Some("community_store::record_voice_ended_fact"),
+    ),
     ("member_joined", Some("handlers::on_join")),
     ("event_attended", Some("rsvp_store::record_checkin")),
     (

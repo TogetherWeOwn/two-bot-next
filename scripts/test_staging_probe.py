@@ -198,6 +198,48 @@ class ProbeTests(unittest.TestCase):
                 failing = {"readyz", "no_internal_error_text"} if status == 500 else {"readyz"}
                 self.assertVerdicts(self.run_probes(), failing=failing)
 
+    def dup_body(self, *pairs):
+        return {"components": [[name, value] for name, value in pairs]}
+
+    def test_duplicate_components_rejected_before_verdict(self):
+        cases = [
+            # down then ready: a later ready must not mask the earlier down.
+            (200, self.dup_body(("process", "ready"), ("gateway", "down"),
+                                ("gateway", "ready"))),
+            # ready then down: order must not matter.
+            (503, self.dup_body(("process", "ready"), ("gateway", "ready"),
+                                ("gateway", "down"))),
+            # identical values repeat just as loudly.
+            (200, self.dup_body(("process", "ready"), ("gateway", "ready"),
+                                ("process", "ready"))),
+        ]
+        for status, body in cases:
+            with self.subTest(status=status, body=body):
+                self.server.readyz = (status, body)
+                results = self.run_probes()
+                self.assertVerdicts(results, failing={"readyz"})
+                failures = results["readyz"]["failures"]
+                self.assertTrue(any("repeats a component name" in f for f in failures),
+                                failures)
+
+    def test_duplicate_diagnostic_echoes_no_component_data(self):
+        sentinel = "SENTINEL_dup_probe_abc123"
+        body = self.dup_body(("process", "ready"), ("gateway", "ready"),
+                             (sentinel, "ready"), (sentinel, "down"))
+        self.server.readyz = (503, body)
+        results = self.run_probes()
+        self.assertVerdicts(results, failing={"readyz"})
+        failures = results["readyz"]["failures"]
+        self.assertTrue(any("repeats a component name" in f for f in failures),
+                        failures)
+        self.assertNotIn(sentinel, json.dumps(results))
+
+    def test_distinct_components_still_pass(self):
+        self.server.readyz = (200, READY)
+        results = self.run_probes()
+        self.assertVerdicts(results)
+        self.assertEqual(results["readyz"]["observed"]["components"]["gateway"], "ready")
+
     def test_configured_fallback(self):
         self.server.fallback = "twoInvite"
         results = self.run_probes(expect_fallback_code="twoInvite")

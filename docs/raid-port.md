@@ -140,13 +140,14 @@ join record. A single worker owns the volatile `RaidWatch`, re-reads
 `TWO_RAID_JOIN_THRESHOLD` / `TWO_RAID_WINDOW_SECONDS` through the settings store
 at most every 15 s (hot-wired keys; a failed read keeps the last good values),
 logs `raid_alert` first, and posts the staff message through the shared
-`ActionExecutor` only to the boot-time `DISCORD_STAFF_ALERT_CHANNEL_ID` when the
+`ActionExecutor` to the live `DISCORD_STAFF_ALERT_CHANNEL_ID` (stored rows win
+over the boot value; a delete hands the key back) when the
 bot can View and Send there, with empty allowed mentions. Missing channel,
 denied permission and send failure are logged and never retried; the cooldown is
 consumed at proposal. It is always on (legacy parity) and independent of
-`TWO_ANTI_NUKE`. `DISCORD_STAFF_ALERT_CHANNEL_ID` is not hot-wired and is not yet
+`TWO_ANTI_NUKE`. `DISCORD_STAFF_ALERT_CHANNEL_ID` is hot-wired but is not yet
 forwarded into the Container by the Worker, so staging stays log-only until a
-separate change classifies it. **Landed — join-risk delivery:**
+separate change forwards it. **Landed — join-risk delivery:**
 `crates/bot/src/join_risk_runtime.rs`. The pipeline takes one observer, so risk
 chains behind the raid watch in a fan-out and both stay behind the funnel's join
 row. The chain is built only under exact `TWO_ANTI_NUKE=1` on the staging guild;

@@ -624,6 +624,76 @@ fn initiator_cap_spans_targets_and_rooms_but_not_guilds() {
     assert_eq!(fresh.kick, None);
 }
 
+// ---- (8) bounded retention (VK-03) ----
+
+#[test]
+fn timer_prune_reaps_expired_state_without_new_starts() {
+    let facts = room_a(&A_OCCUPANTS);
+    let clock = TestClock::new();
+    let mut core = VoteKickCore::new();
+    let vote = core.start(100, facts, 4, TARGET, &clock).unwrap().vote;
+    for voter in [2, 3, 4] {
+        core.cast(vote, facts, voter, VoteBallot::Yes, &clock)
+            .unwrap();
+    }
+    assert_eq!(
+        core.refresh(vote, facts, &clock).unwrap().status,
+        VoteKickStatus::Passed
+    );
+    // Through the horizon inclusive the terminal vote is retained: a prune
+    // reaps nothing, replay still reports Passed, and the ID is rejected.
+    clock.set(START_MS + VOTE_KICK_COOLDOWN_MS);
+    assert!(core.prune(&clock).is_empty());
+    let replay = core.cast(vote, facts, 5, VoteBallot::Yes, &clock).unwrap();
+    assert_eq!(replay.status, VoteKickStatus::Passed);
+    assert_eq!(replay.kick, None);
+    // Strictly past the horizon a timer prune reaps the vote with no new
+    // start and reports it, so the same target is votable again.
+    clock.set(START_MS + VOTE_KICK_COOLDOWN_MS + 1);
+    assert_eq!(core.prune(&clock), vec![100]);
+    assert!(core.prune(&clock).is_empty());
+    let fresh = core.start(101, facts, 4, TARGET, &clock).unwrap();
+    assert_eq!(fresh.status, VoteKickStatus::Active);
+    assert_eq!(fresh.progress, progress(0, 3, 4));
+}
+
+#[test]
+fn sustained_churn_keeps_retained_state_proportional_to_the_live_window() {
+    let clock = TestClock::new();
+    let mut core = VoteKickCore::new();
+    let step_ms: u64 = 60_000;
+    let cycles: u64 = 30;
+    let mut total_evicted = 0usize;
+    for cycle in 0..cycles {
+        let now = START_MS + cycle * step_ms;
+        clock.set(now);
+        // A distinct initiator and target per cycle so the guards never trip:
+        // every start must succeed, proving leaked state refuses nothing.
+        let initiator = 1_000 + cycle;
+        let target = 2_000 + cycle;
+        let occupants = [2, 3, initiator, target];
+        let facts = room_a(&occupants);
+        let id = 10_000 + cycle;
+        let vote = core
+            .start(id, facts, initiator, target, &clock)
+            .unwrap()
+            .vote;
+        clock.set(now + VOTE_KICK_TTL_MS);
+        let settled = core.refresh(vote, facts, &clock).unwrap();
+        assert_eq!(settled.status, VoteKickStatus::Expired);
+        total_evicted += core.prune(&clock).len();
+    }
+    // Reaping keeps pace once the first horizon elapses: cycles retire old
+    // votes instead of accumulating history.
+    assert!(total_evicted > 0);
+    // Past every horizon a final prune drains the remainder: every vote ever
+    // started is reaped exactly once and nothing leaks.
+    clock.set(START_MS + cycles * step_ms + VOTE_KICK_INITIATOR_WINDOW_MS + 1);
+    total_evicted += core.prune(&clock).len();
+    assert_eq!(total_evicted as u64, cycles);
+    assert!(core.prune(&clock).is_empty());
+}
+
 #[test]
 fn target_cooldown_precedes_the_initiator_cap() {
     // Initiator 4 reaches the cap while target 9 sits in a post-pass cooldown:

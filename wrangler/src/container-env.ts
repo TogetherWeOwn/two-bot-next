@@ -79,6 +79,9 @@ export const FORWARDED_FLAGS = [
   "TWO_ANTI_NUKE_TRUSTED_USER_IDS",
   // Temporary voice rooms.
   "TWO_VOICE",
+  // Privileged GUILD_PRESENCES for room-name game/stream facts
+  // (docs/voice-presence.md); needs the app's Presence Intent grant first.
+  "TWO_VOICE_PRESENCE",
   "TWO_TEMP_VOICE",
   "TWO_TEMP_VOICE_CATEGORY_ID",
   "TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS",
@@ -90,6 +93,8 @@ export const FORWARDED_FLAGS = [
   "TWO_TEMP_VOICE_NAME_TEMPLATE",
   "TWO_TEMP_VOICE_PANEL_CHANNEL_ID",
   "TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS",
+  // Staging-only synthetic voice test identities (docs/voice-synthetic.md).
+  "TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS",
   "TWO_TEMP_VOICE_SWEEP_SECONDS",
   // Template assistant (V12): non-secret endpoint URL + model name; the
   // endpoint credential (if any) travels as its own Container secret, never
@@ -248,6 +253,8 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_STAGING_DATABASE_URL: SECRET,
   TWO_BOT_STAGING_MIGRATOR_DATABASE_URL: SECRET,
   TWO_BOT_STAGING_PLAN_DATABASE_URL: SECRET,
+  TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL: SECRET,
+  TWO_BOT_PRODUCTION_PLAN_DATABASE_URL: SECRET,
   TWO_RESTORE_URL: SECRET,
   TWO_MODERATION_AUDIT_SECRET: SECRET,
   TWO_ONBOARDING_ROTA_PSEUDONYM_KEY: SECRET,

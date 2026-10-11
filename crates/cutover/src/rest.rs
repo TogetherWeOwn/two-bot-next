@@ -13,6 +13,7 @@
 //! the analogue of legacy `DISCORD_API_BASE`): verification runs point the
 //! tools at a local mock instead of Discord.
 
+use sqlx::postgres::PgConnectOptions;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -27,6 +28,7 @@ use twilight_model::guild::invite::Invite;
 use twilight_model::guild::{Guild, Member};
 use twilight_model::id::marker::{ChannelMarker, GuildMarker, MessageMarker, UserMarker};
 use twilight_model::id::Id;
+use two_bot_core::database_tls::{self, TlsPolicy};
 use two_bot_core::send_admission::{PgSendAdmission, SendAdmission};
 use two_bot_discord::executor::HyperTransport;
 
@@ -61,6 +63,39 @@ pub enum DeleteOutcome {
     Deleted,
     /// 404: the channel was already gone; nothing was deleted.
     AlreadyGone,
+}
+
+/// Send-admission pool shape for the operator tools: max 2 + 15 s statement
+/// timeout with a 10 s acquire timeout (website-jobs admission parity,
+/// threat-model F6).
+const ADMISSION_POOL_MAX: u32 = 2;
+const ADMISSION_STATEMENT_TIMEOUT_MS: u64 = 15_000;
+const ADMISSION_ACQUIRE_TIMEOUT_SECS: u64 = 10;
+
+/// Read the one TLS policy setting; an unset value is `Required`.
+fn tls_policy_from_env() -> Result<TlsPolicy, RestError> {
+    let value = std::env::var_os(database_tls::POLICY_SETTING);
+    // A non-UTF-8 value parses as "" and is refused like any unknown value.
+    TlsPolicy::from_setting(value.as_ref().map(|v| v.to_str().unwrap_or("")))
+        .map_err(|_| RestError::Wire("admission authority unavailable".to_owned()))
+}
+
+/// Shared fenced options builder: validate before SQLx can WARN-log query
+/// values, enforce the TLS policy, then apply the effective mode. The
+/// statement timeout rides the connection options. Failures are fixed
+/// strings; nothing echoes the URL, host or credential.
+fn admission_connect_options(url: &str, tls: TlsPolicy) -> Result<PgConnectOptions, &'static str> {
+    two_bot_core::database_url::validate(url)?;
+    // Threat-model F6: refuse plaintext/unverified modes and the wrong host
+    // class before SQLx parses the URL (see `docs/database-tls.md`).
+    database_tls::enforce(url, tls)?;
+    let options = two_bot_core::database_url::connect_options(url)
+        .map_err(|_| "admission authority unavailable")?;
+    let options = database_tls::apply(options, tls);
+    Ok(options.options([(
+        "statement_timeout",
+        format!("{ADMISSION_STATEMENT_TIMEOUT_MS}ms"),
+    )]))
 }
 
 /// Paced twilight client with legacy retry semantics.
@@ -105,14 +140,44 @@ impl RestClient {
 
     /// Administrative data targets may differ; admission must use the runtime's
     /// TWO_DATABASE_URL authority, never the backfill/capture target database.
+    /// The pool is fenced by the `TWO_DATABASE_TLS` policy (unset means
+    /// `required`): refusals read as the same redacted authority error, with
+    /// no oracle for which fence tripped and no URL part in the message.
     pub async fn from_env(token: String, proxy_url: Option<String>) -> Result<Self, RestError> {
         let url = std::env::var("TWO_DATABASE_URL").map_err(|_| {
             RestError::Wire("TWO_DATABASE_URL admission authority required".to_owned())
         })?;
-        let options = two_bot_core::database_url::connect_options(&url)
+        let tls = tls_policy_from_env()?;
+        let options = admission_connect_options(&url, tls)
             .map_err(|_| RestError::Wire("admission authority unavailable".to_owned()))?;
+        Self::from_options(token, proxy_url, options).await
+    }
+
+    /// [`Self::from_env`] with an explicit database URL and TLS policy (tests
+    /// pass `LocalOnly`). Refusals are fixed strings with no URL, host or
+    /// credential part, raised before SQLx parses the URL or opens a socket.
+    /// Eager: the pool connects before the gate binds, so a dead authority
+    /// fails here rather than on the first send.
+    pub async fn from_url_with_tls(
+        token: String,
+        proxy_url: Option<String>,
+        url: &str,
+        tls: TlsPolicy,
+    ) -> Result<Self, RestError> {
+        let options =
+            admission_connect_options(url, tls).map_err(|e| RestError::Wire(e.to_owned()))?;
+        Self::from_options(token, proxy_url, options).await
+    }
+
+    /// Eager pool connect plus gate bind for the fenced options above.
+    async fn from_options(
+        token: String,
+        proxy_url: Option<String>,
+        options: PgConnectOptions,
+    ) -> Result<Self, RestError> {
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
+            .max_connections(ADMISSION_POOL_MAX)
+            .acquire_timeout(Duration::from_secs(ADMISSION_ACQUIRE_TIMEOUT_SECS))
             .connect_with(options)
             .await
             .map_err(|_| RestError::Wire("admission authority unavailable".to_owned()))?;
@@ -1151,5 +1216,100 @@ mod tests {
             "one discovery page plus one compat call"
         );
         mock.shutdown();
+    }
+
+    /// Threat-model F6 refusal pins for the operator-tool admission pool: a
+    /// remote `sslmode=disable` URL (and the other refusal cases) fails with
+    /// a fixed string before SQLx parses the URL or opens a socket, with no
+    /// URL part in the error. Hermetic: every case is refused, so no
+    /// connection is attempted and no database is needed. The log-silence half
+    /// of the proof lives in
+    /// `crates/cutover/tests/admission_configuration.rs`, where the capture
+    /// helper is already wired.
+    #[tokio::test]
+    async fn admission_tls_fence_refuses_plaintext_and_wrong_hosts() {
+        use two_bot_core::database_tls::TlsPolicy;
+        let cases = [
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=disable",
+                TlsPolicy::Required,
+                "database sslmode does not require TLS",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=prefer",
+                TlsPolicy::Required,
+                "database sslmode does not require TLS",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db",
+                TlsPolicy::Required,
+                "database URL must set sslmode under the required TLS policy",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@fixture-host/fixture-db?sslmode=verify-full",
+                TlsPolicy::Required,
+                "local database host is refused under the required TLS policy",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=verify-full",
+                TlsPolicy::LocalOnly,
+                "remote database host is refused under the local-only TLS policy",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@fixture-host/fixture-db?sslmode=fixture-mode",
+                TlsPolicy::LocalOnly,
+                "unsupported database sslmode",
+            ),
+        ];
+        for (url, policy, expected) in cases {
+            let error = admission_connect_options(url, policy).unwrap_err();
+            assert_eq!(error, expected, "{url}");
+            assert!(!error.contains("fixture"), "TLS refusal echoed the URL");
+            // Same through the client constructor: refused before the pool
+            // opens, so no socket and no database is needed.
+            let error =
+                RestClient::from_url_with_tls("fixture-token".to_owned(), None, url, policy)
+                    .await
+                    .unwrap_err();
+            let shown = error.to_string();
+            assert_eq!(shown, format!("discord send refused: {expected}"));
+            assert!(!shown.contains("fixture"), "TLS refusal echoed the URL");
+            let debug = format!("{error:?}");
+            assert!(!debug.contains("fixture"), "TLS refusal echoed the URL");
+        }
+    }
+
+    /// Threat-model F6 happy path: a fenced fixture builds fenced options
+    /// (effective SQLx mode applied) and a lazy pool with no socket, so no
+    /// database is needed.
+    #[tokio::test]
+    async fn admission_tls_fence_permits_fenced_fixture() {
+        use two_bot_core::database_tls::TlsPolicy;
+        // `LocalOnly` loopback keeps the URL mode as written.
+        let options = admission_connect_options(
+            "postgres://fixture:fixture-password@127.0.0.1:1/fixture?sslmode=disable",
+            TlsPolicy::LocalOnly,
+        )
+        .unwrap();
+        assert!(matches!(
+            options.get_ssl_mode(),
+            sqlx::postgres::PgSslMode::Disable
+        ));
+        // `Required` upgrades a remote `require` URL to `verify-full`.
+        let options = admission_connect_options(
+            "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=require",
+            TlsPolicy::Required,
+        )
+        .unwrap();
+        assert!(matches!(
+            options.get_ssl_mode(),
+            sqlx::postgres::PgSslMode::VerifyFull
+        ));
+        // A lazy pool from fenced options opens no socket.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy_with(options);
+        assert_eq!(pool.size(), 0);
+        pool.close().await;
     }
 }

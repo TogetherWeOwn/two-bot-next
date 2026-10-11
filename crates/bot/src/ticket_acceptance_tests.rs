@@ -88,7 +88,9 @@ fn config() -> TicketConfig {
 fn runtime(pool: PgPool, mock: &MockRest) -> Arc<TicketRuntime> {
     let executor =
         ActionExecutor::with_proxy("ticket-test-token".into(), Some(mock.origin())).unwrap();
-    let runtime = Arc::new(TicketRuntime::new(pool, executor, config()).unwrap());
+    let runtime = Arc::new(
+        TicketRuntime::new(pool, executor, config(), std::collections::HashMap::new()).unwrap(),
+    );
     runtime.set_bot_id(400);
     runtime
 }
@@ -863,8 +865,15 @@ async fn cold_resumed_dispatch_recovers_controls_panel_and_purges_without_ready(
     .await;
     let executor =
         ActionExecutor::with_proxy("ticket-test-token".into(), Some(mock.origin())).unwrap();
-    let tickets =
-        Arc::new(TicketRuntime::new(db.pool.clone(), executor.clone(), config()).unwrap());
+    let tickets = Arc::new(
+        TicketRuntime::new(
+            db.pool.clone(),
+            executor.clone(),
+            config(),
+            std::collections::HashMap::new(),
+        )
+        .unwrap(),
+    );
     active(&tickets, "expired-resume").await;
     tickets
         .store
@@ -1021,8 +1030,15 @@ async fn failed_cold_resumed_identity_retries_during_recovery_without_another_ga
     .await;
     let executor =
         ActionExecutor::with_proxy("ticket-test-token".into(), Some(mock.origin())).unwrap();
-    let tickets =
-        Arc::new(TicketRuntime::new(db.pool.clone(), executor.clone(), config()).unwrap());
+    let tickets = Arc::new(
+        TicketRuntime::new(
+            db.pool.clone(),
+            executor.clone(),
+            config(),
+            std::collections::HashMap::new(),
+        )
+        .unwrap(),
+    );
     let commands = CommandRuntime::with_tickets(db.pool.clone(), executor, Arc::clone(&tickets));
     commands.suppress_registry_for_test().await;
     commands.dispatch(&twilight_model::gateway::event::Event::Resumed);

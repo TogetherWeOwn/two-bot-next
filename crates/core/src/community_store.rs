@@ -258,6 +258,61 @@ pub fn voice_ended_fact(
     }
 }
 
+/// Record one gateway voice-start fact: build via [`voice_started_fact`] and
+/// insert via [`record_fact`]. Returns the durable session key plus whether
+/// the `voice-start:{session_key}` row was newly inserted (`false` when the
+/// same join redelivers and the key already holds it).
+pub async fn record_voice_started_fact(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    actor: &super::community::ClassifyInput,
+    channel_id: &str,
+    occurred_at: &str,
+    session_key: Option<String>,
+    classification: super::community::Classification,
+) -> Result<(String, bool), CommunityStoreError> {
+    let (key, write) = voice_started_fact(
+        guild_id,
+        actor,
+        channel_id,
+        occurred_at,
+        session_key,
+        classification,
+    );
+    let inserted = record_fact(pool, &write).await?;
+    Ok((key, inserted))
+}
+
+/// Record one gateway voice-end fact: build via [`voice_ended_fact`] and
+/// insert via [`record_fact`]. Returns `true` when inserted, `false` when the
+/// `voice-end:{session_key}` key already held it (duplicate leave delivery).
+/// An end without a seen start carries `startedAt: null`,
+/// `durationSeconds: null`, `startKnown: false` — never a fabricated start.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_voice_ended_fact(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    actor: &super::community::ClassifyInput,
+    session_key: &str,
+    channel_id: &str,
+    occurred_at: &str,
+    started_at: Option<&str>,
+    duration_seconds: Option<i64>,
+    classification: super::community::Classification,
+) -> Result<bool, CommunityStoreError> {
+    let write = voice_ended_fact(
+        guild_id,
+        actor,
+        session_key,
+        channel_id,
+        occurred_at,
+        started_at,
+        duration_seconds,
+        classification,
+    );
+    record_fact(pool, &write).await
+}
+
 /// Upsert one stream heartbeat (legacy `markStreamCoverage`).
 pub async fn mark_stream_coverage(
     pool: &Pool<Postgres>,
@@ -876,6 +931,91 @@ mod tests {
     }
 
     #[test]
+    fn voice_session_key_and_end_metadata_shapes_are_honest() {
+        // Session-key shape: the start keys on guild, member, stamp and
+        // channel, so a redelivered join dedupes on the same idempotency key.
+        let input = actor("human-1");
+        let at = "2026-09-02T10:00:00.000Z";
+        let (key, start) = voice_started_fact(
+            GUILD,
+            &input,
+            "voice-9",
+            at,
+            None,
+            verdict("eligible_human"),
+        );
+        assert_eq!(key, format!("{GUILD}:human-1:{at}:voice-9"));
+        assert_eq!(start.event_type, "voice_session_started");
+        assert_eq!(start.source_event_id, key);
+        assert_eq!(start.idempotency_key, format!("voice-start:{key}"));
+        assert_eq!(start.source, "channel:voice-9");
+        let start_meta = start.metadata.expect("start metadata");
+        assert!(
+            start_meta.contains(&format!("\"sessionKey\":\"{key}\"")),
+            "start carries its session key"
+        );
+
+        // A supplied key survives (the gateway tracker's durable key), so a
+        // move's end and the next start never share a row.
+        let (supplied, _) = voice_started_fact(
+            GUILD,
+            &input,
+            "voice-9",
+            at,
+            Some("durable-key".to_owned()),
+            verdict("eligible_human"),
+        );
+        assert_eq!(supplied, "durable-key");
+
+        // Measured end: all four metadata fields travel together.
+        let end = voice_ended_fact(
+            GUILD,
+            &input,
+            &key,
+            "voice-9",
+            "2026-09-02T10:05:30.000Z",
+            Some(at),
+            Some(330),
+            verdict("eligible_human"),
+        );
+        assert_eq!(end.event_type, "voice_session_ended");
+        assert_eq!(end.source_event_id, key);
+        assert_eq!(end.idempotency_key, format!("voice-end:{key}"));
+        let end_meta = end.metadata.expect("end metadata");
+        for field in [
+            format!("\"sessionKey\":\"{key}\"").as_str(),
+            "\"startedAt\":\"2026-09-02T10:00:00.000Z\"",
+            "\"durationSeconds\":330",
+            "\"startKnown\":true",
+        ] {
+            assert!(end_meta.contains(field), "end carries expected field");
+        }
+
+        // End without a seen start: honest unknown, never a fabricated start.
+        let orphan = voice_ended_fact(
+            GUILD,
+            &input,
+            "guild:member:unknown-start:2026-09-02T10:05:30.000Z:voice-9",
+            "voice-9",
+            "2026-09-02T10:05:30.000Z",
+            None,
+            None,
+            verdict("eligible_human"),
+        );
+        let orphan_meta = orphan.metadata.expect("orphan end metadata");
+        assert!(
+            orphan_meta.contains("\"startedAt\":null")
+                && orphan_meta.contains("\"durationSeconds\":null")
+                && orphan_meta.contains("\"startKnown\":false"),
+            "orphan end is honestly unknown"
+        );
+        assert!(
+            !orphan_meta.contains("2026-09-02T10:00:00.000Z"),
+            "no start is invented"
+        );
+    }
+
+    #[test]
     fn message_fact_carries_ids_and_verdict_without_content() {
         // Idempotency shape plus content minimization: the row keys on the
         // Discord message id, carries the classifier verdict, and stores no
@@ -905,6 +1045,104 @@ mod tests {
             !metadata.contains("hello") && !metadata.contains("content"),
             "no message content stored: {metadata}"
         );
+    }
+
+    /// Voice session start→end round-trip (TOG-19605): one session inserts a
+    /// start and an honestly-measured end, a duplicate start dedupes on
+    /// `voice-start:{session_key}`, and both stream heartbeats are present.
+    /// Routed to a `check.yml` ignored-db-runtime step.
+    #[tokio::test]
+    #[ignore = "needs a disposable test database; routed to a check.yml step"]
+    async fn voice_session_start_end_round_trip_is_idempotent() {
+        let Some((pool, schema)) = test_pool("tog_19605_voice")
+            .await
+            .expect("test database setup")
+        else {
+            eprintln!("skipping community_store test: TWO_TEST_DATABASE_URL not set");
+            return;
+        };
+        let at = "2026-09-02T10:00:00.000Z";
+        let end_at = "2026-09-02T10:05:30.000Z";
+        let input = actor("human-1");
+        let (key, first) = record_voice_started_fact(
+            &pool,
+            GUILD,
+            &input,
+            "voice",
+            at,
+            None,
+            verdict("eligible_human"),
+        )
+        .await
+        .expect("first start inserts");
+        assert!(first, "first join inserts");
+        assert_eq!(key, format!("{GUILD}:human-1:{at}:voice"));
+        // Duplicate join redelivery: the same session key dedupes to false.
+        let (dup_key, retry) = record_voice_started_fact(
+            &pool,
+            GUILD,
+            &input,
+            "voice",
+            at,
+            None,
+            verdict("eligible_human"),
+        )
+        .await
+        .expect("duplicate start");
+        assert_eq!(dup_key, key, "duplicate delivery reuses the session key");
+        assert!(!retry, "duplicate join returns false");
+        // Honest duration math: 330 whole seconds for the 5.5-minute session.
+        let inserted = record_voice_ended_fact(
+            &pool,
+            GUILD,
+            &input,
+            &key,
+            "voice",
+            end_at,
+            Some(at),
+            Some(330),
+            verdict("eligible_human"),
+        )
+        .await
+        .expect("measured end inserts");
+        assert!(inserted, "measured end inserts");
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT event_type, source_event_id, metadata FROM community_facts
+             WHERE guild_id = $1 ORDER BY id",
+        )
+        .bind(GUILD)
+        .fetch_all(&pool)
+        .await
+        .expect("voice rows");
+        assert_eq!(rows.len(), 2, "one start plus one end, no double row");
+        assert_eq!(rows[0].0, "voice_session_started");
+        assert_eq!(rows[0].1, key);
+        assert_eq!(rows[1].0, "voice_session_ended");
+        assert_eq!(rows[1].1, key);
+        assert!(
+            rows[1].2.contains(&format!("\"sessionKey\":\"{key}\""))
+                && rows[1]
+                    .2
+                    .contains("\"startedAt\":\"2026-09-02T10:00:00.000Z\"")
+                && rows[1].2.contains("\"durationSeconds\":330")
+                && rows[1].2.contains("\"startKnown\":true"),
+            "end row carries honest measurement: {}",
+            rows[1].2
+        );
+        for stream in ["voice_session_started", "voice_session_ended"] {
+            mark_stream_coverage(&pool, GUILD, stream, WEEK_START, WEEK_END, GENERATED_AT)
+                .await
+                .expect("voice heartbeat");
+        }
+        let beats: Vec<(String,)> = sqlx::query_as(
+            "SELECT stream FROM community_stream_heartbeats WHERE guild_id = $1 AND stream LIKE 'voice_%' ORDER BY stream",
+        )
+        .bind(GUILD)
+        .fetch_all(&pool)
+        .await
+        .expect("voice heartbeats present");
+        assert_eq!(beats.len(), 2, "both voice stream heartbeats present");
+        drop_schema(&pool, &schema).await;
     }
 
     /// Gateway `MessageCreate` round-trip (TOG-19603): one fact inserts, the

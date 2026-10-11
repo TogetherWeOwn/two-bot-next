@@ -20,6 +20,7 @@ fn runtime(mock: &MockRest) -> TicketRuntime {
             staff_role_id: "300".into(),
             cooldown_seconds: COOLDOWN_SECONDS,
         },
+        std::collections::HashMap::new(),
     )
     .unwrap();
     runtime.set_bot_id(400);
@@ -32,6 +33,117 @@ fn message(id: u64) -> Value {
         "author":{"id":"500","username":"member","discriminator":"0"},
         "content":format!("message-{id}"), "attachments":[{"url":format!("https://example.test/{id}")}],
     })
+}
+
+use std::collections::HashMap;
+use two_bot_core::settings::{live_channel, SettingRow, SettingsSnapshot};
+
+fn deployment_vars() -> HashMap<String, String> {
+    HashMap::from([
+        ("DISCORD_TICKET_CATEGORY_ID".to_owned(), "200".to_owned()),
+        (
+            "DISCORD_TICKET_PANEL_CHANNEL_ID".to_owned(),
+            "700".to_owned(),
+        ),
+        ("DISCORD_TICKET_STAFF_ROLE_ID".to_owned(), "300".to_owned()),
+    ])
+}
+
+#[test]
+fn ticket_destinations_resolve_and_conflicts_refuse() {
+    let vars = deployment_vars();
+    let config = TicketConfig::from_vars(&vars, 100, COOLDOWN_SECONDS).unwrap();
+    assert_eq!(config.category_id, "200");
+    assert_eq!(config.panel_channel_id, "700");
+    assert_eq!(config.staff_role_id, "300");
+    assert_eq!(config.cooldown_seconds, COOLDOWN_SECONDS);
+
+    // The staff role must not be the guild id.
+    let mut staff_is_guild = vars.clone();
+    staff_is_guild.insert("DISCORD_TICKET_STAFF_ROLE_ID".to_owned(), "100".to_owned());
+    assert!(TicketConfig::from_vars(&staff_is_guild, 100, COOLDOWN_SECONDS).is_none());
+
+    // Category and panel must differ.
+    let mut panel_is_category = vars.clone();
+    panel_is_category.insert(
+        "DISCORD_TICKET_PANEL_CHANNEL_ID".to_owned(),
+        "200".to_owned(),
+    );
+    assert!(TicketConfig::from_vars(&panel_is_category, 100, COOLDOWN_SECONDS).is_none());
+
+    // Malformed and missing ids refuse without a config.
+    for bad in ["0", "abc", " 200", "0200"] {
+        let mut malformed = vars.clone();
+        malformed.insert("DISCORD_TICKET_CATEGORY_ID".to_owned(), bad.to_owned());
+        assert!(
+            TicketConfig::from_vars(&malformed, 100, COOLDOWN_SECONDS).is_none(),
+            "{bad:?}"
+        );
+    }
+    let mut missing = vars.clone();
+    missing.remove("DISCORD_TICKET_STAFF_ROLE_ID");
+    assert!(TicketConfig::from_vars(&missing, 100, COOLDOWN_SECONDS).is_none());
+}
+
+#[tokio::test]
+async fn stored_destination_rows_move_the_live_ticket_config_without_restart() {
+    let mock = MockRest::start(Vec::new(), ScriptedResponse::status(500)).await;
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@agent-testdb:5432/agent_test")
+        .unwrap();
+    let executor =
+        ActionExecutor::with_proxy("ticket-test-token".into(), Some(mock.origin())).unwrap();
+    let runtime = TicketRuntime::new(
+        pool,
+        executor,
+        TicketConfig::from_vars(&deployment_vars(), 100, COOLDOWN_SECONDS).unwrap(),
+        deployment_vars(),
+    )
+    .unwrap();
+
+    let (mut writer, live) = live_channel();
+    // A stored category row wins over the boot deployment value on the next
+    // refresh; panel, staff and the cold cooldown are untouched.
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![SettingRow {
+            guild_id: "100".to_owned(),
+            key: "DISCORD_TICKET_CATEGORY_ID".to_owned(),
+            value: json!("201"),
+            version: 1,
+        }],
+    });
+    runtime.refresh_config_with(Some(&live));
+    let moved = runtime.config_for_test();
+    assert_eq!(moved.category_id, "201");
+    assert_eq!(moved.panel_channel_id, "700");
+    assert_eq!(moved.staff_role_id, "300");
+    assert_eq!(moved.cooldown_seconds, COOLDOWN_SECONDS);
+
+    // A malformed stored row keeps the last good config.
+    writer.publish(&SettingsSnapshot {
+        revision: 2,
+        rows: vec![SettingRow {
+            guild_id: "100".to_owned(),
+            key: "DISCORD_TICKET_CATEGORY_ID".to_owned(),
+            value: json!("not-a-snowflake"),
+            version: 1,
+        }],
+    });
+    runtime.refresh_config_with(Some(&live));
+    assert_eq!(runtime.config_for_test(), moved);
+
+    // Deleting the row hands the key back to the boot deployment value.
+    writer.publish(&SettingsSnapshot {
+        revision: 3,
+        rows: vec![],
+    });
+    runtime.refresh_config_with(Some(&live));
+    assert_eq!(
+        runtime.config_for_test(),
+        TicketConfig::from_vars(&deployment_vars(), 100, COOLDOWN_SECONDS).unwrap()
+    );
+    mock.shutdown().await;
 }
 
 #[test]

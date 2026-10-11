@@ -58,27 +58,40 @@ a required value or an implemented consumer. Secret defaults are never rendered.
   Keys in\n\
   legacy `HOT_WIRED` are labeled “reload-report hot” (the `RefreshReport::hot`\n\
   partition in `settings.rs`); every other storable key reports cold.\n\n\
-The twenty-five keys in `STORE_READ_KEYS`\n\
+The thirty-two keys in `STORE_READ_KEYS`\n\
 (`crates/core/tests/reference_docs.rs`) say “applied live by runtime refresh”\n\
 instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECONDS`,\n\
-`TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS` and `TWO_ANTI_NUKE_HEAT_THRESHOLD`\n\
-(`crates/bot/src/containment_runtime.rs:61-67`, `:226`); join-risk applies\n\
-`TWO_JOIN_RISK_THRESHOLD`, `TWO_JOIN_RISK_WINDOW_SECONDS` and\n\
-`TWO_BULK_JOIN_WINDOW_UNTIL` (`crates/bot/src/join_risk_runtime.rs:66-70`,\n\
-`:238`); raid applies `TWO_RAID_JOIN_THRESHOLD` and `TWO_RAID_WINDOW_SECONDS`\n\
-(`crates/bot/src/raid_runtime.rs:45-46`, `:170`); onboarding merges its\n\
+`TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS`, `TWO_ANTI_NUKE_HEAT_THRESHOLD` and\n\
+`DISCORD_STAFF_ALERT_CHANNEL_ID`\n\
+(`crates/bot/src/containment_runtime.rs:61-67`, `:227`); join-risk applies\n\
+`TWO_JOIN_RISK_THRESHOLD`, `TWO_JOIN_RISK_WINDOW_SECONDS`,\n\
+`TWO_BULK_JOIN_WINDOW_UNTIL` and `DISCORD_STAFF_ALERT_CHANNEL_ID`\n\
+(`crates/bot/src/join_risk_runtime.rs:66-70`, `:239`); raid applies\n\
+`TWO_RAID_JOIN_THRESHOLD`, `TWO_RAID_WINDOW_SECONDS` and\n\
+`DISCORD_STAFF_ALERT_CHANNEL_ID`\n\
+(`crates/bot/src/raid_runtime.rs:45-48`, `:177`); onboarding merges its\n\
 `CONFIG_KEYS` from the snapshot on each relevant\n\
 event (`crates/bot/src/onboarding.rs:21-30`, `:175-182`); message-path automod\n\
 applies its ten live lists, thresholds and the enforce flag from the snapshot\n\
 on every delivery (`crates/bot/src/automod_gateway.rs:192-203`, `:273`);\n\
 the feed poller applies `TWO_FEED_POLL_SECONDS` from the snapshot before\n\
-every tick (`crates/bot/src/feed_jobs.rs:232-259`). Two boot-only edges\n\
+every tick (`crates/bot/src/feed_jobs.rs:232-259`); the audit mirror applies\n\
+`DISCORD_AUDIT_LOG_CHANNEL_ID`, `DISCORD_VOICE_LOG_CHANNEL_ID` and\n\
+`DISCORD_MODERATION_LOG_CHANNEL_ID` from the snapshot on every record and\n\
+sweep (`crates/bot/src/audit_runtime.rs`), where blanking all three parks the\n\
+mirror live and a malformed row keeps the last good destinations; ticket operations apply\n\
+`DISCORD_TICKET_CATEGORY_ID`, `DISCORD_TICKET_PANEL_CHANNEL_ID` and\n\
+`DISCORD_TICKET_STAFF_ROLE_ID` from the snapshot on every execute, recovery\n\
+and purge (`crates/bot/src/ticket_runtime.rs`). Three boot-only edges\n\
 remain: the feed supervisor still wakes on the boot cadence, so a stored\n\
 interval change takes effect no earlier than the previously scheduled slot\n\
 and runs at the stored value rounded up to a multiple of the boot cadence\n\
-(`crates/bot/src/feed_jobs.rs:227-244`), and the voice room-name policy is\n\
+(`crates/bot/src/feed_jobs.rs:227-244`); the voice room-name policy is\n\
 built once at boot from the process environment\n\
-(`crates/bot/src/gateway.rs:1608`). Every other\n\
+(`crates/bot/src/gateway.rs:1608`); and gateway intents plus ticket command\n\
+publication read the ticket destination keys once at boot, so a stored ticket\n\
+destination reaches already-published commands only through the per-operation\n\
+refresh above. Every other\n\
 storable row's stored value is unwired.\n\n\
 Gateway boot reads process environment only, through a fixed set of loaders:\n\
 `Config::from_env` (`DISCORD_TOKEN`, `DATABASE_URL`, `LISTEN_ADDR`, `GUILD_ID`),\n\
@@ -95,7 +108,7 @@ When voice is enabled, `build_production_runtime` also reads\n\
 `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID`, `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID`,\n\
 `TWO_TEMP_VOICE_CATEGORY_ID` and `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS` solely\n\
 for delete protection, not creator provisioning. Its empty grace is fixed at\n\
-60 seconds; `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` remains unwired.\n\
+60 seconds unless `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` (0 to 600) sets it.\n\
 Onboarding, automod, scorecard and classifier typed loaders exist but are not\n\
 called during boot; their defaults below come from empty-map calls. The separate\n\
 `preflight` operator CLI validates further catalog keys from the environment\n\
@@ -150,6 +163,7 @@ const BOOT_ENV: &[&str] = &[
     "TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID",
     "TWO_TEMP_VOICE_CATEGORY_ID",
     "TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS",
+    "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS",
 ];
 
 /// Catalog keys whose dashboard-stored values are applied at runtime through
@@ -188,6 +202,13 @@ const STORE_READ_KEYS: &[&str] = &[
     "TWO_AUTOMOD_REPEAT_WINDOW_SECONDS",
     "TWO_AUTOMOD_SANCTIONS",
     "TWO_FEED_POLL_SECONDS",
+    "DISCORD_AUDIT_LOG_CHANNEL_ID",
+    "DISCORD_MODERATION_LOG_CHANNEL_ID",
+    "DISCORD_STAFF_ALERT_CHANNEL_ID",
+    "DISCORD_TICKET_CATEGORY_ID",
+    "DISCORD_TICKET_PANEL_CHANNEL_ID",
+    "DISCORD_TICKET_STAFF_ROLE_ID",
+    "DISCORD_VOICE_LOG_CHANNEL_ID",
 ];
 
 fn repository_root() -> PathBuf {

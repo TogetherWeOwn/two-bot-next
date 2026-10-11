@@ -9,11 +9,13 @@ use twilight_model::{
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
 use two_bot_core::{
-    attendance_totals_text, checkin_duplicate_text, checkin_recorded_text, classify, list_rsvps,
-    now_iso, parse_attendance_occurrence, partition_rsvps, put_rsvp, record_checkin,
-    require_manage_events, rsvp_saved_text, validate_event_id, validate_occurrence_id, write_audit,
-    AttendanceProof, CheckinWrite, ClassifierConfig, ClassifyInput, HandlerId, InteractionRouter,
-    RsvpAudit, RsvpRecord, RsvpStatus, SlashOutcome,
+    attendance_totals_text, checkin_duplicate_text, checkin_idempotency_key,
+    checkin_occurrence_full_text, checkin_recorded_text, classify, compensate_checkin_write,
+    compensate_rsvp_write, list_rsvps, now_iso, parse_attendance_occurrence, partition_rsvps,
+    put_rsvp, record_checkin, require_manage_events, rsvp_event_full_text, rsvp_rate_limited_text,
+    rsvp_saved_text, validate_event_id, validate_occurrence_id, write_audit, AttendanceProof,
+    CheckinWrite, ClassifierConfig, ClassifyInput, HandlerId, InteractionRouter, RsvpAudit,
+    RsvpRecord, RsvpStatus, RsvpStoreError, SlashOutcome,
 };
 
 use crate::{
@@ -165,8 +167,11 @@ enum Membership {
 }
 
 async fn guild_membership(executor: &ActionExecutor, guild_id: &str, user_id: &str) -> Membership {
+    // Mutation-free evidence: a pre-wire admission-Blocked attempt waits out
+    // brief governed-lane occupancy (mixed RSVP/custom contention) instead of
+    // refusing. Every other outcome keeps the RA-01 fail-closed mapping.
     match executor
-        .get_json_strict(&format!("/guilds/{guild_id}/members/{user_id}"))
+        .get_json_strict_with_blocked_retry(&format!("/guilds/{guild_id}/members/{user_id}"))
         .await
     {
         Ok(Some(member))
@@ -181,6 +186,73 @@ async fn guild_membership(executor: &ActionExecutor, guild_id: &str, user_id: &s
         Ok(Some(_)) => Membership::Unavailable,
         Ok(None) => Membership::Absent,
         Err(_) => Membership::Unavailable,
+    }
+}
+
+/// RA-03 consistency contract (TOG-19773): every mutation path observes live
+/// evidence immediately before its write and re-reads the same evidence
+/// immediately after. Any loss, removal, or lookup/store failure refuses the
+/// attempt with zero rows from that attempt, never a success reply. Lookup
+/// errors fail closed before any write; store errors fail closed without a
+/// success reply; a loss racing the write is compensated (the attempt's
+/// exact rows are deleted) and refused. The check-in fence re-reads the
+/// RA-02 anchor event plus the target membership. Historical totals reads
+/// (`list_rsvps`) perform no lookup and no write.
+async fn check_live_event(
+    executor: &ActionExecutor,
+    guild_id: &str,
+    event_id: &str,
+) -> Result<(), String> {
+    let event = executor
+        .get_scheduled_event(guild_id, event_id)
+        .await?
+        .ok_or("No scheduled event with that id exists in this server.")?;
+    // A malformed or mismatched response is not evidence of a live event.
+    if event["id"].as_str() != Some(event_id) || event["guild_id"].as_str() != Some(guild_id) {
+        return Err("Discord returned an invalid scheduled event status.".to_owned());
+    }
+    match event["status"].as_u64() {
+        Some(4) => Err("That scheduled event is cancelled.".to_owned()),
+        Some(1..=3) => Ok(()),
+        _ => Err("Discord returned an invalid scheduled event status.".to_owned()),
+    }
+}
+
+/// RA-03 post-write fence for RSVP: the actor must still belong to the
+/// guild and the event must still be live after the commit.
+async fn revalidate_rsvp(
+    executor: &ActionExecutor,
+    guild_id: &str,
+    event_id: &str,
+    actor_id: &str,
+) -> Result<(), String> {
+    match guild_membership(executor, guild_id, actor_id).await {
+        Membership::Current => {}
+        Membership::Absent => {
+            return Err("You are no longer a member of this server.".to_owned());
+        }
+        Membership::Unavailable => {
+            return Err("Unable to verify server membership.".to_owned());
+        }
+    }
+    check_live_event(executor, guild_id, event_id).await
+}
+
+/// RA-03 post-write fence for host check-in: the RA-02 anchor event must
+/// still be live and the target must still belong to the guild after the
+/// commit. The acting host needs no membership re-read: authority on this
+/// path is Manage Events, checked pre-write, not guild belonging.
+async fn revalidate_attendance(
+    executor: &ActionExecutor,
+    guild_id: &str,
+    anchor_event_id: &str,
+    target_id: &str,
+) -> Result<(), String> {
+    check_live_event(executor, guild_id, anchor_event_id).await?;
+    match guild_membership(executor, guild_id, target_id).await {
+        Membership::Current => Ok(()),
+        Membership::Absent => Err("That member is no longer in this server.".to_owned()),
+        Membership::Unavailable => Err("Unable to verify attendance membership.".to_owned()),
     }
 }
 
@@ -239,21 +311,7 @@ async fn execute(
                     return Err("Unable to verify server membership.".to_owned());
                 }
             }
-            let event = executor
-                .get_scheduled_event(&guild_id, &event_id)
-                .await?
-                .ok_or("No scheduled event with that id exists in this server.")?;
-            // A malformed or mismatched response is not evidence of a live event.
-            if event["id"].as_str() != Some(&event_id)
-                || event["guild_id"].as_str() != Some(&guild_id)
-            {
-                return Err("Discord returned an invalid scheduled event status.".to_owned());
-            }
-            match event["status"].as_u64() {
-                Some(4) => return Err("That scheduled event is cancelled.".to_owned()),
-                Some(1..=3) => {}
-                _ => return Err("Discord returned an invalid scheduled event status.".to_owned()),
-            }
+            check_live_event(executor, &guild_id, &event_id).await?;
             let record = RsvpRecord {
                 guild_id,
                 event_id,
@@ -261,15 +319,47 @@ async fn execute(
                 status,
                 responded_at: now_iso(),
             };
-            put_rsvp(pool, &record)
+            let transition = put_rsvp(pool, &record).await.map_err(|err| match err {
+                RsvpStoreError::EventAtCapacity => rsvp_event_full_text(),
+                RsvpStoreError::RsvpRateLimited => rsvp_rate_limited_text(),
+                // Occurrence capacity and retention floors cannot come
+                // out of an RSVP write; transport/parse failures stay
+                // generic. Every variant is mapped: a refused or failed
+                // write is never reported as saved.
+                RsvpStoreError::OccurrenceAtCapacity
+                | RsvpStoreError::CutoffTooRecent
+                | RsvpStoreError::Db(_)
+                | RsvpStoreError::UnknownStatus(_) => "Unable to save RSVP.".to_owned(),
+            })?;
+            let audit_id = format!("rsvp:{}", interaction.id);
+            write_audit(pool, &RsvpAudit::for_rsvp(&audit_id, &record))
                 .await
-                .map_err(|_| "Unable to save RSVP.")?;
-            write_audit(
-                pool,
-                &RsvpAudit::for_rsvp(&format!("rsvp:{}", interaction.id), &record),
+                .map_err(|_| "Unable to audit RSVP.")?;
+            // RA-03 race fence: the event or membership may have vanished
+            // between the pre-write lookups and the commit. Re-read the same
+            // evidence; on loss or lookup failure compensate (a first
+            // response is removed, a re-response restores the member's exact
+            // prior row) and refuse.
+            if let Err(refusal) = revalidate_rsvp(
+                executor,
+                &record.guild_id,
+                &record.event_id,
+                &record.user_id,
             )
             .await
-            .map_err(|_| "Unable to audit RSVP.")?;
+            {
+                let _ = compensate_rsvp_write(
+                    pool,
+                    &record.guild_id,
+                    &record.event_id,
+                    &record.user_id,
+                    &record.responded_at,
+                    &audit_id,
+                    transition.previous_response(),
+                )
+                .await;
+                return Err(refusal);
+            }
             Ok(rsvp_saved_text(status))
         }
         HandlerId::ScorecardAttendance => {
@@ -392,7 +482,7 @@ async fn execute(
             let inserted = record_checkin(
                 pool,
                 &CheckinWrite {
-                    guild_id,
+                    guild_id: guild_id.clone(),
                     event_occurrence_id: resolved.canonical_id.clone(),
                     member_id: member_id_str.clone(),
                     occurred_at: now_iso(),
@@ -403,12 +493,50 @@ async fn execute(
                 },
             )
             .await
-            .map_err(|_| "Attendance was not recorded.")?;
-            Ok(if inserted {
-                checkin_recorded_text(&member_id_str, &resolved.canonical_id)
-            } else {
-                checkin_duplicate_text(&member_id_str, &resolved.canonical_id)
-            })
+            .map_err(|err| match err {
+                RsvpStoreError::OccurrenceAtCapacity => checkin_occurrence_full_text(),
+                // Event capacity, RSVP rate and retention floors cannot come
+                // out of a check-in write; transport failures stay generic.
+                // Every variant is mapped: a refused or failed write is never
+                // reported as recorded.
+                RsvpStoreError::EventAtCapacity
+                | RsvpStoreError::RsvpRateLimited
+                | RsvpStoreError::CutoffTooRecent
+                | RsvpStoreError::Db(_)
+                | RsvpStoreError::UnknownStatus(_) => "Attendance was not recorded.".to_owned(),
+            })?;
+            if !inserted {
+                return Ok(checkin_duplicate_text(
+                    &member_id_str,
+                    &resolved.canonical_id,
+                ));
+            }
+            // RA-03 race fence: the anchor event or target membership may have
+            // vanished between the pre-write RA-02 reads and the commit. The
+            // `record_checkin` transaction only bounds the occurrence count —
+            // it cannot see Discord-side removal — so re-read the same live
+            // evidence here; on loss or lookup failure compensate (delete
+            // exactly this attempt's fact) and refuse. Duplicates return above
+            // without revalidation: they wrote nothing.
+            if let Err(refusal) = revalidate_attendance(
+                executor,
+                &guild_id,
+                &resolved.anchor_event_id,
+                &member_id_str,
+            )
+            .await
+            {
+                let _ = compensate_checkin_write(
+                    pool,
+                    &checkin_idempotency_key(&resolved.canonical_id, &member_id_str),
+                )
+                .await;
+                return Err(refusal);
+            }
+            Ok(checkin_recorded_text(
+                &member_id_str,
+                &resolved.canonical_id,
+            ))
         }
         _ => unreachable!("only RSVP handlers execute here"),
     }

@@ -68,7 +68,7 @@ Scale to real traffic by replacing 10,000/hour with the observed
 ## Related immediate alerts (not burn)
 
 The fast/slow burn rules above stay silent on a single bad minute by
-design. Two Worker alert rules cover gaps the burn math cannot see, and
+design. Three Worker alert rules cover gaps the burn math cannot see, and
 page immediately rather than consuming budget:
 
 - `gateway_missed_events`: any increase of
@@ -80,8 +80,31 @@ page immediately rather than consuming budget:
   success for more than 10 minutes pages at once, because skipped busy
   deadlines are neither success nor failure and never spend burn budget.
   Runbook: [runbook](runbook.md#alert-ticker-stale).
+- `receiver_refusals:<family>`: refused `two_bot_internal_actions_total`
+  outcomes rising in 3 consecutive keepalive samples pages (a single
+  forged pre-auth probe, always family `other`, stays silent), because a
+  receiver-abuse or refusal storm stays quiet through the burn math.
+  Runbook: [runbook](runbook.md#alert-receiver-refusals).
 
-Neither rule changes the burn thresholds, windows or budget above.
+None of these rules changes the burn thresholds, windows or budget above.
+
+## Related sustained dispatch ticket (not burn)
+
+`dispatch_drops:<lane>` raises a **ticket, never a page**, when
+`two_bot_dispatch_drops_total{lane}` grows in three consecutive completed
+keepalive sample windows after a baseline. The fixed lanes are `messages`,
+`interactions`, `registry`, `privileged`, `busy` and `reactions`; each has its
+own streak. Reaction drops include per-member fairness refusals, so sustained
+growth is not by itself proof of undersizing, nor of gateway packet loss.
+
+A single burst stays silent. Flat or backwards counter windows clear the
+streak and resolve an active ticket. Missing/invalid series and unsuccessful
+scrapes break the streak and invalidate the baseline without falsely resolving
+an active ticket. The next valid sample establishes a baseline, not recovery;
+a subsequent valid flat/reset window is required to resolve. Old DO state
+without the new fields starts unbaselined. Triage within the watch shift using
+[dispatch drops](runbook.md#alert-dispatch-drops); no paging escalation or
+fast/slow burn math is added or changed by this rule.
 
 ## Maintenance
 

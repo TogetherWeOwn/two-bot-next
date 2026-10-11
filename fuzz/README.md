@@ -2,14 +2,16 @@
 
 This is a separate `cargo-fuzz` workspace, explicitly excluded from the root
 workspace. Normal `cargo build`, workspace tests/clippy, `check` and cargo-deny
-keep their existing members, dependency lockfile and stable toolchain. No nightly
-workflow currently exists, so no scheduled smoke/service is added.
+keep their existing members, dependency lockfile and stable toolchain. The required
+`fuzz-compile` CI job (`check.yml`, gated by `ci-ok`) builds all eleven targets
+compile-only on pinned nightly `nightly-2026-10-01` + `cargo-fuzz 0.13.2`; no
+scheduled or continuous fuzz campaign exists, and CI never executes `cargo fuzz run`.
 
 ## Coverage
 
 | Target | Production seam | Checks / limits |
 | --- | --- | --- |
-| `internal_action` | `internal_actions::authorize`, `KeyRing::verify` and payload validators | Arbitrary raw bytes are signed with public synthetic test material so MAC failure cannot starve JSON parsing. Also malformed headers, signed timestamps, unknown key and altered-body rejection. Fresh nonce/rate-limit state each call; no executor. |
+| `internal_action` | `internal_actions::authorize`, `KeyRing::verify` and payload validators | Arbitrary raw bytes are signed with public synthetic test material so MAC failure cannot starve JSON parsing. Also malformed headers, signed timestamps, unknown key and altered-body rejection. Fresh nonce/rate-limit state each call; no executor. Channel-moderation bodies (`moderation.purge`/`slowmode`/`lockdown`/`unlock`): snowflake actor/channel ids (canonical nonzero u64), trimmed audit reason, purge `count` 1–100 and slowmode `seconds` 0–6h, with an independent refusal-vs-accept oracle plus the fixed happy/bad-key matrix (seeds `seed-channel-*`). |
 | `automod` | `AutomodPolicy::is_exempt`, `match_automod` | NFKC/zero-width text, bad words, URL/domain parsing, attachments, mentions and three distinct repeat observations. No moderation effects. |
 | `prefix_trigger` | `leveling::valid_text_trigger`, `valid_command_name` | Independent byte-grammar oracle for `![a-z0-9_-]{1,32}`. **The current bot has no prefix-message parser** (`router.rs` documents this); this target covers the existing validators, not a nonexistent dispatcher. |
 | `mee6_export` | `mee6_xp::parse_mee6_export`, `mee6_rewards::parse_mee6_role_rewards`, `parse_roles_snapshot` | JSON export variants, row types, numeric boundaries, role references. No import planner or database. |
@@ -19,6 +21,7 @@ workflow currently exists, so no scheduled smoke/service is added.
 | `settings_map` | Guild/assistant settings-map parsing including `AssistantConfig::from_map`, `FeatureGates`, `ModerationGates`, `VoiceGates`, `AutomodConfig`, `OnboardingGates`, `DisableGates`, `SelfRoleGates`, `InternalFlags`, `InternalActionConfig` and the settings catalogue | Arbitrary `KEY=VALUE` line maps with hostile strings, huge values, wrong types and unknown keys (max 32 entries, `-max_len=65536`). Invalid input fails closed (`None`/`Err`/disabled, never half-applied); unknown keys must not change outcomes. `Secret<T>` spot-checks assert constant `[REDACTED]` rendering on fuzz-derived values. No environment, network, database or secret use. |
 | `vote_kick` | `VoteKickCore` start/vote/refresh | Arbitrary member/target/room/privilege/clock sequences over small synthetic ID pools (forced reuse), including three-way `target_privileged` evidence (`Some(false)`/`Some(true)`/`None`) so fail-closed `AuthorityUnavailable`/`PrivilegedTarget` refusals and mid-vote `TargetProtected` cancels stay reachable. Asserts no panic, replay refused, terminal votes stay terminal, the kick emits once with room scope, and progress arithmetic holds. No Discord client, database or network. |
 | `vote_kick_reason` | `voice_rooms::sanitize_vote_reason`, `message_safety::neutralize_mentions` | Arbitrary UTF-8 vote-kick reasons (invalid UTF-8 discarded). VK-04 invariants on every output: at most `VOTE_KICK_PUBLIC_REASON_LIMIT` chars, single line, no `@everyone`/`@here`, no `<@`/`<#`/`<:`/`<a:` pills, no `://`; the neutralizer half is pinned too (no raw mass mention, neutralize-twice stable). Seeds mirror the hostile matrix. No database, Discord client, network or secret. |
+| `slash_input_bounds` | `lfg::parse_role_spec`, `custom_commands::AuditRecord` constructors, `scheduled::resolve_scheduled_id` | Arbitrary UTF-8 slash input (invalid UTF-8 discarded) driven through the #694 bounds: overlong `/lfg` role keys (including >2000 chars), multi-thousand-char `/command` names, empty plus overlong schedule id prefixes. `TooLong` if and only if the spec exceeds `MAX_ROLE_SPEC_CHARS` (refusal before parsing); `BadKey` echoes at most 128 chars; every audit `target_key` is exactly the 32-char prefix; empty/overlong prefixes resolve `Missing` before resolution and all other outcomes agree with an independent exact-or-prefix-match oracle over a fixed synthetic inventory. Seeds mirror the hostile matrix (mentions, links, markdown, overlong). No database, Discord client, network or secret. |
 
 All seeds use synthetic IDs/text; no token, environment secret, database,
 Discord client or network is needed at runtime. MEE6's crate currently has SQLx
@@ -55,7 +58,7 @@ set -euo pipefail
 : "${FUZZ_OUTPUT_DIR:?set an absolute non-source output directory}"
 FUZZ_SECONDS=${FUZZ_SECONDS:-300}
 mkdir -p "$FUZZ_OUTPUT_DIR/target" "$FUZZ_OUTPUT_DIR/logs"
-for target in internal_action automod prefix_trigger mee6_export guild_config_snapshot voice_config rsvp settings_map vote_kick vote_kick_reason; do
+for target in internal_action automod prefix_trigger mee6_export guild_config_snapshot voice_config rsvp settings_map vote_kick vote_kick_reason slash_input_bounds; do
   mkdir -p "$FUZZ_OUTPUT_DIR/corpus/$target" "$FUZZ_OUTPUT_DIR/artifacts/$target"
   cargo +nightly fuzz run --target-dir "$FUZZ_OUTPUT_DIR/target" \
     "$target" "$FUZZ_OUTPUT_DIR/corpus/$target" "fuzz/corpus/$target" -- \
@@ -78,10 +81,20 @@ cargo fmt --all -- --check
 cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check
 ```
 
-`fuzz/Cargo.lock` is independent of the root lockfile. Preserve the generated
-fuzz lockfile with the verification evidence before reporting a campaign; record
-nightly, cargo-fuzz, libfuzzer-sys and OS versions and exact git HEAD. Do not claim
-the root's required checks compile these excluded targets.
+`fuzz/Cargo.lock` is committed and seeded from the root lockfile: every shared
+crate pins the same version as the root build, plus exactly three fuzz-only
+crates (`arbitrary`, `jobserver`, `libfuzzer-sys`). The required `fuzz-compile`
+job runs `cargo fetch --locked` before building, so the gate fails instead of
+silently resolving fresh crates.io versions. Dependabot tracks `/fuzz` for
+bump PRs; when the root lockfile moves, re-seed with `cp Cargo.lock
+fuzz/Cargo.lock` plus `cargo generate-lockfile --manifest-path
+fuzz/Cargo.toml` and pin any drifted shared crate back with `cargo update -p
+<crate> --precise <root version>`. Preserve the generated fuzz lockfile with
+the verification evidence before reporting a campaign; record nightly,
+cargo-fuzz, libfuzzer-sys and OS versions and exact git HEAD. The required
+`fuzz-compile` job proves the excluded targets build; it does not execute them. A
+bounded smoke result must cite its own non-controller host, command, elapsed time
+and artifacts, never CI compile alone.
 
 ## Crashes and evidence
 

@@ -17,8 +17,11 @@
 //!    [`crate::build_counter_reading`], then [`write_counter`].
 //! 3. Rank tick: additionally [`crate::match_rank_roles`] (`None` is
 //!    [`crate::RankSkip::RankRoleMissing`]), then
-//!    [`crate::build_community_snapshot`], then [`write_rank_snapshot`]. The
-//!    `Invariant` error below is [`crate::RankSkip::RanksNotNested`].
+//!    [`crate::build_community_snapshot`]. A non-nested ladder self-heals
+//!    first ([`crate::plan_rank_heal`]: grant the missing lower rungs with an
+//!    audit reason, bounded and hierarchy-fenced), then rebuilds before
+//!    [`write_rank_snapshot`]. The `Invariant` error below is the still-bad
+//!    backstop ([`crate::RankSkip::RanksNotNested`]).
 //! 4. Events tick: fetch, [`crate::normalize_events`], then
 //!    [`replace_events`].
 //!
@@ -184,7 +187,8 @@ async fn write_counter_tables(
 ///
 /// Refuses a non-nested ladder or a ranked-over-human count before opening
 /// the transaction (legacy `rank_snapshot_invariant_failed`): a finding, not
-/// a row.
+/// a row. The rank tick heals a non-cumulative roster before calling this, so
+/// reaching the refusal means the ladder is still bad after the heal.
 pub async fn write_rank_snapshot(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -269,6 +273,16 @@ pub async fn write_rank_snapshot(
 /// rows. The tick only calls this after [`crate::normalize_events`] accepts
 /// the whole response, so a failed or malformed read never reaches here and
 /// the last good snapshot stays in place.
+///
+/// Ordering against event mutations (TOG-20273): every mirror row carries the
+/// writer's UTC-millis `observed_at` in `updated_at`, and all writers use the
+/// same fixed-width rendering (`format_iso_millis` / `now_iso`), so TEXT
+/// comparison is chronological. Stamps describe when the observation began:
+/// the poller stamps before its GET and the mutation executor stamps after
+/// Discord returns, so a mutation that lands while a snapshot GET is in flight
+/// keeps its newer row (and a legitimately removed event is still deleted once
+/// the snapshot observing the removal is the newest writer). A stale snapshot
+/// replayed after a newer write changes nothing.
 pub async fn replace_events(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -276,15 +290,21 @@ pub async fn replace_events(
     events: &[ScheduledEvent],
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM scheduled_events WHERE guild_id = $1")
+    sqlx::query("DELETE FROM scheduled_events WHERE guild_id = $1 AND updated_at <= $2")
         .bind(guild_id)
+        .bind(observed_at)
         .execute(&mut *tx)
         .await?;
     for event in events {
         sqlx::query(
             "INSERT INTO scheduled_events
                (guild_id, event_id, name, starts_at, channel_id, description, status, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (guild_id, event_id) DO UPDATE SET
+               name = EXCLUDED.name, starts_at = EXCLUDED.starts_at,
+               channel_id = EXCLUDED.channel_id, description = EXCLUDED.description,
+               status = EXCLUDED.status, updated_at = EXCLUDED.updated_at
+             WHERE scheduled_events.updated_at <= EXCLUDED.updated_at",
         )
         .bind(guild_id)
         .bind(&event.id)
@@ -306,6 +326,17 @@ pub async fn replace_events(
 
 /// Internal event action write: refresh exactly one row before acknowledging
 /// the action. Unlike the poller's whole-guild swap, unrelated events survive.
+///
+/// Ordering against the poller (TOG-20273): the row is only overwritten when
+/// the stored `updated_at` is at or below this mutation's `observed_at` (same
+/// fixed-width UTC-millis rendering, so TEXT comparison is chronological).
+/// The executor stamps after Discord returns, so the instant is the mutation's
+/// own completion — never a pre-send reading that a newer snapshot could beat
+/// despite landing earlier. A stale mutation whose mirror write loses the race
+/// against a newer poller snapshot (or a newer mutation) becomes a silent
+/// no-op: the Discord effect already happened, so this still returns `Ok` —
+/// the mirror simply keeps the newer row. Inserts (no conflicting row) always
+/// apply.
 pub async fn upsert_event(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -319,7 +350,8 @@ pub async fn upsert_event(
          ON CONFLICT (guild_id, event_id) DO UPDATE SET
            name = EXCLUDED.name, starts_at = EXCLUDED.starts_at,
            channel_id = EXCLUDED.channel_id, description = EXCLUDED.description,
-           status = EXCLUDED.status, updated_at = EXCLUDED.updated_at",
+           status = EXCLUDED.status, updated_at = EXCLUDED.updated_at
+         WHERE scheduled_events.updated_at <= EXCLUDED.updated_at",
     )
     .bind(guild_id)
     .bind(&event.id)

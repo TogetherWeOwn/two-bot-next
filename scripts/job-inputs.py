@@ -60,6 +60,8 @@ WORKER = "worker"
 PARITY = "parity"
 SUPPLY = "supply"
 DOCS = "docs"
+# Live voice synthetic offline suite (not a CI job; never part of ALL_JOBS).
+VOICE = "voice"
 ALL_JOBS = frozenset({RUST, WORKER, PARITY, SUPPLY})
 NO_JOBS = frozenset()
 
@@ -146,6 +148,14 @@ RUST_DOCS = frozenset({
 PARITY_DOCS = frozenset({
     "docs/parity.md",
     "docs/parity-baseline.json",
+})
+# Docs read by both Rust tests and the worker suite: docs/metrics.md is
+# pinned by the Rust exposition-conformance test
+# (crates/core/tests/metrics_docs.rs) and by the worker event/alert catalog
+# tests (wrangler/test/event-catalog.test.ts,
+# wrangler/test/alert-job-catalog.test.ts), so its edits select both jobs.
+RUST_WORKER_DOCS = frozenset({
+    "docs/metrics.md",
 })
 WORKER_DOCS = frozenset({
     "docs/runbook.md",
@@ -257,6 +267,8 @@ def classify(path):
         return frozenset(jobs)
     if path.startswith(WORKER_PREFIX):
         return frozenset({WORKER})
+    if path in RUST_WORKER_DOCS:
+        return frozenset({RUST, WORKER})
     if path in RUST_DOCS:
         jobs = {RUST}
         if path in PARITY_DOCS:
@@ -289,6 +301,41 @@ def classify(path):
     # Fail-closed: unrecognized paths (e.g. a brand-new top-level directory)
     # run everything rather than risk silently skipped coverage.
     return ALL_JOBS
+
+
+# Paths whose change can alter temp-voice behaviour or the voice synthetic
+# itself (owner policy 2026-10-11: the synthetic runs on PRs only when these
+# change; always after deploy-staging and every 6 h).
+VOICE_PREFIXES = (
+    "crates/bot/src/voice",
+    "crates/core/src/voice",
+    "crates/bot/src/gateway",
+    "crates/bot/src/presence",
+    "tests/voice_templates/",
+)
+VOICE_EXACT = frozenset({
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    ".github/workflows/check.yml",
+    ".github/workflows/deploy-staging.yml",
+    ".github/workflows/voice-synthetic.yml",
+    "scripts/job-inputs.py",
+    "scripts/staging_voice_synthetic.py",
+    "scripts/test_staging_voice_synthetic.py",
+    "wrangler/src/container-env.ts",
+})
+
+
+def voice_selected(changed, deleted=()):
+    """True when a change can affect temp-voice behaviour (fail-closed on deletions)."""
+    if any(path.strip() for path in deleted):
+        return True
+    for path in changed:
+        path = normalize(path)
+        if path in VOICE_EXACT or path.startswith(VOICE_PREFIXES):
+            return True
+    return False
 
 
 def selection(changed, deleted=()):
@@ -338,7 +385,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-ref", required=True)
     parser.add_argument("--head-ref", required=True)
-    parser.add_argument("--job", choices=(RUST, WORKER, PARITY, SUPPLY, DOCS),
+    parser.add_argument("--job", choices=(RUST, WORKER, PARITY, SUPPLY, DOCS, VOICE),
                         default=None,
                         help="print only this job's selection (default: all)")
     args = parser.parse_args(argv)
@@ -353,10 +400,11 @@ def main(argv=None):
               "selecting full jobs", flush=True)
         return 2
     jobs = selection(changed, deleted)
+    jobs[VOICE] = voice_selected(changed, deleted)
     if args.job is not None:
         print("true" if jobs[args.job] else "false")
     else:
-        for job in (RUST, WORKER, PARITY, SUPPLY, DOCS):
+        for job in (RUST, WORKER, PARITY, SUPPLY, DOCS, VOICE):
             print(f"{job}={'true' if jobs[job] else 'false'}")
     return 0
 

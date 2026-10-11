@@ -123,7 +123,10 @@ that can mutate the copied data can be paused and resumed without duplication.
 **T−15 min:** run read-only command diff and preflight with the production
 application/guild through the authorized REST executor (no gateway startup).
 Capture token-valid/application identity, intent flags, role/channel results and
-session-start budget; FAIL is NO-GO, WARN needs a recorded disposition. Snapshot
+the `session start budget` check (`GET /gateway/bot`: `remaining`, `total`,
+`reset_after_ms`, `max_concurrency`); FAIL is NO-GO (exit 1), including
+`remaining` below 10 or an unreadable budget, while WARN (`remaining` below
+100) needs a recorded disposition but keeps exit 0. Snapshot
 legacy configuration, command definitions **and separate guild permissions**
 *before* any overwrite. Confirm the legacy restart path does not auto-register a
 different registry or resume a stale session. Verify the persisted Worker/DO
@@ -609,6 +612,12 @@ warm until separate retirement authorization; do not close B4 on a failed watch.
 ## Rollback: preserve Next-window writes before reopening legacy
 
 **Maximum accepted loss:** **0 acknowledged committed database writes**.
+See the "Production decision window" section in
+[cutover-rollback-runbook.md](cutover-rollback-runbook.md#production-decision-window)
+for the recorded 2-hour decision window from `T_0` and the forward-fix posture
+after its closure. The zero-loss gate below continues to govern reopening
+legacy.
+
 The Next write window is `[T_0, T_r]` (up to the full 48-hour watch, longer if
 extended), not merely the time since the last nightly backup. Restore-to-`T_f`
 alone would lose that entire window and is **not an acceptable rollback**.
@@ -689,6 +698,18 @@ writes in maintenance, preserve both data sets, and escalate a decision brief to
 the Director of Engineering. **Never silently choose a 48-hour data loss** to
 restore availability. Any proposed loss/irreversible recovery requires its
 separate authority; the lead cannot waive this runbook's zero-loss gate.
+
+**Decision D5 (live cutover, declared by the cutover lead — see
+[cutover-rollback-runbook.md](cutover-rollback-runbook.md) §1 Decider):**
+the production cutover is live. Production is
+the PlanetScale main database `two_bot`. Writes made during the Next window
+are accepted as lost on rollback, bounded by a 2-hour rollback decision
+window; after that window it is forward-fix only, never rollback. Mitigation
+is the pre-cutover PlanetScale backup plus the untouched Coolify `twobot`
+database. The zero-loss gate above describes the pre-cutover plan; during
+the 2-hour rollback decision window this decision supersedes it for
+rollback. After the window closes it is forward-fix only, never rollback,
+so no rollback supersession applies there.
 
 ## Communication template
 

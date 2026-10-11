@@ -108,6 +108,11 @@ DISCORD_STAGING_BOT_TOKEN=... DISCORD_STAGING_GUILD_ID=... \
         [--record staging-smoke-run-record.json]
 ```
 
+These smokes (this one and `staging_voice_smoke.py`) never follow a redirect on an
+authenticated Discord read. Any 301, 302, 303, 307 or 308 stops the request before a
+second one is built, even to the same origin, and fails with a fixed message that
+names no token, `Location` or response body. Production targets stay refused.
+
 Exit 0 is PASS, 1 is NEEDS WORK, 2 is a fence refusal with nothing sent. Run it
 after every `deploy-staging` run you accept; the deploy gate proves the rollout,
 this proves the build answers readiness and the guild publishes the surface.
@@ -115,11 +120,22 @@ this proves the build answers readiness and the guild publishes the surface.
 | Row | Passes when | Failure signature |
 | --- | --- | --- |
 | `GET /health` | 200 with the exact `{"status":"ok"}` shape | `SMOKE-HEALTH-FAIL` |
-| `GET /readyz` | 200 and every component ready; a parked or down container fails | `SMOKE-READYZ-NOT-READY`, `SMOKE-READYZ-DB-BEHIND` |
+| `GET /readyz` | 200 and every component ready; a parked or down container fails | `SMOKE-READYZ-NOT-READY`, `SMOKE-READYZ-CHECKPOINT-READ-FAILED` |
 | `readyz build identity` | `build_revision` equals `--expected-sha` | `SMOKE-BUILD-MISMATCH` |
 | `identity and command list` | the token is the staging application and the guild command list reads | `SMOKE-DISCORD-REFUSED` |
 | `/rank`, `/leaderboard`, `/help` | listed and their own resource is scoped to the staging guild | `SMOKE-REGISTRY-MISSING`, `SMOKE-REGISTRY-DETAIL-MISMATCH` |
 | every other built-in | listed (`pass`) or unpublished (`skipped`, gate off or publish pending) | none: a skip is visible in the verdict, not a failure |
+
+`SMOKE-READYZ-CHECKPOINT-READ-FAILED` replaces the older
+`SMOKE-READYZ-DB-BEHIND` signature for new records. It names the failed read
+step, not migration drift: a root-cause claim requires separate reviewed
+schema/ACL/connectivity evidence and an independent receipt, as described in
+[the health-contract probe](staging-health-contract-probe.md#checkpoint-read-assertion-not-a-root-cause-diagnosis).
+Only a status-consistent 503 classified by the health probe as a failed
+checkpoint read gets this signature. A contradictory status/breakdown
+keeps `SMOKE-READYZ-NOT-READY` even when the response carries the class;
+an all-ready 200 has no failure signature.
+No probe is allowed to apply a migration or test production.
 
 The record's deploy run id defaults to the `readyz` `build_id` prefix (the build
 id is `RUN_ID-RUN_ATTEMPT` of the `deploy-staging` run that built the image), but
@@ -151,6 +167,8 @@ credential-free half (`/health`, `/readyz`, build identity) is already enforced
 on every deploy by the `deploy-staging` gate.
 
 Offline coverage: `scripts/test_staging_smoke_run.py` (live-guild refusal before
-any request, container down, parked, db-behind and mismatched builds, missing
-core surface, foreign or rejected token, token never in output, record schema,
+any request, container down, parked, checkpoint-read failure without a root-cause
+claim, contradictory status/breakdown with the checkpoint class keeping the
+generic signature, all-ready with the class and no failure signature,
+mismatched builds, missing core surface, foreign or rejected token, token never in output, record schema,
 drift against the command matrix).

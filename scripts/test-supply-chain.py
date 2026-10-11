@@ -344,7 +344,7 @@ class SupplyChainTests(unittest.TestCase):
         self.assertIn("inputs.dry_run != true", release)
         self.assertIn("needs.sbom-target.outputs.tag != ''", release)
         self.assertIn("needs.release-sbom.result == 'success'", release)
-        self.assertIn("needs.release-please.outputs.release_created == 'true'", release)
+        self.assertIn("needs.tag.outputs.released == 'true'", release)
         self.assertIn("ref: ${{ inputs.ref }}", supply)
         self.assertIn("persist-credentials: false", supply)
         self.assertEqual(supply.count("exit-code: '1'"), 2)

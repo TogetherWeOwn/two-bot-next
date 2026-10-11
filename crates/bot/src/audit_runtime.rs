@@ -28,13 +28,14 @@ use std::{
 
 use futures_util::future::BoxFuture;
 use sqlx::PgPool;
-use tokio::sync::{watch, OnceCell};
+use tokio::sync::{watch, Mutex as AsyncMutex};
 use two_bot_core::audit::{AuditChannelIds, AuditEvent};
 use two_bot_core::audit_mirror::AuditMirror;
 use two_bot_core::audit_service::{
     AuditMirrorService, DeliverOutcome, DrainReport, MirrorConfig, RecordOutcome,
 };
 use two_bot_core::audit_store::AuditStore;
+use two_bot_core::settings::LiveSettings;
 use two_bot_discord::executor::ActionExecutor;
 
 use crate::{
@@ -76,7 +77,27 @@ pub(crate) fn handle() -> Option<AuditHandle> {
     HANDLE.get().cloned()
 }
 
-/// Mirror destinations from the environment. Unset or blank keys are absent;
+/// Layer the live snapshot over the boot deployment (store-first, like the
+/// raid/join-risk/containment runtimes): stored rows win, deleted rows fall
+/// back to the boot value. Only the three mirror destinations are read; every
+/// other published key is ignored.
+pub(crate) fn layered_vars(
+    deployment: &HashMap<String, String>,
+    guild_id: &str,
+    live: Option<&LiveSettings>,
+) -> HashMap<String, String> {
+    let mut vars = deployment.clone();
+    if let Some(live) = live {
+        vars.extend(
+            live.env_snapshot(Some(guild_id))
+                .into_iter()
+                .filter(|(key, _)| CHANNEL_KEYS.contains(&key.as_str())),
+        );
+    }
+    vars
+}
+
+/// Mirror destinations from layered vars. Unset or blank keys are absent;
 /// `Err` carries the fixed parked reason only, never the raw value.
 pub(crate) fn resolve_channels(
     vars: &HashMap<String, String>,
@@ -111,10 +132,15 @@ fn snowflake(value: &str) -> Option<String> {
 }
 
 /// Build the shared runtime and its `audit_retry` job, or log why it parks.
-/// The handle is installed once per process; a second call reuses it.
+/// The handle is installed once per process; a second call reuses it. A
+/// process with no destination at boot stays parked (the job is never
+/// installed); every installed runtime refreshes its destinations live.
 pub(crate) fn register(context: Arc<Context>, shutdown: watch::Receiver<bool>) -> Option<Job> {
-    let channels = match resolve_channels(&std::env::vars().collect()) {
-        Ok(channels) => channels,
+    let deployment: HashMap<String, String> = std::env::vars()
+        .filter(|(key, _)| CHANNEL_KEYS.contains(&key.as_str()))
+        .collect();
+    let runtime = match AuditRuntime::new(deployment, context.guild.clone(), connector(context)) {
+        Ok(runtime) => runtime,
         Err(reason) => {
             match reason {
                 "invalid_config" => tracing::warn!(job = JOB, reason, "job_disabled"),
@@ -123,12 +149,7 @@ pub(crate) fn register(context: Arc<Context>, shutdown: watch::Receiver<bool>) -
             return None;
         }
     };
-    let runtime = HANDLE
-        .get_or_init(|| {
-            let guild = context.guild.clone();
-            Arc::new(AuditRuntime::new(channels, guild, connector(context)))
-        })
-        .clone();
+    let runtime = HANDLE.get_or_init(|| Arc::new(runtime)).clone();
     Some(retry_job(
         runtime,
         shutdown,
@@ -139,7 +160,7 @@ pub(crate) fn register(context: Arc<Context>, shutdown: watch::Receiver<bool>) -
 /// The `audit_retry` supervisor job over one shared runtime. Rows whose store
 /// write failed fail the run (`database`); every per-row Discord outcome is
 /// the protocol working and counts as success.
-pub(crate) fn retry_job<M: AuditMirror + 'static>(
+pub(crate) fn retry_job<M: AuditMirror + Clone + 'static>(
     runtime: Arc<AuditRuntime<M>>,
     shutdown: watch::Receiver<bool>,
     startup_jitter: Duration,
@@ -208,6 +229,11 @@ async fn rest_parts(
 }
 
 struct Wired<M: AuditMirror> {
+    pool: PgPool,
+    mirror: M,
+    bot_user_id: String,
+    /// Destinations the cached service was built for; a mismatch rebuilds it.
+    channels: AuditChannelIds,
     store: AuditStore,
     service: AuditMirrorService<M>,
 }
@@ -221,56 +247,161 @@ pub(crate) enum Sweep {
 }
 
 pub(crate) struct AuditRuntime<M: AuditMirror> {
-    channels: AuditChannelIds,
+    /// Boot deployment values for the three destinations; the live snapshot
+    /// layers over these on every refresh.
+    deployment: HashMap<String, String>,
     guild: String,
     connect: Connect<M>,
-    /// Built once on first success; a failed connect caches nothing.
-    wired: OnceCell<Wired<M>>,
+    /// Current destinations (boot, then live). Re-resolved whenever the
+    /// published snapshot moves; a malformed stored row keeps the last good
+    /// destinations rather than parking a running mirror.
+    channels: Mutex<AuditChannelIds>,
+    /// Published snapshot revision the destinations were last resolved from;
+    /// `None` before any live reader exists.
+    live_revision: Mutex<Option<i64>>,
+    /// Connection parts (pool, mirror, bot id) built once on first success; a
+    /// failed connect caches nothing. The service rebuilds only when the
+    /// destinations move, so halt-transition memory survives idle sweeps.
+    /// Shared through `Arc`: record and sweep clone the current wiring under
+    /// a brief lock, then run without holding it, so a paced multi-row sweep
+    /// never queues gateway records behind it.
+    wired: AsyncMutex<Option<Arc<Wired<M>>>>,
     /// Halt state seen by the previous sweep, for transition logs only —
     /// every sweep reads the store.
     halted: Mutex<Option<bool>>,
 }
 
-impl<M: AuditMirror> AuditRuntime<M> {
-    pub(crate) fn new(channels: AuditChannelIds, guild: String, connect: Connect<M>) -> Self {
-        Self {
-            channels,
+impl<M: AuditMirror + Clone> AuditRuntime<M> {
+    pub(crate) fn new(
+        deployment: HashMap<String, String>,
+        guild: String,
+        connect: Connect<M>,
+    ) -> Result<Self, &'static str> {
+        let channels = resolve_channels(&layered_vars(
+            &deployment,
+            &guild,
+            crate::settings_jobs::live().as_ref(),
+        ))?;
+        Ok(Self {
+            deployment,
             guild,
             connect,
-            wired: OnceCell::new(),
+            channels: Mutex::new(channels),
+            live_revision: Mutex::new(None),
+            wired: AsyncMutex::new(None),
             halted: Mutex::new(None),
+        })
+    }
+
+    /// Re-resolve destinations when the published snapshot moved. Pure apart
+    /// from the process-wide live reader; production passes the poller's
+    /// snapshot, tests pass an explicit pair.
+    pub(crate) fn refresh_channels_with(&self, live: Option<&LiveSettings>) {
+        let revision = live.map(LiveSettings::revision);
+        if *self.live_revision.lock().unwrap_or_else(|e| e.into_inner()) == revision {
+            return;
+        }
+        *self.live_revision.lock().unwrap_or_else(|e| e.into_inner()) = revision;
+        let vars = layered_vars(&self.deployment, &self.guild, live);
+        match resolve_channels(&vars) {
+            Ok(next) => {
+                let mut current = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+                if *current != next {
+                    tracing::info!(job = JOB, "setting_changed: audit destinations");
+                    *current = next;
+                }
+            }
+            Err("disabled") => {
+                let next = AuditChannelIds::default();
+                let mut current = self.channels.lock().unwrap_or_else(|e| e.into_inner());
+                if *current != next {
+                    tracing::info!(job = JOB, "audit destinations disabled live");
+                    *current = next;
+                }
+            }
+            Err(reason) => {
+                tracing::warn!(
+                    job = JOB,
+                    reason,
+                    "audit destinations unusable; keeping the last good"
+                );
+            }
         }
     }
 
-    async fn wired(&self) -> Result<&Wired<M>, ErrorClass> {
-        self.wired
-            .get_or_try_init(|| async {
+    /// Destinations for tests without a database or a poller.
+    #[cfg(test)]
+    pub(crate) fn channels_for_test(&self) -> AuditChannelIds {
+        self.channels.lock().unwrap().clone()
+    }
+
+    fn build_wired(
+        pool: PgPool,
+        mirror: M,
+        bot_user_id: String,
+        channels: AuditChannelIds,
+        guild: &str,
+    ) -> Wired<M> {
+        let configured = [&channels.audit, &channels.voice, &channels.moderation]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+        let config = MirrorConfig {
+            channels: channels.clone(),
+            configured,
+            mirror_guild_id: Some(guild.to_owned()),
+            bot_user_id: bot_user_id.clone(),
+        };
+        Wired {
+            store: AuditStore::new(&pool),
+            service: AuditMirrorService::new(AuditStore::new(&pool), mirror.clone(), config),
+            pool,
+            mirror,
+            bot_user_id,
+            channels,
+        }
+    }
+
+    async fn wired(&self) -> Result<Arc<Wired<M>>, ErrorClass> {
+        self.refresh_channels_with(crate::settings_jobs::live().as_ref());
+        // Refresh outside the slot lock so a concurrent channel change lands
+        // on the next call instead of racing this one.
+        let current = self
+            .channels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut slot = self.wired.lock().await;
+        match slot.as_ref() {
+            Some(wired) if wired.channels == current => {}
+            Some(wired) => {
+                let guild = self.guild.clone();
+                *slot = Some(Arc::new(Self::build_wired(
+                    wired.pool.clone(),
+                    wired.mirror.clone(),
+                    wired.bot_user_id.clone(),
+                    current,
+                    &guild,
+                )));
+            }
+            None => {
                 let Parts {
                     pool,
                     mirror,
                     bot_user_id,
                 } = (self.connect)().await?;
-                let configured = [
-                    &self.channels.audit,
-                    &self.channels.voice,
-                    &self.channels.moderation,
-                ]
-                .into_iter()
-                .flatten()
-                .cloned()
-                .collect();
-                let config = MirrorConfig {
-                    channels: self.channels.clone(),
-                    configured,
-                    mirror_guild_id: Some(self.guild.clone()),
+                let guild = self.guild.clone();
+                *slot = Some(Arc::new(Self::build_wired(
+                    pool,
+                    mirror,
                     bot_user_id,
-                };
-                Ok(Wired {
-                    store: AuditStore::new(&pool),
-                    service: AuditMirrorService::new(AuditStore::new(&pool), mirror, config),
-                })
-            })
-            .await
+                    current,
+                    &guild,
+                )));
+            }
+        }
+        Ok(slot.as_ref().expect("wired set above").clone())
     }
 
     /// Durably record one event (route + insert) for the next sweep to
