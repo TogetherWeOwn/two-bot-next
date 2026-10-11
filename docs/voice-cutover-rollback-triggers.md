@@ -13,23 +13,30 @@ Triggers are checked at the watch checkpoints (+15 min, +1 h, +6 h, +24 h,
 +48 h) and continuously by the alert rules below. A trigger fires on
 **measured evidence**, never on a single noisy sample.
 
-### T1. DB-behind-binary (staging rollout-timeout lesson)
+### T1. Checkpoint-read failure (staging rollout-timeout lesson)
 
-The staging container boots with embedded migrations baked into the binary.
-When the staging database lags the binary's migration set, boot reads for
-tables the database does not have yet fail with
-`checkpoint_load_failed`, the container crashloops, and
-`deploy-staging verify` times out with `rollout_timeout`. This exact
-signature recurred on 2026-10-03 across consecutive main pushes:
-`rollout=completed instances=active:0,healthy:1,failed:0,starting:0,scheduling:0`.
+The binary embeds its expected migrations, but
+`durable_gateway:checkpoint_load_failed` names only the failed checkpoint
+read step (`crates/bot/src/gateway_failure.rs`,
+`FailureClass::CheckpointLoadFailed`). Schema lag, ACL denial and
+connectivity failures are not distinguished by this class. The observed
+`rollout_timeout` and checkpoint-read failure recurred on 2026-10-03 across
+consecutive main pushes with
+`rollout=completed instances=active:0,healthy:1,failed:0,starting:0,scheduling:0`;
+those observations alone do not establish migration drift or a crashloop.
 
 - **Trigger:** `deploy-staging verify` fails `rollout_timeout` **and** the
   last observation names `gateway_failure=durable_gateway:checkpoint_load_failed`,
   or the container log names `checkpoint_load_failed` as the fatal class.
-- **Response:** do not re-run `deploy-staging` (the same binary against the
-  same lagging database fails the same way). Run `staging-migrate plan`
-  first, reconcile the pending list against the reviewed cutover plan, then
-  `staging-migrate apply` through its governed path. Only then re-deploy.
+- **Response:** do not blindly re-run `deploy-staging`. Preserve the failed
+  read receipt; require separate reviewed schema/ledger, checkpoint-reader
+  ACL and connectivity evidence for the affected staging target/build
+  before claiming a root cause or choosing remediation. An independent
+  receipt must establish schema lag before recommending migrations; only
+  then reconcile `staging-migrate plan` with the reviewed cutover plan and
+  use the separate governed apply path. An ACL or connectivity finding
+  instead needs its own reviewed repair. No probe is allowed to apply a
+  migration or test production.
 - **Cutover gate:** the voice swap does not start while any
   `checkpoint_load_failed` receipt is open on staging, because a staging
   container that cannot read its own checkpoint cannot own voice rooms.
