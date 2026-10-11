@@ -407,19 +407,26 @@ on-call engineer, not another redeploy.
 `two_bot_gateway_checkpoint_failures_total` increased between two keepalive
 samples. Every checkpoint failure stops the dispatch worker, so there is no
 benign singleton: a single increase pages. The first sample after monitoring
-arms only stores the baseline and never fires, and a counter reset (process
-restart) skips the window rather than firing.
+arms only stores the baseline and never fires. The failing process lingers
+75 s before it exits, so at least one keepalive scrape sees the increase
+before the restart resets the counter; the post-restart reset sample resolves
+the alert rather than firing.
 
 First response: read the `stage` label on
 `two_bot_gateway_checkpoint_failures_total` via the authorized
 `/ops/metrics` scrape — `pre_commit` means the commit was skipped after a
 funnel, leveling or acknowledgement failure, while `commit` means the
-durable store write itself failed. Then check the `gateway` component on
-`/readyz` and the Neon status for the staging branch: a `commit` failure
-next to DB-error or pool alerts points at the database, not the gateway.
-Restart only after the logs show the dispatch worker stopped, per the
-[restart semantics](#restart-semantics-durable-resume-not-full-state-recovery);
-do not restart to "clear" the counter, since a replacement resets the
+durable store write itself failed. If the process already restarted, the
+counter and stage are gone from the scrape: read them from the Worker logs
+instead, where the keepalive re-emits each linger tick as
+`{"event":"container_gateway_failure","phase":…,"class":…}`. Then check the
+`gateway` component on `/readyz` and the Neon status for the staging branch:
+a `commit` failure next to DB-error or pool alerts points at the database,
+not the gateway. Do not restart manually: the process exits on its own after
+the linger and the supervisor restarts from the committed checkpoint — verify
+the replacement is healthy per the
+[restart semantics](#restart-semantics-durable-resume-not-full-state-recovery).
+Do not restart to "clear" the counter, since a replacement resets the
 baseline without recovering the uncommitted checkpoint.
 
 Escalate when the increase repeats across windows, when `commit` failures

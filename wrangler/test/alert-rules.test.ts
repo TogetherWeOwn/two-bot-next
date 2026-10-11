@@ -181,6 +181,27 @@ test("gateway checkpoint failures fire on any increase, never on the first sampl
   );
 });
 
+test("gateway checkpoint failure pages on the pre-exit scrape and resolves after the restart", () => {
+  // Models the linger-then-exit lifecycle: `shutdown::FAILURE_LINGER` (75 s)
+  // outlasts one 60 s keepalive tick plus the 6 s probe timeout, so the
+  // incremented counter is always scraped before the process exits and the
+  // restart resets it to zero.
+  const baseline = ev([`two_bot_gateway_checkpoint_failures_total{stage="commit"} 0`]);
+  assert.deepEqual(baseline.firing, []);
+  // Pre-exit scrape during the linger: the increase pages.
+  const page = ev([`two_bot_gateway_checkpoint_failures_total{stage="commit"} 1`], baseline.state);
+  assert.deepEqual(page.firing, ["gateway_checkpoint_failures"]);
+  // Post-restart scrape: the counter reset resolves without firing.
+  const afterRestart = ev([`two_bot_gateway_checkpoint_failures_total{stage="commit"} 0`], page.state);
+  assert.deepEqual(afterRestart.firing, []);
+  // The replacement stays quiet until a new failure increments again.
+  assert.deepEqual(ev([`two_bot_gateway_checkpoint_failures_total{stage="commit"} 0`], afterRestart.state).firing, []);
+  assert.deepEqual(
+    ev([`two_bot_gateway_checkpoint_failures_total{stage="commit"} 1`], afterRestart.state).firing,
+    ["gateway_checkpoint_failures"],
+  );
+});
+
 test("receiver refusals need three consecutive windows with new refusals, never the first sample or a reset", () => {
   const refused = (family: string, outcome: string, n: number) =>
     `two_bot_internal_actions_total{family="${family}",outcome="${outcome}"} ${n}`;

@@ -11,10 +11,14 @@ pub(crate) const TIMEOUT_ENV: &str = "SHUTDOWN_TIMEOUT_SECONDS";
 const MAX_SECONDS: u64 = 900;
 
 /// After the gateway task fails, `/readyz` keeps serving (with `gateway_failure`)
-/// this long before the process drains and exits: long enough for the rollout
-/// gate's 5 s poll and for a keepalive tick to land in it, far below the
+/// this long before the process drains and exits: longer than one 60 s
+/// keepalive tick plus the 6 s probe timeout (see `wrangler/wrangler.toml`
+/// `KEEPALIVE_SECONDS` and the keepalive probes in `wrangler/src/index.ts`),
+/// so at least one keepalive scrape always sees the incremented
+/// `two_bot_gateway_checkpoint_failures_total` counter and the `/readyz`
+/// failure class before the restart resets the counter — still far below the
 /// Container's SIGTERM-to-SIGKILL grace period. A shutdown signal cuts it short.
-pub(crate) const FAILURE_LINGER: Duration = Duration::from_secs(15);
+pub(crate) const FAILURE_LINGER: Duration = Duration::from_secs(75);
 
 /// Accepted dispatches get `DISPATCH_DRAIN_MAX` to commit their checkpoint; the
 /// extra margin covers HTTP and job cleanup.
@@ -89,5 +93,23 @@ mod tests {
         assert_eq!(deadline_from(Some("10")), Duration::from_secs(10));
         assert_eq!(deadline_from(Some(" 900 ")), Duration::from_secs(900));
         assert_eq!(deadline_from(Some("1")), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn failure_linger_covers_a_keepalive_tick() {
+        // Pinned against `wrangler/wrangler.toml` KEEPALIVE_SECONDS (60) and
+        // the 6 s keepalive probe timeout in `wrangler/src/index.ts`: a
+        // checkpoint failure must stay scrapable for at least one full
+        // keepalive tick, or the `gateway_checkpoint_failures` rule never sees
+        // the increase before the restart resets the counter. Keep the bound
+        // far below the container grace period.
+        const KEEPALIVE_SECONDS: u64 = 60;
+        const PROBE_TIMEOUT_SECONDS: u64 = 6;
+        assert!(
+            FAILURE_LINGER.as_secs() > KEEPALIVE_SECONDS + PROBE_TIMEOUT_SECONDS,
+            "linger {:?} must outlast one keepalive tick plus the probe timeout",
+            FAILURE_LINGER
+        );
+        assert!(FAILURE_LINGER.as_secs() < MAX_SECONDS);
     }
 }
