@@ -2085,6 +2085,110 @@ async fn denied_handoff_falls_back_to_revoke_only_then_retries_the_grant() {
 }
 
 #[tokio::test]
+async fn revoked_fallback_keeps_handoff_pending_until_access_returns() {
+    let (live, store, http, trace) = owned_room();
+    let mut room_channel = channel(500, 2, Some(CATEGORY));
+    room_channel.permission_overwrites = Some(vec![owner_overwrite(MEMBER)]);
+    live.upsert_channel(room_channel);
+    // The combined revoke+grant PATCH is refused; the revoke-only fallback
+    // clears the former owner and defers the new-owner grant.
+    http.view_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    let mut worker = GuildRoomWorker::load(live.clone(), store, http)
+        .await
+        .unwrap();
+    worker.apply_ownership(MEMBER, false, OwnershipCommand::Transfer { target_id: 301 });
+    dispatch(&mut worker, 0).await;
+    let owner_mask = Permissions::from_bits_retain(OWNER_ALLOW_BITS);
+    {
+        let state = live.inner.read().unwrap();
+        let overwrites = state.channels[&500].permission_overwrites.as_ref().unwrap();
+        assert!(
+            !overwrites
+                .iter()
+                .any(|o| o.id.get() == MEMBER && o.allow.intersects(owner_mask)),
+            "fallback must revoke the former owner"
+        );
+        assert!(
+            !overwrites
+                .iter()
+                .any(|o| o.id.get() == 301 && o.allow.intersects(owner_mask)),
+            "new owner grant waits for the retry"
+        );
+    }
+    assert!(worker.store.owner_pending.lock().unwrap().contains(&500));
+    assert_eq!(worker.store.rooms.lock().unwrap()[&500].owner_id, MEMBER);
+    // Lose Manage Roles before the retry: the handoff must stay pending even
+    // though no stranded grant remains, or the new owner would never be
+    // granted after access returns.
+    let full_access = live.inner.read().unwrap().bot.clone().unwrap();
+    let mut reduced = full_access.clone();
+    for role in &mut reduced.roles {
+        role.permissions &= !Permissions::MANAGE_ROLES;
+    }
+    live.refresh_bot(reduced);
+    dispatch(&mut worker, 100_000).await;
+    assert!(
+        worker.store.owner_pending.lock().unwrap().contains(&500),
+        "revoked-but-ungranted handoff stays pending without access"
+    );
+    assert_eq!(worker.store.rooms.lock().unwrap()[&500].owner_id, MEMBER);
+    assert!(
+        !trace
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call == "update_ownership:500:301"),
+        "no commit while the grant is still owed"
+    );
+    // Restore access: the retry converges on the new owner.
+    live.refresh_bot(full_access);
+    dispatch(&mut worker, 200_000).await;
+    assert!(!worker.store.owner_pending.lock().unwrap().contains(&500));
+    assert_eq!(worker.store.rooms.lock().unwrap()[&500].owner_id, 301);
+    let state = live.inner.read().unwrap();
+    let overwrites = state.channels[&500].permission_overwrites.as_ref().unwrap();
+    assert!(!overwrites
+        .iter()
+        .any(|o| o.id.get() == MEMBER && o.allow.intersects(owner_mask)));
+    assert!(overwrites.contains(&owner_overwrite(301)));
+}
+
+#[tokio::test]
+async fn fallback_patch_propagates_rate_limit_and_unauthorized() {
+    let rate_limited = RoomHttpError::RateLimited {
+        retry_after_ms: 100,
+        global: false,
+    };
+    for (fallback_error, expected) in [
+        (rate_limited, rate_limited),
+        (RoomHttpError::Unauthorized, RoomHttpError::Unauthorized),
+        (RoomHttpError::Cancelled, RoomHttpError::AccessDenied),
+        (RoomHttpError::NotFound, RoomHttpError::AccessDenied),
+    ] {
+        let (live, store, http, _) = owned_room();
+        let mut room_channel = channel(500, 2, Some(CATEGORY));
+        room_channel.permission_overwrites = Some(vec![owner_overwrite(MEMBER)]);
+        live.upsert_channel(room_channel);
+        http.view_errors
+            .lock()
+            .unwrap()
+            .push_back(RoomHttpError::AccessDenied);
+        http.view_errors.lock().unwrap().push_back(fallback_error);
+        let worker = GuildRoomWorker::load(live.clone(), store, http)
+            .await
+            .unwrap();
+        assert_eq!(
+            worker.rewrite_owner_grant(500, &[MEMBER], 301).await,
+            Err(expected),
+            "fallback {fallback_error:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn late_owner_overwrite_response_never_replaces_newer_gateway_evidence() {
     for event in ["update", "delete", "reconnect"] {
         let (live, store, mut http, _) = owned_room();

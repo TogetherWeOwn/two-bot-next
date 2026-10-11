@@ -3196,14 +3196,27 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 .permissions(self.live.guild_id, channel_id)
                 .is_some_and(|p| p.contains(Permissions::VIEW_CHANNEL | Permissions::MANAGE_ROLES));
             if !can_write {
-                // Rooms created without Manage Roles are category-synced and
-                // have no bot-issued owner grant to move. Do not invent one.
+                // A stranded former-owner grant keeps the handoff pending
+                // until access returns. A revoke-only fallback may also have
+                // cleared that grant without granting the new owner yet: the
+                // cache then looks like a category-synced room with nothing to
+                // move, but closing here would drop the journal and leave the
+                // new owner without permissions permanently. Keep the handoff
+                // pending whenever the current owner still lacks a grant.
                 if current.iter().any(|o| {
                     o.kind == PermissionOverwriteType::Member
                         && o.id.get() != owner_id
                         && issued_members.contains(&o.id.get())
                         && o.allow.intersects(owner_mask)
                 }) {
+                    return Err(RoomHttpError::AccessDenied);
+                }
+                let owner_has_grant = current.iter().any(|o| {
+                    o.kind == PermissionOverwriteType::Member
+                        && o.id.get() == owner_id
+                        && o.allow.intersects(owner_mask)
+                });
+                if !owner_has_grant {
                     return Err(RoomHttpError::AccessDenied);
                 }
                 return Ok(());
@@ -3322,7 +3335,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             .publish_owner_overwrites(revoked, generation, revision);
                         return Err(RoomHttpError::AccessDenied);
                     }
-                    Err(_) => return Err(RoomHttpError::AccessDenied),
+                    Err(fallback_error) => match fallback_error {
+                        RoomHttpError::AccessDenied
+                        | RoomHttpError::Cancelled
+                        | RoomHttpError::NotFound => {
+                            return Err(RoomHttpError::AccessDenied);
+                        }
+                        other => return Err(other),
+                    },
                 }
             }
             Err(error) => return Err(error),
