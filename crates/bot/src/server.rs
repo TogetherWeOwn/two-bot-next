@@ -99,14 +99,22 @@ pub(crate) fn router_with_guard(
         )
 }
 
-/// Span factory for the public listener: method plus a redacted path only.
+/// Routes the public listener serves; the only paths a span may record.
+/// Keep in sync with `router_with_guard` and `metrics_http::router`.
+const TRACED_PATHS: [&str; 4] = ["/health", "/healthz", "/readyz", "/metrics"];
+
+/// Recorded for every path that is not an exact `TRACED_PATHS` entry.
+const REDACTED_PATH: &str = "[REDACTED]";
+
+/// Span factory for the public listener: method plus an allowlisted path only.
 ///
 /// tower-http's default span records the full request URI, query string
 /// included, so a misrouted `webhooks/{app}/{token}` path or a `?token=`
 /// query would copy a credential into trace storage (the same `url.full`
 /// finding that keeps Worker traces off). Query strings are dropped outright
-/// and any `webhooks` path segment redacts the whole path. Headers are never
-/// recorded.
+/// and any path that is not one of the listener's own routes is replaced by a
+/// constant marker, so encoded, mixed-case, parameterized and unknown paths
+/// never reach a span. Headers are never recorded.
 #[derive(Clone, Copy, Debug, Default)]
 struct RedactedHttpMakeSpan;
 
@@ -120,19 +128,15 @@ impl<B> MakeSpan<B> for RedactedHttpMakeSpan {
     }
 }
 
-/// Strip the query string and redact webhook-token shaped paths. The return
-/// borrows the redaction marker for token-bearing paths, else the URI path.
-fn redacted_path(uri: &axum::http::Uri) -> &str {
-    const REDACTED: &str = "[REDACTED]";
+/// Drop the query string and return the path only when it exactly matches a
+/// served route (a static string, never the supplied bytes), else the marker.
+fn redacted_path(uri: &axum::http::Uri) -> &'static str {
     let path = uri.path();
-    if path
-        .split('/')
-        .any(|segment| segment.eq_ignore_ascii_case("webhooks"))
-    {
-        REDACTED
-    } else {
-        path
-    }
+    TRACED_PATHS
+        .iter()
+        .copied()
+        .find(|route| *route == path)
+        .unwrap_or(REDACTED_PATH)
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -429,30 +433,88 @@ mod tests {
     }
 
     #[test]
-    fn redacted_path_strips_queries_and_webhook_segments() {
+    fn redacted_path_allows_only_served_routes() {
         use axum::http::Uri;
         for (raw, expected) in [
             ("/health", "/health"),
+            ("/healthz", "/healthz"),
             ("/readyz", "/readyz"),
             ("/metrics", "/metrics"),
-            ("/readyz?token=fixture-webhook-token", "/readyz"),
+            ("/readyz?token=fixture-query-secret", "/readyz"),
             ("/health?key=fixture-query-secret", "/health"),
             ("/api/webhooks/1/fixture-webhook-token", "[REDACTED]"),
+            ("/api/WebHooks/1/fixture-webhook-token", "[REDACTED]"),
+            ("/api/%77ebhooks/1/fixture-webhook-token", "[REDACTED]"),
+            ("/api/%57EBHOOKS/1/fixture-webhook-token", "[REDACTED]"),
+            ("/api/webhooks%2F1%2Ffixture-webhook-token", "[REDACTED]"),
+            ("/api/interactions/fixture-interaction-token", "[REDACTED]"),
+            ("/Health", "[REDACTED]"),
+            ("/health/", "[REDACTED]"),
+            ("/health/fixture-unknown-segment", "[REDACTED]"),
+            ("/%68ealth", "[REDACTED]"),
+            ("/", "[REDACTED]"),
             (
-                "/api/webhooks/1/fixture-webhook-token?key=fixture-query-secret",
+                "/fixture-unknown-path?token=fixture-query-secret",
                 "[REDACTED]",
             ),
         ] {
             let uri: Uri = raw.parse().unwrap();
-            assert_eq!(redacted_path(&uri), expected, "uri {raw}");
+            assert!(
+                redacted_path(&uri) == expected,
+                "request path redaction failed"
+            );
         }
     }
 
-    /// Webhook tokens must never reach trace spans or log events through the
-    /// public listener: query strings, token-shaped paths and authorization
-    /// headers are all exercised here.
+    /// Credential-shaped request paths and queries must never reach trace
+    /// spans or log events through the public listener, at any level, and
+    /// the listener's routing and status codes must be unchanged.
     #[test]
-    fn http_trace_spans_never_carry_webhook_tokens() {
+    fn http_trace_spans_never_carry_request_paths() {
+        const SENTINELS: [&str; 6] = [
+            "fixture-webhook-token",
+            "fixture-interaction-token",
+            "fixture-unknown-segment",
+            "fixture-query-secret",
+            "fixture-header-secret",
+            "fixture-encoded-token",
+        ];
+        let cases: [(&str, StatusCode); 13] = [
+            (
+                "/readyz?token=fixture-query-secret",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            ("/health?key=fixture-query-secret", StatusCode::OK),
+            ("/healthz", StatusCode::OK),
+            (
+                "/api/webhooks/1/fixture-webhook-token",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "/api/WebHooks/1/fixture-webhook-token",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "/api/%77ebhooks/1/fixture-webhook-token",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "/api/webhooks%2F1%2Ffixture-encoded-token",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "/api/interactions/fixture-interaction-token/callback",
+                StatusCode::NOT_FOUND,
+            ),
+            ("/fixture-unknown-segment", StatusCode::NOT_FOUND),
+            ("/health/fixture-unknown-segment", StatusCode::NOT_FOUND),
+            (
+                "/nope?token=fixture-query-secret&k=fixture-encoded-token",
+                StatusCode::NOT_FOUND,
+            ),
+            ("/Health", StatusCode::NOT_FOUND),
+            ("/metrics?token=fixture-query-secret", StatusCode::OK),
+        ];
         let recorder = SpanRecorder::default();
         tracing::subscriber::with_default(recorder.clone(), || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -461,11 +523,7 @@ mod tests {
                 .unwrap();
             rt.block_on(async {
                 let app = router(state(GatewayState::Unconfigured));
-                for uri in [
-                    "/readyz?token=fixture-webhook-token",
-                    "/health?key=fixture-query-secret",
-                    "/api/webhooks/1/fixture-webhook-token",
-                ] {
+                for (uri, expected) in cases {
                     let response = app
                         .clone()
                         .oneshot(
@@ -477,7 +535,8 @@ mod tests {
                         )
                         .await
                         .unwrap();
-                    let _ = axum::body::to_bytes(response.into_body(), 8192)
+                    assert_eq!(response.status(), expected, "request status changed");
+                    let _ = axum::body::to_bytes(response.into_body(), 65536)
                         .await
                         .unwrap();
                 }
@@ -485,24 +544,32 @@ mod tests {
             });
         });
         let text = recorder.text();
+        // A failed redaction assertion must not dump the captured data itself.
         assert!(
             text.contains("capture remains active"),
-            "recorder saw no events:\n{text}"
+            "recorder saw no events"
         );
-        assert!(
-            text.contains("span request"),
-            "http trace span missing:\n{text}"
-        );
-        assert!(
-            text.contains("[REDACTED]"),
-            "webhook path was not redacted:\n{text}"
-        );
-        for secret in [
-            "fixture-webhook-token",
-            "fixture-query-secret",
-            "fixture-header-secret",
-        ] {
-            assert!(!text.contains(secret), "credential reached traces:\n{text}");
+        assert!(text.contains("span request"), "http trace span missing");
+        assert!(text.contains("http.request.method=GET"), "method missing");
+        for known in ["/health", "/healthz", "/readyz", "/metrics"] {
+            assert!(
+                text.lines()
+                    .any(|l| l.ends_with(&format!("http.request.path={known}"))),
+                "known route missing"
+            );
+        }
+        let spans = text
+            .lines()
+            .filter(|l| l.starts_with("span request"))
+            .count();
+        let marked = text
+            .lines()
+            .filter(|l| l.ends_with("http.request.path=[REDACTED]"))
+            .count();
+        assert_eq!(spans, cases.len(), "one span per request");
+        assert_eq!(marked, 9, "unknown paths must carry the marker");
+        for secret in SENTINELS {
+            assert!(!text.contains(secret), "credential reached traces");
         }
     }
 

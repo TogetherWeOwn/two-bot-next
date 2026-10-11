@@ -115,6 +115,7 @@ headroom below are historical, not measurements of the current PR head:
 |---|---|---|---|---|
 | Runtime image | Historical Docker image inspect `Size` from 2026-09-30 PR #78 (uncompressed layers, not registry transfer size) | 87.19 MiB / 91,429,497 bytes | 112 MiB / 117,440,512 bytes | 24.81 MiB / 28.4% |
 | Release binary | `stat` of `/home/two-bot/two-bot` in the final image, event-executors head | 15.04 MiB / 15,770,928 bytes (2026-10-10; [event-executors CI smoke](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/38062362788/job/114254309361)) | 16 MiB / 16,777,216 bytes | 0.96 MiB / 6.4% |
+| Release binary — automation-only head before event-executor merge | `stat` of `/home/two-bot/two-bot` in the final image | 15.04 MiB / 15,769,872 bytes | 16 MiB / 16,777,216 bytes | 0.96 MiB / 6.0% |
 
 The runtime-image row above is the historical inspect `Size` result, not the
 current gate metric. The linked event-executors job measured the current metric,
@@ -159,6 +160,11 @@ The 16 MiB working tripwire leaves 1,006,288 bytes (0.96 MiB, 6.4%) above the
 event-executors measurement. No new dependencies or release-profile changes;
 revisit if the binary approaches the limit. The 112 MiB image ceiling is
 unchanged.
+
+This branch's automation-only head separately measured 15,769,872 bytes
+(15.04 MiB) before the event-executor merge. This PR keeps the current-main
+16 MiB binary ceiling; the combined exact-head CI measurement is still
+required.
 
 ### Docker history image measurement and immutable-ID pinning
 

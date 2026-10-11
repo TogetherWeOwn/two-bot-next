@@ -133,6 +133,10 @@ pub enum ImportServiceError {
 /// port keeps them atomic with the `put` path). Audit ids derive
 /// deterministically from `audit_id`, so a retried internal action with the
 /// same key replays the receiver's stored result instead of minting new rows.
+/// The summary row keeps the stable `imported:N,skipped:S,conflicts:C` outcome
+/// string and carries the conflict names as a JSON array in `reason`, so a
+/// replay can return the first `{imported,skipped,conflicts}` result verbatim
+/// even after an admin edits a row out of band.
 #[allow(clippy::too_many_arguments)]
 pub async fn import(
     pool: &PgPool,
@@ -237,7 +241,9 @@ pub async fn import(
             "imported:{imported},skipped:{skipped},conflicts:{}",
             conflicts.len()
         ),
-        reason: None,
+        // Conflict names replay verbatim (see the `import` docs): a JSON
+        // array, never message content, so names with separators survive.
+        reason: Some(serde_json::to_string(&conflicts).unwrap_or_else(|_| "[]".to_owned())),
     };
     store::audit(&mut *tx, &summary, &format!("{audit_id}#summary"), at).await?;
     tx.commit().await?;

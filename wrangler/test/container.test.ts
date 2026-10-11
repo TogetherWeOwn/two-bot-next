@@ -1090,6 +1090,58 @@ const ALERT_ENV = {
   OPS_ALERT_FORWARDING: "on",
 };
 
+for (const failure of ["http", "fetch", "body", "missing", "invalid"] as const) {
+  test(`DO dispatch tickets survive ${failure} scrape failure without a false clear`, async (t) => {
+    const h = await alertHarness(t, ALERT_ENV);
+    let count = 20;
+    let failed = false;
+    t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
+      const path = new URL(typeof input === "string" ? input : input.url).pathname;
+      if (path !== "/metrics") return new Response(null, { status: 200 });
+      if (failed) {
+        if (failure === "fetch") throw new Error("synthetic metrics transport failure");
+        if (failure === "http") return new Response(null, { status: 503 });
+        if (failure === "missing") return new Response("");
+        if (failure === "invalid") return new Response('two_bot_dispatch_drops_total{lane="reactions"} NaN\n');
+        const response = new Response("");
+        t.mock.method(response, "text", async () => { throw new Error("synthetic metrics body failure"); });
+        return response;
+      }
+      return new Response(`two_bot_dispatch_drops_total{lane="reactions"} ${count}\n`);
+    });
+    for (const n of [20, 21, 22]) {
+      count = n;
+      await h.tick();
+      assert.equal(h.posts.length, 0);
+    }
+    failed = true;
+    await h.tick();
+    failed = false;
+    count = 23;
+    await h.tick();
+    assert.equal(h.posts.length, 0, "failure interrupted the two-rise streak; return is only a baseline");
+    for (const n of [24, 25, 26]) {
+      count = n;
+      await h.tick();
+    }
+    assert.equal(h.posts.length, 1);
+    const content = JSON.parse(h.posts[0]!.init.body as string).content;
+    assert.match(content, /ALERT dispatch_drops:reactions \(ticket\):/);
+    assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, ["dispatch_drops:reactions"]);
+    failed = true;
+    await h.tick();
+    assert.equal(h.posts.length, 1, "missing evidence must not send RESOLVED");
+    assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, ["dispatch_drops:reactions"]);
+    failed = false;
+    count = 27;
+    await h.tick();
+    await h.tick();
+    assert.equal(h.posts.length, 2, "only the second valid (flat) sample proves recovery");
+    assert.equal(JSON.parse(h.posts[1]!.init.body as string).content, "two-bot-next RESOLVED dispatch_drops:reactions.");
+    assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, []);
+  });
+}
+
 type AlertSender = "readiness" | "metrics";
 async function senderHarness(t: TestContext, sender: AlertSender, env: Partial<Env>, values?: Map<string, unknown>) {
   const h = await alertHarness(t, { UNREADY_ALERT_FAILURES: "1", ...env }, values);
