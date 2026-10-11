@@ -1,3 +1,4 @@
+id: rust-test-global-metrics
 valid:
 - '#[test] fn counter() { let metrics = Metrics::default(); run(&metrics); assert_eq!(metrics.count(), 1); }'
 invalid:

@@ -1,3 +1,4 @@
+id: rust-erased-map-err
 valid:
 - 'fn f() { executor().map_err(|error| format!("cannot configure command REST client: {error}"))?; }'
 invalid:

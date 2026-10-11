@@ -240,7 +240,7 @@ class RuleShapeTests(unittest.TestCase):
         }
         for rule_id in rule_ids:
             rule = ROOT / f"ast-grep-rules/{rule_id}.yml"
-            fixture = ROOT / f"ast-grep-rules/tests/{rule_id}-test.yml"
+            fixture = ROOT / f"ast-grep-rule-tests/{rule_id}-test.yml"
             self.assertTrue(rule.is_file(), rule)
             self.assertTrue(fixture.is_file(), fixture)
             self.assertEqual(yaml.safe_load(rule.read_text())["id"], rule_id)

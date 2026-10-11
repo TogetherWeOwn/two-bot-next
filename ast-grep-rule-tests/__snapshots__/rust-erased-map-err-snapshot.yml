@@ -1,0 +1,8 @@
+id: rust-erased-map-err
+snapshots:
+  fn f() { executor().map_err(|_| "cannot configure command REST client")?; }:
+    labels:
+    - source: executor().map_err(|_| "cannot configure command REST client")
+      style: primary
+      start: 9
+      end: 71

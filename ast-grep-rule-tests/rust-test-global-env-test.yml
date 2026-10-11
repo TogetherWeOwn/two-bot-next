@@ -1,3 +1,4 @@
+id: rust-test-global-env
 valid:
 - '#[test] fn test_flag() { let config = Config { feature: true }; assert!(config.feature); }'
 invalid:
