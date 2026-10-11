@@ -9,7 +9,7 @@ import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { setImmediate } from "node:timers/promises";
-import worker, { TwoBotContainer, type Env } from "../src/index.ts";
+import worker, { MAX_METRICS_BODY_BYTES, TwoBotContainer, readBoundedText, type Env } from "../src/index.ts";
 import { OWNER_KEY, AUDIT_PREFIX, DEPLOYMENT_HEADER, CONTROL_PATH } from "../src/ownership.ts";
 
 const ID = "deployment-A";
@@ -1020,6 +1020,30 @@ test("DO /ops/metrics: small body proxies status with the exposition content typ
   assert.equal(await response.text(), "# HELP x\n");
 });
 
+test("metrics scrape helper passes valid bodies byte-identical and caps at 64 KiB", async () => {
+  assert.equal(MAX_METRICS_BODY_BYTES, 64 * 1024);
+  const valid = `# HELP two_bot_dispatch_drops_total drops\n# TYPE two_bot_dispatch_drops_total counter\ntwo_bot_dispatch_drops_total{lane="messages"} 7\n`;
+  assert.equal(await readBoundedText(new Response(valid), MAX_METRICS_BODY_BYTES), valid);
+  const exact = "m 1\n".repeat(16384);
+  assert.equal(new TextEncoder().encode(exact).byteLength, MAX_METRICS_BODY_BYTES);
+  assert.equal(await readBoundedText(new Response(exact), MAX_METRICS_BODY_BYTES), exact);
+  const over = `${exact}x`;
+  assert.equal(await readBoundedText(new Response(over), MAX_METRICS_BODY_BYTES), null);
+});
+
+test("metrics scrape helper consumes oversize bodies without buffering them", async () => {
+  let pulled = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      pulled += 1;
+      controller.enqueue(new TextEncoder().encode("m 1\n".repeat(8192)));
+      if (pulled >= 8) controller.close();
+    },
+  });
+  assert.equal(await readBoundedText(new Response(stream), MAX_METRICS_BODY_BYTES), null);
+  assert.ok(pulled <= 3, `oversize scrape must cancel early, pulled ${pulled} chunks`);
+});
+
 // Readiness monitoring uses synthetic responses only. Global fetch is stubbed
 // in every alert test: no configured webhook, Worker or database is contacted.
 async function alertHarness(t: TestContext, env: Partial<Env> = {}, values?: Map<string, unknown>) {
@@ -1103,6 +1127,34 @@ for (const failure of ["http", "fetch", "body", "missing", "invalid"] as const) 
     assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, []);
   });
 }
+
+test("DO dispatch tickets survive oversized scrape without buffering it or logging the body", async (t) => {
+  const h = await alertHarness(t, ALERT_ENV);
+  const lane = (n: number) => `two_bot_dispatch_drops_total{lane="messages"} ${n}\n`;
+  let mode: "valid" | "oversize" = "valid";
+  let count = 20;
+  const oversizeMarker = `synthetic-oversize-marker-${"m".repeat(64)}`;
+  const oversizeBody = `${lane(count)}# ${oversizeMarker}\n${"m 1\n".repeat(20000)}`;
+  assert.ok(new TextEncoder().encode(oversizeBody).byteLength > MAX_METRICS_BODY_BYTES);
+  t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
+    const path = new URL(typeof input === "string" ? input : input.url).pathname;
+    if (path !== "/metrics") return new Response(null, { status: 200 });
+    return new Response(mode === "oversize" ? oversizeBody : lane(count));
+  });
+  for (const n of [20, 21, 22, 23]) {
+    count = n;
+    await h.tick();
+  }
+  assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, ["dispatch_drops:messages"]);
+  assert.equal(h.posts.length, 1);
+  mode = "oversize";
+  await h.tick();
+  assert.equal(h.posts.length, 1, "oversize scrape must not send RESOLVED");
+  assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, ["dispatch_drops:messages"]);
+  assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.dispatchDrops, {}, "overflow clears the baseline like other failed scrapes");
+  assert.ok(h.logs.every((line) => !line.includes(oversizeMarker)), "no raw scrape body in logs");
+  assert.ok(h.logs.every((line) => !line.includes("m 1\nm 1")), "no exposition bytes in logs");
+});
 
 type AlertSender = "readiness" | "metrics";
 async function senderHarness(t: TestContext, sender: AlertSender, env: Partial<Env>, values?: Map<string, unknown>) {
