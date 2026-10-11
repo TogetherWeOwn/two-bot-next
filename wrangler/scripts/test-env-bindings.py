@@ -2,6 +2,7 @@
 """Offline regressions for optional alert bindings. No Worker API calls."""
 import importlib.util
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -167,6 +168,93 @@ class AlertBindingTests(unittest.TestCase):
                     errors = self.check_config(config)
                     self.assertTrue(any(f"{key} is an Operator-set Worker secret" in e for e in errors), errors)
                     self.assertFalse(any("synthetic-secret" in e for e in errors))
+
+
+def drop_env(content, env):
+    """Remove every [env.<env>.*] section header and its body lines."""
+    out = []
+    skip = False
+    for line in content.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped.startswith("["):
+            skip = stripped == f"[env.{env}]\n" or stripped.startswith(
+                (f"[env.{env}.", f"[[env.{env}.")
+            )
+            if skip:
+                continue
+        if skip:
+            continue
+        out.append(line)
+    return "".join(out)
+
+
+class RequiredEnvironmentTests(unittest.TestCase):
+    def check_config(self, content):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "wrangler.toml"
+            path.write_text(content)
+            return checker.check(path)
+
+    def run_cli(self, path):
+        return subprocess.run(
+            [sys.executable, str(Path(__file__).with_name("check-env-bindings.py")), str(path)],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_missing_staging_is_rejected(self):
+        errors = self.check_config(drop_env(BASE, "staging"))
+        required = [e for e in errors if "missing required environment(s)" in e]
+        self.assertEqual(len(required), 1)
+        self.assertIn("['staging']", required[0])
+
+    def test_missing_production_is_rejected(self):
+        errors = self.check_config(drop_env(BASE, "production"))
+        self.assertTrue(any("missing required environment(s)" in e for e in errors), errors)
+        required = [e for e in errors if "missing required environment(s)" in e]
+        self.assertEqual(len(required), 1)
+        self.assertIn("['production']", required[0])
+
+    def test_missing_both_envs_is_rejected(self):
+        errors = self.check_config(drop_env(drop_env(BASE, "staging"), "production"))
+        required = [e for e in errors if "missing required environment(s)" in e]
+        self.assertEqual(len(required), 1)
+        self.assertIn("staging", required[0])
+        self.assertIn("production", required[0])
+
+    def test_additional_env_is_still_checked(self):
+        config = BASE + '\n[env.preview.vars]\nTWO_GUILD_NAME = "Preview"\n'
+        errors = self.check_config(config)
+        self.assertTrue(any("[env.preview]" in e for e in errors), errors)
+        self.assertFalse(any("missing required environment(s)" in e for e in errors), errors)
+
+    def test_malformed_toml_is_controlled(self):
+        marker = "SYNTHETIC_MALFORMED_MARKER_XYZ"
+        errors = self.check_config(f"NOT VALID TOML [[[\n{marker} = \"unclosed\n")
+        self.assertEqual(len(errors), 1)
+        self.assertIn("invalid Wrangler config", errors[0])
+        self.assertNotIn(marker, errors[0])
+
+    def test_malformed_toml_cli_has_no_traceback(self):
+        marker = "SYNTHETIC_MALFORMED_MARKER_XYZ"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "wrangler.toml"
+            path.write_text(f"NOT VALID TOML [[[\n{marker} = \"unclosed\n")
+            proc = self.run_cli(path)
+        self.assertNotEqual(proc.returncode, 0)
+        combined = proc.stdout + proc.stderr
+        self.assertNotIn("Traceback", combined)
+        self.assertNotIn(marker, combined)
+
+    def test_missing_file_is_controlled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "does-not-exist.toml"
+            errors = checker.check(missing)
+            proc = self.run_cli(missing)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("unreadable Wrangler config", errors[0])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("Traceback", proc.stdout + proc.stderr)
 
 
 if __name__ == "__main__":

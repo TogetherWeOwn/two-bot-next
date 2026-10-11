@@ -6,6 +6,13 @@ non-inheritable: an [env.*] section deploys with ONLY what it declares.
 TOG-9907: env.staging declared only TWO_GUILD_NAME, so the deployed Worker
 had no TWO_BOT binding and /health + /readyz returned HTTP 1101.
 
+Required-environment contract: wrangler.toml must declare both
+[env.staging] and [env.production]. A config missing either (or both)
+fails with a fixed missing-environment error, before any per-binding
+checks. Additional named environments are allowed and get the same
+per-binding checks as the required ones. An unreadable file or invalid
+TOML fails with a fixed diagnostic and no traceback or value echo.
+
 Usage: python3 scripts/check-env-bindings.py [wrangler.toml]
 Exit 1 lists the missing keys per environment.
 """
@@ -16,6 +23,19 @@ from pathlib import Path
 
 REQUIRED_CONTAINERS_CLASS = "TwoBotContainer"
 REQUIRED_DO_BINDING = "TWO_BOT"
+# Deployment environments that must both be declared. Additional named
+# environments are allowed and receive the same per-binding checks.
+REQUIRED_ENVS = ("staging", "production")
+# Fixed diagnostics: never echo TOML content or values, only these strings.
+INVALID_TOML_ERROR = "invalid Wrangler config: TOML does not parse (expected valid TOML)"
+UNREADABLE_CONFIG_ERROR = "unreadable Wrangler config: file cannot be read"
+
+
+def missing_env_error(missing: list[str]) -> str:
+    return (
+        f"missing required environment(s) {missing} "
+        "(wrangler.toml must declare [env.staging] and [env.production])"
+    )
 # Extra plain vars every environment must repeat beyond the top-level [vars]
 # keys (derived automatically below). Values may differ per env; presence of
 # the key is what matters, since vars are not inherited.
@@ -53,8 +73,13 @@ VOICE_PRESENCE_ENVS = {"staging"}
 
 
 def check(path: Path) -> list[str]:
-    with path.open("rb") as f:
-        cfg = tomllib.load(f)
+    try:
+        with path.open("rb") as f:
+            cfg = tomllib.load(f)
+    except OSError:
+        return [UNREADABLE_CONFIG_ERROR]
+    except (tomllib.TOMLDecodeError, ValueError):
+        return [INVALID_TOML_ERROR]
 
     errors: list[str] = []
     # Every top-level var must be repeated in each named env (values may
@@ -62,8 +87,11 @@ def check(path: Path) -> list[str]:
     # REDIRECT_* vars from TOG-9696 were top-level-only until this check.
     required_vars = (set(cfg.get("vars", {})) - OPTIONAL_SECRET_BINDINGS - OPTIONAL_VARS) | EXTRA_REQUIRED_VARS
     envs = cfg.get("env", {})
-    if not envs:
-        return ["no [env.*] sections found"]
+    if not isinstance(envs, dict):
+        return [INVALID_TOML_ERROR]
+    missing = sorted(set(REQUIRED_ENVS) - set(envs))
+    if missing:
+        return [missing_env_error(missing)]
 
     for prefix, section in [("[vars]", cfg), *[(f"[env.{name}.vars]", env) for name, env in envs.items()]]:
         variables = section.get("vars", {})
@@ -147,7 +175,7 @@ def main() -> int:
     for err in errors:
         print(f"::error file={path}::{err}")
     if errors:
-        print(f"\n{len(errors)} missing env binding(s) in {path}")
+        print(f"\n{len(errors)} env binding problem(s) in {path}")
         return 1
     print(f"env bindings OK in {path}")
     return 0
