@@ -174,7 +174,7 @@ export interface MetricsAlertState {
   gatewayRecoveries: number;
   /** False until a valid sample stores the gateway baseline: the first sample never fires. */
   gatewayUnpairedSeen: boolean;
-  /** Disconnects not yet matched by a RESUMED or fresh READY (never negative). */
+  /** Disconnect outstanding with no RESUMED or fresh READY since (0 or 1). */
   gatewayUnpaired: number;
   /** Consecutive completed samples with an unpaired disconnect outstanding. */
   gatewayUnpairedStreak: number;
@@ -249,18 +249,40 @@ function pairGatewayDisconnects(samples: Sample[], prev: MetricsAlertState): { f
   if (disconnects < carried.gatewayDisconnects || recoveries < carried.gatewayRecoveries) {
     return { firing: wasFiring, fields: baseline };
   }
-  const unpaired = Math.max(
-    0,
-    carried.gatewayUnpaired + (disconnects - carried.gatewayDisconnects) - (recoveries - carried.gatewayRecoveries),
-  );
-  const streak = unpaired > 0 ? carried.gatewayUnpairedStreak + 1 : 0;
+  // Any recovery growth means the gateway came back: a RESUMED or fresh READY
+  // landed since the previous sample. It always clears the outstanding loss,
+  // even when the same window also added disconnects. The disconnect series
+  // counts every failed Twilight retry, close frame, op 9 invalid session and
+  // cold-resume IDENTIFY (`transport_disconnected` in crates/bot/src/gateway.rs),
+  // so one recovered outage routinely adds N disconnects against a single
+  // recovery; subtracting the growths would leave a permanent N-1 remainder
+  // that pages forever (docs/cutover-dashboard-queries.md forbids exactly this
+  // subtraction). Presence, not arithmetic, pairs each loss with its recovery.
+  if (recoveries > carried.gatewayRecoveries) {
+    return {
+      firing: false,
+      fields: {
+        gatewayDisconnects: disconnects,
+        gatewayRecoveries: recoveries,
+        gatewayUnpairedSeen: true,
+        gatewayUnpaired: 0,
+        gatewayUnpairedStreak: 0,
+      },
+    };
+  }
+  // No recovery since the previous sample: new disconnect growth opens an
+  // outstanding loss, and flat counters keep it outstanding. Only consecutive
+  // outstanding samples count toward the bound. `> 0` (not `=== 1`) also
+  // retires balances stored by older Worker versions that carried a count.
+  const outstanding = disconnects > carried.gatewayDisconnects || carried.gatewayUnpaired > 0;
+  const streak = outstanding ? carried.gatewayUnpairedStreak + 1 : 0;
   return {
-    firing: unpaired > 0 && (streak >= GATEWAY_UNPAIRED_SAMPLES || wasFiring),
+    firing: outstanding && (streak >= GATEWAY_UNPAIRED_SAMPLES || wasFiring),
     fields: {
       gatewayDisconnects: disconnects,
       gatewayRecoveries: recoveries,
       gatewayUnpairedSeen: true,
-      gatewayUnpaired: unpaired,
+      gatewayUnpaired: outstanding ? 1 : 0,
       gatewayUnpairedStreak: streak,
     },
   };

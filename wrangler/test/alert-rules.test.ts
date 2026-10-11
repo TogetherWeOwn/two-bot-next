@@ -258,12 +258,38 @@ test("gateway unpaired pages on the third unpaired sample and resolves once reco
   assert.deepEqual(ev(gateway(1, 1), fire.state).firing, []);
 });
 
-test("gateway unpaired: two disconnects against one recovery leave one unpaired, below the bound", () => {
+test("gateway unpaired: one outage with failed retries ends in a single RESUMED and never pages", () => {
+  // A close frame plus one failed Twilight retry, then a single RESUMED in the
+  // same window: N disconnects against one recovery is retry noise, not a loss.
   const base = ev(gateway(0, 0));
-  const two = ev(gateway(2, 1), base.state);
-  assert.deepEqual(two.state.gatewayUnpaired, 1);
-  assert.deepEqual(two.firing, []);
-  assert.deepEqual(ev(gateway(2, 2), two.state).firing, []);
+  const recovered = ev(gateway(2, 1), base.state);
+  assert.deepEqual(recovered.state.gatewayUnpaired, 0);
+  assert.deepEqual(recovered.firing, []);
+  // No remainder lingers: flat samples stay quiet indefinitely.
+  let quiet = recovered;
+  for (let i = 0; i < 5; i++) {
+    quiet = ev(gateway(2, 1), quiet.state);
+    assert.deepEqual(quiet.firing, []);
+  }
+  assert.equal(quiet.state.gatewayUnpairedStreak, 0);
+  // A later healthy disconnect+resume pair stays quiet too.
+  const pair = ev(gateway(3, 2), quiet.state);
+  assert.deepEqual(pair.firing, []);
+  assert.deepEqual(ev(gateway(3, 2), pair.state).firing, []);
+});
+
+test("gateway unpaired: close frame, then op 9, then a fresh READY never pages", () => {
+  const base = ev(gateway(0, 0));
+  const close = ev(gateway(1, 0), base.state);
+  const op9 = ev(gateway(2, 0), close.state);
+  assert.deepEqual([close.firing, op9.firing], [[], []]);
+  const ready = ev(gateway(2, 0, 1), op9.state);
+  assert.deepEqual(ready.firing, []);
+  let quiet = ready;
+  for (let i = 0; i < 5; i++) {
+    quiet = ev(gateway(2, 0, 1), quiet.state);
+    assert.deepEqual(quiet.firing, []);
+  }
 });
 
 test("gateway unpaired never fires on the first sample, which only stores the baseline", () => {

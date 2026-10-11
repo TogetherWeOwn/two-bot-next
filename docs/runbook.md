@@ -411,10 +411,16 @@ the bound. The third consecutive unpaired sample comes about two to three
 minutes after the disconnect, so a reconnect that resumes within two samples
 never pages and a gateway that stays down does.
 
-Each valid window adds the disconnect growth and subtracts the recovery growth
-from an unpaired count that never drops below zero. The alert fires when that
-count stays above zero for 3 consecutive samples and resolves on the first
-sample where it returns to zero. The first sample only stores the baseline. A
+A disconnect is outstanding while the recovery counters have not grown since
+the disconnect growth started. Any growth in RESUMED plus fresh READY clears
+the outstanding loss at once, even when the same window also added
+disconnects: the disconnect series counts every failed Twilight retry, close
+frame, op 9 invalid session and cold-resume IDENTIFY, so one recovered outage
+routinely adds several disconnects against a single recovery, and subtracting
+the growths would page forever on the leftover (see the pairing warning in
+[cutover dashboard queries](cutover-dashboard-queries.md)). The alert fires
+when a loss stays outstanding for 3 consecutive samples and resolves on the
+first sample with recovery growth. The first sample only stores the baseline. A
 missing, duplicated, or non-numeric sample changes nothing and holds the current
 state. A counter that went backwards means the process restarted: that sample is
 not a window, the streak restarts, and a firing alert holds rather than
