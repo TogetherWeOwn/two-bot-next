@@ -898,6 +898,60 @@ class NonfiniteJobFieldTest(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn("PASS jobs-map:", out)
 
+    def test_ungraded_feeds_with_nonfinite_stays_green(self):
+        body = (200, (
+            '{"components": [["process", "ready"], ["gateway", "ready"]],'
+            '"jobs": {"feeds": {"parked": false, "running": true, '
+            '"last_success": NaN}},'
+            '"build_revision": "r", "build_id": "b"}').encode())
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+
+    def test_ungraded_unknown_job_with_nonfinite_stays_green(self):
+        body = (200, (
+            '{"components": [["process", "ready"], ["gateway", "ready"]],'
+            '"jobs": {"brand_new_job": {"parked": false, "running": true, '
+            '"consecutive_failures": Infinity}},'
+            '"build_revision": "r", "build_id": "b"}').encode())
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+
+    def test_degraded_503_with_nonfinite_stays_green(self):
+        body = (503, (
+            '{"components": [["process", "ready"], ["gateway", "ready"], '
+            '["database", "down"]],'
+            '"jobs": {"counter": {"parked": false, "running": true, '
+            '"last_success": NaN}},'
+            '"build_revision": "r", "build_id": "b"}').encode())
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+        self.assertIn("freshness not graded", out)
+
+    def test_fresh_success_with_nonfinite_last_start_still_fails(self):
+        now_ms = int(time.time() * 1000)
+        entry = ('{"parked": false, "running": true, '
+                 '"last_success": %d, "last_start": NaN}' % now_ms)
+        self.assert_structured_fail(entry, "last_start")
+
+    def test_helpers_reject_nonfinite_directly(self):
+        now_ms = int(time.time() * 1000)
+        for field in ("last_success", "last_start"):
+            for value in (float("nan"), float("inf"), float("-inf")):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaisesRegex(probe.ProbeError,
+                                                f"nonfinite {field}"):
+                        probe._field_age_seconds({field: value}, field, now_ms)
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(probe.ProbeError,
+                                            "nonfinite consecutive_failures"):
+                    probe.consecutive_failures({"consecutive_failures": value})
 
 class FixedCadenceJobGradingTest(unittest.TestCase):
     """self_role_recovery (30 s cadence, 25 s timeout) and automod_expiry
