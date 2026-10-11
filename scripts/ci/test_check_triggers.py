@@ -118,7 +118,7 @@ class CheckTriggerSurfaceTests(unittest.TestCase):
         )
         self.assertTrue(
             any(re.match(r"^\s*workflow_dispatch:\s*$", line) for line in on_block),
-            "release workflow dispatches check on release-please branches",
+            "manual dispatch (single-core flake validation) must stay",
         )
 
     def test_concurrency_cancels_superseded_runs(self):
