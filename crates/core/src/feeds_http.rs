@@ -169,7 +169,8 @@ pub fn validate_content_type(content_type: Option<&str>) -> Result<(), FetchErro
     }
     // Media type only: parameters (e.g. `; charset=utf-8`) never grant
     // acceptance. A substring in a parameter (`text/html; foo=atom`) must
-    // not read as a feed type.
+    // not read as a feed type. The `x-` and `text/rss+xml` variants are
+    // legacy media types some servers still send for real feeds.
     let media = raw
         .split(';')
         .next()
@@ -178,7 +179,10 @@ pub fn validate_content_type(content_type: Option<&str>) -> Result<(), FetchErro
         .to_ascii_lowercase();
     match media.as_str() {
         "application/rss+xml"
+        | "application/x-rss+xml"
+        | "text/rss+xml"
         | "application/atom+xml"
+        | "application/x-atom+xml"
         | "application/rdf+xml"
         | "application/xml"
         | "text/xml" => Ok(()),

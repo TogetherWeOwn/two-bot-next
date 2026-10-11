@@ -234,9 +234,14 @@ fn body_cap_counts_chunked_decompressed_bytes_and_utf8() {
 #[test]
 fn content_type_validates_media_type_not_parameters() {
     // Supported feed media types pass, with any parameters ignored.
+    // The `x-` and `text/rss+xml` entries are legacy media types some
+    // servers still send for real feeds.
     for valid in [
         "application/rss+xml",
+        "application/x-rss+xml",
+        "text/rss+xml",
         "application/atom+xml; charset=UTF-8",
+        "application/x-atom+xml; charset=UTF-8",
         "application/xml",
         "text/xml",
         "application/rdf+xml",
@@ -256,6 +261,7 @@ fn content_type_validates_media_type_not_parameters() {
     // substring; the media type alone decides, before any body parsing.
     for hostile in [
         "text/html; foo=atom",
+        "text/html; foo=x-rss+xml",
         "text/html; charset=xml",
         "text/plain; x=rss",
         "application/json; xml=true",
