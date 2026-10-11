@@ -90,7 +90,9 @@ it:
 
 Rules the validator enforces: `revision` is 40 lowercase hex characters;
 `deploy_staging_run_id` is digits; every command has a non-negative
-`duration_ms`; every `fail` row carries a `failure_signature`; records with
+`duration_ms`; every `fail` row carries a `failure_signature`; a record with
+any `fail` row and a `PASS` verdict is rejected (a run with a failed command
+must be `NEEDS WORK`); records with
 `"mock": true` are rejected as real evidence (the mock example is the only
 file allowed to carry it). Duplicate object keys at any depth are rejected in
 both the record and schema, before a repeated field can hide a value or override

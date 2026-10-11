@@ -77,6 +77,55 @@ class RunRecordValidatorTests(unittest.TestCase):
             f"fail without signature must fail: {errors}",
         )
 
+    def test_pass_disposition_with_failed_command_rejected(self):
+        for mock in (True, False):
+            with self.subTest(mock=mock):
+                record = fresh_record(mock=mock)
+                record["verdict"]["disposition"] = "PASS"
+                errors = checker.validate(record, SCHEMA, allow_mock=True)
+                self.assertTrue(
+                    any("$.verdict.disposition" in error for error in errors),
+                    f"PASS over a failed command must fail (mock={mock}): {errors}",
+                )
+                self.assertTrue(
+                    any("NEEDS WORK" in error for error in errors),
+                    f"rejection must point at NEEDS WORK: {errors}",
+                )
+
+    def test_cli_rejects_pass_with_failed_command(self):
+        record = fresh_record()
+        record["verdict"]["disposition"] = "PASS"
+        code, out, err = self.cli(json.dumps(record))
+        self.assertEqual(code, 1)
+        self.assertIn("$.verdict.disposition", out)
+        self.assertEqual(err, "")
+
+    def test_needs_work_with_failed_command_valid(self):
+        record = fresh_record(mock=False)
+        failed = [c for c in record["commands"] if c["result"] == "fail"]
+        self.assertTrue(failed, "fixture must contain a failed command")
+        self.assertEqual(record["verdict"]["disposition"], "NEEDS WORK")
+        self.assertEqual(checker.validate(record, SCHEMA), [])
+
+    def test_pass_with_all_passing_commands_valid(self):
+        record = fresh_record(mock=False)
+        for command in record["commands"]:
+            command["result"] = "pass"
+            command.pop("failure_signature", None)
+        record["verdict"]["disposition"] = "PASS"
+        record["verdict"]["summary"] = "All commands passed."
+        self.assertEqual(checker.validate(record, SCHEMA), [])
+
+    def test_pass_with_skipped_commands_valid(self):
+        record = fresh_record(mock=False)
+        for command in record["commands"]:
+            if command["result"] == "fail":
+                command["result"] = "skipped"
+                command.pop("failure_signature", None)
+        record["verdict"]["disposition"] = "PASS"
+        record["verdict"]["summary"] = "Passing commands plus skipped gated surfaces."
+        self.assertEqual(checker.validate(record, SCHEMA), [])
+
     def test_negative_duration_fails(self):
         record = fresh_record()
         record["commands"][0]["duration_ms"] = -5
