@@ -45,7 +45,8 @@
 
 use crate::voice_conditions::{ConditionFacts, Conditions};
 use crate::voice_naming::{
-    resolve_room_name_with, Evaluation, ExtensionPolicy, RoomContext, Template,
+    parse, render_text, resolve_room_name_with, Evaluation, ExtensionPolicy, RoomContext, Template,
+    MAX_TEMPLATE_BYTES,
 };
 use crate::voice_style::{apply_chain, parse_modes};
 
@@ -105,4 +106,25 @@ pub fn resolve_room_name(
     raw_name: &str,
 ) -> String {
     resolve_room_name_with(template, ctx, raw_name, &TemplateExtensions::new(facts))
+}
+
+/// Render a free-text template (a voice status line) with full V6
+/// behaviour: trimmed, at most `max_chars` characters, and empty for a blank
+/// or oversized template or an empty render. No channel-name fallback.
+#[must_use]
+pub fn resolve_text(
+    template: &str,
+    ctx: &RoomContext,
+    facts: &ConditionFacts,
+    max_chars: usize,
+) -> String {
+    if template.trim().is_empty() || template.len() > MAX_TEMPLATE_BYTES {
+        return String::new();
+    }
+    render_text(
+        &parse(template),
+        ctx,
+        &TemplateExtensions::new(facts),
+        max_chars,
+    )
 }

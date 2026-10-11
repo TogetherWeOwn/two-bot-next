@@ -468,6 +468,9 @@ impl CommandRuntime {
                     pool.clone(),
                     executor.clone(),
                     config,
+                    std::env::vars()
+                        .filter(|(key, _)| crate::ticket_runtime::LIVE_KEYS.contains(&key.as_str()))
+                        .collect(),
                 ) {
                     Ok(runtime) => Some(Arc::new(runtime)),
                     Err(_) => return None,
@@ -559,6 +562,20 @@ impl CommandRuntime {
             })
             .await
             .map(|_| ())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn initialize_custom_commands_for_test(
+        &self,
+        config: crate::gateway_commands::GatewayCommandConfig,
+    ) {
+        let commands = crate::gateway_commands::GatewayCommands::for_test(
+            self.pool.clone(),
+            self.executor.clone(),
+            config,
+            Arc::clone(&self.interactions.router),
+        );
+        assert!(self.gateway_commands.set(commands).is_ok());
     }
 
     /// Test constructor: skips env gate reads so tests inject their own
@@ -914,6 +931,17 @@ impl CommandRuntime {
     /// routing never sends a second response after an acknowledgement.
     pub fn dispatch(self: &Arc<Self>, event: &Event) -> bool {
         self.dispatch_with_verdict(event, None)
+    }
+
+    /// Record a refused prefix candidate without dispatching the message.
+    /// Called by the ordered gateway worker when its capture-only gate stops a
+    /// create before the detached handler can account for the refusal.
+    pub(crate) fn record_refused_prefix_trigger(&self, event: &Event) {
+        if let Event::MessageCreate(message) = event {
+            if let Some(custom) = self.gateway_commands.get() {
+                custom.record_refused_prefix_trigger(&message.0);
+            }
+        }
     }
 
     /// Message dispatch with the automod verdict for this create. `None` keeps

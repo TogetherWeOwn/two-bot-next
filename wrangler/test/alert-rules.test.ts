@@ -252,7 +252,7 @@ test("ticker stale fires past 10 minutes, ignores boot, parked and fresh tickers
 test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   const window = "2026-10-09T20-11-06Z";
   // Single shared spelling with the Rust canonical list (ALERT_RULE_IDS in
-  // crates/core/src/evidence.rs); both sides pin all eleven here and there.
+  // crates/core/src/evidence.rs); both sides pin every spelling here and there.
   assert.deepEqual(RULES.map((r) => r.id), [
     "job_stale",
     "job_consecutive_failures",
@@ -264,6 +264,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "gateway_missed_events",
     "ticker_stale",
     "receiver_refusals",
+    "dispatch_drops",
     "gateway_checkpoint_failures",
   ]);
   assert.equal(packetFilename("job_stale:rank", window), `evidence-job_stale-${window}.json`);
@@ -276,6 +277,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("gateway_missed_events", window), `evidence-gateway_missed_events-${window}.json`);
   assert.equal(packetFilename("ticker_stale:scheduled_messages", window), `evidence-ticker_stale-${window}.json`);
   assert.equal(packetFilename("receiver_refusals:moderation", window), `evidence-receiver_refusals-${window}.json`);
+  assert.equal(packetFilename("dispatch_drops:reactions", window), `evidence-dispatch_drops-${window}.json`);
   assert.equal(packetFilename("gateway_checkpoint_failures", window), `evidence-gateway_checkpoint_failures-${window}.json`);
   // Unknown keys get no filename rather than a misleading one; hostile
   // window stamps stay filename-safe.
@@ -339,6 +341,11 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
     refused = ev([`two_bot_internal_actions_total{family="moderation",outcome="auth_failure"} ${n}`], refused.state);
   }
   firing.push(...refused.firing);
+  let dropped = ev([`two_bot_dispatch_drops_total{lane="reactions"} 0`]);
+  for (const n of [1, 2, 3]) {
+    dropped = ev([`two_bot_dispatch_drops_total{lane="reactions"} ${n}`], dropped.state);
+  }
+  firing.push(...dropped.firing);
   firing.push(
     ...ev(
       [`two_bot_gateway_checkpoint_failures_total{stage="commit"} 1`],

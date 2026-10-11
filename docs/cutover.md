@@ -123,7 +123,10 @@ that can mutate the copied data can be paused and resumed without duplication.
 **T−15 min:** run read-only command diff and preflight with the production
 application/guild through the authorized REST executor (no gateway startup).
 Capture token-valid/application identity, intent flags, role/channel results and
-session-start budget; FAIL is NO-GO, WARN needs a recorded disposition. Snapshot
+the `session start budget` check (`GET /gateway/bot`: `remaining`, `total`,
+`reset_after_ms`, `max_concurrency`); FAIL is NO-GO (exit 1), including
+`remaining` below 10 or an unreadable budget, while WARN (`remaining` below
+100) needs a recorded disposition but keeps exit 0. Snapshot
 legacy configuration, command definitions **and separate guild permissions**
 *before* any overwrite. Confirm the legacy restart path does not auto-register a
 different registry or resume a stale session. Verify the persisted Worker/DO
@@ -609,6 +612,12 @@ warm until separate retirement authorization; do not close B4 on a failed watch.
 ## Rollback: preserve Next-window writes before reopening legacy
 
 **Maximum accepted loss:** **0 acknowledged committed database writes**.
+See the "Production decision window" section in
+[cutover-rollback-runbook.md](cutover-rollback-runbook.md#production-decision-window)
+for the recorded 2-hour decision window from `T_0` and the forward-fix posture
+after its closure. The zero-loss gate below continues to govern reopening
+legacy.
+
 The Next write window is `[T_0, T_r]` (up to the full 48-hour watch, longer if
 extended), not merely the time since the last nightly backup. Restore-to-`T_f`
 alone would lose that entire window and is **not an acceptable rollback**.

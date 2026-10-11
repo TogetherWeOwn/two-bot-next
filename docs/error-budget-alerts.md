@@ -93,6 +93,24 @@ page immediately rather than consuming budget:
 
 None of these rules changes the burn thresholds, windows or budget above.
 
+## Related sustained dispatch ticket (not burn)
+
+`dispatch_drops:<lane>` raises a **ticket, never a page**, when
+`two_bot_dispatch_drops_total{lane}` grows in three consecutive completed
+keepalive sample windows after a baseline. The fixed lanes are `messages`,
+`interactions`, `registry`, `privileged`, `busy` and `reactions`; each has its
+own streak. Reaction drops include per-member fairness refusals, so sustained
+growth is not by itself proof of undersizing, nor of gateway packet loss.
+
+A single burst stays silent. Flat or backwards counter windows clear the
+streak and resolve an active ticket. Missing/invalid series and unsuccessful
+scrapes break the streak and invalidate the baseline without falsely resolving
+an active ticket. The next valid sample establishes a baseline, not recovery;
+a subsequent valid flat/reset window is required to resolve. Old DO state
+without the new fields starts unbaselined. Triage within the watch shift using
+[dispatch drops](runbook.md#alert-dispatch-drops); no paging escalation or
+fast/slow burn math is added or changed by this rule.
+
 ## Maintenance
 
 Thresholds, windows, the budget ratio and the worked example move with

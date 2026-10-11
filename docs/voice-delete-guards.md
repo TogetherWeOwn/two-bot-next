@@ -2,19 +2,22 @@
 
 The worker shares delete evidence with gateway publication. Every ordinary
 room delete checks authoritative readiness, tracked provenance, protected IDs,
-human occupancy, a continuous 60-second human-empty grace, and current
-permissions. The HTTP adapter re-evaluates the same live guard immediately before
+human occupancy, a continuous human-empty grace, and current permissions. The
+grace defaults to 60 seconds; `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` (0 to 600, read
+at boot) changes it. The HTTP adapter re-evaluates the same live guard immediately before
 sending, including after rate-limit waits. A human join cancels the marker even
 if they leave again before the actor next reconciles. Unknown bot identity counts
 as human; known bot-only occupancy still permits cleanup after the grace.
 
-A complete reconnect snapshot starts a new grace. This deliberately takes the
-safer path than the legacy boot-time immediate-empty delete. Missing channels
+A complete reconnect snapshot starts a new grace. With a non-zero grace this
+deliberately takes the safer path than the legacy boot-time immediate-empty
+delete; `0` removes that reconnect grace too, so every human-empty tracked room is
+deleted on the first tick after a boot or reconnect, as the legacy bot did. Missing channels
 need no Discord delete; forgetting their row remains idempotent. Exact-result
 failed-create compensation bypasses only grace, not protected IDs or humans.
 Real-time lifecycle-race fixtures that predate the grace shorten it through
-`VoiceRuntime::with_empty_grace`; no production path calls it, and the paused-time
-guard tests pin the 60-second default.
+`VoiceRuntime::with_empty_grace`. Production calls it once at build time with the
+configured grace, and the paused-time guard tests pin the 60-second default.
 
 ## Legacy obligation map
 

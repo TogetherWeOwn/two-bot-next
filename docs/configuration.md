@@ -29,27 +29,40 @@ Keys in
 legacy `HOT_WIRED` are labeled “reload-report hot” (the `RefreshReport::hot`
 partition in `settings.rs`); every other storable key reports cold.
 
-The twenty-five keys in `STORE_READ_KEYS`
+The thirty-two keys in `STORE_READ_KEYS`
 (`crates/core/tests/reference_docs.rs`) say “applied live by runtime refresh”
 instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECONDS`,
-`TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS` and `TWO_ANTI_NUKE_HEAT_THRESHOLD`
-(`crates/bot/src/containment_runtime.rs:61-67`, `:226`); join-risk applies
-`TWO_JOIN_RISK_THRESHOLD`, `TWO_JOIN_RISK_WINDOW_SECONDS` and
-`TWO_BULK_JOIN_WINDOW_UNTIL` (`crates/bot/src/join_risk_runtime.rs:66-70`,
-`:238`); raid applies `TWO_RAID_JOIN_THRESHOLD` and `TWO_RAID_WINDOW_SECONDS`
-(`crates/bot/src/raid_runtime.rs:45-46`, `:170`); onboarding merges its
+`TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS`, `TWO_ANTI_NUKE_HEAT_THRESHOLD` and
+`DISCORD_STAFF_ALERT_CHANNEL_ID`
+(`crates/bot/src/containment_runtime.rs:61-67`, `:227`); join-risk applies
+`TWO_JOIN_RISK_THRESHOLD`, `TWO_JOIN_RISK_WINDOW_SECONDS`,
+`TWO_BULK_JOIN_WINDOW_UNTIL` and `DISCORD_STAFF_ALERT_CHANNEL_ID`
+(`crates/bot/src/join_risk_runtime.rs:66-70`, `:239`); raid applies
+`TWO_RAID_JOIN_THRESHOLD`, `TWO_RAID_WINDOW_SECONDS` and
+`DISCORD_STAFF_ALERT_CHANNEL_ID`
+(`crates/bot/src/raid_runtime.rs:45-48`, `:177`); onboarding merges its
 `CONFIG_KEYS` from the snapshot on each relevant
 event (`crates/bot/src/onboarding.rs:21-30`, `:175-182`); message-path automod
 applies its ten live lists, thresholds and the enforce flag from the snapshot
 on every delivery (`crates/bot/src/automod_gateway.rs:192-203`, `:273`);
 the feed poller applies `TWO_FEED_POLL_SECONDS` from the snapshot before
-every tick (`crates/bot/src/feed_jobs.rs:232-259`). Two boot-only edges
+every tick (`crates/bot/src/feed_jobs.rs:232-259`); the audit mirror applies
+`DISCORD_AUDIT_LOG_CHANNEL_ID`, `DISCORD_VOICE_LOG_CHANNEL_ID` and
+`DISCORD_MODERATION_LOG_CHANNEL_ID` from the snapshot on every record and
+sweep (`crates/bot/src/audit_runtime.rs`), where blanking all three parks the
+mirror live and a malformed row keeps the last good destinations; ticket operations apply
+`DISCORD_TICKET_CATEGORY_ID`, `DISCORD_TICKET_PANEL_CHANNEL_ID` and
+`DISCORD_TICKET_STAFF_ROLE_ID` from the snapshot on every execute, recovery
+and purge (`crates/bot/src/ticket_runtime.rs`). Three boot-only edges
 remain: the feed supervisor still wakes on the boot cadence, so a stored
 interval change takes effect no earlier than the previously scheduled slot
 and runs at the stored value rounded up to a multiple of the boot cadence
-(`crates/bot/src/feed_jobs.rs:227-244`), and the voice room-name policy is
+(`crates/bot/src/feed_jobs.rs:227-244`); the voice room-name policy is
 built once at boot from the process environment
-(`crates/bot/src/gateway.rs:1608`). Every other
+(`crates/bot/src/gateway.rs:1608`); and gateway intents plus ticket command
+publication read the ticket destination keys once at boot, so a stored ticket
+destination reaches already-published commands only through the per-operation
+refresh above. Every other
 storable row's stored value is unwired.
 
 Gateway boot reads process environment only, through a fixed set of loaders:
@@ -67,7 +80,7 @@ When voice is enabled, `build_production_runtime` also reads
 `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID`, `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID`,
 `TWO_TEMP_VOICE_CATEGORY_ID` and `TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS` solely
 for delete protection, not creator provisioning. Its empty grace is fixed at
-60 seconds; `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` remains unwired.
+60 seconds unless `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` (0 to 600) sets it.
 Onboarding, automod, scorecard and classifier typed loaders exist but are not
 called during boot; their defaults below come from empty-map calls. The separate
 `preflight` operator CLI validates further catalog keys from the environment
@@ -117,22 +130,22 @@ Catalog entries: 122.
 | `CREDENTIALS_DIRECTORY` | env_only | Not specified in Next | environment only | Legacy credential-file directory; environment-only boot input. |
 | `DISCORD_ANCHOR_WELCOME_CHANNEL_ID` | hot | Not specified in Next | stored, applied live by runtime refresh | Destination for anchor-mode welcomes. |
 | `DISCORD_API_BASE` | env_only | Not specified in Next | environment only | Discord REST API origin; not dashboard-selectable. |
-| `DISCORD_AUDIT_LOG_CHANNEL_ID` | hot | Not specified in Next | stored unwired | Discord audit mirror destination. |
+| `DISCORD_AUDIT_LOG_CHANNEL_ID` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Discord audit mirror destination. |
 | `DISCORD_BOT_TOKEN` | env_only | Not rendered (secret) | environment only | Legacy Discord authentication token; never stored in guild settings. |
 | `DISCORD_GOODBYE_CHANNEL_IDS` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Channels used for session-mode goodbye routing. |
 | `DISCORD_GUILD_ID` | env_only | Not specified in Next | environment only | Legacy managed guild identifier; distinct from Container GUILD_ID. |
 | `DISCORD_LANDING_CHANNEL_IDS` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Onboarding landing destinations for game-picker routing. |
-| `DISCORD_MODERATION_LOG_CHANNEL_ID` | hot | Not specified in Next | stored unwired | Destination for moderation logs. |
+| `DISCORD_MODERATION_LOG_CHANNEL_ID` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Destination for moderation logs. |
 | `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID` | hot | Not specified in Next | env at boot; stored, applied live by runtime refresh | Voice lobby offered by session onboarding. |
 | `DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID` | hot | Not specified in Next | stored, applied live by runtime refresh | Looking-to-play destination offered by session onboarding. |
-| `DISCORD_STAFF_ALERT_CHANNEL_ID` | hot | Not specified in Next | stored unwired | Destination for staff alerts. |
+| `DISCORD_STAFF_ALERT_CHANNEL_ID` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Destination for staff alerts. |
 | `DISCORD_STAGING_BOT_TOKEN` | env_only | Not rendered (secret) | environment only | Staging Discord authentication token; never rendered. |
 | `DISCORD_STAGING_GUILD_ID` | env_only | Not specified in Next | environment only | Staging guild boundary; no ID is embedded in the reference. |
-| `DISCORD_TICKET_CATEGORY_ID` | hot | Not specified in Next | env at boot; stored unwired | Category for newly opened ticket channels. |
-| `DISCORD_TICKET_PANEL_CHANNEL_ID` | hot | Not specified in Next | env at boot; stored unwired | Destination for the ticket-opening panel. |
-| `DISCORD_TICKET_STAFF_ROLE_ID` | hot | Not specified in Next | env at boot; stored unwired | Staff role used by ticket authorization. |
+| `DISCORD_TICKET_CATEGORY_ID` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Category for newly opened ticket channels. |
+| `DISCORD_TICKET_PANEL_CHANNEL_ID` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Destination for the ticket-opening panel. |
+| `DISCORD_TICKET_STAFF_ROLE_ID` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Staff role used by ticket authorization. |
 | `DISCORD_TOKEN` | env_only | Not rendered (secret) | environment only | Container Discord authentication token; never stored in guild settings. |
-| `DISCORD_VOICE_LOG_CHANNEL_ID` | hot | Not specified in Next | stored unwired | Destination for voice-session logs. |
+| `DISCORD_VOICE_LOG_CHANNEL_ID` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Destination for voice-session logs. |
 | `LOG_LEVEL` | cold | Not specified in Next | stored unwired | Container two_bot tracing level when RUST_LOG is unset (info default); RUST_LOG overrides. |
 | `TEMP_VOICE_ENABLED` | cold | Not specified in Next | stored unwired | Legacy temporary-voice enable flag; classification does not imply runtime wiring. |
 | `TWO_ANNOUNCEMENTS` | cold | `false` | env at boot; stored unwired | Enable announcement command publication and routing. |
@@ -226,7 +239,7 @@ Catalog entries: 122.
 | `TWO_TEMP_VOICE_CATEGORY_ID` | cold | Not specified in Next | env at boot; stored unwired | Category for generated temporary voice rooms. |
 | `TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS` | cold | Not specified in Next | stored unwired | Cooldown between a member's temporary-room creations. |
 | `TWO_TEMP_VOICE_DISABLED_CONTROLS` | cold | Not specified in Next | stored unwired | Temporary-room controls; classification does not imply runtime wiring. |
-| `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` | cold | Not specified in Next | stored unwired | Grace period before an empty temporary room is removed. |
+| `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` | cold | Not specified in Next | env at boot; stored unwired | Grace period before an empty temporary room is removed. |
 | `TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID` | cold | Not specified in Next | env at boot; stored unwired | Voice channel used to request a temporary room. |
 | `TWO_TEMP_VOICE_MAX_PER_GUILD` | cold | Not specified in Next | stored unwired | Maximum temporary rooms per guild. |
 | `TWO_TEMP_VOICE_MAX_PER_USER` | cold | Not specified in Next | stored unwired | Maximum temporary rooms owned by one member. |
