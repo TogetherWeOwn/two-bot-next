@@ -3278,13 +3278,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// in-flight or scheduled retry — so a stale last-proposed entry or an
     /// externally diverged channel never holds a name. Submit time
     /// (`name_facts`) and flush time share this one helper via
-    /// `held_rename_names_in`; pass the already-held `LiveState` instead of
-    /// re-locking (see `LiveGuild::read_state`).
-    fn held_rename_names(&self, except: Snowflake) -> Vec<String> {
-        let live = self.live.read_state();
-        self.held_rename_names_in(&live, except)
-    }
-
+    /// `held_rename_names_in`, passing the already-held `LiveState` instead
+    /// of re-locking (see `LiveGuild::read_state`).
     fn held_rename_names_in(&self, live: &LiveState, except: Snowflake) -> Vec<String> {
         let mut held: Vec<String> = live
             .channels
