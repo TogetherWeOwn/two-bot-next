@@ -145,7 +145,7 @@ async fn release_lane_or_warn(store: &SelfRoleStore, lane: &PanelClaim, event_id
         Ok(true) => {}
         Ok(false) => warn!(
             event_id = %event_id,
-            "self-role panel claim release matched no live lane"
+            "self-role panel claim release matched no current claim"
         ),
         Err(error) => warn!(?error, event_id = %event_id, "self-role panel claim release failed"),
     }

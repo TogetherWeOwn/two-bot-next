@@ -3943,6 +3943,19 @@ async fn lost_panel_lane_release_is_logged(pool: &PgPool) -> TestResult {
     let logs = capture.text();
     assert!(logs.contains("self-role panel claim release"), "{logs}");
     assert!(logs.contains("lost-lane-release-event"), "{logs}");
+    let closed = PgPoolOptions::new().connect_lazy_with((*pool.connect_options()).clone());
+    closed.close().await;
+    let closed_store = SelfRoleStore::new(closed);
+    let capture = crate::tracing_capture::Capture::default();
+    release_lane_or_warn(&closed_store, &lane, "lost-lane-release-closed-store")
+        .with_subscriber(capture.clone())
+        .await;
+    let logs = capture.text();
+    assert!(
+        logs.contains("self-role panel claim release failed"),
+        "{logs}"
+    );
+    assert!(logs.contains("lost-lane-release-closed-store"), "{logs}");
     mock.shutdown().await;
     Ok(())
 }
