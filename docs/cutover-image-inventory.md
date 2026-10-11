@@ -8,8 +8,8 @@ head, described under Measured sample image.
 - Baseline inventory commit: `7797b1e166d2aa7b28725cdddc1b8f0c097a5ed5` (2026-10-03)
 - Builder-row refresh (2026-10-04): [`Dockerfile:10` at `723663df9c74fd24734170a981cf59908aadd33a`](https://github.com/TogetherWeOwn/two-bot-next/blob/723663df9c74fd24734170a981cf59908aadd33a/Dockerfile#L10).
   The baseline used `rust:1.94-trixie`; only the builder row now records the
-  Rust 1.98 tag and digest. Runtime, layer, SBOM and size notes below are the
-  measured record for the cutover candidate, not the baseline estimate.
+  Rust 1.98 tag and digest. Runtime, layer, SBOM and size notes below are measured on a CI-built
+  main-head sample, not the cutover candidate and not the baseline estimate.
 - Source files: `Dockerfile`, `.github/workflows/sbom.yml`,
   `docs/supply-chain.md`, `scripts/container-smoke.py`, `.trivyignore.yaml`
 - Method: files above plus a CI-built sample image of main head (build logs,
@@ -38,8 +38,8 @@ sample image named under Measured sample image.
 | R1 | `FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792…` | 21 base layers, 29,128,192 bytes (27.78 MiB) as saved-tar blobs | Debian trust bundle plus 14 documented OS packages; no shell, package manager, or OpenSSL CLI |
 | R2 | `LABEL org.opencontainers.image.revision`, `com.togetherweown.build-id` | Metadata only | Non-secret build provenance; zero bytes |
 | R3 | `USER 65532:65532`, `WORKDIR /home/nonroot` | One small layer, 1,024 bytes as saved-tar blob; `USER` is config-only | Config plus the workdir directory entry |
-| R4 | `COPY --from=builder /app/target/release/two-bot ./two-bot` | Yes, one file layer, 16,065,536 bytes (15.32 MiB) as saved-tar blob; file itself 16,062,800 bytes (15.32 MiB) | The only added file content: the stripped release binary (`opt-level=z`, LTO, stripped). Budget: 16 MiB per `scripts/container-smoke.py` |
-| R5 | `EXPOSE 8080`, `ENV LISTEN_ADDR=0.0.0.0:8080` | Metadata only | Liveness/readiness port and bind address |
+| R4 | `COPY --from=builder --chown=65532:65532 /app/target/release/two-bot ./two-bot` | Yes, one file layer, 16,065,536 bytes (15.32 MiB) as saved-tar blob; file itself 16,062,800 bytes (15.32 MiB) | The only added file content: the stripped release binary (`opt-level=z`, LTO, stripped). Budget: 16 MiB per `scripts/container-smoke.py` |
+| R5 | `EXPOSE 8080`, `ENV LISTEN_ADDR=0.0.0.0:8080 LOG_FORMAT=json` | Metadata only | Liveness/readiness port, bind address and JSON log format |
 | R6 | `HEALTHCHECK CMD ["/home/nonroot/two-bot", "--healthcheck"]` | Metadata only | Exec-form probe; needs no shell |
 | R7 | `ENTRYPOINT ["/home/nonroot/two-bot"]` | Metadata only | Exec form so PID 1 receives SIGTERM |
 
@@ -164,9 +164,15 @@ Before the deployment digest is pinned:
 1. Build the cutover candidate in CI and record its immutable image ID and
    source SHA.
 2. Download that run's `supply-chain` artifact; file the two `.cdx.json`
-   names, `SHA256SUMS`, and both gate results in the cutover evidence manifest
-   (`docs/cutover.md` B4).
-3. Re-measure R1 and R4 and the budget metric on the candidate's recorded
-   image ID (`docker history` / `docker inspect`), and confirm the 112 MiB /
-   16 MiB budgets pass. Pinning the deployment digest is tracked separately
-   and is not part of this inventory note.
+   names, `SHA256SUMS`, and both gate results under the Releases receipt of
+   the B4 evidence manifest (`docs/cutover.md` B4). That receipt does not list
+   SBOMs yet, so add them there.
+3. Re-measure R1, R4 and the budget metric on the candidate's image ID with
+   `docker history` / `docker inspect`, and confirm the 112 MiB / 16 MiB
+   budgets pass. CI keeps the candidate image only as the
+   `sbom-partial-<run_id>-<attempt>` artifact (`image.tar`, 1-day retention),
+   so download it and `docker load` it within that window. Otherwise, read the
+   budget lines from the candidate's container-smoke job log, which measures
+   that job's own build of the candidate's source SHA, not the image ID.
+   Pinning the deployment digest is tracked separately and is not part of
+   this inventory note.
