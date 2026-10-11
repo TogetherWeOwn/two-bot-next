@@ -404,8 +404,9 @@ library code with no Discord dependency and can start immediately.
     there.
 - Creator joins wake the guild queue immediately. Create the channel with its
   overrides already included, durably bind and persist it, then move the member
-  before companion creation or other queued writes; no 250 ms tick separates
-  those stages. If the member left before the move, delete the room.
+  before companion creation or unrelated queued writes; no 250 ms tick separates
+  those stages. Earlier writes scoped to the same room retain their order.
+  If the member left before the move, delete the room.
 - Rename and status requests detach immediately, keeping one request in flight
   per channel and collecting outcomes for coalescing and 429 retries.
 - The voice-only database pool keeps one warm connection and retains acquisition
