@@ -3,6 +3,9 @@
 import io
 import json
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
 
 from soak_evidence import summarize
@@ -171,6 +174,110 @@ class SoakEvidenceTests(unittest.TestCase):
                          "2026-09-20T00:00:02+00:00")
         self.assertEqual(summary["window"]["end"],
                          "2026-09-20T00:00:02+00:00")
+
+    def test_timestamp_regression_cannot_close_outage(self):
+        summary = run(
+            '{"ts": "2026-09-20T00:00:00Z", "event": "dispatch", "session": "a", "seq": 1}\n'
+            '{"ts": "2026-09-20T00:00:01Z", "event": "disconnect", "session": "a"}\n'
+            '{"ts": "2026-09-20T00:00:00Z", "event": "resume", "session": "a", "seq": 50}\n'
+            '{"ts": "2026-09-20T00:00:03Z", "event": "resume", "session": "a", "seq": 2}\n'
+            '{"ts": "2026-09-20T00:00:04Z", "event": "dispatch", "session": "a", "seq": 4}\n'
+        )
+        self.assertEqual(summary["redeploy_gaps_s"], [2.0])
+        self.assertTrue(all(gap >= 0 for gap in summary["redeploy_gaps_s"]))
+        self.assertEqual(summary["resumes"], 1)
+        self.assertEqual(summary["missed_sequence_windows"][0]["count"], 1)
+        self.assertEqual(summary["window"], {
+            "start": "2026-09-20T00:00:00+00:00",
+            "end": "2026-09-20T00:00:04+00:00",
+        })
+        self.assertEqual(len(summary["unknown_intervals"]), 1)
+        self.assertEqual(summary["unknown_intervals"][0]["reason"],
+                         "timestamp regression on line 3")
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_timestamp_regression_does_not_advance_sequence(self):
+        summary = run(
+            '{"ts": "2026-09-20T00:00:01Z", "event": "connect", "session": "a"}\n'
+            '{"ts": "2026-09-20T00:00:02Z", "event": "dispatch", "session": "a", "seq": 1}\n'
+            '{"ts": "2026-09-20T00:00:01Z", "event": "dispatch", "session": "a", "seq": 50}\n'
+            '{"ts": "2026-09-20T00:00:03Z", "event": "dispatch", "session": "a", "seq": 4}\n'
+        )
+        self.assertEqual(summary["dispatches"], 2)
+        self.assertEqual(summary["missed_sequence_windows"], [{
+            "session": "a",
+            "expected_after": 1,
+            "received": 4,
+            "count": 2,
+            "at": "2026-09-20T00:00:03+00:00",
+        }])
+        self.assertEqual(summary["unknown_intervals"][0]["reason"],
+                         "timestamp regression on line 3")
+
+    def test_timestamp_regression_does_not_reset_session_sequence(self):
+        summary = run(
+            '{"ts": "2026-09-20T00:00:01Z", "event": "dispatch", "session": "a", "seq": 1}\n'
+            '{"ts": "2026-09-20T00:00:03Z", "event": "dispatch", "session": "a", "seq": 2}\n'
+            '{"ts": "2026-09-20T00:00:02Z", "event": "connect", "session": "a"}\n'
+            '{"ts": "2026-09-20T00:00:04Z", "event": "dispatch", "session": "a", "seq": 4}\n'
+        )
+        self.assertEqual(summary["connects"], 0)
+        self.assertEqual(summary["missed_sequence_windows"][0]["count"], 1)
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_equal_timestamps_and_ordered_duplicate_dispatches_are_accepted(self):
+        summary = run(
+            '{"ts": "2026-09-20T00:00:01Z", "event": "connect", "session": "a"}\n'
+            '{"ts": "2026-09-20T00:00:01Z", "event": "dispatch", "session": "a", "seq": 1}\n'
+            '{"ts": "2026-09-20T00:00:01Z", "event": "dispatch", "session": "a", "seq": 1}\n'
+            '{"ts": "2026-09-20T00:00:02Z", "event": "dispatch", "session": "a", "seq": 2}\n'
+        )
+        self.assertEqual(summary["dispatches"], 3)
+        self.assertEqual(summary["missed_events"], 0)
+        self.assertEqual(summary["unknown_intervals"], [])
+        self.assertEqual(summary["verdict"], "PASS")
+
+    def test_regressed_unknown_record_is_not_applied_and_window_ignores_it(self):
+        summary = run(
+            '{"ts": "2026-09-20T00:00:02Z", "event": "connect", "session": "a"}\n'
+            '{"ts": "2026-09-20T00:00:01Z", "event": "unknown", '
+            '"start": "2026-09-20T00:00:00Z", '
+            '"end": "2026-09-20T00:00:01Z", "reason": "ignored regression"}\n'
+            '{"ts": "2026-09-20T00:00:03Z", "event": "dispatch", "session": "a", "seq": 1}\n'
+        )
+        self.assertEqual(summary["window"], {
+            "start": "2026-09-20T00:00:02+00:00",
+            "end": "2026-09-20T00:00:03+00:00",
+        })
+        self.assertEqual(summary["connects"], 1)
+        self.assertEqual(summary["dispatches"], 1)
+        self.assertEqual(summary["unknown_intervals"], [{
+            "start": "2026-09-20T00:00:01+00:00",
+            "end": "2026-09-20T00:00:01+00:00",
+            "reason": "timestamp regression on line 2",
+        }])
+
+    def test_cli_timestamp_regression_exits_nonzero_without_raw_record(self):
+        raw_record = (
+            '{"ts": "2026-09-20T00:00:00Z", "event": "resume", '
+            '"session": "private-session-value", "seq": 999}\n'
+        )
+        text = (
+            '{"ts": "2026-09-20T00:00:01Z", "event": "disconnect", "session": "a"}\n'
+            + raw_record
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "regression.jsonl"
+            path.write_text(text, encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/soak_evidence.py"), str(path)],
+                capture_output=True, text=True, check=False,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        summary = json.loads(result.stdout)
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+        self.assertNotIn("private-session-value", result.stdout + result.stderr)
+        self.assertNotIn("999", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

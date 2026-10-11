@@ -18,11 +18,14 @@ Log format (one JSON object per line):
     {"ts": "...", "event": "unknown", "start": "...", "end": "...",
      "reason": "log gap: supervisor restart"}
 
-A new session id resets the sequence baseline (Discord sequences are
-per-session; see docs/gateway-recovery.md). A repeated or older seq in the
-same session is a duplicate delivery, not a missed event. Any unrecognised
-``event`` value or malformed line is preserved as an UNKNOWN interval so the
-live run in TOG-10955 must explain it instead of inheriting a silent skip.
+Input records must be in nondecreasing timestamp order; equal timestamps
+are accepted. A regressed event becomes UNKNOWN and is not applied to outage,
+session, or sequence state. A new session id resets the sequence baseline
+(Discord sequences are per-session; see docs/gateway-recovery.md). A repeated
+or older seq in the same session is a duplicate delivery, not a missed event.
+Any unrecognised ``event`` value or malformed line is preserved as an UNKNOWN
+interval so the live run in TOG-10955 must explain it instead of inheriting a
+silent skip.
 
 Usage:
 
@@ -92,7 +95,7 @@ def summarize(lines):
     connects = disconnects = resumes = dispatches = 0
     missed = []
     unknowns = []
-    first_ts = last_ts = None
+    first_ts = last_ts = last_event_ts = None
     last_seq = {}  # session -> highest committed dispatch seq
     down_since = None  # ts of latest disconnect awaiting reconnect
     gaps = []  # disconnect->connect/resume durations in seconds
@@ -141,6 +144,10 @@ def summarize(lines):
         except ValueError:
             note_unknown(None, None, f"malformed line {lineno}: bad ts")
             continue
+        if last_event_ts is not None and ts < last_event_ts:
+            note_unknown(ts, ts, f"timestamp regression on line {lineno}")
+            continue
+        last_event_ts = ts
         first_ts = ts if first_ts is None else min(first_ts, ts)
         last_ts = ts if last_ts is None else max(last_ts, ts)
         # No RecursionError guard here or around parse_ts above: the record
