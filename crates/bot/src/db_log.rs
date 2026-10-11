@@ -13,8 +13,9 @@
 //!   three-variant error;
 //! - [`discord_class`] classifies a Discord executor failure (the fixed
 //!   `DiscordError::cause` vocabulary plus send-admission refusals);
-//! - config/gate failures render as authored strings with no secret and are
-//!   logged under `reason`, never `error`.
+//! - config/gate failures render as authored strings with no secret (an
+//!   invalid `TWO_FEED_POLL_SECONDS` value is echoed) and are logged under
+//!   `reason`, never `error`.
 //!
 //! `scripts/ci/test_db_error_lints.py` rejects new raw-error-field log
 //! sites in the four in-scope files, so add new failure logs with one of
