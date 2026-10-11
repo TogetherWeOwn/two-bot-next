@@ -66,6 +66,15 @@ body cap"; exact-cap valid input passes, and the extra byte never reaches a
 successful JSON path. Refusals never echo the body, headers, URL or parse
 exceptions.
 
+Duplicate-key refusal contract: every JSON object on both routes is decoded
+with duplicate keys refused instead of last-wins, at any depth and after
+escape decoding. A repeated key is refused before liveness, readiness-shape,
+gateway, jobs or fence grading with the fixed message "/health carries
+duplicate JSON object keys" or "/readyz <status> carries duplicate JSON
+object keys"; identical repeats and both conflicting orders fail closed, and
+unique objects still parse. Refusals leave no receipt and never echo keys,
+values, paths or parse exceptions.
+
 Usage:
   python3 scripts/qa_cutover_probes.py --base-url URL [--expect-ready]
       [--timeout SECONDS] [--evidence FILE]
@@ -163,6 +172,30 @@ class ProbeError(Exception):
     """A check's one-line failure reason."""
 
 
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
+
+
+def decode_strict(body):
+    """Decode JSON while refusing duplicate object keys at any depth."""
+    return json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+
+
 @dataclass(frozen=True)
 class Result:
     name: str
@@ -225,7 +258,9 @@ def fetch(url, timeout):
 
 def decode(body):
     try:
-        return json.loads(body)
+        return decode_strict(body)
+    except DuplicateKeyError:
+        raise
     except (ValueError, UnicodeDecodeError):
         return None
 
@@ -235,7 +270,11 @@ def check_liveness(status, body):
         raise ProbeError(f"/health answered {status}, expected 200")
     if len(body) > BODY_CAP:
         raise ProbeError("/health answered over the body cap")
-    if decode(body) != {"status": "ok"}:
+    try:
+        parsed = decode(body)
+    except DuplicateKeyError:
+        raise ProbeError("/health carries duplicate JSON object keys")
+    if parsed != {"status": "ok"}:
         raise ProbeError("/health 200 without {\"status\": \"ok\"}")
     return "/health 200 {\"status\": \"ok\"}: process answers HTTP"
 
@@ -243,7 +282,10 @@ def check_liveness(status, body):
 def check_readyz_shape(status, body):
     if len(body) > BODY_CAP:
         raise ProbeError("/readyz answered over the body cap")
-    report = decode(body)
+    try:
+        report = decode(body)
+    except DuplicateKeyError:
+        raise ProbeError(f"/readyz {status} carries duplicate JSON object keys")
     if isinstance(report, dict) and report.get("error"):
         raise ProbeError(f"/readyz refused with error {report.get('error')!r:.40} "
                          "(ownership fence or proxy refusal, not the container breakdown)")
@@ -486,7 +528,12 @@ def run(args, fetch_fn=None):
                               "no truthful breakdown to rule out a fence refusal",
                               SRC_FENCE))
         return None, results
-    report = decode(readyz_body)
+    try:
+        report = decode(readyz_body)
+    except DuplicateKeyError:
+        # No last-wins breakdown survives: grading sees no report, the
+        # refusal below fails closed, and no receipt is written.
+        report = None
     try:
         state, shape_reason = check_readyz_shape(readyz_status, readyz_body)
     except ProbeError as e:
