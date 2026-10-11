@@ -15,6 +15,15 @@ Two record-specific rules live here, not in the schema:
 * verdict consistency: a record with any `commands[].result == "fail"` and
   `verdict.disposition == "PASS"` is rejected. A run with a failed command
   must be `NEEDS WORK`.
+* execution window: `window.end_utc` must not precede `window.start_utc`;
+  every `commands[].started_utc` must fall inside the window and its
+  completion (`started_utc` + `duration_ms`) must not exceed the window end
+  under the timestamp-precision policy below. `deployment.first_readyz_utc`
+  is deliberately unchecked: a deployment may predate command execution.
+  Malformed or incomparable timestamps fail safely with path-only
+  diagnostics. This check never enforces the separate UTC-representation
+  rule (which suffixes are allowed); it only orders the instants it can
+  parse as timezone-aware datetimes.
 * public-safety scan: no internal tracker IDs (`TOG-`, `PAP-`) and no
   high-confidence secret markers in any string value. This repo is public.
 
@@ -26,6 +35,15 @@ normalized to UTC, matching `datetime.fromisoformat` and RFC 3339's
 `-00:00` (unknown local offset, same UTC instant). Timezone-naive values
 (no suffix) and nonzero offsets (for example `+03:00`, `+00:30`) are
 rejected, as are impossible calendar dates.
+
+Timestamp-precision policy: instants compare as exact parsed datetimes, so
+fractional seconds are preserved. The producer emits second-precision
+`window` bounds (`%Y-%m-%dT%H:%M:%SZ`), truncating the true clock. A
+completion that exceeds a second-precision (fractionless) window end by
+less than one second is therefore attributed to truncation and allowed.
+A completion at or past end + 1s, or any overrun past a fractional end,
+is rejected. Command starts have no allowance: they must lie within
+[start, end] exactly.
 
 Usage:
   python3 scripts/check_run_record.py --record <file.json> [--allow-mock]
@@ -67,6 +85,12 @@ def is_utc_field(path):
     field = path.rsplit(".", 1)[-1]
     field = re.sub(r"\[.*\]$", "", field)
     return field.endswith("_utc")
+
+FRACTION_RE = re.compile(r"\.\d+")
+
+# A completion past a fractionless window end by less than this is
+# second-truncation, not an impossible window (see module docstring).
+TRUNCATION_ALLOWANCE = datetime.timedelta(seconds=1)
 
 TYPE_NAMES = {
     "object": dict,
@@ -263,7 +287,122 @@ def validate(record, schema, allow_mock=False):
             "re-run with --allow-mock only to check the template shape"
         )
     check_verdict_consistency(record, errors)
+    check_execution_window(record, errors)
     return errors
+
+
+def parse_instant(value):
+    """Parse an ISO-8601 timestamp to an aware UTC datetime, or None.
+
+    Returns None for non-strings, unparseable values and timezone-naive
+    values (no suffix). Naive values are incomparable: ordering them
+    against aware bounds would raise, so they fail safely instead.
+    Accepts any explicit offset; zone policy belongs to the separate
+    UTC-representation rule, not to ordering.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, OverflowError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    try:
+        return parsed.astimezone(datetime.timezone.utc)
+    except (ValueError, OverflowError):
+        return None
+
+
+def has_fractional_seconds(value):
+    """True when the raw timestamp text carries fractional seconds."""
+    return isinstance(value, str) and FRACTION_RE.search(value) is not None
+
+
+def check_execution_window(record, errors):
+    """Reject reversed windows and command timings outside the window.
+
+    Requires window end >= start, every command start within [start, end],
+    and every completion (start + duration_ms) within the window end under
+    the module timestamp-precision policy. Reports paths only, never
+    timestamp values. Ignores `deployment.first_readyz_utc`: a deployment
+    may predate command execution.
+    """
+    if not isinstance(record, dict):
+        return
+    window = record.get("window")
+    commands = record.get("commands")
+    if not isinstance(window, dict) or not isinstance(commands, list):
+        return
+    start_raw = window.get("start_utc")
+    end_raw = window.get("end_utc")
+    if not isinstance(start_raw, str) or not isinstance(end_raw, str):
+        return
+    start = parse_instant(start_raw)
+    end = parse_instant(end_raw)
+    if start is None:
+        errors.append(
+            "$.window.start_utc: incomparable timestamp for window ordering; "
+            "window bounds must be parseable timezone-aware date-times"
+        )
+    if end is None:
+        errors.append(
+            "$.window.end_utc: incomparable timestamp for window ordering; "
+            "window bounds must be parseable timezone-aware date-times"
+        )
+    if start is None or end is None:
+        return
+    if end < start:
+        errors.append(
+            "$.window.end_utc: window end precedes start; "
+            "window end must be >= start"
+        )
+        return
+    end_fractional = has_fractional_seconds(end_raw)
+    for index, command in enumerate(commands):
+        if not isinstance(command, dict):
+            continue
+        started_raw = command.get("started_utc")
+        if not isinstance(started_raw, str):
+            continue
+        started = parse_instant(started_raw)
+        if started is None:
+            errors.append(
+                f"$.commands[{index}].started_utc: incomparable timestamp "
+                "for window ordering; command starts must be parseable "
+                "timezone-aware date-times"
+            )
+            continue
+        if started < start or started > end:
+            errors.append(
+                f"$.commands[{index}].started_utc: outside execution window; "
+                "command invocations must fall within [window start, window end]"
+            )
+            # Still check completion when the start parses, so a record
+            # with both defects reports both; skip only when duration is
+            # unusable (schema already reports bad durations).
+        duration = command.get("duration_ms")
+        if isinstance(duration, bool) or not isinstance(duration, int):
+            continue
+        if duration < 0:
+            continue
+        try:
+            completion = started + datetime.timedelta(milliseconds=duration)
+        except (OverflowError, ValueError):
+            errors.append(
+                f"$.commands[{index}]: incomparable completion for window "
+                "ordering"
+            )
+            continue
+        if completion <= end:
+            continue
+        if not end_fractional and (completion - end) < TRUNCATION_ALLOWANCE:
+            continue
+        errors.append(
+            f"$.commands[{index}]: completion exceeds window end; "
+            "recorded completion (started_utc + duration_ms) must not exceed "
+            "the declared window end"
+        )
 
 
 def check_verdict_consistency(record, errors):

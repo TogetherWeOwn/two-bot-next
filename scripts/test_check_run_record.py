@@ -287,9 +287,217 @@ class RunRecordValidatorTests(unittest.TestCase):
         errors = checker.validate(record, SCHEMA)
         self.assertTrue(errors, "production target must fail")
 
+    def test_reversed_window_rejected(self):
+        record = fresh_record(mock=False)
+        record["window"]["start_utc"] = "2026-10-04T00:18:30Z"
+        record["window"]["end_utc"] = "2026-10-04T00:12:00Z"
+        errors = checker.validate(record, SCHEMA)
+        self.assertTrue(
+            any("$.window.end_utc" in error for error in errors),
+            f"reversed window must fail at $.window.end_utc: {errors}",
+        )
+
+    def test_zero_length_window_with_instant_command_valid(self):
+        record = fresh_record(mock=False)
+        record["window"]["start_utc"] = "2026-10-04T00:12:00Z"
+        record["window"]["end_utc"] = "2026-10-04T00:12:00Z"
+        record["commands"] = [{
+            "name": "/rank",
+            "started_utc": "2026-10-04T00:12:00Z",
+            "duration_ms": 0,
+            "result": "pass",
+        }]
+        self.assertEqual(checker.validate(record, SCHEMA), [])
+
+    def test_command_start_before_window_rejected(self):
+        record = fresh_record(mock=False)
+        record["commands"][0]["started_utc"] = "2026-10-04T00:11:59Z"
+        record["commands"][0]["duration_ms"] = 0
+        errors = checker.validate(record, SCHEMA)
+        self.assertTrue(
+            any("$.commands[0].started_utc" in error for error in errors),
+            f"before-window start must fail: {errors}",
+        )
+
+    def test_command_start_after_window_rejected(self):
+        record = fresh_record(mock=False)
+        record["commands"][0]["started_utc"] = "2026-10-04T00:18:31Z"
+        record["commands"][0]["duration_ms"] = 0
+        errors = checker.validate(record, SCHEMA)
+        self.assertTrue(
+            any("$.commands[0].started_utc" in error for error in errors),
+            f"after-window start must fail: {errors}",
+        )
+
+    def test_command_completion_beyond_end_rejected(self):
+        record = fresh_record(mock=False)
+        record["commands"][2]["started_utc"] = "2026-10-04T00:18:29Z"
+        record["commands"][2]["duration_ms"] = 2000
+        errors = checker.validate(record, SCHEMA)
+        self.assertTrue(
+            any("$.commands[2]" in error for error in errors),
+            f"completion beyond end must fail: {errors}",
+        )
+
+    def test_exact_boundary_starts_and_completion_valid(self):
+        record = fresh_record(mock=False)
+        record["commands"] = [
+            {
+                "name": "/rank",
+                "started_utc": "2026-10-04T00:12:00Z",
+                "duration_ms": 0,
+                "result": "pass",
+            },
+            {
+                "name": "/leaderboard",
+                "started_utc": "2026-10-04T00:18:30Z",
+                "duration_ms": 0,
+                "result": "pass",
+            },
+            {
+                "name": "/help",
+                "started_utc": "2026-10-04T00:18:29Z",
+                "duration_ms": 1000,
+                "result": "pass",
+            },
+        ]
+        record["verdict"]["disposition"] = "PASS"
+        record["verdict"]["summary"] = "Boundary commands pass."
+        self.assertEqual(checker.validate(record, SCHEMA), [])
+
+    def test_second_precision_end_allows_subsecond_truncation_overrun(self):
+        # Producer emits second-precision bounds; a completion <1s past a
+        # second-precision end is truncation, not an impossible window.
+        record = fresh_record(mock=False)
+        record["commands"] = [{
+            "name": "/rank",
+            "started_utc": "2026-10-04T00:18:30Z",
+            "duration_ms": 500,
+            "result": "pass",
+        }]
+        record["verdict"]["disposition"] = "PASS"
+        record["verdict"]["summary"] = "Truncation allowance."
+        self.assertEqual(checker.validate(record, SCHEMA), [])
+
+    def test_second_precision_end_rejects_overrun_beyond_truncation(self):
+        record = fresh_record(mock=False)
+        record["commands"] = [{
+            "name": "/rank",
+            "started_utc": "2026-10-04T00:18:30Z",
+            "duration_ms": 1500,
+            "result": "pass",
+        }]
+        record["verdict"]["disposition"] = "PASS"
+        record["verdict"]["summary"] = "Beyond truncation."
+        errors = checker.validate(record, SCHEMA)
+        self.assertTrue(
+            any("$.commands[0]" in error for error in errors),
+            f"1.5s overrun must fail: {errors}",
+        )
+
+    def test_fractional_end_uses_exact_completion_comparison(self):
+        record = fresh_record(mock=False)
+        record["window"]["end_utc"] = "2026-10-04T00:18:30.000Z"
+        record["commands"] = [{
+            "name": "/rank",
+            "started_utc": "2026-10-04T00:18:30Z",
+            "duration_ms": 500,
+            "result": "pass",
+        }]
+        record["verdict"]["disposition"] = "PASS"
+        record["verdict"]["summary"] = "Exact fractional end."
+        errors = checker.validate(record, SCHEMA)
+        self.assertTrue(
+            any("$.commands[0]" in error for error in errors),
+            f"0.5s past a fractional end must fail: {errors}",
+        )
+
+    def test_same_instant_zero_offset_representations_valid(self):
+        record = fresh_record(mock=False)
+        record["window"]["start_utc"] = "2026-10-04T00:12:00Z"
+        record["window"]["end_utc"] = "2026-10-04T00:18:30+00:00"
+        record["commands"] = [{
+            "name": "/rank",
+            "started_utc": "2026-10-04T00:12:03-00:00",
+            "duration_ms": 842,
+            "result": "pass",
+        }]
+        record["verdict"]["disposition"] = "PASS"
+        record["verdict"]["summary"] = "Same instant, zero-offset spellings."
+        self.assertEqual(checker.validate(record, SCHEMA), [])
+
+    def test_naive_and_malformed_window_timestamps_fail_safely(self):
+        cases = [
+            ("2026-10-04T00:12:00", "2026-10-04T00:18:30Z"),
+            ("2026-10-04T00:12:00Z", "not-a-timestamp"),
+            ("2026-13-01T00:00:00Z", "2026-10-04T00:18:30Z"),
+        ]
+        for start, end in cases:
+            with self.subTest(start=start, end=end):
+                record = fresh_record(mock=False)
+                record["window"]["start_utc"] = start
+                record["window"]["end_utc"] = end
+                errors = checker.validate(record, SCHEMA)
+                self.assertTrue(errors, f"malformed window {start}/{end} must fail")
+
+    def test_naive_command_start_fails_safely_without_crash(self):
+        record = fresh_record(mock=False)
+        record["commands"][0]["started_utc"] = "2026-10-04T00:12:03"
+        errors = checker.validate(record, SCHEMA)
+        self.assertTrue(
+            any("$.commands[0].started_utc" in error for error in errors),
+            f"naive command start must fail safely: {errors}",
+        )
+        window_errors = [e for e in errors if "window ordering" in e]
+        self.assertTrue(window_errors, f"window ordering must report: {errors}")
+        self.assertNotIn(
+            "2026-10-04T00:12:03", "\n".join(window_errors)
+        )
+
+    def test_first_readyz_may_predate_or_follow_window(self):
+        for first_readyz in ("2026-10-03T23:59:00Z", "2026-10-04T00:20:00Z"):
+            with self.subTest(first_readyz=first_readyz):
+                record = fresh_record(mock=False)
+                record["deployment"]["first_readyz_utc"] = first_readyz
+                self.assertEqual(
+                    checker.validate(record, SCHEMA), [],
+                    f"first_readyz {first_readyz} must not gate the window",
+                )
+
+    def test_cli_rejects_reversed_window(self):
+        record = fresh_record(mock=False)
+        record["window"]["start_utc"] = "2026-10-04T00:18:30Z"
+        record["window"]["end_utc"] = "2026-10-04T00:12:00Z"
+        code, out, err = self.cli(json.dumps(record))
+        self.assertEqual(code, 1)
+        self.assertIn("$.window.end_utc", out)
+        self.assertEqual(err, "")
+
     def test_utc_fields_require_timezone_aware_utc(self):
         # *_utc fields accept Z or an explicit zero offset (negative zero
         # normalizes to UTC); naive, nonzero-offset and impossible dates fail.
+        # Bases stay inside the mock execution window so the window-ordering
+        # rule (PR #856) does not mask the UTC-representation rule: window
+        # 00:12:00Z-00:18:30Z, first command at 00:12:03Z.
+        suffixes = [
+            "Z",
+            "+00:00",
+            "-00:00",
+            ".123Z",
+            ".123456+00:00",
+            "+0000",
+            "-0000",
+        ]
+        bases = {
+            "window.start_utc": "2026-10-04T00:12:00",
+            "window.end_utc": "2026-10-04T00:18:30",
+            "commands.started_utc": "2026-10-04T00:12:03",
+            "deployment.first_readyz_utc": "2026-10-04T00:00:41",
+        }
+        valid_by_field = {
+            field: [base + suffix for suffix in suffixes]
+            for field, base in bases.items()
+        }
         valid = [
             "2026-10-11T00:00:00Z",
             "2026-10-11T00:00:00+00:00",
@@ -337,7 +545,7 @@ class RunRecordValidatorTests(unittest.TestCase):
             "deployment.first_readyz_utc",
         )
         for field in fields:
-            for stamp in valid:
+            for stamp in valid_by_field[field]:
                 with self.subTest(field=field, stamp=stamp, kind="valid"):
                     record = fresh_record(mock=False)
                     set_field(record, field, stamp)

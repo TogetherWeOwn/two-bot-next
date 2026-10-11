@@ -105,6 +105,22 @@ the mock label. Public-safety failures report only the JSON path and marker
 pattern, never the matched value; they stop validation before schema diagnostics
 can echo the same value. Secret-shaped path keys are redacted too.
 
+Execution window: `window.end_utc` must not precede `window.start_utc`.
+Every `commands[].started_utc` must fall within `[start, end]`, and its
+completion (`started_utc` + `duration_ms`) must not exceed the window end.
+`deployment.first_readyz_utc` is not ordered against the window: a
+deployment may predate command execution. Malformed or incomparable
+timestamps fail safely with path-only diagnostics (no values echoed); this
+ordering check does not define which suffixes count as UTC — that is the
+separate UTC-representation rule.
+
+Timestamp-precision policy: instants compare exactly as parsed, preserving
+fractional seconds. The producer emits second-precision window bounds, so a
+completion less than one second past a fractionless end is truncation
+allowance, not an impossible window. A completion at or past end + 1s, or
+any overrun past a fractional end, is rejected. Command starts have no
+allowance.
+
 ## Collection bounds
 
 - Keys are opaque fixture aliases in the human record; raw member, channel
