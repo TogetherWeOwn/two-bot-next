@@ -273,6 +273,67 @@ class DuplicateComponentTest(unittest.TestCase):
         self.assertIn("repeats a component name", out)
 
 
+class UnknownComponentTest(unittest.TestCase):
+    def unknown_body(self, extra, status=200):
+        pairs = [("process", "ready"), ("gateway", "ready"), extra]
+        return (status, json.dumps({
+            "components": [[name, value] for name, value in pairs],
+            "jobs": {"counter": {"parked": True, "running": False}},
+            "build_revision": "r", "build_id": "b",
+        }).encode())
+
+    def test_unknown_ready_refused(self):
+        _, raw = self.unknown_body(("voice", "ready"), status=200)
+        with self.assertRaisesRegex(probe.ProbeError, "unknown component name"):
+            probe.check_readyz_shape(200, raw)
+
+    def test_unknown_down_refused(self):
+        _, raw = self.unknown_body(("voice", "down"), status=503)
+        with self.assertRaisesRegex(probe.ProbeError, "unknown component name"):
+            probe.check_readyz_shape(503, raw)
+
+    def test_unknown_starting_refused(self):
+        _, raw = self.unknown_body(("voice", "starting"), status=503)
+        with self.assertRaisesRegex(probe.ProbeError, "unknown component name"):
+            probe.check_readyz_shape(503, raw)
+
+    def test_diagnostic_echoes_no_component_data(self):
+        sentinel = "SENTINEL_unknown_cutover_abc123"
+        _, raw = self.unknown_body((sentinel, "ready"), status=200)
+        with self.assertRaises(probe.ProbeError) as ctx:
+            probe.check_readyz_shape(200, raw)
+        self.assertIn("unknown component name", str(ctx.exception))
+        self.assertNotIn(sentinel, str(ctx.exception))
+
+    def test_legitimate_optional_components_still_parse(self):
+        for pairs, status in (
+            ([("process", "ready"), ("gateway", "ready")], 200),
+            ([("process", "ready"), ("gateway", "ready"),
+              ("database", "ready")], 200),
+            ([("process", "ready"), ("gateway", "ready"),
+              ("database", "ready"), ("token_invalid", "ready")], 200),
+            ([("process", "ready"), ("gateway", "down"),
+              ("database", "down"), ("token_invalid", "ready")], 503),
+        ):
+            with self.subTest(pairs=pairs):
+                _, raw = (status, json.dumps({
+                    "components": [[n, v] for n, v in pairs],
+                    "jobs": {"counter": {"parked": True, "running": False}},
+                    "build_revision": "r", "build_id": "b",
+                }).encode())
+                state, _ = probe.check_readyz_shape(status, raw)
+                self.assertEqual(set(state), {n for n, _ in pairs})
+
+    def test_unknown_fails_readiness_shape_end_to_end(self):
+        body = self.unknown_body(("voice", "ready"), status=200)
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL readiness-shape:", out)
+        self.assertIn("unknown component name", out)
+        self.assertNotIn("voice", out)
+
+
 class EvidenceTest(unittest.TestCase):
     def test_pass_writes_receipt_with_sources(self):
         with mock.patch("builtins.open", mock.mock_open()) as handle:
@@ -546,6 +607,205 @@ class CadenceTest(unittest.TestCase):
         self.assertIn("1 not yet run", out)
         self.assertIn("1 parked", out)
         self.assertNotIn("4 jobs fresh", out)
+
+
+class FixedCadenceJobGradingTest(unittest.TestCase):
+    """self_role_recovery (30 s cadence, 25 s timeout) and automod_expiry
+    (60 s cadence, 5 s timeout) have fixed cadences, so they are graded with
+    the same cadence+timeout / 2x cadence+timeout bands as their siblings."""
+
+    # name: (warn line, max line), pinned from the Rust constants.
+    BANDS = {
+        "self_role_recovery": (55, 85),
+        "automod_expiry": (65, 125),
+    }
+
+    def probe(self, jobs):
+        return run(double({"/health": HEALTH, "/readyz": readyz_with_jobs(jobs)}),
+                   "--base-url", "http://h/")
+
+    def test_bands_derive_from_cadence_and_timeout(self):
+        for name, (warn, limit) in self.BANDS.items():
+            self.assertEqual(probe.WARN_LAST_SUCCESS_AGE_SECONDS[name], warn, name)
+            self.assertEqual(probe.MAX_LAST_SUCCESS_AGE_SECONDS[name], limit, name)
+
+    def test_cadence_and_timeout_maps_cover_the_same_jobs(self):
+        self.assertEqual(set(probe.JOB_CADENCE_SECONDS),
+                         set(probe.JOB_TIMEOUT_SECONDS))
+
+    def test_fresh_samples_pass_without_a_warning(self):
+        code, out = self.probe({name: (False, 10) for name in self.BANDS})
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS jobs-map:", out)
+        self.assertIn("2 jobs fresh within cadence", out)
+        self.assertNotIn("ungraded", out)
+        self.assertNotIn("warn", out)
+
+    def test_between_warn_and_max_stays_green_but_is_named(self):
+        for name, (warn, limit) in self.BANDS.items():
+            with self.subTest(name=name):
+                code, out = self.probe({name: (False, warn + 10)})
+                self.assertEqual(code, 0, out)
+                self.assertIn("PASS jobs-map:", out)
+                self.assertIn(f"[warn: {name}=", out)
+
+    def test_past_max_fails_and_names_the_job_and_limit(self):
+        for name, (warn, limit) in self.BANDS.items():
+            with self.subTest(name=name):
+                code, out = self.probe({"counter": (False, 10),
+                                        name: (False, limit + 10)})
+                self.assertEqual(code, 1, out)
+                self.assertIn("FAIL jobs-map:", out)
+                self.assertIn(f"{name}=", out)
+                self.assertIn(f"> {limit}s", out)
+                self.assertNotIn("counter=", out)
+
+    def test_never_succeeded_with_failures_fails_and_names_the_job(self):
+        for name in self.BANDS:
+            with self.subTest(name=name):
+                code, out = self.probe({name: (False, None, {
+                    "consecutive_failures": 4, "last_error_class": "database"})})
+                self.assertEqual(code, 1, out)
+                self.assertIn(f"{name}=no-success 4 consecutive failures", out)
+
+    def test_stale_last_start_without_success_fails(self):
+        for name, (warn, limit) in self.BANDS.items():
+            with self.subTest(name=name):
+                code, out = self.probe({name: (False, None, {
+                    "consecutive_failures": 0, "start_age": limit + 60})})
+                self.assertEqual(code, 1, out)
+                self.assertIn(f"{name}=last_start", out)
+
+    def test_never_run_yet_is_not_evidence(self):
+        code, out = self.probe({name: (False, None) for name in self.BANDS})
+        self.assertEqual(code, 0, out)
+        self.assertIn("2 not yet run", out)
+
+    def test_parked_with_ancient_success_passes(self):
+        code, out = self.probe({name: (True, 10 ** 6) for name in self.BANDS})
+        self.assertEqual(code, 0, out)
+        self.assertIn("2 parked", out)
+
+    def test_absent_from_the_map_is_not_a_failure(self):
+        # Absence (an older build, or the job not registered) is unchanged:
+        # the probe grades only what /readyz reports.
+        code, out = self.probe({"counter": (False, 10)})
+        self.assertEqual(code, 0, out)
+        self.assertIn("1 jobs fresh within cadence", out)
+
+
+class BodyCapRefusalTests(unittest.TestCase):
+    """Oversized bodies are refused before JSON parsing (M4.42)."""
+
+    def padded(self, value, size):
+        raw = json.dumps(value).encode()
+        self.assertLessEqual(len(raw), size, "fixture must fit the target size")
+        return raw + b" " * (size - len(raw))
+
+    def test_exact_cap_valid_input_passes(self):
+        health = self.padded({"status": "ok"}, probe.BODY_CAP)
+        self.assertEqual(len(health), probe.BODY_CAP)
+        code, out = run(double({"/health": (200, health), "/readyz": PARKED}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS liveness:", out)
+        self.assertIn("PASS readiness-shape:", out)
+
+    def test_valid_json_padded_past_cap_refuses_before_parsing(self):
+        sentinel = "SENTINEL_BODY_cutover_padded"
+        base = json.dumps({"status": "ok", "note": sentinel}).encode()
+        health = base + b" " * (probe.BODY_CAP + 1 - len(base))
+        self.assertEqual(len(health), probe.BODY_CAP + 1)
+        self.assertEqual(json.loads(health)["note"], sentinel)
+        code, out = run(double({"/health": (200, health), "/readyz": PARKED}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL liveness:", out)
+        self.assertIn("/health answered over the body cap", out)
+        self.assertNotIn(sentinel, out)
+
+    def test_cap_length_valid_prefix_with_hidden_tail_refuses(self):
+        prefix = self.padded({"status": "ok"}, probe.BODY_CAP)
+        self.assertEqual(json.loads(prefix), {"status": "ok"})
+        code, out = run(double({"/health": (200, prefix + b"X"), "/readyz": PARKED}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL liveness:", out)
+        self.assertIn("/health answered over the body cap", out)
+
+    def test_readyz_oversize_never_reaches_json_and_reports_no_breakdown(self):
+        sentinel = "SENTINEL_BODY_readyz_oversize"
+        payload = {"components": [["process", "ready"], ["gateway", "ready"]],
+                   "jobs": {"counter": {"parked": True, "running": False}},
+                   "build_revision": "r", "build_id": "b", "note": sentinel}
+        base = json.dumps(payload).encode()
+        big = base + b" " * (probe.BODY_CAP + 1 - len(base))
+        self.assertEqual(json.loads(big)["note"], sentinel)
+        code, out = run(double({"/health": HEALTH, "/readyz": (200, big)}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAIL readiness-shape:", out)
+        self.assertIn("/readyz answered over the body cap", out)
+        self.assertIn("FAIL gateway-state:", out)
+        self.assertIn("no truthful breakdown to read gateway from", out)
+        self.assertIn("FAIL jobs-map:", out)
+        self.assertIn("FAIL fence-watch:", out)
+        self.assertNotIn(sentinel, out)
+
+    def test_httperror_oversize_enforces_the_same_bound(self):
+        # The real fetch converts an HTTPError into (status, body); an
+        # oversized 503 body must still refuse with the cap message, never a
+        # breakdown verdict computed from parsed JSON.
+        payload = {"components": [["process", "ready"], ["gateway", "ready"]],
+                   "jobs": {"counter": {"parked": True, "running": False}},
+                   "build_revision": "r", "build_id": "b"}
+        big = self.padded(payload, probe.BODY_CAP + 1)
+        self.assertEqual(len(big), probe.BODY_CAP + 1)
+        code, out = run(double({"/health": HEALTH, "/readyz": (503, big)}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1, out)
+        self.assertIn("/readyz answered over the body cap", out)
+
+    def test_transport_reads_bounded_cap_plus_one_both_paths(self):
+        import urllib.error
+        seen = []
+
+        class Response(io.BytesIO):
+            status = 200
+
+            def __init__(self, payload):
+                super().__init__(payload)
+
+            def read(self, n=-1):
+                seen.append(n)
+                return super().read(n)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class OkOpener:
+            def open(self, request, timeout=None):
+                return Response(b"{}")
+
+        with mock.patch.object(probe.urllib.request, "build_opener", return_value=OkOpener()):
+            probe.fetch("http://h/health", 5)
+        self.assertEqual(seen, [probe.BODY_CAP + 1])
+        seen.clear()
+
+        class ErrorOpener:
+            def open(self, request, timeout=None):
+                fp = Response(b"x")
+                raise urllib.error.HTTPError(request.full_url, 503,
+                                             "Service Unavailable", {}, fp)
+
+        with mock.patch.object(probe.urllib.request, "build_opener",
+                               return_value=ErrorOpener()):
+            status, _ = probe.fetch("http://h/readyz", 5)
+        self.assertEqual(status, 503)
+        self.assertEqual(seen, [probe.BODY_CAP + 1])
 
 
 if __name__ == "__main__":

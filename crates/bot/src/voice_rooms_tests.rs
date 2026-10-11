@@ -1432,6 +1432,37 @@ async fn refused_creation_plan_records_a_failure_before_any_channel_is_created()
     assert!(!worker.dispatch_one(1).await);
     assert!(trace.lock().unwrap().is_empty());
     assert!(worker.http.created_attributes.lock().unwrap().is_empty());
+
+    // A creator-channel overwrite denying the bot Connect refuses the room at
+    // the creator-channel guard, before any `create` call: `prepare` checks
+    // the bot's channel permissions first, so the plan (and its grant) never
+    // runs for this fixture. The guild grant holds Connect, but the
+    // creator-channel overwrite removes it at the guard.
+    let (live, store, http, trace) = fixture();
+    live.upsert_channel(channel_with_overwrites(
+        CREATOR,
+        2,
+        Some(CATEGORY),
+        json!([bot_overwrite(Permissions::empty(), Permissions::CONNECT)]),
+    ));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert!(matches!(
+        worker.failures().back(),
+        Some(LifecycleFailure::MissingPermission {
+            write: RefusedWrite::Create,
+            channel_id: CREATOR,
+            findings,
+        }) if findings.iter().any(|finding| finding.permission == VoicePermission::Connect
+            && finding.scope == VoicePermissionScope::Channel
+            && finding.channel_id == Some(CREATOR))
+    ));
+    assert!(worker.creations.is_empty());
+    assert!(worker.tracked().is_empty());
+    assert!(!worker.dispatch_one(1).await);
+    assert!(trace.lock().unwrap().is_empty());
+    assert!(worker.http.created_attributes.lock().unwrap().is_empty());
 }
 
 /// A failed compensation delete must keep the room (and its provenance)
@@ -1489,16 +1520,15 @@ async fn failed_rollback_keeps_the_room_tracked_until_a_later_sweep_removes_it()
     assert!(!worker.deletes.contains(&500));
 }
 
-/// Pending acceptance for the durable half of "retain provenance after a
-/// failed rollback": the exact channel must outlive the worker that created
-/// it. Today the failed persist writes nothing, so the only record is the
-/// creating worker's in-memory `rooms`/`compensation`, and a worker rebuilt
-/// from persisted state cannot rediscover the channel. Run it with
-/// `--ignored` to see the gap; enable it, unedited, once a durable witness
-/// exists. The parity row for the legacy rollback commit stays `carded` until
-/// then.
+/// Cross-restart provenance for "retain provenance after a failed rollback" is
+/// proven by the disposable-database test
+/// `crates/cutover/tests/voice_create_admission_store.rs::bound_channel_witness_survives_restart_and_holds_the_slot_until_settled`,
+/// which binds the channel to its claim before any room row and rediscovers it
+/// on a fresh pool. This in-memory fixture stays ignored: only `rooms` crosses
+/// its simulated restart and a failed persist writes no room, so the `bound`
+/// witness cannot cross here and the test cannot pass unedited.
 #[tokio::test]
-#[ignore = "pending: no durable witness survives a failed persist plus a refused rollback"]
+#[ignore = "fixture gap: bound witness does not cross the simulated restart; durable proof is bound_channel_witness_survives_restart_and_holds_the_slot_until_settled"]
 async fn a_restarted_worker_rediscovers_a_channel_whose_rollback_failed() {
     let (live, mut store, http, _) = fixture();
     store.persist_error = Some(StoreError::Unavailable);
@@ -1992,6 +2022,211 @@ async fn transfer_rewrites_only_this_rooms_owner_grants_before_persistence() {
         *trace.lock().unwrap(),
         ["overwrites:500", "update_ownership:500:301"]
     );
+}
+
+#[tokio::test]
+async fn denied_handoff_falls_back_to_revoke_only_then_retries_the_grant() {
+    let (live, store, http, trace) = owned_room();
+    let mut room_channel = channel(500, 2, Some(CATEGORY));
+    room_channel.permission_overwrites = Some(vec![owner_overwrite(MEMBER)]);
+    live.upsert_channel(room_channel);
+    // The combined revoke+grant PATCH is refused; the revoke-only fallback
+    // must still clear the former owner's bits and defer the grant.
+    http.view_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    let worker = GuildRoomWorker::load(live.clone(), store, http)
+        .await
+        .unwrap();
+    assert_eq!(
+        worker.rewrite_owner_grant(500, &[MEMBER], 301).await,
+        Err(RoomHttpError::AccessDenied)
+    );
+    let owner_mask = Permissions::from_bits_retain(OWNER_ALLOW_BITS);
+    {
+        let state = live.inner.read().unwrap();
+        let overwrites = state.channels[&500].permission_overwrites.as_ref().unwrap();
+        assert!(
+            !overwrites
+                .iter()
+                .any(|o| o.id.get() == MEMBER && o.allow.intersects(owner_mask)),
+            "former owner bits must be revoked even when the grant is denied"
+        );
+        assert!(
+            !overwrites
+                .iter()
+                .any(|o| o.id.get() == 301 && o.allow.intersects(owner_mask)),
+            "new owner grant must wait for the retry"
+        );
+    }
+    assert_eq!(
+        trace
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.as_str() == "overwrites:500")
+            .count(),
+        2,
+        "combined attempt plus the revoke-only fallback"
+    );
+    // The retry converges: the already-revoked former owner stays revoked
+    // and the new owner is granted.
+    worker
+        .rewrite_owner_grant(500, &[MEMBER], 301)
+        .await
+        .unwrap();
+    let state = live.inner.read().unwrap();
+    let overwrites = state.channels[&500].permission_overwrites.as_ref().unwrap();
+    assert!(!overwrites
+        .iter()
+        .any(|o| o.id.get() == MEMBER && o.allow.intersects(owner_mask)));
+    assert!(overwrites.contains(&owner_overwrite(301)));
+}
+
+#[tokio::test]
+async fn revoked_fallback_keeps_handoff_pending_until_access_returns() {
+    let (live, store, http, trace) = owned_room();
+    let mut room_channel = channel(500, 2, Some(CATEGORY));
+    room_channel.permission_overwrites = Some(vec![owner_overwrite(MEMBER)]);
+    live.upsert_channel(room_channel);
+    // The combined revoke+grant PATCH is refused; the revoke-only fallback
+    // clears the former owner and defers the new-owner grant.
+    http.view_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    let mut worker = GuildRoomWorker::load(live.clone(), store, http)
+        .await
+        .unwrap();
+    worker.apply_ownership(MEMBER, false, OwnershipCommand::Transfer { target_id: 301 });
+    dispatch(&mut worker, 0).await;
+    let owner_mask = Permissions::from_bits_retain(OWNER_ALLOW_BITS);
+    {
+        let state = live.inner.read().unwrap();
+        let overwrites = state.channels[&500].permission_overwrites.as_ref().unwrap();
+        assert!(
+            !overwrites
+                .iter()
+                .any(|o| o.id.get() == MEMBER && o.allow.intersects(owner_mask)),
+            "fallback must revoke the former owner"
+        );
+        assert!(
+            !overwrites
+                .iter()
+                .any(|o| o.id.get() == 301 && o.allow.intersects(owner_mask)),
+            "new owner grant waits for the retry"
+        );
+    }
+    assert!(worker.store.owner_pending.lock().unwrap().contains(&500));
+    assert_eq!(worker.store.rooms.lock().unwrap()[&500].owner_id, MEMBER);
+    // Lose Manage Roles before the retry: the handoff must stay pending even
+    // though no stranded grant remains, or the new owner would never be
+    // granted after access returns.
+    let full_access = live.inner.read().unwrap().bot.clone().unwrap();
+    let mut reduced = full_access.clone();
+    for role in &mut reduced.roles {
+        role.permissions &= !Permissions::MANAGE_ROLES;
+    }
+    live.refresh_bot(reduced);
+    dispatch(&mut worker, 100_000).await;
+    assert!(
+        worker.store.owner_pending.lock().unwrap().contains(&500),
+        "revoked-but-ungranted handoff stays pending without access"
+    );
+    assert_eq!(worker.store.rooms.lock().unwrap()[&500].owner_id, MEMBER);
+    assert!(
+        !trace
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call == "update_ownership:500:301"),
+        "no commit while the grant is still owed"
+    );
+    // Restore access: the retry converges on the new owner.
+    live.refresh_bot(full_access);
+    dispatch(&mut worker, 200_000).await;
+    assert!(!worker.store.owner_pending.lock().unwrap().contains(&500));
+    assert_eq!(worker.store.rooms.lock().unwrap()[&500].owner_id, 301);
+    let state = live.inner.read().unwrap();
+    let overwrites = state.channels[&500].permission_overwrites.as_ref().unwrap();
+    assert!(!overwrites
+        .iter()
+        .any(|o| o.id.get() == MEMBER && o.allow.intersects(owner_mask)));
+    assert!(overwrites.contains(&owner_overwrite(301)));
+}
+
+#[tokio::test]
+async fn category_synced_transfer_commits_without_minting_overwrites_while_access_is_absent() {
+    // Rooms created without Manage Roles are category-synced and carry no
+    // bot-issued owner overwrite ("Do not invent one"). A transfer there
+    // while the bot still lacks Manage Roles must commit the owner change
+    // with no Discord write — the opposite of a revoked-but-ungranted room,
+    // which stays pending until the owed grant lands.
+    let (live, store, http, trace) = owned_room();
+    let mut room_channel = channel(500, 2, Some(CATEGORY));
+    room_channel.permission_overwrites = Some(vec![]);
+    live.upsert_channel(room_channel);
+    let full_access = live.inner.read().unwrap().bot.clone().unwrap();
+    let mut reduced = full_access.clone();
+    for role in &mut reduced.roles {
+        role.permissions &= !Permissions::MANAGE_ROLES;
+    }
+    live.refresh_bot(reduced);
+    let mut worker = GuildRoomWorker::load(live.clone(), store, http)
+        .await
+        .unwrap();
+    worker.apply_ownership(MEMBER, false, OwnershipCommand::Transfer { target_id: 301 });
+    dispatch(&mut worker, 0).await;
+    assert!(
+        trace
+            .lock()
+            .unwrap()
+            .contains(&"update_ownership:500:301".to_owned()),
+        "category-synced ownership change commits without access"
+    );
+    assert!(
+        !trace
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call == "overwrites:500"),
+        "no overwrite is minted for a category-synced room"
+    );
+    assert!(!worker.store.owner_pending.lock().unwrap().contains(&500));
+    assert_eq!(worker.store.rooms.lock().unwrap()[&500].owner_id, 301);
+}
+
+#[tokio::test]
+async fn fallback_patch_propagates_rate_limit_and_unauthorized() {
+    let rate_limited = RoomHttpError::RateLimited {
+        retry_after_ms: 100,
+        global: false,
+    };
+    for (fallback_error, expected) in [
+        (rate_limited, rate_limited),
+        (RoomHttpError::Unauthorized, RoomHttpError::Unauthorized),
+        (RoomHttpError::Cancelled, RoomHttpError::AccessDenied),
+        (RoomHttpError::NotFound, RoomHttpError::AccessDenied),
+    ] {
+        let (live, store, http, _) = owned_room();
+        let mut room_channel = channel(500, 2, Some(CATEGORY));
+        room_channel.permission_overwrites = Some(vec![owner_overwrite(MEMBER)]);
+        live.upsert_channel(room_channel);
+        http.view_errors
+            .lock()
+            .unwrap()
+            .push_back(RoomHttpError::AccessDenied);
+        http.view_errors.lock().unwrap().push_back(fallback_error);
+        let worker = GuildRoomWorker::load(live.clone(), store, http)
+            .await
+            .unwrap();
+        assert_eq!(
+            worker.rewrite_owner_grant(500, &[MEMBER], 301).await,
+            Err(expected),
+            "fallback {fallback_error:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -10816,6 +11051,98 @@ fn empty_grace_config_accepts_zero_to_ten_minutes_and_refuses_garbage() {
     assert_eq!(configured_empty_grace(Some("1m")), Err(InvalidEmptyGrace));
 }
 
+#[test]
+fn synthetic_human_config_takes_up_to_four_snowflakes_and_refuses_garbage() {
+    assert_eq!(configured_synthetic_humans(None), Ok(HashSet::new()));
+    assert_eq!(configured_synthetic_humans(Some(" ")), Ok(HashSet::new()));
+    assert_eq!(
+        configured_synthetic_humans(Some(" 301, 302 ,")),
+        Ok(HashSet::from([301, 302]))
+    );
+    assert_eq!(
+        configured_synthetic_humans(Some("1,2,3,4")),
+        Ok(HashSet::from([1, 2, 3, 4]))
+    );
+    let overflow = format!("{}0", u64::MAX);
+    for bad in [
+        "1,2,3,4,5",
+        "0",
+        "-1",
+        "+5",
+        "12a",
+        "1;2",
+        overflow.as_str(),
+    ] {
+        assert_eq!(
+            configured_synthetic_humans(Some(bad)),
+            Err(InvalidSyntheticHumans),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn synthetic_humans_never_reach_the_live_guild() {
+    let ids = HashSet::from([301]);
+    let live_guild: Snowflake = two_bot_core::backup::guild_config::LIVE_GUILD_ID
+        .parse()
+        .unwrap();
+    assert!(synthetic_humans_for(live_guild, &ids).is_empty());
+    assert_eq!(synthetic_humans_for(GUILD, &ids), ids);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_synthetic_human_bot_keeps_its_room_while_other_bots_leave_rooms_empty() {
+    let (live, store, http, trace) = fixture();
+    live.set_synthetic_humans(HashSet::from([301]));
+    for id in [500, 502] {
+        store.rooms.lock().unwrap().insert(id, room(id));
+    }
+    live.publish(snapshot(
+        &[500, 502],
+        vec![
+            VoiceMember {
+                member_id: 301,
+                channel_id: 500,
+                bot: Some(true),
+            },
+            VoiceMember {
+                member_id: 304,
+                channel_id: 502,
+                bot: Some(true),
+            },
+        ],
+    ));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
+    worker.reconcile();
+    for time in 0..2 {
+        dispatch(&mut worker, time).await;
+    }
+    let calls = trace.lock().unwrap();
+    assert!(!calls.contains(&"delete:500".to_owned()));
+    assert!(calls.contains(&"delete:502".to_owned()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn without_synthetic_humans_a_bot_only_room_is_still_empty() {
+    let (live, store, http, trace) = fixture();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.publish(snapshot(
+        &[500],
+        vec![VoiceMember {
+            member_id: 301,
+            channel_id: 500,
+            bot: Some(true),
+        }],
+    ));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    tokio::time::advance(EMPTY_ROOM_GRACE).await;
+    worker.reconcile();
+    dispatch(&mut worker, 0).await;
+    assert!(trace.lock().unwrap().contains(&"delete:500".to_owned()));
+}
+
 fn two_creator_worker_parts(a_position: i32, b_position: i32) -> (LiveGuild, Store, Http, Trace) {
     let (live, store, http, trace) = fixture();
     {
@@ -10903,4 +11230,68 @@ async fn a_refused_respace_ties_upwards_and_an_unknown_one_takes_no_position() {
     }
     // Unknown outcome: the reorder may have landed, so no stale position.
     assert_eq!(created_positions(&worker)[1], None);
+}
+
+#[tokio::test]
+async fn time_tokens_follow_the_guild_time_zone() {
+    // 2026-10-11 02:30 UTC is 22:30 the previous evening in New York (EDT).
+    let wall =
+        two_bot_core::funnel::parse_iso_millis("2026-10-11T02:30:00.000000+00:00").unwrap() as u64;
+    let (live, store, http, _) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "@@hour@@ @@daypart@@".to_owned();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER, Some(500), Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.wall_clock = test_wall_clock;
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    TEST_WALL_MS.set(wall);
+    worker.name_settings.time_zone = "America/New_York".to_owned();
+    worker.refresh_template_names(0);
+    assert_eq!(worker.desired_names[&500], "22 night");
+    // UTC (the default) renders the UTC hour.
+    worker.name_settings.time_zone = "UTC".to_owned();
+    worker.refresh_template_names(1);
+    assert_eq!(worker.desired_names[&500], "2 late night");
+}
+
+#[test]
+fn name_settings_carry_the_configured_time_zone() {
+    let mut config = empty_config();
+    config.settings.time_zone = "Europe/Berlin".to_owned();
+    assert_eq!(
+        NameSettings::from_config(&config).time_zone,
+        "Europe/Berlin"
+    );
+}
+
+#[test]
+fn import_preview_and_confirm_refuse_a_new_unsupported_time_zone() {
+    let mut config = full_config();
+    config.settings.time_zone = "Mars/Olympus".to_owned();
+    let bytes = serde_json::to_vec(&config).unwrap();
+    match plan_import_preview(&empty_config(), &bytes, &config_inventory()) {
+        ImportDecision::Refuse { message } => {
+            assert!(message.contains("settings.time_zone"), "{message}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    match plan_import_confirm(
+        &empty_config(),
+        &config,
+        &config_inventory(),
+        "0000000000000000",
+    ) {
+        ImportDecision::Refuse { message } => {
+            assert!(message.contains("settings.time_zone"), "{message}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    // The zone already stored is kept as is, so a guild can re-import its export.
+    let mut current = empty_config();
+    current.settings.time_zone = "Mars/Olympus".to_owned();
+    assert!(!matches!(
+        plan_import_preview(&current, &bytes, &config_inventory()),
+        ImportDecision::Refuse { .. }
+    ));
 }

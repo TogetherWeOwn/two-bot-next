@@ -464,6 +464,45 @@ fn attachment_blocklist_and_exemptions_apply_in_runtime() {
 }
 
 #[test]
+fn raw_leading_dot_extensions_normalize_through_config_and_match() {
+    // Deferred `known-raw-leading-dot-policy` preserves the raw direct-policy
+    // divergence (raw `['.exe']` vs normalized `['exe']`) without behavior
+    // change. The production config path normalizes before matching; prove it
+    // here through the real runtime.
+    let vars = HashMap::from([
+        ("TWO_AUTOMOD".into(), "1".into()),
+        ("TWO_AUTOMOD_ENFORCE".into(), "1".into()),
+        (
+            "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS".into(),
+            ".exe,.JS".into(),
+        ),
+    ]);
+    let config = AutomodConfig::from_map(&vars).unwrap();
+    assert_eq!(
+        config.policy.blocked_attachment_extensions,
+        vec!["exe", "js"]
+    );
+    let mut runtime = AutomodRuntime::new(
+        config,
+        AutomodScope {
+            guild_id: STAGING_GUILD_ID.into(),
+            live_approved: false,
+        },
+    );
+    let mut msg = delivery(MessageDeliveryKind::Create, "file");
+    msg.snapshot.as_mut().unwrap().attachment_names = vec!["Setup.EXE".into()];
+    assert_eq!(
+        matched(&mut runtime, &msg).filter,
+        two_bot_core::AutomodFilter::AttachmentType
+    );
+    msg.snapshot.as_mut().unwrap().attachment_names = vec!["photo.png".into()];
+    assert_eq!(
+        runtime.inspect(&msg),
+        Inspection::Accepted(FunnelDisposition::Accept)
+    );
+}
+
+#[test]
 fn interleaved_update_does_not_erase_delayed_create_history() {
     // Mixed resumed batch: identical creates at 0/10/20 s with an unrelated
     // update from another author between them, all received at 60 s. The

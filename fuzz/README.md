@@ -3,7 +3,7 @@
 This is a separate `cargo-fuzz` workspace, explicitly excluded from the root
 workspace. Normal `cargo build`, workspace tests/clippy, `check` and cargo-deny
 keep their existing members, dependency lockfile and stable toolchain. The required
-`fuzz-compile` CI job (`check.yml`, gated by `ci-ok`) builds all eleven targets
+`fuzz-compile` CI job (`check.yml`, gated by `ci-ok`) builds all twelve targets
 compile-only on pinned nightly `nightly-2026-10-01` + `cargo-fuzz 0.13.2`; no
 scheduled or continuous fuzz campaign exists, and CI never executes `cargo fuzz run`.
 
@@ -22,6 +22,7 @@ scheduled or continuous fuzz campaign exists, and CI never executes `cargo fuzz 
 | `vote_kick` | `VoteKickCore` start/vote/refresh | Arbitrary member/target/room/privilege/clock sequences over small synthetic ID pools (forced reuse), including three-way `target_privileged` evidence (`Some(false)`/`Some(true)`/`None`) so fail-closed `AuthorityUnavailable`/`PrivilegedTarget` refusals and mid-vote `TargetProtected` cancels stay reachable. Asserts no panic, replay refused, terminal votes stay terminal, the kick emits once with room scope, and progress arithmetic holds. No Discord client, database or network. |
 | `vote_kick_reason` | `voice_rooms::sanitize_vote_reason`, `message_safety::neutralize_mentions` | Arbitrary UTF-8 vote-kick reasons (invalid UTF-8 discarded). VK-04 invariants on every output: at most `VOTE_KICK_PUBLIC_REASON_LIMIT` chars, single line, no `@everyone`/`@here`, no `<@`/`<#`/`<:`/`<a:` pills, no `://`; the neutralizer half is pinned too (no raw mass mention, neutralize-twice stable). Seeds mirror the hostile matrix. No database, Discord client, network or secret. |
 | `slash_input_bounds` | `lfg::parse_role_spec`, `custom_commands::AuditRecord` constructors, `scheduled::resolve_scheduled_id` | Arbitrary UTF-8 slash input (invalid UTF-8 discarded) driven through the #694 bounds: overlong `/lfg` role keys (including >2000 chars), multi-thousand-char `/command` names, empty plus overlong schedule id prefixes. `TooLong` if and only if the spec exceeds `MAX_ROLE_SPEC_CHARS` (refusal before parsing); `BadKey` echoes at most 128 chars; every audit `target_key` is exactly the 32-char prefix; empty/overlong prefixes resolve `Missing` before resolution and all other outcomes agree with an independent exact-or-prefix-match oracle over a fixed synthetic inventory. Seeds mirror the hostile matrix (mentions, links, markdown, overlong). No database, Discord client, network or secret. |
+| `cutover_parse` | `parse_voice_message`, `parse_member_log_message`, `parse_leave_attribution` (+ `member_log_kind_for_channel` hint) | Arbitrary NUL/newline-separated title/description/footer/content/channel fields (capped at 8 fields, 256 chars per field) with hostile mentions, overlong digit runs, placeholder footers and multibyte usernames. The channel hint comes from the fuzzed channel name plus a cycled explicit hint so the no-context path stays reachable. Bad rows refuse (`None`, never half records); returned member/channel ids are snowflake-shaped, leave attributions carry a non-empty content-slice username with a closed `joined_via` set, and every parse is deterministic. Seeds mirror the hostile matrix (Logger/Wick voice, member join, vanity leave, adversarial). No database, Discord client, network or secret. |
 
 All seeds use synthetic IDs/text; no token, environment secret, database,
 Discord client or network is needed at runtime. MEE6's crate currently has SQLx
@@ -58,7 +59,7 @@ set -euo pipefail
 : "${FUZZ_OUTPUT_DIR:?set an absolute non-source output directory}"
 FUZZ_SECONDS=${FUZZ_SECONDS:-300}
 mkdir -p "$FUZZ_OUTPUT_DIR/target" "$FUZZ_OUTPUT_DIR/logs"
-for target in internal_action automod prefix_trigger mee6_export guild_config_snapshot voice_config rsvp settings_map vote_kick vote_kick_reason slash_input_bounds; do
+for target in internal_action automod prefix_trigger mee6_export guild_config_snapshot voice_config rsvp settings_map vote_kick vote_kick_reason slash_input_bounds cutover_parse; do
   mkdir -p "$FUZZ_OUTPUT_DIR/corpus/$target" "$FUZZ_OUTPUT_DIR/artifacts/$target"
   cargo +nightly fuzz run --target-dir "$FUZZ_OUTPUT_DIR/target" \
     "$target" "$FUZZ_OUTPUT_DIR/corpus/$target" "fuzz/corpus/$target" -- \

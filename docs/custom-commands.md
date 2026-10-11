@@ -39,7 +39,8 @@ It defers responses before transactional work, edits through the shared executor
 suppresses mentions, audits writes/runs, and serializes mutation plus full-set
 publication. A publication failure reports a saved-but-not-synchronized result.
 
-**Gateway composition is implemented, not yet runtime-verified or deployed.**
+**Gateway composition is implemented and runtime-verified in hosted CI; it is
+not deployed.**
 The bot now constructs the shared executor and registered router, bootstraps real
 application/guild context before constructing the shard, and awaits custom-command
 execution after the ordinary pipeline and before checkpoint COMMIT. READY and
@@ -53,7 +54,9 @@ builtin fallback, so acknowledged custom interactions never receive a second
 unavailable reply. Only the custom service's serialized, DB-backed full-set
 publisher runs on READY/RESUMED; no builtin-only publication can erase custom rows.
 The combined mock gateway fixture checks registry coexistence and single replies
-for custom, management, feed and sticky commands. It is added, not locally run.
+for custom, management, feed and sticky commands. It executes in the hosted
+`gateway_tests -- --ignored --test-threads=1` lane (`Gateway restart and
+transaction tests` in `check.yml`).
 
 Prefix execution also needs the automod verdict that the serial dispatch worker
 decides for each create, in addition to both custom-command gates. An explicit

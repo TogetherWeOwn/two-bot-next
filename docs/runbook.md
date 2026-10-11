@@ -21,7 +21,7 @@ separate authorization.
    returning success alone does not prove recovery.
 
 All npm commands below run **from the repository root** and use the pinned
-Wrangler 4.147.0 through `wrangler/package.json`. Use only the already-authorized
+Wrangler 4.148.0 through `wrangler/package.json`. Use only the already-authorized
 Cloudflare connection. An authentication/permission failure is a stop: report
 it, do not try another credential, elevate access, or use a personal token.
 Examples target `staging`; do not substitute `production` without its own gate.
@@ -112,7 +112,7 @@ invocation, unsampled; production traces are off (`wrangler/wrangler.toml`).
 
 `logs` is **Worker/DO tail**, not Rust stdout. Stop it when the bounded incident
 observation is complete. For Rust stdout/stderr, use the affected container's
-logs in the Cloudflare dashboard. Wrangler 4.147.0 has no `containers logs`
+logs in the Cloudflare dashboard. Wrangler 4.148.0 has no `containers logs`
 subcommand; do not invent one. Container inspection may list account-wide
 resources: match the affected environment/application before taking any action.
 No Cloudflare API reaches container stdout either, so voice-event emission has
@@ -142,6 +142,7 @@ Look for these literal messages:
 - `durable gateway failed; checkpoint unchanged, readiness unavailable` — fatal
   initialization failure; underlying SQL error deliberately not logged. Its
   `error_class` is also on `/readyz` as `gateway_failure` for 15 s before exit
+  (startup failures linger 15 s; only a running-gateway failure lingers 75 s)
   and in Workers Logs as `container_gateway_failure` (see
   [startup-diagnostics.md](startup-diagnostics.md)).
 - `container service failed` / `SIGTERM received; draining`.
@@ -191,11 +192,51 @@ succeeded since start (timestamp zero) is not reported here. If the Container
 restarted the series resets; wait one cadence before acting. Restart only after
 the logs show the job loop is wedged, per the [restart semantics](#restart-semantics-durable-resume-not-full-state-recovery).
 
+#### Alert: job unknown stale
+
+A job without a staleness cadence entry recorded no successful completion for
+more than 2 hours (`two_bot_job_last_success_timestamp_seconds{job}`). This is
+a **ticket, not a page**: without a mapped cadence the monitor cannot tell a
+slow-but-healthy schedule from a wedge, so it fails closed and nags for an
+explicit cadence, ticker coverage, or event-driven exclusion instead of
+staying silent. `session_checkpoint` is event-driven (one success per durable
+gateway commit) and is excluded from this rule in
+`UNKNOWN_STALE_EXCLUDED` (`wrangler/src/alert-rules.ts`): it never tickets
+however stale. A job that never succeeded since start (timestamp zero) is not
+reported here: that covers both boot and parked jobs.
+
+First response: check the `jobs` map on `/readyz` for the job's `parked`,
+`last_success` and `consecutive_failures` fields, then read the
+Worker/container logs for `periodic job failed`. A parked job with a zero
+timestamp is configuration, not a wedge. The standing fix is an explicit
+cadence entry, ticker coverage, or event-driven exclusion for the job — a
+reasoned catalog note alone does not stop the ticket — until then this ticket
+re-fires while the timestamp stays stale. Restart only after the
+logs show the job loop is wedged, per the [restart semantics](#restart-semantics-durable-resume-not-full-state-recovery).
+
+Escalate when staleness persists after the suspect deploy or dependency is
+identified, or when it coincides with pool-saturation or DB-error alerts —
+the fix then belongs to the on-call engineer, not another redeploy.
+
 #### Alert: job failures
 
-A job failed three completions in a row. Read `periodic job failed` logs (error
-class only; payloads are never logged). Usual causes: database unreachable,
-Discord REST failing. Fix the dependency; the streak clears on the next success.
+A job failed three completions in a row. The page includes the latest failure
+class when the `two_bot_job_last_error_class` series is available. If it is
+missing (for example, on an older build), the page still fires without a class;
+use sanitized `periodic job failed` logs instead. Error classes are fixed enum
+names, never error text or payloads. Take the first action for the reported class:
+
+| Class | First action |
+|---|---|
+| `database` | Check the database dependency and expected schema/grant state through its authorized owner; do not run SQL probes or widen grants. |
+| `rest` | Check Discord status and REST metrics for 429, 5xx or transport failures; honor `retry-after` and do not replay uncertain writes. |
+| `configuration` | Compare non-secret binding names and feature gates with the reviewed deployment; do not dump values or substitute credentials. |
+| `timeout` | Check the job status and pool-pressure metrics to locate the bounded operation before considering a restart. |
+| `panic` | Correlate the sanitized failure log with the deployed revision; the panic payload is intentionally unavailable. |
+| `feed` | Check the configured feed source's availability and recent fetch status through authorized diagnostics; do not copy response bodies. |
+| `recovery_required` | Preserve feed cursor and pending recovery state; follow the established recovery path before any manual replay or cursor change. |
+
+The streak clears on the next successful completion.
 
 #### Alert: REST 429
 
@@ -219,13 +260,25 @@ containment, when the hot route belongs to a writer this team does not own, or
 when 429s coincide with 5xx/transport failures suggesting a wider Discord or
 network incident.
 
+Executor route templates (fixed vocabulary): `GET /guilds/:guild/members/:member`
+counts member fetches, `GET /users/@me` counts current-user reads (literal
+`@me`, never a user id), `PATCH /webhooks/:application/:token/messages/@original`
+counts interaction-response edits (literal `@original`). Snowflakes, interaction
+tokens and query strings never appear in labels: `guilds/100/members/300?limit=1`
+counts as the member template, `users/@me?limit=100` as `GET /users/@me`,
+`webhooks/7/tok-abc/messages/@original?wait=true` as the webhook template.
+Unknown, wrong-method and overlong shapes collapse to `other` with no new
+series. Source: [`metrics.rs`](../crates/core/src/metrics.rs),
+[`executor_metrics.rs`](../crates/discord/src/executor_metrics.rs).
+
 #### Alert: DB pool
 
 The SQLx pool sat at its maximum with zero idle connections for three
 consecutive keepalive samples. This is pool exhaustion, a proxy for DB trouble;
-there is no DB error counter yet. It means every checkout is held — new queries
-wait rather than fail fast — not proof that the database itself is down (pool
-gauges sample SQLx bookkeeping, not DB reachability).
+recorded storage failures have a separate [DB-error alert](#alert-db-errors).
+It means every checkout is held — new queries wait rather than fail fast —
+not proof that the database itself is down (pool gauges
+sample SQLx bookkeeping, not DB reachability).
 
 First response: check the affected provider's status (PlanetScale for
 production, Neon for staging) before touching the bot; then look at recent
@@ -244,20 +297,26 @@ redeploy.
 
 #### Alert: DB errors
 
-Three or more storage-layer failures arrived between two keepalive samples
-(`two_bot_db_errors_total`, currently counting send-admission SQL; other
-stores adopt the counter incrementally). Unlike the pool rule above, this is
-errors, not pressure: queries already failed, they are not merely waiting.
-A counter reset (process restart) skips the window rather than firing, and a
-slow trickle below threshold stays silent — sustained low-rate failures
-surface instead through `job_consecutive_failures`.
+Three or more storage-layer failures arrived between two keepalive samples.
+`two_bot_db_errors_total` counts send-admission SQL failures (`op="admission"`)
+and voice actor load failures (`op="other"`); other stores adopt the counter
+incrementally, so this is not a database-wide total. Unlike the pool rule
+above, this is errors, not pressure: queries already failed, they are not
+merely waiting. A counter reset (process restart) skips the window rather
+than firing, and a slow trickle below threshold stays silent. Failed jobs
+may also surface through `job_consecutive_failures`; that rule does not
+cover every storage path.
 
 First response: check the affected provider's status (PlanetScale for
 production, Neon for staging) before touching the bot; then correlate with
 the `op` label and recent deploys (a new query path or migration can explain
-a fresh error burst). Do not run SQL probes against staging or production,
-add grants, or restart the container to "clear" the errors; a replacement
-restarts the shard without fixing the failing writes.
+a fresh error burst). For voice actor load failures, read `voice actor load
+failed; actor respawns on the next guild snapshot` in container stdout.
+Every failure increments the counter, but that warn is throttled
+process-wide to once per 300 s; its absence in a short window does not
+prove the actor loaded. Do not run SQL probes against staging or
+production, add grants, or restart the container to "clear" the errors;
+a replacement restarts the shard without fixing the failing storage path.
 
 Escalate when the burst repeats across windows, when it coincides with pool
 saturation or job-failure alerts, or when the affected provider's dashboard
@@ -327,10 +386,12 @@ monitoring arms only stores the baseline and never fires, and a counter
 reset (process restart) skips the window rather than firing.
 
 First response: read the paired `two_bot_gateway_disconnects_total` counter
-via the authorized `/ops/metrics` scrape — a missed-events increase with no
-disconnect means the gap predates this instrumentation or the process
-restarted mid-window (re-baseline both scrapes after it); a rise next to
-disconnects means transport loss with sequence gaps. Correlate with recent
+via the authorized `/ops/metrics` scrape. A missed-events increase without
+a disconnect increase is an unexplained same-session sequence gap, not
+proof that instrumentation predates the gap or that the process restarted.
+A rise next to disconnects warrants investigating transport loss with
+sequence gaps. Re-baseline both scrapes after a confirmed restart.
+Correlate with recent
 deploys (a fresh deploy restarts the process and resets the counter) and
 the container logs for `gateway reconnect failed; Twilight will retry` and
 `gateway ready; checkpoint committed`. Do not restart the container to
@@ -341,6 +402,48 @@ Escalate when the increase repeats across windows, when it coincides with
 unpaired disconnects (no later RESUME or fresh READY), or when missed
 events rise with no disconnect at all — the gap is then unexplained and
 the fix belongs to the on-call engineer, not another redeploy.
+
+#### Alert: gateway unpaired disconnect
+
+`two_bot_gateway_disconnects_total` grew between keepalive samples and the
+recoveries (`two_bot_gateway_resumes_total` plus fresh READY from
+`two_bot_gateway_events_total{event="READY"}`) have not caught up for 3
+consecutive completed samples. Every disconnect should pair with a later
+RESUMED or fresh READY; an unpaired one means the gateway never came back.
+This is page severity (SEV-1 in the
+[watch escalation path](watch-escalation-path.md)).
+
+The bound is 3 samples. Samples arrive about every 60 s and a normal reconnect
+resumes within seconds. A RESUMED that lands before the next sample or the one
+after clears the unpaired count while the streak is at most 2, one short of
+the bound. The third consecutive unpaired sample comes about two to three
+minutes after the disconnect, so a reconnect that resumes within two samples
+never pages and a gateway that stays down does.
+
+A disconnect is outstanding while the recovery counters have not grown since
+the disconnect growth started. Any growth in RESUMED plus fresh READY clears
+the outstanding loss at once, even when the same window also added
+disconnects: the disconnect series counts every failed Twilight retry, close
+frame, op 9 invalid session and cold-resume IDENTIFY, so one recovered outage
+routinely adds several disconnects against a single recovery, and subtracting
+the growths would page forever on the leftover (see the pairing warning in
+[cutover dashboard queries](cutover-dashboard-queries.md)). The alert fires
+when a loss stays outstanding for 3 consecutive samples and resolves on the
+first sample with recovery growth. The first sample only stores the baseline. A
+missing, duplicated, or non-numeric sample changes nothing and holds the current
+state. A counter that went backwards means the process restarted: that sample is
+not a window, the streak restarts, and a firing alert holds rather than
+clearing. The firing key is the constant `gateway_unpaired_disconnect`.
+
+First response: scrape `/ops/metrics` as described above and compare the
+disconnect and recovery counters with the previous scrape. Then read the
+container logs for `gateway reconnect failed; Twilight will retry` (the gateway
+is still retrying) and `gateway ready; checkpoint committed` (a recovery). If
+the logs show no `gateway ready` after the last disconnect, the gateway is still
+down: escalate to the on-call engineer through the watch escalation path. Do not
+restart the container to clear the alert. A restart re-baselines the counters
+without showing that the gateway came back, so confirm `gateway ready` in the
+new process's logs first.
 
 #### Alert: ticker stale
 
@@ -401,6 +504,41 @@ caller is identified, when they coincide with 429 or DB-error alerts, or
 when `executed` traffic for the same family collapses while refusals rise
 — the receiver may be refusing legitimate work and the fix belongs to the
 on-call engineer, not another redeploy.
+
+#### Alert: checkpoint failures
+
+`two_bot_gateway_checkpoint_failures_total` increased between two keepalive
+samples. Every checkpoint failure stops the dispatch worker, so there is no
+benign singleton: a single increase pages. The first sample after monitoring
+arms only stores the baseline and never fires. A running-gateway failure
+lingers 75 s before it exits (startup failures still linger 15 s), which
+leaves about 3 s of margin over one 60 s keepalive tick plus two 6 s probe
+timeouts for a scrape to see the increase; the post-restart reset sample
+resolves the alert rather than firing.
+
+First response: if the failing process is still up (within the linger), read
+the `stage` label on `two_bot_gateway_checkpoint_failures_total` via the
+authorized `/ops/metrics` scrape — `pre_commit` means the commit was skipped
+after a funnel, leveling or acknowledgement failure, while `commit` means the
+durable store write itself failed. Once the process has restarted, the stage
+is not recoverable: the counter resets to zero and the Worker log line
+(`{"event":"container_gateway_failure","phase":…,"class":…}`) carries only
+`phase` and `class` — both stages map to `gateway_runtime_failed` — never
+the `stage`. Do not wait for the stage then; check the `gateway` component on
+`/readyz` and the Neon status for the staging branch instead: a `commit`
+failure next to DB-error or pool alerts points at the database, not the
+gateway. Do not restart manually: the process exits on its own after
+the linger and the supervisor restarts from the committed checkpoint — verify
+the replacement is healthy per the
+[restart semantics](#restart-semantics-durable-resume-not-full-state-recovery).
+Do not restart to "clear" the counter, since a replacement resets the
+baseline without recovering the uncommitted checkpoint.
+
+Escalate when the increase repeats across windows, when `commit` failures
+coincide with DB-error or pool-saturation alerts, or when `pre_commit`
+failures rise with no failing dependency in the logs — the cause is then
+unexplained and the fix belongs to the on-call engineer, not another
+redeploy.
 
 #### Alert: dispatch drops
 
@@ -765,7 +903,7 @@ npm --prefix wrangler run deployments -- list --env staging
 ```
 
 Read the interactive target and confirm the incident's known-good version.
-Do not add `--yes` or override warnings. Wrangler 4.147 updates Durable Object
+Do not add `--yes` or override warnings. Wrangler 4.148 updates Durable Object
 code with `deferred` mode and a 300 s maximum delay by default, so a bare
 rollback can leave the old code serving for up to five minutes. For a manual
 incident rollback add `--durable-objects-code-update-mode immediate`, and expect

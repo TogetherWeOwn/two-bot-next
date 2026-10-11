@@ -86,6 +86,13 @@ WORKER_USER_AGENT = "two-bot-next-staging-rollout/1.0"
 STAGING_HOST = re.compile(r"two-bot-next-staging\.[a-z0-9-]+\.workers\.dev")
 MOCK_TRANSPORT = "mock-local-fixtures"
 
+# Per-surface allowlist for the Worker seam: required process/gateway plus
+# legitimate optional database/token_invalid from the container's full
+# breakdown. Anything else is refused with fixed vocabulary naming no
+# component data.
+WORKER_REQUIRED_COMPONENTS = ("process", "gateway")
+WORKER_ALLOWED_COMPONENTS = frozenset({"process", "gateway", "database", "token_invalid"})
+
 # Pending-registration marker carried on SKIP verdicts (fixed vocabulary).
 AWAITING_REGISTRATION = "awaiting voice command registration"
 
@@ -291,6 +298,12 @@ def parse_worker_readyz(status, report):
     names = [c[0] for c in components]
     if len(set(names)) != len(names):
         raise SmokeError("GET /readyz repeats a component name")
+    if any(name not in WORKER_ALLOWED_COMPONENTS for name in names):
+        raise SmokeError("GET /readyz carries an unknown component name")
+    seen = set(names)
+    missing = [name for name in WORKER_REQUIRED_COMPONENTS if name not in seen]
+    if missing:
+        raise SmokeError(f"GET /readyz breakdown lacks {', '.join(missing)}")
     return dict(components)
 
 

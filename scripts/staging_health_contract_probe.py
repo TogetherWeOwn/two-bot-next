@@ -23,6 +23,13 @@ No probe may apply a migration or test production. This probe never writes,
 follows no redirects, and sends no credentials. The only network calls
 are the two staging GETs above.
 
+Body-cap refusal contract: the transport reads at most BODY_CAP+1 bytes on
+both the normal and HTTPError paths so a hidden suffix is detected. Any body
+longer than BODY_CAP (64 KiB) is refused before JSON parsing with the fixed
+message "<name> probe answered over the body cap"; exact-cap valid input
+passes, and the extra byte never reaches a successful JSON path. Refusals
+never echo the body, headers, URL or parse exceptions.
+
 Origin fence (fail-closed, before any request): only an
 https://two-bot-next-staging.<sub>.workers.dev origin (no port, userinfo,
 path, query or fragment) is fetched; anything else -- including the
@@ -51,6 +58,11 @@ TIMEOUT_SECONDS = 10
 USER_AGENT = "two-bot-next-staging-health-contract-probe/1.0 (read-only E2E)"
 
 REQUIRED_COMPONENTS = ("process", "gateway", "database", "token_invalid")
+# Per-surface allowlist: exactly the four components the container serves
+# (crates/bot/src/server.rs readiness_report + with_token_state). No
+# optionals on this surface; anything else is refused with fixed vocabulary
+# naming no component data.
+ALLOWED_COMPONENTS = frozenset({"process", "gateway", "database", "token_invalid"})
 STATUSES = ("ready", "starting", "down")
 FAILURE_PHASE = "durable_gateway"
 FAILURE_CLASSES = frozenset({
@@ -146,6 +158,8 @@ def get_json(fetch_fn, url, name):
         status, headers, body = fetch_fn(url)
     except (OSError, http.client.HTTPException) as error:
         raise ProbeError(f"{name} probe did not respond ({error.__class__.__name__})")
+    if len(body) > BODY_CAP:
+        raise ProbeError(f"{name} probe answered over the body cap")
     try:
         value = json.loads(body)
     except (ValueError, UnicodeDecodeError):
@@ -181,6 +195,8 @@ def parse_readyz(status, value):
     names = [row[0] for row in components]
     if len(set(names)) != len(names):
         raise ProbeError(f"readyz {status} repeats a component name")
+    if any(name not in ALLOWED_COMPONENTS for name in names):
+        raise ProbeError(f"readyz {status} carries an unknown component name")
     state = dict(components)
     missing = [name for name in REQUIRED_COMPONENTS if name not in state]
     if missing:

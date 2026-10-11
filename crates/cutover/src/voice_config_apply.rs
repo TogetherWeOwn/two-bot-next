@@ -13,8 +13,8 @@
 
 use twilight_model::channel::{Channel, ChannelType};
 use two_bot_core::voice_config::{
-    decode_configuration, validate_configuration, ChannelKind, ChannelReference, GuildInventory,
-    VoiceConfigError, VoiceConfiguration, MAX_IMPORT_BYTES,
+    decode_configuration, validate_configuration, validate_time_zone_change, ChannelKind,
+    ChannelReference, GuildInventory, VoiceConfigError, VoiceConfiguration, MAX_IMPORT_BYTES,
 };
 use two_bot_core::voice_config_diff::{
     diff_configuration, diff_content_hash, render_preview, skip_unknown_channels,
@@ -80,7 +80,9 @@ pub fn plan_apply(
         }
     };
     let (remaining, skipped) = skip_unknown_channels(&incoming, inventory);
-    if let Err(error) = validate_configuration(&remaining, inventory) {
+    if let Err(error) = validate_configuration(&remaining, inventory)
+        .and_then(|()| validate_time_zone_change(&current.settings.time_zone, &remaining))
+    {
         return ApplyPlan::Refuse {
             message: format!("{error} nothing was changed"),
         };
@@ -271,6 +273,24 @@ mod tests {
             .contains_key(&OTHER_GUILD_VOICE.to_string()));
         assert!(inventory.roles.contains_key(&GUILD.to_string()));
         assert!(inventory.members.contains_key("42"));
+    }
+
+    #[test]
+    fn a_new_unsupported_time_zone_is_refused() {
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&empty_document(GUILD)).unwrap();
+        document["settings"]["time_zone"] = serde_json::json!("Mars/Olympus");
+        let bytes = serde_json::to_vec(&document).unwrap();
+        assert!(matches!(
+            plan_apply(&empty_config(), &bytes, &inventory()),
+            ApplyPlan::Refuse { message } if message.contains("settings.time_zone")
+        ));
+        document["settings"]["time_zone"] = serde_json::json!("America/New_York");
+        let bytes = serde_json::to_vec(&document).unwrap();
+        assert!(!matches!(
+            plan_apply(&empty_config(), &bytes, &inventory()),
+            ApplyPlan::Refuse { .. }
+        ));
     }
 
     #[test]

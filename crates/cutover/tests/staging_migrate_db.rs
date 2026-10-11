@@ -262,6 +262,11 @@ impl Fixture {
         ] {
             cmd.env_remove(key);
         }
+        // The runner fences its target pool with the `TWO_DATABASE_TLS`
+        // policy: the disposable CI-service URLs are plaintext local hosts,
+        // so pin `local-only` explicitly instead of inheriting the ambient
+        // setting.
+        cmd.env("TWO_DATABASE_TLS", "local-only");
         if let Some(url) = url {
             cmd.env(binding, url);
         }

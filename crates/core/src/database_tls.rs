@@ -206,6 +206,17 @@ mod tests {
         "postgres://agent_test@%2Fvar%2Frun%2Fpostgresql/agent_test",
     ];
 
+    /// PlanetScale production shapes: `{role}.{branch_id}` dotted logins on
+    /// the direct `*.pg.psdb.cloud:5432` and `*.horizon.psdb.cloud:5432`
+    /// endpoints. Synthetic hostnames only: no real cluster id, host or
+    /// credential.
+    const PLANETSCALE: [&str; 4] = [
+        "postgresql://migrator.cnfixture01@psdb-fixture-1.pg.psdb.cloud:5432/postgres",
+        "postgresql://fixture-role.cnfixture02:fixture-password@psdb-fixture-2.pg.psdb.cloud:5432/two_bot",
+        "postgresql://migrator.cnfixture01@psdb-fixture-1.horizon.psdb.cloud:5432/postgres",
+        "postgres://fixture-role.cnfixture02:fixture-password@psdb-fixture-2.horizon.psdb.cloud/db",
+    ];
+
     fn url(prefix: &str, query: &str) -> String {
         if query.is_empty() {
             prefix.to_owned()
@@ -265,6 +276,66 @@ mod tests {
         let neon = "postgresql://fixture-user:fixture-password@ep-fixture-123.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require";
         assert_eq!(enforce(neon, REQUIRED), Ok(()));
         assert_eq!(enforce(neon, LOCAL_ONLY), Err(REMOTE_REFUSED));
+    }
+
+    #[test]
+    fn planetscale_production_shapes_are_remote_under_required() {
+        // The live production endpoints classify as Remote: the full sslmode
+        // matrix matches every other remote host, and `LocalOnly` refuses
+        // each shape outright.
+        for (index, query) in MODES.iter().enumerate() {
+            for prefix in PLANETSCALE {
+                let raw = url(prefix, query);
+                assert_eq!(enforce(&raw, REQUIRED), REQUIRED_REMOTE[index], "{raw}");
+                assert_eq!(enforce(&raw, LOCAL_ONLY), Err(REMOTE_REFUSED), "{raw}");
+            }
+        }
+    }
+
+    #[test]
+    fn planetscale_hostaddr_and_second_host_overrides_are_checked() {
+        for (raw, required, local_only) in [
+            // A query host pointing at a local socket or service still
+            // refuses under `Required`, and the remote authority still
+            // refuses under `LocalOnly`.
+            (
+                "postgresql://migrator.cnfixture01@psdb-fixture-1.pg.psdb.cloud:5432/postgres?host=/var/run/postgresql&sslmode=require",
+                Err(LOCAL_REFUSED),
+                Err(REMOTE_REFUSED),
+            ),
+            (
+                "postgresql://migrator.cnfixture01@psdb-fixture-1.pg.psdb.cloud:5432/postgres?host=agent-testdb&sslmode=require",
+                Err(LOCAL_REFUSED),
+                Err(REMOTE_REFUSED),
+            ),
+            (
+                "postgresql://migrator.cnfixture01@psdb-fixture-1.pg.psdb.cloud:5432/postgres?hostaddr=127.0.0.1&sslmode=require",
+                Err(LOCAL_REFUSED),
+                Err(REMOTE_REFUSED),
+            ),
+            // A second remote host is still a remote host: admitted under
+            // `Required` with a strong mode, refused under `LocalOnly`.
+            (
+                "postgresql://migrator.cnfixture01@psdb-fixture-1.pg.psdb.cloud:5432/postgres?host=psdb-fixture-2.pg.psdb.cloud&sslmode=verify-full",
+                Ok(()),
+                Err(REMOTE_REFUSED),
+            ),
+            (
+                "postgresql://migrator.cnfixture01@psdb-fixture-1.pg.psdb.cloud:5432/postgres?hostaddr=203.0.113.7&sslmode=require",
+                Ok(()),
+                Err(REMOTE_REFUSED),
+            ),
+            // A local authority with a PlanetScale query host refuses both
+            // ways: neither policy lets the two classes mix.
+            (
+                "postgres://u:p@agent-testdb/db?host=psdb-fixture-1.pg.psdb.cloud&sslmode=require",
+                Err(LOCAL_REFUSED),
+                Err(REMOTE_REFUSED),
+            ),
+        ] {
+            assert_eq!(enforce(raw, REQUIRED), required, "{raw}");
+            assert_eq!(enforce(raw, LOCAL_ONLY), local_only, "{raw}");
+        }
     }
 
     #[test]
@@ -373,12 +444,17 @@ mod tests {
             "fixture-password",
             "ep-fixture-123",
             "neon.tech",
+            "psdb-fixture-1",
+            "psdb-fixture-2",
+            "psdb.cloud",
+            "cnfixture01",
+            "cnfixture02",
             "203.0.113.7",
             "agent-testdb",
             "fixture-unknown-mode",
         ];
         for query in MODES {
-            for prefix in REMOTE.iter().chain(LOCAL.iter()) {
+            for prefix in REMOTE.iter().chain(LOCAL.iter()).chain(PLANETSCALE.iter()) {
                 for policy in [REQUIRED, LOCAL_ONLY] {
                     if let Err(error) = enforce(&url(prefix, query), policy) {
                         for secret in secrets {
@@ -434,5 +510,29 @@ mod tests {
         let local = "postgres://agent_test:@agent-testdb:5432/agent_test?sslmode=disable";
         let options = apply(connect_options(local).unwrap(), LOCAL_ONLY);
         assert!(matches!(options.get_ssl_mode(), PgSslMode::Disable));
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn planetscale_required_connects_as_verify_full() {
+        use crate::database_url::{connect_options, validate};
+        for prefix in PLANETSCALE {
+            for mode in ["require", "verify-ca", "verify-full", "REQUIRE"] {
+                let raw = format!("{prefix}?sslmode={mode}");
+                assert!(validate(&raw).is_ok(), "{raw}");
+                assert_eq!(enforce(&raw, REQUIRED), Ok(()), "{raw}");
+                let options = apply(connect_options(&raw).unwrap(), REQUIRED);
+                assert!(
+                    matches!(options.get_ssl_mode(), PgSslMode::VerifyFull),
+                    "{raw}"
+                );
+            }
+            // Missing and weak modes refuse before SQLx parses the URL.
+            assert_eq!(enforce(prefix, REQUIRED), Err(MISSING_SSLMODE), "{prefix}");
+            for mode in ["disable", "allow", "prefer"] {
+                let raw = format!("{prefix}?sslmode={mode}");
+                assert_eq!(enforce(&raw, REQUIRED), Err(WEAK_SSLMODE), "{raw}");
+            }
+        }
     }
 }

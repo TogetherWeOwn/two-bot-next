@@ -8,6 +8,7 @@ import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import subprocess
+import sys
 import tarfile
 import tempfile
 import threading
@@ -145,6 +146,26 @@ class FlakyHealthHandler(BaseHTTPRequestHandler):
         json_reply(self, 200, b'{"status": "ok"}')
 
 
+class TruncatedBodyHandler(BaseHTTPRequestHandler):
+    """Promises 16 body bytes, sends 8, then closes (dropped mid-body)."""
+
+    truncate = True
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        if type(self).truncate:
+            type(self).truncate = False
+            self.send_response(200)
+            self.send_header("Content-Length", "16")
+            self.end_headers()
+            self.wfile.write(b'{"statu')
+            self.connection.close()
+            return
+        json_reply(self, 200, b'{"status": "ok"}')
+
+
 class RedirectReadyzHandler(BaseHTTPRequestHandler):
     """/readyz 302 -> /other 503 with the expected JSON (the review repro)."""
 
@@ -164,12 +185,152 @@ class RedirectReadyzHandler(BaseHTTPRequestHandler):
             json_reply(self, 200, b'{"status": "ok"}')
 
 
+def padded_json(size):
+    """A valid JSON object of exactly `size` bytes (trailing whitespace)."""
+    head = b'{"status": "ok"}'
+    return head + b" " * (size - len(head))
+
+
+class SizedBodyHandler(BaseHTTPRequestHandler):
+    """Answers every GET with a valid JSON body of `size` bytes."""
+
+    size = 0
+    user_agents = []
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        type(self).user_agents.append(self.headers.get("User-Agent"))
+        try:
+            json_reply(self, 200, padded_json(type(self).size))
+        except OSError:
+            pass  # the client refused the body and hung up mid-write
+
+
+class EndlessBodyHandler(BaseHTTPRequestHandler):
+    """Streams a close-delimited body with no Content-Length, until hung up on."""
+
+    written = 0
+    ended = threading.Event()
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        chunk = b" " * 4096
+        try:
+            # Far more than any socket buffer: an unbounded client would take
+            # all of it, a bounded one leaves this blocked then broken-piped.
+            while type(self).written < 256 * smoke.MIB:
+                self.wfile.write(chunk)
+                self.wfile.flush()
+                type(self).written += len(chunk)
+        except OSError:
+            pass
+        finally:
+            type(self).ended.set()
+
+
 class HttpHelperTests(unittest.TestCase):
     def tearDown(self):
         FlakyHealthHandler.unanswered = True
+        TruncatedBodyHandler.truncate = True
+        SizedBodyHandler.user_agents = []
+        EndlessBodyHandler.written = 0
+        EndlessBodyHandler.ended.clear()
+
+    def sized_get(self, size):
+        SizedBodyHandler.size = size
+        server = serve_in_thread(SizedBodyHandler)
+        try:
+            return smoke.http_response(server_url(server, "/readyz"))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_cap_matches_sibling_probes(self):
+        self.assertEqual(smoke.MAX_BODY_BYTES, 64 * 1024)
+
+    def test_exact_cap_body_still_parses(self):
+        self.assertEqual(self.sized_get(smoke.MAX_BODY_BYTES), (200, {"status": "ok"}))
+
+    def test_body_one_byte_over_cap_is_refused_before_parsing(self):
+        # Valid JSON the whole way, so only the cap can be what rejects it.
+        with self.assertRaises(smoke.BodyTooLarge) as caught:
+            self.sized_get(smoke.MAX_BODY_BYTES + 1)
+        self.assertEqual(str(caught.exception), "loopback response body exceeds the 64 KiB cap")
+        self.assertIsInstance(caught.exception, RuntimeError)
+        self.assertNotIsInstance(caught.exception, ValueError)
+
+    def test_over_cap_refusal_is_not_a_retryable_transport_miss(self):
+        # The caller loops on (None, None) until its deadline; an oversized
+        # body must surface immediately instead of being retried.
+        with self.assertRaises(smoke.BodyTooLarge):
+            self.sized_get(10 * smoke.MIB)
+
+    def test_endless_body_is_cut_off_near_the_cap(self):
+        server = serve_in_thread(EndlessBodyHandler)
+        try:
+            with self.assertRaises(smoke.BodyTooLarge):
+                smoke.http_response(server_url(server, "/health"))
+            self.assertTrue(EndlessBodyHandler.ended.wait(10), "client never hung up")
+            # Loopback socket buffers hold a few MiB at most; reading the
+            # whole 256 MiB stream would have written all of it.
+            self.assertLess(EndlessBodyHandler.written, 64 * smoke.MIB)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_every_read_is_bounded(self):
+        reads = []
+
+        class Response:
+            status = 200
+            length = 0
+
+            def read(self, amt=None):
+                reads.append(amt)
+                return b'{"status": "ok"}'
+
+        class Connection:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def request(self, *args, **kwargs):
+                pass
+
+            def getresponse(self):
+                return Response()
+
+            def close(self):
+                pass
+
+        with patch.object(smoke.http.client, "HTTPConnection", Connection):
+            self.assertEqual(smoke.http_response("http://127.0.0.1:1/health"), (200, {"status": "ok"}))
+        self.assertEqual(reads, [smoke.MAX_BODY_BYTES + 1])
+
+    def test_user_agent_is_pinned(self):
+        self.sized_get(len(b'{"status": "ok"}'))
+        self.assertEqual(SizedBodyHandler.user_agents, [smoke.USER_AGENT])
+        self.assertTrue(smoke.USER_AGENT.startswith("two-bot-next-container-smoke/"))
 
     def test_early_close_is_a_retryable_miss_not_a_crash(self):
         server = serve_in_thread(FlakyHealthHandler)
+        try:
+            url = server_url(server, "/health")
+            self.assertEqual(smoke.http_response(url), (None, None))
+            self.assertEqual(smoke.http_response(url), (200, {"status": "ok"}))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_body_cut_short_mid_stream_is_a_retryable_miss(self):
+        server = serve_in_thread(TruncatedBodyHandler)
         try:
             url = server_url(server, "/health")
             self.assertEqual(smoke.http_response(url), (None, None))
@@ -633,6 +794,28 @@ class ContainerSmokeTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_oversized_health_body_fails_the_smoke_live(self):
+        SizedBodyHandler.size = smoke.MAX_BODY_BYTES + 1
+        server = serve_in_thread(SizedBodyHandler)
+        try:
+            self.fixture.port = f"127.0.0.1:{server.server_address[1]}\n"
+            with self.assertRaises(smoke.BodyTooLarge):
+                self.run_smoke(live_http=True)
+            self.assertEqual(self.fixture.calls[-1][0][:2], ("rm", "--force"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            SizedBodyHandler.user_agents = []
+
+    def test_main_reports_the_body_cap_refusal_without_a_traceback(self):
+        with patch.object(smoke, "smoke", side_effect=smoke.BodyTooLarge("loopback response body exceeds the 64 KiB cap")), \
+                patch.object(sys, "argv", ["container-smoke.py", "two-bot:fixture"]):
+            with self.assertRaises(SystemExit) as caught:
+                smoke.main()
+        self.assertEqual(
+            caught.exception.code,
+            "FAIL container smoke: loopback response body exceeds the 64 KiB cap")
 
     def test_oom_not_accepted(self):
         self.fixture.oom = True

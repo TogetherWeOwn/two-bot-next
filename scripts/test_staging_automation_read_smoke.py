@@ -172,6 +172,133 @@ class AutomationReadSmokeTests(unittest.TestCase):
         self.assertNotIn(TOKEN, Path(self.evidence).read_text())
 
 
+class BodyCapRefusalTests(unittest.TestCase):
+    """Oversized bodies are refused before JSON parsing (M4.42)."""
+
+    def setUp(self):
+        guard = mock.patch.object(smoke.urllib.request.OpenerDirector, "open",
+                                  side_effect=AssertionError("network access in a unit test"))
+        guard.start()
+        self.addCleanup(guard.stop)
+        self.requested = []
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.evidence = str(Path(tmp.name) / "evidence.json")
+
+    def fetch(self, routes):
+        def fake(url):
+            self.requested.append(url)
+            if url not in routes:
+                raise AssertionError(f"unexpected offline fixture route: {url}")
+            response = routes[url]
+            if isinstance(response, Exception):
+                raise response
+            return response
+        return fake
+
+    def padded(self, value, size):
+        raw = json.dumps(value).encode()
+        self.assertLessEqual(len(raw), size, "fixture must fit the target size")
+        return raw + b" " * (size - len(raw))
+
+    def run_main(self, routes):
+        with mock.patch.dict(os.environ, {"DISCORD_STAGING_BOT_TOKEN": TOKEN}, clear=True):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = smoke.main(["--guild-id", STAGING_GUILD, "--evidence", self.evidence],
+                                  fetch_fn=self.fetch(routes))
+        return code, out.getvalue()
+
+    def base_routes(self):
+        app_url = f"{smoke.API}/applications/{STAGING_APP}/guilds/{STAGING_GUILD}/commands"
+        mapping = {f"{smoke.API}/users/@me": (200, json.dumps(
+            {"id": STAGING_APP}).encode()),
+            app_url: (200, json.dumps(COMMANDS).encode())}
+        for command in COMMANDS:
+            mapping[f"{app_url}/{command['id']}"] = (200, json.dumps(command).encode())
+        return mapping, app_url
+
+    def test_exact_cap_valid_input_passes(self):
+        routes, app_url = self.base_routes()
+        identity = json.dumps({"id": STAGING_APP}).encode()
+        routes[f"{smoke.API}/users/@me"] = (200, self.padded({"id": STAGING_APP}, smoke.BODY_CAP))
+        self.assertEqual(len(routes[f"{smoke.API}/users/@me"][1]), smoke.BODY_CAP)
+        code, out = self.run_main(routes)
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS rank:", out)
+
+    def test_valid_json_padded_past_cap_refuses_before_parsing(self):
+        routes, _ = self.base_routes()
+        sentinel = "SENTINEL_BODY_automation_padded"
+        base = json.dumps({"id": STAGING_APP, "note": sentinel}).encode()
+        body = base + b" " * (smoke.BODY_CAP + 1 - len(base))
+        self.assertEqual(len(body), smoke.BODY_CAP + 1)
+        # Still valid JSON (trailing whitespace): the old parser would accept.
+        self.assertEqual(json.loads(body)["note"], sentinel)
+        routes[f"{smoke.API}/users/@me"] = (200, body)
+        code, out = self.run_main(routes)
+        self.assertEqual(code, 1, out)
+        self.assertIn("interactions endpoint answered over the body cap", out)
+        self.assertNotIn(sentinel, out)
+        self.assertNotIn("SENTINEL_BODY", out)
+
+    def test_cap_length_valid_prefix_with_hidden_tail_refuses(self):
+        routes, _ = self.base_routes()
+        prefix = self.padded({"id": STAGING_APP}, smoke.BODY_CAP)
+        self.assertEqual(json.loads(prefix)["id"], STAGING_APP)
+        # Hidden tail beyond the cap: the first CAP bytes alone are valid JSON,
+        # so an exact-cap read would silently accept the prefix.
+        routes[f"{smoke.API}/users/@me"] = (200, prefix + b"X")
+        code, out = self.run_main(routes)
+        self.assertEqual(code, 1, out)
+        self.assertIn("interactions endpoint answered over the body cap", out)
+        self.assertNotIn("X", out.split("over the body cap")[0][-80:])
+
+    def test_transport_reads_bounded_cap_plus_one_both_paths(self):
+        import urllib.error
+        seen = []
+
+        class Response:
+            status = 200
+
+            def __init__(self, payload):
+                self.payload = payload
+
+            def read(self, n):
+                seen.append(n)
+                return self.payload
+
+            def close(self):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class Opener:
+            def __init__(self, behaviour):
+                self.behaviour = behaviour
+
+            def open(self, request, timeout=None):
+                if self.behaviour == "ok":
+                    return Response(b"{}")
+                raise urllib.error.HTTPError(request.full_url, 500, "Server Error", {}, Response(b"x"))
+
+        fetch = smoke.make_fetch(TOKEN)
+        with mock.patch.object(smoke.urllib.request, "build_opener",
+                               return_value=Opener("ok")):
+            fetch("https://discord.com/api/v10/users/@me")
+        self.assertEqual(seen, [smoke.BODY_CAP + 1])
+        seen.clear()
+        with mock.patch.object(smoke.urllib.request, "build_opener",
+                               return_value=Opener("error")):
+            fetch("https://discord.com/api/v10/users/@me")
+        # HTTPError path also reads a bounded amount, never unbounded.
+        self.assertEqual(seen, [smoke.BODY_CAP + 1])
+
+
 class _Loopback:
     """Isolated 127.0.0.1 server that records every request it receives."""
 
