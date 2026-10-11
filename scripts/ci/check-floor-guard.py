@@ -2,16 +2,22 @@
 """HARD gate: the CONSTRAINTS.md floor holds on every diff.
 
 Fails when a diff adds a checker waiver, adds a test skip, deletes a test
-file, strips an assertion from a test that stays, or lowers a number in
-CONSTRAINTS.md. Tightening the bar is silent; loosening it is loud.
+file, strips assertions from test code, or lowers a number in CONSTRAINTS.md.
+Tightening the bar is silent; loosening it is loud.
 
 Contract (reference: constraint-driven-development floor-guard):
 - Input is the merge-base-to-selected-head diff plus untracked files.
 - Exit 0 clean, 1 on a floor violation, 2 when the guard cannot run
   (no merge base). A 2 never reads as a 0.
 - Markdown prose (.md) is exempt from the waiver/skip patterns: mentioning a
-  lint attribute in docs is not adding one. Rule text lives in CONSTRAINTS.md
-  itself, which only gets the threshold check.
+  lint attribute in docs is not adding one.
+- Exceptions come from the merge base's CONSTRAINTS.md, never the head's, so
+  a PR cannot exempt its own waiver. A row names a path glob, the waiver text,
+  an owner and an expiry date, and stops covering after that date.
+- A database ignore that names the agent test DB is accepted in an integration
+  target. check-test-inventory.py requires a CI lane to run each such target.
+- Assertions are counted across the whole diff: a moved assertion passes, a
+  dropped one without a replacement fails.
 
 Rust attributes only take effect at line start, so the gate honours them
 there; prose mentions and fixture strings elsewhere never match. Inline
@@ -22,12 +28,15 @@ committed diff carries none of the contiguous literals it scans for.
 """
 
 import argparse
+import fnmatch
 import re
 import subprocess
 import sys
+from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+CONSTRAINTS = "CONSTRAINTS.md"
 
 
 class NoMergeBase(Exception):
@@ -39,6 +48,10 @@ class NoMergeBase(Exception):
 ATTR_ALLOW = re.compile(r"^\s*#\s*!?\s*\[\s*allow")
 ATTR_RUSTFMT_SKIP = re.compile(r"^\s*#\s*\[\s*rustfmt::skip")
 ATTR_IGNORE = re.compile(r"^\s*#\s*\[\s*ignore")
+ROUTED_DB_IGNORE = re.compile(
+    r'^\s*#\s*\[\s*ignore\s*=\s*"[^"]*(?:agent-testdb|TEST_DATABASE_URL)[^"]*"\s*\]'
+)
+INTEGRATION_TARGET = re.compile(r"^crates/[^/]+/tests/[^/]+\.rs$")
 
 # Trailing-comment waivers take effect mid-line, so they match anywhere.
 INLINE_SUPPRESSIONS = re.compile(
@@ -66,8 +79,13 @@ JS_TEST_SKIP = re.compile(
 PYTHON_TEST_SKIP = re.compile(r"pytest\.mark\.skip")
 GO_TEST_SKIP = re.compile(r"t\.Skip\s*\(")
 
-TEST_PATH = re.compile(r"\.test\.|_test\.|/tests?/|test_")
+TEST_PATH = re.compile(r"\.test\.|_tests?\.|/tests?/|_tests/|/tests?\.rs$|test_")
 ASSERTS = re.compile(r"\bassert(_\w+)?!?|\bexpect\s*\(|\bshould\b")
+SECTION = re.compile(r"^##\s+(.+?)\s*$")
+
+
+def _is_markdown(path):
+    return path.endswith(".md")
 
 
 def _numbers(line):
@@ -75,25 +93,104 @@ def _numbers(line):
     return [float(n) for n in re.findall(r"\d+(?:\.\d+)?", without_dates)]
 
 
-def _constraint_key(line):
-    cells = line.strip().split("|")
-    if len(cells) < 3:
-        return None
-    key = cells[1].strip()
-    if not key or set(key) <= {"-", ":"} or key.lower() == "dimension":
-        return None
-    return key
+def _cells(line):
+    return [cell.strip() for cell in line.strip().strip("|").split("|")]
 
 
-def _is_markdown(path):
-    return path.endswith(".md")
+def _table_rows(text):
+    """Return (section, key, line) for each table row; key is the first cell."""
+    rows = []
+    section = ""
+    for line in (text or "").splitlines():
+        heading = SECTION.match(line)
+        if heading:
+            section = heading.group(1).lower()
+            continue
+        cells = line.strip().split("|")
+        if len(cells) < 3:
+            continue
+        key = cells[1].strip()
+        if not key or set(key) <= {"-", ":"} or key.lower() == "dimension":
+            continue
+        rows.append((section, key, line))
+    return rows
+
+
+def _lowered(old, new):
+    old_nums, new_nums = _numbers(old), _numbers(new)
+    return len(new_nums) < len(old_nums) or any(
+        new_nums[i] < number for i, number in enumerate(old_nums)
+    )
+
+
+def _promoted(old, head_rows, base_keys):
+    """A measured row may move to Enforced under a new name if it is no looser."""
+    if not _numbers(old):
+        return False
+    return any(
+        section.startswith("enforced")
+        and key not in base_keys
+        and not _lowered(old, line)
+        for section, key, line in head_rows
+    )
+
+
+def threshold_violations(base_text, head_text):
+    """Compare CONSTRAINTS.md rows across the diff; a deleted file is scan()'s job."""
+    if base_text is None or head_text is None:
+        return []
+    base_rows = _table_rows(base_text)
+    head_rows = _table_rows(head_text)
+    base_keys = {key for _, key, _ in base_rows}
+    errors = []
+    for section, key, old in base_rows:
+        if section == "exceptions":
+            continue
+        same_key = [line for _, k, line in head_rows if k == key]
+        if same_key:
+            if _lowered(old, same_key[0]):
+                errors.append(
+                    "threshold-lowered: CONSTRAINTS.md weakened: "
+                    f"{old.strip()[:80]} -> {same_key[0].strip()[:80]}"
+                )
+        elif not (section.startswith("measured") and _promoted(old, head_rows, base_keys)):
+            errors.append(f"threshold-lowered: CONSTRAINTS.md row removed: {old.strip()[:80]}")
+    return errors
+
+
+def _exceptions(text):
+    """Waiver rows from the Exceptions table as (path glob, waiver text, expiry)."""
+    rows = []
+    for section, _, line in _table_rows(text):
+        if section != "exceptions":
+            continue
+        cells = _cells(line)
+        if len(cells) < 4 or not all(cells[:3]):
+            continue
+        try:
+            expires = date.fromisoformat(cells[3])
+        except ValueError:
+            continue
+        rows.append((cells[0], cells[1].strip("`"), expires))
+    return rows
+
+
+def _exempt(path, line, exceptions, today):
+    return any(
+        fnmatch.fnmatchcase(path, glob) and waiver in line and today <= expires
+        for glob, waiver, expires in exceptions
+    )
+
+
+def _is_routed_db_ignore(path, line):
+    return bool(INTEGRATION_TARGET.match(path) and ROUTED_DB_IGNORE.match(line))
 
 
 def _is_test_skip(path, line):
+    if path.endswith(".rs"):
+        return bool(ATTR_IGNORE.match(line)) and not _is_routed_db_ignore(path, line)
     if not TEST_PATH.search(path):
         return False
-    if path.endswith(".rs"):
-        return bool(ATTR_IGNORE.match(line))
     if path.endswith((".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts")):
         return bool(JS_TEST_SKIP.search(line))
     if path.endswith(".py"):
@@ -103,64 +200,48 @@ def _is_test_skip(path, line):
     return False
 
 
-def _is_constraints(path):
-    return Path(path).name == "CONSTRAINTS.md"
+def _is_silenced(line):
+    return bool(
+        ATTR_ALLOW.match(line)
+        or ATTR_RUSTFMT_SKIP.match(line)
+        or INLINE_SUPPRESSIONS.search(line)
+    )
 
 
-def scan(added, removed, deleted):
+def _is_assertion(path, line):
+    return bool(not _is_markdown(path) and TEST_PATH.search(path) and ASSERTS.search(line))
+
+
+def scan(added, removed, deleted, exceptions=(), today=None):
     """Check synthetic diff sets. Each of added/removed holds (path, line).
 
     Returns a list of human-readable violation strings (empty when clean).
     """
+    today = today or date.today()
     errors = []
 
     for path, line in added:
         if _is_markdown(path):
             continue
-        if ATTR_ALLOW.match(line) or ATTR_RUSTFMT_SKIP.match(line):
+        if _is_silenced(line) and not _exempt(path, line, exceptions, today):
             errors.append(f"silenced-checker: waiver added in {path}: {line.strip()[:120]}")
-        elif INLINE_SUPPRESSIONS.search(line):
-            errors.append(f"silenced-checker: waiver added in {path}: {line.strip()[:120]}")
-        if _is_test_skip(path, line):
+        if _is_test_skip(path, line) and not _exempt(path, line, exceptions, today):
             errors.append(f"test-made-easier: skip added in {path}: {line.strip()[:120]}")
 
     for path in deleted:
         if TEST_PATH.search(path):
             errors.append(f"deleted-test: test file removed: {path}")
-        if _is_constraints(path):
+        if Path(path).name == CONSTRAINTS:
             errors.append("threshold-lowered: CONSTRAINTS.md deleted")
 
-    removed_assertions = {}
-    added_assertions = {}
-    for path, line in removed:
-        if TEST_PATH.search(path) and ASSERTS.search(line):
-            removed_assertions[path] = removed_assertions.get(path, 0) + 1
-    for path, line in added:
-        if TEST_PATH.search(path) and ASSERTS.search(line):
-            added_assertions[path] = added_assertions.get(path, 0) + 1
-    for path, count in removed_assertions.items():
-        if count > added_assertions.get(path, 0):
-            errors.append(f"assertion-removed: assertion dropped from {path}")
-
-    removed_limits = {}
-    added_limits = {}
-    for path, line in removed:
-        key = _constraint_key(line) if _is_constraints(path) else None
-        if key:
-            removed_limits[key] = line
-    for path, line in added:
-        key = _constraint_key(line) if _is_constraints(path) else None
-        if key:
-            added_limits[key] = line
-    for key, old in removed_limits.items():
-        new = added_limits.get(key)
-        old_nums = _numbers(old)
-        new_nums = _numbers(new) if new is not None else []
-        if new is None or len(new_nums) < len(old_nums) or any(
-            new_nums[i] < number for i, number in enumerate(old_nums)
-        ):
-            changed = f"{old.strip()[:80]} -> {new.strip()[:80]}" if new else old.strip()[:80]
-            errors.append(f"threshold-lowered: CONSTRAINTS.md weakened: {changed}")
+    dropped = [path for path, line in removed if _is_assertion(path, line)]
+    gained = [path for path, line in added if _is_assertion(path, line)]
+    net = len(dropped) - len(gained)
+    if net > 0:
+        paths = ", ".join(sorted(set(dropped)))
+        errors.append(
+            f"assertion-removed: {net} assertion(s) dropped from test code: {paths[:200]}"
+        )
 
     return errors
 
@@ -171,13 +252,20 @@ def _git(root, *args):
     )
 
 
-def collect(root, base_ref, head_ref="HEAD"):
-    """Collect (added, removed, deleted) from the merge-base-to-head diff."""
+def _merge_base(root, base_ref, head_ref):
     mb = _git(root, "merge-base", base_ref, head_ref)
     if mb.returncode != 0:
         raise NoMergeBase(f"no merge base against {base_ref}")
-    base = mb.stdout.strip()
+    return mb.stdout.strip()
 
+
+def _show(root, ref, path):
+    shown = _git(root, "show", f"{ref}:{path}")
+    return shown.stdout if shown.returncode == 0 else None
+
+
+def collect(root, base, head_ref="HEAD"):
+    """Collect (added, removed, deleted) from the base-to-head diff."""
     diff = _git(root, "diff", "--unified=0", "--no-color", base, head_ref, "--")
     added, removed = [], []
     path = ""
@@ -208,10 +296,21 @@ def collect(root, base_ref, head_ref="HEAD"):
     return added, removed, deleted
 
 
-def check(root=ROOT, base_ref="origin/main", head_ref="HEAD"):
+def check(root=ROOT, base_ref="origin/main", head_ref="HEAD", today=None):
     """Run the guard against the selected head. Raises NoMergeBase."""
-    added, removed, deleted = collect(Path(root), base_ref, head_ref)
-    return scan(added, removed, deleted)
+    root = Path(root)
+    base = _merge_base(root, base_ref, head_ref)
+    added, removed, deleted = collect(root, base, head_ref)
+    base_constraints = _show(root, base, CONSTRAINTS)
+    head_constraints = _show(root, head_ref, CONSTRAINTS)
+    errors = scan(
+        added,
+        removed,
+        deleted,
+        exceptions=_exceptions(base_constraints),
+        today=today,
+    )
+    return errors + threshold_violations(base_constraints, head_constraints)
 
 
 def main(argv=None):
@@ -230,7 +329,7 @@ def main(argv=None):
     if errors:
         print(
             "floor-guard: each is a move that lowers the bar. "
-            "Fix the code instead of silencing the check.",
+            "Fix the code, or record a reasoned exception in CONSTRAINTS.md on main.",
             file=sys.stderr,
         )
         raise SystemExit(1)

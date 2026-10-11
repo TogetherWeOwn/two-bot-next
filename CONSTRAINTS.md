@@ -12,12 +12,15 @@ Checked by `scripts/ci/check-floor-guard.py` (HARD) on every PR, in milliseconds
 
 - No new checker waivers: Rust `#[allow(...)]` / `#![allow(...)]`,
   `#[rustfmt::skip]`, JS `eslint-disable`, Python `# noqa` / `# type: ignore`,
-  `nosemgrep`, `gitleaks:allow`, `Stryker disable`, and the like.
-- No test made easier to get green: a newly added test skip (`#[ignore]`,
-  focused-test calls), a deleted test file, or an assertion stripped from a
-  test that stays.
+  `nosemgrep`, `gitleaks:allow`, `Stryker disable`, and the like. A waiver the
+  Exceptions table names is allowed until that row expires.
+- No test made easier to get green: a newly added test skip (a bare
+  `#[ignore]`, an `#[ignore = "..."]` that does not name the agent test DB,
+  focused-test calls), a deleted test file, or assertions dropped from test
+  code with nothing added back in the same diff.
 - No lowered number in this file. Raising a threshold is silent; lowering one
-  fails the PR.
+  fails the PR, and so does removing a row unless the metric is promoted at
+  least as strictly.
 - No secrets in source (enforced by the `secret-scan` required check and
   gitleaks in the supply-chain lane, not the floor guard, so a leaked value
   never lands in a diff report).
@@ -51,7 +54,18 @@ advisory scan stays HARD from day one.
 |--------|-------|-----------|
 | Project-wide line coverage | baseline: first green `main` run of the coverage step | must not fall |
 
+Promote a metric by keeping its name in the first column. A renamed promotion
+is accepted only when the old row has a number and the new enforced row is at
+least as strict.
+
 ## Exceptions
 
-None. An exception needs an owner and an expiry date in this table, and a
-reason the floor guard cannot check away; until then the floor holds.
+A waiver the floor does not allow can land only with a row here. The guard
+reads this table from the merge base, so a PR cannot exempt its own waiver:
+the row must already be on `main`. Each row needs a path glob, the waiver
+text, an owner, and an expiry date. The row stops covering on the day after
+its date, and the waiver fails again until someone renews the row.
+
+| Path glob | Waiver | Owner | Expires | Why |
+|-----------|--------|-------|---------|-----|
+| crates/*/tests/support/*.rs | `allow(dead_code)` | QA & Release Engineer | 2027-10-11 | shared test-support module compiled into several test binaries, so each binary uses only part of it |

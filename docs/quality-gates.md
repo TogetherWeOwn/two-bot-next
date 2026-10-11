@@ -32,8 +32,11 @@ the step itself.
   when a test or fuzz target is built by no CI job; exemptions carry a reason
   in the script.
 - Floor guard (HARD): `scripts/ci/check-floor-guard.py` fails when a diff
-  adds a checker waiver, adds a test skip, deletes a test file, strips an
-  assertion from a test that stays, or lowers a number in `CONSTRAINTS.md`.
+  adds a checker waiver, adds a test skip, deletes a test file, drops
+  assertions from test code, or lowers a number in `CONSTRAINTS.md`. Two
+  waivers are allowed: a database ignore that names the agent test DB in an
+  integration target, and a row in the `CONSTRAINTS.md` Exceptions table. The
+  guard reads that table from the base branch, so a PR cannot exempt itself.
 
 ## Semgrep backlog (41 `panic!` hits, WARN)
 
