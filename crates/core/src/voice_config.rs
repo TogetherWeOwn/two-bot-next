@@ -390,6 +390,12 @@ pub fn validate_configuration(
     literal_name(&settings.no_game_label, "settings.no_game_label")?;
     literal_name(&settings.text_channel_name, "settings.text_channel_name")?;
     nonempty(&settings.time_zone, "settings.time_zone")?;
+    if !crate::voice_time_zone::is_known(&settings.time_zone) {
+        return Err(invalid(
+            "settings.time_zone",
+            "must be UTC, a fixed offset such as UTC-5, or a supported IANA zone such as America/New_York",
+        ));
+    }
     for (field, id) in [
         (
             "settings.text_viewer_role_id",

@@ -553,6 +553,8 @@ fn numbering_names_and_random_choices_have_valid_bounds() {
         ("/settings/text_channel_name", json!("🎮".repeat(101))),
         ("/settings/no_game_label", json!(" ")),
         ("/settings/time_zone", json!("")),
+        ("/settings/time_zone", json!("Mars/Olympus")),
+        ("/settings/time_zone", json!("UTC+15")),
         ("/aliases/0/game", json!("")),
         ("/aliases/0/alias", json!("")),
         ("/lists/0/name", json!("")),

@@ -10904,3 +10904,36 @@ async fn a_refused_respace_ties_upwards_and_an_unknown_one_takes_no_position() {
     // Unknown outcome: the reorder may have landed, so no stale position.
     assert_eq!(created_positions(&worker)[1], None);
 }
+
+#[tokio::test]
+async fn time_tokens_follow_the_guild_time_zone() {
+    // 2026-10-11 02:30 UTC is 22:30 the previous evening in New York (EDT).
+    let wall =
+        two_bot_core::funnel::parse_iso_millis("2026-10-11T02:30:00.000000+00:00").unwrap() as u64;
+    let (live, store, http, _) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "@@hour@@ @@daypart@@".to_owned();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    live.voice_update(MEMBER, Some(500), Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.wall_clock = test_wall_clock;
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    TEST_WALL_MS.set(wall);
+    worker.name_settings.time_zone = "America/New_York".to_owned();
+    worker.refresh_template_names(0);
+    assert_eq!(worker.desired_names[&500], "22 night");
+    // UTC (the default) renders the UTC hour.
+    worker.name_settings.time_zone = "UTC".to_owned();
+    worker.refresh_template_names(1);
+    assert_eq!(worker.desired_names[&500], "2 late night");
+}
+
+#[test]
+fn name_settings_carry_the_configured_time_zone() {
+    let mut config = empty_config();
+    config.settings.time_zone = "Europe/Berlin".to_owned();
+    assert_eq!(
+        NameSettings::from_config(&config).time_zone,
+        "Europe/Berlin"
+    );
+}
