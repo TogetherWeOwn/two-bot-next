@@ -2026,7 +2026,7 @@ async fn transfer_rewrites_only_this_rooms_owner_grants_before_persistence() {
 
 #[tokio::test]
 async fn denied_handoff_falls_back_to_revoke_only_then_retries_the_grant() {
-    let (live, store, mut http, trace) = owned_room();
+    let (live, store, http, trace) = owned_room();
     let mut room_channel = channel(500, 2, Some(CATEGORY));
     room_channel.permission_overwrites = Some(vec![owner_overwrite(MEMBER)]);
     live.upsert_channel(room_channel);
@@ -2036,7 +2036,7 @@ async fn denied_handoff_falls_back_to_revoke_only_then_retries_the_grant() {
         .lock()
         .unwrap()
         .push_back(RoomHttpError::AccessDenied);
-    let mut worker = GuildRoomWorker::load(live.clone(), store, http)
+    let worker = GuildRoomWorker::load(live.clone(), store, http)
         .await
         .unwrap();
     assert_eq!(
@@ -2044,21 +2044,22 @@ async fn denied_handoff_falls_back_to_revoke_only_then_retries_the_grant() {
         Err(RoomHttpError::AccessDenied)
     );
     let owner_mask = Permissions::from_bits_retain(OWNER_ALLOW_BITS);
-    let state = live.inner.read().unwrap();
-    let overwrites = state.channels[&500].permission_overwrites.as_ref().unwrap();
-    assert!(
-        !overwrites
-            .iter()
-            .any(|o| o.id.get() == MEMBER && o.allow.intersects(owner_mask)),
-        "former owner bits must be revoked even when the grant is denied"
-    );
-    assert!(
-        !overwrites
-            .iter()
-            .any(|o| o.id.get() == 301 && o.allow.intersects(owner_mask)),
-        "new owner grant must wait for the retry"
-    );
-    drop(state);
+    {
+        let state = live.inner.read().unwrap();
+        let overwrites = state.channels[&500].permission_overwrites.as_ref().unwrap();
+        assert!(
+            !overwrites
+                .iter()
+                .any(|o| o.id.get() == MEMBER && o.allow.intersects(owner_mask)),
+            "former owner bits must be revoked even when the grant is denied"
+        );
+        assert!(
+            !overwrites
+                .iter()
+                .any(|o| o.id.get() == 301 && o.allow.intersects(owner_mask)),
+            "new owner grant must wait for the retry"
+        );
+    }
     assert_eq!(
         trace
             .lock()
