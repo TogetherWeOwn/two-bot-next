@@ -53,8 +53,8 @@ use two_bot_core::{
     format_iso_millis,
     internal_action_config::InternalActionConfig,
     internal_action_store::{
-        AuditSubject, DiscordId, EventOutcome, InternalActionStore, InternalClaim, RequestIdentity,
-        TerminalFailure, TerminalResponse,
+        AuditSubject, DiscordId, EventOutcome, ExecutionClaim, InternalActionStore, InternalClaim,
+        InternalStoreError, RequestIdentity, TerminalFailure, TerminalResponse,
     },
     internal_actions::{
         new_request_id, require_field_str, require_snowflake, unmapped_event_key,
@@ -1455,13 +1455,13 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             if state.store.finish(&claim, &response).await.is_err() {
                 // Do not return success before its audit/receipt is committed.
                 // An unavailable store leaves the existing claim occupied.
-                let _ = state.store.mark_unknown(&claim).await;
+                mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation(), action);
             }
             state.terminal(response, false, id, key.clone(), action)
         }
         Effect::Unknown => {
-            let _ = state.store.mark_unknown(&claim).await;
+            mark_unknown_best_effort(&state.store, &claim, action).await;
             reject(Failure::reconciliation(), action)
         }
     }
@@ -1624,7 +1624,7 @@ async fn execute_member(
             let bot_user_id = match state.member.resolve_bot().await {
                 Ok(id) => id,
                 Err(_) => {
-                    let _ = state.store.mark_unknown(&claim).await;
+                    mark_unknown_best_effort(&state.store, &claim, action).await;
                     return reject(Failure::reconciliation());
                 }
             };
@@ -1714,7 +1714,7 @@ async fn execute_member(
                 outcome: None,
             };
             if state.store.finish(&claim, &response).await.is_err() {
-                let _ = state.store.mark_unknown(&claim).await;
+                mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
             }
             state.terminal(response, false, id, key.clone(), action)
@@ -1722,13 +1722,13 @@ async fn execute_member(
         Err(error) if error.code == ErrorCode::DiscordRejected => {
             let response = TerminalResponse::Failure(TerminalFailure::DiscordRejected);
             if state.store.finish(&claim, &response).await.is_err() {
-                let _ = state.store.mark_unknown(&claim).await;
+                mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
             }
             state.terminal(response, false, id, key.clone(), action)
         }
         Err(_) => {
-            let _ = state.store.mark_unknown(&claim).await;
+            mark_unknown_best_effort(&state.store, &claim, action).await;
             reject(Failure::reconciliation())
         }
     }
@@ -1825,7 +1825,7 @@ async fn moderation_member(
     {
         Ok(response) => {
             if state.store.finish(&claim, &response).await.is_err() {
-                let _ = state.store.mark_unknown(&claim).await;
+                mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
             }
             moderation_terminal(
@@ -1851,7 +1851,7 @@ async fn moderation_member(
             };
             let response = TerminalResponse::Failure(failure);
             if state.store.finish(&claim, &response).await.is_err() {
-                let _ = state.store.mark_unknown(&claim).await;
+                mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
             }
             moderation_terminal(
@@ -1865,7 +1865,7 @@ async fn moderation_member(
             )
         }
         Err(_) => {
-            let _ = state.store.mark_unknown(&claim).await;
+            mark_unknown_best_effort(&state.store, &claim, action).await;
             reject(Failure::reconciliation())
         }
     }
@@ -2030,7 +2030,7 @@ async fn moderate_channel(
                 )
             });
             let Ok(channel_id) = channel_id else {
-                let _ = state.store.mark_unknown(&claim).await;
+                mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
             };
             let response = TerminalResponse::Success {
@@ -2039,7 +2039,7 @@ async fn moderate_channel(
                 outcome: None,
             };
             if state.store.finish(&claim, &response).await.is_err() {
-                let _ = state.store.mark_unknown(&claim).await;
+                mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
             }
             moderate_channel_terminal(
@@ -2067,7 +2067,7 @@ async fn moderate_channel(
             };
             let response = TerminalResponse::Failure(failure);
             if state.store.finish(&claim, &response).await.is_err() {
-                let _ = state.store.mark_unknown(&claim).await;
+                mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
             }
             moderate_channel_terminal(
@@ -2083,7 +2083,7 @@ async fn moderate_channel(
             )
         }
         Err(_) => {
-            let _ = state.store.mark_unknown(&claim).await;
+            mark_unknown_best_effort(&state.store, &claim, action).await;
             reject(Failure::reconciliation())
         }
     }
@@ -2282,7 +2282,7 @@ async fn mutate_event(
                 // The executor only returns normalized mirror rows, so an
                 // unreadable id is an unknown outcome, never a receipt.
                 _ => {
-                    let _ = state.store.mark_unknown(&claim).await;
+                    mark_unknown_best_effort(&state.store, &claim, action).await;
                     return reject(Failure::reconciliation());
                 }
             };
@@ -2296,7 +2296,7 @@ async fn mutate_event(
                     .await
                     .is_err()
             {
-                let _ = state.store.mark_unknown(&claim).await;
+                mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
             }
             let response = TerminalResponse::Success {
@@ -2307,7 +2307,7 @@ async fn mutate_event(
             if state.store.finish(&claim, &response).await.is_err() {
                 // Do not return success before its audit/receipt is committed.
                 // An unavailable store leaves the existing claim occupied.
-                let _ = state.store.mark_unknown(&claim).await;
+                mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
             }
             state.terminal(response, false, id, key.clone(), action)
@@ -2338,13 +2338,13 @@ async fn mutate_event(
                 ) => {
                     let response = TerminalResponse::Failure(TerminalFailure::DiscordRejected);
                     if state.store.finish(&claim, &response).await.is_err() {
-                        let _ = state.store.mark_unknown(&claim).await;
+                        mark_unknown_best_effort(&state.store, &claim, action).await;
                         return reject(Failure::reconciliation());
                     }
                     state.terminal(response, false, id, key.clone(), action)
                 }
                 _ => {
-                    let _ = state.store.mark_unknown(&claim).await;
+                    mark_unknown_best_effort(&state.store, &claim, action).await;
                     reject(Failure::reconciliation())
                 }
             }
@@ -2437,7 +2437,7 @@ async fn write_setting(
                 outcome: None,
             };
             if state.store.finish(&claim, &terminal).await.is_err() {
-                let _ = state.store.mark_unknown(&claim).await;
+                mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
             }
             metrics::global().internal_action(internal_family(action), "executed");
@@ -2456,12 +2456,12 @@ async fn write_setting(
             };
             if let Some(terminal) = terminal {
                 if state.store.finish(&claim, &terminal).await.is_err() {
-                    let _ = state.store.mark_unknown(&claim).await;
+                    mark_unknown_best_effort(&state.store, &claim, action).await;
                     return reject(Failure::reconciliation());
                 }
                 return reject(Failure::from_action(error));
             }
-            let _ = state.store.mark_unknown(&claim).await;
+            mark_unknown_best_effort(&state.store, &claim, action).await;
             reject(Failure::reconciliation())
         }
     }
@@ -2707,7 +2707,7 @@ async fn import_automations(
                 outcome: None,
             };
             if state.store.finish(&claim, &terminal).await.is_err() {
-                let _ = state.store.mark_unknown(&claim).await;
+                mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
             }
             import_success_response(&outcome, id, false)
@@ -2715,7 +2715,7 @@ async fn import_automations(
         Err(ImportServiceError::OverwriteNotAllowed) => {
             let terminal = TerminalResponse::Failure(TerminalFailure::ActionNotAllowed);
             if state.store.finish(&claim, &terminal).await.is_err() {
-                let _ = state.store.mark_unknown(&claim).await;
+                mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
             }
             reject(Failure::code(ErrorCode::ActionNotAllowed))
@@ -2727,13 +2727,13 @@ async fn import_automations(
         ) => {
             let terminal = TerminalResponse::Failure(TerminalFailure::Malformed);
             if state.store.finish(&claim, &terminal).await.is_err() {
-                let _ = state.store.mark_unknown(&claim).await;
+                mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
             }
             reject(Failure::code(ErrorCode::Malformed))
         }
         Err(ImportServiceError::Storage(_)) => {
-            let _ = state.store.mark_unknown(&claim).await;
+            mark_unknown_best_effort(&state.store, &claim, action).await;
             reject(Failure::reconciliation())
         }
     }
@@ -3126,6 +3126,30 @@ fn member_success(outcome: &str, id: &str) -> Response {
         "ok": true, "result": {"outcome": outcome}, "request_id": id,
     }))
     .into_response()
+}
+
+/// A failed write never releases the claim or resends; this only surfaces the gap.
+async fn mark_unknown_best_effort(
+    store: &InternalActionStore,
+    claim: &ExecutionClaim,
+    action: ActionLabel,
+) {
+    if let Err(error) = store.mark_unknown(claim).await {
+        tracing::error!(
+            msg = "internal_action_unknown_state_persist_failed",
+            action = action.as_str(),
+            persist_class = unknown_persist_class(error),
+            "internal action unknown-state persistence failed"
+        );
+    }
+}
+
+fn unknown_persist_class(error: InternalStoreError) -> &'static str {
+    match error {
+        InternalStoreError::InvalidInput => "invalid_input",
+        InternalStoreError::Unavailable => "storage_unavailable",
+        InternalStoreError::TransitionRefused => "transition_refused",
+    }
 }
 
 fn log_records(records: Vec<RejectionRecord>) {
