@@ -542,6 +542,116 @@ async fn unique_names_conflict_only_when_the_setting_is_on() {
 }
 
 #[tokio::test]
+async fn queued_rename_blocks_folded_duplicate_before_it_lands() {
+    // Two tracked rooms with different owners: a folded duplicate of a
+    // queued-but-unlanded rename is refused at submit (legacy 38041a1
+    // siblingNames applies throttle.pending), and the first rename still lands.
+    const SECOND_ROOM: u64 = 501;
+    let trace = Trace::default();
+    let live = LiveGuild::new(GUILD);
+    live.publish(snapshot(
+        &[ROOM, SECOND_ROOM],
+        vec![occupant(OWNER, ROOM), occupant(GUEST, SECOND_ROOM)],
+    ));
+    live.upsert_channel(named_channel(ROOM, "Alpha"));
+    live.upsert_channel(named_channel(SECOND_ROOM, "Beta"));
+    let store = Store::new(trace.clone());
+    store.rooms.lock().unwrap().insert(ROOM, room(ROOM));
+    let mut second = room(SECOND_ROOM);
+    second.owner_id = GUEST;
+    store.rooms.lock().unwrap().insert(SECOND_ROOM, second);
+    let mut worker = GuildRoomWorker::load(live, store, Http::new(trace.clone()))
+        .await
+        .unwrap();
+    worker.name_settings.unique_names = true;
+
+    let mut first = command(OWNER, false, submit("Squad"));
+    first.settings.unique_names = true;
+    applied(worker.apply_name(first, 0));
+
+    let mut clash = command(
+        GUEST,
+        false,
+        NameInteraction::Submit {
+            room_id: SECOND_ROOM,
+            text: "squad".to_owned(),
+        },
+    );
+    clash.settings.unique_names = true;
+    let reply = refused(worker.apply_name(clash, 0));
+    assert_eq!(reply, NameRefusal::Taken.to_string(), "{reply}");
+
+    drain(&mut worker).await;
+    assert_eq!(channel_name(&worker, ROOM).as_deref(), Some("Squad"));
+    assert_eq!(channel_name(&worker, SECOND_ROOM).as_deref(), Some("Beta"));
+    let renames: Vec<String> = trace
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry.strip_prefix("rename:").map(ToString::to_string))
+        .collect();
+    assert_eq!(renames, vec!["500:Squad".to_owned()]);
+}
+
+#[tokio::test]
+async fn flush_recheck_drops_now_duplicate_rename_and_clears_override() {
+    // A sibling channel landing the folded name after submit but before the
+    // flush drops the queued rename (legacy 38041a1 drops a throttled rename
+    // that would now duplicate): no rename issues, and the never-landed
+    // override is cleared (memory plus store) so the room falls back to its
+    // template instead of stranding a custom name the channel does not carry.
+    const SECOND_ROOM: u64 = 501;
+    let trace = Trace::default();
+    let live = LiveGuild::new(GUILD);
+    live.publish(snapshot(
+        &[ROOM, SECOND_ROOM],
+        vec![occupant(OWNER, ROOM), occupant(GUEST, SECOND_ROOM)],
+    ));
+    live.upsert_channel(named_channel(ROOM, "Alpha"));
+    live.upsert_channel(named_channel(SECOND_ROOM, "Beta"));
+    let store = Store::new(trace.clone());
+    store.rooms.lock().unwrap().insert(ROOM, room(ROOM));
+    let mut second = room(SECOND_ROOM);
+    second.owner_id = GUEST;
+    store.rooms.lock().unwrap().insert(SECOND_ROOM, second);
+    let mut worker = GuildRoomWorker::load(live, store, Http::new(trace.clone()))
+        .await
+        .unwrap();
+    worker.name_settings.unique_names = true;
+
+    let mut first = command(OWNER, false, submit("Squad"));
+    first.settings.unique_names = true;
+    applied(worker.apply_name(first, 0));
+
+    // The sibling lands the folded name before the queued rename flushes.
+    worker
+        .live
+        .upsert_channel(named_channel(SECOND_ROOM, "squad"));
+    drain(&mut worker).await;
+
+    assert_eq!(channel_name(&worker, ROOM).as_deref(), Some("Alpha"));
+    assert_eq!(channel_name(&worker, SECOND_ROOM).as_deref(), Some("squad"));
+    let renames: Vec<String> = trace
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry.strip_prefix("rename:").map(ToString::to_string))
+        .collect();
+    assert!(
+        renames.iter().all(|entry| !entry.starts_with("500:")),
+        "{renames:?}"
+    );
+    assert_eq!(worker.custom_names.get(&ROOM), None);
+    assert_eq!(worker.desired_names.get(&ROOM), None);
+    assert!(!worker
+        .store
+        .custom_names
+        .lock()
+        .unwrap()
+        .contains_key(&ROOM));
+}
+
+#[tokio::test]
 async fn an_unseen_channel_changes_nothing() {
     let (mut worker, trace) = setup().await;
     worker.live.remove_channel(ROOM);
