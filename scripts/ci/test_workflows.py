@@ -21,7 +21,7 @@ JOB_INVENTORY = {
                   # Compile-only libFuzzer build, gated by ci-ok like the Rust lanes.
                   "fuzz-compile"},
     "deploy-production.yml": {"guard", "production", "release"},
-    "deploy-staging.yml": {"deploy"},
+    "deploy-staging.yml": {"deploy", "voice-synthetic"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
     "release.yml": {"tag", "sbom-target", "release-sbom", "attach-sbom"},
@@ -39,12 +39,16 @@ JOB_INVENTORY = {
     # runs the local validation/evidence/preflight scripts without ever
     # checking out inputs.ref (CodeQL cache-poisoning gate).
     "sbom.yml": {"image", "verify"},
+    # Live staging voice synthetic (docs/voice-synthetic.md); pinned shape below.
+    "voice-synthetic.yml": {"synthetic"},
 }
 # Reusable-workflow calls are allowed only to these non-deploy workflows.
 # TOG-10893 registers the read-only sbom.yml calls alongside the benchmark one.
 REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pipeline-benchmark.yml",
                    ("check.yml", "supply-chain"): "./.github/workflows/sbom.yml",
-                   ("release.yml", "release-sbom"): "./.github/workflows/sbom.yml"}
+                   ("release.yml", "release-sbom"): "./.github/workflows/sbom.yml",
+                   # After every staging deploy; its failure fails deploy-staging (promotion gate).
+                   ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml"}
 # Main's runner routing (#265, 2026-10-02): the repo is public and the org's
 # self-hosted runner group refuses public repos, so every job routes through
 # one expression — public repo -> GitHub-hosted, private -> CI_OVERFLOW_* switch
@@ -844,6 +848,64 @@ def staging_active_errors(workflow):
     return errors
 
 
+def voice_synthetic_errors(workflow):
+    """Live staging voice synthetic (docs/voice-synthetic.md).
+
+    Runs on workflow_call (deploy-staging), a 6-hourly schedule and dispatch,
+    only from main, through the `voice-synthetic` environment whose single
+    secret is the dedicated test bot token, on the routed runner for job
+    `synthetic`, with its own non-cancelling concurrency group and a 10 minute
+    timeout. Exactly three steps: pinned checkout without persisted
+    credentials, one Run step (the only holder of the token) that runs the
+    reviewed script, and the evidence upload. No wrangler, no production path,
+    no staging Worker URL, no `set -x`.
+    """
+    name = "voice-synthetic.yml"
+    errors = []
+    if "env" in workflow:
+        errors.append(f"{name}: workflow-level env must stay absent")
+    on = workflow.get("on") or {}
+    if set(on) != {"workflow_call", "schedule", "workflow_dispatch"}:
+        errors.append(f"{name}: triggers must be exactly workflow_call, schedule and workflow_dispatch")
+    if on.get("workflow_call") or on.get("workflow_dispatch"):
+        errors.append(f"{name}: workflow_call/workflow_dispatch must take no inputs or secrets")
+    if workflow.get("permissions") != {}:
+        errors.append(f"{name}: top-level permissions must stay empty")
+    if workflow.get("concurrency") != {"group": "voice-synthetic", "cancel-in-progress": "false"}:
+        errors.append(f"{name}: must use its own voice-synthetic group without cancelling")
+    jobs = workflow.get("jobs") or {}
+    if set(jobs) != {"synthetic"}:
+        errors.append(f"{name}: jobs must be exactly synthetic")
+        return errors
+    job = jobs["synthetic"]
+    if job.get("environment") != "voice-synthetic":
+        errors.append(f"{name}:synthetic: must read only the voice-synthetic Environment")
+    if job.get("if") != "github.ref == 'refs/heads/main'":
+        errors.append(f"{name}:synthetic: must run only from main")
+    if job.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:synthetic: must keep contents:read only")
+    if job.get("timeout-minutes") != "10":
+        errors.append(f"{name}:synthetic: timeout must stay 10 minutes")
+    if not runner_allowed("synthetic", job.get("runs-on")):
+        errors.append(f"{name}:synthetic: must use the routed runner expression for job 'synthetic'")
+    for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+        if key in job:
+            errors.append(f"{name}:synthetic: must not set {key}")
+    steps = job.get("steps") or []
+    runs = [step for step in steps if "run" in step]
+    if len(steps) != 3 or len(runs) != 1 or "scripts/staging_voice_synthetic.py" not in runs[0]["run"]:
+        errors.append(f"{name}:synthetic: must be checkout, one Run step of the reviewed script, evidence upload")
+    for step in steps:
+        if "secrets." in str(step) and step is not (runs[0] if runs else None):
+            errors.append(f"{name}:synthetic: only the Run step may hold a secret")
+    text = str(job).lower().replace(" ", "")
+    for marker in ("wrangler", "production", "staging_worker_url", "tojson(secrets", "secrets[", "set-x",
+                   "setx", "xtrace", "cloudflare_api_token", "ownership_control"):
+        if marker in text:
+            errors.append(f"{name}:synthetic: must not contain {marker!r}")
+    return errors
+
+
 def workflow_policy_errors(workflows):
     errors = []
     # Fail closed on new workflows/jobs, including reusable-workflow alternatives.
@@ -860,6 +922,11 @@ def workflow_policy_errors(workflows):
         if name == "deploy-staging.yml":
             errors.extend(staging_dispatch_errors(workflow))
             errors.extend(staging_active_errors(workflow))
+        if name == "voice-synthetic.yml":
+            # Pinned shape above; the generic environment scan below would
+            # flag its voice-synthetic Environment binding.
+            errors.extend(voice_synthetic_errors(workflow))
+            continue
         if name == "staging-rollback-drill.yml":
             # Manual drill (TOG-14008): pinned shape above; the generic
             # environment/marker scan below would flag its staging binding.
@@ -906,6 +973,27 @@ def workflow_policy_errors(workflows):
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.workflows = load_workflows()
+
+    def test_voice_synthetic_shape_is_pinned_and_mutations_fail(self):
+        import copy
+        synthetic = self.workflows["voice-synthetic.yml"]
+        self.assertEqual(voice_synthetic_errors(synthetic), [])
+        for mutate in (
+            lambda w: w["jobs"]["synthetic"].pop("if"),
+            lambda w: w["jobs"]["synthetic"].__setitem__("environment", "staging"),
+            lambda w: w["on"].__setitem__("push", None),
+            lambda w: w["jobs"]["synthetic"]["steps"][1].__setitem__("run", "wrangler deploy"),
+            lambda w: w["jobs"]["synthetic"]["steps"][0].__setitem__("env", {"T": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"}),
+        ):
+            changed = copy.deepcopy(synthetic)
+            mutate(changed)
+            self.assertNotEqual(voice_synthetic_errors(changed), [])
+
+    def test_staging_deploy_gates_on_the_voice_synthetic(self):
+        job = self.workflows["deploy-staging.yml"]["jobs"]["voice-synthetic"]
+        self.assertEqual(job.get("needs"), "deploy")
+        self.assertEqual(job.get("uses"), "./.github/workflows/voice-synthetic.yml")
+        self.assertNotIn("if", job)
 
     def test_staging_runs_unconditionally_for_push_and_dispatch(self):
         staging = self.workflows["deploy-staging.yml"]
