@@ -213,11 +213,19 @@ type GatewayPairingFields = Pick<
   "gatewayDisconnects" | "gatewayRecoveries" | "gatewayUnpairedSeen" | "gatewayUnpaired" | "gatewayUnpairedStreak"
 >;
 
-/** One counter series value, or undefined when absent, duplicated, or not a count. */
-function gatewayCounter(samples: Sample[], name: string, event?: string): number | undefined {
-  const matches = samples.filter((s) => s.name === name && (event === undefined || s.labels["event"] === event));
-  if (matches.length !== 1) return undefined;
-  const value = matches[0]!.value;
+/**
+ * One counter series value, or undefined when absent, duplicated, or not a
+ * count. Takes the per-series pre-filter from the gauge helper below, so the
+ * scrape-validation guard ("New consumed families cannot silently bypass
+ * validation") covers these series: a Rust rename or malformed value fails
+ * the scrape instead of silently holding the rule off. The
+ * finite/nonnegative/single-row checks stay as a backstop for direct
+ * `evaluateMetrics` callers.
+ */
+function gatewayCounter(matches: Sample[], event?: string): number | undefined {
+  const scoped = event === undefined ? matches : matches.filter((s) => s.labels["event"] === event);
+  if (scoped.length !== 1) return undefined;
+  const value = scoped[0]!.value;
   return Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
@@ -231,9 +239,10 @@ function pairGatewayDisconnects(samples: Sample[], prev: MetricsAlertState): { f
     gatewayUnpairedStreak: prev.gatewayUnpairedStreak ?? 0,
   };
   const wasFiring = prev.firing.includes(GATEWAY_UNPAIRED_RULE);
-  const disconnects = gatewayCounter(samples, "two_bot_gateway_disconnects_total");
-  const resumes = gatewayCounter(samples, "two_bot_gateway_resumes_total");
-  const ready = gatewayCounter(samples, "two_bot_gateway_events_total", "READY");
+  const gauge = (name: string) => samples.filter((s) => s.name === name);
+  const disconnects = gatewayCounter(gauge("two_bot_gateway_disconnects_total"));
+  const resumes = gatewayCounter(gauge("two_bot_gateway_resumes_total"));
+  const ready = gatewayCounter(gauge("two_bot_gateway_events_total"), "READY");
   if (disconnects === undefined || resumes === undefined || ready === undefined) {
     return { firing: wasFiring, fields: carried };
   }

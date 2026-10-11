@@ -47,6 +47,19 @@ test("every consumed series rejects nonfinite, negative, fractional and nonnumer
   assert.equal(parseAlertScrape(valid.replace("two_bot_db_pool_configured 0", "two_bot_db_pool_configured 2")), null);
 });
 
+test("gateway pairing inputs fail the scrape when renamed, missing or malformed", () => {
+  // A Rust-side rename must fail loudly, never silently hold the unpaired
+  // rule off: the required resumes row is absent under its new name.
+  assert.equal(parseAlertScrape(valid.replaceAll("two_bot_gateway_resumes_total", "two_bot_gateway_resumes_renamed_total")), null);
+  assert.equal(parseAlertScrape(valid.replaceAll("two_bot_gateway_disconnects_total", "two_bot_gateway_disconnects_renamed_total")), null);
+  // Absent gateway rows are a failed scrape, not a quiet rule.
+  assert.equal(parseAlertScrape(metricsLines().filter((line) => !line.startsWith("two_bot_gateway_")).join("\n")), null);
+  // Fractional, negative and nonfinite disconnects never reach the rule.
+  for (const value of ["0.5", "-1", "NaN", "1e20"]) {
+    assert.equal(parseAlertScrape(valid.replace("two_bot_gateway_disconnects_total 0", `two_bot_gateway_disconnects_total ${value}`)), null, value);
+  }
+});
+
 for (const [name, body] of Object.entries({
   empty: "", comments: "# HELP x y\n", html: "<html>synthetic-body-marker</html>", json: '{"ready":true}',
   partial: 'two_bot_job_consecutive_failures{job="rank"} 0\n',
