@@ -1,0 +1,148 @@
+"""Offline tests for the patch-coverage WARN gate.
+
+The gate must warn (never fail) below the threshold, stay silent at or above
+it, pass when there is nothing coverable to measure, and stay green-but-loud
+when it is blind. lcov parsing and the covered/coverable math run against
+fixtures; diff parsing runs against a throwaway git repo.
+"""
+
+import io
+import subprocess
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+
+import importlib.util
+
+SPEC = importlib.util.spec_from_file_location(
+    "coverage_gate", Path(__file__).with_name("check-patch-coverage.py")
+)
+gate = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(gate)
+
+
+LCOV = """TN:
+SF:crates/bot/src/gateway_commands.rs
+DA:1,1
+DA:2,0
+DA:3,5
+end_of_record
+TN:
+SF:/abs/path/crates/core/src/router.rs
+DA:10,0
+end_of_record
+"""
+
+
+def write_lcov(text):
+    handle = tempfile.NamedTemporaryFile("w", suffix=".info", delete=False)
+    handle.write(text)
+    handle.close()
+    return handle.name
+
+
+class LcovTests(unittest.TestCase):
+    def test_hit_counts_keyed_by_file_and_line(self):
+        lcov = write_lcov(LCOV)
+        try:
+            hits, error = gate.read_lcov(lcov)
+        finally:
+            Path(lcov).unlink()
+        self.assertEqual(error, "")
+        self.assertEqual(hits[("crates/bot/src/gateway_commands.rs", 1)], 1)
+        self.assertEqual(hits[("crates/bot/src/gateway_commands.rs", 2)], 0)
+        self.assertEqual(hits[("/abs/path/crates/core/src/router.rs", 10)], 0)
+
+    def test_missing_report_is_blindness(self):
+        hits, error = gate.read_lcov("/nonexistent/lcov.info")
+        self.assertIsNone(hits)
+        self.assertTrue(error)
+
+
+class EvaluateTests(unittest.TestCase):
+    def test_only_changed_executable_lines_count(self):
+        hits = {("a.rs", 1): 1, ("a.rs", 2): 0, ("a.rs", 3): 9}
+        covered, coverable, uncovered = gate.evaluate(
+            hits, {("a.rs", 1), ("a.rs", 2), ("a.rs", 4)})
+        self.assertEqual((covered, coverable), (1, 2))
+        self.assertEqual(uncovered, [("a.rs", 2)])
+
+    def test_absolute_lcov_paths_resolve_against_the_root(self):
+        hits = {(str(gate.ROOT / "crates/x.rs"), 7): 1}
+        covered, coverable, _ = gate.evaluate(hits, {("crates/x.rs", 7)})
+        self.assertEqual((covered, coverable), (1, 1))
+
+
+class EndToEndTests(unittest.TestCase):
+    def run_gate(self, lcov_text, added):
+        lcov = write_lcov(lcov_text)
+        real_read, real_added = gate.read_lcov, gate.added_lines
+        gate.read_lcov = lambda _path: real_read(lcov)
+        gate.added_lines = lambda _base, _head: (set(added), "")
+        out = io.StringIO()
+        try:
+            with redirect_stdout(out):
+                code = gate.main(["--lcov", lcov, "--threshold", "80"])
+        finally:
+            gate.read_lcov, gate.added_lines = real_read, real_added
+            Path(lcov).unlink()
+        return code, out.getvalue()
+
+    def test_below_threshold_warns_but_passes(self):
+        code, output = self.run_gate(LCOV, {("crates/bot/src/gateway_commands.rs", 1),
+                                            ("crates/bot/src/gateway_commands.rs", 2)})
+        self.assertEqual(code, 0)
+        self.assertIn("::warning::", output)
+        self.assertIn("50.0%", output)
+
+    def test_at_threshold_is_silent(self):
+        code, output = self.run_gate(LCOV, {("crates/bot/src/gateway_commands.rs", 1),
+                                            ("crates/bot/src/gateway_commands.rs", 3)})
+        self.assertEqual(code, 0)
+        self.assertNotIn("::warning::", output)
+
+    def test_no_coverable_lines_passes_with_a_note(self):
+        code, output = self.run_gate(LCOV, {("other.rs", 1)})
+        self.assertEqual(code, 0)
+        self.assertNotIn("::warning::", output)
+        self.assertIn("no coverable changed lines", output)
+
+    def test_missing_lcov_warns_and_passes(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = gate.main(["--lcov", "/nonexistent/lcov.info"])
+        self.assertEqual(code, 0)
+        self.assertIn("::warning::", out.getvalue())
+        self.assertIn("blind", out.getvalue())
+
+
+class DiffTests(unittest.TestCase):
+    def test_added_lines_tracks_new_file_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "t@t"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "t"], cwd=root, check=True)
+            (root / "a.rs").write_text("one\n")
+            subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "x"], cwd=root, check=True)
+            base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root,
+                                  capture_output=True, text=True, check=True).stdout.strip()
+            (root / "a.rs").write_text("one\ntwo\n")
+            subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "y"], cwd=root, check=True)
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root,
+                                  capture_output=True, text=True, check=True).stdout.strip()
+            real_root = gate.ROOT
+            gate.ROOT = root
+            try:
+                added, error = gate.added_lines(base, head)
+            finally:
+                gate.ROOT = real_root
+        self.assertEqual(error, "")
+        self.assertEqual(added, {("a.rs", 2)})
+
+
+if __name__ == "__main__":
+    unittest.main()
