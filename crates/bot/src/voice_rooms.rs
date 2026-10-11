@@ -2044,6 +2044,39 @@ fn health_overwrites(guild_id: Snowflake, channel: &Channel) -> Vec<HealthOverwr
         .collect()
 }
 
+/// Revoke-only owner overwrites for the 403 fallback: strip previously issued
+/// owner bits without granting the new owner. Returns `None` when nothing
+/// would change, so the caller can return the original denial without a
+/// second PATCH.
+fn revoke_only_owner_overwrites(
+    current: &[PermissionOverwrite],
+    issued_members: &[Snowflake],
+    owner_id: Snowflake,
+) -> Option<Vec<PermissionOverwrite>> {
+    let owner_mask = Permissions::from_bits_retain(OWNER_ALLOW_BITS);
+    let mut overwrites = current.to_vec();
+    for old in &mut overwrites {
+        if old.kind == PermissionOverwriteType::Member
+            && old.id.get() != owner_id
+            && issued_members.contains(&old.id.get())
+        {
+            old.allow &= !owner_mask;
+        }
+    }
+    overwrites.retain(|o| {
+        !(o.kind == PermissionOverwriteType::Member
+            && o.id.get() != owner_id
+            && issued_members.contains(&o.id.get())
+            && o.allow.is_empty()
+            && o.deny.is_empty())
+    });
+    if overwrites == current {
+        None
+    } else {
+        Some(overwrites)
+    }
+}
+
 fn permission_name(permission: VoicePermission) -> &'static str {
     match permission {
         VoicePermission::ManageChannels => "Manage Channels",
@@ -3233,10 +3266,67 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         p.contains(Permissions::VIEW_CHANNEL | Permissions::MANAGE_ROLES)
                     })
         });
-        let channel = self
+        let channel = match self
             .http
             .update_overwrites(channel_id, &overwrites, guard)
-            .await?;
+            .await
+        {
+            Ok(channel) => channel,
+            Err(RoomHttpError::AccessDenied) => {
+                // Build the revoke-only list from the current cache, not the
+                // pre-send snapshot, so a gateway change that landed during
+                // the denied PATCH is preserved rather than clobbered.
+                let live = self.live.clone();
+                let expected = self
+                    .live
+                    .read_state()
+                    .channels
+                    .get(&channel_id)
+                    .and_then(|channel| channel.permission_overwrites.clone())
+                    .unwrap_or_default();
+                let Some(revoke_only) =
+                    revoke_only_owner_overwrites(&expected, issued_members, owner_id)
+                else {
+                    return Err(RoomHttpError::AccessDenied);
+                };
+                let fallback_guard: WriteGuard = Arc::new(move || {
+                    let state = live.read_state();
+                    state.ready
+                        && state.generation == generation
+                        && state.channel_revisions.get(&channel_id) == Some(&revision)
+                        && state.channels.get(&channel_id).is_some_and(|channel| {
+                            channel.permission_overwrites.as_deref() == Some(expected.as_slice())
+                        })
+                        && state
+                            .permissions(live.guild_id, channel_id)
+                            .is_some_and(|p| {
+                                p.contains(Permissions::VIEW_CHANNEL | Permissions::MANAGE_ROLES)
+                            })
+                });
+                match self
+                    .http
+                    .update_overwrites(channel_id, &revoke_only, fallback_guard)
+                    .await
+                {
+                    Ok(revoked) => {
+                        if revoked.id.get() != channel_id
+                            || revoked.guild_id.map(Id::get) != Some(self.live.guild_id)
+                        {
+                            return Err(RoomHttpError::AccessDenied);
+                        }
+                        // Publish the revocation so the stranded grant is gone
+                        // from the cache, then report the original denial so
+                        // the new-owner grant retries with the journal pending.
+                        let _ = self
+                            .live
+                            .publish_owner_overwrites(revoked, generation, revision);
+                        return Err(RoomHttpError::AccessDenied);
+                    }
+                    Err(_) => return Err(RoomHttpError::AccessDenied),
+                }
+            }
+            Err(error) => return Err(error),
+        };
         if channel.id.get() != channel_id
             || channel.guild_id.map(Id::get) != Some(self.live.guild_id)
         {
