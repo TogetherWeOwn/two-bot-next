@@ -72,6 +72,7 @@ import {
 import {
   EMPTY_STATE,
   evaluateMetrics,
+  interruptDispatchDrops,
   transitionMessages,
   type MetricsAlertState,
 } from "./alert-rules.ts";
@@ -778,21 +779,35 @@ export class TwoBotContainer extends Container<Env> {
   /** Pull /metrics, evaluate rules, notify on transitions. Never throws. */
   private async evaluateMetricsAlerts(): Promise<void> {
     try {
-      const signal = AbortSignal.timeout(METRICS_FETCH_TIMEOUT_MS);
-      const request = this.containerFetch("http://c/metrics", { signal }).then((res) => {
-        // Release even a late SDK response after the deadline has already won.
-        if (signal.aborted) void res.body?.cancel().catch(() => {});
-        return res;
-      });
-      const res = await abortable(request, signal);
-      if (signal.aborted || !res.ok) {
-        void res.body?.cancel().catch(() => {});
-        throw new Error("metrics scrape failed");
-      }
-      const body = await readBoundedText(res, MAX_METRICS_BODY_BYTES, signal);
-      const samples = body === null ? null : parseAlertScrape(body);
-      if (signal.aborted || samples === null) throw new Error("metrics scrape failed");
       const previous = (await this.ctx.storage.get<MetricsAlertState>(METRICS_ALERT_KEY)) ?? EMPTY_STATE;
+      let samples;
+      try {
+        const signal = AbortSignal.timeout(METRICS_FETCH_TIMEOUT_MS);
+        const request = this.containerFetch("http://c/metrics", { signal }).then((res) => {
+          // Release even a late SDK response after the deadline has already won.
+          if (signal.aborted) void res.body?.cancel().catch(() => {});
+          return res;
+        });
+        const res = await abortable(request, signal);
+        if (!signal.aborted && res.ok) {
+          const body = await readBoundedText(res, MAX_METRICS_BODY_BYTES, signal);
+          samples = body === null ? null : parseAlertScrape(body);
+        } else {
+          // Release a failed body without unbounded buffering; the failure path
+          // below preserves firing state.
+          void res.body?.cancel().catch(() => {});
+        }
+        if (signal.aborted) samples = null;
+      } catch {
+        samples = null;
+      }
+      if (!samples) {
+        // A failed scrape is not recovery, nor part of a consecutive growth
+        // window. Preserve all firing keys and other rules' existing state.
+        console.warn("two-bot metrics scrape failed");
+        await this.ctx.storage.put(METRICS_ALERT_KEY, interruptDispatchDrops(previous));
+        return;
+      }
       const { firing, state } = evaluateMetrics(samples, previous, Date.now() / 1000);
       // Persist before notifying: at most one attempt per transition.
       await this.ctx.storage.put(METRICS_ALERT_KEY, state);

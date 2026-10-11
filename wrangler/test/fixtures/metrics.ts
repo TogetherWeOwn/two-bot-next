@@ -22,6 +22,7 @@ export const RUST_ALERT_AXES: Record<string, Record<string, string>> = {
   two_bot_voice_dead_letters_total: { action: "VOICE_DEAD_ACTIONS" },
   two_bot_voice_orphans_total: {},
   two_bot_gateway_missed_events_total: {},
+  two_bot_dispatch_drops_total: { lane: "DISPATCH_LANES" },
   two_bot_internal_actions_total: { family: "INTERNAL_ACTION_FAMILIES", outcome: "INTERNAL_ACTION_OUTCOMES" },
 };
 

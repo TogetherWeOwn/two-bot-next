@@ -18,6 +18,7 @@ export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]
   two_bot_voice_dead_letters_total: { action: ["create", "move", "delete", "companion", "ownership", "kick", "rename", "limit", "other"] },
   two_bot_voice_orphans_total: {},
   two_bot_gateway_missed_events_total: {},
+  two_bot_dispatch_drops_total: { lane: ["messages", "interactions", "registry", "privileged", "busy", "reactions"] },
   two_bot_internal_actions_total: {
     family: ["announcement", "event", "settings", "moderation", "membership", "other"],
     outcome: ["executed", "auth_failure", "unknown_key", "clock_skew", "nonce_replay", "rate_limit", "unknown_action", "action_disabled", "malformed_body", "conflict", "upstream", "internal"],

@@ -1054,6 +1054,64 @@ const ALERT_ENV = {
   OPS_ALERT_FORWARDING: "on",
 };
 
+for (const failure of ["http", "fetch", "body", "missing", "invalid"] as const) {
+  test(`DO dispatch tickets survive ${failure} scrape failure without a false clear`, async (t) => {
+    const h = await alertHarness(t, ALERT_ENV);
+    let count = 20;
+    let failed = false;
+    // Complete scrapes: the background validator rejects partial bodies, so the
+    // streak grows from full exposition with only the reactions lane rising.
+    const reactions = (value: string) => metricsBody().replace(
+      'two_bot_dispatch_drops_total{lane="reactions"} 0',
+      `two_bot_dispatch_drops_total{lane="reactions"} ${value}`,
+    );
+    t.mock.method(h.bot, "containerFetch", async (input: string | Request) => {
+      const path = new URL(typeof input === "string" ? input : input.url).pathname;
+      if (path !== "/metrics") return new Response(null, { status: 200 });
+      if (failed) {
+        if (failure === "fetch") throw new Error("synthetic metrics transport failure");
+        if (failure === "http") return new Response(null, { status: 503 });
+        if (failure === "missing") return new Response("");
+        if (failure === "invalid") return new Response(reactions("NaN"));
+        return new Response(new ReadableStream({ start(controller) {
+          controller.error(new Error("synthetic metrics body failure"));
+        } }));
+      }
+      return new Response(reactions(String(count)));
+    });
+    for (const n of [20, 21, 22]) {
+      count = n;
+      await h.tick();
+      assert.equal(h.posts.length, 0);
+    }
+    failed = true;
+    await h.tick();
+    failed = false;
+    count = 23;
+    await h.tick();
+    assert.equal(h.posts.length, 0, "failure interrupted the two-rise streak; return is only a baseline");
+    for (const n of [24, 25, 26]) {
+      count = n;
+      await h.tick();
+    }
+    assert.equal(h.posts.length, 1);
+    const content = JSON.parse(h.posts[0]!.init.body as string).content;
+    assert.match(content, /ALERT dispatch_drops:reactions \(ticket\):/);
+    assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, ["dispatch_drops:reactions"]);
+    failed = true;
+    await h.tick();
+    assert.equal(h.posts.length, 1, "missing evidence must not send RESOLVED");
+    assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, ["dispatch_drops:reactions"]);
+    failed = false;
+    count = 27;
+    await h.tick();
+    await h.tick();
+    assert.equal(h.posts.length, 2, "only the second valid (flat) sample proves recovery");
+    assert.equal(JSON.parse(h.posts[1]!.init.body as string).content, "two-bot-next RESOLVED dispatch_drops:reactions.");
+    assert.deepEqual(h.values.get("two-bot:metrics-alerts")?.firing, []);
+  });
+}
+
 type AlertSender = "readiness" | "metrics";
 async function senderHarness(t: TestContext, sender: AlertSender, env: Partial<Env>, values?: Map<string, unknown>) {
   const h = await alertHarness(t, { UNREADY_ALERT_FAILURES: "1", ...env }, values);
@@ -1555,6 +1613,7 @@ const PRIOR_METRICS: MetricsAlertState = {
   voiceDeadLetters: 1, voiceOrphans: 1, gatewayMissed: 4, gatewayMissedSeen: true,
   receiverRefusals: { membership: 8 }, receiverRefusalsSeen: true,
   receiverRefusalStreaks: { membership: 2 },
+  dispatchDrops: { reactions: 5 }, dispatchDropStreaks: { reactions: 2 },
 };
 
 async function backgroundMetricsHarness(t: TestContext) {
@@ -1570,10 +1629,14 @@ async function backgroundMetricsHarness(t: TestContext) {
   return {
     ...h, previous, puts,
     setMetricsResponse: (next: typeof response) => { response = next; },
-    assertPreserved: () => {
-      assert.equal(h.values.get(METRICS_KEY), previous, "no replacement write");
+    assertInterrupted: () => {
+      // A failed scrape preserves firing keys and every baseline/streak except
+      // the dispatch-drop window, which resets without resolving anything.
+      const writes = puts.mock.calls.filter((call) => call.arguments[0] === METRICS_KEY);
+      assert.equal(writes.length, 1, "one dispatch-interrupt write");
+      assert.deepEqual(writes[0]!.arguments[1], { ...previous, dispatchDrops: {}, dispatchDropStreaks: {} });
       assert.deepEqual(previous, PRIOR_METRICS, "no in-place baseline/streak/firing mutation");
-      assert.equal(puts.mock.calls.filter((call) => call.arguments[0] === METRICS_KEY).length, 0);
+      assert.deepEqual(h.values.get(METRICS_KEY), { ...PRIOR_METRICS, dispatchDrops: {}, dispatchDropStreaks: {} });
       assert.equal(h.posts.length, 0, "no false RESOLVED notification");
       assert.equal(h.events().length, 0, "no false transition logs");
       assert.deepEqual(h.logs.filter((line) => line !== "two-bot container started"), [SCRAPE_FAILURE]);
@@ -1604,7 +1667,7 @@ for (const bytes of [64 * 1024, 64 * 1024 + 1]) {
     }, { highWaterMark: 0 })));
     await h.tick();
     if (bytes > 64 * 1024) {
-      h.assertPreserved();
+      h.assertInterrupted();
       assert.equal(cancelled, 1, "cancel hook does not need to finish");
       assert.equal(pulls, 2);
     } else {
@@ -1630,7 +1693,7 @@ for (const cancel of ["normal", "reject", "stall"] as const) {
       },
     }, { highWaterMark: 0 }), { status: 500 }));
     await h.tick();
-    h.assertPreserved();
+    h.assertInterrupted();
     assert.equal(pulls, 0, "no error-body buffering or draining");
     assert.equal(cancelled, 1);
   });
@@ -1651,7 +1714,7 @@ for (const [name, body] of Object.entries({
     const h = await backgroundMetricsHarness(t);
     h.setMetricsResponse(async () => new Response(body));
     await h.tick();
-    h.assertPreserved();
+    h.assertInterrupted();
   });
 }
 
@@ -1665,7 +1728,7 @@ test("background metrics: interrupted stream after a valid prefix never commits 
     },
   }, { highWaterMark: 0 })));
   await h.tick();
-  h.assertPreserved();
+  h.assertInterrupted();
   assert.equal(pulls, 2);
 });
 
@@ -1697,7 +1760,7 @@ for (const failure of ["fetch stall", "late response", "body stall", "abort resp
     const guard = setTimeout(() => {}, 1000);
     try {
       await h.tick();
-      h.assertPreserved();
+      h.assertInterrupted();
       assert.ok(signal?.aborted);
       assert.ok(timeout.mock.calls.some((call) => call.arguments[0] === 6000));
       if (failure === "late response") { release!(); await setImmediate(); }
@@ -1710,7 +1773,7 @@ test("background metrics: transport rejection is bounded and never throws", asyn
   const h = await backgroundMetricsHarness(t);
   h.setMetricsResponse(async () => { throw new Error("synthetic-secret-fetch-marker"); });
   await h.tick();
-  h.assertPreserved();
+  h.assertInterrupted();
 });
 
 test("background metrics: valid scrape persists before resolving, notifies once and supports extra series", async (t) => {

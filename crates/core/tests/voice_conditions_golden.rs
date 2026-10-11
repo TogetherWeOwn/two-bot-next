@@ -177,7 +177,7 @@ fn heads_have_coverage_unknown_heads_refuse_and_rows_cite_sources() {
     let fixture = fixture();
     assert_eq!(fixture.spec.path, "docs/voice-rooms.md");
     assert_eq!(
-        fixture.spec.sha256, "397eb14173655f94e2acf73df69bdf66acf3bf01b85cdd28336ad0502b452089",
+        fixture.spec.sha256, "3ecc8340eec84640d9587cec931a233e864306f7f7691f98e7e3e08be7132cc4",
         "spec moved: update rows consciously, not by regeneration"
     );
     let mut unknown = 0;

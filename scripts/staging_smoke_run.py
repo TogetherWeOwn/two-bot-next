@@ -64,7 +64,7 @@ RUN_ID_RE = re.compile(r"[0-9]+")
 # Opaque failure-signature IDs (docs/staging-slash-smoke.md "Failure signatures").
 SIGNATURE_HEALTH = "SMOKE-HEALTH-FAIL"
 SIGNATURE_READYZ = "SMOKE-READYZ-NOT-READY"
-SIGNATURE_DB_BEHIND = "SMOKE-READYZ-DB-BEHIND"
+SIGNATURE_CHECKPOINT_READ = "SMOKE-READYZ-CHECKPOINT-READ-FAILED"
 SIGNATURE_BUILD = "SMOKE-BUILD-MISMATCH"
 SIGNATURE_DISCORD = "SMOKE-DISCORD-REFUSED"
 SIGNATURE_MISSING = "SMOKE-REGISTRY-MISSING"
@@ -164,8 +164,8 @@ def health_rows(args, origin, run, fetch_fn):
     }
     for result in results:
         name, expected, timing_key, signature = meta[result.name]
-        if "db-behind-binary" in result.reason:
-            signature = SIGNATURE_DB_BEHIND
+        if result.checkpoint_read_failed:
+            signature = SIGNATURE_CHECKPOINT_READ
         run.rows.append(Row(name, "pass" if result.ok else "fail", expected, result.reason,
                             started, run.durations.get(timing_key, 0),
                             None if result.ok else signature))
@@ -280,7 +280,11 @@ def build_record(args, run, started, ended):
 
 
 def validate_record(record):
-    schema = json.loads(check_run_record.DEFAULT_SCHEMA.read_text(encoding="utf-8"))
+    try:
+        schema = check_run_record.load_json(
+            check_run_record.DEFAULT_SCHEMA.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, check_run_record.DuplicateKeyError) as error:
+        return [f"cannot load schema: {error}"]
     return check_run_record.validate(record, schema)
 
 

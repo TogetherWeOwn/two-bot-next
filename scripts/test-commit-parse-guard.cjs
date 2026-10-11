@@ -210,41 +210,19 @@ try {
 }
 
 // 10. Wiring: one pinned parser version everywhere, the guard runs where claimed.
+// Releases are tagged at production promote from commit subjects
+// (release-on-promote.cjs), so release.yml no longer installs the parser.
 const supply = read('.github/workflows/supply-chain.yml');
-const release = read('.github/workflows/release.yml');
 const check = read('.github/workflows/check.yml');
 const installs = text => [...text.matchAll(/release-please@(\d+\.\d+\.\d+)/g)].map(match => match[1]);
-for (const [name, text] of [['supply-chain', supply], ['release', release], ['check', check]]) {
+for (const [name, text] of [['supply-chain', supply], ['check', check]]) {
   assert(installs(text).length >= 1 && installs(text).every(version => version === '17.6.0'), `${name} must install release-please@17.6.0`);
 }
+assert(!read('.github/workflows/release.yml').includes('release-please-action'), 'release.yml no longer runs release-please');
 const prStep = supply.slice(supply.indexOf('- name: Check the squash commit parses for release notes'));
 assert(prStep.includes("if: steps.pr.outputs.event == 'pull_request'"), 'The PR guard skips push events');
 assert(prStep.slice(0, prStep.indexOf('\n  gitleaks:')).includes('commit-parse-guard.cjs pr'), 'pr-lint runs the PR guard');
 assert(supply.indexOf('commit-parse-guard.cjs pr') < supply.indexOf('\n  gitleaks:'), 'The PR guard is inside the pr-lint job');
-const guardStep = release.indexOf('- name: Check that release-please can parse every commit');
-const action = release.indexOf('googleapis/release-please-action@');
-assert(guardStep > 0 && guardStep < action, 'The range guard precedes release-please');
-const guardBlock = release.slice(guardStep, release.indexOf('- name: Inspect existing release PR'));
-assert(guardBlock.includes("if: github.event_name != 'push'") && guardBlock.includes('commit-parse-guard.cjs range'));
-assert(guardBlock.includes('id: parse_guard') && guardBlock.includes('continue-on-error: true'),
-  'A guard failure must not stop publication: the action runs after it');
-assert(guardBlock.includes('GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}') && guardBlock.includes('GH_REPO: ${{ github.repository }}'),
-  'Range mode reads pull request bodies, so it needs the repo and token');
-// A failed guard skips only the PR regeneration and the steps that follow it, then fails the job last.
-const skipLine = release.match(/skip-github-pull-request: \$\{\{ (.+) \}\}/)[1];
-assert(skipLine.includes("steps.parse_guard.outcome == 'failure'"), 'A failed guard skips PR regeneration, not publication');
-assert(!release.includes('skip-github-release:'), 'Publication stays enabled');
-const failStep = release.indexOf('- name: Fail the run when release-please could not parse every commit');
-assert(failStep > action && failStep < release.indexOf('\n  dispatch-checks:'), 'The failing step is last in the release-please job');
-const failBlock = release.slice(failStep, release.indexOf('\n  dispatch-checks:'));
-assert(failBlock.includes("if: ${{ !cancelled() && steps.parse_guard.outcome == 'failure' }}") && failBlock.includes('exit 1'));
-assert(!/needs: release-please\n\s+if: [^\n]*(always|failure)\(/.test(release.slice(release.indexOf('\n  dispatch-checks:'), release.indexOf('\n  sbom-target:'))),
-  'dispatch-checks keeps the success() gate, so a failed guard never dispatches checks');
-const sbomTarget = release.slice(release.indexOf('\n  sbom-target:'), release.indexOf('\n  release-sbom:'));
-assert(sbomTarget.includes('!cancelled()') && sbomTarget.includes("release_created == 'true'"), 'SBOM publication survives the failing last step');
-assert(release.includes("fetch-depth: ${{ github.event_name == 'push' && 1 || 0 }}"), 'The range guard needs the tag history');
-assert(release.indexOf('dispatch-checks:') > guardStep && /dispatch-checks:[\s\S]*?needs: release-please/.test(release),
-  'dispatch-checks needs the job that runs the guard');
 assert(read('docs/releases.md').includes('commit-parse-guard.cjs'), 'docs/releases.md documents the guard');
 
 console.log('commit parse guard: ok');
