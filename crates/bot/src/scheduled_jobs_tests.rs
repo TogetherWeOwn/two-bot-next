@@ -538,6 +538,80 @@ async fn definition_replaced_mid_post_deletes_the_orphan() {
 }
 
 #[tokio::test]
+async fn definition_replaced_mid_post_surfaces_a_refused_orphan_delete() {
+    let Some(fixture) = fixture().await else {
+        return;
+    };
+    let pool = fixture.pool().clone();
+    seed(&pool, "edited", T0 - 1_000, None).await;
+    let (mock, gate) = MockRest::start_gated(vec![posted()], ScriptedResponse::status(403)).await;
+    let rest = executor(&mock);
+
+    let ticker = {
+        let (pool, rest) = (pool.clone(), rest.clone());
+        tokio::spawn(async move { tick(&pool, &rest, GUILD, || T0).await })
+    };
+    gate.wait_for_request().await;
+    seed(&pool, "edited", T0 + 600_000, None).await;
+    gate.release();
+    ticker.await.unwrap().expect("tick");
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].method, "DELETE");
+    assert_eq!(requests[1].path, "/api/v10/channels/4444/messages/9001");
+    assert_eq!(posts(&mock).len(), 1, "the orphan is never re-posted");
+    let replaced = row(&pool, "edited").await;
+    assert!(replaced.enabled, "the new definition stands");
+    assert_eq!(replaced.next_run_at, format_iso_ms(T0 + 600_000));
+    assert_eq!(
+        audits(&pool, "edited").await,
+        [audit("stale_completion", Some("discord_rejected"))]
+    );
+    mock.shutdown().await;
+    fixture.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn definition_replaced_mid_post_surfaces_a_timed_out_orphan_delete() {
+    let Some(fixture) = fixture().await else {
+        return;
+    };
+    let pool = fixture.pool().clone();
+    seed(&pool, "edited", T0 - 1_000, None).await;
+    let (mock, gate) = MockRest::start_gated(
+        vec![posted()],
+        ScriptedResponse::status(204).delayed(Duration::from_secs(6)),
+    )
+    .await;
+    let rest = executor(&mock);
+
+    let ticker = {
+        let (pool, rest) = (pool.clone(), rest.clone());
+        tokio::spawn(async move { tick(&pool, &rest, GUILD, || T0).await })
+    };
+    gate.wait_for_request().await;
+    seed(&pool, "edited", T0 + 600_000, None).await;
+    gate.release();
+    ticker.await.unwrap().expect("tick");
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].method, "DELETE");
+    assert_eq!(requests[1].path, "/api/v10/channels/4444/messages/9001");
+    assert_eq!(posts(&mock).len(), 1, "the orphan is never re-posted");
+    let replaced = row(&pool, "edited").await;
+    assert!(replaced.enabled, "the new definition stands");
+    assert_eq!(replaced.next_run_at, format_iso_ms(T0 + 600_000));
+    assert_eq!(
+        audits(&pool, "edited").await,
+        [audit("stale_completion", Some("discord_timeout"))]
+    );
+    mock.shutdown().await;
+    fixture.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn supervised_runs_reach_the_metrics_endpoint() {
     use axum::{
         body::{to_bytes, Body},
