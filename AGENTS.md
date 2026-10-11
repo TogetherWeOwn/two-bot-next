@@ -13,6 +13,7 @@ tested and reviewable.
 2. [`README.md`](README.md): architecture, status and operator references.
 3. [`.github/pull_request_template.md`](.github/pull_request_template.md): the PR body; Linked Issues and Verification are required, the rest is optional.
 4. [`SECURITY.md`](SECURITY.md): private vulnerability reporting and secret handling.
+5. [`CONSTRAINTS.md`](CONSTRAINTS.md): the quality bar. Read it before writing code. Do not weaken it to make a change pass.
 
 ## Pull request contract
 

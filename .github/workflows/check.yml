@@ -344,6 +344,14 @@ jobs:
       - name: CI test-target inventory
         run: python3 scripts/ci/check-test-inventory.py
 
+      # Floor guard (CONSTRAINTS.md floor, HARD): pure Python over the PR
+      # diff, milliseconds. Ungated on purpose like the inventory gate: a
+      # docs-only PR can still weaken CONSTRAINTS.md, so this must see it.
+      - name: Floor guard (HARD, CONSTRAINTS.md floor)
+        env:
+          FLOOR_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
+        run: python3 scripts/ci/check-floor-guard.py --base-ref "$FLOOR_BASE"
+
       - name: Patch coverage (WARN, 80% of added lines)
         if: needs.job-inputs.outputs.rust != 'false'
         # The check job runs in a container whose default shell is sh (no pipefail).
