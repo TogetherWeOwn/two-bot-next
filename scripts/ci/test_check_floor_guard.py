@@ -43,7 +43,7 @@ SUPPORT_PATH = "crates/core/tests/support/tracing_capture.rs"
 PATCH_ROW = "| Patch coverage | Changed lines >= 80% covered | llvm-cov | every Rust PR |\n"
 MEASURED_ROW = "| Project-wide line coverage | 71.3% | must not fall |\n"
 EXCEPTION_ROW = (
-    "| crates/*/tests/support/*.rs | `allow(dead_code)` | QA & Release Engineer "
+    "| crates/*/tests/support/*.rs | `allow(dead_code)` | CI maintainers "
     "| 2027-10-11 | shared support |\n"
 )
 BASE = (

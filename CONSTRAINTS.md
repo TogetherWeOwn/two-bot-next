@@ -68,4 +68,4 @@ its date, and the waiver fails again until someone renews the row.
 
 | Path glob | Waiver | Owner | Expires | Why |
 |-----------|--------|-------|---------|-----|
-| crates/*/tests/support/*.rs | `allow(dead_code)` | QA & Release Engineer | 2027-10-11 | shared test-support module compiled into several test binaries, so each binary uses only part of it |
+| crates/*/tests/support/*.rs | `allow(dead_code)` | CI maintainers | 2027-10-11 | shared test-support module compiled into several test binaries, so each binary uses only part of it |
