@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only readback of recent container stdout (stdlib only; no start, no mutation).
+"""Read-only readback of recent container stdout (stdlib only; no start, no Worker/container mutation).
 
 The Rust process's stdout/stderr reaches Cloudflare Workers Observability as the
 `containers` dataset (docs/startup-diagnostics.md, "Reading container stdout").
@@ -9,8 +9,9 @@ cite (`durable gateway failed`, `gateway reconnect failed; Twilight will retry`,
 `gateway ready; checkpoint committed`, ...) can be checked against a live line.
 
 It never touches the Worker or the container: the query goes straight to the
-Cloudflare API, so it cannot wake a sleeping container or reach a bot route. Only
-two calls are possible, and the transport refuses anything else before it sends:
+Cloudflare API, so it cannot wake a sleeping container or reach a bot route. The
+observability API stores the query run itself (its `dry` defaults to false).
+Only two calls are possible, and the transport refuses anything else before it sends:
 
   * GET  /accounts                (only when no account id is supplied)
   * POST /accounts/<id>/workers/observability/telemetry/query   (a read query)
@@ -100,11 +101,15 @@ _URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+")
 # "Discord refused the bot token" or "bot lacks View/Send" stays readable.
 _BEARER = re.compile(r"(?<![\w-])(?:bearer|bot|basic)\s+[A-Za-z0-9._~+/=-]{20,}", re.IGNORECASE)
 _JWT_LIKE = re.compile(r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{20,}\b")
+# A double-quoted value runs greedily to the LAST quote on the line: a secret
+# containing an escaped quote (plain \" or outer-escaped \\\" layers) must not
+# end the match at the escaped quote and leak its tail. Over-redacting prose
+# after a quoted secret is the safe failure mode.
 _KEYED = re.compile(
     r"""(?ix)
     \b([\w.-]{0,64}?(?:token|secret|passw(?:or)?d|authorization|api[_-]?key|credential|dsn|cookie)[\w.-]{0,64})
     (\\?["']?\s*[=:]\s*)
-    ((?:(?:bearer|basic|bot)\s+)?(?:\\?"[^"]*"|'[^']*'|\S+))
+    ((?:(?:bearer|basic|bot)\s+)?(?:\\?".*"|\\?'.*'|\S+))
     """
 )
 _OPAQUE = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{32,}={0,2}(?![A-Za-z0-9+/_-])")

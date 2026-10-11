@@ -86,7 +86,8 @@ differs:
 
 `scripts/container_stdout_read.py` runs that query for you, read-only: it needs only
 `CLOUDFLARE_API_TOKEN`, sends nothing but the accounts list and this query (so it
-cannot start the container), and prints the newest lines oldest-first as JSON with
+cannot start the container; the observability API stores the query run itself),
+and prints the newest lines oldest-first as JSON with
 secret-like values redacted and only a short allowlist of structured fields kept:
 
 ```sh

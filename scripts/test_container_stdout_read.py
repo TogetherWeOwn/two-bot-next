@@ -294,6 +294,25 @@ class RedactionTests(unittest.TestCase):
                 self.assertNotIn(secret, packet["events"][0]["message"])
                 self.assertGreaterEqual(packet["redactions"], 1)
 
+    def test_keyed_secret_containing_a_quote_is_fully_redacted(self):
+        # A password containing a quote: plain JSON escapes it as \" and the
+        # outer-escaped form (Rust Debug / embedded JSON) carries literal
+        # backslashes before every quote. Either way no fragment past the
+        # escaped quote may survive, in any backslash layering.
+        inner = "ab\\\"cd efgh"
+        plain = '{"password":"' + inner + '"}'
+        escaped = plain.replace("\\", "\\\\").replace('"', '\\"')
+        for fragment in (plain, escaped):
+            with self.subTest(fragment=repr(fragment)):
+                packet = self.packet_for("event " + fragment)
+                message = packet["events"][0]["message"]
+                for tail in ("cd efgh", "efgh", "ab"):
+                    self.assertNotIn(tail, message.split("[redacted]")[-1])
+                self.assertGreaterEqual(packet["redactions"], 1)
+        single_plain = "{'secret': 'a\\'b cdefgh'}"
+        packet = self.packet_for("event " + single_plain)
+        self.assertNotIn("cdefgh", packet["events"][0]["message"])
+
     def test_a_runaway_line_is_bounded_in_time_and_size(self):
         for unit in ("a.", "a-", "a_1.", "token="):
             line = unit * 20000
