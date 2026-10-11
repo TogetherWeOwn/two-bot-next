@@ -124,7 +124,7 @@ this proves the build answers readiness and the guild publishes the surface.
 | `readyz build identity` | `build_revision` equals `--expected-sha` | `SMOKE-BUILD-MISMATCH` |
 | `identity and command list` | the token is the staging application and the guild command list reads | `SMOKE-DISCORD-REFUSED` |
 | `/rank`, `/leaderboard`, `/help` | listed and their own resource is scoped to the staging guild | `SMOKE-REGISTRY-MISSING`, `SMOKE-REGISTRY-DETAIL-MISMATCH` |
-| every other built-in | listed (`pass`) or unpublished (`skipped`, gate off or publish pending) | none: a skip is visible in the verdict, not a failure |
+| every other built-in | unpublished: `skipped` (gate off or publish pending); published: listed and its own resource is scoped to the staging guild | `SMOKE-REGISTRY-DETAIL-MISMATCH`, `SMOKE-DISCORD-REFUSED` |
 
 `SMOKE-READYZ-CHECKPOINT-READ-FAILED` replaces the older
 `SMOKE-READYZ-DB-BEHIND` signature for new records. It names the failed read
@@ -170,5 +170,7 @@ Offline coverage: `scripts/test_staging_smoke_run.py` (live-guild refusal before
 any request, container down, parked, checkpoint-read failure without a root-cause
 claim, contradictory status/breakdown with the checkpoint class keeping the
 generic signature, all-ready with the class and no failure signature,
-mismatched builds, missing core surface, foreign or rejected token, token never in output, record schema,
+mismatched builds, missing core surface, present gated detail match, present
+gated detail mismatch, present gated detail refusal, absent gated stays skipped
+with a detail-checked present gated row, foreign or rejected token, token never in output, record schema,
 drift against the command matrix).

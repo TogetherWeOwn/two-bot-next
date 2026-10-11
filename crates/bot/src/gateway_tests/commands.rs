@@ -502,6 +502,9 @@ async fn shared_runtime_preserves_custom_sticky_and_feed_registry_and_single_rep
     assert_eq!(gateway.authentication().await["op"], 2);
     gateway.send(ready(&gateway.url, "combined-session")).await;
     wait_sequence(&db.store, 1).await;
+    // Registry publication rides a detached spawn lane, so wait for the PUT
+    // instead of assuming it lands with the checkpoint.
+    wait_requests(&rest, 3).await;
     assert_registry(&rest);
     let registry: Vec<Value> = serde_json::from_slice(&rest.requests()[2].body).unwrap();
     for name in [
@@ -524,6 +527,9 @@ async fn shared_runtime_preserves_custom_sticky_and_feed_registry_and_single_rep
         interaction["d"]["member"]["permissions"] = json!("32");
         gateway.send(interaction).await;
         wait_sequence(&db.store, sequence).await;
+        // Command replies ride a detached lane after the checkpoint: wait for
+        // both the defer callback and the completion edit before asserting.
+        wait_requests(&rest, 3 + (index + 1) * 2).await;
         let requests = rest.requests();
         let callback = format!("/interactions/{id}/custom-command-fixture/callback");
         assert_eq!(
@@ -533,11 +539,9 @@ async fn shared_runtime_preserves_custom_sticky_and_feed_registry_and_single_rep
                 .count(),
             1
         );
-        assert_eq!(
-            requests.iter().filter(|r| r.method == "PATCH").count(),
-            index + 1
-        );
-        let body: Value = serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+        let patches: Vec<_> = requests.iter().filter(|r| r.method == "PATCH").collect();
+        assert_eq!(patches.len(), index + 1);
+        let body: Value = serde_json::from_slice(&patches.last().unwrap().body).unwrap();
         assert_ne!(
             body["content"],
             "This command is not available in this build yet."

@@ -9,9 +9,10 @@ build and the TWO Staging guild:
   readyz      GET /readyz   200 only when every component is ready
   build       readyz build identity matches the tested revision
   identity    GET /users/@me   the token belongs to the staging application
-  registry    guild command list + per-command resource read for the core
-              surfaces (/rank, /leaderboard, /help), then the rest of the
-              compiled publish set
+  registry    guild command list + per-command resource read for every
+              present builtin: the core surfaces (/rank, /leaderboard, /help)
+              always, then each present gated builtin from the compiled
+              publish set
 
 It is read-mostly by construction: only GET requests, no request bodies, and
 nothing is created or changed in the guild. It does NOT invoke a slash
@@ -226,12 +227,26 @@ def discord_rows(guild, run, fetch_fn):
         if name in CORE_SURFACES:
             continue
         mark()
-        present = name in live_names
-        run.rows.append(Row(f"/{name} (registry read)", "pass" if present else "skipped",
-                            "published when its staging env gate is on",
-                            "registered in the staging guild" if present else
-                            "not published in the staging guild (gate off or publish pending)",
-                            clock["started"], elapsed()))
+        if name not in live_names:
+            run.rows.append(Row(f"/{name} (registry read)", "skipped",
+                                "published when its staging env gate is on",
+                                "not published in the staging guild (gate off or publish pending)",
+                                clock["started"], elapsed()))
+            continue
+        try:
+            result = discord_read.check_command(fetch_fn, app_id, guild, entries, name)
+        except discord_read.SmokeError as error:
+            run.rows.append(Row(f"/{name} (registry read)", "fail",
+                                "published when its staging env gate is on, "
+                                "resource scoped to the staging guild",
+                                str(error), clock["started"], elapsed(), SIGNATURE_DISCORD))
+            continue
+        signature = SIGNATURE_MISSING if "not registered" in result.reason else SIGNATURE_DETAIL
+        run.rows.append(Row(f"/{name} (registry read)", "pass" if result.ok else "fail",
+                            "published when its staging env gate is on, "
+                            "resource scoped to the staging guild",
+                            result.reason, clock["started"], elapsed(),
+                            None if result.ok else signature))
 
 
 def build_record(args, run, started, ended):
