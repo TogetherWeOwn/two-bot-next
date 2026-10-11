@@ -20,7 +20,7 @@ high-rate event without a cap row fails the suite.
   guild/member/channel ID, token, query string, body or message content ever
   becomes a label or a log field.
 
-## Cardinality budget: 413 samples
+## Cardinality budget: 416 samples
 
 `GET /metrics` renders this many non-comment samples from process start,
 before any traffic. Adding any series fails the pinned count until this
@@ -45,7 +45,8 @@ table and the test are updated together.
 | `two_bot_voice_names_total{outcome}` | 12 | 1 create + 5 template-render outcomes + 5 dispatch outcomes + `other` |
 | `two_bot_gateway_checkpoint_failures_total{stage}` | 2 | `pre_commit`, `commit` |
 | `two_bot_internal_actions_total{family,outcome}` | 72 | 6 families x 12 outcomes (`announcement`, `event`, `settings`, `moderation`, `membership`, `other` x `executed` + 11 refusal classes) |
-| `# HELP` / `# TYPE` headers | 80 | 40 families x 2 |
+| `two_bot_community_facts_drain_failures_total{reason}` | 3 | `error`, `timeout`, `other` |
+| `# HELP` / `# TYPE` headers | 82 | 41 families x 2 |
 
 ## Per-event caps (gateway metric labels)
 

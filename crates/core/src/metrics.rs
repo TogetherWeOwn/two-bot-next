@@ -269,6 +269,10 @@ pub const INTERNAL_ACTION_OUTCOMES: &[&str] = &[
     "upstream",
     "internal",
 ];
+/// Reasons for `two_bot_community_facts_drain_failures_total{reason}`:
+/// `error` when the facts writer failed, `timeout` when the drain missed the
+/// dispatch deadline. Both warn and continue; `other` absorbs unknown reasons.
+pub const COMMUNITY_FACTS_DRAIN_REASONS: &[&str] = &["error", "timeout", "other"];
 const BUCKETS_MICROS: &[u64] = &[
     1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
 ];
@@ -347,6 +351,7 @@ struct Values {
     dispatch_drops: [u64; DISPATCH_LANES.len()],
     checkpoint_failures: [u64; CHECKPOINT_FAILURE_STAGES.len()],
     internal_actions: [[u64; INTERNAL_ACTION_OUTCOMES.len()]; INTERNAL_ACTION_FAMILIES.len()],
+    community_facts_drain_failures: [u64; COMMUNITY_FACTS_DRAIN_REASONS.len()],
 }
 
 /// All storage is fixed-size. Unknown labels collapse to `other`, including hostile input.
@@ -635,6 +640,20 @@ impl Metrics {
         *counter = counter.saturating_add(1);
     }
 
+    /// One warn-and-continue community-facts drain failure. Call once per
+    /// failed dispatch; a committed drain records nothing. Unknown reasons
+    /// collapse to `other`. No error text, SQL or identifiers are retained.
+    pub fn community_facts_drain_failure(&self, reason: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.community_facts_drain_failures
+            [bounded_index(reason, COMMUNITY_FACTS_DRAIN_REASONS)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// Pool samples are supplied at scrape time; this function never opens a DB connection.
     /// No supplied guard means a fresh/unconfigured zero snapshot.
     pub fn render(&self, pool: Option<(u32, usize, u32)>) -> String {
         self.render_with_rest_guard(pool, RestGuardSnapshot::default())
@@ -937,6 +956,22 @@ impl Metrics {
                 )
                 .unwrap();
             }
+        }
+        header(
+            &mut out,
+            "two_bot_community_facts_drain_failures_total",
+            "counter",
+            "Community-facts drain failures by bounded reason; the worker warns and continues, so each failed dispatch counts once.",
+        );
+        for (reason, count) in COMMUNITY_FACTS_DRAIN_REASONS
+            .iter()
+            .zip(values.community_facts_drain_failures)
+        {
+            writeln!(
+                out,
+                "two_bot_community_facts_drain_failures_total{{reason=\"{reason}\"}} {count}"
+            )
+            .unwrap();
         }
         for (name, count) in [
             (
@@ -1464,6 +1499,40 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
+        assert!(!text.contains("secret"));
+    }
+
+    #[test]
+    fn community_facts_drain_failures_count_per_reason() {
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_community_facts_drain_failures_total{reason=\"error\"} 0\n"));
+        assert!(
+            text.contains("two_bot_community_facts_drain_failures_total{reason=\"timeout\"} 0\n")
+        );
+        metrics.community_facts_drain_failure("error");
+        metrics.community_facts_drain_failure("error");
+        metrics.community_facts_drain_failure("timeout");
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_community_facts_drain_failures_total{reason=\"error\"} 2\n"));
+        assert!(
+            text.contains("two_bot_community_facts_drain_failures_total{reason=\"timeout\"} 1\n")
+        );
+    }
+
+    #[test]
+    fn community_facts_drain_hostile_reasons_collapse_to_other() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.community_facts_drain_failure(&hostile);
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        assert!(
+            text.contains("two_bot_community_facts_drain_failures_total{reason=\"other\"} 100\n")
+        );
         assert!(!text.contains("secret"));
     }
 
