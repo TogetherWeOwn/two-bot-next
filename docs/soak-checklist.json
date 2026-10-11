@@ -2424,17 +2424,18 @@
           "[984175d](https://github.com/TogetherWeOwn/two-bot/commit/984175de97477389c8888a34173c6f2a654402e8)",
           "`src/tempVoice/`",
           "TOG-3471: serialize and journal temp-voice ownership changes",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
-        "TOG-10099"
+        "TOG-10119"
       ],
-      "status": "manual",
-      "action": "Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Transfer room ownership with the panel/`/voice` controls, then let the owner leave; take a failed transfer from TOG-10099’s fixture.",
-      "expected": "Ownership changes are serialized and journaled; a failed transfer rolls back to the prior owner.",
-      "evidence": "Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.",
-      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
+      "status": "automated",
+      "action": "Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Transfer room ownership with the panel/`/voice` controls, then let the owner leave; attempt a transfer from a non-owner and confirm refusal (NotOwner, ownership unchanged).",
+      "expected": "Ownership changes are serialized and journaled; a failed grant or commit is retried forward - the persisted owner stays the prior owner until the commit lands and a reload revokes uncommitted grants.",
+      "evidence": "Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference. Fixture half: the offline `verification` command at the exact head; the staging half above is unchanged.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- transfer_hands_room_to_occupant_and_remembers_creator owner_leave_hands_room_to_earliest_joiner_and_persists failed_owner_commit_reload_and_later_transfer_revoke_every_issued_recipient"
     },
     {
       "id": "s13-0495e7d",
@@ -3290,17 +3291,18 @@
           "[38041a1](https://github.com/TogetherWeOwn/two-bot/commit/38041a1bf97ed2ba2cc24585af851e4f0173964f)",
           "`src/tempVoice/`",
           "fix(temp-voice): refuse renames that collide with a sibling channel name (#361)",
-          "carded"
+          "ported"
         ]
       },
       "owner": [
-        "TOG-10101"
+        "TOG-10119"
       ],
-      "status": "manual",
-      "action": "Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Rename a room to the name of a sibling channel in the same category, then to a unique name.",
-      "expected": "The colliding rename is refused; the unique name is applied.",
-      "evidence": "Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference.",
-      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row."
+      "status": "automated",
+      "action": "Attach the TOG-10119 temp-voice scenario for this leg on the staging fixture guild; do not run a second voice scenario here. Rename a room to the name of a sibling channel in the same category, then to a unique name; a folded duplicate of a still-queued rename from another room is refused.",
+      "expected": "The colliding rename is refused; a folded duplicate of a queued-but-unlanded rename is refused and a rename that would now duplicate at flush is dropped with its never-landed override cleared (the room keeps its template name, counted as rename_duplicate); the unique name is applied.",
+      "evidence": "Link the exact-SHA voice evidence table and verdict from [TOG-10119](/TOG/issues/TOG-10119), including row/scenario ID and time window. Missing/failing evidence leaves this row NEEDS WORK; do not infer PASS from the reference. Fixture half: the offline `verification` command at the exact head; the staging half above is unchanged.",
+      "reference": "[TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib -- unique_names_conflict_only_when_the_setting_is_on queued_rename_blocks_folded_duplicate_before_it_lands flush_recheck_drops_now_duplicate_rename_and_clears_override && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test voice_name_collision"
     },
     {
       "id": "s13-a40d4a5",
@@ -3537,16 +3539,17 @@
           "[a8d9f53](https://github.com/TogetherWeOwn/two-bot/commit/a8d9f53f6958d036a1f6fc34afcca70baa8e45a4)",
           "`src/announcements/`",
           "fix(announcements): defer interactions before service I/O (#424)",
-          "gap"
+          "ported"
         ]
       },
       "owner": [
         "TOG-10293"
       ],
-      "status": "manual",
-      "action": "Invoke the LFG commands and select in the staging guild with a slow-service leg from a local mock; invoke /rsvp once TOG-10293 wires it.",
-      "expected": "Each interaction is deferred before service I/O, so no interaction-failed reply appears.",
-      "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
+      "status": "automated",
+      "action": "Run the LFG defer-before-I/O fixtures and the ordered-RSVP defer fixtures on disposable fixtures: LFG commands and the select defer before service I/O, and queued RSVPs defer within three seconds and drain in order. The ignored RSVP half needs TWO_GATEWAY_TEST_DATABASE_URL pointed at the disposable agent-testdb/CI service, never staging or production.",
+      "expected": "Each interaction is deferred before service I/O, so no interaction-failed reply appears: one deferred callback first, one completion edit.",
+      "evidence": "Attach the owning slice's exact-head local-fixture command and sanitized PASS/NEEDS WORK result, including the mock request/response, timing or log assertion.",
+      "verification": "python3 scripts/cargo_cache.py run -- test -p two-bot -- lfg_sticky_and_feed_routes_coexist_without_db ordinary_member_lfg_select_reaches_the_feature_before_db && python3 scripts/cargo_cache.py run -- test -p two-bot -- queued_rsvp_is_deferred_within_three_seconds_and_drains_on_overflow sticky_and_feed_are_deferred_at_receipt_while_rsvp_is_pending --include-ignored"
     },
     {
       "id": "s13-f5edc70",
