@@ -1086,7 +1086,6 @@ async fn concurrent_publications_keep_newest_counter(pool: &PgPool, roles: Value
 #[tokio::test]
 async fn rank_tick_missing_rung_names_the_rung_and_writes_nothing() {
     let capture = tracing_capture::global();
-    let start = capture.text().len();
     let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
         assert!(
             std::env::var("GITHUB_ACTIONS").is_err(),
@@ -1128,6 +1127,10 @@ async fn rank_tick_missing_rung_names_the_rung_and_writes_nothing() {
     )
     .await;
     let observation = Mutex::new(());
+    // Mark the capture point just before the tick: earlier text includes sqlx
+    // migration statements that mention rung-like words, so starting here
+    // proves the warning names the failing rung.
+    let start = capture.text().len();
     let outcome = tick(Kind::Rank, &pool, &executor(&mock), guild, &observation).await;
     assert_eq!(outcome, Err(ErrorClass::Configuration));
     for query in [
@@ -1153,9 +1156,10 @@ async fn rank_tick_missing_rung_names_the_rung_and_writes_nothing() {
         .await
         .expect("drop disposable test database");
     let logs = capture.text().split_off(start);
-    for expected in ["Legend", "missing", "matches=0"] {
-        assert!(logs.contains(expected), "missing {expected:?} in logs");
-    }
+    assert!(
+        logs.contains("Legend missing matches=0"),
+        "missing exact rung diagnostic in logs"
+    );
     for leaked in [probe_id, probe_name] {
         assert!(!logs.contains(leaked), "logs leaked {leaked:?}");
     }
