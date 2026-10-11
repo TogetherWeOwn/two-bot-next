@@ -137,7 +137,7 @@ identity-paired evidence leaves the combined budget unknown.
 
 ## Related immediate alerts (not burn)
 
-Unlike the uninstalled fast/slow burn alerts above, these three **installed
+Unlike the uninstalled fast/slow burn alerts above, these four **installed
 Worker rules** evaluate keepalive samples independently of the burn math.
 They fire on their own conditions; notification additionally requires the
 configured [alert-forwarding path](metrics.md#off-container-scrape-and-alert-rules).
@@ -157,6 +157,13 @@ An installed rule is not proof that a page was delivered:
   forged pre-auth probe, always family `other`, stays silent), because a
   receiver-abuse or refusal storm stays quiet through the burn math.
   Runbook: [runbook](runbook.md#alert-receiver-refusals).
+- `gateway_checkpoint_failures`: any increase of
+  `two_bot_gateway_checkpoint_failures_total` summed over every `stage`
+  between two keepalive samples pages at once (zero threshold), because
+  every checkpoint failure stops the dispatch worker. The 75 s runtime
+  linger leaves ~3 s margin over a 60 s tick plus two 6 s probes for a scrape
+  to land before the restart resets the counter.
+  Runbook: [runbook](runbook.md#alert-checkpoint-failures).
 
 None of these rules changes the burn thresholds, windows or budget above.
 
