@@ -6,8 +6,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use two_bot_core::metrics::{
-    Metrics, CHECKPOINT_FAILURE_STAGES, DB_ERROR_OPS, DISPATCH_LANES, EVENTS,
-    INTERNAL_ACTION_FAMILIES, INTERNAL_ACTION_OUTCOMES, JOBS, JOB_OUTCOMES,
+    Metrics, CHECKPOINT_FAILURE_STAGES, COMMUNITY_FACTS_DRAIN_REASONS, DB_ERROR_OPS,
+    DISPATCH_LANES, EVENTS, INTERNAL_ACTION_FAMILIES, INTERNAL_ACTION_OUTCOMES, JOBS, JOB_OUTCOMES,
     PREFIX_TRIGGER_REFUSED_REASONS, REST_ROUTES, RESULTS, SEND_ADMISSION_OUTCOMES,
     VOICE_DEAD_ACTIONS, VOICE_NAME_OUTCOMES, VOICE_OPERATIONS, VOICE_OUTCOMES,
     VOICE_RECONCILE_ACTIONS, VOICE_VOTE_KICK_OUTCOMES,
@@ -126,6 +126,7 @@ fn allowlisted_labels(name: &str) -> Vec<&'static str> {
         "two_bot_voice_vote_kick_total" => vec!["outcome"],
         "two_bot_voice_names_total" => vec!["outcome"],
         "two_bot_internal_actions_total" => vec!["family", "outcome"],
+        "two_bot_community_facts_drain_failures_total" => vec!["reason"],
         "two_bot_gateway_checkpoint_failures_total" => vec!["stage"],
         _ => Vec::new(),
     }
@@ -170,6 +171,9 @@ fn expected_values(name: &str) -> Vec<(&'static str, Vec<&'static str>)> {
             ("family", INTERNAL_ACTION_FAMILIES.to_vec()),
             ("outcome", INTERNAL_ACTION_OUTCOMES.to_vec()),
         ],
+        "two_bot_community_facts_drain_failures_total" => {
+            vec![("reason", COMMUNITY_FACTS_DRAIN_REASONS.to_vec())]
+        }
         "two_bot_gateway_checkpoint_failures_total" => {
             vec![("stage", CHECKPOINT_FAILURE_STAGES.to_vec())]
         }
@@ -187,6 +191,11 @@ const KNOWN_COUNTERS: &[&str] = &[
     "two_bot_gateway_disconnects_total",
     "two_bot_gateway_missed_events_total",
     "two_bot_rest_requests_total",
+    "two_bot_rest_guard_invalid_requests_total",
+    "two_bot_rest_guard_rejected_requests_total",
+    "two_bot_rest_guard_breaker_opens_total",
+    "two_bot_rest_guard_breaker_closes_total",
+    "two_bot_rest_guard_global_pauses_total",
     "two_bot_job_runs_total",
     "two_bot_voice_operations_total",
     "two_bot_voice_reconcile_actions_total",
@@ -199,6 +208,7 @@ const KNOWN_COUNTERS: &[&str] = &[
     "two_bot_gateway_prefix_trigger_refused_total",
     "two_bot_dispatch_drops_total",
     "two_bot_internal_actions_total",
+    "two_bot_community_facts_drain_failures_total",
     "two_bot_gateway_checkpoint_failures_total",
 ];
 
@@ -279,6 +289,53 @@ fn check_docs_against_exposition(doc: &str, exposition: &str) -> Result<(), Stri
 fn committed_metrics_docs_match_exposition() {
     let doc = std::fs::read_to_string(repository_root().join("docs/metrics.md")).unwrap();
     let exposition = Metrics::default().render(None);
+    check_docs_against_exposition(&doc, &exposition).unwrap();
+}
+
+#[test]
+fn rest_guard_fixture_and_all_doc_rows_match_live_renderer() {
+    let doc = std::fs::read_to_string(repository_root().join("docs/metrics.md")).unwrap();
+    let exposition = Metrics::default().render_with_rest_guard(
+        None,
+        two_bot_core::metrics::RestGuardSnapshot {
+            invalid_requests_in_window: 3,
+            invalid_requests_total: 12,
+            rejected_requests_total: 4,
+            breaker_opens_total: 2,
+            breaker_closes_total: 1,
+            global_pauses_total: 3,
+            breaker_open: true,
+            token_invalid: true,
+            global_pause_remaining: std::time::Duration::from_millis(1250),
+            pending_global_responses: 2,
+        },
+    );
+    let guard_text = exposition
+        .lines()
+        .filter(|line| line.contains("two_bot_rest_guard_"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert_eq!(guard_text, include_str!("fixtures/rest_guard_metrics.prom"));
+    let families = parse_exposition(&guard_text);
+    assert_eq!(families.len(), 11);
+    let doc_names: BTreeSet<&str> = doc
+        .lines()
+        .filter(|line| line.starts_with("| `two_bot_rest_guard_"))
+        .map(|line| line.split('`').nth(1).unwrap())
+        .collect();
+    assert_eq!(doc_names, families.keys().map(String::as_str).collect());
+    for (name, family) in families {
+        assert!(family.label_keys.is_empty(), "no guard labels: {name}");
+        assert_eq!(
+            family.kind,
+            if name.ends_with("_total") {
+                "counter"
+            } else {
+                "gauge"
+            }
+        );
+    }
     check_docs_against_exposition(&doc, &exposition).unwrap();
 }
 

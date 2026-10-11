@@ -233,6 +233,12 @@ def probe_readyz(p: Probe, require_ready: bool) -> None:
     if not well_formed:
         p.fail("GET /readyz: body is not a JSON component breakdown")
         return
+    # Reject duplicates before any readiness math: last-wins would let a
+    # later ready mask an earlier down.
+    names = [name for name, _ in components]
+    if len(set(names)) != len(names):
+        p.fail("GET /readyz: repeats a component name")
+        return
     states = {name: state for name, state in components}
     ready = all(state == "ready" for state in states.values())
     p.observed = {"status": reply.status, "ready": ready, "components": states}

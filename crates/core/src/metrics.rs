@@ -7,6 +7,21 @@ use std::{
     time::Duration,
 };
 
+/// Scrape-time input, not a second retained guard or counter registry.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RestGuardSnapshot {
+    pub invalid_requests_in_window: usize,
+    pub invalid_requests_total: u64,
+    pub rejected_requests_total: u64,
+    pub breaker_opens_total: u64,
+    pub breaker_closes_total: u64,
+    pub global_pauses_total: u64,
+    pub breaker_open: bool,
+    pub token_invalid: bool,
+    pub global_pause_remaining: Duration,
+    pub pending_global_responses: usize,
+}
+
 pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 pub const EVENTS: &[&str] = &[
     "READY",
@@ -57,6 +72,9 @@ pub const REST_ROUTES: &[&str] = &[
     "DELETE /guilds/:guild/scheduled-events/:event",
     "POST /guilds/:guild/channels",
     "DELETE /channels/:channel",
+    "GET /guilds/:guild/members/:member",
+    "GET /users/@me",
+    "PATCH /webhooks/:application/:token/messages/@original",
     "other",
 ];
 pub const RESULTS: &[&str] = &["2xx", "3xx", "4xx", "429", "5xx", "transport"];
@@ -254,6 +272,10 @@ pub const INTERNAL_ACTION_OUTCOMES: &[&str] = &[
     "upstream",
     "internal",
 ];
+/// Reasons for `two_bot_community_facts_drain_failures_total{reason}`:
+/// `error` when the facts writer failed, `timeout` when the drain missed the
+/// dispatch deadline. Both warn and continue; `other` absorbs unknown reasons.
+pub const COMMUNITY_FACTS_DRAIN_REASONS: &[&str] = &["error", "timeout", "other"];
 const BUCKETS_MICROS: &[u64] = &[
     1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
 ];
@@ -332,6 +354,7 @@ struct Values {
     dispatch_drops: [u64; DISPATCH_LANES.len()],
     checkpoint_failures: [u64; CHECKPOINT_FAILURE_STAGES.len()],
     internal_actions: [[u64; INTERNAL_ACTION_OUTCOMES.len()]; INTERNAL_ACTION_FAMILIES.len()],
+    community_facts_drain_failures: [u64; COMMUNITY_FACTS_DRAIN_REASONS.len()],
 }
 
 /// All storage is fixed-size. Unknown labels collapse to `other`, including hostile input.
@@ -620,8 +643,31 @@ impl Metrics {
         *counter = counter.saturating_add(1);
     }
 
+    /// One warn-and-continue community-facts drain failure. Call once per
+    /// failed dispatch; a committed drain records nothing. Unknown reasons
+    /// collapse to `other`. No error text, SQL or identifiers are retained.
+    pub fn community_facts_drain_failure(&self, reason: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.community_facts_drain_failures
+            [bounded_index(reason, COMMUNITY_FACTS_DRAIN_REASONS)];
+        *counter = counter.saturating_add(1);
+    }
+
     /// Pool samples are supplied at scrape time; this function never opens a DB connection.
+    /// No supplied guard means a fresh/unconfigured zero snapshot.
     pub fn render(&self, pool: Option<(u32, usize, u32)>) -> String {
+        self.render_with_rest_guard(pool, RestGuardSnapshot::default())
+    }
+
+    /// Pool and guard samples are supplied at scrape time; no network I/O.
+    pub fn render_with_rest_guard(
+        &self,
+        pool: Option<(u32, usize, u32)>,
+        guard: RestGuardSnapshot,
+    ) -> String {
         let values = self
             .0
             .lock()
@@ -914,6 +960,85 @@ impl Metrics {
                 .unwrap();
             }
         }
+        header(
+            &mut out,
+            "two_bot_community_facts_drain_failures_total",
+            "counter",
+            "Community-facts drain failures by bounded reason; the worker warns and continues, so each failed dispatch counts once.",
+        );
+        for (reason, count) in COMMUNITY_FACTS_DRAIN_REASONS
+            .iter()
+            .zip(values.community_facts_drain_failures)
+        {
+            writeln!(
+                out,
+                "two_bot_community_facts_drain_failures_total{{reason=\"{reason}\"}} {count}"
+            )
+            .unwrap();
+        }
+        for (name, count) in [
+            (
+                "two_bot_rest_guard_invalid_requests_total",
+                guard.invalid_requests_total,
+            ),
+            (
+                "two_bot_rest_guard_rejected_requests_total",
+                guard.rejected_requests_total,
+            ),
+            (
+                "two_bot_rest_guard_breaker_opens_total",
+                guard.breaker_opens_total,
+            ),
+            (
+                "two_bot_rest_guard_breaker_closes_total",
+                guard.breaker_closes_total,
+            ),
+            (
+                "two_bot_rest_guard_global_pauses_total",
+                guard.global_pauses_total,
+            ),
+        ] {
+            scalar(&mut out, name, "counter", count);
+        }
+        for (name, value) in [
+            (
+                "two_bot_rest_guard_invalid_requests_in_window",
+                guard.invalid_requests_in_window as u64,
+            ),
+            (
+                "two_bot_rest_guard_breaker_open",
+                u64::from(guard.breaker_open),
+            ),
+            (
+                "two_bot_rest_guard_token_invalid",
+                u64::from(guard.token_invalid),
+            ),
+            (
+                "two_bot_rest_guard_pending_global_responses",
+                guard.pending_global_responses as u64,
+            ),
+            (
+                "two_bot_rest_guard_global_paused",
+                u64::from(
+                    !guard.global_pause_remaining.is_zero() || guard.pending_global_responses > 0,
+                ),
+            ),
+        ] {
+            scalar(&mut out, name, "gauge", value);
+        }
+        header(
+            &mut out,
+            "two_bot_rest_guard_global_pause_remaining_seconds",
+            "gauge",
+            "Remaining global cooldown; pending response bodies may still hold admission at zero.",
+        );
+        // Duration is nonnegative and its entire u64-seconds range is finite in f64.
+        writeln!(
+            out,
+            "two_bot_rest_guard_global_pause_remaining_seconds {}",
+            guard.global_pause_remaining.as_secs_f64()
+        )
+        .unwrap();
         let (size, idle, max) = pool.unwrap_or_default();
         scalar(
             &mut out,
@@ -955,6 +1080,66 @@ fn scalar(out: &mut String, name: &str, kind: &str, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rest_guard_snapshot_is_fixed_size_label_free_and_finite() {
+        let metrics = Metrics::default();
+        let empty = metrics.render(None);
+        let snapshot = RestGuardSnapshot {
+            invalid_requests_in_window: usize::MAX,
+            invalid_requests_total: u64::MAX,
+            rejected_requests_total: u64::MAX,
+            breaker_opens_total: u64::MAX,
+            breaker_closes_total: u64::MAX,
+            global_pauses_total: u64::MAX,
+            breaker_open: true,
+            token_invalid: true,
+            global_pause_remaining: Duration::MAX,
+            pending_global_responses: usize::MAX,
+        };
+        let full = metrics.render_with_rest_guard(None, snapshot);
+        let samples = |text: &str| -> std::collections::BTreeMap<String, f64> {
+            text.lines()
+                .filter(|line| line.starts_with("two_bot_rest_guard_"))
+                .map(|line| {
+                    let (name, value) = line.split_once(' ').unwrap();
+                    assert!(!name.contains('{'), "guard metrics must have no labels");
+                    (name.to_owned(), value.parse::<f64>().unwrap())
+                })
+                .collect()
+        };
+        let zeros = samples(&empty);
+        let maxima = samples(&full);
+        assert_eq!(zeros.len(), 11);
+        assert_eq!(
+            zeros.keys().collect::<Vec<_>>(),
+            maxima.keys().collect::<Vec<_>>()
+        );
+        assert!(zeros.values().all(|value| *value == 0.0));
+        assert!(maxima
+            .values()
+            .all(|value| value.is_finite() && *value >= 0.0));
+        assert_eq!(full.lines().count(), empty.lines().count());
+        assert!(full.len() < 65_536, "must fit the Worker scrape body cap");
+        let pending = metrics.render_with_rest_guard(
+            None,
+            RestGuardSnapshot {
+                pending_global_responses: 1,
+                ..Default::default()
+            },
+        );
+        assert!(pending.contains("two_bot_rest_guard_global_paused 1\n"));
+        assert!(pending.contains("two_bot_rest_guard_global_pause_remaining_seconds 0\n"));
+        let fractional = metrics.render_with_rest_guard(
+            None,
+            RestGuardSnapshot {
+                global_pause_remaining: Duration::from_millis(1250),
+                ..Default::default()
+            },
+        );
+        assert!(fractional.contains("two_bot_rest_guard_global_pause_remaining_seconds 1.25\n"));
+        assert!(fractional.contains("two_bot_rest_guard_global_paused 1\n"));
+    }
 
     #[test]
     fn exposition_has_cumulative_histogram_and_unique_series() {
@@ -1317,6 +1502,40 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
+        assert!(!text.contains("secret"));
+    }
+
+    #[test]
+    fn community_facts_drain_failures_count_per_reason() {
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_community_facts_drain_failures_total{reason=\"error\"} 0\n"));
+        assert!(
+            text.contains("two_bot_community_facts_drain_failures_total{reason=\"timeout\"} 0\n")
+        );
+        metrics.community_facts_drain_failure("error");
+        metrics.community_facts_drain_failure("error");
+        metrics.community_facts_drain_failure("timeout");
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_community_facts_drain_failures_total{reason=\"error\"} 2\n"));
+        assert!(
+            text.contains("two_bot_community_facts_drain_failures_total{reason=\"timeout\"} 1\n")
+        );
+    }
+
+    #[test]
+    fn community_facts_drain_hostile_reasons_collapse_to_other() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.community_facts_drain_failure(&hostile);
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        assert!(
+            text.contains("two_bot_community_facts_drain_failures_total{reason=\"other\"} 100\n")
+        );
         assert!(!text.contains("secret"));
     }
 
