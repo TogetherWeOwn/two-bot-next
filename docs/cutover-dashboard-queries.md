@@ -64,20 +64,34 @@ invite redirect `/healthz` as gateway health. Source:
 [runbook](runbook.md#is-it-alive).
 
 Session continuity from the shipped gateway series (`READY`, accepted RESUMEs,
-and HELLOs after the first — the only session series on `main`):
+reconnects, transport disconnects, and missed sequence gaps):
 
 ```promql
 sum(increase(two_bot_gateway_events_total{event="READY"}[1h]))
 sum(increase(two_bot_gateway_resumes_total[1h]))
 sum(increase(two_bot_gateway_reconnects_total[1h]))
+sum(increase(two_bot_gateway_disconnects_total[1h]))
+sum(increase(two_bot_gateway_missed_events_total[1h]))
 ```
 
-Pending (series not yet shipped — do not query during the watch until they
-land): `two_bot_gateway_disconnects_total`,
-`two_bot_gateway_missed_events_total`, and the unpaired-disconnect detector
-built on them. Until then, disconnects are visible only as `gateway reconnect
-failed; Twilight will retry` lines in container stdout, and every reconnect
-must still pair with a later RESUME or fresh READY in the same window.
+Unpaired-disconnect arithmetic (hand-diff of the two scrapes; every transport
+loss must pair with a later RESUME or fresh READY in the same window):
+
+```promql
+sum(increase(two_bot_gateway_disconnects_total[1h]))
+  - (sum(increase(two_bot_gateway_resumes_total[1h]))
+    + sum(increase(two_bot_gateway_events_total{event="READY"}[1h])))
+```
+
+A positive result means disconnects with no later RESUME or fresh READY.
+`two_bot_gateway_disconnects_total` counts every transport loss funnelled
+through the shard supervisor (reconnect failures, close frames, invalid
+sessions, cold-resume IDENTIFY). `two_bot_gateway_missed_events_total` counts
+dispatches Discord assigned but this process never received (sequence gaps
+inside one session); any increase over the window fails the zero-missed-events
+acceptance and the checked-in `gateway_missed_events` rule fires on it. Until
+a live unpaired-disconnect rule lands, pair disconnects by hand against the
+RESUME/READY counts in the same window.
 
 Cross-check with one log filter over the same window (container stdout in the
 dashboard; Worker tail is not Rust stdout): count `gateway shard loop started`
@@ -85,7 +99,7 @@ against `gateway ready; checkpoint committed`. A rising `READY` count
 means fresh IDENTIFYs (checkpoint older than 15 minutes or rejected sessions);
 a rising `RESUMED` count means the session continued. (`gateway reconnect
 failed; Twilight will retry` is the stdout counterpart of a transport loss;
-there is no disconnect counter series on `main` yet.)
+each one also increments `two_bot_gateway_disconnects_total`.)
 
 | Level | Condition | Action |
 |---|---|---|
@@ -120,15 +134,18 @@ Job health (DB unreachable surfaces here as failed completions):
 
 ```promql
 max by (job) (two_bot_job_consecutive_failures) >= 3
-time() - two_bot_job_last_success_timestamp_seconds > 2 * <job cadence seconds>
+time() - two_bot_job_last_success_timestamp_seconds{job="counter"} > 120
 ```
 
-Cadences live in `JOB_INTERVAL_SECONDS` (`counter` 60, `rank` 600,
-`scheduled_events` 600, `presence_probe` 3600, `community_scorecard` 60,
-`inactivity` 3600). A zero success timestamp means never succeeded since start
-(parked/just-started), not stale — the rule ignores it. Counter resets skip a
-window rather than firing. Cross-check container logs for `periodic job failed`
-(error class only; payloads are never logged).
+Substitute 2 x cadence per job for the staleness threshold: `counter` 120,
+`rank` 1200, `scheduled_events` 1200, `presence_probe` 7200,
+`community_scorecard` 120, `inactivity` 7200. Cadences live in
+`JOB_INTERVAL_SECONDS` (`counter` 60, `rank` 600, `scheduled_events` 600,
+`presence_probe` 3600, `community_scorecard` 60, `inactivity` 3600). A zero
+success timestamp means never succeeded since start (parked/just-started),
+not stale — the checked-in rule requires the timestamp above zero and ignores
+it. Counter resets skip a window rather than firing. Cross-check container
+logs for `periodic job failed` (error class only; payloads are never logged).
 
 Startup failure class (one fixed class per fatal gateway failure, no SQL text):
 
@@ -217,7 +234,7 @@ Sources: [metrics](metrics.md#off-container-scrape-and-alert-rules),
 
 | Panel | Warn (record, keep watching) | Page (freeze writers, decide rollback) |
 |---|---|---|
-| Readiness / gateway | Single 503; paired reconnect | 503 past 60 s; unready alert; reconnects with no RESUME/READY (missed-events series pending) |
+| Readiness / gateway | Single 503; paired reconnect | 503 past 60 s; unready alert; reconnects with no RESUME/READY; any missed-events increase |
 | DB-error proxies | 1 saturated sample; 1–2 job failures | Pool saturated x3; 3 consecutive failures; job stale; store/checkpoint class persists |
 | Send-admission proxies | Single 429 window; 5xx/transport spike; one global pause | Repeat 429 after containment; breaker open; token invalid; indefinite/wedged lane |
 
