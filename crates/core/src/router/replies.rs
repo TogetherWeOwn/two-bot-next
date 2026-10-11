@@ -287,12 +287,8 @@ where
                     // Keep polling the handler while acquiring/sending the ACK:
                     // an early handler reply may itself hold the session lock.
                     // Wait for an in-flight defer before completing its edit.
-                    // Use join (not try_join) so a transport failure on defer does
-                    // not cancel the handler future; completed_reply must run to
-                    // log handler failures even when the ACK is uncertain.
                     let defer_fut = session.defer(ephemeral);
-                    let handler_fut = async { future.await };
-                    let (defer_res, handler_res) = tokio::join!(defer_fut, handler_fut);
+                    let (defer_res, handler_res) = tokio::join!(defer_fut, future);
                     match defer_res {
                         Ok(_) => handler_res,
                         Err(e) => return Err(e),

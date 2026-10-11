@@ -306,11 +306,18 @@ def classify(path):
 # Paths whose change can alter temp-voice behaviour or the voice synthetic
 # itself (owner policy 2026-10-11: the synthetic runs on PRs only when these
 # change; always after deploy-staging and every 6 h).
+# crates/discord + crates/cutover use narrow voice_rooms prefixes (not broad
+# voice): voice_rooms.rs is the Discord-write adapter / room persistence that
+# the synthetic lifecycle exercises, plus its http test and future splits;
+# sibling voice_config_*/voice_ghosts/voice_reconcile are read-only or
+# config-only and never change live rooms.
 VOICE_PREFIXES = (
     "crates/bot/src/voice",
     "crates/core/src/voice",
     "crates/bot/src/gateway",
     "crates/bot/src/presence",
+    "crates/discord/src/voice_rooms",
+    "crates/cutover/src/voice_rooms",
     "tests/voice_templates/",
 )
 VOICE_EXACT = frozenset({
