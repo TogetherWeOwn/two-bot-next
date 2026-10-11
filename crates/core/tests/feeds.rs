@@ -232,6 +232,53 @@ fn body_cap_counts_chunked_decompressed_bytes_and_utf8() {
 }
 
 #[test]
+fn content_type_validates_media_type_not_parameters() {
+    // Supported feed media types pass, with any parameters ignored.
+    // The `x-` and `text/rss+xml` entries are legacy media types some
+    // servers still send for real feeds.
+    for valid in [
+        "application/rss+xml",
+        "application/x-rss+xml",
+        "text/rss+xml",
+        "application/atom+xml; charset=UTF-8",
+        "application/x-atom+xml; charset=UTF-8",
+        "application/xml",
+        "text/xml",
+        "application/rdf+xml",
+        "Application/RSS+XML; Charset=UTF-8",
+        "  application/rss+xml  ;  charset=utf-8  ",
+    ] {
+        assert!(
+            validate_content_type(Some(valid)).is_ok(),
+            "rejected {valid}"
+        );
+    }
+    // Missing header stays lenient.
+    assert!(validate_content_type(None).is_ok());
+    assert!(validate_content_type(Some("")).is_ok());
+    assert!(validate_content_type(Some("   ")).is_ok());
+    // An unrelated type must not pass because a parameter contains a magic
+    // substring; the media type alone decides, before any body parsing.
+    for hostile in [
+        "text/html; foo=atom",
+        "text/html; foo=x-rss+xml",
+        "text/html; charset=xml",
+        "text/plain; x=rss",
+        "application/json; xml=true",
+        "text/html; profile=\"rss\"",
+        "text/html",
+        "application/json",
+        "image/svg+xml",
+        "; foo=atom",
+    ] {
+        assert!(
+            validate_content_type(Some(hostile)).is_err(),
+            "accepted {hostile}"
+        );
+    }
+}
+
+#[test]
 fn rss_fixture_preserves_guid_entities_cdata_and_date() {
     let items = parse_xml_feed(include_str!("fixtures/feeds/rss.xml")).unwrap();
     assert_eq!(items.len(), 2);
