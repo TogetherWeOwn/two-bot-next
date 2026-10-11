@@ -62,6 +62,10 @@ INVITE_CODE = re.compile(r"[A-Za-z0-9-]{1,64}")
 INVITE_URL = re.compile(r"https://discord\.gg/([A-Za-z0-9-]{1,64})")
 COMPONENT_STATES = frozenset({"ready", "starting", "down"})
 REQUIRED_COMPONENTS = ("process", "gateway")
+# Per-surface allowlist: required process/gateway plus legitimate optional
+# database/token_invalid from the container's full breakdown. Anything else
+# is refused with fixed vocabulary naming no component data.
+ALLOWED_COMPONENTS = frozenset({"process", "gateway", "database", "token_invalid"})
 
 # Aliases and subpaths of the reserved internal slugs (redirect.ts
 # RESERVED_SLUGS). Each must 404 with no Location: never a campaign lookup,
@@ -264,6 +268,9 @@ def probe_readyz(p: Probe, require_ready: bool) -> None:
     names = [name for name, _ in components]
     if len(set(names)) != len(names):
         p.fail("GET /readyz: repeats a component name")
+        return
+    if any(name not in ALLOWED_COMPONENTS for name in names):
+        p.fail("GET /readyz: carries an unknown component name")
         return
     states = {name: state for name, state in components}
     ready = all(state == "ready" for state in states.values())

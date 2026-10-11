@@ -325,6 +325,61 @@ class WorkerReadyzDuplicateTests(unittest.TestCase):
         self.assertIsNotNone(info)
         self.assertTrue(all(r.verdict == "pass" for r in results))
 
+    def test_unknown_ready_down_starting_refused(self):
+        for extra_status, http_status in (("ready", 200), ("down", 503), ("starting", 503)):
+            with self.subTest(extra_status=extra_status):
+                with self.assertRaisesRegex(smoke.SmokeError, "unknown component name"):
+                    smoke.parse_worker_readyz(
+                        http_status, self.report(("process", "ready"), ("gateway", "ready"),
+                                                ("voice", extra_status)))
+
+    def test_unknown_sentinel_echoes_no_component_data(self):
+        sentinel = "SENTINEL_unknown_voice_abc123"
+        with self.assertRaises(smoke.SmokeError) as ctx:
+            smoke.parse_worker_readyz(
+                200, self.report(("process", "ready"), ("gateway", "ready"),
+                                 (sentinel, "ready")))
+        self.assertIn("unknown component name", str(ctx.exception))
+        self.assertNotIn(sentinel, str(ctx.exception))
+
+    def test_legitimate_optional_components_still_parse(self):
+        for pairs, status in (
+            ([("process", "ready"), ("gateway", "ready")], 200),
+            ([("process", "ready"), ("gateway", "ready"),
+              ("database", "ready")], 200),
+            ([("process", "ready"), ("gateway", "ready"),
+              ("database", "ready"), ("token_invalid", "ready")], 200),
+            ([("process", "ready"), ("gateway", "starting"),
+              ("database", "ready"), ("token_invalid", "ready")], 503),
+        ):
+            with self.subTest(pairs=pairs):
+                state = smoke.parse_worker_readyz(status, self.report(*pairs))
+                self.assertEqual(set(state), {name for name, _ in pairs})
+
+    def test_missing_required_component_refused(self):
+        with self.assertRaisesRegex(smoke.SmokeError, "lacks gateway"):
+            smoke.parse_worker_readyz(200, self.report(("process", "ready"),))
+
+    def test_check_worker_rejects_unknown_via_fetch_worker(self):
+        unknown = {"components": [["process", "ready"], ["gateway", "ready"],
+                                   ["voice", "ready"]]}
+        health_body = json.dumps({"status": "ok"}).encode()
+        readyz_body = json.dumps(unknown).encode()
+
+        def fake_fetch_worker(url):
+            if url.endswith("/health"):
+                return 200, health_body
+            if url.endswith("/readyz"):
+                return 200, readyz_body
+            raise AssertionError(f"unexpected Worker GET {url}")
+
+        with mock.patch.object(smoke, "fetch_worker", side_effect=fake_fetch_worker):
+            results, info = smoke.check_worker("https://two-bot-next-staging.5150.workers.dev")
+        self.assertIsNone(info)
+        self.assertEqual(results[1].verdict, "fail")
+        self.assertIn("unknown component name", results[1].reason)
+        self.assertNotIn("voice", results[1].reason)
+
 
 class _Loopback:
     """Isolated 127.0.0.1 server that records every request it receives."""
