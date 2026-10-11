@@ -172,6 +172,31 @@ class SoakEvidenceTests(unittest.TestCase):
         self.assertEqual(summary["dispatches"], 0)
         self.assertEqual(summary["verdict"], "NEEDS WORK")
 
+    def test_connect_only_input_refuses_pass_without_dispatches(self):
+        summary = run(
+            '{"ts": "2026-09-20T00:00:01Z", "event": "connect",'
+            ' "session": "a"}\n'
+        )
+        self.assertEqual(summary["connects"], 1)
+        self.assertEqual(summary["dispatches"], 0)
+        self.assertEqual(summary["missed_events"], 0)
+        self.assertEqual(summary["unknown_intervals"], [])
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+
+    def test_connect_plus_resume_without_dispatches_refuses_pass(self):
+        summary = run(
+            '{"ts": "2026-09-20T00:00:01Z", "event": "connect",'
+            ' "session": "a"}\n'
+            '{"ts": "2026-09-20T04:00:01Z", "event": "resume",'
+            ' "session": "a", "seq": 7}\n'
+        )
+        self.assertEqual(summary["connects"], 1)
+        self.assertEqual(summary["resumes"], 1)
+        self.assertEqual(summary["dispatches"], 0)
+        self.assertEqual(summary["missed_events"], 0)
+        self.assertEqual(summary["unknown_intervals"], [])
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+
     def test_cli_exit_code_empty_fails_clean_passes(self):
         with tempfile.NamedTemporaryFile(
                 mode="w", suffix=".jsonl", delete=True,

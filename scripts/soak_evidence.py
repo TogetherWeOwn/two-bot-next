@@ -214,11 +214,13 @@ def summarize(lines):
     missed_events = sum(window["count"] for window in missed)
     max_gap = max(gaps) if gaps else None
     within_budget = (max_gap is None or max_gap < REDEPLOY_GAP_BUDGET_S)
-    # Empty or blank-only input leaves first_ts None with zero counts and a
-    # null window. That is missing evidence, not a clean run (per
+    # Empty, blank-only, or dispatch-free input leaves no evidence of live
+    # traffic. That is missing evidence, not a clean run (per
     # docs/staging-soak.md missing evidence remains UNKNOWN), so it must not
     # PASS. Keep the honest null window/zero counts; fail closed via verdict.
-    has_evidence = first_ts is not None
+    # missed_events derives only from dispatch seq gaps, so zero dispatches
+    # makes "0 missed" vacuous; require at least one dispatch as evidence.
+    has_evidence = first_ts is not None and dispatches > 0
     verdict = "PASS" if (has_evidence and missed_events == 0 and not unknowns
                           and within_budget) else "NEEDS WORK"
     return {
