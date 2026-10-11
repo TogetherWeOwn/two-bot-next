@@ -262,17 +262,14 @@ fn assert_single_failure(failures: Vec<Value>, write: &str) {
         "{diagnostic}"
     );
     let shown = diagnostic.to_string();
-    for secret in [
-        USER,
-        OTHER,
-        EVENT,
-        "mock-rsvp-token",
-        "injected compensation fault",
+    for (kind, value) in [
+        ("member id", USER),
+        ("other member id", OTHER),
+        ("event id", EVENT),
+        ("interaction token", "mock-rsvp-token"),
+        ("database error text", "injected compensation fault"),
     ] {
-        assert!(
-            !shown.contains(secret),
-            "diagnostic leaked {secret}: {shown}"
-        );
+        assert!(!shown.contains(value), "diagnostic leaked a {kind}");
     }
 }
 
