@@ -3128,7 +3128,7 @@ fn member_success(outcome: &str, id: &str) -> Response {
     .into_response()
 }
 
-/// Best-effort: the claim stays occupied either way, so a failure is diagnosed, never retried.
+/// A failed write never releases the claim or resends; this only surfaces the gap.
 async fn mark_unknown_best_effort(
     store: &InternalActionStore,
     claim: &ExecutionClaim,
@@ -3136,6 +3136,7 @@ async fn mark_unknown_best_effort(
 ) {
     if let Err(error) = store.mark_unknown(claim).await {
         tracing::error!(
+            msg = "internal_action_unknown_state_persist_failed",
             action = action.as_str(),
             persist_class = unknown_persist_class(error),
             "internal action unknown-state persistence failed"

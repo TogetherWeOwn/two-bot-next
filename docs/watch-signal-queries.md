@@ -316,10 +316,12 @@ misconfiguration, not at Discord or the database. A rising `executed`
 count next to refusals means the receiver is still serving legitimate
 traffic while refusing the surge. Correlate with the container logs for
 `internal action refused` warn lines (sampled summaries keyed by
-`kind`/`class`/`key`/`action`) and for `internal action unknown-state persistence failed`
-error lines before acting. The error line is not a refusal: its `persist_class` is
-`storage_unavailable`, `transition_refused` or `invalid_input`, and the claim stays
-occupied, so repeats answer `in_progress` until the claim goes stale. A counter that reset to
+`kind`/`class`/`key`/`action`) and for `msg=internal_action_unknown_state_persist_failed`
+error lines before acting. Those lines mean a best-effort unknown-state write failed after an
+effect was attempted; the claim is never released or resent. Read the `persist_class` before
+acting: `storage_unavailable` leaves the claim `in_flight`, so repeats answer `in_progress`
+until it goes stale. `transition_refused` means the row had already moved on (for example to a
+stored terminal response), so a repeat may replay that response instead. A counter that reset to
 zero between scrapes means the process restarted; it does not mean the
 window was quiet.
 

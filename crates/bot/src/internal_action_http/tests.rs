@@ -942,7 +942,7 @@ async fn missing_nonce_or_claim_storage_prevents_any_effect() {
 fn unknown_persist_failures(start: usize) -> Vec<String> {
     crate::tracing_capture::global().text()[start..]
         .lines()
-        .filter(|line| line.contains("internal action unknown-state persistence failed"))
+        .filter(|line| line.contains(r#"msg="internal_action_unknown_state_persist_failed""#))
         .map(str::to_owned)
         .collect()
 }
@@ -993,13 +993,36 @@ async fn finish_failure_after_effect_is_not_success_or_permission_to_resend() {
     assert_eq!(effect.calls(), 1);
     assert_eq!(unknown_persist_failures(start).len(), 1);
 
-    let unknown_app = router(state(
-        db.pool().clone(),
-        Arc::new(MockEffect::new(MockOutcome::Unknown)),
-    ));
-    let (_, _, marked) = answer(unknown_app, signed(payload(), "old", "intent-marked")).await;
+    let healthy = Arc::new(MockEffect::new(MockOutcome::Unknown));
+    let healthy_app = router(state(db.pool().clone(), healthy.clone()));
+    let (_, _, marked) = answer(
+        healthy_app.clone(),
+        signed(payload(), "old", "intent-marked"),
+    )
+    .await;
     assert_eq!(marked["error"]["code"], "needs_reconciliation");
+    let (_, _, repeat) = answer(healthy_app, signed(payload(), "old", "intent-marked")).await;
+    assert_eq!(repeat["error"]["code"], "needs_reconciliation");
+    assert_eq!(healthy.calls(), 1);
     assert_eq!(unknown_persist_failures(start).len(), 1);
+
+    let mut hidden = MockEffect::new(MockOutcome::Unknown);
+    hidden.break_finish = Some(db.pool().clone());
+    let hidden = Arc::new(hidden);
+    let hidden_app = router(state(db.pool().clone(), hidden.clone()));
+    let (_, _, unknown_failed) = answer(
+        hidden_app,
+        signed(payload(), "old", "intent-unknown-failed"),
+    )
+    .await;
+    assert_eq!(unknown_failed["error"]["code"], "needs_reconciliation");
+    sqlx::query("ALTER TABLE receiver_hidden_audit RENAME TO internal_action_log")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let failures = unknown_persist_failures(start);
+    assert_eq!(failures.len(), 2, "{failures:?}");
+    assert!(failures.iter().all(|line| !line.contains("intent-")));
     db.close().await.unwrap();
 }
 
