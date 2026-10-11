@@ -41,8 +41,8 @@ rehearsal record (NEEDS WORK, 2026-10-03).
    `active:1,healthy:0` (starting but never healthy — not the
    `active:0,healthy:1` crashloop signature) and run `37166919319` failed
    earlier with `api_transport_failure`. Available log tails name no
-   `checkpoint_load_failed`. Limit: container stdout is dashboard-only, so
-   the log half is not observable from an agent seat; the verify half is
+   `checkpoint_load_failed`. Limit: this drill did not read container stdout (an agent seat can,
+   via `scripts/container_stdout_read.py`), so the log half is unobserved here; the verify half is
    fully evidenced. Replay steps are in §5.
 2. **T2.** Both halves evaluated: no freeze declared (first half has nothing
    to fire on), and exactly one `staging-migrate` run exists in history —
@@ -110,8 +110,9 @@ staging smoke owns it).
 - Offline only: no `/readyz`, `/ops/metrics`, container-log or database
   contact from this drill; staging halves rest on public CI metadata and
   merged source.
-- Container-stdout halves (T1 log class, `voice_event` emission) are
-  dashboard-only by established verification notes; absence here is "not
-  observed from this seat", never proof of absence on staging.
+- Container-stdout halves (T1 log class, `voice_event` emission) were not read
+  by this drill (`scripts/container_stdout_read.py` can read the T1 log class;
+  `voice_event` names stay dashboard-only); absence here is "not observed
+  from this seat", never proof of absence on staging.
 - T0 fixture pins `origin/main` at authoring revision `27d22b42`; drift
   since is not re-verified here.

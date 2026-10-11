@@ -1,9 +1,11 @@
 # Staging voice-event verification
 
 The four catalogued `voice_event` names are emitted to Rust container
-stdout only. Neither agents nor CI can confirm a catalogued name was
-actually emitted on staging through any API. This page records that
-explicitly and gives the Operator dashboard procedure instead.
+stdout only. That stdout is in the Workers Observability `containers` dataset, which
+`scripts/container_stdout_read.py` reads (see `docs/startup-diagnostics.md`), but the
+script keeps a fixed field allowlist that does not include the `voice_event` field. So no
+agent or CI path confirms a catalogued name was emitted on staging; this page records that
+and gives the Operator dashboard procedure instead.
 
 ## Catalogued names and emission sites
 
@@ -24,27 +26,24 @@ only log on failure paths, and `voice_operation` only logs finished room
 outcomes. Treat a missing name as "not observed", then check the
 corresponding counter below before escalating.
 
-## Why no CI or API read path exists
+## Why no CI or API read path exists for `voice_event`
 
 - `wrangler logs --env staging` shows Worker/DO tail, not Rust stdout, and
   the pinned Wrangler has no `containers logs` subcommand
   (see `docs/runbook.md`, Logs and keepalive).
-- Container stdout is not in Workers Logs
-  (see `docs/startup-diagnostics.md`, self-diagnosing gateway failures).
-  Workers Logs, the Query Builder, and the Workers Observability REST API
-  all query the Workers Logs dataset only, so none of them can return Rust
-  stdout lines.
+- Container stdout is not in the `cloudflare-workers` Workers Logs dataset; it is
+  in the `containers` one (see `docs/startup-diagnostics.md`, Reading container
+  stdout). `scripts/container_stdout_read.py` queries it, but its allowlist
+  drops the `voice_event`, `op`, `outcome` and `action` fields, so it cannot
+  show which voice name a line carried.
 - The Containers API exposes applications, versions, rollouts, instances,
-  registries and images. It exposes no container-stdout log endpoint, so
-  the existing deploy token cannot fetch recent container log events
-  through it either.
+  registries and images. It exposes no container-stdout log endpoint.
 - `GET /metrics` through the Worker is `404` by design; the only
   off-container metrics path is the authenticated `GET /ops/metrics`
   scrape described in `docs/metrics.md`.
-- No live Cloudflare log probe was run from this change: it needs the
-  staging account token and is Operator-owned. The conclusion above rests
-  on the shipped source and the linked Cloudflare documentation, not on a
-  live API attempt.
+- The `containers` dataset was read live, read-only, from an agent run on
+  2026-10-11 (the lines carried `gateway ready; checkpoint committed`). The
+  `voice_event` limit above comes from the script's allowlist, not from the API.
 
 ## What CI verifies today instead
 
@@ -105,9 +104,9 @@ This page authorizes none of that.
 
 ## Sources
 
-- Container stdout is dashboard-only:
+- Container stdout read path:
   `docs/runbook.md` (Logs and keepalive),
-  `docs/startup-diagnostics.md` (self-diagnosing gateway failures).
+  `docs/startup-diagnostics.md` (Reading container stdout).
 - Metrics names and the authenticated off-container scrape:
   `docs/metrics.md` (log fields, off-container scrape and alert rules).
 - Staging rollout provenance and readiness:
