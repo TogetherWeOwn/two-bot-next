@@ -357,6 +357,62 @@ class HealthContractProbeTests(unittest.TestCase):
         self.assertNotIn("[[[[[", text)
         self.assertNotIn("RecursionError", text)
 
+    def test_nested_build_identity_refuses_without_traceback(self):
+        # The decoder's nesting ceiling varies by interpreter, so stub the parse
+        # and let the nested value reach the receipt write.
+        real_loads = json.loads
+        for field in ("build_revision", "build_id"):
+            with self.subTest(field=field):
+                nested = "x"
+                for _ in range(3000):
+                    nested = [nested]
+                report = dict(READY, **{field: nested})
+
+                def parse(raw, report=report):
+                    return report if raw == b"READYZ" else real_loads(raw)
+
+                routes = {STAGING + "/health": body({"status": "ok"}),
+                          STAGING + "/readyz": (200, {}, b"READYZ")}
+                with mock.patch.object(probe.json, "loads", side_effect=parse):
+                    code, results, _ = self.drive(routes)
+                self.assert_only_failure(
+                    "build", "readyz without the compiled build_revision/build_id",
+                    code, results)
+                receipt = json.loads(Path(self.evidence).read_text())
+                self.assertEqual(receipt["result"], "fail")
+                self.assertIsNone(receipt[field])
+
+    def test_non_printable_build_identity_refuses_without_echo(self):
+        for field, value in (("build_revision", "\ud800"),
+                             ("build_revision", "abc\nPASS health: forged"),
+                             ("build_revision", "日本語"),
+                             ("build_id", "1\n-1")):
+            with self.subTest(field=field, value=value):
+                routes = {STAGING + "/health": body({"status": "ok"}),
+                          STAGING + "/readyz": body(dict(READY, **{field: value}))}
+                code, results, _ = self.drive(routes)
+                self.assert_only_failure(
+                    "build", "readyz without the compiled build_revision/build_id",
+                    code, results)
+                self.assertNotIn("forged", "\n".join(results.values()))
+                receipt = json.loads(Path(self.evidence).read_text())
+                self.assertIsNone(receipt[field])
+
+    def test_unhashable_gateway_failure_class_refuses_as_malformed(self):
+        for failure_class in ([1], {"x": 1}):
+            with self.subTest(failure_class=failure_class):
+                down = dict(READY)
+                down["components"] = components(("process", "ready"), ("gateway", "down"),
+                                                ("database", "ready"), ("token_invalid", "ready"))
+                down["gateway_failure"] = {"phase": "durable_gateway", "class": failure_class}
+                routes = {STAGING + "/health": body({"status": "ok"}),
+                          STAGING + "/readyz": body(down, status=503)}
+                code, results, _ = self.drive(routes)
+                self.assert_readyz_unreadable("outside the fixed vocabulary", code, results)
+                receipt = json.loads(Path(self.evidence).read_text())
+                self.assertEqual(receipt["result"], "fail")
+                self.assertIsNone(receipt["gateway_failure_class"])
+
     def test_shallow_nested_json_still_parses(self):
         # Direct decoder control: shallow nesting must still decode.
         routes = {STAGING + "/x": (200, {}, b'{"x": [1, [2, [3]]]}')}

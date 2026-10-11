@@ -258,7 +258,8 @@ def probe_readyz(p: Probe, require_ready: bool) -> None:
         isinstance(components, list)
         and len(components) > 0
         and all(
-            isinstance(c, list) and len(c) == 2 and isinstance(c[0], str) and c[1] in COMPONENT_STATES
+            isinstance(c, list) and len(c) == 2 and isinstance(c[0], str)
+            and isinstance(c[1], str) and c[1] in COMPONENT_STATES
             for c in components
         )
     )

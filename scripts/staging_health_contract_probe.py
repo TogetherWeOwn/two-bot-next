@@ -210,17 +210,23 @@ def parse_readyz(status, value):
     failure = value.get("gateway_failure")
     if failure is not None:
         if (not isinstance(failure, dict) or failure.get("phase") != FAILURE_PHASE
+                or not isinstance(failure.get("class"), str)
                 or failure.get("class") not in FAILURE_CLASSES):
             raise ProbeError(f"readyz {status} with a gateway failure outside the fixed vocabulary")
     return state, value
 
 
+def printable_str(value):
+    # Remote identity is echoed into output and the receipt: ASCII printable only.
+    return value if isinstance(value, str) and value.isascii() and value.isprintable() else None
+
+
 def check_build(report, expected_sha):
     if not isinstance(report, dict):
         return Result("build", False, "no readyz body to read build identity from")
-    revision = report.get("build_revision")
-    build_id = report.get("build_id")
-    if not isinstance(revision, str) or not revision or not isinstance(build_id, str) or not build_id:
+    revision = printable_str(report.get("build_revision"))
+    build_id = printable_str(report.get("build_id"))
+    if not revision or not build_id:
         return Result("build", False, "readyz without the compiled build_revision/build_id")
     if expected_sha and revision != expected_sha:
         return Result("build", False,
@@ -276,8 +282,8 @@ def evidence_shape(results, report, expected_sha):
     failure = (report or {}).get("gateway_failure") or {}
     return {"checks": [{"check": result.name, "verdict": "pass" if result.ok else "fail",
                         "shape": result.reason} for result in results],
-            "build_revision": (report or {}).get("build_revision"),
-            "build_id": (report or {}).get("build_id"),
+            "build_revision": printable_str((report or {}).get("build_revision")),
+            "build_id": printable_str((report or {}).get("build_id")),
             "gateway_failure_class": failure.get("class"),
             "gateway_failure_root_cause": ("unverified"
                                            if any(result.checkpoint_read_failed

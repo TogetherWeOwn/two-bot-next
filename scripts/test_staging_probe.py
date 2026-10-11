@@ -397,6 +397,16 @@ class ProbeTests(unittest.TestCase):
         self.assertIn("body is not a JSON component breakdown",
                       json.dumps(results["readyz"]["failures"]))
 
+    def test_unhashable_component_state_refuses_as_malformed(self):
+        for state in (["ready"], {"ready": True}):
+            with self.subTest(state=state):
+                readyz = json.dumps({"components": [["process", state], ["gateway", "ready"]]})
+                results = self.run_with_overrides(readyz=readyz)
+                self.assertEqual(results["readyz"]["verdict"], "FAIL")
+                self.assertIn("body is not a JSON component breakdown",
+                              json.dumps(results["readyz"]["failures"]))
+                self.assertNotIn("Traceback", json.dumps(results))
+
     def test_shallow_nested_json_still_parses(self):
         self.assertEqual(staging_probe.parse_json(self.reply('[1, [2, [3]]]')), [1, [2, [3]]])
         self.assertEqual(staging_probe.parse_json(self.reply('{"x": {"y": [1]}}')),
