@@ -696,6 +696,10 @@ class VoiceSelectionTest(unittest.TestCase):
             "crates/bot/src/voice_rooms/join_requests.rs",
             "crates/core/src/voice_name_filter.rs",
             "crates/bot/src/gateway.rs",
+            "crates/discord/src/voice_rooms.rs",
+            "crates/cutover/src/voice_rooms.rs",
+            "crates/discord/src/voice_rooms_http_tests.rs",
+            "./crates/cutover/src/voice_rooms.rs",
             "tests/voice_templates/corpus.json",
             "Cargo.lock",
             "scripts/staging_voice_synthetic.py",
@@ -708,6 +712,11 @@ class VoiceSelectionTest(unittest.TestCase):
         for path in (
             "crates/bot/src/tickets.rs",
             "crates/core/src/settings.rs",
+            "crates/discord/src/automod.rs",
+            "crates/cutover/src/tickets.rs",
+            "crates/cutover/src/voice_config_store.rs",
+            "crates/cutover/src/voice_ghosts.rs",
+            "crates/cutover/src/voice_reconcile.rs",
             "docs/voice-rooms.md",
             "wrangler/src/index.ts",
             "README.md",
@@ -717,6 +726,11 @@ class VoiceSelectionTest(unittest.TestCase):
 
     def test_any_deletion_selects_the_synthetic(self):
         self.assertTrue(inputs.voice_selected([], ["docs/old.md"]))
+        for path in (
+            "crates/discord/src/voice_rooms.rs",
+            "crates/cutover/src/voice_rooms.rs",
+        ):
+            self.assertTrue(inputs.voice_selected([], [path]), path)
 
     def test_voice_is_never_a_ci_job(self):
         self.assertNotIn(inputs.VOICE, inputs.ALL_JOBS)
