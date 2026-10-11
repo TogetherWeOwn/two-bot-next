@@ -1,6 +1,9 @@
 //! Internal-only route on the existing listener; the Worker never proxies it.
 
-use std::sync::{OnceLock, RwLock};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Once, OnceLock, RwLock,
+};
 
 use axum::{http::header, routing::get, Router};
 use sqlx::PgPool;
@@ -11,10 +14,58 @@ fn pool_slot() -> &'static RwLock<Option<PgPool>> {
     POOL.get_or_init(|| RwLock::new(None))
 }
 
-pub(crate) fn register_pool(pool: PgPool) {
-    *pool_slot()
+/// Rejected duplicate `register_pool` calls observed since boot. In-memory
+/// only and never rendered into `/metrics` output, so repeated
+/// misconfiguration costs O(1) memory and O(1) log lines.
+static DUPLICATE_REGISTRATIONS: AtomicU64 = AtomicU64::new(0);
+static DUPLICATE_WARNED: Once = Once::new();
+
+fn try_install(slot: &RwLock<Option<PgPool>>, pool: PgPool) -> bool {
+    let mut guard = slot
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.is_some() {
+        return false;
+    }
+    *guard = Some(pool);
+    true
+}
+
+fn install_replace(slot: &RwLock<Option<PgPool>>, pool: PgPool) {
+    *slot
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(pool);
+}
+
+/// First registration wins. A second call drops its handle without
+/// re-pointing scrapes, counts the rejection in memory, and emits at most
+/// one `tracing::warn` per process. Returns whether the pool was installed.
+/// The rejected handle is dropped, never closed: `PgPool` clones share the
+/// underlying pool, so closing could kill the live pool.
+pub(crate) fn register_pool(pool: PgPool) -> bool {
+    if try_install(pool_slot(), pool) {
+        return true;
+    }
+    DUPLICATE_REGISTRATIONS.fetch_add(1, Ordering::Relaxed);
+    DUPLICATE_WARNED.call_once(|| {
+        tracing::warn!("metrics pool already registered; keeping first pool");
+    });
+    false
+}
+
+/// Explicit escape hatch for deliberate replacement (tests, future reconnect
+/// flows). The sole production caller (`main.rs`) stays on `register_pool`.
+/// No production caller yet; kept as the documented replacement path.
+#[allow(dead_code)]
+pub(crate) fn replace_pool(pool: PgPool) {
+    install_replace(pool_slot(), pool);
+}
+
+/// In-memory rejection count for introspection. No production reader yet;
+/// kept alongside the counter so the diagnostic stays queryable.
+#[allow(dead_code)]
+pub(crate) fn duplicate_registration_count() -> u64 {
+    DUPLICATE_REGISTRATIONS.load(Ordering::Relaxed)
 }
 
 pub(crate) fn router() -> Router {
@@ -164,6 +215,44 @@ mod tests {
             assert!(text.contains(sample), "missing sample {sample}");
         }
         assert!(text.ends_with('\n'));
+    }
+
+    #[test]
+    fn double_registration_keeps_first_pool() {
+        // Exercises the `register_pool` keep-first path on a local slot so
+        // the global scrape slot stays untouched for other tests. Distinct
+        // max-connections values identify which handle survived.
+        let slot = RwLock::new(None);
+        let first = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .connect_lazy("postgres://agent_test@agent-testdb/agent_test")
+            .unwrap();
+        let second = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(7)
+            .connect_lazy("postgres://agent_test@agent-testdb/agent_test")
+            .unwrap();
+        assert!(try_install(&slot, first));
+        assert!(!try_install(&slot, second));
+        let guard = slot.read().unwrap();
+        assert_eq!(guard.as_ref().unwrap().options().get_max_connections(), 3);
+    }
+
+    #[test]
+    fn explicit_replace_repoints_slot() {
+        // The deliberate replacement path used by `replace_pool`.
+        let slot = RwLock::new(None);
+        let first = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .connect_lazy("postgres://agent_test@agent-testdb/agent_test")
+            .unwrap();
+        let second = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(7)
+            .connect_lazy("postgres://agent_test@agent-testdb/agent_test")
+            .unwrap();
+        assert!(try_install(&slot, first));
+        install_replace(&slot, second);
+        let guard = slot.read().unwrap();
+        assert_eq!(guard.as_ref().unwrap().options().get_max_connections(), 7);
     }
 
     #[tokio::test]
