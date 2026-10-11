@@ -50,7 +50,7 @@ pub fn router_with_jobs(state: SharedState, jobs: crate::jobs::SharedStatus) -> 
     )
 }
 
-fn router_with_guard(
+pub(crate) fn router_with_guard(
     state: SharedState,
     jobs: crate::jobs::SharedStatus,
     guard: Arc<two_bot_discord::ratelimit_guard::RateLimitGuard>,
@@ -60,9 +60,9 @@ fn router_with_guard(
         .route("/healthz", get(health))
         .route("/readyz", get(readyz))
         .with_state((state, jobs))
-        .layer(axum::Extension(guard))
-        // Internal metrics live on the same listener (Worker never proxies it).
-        .merge(crate::metrics_http::router())
+        .layer(axum::Extension(Arc::clone(&guard)))
+        // Metrics and readiness sample the same guard as production executors.
+        .merge(crate::metrics_http::router_with_guard(guard))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(RedactedHttpMakeSpan)
@@ -100,7 +100,7 @@ fn router_with_guard(
 }
 
 /// Routes the public listener serves; the only paths a span may record.
-/// Keep in sync with `router_with_guard` and `metrics_http::router`.
+/// Keep in sync with `router_with_guard` and `metrics_http::router_with_guard`.
 const TRACED_PATHS: [&str; 4] = ["/health", "/healthz", "/readyz", "/metrics"];
 
 /// Recorded for every path that is not an exact `TRACED_PATHS` entry.

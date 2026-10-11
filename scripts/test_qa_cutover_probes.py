@@ -224,6 +224,55 @@ class FenceTest(unittest.TestCase):
         self.assertIn("FAIL jobs-map:", out)
 
 
+class DuplicateComponentTest(unittest.TestCase):
+    def dup_body(self, pairs, status):
+        return (status, json.dumps({
+            "components": [[name, value] for name, value in pairs],
+            "jobs": {"counter": {"parked": True, "running": False}},
+            "build_revision": "r", "build_id": "b",
+        }).encode())
+
+    def assert_rejected(self, pairs, status):
+        _, raw = self.dup_body(pairs, status)
+        with self.assertRaisesRegex(probe.ProbeError, "repeats a component name"):
+            probe.check_readyz_shape(status, raw)
+
+    def test_down_then_ready_rejected(self):
+        self.assert_rejected([("process", "ready"), ("gateway", "down"),
+                              ("gateway", "ready")], 200)
+
+    def test_ready_then_down_rejected(self):
+        self.assert_rejected([("process", "ready"), ("gateway", "ready"),
+                              ("gateway", "down")], 503)
+
+    def test_same_value_repeat_rejected(self):
+        self.assert_rejected([("process", "ready"), ("gateway", "ready"),
+                              ("process", "ready")], 200)
+
+    def test_distinct_components_still_parse(self):
+        _, raw = self.dup_body([("process", "ready"), ("gateway", "ready")], 200)
+        state, _ = probe.check_readyz_shape(200, raw)
+        self.assertEqual(state["gateway"], "ready")
+
+    def test_diagnostic_echoes_no_component_data(self):
+        sentinel = "SENTINEL_dup_cutover_abc123"
+        _, raw = self.dup_body([("process", "ready"), ("gateway", "ready"),
+                                (sentinel, "ready"), (sentinel, "down")], 503)
+        with self.assertRaises(probe.ProbeError) as ctx:
+            probe.check_readyz_shape(503, raw)
+        self.assertIn("repeats a component name", str(ctx.exception))
+        self.assertNotIn(sentinel, str(ctx.exception))
+
+    def test_duplicate_fails_readiness_shape_end_to_end(self):
+        body = self.dup_body([("process", "ready"), ("gateway", "down"),
+                              ("gateway", "ready")], 200)
+        code, out = run(double({"/health": HEALTH, "/readyz": body}),
+                        "--base-url", "http://h/")
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL readiness-shape:", out)
+        self.assertIn("repeats a component name", out)
+
+
 class EvidenceTest(unittest.TestCase):
     def test_pass_writes_receipt_with_sources(self):
         with mock.patch("builtins.open", mock.mock_open()) as handle:
