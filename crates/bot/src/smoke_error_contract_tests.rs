@@ -57,7 +57,7 @@ const CHANNEL: u64 = 3333;
 /// `docs/production-deploy.md` (`error-class: fixed vocabulary only`, sourced
 /// from `docs/startup-diagnostics.md`). The smoke harness may file a watch-log
 /// row only with one of these tokens — never raw text, URLs or credentials.
-const WATCH_LOG_VOCABULARY: [&str; 16] = [
+const WATCH_LOG_VOCABULARY: [&str; 18] = [
     "listener_bind_failed",
     "gateway_override_invalid",
     "database_connect_failed",
@@ -66,9 +66,11 @@ const WATCH_LOG_VOCABULARY: [&str; 16] = [
     "checkpoint_load_failed",
     "onboarding_gates_invalid",
     "onboarding_init_failed",
+    "custom_commands_init_failed",
     "milestones_load_failed",
     "automod_config_invalid",
     "automod_executor_failed",
+    "raid_executor_failed",
     "gateway_runtime_failed",
     "gateway_task_panicked",
     "container_service_failed",
@@ -486,6 +488,22 @@ fn watch_log_vocabulary_stays_fixed_tokens() {
             "vocabulary token shape: {token}"
         );
         assert!(seen.insert(token), "duplicate vocabulary token: {token}");
+    }
+}
+
+#[test]
+fn watch_log_vocabulary_covers_every_failure_class() {
+    // The 48-hour watch log sources its `error-class` vocabulary from
+    // `docs/startup-diagnostics.md`, so every `FailureClass` token must be a
+    // member of the transcribed `WATCH_LOG_VOCABULARY`. Without this, a new
+    // failure class can ship with a diagnostics row but no permitted watch-log
+    // token to file it under.
+    for class in FailureClass::ALL {
+        assert!(
+            WATCH_LOG_VOCABULARY.contains(&class.as_str()),
+            "FailureClass {class:?} ({}) missing from WATCH_LOG_VOCABULARY",
+            class.as_str(),
+        );
     }
 }
 
