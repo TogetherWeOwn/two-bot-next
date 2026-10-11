@@ -14,7 +14,7 @@ export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]
   two_bot_db_pool_max_connections: {},
   two_bot_db_errors_total: { op: ["admission", "other"] },
   two_bot_send_admissions_total: { outcome: ["admitted", "blocked", "storage_error", "other"] },
-  two_bot_voice_operations_total: { op: ["create", "move", "delete"], outcome: ["success", "category_full", "discord", "persistence", "cancelled"] },
+  two_bot_voice_operations_total: { op: ["create", "move", "delete"], outcome: ["success", "category_full", "discord", "persistence", "refused", "cancelled"] },
   two_bot_voice_dead_letters_total: { action: ["create", "move", "delete", "companion", "ownership", "kick", "rename", "limit", "other"] },
   two_bot_voice_orphans_total: {},
   two_bot_gateway_missed_events_total: {},

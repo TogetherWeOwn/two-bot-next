@@ -47,7 +47,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_job_last_success_timestamp_seconds{job}` | Last successful completion time in Unix seconds; zero means no success recorded |
 | `two_bot_job_consecutive_failures{job}` | Failed completions since the last success; resets to zero on success |
 | `two_bot_job_last_error_class{job,class}` | One-hot class of the last failed completion; clears on success; fixed 16 × 7 = 112 series |
-| `two_bot_voice_operations_total{op,outcome}` | Finished room create/move/delete outcomes; `op` is `create`, `move` or `delete`, `outcome` is `success`, `category_full`, `discord`, `persistence` or `cancelled`; retries and 429 backoffs are not outcomes |
+| `two_bot_voice_operations_total{op,outcome}` | Finished room create/move/delete outcomes; `op` is `create`, `move` or `delete`, `outcome` is `success`, `category_full`, `discord`, `persistence`, `cancelled` or `refused` (create admission refused: cap or rolling burst); retries and 429 backoffs are not outcomes |
 | `two_bot_voice_reconcile_actions_total{action}` | Reconcile plan sizes; `action` is `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued` |
 | `two_bot_voice_dead_letters_total{action}` | Queue writes that exhausted `QUEUE_MAX_ATTEMPTS` (10); `action` is `create`, `move`, `delete`, `companion`, `ownership`, `kick`, `rename`, `limit` or `other` |
 | `two_bot_voice_tracked_rooms` | Rooms tracked in memory; compare with live Discord channels for ghosts |
@@ -215,7 +215,7 @@ as dynamic labels.
   names fold into `other`; class labels are fixed enum names, never error text.
 - `two_bot_voice_operations_total{op,outcome}` — `op` is `create`, `move`
   or `delete`; `outcome` is `success`, `category_full`, `discord`,
-  `persistence` or `cancelled`. `Rejected` status/code values never become
+  `persistence`, `cancelled` or `refused` (create admission refused the join). `Rejected` status/code values never become
   labels; all store variants share `persistence`.
 - `two_bot_voice_reconcile_actions_total{action}` — `action` is
   `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued`.

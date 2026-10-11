@@ -9,8 +9,8 @@
 //! [`Metrics::default`] so parallel tests never share state.
 
 use two_bot_core::metrics::{
-    Metrics, REST_ROUTES, VOICE_DEAD_ACTIONS, VOICE_OPERATIONS, VOICE_RECONCILE_ACTIONS,
-    VOICE_VOTE_KICK_OUTCOMES,
+    Metrics, REST_ROUTES, VOICE_DEAD_ACTIONS, VOICE_OPERATIONS, VOICE_OUTCOMES,
+    VOICE_RECONCILE_ACTIONS, VOICE_VOTE_KICK_OUTCOMES,
 };
 use two_bot_core::voice_vote_kick::VoteKickError;
 use two_bot_core::voice_vote_kick_audit::{
@@ -41,7 +41,7 @@ fn series_for(text: &str, family: &str) -> Vec<(String, u64)> {
 /// The cutover health queries name exact `op`/`outcome` pairs; every
 /// emission site must survive to exposition. The grid below mirrors the
 /// worker's call sites: `success` for create/move/delete, `category_full`
-/// for create, `discord` for create/move/delete, `persistence` for
+/// and `refused` for create, `discord` for create/move/delete, `persistence` for
 /// create/delete, and `cancelled` for create/delete.
 #[test]
 fn full_operation_outcome_grid_renders_every_cutover_series() {
@@ -54,6 +54,7 @@ fn full_operation_outcome_grid_renders_every_cutover_series() {
                 "category_full",
                 "discord",
                 "persistence",
+                "refused",
                 "cancelled",
             ],
         ),
@@ -70,8 +71,8 @@ fn full_operation_outcome_grid_renders_every_cutover_series() {
     }
     let text = metrics.render(None);
     let series = series_for(&text, "two_bot_voice_operations_total{");
-    // Fixed cardinality: 3 ops x 5 outcomes, zeros included.
-    assert_eq!(series.len(), VOICE_OPERATIONS.len() * 5);
+    // Fixed cardinality: 3 ops x 6 outcomes, zeros included.
+    assert_eq!(series.len(), VOICE_OPERATIONS.len() * VOICE_OUTCOMES.len());
     for (op, outcomes) in grid {
         for outcome in *outcomes {
             let line =
@@ -94,7 +95,7 @@ fn repeated_outcomes_accumulate_without_new_series() {
     }
     let text = metrics.render(None);
     let series = series_for(&text, "two_bot_voice_operations_total{");
-    assert_eq!(series.len(), VOICE_OPERATIONS.len() * 5);
+    assert_eq!(series.len(), VOICE_OPERATIONS.len() * VOICE_OUTCOMES.len());
     assert!(text.contains("two_bot_voice_operations_total{op=\"delete\",outcome=\"success\"} 7\n"));
 }
 
