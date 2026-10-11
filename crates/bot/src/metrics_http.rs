@@ -217,8 +217,8 @@ mod tests {
         assert!(text.ends_with('\n'));
     }
 
-    #[test]
-    fn double_registration_keeps_first_pool() {
+    #[tokio::test]
+    async fn double_registration_keeps_first_pool() {
         // Exercises the `register_pool` keep-first path on a local slot so
         // the global scrape slot stays untouched for other tests. Distinct
         // max-connections values identify which handle survived.
@@ -237,8 +237,8 @@ mod tests {
         assert_eq!(guard.as_ref().unwrap().options().get_max_connections(), 3);
     }
 
-    #[test]
-    fn explicit_replace_repoints_slot() {
+    #[tokio::test]
+    async fn explicit_replace_repoints_slot() {
         // The deliberate replacement path used by `replace_pool`.
         let slot = RwLock::new(None);
         let first = sqlx::postgres::PgPoolOptions::new()
