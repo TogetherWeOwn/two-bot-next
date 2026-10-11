@@ -7,6 +7,21 @@ use std::{
     time::Duration,
 };
 
+/// Scrape-time input, not a second retained guard or counter registry.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RestGuardSnapshot {
+    pub invalid_requests_in_window: usize,
+    pub invalid_requests_total: u64,
+    pub rejected_requests_total: u64,
+    pub breaker_opens_total: u64,
+    pub breaker_closes_total: u64,
+    pub global_pauses_total: u64,
+    pub breaker_open: bool,
+    pub token_invalid: bool,
+    pub global_pause_remaining: Duration,
+    pub pending_global_responses: usize,
+}
+
 pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 pub const EVENTS: &[&str] = &[
     "READY",
@@ -642,7 +657,17 @@ impl Metrics {
     }
 
     /// Pool samples are supplied at scrape time; this function never opens a DB connection.
+    /// No supplied guard means a fresh/unconfigured zero snapshot.
     pub fn render(&self, pool: Option<(u32, usize, u32)>) -> String {
+        self.render_with_rest_guard(pool, RestGuardSnapshot::default())
+    }
+
+    /// Pool and guard samples are supplied at scrape time; no network I/O.
+    pub fn render_with_rest_guard(
+        &self,
+        pool: Option<(u32, usize, u32)>,
+        guard: RestGuardSnapshot,
+    ) -> String {
         let values = self
             .0
             .lock()
@@ -951,6 +976,69 @@ impl Metrics {
             )
             .unwrap();
         }
+        for (name, count) in [
+            (
+                "two_bot_rest_guard_invalid_requests_total",
+                guard.invalid_requests_total,
+            ),
+            (
+                "two_bot_rest_guard_rejected_requests_total",
+                guard.rejected_requests_total,
+            ),
+            (
+                "two_bot_rest_guard_breaker_opens_total",
+                guard.breaker_opens_total,
+            ),
+            (
+                "two_bot_rest_guard_breaker_closes_total",
+                guard.breaker_closes_total,
+            ),
+            (
+                "two_bot_rest_guard_global_pauses_total",
+                guard.global_pauses_total,
+            ),
+        ] {
+            scalar(&mut out, name, "counter", count);
+        }
+        for (name, value) in [
+            (
+                "two_bot_rest_guard_invalid_requests_in_window",
+                guard.invalid_requests_in_window as u64,
+            ),
+            (
+                "two_bot_rest_guard_breaker_open",
+                u64::from(guard.breaker_open),
+            ),
+            (
+                "two_bot_rest_guard_token_invalid",
+                u64::from(guard.token_invalid),
+            ),
+            (
+                "two_bot_rest_guard_pending_global_responses",
+                guard.pending_global_responses as u64,
+            ),
+            (
+                "two_bot_rest_guard_global_paused",
+                u64::from(
+                    !guard.global_pause_remaining.is_zero() || guard.pending_global_responses > 0,
+                ),
+            ),
+        ] {
+            scalar(&mut out, name, "gauge", value);
+        }
+        header(
+            &mut out,
+            "two_bot_rest_guard_global_pause_remaining_seconds",
+            "gauge",
+            "Remaining global cooldown; pending response bodies may still hold admission at zero.",
+        );
+        // Duration is nonnegative and its entire u64-seconds range is finite in f64.
+        writeln!(
+            out,
+            "two_bot_rest_guard_global_pause_remaining_seconds {}",
+            guard.global_pause_remaining.as_secs_f64()
+        )
+        .unwrap();
         let (size, idle, max) = pool.unwrap_or_default();
         scalar(
             &mut out,
@@ -992,6 +1080,66 @@ fn scalar(out: &mut String, name: &str, kind: &str, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rest_guard_snapshot_is_fixed_size_label_free_and_finite() {
+        let metrics = Metrics::default();
+        let empty = metrics.render(None);
+        let snapshot = RestGuardSnapshot {
+            invalid_requests_in_window: usize::MAX,
+            invalid_requests_total: u64::MAX,
+            rejected_requests_total: u64::MAX,
+            breaker_opens_total: u64::MAX,
+            breaker_closes_total: u64::MAX,
+            global_pauses_total: u64::MAX,
+            breaker_open: true,
+            token_invalid: true,
+            global_pause_remaining: Duration::MAX,
+            pending_global_responses: usize::MAX,
+        };
+        let full = metrics.render_with_rest_guard(None, snapshot);
+        let samples = |text: &str| -> std::collections::BTreeMap<String, f64> {
+            text.lines()
+                .filter(|line| line.starts_with("two_bot_rest_guard_"))
+                .map(|line| {
+                    let (name, value) = line.split_once(' ').unwrap();
+                    assert!(!name.contains('{'), "guard metrics must have no labels");
+                    (name.to_owned(), value.parse::<f64>().unwrap())
+                })
+                .collect()
+        };
+        let zeros = samples(&empty);
+        let maxima = samples(&full);
+        assert_eq!(zeros.len(), 11);
+        assert_eq!(
+            zeros.keys().collect::<Vec<_>>(),
+            maxima.keys().collect::<Vec<_>>()
+        );
+        assert!(zeros.values().all(|value| *value == 0.0));
+        assert!(maxima
+            .values()
+            .all(|value| value.is_finite() && *value >= 0.0));
+        assert_eq!(full.lines().count(), empty.lines().count());
+        assert!(full.len() < 65_536, "must fit the Worker scrape body cap");
+        let pending = metrics.render_with_rest_guard(
+            None,
+            RestGuardSnapshot {
+                pending_global_responses: 1,
+                ..Default::default()
+            },
+        );
+        assert!(pending.contains("two_bot_rest_guard_global_paused 1\n"));
+        assert!(pending.contains("two_bot_rest_guard_global_pause_remaining_seconds 0\n"));
+        let fractional = metrics.render_with_rest_guard(
+            None,
+            RestGuardSnapshot {
+                global_pause_remaining: Duration::from_millis(1250),
+                ..Default::default()
+            },
+        );
+        assert!(fractional.contains("two_bot_rest_guard_global_pause_remaining_seconds 1.25\n"));
+        assert!(fractional.contains("two_bot_rest_guard_global_paused 1\n"));
+    }
 
     #[test]
     fn exposition_has_cumulative_histogram_and_unique_series() {

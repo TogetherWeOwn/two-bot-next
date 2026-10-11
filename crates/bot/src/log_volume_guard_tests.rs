@@ -650,13 +650,13 @@ fn exposition_series_count_matches_the_cardinality_budget() {
         .lines()
         .filter(|line| line.starts_with("# TYPE "))
         .count();
-    assert_eq!(help_headers, 30, "rendered HELP family count changed");
-    assert_eq!(type_headers, 30, "rendered TYPE family count changed");
+    assert_eq!(help_headers, 41, "rendered HELP family count changed");
+    assert_eq!(type_headers, 41, "rendered TYPE family count changed");
     let series = text.lines().filter(|line| !line.starts_with('#')).count();
     assert_eq!(
-        series, 423,
-        "exposition grew past the 423-sample budget (21 events + 4 scalars + 1 latency \
-         + 11 histogram + 174 rest + 48 jobs + 31 voice + 26 vote-kick + 12 voice-names + 2 db-errors + 4 send-admissions + 2 prefix-refused + 6 dispatch-drops + 2 checkpoint-failures + 72 internal-actions + 3 facts-drain + 4 pool); \
+        series, 434,
+        "exposition grew past the 434-sample budget (21 events + 4 scalars + 1 latency \
+         + 11 histogram + 174 rest + 11 REST guard + 48 jobs + 31 voice + 26 vote-kick + 12 voice-names + 2 db-errors + 4 send-admissions + 2 prefix-refused + 6 dispatch-drops + 2 checkpoint-failures + 72 internal-actions + 3 facts-drain + 4 pool); \
          update docs/log-volume-guard.md with the new series"
     );
 }
