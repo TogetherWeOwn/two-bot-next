@@ -59,7 +59,11 @@ kept for the whole watch:
    per-table and per-key mapping, not a bare timestamp filter.
    Record counts, hashes, conflicts and the applied watermark.
    Maximum accepted loss is zero acknowledged committed writes.
-   Never down-migrate or restore an old snapshot over additive schema.
+   See the "Production decision window" section in
+   [cutover-rollback-runbook.md](cutover-rollback-runbook.md#production-decision-window)
+   for the recorded 2-hour decision window from `T_0` and the forward-fix
+   posture after its closure. Never down-migrate or restore an old snapshot
+   over additive schema.
 3. Classify applied Discord effects from delivery, audit and replay
    receipts. Completed messages, sanctions, role changes and callbacks
    are not replayed or undone by a restore. Reconcile uncertain

@@ -115,7 +115,7 @@ controls, or exploit reachability.
 
 ## Release and dry-run
 
-On release-please publication, `release.yml` resolves the explicit Git tag ref
+When the production promote publishes a release, `release.yml` resolves the explicit Git tag ref
 `refs/tags/vX.Y.Z` through the read-only Git API, peels annotated tags, and
 checks out the resulting commit SHA, never an ambiguous same-named branch. It
 rebuilds/scans that commit and attaches `rust-workspace.cdx.json`,
@@ -127,7 +127,7 @@ The source SHA and local image ID bind the files to this build. They do not
 claim this image is the deployment's digest (there is no image push here).
 An asset failure does not erase the published release; inspect the failed run
 and use the explicit repair input below. Publication isn't atomic with
-release-please; require the assets before treating the release as fully delivered.
+the tag; require the assets before treating the release as fully delivered.
 
 ```sh
 # Opening/updating a PR automatically runs check.yml's PR SBOM dry-run.
@@ -153,7 +153,7 @@ it does not change either size budget or establish why a prior size check failed
 The optional release-workflow dry-run input also has no publication tag, even
 if a release tag input is supplied; PR verification does not use that dispatch.
 The repair path skips
-release-please and replaces assets only after the full scan passes. Release
+tagging and replaces assets only after the full scan passes. Release
 upload uses the short-lived Actions GITHUB_TOKEN with only `contents: write`;
 all builder/scanner jobs have only `contents: read` and no repository credential
 persisted in their checkout.
@@ -204,5 +204,5 @@ PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-runtime-image-evidence.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-vulnerability-preflight.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_container_smoke.py
 python3 scripts/test-docker-deps.py
-python3 scripts/test-release-retry.py
+node scripts/test-release-on-promote.cjs
 ```

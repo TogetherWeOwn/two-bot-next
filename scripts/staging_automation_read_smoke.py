@@ -100,6 +100,20 @@ def require_token(token):
     return token
 
 
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Authenticated reads never follow a redirect, even to the same origin.
+
+    Raising here stops urllib before it builds the second request, so the bot
+    token is never replayed; the Location and body are never read.
+    """
+
+    def http_error_301(self, req, fp, code, msg, headers):
+        fp.close()
+        raise SmokeError("refusing: authenticated read answered a redirect (not followed)")
+
+    http_error_302 = http_error_303 = http_error_307 = http_error_308 = http_error_301
+
+
 def make_fetch(token):
     """Build the only network function; the token never leaves this closure."""
 
@@ -112,7 +126,8 @@ def make_fetch(token):
                      "Cache-Control": "no-cache"},
         )
         try:
-            with urllib.request.build_opener().open(request, timeout=TIMEOUT_SECONDS) as response:
+            with urllib.request.build_opener(_RefuseRedirect).open(
+                    request, timeout=TIMEOUT_SECONDS) as response:
                 return response.status, response.read(BODY_CAP + 1)
         except urllib.error.HTTPError as error:
             return error.code, error.read(BODY_CAP + 1)
