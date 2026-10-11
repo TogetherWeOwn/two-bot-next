@@ -152,3 +152,13 @@ jobs:
           # Evidence contains only allowlisted version/digest/build IDs + statuses.
           # No raw Wrangler sessions, CF configs, env values or HTTP error bodies.
           python3 -c 'import json, os; print(json.dumps(json.load(open(os.environ["ROLLOUT_DIR"] + "/evidence.json")), sort_keys=True))'
+
+  # Live voice synthetic against the deployed staging bot (docs/voice-synthetic.md).
+  # A failure fails this workflow run, and deploy-production only promotes a
+  # commit whose latest deploy-staging run succeeded, so a broken temp-voice
+  # lifecycle cannot reach production.
+  voice-synthetic:
+    needs: deploy
+    permissions:
+      contents: read
+    uses: ./.github/workflows/voice-synthetic.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows

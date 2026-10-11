@@ -1230,6 +1230,7 @@ jobs:
       parity: ${{ steps.select.outputs.parity }}
       supply: ${{ steps.select.outputs.supply }}
       docs: ${{ steps.select.outputs.docs }}
+      voice: ${{ steps.select.outputs.voice }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1245,7 +1246,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          rust=true worker=true parity=true supply=true docs=false
+          rust=true worker=true parity=true supply=true docs=false voice=true
           if [ "${{ github.event_name }}" = "pull_request" ] \
             && [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ] \
             && result=$(python3 scripts/job-inputs.py \
@@ -1255,13 +1256,14 @@ jobs:
             parity=$(printf '%s' "$result" | sed -n 's/^parity=//p')
             supply=$(printf '%s' "$result" | sed -n 's/^supply=//p')
             docs=$(printf '%s' "$result" | sed -n 's/^docs=//p')
+            voice=$(printf '%s' "$result" | sed -n 's/^voice=//p')
             rust=${rust:-true} worker=${worker:-true} parity=${parity:-true}
-            supply=${supply:-true} docs=${docs:-false}
+            supply=${supply:-true} docs=${docs:-false} voice=${voice:-true}
           fi
-          printf 'job-inputs: rust=%s worker=%s parity=%s supply=%s docs=%s (event=%s)\n' \
-            "$rust" "$worker" "$parity" "$supply" "$docs" "${{ github.event_name }}"
-          printf 'rust=%s\nworker=%s\nparity=%s\nsupply=%s\ndocs=%s\n' \
-            "$rust" "$worker" "$parity" "$supply" "$docs" >>"$GITHUB_OUTPUT"
+          printf 'job-inputs: rust=%s worker=%s parity=%s supply=%s docs=%s voice=%s (event=%s)\n' \
+            "$rust" "$worker" "$parity" "$supply" "$docs" "$voice" "${{ github.event_name }}"
+          printf 'rust=%s\nworker=%s\nparity=%s\nsupply=%s\ndocs=%s\nvoice=%s\n' \
+            "$rust" "$worker" "$parity" "$supply" "$docs" "$voice" >>"$GITHUB_OUTPUT"
 
   # Dependency-aware selector for the container job (TOG-12056): PRs that
   # touch only docs, worker UI or unrelated CI tooling skip the ~15-minute
@@ -1662,6 +1664,11 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_automation_read_smoke.py -v
       - name: Verify staging voice smoke (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_voice_smoke.py -v
+      # Voice synthetic offline suite, only when voice inputs change (owner
+      # policy 2026-10-11). The live run gates promotion after deploy-staging.
+      - name: Verify staging voice synthetic (offline fixtures)
+        if: needs.job-inputs.outputs.voice != 'false'
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_voice_synthetic.py -v
       - name: Verify staging health-contract probe (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_health_contract_probe.py -v
       - name: Verify voice denied-copy fixtures (offline fixtures)

@@ -93,6 +93,8 @@ export const FORWARDED_FLAGS = [
   "TWO_TEMP_VOICE_NAME_TEMPLATE",
   "TWO_TEMP_VOICE_PANEL_CHANNEL_ID",
   "TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS",
+  // Staging-only synthetic voice test identities (docs/voice-synthetic.md).
+  "TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS",
   "TWO_TEMP_VOICE_SWEEP_SECONDS",
   // Template assistant (V12): non-secret endpoint URL + model name; the
   // endpoint credential (if any) travels as its own Container secret, never
