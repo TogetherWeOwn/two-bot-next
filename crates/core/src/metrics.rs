@@ -91,6 +91,8 @@ pub const JOBS: &[&str] = &[
     "inactivity",
     "audit_retry",
     "scheduled_messages",
+    "feeds",
+    "self_role_recovery",
     "other",
 ];
 pub const JOB_OUTCOMES: &[&str] = &["success", "failure"];
@@ -122,7 +124,7 @@ impl JobErrorClass {
     }
 }
 
-/// Complete error-class allowlist. With `JOBS`, this yields 84 fixed series.
+/// Complete error-class allowlist. With `JOBS`, this yields 98 fixed series.
 pub const JOB_ERROR_CLASSES: &[JobErrorClass] = &[
     JobErrorClass::Database,
     JobErrorClass::Rest,
@@ -1272,6 +1274,53 @@ mod tests {
         assert!(text.contains("two_bot_job_last_success_timestamp_seconds{job=\"other\"} 123\n"));
         assert!(text.contains("two_bot_job_consecutive_failures{job=\"other\"} 1\n"));
         assert!(text.contains("two_bot_job_last_error_class{job=\"other\",class=\"database\"} 1\n"));
+    }
+
+    #[test]
+    fn feeds_and_self_role_recovery_have_independent_job_series() {
+        for (succeeded, failed) in [
+            ("feeds", "self_role_recovery"),
+            ("self_role_recovery", "feeds"),
+        ] {
+            let metrics = Metrics::default();
+            metrics.job_success(failed, 123);
+            metrics.job_failure(failed, JobErrorClass::Database);
+            metrics.job_failure(failed, JobErrorClass::Database);
+            metrics.job_success("unknown_job", 234);
+            metrics.job_failure("another_unknown_job", JobErrorClass::Database);
+            metrics.job_failure(succeeded, JobErrorClass::Database);
+            metrics.job_success(succeeded, 456);
+            let text = metrics.render(None);
+            for (job, success, failure, last_success, streak) in [
+                (succeeded, 1, 1, 456, 0),
+                (failed, 1, 2, 123, 2),
+                ("other", 1, 1, 234, 1),
+            ] {
+                for (outcome, count) in [("success", success), ("failure", failure)] {
+                    assert!(text.contains(&format!(
+                        "two_bot_job_runs_total{{job=\"{job}\",outcome=\"{outcome}\"}} {count}\n"
+                    )));
+                }
+                assert!(text.contains(&format!(
+                    "two_bot_job_last_success_timestamp_seconds{{job=\"{job}\"}} {last_success}\n"
+                )));
+                assert!(text.contains(&format!(
+                    "two_bot_job_consecutive_failures{{job=\"{job}\"}} {streak}\n"
+                )));
+            }
+            for (name, count) in [
+                ("two_bot_job_runs_total", JOBS.len() * JOB_OUTCOMES.len()),
+                ("two_bot_job_last_success_timestamp_seconds", JOBS.len()),
+                ("two_bot_job_consecutive_failures", JOBS.len()),
+            ] {
+                assert_eq!(
+                    text.lines().filter(|line| line.starts_with(name)).count(),
+                    count
+                );
+            }
+            assert_eq!(JOBS.len(), 14);
+            assert!(!text.contains("unknown_job"));
+        }
     }
 
     #[test]

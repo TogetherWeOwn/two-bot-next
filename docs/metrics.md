@@ -46,7 +46,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_job_runs_total{job,outcome}` | Completed attempts; outcome is `success` or `failure` (including returned errors, timeouts and isolated panics) |
 | `two_bot_job_last_success_timestamp_seconds{job}` | Last successful completion time in Unix seconds; zero means no success recorded |
 | `two_bot_job_consecutive_failures{job}` | Failed completions since the last success; resets to zero on success |
-| `two_bot_job_last_error_class{job,class}` | One-hot class of the last failed completion; clears on success; fixed 12 × 7 = 84 series |
+| `two_bot_job_last_error_class{job,class}` | One-hot class of the last failed completion; clears on success; fixed 14 × 7 = 98 series |
 | `two_bot_voice_operations_total{op,outcome}` | Finished room create/move/delete outcomes; `op` is `create`, `move` or `delete`, `outcome` is `success`, `category_full`, `discord`, `persistence` or `cancelled`; retries and 429 backoffs are not outcomes |
 | `two_bot_voice_reconcile_actions_total{action}` | Reconcile plan sizes; `action` is `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued` |
 | `two_bot_voice_dead_letters_total{action}` | Queue writes that exhausted `QUEUE_MAX_ATTEMPTS` (10); `action` is `create`, `move`, `delete`, `companion`, `ownership`, `kick`, `rename`, `limit` or `other` |
@@ -90,16 +90,18 @@ leaves the existing Worker authentication gate and 64 KiB scrape cap intact.
 The supervisor records all three job metrics centrally after each completed
 attempt. Individual periodic jobs need no instrumentation. The current scheduled
 labels are `counter`, `rank`, `scheduled_events`, `presence_probe`,
-`community_scorecard`, `inactivity`, `audit_retry`, `self_role_recovery` and
-`scheduled_messages` (the 15 s scheduled-message ticker). The community, audit,
-recovery and ticker names may be parked by configuration.
+`community_scorecard`, `inactivity`, `audit_retry`, `self_role_recovery`, `feeds`,
+`settings` and `scheduled_messages` (the two 15 s tickers). The community, audit,
+recovery, feed and ticker names may be parked by configuration.
 All allowlisted series are exposed from process startup at zero, even before the
 first run. A zero success timestamp does not distinguish a parked, never-started,
 still-running or always-failing job; use `/readyz` job status for that distinction.
 
 Starts, skipped busy deadlines and shutdown cancellation are not completed
-outcomes. A returned `Ok(())` is a success even when the job is a gated/no-op tick;
-these counters measure scheduler health, not business events or changed rows.
+outcomes. A returned `Ok(())` is a success even when the job is a gated/no-op tick,
+including a feed inner poll skipped by the live interval gate; each such success
+resets that job's consecutive-failure streak. These counters measure scheduler
+health, not business events or changed rows.
 Failures preserve the previous success timestamp. The supervisor's `/readyz`
 status uses milliseconds; metrics convert the same completion sample to seconds.
 Errors and panic payloads are never labels.
@@ -110,14 +112,28 @@ The fixed job allowlist also retains `session_checkpoint`, `invite_snapshot` and
 not a scheduled-job count and its failures are not instrumented here.
 `invite_snapshot` remains zero until a real caller records a completion. Unknown
 job names share the `other` counters, timestamp and failure streak; an unknown
-success resets that shared streak. Add new scheduled names to the compile-time
-allowlist, never to a dynamic label map. The supervisor fixture checks the current
-website/community registration name catalogs against that allowlist.
+success resets that shared streak. Two known registered jobs still share `other`
+as a deferred follow-up: `member_unban_sweep` (30 s) and `automod_expiry` (60 s,
+only when `TWO_AUTOMOD=1`); either success resets the shared `other` streak until
+#788 lands, so `other` is not an unknown-name-only fallback in this slice.
+`feeds` and `self_role_recovery` have independent counters, timestamps and streaks:
+success in either cannot clear failures or change last-success in the other or in
+`other`. Add new scheduled names to the compile-time allowlist, never to a dynamic
+label map. The supervisor fixture checks the current website/community, audit,
+scheduled-message, feed and self-role recovery names against that allowlist.
 
-This change does not add a feed/roster scheduler or new jobs. Executor calls
-already record REST metrics wherever the executor is used; other REST clients
-are not silently claimed as covered. Off-container scraping and alerts remain
-separate work.
+No scheduler or registration gate changes are implied by these labels. Feed
+supervisor cadence is the boot-configured interval (default 300 s, range
+60–86,400 s); live interval changes gate polling inside those fixed opportunities.
+A skipped inner poll returns success and resets the `feeds` consecutive-failure
+streak, so `job_consecutive_failures:feeds` is reliable only while the live
+interval is at most the boot cadence; with a live interval at least twice the boot
+cadence each failed real poll is followed by a skipped tick that zeroes the streak
+before it can reach 3. Self-role recovery runs every 30 s with 0–5 s startup jitter
+and a 25 s timeout; a successful sweep need not settle every pending repair. Neither
+job's last-success timestamp is business-delivery proof.
+Executor calls already record REST metrics wherever the executor is used; other
+REST clients are not silently claimed as covered.
 
 ## Scrape contract
 
@@ -176,15 +192,15 @@ as dynamic labels.
   `two_bot_job_consecutive_failures{job}` — `job` is one of
   `invite_snapshot`, `session_checkpoint`, `counter`, `rank`,
   `scheduled_events`, `settings`, `presence_probe`, `community_scorecard`,
-  `inactivity`, `audit_retry`, `scheduled_messages`, `other`; `outcome` is
-  `success` or `failure`.
+  `inactivity`, `audit_retry`, `scheduled_messages`, `feeds`, `self_role_recovery`,
+  `other`; `outcome` is `success` or `failure`.
   `session_checkpoint` records successful durable gateway commits; zero means
   never run. `audit_retry` is the audit supervisor's 30 s retry sweep.
   `settings` is the DB-only 15 s `guild_settings` version poll.
 - `two_bot_job_last_error_class{job,class}` — `job` uses the list above;
   `class` is one of `database`, `rest`, `configuration`, `timeout`, `panic`,
   `feed` or `recovery_required` (the fixed `ErrorClass` variants). Each of the
-  12 jobs has one series per class (84 total); exactly the latest failure's class
+  14 jobs has one series per class (98 total); exactly the latest failure's class
   is `1`, and every class is `0` before a failure or after success. Unknown job
   names fold into `other`; class labels are fixed enum names, never error text.
 - `two_bot_voice_operations_total{op,outcome}` — `op` is `create`, `move`
@@ -443,20 +459,37 @@ Rust `*_INTERVAL_MS / 1000`. The 15 s tickers (`scheduled_messages`,
 window instead: at two intervals a 15 s cadence would flap on a single slow
 scrape, and skipped busy deadlines are neither success nor failure, so
 `job_stale` and `job_consecutive_failures` cannot see a wedged ticker.
-`invite_snapshot`, `other` and `audit_retry` have no cadence entry; a stale
-nonzero success timestamp on any of them — or on any future label the scrape
-accepts before the catalog maps it — raises the `job_unknown_stale` ticket
-above (`UNKNOWN_JOB_STALE_SECONDS`, 7200) instead of staying silent.
-`session_checkpoint` is event-driven (one success per durable gateway commit,
-so idle guilds go stale while healthy) and is excluded from the fallback via
-`UNKNOWN_STALE_EXCLUDED` in `wrangler/src/alert-rules.ts`: it never tickets.
-`audit_retry` keeps its parked/halt reason in the catalog; a halted sweep still
-records success, so only a truly wedged sweep tickets.
-`wrangler/test/alert-job-catalog.test.ts` fails when a `JOBS` label has
-neither a matching cadence, ticker_stale coverage, nor a reasoned
-unknown-stale entry. Only a cadence, ticker coverage, or event-driven
-exclusion in `wrangler/src/alert-rules.ts` retires the fallback; a reasoned
-note alone does not.
+`invite_snapshot`, `other`, `audit_retry`, `feeds` and `self_role_recovery`
+have no cadence entry; a stale nonzero success timestamp on any of them — or
+on any future label the scrape accepts before the catalog maps it — raises
+the `job_unknown_stale` ticket above (`UNKNOWN_JOB_STALE_SECONDS`, 7200)
+instead of staying silent. `other` is the catch-all for unknown job names and
+currently also covers two known deferred jobs (`member_unban_sweep` at 30 s
+and `automod_expiry` at 60 s), so it has no single cadence until #788 gives
+them independent labels. `session_checkpoint` is event-driven (one success per
+durable gateway commit, so idle guilds go stale while healthy) and is excluded
+from the fallback via `UNKNOWN_STALE_EXCLUDED` in
+`wrangler/src/alert-rules.ts`: it never tickets. `audit_retry` keeps its
+parked/halt reason in the catalog; a halted sweep still records success, so
+only a truly wedged sweep tickets. `feeds` is covered by the coarse fallback,
+not a precise cadence, because its cadence is boot-configured (60–86400 s)
+with a live-configurable inner polling gate and successful gated ticks are
+not polling freshness; its failure alerting is reliable only while the live
+interval is at most the boot cadence, since skipped gated ticks return success
+and reset the streak. `self_role_recovery` keeps failure-only alerting: twice
+its 30 s cadence is too close to the ~60 s scrape interval for safe
+`job_stale` paging, and this label-isolation change adds no ticker-staleness
+policy. `self_role_recovery` triggers `job_consecutive_failures` independently
+at three completed failures; `feeds` does the same within its live-interval
+limit above. A sweep with no completions is covered only by the coarse 2-hour
+fallback, not a precise cadence.
+`wrangler/test/alert-job-catalog.test.ts` checks website/community cadence
+catalogs and direct feed/self-role job producers. It fails when a registered
+producer is absent from `JOBS` or a `JOBS` label has neither a matching
+cadence, ticker_stale coverage, nor a reasoned unknown-stale entry. Only a
+cadence, ticker coverage, or event-driven exclusion in
+`wrangler/src/alert-rules.ts` retires the fallback; a reasoned note alone does
+not.
 
 Packet identity (TOG-12100): rule ids above are the single shared spelling
 used on both sides of the B2 soak evidence seam. The Rust canonical list is
