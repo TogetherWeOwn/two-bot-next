@@ -33,7 +33,7 @@ Port-written row cells are strings/nulls. Frozen legacy v3 dumps have no
 `column_types` and carry native numbers/booleans; these decode to bound
 PostgreSQL input using the target's type, never silently to NULL. JSON-looking
 TEXT stays unchanged, and native JSON cells serialize for JSON/JSONB targets.
-Unsupported composite cells refuse; see `tests/fixtures/README.md` for scope
+Unsupported composite cells refuse; see `crates/core/tests/fixtures/README.md` for scope
 and actual frozen-writer fixture provenance.
 
 Input is streamed with separate caps: 1 GiB compressed **and decoded**,

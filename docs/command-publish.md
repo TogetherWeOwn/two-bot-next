@@ -123,7 +123,7 @@ before opting into this boot behavior.
 `TWO_COMMANDS_PUBLISH_ON_BOOT = "1"` plus the staging bot's public
 `DISCORD_APPLICATION_ID`. The container publishes with its own send-admission
 database, so an operator CLI run needs no second database credential, and the
-live-guild fence stays on. `scripts/check-env-bindings.py` rejects the opt-in
+live-guild fence stays on. `wrangler/scripts/check-env-bindings.py` rejects the opt-in
 at top level and in production; production publication stays an
 Operator-approved Worker binding. The staging guild's registry is a full
 replacement on every boot where the hashes differ: do not keep a separate
