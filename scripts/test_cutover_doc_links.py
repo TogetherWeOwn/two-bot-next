@@ -18,13 +18,20 @@ HEADING = re.compile(r"#{1,6}\s+(.*?)\s*#*\s*$")
 INTERNAL_TRACKER = "/TOG/issues/"
 
 
+FENCE_OPEN = re.compile(r"(`{3,}|~{3,})")
+
+
 def _prose_lines(text):
-    fenced = False
+    fence = None
     for number, line in enumerate(text.splitlines(), start=1):
-        if line.lstrip().startswith(("```", "~~~")):
-            fenced = not fenced
-        elif not fenced:
-            yield number, line
+        if fence is None:
+            opened = FENCE_OPEN.match(line.lstrip())
+            if opened:
+                fence = opened.group(1)
+            else:
+                yield number, line
+        elif re.fullmatch(re.escape(fence[0]) + "{%d,}" % len(fence), line.strip()):
+            fence = None
 
 
 def _slug(heading):
@@ -102,12 +109,18 @@ class CutoverDocLinks(unittest.TestCase):
                 "[backup](backup-fixture.md#coverage-and-recovery-semantics-v4-old-suffix)\n"
                 "[overrun](../crates/table.rs#L99)\n"
                 "[closer](../crates/table.rs#L3)\n"
-                "[reversed](../crates/table.rs#L3-L1)\n"
+                "[reversed](../crates/table.rs#L2-L1)\n"
+                "[zero](../crates/table.rs#L0)\n"
                 "[range](../crates/table.rs#L1-L99)\n"
                 "[directory](../crates#L1)\n"
                 "~~~\n"
-                "[fenced](../crates/table.rs#L99)\n"
+                "[tilde-fenced](../crates/table.rs#L96)\n"
                 "~~~\n"
+                "````text\n"
+                "~~~\n"
+                "[nested](../crates/table.rs#L98)\n"
+                "````\n"
+                "[after](../crates/table.rs#L97)\n"
             )
             live = (
                 "[backup](backup-fixture.md#coverage-and-recovery-semantics-v4-and-v5)\n"
@@ -115,7 +128,12 @@ class CutoverDocLinks(unittest.TestCase):
                 "[tracker](/TOG/issues/fixture-link)\n"
                 "[directory](../crates)\n"
             )
-            self.assertEqual(len(_problems(doc, stale)), 6)
+            problems = _problems(doc, stale)
+            self.assertEqual(len(problems), 8)
+            self.assertFalse(any("#L96" in p or "#L98" in p for p in problems))
+            self.assertTrue(any("#L97" in p for p in problems))
+            self.assertIn("invalid line range", " ".join(p for p in problems if "#L2-L1" in p))
+            self.assertIn("invalid line range", " ".join(p for p in problems if "#L0" in p))
             self.assertEqual(_problems(doc, live), [])
 
 
