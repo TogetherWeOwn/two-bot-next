@@ -350,7 +350,8 @@ jobs:
       - name: Floor guard (HARD, CONSTRAINTS.md floor)
         env:
           FLOOR_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
-        run: python3 scripts/ci/check-floor-guard.py --base-ref "$FLOOR_BASE"
+          FLOOR_HEAD: ${{ github.event.pull_request.head.sha || 'HEAD' }}
+        run: python3 scripts/ci/check-floor-guard.py --base-ref "$FLOOR_BASE" --head-ref "$FLOOR_HEAD"
 
       - name: Patch coverage (WARN, 80% of added lines)
         if: needs.job-inputs.outputs.rust != 'false'
@@ -406,6 +407,7 @@ jobs:
           PATH="$RUNNER_TEMP/ast-grep:$PATH" \
             python3 scripts/ci/check-unwrap-request-paths.py \
             --base-ref "$QUALITY_BASE" --head-ref "$QUALITY_HEAD"
+          PATH="$RUNNER_TEMP/ast-grep:$PATH" ast-grep test -c sgconfig.yml
 
       - name: Semgrep Rust rules (WARN)
         if: needs.job-inputs.outputs.rust != 'false'

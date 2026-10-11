@@ -6,7 +6,7 @@ file, strips an assertion from a test that stays, or lowers a number in
 CONSTRAINTS.md. Tightening the bar is silent; loosening it is loud.
 
 Contract (reference: constraint-driven-development floor-guard):
-- Input is the merge-base-to-HEAD diff plus untracked files.
+- Input is the merge-base-to-selected-head diff plus untracked files.
 - Exit 0 clean, 1 on a floor violation, 2 when the guard cannot run
   (no merge base). A 2 never reads as a 0.
 - Markdown prose (.md) is exempt from the waiver/skip patterns: mentioning a
@@ -138,14 +138,14 @@ def _git(root, *args):
     )
 
 
-def collect(root, base_ref):
-    """Collect (added, removed, deleted) from the merge-base-to-HEAD diff."""
-    mb = _git(root, "merge-base", base_ref, "HEAD")
+def collect(root, base_ref, head_ref="HEAD"):
+    """Collect (added, removed, deleted) from the merge-base-to-head diff."""
+    mb = _git(root, "merge-base", base_ref, head_ref)
     if mb.returncode != 0:
         raise NoMergeBase(f"no merge base against {base_ref}")
     base = mb.stdout.strip()
 
-    diff = _git(root, "diff", "--unified=0", "--no-color", base, "HEAD", "--")
+    diff = _git(root, "diff", "--unified=0", "--no-color", base, head_ref, "--")
     added, removed = [], []
     path = ""
     for line in diff.stdout.splitlines():
@@ -156,7 +156,7 @@ def collect(root, base_ref):
         elif line.startswith("-") and not line.startswith("---"):
             removed.append((path, line[1:]))
 
-    status = _git(root, "diff", "--name-status", base, "HEAD", "--")
+    status = _git(root, "diff", "--name-status", base, head_ref, "--")
     deleted = [
         line.split("\t", 1)[1]
         for line in status.stdout.splitlines()
@@ -175,19 +175,20 @@ def collect(root, base_ref):
     return added, removed, deleted
 
 
-def check(root=ROOT, base_ref="origin/main"):
-    """Run the guard against the working tree. Raises NoMergeBase."""
-    added, removed, deleted = collect(Path(root), base_ref)
+def check(root=ROOT, base_ref="origin/main", head_ref="HEAD"):
+    """Run the guard against the selected head. Raises NoMergeBase."""
+    added, removed, deleted = collect(Path(root), base_ref, head_ref)
     return scan(added, removed, deleted)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-ref", default="origin/main")
+    parser.add_argument("--head-ref", default="HEAD")
     parser.add_argument("--root", type=Path, default=ROOT)
     args = parser.parse_args(argv)
     try:
-        errors = check(args.root, args.base_ref)
+        errors = check(args.root, args.base_ref, args.head_ref)
     except NoMergeBase as exc:
         print(f"floor-guard: {exc}", file=sys.stderr)
         raise SystemExit(2)

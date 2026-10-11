@@ -281,6 +281,36 @@ class GitPlumbingTests(unittest.TestCase):
             tmp.cleanup()
         self.assertEqual(errors, [])
 
+    def test_pull_request_head_excludes_unrelated_base_branch_changes(self):
+        tmp, root, environ = make_repo()
+        commit_env = {**__import__("os").environ, **environ}
+        try:
+            base = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=root, text=True
+            ).strip()
+            git("checkout", "-b", "pr", cwd=root)
+            (root / "src" / "pr.rs").write_text("fn pr() {}\n")
+            git("add", ".", cwd=root)
+            git("commit", "-m", "PR change", cwd=root, env=commit_env)
+            pr_head = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=root, text=True
+            ).strip()
+
+            git("checkout", "main", cwd=root)
+            (root / "scripts").mkdir()
+            waiver = "import example  # " + "noqa: E402\n"
+            (root / "scripts" / "test_upstream.py").write_text(waiver)
+            git("add", ".", cwd=root)
+            git("commit", "-m", "unrelated base change", cwd=root, env=commit_env)
+            git("merge", "--no-ff", "pr", "-m", "PR merge", cwd=root, env=commit_env)
+
+            merge_errors = gate.check(root, base)
+            pr_errors = gate.check(root, base, pr_head)
+        finally:
+            tmp.cleanup()
+        self.assertTrue(any("silenced-checker" in error for error in merge_errors))
+        self.assertEqual(pr_errors, [])
+
 
 if __name__ == "__main__":
     unittest.main()

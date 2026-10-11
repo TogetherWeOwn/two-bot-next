@@ -93,6 +93,15 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(error, "")
         self.assertEqual(len(hits), 2)
 
+    def test_all_rules_scan_includes_advisory_rule_ids(self):
+        tmp, binary = fake_ast_grep(json.dumps(SCAN_FIXTURE))
+        try:
+            hits, error = gate.run_scan(binary, all_rules=True)
+        finally:
+            tmp.cleanup()
+        self.assertEqual(error, "")
+        self.assertIn(("some-other-rule", "crates/bot/src/gateway_commands.rs", 11), hits)
+
     def test_scan_reports_garbage_instead_of_crashing(self):
         tmp, binary = fake_ast_grep("not json")
         try:
@@ -157,8 +166,6 @@ class GateTests(unittest.TestCase):
             scan = [{"ruleId": "no-unwrap-request-paths",
                      "file": "crates/bot/src/gateway_commands.rs",
                      "range": {"start": {"line": 2}}}]
-            pack = Path(tempfile.mktemp())
-            pack.write_text(json.dumps(scan))
             fake_tmp, binary = fake_ast_grep(json.dumps(scan))
             out = io.StringIO()
             try:
@@ -178,6 +185,21 @@ class GateTests(unittest.TestCase):
         code, output = self.run_gate(SCAN_FIXTURE, "HEAD", "HEAD")
         self.assertEqual(code, 0)
         self.assertNotIn("::warning::", output)
+
+    def test_new_shared_advisory_warns_but_passes(self):
+        real_scan, real_added = gate.run_scan, gate.added_lines
+        gate.run_scan = lambda _binary, all_rules=False: (
+            [("rust-erased-map-err", "crates/core/src/example.rs", 7)], "")
+        gate.added_lines = lambda _base, _head: ({("crates/core/src/example.rs", 7)}, "")
+        out = io.StringIO()
+        try:
+            with redirect_stdout(out):
+                code = gate.main(["--base-ref", "base", "--head-ref", "head"])
+        finally:
+            gate.run_scan, gate.added_lines = real_scan, real_added
+        self.assertEqual(code, 0)
+        self.assertIn("rust-erased-map-err", out.getvalue())
+        self.assertIn("::warning::", out.getvalue())
 
     def test_blind_gate_warns_and_passes(self):
         out = io.StringIO()
@@ -206,6 +228,22 @@ class RuleShapeTests(unittest.TestCase):
     def test_backlog_exists_and_names_every_enforced_hit(self):
         backlog = (ROOT / "docs/unwrap-backlog.md").read_text()
         self.assertIn("no-unwrap-request-paths", backlog)
+
+    def test_shared_rust_advisories_have_local_rules_and_fixtures(self):
+        rule_ids = {
+            "rust-byte-split-offset",
+            "rust-dropped-wait-for-future",
+            "rust-erased-map-err",
+            "rust-test-global-env",
+            "rust-test-global-metrics",
+            "rust-wildcard-access-denied",
+        }
+        for rule_id in rule_ids:
+            rule = ROOT / f"ast-grep-rules/{rule_id}.yml"
+            fixture = ROOT / f"ast-grep-rules/tests/{rule_id}-test.yml"
+            self.assertTrue(rule.is_file(), rule)
+            self.assertTrue(fixture.is_file(), fixture)
+            self.assertEqual(yaml.safe_load(rule.read_text())["id"], rule_id)
 
 
 if __name__ == "__main__":

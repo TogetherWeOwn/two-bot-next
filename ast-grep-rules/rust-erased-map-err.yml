@@ -1,0 +1,6 @@
+id: rust-erased-map-err
+language: Rust
+severity: warning
+message: 'Retain the failure cause instead of replacing every error with one constant message Example: two-bot-next#609.'
+rule:
+  pattern: $RESULT.map_err(|_| $MESSAGE)

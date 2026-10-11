@@ -10,10 +10,17 @@ the step itself.
   lines the PR adds. Shortfalls annotate the PR and pass.
 - Dependency advisories (HARD): the `cargo-deny` step (`check all`, which
   includes advisories) runs on every PR, not only Rust-selected ones.
-- Unwrap in request paths (WARN): ast-grep rule
-  `ast-grep-rules/no-unwrap-request-paths.yml` forbids new `.unwrap()` in
-  non-test route/handler/interaction/command/webhook files; current hits are
-  listed in `docs/unwrap-backlog.md`.
+- Rust ast-grep advisories (WARN): the local `sgconfig.yml` runs the request-path
+  `.unwrap()` rule plus the six Rust detectors and positive/negative fixtures
+  adapted from TogetherWeOwn/paperclip-ops-tooling `quality/meta-only/` at
+  source commit `a10103b5f8c9846b8d12cc2d19c7bc2246d12349`. The additional rules
+  flag byte-based UTF-8 splitting, dropped `wait_for` futures, erased `map_err`
+  causes, wildcard errors collapsed to `AccessDenied`, and process-global env or
+  metrics access in tests. Only findings on added lines warn; the unwrap backlog
+  remains in `docs/unwrap-backlog.md`. Thanks to the shared tooling contributors.
+  The corresponding Rust review checklist is available at the same source commit
+  ([`rust-bot.yaml`](https://github.com/TogetherWeOwn/paperclip-ops-tooling/blob/a10103b5f8c9846b8d12cc2d19c7bc2246d12349/quality/meta-only/checklists/rust-bot.yaml));
+  it is review guidance with fail-unknown evidence rules, not an automated CI gate.
 - Semgrep Rust rules (WARN): vendored `.semgrep/rust-warn.yml` (local rules
   only, no registry) flags new `todo!`/`unimplemented!`, empty `.expect("")`,
   `panic!` in non-test code and `process::exit` in library code; current

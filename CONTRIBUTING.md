@@ -61,7 +61,7 @@ exempt: it can take up to 30 minutes, and image security stays gated through
 the SBOM job. The legacy `required-checks` aggregate is removed.
 
 Deterministic quality gates (patch coverage WARN, per-PR advisories HARD,
-unwrap and Semgrep WARN, required voice synthetic, test-target inventory
+ast-grep and Semgrep WARN, required voice synthetic, test-target inventory
 HARD) run as steps of the `check` lane on the existing routed runner; see
 [`docs/quality-gates.md`](docs/quality-gates.md). New checks start in WARN
 (report, never fail) and flip to HARD only with their backlog burned down.
