@@ -580,6 +580,11 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
         12,
         "internal-action outcome family grew; update the cardinality budget and the guard doc"
     );
+    assert_eq!(
+        metrics::COMMUNITY_FACTS_DRAIN_REASONS.len(),
+        3,
+        "community-facts drain-reason family grew; update the cardinality budget and the guard doc"
+    );
     for (allowlist, name) in [
         (metrics::EVENTS, "EVENTS"),
         (metrics::REST_ROUTES, "routes"),
@@ -596,6 +601,10 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
         (
             metrics::INTERNAL_ACTION_FAMILIES,
             "internal-action families",
+        ),
+        (
+            metrics::COMMUNITY_FACTS_DRAIN_REASONS,
+            "community-facts drain reasons",
         ),
     ] {
         assert_eq!(
@@ -641,13 +650,13 @@ fn exposition_series_count_matches_the_cardinality_budget() {
         .lines()
         .filter(|line| line.starts_with("# TYPE "))
         .count();
-    assert_eq!(help_headers, 29, "rendered HELP family count changed");
-    assert_eq!(type_headers, 29, "rendered TYPE family count changed");
+    assert_eq!(help_headers, 30, "rendered HELP family count changed");
+    assert_eq!(type_headers, 30, "rendered TYPE family count changed");
     let series = text.lines().filter(|line| !line.starts_with('#')).count();
     assert_eq!(
-        series, 402,
-        "exposition grew past the 402-sample budget (21 events + 4 scalars + 1 latency \
-         + 11 histogram + 156 rest + 48 jobs + 31 voice + 26 vote-kick + 12 voice-names + 2 db-errors + 4 send-admissions + 2 prefix-refused + 6 dispatch-drops + 2 checkpoint-failures + 72 internal-actions + 4 pool); \
+        series, 405,
+        "exposition grew past the 405-sample budget (21 events + 4 scalars + 1 latency \
+         + 11 histogram + 156 rest + 48 jobs + 31 voice + 26 vote-kick + 12 voice-names + 2 db-errors + 4 send-admissions + 2 prefix-refused + 6 dispatch-drops + 2 checkpoint-failures + 72 internal-actions + 3 facts-drain + 4 pool); \
          update docs/log-volume-guard.md with the new series"
     );
 }
