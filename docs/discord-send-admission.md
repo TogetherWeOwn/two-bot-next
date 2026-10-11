@@ -164,7 +164,7 @@ live sender.
 `GET /guilds/{id}`) and the boot registry publish race the supervised jobs'
 first reads for this single-flight lane, and a predecessor killed mid-request
 leaves its occupancy for up to the lease. A refusal there fails the gateway,
-which lingers 15 s and exits for a container restart (October 2026: three to four
+which lingers 15 s (the startup linger) and exits for a container restart (October 2026: three to four
 starts and a 92-139 s staging redeploy; `custom_commands_init_failed` after every
 deploy). For `BOOT_WINDOW_MS` (120 s) after an executor is built,
 `current_application_id`, `guild_name` and `publish_guild_commands` therefore

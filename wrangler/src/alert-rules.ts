@@ -84,6 +84,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "ticker_stale", summary: `15 s ticker has no success for more than ${TICKER_STALE_SECONDS / 60} minutes`, runbook: "runbook.md#alert-ticker-stale" },
   { id: "receiver_refusals", summary: `website-action receiver refusals for ${RECEIVER_REFUSAL_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-receiver-refusals" },
   { id: "dispatch_drops", summary: `dispatch-lane drops grew for ${DISPATCH_DROP_SAMPLES} consecutive sample windows (reactions include fairness refusals; not proof of gateway packet loss)`, runbook: "runbook.md#alert-dispatch-drops", severity: "ticket" },
+  { id: "gateway_checkpoint_failures", summary: `gateway checkpoint commit failures increased between samples`, runbook: "runbook.md#alert-checkpoint-failures" },
 ];
 
 /**
@@ -114,6 +115,9 @@ export interface MetricsAlertState {
   gatewayMissed: number;
   /** False until the first evaluation stores a baseline: the first sample never fires. */
   gatewayMissedSeen: boolean;
+  checkpointFailures: number;
+  /** False until the first evaluation stores a baseline: the first sample never fires. */
+  checkpointFailuresSeen: boolean;
   /** Refused `two_bot_internal_actions_total` outcomes summed by family. */
   receiverRefusals: Record<string, number>;
   /** False until the first evaluation stores a baseline: the first sample never fires. */
@@ -126,7 +130,7 @@ export interface MetricsAlertState {
   dispatchDropStreaks?: Record<string, number>;
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, dispatchDrops: {}, dispatchDropStreaks: {} };
+export const EMPTY_STATE: MetricsAlertState = { firing: [], rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, dispatchDrops: {}, dispatchDropStreaks: {} };
 
 /** An unsuccessful scrape breaks the dispatch streak, never an existing alert. */
 export function interruptDispatchDrops(state: MetricsAlertState): MetricsAlertState {
@@ -265,6 +269,21 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   const gatewayReset = gatewayMissed < prevGatewayMissed;
   if (gatewaySeen && !gatewayReset && gatewayMissed > prevGatewayMissed) firing.push("gateway_missed_events");
 
+  // Gateway checkpoint commit failures (every failure stops the dispatch
+  // worker, so there is no benign singleton): any increase between two
+  // samples pages. The first sample only stores the baseline and never
+  // fires. The failing process lingers past one full keepalive tick
+  // (`shutdown::FAILURE_LINGER`), so the increase is always scraped before
+  // the exit resets the counter; the post-restart reset sample resolves
+  // rather than firing. `??` covers DO storage written before these fields
+  // existed.
+  let checkpointFailures = 0;
+  for (const s of gauge("two_bot_gateway_checkpoint_failures_total")) checkpointFailures += s.value;
+  const prevCheckpointFailures = prev.checkpointFailures ?? 0;
+  const checkpointSeen = prev.checkpointFailuresSeen ?? false;
+  const checkpointReset = checkpointFailures < prevCheckpointFailures;
+  if (checkpointSeen && !checkpointReset && checkpointFailures > prevCheckpointFailures) firing.push("gateway_checkpoint_failures");
+
   // Website-action receiver refusals by family: refused
   // `two_bot_internal_actions_total` outcomes (every outcome other than
   // `executed`) must rise in RECEIVER_REFUSAL_SAMPLES consecutive windows
@@ -350,7 +369,7 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     if (grew && (wasFiring || streak >= DISPATCH_DROP_SAMPLES)) firing.push(key);
   }
 
-  return { firing, state: { firing, rest429, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, dispatchDrops, dispatchDropStreaks } };
+  return { firing, state: { firing, rest429, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, dispatchDrops, dispatchDropStreaks } };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {
