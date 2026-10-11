@@ -28,7 +28,8 @@ no `db` feature, Discord wire types, clock or external I/O.
 - Comparisons `< > <= >= = !=` take an integer literal or a numeric operand on
   each side, including token against token. Numeric operands are the
   `@@num@@`, `@@num_others@@`, `@@num_live@@`, `@@num_playing@@`, `@@limit@@`,
-  `@@slots@@`, `@@party_size@@` and `@@hour@@` tokens, plus `$#`/`$0..#` for the
+  `@@slots@@`, `@@party_size@@`, `@@hour@@`, `@@room_minutes@@`, `@@room_tier@@`,
+  `@@game_minutes@@` and `@@game_tier@@` tokens, plus `$#`/`$0..#` for the
   room number. Each token takes the value the V5 renderer gives it. A blank
   value (`@@slots@@` with no limit) makes the comparison false for every
   operator. `##`, `+#` and name tokens are not numeric.
@@ -53,6 +54,7 @@ no `db` feature, Discord wire types, clock or external I/O.
   | `FULL` | a limit is set and the member count has reached it |
   | `PRIVATE` | the room is private and not a standalone channel |
   | `WEEKEND`, `WEEKDAY` | Saturday or Sunday; Monday to Friday |
+  | `MORNING`, `AFTERNOON`, `EVENING`, `NIGHT`, `LATE_NIGHT` | local hour in 05–11, 12–16, 17–21, 22–01, 02–04 |
 
 - Bare `MONTH` names no fact and is false. The shown party follows the V5
   `@@party_size@@` rule: the largest party, none on a three-way tie.

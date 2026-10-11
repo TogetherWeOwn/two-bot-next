@@ -49,9 +49,11 @@ Run/guild/interaction correlation spans remain enabled independently of event
 verbosity, including `WARN`, `ERROR`, and `OFF`; `OFF` still emits no events.
 HTTP request execution restores the serving future's run span and subscriber
 around the trace layer, including Axum's separately spawned connection tasks.
-HTTP request spans record the method and a redacted path only (no query string
-or headers; any `webhooks` path is fully redacted) and remain available for failure
-logs.
+HTTP request spans record the method and an allowlisted path only: the
+listener's own health, readiness and metrics routes are recorded verbatim, and
+every other path (unknown, parameterized, mixed-case or percent-encoded) is
+replaced by the constant `[REDACTED]`. Query strings and headers are never
+recorded. Spans remain available for failure logs.
 
 Existing snake_case message-only events retain their name as `msg`. Events with
 neither a valid string `msg` nor a snake_case `message` use `msg=tracing_event`,
@@ -125,7 +127,7 @@ gateway session IDs/resume URLs, raw packets, request bodies, message contents,
 modal/component values, and debug dumps of config/interactions/requests. Prefer
 binding names, allowlisted identifiers, counts, status codes, and bounded reasons.
 Do not add `%error`/`?error` for SQL/HTTP/provider failures: their display/debug
-chains can contain URLs. HTTP tracing records only the method and a redacted path. Existing settings
+chains can contain URLs. HTTP tracing records only the method and an allowlisted path. Existing settings
 reports log only catalog-approved hot-key values; never add env-only/secret values
 to those reports. Database URL query keys are validated before SQLx parses them:
 unsupported keys (including `sslpassword`) are rejected without logging keys or

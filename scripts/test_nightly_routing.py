@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/nightly.yml"
+CHECK = ROOT / ".github/workflows/check.yml"
 
 
 class NightlyRoutingTests(unittest.TestCase):
@@ -17,6 +18,18 @@ class NightlyRoutingTests(unittest.TestCase):
         broad = broad.split("- name: Channel moderation ignored tests with their guarded URL", 1)[0]
         routed = set(re.findall(r"--skip channel_moderation_store::tests::(\w+)", broad))
         self.assertEqual(routed, names, "no guarded fixture runs with the incompatible bootstrap")
+
+    def test_broad_sweep_never_regenerates_the_committed_reference_docs(self):
+        # The ignored regen test rewrites docs/commands.md and docs/configuration.md in
+        # the checkout; tests later in the same sweep would then compare against
+        # regenerated docs and hide drift. check.yml says it must never run in CI.
+        source = (ROOT / "crates/core/tests/reference_docs.rs").read_text()
+        self.assertRegex(source, r"#\[ignore[^\]]*\]\s*fn regenerate_reference_docs\(")
+        workflow = WORKFLOW.read_text()
+        broad = workflow.split("- name: Full workspace sweep including ignored tests", 1)[1]
+        broad = broad.split("- name: Channel moderation ignored tests with their guarded URL", 1)[0]
+        self.assertIn("--include-ignored", broad)
+        self.assertIn("--skip regenerate_reference_docs\n", broad)
 
     def test_dedicated_channel_suite_runs_all_fixtures_with_unchanged_guard(self):
         workflow = WORKFLOW.read_text()
@@ -160,6 +173,91 @@ class NightlyRoutingTests(unittest.TestCase):
         free = set(re.findall(r"(?m)^(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn (\w+)\(", source))
         bare = set(re.findall(r"\[`([a-z][a-z0-9_]*)`\]", source))
         self.assertEqual(bare - free, set(), "method links must be Self:: qualified")
+
+
+    def test_check_runs_exactly_one_full_leveling_runtime(self):
+        workflow = CHECK.read_text()
+        invocations = re.findall(r"--test leveling_runtime\b", workflow)
+        self.assertEqual(len(invocations), 1, "exactly one leveling_runtime invocation must remain")
+        self.assertIn("--test leveling_runtime -- --ignored", workflow)
+        full = workflow.split("- name: leveling gateway and interaction integration", 1)[1]
+        full = full.split("\n      - name: ", 1)[0]
+        self.assertIn(
+            "TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+            full,
+        )
+        self.assertIn("-- --ignored --test-threads=1", full)
+
+    def test_check_has_no_duplicate_filtered_leveling_invocations(self):
+        workflow = CHECK.read_text()
+        filtered = re.findall(r"leveling_runtime\s+[A-Za-z_]", workflow)
+        self.assertEqual(
+            filtered,
+            [],
+            "filtered leveling_runtime reruns repeat the full ignored run",
+        )
+
+    def test_check_has_no_noop_leveling_store_selector_or_obsolete_flag(self):
+        workflow = CHECK.read_text()
+        self.assertNotIn(
+            "leveling_store -- --ignored",
+            workflow,
+            "leveling_store has no ignored tests; the selector runs zero tests",
+        )
+        self.assertNotIn("TWO_LEVELING_TEST_CI", workflow)
+        self.assertNotIn(
+            "TWO_LEVELING_TEST_CI",
+            WORKFLOW.read_text(),
+            "nightly must not retain the obsolete flag",
+        )
+
+    def test_leveling_store_ordinary_tests_stay_in_broad_integration_and_nightly(self):
+        source = (ROOT / "crates/core/tests/leveling_store.rs").read_text()
+        self.assertEqual(
+            len(re.findall(r"#\[tokio::test", source)),
+            15,
+            "all 15 ordinary store tests must remain",
+        )
+        self.assertNotIn(
+            "#[ignore",
+            source,
+            "store tests are ordinary; an ignore would silently drop PR coverage",
+        )
+        check = CHECK.read_text()
+        broad = check.split(
+            "- name: cargo test (integration, including website acceptance and backup round trip)",
+            1,
+        )[1].split("\n      - name: ", 1)[0]
+        self.assertIn(
+            "TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+            broad,
+        )
+        self.assertIn("cargo test --workspace --test '*'", broad)
+        nightly = WORKFLOW.read_text()
+        sweep = nightly.split("- name: Full workspace sweep including ignored tests", 1)[1]
+        sweep = sweep.split("- name: Channel moderation ignored tests with their guarded URL", 1)[0]
+        self.assertIn(
+            "TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090_nightly",
+            sweep,
+        )
+        self.assertIn("--include-ignored", sweep)
+
+    def test_check_preserves_selector_gating_and_ci_ok_for_ignored_stores(self):
+        workflow = CHECK.read_text()
+        job = workflow.split("  ignored-db-stores:", 1)[1].split("\n  ignored-db-runtime:", 1)[0]
+        self.assertIn("needs: [job-inputs]", job)
+        self.assertIn("needs.job-inputs.outputs.rust != 'false'", job)
+        aggregate = workflow.split("\n  ci-ok:", 1)[1].split("steps:", 1)[0]
+        self.assertIn("ignored-db-stores", aggregate)
+        # Preserved ignored lib coverage the discord runtime binary does not run.
+        self.assertIn(
+            "community_store::tests::voice_session_start_end_round_trip_is_idempotent -- --ignored",
+            workflow,
+        )
+        self.assertIn(
+            "community_store::tests::message_created_fact_round_trip_is_idempotent -- --ignored",
+            workflow,
+        )
 
 
 if __name__ == "__main__":

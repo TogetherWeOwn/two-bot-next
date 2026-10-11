@@ -593,6 +593,7 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
         (metrics::DB_ERROR_OPS, "db-errors"),
         (metrics::SEND_ADMISSION_OUTCOMES, "send-admissions"),
         (metrics::VOICE_VOTE_KICK_OUTCOMES, "vote-kick"),
+        (metrics::VOICE_NAME_OUTCOMES, "voice-names"),
         (
             metrics::PREFIX_TRIGGER_REFUSED_REASONS,
             "prefix-trigger-refused",
@@ -649,13 +650,13 @@ fn exposition_series_count_matches_the_cardinality_budget() {
         .lines()
         .filter(|line| line.starts_with("# TYPE "))
         .count();
-    assert_eq!(help_headers, 29, "rendered HELP family count changed");
-    assert_eq!(type_headers, 29, "rendered TYPE family count changed");
+    assert_eq!(help_headers, 30, "rendered HELP family count changed");
+    assert_eq!(type_headers, 30, "rendered TYPE family count changed");
     let series = text.lines().filter(|line| !line.starts_with('#')).count();
     assert_eq!(
-        series, 393,
-        "exposition grew past the 393-sample budget (21 events + 4 scalars + 1 latency \
-         + 11 histogram + 156 rest + 48 jobs + 31 voice + 26 vote-kick + 2 db-errors + 4 send-admissions + 2 prefix-refused + 6 dispatch-drops + 2 checkpoint-failures + 72 internal-actions + 3 facts-drain + 4 pool); \
+        series, 405,
+        "exposition grew past the 405-sample budget (21 events + 4 scalars + 1 latency \
+         + 11 histogram + 156 rest + 48 jobs + 31 voice + 26 vote-kick + 12 voice-names + 2 db-errors + 4 send-admissions + 2 prefix-refused + 6 dispatch-drops + 2 checkpoint-failures + 72 internal-actions + 3 facts-drain + 4 pool); \
          update docs/log-volume-guard.md with the new series"
     );
 }
