@@ -902,3 +902,184 @@ async fn real_sqlx_runner_cases() -> TestResult {
     c.close().await?;
     fx.finish().await
 }
+
+/// Marker the runner records when the ledger cannot be read after a run.
+const LEDGER_UNKNOWN: &str = "unknown: ledger unreadable";
+
+struct PostRunFault {
+    code: i32,
+    stdout: String,
+    stderr: String,
+    present: Vec<i64>,
+    pending: Vec<i64>,
+}
+
+/// Real apply whose post-run ledger read is denied by a committed migration.
+///
+/// The first pending migration commits a grant change that revokes table-level
+/// SELECT from the migrator, keeping only the columns SQLx itself reads. The
+/// runner's read of `description` is then denied after the run. With
+/// `fail_second`, the second pending migration fails on its ledger insert, so
+/// the run fails while the read is still broken.
+async fn apply_with_post_run_read_fault(
+    revoke_read: bool,
+    fail_second: bool,
+) -> Result<PostRunFault, Box<dyn std::error::Error + Send + Sync>> {
+    let fx = Fixture::new().await?;
+    seed_staging_state(&fx).await?;
+    let mut c = fx.scratch().await?;
+    sqlx::query("GRANT SELECT ON public._sqlx_migrations TO two_bot_migrator_ro")
+        .execute(&mut c)
+        .await?;
+    c.close().await?;
+    let (host, db) = (fx.host.clone(), fx.database.clone());
+    let member = fx.url(&fx.mlogin, &fx.database);
+    let ro = fx.url(&fx.rologin, &fx.database);
+
+    let (code, out, err) = fx.run("--plan", Some(ro), &host, &db, None, None).await;
+    assert_eq!(code, 0, "{err}");
+    let plan = manifest(&out);
+    let plan_hash = plan["plan_manifest_sha256"]
+        .as_str()
+        .expect("plan hash")
+        .to_owned();
+    let plan_artifact = snapshot_plan_manifest(&out);
+    let pending = pending_list(&plan["pending_before"]);
+    assert!(pending.len() >= 2, "need two pending migrations to fault");
+    let expected_csv = pending
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let revoke_at = revoke_read.then_some(pending[0]);
+    let raise_at = fail_second.then_some(pending[1]);
+    install_post_run_fault(&fx, revoke_at, raise_at).await?;
+
+    let (code, stdout, stderr) = fx
+        .run(
+            "--apply",
+            Some(member),
+            &host,
+            &db,
+            Some(&expected_csv),
+            Some((&plan_hash, "424242", &plan_artifact)),
+        )
+        .await;
+    let mut c = fx.scratch().await?;
+    let present: Vec<i64> = sqlx::query_scalar(
+        "SELECT version FROM public._sqlx_migrations WHERE success ORDER BY version",
+    )
+    .fetch_all(&mut c)
+    .await?;
+    c.close().await?;
+    fx.finish().await?;
+    Ok(PostRunFault {
+        code,
+        stdout,
+        stderr,
+        present,
+        pending,
+    })
+}
+
+async fn install_post_run_fault(
+    fx: &Fixture,
+    revoke_at: Option<i64>,
+    raise_at: Option<i64>,
+) -> TestResult {
+    let mut body = String::new();
+    if let Some(version) = revoke_at {
+        body.push_str(&format!(
+            "IF NEW.version = {version} THEN \
+             REVOKE SELECT ON public._sqlx_migrations FROM two_bot_migrator; \
+             GRANT SELECT (version, success, checksum) ON public._sqlx_migrations \
+             TO two_bot_migrator; END IF;"
+        ));
+    }
+    if let Some(version) = raise_at {
+        body.push_str(&format!(
+            "IF NEW.version = {version} THEN \
+             RAISE EXCEPTION 'injected migration failure'; END IF;"
+        ));
+    }
+    let mut c = fx.scratch().await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION public.stg_fx_post_run_fault() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN {body} RETURN NEW; END $$"
+    )))
+    .execute(&mut c)
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER stg_fx_post_run_fault BEFORE INSERT ON public._sqlx_migrations \
+         FOR EACH ROW EXECUTE FUNCTION public.stg_fx_post_run_fault()",
+    )
+    .execute(&mut c)
+    .await?;
+    c.close().await?;
+    Ok(())
+}
+
+/// Fault: the post-failure read is denied. The evidence must say unknown, never
+/// an empty ledger, and the original migration error must still be returned.
+#[tokio::test]
+#[ignore = "requires agent-testdb or the CI service"]
+async fn post_failure_unreadable_ledger_is_unknown_not_empty() -> TestResult {
+    let run = apply_with_post_run_read_fault(true, true).await?;
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    assert!(
+        run.stderr.contains("migration execution failed"),
+        "{}",
+        run.stderr
+    );
+    let evidence = manifest(&run.stdout);
+    assert_eq!(
+        evidence["ledger_after_failure"], LEDGER_UNKNOWN,
+        "{}",
+        run.stdout
+    );
+    let error = evidence["error"].as_str().expect("original error");
+    assert!(error.contains("injected migration failure"), "{error}");
+    // Only the first pending migration committed; the failed one left no row.
+    let mut expected = SEED_VERSIONS.to_vec();
+    expected.push(run.pending[0]);
+    expected.sort_unstable();
+    assert_eq!(run.present, expected);
+    Ok(())
+}
+
+/// Control: a readable ledger after a failed apply keeps the array output.
+#[tokio::test]
+#[ignore = "requires agent-testdb or the CI service"]
+async fn post_failure_readable_ledger_keeps_array_output() -> TestResult {
+    let run = apply_with_post_run_read_fault(false, true).await?;
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    let evidence = manifest(&run.stdout);
+    let ledger = evidence["ledger_after_failure"]
+        .as_array()
+        .expect("readable ledger stays an array");
+    assert_eq!(ledger.len(), SEED_VERSIONS.len() + 1);
+    assert!(ledger.iter().any(|row| row["version"] == run.pending[0]));
+    let error = evidence["error"].as_str().expect("original error");
+    assert!(error.contains("injected migration failure"), "{error}");
+    Ok(())
+}
+
+/// Fault after a successful apply: refuse as unreadable, not as an incomplete
+/// ledger that reports an empty list.
+#[tokio::test]
+#[ignore = "requires agent-testdb or the CI service"]
+async fn post_apply_unreadable_ledger_is_unknown_not_empty() -> TestResult {
+    let run = apply_with_post_run_read_fault(true, false).await?;
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    assert!(
+        run.stderr.contains("ledger unreadable after apply"),
+        "{}",
+        run.stderr
+    );
+    assert!(!run.stderr.contains("ledger incomplete"), "{}", run.stderr);
+    assert_eq!(manifest(&run.stdout)["ledger_after"], LEDGER_UNKNOWN);
+    let total = two_bot_cutover::staging_migrate::MIGRATOR.iter().count();
+    assert_eq!(run.present.len(), total, "every pending migration applied");
+    Ok(())
+}
