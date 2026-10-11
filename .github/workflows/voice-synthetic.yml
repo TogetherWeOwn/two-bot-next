@@ -22,6 +22,12 @@ name: voice-synthetic
 # a failure (set it after the first green run).
 on:
   workflow_call:
+    # The caller must pass the token by name: an environment secret resolves
+    # to "" inside a called workflow unless the caller passes it, even though
+    # this job declares `environment: voice-synthetic`.
+    secrets:
+      TWO_VOICE_SYNTHETIC_BOT_TOKEN:
+        required: false
   schedule:
     - cron: '41 */6 * * *'
   workflow_dispatch:
