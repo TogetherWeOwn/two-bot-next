@@ -50,14 +50,46 @@ pressure is the pool instance, so the pool owns the identity.
 
 ## Exposition migration (a future code change, not this doc)
 
-- Keep emitting the current four unlabeled series for the `store` pool
-  verbatim until every consumer (alert rules, dashboards, validator) reads the
-  labeled form. The validator already accepts additional series.
-- Add the labeled copies (`{pool="store"}`, …) for every registered pool.
-- Keep `render(pool)` working for single-pool callers; add a named-pools entry
-  point (e.g. `render_named`) that takes one sample per registered name.
-- Cardinality stays bounded because the name set is closed and small; the
-  validator allowlists `pool` values exactly like other label values.
+The Worker validator rejects labeled pool series today. `ALERT_INPUT_LABELS`
+pins the four families to zero labels (`wrangler/src/metrics-scrape.ts:11-14`),
+and `parseAlertScrape` returns `null` for any sample whose label count
+differs (`metrics-scrape.ts:93-98`). A `null` scrape only logs `two-bot
+metrics scrape failed` and keeps the previous state
+(`wrangler/src/index.ts:794-809`), so a container that emits `{pool="store"}`
+copies before the validator accepts them freezes every metrics alert: no new
+pages and no recoveries, not just `db_pool_saturated`. The opposite mistake
+also fails: adding a `pool` axis to `ALERT_INPUT_LABELS` makes the label
+mandatory on every sample and adds the labeled rows to `REQUIRED_INPUTS`, so
+scrapes from older containers fail once the Worker deploys. Ship in this
+order, one PR each, so every step is safe on its own:
+
+1. **Worker accepts both shapes.** The four unlabeled series stay required.
+   Add a pool-specific shape check, not an `ALERT_OPTIONAL_INPUT_LABELS`
+   entry for the same names: that map is spread over `ALERT_INPUT_LABELS` in
+   `VALIDATED_INPUT_LABELS` (`metrics-scrape.ts:43-46`), so reusing a family
+   name would demand a label on the unlabeled series too. The check accepts a
+   sample with zero labels, or exactly one `pool` label whose value is in the
+   closed name set, and never makes the labeled rows required. Keep the
+   inherited-property guard (`in Object.prototype`) for `pool` values, since
+   per-pool state will use plain objects. Make the evaluator read the
+   unlabeled series explicitly: `gauge(name)[0]` at `alert-rules.ts:376-379`
+   takes the first sample of the name whatever its labels, so labeled copies
+   would otherwise be read by exposition order. Add a `metrics-scrape.test.ts`
+   fixture where the unlabeled series plus labeled copies must still parse,
+   and one where a labeled copy with an unknown `pool` value returns `null`.
+2. **Container emits the labeled copies.** Keep the four unlabeled series for
+   the `store` pool verbatim, and add `{pool="<name>"}` copies for every
+   registered pool. Keep `render(pool)` working for single-pool callers; add
+   a named-pools entry point (e.g. `render_named`) that takes one sample per
+   registered name. Cardinality stays bounded because the name set is closed
+   and small.
+3. **Rule switches to per-pool grouping**, as described under the alert-rules
+   join below. Retire the unlabeled series only after every consumer (alert
+   rules, dashboards, validator) reads the labeled form, in a separate change
+   that makes the labeled rows required and removes the zero-label shape.
+
+Rolling the container back after step 2 is safe: older containers emit only
+the unlabeled series, which the step 1 validator still accepts.
 
 ## Alert-rules join
 
