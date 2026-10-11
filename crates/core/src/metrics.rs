@@ -340,6 +340,12 @@ struct Values {
     checkpoint_failures: [u64; CHECKPOINT_FAILURE_STAGES.len()],
     internal_actions: [[u64; INTERNAL_ACTION_OUTCOMES.len()]; INTERNAL_ACTION_FAMILIES.len()],
     community_facts_drain_failures: [u64; COMMUNITY_FACTS_DRAIN_REASONS.len()],
+    /// Audit mirror delivery halt (M4.48): 1 while the persistent kill switch
+    /// is engaged, 0 otherwise. Last writer wins; set once per readable
+    /// `audit_retry` sweep from the store's `delivery_halt` read. No labels,
+    /// so the vocabulary is the single series name — no actor ID, timestamp,
+    /// error text or row content ever reaches exposition.
+    audit_delivery_halt: u64,
 }
 
 /// All storage is fixed-size. Unknown labels collapse to `other`, including hostile input.
@@ -639,6 +645,19 @@ impl Metrics {
         let counter = &mut values.community_facts_drain_failures
             [bounded_index(reason, COMMUNITY_FACTS_DRAIN_REASONS)];
         *counter = counter.saturating_add(1);
+    }
+
+    /// Current audit mirror delivery-halt state (M4.48): `true` while the
+    /// persistent kill switch is engaged, `false` once it is cleared. Call
+    /// once per readable `audit_retry` sweep from the store's `delivery_halt`
+    /// read; an unreadable halt leaves the last reported state untouched, so
+    /// a database outage never fabricates a clear. Last writer wins. No
+    /// actor ID, timestamp, error text or row content is retained.
+    pub fn set_audit_delivery_halt(&self, halted: bool) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .audit_delivery_halt = u64::from(halted);
     }
 
     /// Pool samples are supplied at scrape time; this function never opens a DB connection.
@@ -951,6 +970,18 @@ impl Metrics {
             )
             .unwrap();
         }
+        header(
+            out,
+            "two_bot_audit_delivery_halt",
+            "gauge",
+            "Audit mirror delivery halt; 1 while the persistent kill switch is engaged, 0 otherwise. Set once per readable audit_retry sweep; an unreadable halt keeps the last reported state.",
+        );
+        writeln!(
+            out,
+            "two_bot_audit_delivery_halt {}",
+            values.audit_delivery_halt
+        )
+        .unwrap();
         let (size, idle, max) = pool.unwrap_or_default();
         scalar(
             &mut out,
@@ -1389,6 +1420,45 @@ mod tests {
             text.contains("two_bot_community_facts_drain_failures_total{reason=\"other\"} 100\n")
         );
         assert!(!text.contains("secret"));
+    }
+
+    #[test]
+    fn audit_delivery_halt_gauge_is_a_label_free_switch() {
+        // M4.48: the kill-switch state renders as one gauge series with no
+        // labels — 1 engaged, 0 cleared — so no actor ID, timestamp, error
+        // text or row content can reach exposition.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_audit_delivery_halt gauge\n"));
+        assert!(text.contains("two_bot_audit_delivery_halt 0\n"));
+        metrics.set_audit_delivery_halt(true);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_audit_delivery_halt 1\n"));
+        assert!(!text.contains("two_bot_audit_delivery_halt{"));
+        // Clearing returns to zero; the last writer wins.
+        metrics.set_audit_delivery_halt(false);
+        metrics.set_audit_delivery_halt(false);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_audit_delivery_halt 0\n"));
+        metrics.set_audit_delivery_halt(true);
+        metrics.set_audit_delivery_halt(false);
+        metrics.set_audit_delivery_halt(true);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_audit_delivery_halt 1\n"));
+        // Fixed cardinality: exactly one series, a parseable number.
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("two_bot_audit_delivery_halt "))
+            .collect();
+        assert_eq!(series.len(), 1);
+        let (_, value) = series[0].rsplit_once(' ').unwrap();
+        assert!(value.parse::<f64>().is_ok(), "bad sample: {}", series[0]);
+        let mut unique = std::collections::HashSet::new();
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (key, sample) = line.rsplit_once(' ').unwrap();
+            assert!(unique.insert(key), "duplicate series: {key}");
+            assert!(sample.parse::<f64>().is_ok(), "bad sample: {line}");
+        }
     }
 
     #[test]
