@@ -4,6 +4,9 @@
 #[allow(dead_code)]
 mod common;
 
+use std::io::Write;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use common::{MockRest, ScriptedResponse};
 use serde_json::{json, Value};
 use sqlx::{Pool, Postgres};
@@ -191,6 +194,83 @@ fn fixture_refuses_unsafe_database_urls_without_connecting() {
 async fn counts(pool: &Pool<Postgres>) -> (i64, i64, i64) {
     sqlx::query_as("SELECT (SELECT count(*) FROM event_rsvps), (SELECT count(*) FROM announcements_audit_log), (SELECT count(*) FROM community_facts)")
         .fetch_one(pool).await.unwrap()
+}
+
+/// Process-wide JSON log sink. One subscriber serves the whole test binary: a
+/// thread-local default can miss events because callsite interest is cached
+/// against the first thread that registers it. Readers only consume bytes
+/// written after their own mark.
+#[derive(Clone, Default)]
+struct LogSink(Arc<Mutex<Vec<u8>>>);
+
+impl Write for LogSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn log_sink() -> LogSink {
+    static SINK: OnceLock<LogSink> = OnceLock::new();
+    SINK.get_or_init(|| {
+        let sink = LogSink::default();
+        let writer = sink.clone();
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .json()
+                .with_writer(move || writer.clone())
+                .finish(),
+        )
+        .expect("install the process-wide log sink once");
+        sink
+    })
+    .clone()
+}
+
+/// Serializes every test that reads a diagnostic window, so a failure injected
+/// by one test can never appear inside another test's window.
+static DIAGNOSTIC_WINDOW: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn log_mark() -> usize {
+    log_sink().0.lock().unwrap().len()
+}
+
+fn compensation_failures_since(mark: usize) -> Vec<Value> {
+    let bytes = log_sink().0.lock().unwrap()[mark..].to_vec();
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["fields"]["msg"] == "compensation_failed")
+        .collect()
+}
+
+/// Exactly one compensation-failure diagnostic: the fixed field vocabulary
+/// (`msg`, `write`, `message`) and none of the attempt's member or event IDs,
+/// the interaction credential, or the injected database error text.
+fn assert_single_failure(failures: Vec<Value>, write: &str) {
+    let [diagnostic] = failures.as_slice() else {
+        panic!("expected one compensation_failed diagnostic, found {failures:?}");
+    };
+    assert_eq!(diagnostic["level"], "ERROR", "{diagnostic}");
+    assert_eq!(diagnostic["fields"]["write"], write, "{diagnostic}");
+    assert_eq!(
+        diagnostic["fields"].as_object().map(|fields| fields.len()),
+        Some(3),
+        "{diagnostic}"
+    );
+    let shown = diagnostic.to_string();
+    for (kind, value) in [
+        ("member id", USER),
+        ("other member id", OTHER),
+        ("event id", EVENT),
+        ("interaction token", "mock-rsvp-token"),
+        ("database error text", "injected compensation fault"),
+    ] {
+        assert!(!shown.contains(value), "diagnostic leaked a {kind}");
+    }
 }
 
 fn assert_reply(mock: &MockRest, content: &str, deferred: bool) {
@@ -1175,6 +1255,8 @@ async fn failed_final_reply_does_not_retry_committed_effects() {
 /// compensated — the success reply never fires and no rows remain.
 #[tokio::test]
 async fn rsvp_mid_write_event_removal_is_compensated_and_refused() {
+    let _window = DIAGNOSTIC_WINDOW.lock().await;
+    let mark = log_mark();
     let Some(fixture) = pool().await else {
         return;
     };
@@ -1199,6 +1281,7 @@ async fn rsvp_mid_write_event_removal_is_compensated_and_refused() {
     );
     assert_eq!(mock.requests().len(), 6);
     assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
+    assert!(compensation_failures_since(mark).is_empty());
     mock.shutdown().await;
     fixture.close().await;
 }
@@ -1309,6 +1392,8 @@ async fn rsvp_refused_rewrite_restores_previous_response() {
 /// refused and compensated — no attendance fact survives.
 #[tokio::test]
 async fn checkin_mid_write_target_departure_is_compensated_and_refused() {
+    let _window = DIAGNOSTIC_WINDOW.lock().await;
+    let mark = log_mark();
     let Some(fixture) = pool().await else {
         return;
     };
@@ -1338,8 +1423,100 @@ async fn checkin_mid_write_target_departure_is_compensated_and_refused() {
     assert_reply(&mock, "That member is no longer in this server.", true);
     assert_eq!(mock.requests().len(), 7);
     assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
+    assert!(compensation_failures_since(mark).is_empty());
     mock.shutdown().await;
     fixture.close().await;
+}
+
+/// RA-03 compensation failure: when the compensating delete itself fails, the
+/// user still gets only the refusal, the attempt's rows remain, and exactly one
+/// bounded diagnostic names the failed write. The fault is a trigger that
+/// rejects any DELETE on the table; only compensation issues one, so the write
+/// path and the success controls are unaffected.
+#[tokio::test]
+async fn failed_compensation_keeps_refusal_and_emits_one_diagnostic() {
+    let _window = DIAGNOSTIC_WINDOW.lock().await;
+    let Some(rsvp_db) = pool().await else {
+        return;
+    };
+    sqlx::query("CREATE FUNCTION injected_compensation_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected compensation fault'; END $$")
+        .execute(rsvp_db.pool())
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fault_rsvp_delete BEFORE DELETE ON event_rsvps FOR EACH STATEMENT EXECUTE FUNCTION injected_compensation_fault()")
+        .execute(rsvp_db.pool())
+        .await
+        .unwrap();
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            member(USER),
+            event(1),
+            member(USER),
+            ScriptedResponse::status(404),
+            ScriptedResponse::json(200, json!({"id": "99"})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let mark = log_mark();
+    run(rsvp_db.pool(), &mock, &rsvp(820, "going")).await;
+    assert_reply(
+        &mock,
+        "No scheduled event with that id exists in this server.",
+        true,
+    );
+    assert_eq!(mock.requests().len(), 6);
+    // The failed compensation kept this attempt's fact and its audit row.
+    assert_eq!(counts(rsvp_db.pool()).await, (1, 1, 0));
+    let audits: Vec<String> = sqlx::query_scalar("SELECT id FROM announcements_audit_log")
+        .fetch_all(rsvp_db.pool())
+        .await
+        .unwrap();
+    assert_eq!(audits, ["rsvp:820".to_owned()]);
+    assert_single_failure(compensation_failures_since(mark), "rsvp");
+    mock.shutdown().await;
+    rsvp_db.close().await;
+
+    let Some(checkin_db) = pool().await else {
+        return;
+    };
+    sqlx::query("CREATE FUNCTION injected_compensation_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected compensation fault'; END $$")
+        .execute(checkin_db.pool())
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fault_checkin_delete BEFORE DELETE ON community_facts FOR EACH STATEMENT EXECUTE FUNCTION injected_compensation_fault()")
+        .execute(checkin_db.pool())
+        .await
+        .unwrap();
+    let occ = anchored("2026-09-30");
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            event(1),
+            member(USER),
+            member_get(OTHER, None),
+            event(1),
+            ScriptedResponse::status(404),
+            ScriptedResponse::json(200, json!({"id": "99"})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let mark = log_mark();
+    run(
+        checkin_db.pool(),
+        &mock,
+        &attendance(821, MANAGE_EVENTS, OTHER, &occ),
+    )
+    .await;
+    assert_reply(&mock, "That member is no longer in this server.", true);
+    assert_eq!(mock.requests().len(), 7);
+    // The failed compensation kept this attempt's attendance fact.
+    assert_eq!(counts(checkin_db.pool()).await, (0, 0, 1));
+    assert_single_failure(compensation_failures_since(mark), "checkin");
+    mock.shutdown().await;
+    checkin_db.close().await;
 }
 
 /// RA-03: store failures fail closed — a refused commit is reported as a

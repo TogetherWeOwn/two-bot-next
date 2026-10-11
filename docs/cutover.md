@@ -182,8 +182,8 @@ safety boundary.
 | `two-bot backup-upload <dump.ndjson.gz>` | Uploads one dump using approved S3 bindings; an upload is not proof of completeness or restore compatibility |
 | `two-bot guild-config-snapshot` / `two-bot guild-config-restore --snapshot FILE` | Pinned **staging-only** guild structure recovery. Does **not** snapshot application commands; never use as production registry rollback |
 
-Reference: [backup CLI commands/bindings](../crates/bot/src/backup_cli.rs#L99),
-[restore implementation](../crates/bot/src/backup_cli.rs#L380) and
+Reference: [backup CLI commands/bindings](../crates/bot/src/backup_cli.rs#L136),
+[restore implementation](../crates/bot/src/backup_cli.rs#L482) and
 [backup runbook](backup.md). `restore --dry-run` optionally reads a target when
 `TWO_RESTORE_URL` is set; do not mistake it for automatically offline operation.
 For local fixture/artifact inspection **without any DB connection**:
@@ -200,12 +200,12 @@ FAIL; on a real restore require exit 0 and `RESTORE VERIFIED`, then separately
 verify canonical content and required table coverage. A v4 dump covers every
 table that either migration chain creates, except `xp_cooldowns`, the store
 chain's `rollback_journal`/`rollback_watermarks` and the migration ledgers
-([`EXCLUDED_TABLES`](../crates/core/src/backup/dump_file.rs#L141)),
+([`EXCLUDED_TABLES`](../crates/core/src/backup/dump_file.rs#L158)),
 plus retired legacy tables when the source still has them
 ([`DUMP_TABLES`](../crates/core/src/backup/dump_file.rs#L44)). Restore needs a
 target migrated to the dump's schema, and refuses before any write when a
 current table is missing. Coverage and the trigger and sequence handling are in
-[backup.md](backup.md#coverage-and-recovery-semantics-v4-tog-11142). Do not
+[backup.md](backup.md#coverage-and-recovery-semantics-v4-and-v5). Do not
 treat its per-table count checks as complete final-copy verification.
 
 MEE6 XP/backfill/capture/reward utilities are **separate binaries**, not a
@@ -350,19 +350,21 @@ alongside an unconfirmed Next gateway.
 - Server binds `DISCORD_TOKEN`, `DATABASE_URL`, `GUILD_ID`, and optional
   `LISTEN_ADDR`. Cutover utilities instead use `TWO_DATABASE_URL`, and some
   use `DISCORD_GUILD_ID`. Do not silently substitute bindings. Worker forwarding
-  currently covers token/database/guild/listener, **not feature flags**:
-  [configuration](../crates/core/src/config.rs#L34),
-  [tool connection](../crates/cutover/src/cli.rs#L102),
-  [Worker environment](../wrangler/src/index.ts#L73).
+  currently covers token/database/guild/listener, the non-secret flags in
+  [`FORWARDED_FLAGS`](../wrangler/src/container-env.ts#L20) and the ids in
+  `FORWARDED_DISCORD_IDS`:
+  [configuration](../crates/core/src/config.rs#L24),
+  [tool connection](../crates/cutover/src/cli.rs#L180),
+  [Worker environment](../wrangler/src/index.ts#L360).
 - Configured server startup runs embedded migrations; it is not a read-only
   preflight. Gateway boot wires the funnel pipeline, not the full feature/job
   stack. Domain/store libraries and command definitions are not activated
-  runtime evidence: [boot](../crates/bot/src/main.rs#L78),
-  [pipeline construction](../crates/bot/src/gateway.rs#L336).
+  runtime evidence: [boot](../crates/bot/src/main.rs#L106),
+  [pipeline construction](../crates/bot/src/gateway.rs#L1653).
 - Fresh checkpoints (up to 15 minutes old) automatically trigger RESUME.
   Persistence deduplicates funnel batches, not all Discord effects:
   [session policy](../crates/core/src/gateway_session.rs#L4),
-  [boot resume](../crates/bot/src/gateway.rs#L315). A reviewed force-fresh path is
+  [boot resume](../crates/core/src/gateway_session.rs#L23). A reviewed force-fresh path is
   required for first production boot; do not assume a restart gives IDENTIFY.
 - SIGTERM drains accepted gateway dispatches, jobs and HTTP within
   `SHUTDOWN_TIMEOUT_SECONDS` (default 35 s), then exits; a second signal exits
@@ -375,7 +377,7 @@ alongside an unconfirmed Next gateway.
   `crates/bot/src/internal_action_http.rs:285`, bound at `crates/bot/src/main.rs:301`),
   but it does serve `/metrics` on the same listener
   (`crates/bot/src/server.rs:65`, `crates/bot/src/metrics_http.rs:21`):
-  [HTTP routes and readiness](../crates/bot/src/server.rs#L21). Feature and
+  [HTTP routes and readiness](../crates/bot/src/server.rs#L59). Feature and
   internal-action acceptance therefore require separate merged runtime evidence.
 
 These are execution blockers to resolve on the implementation/acceptance cards,
@@ -524,10 +526,10 @@ the authorized migration procedure: no agent-run live test inserts, generic
 `setval` recipe or allowlisted dump restore as a substitute. Missing coverage or
 receipt is **NO-GO**. The same allocator gate applies to a rollback recovery target.
 
-Source example: [events BIGSERIAL](../crates/cutover/migrations/0001_funnel.sql#L13)
-is allocated by [gateway inserts](../crates/cutover/src/gateway_session.rs#L98)
+Source example: [events BIGSERIAL](../crates/cutover/migrations/0001_funnel.sql#L14)
+is allocated by [gateway inserts](../crates/cutover/src/gateway_session.rs#L304)
 that handle only idempotency-key conflicts, not primary-key collisions. The
-[restore's sequence restart](../crates/core/src/backup/dump.rs#L215)
+[restore's sequence restart](../crates/core/src/backup/dump.rs#L218)
 illustrates the hazard; it does not prove the planned copier covers every table.
 
 A backup restore (the drill, or a rollback recovery target) meets this gate for

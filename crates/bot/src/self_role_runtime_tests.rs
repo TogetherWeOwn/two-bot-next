@@ -6,6 +6,7 @@ use serde_json::json;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 use std::sync::atomic::AtomicI64;
+use tracing::instrument::WithSubscriber;
 use two_bot_core::self_roles::{event_order_for_event_id, SelfRoleOption};
 
 const GUILD: &str = "100000000000000001";
@@ -324,7 +325,32 @@ async fn exercise(pool: &PgPool) -> TestResult {
     empty_select_recovery(pool).await?;
     reaction_partial_and_duplicate(pool).await?;
     exclusive_lane_before_reads(pool).await?;
+    lost_panel_lane_release_is_logged(pool).await?;
     Ok(())
+}
+
+/// Pins the five discarded-release sites (settle, settle_dry_run, park,
+/// recover_terminal, failed admission in prepare) to the logging helper, so a
+/// refactor or conflict resolution cannot silently restore `let _ = ...`.
+#[test]
+fn discarded_panel_claim_releases_stay_logged() {
+    let source: String = include_str!("self_role_runtime.rs")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert!(
+        !source.contains("let_=store_io(self.store.release_panel_claim"),
+        "a panel claim release is discarded again; use release_lane_or_warn"
+    );
+    assert!(
+        !source.contains("let_=store.release_panel_claim"),
+        "a panel claim release is discarded again; use release_lane_or_warn"
+    );
+    assert_eq!(
+        source.matches("release_lane_or_warn(&").count(),
+        5,
+        "expected exactly the five logged release sites"
+    );
 }
 
 #[test]
@@ -3904,6 +3930,59 @@ async fn exclusive_lane_before_reads(pool: &PgPool) -> TestResult {
     assert_eq!(second.event.desired_role_ids, [NEW_ROLE]);
     assert_eq!(mock.requests().len(), 8);
     drop(second);
+    mock.shutdown().await;
+    Ok(())
+}
+
+async fn lost_panel_lane_release_is_logged(pool: &PgPool) -> TestResult {
+    let clock = Arc::new(AtomicI64::new(NOW));
+    let mock = MockRest::start(snapshot(&[OTHER]), ScriptedResponse::status(500)).await;
+    let feature = runtime(pool, &clock, &mock);
+    let mut panel = panel(PanelMode::Button);
+    panel.id = "lost-lane-release".into();
+    let request = request(
+        "lost-lane-release-event",
+        Selection::Button {
+            option_key: "old".into(),
+        },
+    );
+    let mut prepared = ready(feature.prepare(&request, &panel).await.unwrap());
+    let lane = prepared.panel.clone().unwrap();
+    clock.store(NOW + 1_000, Ordering::SeqCst);
+    let key = PanelKey {
+        guild_id: GUILD.into(),
+        member_id: USER.into(),
+        panel_id: panel.id.clone(),
+    };
+    assert!(matches!(
+        feature.store.claim_panel(&key, None).await?,
+        PanelClaimResult::Acquired(_)
+    ));
+    assert!(!feature.store.owns_panel_claim(&lane).await?);
+    let capture = crate::tracing_capture::Capture::default();
+    feature
+        .park(&mut prepared)
+        .with_subscriber(capture.clone())
+        .await;
+    let logs = capture.text();
+    assert!(
+        logs.contains("self-role panel claim release matched no current claim"),
+        "{logs}"
+    );
+    assert!(logs.contains("lost-lane-release-event"), "{logs}");
+    let closed = PgPoolOptions::new().connect_lazy_with((*pool.connect_options()).clone());
+    closed.close().await;
+    let closed_store = SelfRoleStore::new(closed);
+    let capture = crate::tracing_capture::Capture::default();
+    release_lane_or_warn(&closed_store, &lane, "lost-lane-release-closed-store")
+        .with_subscriber(capture.clone())
+        .await;
+    let logs = capture.text();
+    assert!(
+        logs.contains("self-role panel claim release failed"),
+        "{logs}"
+    );
+    assert!(logs.contains("lost-lane-release-closed-store"), "{logs}");
     mock.shutdown().await;
     Ok(())
 }

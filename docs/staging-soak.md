@@ -165,8 +165,9 @@ The ledger is machine-checked, not prose:
   `python3 scripts/check_soak_checklist.py` plus
   `python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v`.
   Any unmapped row, any missing or stale owner card, any `waived` entry
-  without **both** `reason` and `approver`, or any Markdown drift fails the
-  gate.
+  without **both** `reason` and `approver`, any operative `scripts/` path in a
+  checklist entry that does not exist (unless the entry lists it under
+  `historical` with a reason), or any Markdown drift fails the gate.
 
 Every `waived` entry carries `reason` and `approver`. The first waivers,
 filed under [TOG-12140](/TOG/issues/TOG-12140), cover the 25 rows staging

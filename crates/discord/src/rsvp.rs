@@ -192,12 +192,13 @@ async fn guild_membership(executor: &ActionExecutor, guild_id: &str, user_id: &s
 /// RA-03 consistency contract (TOG-19773): every mutation path observes live
 /// evidence immediately before its write and re-reads the same evidence
 /// immediately after. Any loss, removal, or lookup/store failure refuses the
-/// attempt with zero rows from that attempt, never a success reply. Lookup
-/// errors fail closed before any write; store errors fail closed without a
-/// success reply; a loss racing the write is compensated (the attempt's
-/// exact rows are deleted) and refused. The check-in fence re-reads the
-/// RA-02 anchor event plus the target membership. Historical totals reads
-/// (`list_rsvps`) perform no lookup and no write.
+/// attempt, never a success reply. Lookup errors fail closed before any write;
+/// store errors fail closed without a success reply; a loss racing the write is
+/// compensated (the attempt's exact rows are deleted) and refused. If that
+/// compensating delete fails, the refusal stands, the attempt's rows may
+/// remain, and a `compensation_failed` diagnostic names the write. The
+/// check-in fence re-reads the RA-02 anchor event plus the target membership.
+/// Historical totals reads (`list_rsvps`) perform no lookup and no write.
 async fn check_live_event(
     executor: &ActionExecutor,
     guild_id: &str,
@@ -348,7 +349,7 @@ async fn execute(
             )
             .await
             {
-                let _ = compensate_rsvp_write(
+                if compensate_rsvp_write(
                     pool,
                     &record.guild_id,
                     &record.event_id,
@@ -357,7 +358,15 @@ async fn execute(
                     &audit_id,
                     transition.previous_response(),
                 )
-                .await;
+                .await
+                .is_err()
+                {
+                    tracing::error!(
+                        msg = "compensation_failed",
+                        write = "rsvp",
+                        "refusal kept; compensating RSVP write failed"
+                    );
+                }
                 return Err(refusal);
             }
             Ok(rsvp_saved_text(status))
@@ -526,11 +535,19 @@ async fn execute(
             )
             .await
             {
-                let _ = compensate_checkin_write(
+                if compensate_checkin_write(
                     pool,
                     &checkin_idempotency_key(&resolved.canonical_id, &member_id_str),
                 )
-                .await;
+                .await
+                .is_err()
+                {
+                    tracing::error!(
+                        msg = "compensation_failed",
+                        write = "checkin",
+                        "refusal kept; compensating check-in write failed"
+                    );
+                }
                 return Err(refusal);
             }
             Ok(checkin_recorded_text(
