@@ -20,7 +20,7 @@ DISPOSITION_HEADERS = ("Disposition", "Next boundary / disposition")
 LEDGER_HEADER = ("Legacy commit", "Area", "Change", "Status", "Disposition")
 LEDGER_STATUSES = ("ported", "carded", "gap", "dropped")
 CARD = re.compile(r"\bTOG-\d+\b")
-SCRIPT_REF = re.compile(r"(?<![\w/.-])((?:\.{1,2}/)?(?:\.github/)?scripts/[\w./-]+\.\w+)")
+SCRIPT_REF = re.compile(r"(?<![\w/.-])((?:\.{1,2}/)*(?:\.github/)?scripts/[\w./-]+\.\w+)")
 # Automated rows run Cargo through the controller cache wrapper only.
 WRAPPER = ("python3", "scripts/cargo_cache.py", "run", "--")
 CARGO_VALUE_OPTIONS = ("-p", "--package", "--test", "-F", "--features", "--target",

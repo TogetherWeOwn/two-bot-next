@@ -560,10 +560,20 @@ class ScriptReferenceTests(unittest.TestCase):
 
     def test_missing_live_script_fails(self):
         for path in ("scripts/missing-check.cjs", "./scripts/missing-check.sh",
-                     "../scripts/missing-check.py", "scripts/fixtures/missing-check.json"):
+                     "../scripts/missing-check.py", "../../scripts/missing-check.cjs",
+                     ".././scripts/missing-check.cjs", "scripts/fixtures/missing-check.json"):
             with self.subTest(path=path):
                 with self.assertRaisesRegex(ValueError, rf"^fixture: missing script {re.escape(path)} "):
                     check_script_refs({"id": "fixture", "action": f"Run `{path}`."})
+
+    def test_script_outside_the_repository_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / "scripts").mkdir(parents=True)
+            (Path(tmp) / "scripts").mkdir()
+            (Path(tmp) / "scripts/outside.py").write_text("")
+            with self.assertRaisesRegex(ValueError, r"^fixture: missing script \.\./scripts/outside\.py "):
+                check_script_refs({"id": "fixture", "action": "Run `../scripts/outside.py`."}, repo)
 
     def test_named_historical_script_passes(self):
         check_script_refs({

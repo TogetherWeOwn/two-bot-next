@@ -2032,7 +2032,7 @@
       "status": "waived",
       "action": "Historical only, not runnable: `scripts/migrate-release-notes.cjs` and its bootstrap fixture were removed in `6032fc72a`, so no fixture runs for this row and no check replaces it. Do not read the current promote-time release path as satisfying it; that path is documented in [releases.md](releases.md).",
       "expected": "Historical record of the retired bootstrap contract only: `Security` migrated alongside Added/Fixed/Changed/Notes, unknown sections failed closed, and later releases did not repeat the bootstrap tail. No current check asserts this.",
-      "evidence": "Historical record only: the fixture receipt cannot be reproduced because the script is gone, so none is attached. The bootstrap documentation that cited #329 is in `docs/releases.md` at `6032fc72a^`; the removal is commit `6032fc72a`. Waiver decision and approver stay on [TOG-9699](/TOG/issues/TOG-9699); this checklist records no PASS.",
+      "evidence": "Historical record only: the fixture receipt cannot be reproduced because the script is gone, so none is attached. The #329 bootstrap documentation is in `docs/releases.md` at `6032fc72a^`; the removal is commit `6032fc72a`. Waiver decision and approver stay on [TOG-9699](/TOG/issues/TOG-9699); this checklist records no PASS.",
       "historical": [
         {
           "path": "scripts/migrate-release-notes.cjs",
