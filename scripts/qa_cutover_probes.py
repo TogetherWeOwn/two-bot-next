@@ -99,6 +99,10 @@ KNOWN_COMPONENTS = frozenset({"process", "gateway", "database", "token_invalid"}
 #   member_unban_sweep: 30s cadence (UNBAN_SWEEP_INTERVAL_SECONDS,
 #     member_moderation.rs:69) + 180s timeout (SWEEP_TIMEOUT,
 #     member_runtime.rs:57) -> warn 210, max 240
+#   self_role_recovery: 30s cadence + 25s timeout (recovery_job,
+#     self_role_handlers.rs:303-310) -> warn 55, max 85
+#   automod_expiry: 60s cadence (EXPIRY_CADENCE, automod_gateway.rs:44) + 5s
+#     timeout (expiry_job, automod_gateway.rs:308-313) -> warn 65, max 125
 #   scheduled_messages: 15s cadence (SCHEDULER_TICK_MS, scheduled.rs:49)
 #     + 120s timeout (scheduled_jobs.rs) -> warn 135, max 150
 #   settings: 15s cadence (POLL_SECONDS, settings.rs:47) + 10s timeout
@@ -117,6 +121,8 @@ KNOWN_COMPONENTS = frozenset({"process", "gateway", "database", "token_invalid"}
 JOB_CADENCE_SECONDS = {
     "counter": 60,
     "member_unban_sweep": 30,
+    "self_role_recovery": 30,
+    "automod_expiry": 60,
     "scheduled_messages": 15,
     "settings": 15,
     "rank": 600,
@@ -127,6 +133,8 @@ JOB_CADENCE_SECONDS = {
 JOB_TIMEOUT_SECONDS = {
     "counter": 45,
     "member_unban_sweep": 180,
+    "self_role_recovery": 25,
+    "automod_expiry": 5,
     "scheduled_messages": 120,
     "settings": 10,
     "rank": 120,
