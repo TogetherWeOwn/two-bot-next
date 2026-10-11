@@ -36,6 +36,19 @@ pub async fn audit<'c>(
     Ok(())
 }
 
+/// Read one audit fact's `(outcome, reason)` by id. Replay paths use this to
+/// return the first result verbatim; `Ok(None)` means no such row (a receipt
+/// predating the summary row, or a rolled-back apply that never committed).
+pub async fn load_audit(
+    pool: &sqlx::PgPool,
+    id: &str,
+) -> Result<Option<(String, Option<String>)>, sqlx::Error> {
+    sqlx::query_as("SELECT outcome, reason FROM automation_audit_log WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
 /// Permanently reserve one text invocation before any Discord POST. The audit
 /// primary key excludes concurrent/replayed attempts even after Discord's nonce
 /// window expires. Call with the pool (autocommit), NOT a transaction that could

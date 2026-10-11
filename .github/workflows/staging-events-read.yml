@@ -67,7 +67,7 @@ jobs:
           RUN_ID: ${{ github.run_id }}
         run: python3 scripts/staging_events_read.py --window-start "$WINDOW_START" --window-end "$WINDOW_END" --output "staging-events-read-$RUN_ID.json"
       - name: Upload the sanitized read
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: staging-events-read-${{ github.run_id }}
           path: staging-events-read-${{ github.run_id }}.json

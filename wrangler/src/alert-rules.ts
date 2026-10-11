@@ -19,6 +19,8 @@ export interface RuleDef {
   summary: string;
   /** Anchor inside docs/runbook.md. */
   runbook: string;
+  /** Explicit non-paging classification; existing rules retain their alert copy. */
+  severity?: "ticket";
 }
 
 /** Cadence in seconds of every scheduled job (crates/core/src/*_INTERVAL_MS). */
@@ -65,6 +67,10 @@ export const RECEIVER_REFUSAL_SAMPLES = 3;
 export const VOICE_FAILURE_RATIO = 0.05;
 /** ...and the window must hold at least this many operations. */
 export const VOICE_FAILURE_MIN_OPS = 10;
+/** Dispatch drops must grow in this many consecutive completed sample windows. */
+export const DISPATCH_DROP_SAMPLES = 3;
+/** Mirrors the fixed DISPATCH_LANES allowlist in crates/core/src/metrics.rs. */
+export const DISPATCH_LANES: readonly string[] = ["messages", "interactions", "registry", "privileged", "busy", "reactions"];
 
 export const RULES: readonly RuleDef[] = [
   { id: "job_stale", summary: `scheduled job has no success for more than ${STALE_INTERVALS} intervals`, runbook: "runbook.md#alert-job-stale" },
@@ -77,6 +83,7 @@ export const RULES: readonly RuleDef[] = [
   { id: "gateway_missed_events", summary: `gateway missed events increased between samples`, runbook: "runbook.md#alert-gateway-missed-events" },
   { id: "ticker_stale", summary: `15 s ticker has no success for more than ${TICKER_STALE_SECONDS / 60} minutes`, runbook: "runbook.md#alert-ticker-stale" },
   { id: "receiver_refusals", summary: `website-action receiver refusals for ${RECEIVER_REFUSAL_SAMPLES} consecutive samples`, runbook: "runbook.md#alert-receiver-refusals" },
+  { id: "dispatch_drops", summary: `dispatch-lane drops grew for ${DISPATCH_DROP_SAMPLES} consecutive sample windows (reactions include fairness refusals; not proof of gateway packet loss)`, runbook: "runbook.md#alert-dispatch-drops", severity: "ticket" },
 ];
 
 /**
@@ -113,9 +120,18 @@ export interface MetricsAlertState {
   receiverRefusalsSeen: boolean;
   /** Per-family consecutive windows with new refusals (sustained surge, not one probe). */
   receiverRefusalStreaks: Record<string, number>;
+  /** Per-lane baseline; absent after a missing/invalid sample or in legacy storage. */
+  dispatchDrops?: Record<string, number>;
+  /** Consecutive positive deltas, capped at DISPATCH_DROP_SAMPLES. */
+  dispatchDropStreaks?: Record<string, number>;
 }
 
-export const EMPTY_STATE: MetricsAlertState = { firing: [], rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {} };
+export const EMPTY_STATE: MetricsAlertState = { firing: [], rest429: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, dispatchDrops: {}, dispatchDropStreaks: {} };
+
+/** An unsuccessful scrape breaks the dispatch streak, never an existing alert. */
+export function interruptDispatchDrops(state: MetricsAlertState): MetricsAlertState {
+  return { ...state, dispatchDrops: {}, dispatchDropStreaks: {} };
+}
 
 export function parseExposition(text: string): Sample[] {
   const samples: Sample[] = [];
@@ -283,7 +299,58 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     for (const family of Object.keys(receiverRefusals)) receiverRefusalStreaks[family] = 0;
   }
 
-  return { firing, state: { firing, rest429, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks } };
+  // Dispatch saturation is a ticket, not evidence of gateway sequence loss.
+  // Iterate only the fixed lanes: neither storage nor firing keys can acquire
+  // member/channel labels from a malformed exposition. Each lane needs one
+  // nonnegative, safely represented integer with only its lane label.
+  const dispatchDrops: Record<string, number> = {};
+  const dispatchDropStreaks: Record<string, number> = {};
+  const dropSamples = gauge("two_bot_dispatch_drops_total");
+  for (const lane of DISPATCH_LANES) {
+    const rows = dropSamples.filter((s) => s.labels["lane"] === lane);
+    const sample = rows[0];
+    if (rows.length === 1 && sample && Object.keys(sample.labels).length === 1
+      && Number.isSafeInteger(sample.value) && sample.value >= 0) {
+      dispatchDrops[lane] = sample.value;
+    }
+  }
+  // All lanes belong to one process. A reset in any observed lane invalidates
+  // the whole window, including lanes whose new count overtook their old one.
+  const dispatchReset = DISPATCH_LANES.some((lane) => {
+    const count = dispatchDrops[lane];
+    const previous = prev.dispatchDrops?.[lane];
+    return count !== undefined && previous !== undefined && count < previous;
+  });
+  for (const lane of DISPATCH_LANES) {
+    const key = `dispatch_drops:${lane}`;
+    const wasFiring = prev.firing.includes(key);
+    const count = dispatchDrops[lane];
+    const previous = prev.dispatchDrops?.[lane];
+    if (count === undefined) {
+      // Missing/invalid data breaks consecutive growth and drops the baseline,
+      // but does not provide recovery evidence for a currently firing lane.
+      if (wasFiring) firing.push(key);
+      continue;
+    }
+    if (dispatchReset) {
+      dispatchDropStreaks[lane] = 0;
+      continue;
+    }
+    if (previous === undefined) {
+      dispatchDropStreaks[lane] = 0;
+      // The first valid sample (including after a gap) is only a baseline.
+      if (wasFiring) firing.push(key);
+      continue;
+    }
+    // Flat samples resolve; positive deltas after a gap retain an already
+    // firing ticket until a valid quiet window.
+    const grew = count > previous;
+    const streak = grew ? Math.min((prev.dispatchDropStreaks?.[lane] ?? 0) + 1, DISPATCH_DROP_SAMPLES) : 0;
+    dispatchDropStreaks[lane] = streak;
+    if (grew && (wasFiring || streak >= DISPATCH_DROP_SAMPLES)) firing.push(key);
+  }
+
+  return { firing, state: { firing, rest429, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, dispatchDrops, dispatchDropStreaks } };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {
@@ -312,7 +379,8 @@ export function transitionMessages(before: string[], after: string[]): string[] 
   for (const key of after.filter((k) => !before.includes(k))) {
     const rule = ruleFor(key);
     const runbook = rule ? runbookUrl(rule) : `${RUNBOOK_BASE_URL}runbook.md`;
-    out.push(`two-bot-next ALERT ${key}: ${rule?.summary ?? key}. Runbook: ${runbook}`);
+    const severity = rule?.severity ? ` (${rule.severity})` : "";
+    out.push(`two-bot-next ALERT ${key}${severity}: ${rule?.summary ?? key}. Runbook: ${runbook}`);
   }
   for (const key of before.filter((k) => !after.includes(k))) {
     out.push(`two-bot-next RESOLVED ${key}.`);

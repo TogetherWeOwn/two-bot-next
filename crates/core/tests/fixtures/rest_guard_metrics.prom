@@ -1,0 +1,33 @@
+# HELP two_bot_rest_guard_invalid_requests_total Process-local health metric.
+# TYPE two_bot_rest_guard_invalid_requests_total counter
+two_bot_rest_guard_invalid_requests_total 12
+# HELP two_bot_rest_guard_rejected_requests_total Process-local health metric.
+# TYPE two_bot_rest_guard_rejected_requests_total counter
+two_bot_rest_guard_rejected_requests_total 4
+# HELP two_bot_rest_guard_breaker_opens_total Process-local health metric.
+# TYPE two_bot_rest_guard_breaker_opens_total counter
+two_bot_rest_guard_breaker_opens_total 2
+# HELP two_bot_rest_guard_breaker_closes_total Process-local health metric.
+# TYPE two_bot_rest_guard_breaker_closes_total counter
+two_bot_rest_guard_breaker_closes_total 1
+# HELP two_bot_rest_guard_global_pauses_total Process-local health metric.
+# TYPE two_bot_rest_guard_global_pauses_total counter
+two_bot_rest_guard_global_pauses_total 3
+# HELP two_bot_rest_guard_invalid_requests_in_window Process-local health metric.
+# TYPE two_bot_rest_guard_invalid_requests_in_window gauge
+two_bot_rest_guard_invalid_requests_in_window 3
+# HELP two_bot_rest_guard_breaker_open Process-local health metric.
+# TYPE two_bot_rest_guard_breaker_open gauge
+two_bot_rest_guard_breaker_open 1
+# HELP two_bot_rest_guard_token_invalid Process-local health metric.
+# TYPE two_bot_rest_guard_token_invalid gauge
+two_bot_rest_guard_token_invalid 1
+# HELP two_bot_rest_guard_pending_global_responses Process-local health metric.
+# TYPE two_bot_rest_guard_pending_global_responses gauge
+two_bot_rest_guard_pending_global_responses 2
+# HELP two_bot_rest_guard_global_paused Process-local health metric.
+# TYPE two_bot_rest_guard_global_paused gauge
+two_bot_rest_guard_global_paused 1
+# HELP two_bot_rest_guard_global_pause_remaining_seconds Remaining global cooldown; pending response bodies may still hold admission at zero.
+# TYPE two_bot_rest_guard_global_pause_remaining_seconds gauge
+two_bot_rest_guard_global_pause_remaining_seconds 1.25
