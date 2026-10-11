@@ -10,7 +10,9 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import socket
 import threading
+import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -51,12 +53,15 @@ def hostile_event(message, **source):
             "$metadata": {"service": SERVICE, "level": "warn", "message": message}}
 
 
+_FIXTURE = object()
+
+
 class FakeTransport:
     """Records every call; answers the accounts list and the telemetry query."""
 
-    def __init__(self, query_answer=None, accounts=None):
+    def __init__(self, query_answer=_FIXTURE, accounts=None):
         self.calls = []
-        self.query_answer = RESPONSE if query_answer is None else query_answer
+        self.query_answer = RESPONSE if query_answer is _FIXTURE else query_answer
         self.accounts = [{"id": ACCOUNT}] if accounts is None else accounts
 
     def __call__(self, method, path, body=None):
@@ -166,6 +171,17 @@ class OutputTests(unittest.TestCase):
         message = read_with(FakeTransport(answer))["events"][0]["message"]
         self.assertFalse(re.search(r"[\x00-\x1f\x7f-\x9f]", message), repr(message))
 
+    def test_equal_timestamps_keep_oldest_first(self):
+        newest_first = []
+        for text in ("second", "first"):
+            event = hostile_event(text)
+            event["timestamp"] = 1791721190000
+            newest_first.append(event)
+        answer = copy.deepcopy(RESPONSE)
+        answer["result"]["events"]["events"] = newest_first
+        self.assertEqual([e["message"] for e in read_with(FakeTransport(answer))["events"]],
+                         ["first", "second"])
+
     def test_playbook_literals_are_readable_in_the_output(self):
         messages = {e["message"] for e in read_with(FakeTransport())["events"]}
         self.assertIn("gateway ready; checkpoint committed", messages)
@@ -227,6 +243,49 @@ class RedactionTests(unittest.TestCase):
         self.assertEqual(packet["events"][0]["message"], "gateway_runtime_failed_after_checkpoint_commit_retry")
         self.assertEqual(packet["redactions"], 0)
 
+    def test_english_log_text_is_not_mangled(self):
+        # Literals the runbook tells operators to look for, plus scheme words in prose.
+        for message in ("Discord refused the bot token; REST disabled until restart",
+                        "create failed: bot lacks View/Send permission",
+                        "Bearer authentication failed", "Basic checks passed",
+                        "gateway reconnect failed; Twilight will retry"):
+            with self.subTest(message=message):
+                packet = self.packet_for(message)
+                self.assertEqual(packet["events"][0]["message"], message)
+                self.assertEqual(packet["redactions"], 0)
+
+    def test_credential_length_auth_values_are_replaced(self):
+        for header in ("Authorization: Bearer " + "q" * 24, "Bot " + "Ab1" * 10, "Basic " + "dXNlcjpwYXNz" * 3):
+            with self.subTest(header=header[:14]):
+                packet = self.packet_for("sent " + header)
+                self.assertNotRegex(json.dumps(packet), r"qqqq|Ab1Ab1|dXNlcjpwYXNz")
+                self.assertGreaterEqual(packet["redactions"], 1)
+
+    def test_json_quoted_key_names_are_redacted(self):
+        for fragment, secret in (('{"token":"abc123"}', "abc123"), ('{"password": "hunter2"}', "hunter2"),
+                                 ('"api_key":"short"', "short"), ("{'secret': 'tiny'}", "tiny"),
+                                 ("DATABASE_DSN=x", "=x")):
+            with self.subTest(fragment=fragment):
+                packet = self.packet_for("event " + fragment)
+                self.assertNotIn(secret, packet["events"][0]["message"])
+                self.assertGreaterEqual(packet["redactions"], 1)
+
+    def test_a_runaway_line_is_bounded_in_time_and_size(self):
+        for unit in ("a.", "a-", "a_1.", "token="):
+            line = unit * 20000
+            started = time.monotonic()
+            packet = self.packet_for(line)
+            self.assertLess(time.monotonic() - started, 5.0, unit)
+            self.assertLessEqual(len(packet["events"][0]["message"]), reader.MAX_VALUE_CHARS + 3)
+        self.assertEqual(self.packet_for("a" * 5000)["events"][0]["message"], "...")
+
+    def test_a_secret_cut_by_the_redaction_bound_leaves_no_fragment(self):
+        fragment = "A1" * 30
+        line = "y " * (reader.MAX_REDACT_CHARS // 2 - 1) + fragment + " tail"
+        message = self.packet_for(line)["events"][0]["message"]
+        self.assertNotIn("A1A1", message)
+        self.assertTrue(message.endswith("..."))
+
     def test_nested_and_non_scalar_fields_are_dropped(self):
         packet = self.packet_for("x", error_class={"nested": HOSTILE["url"]}, step=["a"], job=None)
         event = packet["events"][0]
@@ -283,6 +342,12 @@ class FenceTests(unittest.TestCase):
         self.assertEqual(run.returncode, 2)
         self.assertEqual(run.stdout, "")
 
+    def test_help_exits_zero(self):
+        run = subprocess.run([sys.executable, str(SCRIPT), "--help"], capture_output=True, text=True,
+                             env={"PATH": os.environ.get("PATH", "")})
+        self.assertEqual(run.returncode, 0)
+        self.assertIn("--service", run.stdout)
+
     def test_end_of_now_is_allowed(self):
         code, _, _ = run_main(["--service", SERVICE, "--end", "2026-10-11T12:30:00Z"], FakeTransport(),
                               env={reader.ACCOUNT_ENV: ACCOUNT})
@@ -293,6 +358,7 @@ class FailureTests(unittest.TestCase):
     def test_malformed_responses_fail_closed_with_a_fixed_line(self):
         events = RESPONSE["result"]["events"]["events"]
         broken = [
+            [], None, "text", 5,
             {"success": False, "result": RESPONSE["result"]},
             {"success": True, "result": None},
             {"success": True, "result": {"events": {"events": "nope"}}},
@@ -402,6 +468,26 @@ class LoopbackTests(unittest.TestCase):
         with self.assertRaises(reader.ReadFailed):
             self.transport("POST", self.query_path, REQUEST)
         self.assertEqual(other.seen, [])
+
+    def test_a_malformed_http_answer_is_a_network_error_not_a_traceback(self):
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        self.addCleanup(listener.close)
+
+        def answer_garbage():
+            connection, _ = listener.accept()
+            with connection:
+                connection.recv(65536)
+                connection.sendall(b"this is not http\r\n\r\n")
+
+        threading.Thread(target=answer_garbage, daemon=True).start()
+        broken = reader.HttpTransport(TOKEN, base=f"http://127.0.0.1:{listener.getsockname()[1]}", timeout=5)
+        out, err = io.StringIO(), io.StringIO()
+        code = reader.main(["--service", SERVICE, "--end", END, "--account-id", ACCOUNT], env={},
+                           transport=broken, now=lambda: NOW, stdout=out, stderr=err)
+        self.assertEqual((code, out.getvalue()), (1, ""))
+        self.assertEqual(err.getvalue().strip(), "container_stdout_read: read failed (network_error)")
 
     def test_unreachable_host_is_a_network_error(self):
         dead = reader.HttpTransport(TOKEN, base="http://127.0.0.1:9", timeout=2)

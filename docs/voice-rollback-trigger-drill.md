@@ -111,8 +111,9 @@ staging smoke owns it).
   contact from this drill; staging halves rest on public CI metadata and
   merged source.
 - Container-stdout halves (T1 log class, `voice_event` emission) were not read
-  by this drill (`scripts/container_stdout_read.py` can read the T1 log class;
-  `voice_event` names stay dashboard-only); absence here is "not observed
-  from this seat", never proof of absence on staging.
+  by this drill. `scripts/container_stdout_read.py` can read the T1 log class and
+  find a voice line by its message; the `voice_event` field itself stays
+  dashboard-only. Absence here is "not observed from this seat", never proof of
+  absence on staging.
 - T0 fixture pins `origin/main` at authoring revision `27d22b42`; drift
   since is not re-verified here.

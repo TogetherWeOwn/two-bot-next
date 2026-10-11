@@ -49,6 +49,7 @@ Usage:
 
 import argparse
 from datetime import datetime, timedelta, timezone
+import http.client
 import json
 import os
 import re
@@ -72,6 +73,9 @@ MAX_CONTAINS = 120
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 HTTP_TIMEOUT_SECONDS = 30
 MAX_VALUE_CHARS = 400
+# Redaction runs on at most this much of a value, so a hostile or runaway line cannot
+# make the regexes spend time proportional to its full length.
+MAX_REDACT_CHARS = 4 * MAX_VALUE_CHARS
 
 UUID_RE = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 ACCOUNT_RE = re.compile(r"[0-9a-f]{32}")
@@ -92,12 +96,14 @@ FIELD_KEYS = (
 
 # Ordered: URLs go first so a token inside one is not split by a later rule.
 _URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+")
-_BEARER = re.compile(r"\b(?:Bearer|Bot|Basic)\s+\S+", re.IGNORECASE)
+# An auth scheme only counts when a credential-length value follows, so prose such as
+# "Discord refused the bot token" or "bot lacks View/Send" stays readable.
+_BEARER = re.compile(r"\b(?:[Bb]earer|Bot|Basic)\s+[A-Za-z0-9._~+/=-]{20,}")
 _JWT_LIKE = re.compile(r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{20,}\b")
 _KEYED = re.compile(
     r"""(?ix)
-    \b([\w.-]*(?:token|secret|passw(?:or)?d|authorization|api[_-]?key|credential|dsn|cookie)[\w.-]*)
-    (\s*[=:]\s*)
+    \b([\w.-]{0,32}?(?:token|secret|passw(?:or)?d|authorization|api[_-]?key|credential|dsn|cookie)[\w.-]{0,32})
+    (["']?\s*[=:]\s*)
     ("[^"]*"|'[^']*'|\S+)
     """
 )
@@ -160,8 +166,13 @@ def clean_value(key, value):
         return REDACTED, 1
     # A log line must not be able to drive the reader's terminal or transcript.
     value = _CONTROL.sub(" ", _ANSI.sub("", value))
+    cut = len(value) > MAX_REDACT_CHARS
+    if cut:
+        # Drop the last, possibly half-cut word: a secret must not survive as a fragment.
+        value = value[:MAX_REDACT_CHARS]
+        value = value[:value.rfind(" ")] if " " in value else ""
     text, replaced = redact(value)
-    if len(text) > MAX_VALUE_CHARS:
+    if cut or len(text) > MAX_VALUE_CHARS:
         text = text[:MAX_VALUE_CHARS] + "..."
     return text, replaced
 
@@ -231,7 +242,7 @@ class HttpTransport:
         except urllib.error.HTTPError as error:
             status, raw = error.code, b""
             error.close()
-        except (urllib.error.URLError, OSError):
+        except (urllib.error.URLError, http.client.HTTPException, OSError):
             raise ReadFailed("network_error") from None
         if len(raw) > MAX_RESPONSE_BYTES:
             raise ReadFailed("bad_response")
@@ -298,7 +309,9 @@ def read(transport, service, minutes, end, limit, contains, account_id=None, que
     account = resolve_account(transport, account_id)
     body = build_query(service, start, end, limit, contains, query_id or str(uuid.uuid4()))
     answer = transport("POST", f"/accounts/{account}/workers/observability/telemetry/query", body)
-    result = answer.get("result") if isinstance(answer, dict) else None
+    if not isinstance(answer, dict):
+        raise ReadFailed("bad_response")
+    result = answer.get("result")
     events = result.get("events", {}).get("events") if isinstance(result, dict) and isinstance(result.get("events"), dict) else None
     if answer.get("success") is not True or not isinstance(events, list):
         raise ReadFailed("bad_response")
@@ -307,7 +320,8 @@ def read(transport, service, minutes, end, limit, contains, account_id=None, que
         event, replaced = sanitize_event(raw)
         kept.append(event)
         redactions += replaced
-    kept.sort(key=lambda event: event["ts"])  # the query is newest-first; print oldest first
+    kept.reverse()  # the query is newest-first; equal timestamps keep that order reversed
+    kept.sort(key=lambda event: event["ts"])  # stable: oldest first
     return {
         "schema_version": SCHEMA_VERSION,
         "service": service,
@@ -338,8 +352,8 @@ def main(argv=None, env=None, transport=None, now=None, stdout=None, stderr=None
     stderr = sys.stderr if stderr is None else stderr
     try:
         args = parse_args(argv)
-    except SystemExit:
-        return 2
+    except SystemExit as stop:  # argparse: --help exits 0, a usage error exits 2
+        return stop.code if isinstance(stop.code, int) else 2
     try:
         if not UUID_RE.fullmatch(args.service):
             raise Refused("refusing: --service must be a Container application id (lowercase UUID)")

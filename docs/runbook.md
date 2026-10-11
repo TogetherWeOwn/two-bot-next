@@ -119,8 +119,10 @@ Container stdout is also in the Workers Observability `containers` dataset, whic
 read-only `CLOUDFLARE_API_TOKEN` can query without starting the container:
 `python3 scripts/container_stdout_read.py --service <container-application-id>`
 (see [Reading container stdout](startup-diagnostics.md#reading-container-stdout)).
-That script keeps a fixed allowlist of fields, so `voice_event` names still follow the
-[staging voice-event verification](staging-voice-event-verification.md) dashboard procedure.
+That script keeps each line's message and a fixed allowlist of fields that excludes
+`voice_event`; it can find a voice line by message, and the
+[staging voice-event verification](staging-voice-event-verification.md) dashboard procedure
+reads the `voice_event` field.
 
 Rust uses JSON `tracing` logs, configured by `RUST_LOG`, fallback
 `error,two_bot={LOG_LEVEL:-info}` (dependency crates stay ERROR-only unless

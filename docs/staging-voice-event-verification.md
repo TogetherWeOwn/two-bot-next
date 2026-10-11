@@ -2,10 +2,12 @@
 
 The four catalogued `voice_event` names are emitted to Rust container
 stdout only. That stdout is in the Workers Observability `containers` dataset, which
-`scripts/container_stdout_read.py` reads (see `docs/startup-diagnostics.md`), but the
-script keeps a fixed field allowlist that does not include the `voice_event` field. So no
-agent or CI path confirms a catalogued name was emitted on staging; this page records that
-and gives the Operator dashboard procedure instead.
+`scripts/container_stdout_read.py` reads (see `docs/startup-diagnostics.md`). The script
+keeps each line's message and a fixed field allowlist that does not include `voice_event`,
+`op`, `outcome` or `action`: it can find a voice line by its message
+(`--contains "voice_operation"`, `"voice_reconcile planned"`, `"voice action dead-lettered"`,
+`"voice creator orphan needs manual deletion"`) but cannot show the `voice_event` field. This
+page gives the Operator dashboard procedure that reads the field.
 
 ## Catalogued names and emission sites
 
@@ -33,17 +35,17 @@ corresponding counter below before escalating.
   (see `docs/runbook.md`, Logs and keepalive).
 - Container stdout is not in the `cloudflare-workers` Workers Logs dataset; it is
   in the `containers` one (see `docs/startup-diagnostics.md`, Reading container
-  stdout). `scripts/container_stdout_read.py` queries it, but its allowlist
-  drops the `voice_event`, `op`, `outcome` and `action` fields, so it cannot
-  show which voice name a line carried.
+  stdout). `scripts/container_stdout_read.py` queries it and keeps the message, but its
+  allowlist drops the `voice_event`, `op`, `outcome` and `action` fields.
 - The Containers API exposes applications, versions, rollouts, instances,
   registries and images. It exposes no container-stdout log endpoint.
 - `GET /metrics` through the Worker is `404` by design; the only
   off-container metrics path is the authenticated `GET /ops/metrics`
   scrape described in `docs/metrics.md`.
-- The `containers` dataset was read live, read-only, from an agent run on
-  2026-10-11 (the lines carried `gateway ready; checkpoint committed`). The
-  `voice_event` limit above comes from the script's allowlist, not from the API.
+- The `containers` dataset and the script's `--service` and `--contains` filters
+  were exercised live, read-only, from an agent run on 2026-10-11, in addition to the
+  offline fixtures. The `voice_event` limit above comes from the script's allowlist,
+  not from the API.
 
 ## What CI verifies today instead
 
