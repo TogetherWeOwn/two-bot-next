@@ -2173,9 +2173,68 @@ pub enum RefusedWrite {
     Move,
 }
 
+/// One accepted creator transition, carried across create/move retries. Only
+/// terminal outcomes log; only confirmed moves enter the latency histogram.
+#[derive(Debug, Clone)]
+struct JoinTiming {
+    received: tokio::time::Instant,
+    queued: tokio::time::Instant,
+    queue_dwell: Duration,
+    wait_before_dispatch: Duration,
+    claim: Duration,
+    reorder: Duration,
+    post: Duration,
+    persist: Duration,
+    move_member: Duration,
+    reorder_deferred: bool,
+}
+
+impl JoinTiming {
+    fn new(received: tokio::time::Instant) -> Self {
+        Self {
+            received,
+            queued: tokio::time::Instant::now(),
+            queue_dwell: received.elapsed(),
+            wait_before_dispatch: Duration::ZERO,
+            claim: Duration::ZERO,
+            reorder: Duration::ZERO,
+            post: Duration::ZERO,
+            persist: Duration::ZERO,
+            move_member: Duration::ZERO,
+            reorder_deferred: false,
+        }
+    }
+
+    fn dispatched(&mut self) {
+        self.wait_before_dispatch += self.queued.elapsed();
+    }
+
+    fn finish(self, outcome: &'static str) {
+        let elapsed = self.received.elapsed();
+        if outcome == "success" {
+            metrics::global().voice_join_to_move(elapsed);
+        }
+        info!(
+            voice_event = "voice_join",
+            outcome,
+            queue_dwell_seconds = self.queue_dwell.as_secs_f64(),
+            wait_before_dispatch_seconds = self.wait_before_dispatch.as_secs_f64(),
+            claim_seconds = self.claim.as_secs_f64(),
+            reorder_seconds = self.reorder.as_secs_f64(),
+            reorder_deferred = self.reorder_deferred,
+            post_seconds = self.post.as_secs_f64(),
+            persist_seconds = self.persist.as_secs_f64(),
+            move_seconds = self.move_member.as_secs_f64(),
+            elapsed_seconds = elapsed.as_secs_f64(),
+            "voice join completed"
+        );
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Creation {
     ticket: JoinTicket,
+    timing: JoinTiming,
     spec: NewRoomSpec,
     /// The durable admission reservation, once claimed. Kept across a 429
     /// requeue so the retry never claims (and counts) a second slot.
@@ -2274,6 +2333,7 @@ pub struct GuildRoomWorker<S, H> {
     creations: HashMap<u64, Creation>,
     accepted: HashMap<Snowflake, (u64, u64)>,
     moves: HashMap<Snowflake, JoinTicket>,
+    move_timings: HashMap<Snowflake, JoinTiming>,
     uncertain_moves: HashMap<Snowflake, JoinTicket>,
     deletes: HashSet<Snowflake>,
     compensation: HashSet<Snowflake>,
@@ -2559,6 +2619,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             creations: HashMap::new(),
             accepted: HashMap::new(),
             moves: HashMap::new(),
+            move_timings: HashMap::new(),
             uncertain_moves: HashMap::new(),
             deletes: HashSet::new(),
             compensation,
@@ -2616,6 +2677,23 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         seed: u64,
         created_at: String,
     ) -> bool {
+        self.accept_join_received(
+            ticket,
+            display,
+            seed,
+            created_at,
+            tokio::time::Instant::now(),
+        )
+    }
+
+    fn accept_join_received(
+        &mut self,
+        ticket: JoinTicket,
+        display: &str,
+        seed: u64,
+        created_at: String,
+        received: tokio::time::Instant,
+    ) -> bool {
         if self.halted
             || !may_create_room(&self.access)
             || !self.creators.contains_key(&ticket.creator_id)
@@ -2627,6 +2705,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         {
             return false;
         }
+        let timing = JoinTiming::new(received);
         self.accepted
             .insert(ticket.member_id, (ticket.generation, ticket.transition));
         self.name_directory
@@ -2643,6 +2722,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     creator_id: ticket.creator_id,
                     error: blocked.error,
                 });
+                timing.finish("name_blocked");
                 return false;
             }
         };
@@ -2669,6 +2749,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             id,
             Creation {
                 ticket,
+                timing,
                 spec: NewRoomSpec {
                     guild_id: self.live.guild_id,
                     creator_channel_id: ticket.creator_id,
@@ -4227,10 +4308,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 creator_channel_id,
                 ..
             } => {
-                let Some(creation) = self.creations.get(&action.id).cloned() else {
+                let Some(mut creation) = self.creations.get(&action.id).cloned() else {
                     self.queue.mark_succeeded(&action);
                     return true;
                 };
+                creation.timing.dispatched();
                 let attributes = match self.prepare(creation.ticket) {
                     Ok(attributes) => attributes,
                     Err(failure) => {
@@ -4270,6 +4352,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         }
                         self.creations.remove(&action.id);
                         self.queue.mark_succeeded(&action);
+                        creation.timing.finish(voice_outcome_from_http(&error));
                         return true;
                     }
                 };
@@ -4278,52 +4361,59 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 // refusal never reaches Discord; a 429 requeue keeps its claim.
                 let reservation = match creation.reservation.clone() {
                     Some(held) => held,
-                    None => match self
-                        .store
-                        .claim_create(
-                            self.live.guild_id,
-                            creation.ticket.member_id,
-                            &self.rooms_left_by(creation.ticket.member_id),
-                            &self.admission,
-                            unix_now_secs(),
-                        )
-                        .await
-                    {
-                        Ok(CreateClaim::Admitted { reservation_id }) => {
-                            if let Some(entry) = self.creations.get_mut(&action.id) {
-                                entry.reservation = Some(reservation_id.clone());
+                    None => {
+                        let claim_started = tokio::time::Instant::now();
+                        let claim = self
+                            .store
+                            .claim_create(
+                                self.live.guild_id,
+                                creation.ticket.member_id,
+                                &self.rooms_left_by(creation.ticket.member_id),
+                                &self.admission,
+                                unix_now_secs(),
+                            )
+                            .await;
+                        creation.timing.claim += claim_started.elapsed();
+                        match claim {
+                            Ok(CreateClaim::Admitted { reservation_id }) => {
+                                if let Some(entry) = self.creations.get_mut(&action.id) {
+                                    entry.reservation = Some(reservation_id.clone());
+                                }
+                                reservation_id
                             }
-                            reservation_id
-                        }
-                        Ok(CreateClaim::Refused(reason)) => {
-                            observe_voice_operation("create", "refused");
-                            self.record(LifecycleFailure::CreateRefused {
-                                creator_id: creator_channel_id,
-                                reason,
-                                message: reason.user_message(&self.admission),
-                            });
-                            self.creations.remove(&action.id);
-                            self.queue.mark_succeeded(&action);
-                            return true;
-                        }
-                        Err(error) => {
-                            observe_voice_operation("create", voice_outcome_from_store(&error));
-                            self.record(LifecycleFailure::Persistence {
-                                channel_id: None,
-                                error,
-                            });
-                            if error == StoreError::CredentialRefused {
-                                self.halted = true;
+                            Ok(CreateClaim::Refused(reason)) => {
+                                observe_voice_operation("create", "refused");
+                                self.record(LifecycleFailure::CreateRefused {
+                                    creator_id: creator_channel_id,
+                                    reason,
+                                    message: reason.user_message(&self.admission),
+                                });
+                                creation.timing.finish("refused");
+                                self.creations.remove(&action.id);
+                                self.queue.mark_succeeded(&action);
+                                return true;
                             }
-                            self.creations.remove(&action.id);
-                            self.queue.mark_succeeded(&action);
-                            return true;
+                            Err(error) => {
+                                observe_voice_operation("create", voice_outcome_from_store(&error));
+                                creation.timing.finish(voice_outcome_from_store(&error));
+                                self.record(LifecycleFailure::Persistence {
+                                    channel_id: None,
+                                    error,
+                                });
+                                if error == StoreError::CredentialRefused {
+                                    self.halted = true;
+                                }
+                                self.creations.remove(&action.id);
+                                self.queue.mark_succeeded(&action);
+                                return true;
+                            }
                         }
-                    },
+                    }
                 };
                 let mut attributes = attributes;
                 if !attributes.respace.is_empty() {
                     let respace = std::mem::take(&mut attributes.respace);
+                    let reorder_started = tokio::time::Instant::now();
                     match self
                         .http
                         .reorder_channels(self.live.guild_id, &respace)
@@ -4342,9 +4432,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         // the old nor the new positions are safe to use.
                         Err(_) => attributes.position = None,
                     }
+                    creation.timing.reorder += reorder_started.elapsed();
                 }
                 let guard = self.live.join_guard(creation.ticket);
-                match self
+                let post_started = tokio::time::Instant::now();
+                let result = self
                     .http
                     .create(
                         self.live.guild_id,
@@ -4352,8 +4444,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         &attributes,
                         Arc::clone(&guard.check),
                     )
-                    .await
-                {
+                    .await;
+                creation.timing.post += post_started.elapsed();
+                match result {
                     Ok(channel) => {
                         self.queue.mark_succeeded(&action);
                         self.creations.remove(&action.id);
@@ -4367,6 +4460,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         // a SQL error nor elapsed time proves channel absence.
                         // The channel is bound to its claim first so a restart
                         // can still find it if persist and compensation fail.
+                        let persist_started = tokio::time::Instant::now();
                         let transferred = match self
                             .store
                             .bind_create_channel(self.live.guild_id, &reservation, channel_id)
@@ -4375,6 +4469,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             Ok(()) => self.store.persist_create(&reservation, &room).await,
                             Err(error) => Err(error),
                         };
+                        creation.timing.persist += persist_started.elapsed();
                         match transferred {
                             Ok(()) => {
                                 // V9c: companion first (same ordered lane), then
@@ -4386,6 +4481,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 self.enqueue_companion_create(channel_id);
                                 if self.live.read_state().ticket_valid(creation.ticket) {
                                     self.moves.insert(channel_id, creation.ticket);
+                                    creation.timing.queued = tokio::time::Instant::now();
+                                    self.move_timings.insert(channel_id, creation.timing);
                                     self.queue.enqueue(
                                         self.live.guild_id,
                                         RoomAction::MoveMember {
@@ -4394,11 +4491,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                         },
                                     );
                                 } else {
+                                    creation.timing.finish("cancelled");
                                     self.queue_delete(channel_id, true);
                                 }
                             }
                             Err(error) => {
                                 let outcome = voice_outcome_from_store(&error);
+                                creation.timing.finish(outcome);
                                 self.record(LifecycleFailure::Persistence {
                                     channel_id: Some(channel_id),
                                     error,
@@ -4415,6 +4514,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         }
                     }
                     Err(RoomHttpError::RateLimited { retry_after_ms, .. }) => {
+                        creation.timing.queued = tokio::time::Instant::now();
+                        if let Some(entry) = self.creations.get_mut(&action.id) {
+                            entry.timing = creation.timing;
+                        }
                         self.queue.mark_rate_limited(
                             self.live.guild_id,
                             retry_after_ms,
@@ -4423,6 +4526,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         );
                     }
                     Err(error) => {
+                        creation.timing.finish(voice_outcome_from_http(&error));
                         // Unknown outcomes must never produce another POST or
                         // refund capacity: Discord may have created the room.
                         self.creations.remove(&action.id);
@@ -4450,6 +4554,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     self.queue.mark_succeeded(&action);
                     return true;
                 };
+                if let Some(timing) = self.move_timings.get_mut(&channel_id) {
+                    timing.dispatched();
+                }
+                let move_started = tokio::time::Instant::now();
                 let guard = self.live.move_guard(ticket, channel_id);
                 let result = if !self.live.read_state().ticket_valid(ticket) {
                     Err(RoomHttpError::Cancelled)
@@ -4469,6 +4577,18 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         )
                         .await
                 };
+                if let Some(timing) = self.move_timings.get_mut(&channel_id) {
+                    timing.move_member += move_started.elapsed();
+                    timing.queued = tokio::time::Instant::now();
+                }
+                if !matches!(result, Err(RoomHttpError::RateLimited { .. })) {
+                    if let Some(timing) = self.move_timings.remove(&channel_id) {
+                        timing.finish(match &result {
+                            Ok(()) => "success",
+                            Err(error) => voice_outcome_from_http(error),
+                        });
+                    }
+                }
                 match result {
                     Ok(()) => {
                         self.queue.mark_succeeded(&action);
@@ -4534,6 +4654,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 self.deletes.remove(&channel_id);
                                 self.renames.forget(channel_id);
                                 self.moves.remove(&channel_id);
+                                if let Some(timing) = self.move_timings.remove(&channel_id) {
+                                    timing.finish("cancelled");
+                                }
                                 self.uncertain_moves.remove(&channel_id);
                                 self.desired_names.remove(&channel_id);
                                 self.observe_voice_state();
@@ -4655,6 +4778,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                                 self.denied.remove(&channel_id);
                                 self.renames.forget(channel_id);
                                 self.moves.remove(&channel_id);
+                                if let Some(timing) = self.move_timings.remove(&channel_id) {
+                                    timing.finish("cancelled");
+                                }
                                 self.uncertain_moves.remove(&channel_id);
                                 self.desired_names.remove(&channel_id);
                                 self.custom_names.remove(&channel_id);
@@ -5667,6 +5793,15 @@ pub trait VoiceEventSink: Send + Sync {
     ) {
     }
     fn handle(&self, event: &Event, cache: &DefaultInMemoryCache);
+    /// Preserve the gateway receipt clock across the shard dispatch FIFO.
+    fn handle_received(
+        &self,
+        event: &Event,
+        cache: &DefaultInMemoryCache,
+        _received: tokio::time::Instant,
+    ) {
+        self.handle(event, cache);
+    }
     /// One `PRESENCE_UPDATE` (`TWO_VOICE_PRESENCE`), fed by the dispatch worker
     /// in gateway order (after any earlier `GUILD_CREATE` snapshot) without a
     /// checkpoint commit: it only updates in-memory room-name facts.
@@ -5724,6 +5859,7 @@ enum ActorCommand {
         display: String,
         seed: u64,
         created_at: String,
+        received: tokio::time::Instant,
     },
     /// A new or edited creator row (`/create`, `/textchannels`): the worker
     /// swaps it in for rooms created from here on.
@@ -6049,6 +6185,25 @@ where
         bot: Option<bool>,
         display: String,
     ) -> bool {
+        self.voice_frame_received(
+            guild,
+            member,
+            channel,
+            bot,
+            display,
+            tokio::time::Instant::now(),
+        )
+    }
+
+    fn voice_frame_received(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+        channel: Option<Snowflake>,
+        bot: Option<bool>,
+        display: String,
+        received: tokio::time::Instant,
+    ) -> bool {
         let Some(actor) = self.live_actor(guild) else {
             return false;
         };
@@ -6058,6 +6213,7 @@ where
                 display,
                 seed: self.seeds.fetch_add(1, Ordering::Relaxed),
                 created_at: now_iso(),
+                received,
             },
             None => {
                 if channel.is_some() {
@@ -6403,6 +6559,15 @@ where
     }
 
     fn handle(&self, event: &Event, cache: &DefaultInMemoryCache) {
+        self.handle_received(event, cache, tokio::time::Instant::now());
+    }
+
+    fn handle_received(
+        &self,
+        event: &Event,
+        cache: &DefaultInMemoryCache,
+        received: tokio::time::Instant,
+    ) {
         if !self.enabled {
             return;
         }
@@ -6459,12 +6624,13 @@ where
                             .member(guild_key, user_key)
                             .map(|member| member.roles().iter().map(|id| id.get()).collect())
                     });
-                self.voice_frame(
+                self.voice_frame_received(
                     guild_id,
                     member_id,
                     update.channel_id.map(|id| id.get()),
                     bot,
                     display_name(cache, guild_id, member_id),
+                    received,
                 );
                 if let Some(actor) = self.live_actor(guild_id) {
                     actor.live.set_member_roles(member_id, roles);
@@ -6638,8 +6804,9 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             display,
             seed,
             created_at,
+            received,
         } => {
-            worker.accept_join(ticket, &display, seed, created_at);
+            worker.accept_join_received(ticket, &display, seed, created_at, received);
             worker.reconcile();
         }
         ActorCommand::CreatorAdded(creator) => {
@@ -10414,7 +10581,16 @@ where
     }
 
     fn handle(&self, event: &Event, cache: &DefaultInMemoryCache) {
-        self.runtime.handle(event, cache);
+        self.handle_received(event, cache, tokio::time::Instant::now());
+    }
+
+    fn handle_received(
+        &self,
+        event: &Event,
+        cache: &DefaultInMemoryCache,
+        received: tokio::time::Instant,
+    ) {
+        self.runtime.handle_received(event, cache, received);
         if !self.runtime.enabled {
             return;
         }
