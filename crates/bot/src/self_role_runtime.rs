@@ -14,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+use tracing::warn;
 use two_bot_core::self_roles::{
     event_order_from_snowflake, plan_select_delta, plan_self_role_change, PanelMode, PlanRejection,
     RoleOperation, SelfRolePanel, SelfRolePlan, SettledOutcome,
@@ -137,6 +138,17 @@ async fn store_io<T>(
             StoreError::PendingExchange => RuntimeError::PendingExchange,
             _ => RuntimeError::Store,
         })
+}
+
+async fn release_lane_or_warn(store: &SelfRoleStore, lane: &PanelClaim, event_id: &str) {
+    match store_io(store.release_panel_claim(lane)).await {
+        Ok(true) => {}
+        Ok(false) => warn!(
+            event_id = %event_id,
+            "self-role panel claim release matched no live lane"
+        ),
+        Err(error) => warn!(?error, event_id = %event_id, "self-role panel claim release failed"),
+    }
 }
 
 /// Renewal is concurrent with REST/pacing/pool waits. Failure latches a shared
@@ -673,7 +685,7 @@ impl SelfRoleRuntime {
         // The write above is authoritative. Release failure must not falsely
         // turn an already committed success into a rejected audit/user reply.
         if let Some(lane) = &prepared.panel {
-            let _ = store_io(self.store.release_panel_claim(lane)).await;
+            release_lane_or_warn(&self.store, lane, &prepared.audit.event_id).await;
         }
         prepared._event_keeper.0.abort();
         prepared._panel_keeper.take();
@@ -712,7 +724,7 @@ impl SelfRoleRuntime {
         .await?;
         // Keep the last actual committed target, not the simulated intention.
         if let Some(lane) = &prepared.panel {
-            let _ = store_io(self.store.release_panel_claim(lane)).await;
+            release_lane_or_warn(&self.store, lane, &prepared.audit.event_id).await;
         }
         prepared._event_keeper.0.abort();
         prepared._panel_keeper.take();
@@ -725,7 +737,7 @@ impl SelfRoleRuntime {
         prepared._event_keeper.0.abort();
         prepared._panel_keeper.take();
         if let Some(lane) = &prepared.panel {
-            let _ = store_io(self.store.release_panel_claim(lane)).await;
+            release_lane_or_warn(&self.store, lane, &prepared.audit.event_id).await;
         }
     }
 
@@ -873,7 +885,7 @@ impl SelfRoleRuntime {
             _keeper: keeper,
         };
         let result = self.repair_terminal_owned(&mut owner, panel, &lane).await;
-        let _ = store_io(self.store.release_panel_claim(&lane.claim)).await;
+        release_lane_or_warn(&self.store, &lane.claim, &candidate.event_id).await;
         result
     }
 
@@ -1268,7 +1280,7 @@ impl SelfRoleRuntime {
             Ok(Err(code)) => return self.reject(audit, &event, lane.as_ref(), code).await,
             Err(err) => {
                 if let Some(lane) = &lane {
-                    let _ = store_io(self.store.release_panel_claim(lane)).await;
+                    release_lane_or_warn(&self.store, lane, &request.event_id).await;
                 }
                 return Err(err);
             }

@@ -6,6 +6,7 @@ use serde_json::json;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 use std::sync::atomic::AtomicI64;
+use tracing::instrument::WithSubscriber;
 use two_bot_core::self_roles::{event_order_for_event_id, SelfRoleOption};
 
 const GUILD: &str = "100000000000000001";
@@ -324,6 +325,7 @@ async fn exercise(pool: &PgPool) -> TestResult {
     empty_select_recovery(pool).await?;
     reaction_partial_and_duplicate(pool).await?;
     exclusive_lane_before_reads(pool).await?;
+    lost_panel_lane_release_is_logged(pool).await?;
     Ok(())
 }
 
@@ -3904,6 +3906,43 @@ async fn exclusive_lane_before_reads(pool: &PgPool) -> TestResult {
     assert_eq!(second.event.desired_role_ids, [NEW_ROLE]);
     assert_eq!(mock.requests().len(), 8);
     drop(second);
+    mock.shutdown().await;
+    Ok(())
+}
+
+async fn lost_panel_lane_release_is_logged(pool: &PgPool) -> TestResult {
+    let clock = Arc::new(AtomicI64::new(NOW));
+    let mock = MockRest::start(snapshot(&[OTHER]), ScriptedResponse::status(500)).await;
+    let feature = runtime(pool, &clock, &mock);
+    let mut panel = panel(PanelMode::Button);
+    panel.id = "lost-lane-release".into();
+    let request = request(
+        "lost-lane-release-event",
+        Selection::Button {
+            option_key: "old".into(),
+        },
+    );
+    let mut prepared = ready(feature.prepare(&request, &panel).await.unwrap());
+    let lane = prepared.panel.clone().unwrap();
+    clock.store(NOW + 1_000, Ordering::SeqCst);
+    let key = PanelKey {
+        guild_id: GUILD.into(),
+        member_id: USER.into(),
+        panel_id: panel.id.clone(),
+    };
+    assert!(matches!(
+        feature.store.claim_panel(&key, None).await?,
+        PanelClaimResult::Acquired(_)
+    ));
+    assert!(!feature.store.owns_panel_claim(&lane).await?);
+    let capture = crate::tracing_capture::Capture::default();
+    feature
+        .park(&mut prepared)
+        .with_subscriber(capture.clone())
+        .await;
+    let logs = capture.text();
+    assert!(logs.contains("self-role panel claim release"), "{logs}");
+    assert!(logs.contains("lost-lane-release-event"), "{logs}");
     mock.shutdown().await;
     Ok(())
 }
