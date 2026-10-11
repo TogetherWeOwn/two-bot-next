@@ -74,19 +74,27 @@ sum(increase(two_bot_gateway_disconnects_total[1h]))
 sum(increase(two_bot_gateway_missed_events_total[1h]))
 ```
 
-Unpaired-disconnect arithmetic (hand-diff of the two scrapes; every transport
+Unpaired-disconnect presence check (hand-diff of the two scrapes; every transport
 loss must pair with a later RESUME or fresh READY in the same window):
 
 ```promql
-sum(increase(two_bot_gateway_disconnects_total[1h]))
-  - (sum(increase(two_bot_gateway_resumes_total[1h]))
-    + sum(increase(two_bot_gateway_events_total{event="READY"}[1h])))
+sum(increase(two_bot_gateway_disconnects_total[1h])) > 0
+  and sum(increase(two_bot_gateway_resumes_total[1h]))
+    + sum(increase(two_bot_gateway_events_total{event="READY"}[1h])) == 0
 ```
 
-A positive result means disconnects with no later RESUME or fresh READY.
-`two_bot_gateway_disconnects_total` counts every transport loss funnelled
-through the shard supervisor (reconnect failures, close frames, invalid
-sessions, cold-resume IDENTIFY). `two_bot_gateway_missed_events_total` counts
+A firing result means disconnects with no later RESUME or fresh READY in the
+window (same shape as [watch signals §8](watch-signal-queries.md#8-gateway-disconnects-and-missed-events)).
+Do not subtract RESUME + READY from disconnects to certify pairing:
+`two_bot_gateway_disconnects_total` counts each failed reconnect attempt
+through the shard supervisor (`transport_disconnected` in
+`crates/bot/src/gateway.rs` runs on every `Err(Reconnect)`, plus close frames,
+invalid sessions, and cold-resume IDENTIFY), so one recovered outage with N
+failed retries ends in a RESUME yet still leaves a positive subtraction
+remainder — while a process start or cold resume contributes a READY or RESUME
+with no disconnect, which can hide a real unpaired loss inside the same
+window. Match each loss to its recovery by timestamps in the container logs,
+not by counts. `two_bot_gateway_missed_events_total` counts
 dispatches Discord assigned but this process never received (sequence gaps
 inside one session); any increase over the window fails the zero-missed-events
 acceptance and the checked-in `gateway_missed_events` rule fires on it. Until
@@ -98,8 +106,10 @@ dashboard; Worker tail is not Rust stdout): count `gateway shard loop started`
 against `gateway ready; checkpoint committed`. A rising `READY` count
 means fresh IDENTIFYs (checkpoint older than 15 minutes or rejected sessions);
 a rising `RESUMED` count means the session continued. (`gateway reconnect
-failed; Twilight will retry` is the stdout counterpart of a transport loss;
-each one also increments `two_bot_gateway_disconnects_total`.)
+failed; Twilight will retry` marks one failed reconnect attempt, not one
+transport loss: close frames and invalid sessions increment
+`two_bot_gateway_disconnects_total` without logging that line, and one outage
+can log it many times before a RESUME.)
 
 | Level | Condition | Action |
 |---|---|---|
