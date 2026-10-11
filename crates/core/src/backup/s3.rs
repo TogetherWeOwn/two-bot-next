@@ -167,11 +167,23 @@ fn parse_endpoint(endpoint: &str) -> Result<ParsedEndpoint, S3ConfigError> {
         .trim_end_matches(']')
         .trim_end_matches('.')
         .to_ascii_lowercase();
-    let path = url.path();
-    let prefix = if path == "/" {
+    // The prefix is the raw endpoint text after the authority, not
+    // `url.path()`: the parsed path is already percent-encoded and
+    // dot-normalised, so encoding it again signs `%2520` for a typed space
+    // and resolves `/a/../b` to `/b` — a write to a different place than
+    // restore expects. Raw text is encoded exactly once by `canonical_path`
+    // at the signing seam. Query/fragment cannot be present here: both are
+    // refused above.
+    let raw_path = endpoint
+        .strip_prefix("https://")
+        .or_else(|| endpoint.strip_prefix("http://"))
+        .unwrap_or(endpoint)
+        .split_at(authority_of(endpoint).len())
+        .1;
+    let prefix = if raw_path.is_empty() || raw_path == "/" {
         String::new()
     } else {
-        path.trim_end_matches('/').to_owned()
+        raw_path.trim_end_matches('/').to_owned()
     };
     Ok(ParsedEndpoint {
         scheme: url.scheme().to_owned(),
@@ -801,6 +813,54 @@ mod tests {
             .find(|(n, _)| n == "host")
             .map(|(_, v)| v.as_str());
         assert_eq!(host, Some("proxy.example.com"));
+    }
+
+    #[test]
+    fn sign_put_encodes_an_endpoint_prefix_once() {
+        // Regression: `parse_endpoint` kept `url.path()` (already
+        // percent-encoded) and `sign_put` encoded it again, so a space in
+        // the prefix signed `/my%2520prefix/...` while restore expected
+        // `/my%20prefix/...` — a write to the wrong place.
+        for (endpoint, encoded_prefix) in [
+            ("https://proxy.example.com/my prefix", "/my%20prefix"),
+            ("https://proxy.example.com/café", "/caf%C3%A9"),
+        ] {
+            let mut prefixed = target();
+            prefixed.endpoint = Secret::new(endpoint.to_owned());
+            let req = sign_put(
+                &prefixed,
+                "two-bot/f.gz",
+                b"data",
+                "20260903T041700Z",
+                "20260903",
+            );
+            assert_eq!(
+                req.url.expose(),
+                &format!(
+                    "https://proxy.example.com{encoded_prefix}/paperclip-backups/two-bot/f.gz"
+                ),
+                "endpoint {endpoint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sign_put_keeps_endpoint_dot_segments_literal() {
+        // Dot segments must not be silently resolved: `/a/../b` signs and
+        // sends literally, the same string restore and operators see.
+        let mut prefixed = target();
+        prefixed.endpoint = Secret::new("https://proxy.example.com/a/../b".to_owned());
+        let req = sign_put(
+            &prefixed,
+            "two-bot/f.gz",
+            b"data",
+            "20260903T041700Z",
+            "20260903",
+        );
+        assert_eq!(
+            req.url.expose(),
+            "https://proxy.example.com/a/../b/paperclip-backups/two-bot/f.gz"
+        );
     }
 
     #[test]
