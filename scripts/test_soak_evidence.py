@@ -150,6 +150,28 @@ class SoakEvidenceTests(unittest.TestCase):
         self.assertNotIn(nested, dumped)
         self.assertNotIn("Traceback", dumped)
 
+    def test_decoder_recursion_overflow_becomes_unknown_then_continues(self):
+        # Deep enough to overflow the C JSON decoder itself (default
+        # recursion limit 1000), so json.loads raises RecursionError before
+        # _too_deeply_nested is reached. This pins the except RecursionError
+        # branch in summarize(): without it the whole run aborts.
+        bad = "[" * 100000 + "\n"
+        good = (
+            '{"ts": "2026-09-20T00:00:02Z", "event": "connect", '
+            '"session": "a"}\n'
+        )
+        # Must not raise; the bad line is UNKNOWN and the good line counts.
+        summary = run(bad + good)
+        self.assertEqual(len(summary["unknown_intervals"]), 1)
+        reason = summary["unknown_intervals"][0]["reason"]
+        self.assertEqual(reason, "malformed line 1: too deeply nested")
+        self.assertEqual(summary["connects"], 1)
+        self.assertEqual(summary["verdict"], "NEEDS WORK")
+        self.assertEqual(summary["window"]["start"],
+                         "2026-09-20T00:00:02+00:00")
+        self.assertEqual(summary["window"]["end"],
+                         "2026-09-20T00:00:02+00:00")
+
 
 if __name__ == "__main__":
     unittest.main()

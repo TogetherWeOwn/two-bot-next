@@ -111,6 +111,11 @@ def summarize(lines):
         try:
             record = json.loads(line, object_pairs_hook=_unique_object)
         except RecursionError:
+            # Decoder-level backstop: a line deeper than the C decoder's
+            # own stack raises here before _too_deeply_nested ever sees
+            # it. Pinned by
+            # test_decoder_recursion_overflow_becomes_unknown_then_continues;
+            # do not drop this branch as redundant.
             note_unknown(None, None,
                          f"malformed line {lineno}: too deeply nested")
             continue
@@ -133,77 +138,72 @@ def summarize(lines):
             continue
         try:
             ts = parse_ts(record.get("ts"))
-        except RecursionError:
-            note_unknown(None, None,
-                         f"malformed line {lineno}: too deeply nested")
-            continue
         except ValueError:
             note_unknown(None, None, f"malformed line {lineno}: bad ts")
             continue
         first_ts = ts if first_ts is None else min(first_ts, ts)
         last_ts = ts if last_ts is None else max(last_ts, ts)
-        try:
-            event = record.get("event")
-            session = record.get("session")
+        # No RecursionError guard here or around parse_ts above: the record
+        # already passed the iterative _too_deeply_nested check, so this
+        # block performs no recursive traversal and cannot raise it. The
+        # only decoder-level backstop is the json.loads handler above.
+        event = record.get("event")
+        session = record.get("session")
 
-            if event == "connect":
-                connects += 1
-                last_seq.pop(session, None)
-                if down_since is not None:
-                    gaps.append((ts - down_since).total_seconds())
-                    down_since = None
-            elif event == "disconnect":
-                disconnects += 1
-                if down_since is None:
-                    down_since = ts
-            elif event == "resume":
-                resumes += 1
-                if down_since is not None:
-                    gaps.append((ts - down_since).total_seconds())
-                    down_since = None
-                if isinstance(record.get("seq"), int):
-                    prev = last_seq.get(session)
-                    if prev is None or record["seq"] > prev:
-                        last_seq[session] = record["seq"]
-            elif event == "dispatch":
-                seq = record.get("seq")
-                if not isinstance(seq, int):
-                    note_unknown(ts, ts, "dispatch without integer seq")
-                    continue
-                dispatches += 1
+        if event == "connect":
+            connects += 1
+            last_seq.pop(session, None)
+            if down_since is not None:
+                gaps.append((ts - down_since).total_seconds())
+                down_since = None
+        elif event == "disconnect":
+            disconnects += 1
+            if down_since is None:
+                down_since = ts
+        elif event == "resume":
+            resumes += 1
+            if down_since is not None:
+                gaps.append((ts - down_since).total_seconds())
+                down_since = None
+            if isinstance(record.get("seq"), int):
                 prev = last_seq.get(session)
-                if prev is None:
-                    last_seq[session] = seq
-                elif seq <= prev:
-                    pass  # duplicate/redelivered dispatch, not a miss
-                else:
-                    if seq > prev + 1:
-                        missed.append({
-                            "session": session,
-                            "expected_after": prev,
-                            "received": seq,
-                            "count": seq - prev - 1,
-                            "at": ts.isoformat(),
-                        })
-                    last_seq[session] = seq
-            elif event == "unknown":
-                start = end = None
-                try:
-                    if record.get("start"):
-                        start = parse_ts(record["start"])
-                    if record.get("end"):
-                        end = parse_ts(record["end"])
-                except ValueError:
-                    note_unknown(ts, ts, "unknown interval with bad start/end")
-                    continue
-                note_unknown(start or ts, end,
-                             str(record.get("reason", "unspecified")))
+                if prev is None or record["seq"] > prev:
+                    last_seq[session] = record["seq"]
+        elif event == "dispatch":
+            seq = record.get("seq")
+            if not isinstance(seq, int):
+                note_unknown(ts, ts, "dispatch without integer seq")
+                continue
+            dispatches += 1
+            prev = last_seq.get(session)
+            if prev is None:
+                last_seq[session] = seq
+            elif seq <= prev:
+                pass  # duplicate/redelivered dispatch, not a miss
             else:
-                note_unknown(ts, ts, f"unrecognised event {event!r}")
-        except RecursionError:
-            note_unknown(ts, ts,
-                         f"malformed line {lineno}: too deeply nested")
-            continue
+                if seq > prev + 1:
+                    missed.append({
+                        "session": session,
+                        "expected_after": prev,
+                        "received": seq,
+                        "count": seq - prev - 1,
+                        "at": ts.isoformat(),
+                    })
+                last_seq[session] = seq
+        elif event == "unknown":
+            start = end = None
+            try:
+                if record.get("start"):
+                    start = parse_ts(record["start"])
+                if record.get("end"):
+                    end = parse_ts(record["end"])
+            except ValueError:
+                note_unknown(ts, ts, "unknown interval with bad start/end")
+                continue
+            note_unknown(start or ts, end,
+                         str(record.get("reason", "unspecified")))
+        else:
+            note_unknown(ts, ts, f"unrecognised event {event!r}")
 
     if down_since is not None:
         # Log ends while disconnected: the outage length is unbounded, so it
