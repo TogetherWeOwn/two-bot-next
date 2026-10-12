@@ -32,6 +32,7 @@ committed diff carries none of the contiguous literals it scans for.
 import argparse
 import fnmatch
 import re
+import shlex
 import subprocess
 import sys
 from datetime import date
@@ -216,13 +217,53 @@ def _scope_cells(line):
     return cells[2], cells[3]
 
 
-def _cell_gutted(base_cell, head_cell):
-    """Whether a cell rewrite keeps none of the base cell's words.
+def _checked_by_narrowed(base_cell, head_cell):
+    """Whether a Checked-by edit removes a command or one of its flags."""
+    commands = re.findall(r"`([^`]+)`", base_cell)
+    head_commands = re.findall(r"`([^`]+)`", head_cell)
+    for command in commands:
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            return True
+        if not tokens:
+            continue
+        script = next((token for token in tokens[1:] if "/" in token), None)
+        anchor = script or tokens[0]
+        if not any(anchor in candidate for candidate in head_commands):
+            return True
+        for index, token in enumerate(tokens):
+            if not token.startswith("-"):
+                continue
+            required = token
+            if index + 1 < len(tokens) and not tokens[index + 1].startswith("-"):
+                required += " " + tokens[index + 1]
+            if not any(required in candidate for candidate in head_commands):
+                return True
+    return False
 
-    Rewording a command or lane keeps its substance, so it passes; replacing
-    the cell wholesale drops the check or schedule it named, so it fails as
-    a narrowed scope.
-    """
+
+def _schedule_rank(cell):
+    """Rank the repository's supported CI schedules by breadth."""
+    text = " ".join(_words(cell))
+    if "every" in text and "rust" in text and "pr" in text:
+        return 3
+    if "every" in text and "pr" in text:
+        return 4
+    if "nightly" in text:
+        return 2
+    if "manual" in text:
+        return 1
+    return None
+
+
+def _runs_at_narrowed(base_cell, head_cell):
+    base_rank = _schedule_rank(base_cell)
+    head_rank = _schedule_rank(head_cell)
+    if base_rank is not None:
+        return head_rank is None or head_rank < base_rank
+    if head_rank is not None:
+        return False
     base_words = _words(base_cell)
     return bool(base_words) and not (base_words & _words(head_cell))
 
@@ -280,13 +321,13 @@ def threshold_violations(base_text, head_text):
                 else:
                     old_checked, old_runs = _scope_cells(old)
                     head_checked, head_runs = _scope_cells(head_line)
-                    if _cell_gutted(old_runs, head_runs):
+                    if _runs_at_narrowed(old_runs, head_runs):
                         errors.append(
                             "threshold-lowered: CONSTRAINTS.md Enforced row "
                             "Runs-at scope narrowed: "
                             f"{old.strip()[:80]} -> {head_line.strip()[:80]}"
                         )
-                    elif _cell_gutted(old_checked, head_checked):
+                    elif _checked_by_narrowed(old_checked, head_checked):
                         errors.append(
                             "threshold-lowered: CONSTRAINTS.md Enforced row "
                             "Checked-by scope narrowed: "

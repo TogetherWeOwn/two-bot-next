@@ -42,6 +42,8 @@ SUPPORT_PATH = "crates/core/tests/support/tracing_capture.rs"
 
 PATCH_ROW = "| Patch coverage | Changed lines >= 80% covered | llvm-cov | every Rust PR |\n"
 LINT_ROW = "| Lint | Zero clippy warnings | `cargo clippy --workspace --all-targets -- -D warnings` | every Rust PR |\n"
+REAL_LINT_ROW = "| Lint | Zero clippy warnings | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, `check` lane | every Rust PR |\n"
+REAL_DEPENDENCIES_ROW = "| Dependencies | Nothing at high or above; advisories fail | `cargo-deny check all`, `check` lane | every PR |\n"
 FLOOR_RULE_ROW = "| Floor | No waivers, skips, deleted tests, stripped assertions, lowered thresholds | `python3 scripts/ci/check-floor-guard.py` | every PR |\n"
 ENFORCED_BASE = (
     "# Constraints\n\n## Enforced with numbers\n\n"
@@ -520,6 +522,54 @@ class ThresholdTests(unittest.TestCase):
         )
         errors = gate.threshold_violations(ENFORCED_BASE, head)
         self.assertTrue(any("threshold-lowered" in e for e in errors), errors)
+
+    def test_checked_by_real_row_rejects_true_even_with_check_lane(self):
+        base_row = REAL_LINT_ROW.replace("every Rust PR", "every PR")
+        base = ENFORCED_BASE.replace(LINT_ROW, base_row)
+        head = base.replace(
+            base_row,
+            base_row.replace(
+                "`cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`",
+                "`true`",
+            ),
+        )
+        errors = gate.threshold_violations(base, head)
+        self.assertTrue(any("Checked-by scope narrowed" in e for e in errors), errors)
+
+    def test_checked_by_real_row_rejects_dropped_clippy_severity_flag(self):
+        base = ENFORCED_BASE.replace(LINT_ROW, REAL_LINT_ROW)
+        head = base.replace(
+            "-- -D warnings`, `check` lane",
+            "`, `check` lane",
+        )
+        errors = gate.threshold_violations(base, head)
+        self.assertTrue(any("Checked-by scope narrowed" in e for e in errors), errors)
+
+    def test_checked_by_real_row_allows_added_flags(self):
+        base = ENFORCED_BASE.replace(LINT_ROW, REAL_LINT_ROW)
+        head = base.replace(
+            "-- -D warnings`, `check` lane",
+            "-- -D warnings --message-format short`, `check` lane",
+        )
+        self.assertEqual(gate.threshold_violations(base, head), [])
+
+    def test_runs_at_real_every_pr_row_cannot_narrow_to_rust_prs(self):
+        base = ENFORCED_BASE + REAL_DEPENDENCIES_ROW
+        head = base.replace(
+            REAL_DEPENDENCIES_ROW,
+            REAL_DEPENDENCIES_ROW.replace("every PR", "every Rust PR"),
+        )
+        errors = gate.threshold_violations(base, head)
+        self.assertTrue(any("Runs-at scope narrowed" in e for e in errors), errors)
+
+    def test_runs_at_real_every_rust_pr_row_cannot_narrow_to_nightly(self):
+        base = ENFORCED_BASE.replace(LINT_ROW, REAL_LINT_ROW)
+        head = base.replace(
+            REAL_LINT_ROW,
+            REAL_LINT_ROW.replace("every Rust PR", "nightly"),
+        )
+        errors = gate.threshold_violations(base, head)
+        self.assertTrue(any("Runs-at scope narrowed" in e for e in errors), errors)
 
     def test_measured_promotion_with_flagged_checked_by_passes(self):
         measured = "| Project-wide line coverage | >= 70% on main | must not fall |\n"

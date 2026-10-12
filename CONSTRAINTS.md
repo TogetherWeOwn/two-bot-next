@@ -25,7 +25,10 @@ Checked by `scripts/ci/check-floor-guard.py` (HARD) on every PR, in milliseconds
   edit elsewhere on the row never reads as a lowered threshold. Graduating a
   WARN-first gate to HARD (dropping the marker) and rewording its Checked-by
   cell pass; adding the marker back fails as a demotion, and replacing the
-  Checked-by or Runs-at cell wholesale fails as a narrowed scope.
+  Checked-by or Runs-at cell wholesale fails as a narrowed scope. The guard
+  also requires the Checked-by commands and flags to remain, and rejects a
+  Runs-at change from every PR to every Rust PR, nightly, or manual, or from
+  every Rust PR to nightly or manual.
 - No secrets in source (enforced by the `secret-scan` required check and
   gitleaks in the supply-chain lane, not the floor guard, so a leaked value
   never lands in a diff report).
