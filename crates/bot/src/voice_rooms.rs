@@ -5133,6 +5133,20 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         if error == StoreError::CredentialRefused {
                             self.halted = true;
                             self.queue.mark_succeeded(&action);
+                        } else if error == StoreError::Conflict {
+                            // Preparation reports a conflict only when the
+                            // room row is gone (a concurrent write surfaces
+                            // later as a superseded completion instead).
+                            // Retrying a deleted row every minute converges
+                            // on nothing, so drop the repair like a room the
+                            // worker no longer tracks.
+                            self.ownership_queued.remove(&channel_id);
+                            self.ownership_repairs.remove(&channel_id);
+                            self.grants_owed
+                                .lock()
+                                .expect("grant-owed marker")
+                                .remove(&channel_id);
+                            self.queue.mark_succeeded(&action);
                         } else {
                             self.owner_action_failed(
                                 action,

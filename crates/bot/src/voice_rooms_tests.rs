@@ -2674,6 +2674,37 @@ async fn owner_grants_are_never_issued_after_failed_journal_preparation() {
 }
 
 #[tokio::test]
+async fn owner_repair_is_dropped_when_the_room_row_is_deleted_out_of_band() {
+    let (live, store, http, trace) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // The worker still tracks the room, but its database row was deleted
+    // out-of-band, so journal preparation reports a conflict.
+    worker.store.rooms.lock().unwrap().remove(&500);
+    worker.apply_ownership(MEMBER, false, OwnershipCommand::Transfer { target_id: 301 });
+    dispatch(&mut worker, 0).await;
+    assert!(
+        trace.lock().unwrap().is_empty(),
+        "no Discord grant or ownership commit without a journal row"
+    );
+    assert!(
+        !worker.ownership_queued.contains(&500),
+        "the repair is dropped, not re-queued"
+    );
+    assert!(
+        !worker.ownership_repairs.contains_key(&500),
+        "the repair is dropped, not re-armed after the cooldown"
+    );
+    assert!(
+        !worker.grants_owed.lock().unwrap().contains(&500),
+        "no owed grant outlives its repair"
+    );
+    // Past the repair cooldown the dropped repair must not come back.
+    worker.enqueue_owner_repairs(OWNER_REPAIR_COOLDOWN_MS + 1);
+    assert!(!worker.ownership_queued.contains(&500));
+    assert!(!worker.ownership_repairs.contains_key(&500));
+}
+
+#[tokio::test]
 async fn failed_owner_commit_reload_and_later_transfer_revoke_every_issued_recipient() {
     let (live, store, http, trace) = owned_room();
     let mut original = channel(500, 2, Some(CATEGORY));
