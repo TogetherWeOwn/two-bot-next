@@ -249,31 +249,6 @@ impl PgRoomStore {
         tx.commit().await
     }
 
-    /// Persist a V2 ownership handoff on an already-tracked room. Only the
-    /// owner fields move: seed, creator channel and timestamp stay insert-once
-    /// like [`PgRoomStore::add_room`]. Returns false when no row exists.
-    pub async fn update_ownership(
-        &self,
-        guild_id: Snowflake,
-        channel_id: Snowflake,
-        owner_id: Snowflake,
-        original_creator_id: Snowflake,
-    ) -> Result<bool, sqlx::Error> {
-        Ok(sqlx::query(
-            "UPDATE voice_rooms
-             SET owner_id = $3, original_creator_id = $4, owner_touched_at = now()
-             WHERE guild_id = $1 AND channel_id = $2",
-        )
-        .bind(guild_id.to_string())
-        .bind(channel_id.to_string())
-        .bind(owner_id.to_string())
-        .bind(original_creator_id.to_string())
-        .execute(&self.pool)
-        .await?
-        .rows_affected()
-            != 0)
-    }
-
     /// Record every possible recipient before an owner overwrite is issued.
     /// The persisted owner is included even when volatile handoffs ran ahead.
     pub async fn prepare_owner_grants(
