@@ -17,6 +17,7 @@
 //! the shard is polled independently on the multi-thread Tokio runtime.
 
 pub mod backfill_cursors;
+pub mod backfill_history;
 pub mod journal;
 pub mod migrations;
 pub mod pool;
