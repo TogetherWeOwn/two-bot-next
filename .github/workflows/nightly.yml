@@ -297,6 +297,11 @@ jobs:
           --skip event_store_s7_scheduled_event_user_add_remove_persist_user_id_deltas_only
           --skip event_store_s7_duplicate_delivery_inserts_once
           --skip event_store_s7_privacy_tripwire_rejects_descriptions_and_locations
+          --skip event_store_s8_stage_lifecycle_persists_ids_and_privacy_enum_only
+          --skip event_store_s8_interaction_create_observes_ids_and_command_enums_only
+          --skip event_store_s8_audit_log_entry_persists_ids_and_action_enum_only
+          --skip event_store_s8_duplicate_delivery_inserts_once
+          --skip event_store_s8_privacy_tripwire_rejects_topic_token_and_change_details
       - name: Channel moderation ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:
