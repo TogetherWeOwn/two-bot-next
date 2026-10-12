@@ -392,6 +392,95 @@ async fn governed_observed_read_with_sleeping_admit_times_out_without_wire() {
     mock.shutdown().await;
 }
 
+/// Ten queued role reads must share each caller's deadline across pacing and
+/// the stalled wire phase; restarting the full timeout after pacing lets the
+/// final request escape the 5.5 s aggregate bound.
+#[tokio::test(start_paused = true)]
+async fn paced_member_role_reads_share_the_attempt_budget_with_guard_admission() {
+    let mock = MockRest::start(
+        vec![],
+        ScriptedResponse::json(200, serde_json::json!({"roles":[]}))
+            .delayed(Duration::from_secs(600)),
+    )
+    .await;
+    let exec = ActionExecutor::with_proxy("fixture-token".into(), Some(mock.origin())).unwrap();
+    let started = tokio::time::Instant::now();
+    let results =
+        futures_util::future::join_all((0..10).map(|_| exec.member_role_ids(2222, 3333))).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        results.iter().all(|result| matches!(
+            result,
+            Err(two_bot_discord::executor::DiscordError::Timeout)
+        )),
+        "stalled reads must classify as timeouts: {results:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(5_500),
+        "ten paced reads must share the 5 s request budget, took {elapsed:?}"
+    );
+    assert_eq!(mock.requests().len(), 10, "each read reaches the wire once");
+    mock.shutdown().await;
+}
+
+/// A never-resolving durable admit is part of the same timeout and retains the
+/// timeout classification without reaching the wire.
+#[tokio::test(start_paused = true)]
+async fn paced_member_role_read_classifies_a_stalled_admit_as_timeout() {
+    #[derive(Debug)]
+    struct PendingAdmission {
+        key: TokenKey,
+        admits: AtomicU32,
+    }
+
+    impl SendAdmission for PendingAdmission {
+        fn token_key(&self) -> &TokenKey {
+            &self.key
+        }
+
+        fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+            self.admits.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mock = MockRest::start(
+        vec![],
+        ScriptedResponse::json(200, serde_json::json!({"roles":[]})),
+    )
+    .await;
+    let admission = Arc::new(PendingAdmission {
+        key: TokenKey::for_bot_token("fixture-token").unwrap(),
+        admits: AtomicU32::new(0),
+    });
+    let exec = ActionExecutor::with_admission(
+        "fixture-token".to_owned(),
+        Some(mock.origin()),
+        Arc::clone(&admission) as Arc<dyn SendAdmission>,
+    )
+    .unwrap();
+    let started = tokio::time::Instant::now();
+    let result = exec.member_role_ids(2222, 3333).await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        result,
+        Err(two_bot_discord::executor::DiscordError::Timeout)
+    );
+    assert!(
+        elapsed < Duration::from_millis(5_500),
+        "pacing and stalled admission must share the 5 s request budget, took {elapsed:?}"
+    );
+    assert_eq!(admission.admits.load(Ordering::SeqCst), 1);
+    assert!(
+        mock.requests().is_empty(),
+        "a stalled admit must not reach the wire"
+    );
+    mock.shutdown().await;
+}
+
 /// A GET whose response stalls must release the lane where the permit is in
 /// scope: otherwise the retries are `Blocked` by the read's own orphaned
 /// permit until the 60 s lease. Five wire requests, zero `Blocked`, lane
