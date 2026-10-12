@@ -53,6 +53,11 @@ strictly later than now. `Uncertain` blocks indefinitely, including after
 cooldown; other states, including stranded `Containing`, release at expiry.
 No retry instruction is produced.
 
+The durable store records instants only through `9999-12-31T23:59:59.999Z`. A
+window that would end later caps the cooldown there: the incident still opens
+and alerts, the executor stays suppressed through that instant, and the store
+logs `containment_cooldown_capped`.
+
 `plan_quarantine` returns dry-run, whole-plan refusal, or ordered role IDs. It
 excludes safe roles, unheld roles and `@everyone`. If any held dangerous role is
 managed or at/above the bot's highest role, **none** are removable. A managed-role
