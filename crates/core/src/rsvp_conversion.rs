@@ -13,24 +13,31 @@
 //!   `announcement_post_only` (plain announcement post, no entity, no
 //!   reminders). Assignment ([`assign_variant`]) is a stable hash of the event
 //!   id, so an event always lands in the same arm without stored state.
-//! - the conversion report ([`ConversionReport`]): Interested RSVPs (from
-//!   `event_rsvps`, see [`crate::rsvp`]) joined against actual attendance
-//!   facts (host check-ins in `community_facts` or event-channel joins
-//!   observed on the gateway). [`compute_conversion`] intersects the two id sets and
-//!   reports the rate in basis points, or `None` when nobody RSVP'd
-//!   Interested (0/0 is undefined, never 0%).
+//! - the conversion report ([`ConversionReport`]): the RSVP cohort — Going
+//!   plus Interested RSVPs (from `event_rsvps` as [`RsvpTotals`], see
+//!   [`crate::rsvp`]; Declined never counts) — joined against actual
+//!   attendance facts (host check-ins in `community_facts` or event-channel
+//!   joins observed on the gateway). [`compute_conversion`] intersects the
+//!   two id sets and reports the rate in basis points, or `None` when the
+//!   cohort is empty (0/0 is undefined, never 0%). Both A/B arms measure the
+//!   same cohort so the published numbers stay comparable.
 //! - the publish line ([`render_report_text`]): one deterministic line per
 //!   event carrying the numbers event-reward design consumes (AC3).
 //! - the reminder schedule ([`ReminderKind`], [`reminders_due`]): the
-//!   day/hour/15-min reminder leads the vendor guide claims. A reminder is due
-//!   when the event starts strictly after now and within its lead time.
+//!   day/hour/15-min reminder leads the vendor guide claims. At most one
+//!   reminder is due per call: the tightest lead still covering the remaining
+//!   time, so a late-created event or a scheduler restart skips (never
+//!   backfills) the wider leads.
 //!
 //! Deliberately out of scope: reading `event_rsvps` / `community_facts`
 //! (the `rsvp_store` slice owns that), observing voice/channel joins on the
 //! gateway, sending reminders over Discord, and any persistence. Callers feed
-//! this module the two id sets and get back the numbers to publish.
+//! this module the RSVP cohort plus the attendance id set and get back the
+//! numbers to publish.
 
 use std::collections::HashSet;
+
+use super::rsvp::RsvpTotals;
 
 /// The two arms of the event-announcement A/B (AC2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -86,22 +93,22 @@ pub fn assign_variant(event_id: &str) -> AnnouncementVariant {
     }
 }
 
-/// Conversion numbers for one event (AC1 + AC3): how many of the Interested
-/// RSVPs actually showed up.
+/// Conversion numbers for one event (AC1 + AC3): how many of the RSVP cohort
+/// (Going plus Interested) actually showed up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversionReport {
     /// Discord scheduled-event id (snowflake).
     pub event_id: String,
     /// The A/B arm this event ran in.
     pub variant: AnnouncementVariant,
-    /// Distinct members holding an Interested RSVP.
-    pub interested: usize,
+    /// Distinct members holding a Going or Interested RSVP (the RSVP cohort).
+    pub cohort: usize,
     /// Distinct members with an attendance fact (check-in or channel join).
     pub attended: usize,
-    /// Interested members who attended (the intersection).
+    /// Cohort members who attended (the intersection).
     pub converted: usize,
-    /// Conversion rate in basis points (`converted * 10_000 / interested`);
-    /// `None` when nobody RSVP'd Interested — 0/0 is undefined, never 0%.
+    /// Conversion rate in basis points (`converted * 10_000 / cohort`);
+    /// `None` when the cohort is empty — 0/0 is undefined, never 0%.
     pub rate_bps: Option<u32>,
     /// Converted member ids, sorted ascending for deterministic output.
     pub converted_members: Vec<String>,
@@ -109,7 +116,7 @@ pub struct ConversionReport {
 
 impl ConversionReport {
     /// Conversion rate as a percentage string (`"42.50%"`), or `"n/a"` when
-    /// no Interested RSVPs exist.
+    /// the RSVP cohort is empty.
     #[must_use]
     pub fn rate_text(&self) -> String {
         self.rate_bps.map_or_else(
@@ -119,38 +126,47 @@ impl ConversionReport {
     }
 }
 
-/// Join Interested RSVPs against attendance facts (AC1).
+/// Join the RSVP cohort against attendance facts (AC1).
 ///
-/// Both id sets dedupe: a member counts once no matter how many times they
-/// RSVP'd or checked in. Attendance from members who never RSVP'd Interested
-/// still counts in `attended` (walk-ins are real attendance) but never in
-/// `converted` — the rate measures the Interested cohort only.
+/// The cohort is the union of the Going and Interested lists from
+/// [`RsvpTotals`] (Declined never counts): taking the typed totals forces the
+/// follow-up wiring to pass both lists, so a Going member who attends counts
+/// as converted instead of as a walk-in. Both id sets dedupe: a member counts
+/// once no matter how many times they RSVP'd or checked in (a member present
+/// in both Going and Interested still counts once). Attendance from members
+/// outside the cohort still counts in `attended` (walk-ins are real
+/// attendance) but never in `converted` — the rate measures the cohort only.
 #[must_use]
 pub fn compute_conversion(
     event_id: &str,
     variant: AnnouncementVariant,
-    interested: &[String],
+    totals: &RsvpTotals,
     attended: &[String],
 ) -> ConversionReport {
-    let interested_set: HashSet<&str> = interested.iter().map(String::as_str).collect();
+    let cohort_set: HashSet<&str> = totals
+        .going
+        .iter()
+        .chain(totals.interested.iter())
+        .map(String::as_str)
+        .collect();
     let attended_set: HashSet<&str> = attended.iter().map(String::as_str).collect();
-    let mut converted_members: Vec<String> = interested_set
+    let mut converted_members: Vec<String> = cohort_set
         .intersection(&attended_set)
         .map(|member| (*member).to_owned())
         .collect();
     converted_members.sort();
     let converted = converted_members.len();
-    let interested_count = interested_set.len();
-    let rate_bps = if interested_count == 0 {
+    let cohort_count = cohort_set.len();
+    let rate_bps = if cohort_count == 0 {
         None
     } else {
-        // `converted <= interested`, so `converted * 10_000` cannot overflow u64.
-        Some((converted as u64 * 10_000 / interested_count as u64) as u32)
+        // `converted <= cohort`, so `converted * 10_000` cannot overflow u64.
+        Some((converted as u64 * 10_000 / cohort_count as u64) as u32)
     };
     ConversionReport {
         event_id: event_id.to_owned(),
         variant,
-        interested: interested_count,
+        cohort: cohort_count,
         attended: attended_set.len(),
         converted,
         rate_bps,
@@ -161,17 +177,17 @@ pub fn compute_conversion(
 /// One deterministic publish line per event carrying the conversion numbers
 /// event-reward design consumes (AC3).
 ///
-/// Format: `Event <id> [<variant>]: <converted>/<interested> interested
-/// attended (<rate>); <attended> total attended`. Fixed so dashboards and
-/// follow-up cards can parse it back.
+/// Format: `Event <id> [<variant>]: <converted>/<cohort> rsvp attended
+/// (<rate>); <attended> total attended`. Fixed so dashboards and follow-up
+/// cards can parse it back.
 #[must_use]
 pub fn render_report_text(report: &ConversionReport) -> String {
     format!(
-        "Event {} [{}]: {}/{} interested attended ({}); {} total attended",
+        "Event {} [{}]: {}/{} rsvp attended ({}); {} total attended",
         report.event_id,
         report.variant.as_str(),
         report.converted,
-        report.interested,
+        report.cohort,
         report.rate_text(),
         report.attended,
     )
@@ -225,31 +241,46 @@ impl ReminderKind {
     }
 }
 
-/// Which reminders are due now (entity arm only; the post-only arm sends
-/// none). A reminder is due when the event starts strictly after `now_ms` and
-/// within its lead time (`start - now <= lead`). Boundary-inclusive on the
-/// lead, so an event starting in exactly 1 hour still gets its hour reminder;
-/// an event starting now or in the past gets nothing. Returned largest lead
-/// first. All inputs are Unix millis; `saturating_sub` keeps extreme clocks
-/// from wrapping.
+/// Which reminder is due now (entity arm only; the post-only arm sends none).
+/// Returns at most one reminder: the tightest lead still covering the
+/// remaining time (`start - now <= lead`, boundary-inclusive, so an event
+/// starting in exactly 1 hour yields the hour reminder). Wider leads are
+/// treated as skipped, never backfilled: an event first seen 30 minutes out
+/// yields only the hour reminder, never a stale "starts in 24 hours" burst
+/// after a late create or scheduler restart. Callers must remember which kind
+/// they already sent (the day window re-reports `Day` on every tick until the
+/// hour window opens). An event starting now or in the past yields nothing.
+/// All inputs are Unix millis; `saturating_sub` keeps extreme clocks from
+/// wrapping.
 #[must_use]
 pub fn reminders_due(event_start_ms: i64, now_ms: i64) -> Vec<ReminderKind> {
-    let lead = event_start_ms.saturating_sub(now_ms);
-    if lead <= 0 {
+    let remaining = event_start_ms.saturating_sub(now_ms);
+    if remaining <= 0 {
         return Vec::new();
     }
     ReminderKind::ALL
         .into_iter()
-        .filter(|kind| lead <= kind.lead_ms())
+        .filter(|kind| remaining <= kind.lead_ms())
+        .min_by_key(|kind| kind.lead_ms())
+        .into_iter()
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rsvp::RsvpTotals;
 
     fn ids(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    fn totals(going: &[&str], interested: &[&str]) -> RsvpTotals {
+        RsvpTotals {
+            going: ids(going),
+            interested: ids(interested),
+            declined: Vec::new(),
+        }
     }
 
     #[test]
@@ -291,19 +322,34 @@ mod tests {
     }
 
     #[test]
-    fn conversion_counts_interested_who_attended() {
+    fn conversion_counts_cohort_who_attended() {
         let report = compute_conversion(
             "1546451670500642999",
             AnnouncementVariant::EventEntityWithReminders,
-            &ids(&["u1", "u2", "u3", "u4"]),
-            &ids(&["u2", "u4", "walkin"]),
+            &totals(&["g1", "g2"], &["u1", "u2", "u3", "u4"]),
+            &ids(&["g1", "u2", "u4", "walkin"]),
         );
-        assert_eq!(report.interested, 4);
-        assert_eq!(report.attended, 3);
-        assert_eq!(report.converted, 2);
+        assert_eq!(report.cohort, 6);
+        assert_eq!(report.attended, 4);
+        assert_eq!(report.converted, 3);
         assert_eq!(report.rate_bps, Some(5_000));
-        assert_eq!(report.converted_members, ids(&["u2", "u4"]));
+        assert_eq!(report.converted_members, ids(&["g1", "u2", "u4"]));
         assert_eq!(report.rate_text(), "50.00%");
+    }
+
+    #[test]
+    fn conversion_counts_going_attendance_as_converted_not_walkin() {
+        let report = compute_conversion(
+            "1546451670500642999",
+            AnnouncementVariant::EventEntityWithReminders,
+            &totals(&["g1"], &["u1"]),
+            &ids(&["g1"]),
+        );
+        assert_eq!(report.cohort, 2);
+        assert_eq!(report.attended, 1);
+        assert_eq!(report.converted, 1);
+        assert_eq!(report.converted_members, ids(&["g1"]));
+        assert_eq!(report.rate_bps, Some(5_000));
     }
 
     #[test]
@@ -311,24 +357,24 @@ mod tests {
         let report = compute_conversion(
             "1546451670500642999",
             AnnouncementVariant::AnnouncementPostOnly,
-            &ids(&["u1", "u1", "u2"]),
+            &totals(&["u1", "u1"], &["u1", "u2"]),
             &ids(&["u1", "u1", "u1"]),
         );
-        assert_eq!(report.interested, 2);
+        assert_eq!(report.cohort, 2);
         assert_eq!(report.attended, 1);
         assert_eq!(report.converted, 1);
         assert_eq!(report.rate_bps, Some(5_000));
     }
 
     #[test]
-    fn conversion_with_no_interested_is_undefined_never_zero() {
+    fn conversion_with_empty_cohort_is_undefined_never_zero() {
         let report = compute_conversion(
             "1546451670500642999",
             AnnouncementVariant::EventEntityWithReminders,
-            &[],
+            &RsvpTotals::default(),
             &ids(&["walkin"]),
         );
-        assert_eq!(report.interested, 0);
+        assert_eq!(report.cohort, 0);
         assert_eq!(report.attended, 1);
         assert_eq!(report.converted, 0);
         assert_eq!(report.rate_bps, None);
@@ -341,7 +387,7 @@ mod tests {
         let report = compute_conversion(
             "1546451670500642999",
             AnnouncementVariant::EventEntityWithReminders,
-            &ids(&["u1", "u2"]),
+            &totals(&["g1"], &["u1"]),
             &[],
         );
         assert_eq!(report.converted, 0);
@@ -354,24 +400,24 @@ mod tests {
         let report = compute_conversion(
             "1546451670500642999",
             AnnouncementVariant::EventEntityWithReminders,
-            &ids(&["u1", "u2", "u3", "u4"]),
-            &ids(&["u2", "u4", "walkin"]),
+            &totals(&["g1", "g2"], &["u1", "u2", "u3", "u4"]),
+            &ids(&["g1", "u2", "u4", "walkin"]),
         );
         assert_eq!(
             render_report_text(&report),
             "Event 1546451670500642999 [event_entity_with_reminders]: \
-             2/4 interested attended (50.00%); 3 total attended"
+             3/6 rsvp attended (50.00%); 4 total attended"
         );
         let empty = compute_conversion(
             "1546451670500642999",
             AnnouncementVariant::AnnouncementPostOnly,
-            &[],
+            &RsvpTotals::default(),
             &[],
         );
         assert_eq!(
             render_report_text(&empty),
             "Event 1546451670500642999 [announcement_post_only]: \
-             0/0 interested attended (n/a); 0 total attended"
+             0/0 rsvp attended (n/a); 0 total attended"
         );
     }
 
@@ -390,26 +436,43 @@ mod tests {
     }
 
     #[test]
-    fn reminders_due_fires_each_lead_inside_its_window() {
+    fn reminders_due_fires_tightest_lead_only() {
         let start = 1_769_000_000_000;
         // A day out: only the day reminder is due.
         assert_eq!(
             reminders_due(start, start - 24 * 60 * 60 * 1000),
             vec![ReminderKind::Day]
         );
-        // An hour out: day and hour are due, quarter-hour is not.
+        // An hour out: the hour window is tighter than day, so only hour.
         assert_eq!(
             reminders_due(start, start - 60 * 60 * 1000),
-            vec![ReminderKind::Day, ReminderKind::Hour]
+            vec![ReminderKind::Hour]
         );
-        // Fifteen minutes out: all three are due, largest lead first.
+        // Fifteen minutes out: only the quarter-hour reminder is due.
         assert_eq!(
             reminders_due(start, start - 15 * 60 * 1000),
-            vec![
-                ReminderKind::Day,
-                ReminderKind::Hour,
-                ReminderKind::QuarterHour
-            ]
+            vec![ReminderKind::QuarterHour]
+        );
+    }
+
+    #[test]
+    fn reminders_due_skips_stale_leads_for_late_seen_events() {
+        let start = 1_769_000_000_000;
+        // Event first seen 30 minutes out: the day lead is skipped, never
+        // backfilled as a stale "starts in 24 hours" burst.
+        assert_eq!(
+            reminders_due(start, start - 30 * 60 * 1000),
+            vec![ReminderKind::Hour]
+        );
+        // Two hours out: still the day window, hour is not yet open.
+        assert_eq!(
+            reminders_due(start, start - 2 * 60 * 60 * 1000),
+            vec![ReminderKind::Day]
+        );
+        // Ten minutes out: the quarter-hour window already covers it.
+        assert_eq!(
+            reminders_due(start, start - 10 * 60 * 1000),
+            vec![ReminderKind::QuarterHour]
         );
     }
 
@@ -427,11 +490,7 @@ mod tests {
         assert!(reminders_due(i64::MIN, i64::MAX).is_empty());
         assert_eq!(
             reminders_due(i64::MAX, i64::MAX - 60 * 1000),
-            vec![
-                ReminderKind::Day,
-                ReminderKind::Hour,
-                ReminderKind::QuarterHour
-            ]
+            vec![ReminderKind::QuarterHour]
         );
     }
 }
