@@ -357,11 +357,10 @@ async fn read_discord<T: serde::de::DeserializeOwned>(
     let (response, _) = transport
         .send_request(&request, Some(deadline))
         .await
-        .map_err(|_| Check::fail(check, "Discord request timed out"))?
         .map_err(|_| {
             Check::fail(
                 check,
-                "Discord send unavailable or admission held (checks stopped)",
+                "Discord request timed out, send unavailable or admission held (checks stopped)",
             )
         })?;
     if !(200..=299).contains(&response.status) {
