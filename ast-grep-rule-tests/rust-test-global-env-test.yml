@@ -1,0 +1,6 @@
+id: rust-test-global-env
+valid:
+- '#[test] fn test_flag() { let config = Config { feature: true }; assert!(config.feature); }'
+invalid:
+- '#[test] fn test_flag() { std::env::set_var("FEATURE", "1"); }'
+- '#[test] fn test_flag() { env::remove_var("FEATURE"); }'

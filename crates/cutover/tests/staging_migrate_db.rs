@@ -15,6 +15,7 @@
 
 use std::{
     collections::HashSet,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -50,6 +51,24 @@ fn admin_options(host: &str, database: &str) -> PgConnectOptions {
         .ssl_mode(PgSslMode::Disable)
 }
 
+/// Process-wide fixture sequence. `SystemTime` nanos can repeat across threads
+/// (concurrent callers read the same tick), so parallel fixtures must not rely
+/// on the clock alone for unique database/role names: two fixtures sharing one
+/// name fail at `CREATE DATABASE` with Postgres 23505. Concurrency is kept;
+/// each fixture still gets its own database and roles.
+static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Unique tag shared by one fixture's database and roles (and its plan-manifest
+/// snapshot): pid plus clock nanos plus a process-wide sequence number.
+fn fixture_tag() -> String {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{}_{}_{}", std::process::id(), nonce, seq)
+}
+
 struct Fixture {
     admin: PgConnection,
     host: String,
@@ -72,13 +91,12 @@ impl Fixture {
             "agent-testdb"
         };
         let mut admin = PgConnection::connect_with(&admin_options(host, "agent_test")).await?;
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let pid = std::process::id();
-        let database = format!("two_bot_staging_fx_{pid}_{nonce}");
-        let outsider = format!("stg_fx_outsider_{pid}_{nonce}");
-        let mlogin = format!("stg_fx_mlogin_{pid}_{nonce}");
-        let rologin = format!("stg_fx_rologin_{pid}_{nonce}");
-        let bothlogin = format!("stg_fx_bothlogin_{pid}_{nonce}");
+        let tag = fixture_tag();
+        let database = format!("two_bot_staging_fx_{tag}");
+        let outsider = format!("stg_fx_outsider_{tag}");
+        let mlogin = format!("stg_fx_mlogin_{tag}");
+        let rologin = format!("stg_fx_rologin_{tag}");
+        let bothlogin = format!("stg_fx_bothlogin_{tag}");
         // Cluster-level groups shared with other suites: tolerate concurrent creates.
         sqlx::query(
             "DO $$ BEGIN CREATE ROLE two_bot_migrator NOLOGIN; \
@@ -326,14 +344,7 @@ fn manifest(stdout: &str) -> Value {
 /// `--plan-manifest-path` so apply proves the bound hash against the
 /// producing plan's manifest. Returns the path; the OS reclaims temp files.
 fn snapshot_plan_manifest(stdout: &str) -> String {
-    let path = std::env::temp_dir().join(format!(
-        "staging-migrate-db-plan-{}-{}.json",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let path = std::env::temp_dir().join(format!("staging-migrate-db-plan-{}.json", fixture_tag()));
     std::fs::write(&path, stdout).expect("plan snapshot must be writable");
     path.to_string_lossy().into_owned()
 }
@@ -345,6 +356,33 @@ fn pending_list(value: &Value) -> Vec<i64> {
         .iter()
         .map(|v| v.as_i64().expect("version"))
         .collect()
+}
+
+/// Guard: fixture tags stay unique when generated from many threads at once.
+/// Clock nanos alone can repeat within one tick, which used to collide parallel
+/// fixtures on the same database name (`CREATE DATABASE` then fails with
+/// Postgres 23505). Needs no database, so it runs outside `--ignored`.
+#[test]
+fn fixture_tag_is_unique_under_concurrency() {
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+    let workers: Vec<_> = (0..16)
+        .map(|_| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                (0..1000).map(|_| fixture_tag()).collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    let mut seen = HashSet::new();
+    let mut total = 0;
+    for worker in workers {
+        for tag in worker.join().expect("worker") {
+            total += 1;
+            assert!(seen.insert(tag), "duplicate fixture tag under concurrency");
+        }
+    }
+    assert_eq!(total, 16_000);
 }
 
 /// Seed the 29-version staging state through a filtered SQLx migrator, as the

@@ -1,0 +1,14 @@
+id: rust-test-global-env
+language: Rust
+severity: warning
+message: 'Process environment mutation in parallel tests needs one shared serialization boundary Example: two-bot-next#686.'
+rule:
+  any:
+  - pattern: std::env::set_var($$$ARGS)
+  - pattern: std::env::remove_var($$$ARGS)
+  - pattern: env::set_var($$$ARGS)
+  - pattern: env::remove_var($$$ARGS)
+files:
+- '**/tests/**/*.rs'
+- '**/*tests*.rs'
+- '**/*test*.rs'

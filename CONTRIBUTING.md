@@ -21,13 +21,17 @@ contributors. Every change lands through a PR; nobody pushes to `main`.
   What Changed and Notes for reviewers are optional. A PR created through the
   API gets no template, so paste it in. `docs`, `chore`, `build`, `ci`, `style`,
   `test` and `revert` PRs need no linked issue. The `pr-lint` check fails an
-  empty body; the other body rules warn until open PRs migrate.
+  empty body and, on a public repo, a tracker id, instance UI link or the
+  internal host in the title or body; the other body rules warn until open
+  PRs migrate.
 - **Search first.** Look for an open or recent PR that touches the same area,
   and link what you find.
 - **No internal references.** This repo is public: put no internal ticket id,
   instance link, localhost URL or private host in any title, body, commit,
   comment or branch name. Link public GitHub issues as `Closes #123` and say
-  the rest in plain words. `pr-lint` warns when it sees one.
+  the rest in plain words. `pr-lint` fails the title or body when it holds a
+  tracker id, an instance UI link or the internal host, and follows
+  `PR_STANDARDS_MODE` for the other references and branch names.
 - **Honest disclosure.** Report only test runs you saw, and say what you did not run.
 - **Review.** Address every review finding, or reply with why it does not apply.
   Re-request review after you push.
@@ -43,7 +47,9 @@ and force-pushes. `ci-ok`, `gitleaks` and `pr-lint` are required checks on `main
 `pr-lint` runs `.github/scripts/pr_standards.py` (tests beside it): it checks
 the title format, the 100-character limit, the trailing period and a non-empty
 body as errors, and the two required template sections (Linked Issues and
-Verification) and internal references in warn mode (`PR_STANDARDS_MODE: "warn"`). On a push to `main` it
+Verification), the advisory title/body remainder and branch names in warn mode
+(`PR_STANDARDS_MODE: "warn"`). The strict title/body subset (tracker id,
+instance UI link, internal host) always fails. On a push to `main` it
 also checks every commit subject. All required checks must be green on the
 exact head commit. Never bypass or weaken a check.
 
@@ -59,6 +65,12 @@ evaluation, or carry a reviewed `# ci-ok: exempt <reason>` marker with a pin
 in `scripts/ci/test_required_checks.py`. Only advisory `container smoke` is
 exempt: it can take up to 30 minutes, and image security stays gated through
 the SBOM job. The legacy `required-checks` aggregate is removed.
+
+Deterministic quality gates (patch coverage WARN, per-PR advisories HARD,
+ast-grep and Semgrep WARN, required voice synthetic, test-target inventory
+HARD) run as steps of the `check` lane on the existing routed runner; see
+[`docs/quality-gates.md`](docs/quality-gates.md). New checks start in WARN
+(report, never fail) and flip to HARD only with their backlog burned down.
 
 Every Rust setup step in `check.yml` installs the exact version from
 `rust-toolchain.toml`, including fmt/clippy components where required. Do not use

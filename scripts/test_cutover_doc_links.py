@@ -10,7 +10,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CUTOVER_DOCS = sorted((ROOT / "docs").glob("cutover*.md"))
+AUTOMOD_DOCS = [ROOT / "docs" / "automod-runtime.md"]
 LINK = re.compile(r"\]\(([^)\s]+)\)")
+CODE_SPAN = re.compile(r"`([^`]+)`")
+CODE_TARGET = re.compile(
+    r"(?P<path>[A-Za-z0-9_./-]+\.(?:rs|py|sql|ts|js|md|toml|yml|yaml))"
+    r":(?P<start>\d+)(?:-(?P<end>\d+))?"
+)
+BARE_LINE = re.compile(r"^:\d+(?:-\d+)?$")
 SCHEME = re.compile(r"[a-z][a-z0-9+.-]*:", re.IGNORECASE)
 LINE_TARGET = re.compile(r"L(\d+)(?:-L(\d+))?")
 HEADING = re.compile(r"#{1,6}\s+(.*?)\s*#*\s*$")
@@ -83,6 +90,40 @@ def _problems(doc, text):
     return found
 
 
+def _resolve_code_path(doc, path):
+    for base in (ROOT, doc.parent, doc.parent.parent):
+        candidate = (base / path).resolve()
+        if candidate.exists():
+            return candidate
+    return (doc.parent / path).resolve()
+
+
+def _code_problems(doc, text):
+    found = []
+    for number, line in _prose_lines(text):
+        for span in CODE_SPAN.findall(line):
+            if BARE_LINE.match(span.strip()):
+                found.append(f"{doc.name}:{number}: `{span}` -> bare line shorthand without file")
+                continue
+            for target in CODE_TARGET.findall(span):
+                path, start, end = target[0], int(target[1]), int(target[2] or target[1])
+                resolved = _resolve_code_path(doc, path)
+                where = f"{doc.name}:{number}: `{path}:{start}" + (
+                    f"-{end}`" if target[2] else "`"
+                )
+                if not resolved.exists() or resolved.is_dir():
+                    found.append(f"{where} -> missing file")
+                else:
+                    lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
+                    if start < 1 or end < start:
+                        found.append(f"{where} -> invalid line range")
+                    elif end > len(lines):
+                        found.append(f"{where} -> line beyond end of file ({len(lines)} lines)")
+                    elif not re.search(r"\w", lines[start - 1]):
+                        found.append(f"{where} -> points at a blank or punctuation-only line")
+    return found
+
+
 class CutoverDocLinks(unittest.TestCase):
     def test_cutover_runbook_is_found(self):
         self.assertIn(ROOT / "docs" / "cutover.md", CUTOVER_DOCS)
@@ -91,6 +132,15 @@ class CutoverDocLinks(unittest.TestCase):
         problems = []
         for doc in CUTOVER_DOCS:
             problems += _problems(doc, doc.read_text(encoding="utf-8"))
+        self.assertEqual(problems, [])
+
+    def test_automod_runtime_doc_is_found(self):
+        self.assertIn(ROOT / "docs" / "automod-runtime.md", AUTOMOD_DOCS)
+
+    def test_every_code_citation_in_automod_docs_resolves(self):
+        problems = []
+        for doc in AUTOMOD_DOCS:
+            problems += _code_problems(doc, doc.read_text(encoding="utf-8"))
         self.assertEqual(problems, [])
 
     def test_the_checker_reports_stale_targets_and_accepts_live_ones(self):
@@ -135,6 +185,39 @@ class CutoverDocLinks(unittest.TestCase):
             self.assertIn("invalid line range", " ".join(p for p in problems if "#L2-L1" in p))
             self.assertIn("invalid line range", " ".join(p for p in problems if "#L0" in p))
             self.assertEqual(_problems(doc, live), [])
+
+    def test_the_code_checker_reports_stale_citations_and_accepts_live_ones(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "docs").mkdir()
+            (root / "crates").mkdir()
+            (root / "crates" / "table.rs").write_text(
+                'pub const TABLES: &[&str] = &[\n    "a",\n];\n', encoding="utf-8"
+            )
+            doc = root / "docs" / "automod-fixture.md"
+            stale = (
+                "witness (`crates/table.rs:99`)\n"
+                "blank (`crates/table.rs:3`)\n"
+                "reversed (`crates/table.rs:2-1`)\n"
+                "zero (`crates/table.rs:0`)\n"
+                "range (`crates/table.rs:1-99`)\n"
+                "missing (`crates/absent.rs:1`)\n"
+                "bare (`table.rs:1`)\n"
+                "shorthand (`:2-1`)\n"
+                "```\n"
+                "`crates/table.rs:99`\n"
+                "```\n"
+                "live (`crates/table.rs:1`)\n"
+            )
+            live = "witness (`crates/table.rs:1`)\n"
+            problems = _code_problems(doc, stale)
+            self.assertEqual(len(problems), 8)
+            self.assertEqual(sum(1 for p in problems if "table.rs:99" in p), 1)
+            self.assertIn("invalid line range", " ".join(p for p in problems if ":2-1" in p))
+            self.assertIn("invalid line range", " ".join(p for p in problems if ":0" in p))
+            self.assertTrue(any("bare line shorthand" in p for p in problems))
+            self.assertTrue(any("missing file" in p for p in problems))
+            self.assertEqual(_code_problems(doc, live), [])
 
 
 if __name__ == "__main__":

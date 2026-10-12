@@ -778,6 +778,16 @@ pub enum RoomAction {
         channel_id: Snowflake,
         name: String,
     },
+    /// Deferred post-move channel respacing for one room. Enqueued when its
+    /// creator move succeeds and the room does not already render at its
+    /// planned slot; the dispatch rebuilds the position plan from a fresh
+    /// snapshot under the same lock as its guard, so a gateway interleave
+    /// cannot pair an old plan with newer-state evidence. Cosmetic: a 429
+    /// holds only the reorder route, never the guild, and a refusal or an
+    /// unknown outcome drops the action without touching the room.
+    RespaceChannels {
+        room_channel_id: Snowflake,
+    },
     /// V3 `/limit` and `/unlimit`: set the room channel's user limit
     /// (`0` is unlimited, at most [`MAX_USER_LIMIT`]). The worker has already
     /// decided the value with the pure room-controls core; the write is
@@ -870,7 +880,7 @@ enum Lane {
 impl RoomAction {
     fn lane(&self) -> Lane {
         match self {
-            Self::RenameRoom { .. } => Lane::Deferred,
+            Self::RenameRoom { .. } | Self::RespaceChannels { .. } => Lane::Deferred,
             _ => Lane::Urgent,
         }
     }
@@ -901,6 +911,9 @@ impl RoomAction {
             | Self::DeleteRoom { channel_id }
             | Self::UpdateOwnership { channel_id, .. }
             | Self::RenameRoom { channel_id, .. }
+            | Self::RespaceChannels {
+                room_channel_id: channel_id,
+            }
             | Self::SetUserLimit { channel_id, .. }
             | Self::SetEveryoneConnect { channel_id, .. }
             | Self::SavePrivacy { channel_id }
@@ -987,6 +1000,9 @@ struct QueueInner {
     deferred: HashMap<Snowflake, VecDeque<QueuedAction>>,
     /// Per-guild 429 backoff: nothing for the guild runs before this.
     guild_not_before_ms: HashMap<Snowflake, u64>,
+    /// Per-guild reorder-route 429 backoff (`PATCH /guilds/{id}/channels`):
+    /// every pending reorder waits it out while other routes keep flowing.
+    respace_not_before_ms: HashMap<Snowflake, u64>,
     /// (guild, channel) pairs with lost access: actions touching them wait.
     suspended: HashSet<(Snowflake, Snowflake)>,
     failed: Vec<FailedAction>,
@@ -1047,6 +1063,22 @@ impl ActionQueue {
                 return pending.id;
             }
         }
+        // The dispatch recomputes the positions fresh, so a newer respace
+        // for the same room supersedes a still-queued one.
+        if let RoomAction::RespaceChannels { room_channel_id } = &action {
+            if let Some(pending) = inner.deferred.get_mut(&guild_id).and_then(|queue| {
+                queue.iter_mut().find(|queued| {
+                    matches!(
+                        queued.action,
+                        RoomAction::RespaceChannels { room_channel_id: id }
+                        if id == *room_channel_id
+                    )
+                })
+            }) {
+                pending.action = action;
+                return pending.id;
+            }
+        }
         inner.next_id += 1;
         let queued = QueuedAction {
             id: inner.next_id,
@@ -1100,6 +1132,11 @@ impl ActionQueue {
         let suspended: Vec<(Snowflake, Snowflake)> = inner.suspended.iter().copied().collect();
         // Carry waiting room scopes into the deferred lane too: a rename
         // must not overtake that room's delayed lifecycle action.
+        // The reorder-route backoff is snapshotted for the same reason.
+        let respace_held = inner
+            .respace_not_before_ms
+            .get(&guild_id)
+            .is_some_and(|t| now_ms < *t);
         let mut waiting_channels = HashSet::new();
         for urgent in [true, false] {
             let queue = if urgent {
@@ -1112,6 +1149,11 @@ impl ActionQueue {
             };
             let mut idx = None;
             for (i, queued) in queue.iter().enumerate() {
+                // A backed-off reorder route waits out every pending reorder
+                // while renames, moves and creates keep flowing past it.
+                if respace_held && matches!(queued.action, RoomAction::RespaceChannels { .. }) {
+                    continue;
+                }
                 if queued
                     .action
                     .channel_id()
@@ -1179,7 +1221,9 @@ impl ActionQueue {
             return false;
         }
         let not_before_ms = now_ms.saturating_add(retry_after_ms);
-        if action.action.lane() == Lane::Urgent {
+        if matches!(action.action, RoomAction::RespaceChannels { .. }) {
+            inner.respace_not_before_ms.insert(guild_id, not_before_ms);
+        } else if action.action.lane() == Lane::Urgent {
             inner.guild_not_before_ms.insert(guild_id, not_before_ms);
         }
         inner.requeue(QueuedAction {
@@ -1328,6 +1372,18 @@ impl ActionQueue {
             .lock()
             .expect("queue lock")
             .guild_not_before_ms
+            .get(&guild_id)
+            .is_some_and(|t| now_ms < *t)
+    }
+
+    /// Whether the guild's reorder route is waiting out a Discord 429.
+    /// Every pending reorder honours it; other routes are unaffected.
+    #[must_use]
+    pub fn respace_backed_off(&self, guild_id: Snowflake, now_ms: u64) -> bool {
+        self.inner
+            .lock()
+            .expect("queue lock")
+            .respace_not_before_ms
             .get(&guild_id)
             .is_some_and(|t| now_ms < *t)
     }
@@ -2161,6 +2217,84 @@ mod tests {
         let action = q.pop_due(GUILD, 6_000).expect("first room's second retry");
         assert_eq!(action.id, first);
         assert_eq!(action.attempts, 2);
+    }
+
+    #[test]
+    fn respace_429_backs_off_every_pending_reorder_not_the_guild() {
+        let q = ActionQueue::new();
+        q.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 500 });
+        q.enqueue(
+            GUILD,
+            RoomAction::RespaceChannels {
+                room_channel_id: 501,
+            },
+        );
+        q.enqueue(
+            GUILD,
+            RoomAction::RespaceChannels {
+                room_channel_id: 502,
+            },
+        );
+        // Lifecycle writes drain first; the cosmetic respace waits its turn.
+        let delete = q.pop_due(GUILD, 0).expect("delete due");
+        assert!(matches!(delete.action, RoomAction::DeleteRoom { .. }));
+        q.mark_succeeded(&delete);
+        let first = q.pop_due(GUILD, 0).expect("respace due");
+        assert!(matches!(first.action, RoomAction::RespaceChannels { .. }));
+        // A 429 on one room's reorder holds every pending reorder on the
+        // route, while lifecycle writes for other rooms still flow.
+        q.mark_rate_limited(GUILD, 1500, 0, first);
+        assert!(q.respace_backed_off(GUILD, 1499));
+        assert!(
+            !q.backed_off(GUILD, 1499),
+            "a cosmetic reorder never holds the guild"
+        );
+        q.enqueue(
+            GUILD,
+            RoomAction::MoveMember {
+                member_id: MEMBER,
+                channel_id: 503,
+            },
+        );
+        let moved = q
+            .pop_due(GUILD, 1499)
+            .expect("move bypasses the route backoff");
+        assert!(matches!(moved.action, RoomAction::MoveMember { .. }));
+        q.mark_succeeded(&moved);
+        assert_eq!(
+            q.pop_due(GUILD, 1499),
+            None,
+            "the other room's reorder waits out the same route backoff"
+        );
+        let second = q.pop_due(GUILD, 1500).expect("route backoff elapsed");
+        assert!(matches!(second.action, RoomAction::RespaceChannels { .. }));
+    }
+
+    #[test]
+    fn respace_enqueue_coalesces_per_room() {
+        let q = ActionQueue::new();
+        q.enqueue(
+            GUILD,
+            RoomAction::RespaceChannels {
+                room_channel_id: 501,
+            },
+        );
+        q.enqueue(
+            GUILD,
+            RoomAction::RespaceChannels {
+                room_channel_id: 501,
+            },
+        );
+        q.enqueue(
+            GUILD,
+            RoomAction::RespaceChannels {
+                room_channel_id: 502,
+            },
+        );
+        assert_eq!(q.pending_counts(GUILD), (0, 2));
+        // A forgotten room drops its pending respace with everything else.
+        assert_eq!(q.drop_for_channel(GUILD, 501), 1);
+        assert_eq!(q.pending_counts(GUILD), (0, 1));
     }
 
     #[test]

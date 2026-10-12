@@ -84,12 +84,14 @@ Bindings:
 | Where | Name | Value |
 |---|---|---|
 | GitHub environment `voice-synthetic` (main only, no reviewer) | secret `TWO_VOICE_SYNTHETIC_BOT_TOKEN` | the test bot token |
-| GitHub repository variable | `VOICE_SYNTHETIC_REQUIRED` | `true` once the first live run is green |
+| GitHub repository variable (optional) | `VOICE_SYNTHETIC_REQUIRED` | `false` only while the test bot is being provisioned; required by default |
 | GitHub repository variable (optional) | `STAGING_EMPTY_GRACE_SECONDS` | staging empty grace, default 60 |
 | Staging Worker setting | `TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS` | the test bot's user ID |
 
-Until the token exists, runs report "not configured" and pass. With
-`VOICE_SYNTHETIC_REQUIRED=true`, a missing token fails the run.
+A missing token fails the run: the voice gate is required by default, so an
+unconfigured gate never reads as green. Set `VOICE_SYNTHETIC_REQUIRED=false`
+to restore the old "not configured" notice-and-pass while the test bot is
+being provisioned.
 
 ## Run it by hand
 

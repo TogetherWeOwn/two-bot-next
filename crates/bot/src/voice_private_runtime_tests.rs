@@ -760,9 +760,9 @@ async fn handle_private_runs_through_the_actor_and_names_the_join_channel_after_
     let text = response_text(response.as_ref().expect("reply"));
     assert!(text.contains("Making this room private"), "{text}");
     wait_trace(&trace, &format!("overwrite:500:{GUILD}:Role")).await;
-    wait_trace(
+    wait_trace_prefix(
         &trace,
-        &format!("create_join:⇩ Join member:Some({CATEGORY}):None"),
+        &format!("create_join:⇩ Join member:Some({CATEGORY}):"),
     )
     .await;
 }

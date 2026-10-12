@@ -336,6 +336,10 @@ library code with no Discord dependency and can start immediately.
 - `/alwaysprivate`: new rooms from this creator start private.
 - The owner gets extra permissions on their own room so they can manage it.
 - Overrides are included when the channel is created, never patched afterwards.
+- When the slot needs a gap, the room is created first (at a fallback tie that
+  still renders on the correct side) and moved immediately; a deferred repair
+  opens the gap afterwards, touching only that room and the suffix below its
+  slot. A refused repair keeps the tie, so joins never wait on a reorder.
 
 ## V9: Temporary text channels
 
@@ -415,8 +419,9 @@ library code with no Discord dependency and can start immediately.
 - Measure actual gateway-to-move latency with
   `two_bot_voice_join_to_move_seconds`; `voice join completed` reports queue
   dwell, dispatch wait, claim, reorder, POST, persist and move stage seconds.
-  Packed-category respacing still runs before creation and is included in the
-  reorder stage. HTTP/SQL latency and required rate-limit waits still apply.
+  Packed-category respacing is deferred until after the creator move and runs
+  as a post-move repair; the create itself never waits on a reorder.
+  HTTP/SQL latency and required rate-limit waits still apply.
 - Handle channel create, move and delete events idempotently.
   - Use per-guild ordered queues and honour retry-after on 429 responses.
   - At startup and after reconnects, reconcile tracked rooms against the actual

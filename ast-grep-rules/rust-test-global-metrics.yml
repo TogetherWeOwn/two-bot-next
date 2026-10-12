@@ -1,0 +1,12 @@
+id: rust-test-global-metrics
+language: Rust
+severity: warning
+message: 'Exact counter deltas against process-global metrics race in parallel test binaries Example: two-bot-next#710.'
+rule:
+  any:
+  - pattern: metrics::global()
+  - pattern: two_bot_core::metrics::global()
+files:
+- '**/tests/**/*.rs'
+- '**/*tests*.rs'
+- '**/*test*.rs'

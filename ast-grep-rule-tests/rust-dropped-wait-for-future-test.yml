@@ -1,0 +1,6 @@
+id: rust-dropped-wait-for-future
+valid:
+- async fn test_dispatch() { wait_for(|| idle(), "idle").await; }
+- async fn test_dispatch() { let future = wait_for(|| idle(), "idle"); future.await; }
+invalid:
+- async fn test_dispatch() { wait_for(|| idle(), "idle"); }

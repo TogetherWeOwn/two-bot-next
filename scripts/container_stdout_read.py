@@ -93,7 +93,7 @@ QUERY_PATH_RE = re.compile(r"/accounts/[0-9a-f]{32}/workers/observability/teleme
 FIELD_KEYS = (
     "msg", "target", "run_id", "error_class", "startup_phase", "phase", "class",
     "step", "cause", "reason", "signal", "missing", "job", "code", "count", "revision",
-    "persist_class",
+    "persist_class", "persist_op",
 )
 
 # Ordered: URLs go first so a token inside one is not split by a later rule.

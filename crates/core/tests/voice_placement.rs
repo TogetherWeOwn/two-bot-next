@@ -3,8 +3,9 @@
 use proptest::prelude::*;
 use two_bot_core::voice_config::RoomPosition;
 use two_bot_core::voice_placement::{
-    next_room_number, plan_placement, position_for_index, resolve_initial_state, CategoryChannel,
-    CategoryEntryKind, PlacementError, PlacementRequest, RoomInitialState, MAX_ROOM_USER_LIMIT,
+    next_room_number, plan_placement, position_for_index, resolve_initial_state, suffix_respace,
+    CategoryChannel, CategoryEntryKind, PlacementError, PlacementRequest, RoomInitialState,
+    MAX_ROOM_USER_LIMIT,
 };
 
 fn creator(id: u64, position: i32) -> CategoryChannel {
@@ -598,27 +599,90 @@ fn position_for_index_never_goes_negative() {
     assert_eq!(position_for_index(&order, 2), 1);
 }
 
+// ---- suffix_respace (deferred post-move repair) ----
+
+/// `rest` is the category WITHOUT the room; applying a patch must render
+/// `room_id` at `index` of display order.
+fn rendered_rank(
+    rest: &[CategoryChannel],
+    patch: &[(u64, u64)],
+    room_id: u64,
+    room_position: i32,
+) -> usize {
+    let mut patched: Vec<(i32, u64)> = rest
+        .iter()
+        .map(|entry| (entry.position, entry.id))
+        .collect();
+    patched.push((room_position, room_id));
+    for (id, position) in patch {
+        let entry = patched
+            .iter_mut()
+            .find(|(_, entry_id)| entry_id == id)
+            .expect("patch targets a listed channel");
+        entry.0 = i32::try_from(*position).expect("test positions fit");
+    }
+    patched.sort();
+    patched
+        .iter()
+        .position(|(_, id)| *id == room_id)
+        .expect("room stays listed")
+}
+
 #[test]
-fn create_slot_never_ties_downwards_at_the_top_of_a_category() {
-    use two_bot_core::voice_placement::create_slot;
-    let order = [
-        CategoryChannel {
-            id: 10,
-            position: 0,
-            kind: CategoryEntryKind::Creator,
-        },
-        CategoryChannel {
-            id: 11,
-            position: 1,
-            kind: CategoryEntryKind::Other,
-        },
-    ];
-    // Above the creator at 0: no free position and nothing above the slot.
-    let slot = create_slot(&order, 0);
-    assert_eq!(slot.position, 16);
-    assert_eq!(slot.respace, [(10, 32), (11, 48)]);
-    assert_eq!(slot.fallback, None);
-    // Below the creator: the fallback ties with the creator itself.
-    let slot = create_slot(&order, 1);
-    assert_eq!(slot.fallback, Some(0));
+fn suffix_respace_leaves_a_clean_slot_alone() {
+    // Room 20 created into a free gap already renders at its slot: no PATCH.
+    let rest = [creator(10, 0), other(30, 32)];
+    assert_eq!(suffix_respace(&rest, 1, 20, 1), Vec::new());
+}
+
+#[test]
+fn suffix_respace_repairs_only_the_suffix() {
+    // Packed category with the room tied below its creator: the prefix keeps
+    // its exact positions while the room and everything after it are
+    // re-spaced, preserving their relative order.
+    let rest = [creator(10, 0), other(30, 1), room(40, 1)];
+    let patch = suffix_respace(&rest, 1, 20, 0);
+    assert_eq!(patch, vec![(20, 16), (30, 32), (40, 48)]);
+    assert_eq!(rendered_rank(&rest, &patch, 20, 0), 1);
+}
+
+#[test]
+fn suffix_respace_preserves_manual_prefix_order() {
+    // A hand-arranged prefix (arbitrary sparse positions) is never rewritten,
+    // even when the room needs a new slot below it.
+    let rest = [other(5, 7), creator(10, 3), other(30, 4)];
+    let patch = suffix_respace(&rest, 2, 20, 3);
+    assert_eq!(patch, vec![(20, 20), (5, 36)]);
+    assert_eq!(rendered_rank(&rest, &patch, 20, 3), 2);
+}
+
+#[test]
+fn suffix_respace_repairs_a_shared_suffix_position() {
+    // The room sits at the right rank but shares its position: only the room
+    // and the suffix below it move, and the room keeps its rank.
+    let rest = [creator(10, 0), other(30, 16)];
+    let patch = suffix_respace(&rest, 1, 20, 16);
+    assert_eq!(patch, vec![(20, 16), (30, 32)]);
+    assert_eq!(rendered_rank(&rest, &patch, 20, 16), 1);
+}
+
+#[test]
+fn suffix_respace_appends_past_the_end() {
+    // A room already last with a unique position needs no patch even when the
+    // slot index points past the end.
+    let rest = [creator(10, 0), other(30, 1)];
+    assert_eq!(suffix_respace(&rest, 9, 20, 17), Vec::new());
+    // A tied room heading for the end moves below everything else.
+    let patch = suffix_respace(&rest, 9, 20, 0);
+    assert_eq!(patch, vec![(20, 17)]);
+    assert_eq!(rendered_rank(&rest, &patch, 20, 0), 2);
+}
+
+#[test]
+fn suffix_respace_repairs_a_lone_room() {
+    // The room alone with its creator still needs its tie broken.
+    let rest = [creator(10, 0)];
+    assert_eq!(suffix_respace(&rest, 1, 20, 1), Vec::new());
+    let patch = suffix_respace(&rest, 1, 20, 0);
+    assert_eq!(patch, vec![(20, 16)]);
 }
