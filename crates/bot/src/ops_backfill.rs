@@ -53,7 +53,7 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
-    Extension, Json, Router,
+    Json, Router,
 };
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use serde_json::{json, Value};
@@ -101,9 +101,12 @@ struct RingInner {
 
 /// Shared verifier for the backfill route. Built once per router from the
 /// process environment in production, or from an explicit key spec in tests
-/// (no process-env mutation, so tests stay parallel-safe).
+/// (no process-env mutation, so tests stay parallel-safe). Lives in
+/// [`crate::server::SharedState`] — not an `Extension` layer — so the
+/// handler stays a `State + Request` pair like the internal-action
+/// receiver's `handle`.
 #[derive(Clone)]
-pub(crate) struct SharedRing(Arc<Mutex<RingInner>>);
+pub struct SharedRing(Arc<Mutex<RingInner>>);
 
 impl SharedRing {
     fn new(keys: Vec<two_bot_core::internal_actions::SigningKey>) -> Self {
@@ -112,6 +115,17 @@ impl SharedRing {
                 .into_iter()
                 .map(|key| (key.id, key.secret.expose().clone()))
                 .collect(),
+            decoy: rand::random(),
+            nonces: internal_actions::NonceCache::new(NONCE_TTL_SECONDS),
+            clock: ClockGuard::new(),
+        })))
+    }
+
+    /// Fail-closed empty ring: every read refuses. Default until production
+    /// attaches [`SharedRing::from_env`] or a test attaches an explicit spec.
+    pub(crate) fn empty() -> Self {
+        Self(Arc::new(Mutex::new(RingInner {
+            keys: HashMap::new(),
             decoy: rand::random(),
             nonces: internal_actions::NonceCache::new(NONCE_TTL_SECONDS),
             clock: ClockGuard::new(),
@@ -131,12 +145,7 @@ impl SharedRing {
                     msg = "ops_backfill_keys_invalid",
                     "TWO_INTERNAL_KEYS missing or invalid; backfill reads will refuse"
                 );
-                Self(Arc::new(Mutex::new(RingInner {
-                    keys: HashMap::new(),
-                    decoy: rand::random(),
-                    nonces: internal_actions::NonceCache::new(NONCE_TTL_SECONDS),
-                    clock: ClockGuard::new(),
-                })))
+                Self::empty()
             }
         }
     }
@@ -155,15 +164,15 @@ struct FamilyRow {
     updated_at: i64,
 }
 
-/// Build the route. The pool arrives via listener state (no module slot: the
-/// database handle is already there); the key ring arrives via Extension so
-/// tests can inject an explicit spec.
-pub(crate) fn router_with_ring(
-    ring: SharedRing,
-) -> Router<(crate::server::SharedState, crate::jobs::SharedStatus)> {
+/// Build the route. The pool and the key ring both arrive via listener state
+/// (no module slot, no `Extension` layer: the database handle is already
+/// there, and the ring rides in [`crate::server::SharedState`]), so the
+/// handler stays a `State + Request` pair like the internal-action
+/// receiver's `handle`. Tests inject an explicit spec through
+/// [`crate::server::SharedState::with_backfill_ring`].
+pub(crate) fn router() -> Router<(crate::server::SharedState, crate::jobs::SharedStatus)> {
     Router::<(crate::server::SharedState, crate::jobs::SharedStatus)>::new()
         .route(BACKFILL_PATH, get(handler))
-        .layer(Extension(ring))
 }
 
 fn header_value<'a>(headers: &'a HeaderMap, name: &str, max: usize) -> Option<&'a str> {
@@ -322,22 +331,19 @@ fn now_ms() -> u64 {
 
 async fn handler(
     State((shared, _jobs)): State<(crate::server::SharedState, crate::jobs::SharedStatus)>,
-    Extension(ring): Extension<SharedRing>,
     request: axum::extract::Request,
 ) -> Response {
-    // Single `Request` extractor (proven by `internal_action_http::handle`):
-    // the prior `HeaderMap + Bytes` pair never satisfied `Handler` for this
-    // state, blocking every cargo build on the branch.
+    // `State + Request` pair (proven by `internal_action_http::handle` and
+    // `server::readyz`): the ring rides in listener state, never an
+    // `Extension` layer, so one body-consuming extractor is enough.
+    let ring = &shared.backfill_ring;
     let (parts, body) = request.into_parts();
     let headers = parts.headers;
     let body_bytes = match axum::body::to_bytes(body, 64 * 1024).await {
         Ok(bytes) => bytes,
         Err(_) => {
             // Fail closed: an unreadable body can never authenticate.
-            return refusal(&internal_actions::new_request_id(
-                now_ms(),
-                &rand::random(),
-            ));
+            return refusal(&internal_actions::new_request_id(now_ms(), &rand::random()));
         }
     };
     let id = internal_actions::new_request_id(now_ms(), &rand::random());
@@ -415,11 +421,12 @@ mod tests {
     }
 
     fn test_app(ring: SharedRing) -> Router {
-        Router::new().merge(router_with_ring(ring)).with_state((
+        Router::new().merge(router()).with_state((
             crate::server::SharedState::new(
                 Arc::new(AsyncRwLock::new(GatewayState::Unconfigured)),
                 None,
-            ),
+            )
+            .with_backfill_ring(ring),
             crate::jobs::statuses(&[], true),
         ))
     }

@@ -65,9 +65,9 @@ pub async fn fetch_member_page(
     }
     let after_id: Option<Id<UserMarker>> = match after {
         Some(cursor) => {
-            let raw: u64 = cursor
-                .parse()
-                .map_err(|_| RestError::Wire("member after cursor is not a snowflake".to_owned()))?;
+            let raw: u64 = cursor.parse().map_err(|_| {
+                RestError::Wire("member after cursor is not a snowflake".to_owned())
+            })?;
             Some(Id::new(raw))
         }
         None => None,

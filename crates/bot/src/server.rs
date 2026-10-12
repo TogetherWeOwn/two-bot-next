@@ -24,6 +24,13 @@ pub struct SharedState {
     pub database: Option<sqlx::PgPool>,
     /// Why the gateway task last stopped (TOG-13044); empty until it fails.
     pub failure: FailureSlot,
+    /// Verifier for the private backfill progress route: the same
+    /// `TWO_INTERNAL_KEYS` ring as the internal-action receiver. Empty by
+    /// default (every read refuses); production attaches `from_env()`, tests
+    /// attach an explicit spec. Lives in listener state — not an `Extension`
+    /// layer — so the handler stays a `State + Request` pair like the
+    /// receiver's `handle`.
+    pub backfill_ring: crate::ops_backfill::SharedRing,
 }
 
 impl SharedState {
@@ -32,7 +39,14 @@ impl SharedState {
             gateway,
             database,
             failure: FailureSlot::default(),
+            backfill_ring: crate::ops_backfill::SharedRing::empty(),
         }
+    }
+
+    /// Attach the backfill verifier without disturbing the other fields.
+    pub fn with_backfill_ring(mut self, ring: crate::ops_backfill::SharedRing) -> Self {
+        self.backfill_ring = ring;
+        self
     }
 }
 
@@ -55,6 +69,10 @@ pub(crate) fn router_with_guard(
     jobs: crate::jobs::SharedStatus,
     guard: Arc<two_bot_discord::ratelimit_guard::RateLimitGuard>,
 ) -> Router {
+    // Attach the backfill verifier before `with_state`: the handler reads
+    // both pool and ring from listener state (a `State + Request` pair like
+    // the internal-action receiver's `handle`), never an `Extension` layer.
+    let state = state.with_backfill_ring(crate::ops_backfill::SharedRing::from_env());
     Router::new()
         .route("/health", get(health))
         .route("/healthz", get(health))
@@ -62,10 +80,8 @@ pub(crate) fn router_with_guard(
         // Backfill progress reads the same TWO_INTERNAL_KEYS ring as the
         // internal-action receiver, over its own path-bound signature. Merged
         // before `with_state` (unlike the stateless metrics route below): the
-        // handler reads the pool from listener state.
-        .merge(crate::ops_backfill::router_with_ring(
-            crate::ops_backfill::SharedRing::from_env(),
-        ))
+        // handler reads pool and ring from listener state.
+        .merge(crate::ops_backfill::router())
         .with_state((state, jobs))
         .layer(axum::Extension(Arc::clone(&guard)))
         // Metrics and readiness sample the same guard as production executors.
@@ -108,7 +124,7 @@ pub(crate) fn router_with_guard(
 
 /// Routes the public listener serves; the only paths a span may record.
 /// Keep in sync with `router_with_guard`, `metrics_http::router_with_guard`
-/// and `ops_backfill::router_with_ring`.
+/// and `ops_backfill::router`.
 const TRACED_PATHS: [&str; 5] = [
     "/health",
     "/healthz",
