@@ -139,13 +139,16 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_vote_kick_audit",
     // V5 adds accepted-create history; see [`V5_ADDED_TABLES`].
     "voice_create_reservations",
+    // Event-store S8 stage/interaction-observe/audit-log capture (0429):
+    // append-only, guild-keyed, no foreign keys.
+    "event_store",
 ];
 
 /// Tables first covered by v5. A v4 archive predates them and need not declare
 /// them; every other covered table is still required, so a v4 recovery point
 /// written before create-reservation persistence stays readable without
 /// waiving arbitrary missing tables.
-pub const V5_ADDED_TABLES: &[&str] = &["voice_create_reservations"];
+pub const V5_ADDED_TABLES: &[&str] = &["voice_create_reservations", "event_store"];
 
 /// Covered tables not created by the current cutover migration set, if any.
 /// Keep legacy data when such tables exist, but do not require nonexistent
