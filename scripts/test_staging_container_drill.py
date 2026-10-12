@@ -221,6 +221,11 @@ WRANGLER_TOML = """\
 name = "two-bot-next"
 main = "src/index.ts"
 
+[[containers]]
+class_name = "TwoBotContainer"
+image = "../Dockerfile"
+max_instances = 1
+
 [env.staging.version_metadata]
 binding = "CF_VERSION_METADATA"
 
@@ -462,6 +467,16 @@ class FailureRecoveryTests(unittest.TestCase):
         self.assertEqual((world.phase, world.running), ("active", True))
         self.assertEqual(instance.evidence["restore"]["running_image"], PRE_IMAGE)
 
+    def test_deploy_failure_reports_exit_code(self):
+        # A bare deploy_failed carries no cause (wrangler output is
+        # discarded by design); the exit code at least tells a config
+        # refusal (1, fast) from a lost subprocess. Integers only.
+        world = World()
+        world.refuse_deploy = True
+        _, failures, logs = run_drill(world)
+        self.assertEqual(failures, ["drill:deploy_failed"])
+        self.assertIn("deploy_failed (elapsed=2.0 code=1)", "\n".join(logs))
+
     def test_target_that_never_becomes_ready_is_restored(self):
         world = World()
         world.never_ready.add(BACKOUT_IMAGE)  # the backout image never reports ready
@@ -684,6 +699,32 @@ class ConfigTests(unittest.TestCase):
             container_drill.generate_deploy_config(str(Path(directory) / "out.json"),
                                                    BACKOUT_IMAGE, str(wrangler_dir))
         self.assertEqual(str(caught.exception), "wrong_staging_config")
+
+    def test_generated_config_has_no_dangling_relative_images(self):
+        # The generated config is written outside the wrangler directory
+        # (like $RUNNER_TEMP), so any untouched relative image (the
+        # top-level "../Dockerfile") dangles and wrangler refuses the deploy
+        # during config validation before any network. Every non-digest
+        # image must resolve to an existing file.
+        directory = tempfile.mkdtemp()
+        wrangler_dir = Path(directory) / "wrangler"
+        wrangler_dir.mkdir()
+        (wrangler_dir / "wrangler.toml").write_text(WRANGLER_TOML)
+        (Path(directory) / "Dockerfile").write_text("FROM scratch\n")
+        out = Path(directory) / "deploy.json"
+        container_drill.generate_deploy_config(str(out), BACKOUT_IMAGE,
+                                               str(wrangler_dir))
+        config = json.loads(out.read_text())
+        seen = [container["image"] for container in config.get("containers", [])]
+        for env in config.get("env", {}).values():
+            seen.extend(container["image"]
+                        for container in env.get("containers", []))
+        self.assertIn(BACKOUT_IMAGE, seen)
+        for ref in seen:
+            if ref == BACKOUT_IMAGE:
+                continue
+            self.assertTrue(os.path.isabs(ref), ref)
+            self.assertTrue(Path(ref).exists(), ref)
 
 
 class MainTests(unittest.TestCase):

@@ -574,8 +574,10 @@ epoch-checked handoff, and verifies a converged `full_auto` rollout plus the
 exact Worker version, source revision, build id and running image digest
 before timing first ready. Old source is never checked out and no Dockerfile
 is rebuilt: the deploy config is generated from the reviewed `wrangler.toml`
-on `main` with only the container image overridden to the digest-pinned
-registry reference.
+on `main` with the staging container image overridden to the digest-pinned
+registry reference (every other relative image path is absolutized, because
+the generated file lives outside the wrangler directory and wrangler
+resolves config-relative paths against it).
 
 Dispatch contract (all pins immutable; `latest` and mutable tags are refused):
 `backout_source_sha` (40-hex), `backout_build_id`, `backout_image`
