@@ -1868,8 +1868,7 @@ impl LiveGuild {
         channel: Option<Snowflake>,
         bot: Option<bool>,
     ) -> Option<JoinTicket> {
-        self.voice_update_with_occupancy(member, channel, bot)
-            .map(|(ticket, _)| ticket)
+        self.voice_update_at(member, channel, bot, wall_ms())
     }
 
     /// Ticket plus the seeding-TEST occupancy sample: the humans already
