@@ -83,6 +83,10 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "counter_snapshots", measure: TableMeasure::Columns(&["human_member_count_at", "online_count_at"]) },
     TableSpec { table: "event_rsvps", measure: TableMeasure::Columns(&["responded_at"]) },
     TableSpec { table: "events", measure: TableMeasure::Columns(&["recorded_at"]) },
+    // Append-only gateway capture (0429 S6): every row carries event_time, and
+    // received_at defaults to NOW(), so the maximum across both is the row's
+    // last write.
+    TableSpec { table: "event_store", measure: TableMeasure::Columns(&["event_time", "received_at"]) },
     TableSpec { table: "feed_deliveries", measure: TableMeasure::Columns(&["first_seen_at"]) },
     TableSpec { table: "feed_relays", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "gateway_boot_directives", measure: TableMeasure::Columns(&["armed_at", "consumed_at"]) },
