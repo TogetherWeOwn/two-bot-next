@@ -98,6 +98,16 @@ pub const RESPONSE_BODY_TIMEOUT_MS: u64 = 5_000;
 /// deadline stays deterministic when the inner body budget and the outer wire
 /// budget expire in the same timer tick ([TOG-12562](/TOG/issues/TOG-12562)).
 pub(crate) const BODY_TIMEOUT_MESSAGE: &str = "read body timed out";
+/// Wire marker for stalled response headers: the request reached the wire but
+/// headers never arrived within [`MODERATION_TIMEOUT_MS`]. The executor seam
+/// maps this to [`DiscordError::Timeout`] like the body marker. A GET has no
+/// mutation effect, so the transport releases the durable send lane on this
+/// path; other methods keep the permit held (uncertain mutation).
+pub(crate) const HEADER_TIMEOUT_MESSAGE: &str = "read headers timed out";
+/// Grace added to the outer wire backstop so the inner header budget above
+/// wins the race and releases a GET lane before the outer timeout can cancel
+/// the attempt with the permit still in scope.
+const WIRE_BACKSTOP_MS: u64 = 500;
 /// Legacy audit-log-reason header bound (`X-Audit-Log-Reason`, latin-1,
 /// percent-encoded; twilight validates ≤512 chars).
 pub const MAX_AUDIT_REASON_CHARS: usize = 512;
@@ -524,11 +534,29 @@ impl HyperTransport {
             None => None, // Constructor restricts ungoverned transport to loopback fixtures.
         };
         let mut attempt = crate::executor_metrics::Attempt::new(request);
-        let response = self
-            .inner
-            .request(hyper_req)
-            .await
-            .map_err(|e| format!("transport: {e}"))?;
+        // Bound the header wait inside the permit scope so a stalled read
+        // cannot orphan the durable lane: the outer `send_admitted_within`
+        // backstop would cancel with the permit already taken, leaving retries
+        // `Blocked` on the read's own permit and holding the lane for the
+        // 60 s lease. A GET cannot mutate, so release it here; other methods
+        // keep the permit held by dropping it uncompleted (uncertain).
+        let response = match tokio::time::timeout(
+            Duration::from_millis(MODERATION_TIMEOUT_MS),
+            self.inner.request(hyper_req),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => return Err(format!("transport: {error}")),
+            Err(_) => {
+                if request.method() == Method::Get {
+                    if let Some(permit) = permit {
+                        let _ = permit.complete(None).await;
+                    }
+                }
+                return Err(HEADER_TIMEOUT_MESSAGE.to_owned());
+            }
+        };
         let status = response.status().as_u16();
         let accounting = crate::ratelimit_guard::ResponseAccounting::new(
             &self.guard,
@@ -972,13 +1000,18 @@ impl ActionExecutor {
     }
 
     /// One admitted send bounded by `timeout` (the wire budget only: callers
-    /// have already passed local admission).
+    /// have already passed local admission). The transport owns the header
+    /// deadline so a GET releases its lane before this backstop fires; the
+    /// extra [`WIRE_BACKSTOP_MS`] only catches a hung body/collect path.
     async fn send_admitted_within(
         &self,
         request: &Request,
         timeout: Duration,
     ) -> Result<(RawResponse, bool), DiscordError> {
-        tokio::time::timeout(timeout, self.send_admitted(request))
+        let backstop = timeout
+            .checked_add(Duration::from_millis(WIRE_BACKSTOP_MS))
+            .unwrap_or(timeout);
+        tokio::time::timeout(backstop, self.send_admitted(request))
             .await
             .map_err(|_| DiscordError::Timeout)?
     }
@@ -996,8 +1029,9 @@ impl ActionExecutor {
                 // wire-deadline error: a body that never completed inside the wire
                 // budget is "Discord did not answer in time" (legacy
                 // `upstream_timeout`), whichever timer wins
-                // ([TOG-12562](/TOG/issues/TOG-12562)).
-                if detail == BODY_TIMEOUT_MESSAGE {
+                // ([TOG-12562](/TOG/issues/TOG-12562)). The stalled-header
+                // marker maps the same way: headers never arrived in time.
+                if detail == BODY_TIMEOUT_MESSAGE || detail == HEADER_TIMEOUT_MESSAGE {
                     DiscordError::Timeout
                 } else {
                     DiscordError::Unavailable(detail)
@@ -1033,7 +1067,10 @@ impl ActionExecutor {
         tokio::time::timeout_at(deadline, self.admit(request, lane))
             .await
             .map_err(|_| GuardError::AdmissionTimeout)??;
-        tokio::time::timeout_at(deadline, self.send_admitted(request))
+        // Backstop past the transport's inner header deadline so a GET lane
+        // release inside `send_request_headers` wins the race.
+        let send_deadline = deadline + Duration::from_millis(WIRE_BACKSTOP_MS);
+        tokio::time::timeout_at(send_deadline, self.send_admitted(request))
             .await
             .map_err(|_| DiscordError::Timeout)?
     }

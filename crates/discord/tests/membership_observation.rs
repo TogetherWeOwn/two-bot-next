@@ -3,8 +3,16 @@
 mod common;
 
 use common::{MockRest, ScriptedResponse};
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    Arc, Mutex,
+};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use two_bot_core::send_admission::{
+    AdmissionError, AdmissionFuture, AdmissionPermit, SendAdmission, SendCompletion, SendCooldown,
+    TokenKey,
+};
 use two_bot_discord::ActionExecutor;
 
 fn ms(value: &str) -> i64 {
@@ -168,5 +176,125 @@ async fn observed_read_with_prompt_headers_still_returns_data() {
         .unwrap()
         .unwrap();
     assert_eq!(data[0]["id"], "1");
+    mock.shutdown().await;
+}
+
+/// Single-flight lane mirroring `PgSendAdmission` take-or-`Blocked`
+/// semantics: the first `admit` takes the lane and later ones are `Blocked`
+/// until the holder's `complete` releases it.
+#[derive(Debug)]
+struct SingleFlightLane {
+    key: TokenKey,
+    held: Arc<Mutex<bool>>,
+    admits: AtomicU32,
+    blocked: AtomicU32,
+    released: Arc<AtomicU32>,
+}
+
+struct SingleFlightRelease {
+    held: Arc<Mutex<bool>>,
+    released: Arc<AtomicU32>,
+}
+
+impl SendCompletion for SingleFlightRelease {
+    fn complete(
+        self: Box<Self>,
+        _cooldown: Option<SendCooldown>,
+    ) -> AdmissionFuture<'static, Result<(), AdmissionError>> {
+        *self.held.lock().unwrap() = false;
+        self.released.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl SendAdmission for SingleFlightLane {
+    fn token_key(&self) -> &TokenKey {
+        &self.key
+    }
+
+    fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+        self.admits.fetch_add(1, Ordering::SeqCst);
+        if *self.held.lock().unwrap() {
+            self.blocked.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(AdmissionError::Blocked) })
+        } else {
+            *self.held.lock().unwrap() = true;
+            let held = Arc::clone(&self.held);
+            let released = Arc::clone(&self.released);
+            Box::pin(async move {
+                Ok(AdmissionPermit::new(Box::new(SingleFlightRelease {
+                    held,
+                    released,
+                })))
+            })
+        }
+    }
+}
+
+/// A governed read whose headers never arrive must retry on the wire instead
+/// of being `Blocked` by its own orphaned permit, and the lane must be free
+/// afterwards so the next send reaches the wire. The clock is paused so the
+/// bounds elapse without wall time; the mock's 600 s delay can never win.
+#[tokio::test(start_paused = true)]
+async fn governed_observed_read_with_stalled_headers_retries_each_attempt_and_releases_lane() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mock = MockRest::start(
+        vec![],
+        ScriptedResponse::json(200, serde_json::json!([])).delayed(Duration::from_secs(600)),
+    )
+    .await;
+    let lane = Arc::new(SingleFlightLane {
+        key: TokenKey::for_bot_token("fixture-token").unwrap(),
+        held: Arc::new(Mutex::new(false)),
+        admits: AtomicU32::new(0),
+        blocked: AtomicU32::new(0),
+        released: Arc::new(AtomicU32::new(0)),
+    });
+    let exec = ActionExecutor::with_admission(
+        "fixture-token".to_owned(),
+        Some(mock.origin()),
+        Arc::clone(&lane) as Arc<dyn SendAdmission>,
+    )
+    .expect("governed executor builds against loopback");
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        exec.get_json_observed("/guilds/2222/roles"),
+    )
+    .await
+    .expect("a stalled roles read must not outlive the moderation bound");
+    assert!(result.is_err(), "stall is an error, not absent: {result:?}");
+    let budget = u64::from(two_bot_core::MAX_HTTP_TRIES);
+    assert_eq!(
+        mock.requests().len() as u64,
+        budget,
+        "one wire request per attempt"
+    );
+    assert_eq!(
+        lane.admits.load(Ordering::SeqCst) as u64,
+        budget,
+        "one admission per attempt"
+    );
+    assert_eq!(
+        lane.blocked.load(Ordering::SeqCst),
+        0,
+        "retries must not be Blocked by the read's own permit"
+    );
+    assert!(
+        !*lane.held.lock().unwrap(),
+        "a timed-out GET must release the lane"
+    );
+    assert_eq!(
+        lane.released.load(Ordering::SeqCst) as u64,
+        budget,
+        "each timed-out GET attempt releases its permit"
+    );
+    // The lane is immediately usable again: a direct admit succeeds (a held
+    // lane would return `Blocked`). Retries already proved wire reachability
+    // (one wire request per attempt, none `Blocked`).
+    let permit = lane
+        .admit()
+        .await
+        .expect("the lane must admit once the timed-out GETs release it");
+    permit.complete(None).await.expect("test lane completion");
     mock.shutdown().await;
 }

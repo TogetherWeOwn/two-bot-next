@@ -658,8 +658,9 @@ async fn containment_worker_survives_a_stalled_roles_read_and_handles_the_next_e
     };
 
     // Executor 5001 opens an incident whose roles read never answers. The
-    // worker must give up once the read budget is spent (real time, ~17 s), then
-    // plan executor 5002's incident from the same queue.
+    // worker must give up once the five-try read budget is spent (real time,
+    // about 32.5 s: five 5 s bounds plus 0.5+1+2+4 s backoff), then plan
+    // executor 5002's incident from the same queue.
     tokio::time::timeout(
         Duration::from_secs(60),
         run(
