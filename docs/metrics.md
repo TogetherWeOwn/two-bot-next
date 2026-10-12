@@ -381,7 +381,9 @@ proxies them with the same 6 s deadline and 64 KiB body cap as the scrape.
 Every database-backed section degrades to an explicit `available: false`
 with `200`, never a 500 or an error string: a database outage must not hide
 gateway and job health. Event-store reads share the 2 s `/readyz` probe
-budget. Responses carry `no-store`; bodies are `application/json`.
+budget and run as one statement over the covered tables (per-table index
+seeks, one snapshot), so a commit cannot pair a new tip with an old
+watermark. Responses carry `no-store`; bodies are `application/json`.
 
 ## Cardinality and memory
 

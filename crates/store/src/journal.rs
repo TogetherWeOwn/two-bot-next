@@ -21,6 +21,9 @@
 //! * [`watermark_for`] / [`restorable_point`]: the restorable cursors. The
 //!   global restorable point is `MAX(id)`; per-table cursors advance with
 //!   `GREATEST`, so concurrent writers keep them monotonic.
+//! * [`snapshot`]: point, cursors and tips for the read-only `/ops`
+//!   roll-ups in one statement and one snapshot (per-table seeks, no full
+//!   journal scan).
 //! * [`entries_since`]: the replay read path — every journal row for a
 //!   table after a baseline id, in journal order.
 //! * [`COVERED_TABLES`]: the affected-table inventory the cutover procedure
@@ -301,17 +304,69 @@ pub async fn watermarks(pool: &Pool<Postgres>) -> Result<BTreeMap<String, i64>, 
     Ok(rows.into_iter().collect())
 }
 
-/// Newest journal id per table, for the read-only `/ops` roll-ups. One
-/// grouped read served by `idx_rollback_journal_table_seq`; tables with no
-/// journal rows are absent from the map. Per-table lag is tip minus
-/// watermark: the global point minus the watermark would count other
-/// tables' writes, not this table's backlog.
+/// Newest journal id per table, for the read-only `/ops` roll-ups. Served
+/// by one per-table backward seek on `idx_rollback_journal_table_seq`
+/// (never a `GROUP BY` over the whole journal: PostgreSQL has no loose
+/// index scan for `GROUP BY ... MAX`, so the grouped form degrades to a
+/// full scan on a large append-only journal). Tables with no journal rows
+/// are absent from the map. Per-table lag is tip minus watermark: the
+/// global point minus the watermark would count other tables' writes, not
+/// this table's backlog. Implemented as [`snapshot`] so tips share one
+/// snapshot with cursors and the point.
 pub async fn table_tips(pool: &Pool<Postgres>) -> Result<BTreeMap<String, i64>, JournalError> {
-    let rows: Vec<(String, i64)> =
-        sqlx::query_as("SELECT table_name, MAX(id) FROM rollback_journal GROUP BY table_name")
-            .fetch_all(pool)
-            .await?;
-    Ok(rows.into_iter().collect())
+    Ok(snapshot(pool).await?.tips)
+}
+
+/// Point, cursors and tips for the read-only `/ops` roll-ups in one
+/// statement and therefore one snapshot. Per-table tips are correlated
+/// `MAX(id)` seeks over `idx_rollback_journal_table_seq` (one backward
+/// index seek per covered table); the point is the global `MAX(id)` from
+/// the same snapshot via the primary key. A single statement matters:
+/// separate reads each take their own `READ COMMITTED` snapshot, so a
+/// commit between them can pair a new tip with an old watermark and report
+/// a lag that counts other tables' writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    pub point: i64,
+    pub cursors: BTreeMap<String, i64>,
+    pub tips: BTreeMap<String, i64>,
+}
+
+/// Read [`Snapshot`] in a single statement over [`COVERED_TABLES`].
+pub async fn snapshot(pool: &Pool<Postgres>) -> Result<Snapshot, JournalError> {
+    let tables: Vec<String> = COVERED_TABLES
+        .iter()
+        .map(|table| (*table).to_owned())
+        .collect();
+    let rows: Vec<(String, Option<i64>, Option<i64>, i64)> = sqlx::query_as(
+        "SELECT t.name,
+                w.last_journal_id,
+                (SELECT MAX(j.id) FROM rollback_journal j WHERE j.table_name = t.name),
+                p.point
+         FROM unnest($1::text[]) AS t(name)
+         LEFT JOIN rollback_watermarks w ON w.table_name = t.name
+         CROSS JOIN (SELECT COALESCE(MAX(id), 0) AS point FROM rollback_journal) p",
+    )
+    .bind(&tables)
+    .fetch_all(pool)
+    .await?;
+    let mut cursors = BTreeMap::new();
+    let mut tips = BTreeMap::new();
+    let mut point = 0;
+    for (table, watermark, tip, row_point) in rows {
+        point = row_point;
+        if let Some(mark) = watermark {
+            cursors.insert(table.clone(), mark);
+        }
+        if let Some(tip) = tip {
+            tips.insert(table, tip);
+        }
+    }
+    Ok(Snapshot {
+        point,
+        cursors,
+        tips,
+    })
 }
 
 /// The global restorable point: the newest journal id across all tables.

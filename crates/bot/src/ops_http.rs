@@ -47,9 +47,11 @@ fn gateway_state_name(state: GatewayState) -> &'static str {
 /// Signed per-table journal lag: the table's own newest journal id minus
 /// its committed watermark. `None` while the table has no journal rows or
 /// no committed watermark: reconcile from the baseline, never assume zero
-/// writes. Zero means fully journaled. Negative means the watermark
-/// observes a newer commit than the table's newest sampled row (concurrent
-/// writers commit out of order, or a cursor advanced past the tip).
+/// writes. Zero means fully journaled. Negative only means the watermark
+/// was advanced past the table's own tip via `advance_watermark`:
+/// [`record`] commits the tip and the watermark together, and tips and
+/// watermarks are read in one snapshot, so concurrent writers alone cannot
+/// produce a negative lag.
 fn cursor_lag(tip: Option<i64>, watermark: Option<i64>) -> Option<i64> {
     tip.zip(watermark).map(|(tip, mark)| tip - mark)
 }
@@ -92,10 +94,12 @@ struct BackfillDetail {
     tables: Vec<TableCursor>,
 }
 
-/// Bounded event-store reads behind every database-backed ops section:
-/// the global restorable point, every committed per-table cursor, and
-/// every table's newest journal id. `None` when the database is absent,
-/// unreadable, or slower than the probe budget — never an error string.
+/// Bounded event-store read behind every database-backed ops section: the
+/// global restorable point, every committed per-table cursor, and every
+/// table's newest journal id, all from one statement and one snapshot (see
+/// [`two_bot_store::journal::snapshot`]). `None` when the database is
+/// absent, unreadable, or slower than the probe budget — never an error
+/// string.
 struct StoreSnapshot {
     point: i64,
     cursors: BTreeMap<String, i64>,
@@ -105,13 +109,11 @@ struct StoreSnapshot {
 async fn store_snapshot(pool: Option<&sqlx::PgPool>) -> Option<StoreSnapshot> {
     let pool = pool?;
     let fetch = async {
-        let point = two_bot_store::journal::restorable_point(pool).await.ok()?;
-        let cursors = two_bot_store::journal::watermarks(pool).await.ok()?;
-        let tips = two_bot_store::journal::table_tips(pool).await.ok()?;
+        let snapshot = two_bot_store::journal::snapshot(pool).await.ok()?;
         Some(StoreSnapshot {
-            point,
-            cursors,
-            tips,
+            point: snapshot.point,
+            cursors: snapshot.cursors,
+            tips: snapshot.tips,
         })
     };
     tokio::time::timeout(EVENT_STORE_TIMEOUT, fetch)
