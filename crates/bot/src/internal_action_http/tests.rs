@@ -947,6 +947,14 @@ fn unknown_persist_failures(start: usize) -> Vec<String> {
         .collect()
 }
 
+fn terminal_persist_failures(start: usize) -> Vec<String> {
+    crate::tracing_capture::global().text()[start..]
+        .lines()
+        .filter(|line| line.contains(r#"msg="internal_action_terminal_persist_failed""#))
+        .map(str::to_owned)
+        .collect()
+}
+
 #[test]
 fn unknown_persist_class_is_a_fixed_vocabulary() {
     assert_eq!(
@@ -963,6 +971,53 @@ fn unknown_persist_class_is_a_fixed_vocabulary() {
     );
 }
 
+#[test]
+fn terminal_persist_helper_emits_one_fixed_vocabulary_line_per_op() {
+    let start = crate::tracing_capture::global().text().len();
+    // The post-claim `Malformed` revalidations in `execute_member` use the
+    // same deterministic inputs as their pre-claim checks, so no signed HTTP
+    // body can make the second validation fail while the first passes; the
+    // `finish` failure on those defensive branches is proven here at the
+    // helper level, with the HTTP-level no-false-positive check in
+    // `member_preclaim_malformed_emits_no_terminal_diagnostic` below.
+    for (op, error, class) in [
+        (
+            "finish",
+            InternalStoreError::Unavailable,
+            "storage_unavailable",
+        ),
+        (
+            "finish",
+            InternalStoreError::TransitionRefused,
+            "transition_refused",
+        ),
+        (
+            "release",
+            InternalStoreError::Unavailable,
+            "storage_unavailable",
+        ),
+        (
+            "release",
+            InternalStoreError::TransitionRefused,
+            "transition_refused",
+        ),
+    ] {
+        let before = terminal_persist_failures(start).len();
+        log_terminal_persist_failed(ActionLabel::Known("announcement.post"), op, error);
+        let after = terminal_persist_failures(start);
+        assert_eq!(after.len(), before + 1, "{after:?}");
+        let line = after.last().unwrap();
+        assert!(line.contains(r#"msg="internal_action_terminal_persist_failed""#));
+        assert!(line.contains(&format!(r#"persist_op="{op}""#)));
+        assert!(line.contains(&format!(r#"persist_class="{class}""#)));
+        assert!(line.contains(r#"action="announcement.post""#));
+        for secret in ["intent-fixture", "fixture announcement", "secret-sentinel"] {
+            assert!(!line.contains(secret));
+        }
+    }
+    assert_eq!(terminal_persist_failures(start).len(), 4);
+}
+
 #[tokio::test]
 async fn finish_failure_after_effect_is_not_success_or_permission_to_resend() {
     let Some(db) = database().await else { return };
@@ -973,6 +1028,15 @@ async fn finish_failure_after_effect_is_not_success_or_permission_to_resend() {
     let app = router(state(db.pool().clone(), effect.clone()));
     let (_, _, first) = answer(app.clone(), signed(payload(), "old", "intent-fixture")).await;
     assert_eq!(first["error"]["code"], "needs_reconciliation");
+    // A failed `finish` is now diagnosed even when the follow-up
+    // `mark_unknown` also fails: one terminal line plus one unknown-state
+    // line. Previously only the unknown-state line existed, so a failed
+    // `finish` followed by a successful `mark_unknown` was silent.
+    let terminal = terminal_persist_failures(start);
+    assert_eq!(terminal.len(), 1, "{terminal:?}");
+    assert!(terminal[0].contains(r#"persist_op="finish""#));
+    assert!(terminal[0].contains(r#"persist_class="storage_unavailable""#));
+    assert!(terminal[0].contains(r#"action="announcement.post""#));
     let failures = unknown_persist_failures(start);
     assert_eq!(failures.len(), 1, "{failures:?}");
     assert!(failures[0].contains(r#"persist_class="storage_unavailable""#));
@@ -982,6 +1046,7 @@ async fn finish_failure_after_effect_is_not_success_or_permission_to_resend() {
         "intent-fixture",
         "fixture announcement",
     ] {
+        assert!(!terminal[0].contains(secret));
         assert!(!failures[0].contains(secret));
     }
     sqlx::query("ALTER TABLE receiver_hidden_audit RENAME TO internal_action_log")
@@ -991,6 +1056,7 @@ async fn finish_failure_after_effect_is_not_success_or_permission_to_resend() {
     let (_, _, second) = answer(app.clone(), signed(payload(), "old", "intent-fixture")).await;
     assert_eq!(second["error"]["code"], "in_progress");
     assert_eq!(effect.calls(), 1);
+    assert_eq!(terminal_persist_failures(start).len(), 1);
     assert_eq!(unknown_persist_failures(start).len(), 1);
 
     let healthy = Arc::new(MockEffect::new(MockOutcome::Unknown));
@@ -1004,6 +1070,7 @@ async fn finish_failure_after_effect_is_not_success_or_permission_to_resend() {
     let (_, _, repeat) = answer(healthy_app, signed(payload(), "old", "intent-marked")).await;
     assert_eq!(repeat["error"]["code"], "needs_reconciliation");
     assert_eq!(healthy.calls(), 1);
+    assert_eq!(terminal_persist_failures(start).len(), 1);
     assert_eq!(unknown_persist_failures(start).len(), 1);
 
     let mut hidden = MockEffect::new(MockOutcome::Unknown);
@@ -1020,9 +1087,194 @@ async fn finish_failure_after_effect_is_not_success_or_permission_to_resend() {
         .execute(db.pool())
         .await
         .unwrap();
+    // The unknown-only path takes no `finish`, so no terminal line is added
+    // here; only the unknown-state write fails.
+    assert_eq!(terminal_persist_failures(start).len(), 1);
     let failures = unknown_persist_failures(start);
     assert_eq!(failures.len(), 2, "{failures:?}");
     assert!(failures.iter().all(|line| !line.contains("intent-")));
+    assert!(terminal_persist_failures(start)
+        .iter()
+        .all(|line| !line.contains("intent-")));
+    db.close().await.unwrap();
+}
+
+/// Counted scripted mutation double for the release-failure test: records
+/// every entry so a second dispatch fails the test instead of panicking on
+/// an exhausted reply queue. `break_release` renames the audit relation
+/// inside the effect (after the claim committed, like
+/// `MockEffect::break_finish`), so the follow-up `release_proven_not_sent`
+/// fails while the claim itself succeeded.
+struct CountedScriptedMutate {
+    calls: AtomicUsize,
+    replies: Mutex<Vec<Result<Value, EventActionError>>>,
+    break_release: Option<sqlx::PgPool>,
+}
+
+impl EventMutateEffect for CountedScriptedMutate {
+    fn execute_mutation<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a EventCall,
+    ) -> BoxFuture<'a, Result<Value, EventActionError>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(pool) = &self.break_release {
+                // Dispose only a migrated TestDatabase relation, not a live DB.
+                sqlx::query("ALTER TABLE internal_action_log RENAME TO receiver_hidden_audit")
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+            self.replies.lock().unwrap().remove(0)
+        })
+    }
+}
+
+#[tokio::test]
+async fn event_release_failure_is_logged_without_releasing_claim() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_event_cancel_flag(false);
+    let start = crate::tracing_capture::global().text().len();
+    let blocked = two_bot_core::send_admission::AdmissionError::Blocked.to_string();
+    let mutates: Arc<CountedScriptedMutate> = Arc::new(CountedScriptedMutate {
+        calls: AtomicUsize::new(0),
+        replies: Mutex::new(vec![Err(EventActionError::Discord(
+            DiscordError::Unavailable(blocked),
+        ))]),
+        break_release: Some(db.pool().clone()),
+    });
+    let app = router(Arc::new(ReceiverState::new(
+        config(),
+        db.pool().clone(),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
+        Arc::new(MockEventRead::default()),
+        mutates.clone(),
+        Arc::new(MockModeration::default()),
+        Arc::new(MockChannel::default()),
+    )));
+    // The effect renames the audit relation after the claim committed, so
+    // `release_proven_not_sent` fails after the admission refusal proved
+    // nothing was sent.
+    let raw = upsert_payload("release-fail");
+    let (status, _, first) = answer(app.clone(), signed(&raw, "old", "intent-release-fail")).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(first["error"]["code"], "internal");
+    let terminal = terminal_persist_failures(start);
+    assert_eq!(terminal.len(), 1, "{terminal:?}");
+    assert!(terminal[0].contains(r#"persist_op="release""#));
+    assert!(terminal[0].contains(r#"persist_class="storage_unavailable""#));
+    assert!(terminal[0].contains(r#"action="event.upsert""#));
+    assert_eq!(unknown_persist_failures(start).len(), 0);
+    for secret in [
+        first["request_id"].as_str().unwrap(),
+        "intent-release-fail",
+        "release-fail",
+    ] {
+        assert!(!terminal[0].contains(secret));
+    }
+    assert_eq!(mutates.calls.load(Ordering::SeqCst), 1);
+    sqlx::query("ALTER TABLE receiver_hidden_audit RENAME TO internal_action_log")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    // The failed release leaves the claim occupied: the same key sees
+    // `in_progress` with no second dispatch, no new diagnostic and no
+    // released claim.
+    let (status, _, repeat) = answer(app.clone(), signed(&raw, "old", "intent-release-fail")).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(repeat["error"]["code"], "in_progress");
+    assert_eq!(mutates.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(terminal_persist_failures(start).len(), 1);
+    assert_eq!(unknown_persist_failures(start).len(), 0);
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM internal_idempotency WHERE action = 'event.upsert'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(state, "in_flight");
+
+    // Success path with a fresh intent: an admission refusal that releases
+    // cleanly answers `discord_unavailable` with no diagnostic, and the same
+    // key may then retry to a stored receipt.
+    let blocked = two_bot_core::send_admission::AdmissionError::Blocked.to_string();
+    let ok_mutates: Arc<CountedScriptedMutate> = Arc::new(CountedScriptedMutate {
+        calls: AtomicUsize::new(0),
+        replies: Mutex::new(vec![
+            Err(EventActionError::Discord(DiscordError::Unavailable(
+                blocked,
+            ))),
+            Ok(json!({"event_id": CREATE_EVENT_ID})),
+        ]),
+        break_release: None,
+    });
+    let ok_app = router(Arc::new(ReceiverState::new(
+        config(),
+        db.pool().clone(),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
+        Arc::new(MockEventRead::default()),
+        ok_mutates.clone(),
+        Arc::new(MockModeration::default()),
+        Arc::new(MockChannel::default()),
+    )));
+    let raw = upsert_payload("release-ok");
+    let (status, _, refused) =
+        answer(ok_app.clone(), signed(&raw, "old", "intent-release-ok")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(refused["error"]["code"], "discord_unavailable");
+    let (status, _, created) =
+        answer(ok_app.clone(), signed(&raw, "old", "intent-release-ok")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        created["result"],
+        json!({"outcome": "created", "event_id": CREATE_EVENT_ID})
+    );
+    assert_eq!(ok_mutates.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(terminal_persist_failures(start).len(), 1);
+    assert_eq!(unknown_persist_failures(start).len(), 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn member_preclaim_malformed_emits_no_terminal_diagnostic() {
+    let Some(db) = database().await else { return };
+    let _flag = ADD_MEMBER_FLAG_LOCK.lock().await;
+    set_add_member_flag(true);
+    let start = crate::tracing_capture::global().text().len();
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let app = router(state(db.pool().clone(), effect.clone()));
+    // Pre-claim `Malformed` refusals take no claim and perform no store
+    // write, so they must emit no terminal-persist diagnostic. The post-claim
+    // `Malformed` revalidations are defensive (same deterministic inputs as
+    // the pre-claim checks, proven at the helper level above); these cases
+    // pin the no-false-positive side over HTTP.
+    for (raw, intent) in [
+        (
+            r#"{"action":"role.assign","discord_id":"bad","role_key":"member"}"#,
+            "intent-member-malformed-id",
+        ),
+        (
+            r#"{"action":"guild.add_member","discord_id":"bad","access_token":"fixture-oauth"}"#,
+            "intent-member-malformed-add",
+        ),
+    ] {
+        let (status, _, body) = answer(app.clone(), signed(raw, "old", intent)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "malformed");
+        assert!(!body.to_string().contains("fixture-oauth"));
+    }
+    assert_eq!(effect.calls(), 0);
+    assert_eq!(terminal_persist_failures(start).len(), 0);
+    assert_eq!(unknown_persist_failures(start).len(), 0);
+    let claims: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM internal_idempotency")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(claims, 0);
+    set_add_member_flag(false);
     db.close().await.unwrap();
 }
 

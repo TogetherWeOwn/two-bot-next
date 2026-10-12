@@ -317,7 +317,10 @@ count next to refusals means the receiver is still serving legitimate
 traffic while refusing the surge. Correlate with the container logs for
 `internal action refused` warn lines (sampled summaries keyed by
 `kind`/`class`/`key`/`action`) and for `msg=internal_action_unknown_state_persist_failed`
-error lines before acting. Those lines mean a best-effort unknown-state write failed after the
+and `msg=internal_action_terminal_persist_failed`
+error lines before acting. Those lines mean a best-effort unknown-state write, or a terminal
+(`persist_op=finish`) or proven-not-sent (`persist_op=release`) write including the `Malformed`
+finishes in `execute_member`, failed after the
 claim was committed; the claim is never released or resent. Read the `persist_class` before
 acting: `storage_unavailable` leaves the claim `in_flight`, so repeats answer `in_progress`
 until it goes stale. `transition_refused` means the row had already moved on (for example to a

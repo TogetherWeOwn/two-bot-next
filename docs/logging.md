@@ -102,6 +102,7 @@ draining state is observable via `/readyz` and `shutdown_started/completed`.
 | `shutdown_completed` | HTTP graceful drain completed successfully |
 | `shutdown_failed` | Service/supervisor failed; process exits nonzero |
 | `internal_action_unknown_state_persist_failed` | Receiver's best-effort unknown-state write refused or failed after the claim was committed; `action`, `persist_class` (`storage_unavailable` or `transition_refused`; `invalid_input` cannot occur from this write today). The claim is never released or resent |
+| `internal_action_terminal_persist_failed` | Receiver's terminal (`finish`) or proven-not-sent (`release`) write refused or failed after the claim was committed, including the `Malformed` finishes in `execute_member` and a failed `finish` whose follow-up `mark_unknown` then succeeds; `action`, `persist_op` (`finish` or `release`), `persist_class` (`storage_unavailable` or `transition_refused`; `invalid_input` cannot occur from these writes today). The claim is never released or resent; the wire response is unchanged |
 | `tracing_event` | Uncataloged/free-form tracing diagnostic; inspect `target`/`message` |
 
 ### Reserved job names
