@@ -7,21 +7,26 @@ the measure-first step; the voice-seeding rewards card builds on its output.
 
 ## What is recorded
 
-Every ticketed `VOICE_STATE_UPDATE` join emits, at gateway receipt:
+Every organic ticketed `VOICE_STATE_UPDATE` join increments, at gateway
+receipt:
 
 - Metric: `two_bot_voice_join_occupancy_total{occupancy="0|1|..|6|7+"}`.
   `occupancy` is the humans already present in the target channel, joiner
   excluded, capped at `7+`. Fixed 8-series vocabulary; no channel, member,
   guild or time labels ever reach exposition.
-- Log: `voice_event="voice_join_occupancy"` with numeric `occupancy_at_join`.
-  Token-free and ID-free, per the observability catalog. Log timestamps give
-  the hour; the dispatch span gives guild correlation.
 
-Leaves, same-channel updates and pre-`READY` frames emit no sample. Bot
-joins (music bots) are ticketed samples too; filter them downstream if they
-pollute the curve.
+No per-event log line is emitted: `VOICE_STATE_UPDATE` is hot per
+`docs/log-volume-guard.md`. Hourly curves come from
+`increase(two_bot_voice_join_occupancy_total[1h])`.
 
-## Computing P(join | occupancy)
+Leaves, same-channel updates and pre-`READY` frames emit no sample.
+Mechanical transitions emit no sample either: joining a
+protected/creator channel (the join-to-create generator), and the bot's
+own move echo out of one into the new room. Both keep their ticket so
+room creation is unaffected. Bot joins (music bots) are ticketed samples
+too; filter them downstream if they pollute the curve.
+
+## Join share by occupancy
 
 Overall distribution (Prometheus):
 
@@ -30,12 +35,13 @@ sum by (occupancy) (increase(two_bot_voice_join_occupancy_total[7d]))
 ```
 
 Divide each bucket by the total for the empirical join share at that
-occupancy. Per-hour curves: run the same query per hour, or bucket the
-`voice_join_occupancy` log lines by timestamp hour and count
-`occupancy_at_join` per hour. Per-guild curves: split log lines by the
-dispatch span guild correlation. Per-channel curves need channel-scoped
+occupancy: P(occupancy | join). Per-hour curves run the same query with
+`increase(...[1h])`. Each process serves one configured guild, so the
+counter is per-guild by process. Per-channel curves need channel-scoped
 logging, which the ID-free contract deliberately withholds; the rewards
 card decides whether that extra scope is worth its cardinality cost.
+P(join | occupancy) needs an exposure denominator (for example,
+channel-seconds spent at each occupancy), which nothing records yet.
 
 ## Worked example
 
@@ -52,16 +58,22 @@ Seven days, one guild, 1,000 sampled joins:
 | 6 | 40 | 0.04 |
 | 7+ | 30 | 0.03 |
 
-Read: joins concentrate at occupancy 1-3; empty channels convert worst.
-That is a join *share*, not a causal lift: it does not say seeding a
-channel to 2 occupants causes 3x the joins of an empty one. The rewards
-card must control for time-of-day, channel kind and guild size before
-paying for seeds.
+Read: joins concentrate at occupancy 1-3. That is a join *share*,
+not a conversion rate and not a causal lift: it does not say empty
+channels convert worst, nor that seeding a channel to 2 occupants
+causes 3x the joins of an empty one. The rewards card must control for
+time-of-day, channel kind and guild size before paying for seeds, and
+needs an exposure denominator before claiming P(join | occupancy).
 
 ## Caveats
 
 - Samples are ticketed joins only: the bot must be live and the guild
   snapshotted. Downtime gaps are missing samples, not zero joins.
+- Mechanical transitions are excluded by design: generator joins and the
+  bot's move echo keep their ticket but emit no sample, so the 0 bucket
+  counts organic joins into empty channels, not room creations.
 - Occupancy counts humans (`counts_as_human`); unknown identities count
   as human, known bots do not, but bot *joiners* still sample.
 - `7+` hides the tail; if it exceeds ~10% of samples, raise the cap.
+- Join share is not conversion: without channel-time per occupancy bucket,
+  do not read the table as P(join | occupancy).

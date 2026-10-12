@@ -1873,13 +1873,17 @@ impl LiveGuild {
 
     /// Ticket plus the seeding-TEST occupancy sample: the humans already
     /// present in the target channel when the join arrived, excluding the
-    /// joiner. `None` for leaves, same-channel updates and pre-READY frames.
+    /// joiner. The sample is `None` for mechanical transitions (joining a
+    /// protected/creator channel, or moving out of one: the generator join
+    /// and the bot's own move echo), which are not organic join decisions.
+    /// The outer `None` still means leaves, same-channel updates and
+    /// pre-READY frames (no ticket at all).
     pub fn voice_update_with_occupancy(
         &self,
         member: Snowflake,
         channel: Option<Snowflake>,
         bot: Option<bool>,
-    ) -> Option<(JoinTicket, u64)> {
+    ) -> Option<(JoinTicket, Option<u64>)> {
         self.voice_update_at_with_occupancy(member, channel, bot, wall_ms())
     }
 
@@ -1899,13 +1903,17 @@ impl LiveGuild {
     /// Tenure seam with the occupancy sample. The count is taken before the
     /// insert, inside the same write lock, so concurrent joins cannot skew
     /// it; the joiner is never in the target yet, so no self-count.
+    /// Mechanical transitions (target or previous channel protected: the
+    /// join-to-create generator and the bot's move echo into the new room)
+    /// keep their ticket but carry no sample, so the 0 bucket counts only
+    /// organic joins into empty channels.
     fn voice_update_at_with_occupancy(
         &self,
         member: Snowflake,
         channel: Option<Snowflake>,
         bot: Option<bool>,
         now_ms: u64,
-    ) -> Option<(JoinTicket, u64)> {
+    ) -> Option<(JoinTicket, Option<u64>)> {
         let mut live = self.write_state();
         let previous_channel = live
             .members
@@ -1920,7 +1928,13 @@ impl LiveGuild {
                 return None;
             }
         }
-        let occupancy_at_join = channel.map(|target| live.humans(target) as u64);
+        let mechanical = channel.is_some_and(|target| live.protected_channels.contains(&target))
+            || previous_channel.is_some_and(|previous| live.protected_channels.contains(&previous));
+        let occupancy_at_join = if mechanical {
+            None
+        } else {
+            channel.map(|target| live.humans(target) as u64)
+        };
         let bot = bot.or_else(|| live.members.get(&member).and_then(|previous| previous.bot));
         live.next_transition += 1;
         let transition = live.next_transition;
@@ -1947,7 +1961,7 @@ impl LiveGuild {
                     generation: live.generation,
                     transition,
                 },
-                occupancy_at_join.unwrap_or_default(),
+                occupancy_at_join,
             )
         })
     }
@@ -6636,14 +6650,16 @@ where
         let command = match actor.live.voice_update_with_occupancy(member, channel, bot) {
             Some((ticket, occupancy_at_join)) => {
                 // Seeding TEST (occupancy-to-join curve): one label-free
-                // counter sample plus a token-free log line per ticketed
-                // join. No member, channel or guild IDs are recorded.
-                metrics::global().voice_join_occupancy(occupancy_at_join);
-                info!(
-                    voice_event = "voice_join_occupancy",
-                    occupancy_at_join = occupancy_at_join,
-                    "voice join observed with occupancy-at-join"
-                );
+                // counter sample per organic ticketed join. No member,
+                // channel or guild IDs are recorded, and no per-event log
+                // line is emitted: VOICE_STATE_UPDATE is hot per
+                // docs/log-volume-guard.md. Mechanical transitions (the
+                // join-to-create generator join and the bot's move echo)
+                // carry no sample but still dispatch their ticket so room
+                // creation is unaffected.
+                if let Some(occupancy) = occupancy_at_join {
+                    metrics::global().voice_join_occupancy(occupancy);
+                }
                 ActorCommand::Join {
                     ticket,
                     display,

@@ -76,9 +76,8 @@ const SHUTDOWN_RS_EVENTS: [&str; 2] = [
 const JOBS_RS_EVENTS: [&str; 1] = ["periodic job failed"];
 
 /// `crates/bot/src/voice_rooms.rs`: the cataloged voice messages.
-const VOICE_RS_CATALOG_MESSAGES: [&str; 9] = [
+const VOICE_RS_CATALOG_MESSAGES: [&str; 8] = [
     "voice join completed",
-    "voice join observed with occupancy-at-join",
     "voice_operation succeeded",
     "voice_operation failed",
     "voice respace succeeded",
@@ -90,9 +89,8 @@ const VOICE_RS_CATALOG_MESSAGES: [&str; 9] = [
 
 /// `voice_event` field values (`crates/bot/src/voice_rooms.rs`), the bounded
 /// voice vocabulary that rides the gateway sink.
-const VOICE_EVENT_VALUES: [&str; 7] = [
+const VOICE_EVENT_VALUES: [&str; 6] = [
     "voice_join",
-    "voice_join_occupancy",
     "voice_operation",
     "voice_respace",
     "voice_reconcile",

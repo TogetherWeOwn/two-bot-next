@@ -1982,16 +1982,16 @@ fn join_reports_human_occupancy_at_join_before_insert() {
     let (_, occupancy) = live
         .voice_update_at_with_occupancy(301, Some(500), Some(false), 1_000)
         .expect("ticket");
-    assert_eq!(occupancy, 1);
+    assert_eq!(occupancy, Some(1));
     let (_, occupancy) = live
         .voice_update_at_with_occupancy(302, Some(500), Some(false), 2_000)
         .expect("ticket");
-    assert_eq!(occupancy, 2);
+    assert_eq!(occupancy, Some(2));
     // An empty creator sees zero.
     let (_, occupancy) = live
         .voice_update_at_with_occupancy(303, Some(CREATOR), Some(false), 3_000)
         .expect("ticket");
-    assert_eq!(occupancy, 0);
+    assert_eq!(occupancy, Some(0));
     // Leaves and same-channel updates are not join samples.
     assert!(live
         .voice_update_at_with_occupancy(MEMBER, None, Some(false), 4_000)
@@ -1999,6 +1999,40 @@ fn join_reports_human_occupancy_at_join_before_insert() {
     assert!(live
         .voice_update_at_with_occupancy(301, Some(500), Some(false), 5_000)
         .is_none());
+}
+
+#[test]
+fn mechanical_generator_and_move_echo_carry_no_occupancy_sample() {
+    // Review finding: one room creation emitted two occupancy-0 samples
+    // (the generator join and the bot's move echo into the new room),
+    // skewing the 0 bucket. Both keep their ticket so room creation is
+    // unaffected, but carry no sample.
+    const GENERATOR: u64 = 900;
+    let live = LiveGuild::new(GUILD);
+    live.publish(snapshot(
+        &[500],
+        vec![VoiceMember {
+            member_id: MEMBER,
+            channel_id: 500,
+            bot: Some(false),
+        }],
+    ));
+    live.protect_channels([GENERATOR]);
+    // Joining the protected generator keeps the ticket, samples nothing.
+    let (_, sample) = live
+        .voice_update_at_with_occupancy(301, Some(GENERATOR), Some(false), 1_000)
+        .expect("generator join keeps its ticket");
+    assert_eq!(sample, None);
+    // The move echo out of the generator into the new room also samples
+    // nothing, while an organic join into the same room still samples.
+    let (_, sample) = live
+        .voice_update_at_with_occupancy(301, Some(500), Some(false), 2_000)
+        .expect("move echo keeps its ticket");
+    assert_eq!(sample, None);
+    let (_, sample) = live
+        .voice_update_at_with_occupancy(302, Some(500), Some(false), 3_000)
+        .expect("organic join keeps its sample");
+    assert_eq!(sample, Some(2));
 }
 
 #[tokio::test]
@@ -4374,9 +4408,11 @@ fn runtime_drops_voice_frames_before_first_snapshot() {
 }
 
 #[tokio::test]
-async fn voice_frame_logs_occupancy_at_join() {
-    // Seeding TEST AC(1): every VOICE_STATE_UPDATE join carries its channel
-    // occupancy-at-join; leaves carry no sample.
+async fn voice_frame_counts_occupancy_without_per_event_log() {
+    // Seeding TEST AC(1): organic VOICE_STATE_UPDATE joins increment the
+    // occupancy counter (pinned at the LiveGuild seam above); VOICE_STATE_UPDATE
+    // is hot per docs/log-volume-guard.md, so no per-event log line is emitted.
+    // Joins still dispatch their ticket; leaves dispatch none.
     let (bytes, _subscriber) = capture_join_logs();
     let trace = Trace::default();
     let runtime = test_runtime(trace);
@@ -4400,9 +4436,7 @@ async fn voice_frame_logs_occupancy_at_join() {
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .filter(|event| event["fields"]["voice_event"] == "voice_join_occupancy")
         .collect();
-    assert_eq!(joins.len(), 2, "{text}");
-    assert_eq!(joins[0]["fields"]["occupancy_at_join"].as_u64(), Some(1));
-    assert_eq!(joins[1]["fields"]["occupancy_at_join"].as_u64(), Some(2));
+    assert!(joins.is_empty(), "{text}");
     runtime.remove_guild(GUILD);
 }
 
