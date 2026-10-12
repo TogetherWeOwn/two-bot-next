@@ -1,0 +1,14 @@
+id: rust-test-global-env
+snapshots:
+  '#[test] fn test_flag() { env::remove_var("FEATURE"); }':
+    labels:
+    - source: env::remove_var("FEATURE")
+      style: primary
+      start: 25
+      end: 51
+  '#[test] fn test_flag() { std::env::set_var("FEATURE", "1"); }':
+    labels:
+    - source: std::env::set_var("FEATURE", "1")
+      style: primary
+      start: 25
+      end: 58

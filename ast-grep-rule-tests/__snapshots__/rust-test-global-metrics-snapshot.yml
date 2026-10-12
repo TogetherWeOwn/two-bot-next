@@ -1,0 +1,14 @@
+id: rust-test-global-metrics
+snapshots:
+  '#[test] fn counter() { let before = metrics::global().count(); run(); assert_eq!(metrics::global().count(), before + 1); }':
+    labels:
+    - source: metrics::global()
+      style: primary
+      start: 36
+      end: 53
+  '#[test] fn counter() { let before = two_bot_core::metrics::global().count(); }':
+    labels:
+    - source: two_bot_core::metrics::global()
+      style: primary
+      start: 36
+      end: 67

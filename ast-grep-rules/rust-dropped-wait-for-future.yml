@@ -1,0 +1,6 @@
+id: rust-dropped-wait-for-future
+language: Rust
+severity: error
+message: 'Await the test wait_for future; otherwise it never runs Example: two-bot-next#705.'
+rule:
+  pattern: wait_for($$$ARGS);

@@ -1,0 +1,6 @@
+id: rust-byte-split-offset
+language: Rust
+severity: warning
+message: 'Do not split UTF-8 input at len minus a byte count without validating a character boundary Example: two-bot-next#799.'
+rule:
+  pattern: $TEXT.split_at($TEXT.len() - $N)

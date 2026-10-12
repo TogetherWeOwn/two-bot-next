@@ -1,0 +1,8 @@
+id: rust-byte-split-offset
+snapshots:
+  'fn parse(digits: &str) { let parts = digits.split_at(digits.len() - 2); }':
+    labels:
+    - source: digits.split_at(digits.len() - 2)
+      style: primary
+      start: 37
+      end: 70

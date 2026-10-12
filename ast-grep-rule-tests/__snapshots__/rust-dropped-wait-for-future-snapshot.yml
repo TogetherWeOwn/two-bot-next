@@ -1,0 +1,8 @@
+id: rust-dropped-wait-for-future
+snapshots:
+  async fn test_dispatch() { wait_for(|| idle(), "idle"); }:
+    labels:
+    - source: wait_for(|| idle(), "idle");
+      style: primary
+      start: 27
+      end: 55

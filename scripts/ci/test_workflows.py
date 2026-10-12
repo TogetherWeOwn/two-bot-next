@@ -981,6 +981,23 @@ class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.workflows = load_workflows()
 
+    def test_quality_gates_diff_merge_checkout_against_its_first_parent(self):
+        steps = self.workflows["check.yml"]["jobs"]["check"]["steps"]
+        expected_base = "${{ github.event.pull_request && format('{0}^1', github.sha) || github.event.before || 'origin/main' }}"
+        expected_head = "${{ github.sha }}"
+        for name in (
+            "Floor guard (HARD, CONSTRAINTS.md floor)",
+            "Patch coverage (WARN, 80% of added lines)",
+            "Unwrap in request paths (WARN)",
+            "Semgrep Rust rules (WARN)",
+        ):
+            with self.subTest(name=name):
+                step = next(step for step in steps if step.get("name") == name)
+                base_key = "FLOOR_BASE" if name.startswith("Floor guard") else "QUALITY_BASE"
+                head_key = "FLOOR_HEAD" if name.startswith("Floor guard") else "QUALITY_HEAD"
+                self.assertEqual(step["env"][base_key], expected_base)
+                self.assertEqual(step["env"][head_key], expected_head)
+
     def test_voice_synthetic_shape_is_pinned_and_mutations_fail(self):
         import copy
         synthetic = self.workflows["voice-synthetic.yml"]
