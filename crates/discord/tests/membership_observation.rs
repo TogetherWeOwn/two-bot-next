@@ -9,11 +9,12 @@ use std::sync::{
 };
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use twilight_http::{request::Request, routing::Route};
 use two_bot_core::send_admission::{
     AdmissionError, AdmissionFuture, AdmissionPermit, SendAdmission, SendCompletion, SendCooldown,
     TokenKey,
 };
-use two_bot_discord::executor::self_roles::SelfRoleRestError;
+use two_bot_discord::executor::{self_roles::SelfRoleRestError, HyperTransport};
 use two_bot_discord::ActionExecutor;
 
 fn ms(value: &str) -> i64 {
@@ -358,13 +359,22 @@ async fn governed_observed_read_with_sleeping_admit_times_out_without_wire() {
         Arc::clone(&lane) as Arc<dyn SendAdmission>,
     )
     .expect("governed executor builds against loopback");
+    let started = tokio::time::Instant::now();
     let result = tokio::time::timeout(
         Duration::from_secs(60),
         exec.get_json_observed("/guilds/2222/roles"),
     )
     .await
     .expect("a sleeping admit must not outlive the moderation bound");
+    let elapsed = started.elapsed();
     assert!(result.is_err(), "stall is an error, not absent: {result:?}");
+    // Five 5 s admit deadlines plus 0.5/1/2/4 s backoff settle at ~32.5 s.
+    // An admit outside the deadline sleeps the full 6 s per attempt (~37.5 s),
+    // so the bound pins the deadline to the admit path, not just the outcome.
+    assert!(
+        elapsed < Duration::from_secs(35),
+        "five bounded admits must settle under 35 s, took {elapsed:?}"
+    );
     assert_eq!(
         mock.requests().len(),
         0,
@@ -382,10 +392,13 @@ async fn governed_observed_read_with_sleeping_admit_times_out_without_wire() {
     mock.shutdown().await;
 }
 
-/// A GET whose headers arrive but whose body stalls must release the lane
-/// where the permit is in scope: otherwise the retries are `Blocked` by the
-/// read's own orphaned permit until the 60 s lease. Five wire requests, zero
-/// `Blocked`, lane free and re-admittable afterwards.
+/// A GET whose response stalls must release the lane where the permit is in
+/// scope: otherwise the retries are `Blocked` by the read's own orphaned
+/// permit until the 60 s lease. Five wire requests, zero `Blocked`, lane
+/// free and re-admittable afterwards. Under a paused clock the virtual time
+/// jumps to the attempt deadline before loopback headers are processed, so
+/// this always ends in the header arm; the body arms below are pinned at the
+/// transport in real time instead.
 #[tokio::test(start_paused = true)]
 async fn governed_observed_read_with_stalled_body_releases_lane() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -440,6 +453,157 @@ async fn governed_observed_read_with_stalled_body_releases_lane() {
         .expect("the lane must admit once the body-timed-out GETs release it");
     permit.complete(None).await.expect("test lane completion");
     mock.shutdown().await;
+}
+
+/// A GET whose headers arrive but whose body stalls must take the body-timeout
+/// arm and release the lane: headers land in milliseconds on loopback, so a
+/// short real-time deadline proves the error is the body bound (not the header
+/// one) and that the wait stays near the deadline instead of the 30 s stall.
+/// Deleting the release in the body-timeout arm orphans the permit (a second
+/// admit is `Blocked`, the lane stays held).
+#[tokio::test]
+async fn transport_stalled_body_times_out_and_releases_lane() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mock = MockRest::start(
+        vec![],
+        ScriptedResponse::json(200, serde_json::json!([])).delayed_body(Duration::from_secs(30)),
+    )
+    .await;
+    let lane = Arc::new(SingleFlightLane {
+        key: TokenKey::for_bot_token("fixture-token").unwrap(),
+        held: Arc::new(Mutex::new(false)),
+        admits: AtomicU32::new(0),
+        blocked: AtomicU32::new(0),
+        released: Arc::new(AtomicU32::new(0)),
+    });
+    let transport = HyperTransport::with_admission(
+        "fixture-token".to_owned(),
+        Some(mock.origin()),
+        Arc::clone(&lane) as Arc<dyn SendAdmission>,
+    )
+    .expect("governed transport builds against loopback");
+    let request = Request::from_route(&Route::GetGuildRoles { guild_id: 2222 });
+    let started = tokio::time::Instant::now();
+    let result = transport
+        .send_request(&request, Some(started + Duration::from_secs(2)))
+        .await;
+    let elapsed = started.elapsed();
+    assert_eq!(
+        result.map(|_| ()),
+        Err("read body timed out".to_owned()),
+        "headers arrived, so the stall must report the body bound"
+    );
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "the body bound must win near the 2 s deadline, not the 30 s stall: {elapsed:?}"
+    );
+    assert_eq!(mock.requests().len(), 1, "one wire request");
+    assert!(
+        !*lane.held.lock().unwrap(),
+        "a body-timed-out GET must release the lane"
+    );
+    assert_eq!(
+        lane.released.load(Ordering::SeqCst),
+        1,
+        "the body-timed-out attempt releases its permit"
+    );
+    let permit = lane
+        .admit()
+        .await
+        .expect("the lane must admit once the body-timed-out GET releases it");
+    assert_eq!(
+        lane.blocked.load(Ordering::SeqCst),
+        0,
+        "no Blocked on the read's own permit"
+    );
+    permit.complete(None).await.expect("test lane completion");
+    mock.shutdown().await;
+}
+
+/// A GET whose body is truncated on the wire (fewer bytes than declared, then
+/// close) must take the body-unavailable arm and release the lane, like a
+/// stalled body. Deleting the release in that arm orphans the permit. An
+/// inline server drives this: it closes with a byte missing, so the body
+/// read errors instead of timing out.
+/// (The scripted mock keeps a short connection open, which lands in the
+/// timeout arm above — not this one.)
+#[tokio::test]
+async fn transport_truncated_body_releases_lane() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind truncate");
+    let origin = format!("http://{}", listener.local_addr().expect("addr"));
+    let handle = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut buf = Vec::with_capacity(1024);
+        let mut chunk = [0u8; 1024];
+        loop {
+            let Ok(n) = stream.read(&mut chunk).await else {
+                break;
+            };
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let body = b"[]";
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len() + 1,
+        );
+        let _ = stream.write_all(head.as_bytes()).await;
+        let _ = stream.write_all(body).await;
+        // Drop the socket with a byte missing: the body read errors.
+    });
+    let lane = Arc::new(SingleFlightLane {
+        key: TokenKey::for_bot_token("fixture-token").unwrap(),
+        held: Arc::new(Mutex::new(false)),
+        admits: AtomicU32::new(0),
+        blocked: AtomicU32::new(0),
+        released: Arc::new(AtomicU32::new(0)),
+    });
+    let transport = HyperTransport::with_admission(
+        "fixture-token".to_owned(),
+        Some(origin),
+        Arc::clone(&lane) as Arc<dyn SendAdmission>,
+    )
+    .expect("governed transport builds against loopback");
+    let request = Request::from_route(&Route::GetGuildRoles { guild_id: 2222 });
+    let result = transport
+        .send_request(
+            &request,
+            Some(tokio::time::Instant::now() + Duration::from_secs(10)),
+        )
+        .await;
+    assert_eq!(
+        result.map(|_| ()),
+        Err("Discord response body unavailable".to_owned()),
+        "a truncated body must report unavailability, not a partial read"
+    );
+    assert!(
+        !*lane.held.lock().unwrap(),
+        "a truncated GET body must release the lane"
+    );
+    assert_eq!(
+        lane.released.load(Ordering::SeqCst),
+        1,
+        "the truncated attempt releases its permit"
+    );
+    let permit = lane
+        .admit()
+        .await
+        .expect("the lane must admit once the truncated GET releases it");
+    assert_eq!(
+        lane.blocked.load(Ordering::SeqCst),
+        0,
+        "no Blocked on the read's own permit"
+    );
+    permit.complete(None).await.expect("test lane completion");
+    handle.abort();
 }
 
 /// The self-role GET travels the budgeted wire path without an outer timer:

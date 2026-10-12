@@ -74,13 +74,13 @@ export is required. The report names this coverage gate explicitly.
    (`docs/voice-presence.md`). Missing a requested portal flag is FAIL; an
    unused enabled flag is WARN.
 3. `GET /gateway/bot` reads the Discord session-start budget through the same
-   governed GET path (lane held, no retry). The cutover's forced IDENTIFY
+   governed GET path (lane released, no retry). The cutover's forced IDENTIFY
    spends one start against this hard daily limit, plus more on reconnect
    retries, so `remaining` below 10 is FAIL and below 100 is WARN; otherwise
    PASS. The detail prints `remaining`, `total`, `reset_after_ms` and
    `max_concurrency` only, never the token. A failed, timed-out or malformed
    budget read fails closed and stops further checks. A 429 or 5xx follows the
-   same handling as every other check: recorded by the shared gate, lane held,
+   same handling as every other check: recorded by the shared gate, lane released,
    never retried by this command.
 4. The bot's guild member and all guild roles are fetched. Permissions are the
    union of `@everyone` and the bot's held roles. The legacy funnel/internal-action

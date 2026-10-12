@@ -985,6 +985,57 @@ mod tests {
     }
 
     #[test]
+    /// A preflight read whose headers never arrive must fail at the 30 s
+    /// absolute deadline instead of parking the check sequence: the deadline
+    /// lives in the transport call, so reverting it to `None` hangs here.
+    /// The clock is paused so the budget elapses without wall time.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_preflight_read_times_out_at_deadline() {
+        use twilight_http::{request::Request, routing::Route};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stall");
+        let origin = format!("http://{}", listener.local_addr().expect("addr"));
+        let handle = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = Vec::with_capacity(1024);
+            let mut chunk = [0u8; 1024];
+            loop {
+                let Ok(n) = stream.read(&mut chunk).await else {
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+        });
+        let transport = HyperTransport::with_proxy("fixture-token".to_owned(), Some(origin))
+            .expect("loopback transport");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            super::read_discord::<serde_json::Value>(
+                &transport,
+                "stall check",
+                Ok(Request::from_route(&Route::GetCurrentUser)),
+            ),
+        )
+        .await
+        .expect("a stalled preflight read must not outlive its deadline");
+        assert!(
+            result.is_err(),
+            "a stalled preflight read is an error, not a verdict"
+        );
+        handle.abort();
+    }
+
     fn target_collection_deduplicates_and_combines_channel_requirements() {
         let mut env = vars("2222", "session");
         env.insert("DISCORD_LANDING_CHANNEL_IDS".into(), "6666,7777".into());

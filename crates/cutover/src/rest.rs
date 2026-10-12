@@ -1225,6 +1225,81 @@ mod tests {
         mock.shutdown();
     }
 
+    /// A page whose headers never arrive must fail at the 30 s page budget on
+    /// every transport call site (`exec_list`, `exec_one`, `delete_channel`):
+    /// the absolute deadline lives in the transport, so reverting any of
+    /// those sites to `None` parks the caller instead of returning. The clock
+    /// is paused so the three budgets elapse without wall time; the stall can
+    /// never win.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_reads_time_out_at_page_budget() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use twilight_model::id::{
+            marker::{ChannelMarker, GuildMarker},
+            Id,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stall");
+        let origin = format!("http://{}", listener.local_addr().expect("addr"));
+        let accepted = Arc::new(AtomicU32::new(0));
+        let handle = {
+            let accepted = Arc::clone(&accepted);
+            tokio::spawn(async move {
+                // One stalled connection per call site below: read the request
+                // head, then sleep past the budget without answering.
+                for _ in 0..3 {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    let mut buf = Vec::with_capacity(1024);
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        let Ok(n) = stream.read(&mut chunk).await else {
+                            break;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(600)).await;
+                }
+            })
+        };
+        let rest = client_for(&origin);
+        let result = tokio::time::timeout(
+            Duration::from_secs(300),
+            rest.fetch_all_members(Id::<GuildMarker>::new(2222)),
+        )
+        .await
+        .expect("a stalled member page must not outlive the page budget");
+        assert!(result.is_err(), "a stalled page is an error: {result:?}");
+        let result = tokio::time::timeout(
+            Duration::from_secs(300),
+            rest.guild(Id::<GuildMarker>::new(2222)),
+        )
+        .await
+        .expect("a stalled guild read must not outlive the page budget");
+        assert!(result.is_err(), "a stalled read is an error: {result:?}");
+        let result = tokio::time::timeout(
+            Duration::from_secs(300),
+            rest.delete_channel(Id::<ChannelMarker>::new(3333), "stall test"),
+        )
+        .await
+        .expect("a stalled delete must not outlive the page budget");
+        assert!(result.is_err(), "a stalled delete is an error: {result:?}");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            3,
+            "one stalled wire request per call site"
+        );
+        handle.abort();
+    }
+
     /// Threat-model F6 refusal pins for the operator-tool admission pool: a
     /// remote `sslmode=disable` URL (and the other refusal cases) fails with
     /// a fixed string before SQLx parses the URL or opens a socket, with no
