@@ -59,6 +59,13 @@ pub(crate) fn router_with_guard(
         .route("/health", get(health))
         .route("/healthz", get(health))
         .route("/readyz", get(readyz))
+        // Backfill progress reads the same TWO_INTERNAL_KEYS ring as the
+        // internal-action receiver, over its own path-bound signature. Merged
+        // before `with_state` (unlike the stateless metrics route below): the
+        // handler reads the pool from listener state.
+        .merge(crate::ops_backfill::router_with_ring(
+            crate::ops_backfill::SharedRing::from_env(),
+        ))
         .with_state((state, jobs))
         .layer(axum::Extension(Arc::clone(&guard)))
         // Metrics and readiness sample the same guard as production executors.
@@ -100,8 +107,15 @@ pub(crate) fn router_with_guard(
 }
 
 /// Routes the public listener serves; the only paths a span may record.
-/// Keep in sync with `router_with_guard` and `metrics_http::router_with_guard`.
-const TRACED_PATHS: [&str; 4] = ["/health", "/healthz", "/readyz", "/metrics"];
+/// Keep in sync with `router_with_guard`, `metrics_http::router_with_guard`
+/// and `ops_backfill::router_with_ring`.
+const TRACED_PATHS: [&str; 5] = [
+    "/health",
+    "/healthz",
+    "/readyz",
+    "/metrics",
+    "/ops/backfill",
+];
 
 /// Recorded for every path that is not an exact `TRACED_PATHS` entry.
 const REDACTED_PATH: &str = "[REDACTED]";
@@ -440,6 +454,7 @@ mod tests {
             ("/healthz", "/healthz"),
             ("/readyz", "/readyz"),
             ("/metrics", "/metrics"),
+            ("/ops/backfill", "/ops/backfill"),
             ("/readyz?token=fixture-query-secret", "/readyz"),
             ("/health?key=fixture-query-secret", "/health"),
             ("/api/webhooks/1/fixture-webhook-token", "[REDACTED]"),
@@ -479,7 +494,7 @@ mod tests {
             "fixture-header-secret",
             "fixture-encoded-token",
         ];
-        let cases: [(&str, StatusCode); 13] = [
+        let cases: [(&str, StatusCode); 14] = [
             (
                 "/readyz?token=fixture-query-secret",
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -514,6 +529,9 @@ mod tests {
             ),
             ("/Health", StatusCode::NOT_FOUND),
             ("/metrics?token=fixture-query-secret", StatusCode::OK),
+            // The backfill route is signed: a bare read refuses without
+            // leaking whether any key exists.
+            ("/ops/backfill", StatusCode::UNAUTHORIZED),
         ];
         let recorder = SpanRecorder::default();
         tracing::subscriber::with_default(recorder.clone(), || {
