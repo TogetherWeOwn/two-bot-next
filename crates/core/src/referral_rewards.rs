@@ -10,9 +10,11 @@
 //! system has no cash-equivalent kind, so one cannot be added by accident.
 //!
 //! 2nd-hop bonus: when a credited join's inviter was themselves referred (a
-//! prior credited edge), the grand-inviter earns a bonus credit. Referred
-//! members get `referred-in, now refer` framing copy, which is the contagion
-//! lever: referred users refer downstream at higher rates.
+//! prior credited edge, or one credited in the same batch), the
+//! grand-inviter earns a bonus credit. The bonus never pays the inviter
+//! themselves or the member who just joined. Referred members get
+//! `referred-in, now refer` framing copy, which is the contagion lever:
+//! referred users refer downstream at higher rates.
 //!
 //! Anti-fraud: self-referrals, duplicate joins (leave-rejoin farming) and
 //! temporary memberships (joined then left before the minimum tenure) are
@@ -62,6 +64,11 @@ pub struct ReferralInput {
     /// Prior credited edges (member → inviter), all earlier batches plus
     /// already-merged history. Drives 2nd-hop lookup and rejoin dedupe.
     pub known_referrals: HashMap<Snowflake, Snowflake>,
+    /// Per-inviter credit totals banked in earlier batches (direct + bonus as
+    /// counted toward tiers). Tiers accumulate across batches: the reported
+    /// tier covers prior plus this batch, and a milestone fires only when the
+    /// batch lifts the inviter above its pre-batch tier.
+    pub prior_credits: HashMap<Snowflake, u64>,
     pub standings: HashMap<Snowflake, ReferralStanding>,
     pub now_ms: i64,
     pub min_tenure_days: i64,
@@ -202,28 +209,67 @@ pub fn second_hop_copy(referred_inviter: Snowflake) -> String {
 
 /// Evaluate one batch of attributed joins into credits, tiers and notices.
 ///
+/// Second-hop bonuses resolve against prior edges plus every edge credited
+/// in this batch, so chains that mature together still pay the bonus and
+/// input order does not matter. Tier milestones compare against
+/// [`ReferralInput::prior_credits`], so a milestone fires only when this
+/// batch lifts an inviter above its pre-batch tier.
+///
 /// Notices come out in a stable order: per-join framing in input order, then
-/// one tier milestone per unlocked inviter ordered by inviter id.
+/// one tier milestone per newly-unlocked inviter ordered by inviter id.
 #[must_use]
 pub fn evaluate_referrals(input: &ReferralInput) -> ReferralReport {
     let mut verdicts = Vec::with_capacity(input.joins.len());
-    let mut direct_credits: HashMap<Snowflake, u64> = HashMap::new();
-    let mut bonus_credits: HashMap<Snowflake, u64> = HashMap::new();
-    let mut notices = Vec::new();
     let mut seen: HashSet<Snowflake> = HashSet::new();
 
+    // Credit pass: verdicts without second-hop yet; collect this batch's edges.
+    let mut batch_edges: Vec<(Snowflake, Snowflake)> = Vec::new();
     for join in &input.joins {
         let member = join.member_id;
         let already_seen = !seen.insert(member);
         let outcome = evaluate_one(input, join, already_seen);
+        if let JoinOutcome::Credited { inviter_id, .. } = outcome {
+            batch_edges.push((member, inviter_id));
+        }
+        verdicts.push(JoinVerdict {
+            member_id: member,
+            outcome,
+        });
+    }
+
+    // Resolution pass: the working edge map is prior edges plus everything
+    // credited above, so a parent credited in this batch is visible to its
+    // children regardless of input order. A bonus never pays the inviter
+    // themselves, nor the member who just joined.
+    let mut edges = input.known_referrals.clone();
+    for (member, inviter) in &batch_edges {
+        edges.insert(*member, *inviter);
+    }
+    for verdict in &mut verdicts {
         if let JoinOutcome::Credited {
             inviter_id,
             second_hop,
-        } = outcome
+        } = &mut verdict.outcome
+        {
+            *second_hop = edges
+                .get(inviter_id)
+                .copied()
+                .filter(|grand| *grand != *inviter_id && *grand != verdict.member_id);
+        }
+    }
+
+    let mut direct_credits: HashMap<Snowflake, u64> = HashMap::new();
+    let mut bonus_credits: HashMap<Snowflake, u64> = HashMap::new();
+    let mut notices = Vec::new();
+    for verdict in &verdicts {
+        if let JoinOutcome::Credited {
+            inviter_id,
+            second_hop,
+        } = verdict.outcome
         {
             *direct_credits.entry(inviter_id).or_default() += 1;
             notices.push(Notice {
-                recipient_id: member,
+                recipient_id: verdict.member_id,
                 text: referred_in_copy(inviter_id),
             });
             if let Some(grand) = second_hop {
@@ -234,12 +280,11 @@ pub fn evaluate_referrals(input: &ReferralInput) -> ReferralReport {
                 });
             }
         }
-        verdicts.push(JoinVerdict {
-            member_id: member,
-            outcome,
-        });
     }
 
+    // Tiers accumulate: prior totals plus this batch. A milestone fires only
+    // when the batch lifts the inviter above its pre-batch tier, so repeat
+    // credits at the same tier do not re-notify.
     let mut tiers = HashMap::new();
     let mut inviters: Vec<Snowflake> = direct_credits
         .keys()
@@ -249,13 +294,17 @@ pub fn evaluate_referrals(input: &ReferralInput) -> ReferralReport {
     inviters.sort_unstable();
     inviters.dedup();
     for inviter in inviters {
-        let total = direct_credits.get(&inviter).copied().unwrap_or(0)
+        let batch_total = direct_credits.get(&inviter).copied().unwrap_or(0)
             + bonus_credits.get(&inviter).copied().unwrap_or(0);
-        if let Some(tier) = tier_for_total(total) {
-            notices.push(Notice {
-                recipient_id: inviter,
-                text: tier_copy(tier),
-            });
+        let prior = input.prior_credits.get(&inviter).copied().unwrap_or(0);
+        if let Some(tier) = tier_for_total(prior + batch_total) {
+            let is_new_unlock = tier_for_total(prior).is_none_or(|before| before.kind != tier.kind);
+            if is_new_unlock {
+                notices.push(Notice {
+                    recipient_id: inviter,
+                    text: tier_copy(tier),
+                });
+            }
             tiers.insert(inviter, tier);
         }
     }
@@ -270,7 +319,9 @@ pub fn evaluate_referrals(input: &ReferralInput) -> ReferralReport {
 }
 
 /// Verdict for a single join. `already_seen` marks a repeat of the same
-/// member earlier in this batch (leave-rejoin farming guard).
+/// member earlier in this batch (leave-rejoin farming guard). A credited join
+/// comes back with `second_hop: None`; the caller resolves it once the whole
+/// batch's edges are known.
 fn evaluate_one(input: &ReferralInput, join: &AttributedJoin, already_seen: bool) -> JoinOutcome {
     if already_seen || input.known_referrals.contains_key(&join.member_id) {
         return JoinOutcome::Rejected(RejectionReason::DuplicateJoin);
@@ -307,14 +358,11 @@ fn evaluate_one(input: &ReferralInput, join: &AttributedJoin, already_seen: bool
     if !engaged {
         return JoinOutcome::Pending(PendingReason::AwaitingEngagement);
     }
-    let second_hop = input
-        .known_referrals
-        .get(&inviter)
-        .copied()
-        .filter(|grand| *grand != inviter);
+    // Second-hop resolves later in `evaluate_referrals`, against prior edges
+    // plus every edge credited in this batch.
     JoinOutcome::Credited {
         inviter_id: inviter,
-        second_hop,
+        second_hop: None,
     }
 }
 
@@ -350,10 +398,23 @@ mod tests {
             joins,
             code_inviter: codes.iter().map(|(c, id)| ((*c).to_owned(), *id)).collect(),
             known_referrals: edges.iter().copied().collect(),
+            prior_credits: HashMap::new(),
             standings: standings.into_iter().collect(),
             now_ms: 1_000_000_000_000,
             min_tenure_days: MIN_TENURE_DAYS_DEFAULT,
         }
+    }
+
+    fn input_prior(
+        joins: Vec<AttributedJoin>,
+        codes: &[(&str, Snowflake)],
+        edges: &[(Snowflake, Snowflake)],
+        standings: Vec<(Snowflake, ReferralStanding)>,
+        prior: &[(Snowflake, u64)],
+    ) -> ReferralInput {
+        let mut base = input(joins, codes, edges, standings);
+        base.prior_credits = prior.iter().copied().collect();
+        base
     }
 
     fn credited(
@@ -663,5 +724,98 @@ mod tests {
         ));
         assert!(report.notices.is_empty());
         assert_eq!(report.verdicts.len(), 2);
+    }
+
+    #[test]
+    fn tiers_accumulate_across_batches_and_notify_once_per_tier() {
+        // Inviter 1 banked 4 credits before this batch; one more reaches the
+        // 5-credit role tier instead of repeating the spotlight milestone.
+        let report = evaluate_referrals(&input_prior(
+            vec![join(20, "invite:aaa", true, 10)],
+            &[("aaa", 1)],
+            &[],
+            vec![(20, present(true))],
+            &[(1, 4)],
+        ));
+        assert_eq!(report.direct_credits.get(&1), Some(&1));
+        assert_eq!(report.tiers.get(&1).map(|t| t.kind), Some(RewardKind::Role));
+        assert!(
+            report
+                .notices
+                .iter()
+                .any(|n| n.recipient_id == 1 && n.text.contains("status role")),
+            "fifth cumulative credit unlocks the role milestone, got: {:?}",
+            report.notices
+        );
+        assert!(
+            report
+                .notices
+                .iter()
+                .all(|n| { n.recipient_id != 1 || !n.text.contains("spotlight") }),
+            "no repeat spotlight milestone, got: {:?}",
+            report.notices
+        );
+
+        // A repeat credit inside the same tier re-notifies nothing: prior 1
+        // plus one more is still spotlight, so inviter 1 gets no notice.
+        let report = evaluate_referrals(&input_prior(
+            vec![join(21, "invite:aaa", true, 10)],
+            &[("aaa", 1)],
+            &[],
+            vec![(21, present(true))],
+            &[(1, 1)],
+        ));
+        assert_eq!(
+            report.tiers.get(&1).map(|t| t.kind),
+            Some(RewardKind::Spotlight)
+        );
+        assert!(
+            report.notices.iter().all(|n| n.recipient_id != 1),
+            "same-tier repeat credit must not re-notify, got: {:?}",
+            report.notices
+        );
+    }
+
+    #[test]
+    fn second_hop_bonus_is_never_paid_to_the_joining_member() {
+        // Edge 2->1 exists; member 1 rejoins through 2's code. The direct
+        // credit stands, but member 1 must not earn a bonus (or a milestone)
+        // for its own join.
+        let report = evaluate_referrals(&input(
+            vec![join(1, "invite:bbb", true, 10)],
+            &[("bbb", 2)],
+            &[(2, 1)],
+            vec![(1, present(true))],
+        ));
+        assert_eq!(credited(&report, 1), Some((2, None)));
+        assert!(report.bonus_credits.is_empty());
+        assert!(
+            report.notices.iter().all(|n| !n.text.contains("bonus")),
+            "no bonus notice may fire, got: {:?}",
+            report.notices
+        );
+    }
+
+    #[test]
+    fn second_hop_bonus_survives_same_batch_chains_in_any_order() {
+        // 1->2 and 2->3 mature in one batch: member 3 still pays the bonus
+        // to 1, whichever order the joins arrive in.
+        for joins in [
+            vec![
+                join(2, "invite:aaa", true, 10),
+                join(3, "invite:bbb", true, 10),
+            ],
+            vec![
+                join(3, "invite:bbb", true, 10),
+                join(2, "invite:aaa", true, 10),
+            ],
+        ] {
+            let standings = vec![(2, present(true)), (3, present(true))];
+            let report =
+                evaluate_referrals(&input(joins, &[("aaa", 1), ("bbb", 2)], &[], standings));
+            assert_eq!(credited(&report, 2), Some((1, None)));
+            assert_eq!(credited(&report, 3), Some((2, Some(1))));
+            assert_eq!(report.bonus_credits.get(&1), Some(&1));
+        }
     }
 }
