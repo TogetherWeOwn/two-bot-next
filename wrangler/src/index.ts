@@ -93,6 +93,12 @@ import {
 } from "./alert-rules.ts";
 import { parseAlertScrape } from "./metrics-scrape.ts";
 import { applySecurityHeaders, withSecurityHeaders } from "./security-headers.ts";
+import {
+  OPS_DASHBOARD_PATH,
+  OPS_SUMMARY_PATH,
+  dashboardPageResponse,
+  dashboardRefusal,
+} from "./ops-dashboard.ts";
 
 /**
  * Plus the optional reviewed TWO_* flags in container-env.ts (TOG-12020) and
@@ -129,6 +135,13 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   OPS_ALERT_FORWARDING?: string;
   /** Optional Worker secret: bearer token for GET /ops/metrics. Unset → route 404s. */
   METRICS_SCRAPE_TOKEN?: string;
+  /**
+   * Optional Worker secrets: Cloudflare Access service-token pair gating the
+   * read-only ops dashboard page and summary. Either unset (or short) → both
+   * routes 404. Never committed as wrangler.toml vars.
+   */
+  OPS_DASHBOARD_CLIENT_ID?: string;
+  OPS_DASHBOARD_CLIENT_SECRET?: string;
   /** Dedicated least-privilege bearer for the admin control surface
    * (GET /ops/config, /ops/kill-switch, /ops/audit). Absent/short → dark. */
   OPS_CONTROL_TOKEN?: string;
@@ -212,6 +225,11 @@ const metricsAuthBuckets = new TokenBuckets({ capacity: 10, refillPerSecond: 1 }
 // information: say so once per isolate so scanners cannot flood the logs.
 let metricsShortTokenLogged = false;
 
+// Attempt cap for the dashboard service-token gate. Separate budget from the
+// metrics scrape so guessing at one cannot throttle the other; otherwise the
+// same take-before-compare semantics (see metricsAuthBuckets above).
+const dashboardAuthBuckets = new TokenBuckets({ capacity: 10, refillPerSecond: 1 });
+
 // Store instances are request-scoped, but the lookup cache must survive
 // across requests to blunt repeated lookups — so it lives here beside the
 // miss cache, keyed (and reset) on the same configuration identity. A changed
@@ -269,6 +287,11 @@ const METRICS_FETCH_TIMEOUT_MS = 6000;
 // Prometheus exposition is small; cap the proxied body so a compromised or
 // wedged container cannot exhaust the isolate reading it.
 const MAX_METRICS_BODY_BYTES = 64 * 1024;
+// The DO serves the dashboard summary from inside blockConcurrencyWhile, so
+// the container fetch must be bounded well below the 30s DO gate.
+const SUMMARY_FETCH_TIMEOUT_MS = 6000;
+// Readiness JSON is small; cap the proxied body like the metrics scrape.
+const MAX_SUMMARY_BODY_BYTES = 64 * 1024;
 
 /** Compare via digests so length/prefix timing does not leak the token. */
 async function tokenMatches(provided: string, expected: string): Promise<boolean> {
@@ -501,7 +524,7 @@ export class TwoBotContainer extends Container<Env> {
     if (url.pathname === OPS_CONFIG_PATH || url.pathname === OPS_KILLSWITCH_PATH || url.pathname === OPS_AUDIT_PATH) {
       return this.opsControl(request);
     }
-    if (url.pathname !== "/health" && url.pathname !== "/readyz" && url.pathname !== OPS_METRICS_PATH) {
+    if (url.pathname !== "/health" && url.pathname !== "/readyz" && url.pathname !== OPS_METRICS_PATH && url.pathname !== OPS_SUMMARY_PATH) {
       return new Response("not found", { status: 404, headers: withSecurityHeaders() });
     }
     try {
@@ -552,6 +575,44 @@ export class TwoBotContainer extends Container<Env> {
           return new Response(body, {
             status: upstream.status,
             headers: withSecurityHeaders({ "content-type": "text/plain; version=0.0.4; charset=utf-8", "cache-control": "no-store" }),
+          });
+        }
+        // Reached only through the Worker's service-token gate (see default
+        // export). Unlike the metrics scrape, readiness 503 is meaningful data
+        // for the dashboard, so any bot probe answer (200 or JSON 503) proxies
+        // with its status; anything else is a 504 with a generic body.
+        if (url.pathname === OPS_SUMMARY_PATH) {
+          await this.armKeepalive();
+          const fetchSignal = AbortSignal.timeout(SUMMARY_FETCH_TIMEOUT_MS);
+          const summaryUnavailable = (status: number) =>
+            new Response("summary unavailable\n", {
+              status,
+              headers: withSecurityHeaders({ "content-type": "text/plain", "cache-control": "no-store" }),
+            });
+          let upstream: Response;
+          try {
+            upstream = await this.containerFetch("http://c/readyz", {
+              signal: fetchSignal,
+            });
+          } catch {
+            return summaryUnavailable(504);
+          }
+          if (fetchSignal.aborted || !isBotProbeResponse(upstream)) {
+            await upstream.body?.cancel().catch(() => {});
+            return summaryUnavailable(504);
+          }
+          let body: string | null;
+          try {
+            body = await readBoundedText(upstream, MAX_SUMMARY_BODY_BYTES);
+          } catch {
+            return summaryUnavailable(504);
+          }
+          if (body === null) {
+            return summaryUnavailable(502);
+          }
+          return new Response(body, {
+            status: upstream.status,
+            headers: withSecurityHeaders({ "content-type": "application/json", "cache-control": "no-store" }),
           });
         }
         // Bound the entire probe, including auto-start, below the 30s DO gate.
@@ -1197,6 +1258,47 @@ export default {
       try {
         // The fenced DO route requires the deployment header (see fetch);
         // stamp it here like the health/readyz forward above.
+        const forwarded = new Request(request);
+        forwarded.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
+        return await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(forwarded);
+      } catch (error) { return refused(error); }
+    }
+
+    // Read-only ops dashboard (TOG-22861). The static page holds no data
+    // and is ungated so a browser can open it; only the summary needs human
+    // auth (Cloudflare Access service tokens: both CF-Access-Client-Id and
+    // CF-Access-Client-Secret on every summary request, strict mode — no
+    // cookies or sessions). Unconfigured or short Operator secrets, or any
+    // non-GET summary method → 404 (the route does not exist);
+    // missing/wrong summary credentials → 401. Summary attempts are
+    // per-caller throttled before any comparison, on a separate budget from
+    // the metrics scrape. The page serves static HTML (no container touch);
+    // the summary forwards to the fenced DO route, which proxies the
+    // container's /readyz (200 and JSON 503 both proxy with their status).
+    if (url.pathname === OPS_DASHBOARD_PATH) {
+      if (request.method !== "GET") {
+        return new Response("not found", { status: 404, headers: withSecurityHeaders() });
+      }
+      return dashboardPageResponse();
+    }
+    if (url.pathname === OPS_SUMMARY_PATH) {
+      if (request.method !== "GET") {
+        return new Response("not found", { status: 404, headers: withSecurityHeaders() });
+      }
+      const caller = request.headers.get("cf-connecting-ip") ?? "unknown";
+      const verdict = dashboardAuthBuckets.take(caller);
+      if (!verdict.allowed && !dashboardAuthBuckets.peek(caller).allowed) {
+        return new Response("slow down\n", {
+          status: 429,
+          headers: withSecurityHeaders({
+            "content-type": "text/plain",
+            "retry-after": String(verdict.retryAfter),
+          }),
+        });
+      }
+      const refusal = await dashboardRefusal(request, env);
+      if (refusal) return refusal;
+      try {
         const forwarded = new Request(request);
         forwarded.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
         return await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(forwarded);
