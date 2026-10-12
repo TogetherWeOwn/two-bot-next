@@ -15,7 +15,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, RwLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -2403,7 +2403,11 @@ struct Creation {
 pub struct GuildRoomWorker<S, H> {
     live: LiveGuild,
     store: S,
-    http: H,
+    /// Shared writer handle: the actor loop's watchdog sibling holds a clone
+    /// so it can republish the in-flight REST age while a dispatch is hung
+    /// inside the main task. Method calls resolve through the `Arc` deref;
+    /// only whole-handle replacement needs `Arc::get_mut`.
+    http: Arc<H>,
     creators: HashMap<Snowflake, CreatorChannel>,
     access: AccessControls,
     /// Caps and cooldown for the durable create admission; the rolling burst
@@ -2753,7 +2757,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         let worker = Self {
             live,
             store,
-            http,
+            http: Arc::new(http),
             creators,
             access,
             admission: temp_voice_admission(),
@@ -4210,9 +4214,18 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// Clear the store-credential latch after a successful re-probe. Only
     /// the actor loop calls this, and only for non-Discord halts; every
     /// other halted write path sets the latch.
+    ///
+    /// Recovery also drops the delete and ownership dedup markers. Halted
+    /// branches `mark_succeeded` their action while leaving the marker, so
+    /// without this the next reconcile dedups against the leftover marker
+    /// and strands the work until a restart. Re-derivation is safe: a
+    /// duplicate `DeleteRoom` returns early when the room is gone, and an
+    /// ownership handoff reconverges on the latest worker owner.
     pub fn clear_halt(&mut self) {
         self.halted = false;
         self.halted_by_discord = false;
+        self.deletes.clear();
+        self.ownership_queued.clear();
     }
     pub fn tracked(&self) -> &HashMap<Snowflake, VoiceRoom> {
         &self.rooms
@@ -7221,7 +7234,7 @@ where
     }
 }
 
-async fn run_actor<S: RoomPersistence, H: RoomWrites>(
+async fn run_actor<S: RoomPersistence, H: RoomWrites + 'static>(
     worker: &mut GuildRoomWorker<S, H>,
     inbox: mpsc::UnboundedReceiver<ActorCommand>,
     tick: Duration,
@@ -7294,7 +7307,94 @@ fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(worker: &GuildRoomWor
     );
 }
 
-async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites>(
+/// Stall posture shared between the guild actor loop and its watchdog
+/// sibling. The main task owns `&mut worker` and refreshes the snapshot; the
+/// sibling only reads it, so the watchdog and the gauge publish keep running
+/// while a dispatch is hung inside an unbounded await. A hung dispatch still
+/// cannot answer inbox commands (the inbox consumer is the hung task) and
+/// still cannot recover the halt latch mid-hang: the sibling detects, the
+/// main task recovers once the write returns.
+struct StallShared<H> {
+    guild: Snowflake,
+    http: Arc<H>,
+    state: Mutex<StallState>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StallState {
+    last_progress: tokio::time::Instant,
+    urgent: usize,
+    deferred: usize,
+    oldest_age_secs: u64,
+    halted: bool,
+}
+
+impl<H: RoomWrites> StallShared<H> {
+    fn snapshot<S: RoomPersistence>(
+        &self,
+        worker: &GuildRoomWorker<S, H>,
+        last_progress: tokio::time::Instant,
+    ) {
+        let guild = worker.live.guild_id;
+        let (urgent, deferred) = worker.queue.pending_counts(guild);
+        let oldest_age_secs = worker
+            .queue
+            .oldest_pending_age(guild)
+            .map_or(0, |age| age.as_secs());
+        *self.state.lock().expect("stall snapshot lock") = StallState {
+            last_progress,
+            urgent,
+            deferred,
+            oldest_age_secs,
+            halted: worker.halted(),
+        };
+    }
+
+    /// Watchdog + gauge publish from the shared snapshot. Reads only: safe
+    /// to run on the sibling task while the main task is hung in dispatch.
+    fn observe(&self, stuck_after: Duration, last_fire: &mut Option<tokio::time::Instant>) {
+        let snap = *self.state.lock().expect("stall snapshot lock");
+        // Recompute the in-flight REST age from attempts still live, so the
+        // gauge shows a currently-stalled request instead of the begin/drop
+        // snapshots (0 at begin, already removed at drop).
+        self.http.republish_rest_age();
+        let gauges = metrics::global();
+        gauges.set_voice_halted(snap.halted);
+        gauges.set_voice_queue(
+            u64::try_from(snap.urgent).unwrap_or(u64::MAX),
+            u64::try_from(snap.deferred).unwrap_or(u64::MAX),
+            snap.oldest_age_secs,
+        );
+        // Stuck-worker watchdog: queued work with no completed turn for the
+        // full window. Log + metric only; the queue keeps its retries so a
+        // transient outage still drains on recovery.
+        let now = tokio::time::Instant::now();
+        let fire_cooled = last_fire.is_none_or(|fired| {
+            now.saturating_duration_since(fired) >= stuck_after
+        });
+        if fire_cooled
+            && watchdog_due(
+                snap.last_progress,
+                now,
+                snap.urgent + snap.deferred > 0,
+                stuck_after,
+            )
+        {
+            *last_fire = Some(now);
+            metrics::global().voice_watchdog_stuck();
+            error!(
+                guild = self.guild.to_string(),
+                urgent = snap.urgent,
+                deferred = snap.deferred,
+                oldest_pending_age_secs = snap.oldest_age_secs,
+                halted = snap.halted,
+                "voice worker stuck: queued actions with no progress"
+            );
+        }
+    }
+}
+
+async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
     worker: &mut GuildRoomWorker<S, H>,
     mut inbox: mpsc::UnboundedReceiver<ActorCommand>,
     tick: Duration,
@@ -7308,8 +7408,40 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites>(
     let mut dispatch_budget = 8u8;
     let mut complete_join_pair = false;
     let mut last_progress = tokio::time::Instant::now();
-    let mut last_watchdog_fire: Option<tokio::time::Instant> = None;
     let mut last_halt_probe = tokio::time::Instant::now();
+    // Watchdog sibling: observes the shared snapshot on its own timer, so a
+    // dispatch hung in an unbounded await still counts stucks and publishes
+    // gauges. The sibling never touches `worker`.
+    let stall = Arc::new(StallShared {
+        guild: worker.live.guild_id,
+        http: Arc::clone(&worker.http),
+        state: Mutex::new(StallState {
+            last_progress,
+            urgent: 0,
+            deferred: 0,
+            oldest_age_secs: 0,
+            halted: false,
+        }),
+    });
+    stall.snapshot(worker, last_progress);
+    let stop_watchdog = Arc::new(AtomicBool::new(false));
+    let watchdog = {
+        let stall = Arc::clone(&stall);
+        let stop = Arc::clone(&stop_watchdog);
+        let stuck_after = limits.watchdog_stuck_after;
+        tokio::spawn(async move {
+            let mut watch_timer = tokio::time::interval(tick);
+            watch_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last_fire = None;
+            loop {
+                watch_timer.tick().await;
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                stall.observe(stuck_after, &mut last_fire);
+            }
+        })
+    };
     loop {
         tokio::select! {
             biased;
@@ -7323,6 +7455,7 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites>(
                 if accepted {
                     last_progress = tokio::time::Instant::now();
                 }
+                stall.snapshot(worker, last_progress);
                 dispatch_ready |= accepted;
             }
             // Inbox first between writes, but no timer between a persisted
@@ -7336,6 +7469,8 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites>(
                 // Observe-only bound: the future runs to completion (dropping
                 // it would leak the creation record), but an over-budget turn
                 // means a constituent await has no cap — count it loudly.
+                // While the turn is still in flight, the watchdog sibling is
+                // the stuck signal: this counter only fires after a return.
                 if dispatch_started.elapsed() >= limits.dispatch_observe_after {
                     metrics::global().voice_dispatch_timeout();
                     warn!(
@@ -7347,41 +7482,17 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites>(
                 if progressed {
                     last_progress = tokio::time::Instant::now();
                 }
+                stall.snapshot(worker, last_progress);
                 dispatch_ready = progressed;
                 complete_join_pair = worker.moves.len() > pending_moves;
                 dispatch_budget = dispatch_budget.saturating_sub(1);
             }
             _ = timer.tick() => {
                 publish_voice_gauges(worker);
-                // Stuck-worker watchdog: queued work with no completed turn
-                // for the full window. Log + metric only; the queue keeps its
-                // retries so a transient outage still drains on recovery.
-                let (urgent, deferred) = worker.queue.pending_counts(worker.live.guild_id);
+                // The stuck-worker watchdog lives on the sibling task now, so
+                // it fires while a dispatch is hung: see `StallShared`. The
+                // tick arm keeps the fresh gauge publish plus recovery below.
                 let now = tokio::time::Instant::now();
-                let fire_cooled = last_watchdog_fire
-                    .is_none_or(|fired| now.saturating_duration_since(fired) >= limits.watchdog_stuck_after);
-                if fire_cooled
-                    && watchdog_due(
-                        last_progress,
-                        now,
-                        urgent + deferred > 0,
-                        limits.watchdog_stuck_after,
-                    )
-                {
-                    last_watchdog_fire = Some(now);
-                    metrics::global().voice_watchdog_stuck();
-                    error!(
-                        guild = worker.live.guild_id.to_string(),
-                        urgent,
-                        deferred,
-                        oldest_pending_age_secs = worker
-                            .queue
-                            .oldest_pending_age(worker.live.guild_id)
-                            .map_or(0, |age| age.as_secs()),
-                        halted = worker.halted(),
-                        "voice worker stuck: queued actions with no progress"
-                    );
-                }
                 // Halted-latch recovery: a CredentialRefused parks the worker
                 // silently. Re-probe credentials under a timeout; a healthy
                 // read clears the latch so the next join flows.
@@ -7441,6 +7552,7 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites>(
                 // V5: re-render template names whose facts changed (create,
                 // join/leave, owner handoff); the rename lane paces them.
                 worker.refresh_template_names(now_ms);
+                stall.snapshot(worker, last_progress);
                 dispatch_ready = true;
                 maintenance_ready = true;
             }
@@ -7460,6 +7572,11 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites>(
             }
         }
     }
+    // Inbox closed: stop the sibling first so no watchdog publish outlives
+    // the actor (and its tests).
+    stop_watchdog.store(true, Ordering::Relaxed);
+    watchdog.abort();
+    let _ = watchdog.await;
     worker.finish_pending_joins();
     // Inbox closed: append what is left (one failed batch ends it) so a clean
     // shutdown keeps the trail.

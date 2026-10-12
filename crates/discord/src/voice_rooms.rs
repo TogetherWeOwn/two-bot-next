@@ -327,15 +327,23 @@ impl InFlightRest {
     }
 }
 
-fn publish_rest_age(slots: &Arc<Mutex<InFlightRest>>) {
-    let age_secs = slots
+/// Oldest live REST attempt in whole seconds. Pure computation behind
+/// [`publish_rest_age`]: tests assert on this return value instead of the
+/// process-global gauge, which is last-writer-wins and flakes when another
+/// test's begin/drop lands between the publish and the read.
+fn oldest_age_secs(slots: &Arc<Mutex<InFlightRest>>) -> u64 {
+    slots
         .lock()
         .expect("in-flight lock")
         .live
         .values()
         .map(|started| started.elapsed().as_secs())
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+fn publish_rest_age(slots: &Arc<Mutex<InFlightRest>>) {
+    let age_secs = oldest_age_secs(slots);
     two_bot_core::metrics::global().set_voice_rest_in_flight_age_secs(age_secs);
 }
 
@@ -1628,7 +1636,10 @@ mod tests {
     fn republish_rest_age_reports_a_live_stalled_attempt() {
         // The gauge must reflect attempts still live, not just the begin
         // (always 0) and drop (already removed) snapshots: backdate one
-        // attempt 7 s and republish mid-flight.
+        // attempt 7 s and republish mid-flight. The assertion reads the pure
+        // computation, not the process-global gauge: the gauge is
+        // last-writer-wins and any concurrent test's begin/drop between the
+        // publish and the read fails an exact gauge read.
         let slots = Arc::new(Mutex::new(InFlightRest::default()));
         {
             let mut inner = slots.lock().expect("in-flight lock");
@@ -1641,7 +1652,7 @@ mod tests {
                     .expect("stalled start 7s ago"),
             );
         }
+        assert_eq!(oldest_age_secs(&slots), 7);
         publish_rest_age(&slots);
-        assert_eq!(global_series("two_bot_voice_rest_in_flight_age_seconds"), 7);
     }
 }
