@@ -9,11 +9,17 @@
  * CSP: X-Frame-Options DENY already states the posture with fewer bytes.
  */
 
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
 import { SECURITY_HEADERS } from "../src/security-headers.ts";
 import { handleRedirect } from "../src/redirect.ts";
-import worker, { type Env } from "../src/index.ts";
+import worker, { TwoBotContainer, type Env } from "../src/index.ts";
+import {
+  CONTROL_PATH,
+  DEPLOYMENT_HEADER,
+  OWNER_KEY,
+} from "../src/ownership.ts";
 
 const EXPECTED: Record<string, string> = {
   "x-content-type-options": "nosniff",
@@ -140,4 +146,239 @@ test("Worker-constructed responses carry the decided set", async () => {
   );
   assert.equal(unavailable.status, 500);
   assertHardened(unavailable.headers, "ready 500");
+});
+
+test("Worker probe edge copy stamps the decided set on bot-shaped upstream", async () => {
+  // Pins wrangler/src/index.ts:1010: the /health and /readyz edge copy must
+  // harden the Worker's answer even when the DO/container bytes arrive
+  // without the headers. Deleting the applySecurityHeaders line leaves the
+  // upstream headers bare, so these assertions fail without the stamp.
+  // Fresh caller IPs: the probe budget is module-level per isolate and the
+  // earlier burst test already exhausts 192.0.2.50.
+  const ctx = { waitUntil() {} } as unknown as ExecutionContext;
+  const botUpstream = (upstream: Response) =>
+    ({
+      REDIRECT_MAPPINGS_JSON: "[]",
+      REDIRECT_FALLBACK_CODE: "fallbackCode",
+      CF_VERSION_METADATA: { id: "synthetic-edge-copy-deployment" },
+      TWO_BOT: { getByName: () => ({ fetch: async () => upstream }) },
+    }) as unknown as Env;
+
+  // Bot-shaped 200: status 200 always counts as a bot probe response.
+  const ok = await worker.fetch(
+    new Request("https://worker.invalid/health", {
+      headers: { "cf-connecting-ip": "192.0.2.60" },
+    }),
+    botUpstream(new Response("bot-ok-body")),
+    ctx,
+  );
+  assert.equal(ok.status, 200);
+  assert.equal(await ok.text(), "bot-ok-body");
+  assertHardened(ok.headers, "edge 200");
+  assert.equal(
+    ok.headers.get("x-two-worker-version"),
+    "synthetic-edge-copy-deployment",
+  );
+
+  // Parked readiness: JSON 503 also counts as a bot probe response.
+  const parkedUpstream = Response.json({ ready: false }, { status: 503 });
+  assert.equal(parkedUpstream.headers.get("x-content-type-options"), null);
+  const parked = await worker.fetch(
+    new Request("https://worker.invalid/readyz", {
+      headers: { "cf-connecting-ip": "192.0.2.61" },
+    }),
+    botUpstream(parkedUpstream),
+    ctx,
+  );
+  assert.equal(parked.status, 503);
+  assertHardened(parked.headers, "edge 503");
+  assert.deepEqual(await parked.json(), { ready: false });
+});
+
+const DO_ID = "synthetic-headers-do-deployment";
+const DO_CONTROL_TOKEN = "synthetic-headers-control-token-0123456789";
+const DO_ACTIVE_OWNER = {
+  deploymentId: DO_ID,
+  epoch: 1,
+  phase: "active",
+  actor: "fixture-operator",
+  timestamp: "2026-10-01T00:00:00.000Z",
+  oldEpoch: 0,
+  oldDeploymentId: null,
+};
+
+async function headersDoHarness(t: TestContext) {
+  const database = new DatabaseSync(":memory:");
+  t.after(() => database.close());
+  for (const method of ["log", "warn", "error"] as const) {
+    t.mock.method(console, method, () => {});
+  }
+  const values = new Map<string, unknown>([[OWNER_KEY, DO_ACTIVE_OWNER]]);
+  const gates: Promise<unknown>[] = [];
+  const ctx = {
+    exports: {
+      ContainerProxy: () => ({
+        fetch: () => {
+          throw new Error("unexpected outbound request");
+        },
+      }),
+    },
+    id: { toString: () => "synthetic-headers-do-id" },
+    container: {
+      running: false,
+      async destroy() {},
+      start() {},
+      monitor: () => new Promise<void>(() => {}),
+      getTcpPort: () => ({
+        fetch: async () => new Response(null, { status: 500 }),
+      }),
+    },
+    storage: {
+      get: async (key: string) => values.get(key),
+      put: async (key: string | Record<string, unknown>, value?: unknown) => {
+        if (typeof key === "string") values.set(key, value);
+        else for (const [k, v] of Object.entries(key)) values.set(k, v);
+      },
+      delete: async (key: string) => {
+        values.delete(key);
+      },
+      kv: {
+        get: (key: string) => values.get(key),
+        put: (key: string, value: unknown) => {
+          values.set(key, value);
+        },
+        delete: (key: string) => {
+          values.delete(key);
+        },
+      },
+      sql: {
+        exec(query: string, ...bindings: (string | number | null)[]) {
+          return database.prepare(query).all(...bindings);
+        },
+      },
+      setAlarm: async () => {},
+      deleteAlarm: async () => {},
+      sync: async () => {},
+    },
+    blockConcurrencyWhile<T>(callback: () => Promise<T>) {
+      const promise = callback();
+      gates.push(promise);
+      return promise;
+    },
+  };
+  const bot = new TwoBotContainer(
+    ctx as unknown as DurableObjectState<{}>,
+    {
+      CF_VERSION_METADATA: { id: DO_ID },
+      OWNERSHIP_CONTROL_TOKEN: DO_CONTROL_TOKEN,
+    } as Env,
+  );
+  await Promise.all(gates);
+  return { bot };
+}
+
+function doRequest(path: string, init?: RequestInit): Request {
+  const request = new Request(`https://worker.invalid${path}`, init);
+  request.headers.set(DEPLOYMENT_HEADER, DO_ID);
+  return request;
+}
+
+test("Durable Object responses carry the decided set", async (t) => {
+  // Pins the ten withSecurityHeaders call sites inside TwoBotContainer:
+  // the DO 404, the metrics 200/502/503/504 answers, the control
+  // 401/405/400 answers and both control JSON answers. Reverting those
+  // calls to plain objects leaves the suite green without these cases.
+  const { bot } = await headersDoHarness(t);
+
+  // DO 404 for unknown paths.
+  const missing = await bot.fetch(doRequest("/no-such-route"));
+  assert.equal(missing.status, 404);
+  assertHardened(missing.headers, "do 404");
+  await missing.text();
+
+  // DO metrics answers via a mocked container fetch.
+  t.mock.method(bot, "containerFetch", async () => new Response("# HELP x\n", { status: 200 }));
+  const metricsOk = await bot.fetch(doRequest("/ops/metrics"));
+  assert.equal(metricsOk.status, 200);
+  assertHardened(metricsOk.headers, "do metrics 200");
+  assert.equal(await metricsOk.text(), "# HELP x\n");
+
+  t.mock.method(bot, "containerFetch", async () => {
+    throw new Error("fixture transport failure");
+  });
+  const metricsThrow = await bot.fetch(doRequest("/ops/metrics"));
+  assert.equal(metricsThrow.status, 504);
+  assertHardened(metricsThrow.headers, "do metrics 504 throw");
+  assert.equal(await metricsThrow.text(), "metrics unavailable\n");
+
+  t.mock.method(bot, "containerFetch", async () => new Response("boom", { status: 500 }));
+  const metricsNonOk = await bot.fetch(doRequest("/ops/metrics"));
+  assert.equal(metricsNonOk.status, 504);
+  assertHardened(metricsNonOk.headers, "do metrics 504 non-ok");
+  await metricsNonOk.text();
+
+  t.mock.method(bot, "containerFetch", async () => new Response("m 1\n".repeat(20000)));
+  const metricsHuge = await bot.fetch(doRequest("/ops/metrics"));
+  assert.equal(metricsHuge.status, 502);
+  assertHardened(metricsHuge.headers, "do metrics 502");
+  assert.equal(await metricsHuge.text(), "metrics unavailable\n");
+
+  // DO control answers: 401/405/400 before the gate, JSON answers inside it.
+  const controlNoAuth = await bot.fetch(doRequest(CONTROL_PATH));
+  assert.equal(controlNoAuth.status, 401);
+  assertHardened(controlNoAuth.headers, "do control 401");
+  await controlNoAuth.text();
+
+  const controlMethod = await bot.fetch(
+    doRequest(CONTROL_PATH, {
+      method: "PUT",
+      headers: { authorization: `Bearer ${DO_CONTROL_TOKEN}` },
+    }),
+  );
+  assert.equal(controlMethod.status, 405);
+  assertHardened(controlMethod.headers, "do control 405");
+  assert.equal(controlMethod.headers.get("allow"), "GET, POST");
+  await controlMethod.text();
+
+  const controlBadChange = await bot.fetch(
+    doRequest(CONTROL_PATH, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${DO_CONTROL_TOKEN}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ action: "not-a-change" }),
+    }),
+  );
+  assert.equal(controlBadChange.status, 400);
+  assertHardened(controlBadChange.headers, "do control 400");
+  await controlBadChange.text();
+
+  const controlGet = await bot.fetch(
+    doRequest(CONTROL_PATH, {
+      headers: { authorization: `Bearer ${DO_CONTROL_TOKEN}` },
+    }),
+  );
+  assert.equal(controlGet.status, 200);
+  assertHardened(controlGet.headers, "do control get json");
+  assert.equal(controlGet.headers.get("cache-control"), "no-store");
+  await controlGet.json();
+
+  const controlPost = await bot.fetch(
+    doRequest(CONTROL_PATH, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${DO_CONTROL_TOKEN}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        action: "takeover",
+        expectedEpoch: 1,
+        actor: "fixture-operator",
+      }),
+    }),
+  );
+  assert.equal(controlPost.status, 200);
+  assertHardened(controlPost.headers, "do control post json");
+  await controlPost.json();
 });
