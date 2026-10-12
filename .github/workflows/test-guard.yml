@@ -5,8 +5,8 @@ name: test-guard
 # acceptance tests written by the Test Author). Lands in warn mode:
 # it reports but never fails. Per-repo overrides go in
 # `.github/test-guard.json` (see TEST-GUARD.md in the .github repo).
-# Replace 3fffeb9f9465f371763fcc3c789ed4baefe38f95 with the merge SHA of the reusable workflow,
-# then repin the same way on later updates — never a moving tag.
+# Pinned to the org reusable merge SHA; repin the same way on later
+# updates — never a moving tag.
 # Do NOT add this check to any ruleset until the repo flips to enforce.
 
 on:
@@ -15,9 +15,9 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
 
-permissions:
-  contents: read
-  pull-requests: read # marker-label actor audit via the issue-events API
+# Repo policy (scripts/ci/test_workflows.py): top-level permissions stay
+# empty; the least-privilege grant lives on the job instead.
+permissions: {}
 
 concurrency:
   group: test-guard-${{ github.event.pull_request.number || github.sha }}
@@ -27,4 +27,9 @@ jobs:
   # Keep id and name byte-identical: a future org ruleset requires `test-guard`.
   test-guard:
     name: test-guard
+    # Least-privilege grant: contents for the diff, pull-requests for the
+    # marker-label actor audit via the issue-events API.
+    permissions:
+      contents: read
+      pull-requests: read
     uses: TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95
