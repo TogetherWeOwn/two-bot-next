@@ -991,27 +991,6 @@ impl RoomHttp {
         Ok(())
     }
 
-    /// Atomic room-scoped overwrite replacement for an owner handoff.
-    /// Source: <https://docs.discord.com/developers/resources/channel#modify-channel>
-    pub async fn update_room_overwrites(
-        &self,
-        channel_id: Snowflake,
-        overwrites: &[PermissionOverwrite],
-        still_valid: impl Fn() -> bool + Send + 'static,
-    ) -> Result<Channel, RoomHttpError> {
-        if channel_id == 0 {
-            return Err(RoomHttpError::InvalidRequest);
-        }
-        let request = self
-            .http
-            .update_channel(Id::new(channel_id))
-            .permission_overwrites(overwrites)
-            .try_into_request()
-            .map_err(classify_http_error)?;
-        let body = self.send(request, still_valid).await?;
-        serde_json::from_slice(&body).map_err(|_| RoomHttpError::UnknownOutcome)
-    }
-
     /// Set (or clear with `""`) a voice channel's status line: Discord's
     /// `PUT /channels/{channel.id}/voice-status`, which needs Set Voice Channel
     /// Status. Bounded like renames; the caller keeps only the latest text.
