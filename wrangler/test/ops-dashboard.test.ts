@@ -165,7 +165,7 @@ test(`${OPS_DASHBOARD_PATH}: serves the static read-only page with the right hea
 });
 
 function extractPageScript(html: string): string {
-  const match = html.match(/<script>([\s\S]*?)<\/script>/);
+  const match = html.match(/<script>([\s\S]*?)<\/script>/i);
   assert.ok(match, "page must contain one inline script");
   return match![1]!;
 }
