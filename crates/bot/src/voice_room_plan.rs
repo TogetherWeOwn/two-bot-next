@@ -178,7 +178,10 @@ fn bot_can_manage(
 /// Placement is best effort: a category whose order cannot be planned leaves
 /// the position to Discord (the room is appended) rather than blocking the
 /// join.
-fn placement(input: &RoomPlanInput<'_>) -> Option<CreateSlot> {
+/// The category order and the new room's slot index in it, without mapping
+/// to a concrete Discord position. The deferred post-move repair reuses the
+/// same slot so the room converges on the setting-prescribed place.
+pub(crate) fn placement_order(input: &RoomPlanInput<'_>) -> Option<(Vec<CategoryChannel>, usize)> {
     let parent = input.creator.parent_id;
     // Voice and stage channels sort among themselves (text channels always
     // render above them), so only they decide where a room lands.
@@ -236,6 +239,11 @@ fn placement(input: &RoomPlanInput<'_>) -> Option<CreateSlot> {
         category_order: &order,
     })
     .ok()?;
+    Some((order, index))
+}
+
+fn placement(input: &RoomPlanInput<'_>) -> Option<CreateSlot> {
+    let (order, index) = placement_order(input)?;
     Some(create_slot(&order, index))
 }
 

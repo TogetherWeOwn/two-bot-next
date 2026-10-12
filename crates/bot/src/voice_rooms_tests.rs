@@ -1253,7 +1253,8 @@ async fn duplicate_voice_frames_and_duplicate_tickets_do_not_create_twice() {
     dispatch(&mut worker, 0).await;
     dispatch(&mut worker, 1).await;
     worker.reconcile();
-    assert!(!worker.dispatch_one(2).await);
+    dispatch(&mut worker, 2).await;
+    assert!(!worker.dispatch_one(3).await);
     assert_eq!(
         *trace.lock().unwrap(),
         ["create", "persist:500", "move:300:500"]
@@ -3760,12 +3761,31 @@ async fn created_rooms_carry_the_owner_override_and_a_placement_from_the_start()
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     join(&mut worker, MEMBER);
     dispatch(&mut worker, 0).await;
-    let created = worker.http.created_attributes.lock().unwrap();
-    assert!(created[0]
-        .overwrites
-        .iter()
-        .any(|overwrite| overwrite.id.get() == MEMBER));
-    assert!(created[0].position.is_some());
+    {
+        let created = worker.http.created_attributes.lock().unwrap();
+        assert!(created[0]
+            .overwrites
+            .iter()
+            .any(|overwrite| overwrite.id.get() == MEMBER));
+        // Deferred respacing: the create carries no position when the slot
+        // needs a gap (here, above the creator); the post-move repair places
+        // the room.
+        assert_eq!(created[0].position, None);
+    }
+    for now in 1..4 {
+        worker.dispatch_one(now).await;
+    }
+    // The room takes the slot above its creator; the creator itself rides
+    // the suffix below it, keeping its relative order.
+    assert_eq!(
+        worker.http.reorders.lock().unwrap().as_slice(),
+        [[(200, 31), (500, 15)]],
+    );
+    let live = worker.live.read_state();
+    assert_eq!(live.channels[&500].position, Some(15));
+    assert_eq!(live.channels[&200].position, Some(31));
+    drop(live);
+    assert_eq!(worker.queue.pending_counts(GUILD), (0, 0));
 }
 
 #[test]
@@ -7330,7 +7350,8 @@ async fn no_companion_when_toggle_off() {
     dispatch(&mut worker, 0).await;
     dispatch(&mut worker, 1).await;
     worker.reconcile();
-    assert!(!worker.dispatch_one(2).await);
+    dispatch(&mut worker, 2).await;
+    assert!(!worker.dispatch_one(3).await);
     let calls = trace.lock().unwrap().clone();
     assert!(
         !calls.iter().any(|call| call.contains("companion")),
@@ -7555,6 +7576,9 @@ async fn later_promoted_admin_role_is_resolved_live_without_touching_open_rooms(
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     let mut now = 0;
     join_with_companion(&mut worker, MEMBER, &mut now).await;
+    while worker.dispatch_one(now).await {
+        now += 1;
+    }
     {
         let state = worker.live.inner.read().unwrap();
         assert!(state.admin_role_ids(GUILD).is_empty());
@@ -10140,6 +10164,12 @@ fn dead_letter_families_cover_every_queue_action_shape() {
             },
             "limit",
         ),
+        (
+            RoomAction::RespaceChannels {
+                room_channel_id: 500,
+            },
+            "respace",
+        ),
     ];
     for (action, family) in &cases {
         assert_eq!(voice_dead_action(action), *family, "{action:?}");
@@ -11216,28 +11246,179 @@ fn created_positions(worker: &GuildRoomWorker<Store, Http>) -> Vec<Option<u64>> 
         .collect()
 }
 
-#[tokio::test]
-async fn a_respace_reaches_the_snapshot_before_the_next_create_is_planned() {
-    // Creators at 2 and 3: the first room needs a re-space (A 16, room 32,
-    // B 48). The second join, on the other creator, comes before any
-    // CHANNEL_UPDATE and must plan from the re-spaced positions.
+#[tokio::test(start_paused = true)]
+async fn a_post_move_respace_repairs_only_the_suffix() {
+    // Deferred respacing: creators at 2 and 3, so the first room needs a
+    // gap. No PATCH runs before either POST; the post-move repair touches
+    // only the room and the suffix below its slot while the prefix keeps
+    // its exact positions.
+    let (live, store, http, _) = two_creator_worker_parts(2, 3);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join_creator(&mut worker, MEMBER, CREATOR);
+    dispatch(&mut worker, 0).await;
+    // No pre-create reorder: the room takes the fallback tie with its creator.
+    assert!(worker.http.reorders.lock().unwrap().is_empty());
+    assert_eq!(created_positions(&worker), [Some(2)]);
+    join_creator(&mut worker, MEMBER + 1, 210);
+    for now in 1..8 {
+        worker.dispatch_one(now).await;
+    }
+    // The second create also waited on no reorder and found the free gap.
+    assert_eq!(created_positions(&worker), [Some(2), Some(4)]);
+    // One deferred PATCH, recomputed after both moves: the room first, then
+    // the suffix below its slot in current relative order.
+    assert_eq!(
+        worker.http.reorders.lock().unwrap().as_slice(),
+        [[(210, 34), (500, 18), (501, 50)]],
+    );
+    let live = worker.live.read_state();
+    assert_eq!(live.channels[&CREATOR].position, Some(2));
+    assert_eq!(live.channels[&500].position, Some(18));
+    assert_eq!(live.channels[&210].position, Some(34));
+    assert_eq!(live.channels[&501].position, Some(50));
+    assert_eq!(worker.queue.pending_counts(GUILD), (0, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_second_join_moves_while_a_respace_is_pending() {
+    // Two members join packed creators back to back. Only the first create
+    // needs respacing, and B's create and move both run before any PATCH:
+    // B never waits behind A's deferred repair.
     let (live, store, http, _) = two_creator_worker_parts(2, 3);
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     join_creator(&mut worker, MEMBER, CREATOR);
     dispatch(&mut worker, 0).await;
     join_creator(&mut worker, MEMBER + 1, 210);
-    for now in 1..4 {
+    dispatch(&mut worker, 1).await;
+    dispatch(&mut worker, 2).await;
+    dispatch(&mut worker, 3).await;
+    // Both members created and moved with no PATCH sent yet.
+    assert_eq!(created_positions(&worker), [Some(2), Some(4)]);
+    assert!(worker.moves.is_empty());
+    assert_eq!(worker.tracked().len(), 2);
+    assert!(worker.http.reorders.lock().unwrap().is_empty());
+    for now in 4..8 {
         worker.dispatch_one(now).await;
     }
-    assert_eq!(
-        worker.http.reorders.lock().unwrap()[0],
-        [(CREATOR, 16), (210, 48)]
-    );
-    assert_eq!(created_positions(&worker), [Some(32), Some(49)]);
+    // Exactly one deferred repair afterwards; nothing lingers queued.
+    assert_eq!(worker.http.reorders.lock().unwrap().len(), 1);
+    assert_eq!(worker.queue.pending_counts(GUILD), (0, 0));
 }
 
-#[tokio::test]
-async fn a_refused_respace_ties_upwards_and_an_unknown_one_takes_no_position() {
+#[tokio::test(start_paused = true)]
+async fn a_respace_plans_from_dispatch_time_state() {
+    // Plan and guard share one snapshot at dispatch: a sibling the gateway
+    // moved after the move still lands in the repair at its new position,
+    // and the prefix is never rewritten.
+    let (live, store, http, _) = two_creator_worker_parts(2, 3);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join_creator(&mut worker, MEMBER, CREATOR);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    let mut sibling = worker.live.read_state().channels[&210].clone();
+    sibling.position = Some(7);
+    worker.live.upsert_channel(sibling);
+    for now in 2..6 {
+        worker.dispatch_one(now).await;
+    }
+    // An enqueue-time plan would have patched the sibling to 19; the
+    // dispatch-time repair tracks its reported position 7 instead.
+    assert_eq!(
+        worker.http.reorders.lock().unwrap().as_slice(),
+        [[(210, 34), (500, 18)]],
+    );
+    let live = worker.live.read_state();
+    assert_eq!(live.channels[&CREATOR].position, Some(2));
+    assert_eq!(live.channels[&500].position, Some(18));
+    assert_eq!(live.channels[&210].position, Some(34));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_respace_drops_when_the_slot_converges_first() {
+    // Gateway CHANNEL_UPDATEs converge the slot before the queued repair
+    // dispatches, so no PATCH is sent at all.
+    let (live, store, http, _) = two_creator_worker_parts(2, 3);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join_creator(&mut worker, MEMBER, CREATOR);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    assert_eq!(worker.queue.pending_counts(GUILD), (0, 1));
+    let mut room = worker.live.read_state().channels[&500].clone();
+    room.position = Some(18);
+    worker.live.upsert_channel(room);
+    let mut sibling = worker.live.read_state().channels[&210].clone();
+    sibling.position = Some(19);
+    worker.live.upsert_channel(sibling);
+    for now in 2..6 {
+        worker.dispatch_one(now).await;
+    }
+    assert!(worker.http.reorders.lock().unwrap().is_empty());
+    assert_eq!(worker.queue.pending_counts(GUILD), (0, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_respace_429_holds_the_route_while_joins_flow() {
+    // A 429 on one room's reorder holds every pending reorder on the route,
+    // while creates and moves for other rooms keep flowing past it.
+    let (live, store, http, _) = two_creator_worker_parts(2, 3);
+    http.reorder_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::RateLimited {
+            retry_after_ms: 100,
+            global: false,
+        });
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join_creator(&mut worker, MEMBER, CREATOR);
+    dispatch(&mut worker, 0).await;
+    // Pack B's slot so its move also queues a repair.
+    join_creator(&mut worker, MEMBER + 1, 210);
+    dispatch(&mut worker, 1).await;
+    dispatch(&mut worker, 2).await;
+    let mut created = worker.live.read_state().channels[&501].clone();
+    created.position = Some(3);
+    worker.live.upsert_channel(created);
+    dispatch(&mut worker, 3).await;
+    // A's repair sends once and hits the scripted 429.
+    dispatch(&mut worker, 4).await;
+    assert_eq!(
+        worker.http.reorders.lock().unwrap().as_slice(),
+        [[(210, 34), (500, 18), (501, 50)]],
+    );
+    // A third join flows through the held route: created and moved, with no
+    // second PATCH while backed off.
+    join_creator(&mut worker, MEMBER + 2, 210);
+    for now in 50..56 {
+        worker.dispatch_one(now).await;
+    }
+    assert_eq!(created_positions(&worker), [Some(2), Some(4), Some(4)]);
+    assert_eq!(worker.queue.pending_counts(GUILD), (0, 2));
+    assert!(worker.moves.is_empty());
+    assert_eq!(worker.http.reorders.lock().unwrap().len(), 1);
+    // Past retry-after, the queued repairs converge on fresh state: one more
+    // PATCH, then every room renders at its slot and nothing lingers.
+    for now in 100..108 {
+        worker.dispatch_one(now).await;
+    }
+    let reorders = worker.http.reorders.lock().unwrap();
+    assert_eq!(reorders.len(), 2);
+    assert_eq!(reorders[0], [(210, 34), (500, 18), (501, 50)]);
+    assert_eq!(reorders[1], [(210, 34), (500, 18), (501, 50), (502, 66)]);
+    drop(reorders);
+    let live = worker.live.read_state();
+    assert_eq!(live.channels[&CREATOR].position, Some(2));
+    assert_eq!(live.channels[&500].position, Some(18));
+    assert_eq!(live.channels[&210].position, Some(34));
+    assert_eq!(live.channels[&501].position, Some(50));
+    assert_eq!(live.channels[&502].position, Some(66));
+    assert_eq!(worker.queue.pending_counts(GUILD), (0, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_post_move_respace_keeps_the_fallback_tie() {
+    // The create never waits on a reorder, so scripted reorder failures
+    // cannot change its position; a refused or unknown post-move repair
+    // drops without retrying and the room keeps its fallback tie.
     let (live, store, http, _) = two_creator_worker_parts(2, 3);
     http.reorder_errors.lock().unwrap().extend([
         RoomHttpError::Rejected {
@@ -11249,10 +11430,18 @@ async fn a_refused_respace_ties_upwards_and_an_unknown_one_takes_no_position() {
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     join_creator(&mut worker, MEMBER, CREATOR);
     dispatch(&mut worker, 0).await;
-    // Refused: nothing moved, so the room ties with its creator (2) and,
-    // being newer, renders directly below it.
+    assert!(worker.http.reorders.lock().unwrap().is_empty());
     assert_eq!(created_positions(&worker), [Some(2)]);
-    // The second creator's block again has no free position below it.
+    for now in 1..6 {
+        worker.dispatch_one(now).await;
+    }
+    // Refused: one PATCH attempted, then dropped; the tie stands.
+    assert_eq!(
+        worker.http.reorders.lock().unwrap().as_slice(),
+        [[(210, 34), (500, 18)]],
+    );
+    assert_eq!(worker.live.read_state().channels[&500].position, Some(2));
+    // Pack the second block: its repair meets the unknown outcome.
     let mut room = worker.live.read_state().channels[&500].clone();
     room.position = Some(4);
     worker.live.upsert_channel(room);
@@ -11260,11 +11449,18 @@ async fn a_refused_respace_ties_upwards_and_an_unknown_one_takes_no_position() {
     b.position = Some(3);
     worker.live.upsert_channel(b);
     join_creator(&mut worker, MEMBER + 1, 210);
-    for now in 1..4 {
+    for now in 6..12 {
         worker.dispatch_one(now).await;
     }
-    // Unknown outcome: the reorder may have landed, so no stale position.
-    assert_eq!(created_positions(&worker)[1], None);
+    // Unknown: the repair may have landed, so local positions stay as the
+    // gateway last reported them and nothing retries.
+    let reorders = worker.http.reorders.lock().unwrap();
+    assert_eq!(reorders.len(), 2);
+    assert_eq!(reorders[1], [(500, 35), (501, 19)]);
+    drop(reorders);
+    assert_eq!(created_positions(&worker), [Some(2), Some(3)]);
+    assert_eq!(worker.live.read_state().channels[&501].position, Some(3));
+    assert_eq!(worker.queue.pending_counts(GUILD), (0, 0));
 }
 
 #[tokio::test]

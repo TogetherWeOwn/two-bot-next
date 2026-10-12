@@ -336,6 +336,10 @@ library code with no Discord dependency and can start immediately.
 - `/alwaysprivate`: new rooms from this creator start private.
 - The owner gets extra permissions on their own room so they can manage it.
 - Overrides are included when the channel is created, never patched afterwards.
+- When the slot needs a gap, the room is created first (at a fallback tie that
+  still renders on the correct side) and moved immediately; a deferred repair
+  opens the gap afterwards, touching only that room and the suffix below its
+  slot. A refused repair keeps the tie, so joins never wait on a reorder.
 
 ## V9: Temporary text channels
 

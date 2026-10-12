@@ -84,6 +84,7 @@ use two_bot_core::{
         RoomMember, RoomOwnership,
     },
     voice_permissions::OWNER_ALLOW_BITS,
+    voice_placement::{suffix_respace, CategoryChannel, CategoryEntryKind},
     voice_private::{MemberId, PrivacyRecord, PrivateRoom},
     voice_room_controls::name_conflicts,
     voice_room_name::is_literal_name,
@@ -687,6 +688,7 @@ fn voice_dead_action(action: &RoomAction) -> &'static str {
         | RoomAction::RevokeJoinAccess { .. }
         | RoomAction::RetireJoinPrompt { .. } => "other",
         RoomAction::SetUserLimit { .. } => "limit",
+        RoomAction::RespaceChannels { .. } => "respace",
     }
 }
 
@@ -768,8 +770,8 @@ pub trait RoomWrites: Send + Sync {
         channel: Snowflake,
         guard: WriteGuard,
     ) -> impl Future<Output = Result<(), RoomHttpError>> + Send;
-    /// Bulk channel reorder (`PATCH /guilds/{id}/channels`) run before a
-    /// create that needs a free position. Writers without one accept it.
+    /// Bulk channel reorder (`PATCH /guilds/{id}/channels`), run after the
+    /// creator move whose room needs a free slot. Writers without one accept it.
     fn reorder_channels(
         &self,
         guild: Snowflake,
@@ -4184,6 +4186,139 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         })
     }
 
+    /// Post-move respace need for one room, planned and guarded from a
+    /// single live snapshot: the room's slot index, its suffix repair and
+    /// the permission evidence all come from the same lock hold, so a
+    /// gateway interleave cannot pair an old plan with newer-state
+    /// evidence. Returns the repair when the room still needs one.
+    ///
+    /// The slot is seniority-aware: within its block (its creator's rooms,
+    /// or its `/group` block) rooms order oldest first below the anchor and
+    /// newest first above it, so a repair converges instead of displacing
+    /// the next repair's room. Only the room and the suffix below its slot
+    /// move; manual and established sibling order is never rewritten.
+    fn respace_for(&self, room_channel_id: Snowflake) -> Option<Vec<(Snowflake, u64)>> {
+        let live = self.live.read_state();
+        let room = self.rooms.get(&room_channel_id)?;
+        let creator = live.channels.get(&room.creator_channel_id)?;
+        let settings = self.creators.get(&room.creator_channel_id)?;
+        let room_channel = live.channels.get(&room_channel_id)?;
+        // The room must still sit in its creator's category: a delete or a
+        // hand-move between enqueue and dispatch needs no repair.
+        if room_channel.parent_id != creator.parent_id {
+            return None;
+        }
+        // Guard evidence from the same snapshot: the bot can still manage
+        // both the creator and the room, mirroring the create guard.
+        let permissions = live.permissions(self.live.guild_id, room.creator_channel_id);
+        let room_permissions = live.permissions(self.live.guild_id, room_channel_id);
+        if !can_manage_room(permissions) || !can_manage_room(room_permissions) {
+            return None;
+        }
+        let parent = creator.parent_id;
+        let mut rest: Vec<CategoryChannel> = live
+            .channels
+            .values()
+            .filter(|channel| {
+                channel.parent_id == parent
+                    && channel.id.get() != room_channel_id
+                    && matches!(
+                        channel.kind,
+                        ChannelType::GuildVoice | ChannelType::GuildStageVoice
+                    )
+            })
+            .map(|channel| {
+                let id = channel.id.get();
+                CategoryChannel {
+                    id,
+                    position: channel.position.unwrap_or(0),
+                    kind: if self.creators.contains_key(&id) {
+                        CategoryEntryKind::Creator
+                    } else if self.rooms.contains_key(&id) {
+                        CategoryEntryKind::Room
+                    } else {
+                        CategoryEntryKind::Other
+                    },
+                }
+            })
+            .collect();
+        rest.sort_by_key(|entry| (entry.position, entry.id));
+        // Block mates in rest frame: the `/group` block when the room has
+        // one, else its creator's rooms in this category. Seniority is
+        // creation order, oldest first.
+        let grouped: Vec<Snowflake> = if settings.group_by_category {
+            category_room_ids(creator, &live.channels, &self.rooms)
+                .into_iter()
+                .filter(|id| *id != room_channel_id)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let senior = |id: Snowflake| {
+            self.rooms.get(&id).map_or_else(
+                || (String::new(), u64::MAX),
+                |mate| (mate.created_at.clone(), mate.channel_id),
+            )
+        };
+        let room_senior = (room.created_at.clone(), room_channel_id);
+        let index = if grouped.is_empty() {
+            let creator_rank = rest
+                .iter()
+                .position(|entry| entry.id == room.creator_channel_id)?;
+            let mates: Vec<&VoiceRoom> = self
+                .rooms
+                .values()
+                .filter(|mate| {
+                    mate.creator_channel_id == room.creator_channel_id
+                        && mate.channel_id != room_channel_id
+                        && live
+                            .channels
+                            .get(&mate.channel_id)
+                            .is_some_and(|channel| channel.parent_id == parent)
+                })
+                .collect();
+            match settings.position {
+                RoomPosition::Above => {
+                    let newer = mates
+                        .iter()
+                        .filter(|mate| senior(mate.channel_id) > room_senior)
+                        .count();
+                    creator_rank.saturating_sub(mates.len()) + newer
+                }
+                RoomPosition::Below => {
+                    let older = mates
+                        .iter()
+                        .filter(|mate| senior(mate.channel_id) < room_senior)
+                        .count();
+                    creator_rank + 1 + older
+                }
+            }
+        } else {
+            let edge = grouped
+                .iter()
+                .filter_map(|id| rest.iter().position(|entry| entry.id == *id))
+                .min()?;
+            let preceding = grouped
+                .iter()
+                .filter(|id| {
+                    let mate_senior = senior(**id);
+                    match settings.position {
+                        RoomPosition::Above => mate_senior > room_senior,
+                        RoomPosition::Below => mate_senior < room_senior,
+                    }
+                })
+                .count();
+            edge + preceding
+        };
+        let patch = suffix_respace(
+            &rest,
+            index,
+            room_channel_id,
+            room_channel.position.unwrap_or(0),
+        );
+        (!patch.is_empty()).then_some(patch)
+    }
+
     /// Executes at most one write, releasing the guild lane on every outcome.
     /// `now_ms` is a monotonic actor clock, not a wall-clock timestamp.
     pub async fn dispatch_one(&mut self, now_ms: u64) -> bool {
@@ -4322,26 +4457,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     },
                 };
                 let mut attributes = attributes;
+                // Deferred respacing: the create never waits on a bulk
+                // reorder. When the plan needed a gap, create at the
+                // fallback tie instead (nothing above the slot: no
+                // position); the post-move repair, enqueued when the
+                // creator move succeeds, opens the gap afterwards.
                 if !attributes.respace.is_empty() {
-                    let respace = std::mem::take(&mut attributes.respace);
-                    match self
-                        .http
-                        .reorder_channels(self.live.guild_id, &respace)
-                        .await
-                    {
-                        Ok(()) => self.live.set_channel_positions(&respace),
-                        // Refused: nothing moved, so tie with the channel
-                        // above the slot, or take no position.
-                        Err(
-                            RoomHttpError::RateLimited { .. }
-                            | RoomHttpError::Rejected { .. }
-                            | RoomHttpError::AccessDenied
-                            | RoomHttpError::InvalidRequest,
-                        ) => attributes.position = attributes.fallback_position,
-                        // Unknown: the reorder may have landed, so neither
-                        // the old nor the new positions are safe to use.
-                        Err(_) => attributes.position = None,
-                    }
+                    attributes.respace.clear();
+                    attributes.position = attributes.fallback_position;
                 }
                 let guard = self.live.join_guard(creation.ticket);
                 match self
@@ -4477,6 +4600,17 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         // this member's transition or a complete refresh before pruning.
                         self.uncertain_moves.insert(channel_id, ticket);
                         observe_voice_operation("move", "success");
+                        // Deferred respacing: when the fresh snapshot still
+                        // needs a repair for this room, queue it behind the
+                        // move it follows. Planned and guarded under one lock.
+                        if self.respace_for(channel_id).is_some() {
+                            self.queue.enqueue(
+                                self.live.guild_id,
+                                RoomAction::RespaceChannels {
+                                    room_channel_id: channel_id,
+                                },
+                            );
+                        }
                     }
                     Err(RoomHttpError::RateLimited { retry_after_ms, .. }) => {
                         self.queue.mark_rate_limited(
@@ -4506,6 +4640,43 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         );
                         self.queue_delete(channel_id, true);
                         self.observe_voice_state();
+                    }
+                }
+            }
+            RoomAction::RespaceChannels { room_channel_id } => {
+                // Same-snapshot plan and guard: the slot plan, the tracked
+                // room and the permission evidence are rebuilt from one lock
+                // hold, so a gateway interleave cannot pair an old plan with
+                // newer-state evidence.
+                let patch = self.respace_for(room_channel_id);
+                let Some(patch) = patch else {
+                    // Converged while queued, or the room went away.
+                    self.queue.mark_succeeded(&action);
+                    return true;
+                };
+                match self.http.reorder_channels(self.live.guild_id, &patch).await {
+                    Ok(()) => {
+                        self.live.set_channel_positions(&patch);
+                        observe_voice_operation("respace", "success");
+                        self.queue.mark_succeeded(&action);
+                    }
+                    Err(RoomHttpError::RateLimited { retry_after_ms, .. }) => {
+                        // Route-level backoff: every pending reorder waits
+                        // while creates, moves and renames keep flowing.
+                        self.queue.mark_rate_limited(
+                            self.live.guild_id,
+                            retry_after_ms,
+                            elapsed_ms(now_ms, started),
+                            action,
+                        );
+                    }
+                    Err(error) => {
+                        // Cosmetic: a refusal or an unknown outcome drops the
+                        // repair without touching the room. The create used
+                        // the fallback tie, which renders on the correct
+                        // side; the next move rechecks the slot.
+                        observe_voice_operation("respace", voice_outcome_from_http(&error));
+                        self.queue.mark_succeeded(&action);
                     }
                 }
             }
