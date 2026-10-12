@@ -93,6 +93,24 @@ pub struct OnboardingRuntime {
     bot_id: u64,
 }
 
+/// Merge a stored `TWO_ONBOARDING_DRY_RUN` rendering over the deployment map.
+/// Stored rows predate write-time refusal: a legacy rendering the old writer
+/// accepted and ran live (`"true"`, `"false"`, `"on"`, ...) must not fail the
+/// hot-refresh path closed. Only an exact `"0"` or `"1"` overrides the
+/// boot-validated deployment value; anything else keeps deployment.
+/// Returns true when a present-but-invalid stored value was refused, so the
+/// caller can log the key (never the value). No database access: pure merge.
+fn apply_stored_dry_run(vars: &mut HashMap<String, String>, stored: Option<&str>) -> bool {
+    match stored {
+        None => false,
+        Some(value @ ("0" | "1")) => {
+            vars.insert("TWO_ONBOARDING_DRY_RUN".to_owned(), value.to_owned());
+            false
+        }
+        Some(_) => true,
+    }
+}
+
 impl OnboardingRuntime {
     pub async fn from_env(
         pool: PgPool,
@@ -172,13 +190,28 @@ impl OnboardingRuntime {
         let cache = SettingsCache::load(&snapshot);
         let stored = cache.env_snapshot(Some(&self.guild_id.to_string()));
         let mut vars = self.deployment.clone();
-        for key in CONFIG_KEYS
-            .iter()
-            .filter(|key| !matches!(**key, "DISCORD_GUILD_ID" | "TWO_ONBOARDING_MODE"))
-        {
+        for key in CONFIG_KEYS.iter().filter(|key| {
+            !matches!(
+                **key,
+                "DISCORD_GUILD_ID" | "TWO_ONBOARDING_MODE" | "TWO_ONBOARDING_DRY_RUN"
+            )
+        }) {
             if let Some(value) = stored.get(*key) {
                 vars.insert((*key).to_owned(), value.clone());
             }
+        }
+        // A legacy stored dry-run row must not fail the worker closed: only
+        // an exact "0"/"1" overrides the boot-validated deployment value. A
+        // refused row keeps deployment and logs the key (never the value), so
+        // the job keeps running instead of poisoning itself into `failed` and
+        // blocking every later boot in `recover_onboarding_jobs`.
+        if apply_stored_dry_run(
+            &mut vars,
+            stored.get("TWO_ONBOARDING_DRY_RUN").map(String::as_str),
+        ) {
+            tracing::error!(
+                "stored TWO_ONBOARDING_DRY_RUN must be exactly \"0\" or \"1\" when set; keeping deployment value"
+            );
         }
         OnboardingConfig::from_map(&vars)
             .map_err(|_| RuntimeError::Config)?
@@ -744,5 +777,59 @@ impl OnboardingRuntime {
         .await
         .map_err(|_| RuntimeError::Discord)?
         .map_err(|_| RuntimeError::Discord)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A legacy stored `TWO_ONBOARDING_DRY_RUN` row must never fail the
+    /// hot-refresh path closed: only an exact `"0"`/`"1"` overrides the
+    /// boot-validated deployment value, anything else keeps deployment and
+    /// reports refusal (the caller logs the key, never the value).
+    #[test]
+    fn legacy_stored_dry_run_keeps_deployment_value() {
+        // No stored row: deployment untouched, nothing to report.
+        let mut vars = HashMap::from([("TWO_ONBOARDING_DRY_RUN".to_owned(), "0".to_owned())]);
+        assert!(!apply_stored_dry_run(&mut vars, None));
+        assert_eq!(
+            vars.get("TWO_ONBOARDING_DRY_RUN").map(String::as_str),
+            Some("0")
+        );
+        // Exact "0"/"1" still override, either direction.
+        let mut vars = HashMap::from([("TWO_ONBOARDING_DRY_RUN".to_owned(), "0".to_owned())]);
+        assert!(!apply_stored_dry_run(&mut vars, Some("1")));
+        assert_eq!(
+            vars.get("TWO_ONBOARDING_DRY_RUN").map(String::as_str),
+            Some("1")
+        );
+        let mut vars = HashMap::new();
+        assert!(!apply_stored_dry_run(&mut vars, Some("0")));
+        assert_eq!(
+            vars.get("TWO_ONBOARDING_DRY_RUN").map(String::as_str),
+            Some("0")
+        );
+        // Legacy renderings the old writer accepted and ran live ("true",
+        // "false", "on", ...) keep deployment and report refusal, so the
+        // worker keeps running instead of poisoning its job row into `failed`.
+        for raw in ["true", "false", "yes", "on", "TRUE", "", "01", " 1", "2"] {
+            let mut vars = HashMap::from([("TWO_ONBOARDING_DRY_RUN".to_owned(), "0".to_owned())]);
+            assert!(
+                apply_stored_dry_run(&mut vars, Some(raw)),
+                "{raw:?} must be refused"
+            );
+            assert_eq!(
+                vars.get("TWO_ONBOARDING_DRY_RUN").map(String::as_str),
+                Some("0"),
+                "{raw:?} must keep deployment"
+            );
+            let mut vars = HashMap::new();
+            assert!(apply_stored_dry_run(&mut vars, Some(raw)));
+            assert!(
+                vars.get("TWO_ONBOARDING_DRY_RUN").is_none(),
+                "{raw:?} must not invent a value"
+            );
+        }
     }
 }
