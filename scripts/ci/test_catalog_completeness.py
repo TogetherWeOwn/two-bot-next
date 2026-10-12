@@ -108,6 +108,17 @@ EXEMPT_SERIES = {
         "manual check documented in docs/metrics.md, consumed by no alert "
         "rule; catalog row lands with the halt-gauge change"
     ),
+    # Voice stall-observability families (lobby-stall follow-up): refusal
+    # labels, backoff cap, halt gauge, and the per-tick stall gauges. All rows
+    # live in docs/metrics.md; the catalog covers voice_event log fields.
+    # (joins_received, dispatch_timeouts, watchdog_stucks, halt_recoveries are
+    # cataloged, so they carry no exemption.)
+    "two_bot_voice_join_refused_total": _VOICE_SERIES_REASON,
+    "two_bot_voice_global_backoff_capped_total": _VOICE_SERIES_REASON,
+    "two_bot_voice_worker_halted": _VOICE_SERIES_REASON,
+    "two_bot_voice_queue_pending": _VOICE_SERIES_REASON,
+    "two_bot_voice_queue_oldest_age_seconds": _VOICE_SERIES_REASON,
+    "two_bot_voice_rest_in_flight_age_seconds": _VOICE_SERIES_REASON,
 }
 
 _PREDATES_ROWS_REASON = (
