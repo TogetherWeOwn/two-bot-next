@@ -40,6 +40,7 @@ libc = "0.2.189"
 
 [dev-dependencies]
 rustls = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 two-bot-testsupport = { version = "0.4.0", path = "../testsupport" }
 
 [[bin]]

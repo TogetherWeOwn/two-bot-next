@@ -252,11 +252,15 @@ impl RestClient {
             self.pace().await;
             let request = make()?;
             self.inner.requests.fetch_add(1, Ordering::Relaxed);
-            let (res, _) =
-                tokio::time::timeout(Duration::from_secs(30), transport.send_request(&request))
-                    .await
-                    .map_err(|_| RestError::Wire("request timed out; lane held".to_owned()))?
-                    .map_err(RestError::Wire)?;
+            // The 30 s page budget is the transport's absolute deadline —
+            // durable admission, headers and body share it — so a stalled GET
+            // times out where its permit is in scope and releases the lane.
+            // No outer timeout may wrap this call (it would orphan the lane).
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let (res, _) = transport
+                .send_request(&request, Some(deadline))
+                .await
+                .map_err(RestError::Wire)?;
             match res.status {
                 200..=299 => return Ok(ListPage::Read(serde_json::from_slice(&res.body)?)),
                 403 | 404 => return Ok(ListPage::Interrupted(ScanCompletion::Unreadable)),
@@ -287,11 +291,12 @@ impl RestClient {
             self.pace().await;
             let request = make()?;
             self.inner.requests.fetch_add(1, Ordering::Relaxed);
-            let (res, _) =
-                tokio::time::timeout(Duration::from_secs(30), transport.send_request(&request))
-                    .await
-                    .map_err(|_| RestError::Wire("request timed out; lane held".to_owned()))?
-                    .map_err(RestError::Wire)?;
+            // Same absolute-deadline shape as the page scan above.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let (res, _) = transport
+                .send_request(&request, Some(deadline))
+                .await
+                .map_err(RestError::Wire)?;
             match res.status {
                 200..=299 => return Ok(Some(serde_json::from_slice(&res.body)?)),
                 403 | 404 => return Ok(None),
@@ -422,11 +427,13 @@ impl RestClient {
                 .reason(reason)
                 .try_into_request()?;
             self.inner.requests.fetch_add(1, Ordering::Relaxed);
-            let (res, _) =
-                tokio::time::timeout(Duration::from_secs(30), transport.send_request(&request))
-                    .await
-                    .map_err(|_| RestError::Wire("request timed out; lane held".to_owned()))?
-                    .map_err(RestError::Wire)?;
+            // Absolute deadline covers admission, headers and body. A DELETE
+            // timeout keeps the permit held (uncertain mutation) by design.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let (res, _) = transport
+                .send_request(&request, Some(deadline))
+                .await
+                .map_err(RestError::Wire)?;
             match res.status {
                 200..=299 => return Ok(DeleteOutcome::Deleted),
                 404 => return Ok(DeleteOutcome::AlreadyGone),
@@ -1216,6 +1223,83 @@ mod tests {
             "one discovery page plus one compat call"
         );
         mock.shutdown();
+    }
+
+    /// A page whose headers never arrive must fail at the 30 s page budget on
+    /// every transport call site (`exec_list`, `exec_one`, `delete_channel`):
+    /// the absolute deadline lives in the transport, so reverting any of
+    /// those sites to `None` parks the caller instead of returning. The clock
+    /// is paused so the three budgets elapse without wall time; the stall can
+    /// never win.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_reads_time_out_at_page_budget() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use twilight_model::id::{
+            marker::{ChannelMarker, GuildMarker},
+            Id,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stall");
+        let origin = format!("http://{}", listener.local_addr().expect("addr"));
+        let accepted = Arc::new(AtomicU32::new(0));
+        let handle = {
+            let accepted = Arc::clone(&accepted);
+            tokio::spawn(async move {
+                // One stalled connection per call site below. Each connection
+                // is stalled on its own task so the accept loop stays
+                // responsive: a sequential sleep past the budget would hold
+                // the loop while the paused clock fires the caller's timeout,
+                // and later call sites would time out before being accepted.
+                for _ in 0..3 {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        let mut buf = Vec::with_capacity(1024);
+                        let mut chunk = [0u8; 1024];
+                        while let Ok(n) = stream.read(&mut chunk).await {
+                            if n == 0 {
+                                break;
+                            }
+                            buf.extend_from_slice(&chunk[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_secs(600)).await;
+                    });
+                }
+            })
+        };
+        let rest = client_for(&origin);
+        let result = tokio::time::timeout(
+            Duration::from_secs(300),
+            rest.fetch_all_members(Id::<GuildMarker>::new(2222)),
+        )
+        .await
+        .expect("a stalled member page must not outlive the page budget");
+        assert!(result.is_err(), "a stalled page is an error: {result:?}");
+        let result = tokio::time::timeout(
+            Duration::from_secs(300),
+            rest.guild(Id::<GuildMarker>::new(2222)),
+        )
+        .await
+        .expect("a stalled guild read must not outlive the page budget");
+        assert!(result.is_err(), "a stalled read is an error: {result:?}");
+        let result = tokio::time::timeout(
+            Duration::from_secs(300),
+            rest.delete_channel(Id::<ChannelMarker>::new(3333), "stall test"),
+        )
+        .await
+        .expect("a stalled delete must not outlive the page budget");
+        assert!(result.is_err(), "a stalled delete is an error: {result:?}");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            3,
+            "one stalled wire request per call site"
+        );
+        handle.abort();
     }
 
     /// Threat-model F6 refusal pins for the operator-tool admission pool: a

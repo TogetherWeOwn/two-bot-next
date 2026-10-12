@@ -353,18 +353,18 @@ async fn read_discord<T: serde::de::DeserializeOwned>(
 ) -> Result<T, Check> {
     let request =
         request.map_err(|_| Check::fail(check, "Discord request invalid (checks stopped)"))?;
-    let (response, _) = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        transport.send_request(&request),
-    )
-    .await
-    .map_err(|_| Check::fail(check, "Discord request timed out (lane held)"))?
-    .map_err(|_| {
-        Check::fail(
-            check,
-            "Discord send unavailable or admission held (checks stopped)",
-        )
-    })?;
+    // Absolute deadline covers admission, headers and body, so a stalled GET
+    // releases its lane where the permit is in scope instead of orphaning it.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let (response, _) = transport
+        .send_request(&request, Some(deadline))
+        .await
+        .map_err(|_| {
+            Check::fail(
+                check,
+                "Discord request timed out, send unavailable or admission held (checks stopped)",
+            )
+        })?;
     if !(200..=299).contains(&response.status) {
         return Err(Check::fail(
             check,
@@ -450,7 +450,7 @@ async fn check_discord(
     }
     // The cutover's forced IDENTIFY spends one session start against a hard
     // Discord daily limit, so the budget is read here through the same
-    // governed GET path: lane held, no retry, and any failed, timed-out or
+    // governed GET path: lane released on timeout, no retry, and any failed, timed-out or
     // malformed read fails closed like every other check. Counts only; the
     // token is never part of the detail.
     let budget: BotConnectionInfo = read_discord(
@@ -984,6 +984,54 @@ mod tests {
         assert!(
             targets.roles.is_empty() && targets.channels.is_empty() && targets.level_roles_known
         );
+    }
+
+    /// A preflight read whose headers never arrive must fail at the 30 s
+    /// absolute deadline instead of parking the check sequence: the deadline
+    /// lives in the transport call, so reverting it to `None` hangs here.
+    /// The clock is paused so the budget elapses without wall time.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_preflight_read_times_out_at_deadline() {
+        use twilight_http::{request::Request, routing::Route};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stall");
+        let origin = format!("http://{}", listener.local_addr().expect("addr"));
+        let handle = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt as _;
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = Vec::with_capacity(1024);
+            let mut chunk = [0u8; 1024];
+            while let Ok(n) = stream.read(&mut chunk).await {
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+        });
+        let transport = HyperTransport::with_proxy("fixture-token".to_owned(), Some(origin))
+            .expect("loopback transport");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            super::read_discord::<serde_json::Value>(
+                &transport,
+                "stall check",
+                Ok(Request::from_route(&Route::GetCurrentUser)),
+            ),
+        )
+        .await
+        .expect("a stalled preflight read must not outlive its deadline");
+        assert!(
+            result.is_err(),
+            "a stalled preflight read is an error, not a verdict"
+        );
+        handle.abort();
     }
 
     #[test]

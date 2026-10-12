@@ -98,6 +98,14 @@ pub const RESPONSE_BODY_TIMEOUT_MS: u64 = 5_000;
 /// deadline stays deterministic when the inner body budget and the outer wire
 /// budget expire in the same timer tick ([TOG-12562](/TOG/issues/TOG-12562)).
 pub(crate) const BODY_TIMEOUT_MESSAGE: &str = "read body timed out";
+/// Wire marker for stalled response headers: the request reached the wire but
+/// headers never arrived within the caller's header allowance (the admitted
+/// paths pass their remaining attempt budget; the unadmitted public path
+/// passes no limit and relies on its own outer deadline). The executor seam
+/// maps this to [`DiscordError::Timeout`] like the body marker. A GET has no
+/// mutation effect, so the transport releases the durable send lane on this
+/// path; other methods keep the permit held (uncertain mutation).
+pub(crate) const HEADER_TIMEOUT_MESSAGE: &str = "read headers timed out";
 /// Legacy audit-log-reason header bound (`X-Audit-Log-Reason`, latin-1,
 /// percent-encoded; twilight validates ≤512 chars).
 pub const MAX_AUDIT_REASON_CHARS: usize = 512;
@@ -461,11 +469,23 @@ impl HyperTransport {
         )
     }
 
-    /// Send one governed attempt through headers receipt. The caller either
-    /// collects the bounded body ([`PendingHeaders::collect`]) or settles a
-    /// status-only verdict without waiting on the body; dropping the pending
-    /// headers commits only header-anchored global timing.
-    async fn send_request_headers(&self, request: &Request) -> Result<PendingHeaders<'_>, String> {
+    /// Send one governed attempt through headers receipt. `deadline` is the
+    /// caller's absolute attempt instant: durable admission and the header
+    /// wait share it (the body takes what is left via [`Self::send_request`]),
+    /// so a slow admit cannot outlive the caller's budget — the 2.5 s receipt
+    /// window, the 5 s moderation reads, the 30 s cutover/preflight pages.
+    /// The unadmitted loopback path passes `None` (no durable lane, unbounded
+    /// headers). A stalled GET times out inside the permit scope, where it
+    /// releases its lane; other methods keep the permit held by dropping it
+    /// uncompleted (uncertain). The caller either collects the bounded body
+    /// ([`PendingHeaders::collect`]) or settles a status-only verdict without
+    /// waiting on the body; dropping the pending headers commits only
+    /// header-anchored global timing.
+    async fn send_request_headers(
+        &self,
+        request: &Request,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<PendingHeaders<'_>, String> {
         if request
             .headers()
             .is_some_and(|headers| headers.contains_key(hyper::header::AUTHORIZATION))
@@ -519,16 +539,50 @@ impl HyperTransport {
         let hyper_req = builder
             .body(http_body_util::Full::new(body_bytes))
             .map_err(|e| format!("build request: {e}"))?;
+        // Durable admission shares the caller's absolute deadline: it is a
+        // Postgres statement on a pooled connection, not a local lock, so an
+        // unbounded admit would outlive the receipt/moderation/boot budgets.
+        // A timed-out admit never resolved, so no permit exists to release;
+        // it reports as a header stall so the caller spends one attempt.
         let permit = match &self.admission {
-            Some(admission) => Some(admission.admit().await.map_err(|e| e.to_string())?),
-            None => None, // Constructor restricts ungoverned transport to loopback fixtures.
+            // Constructor restricts ungoverned transport to loopback fixtures.
+            None => None,
+            Some(admission) => match deadline {
+                None => Some(admission.admit().await.map_err(|e| e.to_string())?),
+                Some(at) => match tokio::time::timeout_at(at, admission.admit()).await {
+                    Ok(Ok(permit)) => Some(permit),
+                    Ok(Err(error)) => return Err(error.to_string()),
+                    Err(_) => return Err(HEADER_TIMEOUT_MESSAGE.to_owned()),
+                },
+            },
         };
         let mut attempt = crate::executor_metrics::Attempt::new(request);
-        let response = self
-            .inner
-            .request(hyper_req)
-            .await
-            .map_err(|e| format!("transport: {e}"))?;
+        // Bound the header wait inside the permit scope so a stalled read
+        // releases its lane instead of orphaning it: an outer cancellation
+        // would drop the future with the permit already taken, leaving
+        // retries `Blocked` on the read's own permit and holding the lane
+        // for the 60 s lease. There is exactly one header timer — the
+        // caller's absolute deadline — so no outer backstop races it. A GET
+        // cannot mutate, so release it here; other methods keep the permit
+        // held by dropping it uncompleted (uncertain).
+        let request_fut = self.inner.request(hyper_req);
+        let response = match deadline {
+            None => request_fut
+                .await
+                .map_err(|error| format!("transport: {error}"))?,
+            Some(at) => match tokio::time::timeout_at(at, request_fut).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => return Err(format!("transport: {error}")),
+                Err(_) => {
+                    if request.method() == Method::Get {
+                        if let Some(permit) = permit {
+                            let _ = permit.complete(None).await;
+                        }
+                    }
+                    return Err(HEADER_TIMEOUT_MESSAGE.to_owned());
+                }
+            },
+        };
         let status = response.status().as_u16();
         let accounting = crate::ratelimit_guard::ResponseAccounting::new(
             &self.guard,
@@ -561,8 +615,34 @@ impl HyperTransport {
 
     /// One governed wire attempt; no Twilight or pooled-connection resends.
     /// Returns the response and whether a process-global pause was recorded.
-    pub async fn send_request(&self, request: &Request) -> Result<(RawResponse, bool), String> {
-        self.send_request_headers(request).await?.collect().await
+    /// `deadline` is the caller's absolute attempt instant: admission,
+    /// headers and body together stay inside it. The unadmitted loopback path
+    /// passes `None` (headers unbounded, body at the fixed
+    /// [`RESPONSE_BODY_TIMEOUT_MS`]).
+    pub async fn send_request(
+        &self,
+        request: &Request,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<(RawResponse, bool), String> {
+        match deadline {
+            None => {
+                self.send_request_headers(request, None)
+                    .await?
+                    .collect()
+                    .await
+            }
+            Some(at) => {
+                let pending = self.send_request_headers(request, Some(at)).await?;
+                let remaining = at
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .unwrap_or(Duration::ZERO);
+                // Body shares the attempt deadline: cap it at whatever is
+                // left, so headers-plus-body can never overrun the caller's
+                // absolute budget (the receipt/boot windows).
+                let body_budget = remaining.min(Duration::from_millis(RESPONSE_BODY_TIMEOUT_MS));
+                pending.collect_with(body_budget).await
+            }
+        }
     }
 }
 
@@ -589,14 +669,22 @@ struct PendingHeaders<'a> {
 impl PendingHeaders<'_> {
     /// Collect the bounded body and settle guard/admission accounting exactly
     /// as the pre-split `send_request` always has.
-    async fn collect(mut self) -> Result<(RawResponse, bool), String> {
+    async fn collect(self) -> Result<(RawResponse, bool), String> {
+        self.collect_with(Duration::from_millis(RESPONSE_BODY_TIMEOUT_MS))
+            .await
+    }
+
+    /// [`Self::collect`] with the caller's body allowance: budgeted wire
+    /// attempts pass what is left of their attempt deadline so a slow header
+    /// phase cannot push the body phase past it.
+    async fn collect_with(mut self, body_timeout: Duration) -> Result<(RawResponse, bool), String> {
         use http_body_util::BodyExt as _;
         let response = self.response.take().expect("pending headers");
         let status = self.status;
         // Expiry drops accounting, resolving the pending header restriction to
         // its header-anchored timing/fallback without opening admission early.
         let collected = tokio::time::timeout(
-            Duration::from_millis(RESPONSE_BODY_TIMEOUT_MS),
+            body_timeout,
             http_body_util::Limited::new(response.into_body(), 8 * 1024 * 1024).collect(),
         )
         .await;
@@ -606,8 +694,29 @@ impl PendingHeaders<'_> {
             // timed-out body. Missing timing installs an indefinite hold
             // instead of a default.
             Err(_) | Ok(Err(_)) if status == 429 => Vec::new(),
-            Err(_) => return Err(BODY_TIMEOUT_MESSAGE.to_owned()),
-            Ok(Err(_)) => return Err("Discord response body unavailable".to_owned()),
+            Err(_) => {
+                // Headers arrived but the body stalled: a GET cannot mutate,
+                // so release the lane where the permit is in scope. Without
+                // this the retries are `Blocked` by this attempt's own
+                // orphaned permit until the 60 s lease. Mutations keep the
+                // permit held (uncertain) by returning with it taken.
+                if self.complete_on_receipt {
+                    if let Some(permit) = self.permit.take() {
+                        let _ = permit.complete(None).await;
+                    }
+                }
+                return Err(BODY_TIMEOUT_MESSAGE.to_owned());
+            }
+            Ok(Err(_)) => {
+                // Same orphan as a timed-out body: a truncated/errored body on
+                // a receipted read (every GET) must release the lane.
+                if self.complete_on_receipt {
+                    if let Some(permit) = self.permit.take() {
+                        let _ = permit.complete(None).await;
+                    }
+                }
+                return Err("Discord response body unavailable".to_owned());
+            }
         };
         let mut res = RawResponse {
             status,
@@ -971,33 +1080,44 @@ impl ActionExecutor {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// One admitted send bounded by `timeout` (the wire budget only: callers
-    /// have already passed local admission).
+    /// One admitted send bounded by `timeout` (the total wire budget:
+    /// callers have already passed local admission). The budget is the single
+    /// attempt deadline inside the transport — headers take at most `timeout`
+    /// and the body takes what is left — so there is no outer timer to race
+    /// the inner one: a stalled GET times out where its permit is in scope
+    /// and releases the lane instead of orphaning it.
     async fn send_admitted_within(
         &self,
         request: &Request,
         timeout: Duration,
     ) -> Result<(RawResponse, bool), DiscordError> {
-        tokio::time::timeout(timeout, self.send_admitted(request))
-            .await
-            .map_err(|_| DiscordError::Timeout)?
+        self.send_admitted_for(request, timeout).await
     }
 
     async fn send_admitted(&self, request: &Request) -> Result<(RawResponse, bool), DiscordError> {
+        self.send_admitted_for(request, self.inner.moderation_timeout)
+            .await
+    }
+
+    async fn send_admitted_for(
+        &self,
+        request: &Request,
+        budget: Duration,
+    ) -> Result<(RawResponse, bool), DiscordError> {
         self.count();
+        // The absolute attempt instant is fixed before durable admission, so
+        // the admit, the header wait and the body share the one deadline.
+        let deadline = tokio::time::Instant::now() + budget;
         self.inner
             .transport
-            .send_request(request)
+            .send_request(request, Some(deadline))
             .await
             .map_err(|detail| {
-                // The body budget equals the wire budget and both start within
-                // milliseconds of each other, so on a loaded runner they expire in
-                // the same timer tick. Normalize the stalled-body marker to the
-                // wire-deadline error: a body that never completed inside the wire
-                // budget is "Discord did not answer in time" (legacy
-                // `upstream_timeout`), whichever timer wins
-                // ([TOG-12562](/TOG/issues/TOG-12562)).
-                if detail == BODY_TIMEOUT_MESSAGE {
+                // A body that never completed inside the wire budget is
+                // "Discord did not answer in time" (legacy `upstream_timeout`).
+                // The stalled-header marker maps the same way: headers never
+                // arrived in time ([TOG-12562](/TOG/issues/TOG-12562)).
+                if detail == BODY_TIMEOUT_MESSAGE || detail == HEADER_TIMEOUT_MESSAGE {
                     DiscordError::Timeout
                 } else {
                     DiscordError::Unavailable(detail)
@@ -1033,9 +1153,15 @@ impl ActionExecutor {
         tokio::time::timeout_at(deadline, self.admit(request, lane))
             .await
             .map_err(|_| GuardError::AdmissionTimeout)??;
-        tokio::time::timeout_at(deadline, self.send_admitted(request))
-            .await
-            .map_err(|_| DiscordError::Timeout)?
+        // The wire phase takes whatever is left of the caller's deadline, so
+        // guard admission, durable admission, headers and body together stay
+        // inside it (the receipt window refuses to land past it). No outer
+        // backstop: the transport's timers share the absolute deadline, and a
+        // stalled GET releases its lane where the permit is in scope.
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or(Duration::ZERO);
+        self.send_admitted_for(request, remaining).await
     }
 
     /// Singular role mutations use status only. A truncated/stalled provider
@@ -1044,7 +1170,12 @@ impl ActionExecutor {
     /// compensates instead of trusting a partial exchange.
     async fn send_status(&self, request: &Request) -> Result<u16, String> {
         self.count();
-        let pending = self.inner.transport.send_request_headers(request).await?;
+        let deadline = tokio::time::Instant::now() + self.inner.moderation_timeout;
+        let pending = self
+            .inner
+            .transport
+            .send_request_headers(request, Some(deadline))
+            .await?;
         Ok(pending.settle_status().await)
     }
 
@@ -1625,7 +1756,15 @@ impl ActionExecutor {
                 .await
                 .map_err(|error| error.to_string())?;
             let observed_at = two_bot_core::now_iso();
-            let (res, global) = match self.send_admitted(&request).await {
+            // Each attempt gets the moderation bound across headers and body,
+            // so a response that never answers cannot park the caller (the
+            // containment worker's roles snapshot). A timeout spends one read
+            // attempt like any transport failure; `observed_at` above still
+            // marks the request start, never the deadline.
+            let (res, global) = match self
+                .send_admitted_within(&request, self.inner.moderation_timeout)
+                .await
+            {
                 Ok(r) => r,
                 Err(detail) => {
                     if attempt >= MAX_HTTP_TRIES - 1 {
@@ -2771,11 +2910,14 @@ impl ActionExecutor {
         for attempt in 0..MAX_HTTP_TRIES {
             // Paced non-kick lane with the same bounded wire budget as the
             // publish sibling; 429 parks and 5xx back off within MAX_HTTP_TRIES.
+            // The budget travels inside the transport (headers take at most
+            // the allowance, the body takes what is left), so a stalled GET
+            // times out where its permit is in scope and releases the lane
+            // instead of orphaning it for the lease.
             self.admit(&req, Some(false)).await?;
-            let (res, _) =
-                tokio::time::timeout(self.inner.moderation_timeout, self.send_admitted(&req))
-                    .await
-                    .map_err(|_| DiscordError::Timeout)??;
+            let (res, _) = self
+                .send_admitted_within(&req, self.inner.moderation_timeout)
+                .await?;
             match res.status {
                 200..=299 => {
                     return crate::command_registry::decode_guild_commands(&res.body).map_err(

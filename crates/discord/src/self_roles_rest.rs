@@ -170,16 +170,17 @@ impl ActionExecutor {
             .map_err(|_| SelfRoleRestError::InvalidId)?;
         let mut lane = self.paced_lane(false).await.map_err(guard_error)?;
         self.stamp_paced_lane(&mut lane, false);
-        // `send_admitted` skips lane locking: the reservation above is the
-        // pacing. It still collects the bounded body, so a truncated member
-        // document stays `Ambiguous`, never a parsed partial snapshot.
-        let (response, _) = tokio::time::timeout(
-            Duration::from_millis(MODERATION_TIMEOUT_MS),
-            self.send_admitted(&request),
-        )
-        .await
-        .map_err(|_| SelfRoleRestError::Ambiguous)?
-        .map_err(|_| SelfRoleRestError::Ambiguous)?;
+        // `send_admitted_within` skips lane locking: the reservation above is
+        // the pacing. The wire budget lives inside the transport — where a
+        // stalled GET releases its durable permit — so no outer timeout may
+        // wrap this call: an outer abort would drop the future with the
+        // permit taken and orphan the lane. It still collects the bounded
+        // body, so a truncated member document stays `Ambiguous`, never a
+        // parsed partial snapshot.
+        let (response, _) = self
+            .send_admitted_within(&request, Duration::from_millis(MODERATION_TIMEOUT_MS))
+            .await
+            .map_err(|_| SelfRoleRestError::Ambiguous)?;
         status(&response)?;
         serde_json::from_slice(&response.body).map_err(|_| SelfRoleRestError::Snapshot)
     }

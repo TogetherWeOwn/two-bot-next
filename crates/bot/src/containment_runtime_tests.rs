@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
@@ -630,6 +630,102 @@ async fn containment_worker_armed_partial_failure_is_uncertain_and_blocks() {
     );
     assert!(bodies[0].contains("uncertain"), "{bodies:?}");
     assert!(bodies[0].contains("`77`"), "{bodies:?}");
+    mock.shutdown().await;
+    db.close().await;
+}
+
+/// The first guild-roles reads (one whole read budget) never answer; later
+/// ones are prompt.
+async fn discord_first_roles_read_stalls() -> MockRest {
+    let roles_reads = std::sync::atomic::AtomicUsize::new(0);
+    MockRest::with_responder(move |request: &RestRequest| {
+        let path = request.path.strip_prefix("/api/v10").unwrap();
+        match (request.method.as_str(), path) {
+            ("GET", "/users/@me") => {
+                ScriptedResponse::json(200, json!({"id":"999","bot":true,"username":"bot"}))
+            }
+            ("GET", "/applications/@me") => {
+                ScriptedResponse::json(200, json!({"id": STAGING_BOT_APPLICATION_ID}))
+            }
+            ("GET", "/guilds/22") => {
+                ScriptedResponse::json(200, json!({"id":"22","owner_id":"888"}))
+            }
+            ("GET", "/guilds/22/roles") => {
+                let roles = ScriptedResponse::json(
+                    200,
+                    json!([
+                        {"id":"22","permissions":"3072","position":0,"managed":false},
+                        {"id":"77","permissions":"8","position":1,"managed":false},
+                        {"id":"88","permissions":"0","position":5,"managed":false},
+                    ]),
+                );
+                if roles_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    < two_bot_core::MAX_HTTP_TRIES as usize
+                {
+                    roles.delayed(Duration::from_secs(600))
+                } else {
+                    roles
+                }
+            }
+            ("GET", "/guilds/22/members/999") => {
+                ScriptedResponse::json(200, json!({"user":{"id":"999"},"roles":["88"]}))
+            }
+            ("GET", "/guilds/22/members/5001") => {
+                ScriptedResponse::json(200, json!({"user":{"id":"5001"},"roles":["77"]}))
+            }
+            ("GET", "/guilds/22/members/5002") => {
+                ScriptedResponse::json(200, json!({"user":{"id":"5002"},"roles":["77"]}))
+            }
+            ("GET", "/channels/12") => ScriptedResponse::json(
+                200,
+                json!({"id":"12","guild_id":"22","type":0,"permission_overwrites":[]}),
+            ),
+            ("POST", "/channels/12/messages") => ScriptedResponse::json(201, json!({"id":"99"})),
+            _ => panic!("unexpected mock Discord route: {} {}", request.method, path),
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb; never live Discord or DATABASE_URL"]
+async fn containment_worker_survives_a_stalled_roles_read_and_handles_the_next_entry() {
+    let db = TestSchema::new().await;
+    let store = ContainmentStore::from_pool(db.pool.clone());
+    let mock = discord_first_roles_read_stalls().await;
+    let other_executor = |entry_id| AuditLogObservation {
+        executor_id: Some(5002),
+        ..entry(entry_id)
+    };
+
+    // Executor 5001 opens an incident whose roles read never answers. The
+    // worker must give up once the five-try read budget is spent (real time,
+    // about 32.5 s: five 5 s bounds plus 0.5+1+2+4 s backoff), then plan
+    // executor 5002's incident from the same queue.
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        run(
+            Scripted(settings(Some(CHANNEL))),
+            store,
+            &mock,
+            [
+                entry(fresh_entry_id(0)),
+                entry(fresh_entry_id(1_000)),
+                other_executor(fresh_entry_id(2_000)),
+                other_executor(fresh_entry_id(3_000)),
+            ],
+            false,
+        ),
+    )
+    .await
+    .expect("a stalled roles read must not park the containment worker");
+    let bodies = posted_contents(&mock);
+    assert_eq!(bodies.len(), 2, "{bodies:?}");
+    assert!(bodies[0].contains("failed"), "stalled incident: {bodies:?}");
+    assert!(
+        bodies[1].contains("dry_run"),
+        "next entry planned: {bodies:?}"
+    );
     mock.shutdown().await;
     db.close().await;
 }
