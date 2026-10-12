@@ -381,7 +381,8 @@ impl<S: InviteSnapshotStore> InviteTracker<S> {
             inviter_id: old.inviter_id,
             channel_id: old.channel_id,
         };
-        self.store.store_all(guild_id, &[rotated.clone()]);
+        self.store
+            .store_all(guild_id, std::slice::from_ref(&rotated));
         let live: HashSet<String> = current
             .iter()
             .map(|state| state.code.clone())
