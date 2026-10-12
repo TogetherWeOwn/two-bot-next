@@ -37,12 +37,15 @@ pub fn init() {
     let format = std::env::var("LOG_FORMAT").ok();
     let rust_log = std::env::var("RUST_LOG").ok();
     let log_level = std::env::var("LOG_LEVEL").ok();
+    let (rust_log_invalid, log_level_invalid) =
+        boot_warning_flags(rust_log.as_deref(), log_level.as_deref());
     subscriber(
         LogFormat::from_setting(format.as_deref()),
         filter(rust_log.as_deref(), log_level.as_deref()),
         std::io::stdout,
     )
     .init();
+    emit_boot_warnings(rust_log_invalid, log_level_invalid);
     if format
         .as_deref()
         .is_some_and(|v| v != "json" && v != "pretty")
@@ -89,6 +92,64 @@ pub fn shard_closed(message: &twilight_gateway::Message) {
     }
 }
 
+/// Emit one warn-level line per present-but-unparsable log key, naming the
+/// key without echoing its value. Call after the subscriber is installed so
+/// the lines flow through the fallback filter (subject to it, like
+/// `log_format_invalid`).
+fn emit_boot_warnings(rust_log_invalid: bool, log_level_invalid: bool) {
+    if rust_log_invalid {
+        // Never echo configuration values: even a malformed setting can be a secret.
+        tracing::warn!(
+            msg = "rust_log_invalid",
+            "ignoring invalid RUST_LOG; using LOG_LEVEL fallback"
+        );
+    }
+    if log_level_invalid {
+        // Never echo configuration values: even a malformed setting can be a secret.
+        tracing::warn!(
+            msg = "log_level_invalid",
+            "ignoring invalid LOG_LEVEL; using INFO fallback"
+        );
+    }
+}
+
+/// Present-but-unparsable `RUST_LOG`: nonempty (after trim) yet rejected by
+/// `EnvFilter::try_new`. Absent, empty and valid values stay quiet.
+fn rust_log_unparsable(rust_log: Option<&str>) -> bool {
+    matches!(
+        rust_log.filter(|value| !value.trim().is_empty()),
+        Some(value) if EnvFilter::try_new(value).is_err()
+    )
+}
+
+/// Valid `RUST_LOG` that takes precedence over `LOG_LEVEL`: nonempty (after
+/// trim) and accepted by `EnvFilter::try_new`, mirroring `filter()`.
+fn rust_log_valid(rust_log: Option<&str>) -> bool {
+    matches!(
+        rust_log.filter(|value| !value.trim().is_empty()),
+        Some(value) if EnvFilter::try_new(value).is_ok()
+    )
+}
+
+/// Boot-warning flags as `init()` computes them: each present-but-unparsable
+/// key warns, except an invalid `LOG_LEVEL` stays quiet when a valid
+/// `RUST_LOG` takes precedence (then `LOG_LEVEL` is ignored entirely).
+fn boot_warning_flags(rust_log: Option<&str>, log_level: Option<&str>) -> (bool, bool) {
+    let rust_log_invalid = rust_log_unparsable(rust_log);
+    let log_level_invalid = log_level_unparsable(log_level) && !rust_log_valid(rust_log);
+    (rust_log_invalid, log_level_invalid)
+}
+
+/// Present-but-unparsable `LOG_LEVEL`: nonempty (after trim) yet rejected by
+/// `LevelFilter` parsing. Absent, empty and valid values stay quiet. The parse
+/// runs on the raw value so the fallback filter stays exactly as today.
+fn log_level_unparsable(log_level: Option<&str>) -> bool {
+    matches!(
+        log_level.filter(|value| !value.trim().is_empty()),
+        Some(value) if value.parse::<LevelFilter>().is_err()
+    )
+}
+
 fn filter(rust_log: Option<&str>, log_level: Option<&str>) -> EnvFilter {
     // try_new rejects the entire malformed directive rather than writing a plain
     // text diagnostic to stderr. RUST_LOG takes precedence when valid/nonempty.
@@ -98,7 +159,12 @@ fn filter(rust_log: Option<&str>, log_level: Option<&str>) -> EnvFilter {
             return filter;
         }
     }
+    // Empty/blank levels count as missing: `LevelFilter` parses `""` as
+    // ERROR, which would silently hide info/warn lines (including boot
+    // warnings). Skip empties so absent, empty and whitespace-only all fall
+    // back to INFO, matching the detectors and docs.
     let level = log_level
+        .filter(|value| !value.trim().is_empty())
         .and_then(|value| value.parse::<LevelFilter>().ok())
         .unwrap_or(LevelFilter::INFO);
     // Scope verbosity to our crates (`EnvFilter` matches target prefixes, so
@@ -451,9 +517,126 @@ mod tests {
     }
 
     #[test]
+    fn invalid_log_settings_warn_then_fallback() {
+        // Present-but-unparsable keys warn; absent/empty/valid keys stay quiet.
+        assert!(log_level_unparsable(Some("debgu")));
+        assert!(rust_log_unparsable(Some("two_bot=not_a_level")));
+        for absent_or_empty in [None, Some(""), Some("   ")] {
+            assert!(
+                !log_level_unparsable(absent_or_empty),
+                "LOG_LEVEL={absent_or_empty:?} must stay quiet"
+            );
+            assert!(
+                !rust_log_unparsable(absent_or_empty),
+                "RUST_LOG={absent_or_empty:?} must stay quiet"
+            );
+        }
+        for valid in ["info", "WARN", "off", "debug"] {
+            assert!(
+                !log_level_unparsable(Some(valid)),
+                "LOG_LEVEL={valid:?} must stay quiet"
+            );
+        }
+        for valid in ["info", "warn", "two_bot=warn", "error,two_bot=debug"] {
+            assert!(
+                !rust_log_unparsable(Some(valid)),
+                "RUST_LOG={valid:?} must stay quiet"
+            );
+        }
+        // Warn-then-fallback: invalid LOG_LEVEL keeps today's INFO fallback
+        // (info + warn pass), invalid RUST_LOG keeps today's fallthrough to
+        // LOG_LEVEL (warn passes, info filtered).
+        for (rust_log, log_level, expected) in [
+            (None, Some("debgu"), 2),
+            (Some("two_bot=not_a_level"), Some("warn"), 1),
+            (Some("two_bot=not_a_level"), Some("debgu"), 2),
+        ] {
+            let capture = Capture::default();
+            tracing::subscriber::with_default(
+                subscriber(
+                    LogFormat::Json,
+                    filter(rust_log, log_level),
+                    capture.clone(),
+                ),
+                || {
+                    tracing::info!(msg = "ready");
+                    tracing::warn!(msg = "shard_closed");
+                },
+            );
+            assert_eq!(
+                capture.lines().len(),
+                expected,
+                "RUST_LOG={rust_log:?} LOG_LEVEL={log_level:?}"
+            );
+        }
+        // Boot warnings flow through the fallback filter, name the key, and
+        // never echo the value.
+        for (rust_log, log_level, expected_msgs) in [
+            (None, Some("debgu"), vec!["log_level_invalid"]),
+            (
+                Some("two_bot=not_a_level"),
+                Some("warn"),
+                vec!["rust_log_invalid"],
+            ),
+            (
+                Some("two_bot=not_a_level"),
+                Some("debgu"),
+                vec!["rust_log_invalid", "log_level_invalid"],
+            ),
+            (None, None, vec![]),
+            (Some(""), Some("warn"), vec![]),
+            // Valid RUST_LOG wins: an invalid LOG_LEVEL is ignored entirely,
+            // so it stays quiet instead of claiming the INFO fallback is in use.
+            (Some("warn"), Some("debgu"), vec![]),
+            (Some("two_bot=debug"), Some("debgu"), vec![]),
+        ] {
+            let capture = Capture::default();
+            tracing::subscriber::with_default(
+                subscriber(
+                    LogFormat::Json,
+                    filter(rust_log, log_level),
+                    capture.clone(),
+                ),
+                || {
+                    let (rust_log_invalid, log_level_invalid) =
+                        boot_warning_flags(rust_log, log_level);
+                    emit_boot_warnings(rust_log_invalid, log_level_invalid);
+                },
+            );
+            let lines = capture.lines();
+            let msgs: Vec<&str> = lines
+                .iter()
+                .map(|line| line["msg"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                msgs, expected_msgs,
+                "RUST_LOG={rust_log:?} LOG_LEVEL={log_level:?}"
+            );
+            for line in &lines {
+                assert_eq!(line["level"], "warn");
+            }
+            let text = capture.text();
+            assert!(
+                !text.contains("debgu") && !text.contains("not_a_level"),
+                "boot warnings must name the key, never the value: {text}"
+            );
+            if !expected_msgs.is_empty() {
+                assert!(
+                    text.contains("RUST_LOG") || text.contains("LOG_LEVEL"),
+                    "boot warning must name its key: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn log_level_and_rust_log_precedence_are_respected() {
         for (rust_log, log_level, expected) in [
             (None, None, 2),
+            // Empty/blank LOG_LEVEL counts as missing (INFO fallback): `""`
+            // must not silently parse as ERROR.
+            (None, Some(""), 2),
+            (None, Some("   "), 2),
             (None, Some("error"), 0),
             (None, Some("WARN"), 1),
             (Some("info"), Some("error"), 2),
