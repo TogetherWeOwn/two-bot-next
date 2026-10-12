@@ -271,6 +271,15 @@ jobs:
           --skip backfill_cursor_survives_crash_restart_and_never_resets_to_zero
           --skip concurrent_families_never_clobber_each_other
           --skip backfill_cursor_rows_hold_ids_cursors_timestamps_only
+          --skip history_pagination_honors_limit_range_and_before_after_around_cursors
+          --skip history_reads_all_pass_through_rate_limit_guard
+          --skip history_rows_hold_ids_timestamps_counts_only_with_body_tripwire
+          --skip history_resume_continues_from_persisted_cursor_after_restart
+          --skip audit_log_pagination_limit_1_to_100_before_after_covers_45d_window
+          --skip audit_log_requests_ride_rate_limit_client_never_direct_rest
+          --skip audit_cursor_persists_per_window_and_resumes_mid_window
+          --skip audit_rows_hold_ids_timestamps_enums_only
+          --skip audit_429_retry_after_pauses_without_losing_place
       - name: Channel moderation ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:

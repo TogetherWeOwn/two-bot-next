@@ -863,7 +863,7 @@ jobs:
       - name: Store Postgres integration (isolated CI schemas)
         env:
           TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/postgres
-        run: cargo test -p two-bot-store --locked --test postgres --test journal --test membership_pg --test backfill_cursors -- --ignored
+        run: cargo test -p two-bot-store --locked --test postgres --test journal --test membership_pg --test backfill_cursors --test backfill_history --test backfill_audit_log -- --ignored
 
       - name: sticky live store regressions (CI service container only)
         run: cargo test -p two-bot-core --features db --locked --test sticky_store_live -- --ignored
