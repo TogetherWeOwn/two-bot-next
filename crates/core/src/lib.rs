@@ -106,6 +106,7 @@ pub mod referral_rewards;
 pub mod rejection_telemetry;
 pub mod router;
 pub mod rsvp;
+pub mod rsvp_conversion;
 #[cfg(feature = "db")]
 pub mod rsvp_store;
 pub mod scheduled;
@@ -367,6 +368,10 @@ pub use rsvp::{
     RsvpError, RsvpRecord, RsvpStatus, RsvpTotals, RsvpTransition, ATTENDANCE_EVENT_TYPE,
     AUDIT_RETENTION_DAYS, MAX_CHECKINS_PER_OCCURRENCE, MAX_RSVPS_PER_EVENT,
     MAX_RSVP_WRITES_PER_USER_PER_MINUTE, RSVP_AUDIT_ACTION, RSVP_RETENTION_DAYS,
+};
+pub use rsvp_conversion::{
+    assign_variant, compute_conversion, reminders_due, render_report_text, AnnouncementVariant,
+    ConversionReport, ReminderKind,
 };
 #[cfg(feature = "db")]
 pub use rsvp_store::{
