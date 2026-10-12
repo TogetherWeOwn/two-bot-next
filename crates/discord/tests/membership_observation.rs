@@ -13,6 +13,7 @@ use two_bot_core::send_admission::{
     AdmissionError, AdmissionFuture, AdmissionPermit, SendAdmission, SendCompletion, SendCooldown,
     TokenKey,
 };
+use two_bot_discord::executor::self_roles::SelfRoleRestError;
 use two_bot_discord::ActionExecutor;
 
 fn ms(value: &str) -> i64 {
@@ -303,6 +304,206 @@ async fn governed_observed_read_with_stalled_headers_retries_each_attempt_and_re
         .admit()
         .await
         .expect("the lane must admit once the timed-out GETs release it");
+    permit.complete(None).await.expect("test lane completion");
+    mock.shutdown().await;
+}
+
+/// Durable admission shares the caller's absolute deadline: it is a Postgres
+/// statement on a pooled connection, not a local lock, so an admit that
+/// sleeps past the moderation budget must time out without reaching the
+/// wire — not resolve late, past the budget the caller exists to protect.
+/// A lane whose admit sleeps 6 s against a prompt mock: five attempts, zero
+/// wire requests, lane never held.
+#[tokio::test(start_paused = true)]
+async fn governed_observed_read_with_sleeping_admit_times_out_without_wire() {
+    #[derive(Debug)]
+    struct SleepingLane {
+        key: TokenKey,
+        held: Arc<Mutex<bool>>,
+        admits: AtomicU32,
+    }
+
+    impl SendAdmission for SleepingLane {
+        fn token_key(&self) -> &TokenKey {
+            &self.key
+        }
+
+        fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+            self.admits.fetch_add(1, Ordering::SeqCst);
+            let held = Arc::clone(&self.held);
+            Box::pin(async move {
+                // Sleep past the 5 s moderation budget: the transport must
+                // abort this admit at the absolute deadline instead of
+                // waiting it out and sending late.
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                *held.lock().unwrap() = true;
+                Ok(AdmissionPermit::new(Box::new(SingleFlightRelease {
+                    held,
+                    released: Arc::new(AtomicU32::new(0)),
+                })))
+            })
+        }
+    }
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, serde_json::json!([]))).await;
+    let lane = Arc::new(SleepingLane {
+        key: TokenKey::for_bot_token("fixture-token").unwrap(),
+        held: Arc::new(Mutex::new(false)),
+        admits: AtomicU32::new(0),
+    });
+    let exec = ActionExecutor::with_admission(
+        "fixture-token".to_owned(),
+        Some(mock.origin()),
+        Arc::clone(&lane) as Arc<dyn SendAdmission>,
+    )
+    .expect("governed executor builds against loopback");
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        exec.get_json_observed("/guilds/2222/roles"),
+    )
+    .await
+    .expect("a sleeping admit must not outlive the moderation bound");
+    assert!(result.is_err(), "stall is an error, not absent: {result:?}");
+    assert_eq!(
+        mock.requests().len(),
+        0,
+        "an admit that never resolves must never reach the wire"
+    );
+    assert_eq!(
+        lane.admits.load(Ordering::SeqCst) as u64,
+        u64::from(two_bot_core::MAX_HTTP_TRIES),
+        "one timed-out admission per attempt"
+    );
+    assert!(
+        !*lane.held.lock().unwrap(),
+        "a timed-out admit must never take the lane"
+    );
+    mock.shutdown().await;
+}
+
+/// A GET whose headers arrive but whose body stalls must release the lane
+/// where the permit is in scope: otherwise the retries are `Blocked` by the
+/// read's own orphaned permit until the 60 s lease. Five wire requests, zero
+/// `Blocked`, lane free and re-admittable afterwards.
+#[tokio::test(start_paused = true)]
+async fn governed_observed_read_with_stalled_body_releases_lane() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mock = MockRest::start(
+        vec![],
+        ScriptedResponse::json(200, serde_json::json!([])).delayed_body(Duration::from_secs(600)),
+    )
+    .await;
+    let lane = Arc::new(SingleFlightLane {
+        key: TokenKey::for_bot_token("fixture-token").unwrap(),
+        held: Arc::new(Mutex::new(false)),
+        admits: AtomicU32::new(0),
+        blocked: AtomicU32::new(0),
+        released: Arc::new(AtomicU32::new(0)),
+    });
+    let exec = ActionExecutor::with_admission(
+        "fixture-token".to_owned(),
+        Some(mock.origin()),
+        Arc::clone(&lane) as Arc<dyn SendAdmission>,
+    )
+    .expect("governed executor builds against loopback");
+    let result = tokio::time::timeout(
+        Duration::from_secs(120),
+        exec.get_json_observed("/guilds/2222/roles"),
+    )
+    .await
+    .expect("a stalled body must not outlive the attempt budgets");
+    assert!(result.is_err(), "stall is an error, not absent: {result:?}");
+    let budget = u64::from(two_bot_core::MAX_HTTP_TRIES);
+    assert_eq!(
+        mock.requests().len() as u64,
+        budget,
+        "one wire request per attempt"
+    );
+    assert_eq!(
+        lane.blocked.load(Ordering::SeqCst),
+        0,
+        "retries must not be Blocked by the read's own body-stalled permit"
+    );
+    assert!(
+        !*lane.held.lock().unwrap(),
+        "a body-timed-out GET must release the lane"
+    );
+    assert_eq!(
+        lane.released.load(Ordering::SeqCst) as u64,
+        budget,
+        "each body-timed-out GET attempt releases its permit"
+    );
+    let permit = lane
+        .admit()
+        .await
+        .expect("the lane must admit once the body-timed-out GETs release it");
+    permit.complete(None).await.expect("test lane completion");
+    mock.shutdown().await;
+}
+
+/// The self-role GET travels the budgeted wire path without an outer timer:
+/// a stall must time out inside the permit scope and release the lane.
+/// Single attempt, so exactly one wire request, one admission, one release.
+#[tokio::test(start_paused = true)]
+async fn governed_self_role_read_with_stalled_headers_releases_lane() {
+    const CHANNEL: &str = "100000000000000007";
+    const MESSAGE: &str = "100000000000000008";
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mock = MockRest::start(
+        vec![],
+        ScriptedResponse::json(
+            200,
+            serde_json::json!({"id": MESSAGE, "channel_id": CHANNEL}),
+        )
+        .delayed(Duration::from_secs(600)),
+    )
+    .await;
+    let lane = Arc::new(SingleFlightLane {
+        key: TokenKey::for_bot_token("fixture-token").unwrap(),
+        held: Arc::new(Mutex::new(false)),
+        admits: AtomicU32::new(0),
+        blocked: AtomicU32::new(0),
+        released: Arc::new(AtomicU32::new(0)),
+    });
+    let exec = ActionExecutor::with_admission(
+        "fixture-token".to_owned(),
+        Some(mock.origin()),
+        Arc::clone(&lane) as Arc<dyn SendAdmission>,
+    )
+    .expect("governed executor builds against loopback");
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        exec.fetch_self_role_message(CHANNEL, MESSAGE),
+    )
+    .await
+    .expect("a stalled self-role read must not outlive the moderation bound");
+    assert_eq!(
+        result,
+        Err(SelfRoleRestError::Ambiguous),
+        "a stall stays Ambiguous, never a parsed partial snapshot"
+    );
+    assert_eq!(mock.requests().len(), 1, "one wire request");
+    assert_eq!(lane.admits.load(Ordering::SeqCst), 1, "one admission");
+    assert_eq!(
+        lane.blocked.load(Ordering::SeqCst),
+        0,
+        "no Blocked on the read's own permit"
+    );
+    assert!(
+        !*lane.held.lock().unwrap(),
+        "a timed-out self-role GET must release the lane"
+    );
+    assert_eq!(
+        lane.released.load(Ordering::SeqCst),
+        1,
+        "the timed-out GET attempt releases its permit"
+    );
+    let permit = lane
+        .admit()
+        .await
+        .expect("the lane must admit once the timed-out GET releases it");
     permit.complete(None).await.expect("test lane completion");
     mock.shutdown().await;
 }

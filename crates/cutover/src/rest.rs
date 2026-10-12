@@ -252,13 +252,15 @@ impl RestClient {
             self.pace().await;
             let request = make()?;
             self.inner.requests.fetch_add(1, Ordering::Relaxed);
-            let (res, _) = tokio::time::timeout(
-                Duration::from_secs(30),
-                transport.send_request(&request, None),
-            )
-            .await
-            .map_err(|_| RestError::Wire("request timed out; lane held".to_owned()))?
-            .map_err(RestError::Wire)?;
+            // The 30 s page budget is the transport's absolute deadline —
+            // durable admission, headers and body share it — so a stalled GET
+            // times out where its permit is in scope and releases the lane.
+            // No outer timeout may wrap this call (it would orphan the lane).
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let (res, _) = transport
+                .send_request(&request, Some(deadline))
+                .await
+                .map_err(RestError::Wire)?;
             match res.status {
                 200..=299 => return Ok(ListPage::Read(serde_json::from_slice(&res.body)?)),
                 403 | 404 => return Ok(ListPage::Interrupted(ScanCompletion::Unreadable)),
@@ -289,13 +291,12 @@ impl RestClient {
             self.pace().await;
             let request = make()?;
             self.inner.requests.fetch_add(1, Ordering::Relaxed);
-            let (res, _) = tokio::time::timeout(
-                Duration::from_secs(30),
-                transport.send_request(&request, None),
-            )
-            .await
-            .map_err(|_| RestError::Wire("request timed out; lane held".to_owned()))?
-            .map_err(RestError::Wire)?;
+            // Same absolute-deadline shape as the page scan above.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let (res, _) = transport
+                .send_request(&request, Some(deadline))
+                .await
+                .map_err(RestError::Wire)?;
             match res.status {
                 200..=299 => return Ok(Some(serde_json::from_slice(&res.body)?)),
                 403 | 404 => return Ok(None),
@@ -426,13 +427,13 @@ impl RestClient {
                 .reason(reason)
                 .try_into_request()?;
             self.inner.requests.fetch_add(1, Ordering::Relaxed);
-            let (res, _) = tokio::time::timeout(
-                Duration::from_secs(30),
-                transport.send_request(&request, None),
-            )
-            .await
-            .map_err(|_| RestError::Wire("request timed out; lane held".to_owned()))?
-            .map_err(RestError::Wire)?;
+            // Absolute deadline covers admission, headers and body. A DELETE
+            // timeout keeps the permit held (uncertain mutation) by design.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let (res, _) = transport
+                .send_request(&request, Some(deadline))
+                .await
+                .map_err(RestError::Wire)?;
             match res.status {
                 200..=299 => return Ok(DeleteOutcome::Deleted),
                 404 => return Ok(DeleteOutcome::AlreadyGone),

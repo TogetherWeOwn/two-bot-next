@@ -351,18 +351,19 @@ async fn read_discord<T: serde::de::DeserializeOwned>(
 ) -> Result<T, Check> {
     let request =
         request.map_err(|_| Check::fail(check, "Discord request invalid (checks stopped)"))?;
-    let (response, _) = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        transport.send_request(&request, None),
-    )
-    .await
-    .map_err(|_| Check::fail(check, "Discord request timed out (lane held)"))?
-    .map_err(|_| {
-        Check::fail(
-            check,
-            "Discord send unavailable or admission held (checks stopped)",
-        )
-    })?;
+    // Absolute deadline covers admission, headers and body, so a stalled GET
+    // releases its lane where the permit is in scope instead of orphaning it.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let (response, _) = transport
+        .send_request(&request, Some(deadline))
+        .await
+        .map_err(|_| Check::fail(check, "Discord request timed out"))?
+        .map_err(|_| {
+            Check::fail(
+                check,
+                "Discord send unavailable or admission held (checks stopped)",
+            )
+        })?;
     if !(200..=299).contains(&response.status) {
         return Err(Check::fail(
             check,
@@ -448,7 +449,7 @@ async fn check_discord(
     }
     // The cutover's forced IDENTIFY spends one session start against a hard
     // Discord daily limit, so the budget is read here through the same
-    // governed GET path: lane held, no retry, and any failed, timed-out or
+    // governed GET path: lane released on timeout, no retry, and any failed, timed-out or
     // malformed read fails closed like every other check. Counts only; the
     // token is never part of the detail.
     let budget: BotConnectionInfo = read_discord(
