@@ -3615,7 +3615,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             return Ok(());
         }
         match write_owner_overwrite_delta(
-            &self.http,
+            // The writer handle is shared with the watchdog sibling: pass
+            // the inner writer, not the `Arc`, to the `RoomWrites` bound.
+            &*self.http,
             &self.live,
             channel_id,
             generation,
@@ -3644,7 +3646,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     return Err(RoomHttpError::AccessDenied);
                 };
                 match write_owner_overwrite_delta(
-                    &self.http,
+                    // The writer handle is shared with the watchdog sibling:
+                    // pass the inner writer, not the `Arc`, to the bound.
+                    &*self.http,
                     &self.live,
                     channel_id,
                     generation,
