@@ -178,6 +178,7 @@ sink attaches to the gateway writer on the cutover path.
 | `voice_event="voice_reconcile"` | `crates/bot/src/voice_rooms.rs` (`reconcile`: `voice_reconcile planned`) | One reconcile pass plan size with per-action counts |
 | `voice_event="voice_dead_letter"` | `crates/bot/src/voice_rooms.rs` (`mark_failed_observed`: `voice action dead-lettered`) | Queue write exhausted retries with bounded `action` and attempts |
 | `voice_event="voice_creator_orphan"` | `crates/bot/src/voice_rooms.rs` (`execute_create`: `voice creator orphan needs manual deletion`) | Untracked creator-channel orphan needing manual deletion |
+| `voice_event="voice_join_received"` | `crates/bot/src/voice_rooms.rs` (`accept_join_received`: `voice creator join accepted` / `voice creator join refused before queueing`) | One creator-channel join delivered to the guild actor, accepted or refused. The refused line carries a bounded `reason` (`halted`, `access`, `unknown_creator`, `stale_ticket`, `duplicate`, `name_blocked`, `other`); every delivery bumps `two_bot_voice_joins_received_total`, so received-vs-handled drift is the stall signal |
 
 Adjacent actor message without a `voice_event` field:
 `voice actor load failed; actor respawns on the next guild snapshot`
@@ -188,6 +189,26 @@ one line per 5 minutes, so a burst across guilds names only the first. The
 actor respawns on the next guild snapshot (`publish_snapshot` on
 `GuildCreate`/resumed replay); voice, channel and role events for the guild
 are dropped until then.
+
+Stall-watchdog actor messages without a `voice_event` field (all in
+`run_actor_with_limits` in `crates/bot/src/voice_rooms.rs`, guild-only fields,
+no IDs):
+`voice worker stuck: queued actions with no progress` (error, at most one per
+stuck window): actions are queued but no dispatch turn completed for the full
+window; bumps `two_bot_voice_watchdog_stucks_total`.
+`voice dispatch turn exceeded observe bound` (warn): one dispatch turn ran
+past the observe bound; the turn ran to completion and the queue keeps its
+retries; bumps `two_bot_voice_dispatch_timeouts_total`.
+`voice worker halt cleared: store credentials healthy` (info): a halted
+worker's credential re-probe read the store under timeout, so the
+store-CredentialRefused latch cleared; bumps `two_bot_voice_halt_recoveries_total`.
+Discord-401 halts never reach the probe (see below), so this line always
+means a store recovery, never a token recovery.
+`voice halt re-probe skipped: Discord credential latch set` (debug): the
+worker halted on a Discord 401 (or the writer latched one); the probe stays
+out because only a token fix and a restart clear that halt.
+`voice halt re-probe: store still refusing` / `voice halt re-probe timed out`
+(debug): the latch stays set; the next probe runs after the re-probe interval.
 
 ## Unknowns (TBD)
 

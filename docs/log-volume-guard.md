@@ -20,7 +20,7 @@ high-rate event without a cap row fails the suite.
   guild/member/channel ID, token, query string, body or message content ever
   becomes a label or a log field.
 
-## Cardinality budget: 589 samples
+## Cardinality budget: 606 samples
 
 `GET /metrics` renders this many non-comment samples from process start,
 before any traffic. Adding any series fails the pinned count until this
@@ -37,7 +37,7 @@ table and the test are updated together.
 | `two_bot_rest_guard_*` | 11 | Fixed, label-free shared admission-guard counters and gauges |
 | job runs, timestamps, failure streaks | 64 | 16 jobs x (2 outcomes + timestamp + streak) |
 | `two_bot_job_last_error_class{job,class}` | 112 | 16 jobs x 7 classes (`database`, `rest`, `configuration`, `timeout`, `panic`, `feed`, `recovery_required`) |
-| voice ops, reconcile, dead-letters, state | 34 | 3x6 ops + 4 reconcile + 9 dead-letter + tracked + compensation + orphans |
+| voice ops, reconcile, dead-letters, state | 51 | 3x6 ops + 4 reconcile + 9 dead-letter + tracked + compensation + orphans + 7 join-refused reasons + 2 queue lanes + halted + oldest-age + rest-age + backoff-capped + dispatch-timeouts + watchdog-stucks + halt-recoveries |
 | pool gauges | 4 | configured, size, idle, max |
 | `two_bot_db_errors_total{op}` | 2 | `admission`, `other` |
 | `two_bot_send_admissions_total{outcome}` | 4 | `admitted`, `blocked`, `storage_error`, `other` |
@@ -50,7 +50,7 @@ table and the test are updated together.
 | `two_bot_community_facts_drain_failures_total{reason}` | 3 | `error`, `timeout`, `other` |
 | `two_bot_presence_capture_total{outcome}` | 3 | `inserted`, `duplicate`, `rejected` |
 | `two_bot_audit_delivery_halt` | 1 | label-free gauge: 1 engaged, 0 cleared |
-| `# HELP` / `# TYPE` headers | 90 | 45 families x 2 |
+| `# HELP` / `# TYPE` headers | 110 | 55 families x 2 |
 
 ## Per-event caps (gateway metric labels)
 
