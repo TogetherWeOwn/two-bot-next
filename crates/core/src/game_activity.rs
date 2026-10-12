@@ -15,12 +15,13 @@
 //! YouTube.
 //!
 //! Sessionization processes deltas in time order (stable sort by
-//! `observed_at_ms`). Contiguous Playing deltas for the same user and game
-//! merge; a game change, a gap timeout, a user change, an interleaving
-//! observation from another member, or a non-Playing activity closes the
-//! interval. Each session carries an in-voice overlap flag derived from voice
-//! spans (join/leave plus Discord `self_stream`); streaming sessions are
-//! flagged as streaming.
+//! `observed_at_ms`) tracking one open interval per member. Contiguous
+//! Playing deltas for the same user and game merge; a game change, a gap
+//! timeout, or a non-Playing activity from that same member closes their
+//! interval. Other members' observations never disturb it. Each session
+//! carries its in-voice overlap in millis, summed from voice spans
+//! (join/leave plus Discord `self_stream`); streaming sessions are flagged
+//! as streaming.
 
 use serde::{Deserialize, Serialize};
 
@@ -126,8 +127,12 @@ pub struct PlaySession {
     /// True when the opening activity was Streaming.
     pub is_streaming: bool,
     /// True when the interval shares time with a voice span for the same
-    /// member (see [`sessionize`]).
+    /// member (see [`sessionize`]). Equivalent to `in_voice_ms > 0`.
     pub in_voice: bool,
+    /// Millis of the interval spent in voice: the summed intersection of
+    /// the session span with that member's voice spans, merged so
+    /// overlapping spans are never double-counted.
+    pub in_voice_ms: i64,
 }
 
 /// Guild-level aggregate for one (guild, game).
@@ -142,7 +147,7 @@ pub struct GuildGameAggregate {
     pub game: Option<String>,
     /// Sum of session wall-clock spans in millis.
     pub total_play_ms: i64,
-    /// Sum of spans for sessions flagged `in_voice`.
+    /// Sum of session voice-overlap millis (see [`PlaySession::in_voice_ms`]).
     pub in_voice_ms: i64,
     /// Number of sessions folded into this row.
     pub session_count: u64,
@@ -234,18 +239,46 @@ fn session_game(delta: &PresenceDelta) -> Option<(String, bool)> {
     None
 }
 
-fn spans_overlap(a_start: i64, a_end: i64, b_start: i64, b_end: i64) -> bool {
-    let (a_start, a_end) = if a_start <= a_end {
-        (a_start, a_end)
-    } else {
-        (a_end, a_start)
-    };
-    let (b_start, b_end) = if b_start <= b_end {
-        (b_start, b_end)
-    } else {
-        (b_end, b_start)
-    };
-    a_start <= b_end && b_start <= a_end
+/// Millis of `[started, ended)` spent inside `user_key`'s voice spans.
+///
+/// Intersections use half-open semantics, so a span that ends exactly when
+/// the session starts contributes zero. Same-member spans are merged first
+/// so overlapping spans are never double-counted.
+fn session_voice_overlap_ms(
+    started_at_ms: i64,
+    ended_at_ms: i64,
+    user_key: &str,
+    voices: &[VoiceSpan],
+) -> i64 {
+    let mut clipped: Vec<(i64, i64)> = voices
+        .iter()
+        .filter(|span| span.user_key == user_key)
+        .map(|span| {
+            let (join, leave) = if span.join_ms <= span.leave_ms {
+                (span.join_ms, span.leave_ms)
+            } else {
+                (span.leave_ms, span.join_ms)
+            };
+            (join.max(started_at_ms), leave.min(ended_at_ms))
+        })
+        .filter(|(start, end)| start < end)
+        .collect();
+    if clipped.is_empty() {
+        return 0;
+    }
+    clipped.sort();
+    let mut total = 0i64;
+    let (mut current_start, mut current_end) = clipped[0];
+    for (start, end) in clipped.into_iter().skip(1) {
+        if start <= current_end {
+            current_end = current_end.max(end);
+        } else {
+            total = total.saturating_add(current_end.saturating_sub(current_start).max(0));
+            current_start = start;
+            current_end = end;
+        }
+    }
+    total.saturating_add(current_end.saturating_sub(current_start).max(0))
 }
 
 fn finish_open(open: OpenSession, voices: &[VoiceSpan], out: &mut Vec<PlaySession>) {
@@ -255,59 +288,62 @@ fn finish_open(open: OpenSession, voices: &[VoiceSpan], out: &mut Vec<PlaySessio
     } else {
         open.ended_at_ms
     };
-    let in_voice = voices.iter().any(|span| {
-        span.user_key == open.user_key
-            && spans_overlap(open.started_at_ms, ended_at_ms, span.join_ms, span.leave_ms)
-    });
+    let in_voice_ms =
+        session_voice_overlap_ms(open.started_at_ms, ended_at_ms, &open.user_key, voices);
     out.push(PlaySession {
         game: Some(open.game),
         started_at_ms: open.started_at_ms,
         ended_at_ms,
         is_streaming: open.is_streaming,
-        in_voice,
+        in_voice: in_voice_ms > 0,
+        in_voice_ms,
     });
 }
 
 /// Sessionize play intervals per user and game from presence deltas.
 ///
-/// Deltas are processed in time order (stable sort by `observed_at_ms`).
-/// Contiguous Playing (or Streaming) observations for the same user and the
-/// same sanitized title merge while each step stays within `gap_timeout_ms`;
-/// a game change, a streaming-flag change, a user change, an interleaving
-/// observation from another member, a gap beyond the timeout, or a delta
-/// with no Playing / Streaming activity closes the open interval.
+/// Deltas are processed in time order (stable sort by `observed_at_ms`)
+/// with one open interval tracked per member. Contiguous Playing (or
+/// Streaming) observations for the same user and the same sanitized title
+/// merge while each step stays within `gap_timeout_ms`; a game change, a
+/// streaming-flag change, a gap beyond the timeout, or a delta with no
+/// Playing / Streaming activity from that same member closes their open
+/// interval. Other members' observations never disturb it.
 ///
-/// Each returned session carries an in-voice flag: true when its wall-clock
-/// span shares time with a voice span for the same `user_key` (join/leave
-/// overlap; `self_stream` needs no special case because an overlapping span
-/// already flags, whether or not the member streamed through Discord).
+/// Each returned session carries its in-voice overlap in millis: the summed
+/// intersection of the session span with voice spans for the same
+/// `user_key` (join/leave overlap, merged so overlapping spans count once;
+/// `self_stream` needs no special case because an overlapping span already
+/// contributes, whether or not the member streamed through Discord).
 /// Streaming sessions are flagged via the opening Streaming activity.
+/// Output is sorted by `(started_at_ms, ended_at_ms)` for determinism.
 #[must_use]
 pub fn sessionize(
     deltas: &[PresenceDelta],
     voices: &[VoiceSpan],
     gap_timeout_ms: i64,
 ) -> Vec<PlaySession> {
+    use std::collections::HashMap;
+
     let mut ordered: Vec<&PresenceDelta> = deltas.iter().collect();
     ordered.sort_by_key(|delta| delta.observed_at_ms);
 
     let mut out: Vec<PlaySession> = Vec::new();
-    let mut current: Option<OpenSession> = None;
+    let mut open_by_user: HashMap<String, OpenSession> = HashMap::new();
 
     for delta in ordered {
         let Some((game, is_streaming)) = session_game(delta) else {
-            if let Some(open) = current.take() {
+            // A non-playing delta closes only its own member's interval.
+            if let Some(open) = open_by_user.remove(&delta.user_key) {
                 finish_open(open, voices, &mut out);
             }
             continue;
         };
-        // Merge only with the immediately previous observation in time order:
-        // any interleaving delta (another member, another game) breaks
-        // contiguity and closes the interval.
-        let can_merge = match current.as_ref() {
+        // Merge only with this member's own previous observation: another
+        // member's interleaving deltas must not break contiguity.
+        let can_merge = match open_by_user.get(&delta.user_key) {
             Some(open) => {
-                open.user_key == delta.user_key
-                    && open.game == game
+                open.game == game
                     && open.is_streaming == is_streaming
                     && delta.observed_at_ms >= open.ended_at_ms
                     && delta.observed_at_ms.saturating_sub(open.ended_at_ms) <= gap_timeout_ms
@@ -315,33 +351,39 @@ pub fn sessionize(
             None => false,
         };
         if can_merge {
-            if let Some(open) = current.as_mut() {
+            if let Some(open) = open_by_user.get_mut(&delta.user_key) {
                 open.ended_at_ms = delta.observed_at_ms;
             }
         } else {
-            if let Some(open) = current.take() {
+            if let Some(open) = open_by_user.remove(&delta.user_key) {
                 finish_open(open, voices, &mut out);
             }
-            current = Some(OpenSession {
-                user_key: delta.user_key.clone(),
-                game,
-                is_streaming,
-                started_at_ms: delta.observed_at_ms,
-                ended_at_ms: delta.observed_at_ms,
-            });
+            open_by_user.insert(
+                delta.user_key.clone(),
+                OpenSession {
+                    user_key: delta.user_key.clone(),
+                    game,
+                    is_streaming,
+                    started_at_ms: delta.observed_at_ms,
+                    ended_at_ms: delta.observed_at_ms,
+                },
+            );
         }
     }
-    if let Some(open) = current.take() {
+    let mut remaining: Vec<OpenSession> = open_by_user.into_values().collect();
+    remaining.sort_by_key(|open| (open.started_at_ms, open.ended_at_ms));
+    for open in remaining {
         finish_open(open, voices, &mut out);
     }
+    out.sort_by_key(|session| (session.started_at_ms, session.ended_at_ms));
     out
 }
 
 /// Fold sessions into guild-level aggregates keyed by (guild, game).
 ///
 /// One row per distinct game title. `total_play_ms` sums wall-clock spans;
-/// `in_voice_ms` sums spans of sessions flagged in-voice, so it never
-/// exceeds the total. Rows carry no member key. Sorted by game title
+/// `in_voice_ms` sums each session's stored voice-overlap millis, so it
+/// never exceeds the total. Rows carry no member key. Sorted by game title
 /// (`None` first) for deterministic output.
 #[must_use]
 pub fn aggregate_guild(guild_id: &str, sessions: &[PlaySession]) -> Vec<GuildGameAggregate> {
@@ -362,9 +404,7 @@ pub fn aggregate_guild(guild_id: &str, sessions: &[PlaySession]) -> Vec<GuildGam
             .saturating_sub(session.started_at_ms)
             .max(0);
         fold.total_play_ms = fold.total_play_ms.saturating_add(span);
-        if session.in_voice {
-            fold.in_voice_ms = fold.in_voice_ms.saturating_add(span);
-        }
+        fold.in_voice_ms = fold.in_voice_ms.saturating_add(session.in_voice_ms.max(0));
         fold.session_count = fold.session_count.saturating_add(1);
     }
 
@@ -384,8 +424,87 @@ pub fn aggregate_guild(guild_id: &str, sessions: &[PlaySession]) -> Vec<GuildGam
 mod tests {
     use super::*;
 
+    const MIN_MS: i64 = 60_000;
+
+    fn playing_snapshot(name: &str) -> ActivitySnapshot {
+        ActivitySnapshot {
+            activity_type: ActivityType::Playing,
+            name: name.to_owned(),
+            application_id: None,
+            details: None,
+            state: None,
+            party_size: None,
+            assets: false,
+            button_labels: Vec::new(),
+            button_urls: Vec::new(),
+            stream_url: None,
+        }
+    }
+
+    fn user_delta(user_key: &str, at_ms: i64, game: &str) -> PresenceDelta {
+        PresenceDelta {
+            user_key: user_key.to_owned(),
+            observed_at_ms: at_ms,
+            activities: vec![playing_snapshot(game)],
+        }
+    }
+
     #[test]
     fn floor_keeps_singletons_positive_without_moving_merged_end() {
         assert_eq!(SINGLE_OBSERVATION_FLOOR_MS, 60_000);
+    }
+
+    #[test]
+    fn interleaved_members_keep_their_own_sessions() {
+        // Two members each play Apex for 20 minutes, updates every 5 minutes
+        // offset by 1 minute. Per-user sessionization must yield 2 sessions
+        // totalling ~40 minutes, not 10 singletons totalling 10 minutes.
+        let t0 = 1_750_000_000_000i64;
+        let mut deltas = Vec::new();
+        for step in 0..5 {
+            deltas.push(user_delta("user-a", t0 + step * 5 * MIN_MS, "Apex"));
+            deltas.push(user_delta(
+                "user-b",
+                t0 + MIN_MS + step * 5 * MIN_MS,
+                "Apex",
+            ));
+        }
+        let sessions = sessionize(&deltas, &[], 15 * MIN_MS);
+        assert_eq!(
+            sessions.len(),
+            2,
+            "one session per member, got {sessions:?}"
+        );
+        let total: i64 = sessions
+            .iter()
+            .map(|s| s.ended_at_ms.saturating_sub(s.started_at_ms).max(0))
+            .sum();
+        assert_eq!(total, 40 * MIN_MS, "both members' play time kept");
+    }
+
+    #[test]
+    fn in_voice_ms_counts_overlap_not_whole_span() {
+        // 30-minute session sharing 1 minute with a voice span must report
+        // 1 minute in-voice, not the whole 30-minute span.
+        let t0 = 1_750_000_000_000i64;
+        let deltas = vec![
+            user_delta("user-1", t0, "Apex"),
+            user_delta("user-1", t0 + 30 * MIN_MS, "Apex"),
+        ];
+        let voices = vec![VoiceSpan {
+            user_key: "user-1".to_owned(),
+            join_ms: t0,
+            leave_ms: t0 + MIN_MS,
+            self_stream: false,
+        }];
+        let sessions = sessionize(&deltas, &voices, 60 * MIN_MS);
+        assert_eq!(sessions.len(), 1);
+        let rows = aggregate_guild("guild-1", &sessions);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].in_voice_ms, MIN_MS,
+            "in-voice time is the 1-minute overlap, got {:?}",
+            rows[0]
+        );
     }
 }

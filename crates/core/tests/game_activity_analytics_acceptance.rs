@@ -221,7 +221,9 @@ fn aggregates_are_guild_level_only_never_per_member() {
     assert_eq!(row.guild_id, "guild-1");
     assert_eq!(row.game.as_deref(), Some("Apex Legends"));
     assert!(row.total_play_ms > 0);
-    assert_eq!(row.session_count, 3);
+    // Per-user sessionization: user-1's two deltas merge into one interval
+    // and user-2's delta is a singleton, so two sessions total.
+    assert_eq!(row.session_count, 2);
     let debug = format!("{row:?}");
     assert!(
         !debug.contains("user-1") && !debug.contains("user-2"),
