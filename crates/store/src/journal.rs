@@ -33,6 +33,8 @@
 //! funnel `events.metadata` convention — the journal is a restore source,
 //! not a query index, so there is no JSONB and no secondary parsing.
 
+use std::collections::BTreeMap;
+
 use sqlx::{Pool, Postgres, Transaction};
 use thiserror::Error;
 
@@ -286,6 +288,17 @@ pub async fn watermark_for(
             .fetch_optional(pool)
             .await?;
     Ok(id)
+}
+
+/// Every committed per-table cursor in one read, for the read-only `/ops`
+/// roll-ups. Tables without a committed watermark are absent from the map
+/// (see [`watermark_for`]).
+pub async fn watermarks(pool: &Pool<Postgres>) -> Result<BTreeMap<String, i64>, JournalError> {
+    let rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT table_name, last_journal_id FROM rollback_watermarks")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().collect())
 }
 
 /// The global restorable point: the newest journal id across all tables.

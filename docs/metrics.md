@@ -351,6 +351,35 @@ as dynamic labels.
   readiness code. Supervisor outcomes and alert rules are separately owned
   and not part of this contract.
 
+## Read-only ops roll-ups (`/ops/summary`, `/ops/gateway`, `/ops/backfill`)
+
+Three JSON roll-ups on the same listener reuse the `/readyz`, gateway,
+job, pool and event-store sources above. Like `/metrics` they are served
+openly on the container port; the only off-container path is the Worker,
+gated by the same scrape bearer (`METRICS_SCRAPE_TOKEN`, 404 when unset or
+short, 401 on a wrong bearer, 429 per-caller attempt budget). The Worker
+exact-matches the three paths before the invite-redirect lookup, and the DO
+proxies them with the same 6 s deadline and 64 KiB body cap as the scrape.
+
+- `GET /ops/summary`: readiness (`ready`, `components`), gateway state and
+  failure, the informational `jobs` map, pool gauges (`size`/`idle`/`max`),
+  event-store lag (`restorable_point`, `max_lag`) and backfill progress
+  (`tables_total`, `tables_at_point`), plus the build revision/id.
+- `GET /ops/gateway`: shard state (`unconfigured`/`armed`/`connected`/
+  `draining`), gateway status, the last gateway-task failure, reconnect /
+  resume / disconnect / missed-event counters, `last_ready_unix` and
+  `last_resume_unix` (Unix seconds of the last observed READY/RESUMED
+  dispatch), per-event counts, per-stage checkpoint failures, and the
+  `session_checkpoint` job's last success.
+- `GET /ops/backfill`: the global restorable point plus every covered
+  journal table's durable cursor (`watermark`) and signed `lag` behind the
+  point; a table with no committed watermark reports `null`, never zero.
+
+Every database-backed section degrades to an explicit `available: false`
+with `200`, never a 500 or an error string: a database outage must not hide
+gateway and job health. Event-store reads share the 2 s `/readyz` probe
+budget. Responses carry `no-store`; bodies are `application/json`.
+
 ## Cardinality and memory
 
 All retained metric values are fixed-size arrays. Only compile-time allowlisted

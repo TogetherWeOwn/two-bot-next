@@ -85,21 +85,28 @@ pub(crate) fn router_with_guard(
         .layer(axum::Extension(guard))
 }
 
+/// Pool bookkeeping for scrapes and the read-only `/ops` roll-ups.
+/// SQLx exposes this without SQL or acquiring a connection.
+/// https://docs.rs/sqlx/0.9.0/sqlx/struct.Pool.html#method.size
+/// `None` while no pool is registered (unconfigured boot).
+pub(crate) fn pool_sample() -> Option<(u32, usize, u32)> {
+    pool_slot()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .map(|pool| {
+            (
+                pool.size(),
+                pool.num_idle(),
+                pool.options().get_max_connections(),
+            )
+        })
+}
+
 async fn scrape(
     axum::Extension(guard): axum::Extension<Arc<two_bot_discord::ratelimit_guard::RateLimitGuard>>,
 ) -> ([(header::HeaderName, &'static str); 2], String) {
-    // SQLx exposes pool bookkeeping without SQL or acquiring a connection.
-    // https://docs.rs/sqlx/0.9.0/sqlx/struct.Pool.html#method.size
-    let pool = pool_slot()
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let sample = pool.as_ref().map(|pool| {
-        (
-            pool.size(),
-            pool.num_idle(),
-            pool.options().get_max_connections(),
-        )
-    });
+    let sample = pool_sample();
     (
         [
             (header::CONTENT_TYPE, metrics::CONTENT_TYPE),
