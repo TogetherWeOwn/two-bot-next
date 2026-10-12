@@ -1245,25 +1245,30 @@ mod tests {
         let handle = {
             let accepted = Arc::clone(&accepted);
             tokio::spawn(async move {
-                // One stalled connection per call site below: read the request
-                // head, then sleep past the budget without answering.
+                // One stalled connection per call site below. Each connection
+                // is stalled on its own task so the accept loop stays
+                // responsive: a sequential sleep past the budget would hold
+                // the loop while the paused clock fires the caller's timeout,
+                // and later call sites would time out before being accepted.
                 for _ in 0..3 {
                     let Ok((mut stream, _)) = listener.accept().await else {
                         return;
                     };
                     accepted.fetch_add(1, Ordering::SeqCst);
-                    let mut buf = Vec::with_capacity(1024);
-                    let mut chunk = [0u8; 1024];
-                    while let Ok(n) = stream.read(&mut chunk).await {
-                        if n == 0 {
-                            break;
+                    tokio::spawn(async move {
+                        let mut buf = Vec::with_capacity(1024);
+                        let mut chunk = [0u8; 1024];
+                        while let Ok(n) = stream.read(&mut chunk).await {
+                            if n == 0 {
+                                break;
+                            }
+                            buf.extend_from_slice(&chunk[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
                         }
-                        buf.extend_from_slice(&chunk[..n]);
-                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                            break;
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_secs(600)).await;
+                        tokio::time::sleep(Duration::from_secs(600)).await;
+                    });
                 }
             })
         };
