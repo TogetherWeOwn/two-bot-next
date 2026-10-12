@@ -166,9 +166,33 @@ fn truncate_utf16(value: &str, limit: usize) -> String {
         .collect()
 }
 
+/// Collapse line breaks and cut plain (non-Discord) text to `limit` UTF-16
+/// units with an ellipsis. Unlike [`truncate_escaped_markdown`], this adds no
+/// backslash escapes: YouTube comments render backslashes literally, so
+/// Discord escaping garbles titles there while protecting nothing (YouTube
+/// has no masked links).
+fn truncate_plain_text(value: &str, limit: usize) -> String {
+    let flat: String = value
+        .chars()
+        .map(|ch| if matches!(ch, '\r' | '\n') { ' ' } else { ch })
+        .collect();
+    if flat.encode_utf16().count() <= limit {
+        return flat;
+    }
+    if limit == 0 {
+        return String::new();
+    }
+    let mut truncated = truncate_utf16(&flat, limit - 1);
+    truncated.push('…');
+    truncated
+}
+
 /// Parse a full EventSub notification (`{ subscription, event }`) into a
 /// validated [`StreamOnline`]. Rejects any other subscription type or version
 /// so a misrouted `stream.offline` or `channel.update` can never post LIVE.
+/// A present `event.type` must be `live`: Twitch documents `playlist`,
+/// `watch_party`, `premiere` and `rerun` as further values, and none of them
+/// is a genuine go-live. An absent `type` is accepted for older payloads.
 pub fn parse_stream_online(
     notification: &serde_json::Value,
 ) -> Result<StreamOnline, StreamFunnelError> {
@@ -192,6 +216,11 @@ pub fn parse_stream_online(
     let event = notification
         .get("event")
         .ok_or(StreamFunnelError::MissingField)?;
+    if let Some(event_type) = event.get("type").and_then(serde_json::Value::as_str) {
+        if event_type != "live" {
+            return Err(StreamFunnelError::WrongType);
+        }
+    }
     let broadcaster_user_id = event_string(event, "broadcaster_user_id")?;
     if !valid_broadcaster_id(&broadcaster_user_id) {
         return Err(StreamFunnelError::InvalidBroadcasterId);
@@ -286,8 +315,12 @@ pub fn vod_description_footer(discord_invite_url: &str) -> Result<String, Stream
 }
 
 /// Pinned-comment text for a VOD upload. Same convention as the description
-/// footer: Discord link first, optional neutralized and Markdown-escaped
-/// title for context.
+/// footer: Discord link first, optional neutralized title for context. The
+/// title is plain text with NO Markdown escaping: this posts to YouTube,
+/// which renders backslashes literally, so Discord escaping would garble it
+/// (YouTube has no masked links to defend against). Mass mentions stay
+/// neutralized — the zero-width break is invisible on YouTube and keeps the
+/// text safe if quoted back into Discord.
 pub fn vod_pinned_comment(
     video_title: Option<&str>,
     discord_invite_url: &str,
@@ -297,7 +330,7 @@ pub fn vod_pinned_comment(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(crate::message_safety::neutralize_mentions)
-        .map(|value| truncate_escaped_markdown(&value, 200));
+        .map(|value| truncate_plain_text(&value, 200));
     let content = match clean.as_deref() {
         Some(title) => format!(
             "Thanks for watching {title}! Full VOD list lives here, and we hang out live on Discord: {invite}"
@@ -505,5 +538,38 @@ mod tests {
     #[test]
     fn insert_bucket_defaults_to_one_hundred_daily_calls() {
         assert_eq!(YOUTUBE_INSERT_DAILY_CALL_LIMIT, 100);
+    }
+
+    #[test]
+    fn pinned_comment_keeps_youtube_title_unescaped() {
+        let pinned = vod_pinned_comment(
+            Some("Game Night #3: Finals (part 1)!"),
+            "https://discord.gg/example",
+        )
+        .expect("pinned");
+        assert!(
+            pinned.contains("Game Night #3: Finals (part 1)!"),
+            "YouTube title must appear verbatim, no backslash escapes: {pinned}"
+        );
+        assert!(
+            !pinned.contains('\\'),
+            "no Discord backslash escapes in YouTube text: {pinned}"
+        );
+    }
+
+    #[test]
+    fn rejects_non_live_event_type() {
+        for event_type in ["rerun", "playlist", "watch_party", "premiere"] {
+            let mut probe = notification();
+            probe["event"]["type"] = json!(event_type);
+            assert_eq!(
+                parse_stream_online(&probe),
+                Err(StreamFunnelError::WrongType),
+                "event type {event_type:?} is not a go-live"
+            );
+        }
+        let mut live = notification();
+        live["event"]["type"] = json!("live");
+        parse_stream_online(&live).expect("live event type parses");
     }
 }

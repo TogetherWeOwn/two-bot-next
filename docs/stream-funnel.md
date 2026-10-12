@@ -20,7 +20,9 @@ announcements-channel posting) is a separate reviewed slice.
   `https://dev.twitch.tv/docs/eventsub/manage-subscriptions/`.
 
 The bot accepts only `type: stream.online` + `version: 1`, validates the
-broadcaster id/login/`started_at`, checks the condition against the event,
+broadcaster id/login/`started_at`, requires a present `event.type` to be
+`live` (`rerun`, `playlist`, `watch_party`, `premiere` are rejected),
+checks the condition against the event,
 and keys redelivery dedup on broadcaster + instant. Anything else
 (`stream.offline`, `channel.update`, wrong version) is rejected before any
 post is planned. See `crates/core/src/stream_funnel.rs`.
@@ -33,7 +35,9 @@ post is planned. See `crates/core/src/stream_funnel.rs`.
   quota-extension form.
 - Every game-night VOD description ends with the footer from
   `vod_description_footer`, and the pinned comment uses
-  `vod_pinned_comment`. Both carry the Discord invite link.
+  `vod_pinned_comment`. Both carry the Discord invite link. The pinned-comment
+  title is unescaped plain text: YouTube renders backslashes literally, so no
+  Discord Markdown escaping is applied there.
 - There is no Community-post creation endpoint, so no helper plans one.
 - Reference: `https://developers.google.com/youtube/v3/getting-started#quota`.
 
