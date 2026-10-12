@@ -9,22 +9,28 @@
 //! Contract under test (event-store P1 slice 1: append-only core +
 //! message-create metadata + idempotent keys + lag metric):
 //!
-//! - `event_store` table, append-only, minimal fields: `event_type`,
-//!   `guild_id`, `channel_id`, `message_id`, `user_id`, `event_time`,
-//!   `received_at`, `dedup_key` (+ surrogate `id`). No message bodies, no
-//!   custom-status text, no other free-text columns. `dedup_key` is UNIQUE.
+//! - `event_store` table, append-only, exactly these columns: `id`,
+//!   `event_type`, `guild_id`, `channel_id`, `message_id`, `user_id`,
+//!   `event_time`, `received_at`, `dedup_key`. Any added column (a raw
+//!   payload or free-text column included) fails the schema check.
+//!   `dedup_key` is UNIQUE.
 //! - Resume-safe idempotent inserts: `dedup_key = "MESSAGE_CREATE:<id>"`,
-//!   `ON CONFLICT (dedup_key) DO NOTHING`, first-wins on replay.
+//!   `ON CONFLICT (dedup_key) DO NOTHING`, first-wins on replay. AC 2/3 pin
+//!   only this UNIQUE-key behaviour: the insert below is test-side SQL until
+//!   the S1 build routes the fixture through its real capture function.
 //! - Out-of-order / replayed MESSAGE_CREATE fixtures never add a row.
 //! - Consumer lag gauge `two_bot_event_store_consumer_lag_seconds` in the
 //!   `/ops/metrics` exposition with fixed cardinality (no unbounded labels).
 //! - Privacy tripwire: a fixture carrying a body / custom-status text leaves
 //!   no such text persisted anywhere in the table.
 //!
-//! Pending-test routing (established pattern): every test is `#[ignore]`d and
-//! skipped in the nightly broad sweep, so this card's CI stays green while
-//! the S1 build is outstanding; run with `-- --ignored` to see the gap. The
-//! S1 build card un-ignores these tests and wires their `check.yml` step once
+//! Pending-test routing: every test is `#[ignore]`d with a truthful
+//! `pending: S1 ...` reason, covered by a `CONSTRAINTS.md` exception row
+//! (owner: S1 build card, expires 2026-11-12) and a
+//! `check-test-inventory.py` exemption, and skipped in the nightly broad
+//! sweep, so this card's CI stays green while the S1 build is outstanding;
+//! run with `-- --ignored` to see the gap. The S1 build card un-ignores
+//! these tests, drops the exemption rows and wires a `check.yml` lane once
 //! the migration, capture path and gauge land. DB tests run only against the
 //! disposable test database (`TestDatabase` refuses anything but
 //! agent-testdb), never staging or production.
@@ -133,26 +139,37 @@ const FORBIDDEN_COLUMNS: &[&str] = &[
     "status_text",
 ];
 
+/// Exact S1 column set: `id` plus the eight metadata columns. Any added
+/// column (a raw payload or free-text column included) fails here, so an S1
+/// build that stores the gateway dispatch outside these columns cannot pass.
+const EXPECTED_COLUMNS: &[&str] = &[
+    "id",
+    "event_type",
+    "guild_id",
+    "channel_id",
+    "message_id",
+    "user_id",
+    "event_time",
+    "received_at",
+    "dedup_key",
+];
+
 fn assert_minimal_schema(columns: &[String]) {
     assert!(
         !columns.is_empty(),
         "S1 creates the append-only event_store table"
     );
-    for required in [
-        "event_type",
-        "guild_id",
-        "channel_id",
-        "message_id",
-        "user_id",
-        "event_time",
-        "received_at",
-        "dedup_key",
-    ] {
-        assert!(
-            columns.iter().any(|column| column == required),
-            "event_store keeps minimal column {required}; has {columns:?}"
-        );
-    }
+    let mut actual = columns.to_vec();
+    actual.sort();
+    let mut expected: Vec<String> = EXPECTED_COLUMNS
+        .iter()
+        .map(|column| column.to_string())
+        .collect();
+    expected.sort();
+    assert_eq!(
+        actual, expected,
+        "event_store keeps exactly the S1 column set; has {columns:?}"
+    );
     for forbidden in FORBIDDEN_COLUMNS {
         assert!(
             !columns.iter().any(|column| column == forbidden),
@@ -167,7 +184,7 @@ fn assert_minimal_schema(columns: &[String]) {
 /// Pending: no `event_store` table exists until the S1 migration lands, so
 /// run with `-- --ignored` to see the gap.
 #[tokio::test]
-#[ignore = "requires agent-testdb or CI service; pending: S1 migration missing; run with --ignored to see the gap"]
+#[ignore = "pending: S1 migration missing; CONSTRAINTS exception expires 2026-11-12; run with --ignored to see the gap"]
 async fn event_store_s1_append_only_insert_uses_minimal_fields() {
     let db = TestDb::new().await;
     assert_minimal_schema(&table_columns(&db.pool).await);
@@ -209,7 +226,7 @@ async fn event_store_s1_append_only_insert_uses_minimal_fields() {
 /// Pending: no `event_store` table exists until the S1 migration lands, so
 /// run with `-- --ignored` to see the gap.
 #[tokio::test]
-#[ignore = "requires agent-testdb or CI service; pending: S1 migration missing; run with --ignored to see the gap"]
+#[ignore = "pending: S1 migration missing; CONSTRAINTS exception expires 2026-11-12; run with --ignored to see the gap"]
 async fn event_store_s1_duplicate_delivery_inserts_once() {
     let db = TestDb::new().await;
     let fixture = message_create_fixture("dup-1", "2026-10-12T12:00:00.000Z");
@@ -237,7 +254,7 @@ async fn event_store_s1_duplicate_delivery_inserts_once() {
 /// Pending: no `event_store` table exists until the S1 migration lands, so
 /// run with `-- --ignored` to see the gap.
 #[tokio::test]
-#[ignore = "requires agent-testdb or CI service; pending: S1 migration missing; run with --ignored to see the gap"]
+#[ignore = "pending: S1 migration missing; CONSTRAINTS exception expires 2026-11-12; run with --ignored to see the gap"]
 async fn event_store_s1_replayed_message_create_does_not_duplicate() {
     let db = TestDb::new().await;
     // Original delivery wins; a late replay carrying an earlier event_time
@@ -274,7 +291,7 @@ async fn event_store_s1_replayed_message_create_does_not_duplicate() {
 /// Pending: no lag series exists until the S1 metrics seam lands, so run
 /// with `-- --ignored` to see the gap.
 #[test]
-#[ignore = "requires agent-testdb or CI service; pending: S1 lag gauge missing; run with --ignored to see the gap"]
+#[ignore = "pending: S1 lag gauge missing; CONSTRAINTS exception expires 2026-11-12; run with --ignored to see the gap"]
 fn event_store_s1_consumer_lag_gauge_has_fixed_cardinality() {
     let name = "two_bot_event_store_consumer_lag_seconds";
     let text = two_bot_core::metrics::Metrics::default().render(None);
@@ -328,21 +345,17 @@ fn event_store_s1_consumer_lag_gauge_has_fixed_cardinality() {
 /// Pending: no `event_store` table exists until the S1 migration lands, so
 /// run with `-- --ignored` to see the gap.
 #[tokio::test]
-#[ignore = "requires agent-testdb or CI service; pending: S1 migration missing; run with --ignored to see the gap"]
+#[ignore = "pending: S1 migration missing; CONSTRAINTS exception expires 2026-11-12; run with --ignored to see the gap"]
 async fn event_store_s1_privacy_tripwire_rejects_body_text() {
     let db = TestDb::new().await;
-    // Tripwire part 1: no free-text column may exist to hold the payload.
+    // Tripwire part 1: the table holds exactly the S1 column set, so no
+    // free-text or raw-payload column exists to hold the sentinels.
     let columns = table_columns(&db.pool).await;
     assert!(
         !columns.is_empty(),
         "S1 creates the append-only event_store table"
     );
-    for forbidden in FORBIDDEN_COLUMNS {
-        assert!(
-            !columns.iter().any(|column| column == forbidden),
-            "privacy fence: no {forbidden} column; has {columns:?}"
-        );
-    }
+    assert_minimal_schema(&columns);
     // Tripwire part 2: a fixture carrying body + custom-status text persists
     // its ids only; the sentinels appear in no stored row.
     let fixture = message_create_fixture("trip-1", "2026-10-12T12:00:00.000Z");
