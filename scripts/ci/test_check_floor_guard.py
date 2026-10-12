@@ -256,10 +256,24 @@ class GitPlumbingTests(unittest.TestCase):
                 any("silenced-checker" in error for error in merge_errors),
                 merge_errors,
             )
+            checked_merge_errors = gate.check(root, target_head, "HEAD")
             pr_errors = gate.check(root, target_head, pr_head)
         finally:
             tmp.cleanup()
+        self.assertEqual(checked_merge_errors, [])
         self.assertEqual(pr_errors, [])
+
+    def test_explicit_head_ref_ignores_untracked_files(self):
+        tmp, root, _ = make_repo()
+        try:
+            base = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=root, text=True
+            ).strip()
+            (root / "src" / "untracked.py").write_text("import sys  " + NOQA + "\n")
+            errors = gate.check(root, base, base)
+        finally:
+            tmp.cleanup()
+        self.assertEqual(errors, [])
 
     def test_missing_base_raises_no_merge_base(self):
         tmp, root, _ = make_repo()

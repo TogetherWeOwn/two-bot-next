@@ -6,7 +6,8 @@ file, strips an assertion from a test that stays, or lowers a number in
 CONSTRAINTS.md. Tightening the bar is silent; loosening it is loud.
 
 Contract (reference: constraint-driven-development floor-guard):
-- Input is the merge-base-to-requested-head diff plus untracked files.
+- Input is the merge-base-to-requested-head diff. Untracked files are included
+  only for local checks that use the default ``HEAD`` ref.
 - Exit 0 clean, 1 on a floor violation, 2 when the guard cannot run
   (no merge base). A 2 never reads as a 0.
 - Markdown prose (.md) is exempt from the waiver/skip patterns: mentioning a
@@ -163,14 +164,15 @@ def collect(root, base_ref, head_ref):
         if line.startswith("D\t")
     ]
 
-    others = _git(root, "ls-files", "--others", "--exclude-standard")
-    for name in others.stdout.split():
-        try:
-            text = (root / name).read_text(errors="replace")
-        except OSError:
-            continue
-        for line in text.splitlines():
-            added.append((name, line))
+    if head_ref == "HEAD":
+        others = _git(root, "ls-files", "--others", "--exclude-standard")
+        for name in others.stdout.split():
+            try:
+                text = (root / name).read_text(errors="replace")
+            except OSError:
+                continue
+            for line in text.splitlines():
+                added.append((name, line))
 
     return added, removed, deleted
 

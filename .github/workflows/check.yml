@@ -114,6 +114,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # Keep WARN scans and their line diffs on this same merge checkout.
+          ref: ${{ github.sha }}
           # The migration guard reads PR base/push-before blobs, including the lock.
           fetch-depth: 0
 
@@ -342,6 +344,27 @@ jobs:
       # still fails so blindness cannot hide. The inventory gate is HARD and
       # always on (pure Python, milliseconds); the rest are gated on the rust
       # selector like the other heavy steps.
+      - name: Resolve quality gate diff refs
+        shell: bash
+        env:
+          QUALITY_HEAD: ${{ github.sha }}
+          EVENT_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            quality_base="$(git rev-parse "${QUALITY_HEAD}^1")"
+          else
+            quality_base="${EVENT_BASE:-origin/main}"
+            if [[ "$quality_base" =~ ^0+$ ]]; then
+              quality_base=origin/main
+            fi
+          fi
+          git rev-parse --verify "${quality_base}^{commit}" >/dev/null
+          {
+            printf 'QUALITY_BASE=%s\n' "$quality_base"
+            printf 'QUALITY_HEAD=%s\n' "$QUALITY_HEAD"
+          } >> "$GITHUB_ENV"
+
       - name: CI test-target inventory
         run: python3 scripts/ci/check-test-inventory.py
 
@@ -349,18 +372,12 @@ jobs:
       # diff, milliseconds. Ungated on purpose like the inventory gate: a
       # docs-only PR can still weaken CONSTRAINTS.md, so this must see it.
       - name: Floor guard (HARD, CONSTRAINTS.md floor)
-        env:
-          FLOOR_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
-          FLOOR_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: python3 scripts/ci/check-floor-guard.py --base-ref "$FLOOR_BASE" --head-ref "$FLOOR_HEAD"
+        run: python3 scripts/ci/check-floor-guard.py --base-ref "$QUALITY_BASE" --head-ref "$QUALITY_HEAD"
 
       - name: Patch coverage (WARN, 80% of added lines)
         if: needs.job-inputs.outputs.rust != 'false'
         # The check job runs in a container whose default shell is sh (no pipefail).
         shell: bash
-        env:
-          QUALITY_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
-          QUALITY_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           rustup component add llvm-tools-preview
@@ -388,9 +405,6 @@ jobs:
       - name: Unwrap in request paths (WARN)
         if: needs.job-inputs.outputs.rust != 'false'
         shell: bash
-        env:
-          QUALITY_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
-          QUALITY_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/ast-grep.zip"
@@ -412,9 +426,6 @@ jobs:
       - name: Semgrep Rust rules (WARN)
         if: needs.job-inputs.outputs.rust != 'false'
         shell: bash
-        env:
-          QUALITY_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
-          QUALITY_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           python3 -m pip --isolated --disable-pip-version-check --no-cache-dir install \
