@@ -97,9 +97,9 @@ impl ContainmentSettings {
     pub(crate) fn from_vars(vars: &HashMap<String, String>) -> Self {
         let seconds = |key: &str, default_ms: i64| match vars.get(key).map(|raw| raw.trim()) {
             None | Some("") => default_ms,
-            Some(raw) => match raw.parse::<f64>() {
-                Ok(value) if value.is_finite() && value > 0.0 => (value * 1000.0) as i64,
-                _ => {
+            Some(raw) => match raw.parse::<f64>().ok().and_then(seconds_to_ms) {
+                Some(ms) => ms,
+                None => {
                     warn!(key, "containment setting unusable; using the default");
                     default_ms
                 }
@@ -130,6 +130,14 @@ impl ContainmentSettings {
             staff_channel,
         }
     }
+}
+
+/// Whole positive i64 milliseconds; sub-millisecond, overflow and non-finite input give `None`.
+fn seconds_to_ms(seconds: f64) -> Option<i64> {
+    // Upper bound is 2^63: the first f64 that no longer fits in an i64.
+    let ms = seconds * 1000.0;
+    let upper = (1_u64 << 63) as f64;
+    (1.0..upper).contains(&ms).then_some(ms as i64)
 }
 
 fn is_snowflake(value: &str) -> bool {
