@@ -336,7 +336,8 @@ async fn handler(
     // `State + Request` pair (proven by `internal_action_http::handle` and
     // `server::readyz`): the ring rides in listener state, never an
     // `Extension` layer, so one body-consuming extractor is enough.
-    let ring = &shared.backfill_ring;
+    // The std-mutex guard never crosses an await: the whole authenticate
+    // section is lexically scoped so the handler future stays Send.
     let (parts, body) = request.into_parts();
     let headers = parts.headers;
     let body_bytes = match axum::body::to_bytes(body, 64 * 1024).await {
@@ -347,12 +348,14 @@ async fn handler(
         }
     };
     let id = internal_actions::new_request_id(now_ms(), &rand::random());
-    let mut guard = ring
-        .0
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let denial = authenticate(&mut guard, &headers, &body_bytes, now_ms()).err();
-    drop(guard);
+    let denial = {
+        let ring = &shared.backfill_ring;
+        let mut guard = ring
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        authenticate(&mut guard, &headers, &body_bytes, now_ms()).err()
+    };
     if let Some(denial) = denial {
         tracing::debug!(
             msg = "ops_backfill_refused",
