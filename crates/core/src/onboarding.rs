@@ -105,6 +105,8 @@ pub struct OnboardingGates {
 pub enum OnboardingGateError {
     #[error("TWO_ONBOARDING_MODE must be exactly \"legacy\", \"session\" or \"anchor\" when set, got {0:?}")]
     InvalidMode(String),
+    #[error("TWO_ONBOARDING_DRY_RUN must be exactly \"0\" or \"1\" when set")]
+    InvalidDryRun,
 }
 
 impl OnboardingGates {
@@ -121,10 +123,12 @@ impl OnboardingGates {
             Some("anchor") => OnboardingMode::Anchor,
             Some(raw) => return Err(OnboardingGateError::InvalidMode(raw.to_owned())),
         };
-        Ok(Self {
-            mode,
-            dry_run: vars.get("TWO_ONBOARDING_DRY_RUN").is_some_and(|v| v == "1"),
-        })
+        let dry_run = match vars.get("TWO_ONBOARDING_DRY_RUN").map(String::as_str) {
+            None | Some("0") => false,
+            Some("1") => true,
+            Some(_) => return Err(OnboardingGateError::InvalidDryRun),
+        };
+        Ok(Self { mode, dry_run })
     }
 }
 
@@ -1420,6 +1424,30 @@ mod tests {
         let gates =
             OnboardingGates::from_map(&vars(&[("TWO_ONBOARDING_DRY_RUN", "1")])).expect("parses");
         assert!(gates.dry_run);
+    }
+
+    #[test]
+    fn dry_run_accepts_only_absent_zero_or_one() {
+        let gates =
+            OnboardingGates::from_map(&vars(&[("TWO_ONBOARDING_DRY_RUN", "0")])).expect("parses");
+        assert!(!gates.dry_run);
+        for raw in ["true", "yes", "on", "TRUE", "", "01", " 1"] {
+            assert_eq!(
+                OnboardingGates::from_map(&vars(&[("TWO_ONBOARDING_DRY_RUN", raw)])),
+                Err(OnboardingGateError::InvalidDryRun),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dry_run_error_names_the_variable_and_never_echoes_the_value() {
+        let err = OnboardingGates::from_map(&vars(&[("TWO_ONBOARDING_DRY_RUN", "sentinel-7f3a")]))
+            .expect_err("refused");
+        assert_eq!(
+            err.to_string(),
+            "TWO_ONBOARDING_DRY_RUN must be exactly \"0\" or \"1\" when set"
+        );
     }
 
     #[test]

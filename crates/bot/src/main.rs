@@ -390,7 +390,7 @@ async fn run(cli_args: &[String]) {
                     let gates = two_bot_core::OnboardingGates::from_env().map_err(|_| {
                         step_failure(
                             FailureClass::OnboardingGatesInvalid,
-                            sqlx::Error::InvalidArgument("invalid onboarding mode".into()),
+                            sqlx::Error::InvalidArgument("invalid onboarding gates".into()),
                         )
                     })?;
                     // ONE router + REST executor + sqlx stores over the feature pool.
