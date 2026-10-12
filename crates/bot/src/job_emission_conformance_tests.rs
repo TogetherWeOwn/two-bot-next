@@ -7,18 +7,57 @@
 //! (the parsed job templates) and requires each one to name a live emitter
 //! source or an explicit parked exemption with its reason.
 //!
-//! The framework pattern is a `jobs::` use: audit_runtime shows the shape a
-//! supervised emitter keeps. A file that calls `job_success` or `job_failure`
-//! without that marker bypasses the supervisor and fails here until it joins
-//! the explicit bypass list with its reason. Nothing here changes runtime
-//! behavior; the suite is fully offline.
+//! The framework pattern is a supervisor import (`crate::jobs`) plus the
+//! startup-jitter schedule or a built `Job`: audit_runtime shows the shape a
+//! supervised emitter keeps. A file that calls `job_success` / `job_failure`
+//! as a method (`.job_success(`) without joining the explicit bypass list
+//! with its reason bypasses the supervisor and fails here — including files
+//! the suite has never seen before, which a whole-`src` walk catches.
+//! Registration is checked where it happens (`website_jobs.rs`), not just
+//! where jobs are defined. Nothing here changes runtime behavior; the suite
+//! is fully offline.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use two_bot_core::metrics;
 
-/// Marker every supervised emitter keeps in its source.
-const FRAMEWORK_MARKER: &str = "jobs::";
+/// `needle` present with a word boundary: the byte before the match must not
+/// be an identifier character, so `website_jobs::` never satisfies a `jobs::`
+/// marker.
+fn has_bounded_marker(source: &str, needle: &str) -> bool {
+    let mut from = 0;
+    while let Some(rel) = source[from..].find(needle) {
+        let start = from + rel;
+        if start == 0
+            || !matches!(
+                source.as_bytes()[start - 1],
+                b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b'_'
+            )
+        {
+            return true;
+        }
+        from = start + needle.len();
+    }
+    false
+}
+
+/// A direct supervisor bypass: a `.job_success(` / `.job_failure(` method
+/// call. The leading dot keeps helper names such as
+/// `invalid_onboarding_job_failure` from tripping the scan.
+fn emits_directly(source: &str) -> bool {
+    source.contains(".job_success(") || source.contains(".job_failure(")
+}
+
+/// The shape a supervised emitter keeps: a supervisor import plus either the
+/// startup-jitter schedule or a built `Job`. `feed_jobs` takes the second
+/// arm: it mints `Job`s with a zero jitter for the gated register path
+/// instead of calling `startup_jitter` itself.
+fn has_framework_marker(source: &str) -> bool {
+    let imports_supervisor =
+        source.contains("crate::jobs") || has_bounded_marker(source, "jobs::{");
+    imports_supervisor
+        && (has_bounded_marker(source, "jobs::startup_jitter(") || source.contains("Job {"))
+}
 
 /// Emitter sources read at compile time so the suite is fully offline.
 const EMITTER_SOURCES: [(&str, &str); 10] = [
@@ -53,6 +92,30 @@ const LIVE_JOB_EMITTERS: [(&str, &str); 13] = [
     ("member_unban_sweep", "member_runtime.rs"),
     ("self_role_recovery", "self_role_handlers.rs"),
     ("automod_expiry", "automod_gateway.rs"),
+];
+
+/// Every `website_jobs.rs` call that schedules a live job. Naming the job in
+/// its defining file is not enough: a registration that stops being called
+/// must fail here even while the name still appears elsewhere.
+const REGISTER_CALLS: [&str; 8] = [
+    "crate::settings_jobs::job(",
+    "scheduled_jobs::register(",
+    "community_jobs::register(",
+    "audit_runtime::register(",
+    "feed_jobs::register(",
+    "member_runtime::sweep_job(",
+    ".recovery_job()",
+    "automod_gateway::expiry_job(",
+];
+
+/// Entries the shared `NAMES` loop schedules. Pinned inside the array block
+/// so a quiet removal fails here even when the name still appears elsewhere
+/// in the file.
+const NAMES_ENTRIES: [&str; 4] = [
+    "\"counter\"",
+    "\"rank\"",
+    "\"scheduled_events\"",
+    "settings_jobs::NAME",
 ];
 
 /// Direct emission outside the supervisor. `session_checkpoint` is the dispatch
@@ -130,6 +193,57 @@ fn source_by_name(name: &str) -> &'static str {
         .unwrap_or_else(|| panic!("no emitter source for {name}"))
 }
 
+/// A new module that emits directly must fail here even though it is not in
+/// [`EMITTER_SOURCES`]: walk every file under `crates/bot/src` so an
+/// unlisted emitter cannot bypass the supervisor silently, whether or not it
+/// is wired into `main.rs`. Test-only sources (`*_tests.rs` files and
+/// `tests` / `*_tests` directories) are skipped; the supervisor itself and
+/// the [`DIRECT_BYPASS`] files are exempt by name.
+fn scan_every_source_file_for_direct_emission() {
+    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+    let bypass: BTreeSet<&str> = DIRECT_BYPASS.iter().map(|(_, file, _)| *file).collect();
+    let mut stack = vec![root.to_path_buf()];
+    let mut offenders = Vec::new();
+    while let Some(dir) = stack.pop() {
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|_| panic!("read emitter dir {}", dir.display()))
+            .map(|entry| entry.expect("src dir entry").path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            let name = path
+                .file_name()
+                .expect("file name")
+                .to_string_lossy()
+                .into_owned();
+            if path.is_dir() {
+                if !name.ends_with("tests") {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if !name.ends_with(".rs")
+                || name == "jobs.rs"
+                || name.ends_with("_tests.rs")
+                || bypass.contains(name.as_str())
+            {
+                continue;
+            }
+            let text =
+                std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("read emitter {name}"));
+            if emits_directly(&text) {
+                offenders.push(name);
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "emitters call job_success/job_failure outside the supervisor: {}; \
+         route them through the framework or record them in DIRECT_BYPASS",
+        offenders.join(", ")
+    );
+}
+
 #[test]
 fn scrape_parser_covers_every_job_series() {
     let text = metrics::Metrics::default().render(None);
@@ -145,47 +259,60 @@ fn scrape_parser_covers_every_job_series() {
 fn every_scrape_job_has_a_live_emitter_or_parked_reason() {
     let text = metrics::Metrics::default().render(None);
     let parsed = parse_scrape_job_labels(&text);
+    let live: BTreeSet<&str> = LIVE_JOB_EMITTERS
+        .iter()
+        .map(|(name, _)| *name)
+        .chain(DIRECT_BYPASS.iter().map(|(name, _, _)| *name))
+        .collect();
+    let parked: BTreeMap<&str, &str> = PARKED_EXEMPTIONS.into_iter().collect();
     for job in &parsed {
         if job == "other" {
             continue;
         }
-        let live = LIVE_JOB_EMITTERS
-            .iter()
-            .any(|(name, _)| *name == job.as_str());
-        let direct = DIRECT_BYPASS
-            .iter()
-            .any(|(name, _, _)| *name == job.as_str());
-        let parked = PARKED_EXEMPTIONS
-            .iter()
-            .any(|(name, _)| *name == job.as_str());
         assert!(
-            live || direct || parked,
+            conformance_for(job, &live, &parked).is_ok(),
             "scrape job {job} has no live emitter or parked exemption; \
              schedule it through the supervisor or record the parked reason here"
         );
     }
+    let website = source_by_name("website_jobs.rs");
     for (job, file) in LIVE_JOB_EMITTERS {
         let source = source_by_name(file);
+        let quoted = format!("\"{job}\"");
         assert!(
-            source.contains(job),
+            source.contains(&quoted),
             "live emitter {file} no longer names {job}; a dropped schedule must fail here"
         );
         assert!(
-            source.contains(FRAMEWORK_MARKER),
-            "live emitter {file} lost the {FRAMEWORK_MARKER} framework pattern for {job}"
+            has_framework_marker(source),
+            "live emitter {file} lost the supervisor pattern for {job}"
+        );
+    }
+    for snippet in REGISTER_CALLS {
+        assert!(
+            website.contains(snippet),
+            "website_jobs.rs no longer calls {snippet}; a dropped registration must fail here"
+        );
+    }
+    let names_block = website
+        .split("pub const NAMES")
+        .nth(1)
+        .expect("website_jobs.rs NAMES array")
+        .split("];")
+        .next()
+        .expect("NAMES array terminator");
+    for entry in NAMES_ENTRIES {
+        assert!(
+            names_block.contains(entry),
+            "website_jobs.rs NAMES no longer schedules {entry}; a dropped schedule must fail here"
         );
     }
     for (job, file, _) in DIRECT_BYPASS {
         let source = source_by_name(file);
+        let quoted = format!("\"{job}\"");
         assert!(
-            source.contains(job),
+            source.contains(&quoted),
             "bypass emitter {file} no longer names {job}"
-        );
-    }
-    for (job, reason) in PARKED_EXEMPTIONS {
-        assert!(
-            !reason.is_empty(),
-            "parked exemption {job} needs a documented reason"
         );
     }
 }
@@ -194,36 +321,33 @@ fn every_scrape_job_has_a_live_emitter_or_parked_reason() {
 fn emitters_stay_on_the_framework_pattern() {
     for (file, source) in EMITTER_SOURCES {
         let is_bypass = DIRECT_BYPASS.iter().any(|(_, name, _)| *name == file);
-        let calls_direct = source.contains("job_success") || source.contains("job_failure");
         if is_bypass {
             assert!(
-                calls_direct,
+                emits_directly(source),
                 "bypass emitter {file} lost its direct emission; remove the bypass row"
             );
             continue;
         }
-        if file == "jobs.rs" {
-            continue;
-        }
-        if calls_direct {
+        if emits_directly(source) {
             panic!(
                 "emitter {file} calls job_success/job_failure outside the supervisor; \
                  route it through the framework or record it in DIRECT_BYPASS"
             );
         }
         assert!(
-            source.contains(FRAMEWORK_MARKER) || !source.contains("Job {"),
-            "emitter {file} builds a supervisor job without the {FRAMEWORK_MARKER} pattern"
+            has_framework_marker(source),
+            "emitter {file} lost the supervisor pattern for its jobs"
         );
     }
+    scan_every_source_file_for_direct_emission();
     let framework = include_str!("jobs.rs");
     assert!(
-        framework.contains("job_success") && framework.contains("job_failure"),
+        emits_directly(framework),
         "supervisor lost its success/failure emission"
     );
     let audit = source_by_name("audit_runtime.rs");
     assert!(
-        audit.contains(FRAMEWORK_MARKER),
+        has_framework_marker(audit),
         "audit_runtime lost the framework pattern this test locks in"
     );
 }
