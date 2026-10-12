@@ -293,7 +293,8 @@ mod tests {
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i)
             .expect("non-empty grid");
-        assert_eq!(argmax, 0 * HOURS_PER_DAY + PEAK_HOUR as usize);
+        // Sunday is weekday 0, so its peak cell is at flattened index PEAK_HOUR.
+        assert_eq!(argmax, PEAK_HOUR as usize);
         assert!((prior[argmax] - 0.1658 * 0.0851).abs() < 1e-4);
     }
 
