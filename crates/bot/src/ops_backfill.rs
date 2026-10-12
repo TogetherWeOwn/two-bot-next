@@ -68,7 +68,7 @@ pub const BACKFILL_PATH: &str = "/ops/backfill";
 
 /// Failure class for the debug log only: every class renders the same 401, so
 /// these tokens never reach the wire.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Denial {
     Missing,
     Malformed,
@@ -162,7 +162,7 @@ struct FamilyRow {
 pub(crate) fn router_with_ring(
     ring: SharedRing,
 ) -> Router<(crate::server::SharedState, crate::jobs::SharedStatus)> {
-    Router::new()
+    Router::<(crate::server::SharedState, crate::jobs::SharedStatus)>::new()
         .route(BACKFILL_PATH, get(handler))
         .layer(Extension(ring))
 }

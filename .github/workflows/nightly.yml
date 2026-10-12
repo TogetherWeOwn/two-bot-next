@@ -286,6 +286,10 @@ jobs:
           --skip blocklisted_users_skipped_for_per_user_rows_while_aggregates_keep_counting
           --skip persisted_rows_hold_ids_timestamps_enums_only
           --skip resume_continues_from_persisted_cursors_per_family
+          --skip bans_fetch_applies_blocklist_and_counts_everyone
+          --skip invite_rows_hold_metadata_only
+          --skip onboarding_rows_hold_ids_enums_metadata_only
+          --skip bans_invites_onboarding_resume_continues_from_persisted_cursors
       - name: Channel moderation ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:
