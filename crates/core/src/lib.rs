@@ -119,6 +119,7 @@ pub mod self_roles;
 pub mod send_admission;
 pub mod settings;
 pub mod sticky;
+pub mod stream_funnel;
 pub mod tickets;
 pub mod voice;
 pub mod voice_access;
