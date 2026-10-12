@@ -11357,6 +11357,50 @@ async fn a_respace_drops_when_the_slot_converges_first() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_grouped_repair_sends_no_patch_when_the_create_found_a_free_slot() {
+    // Mixed grouped/ungrouped creators sharing one category: the grouped
+    // block is every room in the category, so a min-rank plus seniority
+    // count assumes a contiguous block and repairs a room the create had
+    // already placed. The repair must reuse the create slot (block edge).
+    let (live, store, http, _) = two_creator_worker_parts(10, 20);
+    {
+        let mut creators = store.creators.lock().unwrap();
+        creators
+            .iter_mut()
+            .find(|creator| creator.channel_id == CREATOR)
+            .expect("CREATOR present")
+            .group_by_category = true;
+    }
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join_creator(&mut worker, MEMBER, CREATOR);
+    for now in 0..6 {
+        worker.dispatch_one(now).await;
+    }
+    assert!(worker.http.reorders.lock().unwrap().is_empty());
+    join_creator(&mut worker, MEMBER + 1, 210);
+    for now in 6..12 {
+        worker.dispatch_one(now).await;
+    }
+    assert!(worker.http.reorders.lock().unwrap().is_empty());
+    join_creator(&mut worker, MEMBER + 2, CREATOR);
+    for now in 12..20 {
+        worker.dispatch_one(now).await;
+    }
+    assert_eq!(created_positions(&worker), [Some(11), Some(21), Some(22)]);
+    assert!(
+        worker.http.reorders.lock().unwrap().is_empty(),
+        "free-slot create needs no post-move PATCH"
+    );
+    let live = worker.live.read_state();
+    assert_eq!(live.channels[&CREATOR].position, Some(10));
+    assert_eq!(live.channels[&500].position, Some(11));
+    assert_eq!(live.channels[&210].position, Some(20));
+    assert_eq!(live.channels[&501].position, Some(21));
+    assert_eq!(live.channels[&502].position, Some(22));
+    assert_eq!(worker.queue.pending_counts(GUILD), (0, 0));
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_respace_429_holds_the_route_while_joins_flow() {
     // A 429 on one room's reorder holds every pending reorder on the route,
     // while creates and moves for other rooms keep flowing past it.

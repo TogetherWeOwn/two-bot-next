@@ -59,8 +59,9 @@ use two_bot_core::{
     },
     voice_config::{
         decode_configuration, export_configuration, validate_configuration,
-        validate_time_zone_change, ChannelKind, ChannelReference, GuildInventory, VoiceConfigError,
-        VoiceConfiguration, MAX_IMPORT_BYTES, VOICE_CONFIG_VERSION,
+        validate_time_zone_change, ChannelKind, ChannelReference, GuildInventory,
+        RoomPosition as PlacementSide, VoiceConfigError, VoiceConfiguration, MAX_IMPORT_BYTES,
+        VOICE_CONFIG_VERSION,
     },
     voice_config_diff::{
         diff_configuration, diff_content_hash, render_preview, skip_unknown_channels,
@@ -84,7 +85,9 @@ use two_bot_core::{
         RoomMember, RoomOwnership,
     },
     voice_permissions::OWNER_ALLOW_BITS,
-    voice_placement::{suffix_respace, CategoryChannel, CategoryEntryKind},
+    voice_placement::{
+        plan_placement, suffix_respace, CategoryChannel, CategoryEntryKind, PlacementRequest,
+    },
     voice_private::{MemberId, PrivacyRecord, PrivateRoom},
     voice_room_controls::name_conflicts,
     voice_room_name::is_literal_name,
@@ -4192,11 +4195,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// gateway interleave cannot pair an old plan with newer-state
     /// evidence. Returns the repair when the room still needs one.
     ///
-    /// The slot is seniority-aware: within its block (its creator's rooms,
-    /// or its `/group` block) rooms order oldest first below the anchor and
-    /// newest first above it, so a repair converges instead of displacing
-    /// the next repair's room. Only the room and the suffix below its slot
-    /// move; manual and established sibling order is never rewritten.
+    /// The slot reuses the create plan (`plan_placement`) on the rest frame
+    /// without the room, so the repair converges on the setting-prescribed
+    /// place instead of computing a different slot: the block's real first
+    /// rank for Above, last+1 for Below. Only the room and the suffix below
+    /// its slot move; manual and established sibling order is never
+    /// rewritten.
     fn respace_for(&self, room_channel_id: Snowflake) -> Option<Vec<(Snowflake, u64)>> {
         let live = self.live.read_state();
         let room = self.rooms.get(&room_channel_id)?;
@@ -4243,30 +4247,21 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             })
             .collect();
         rest.sort_by_key(|entry| (entry.position, entry.id));
-        // Block mates in rest frame: the `/group` block when the room has
-        // one, else its creator's rooms in this category. Seniority is
-        // creation order, oldest first.
-        let grouped: Vec<Snowflake> = if settings.group_by_category {
+        // Same slot as the create plan: anchor on the block's real edge
+        // (`plan_placement`'s first for Above, last+1 for Below) and apply
+        // the seniority offset only among block members contiguous at that
+        // edge. A bare min-rank plus seniority count assumes a contiguous
+        // block and repairs rooms the create already placed; a bare
+        // `plan_placement` on the rest frame moves older rooms behind newer
+        // ones. The rest frame without the room is what the create saw
+        // before the POST.
+        let group_room_ids: Vec<Snowflake> = if settings.group_by_category {
             category_room_ids(creator, &live.channels, &self.rooms)
                 .into_iter()
                 .filter(|id| *id != room_channel_id)
                 .collect()
         } else {
-            Vec::new()
-        };
-        let senior = |id: Snowflake| {
-            self.rooms.get(&id).map_or_else(
-                || (String::new(), u64::MAX),
-                |mate| (mate.created_at.clone(), mate.channel_id),
-            )
-        };
-        let room_senior = (room.created_at.clone(), room_channel_id);
-        let index = if grouped.is_empty() {
-            let creator_rank = rest
-                .iter()
-                .position(|entry| entry.id == room.creator_channel_id)?;
-            let mates: Vec<&VoiceRoom> = self
-                .rooms
+            self.rooms
                 .values()
                 .filter(|mate| {
                     mate.creator_channel_id == room.creator_channel_id
@@ -4276,39 +4271,73 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             .get(&mate.channel_id)
                             .is_some_and(|channel| channel.parent_id == parent)
                 })
+                .map(|mate| mate.channel_id)
+                .collect()
+        };
+        let senior = |id: Snowflake| {
+            self.rooms.get(&id).map_or_else(
+                || (String::new(), u64::MAX),
+                |mate| (mate.created_at.clone(), mate.channel_id),
+            )
+        };
+        let room_senior = (room.created_at.clone(), room_channel_id);
+        let index = if group_room_ids.is_empty() {
+            // First room in its block: creator-adjacent, as the create plan.
+            let side = match settings.position {
+                RoomPosition::Above => PlacementSide::Above,
+                RoomPosition::Below => PlacementSide::Below,
+            };
+            plan_placement(PlacementRequest {
+                creator_id: room.creator_channel_id,
+                side,
+                grouped: settings.group_by_category,
+                group_room_ids: &group_room_ids,
+                category_order: &rest,
+            })
+            .ok()?
+        } else {
+            let mate_ranks: Vec<(Snowflake, usize)> = group_room_ids
+                .iter()
+                .filter_map(|id| {
+                    rest.iter()
+                        .position(|entry| entry.id == *id)
+                        .map(|rank| (*id, rank))
+                })
                 .collect();
+            if mate_ranks.is_empty() {
+                return None;
+            }
             match settings.position {
                 RoomPosition::Above => {
-                    let newer = mates
+                    let first = mate_ranks.iter().map(|(_, rank)| *rank).min()?;
+                    let mut run_end = first;
+                    while mate_ranks.iter().any(|(_, rank)| *rank == run_end + 1) {
+                        run_end += 1;
+                    }
+                    let newer_in_run = mate_ranks
                         .iter()
-                        .filter(|mate| senior(mate.channel_id) > room_senior)
+                        .filter(|(id, rank)| {
+                            *rank >= first && *rank <= run_end && senior(*id) > room_senior
+                        })
                         .count();
-                    creator_rank.saturating_sub(mates.len()) + newer
+                    first + newer_in_run
                 }
                 RoomPosition::Below => {
-                    let older = mates
+                    let last = mate_ranks.iter().map(|(_, rank)| *rank).max()?;
+                    let mut run_start = last;
+                    while run_start > 0 && mate_ranks.iter().any(|(_, rank)| *rank == run_start - 1)
+                    {
+                        run_start -= 1;
+                    }
+                    let older_in_run = mate_ranks
                         .iter()
-                        .filter(|mate| senior(mate.channel_id) < room_senior)
+                        .filter(|(id, rank)| {
+                            *rank >= run_start && *rank <= last && senior(*id) < room_senior
+                        })
                         .count();
-                    creator_rank + 1 + older
+                    run_start + older_in_run
                 }
             }
-        } else {
-            let edge = grouped
-                .iter()
-                .filter_map(|id| rest.iter().position(|entry| entry.id == *id))
-                .min()?;
-            let preceding = grouped
-                .iter()
-                .filter(|id| {
-                    let mate_senior = senior(**id);
-                    match settings.position {
-                        RoomPosition::Above => mate_senior > room_senior,
-                        RoomPosition::Below => mate_senior < room_senior,
-                    }
-                })
-                .count();
-            edge + preceding
         };
         let patch = suffix_respace(
             &rest,
