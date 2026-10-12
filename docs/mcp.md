@@ -18,7 +18,12 @@ the `/mcp` route in `wrangler/src/index.ts` (method + bearer gate).
 Every container-backed tool call is bounded: 6 s timeout plus a 64 KiB body
 cap (same bound as the metrics scrape). Oversize surfaces a generic
 `-32000` JSON-RPC error without echoing upstream bytes; timeouts and
-non-2xx upstreams surface a generic `-32000` without proxied error text.
+non-bot upstreams surface a generic `-32000` without proxied error text.
+`/readyz` accepts 200 and its routine 503 JSON (any component not ready);
+other statuses stay failures. `get_gateway` reads the `[name, status]`
+pairs in `components` plus `gateway_failure`. `get_config.build_revision`
+is the Worker version (`CF_VERSION_METADATA.id`).
+`initialize` echoes only a supported protocol version, else the default.
 Unknown tool names return `-32601`. `GET /mcp` returns `405` with
 `Allow: POST` and never executes tools. Client stream close aborts the
 in-flight container fetch via the request signal.

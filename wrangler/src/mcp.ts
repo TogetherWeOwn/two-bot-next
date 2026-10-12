@@ -32,6 +32,8 @@ export interface McpEnv {
 }
 
 export const MCP_PROTOCOL_VERSION = "2025-06-18";
+/** Protocol versions this handler implements; initialize never echoes others. */
+export const MCP_SUPPORTED_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26"];
 export const MCP_SERVER_NAME = "two-bot-next-mcp";
 export const MCP_SERVER_VERSION = "0.1.0";
 /** Container-fetch bound for every MCP tool call (mirrors the scrape bound). */
@@ -192,6 +194,17 @@ function combineSignals(request: Request, timeoutMs: number): AbortSignal {
   }
 }
 
+/** The bot's /readyz answers 200 when ready and 503 JSON when any component
+ * is not ready (see crates/bot/src/server.rs). Both carry the full report;
+ * only bot-shaped responses may be parsed, mirroring isBotProbeResponse in
+ * index.ts. Other statuses (SDK-synthesized text, 429/500) stay failures. */
+function isReadyzBotResponse(status: number, contentType: string | null): boolean {
+  if (status === 200) return true;
+  return (
+    status === 503 && contentType?.split(";")[0]?.trim().toLowerCase() === "application/json"
+  );
+}
+
 async function readContainerJson(
   env: McpEnv,
   path: "/health" | "/readyz",
@@ -203,7 +216,9 @@ async function readContainerJson(
   } catch {
     return { ok: false, oversize: false };
   }
-  if (signal.aborted || !upstream.ok) {
+  const botResponse =
+    path === "/health" ? upstream.ok : isReadyzBotResponse(upstream.status, upstream.headers.get("content-type"));
+  if (signal.aborted || !botResponse) {
     await upstream.body?.cancel().catch(() => {});
     return { ok: false, oversize: false };
   }
@@ -232,7 +247,16 @@ function gatewayExcerpt(readyz: unknown): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   if ("gateway_failure" in report) out["gateway_failure"] = report["gateway_failure"];
   const components = report["components"];
-  if (typeof components === "object" && components !== null) {
+  // HealthReport.components is Vec<(String, ComponentStatus)>, serialized as
+  // [["process","ready"],["gateway","down"],...] (crates/core/src/health.rs).
+  if (Array.isArray(components)) {
+    for (const entry of components) {
+      if (Array.isArray(entry) && entry[0] === "gateway") {
+        out["gateway"] = entry[1];
+        break;
+      }
+    }
+  } else if (typeof components === "object" && components !== null) {
     const gateway = (components as Record<string, unknown>)["gateway"];
     if (gateway !== undefined) out["gateway"] = gateway;
   }
@@ -299,8 +323,11 @@ async function callTool(
     case "get_config": {
       // Worker-side redacted snapshot only: build identity plus non-secret
       // routing/keepalive vars. Secrets are never read here by construction.
+      // CF_VERSION_METADATA.id is the Worker version (already on McpEnv);
+      // the /mcp route only forwards BOT_PORT/KEEPALIVE_SECONDS, so no
+      // CF_REVISION key exists in fullEnv.
       return toolResult(id, {
-        build_revision: fullEnv["CF_REVISION"] ?? "unknown",
+        build_revision: env.CF_VERSION_METADATA?.id ?? fullEnv["CF_REVISION"] ?? "unknown",
         bot_port: fullEnv["BOT_PORT"] ?? "8080",
         keepalive_seconds: fullEnv["KEEPALIVE_SECONDS"] ?? "60",
       });
@@ -352,13 +379,18 @@ export async function handleMcp(
 
   switch (method) {
     case "initialize": {
+      // MCP spec: echo the client's version only when the server supports
+      // it, else answer with a supported version. Unknown versions (e.g.
+      // "1999-01-01") must not be echoed back as negotiated.
       const requested =
-        typeof params["protocolVersion"] === "string" &&
-        (params["protocolVersion"] as string).length > 0
+        typeof params["protocolVersion"] === "string"
           ? (params["protocolVersion"] as string)
-          : MCP_PROTOCOL_VERSION;
+          : "";
+      const protocolVersion = MCP_SUPPORTED_PROTOCOL_VERSIONS.includes(requested)
+        ? requested
+        : MCP_PROTOCOL_VERSION;
       return jsonResult(id, {
-        protocolVersion: requested,
+        protocolVersion,
         capabilities: { tools: {} },
         serverInfo: { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION },
       });
