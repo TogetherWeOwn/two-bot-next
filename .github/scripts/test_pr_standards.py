@@ -165,6 +165,45 @@ class CardAndInternalRefs(unittest.TestCase):
             f = ps.evaluate(env(BODY=clean, REPO_PRIVATE="false", HEAD_REF=ref))
             self.assertEqual([], f, ref)
 
+    def test_public_branch_all_fixed_patterns_follow_mode(self):
+        # FIXED_INTERNAL is now consumed only by the branch/commit gates (title/body
+        # go through strict_hits/other_hits), so the branch gate must pin every
+        # non-ticket-id pattern. Each ref carries only its own pattern.
+        clean = GOOD_BODY.replace("Refs: TOG-1234", "Fixes #12")
+        refs = ("fix/x-agent://abc", "fix/x-(/TOG/issues/abc)", "fix/x-localhost-y",
+                "fix/x-10.0.0.5-y", "fix/x-box.tail1234.ts.net-y",
+                "fix/x-workforce.infextion.net-y")
+        for mode, level in (("warn", "warning"), ("error", "error")):
+            for ref in refs:
+                f = ps.evaluate(env(BODY=clean, REPO_PRIVATE="false",
+                                    PR_STANDARDS_MODE=mode, HEAD_REF=ref))
+                self.assertEqual([(level, "Internal reference")], levels(f), (mode, ref))
+                self.assertIn("branch name", f[0].message, (mode, ref))
+
+    def test_public_title_body_strict_subset_always_errors(self):
+        # Tracker id, instance UI link and internal host fail the title/body even in warn mode.
+        # Each fixture carries only its own pattern, so demoting one strict pattern fails this test.
+        # Hostnames are case-insensitive and instance links stay links inside inline code.
+        clean = GOOD_BODY.replace("Refs: TOG-1234", "Fixes #12")
+        for leak in ("TOG-123", "(/TOG/issues/abc)", "`/TOG/issues/abc`",
+                     "https://workforce.infextion.net/x", "https://WORKFORCE.INFEXTION.NET/x"):
+            for where in ("TITLE", "BODY"):
+                body = clean if where == "TITLE" else GOOD_BODY.replace("Refs: TOG-1234", leak)
+                title = "fix(auth): refresh the key " + leak if where == "TITLE" else "fix(auth): refresh the key"
+                f = ps.evaluate(env(TITLE=title, BODY=body, REPO_PRIVATE="false",
+                                    PR_STANDARDS_MODE="warn"))
+                self.assertIn(("error", "Internal reference"), levels(f), (where, leak))
+
+    def test_public_title_body_advisory_subset_follows_mode(self):
+        # Agent links, localhost, private nets and tailnet names stay advisory in warn mode
+        for leak in ("agent://abc", "http://localhost:3100/x", "http://10.0.0.5/x",
+                     "https://box.tail1234.ts.net/x"):
+            body = GOOD_BODY.replace("Refs: TOG-1234", leak)
+            f = ps.evaluate(env(BODY=body, REPO_PRIVATE="false", PR_STANDARDS_MODE="warn"))
+            self.assertEqual([("warning", "Internal reference")], levels(f), leak)
+            f = ps.evaluate(env(BODY=body, REPO_PRIVATE="false", PR_STANDARDS_MODE="error"))
+            self.assertEqual([("error", "Internal reference")], levels(f), leak)
+
     def test_private_repo_allows_lowercase_ids_in_branch(self):
         self.assertEqual([], ps.evaluate(env(HEAD_REF="qa/tog-123-example")))
 
@@ -173,7 +212,7 @@ class CardAndInternalRefs(unittest.TestCase):
         self.assertEqual([], ps.evaluate(env(BODY=body, REPO_PRIVATE="false")))
 
     def test_public_repo_catches_instance_links_and_hosts(self):
-        for leak in ("see /TOG/issues/TOG-1", "agent://abc", "http://localhost:3100/x", "http://10.0.0.5/x",
+        for leak in ("(/TOG/issues/abc)", "agent://abc", "http://localhost:3100/x", "http://10.0.0.5/x",
                      "http://192.168.1.4", "https://box.tail1234.ts.net/x", "https://workforce.infextion.net/x"):
             body = GOOD_BODY.replace("Refs: TOG-1234", leak)
             f = ps.evaluate(env(BODY=body, REPO_PRIVATE="false"))
@@ -183,9 +222,17 @@ class CardAndInternalRefs(unittest.TestCase):
         body = GOOD_BODY.replace("Refs: TOG-1234", "Fixes #12. Mentions CVE-2026-1234, UTF-8, SHA-256, GPT-4 and 172.32.0.1.")
         self.assertEqual([], ps.evaluate(env(BODY=body, REPO_PRIVATE="false")))
 
-    def test_html_comments_are_not_scanned(self):
-        body = GOOD_BODY.replace("Refs: TOG-1234", "Fixes #12\n<!-- do not write TOG-123 or localhost here -->")
+    def test_html_comments_are_not_scanned_for_advisory(self):
+        body = GOOD_BODY.replace("Refs: TOG-1234", "Fixes #12\n<!-- do not write localhost here -->")
         self.assertEqual([], ps.evaluate(env(BODY=body, REPO_PRIVATE="false")))
+
+    def test_strict_hits_inside_html_comments_still_fail(self):
+        # Comment text is still stored and served, so the fail-closed subset scans raw text.
+        for leak in ("TOG-123", "(/TOG/issues/abc)", "https://workforce.infextion.net/x"):
+            body = GOOD_BODY.replace("Refs: TOG-1234", f"Fixes #12\n<!-- hidden {leak} -->")
+            self.assertIn(("error", "Internal reference"),
+                          levels(ps.evaluate(env(BODY=body, REPO_PRIVATE="false", PR_STANDARDS_MODE="warn"))),
+                          leak)
 
     def test_prefixes_are_configurable(self):
         body = GOOD_BODY.replace("Refs: TOG-1234", "Refs ACME-77")
@@ -211,6 +258,19 @@ class Push(unittest.TestCase):
         self.assertEqual([("error", "Internal reference")],
                          levels(ps.evaluate(env(EVENT="push", COMMITS=c, REPO_PRIVATE="false"))))
         self.assertEqual([], ps.evaluate(env(EVENT="push", COMMITS=c, REPO_PRIVATE="true")))
+
+    def test_public_history_all_fixed_patterns_follow_mode(self):
+        # Same pin as the branch gate: every non-ticket-id entry in FIXED_INTERNAL
+        # must warn/error on push. Each message carries only its own pattern.
+        leaks = ("agent://abc", "(/TOG/issues/abc)", "http://localhost:3100/x",
+                 "http://10.0.0.5/x", "https://box.tail1234.ts.net/x",
+                 "https://workforce.infextion.net/x")
+        for leak in leaks:
+            c = self.commits(f"fix(auth): refresh the key (#12)\n\nSee {leak}")
+            for mode, level in (("warn", "warning"), ("error", "error")):
+                f = ps.evaluate(env(EVENT="push", COMMITS=c, REPO_PRIVATE="false",
+                                    PR_STANDARDS_MODE=mode))
+                self.assertEqual([(level, "Internal reference")], levels(f), (mode, leak))
 
     def test_garbage_commits_json_does_not_crash(self):
         self.assertEqual([], ps.evaluate(env(EVENT="push", COMMITS="not json")))
@@ -248,6 +308,9 @@ class Template(unittest.TestCase):
 
     def test_template_has_no_internal_references_outside_comments(self):
         self.assertEqual([], ps.internal_hits(self.text, "TOG|PAP|PAPA"))
+        # The strict subset scans raw text (including comments), so the shipped
+        # template must carry no strict hit at all.
+        self.assertEqual([], ps.strict_hits(self.text, "TOG|PAP|PAPA"))
 
 
 class Main(unittest.TestCase):
