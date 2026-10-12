@@ -50,14 +50,30 @@ COMMENT = re.compile(r"<!--.*?-->", re.S)
 
 # Instance-local references a public contributor cannot open (upstream "No Internal Issue References").
 # The ticket-id pattern is built per call from INTERNAL_ID_PREFIXES; these are the fixed ones.
-FIXED_INTERNAL = [
+#
+# Forward control (public-text lint): on a public repo the PR title and body must not carry a
+# strict tracker id, an instance UI link, or the internal host. Those three always fail the
+# title/body check, regardless of PR_STANDARDS_MODE.
+# The remaining fixed patterns (agent links, localhost, private-network addresses, tailnet names)
+# stay at PR_STANDARDS_MODE: they are common in legitimate verification prose.
+INSTANCE_UI = (re.compile(r"(?:^|[\s(<\[])/[A-Z]{2,6}/(?:issues|agents|projects|approvals|runs)/"), "an instance UI link")
+HOST_INTERNAL = (re.compile(r"\binfextion\.net\b"), "the internal Paperclip host")
+STRICT_FIXED = [INSTANCE_UI, HOST_INTERNAL]
+OTHER_FIXED = [
     (re.compile(r"\bagent://"), "an agent:// link"),
-    (re.compile(r"(?:^|[\s(<\[])/[A-Z]{2,6}/(?:issues|agents|projects|approvals|runs)/"), "an instance UI link"),
     (re.compile(r"\b(?:localhost|127\.0\.0\.1)\b"), "a localhost URL"),
     (re.compile(r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b"),
      "a private-network address"),
     (re.compile(r"\b[\w-]+(?:\.[\w-]+)*\.ts\.net\b"), "a tailnet hostname"),
-    (re.compile(r"\binfextion\.net\b"), "the internal Paperclip host"),
+]
+FIXED_INTERNAL = [
+    (re.compile(r"\bagent://"), "an agent:// link"),
+    INSTANCE_UI,
+    (re.compile(r"\b(?:localhost|127\.0\.0\.1)\b"), "a localhost URL"),
+    (re.compile(r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b"),
+     "a private-network address"),
+    (re.compile(r"\b[\w-]+(?:\.[\w-]+)*\.ts\.net\b"), "a tailnet hostname"),
+    HOST_INTERNAL,
 ]
 
 
@@ -133,6 +149,28 @@ def internal_hits(text, prefixes, ignore_case=False):
     return hits
 
 
+def strict_hits(text, prefixes):
+    """Fail-closed subset for public title/body: tracker ids, instance UI links, internal host.
+
+    Always case-sensitive in prose. Returns label strings naming each strict hit,
+    without echoing the matched value."""
+    text = strip_comments(text)
+    hits = []
+    m = re.search(rf"\b(?:{prefixes})-\d+\b", text)
+    if m:
+        hits.append(f"ticket id {m.group(0)}")
+    for pat, label in STRICT_FIXED:
+        if pat.search(text):
+            hits.append(label)
+    return hits
+
+
+def other_hits(text):
+    """Advisory remainder for public title/body: agent links, localhost, private nets, tailnet."""
+    text = strip_comments(text)
+    return [label for pat, label in OTHER_FIXED if pat.search(text)]
+
+
 def check_pull_request(env):
     mode = "error" if env.get("PR_STANDARDS_MODE", "warn").strip().lower() == "error" else "warning"
     prefixes = env.get("INTERNAL_ID_PREFIXES") or "TOG|PAP|PAPA"
@@ -178,12 +216,27 @@ def check_pull_request(env):
             level = "error" if env.get("REQUIRE_CARD_REF", "true").strip().lower() == "true" else "warning"
             out.append(Finding(level, "Card reference", "Add 'Refs: TOG-1234' to the PR body."))
     else:
-        for where, text in (("title", title), ("body", body), ("branch name", head_ref)):
-            hits = internal_hits(text, prefixes, ignore_case=where == "branch name")
-            if hits:
-                out.append(Finding(mode, "Internal reference", f"The PR {where} holds {', '.join(hits)}. Public "
+        # Titles and bodies: the strict subset (tracker id, instance UI link, internal host)
+        # always fails; the advisory remainder follows PR_STANDARDS_MODE. Branch names keep
+        # the existing behavior; commit history is out of scope for this gate.
+        for where, text in (("title", title), ("body", body)):
+            strict = strict_hits(text, prefixes)
+            if strict:
+                out.append(Finding("error", "Internal reference",
+                                   f"The PR {where} holds {', '.join(strict)}. Public "
                                    "repos carry no internal references: say it in plain words, link only public "
                                    "GitHub issues, and name the branch after the change (fix/short-slug)."))
+            rest = other_hits(text)
+            if rest:
+                out.append(Finding(mode, "Internal reference",
+                                   f"The PR {where} holds {', '.join(rest)}. Public "
+                                   "repos carry no internal references: say it in plain words, link only public "
+                                   "GitHub issues, and name the branch after the change (fix/short-slug)."))
+        hits = internal_hits(head_ref, prefixes, ignore_case=True)
+        if hits:
+            out.append(Finding(mode, "Internal reference", f"The PR branch name holds {', '.join(hits)}. Public "
+                               "repos carry no internal references: say it in plain words, link only public "
+                               "GitHub issues, and name the branch after the change (fix/short-slug)."))
     return out
 
 
