@@ -129,22 +129,24 @@ fn member_update_fixture(event_time: &str, nick: &str, roles: &[&str]) -> Value 
     })
 }
 
-/// S2 append-only insert for a member event: identity + timestamps + the
-/// membership enum deltas, idempotent on `dedup_key`. Returns rows inserted
-/// (1) or deduplicated (0). The column list is the whole contract: anything
-/// the fixture carries beyond these columns (username, bio, about) has no
-/// binding and can never persist.
-async fn insert_member_event(
-    pool: &PgPool,
-    event_type: &str,
-    guild_id: &str,
-    user_id: &str,
-    event_time: &str,
-    premium_since: Option<&str>,
-    nick: Option<&str>,
+/// One S2 member event: identity + timestamps + the membership enum deltas.
+/// A struct keeps the wide column list under the argument-count lint.
+struct MemberEvent<'a> {
+    event_type: &'a str,
+    guild_id: &'a str,
+    user_id: &'a str,
+    event_time: &'a str,
+    premium_since: Option<&'a str>,
+    nick: Option<&'a str>,
     roles: Value,
-) -> Result<u64, sqlx::Error> {
-    let key = dedup_key(event_type, event_time);
+}
+
+/// S2 append-only insert for a member event, idempotent on `dedup_key`.
+/// Returns rows inserted (1) or deduplicated (0). The column list is the
+/// whole contract: anything the fixture carries beyond these columns
+/// (username, bio, about) has no binding and can never persist.
+async fn insert_member_event(pool: &PgPool, event: MemberEvent<'_>) -> Result<u64, sqlx::Error> {
+    let key = dedup_key(event.event_type, event.event_time);
     let result = sqlx::query(
         "INSERT INTO event_store
             (event_type, guild_id, user_id, event_time, received_at, dedup_key,
@@ -153,14 +155,14 @@ async fn insert_member_event(
             ($1, $2, $3, $4::timestamptz, NOW(), $5, $6::timestamptz, $7, $8)
          ON CONFLICT (dedup_key) DO NOTHING",
     )
-    .bind(event_type)
-    .bind(guild_id)
-    .bind(user_id)
-    .bind(event_time)
+    .bind(event.event_type)
+    .bind(event.guild_id)
+    .bind(event.user_id)
+    .bind(event.event_time)
     .bind(&key)
-    .bind(premium_since)
-    .bind(nick)
-    .bind(sqlx::types::Json(roles))
+    .bind(event.premium_since)
+    .bind(event.nick)
+    .bind(sqlx::types::Json(event.roles))
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
@@ -263,13 +265,15 @@ async fn event_store_s2_member_add_persists_ids_and_premium_since_only() {
     );
     let inserted = insert_member_event(
         &db.pool,
-        "GUILD_MEMBER_ADD",
-        GUILD,
-        USER,
-        joined_at,
-        Some(premium_since),
-        None,
-        json!([]),
+        MemberEvent {
+            event_type: "GUILD_MEMBER_ADD",
+            guild_id: GUILD,
+            user_id: USER,
+            event_time: joined_at,
+            premium_since: Some(premium_since),
+            nick: None,
+            roles: json!([]),
+        },
     )
     .await
     .expect("S2 append-only member insert");
@@ -321,13 +325,15 @@ async fn event_store_s2_member_remove_persists_ids_only() {
     );
     let inserted = insert_member_event(
         &db.pool,
-        "GUILD_MEMBER_REMOVE",
-        GUILD,
-        USER,
-        removed_at,
-        None,
-        None,
-        json!([]),
+        MemberEvent {
+            event_type: "GUILD_MEMBER_REMOVE",
+            guild_id: GUILD,
+            user_id: USER,
+            event_time: removed_at,
+            premium_since: None,
+            nick: None,
+            roles: json!([]),
+        },
     )
     .await
     .expect("S2 append-only member insert");
@@ -380,13 +386,15 @@ async fn event_store_s2_member_update_persists_nick_and_role_deltas_only() {
     );
     let inserted = insert_member_event(
         &db.pool,
-        "GUILD_MEMBER_UPDATE",
-        GUILD,
-        USER,
-        updated_at,
-        Some(premium_since),
-        Some(NICK_FIXTURE),
-        json!([ROLE_A, ROLE_B]),
+        MemberEvent {
+            event_type: "GUILD_MEMBER_UPDATE",
+            guild_id: GUILD,
+            user_id: USER,
+            event_time: updated_at,
+            premium_since: Some(premium_since),
+            nick: Some(NICK_FIXTURE),
+            roles: json!([ROLE_A, ROLE_B]),
+        },
     )
     .await
     .expect("S2 append-only member insert");
@@ -444,13 +452,15 @@ async fn event_store_s2_duplicate_delivery_inserts_once() {
     let joined_at = "2026-10-12T12:00:00.000Z";
     let first = insert_member_event(
         &db.pool,
-        "GUILD_MEMBER_ADD",
-        GUILD,
-        USER,
-        joined_at,
-        None,
-        None,
-        json!([]),
+        MemberEvent {
+            event_type: "GUILD_MEMBER_ADD",
+            guild_id: GUILD,
+            user_id: USER,
+            event_time: joined_at,
+            premium_since: None,
+            nick: None,
+            roles: json!([]),
+        },
     )
     .await
     .expect("first delivery inserts");
@@ -458,13 +468,15 @@ async fn event_store_s2_duplicate_delivery_inserts_once() {
     // Gateway resume redelivery of the same dispatch: same dedup_key.
     let retry = insert_member_event(
         &db.pool,
-        "GUILD_MEMBER_ADD",
-        GUILD,
-        USER,
-        joined_at,
-        None,
-        None,
-        json!([]),
+        MemberEvent {
+            event_type: "GUILD_MEMBER_ADD",
+            guild_id: GUILD,
+            user_id: USER,
+            event_time: joined_at,
+            premium_since: None,
+            nick: None,
+            roles: json!([]),
+        },
     )
     .await
     .expect("duplicate delivery is resume-safe");
@@ -511,13 +523,15 @@ async fn event_store_s2_privacy_tripwire_rejects_bio_text() {
     );
     insert_member_event(
         &db.pool,
-        "GUILD_MEMBER_UPDATE",
-        GUILD,
-        USER,
-        updated_at,
-        None,
-        Some(NICK_FIXTURE),
-        json!([ROLE_A]),
+        MemberEvent {
+            event_type: "GUILD_MEMBER_UPDATE",
+            guild_id: GUILD,
+            user_id: USER,
+            event_time: updated_at,
+            premium_since: None,
+            nick: Some(NICK_FIXTURE),
+            roles: json!([ROLE_A]),
+        },
     )
     .await
     .expect("metadata insert");
