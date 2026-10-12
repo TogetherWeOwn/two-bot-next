@@ -335,7 +335,8 @@ class Drill:
         started = self.now()
         returncode = self.deploy(self.deploy_path)
         elapsed = round(self.now() - started, 1)
-        require(returncode == 0, "deploy_failed", f"elapsed={elapsed}")
+        require(returncode == 0, "deploy_failed",
+                f"elapsed={elapsed} code={returncode}")
         return self.stamp(f"{label}: deployed"), elapsed
 
     def wait_ready(self, worker, revision, build_id, image, deployed,
@@ -642,10 +643,13 @@ def generate_deploy_config(path, image, wrangler_dir):
     """Write a staging deploy config identical to `staging_rollout.prepare`
     except the container image is the pinned pre-built digest reference.
 
-    Read from the reviewed `wrangler.toml` on main; the only mutation is the
-    image override, so no old Dockerfile is rebuilt and no old source is
-    checked out. `main` is absolutized because the generated config lives
-    outside the wrangler directory.
+    Read from the reviewed `wrangler.toml` on main; the staging image is
+    overridden so no old Dockerfile is rebuilt and no old source is checked
+    out. `main` is absolutized because the generated config lives outside
+    the wrangler directory, and so is every other relative container image:
+    wrangler resolves config-relative paths against the generated file, so
+    an untouched top-level "../Dockerfile" would dangle and refuse the
+    deploy during config validation before any network.
     """
     source = Path(wrangler_dir) / "wrangler.toml"
     config = tomllib.loads(source.read_text())
@@ -657,6 +661,24 @@ def generate_deploy_config(path, image, wrangler_dir):
     require(rollout.mapping(staging.get("version_metadata")).get("binding")
             == "CF_VERSION_METADATA", "missing_worker_version_binding")
     config["main"] = str((source.parent / config["main"]).resolve())
+    seen = set()
+
+    def absolutize(container):
+        if id(container) in seen:
+            return
+        seen.add(id(container))
+        ref = container.get("image")
+        if isinstance(ref, str) and not IMAGE.fullmatch(ref):
+            container["image"] = str((source.parent / ref).resolve())
+
+    for container in config.get("containers", []):
+        if isinstance(container, dict):
+            absolutize(container)
+    for env in rollout.mapping(config.get("env")).values():
+        if isinstance(env, dict):
+            for container in rollout.sequence(env.get("containers", [])):
+                if isinstance(container, dict):
+                    absolutize(container)
     containers[0]["image"] = image
     containers[0]["rollout_kind"] = "full_auto"
     containers[0].pop("image_vars", None)
