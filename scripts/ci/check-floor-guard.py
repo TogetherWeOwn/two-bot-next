@@ -60,7 +60,7 @@ ROUTED_DB_IGNORE = re.compile(
     r'^\s*#\s*\[\s*ignore\s*=\s*"[^"]*(?:agent-testdb|TEST_DATABASE_URL|disposable[^"]*database)[^"]*"\s*\]',
     re.IGNORECASE,
 )
-INTEGRATION_TARGET = re.compile(r"^crates/[^/]+/tests/[^/]+\.rs$")
+INTEGRATION_TARGET = re.compile(r"^crates/[^/]+/tests/.+\.rs$")
 SRC_ROUTED_TARGET = re.compile(r"^crates/[^/]+/src/.*\.rs$")
 
 # Trailing-comment waivers take effect mid-line, so they match anywhere.
@@ -138,15 +138,44 @@ def _table_rows(text):
     return rows
 
 
+def _op_numbers(line):
+    """Numbers with a comparison operator: the operative thresholds.
+
+    A parenthetical like ``(was 80%)`` or a bare count like ``100 files``
+    or ``RFC 7`` carries no operator, so it is history or context, not the
+    bar itself.
+    """
+    return [float(n) for n in re.findall(r"(?:>=|<=|>|<|=)\s*(\d+(?:\.\d+)?)", line)]
+
+
+def _pct_numbers(line):
+    return [float(n) for n in re.findall(r"(\d+(?:\.\d+)?)\s*%", line)]
+
+
 def _lowered(old, new):
-    # Largest-first so an added reference number (``Per RFC 7, ... >= 80%``)
-    # cannot read as a lowered threshold, and so a reordered pair of
-    # thresholds compares like-for-like instead of by position.
-    old_nums = sorted(_numbers(old), reverse=True)
-    new_nums = sorted(_numbers(new), reverse=True)
+    # Operative thresholds carry an operator (``>= 80%``); history notes and
+    # bare counts do not. Compare operator thresholds when the old row has
+    # them so a lowered bar cannot hide behind its own history note; fall
+    # back to percents, then to all numbers, for rows without one. Sorted
+    # ascending so a reordered pair compares like-for-like, while a lowered
+    # threshold plus a large history number still reads as lowered.
+    old_ops = sorted(_op_numbers(old))
+    if old_ops:
+        new_ops = sorted(_op_numbers(new))
+        if len(new_ops) < len(old_ops):
+            return True
+        return any(n < o for o, n in zip(old_ops, new_ops))
+    old_pct = sorted(_pct_numbers(old))
+    if old_pct:
+        new_pct = sorted(_pct_numbers(new))
+        if len(new_pct) < len(old_pct):
+            return True
+        return any(n < o for o, n in zip(old_pct, new_pct))
+    old_nums = sorted(_numbers(old))
+    new_nums = sorted(_numbers(new))
     if len(new_nums) < len(old_nums):
         return True
-    return any(new_nums[i] < number for i, number in enumerate(old_nums))
+    return any(n < o for o, n in zip(old_nums, new_nums))
 
 
 def _promoted(old, head_rows, base_keys):
@@ -161,13 +190,23 @@ def _promoted(old, head_rows, base_keys):
     )
 
 
+def _rule_cell(line):
+    """The Rule cell (second column) of a CONSTRAINTS.md table row."""
+    cells = _cells(line)
+    return cells[1] if len(cells) >= 2 else line
+
+
 def threshold_violations(base_text, head_text):
     """Compare CONSTRAINTS.md rows across the diff; a deleted file is scan()'s job.
 
     An Enforced key must stay in an enforced section: moving it under
-    Measured is a demotion and fails. An Enforced row that keeps its key but
-    drops words from its rule text is a rewording and fails, while added
-    words alone pass so tightening stays silent.
+    Measured is a demotion and fails, and removing it fails even when an
+    unrelated Enforced row is added (a rename must keep its key). An
+    Enforced row that keeps its key but drops words from its Rule cell is a
+    rewording and fails, while added words alone pass so tightening stays
+    silent. Dropping the ``(WARN first)`` marker graduates a gate to HARD
+    and passes, as do edits to the Checked-by cell; only the Rule cell is
+    compared.
     """
     if base_text is None or head_text is None:
         return []
@@ -191,7 +230,10 @@ def threshold_violations(base_text, head_text):
                         "threshold-lowered: CONSTRAINTS.md weakened: "
                         f"{old.strip()[:80]} -> {head_line.strip()[:80]}"
                     )
-                elif _words(old) - _words(head_line):
+                elif _words(_rule_cell(old)) - _words(_rule_cell(head_line)) - {
+                    "warn",
+                    "first",
+                }:
                     errors.append(
                         "threshold-lowered: CONSTRAINTS.md Enforced row reworded: "
                         f"{old.strip()[:80]} -> {head_line.strip()[:80]}"
@@ -201,7 +243,7 @@ def threshold_violations(base_text, head_text):
                     "threshold-lowered: CONSTRAINTS.md Enforced row demoted "
                     f"out of Enforced: {old.strip()[:80]}"
                 )
-            elif not _promoted(old, head_rows, base_keys):
+            else:
                 errors.append(
                     f"threshold-lowered: CONSTRAINTS.md row removed: {old.strip()[:80]}"
                 )

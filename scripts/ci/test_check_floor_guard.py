@@ -202,6 +202,17 @@ class ScanTests(unittest.TestCase):
         )
         self.assertEqual(errors, [])
 
+    def test_routed_db_ignore_in_tests_support_passes(self):
+        errors = gate.scan(
+            added(
+                "crates/core/tests/support/member_moderation_backup.rs",
+                '#[ignore = "requires approved agent-testdb or CI Postgres service"]',
+            ),
+            [],
+            [],
+        )
+        self.assertEqual(errors, [])
+
     def test_routed_db_ignore_outside_any_crate_target_fails(self):
         errors = gate.scan(
             added(
@@ -421,6 +432,44 @@ class ThresholdTests(unittest.TestCase):
     def test_removed_enforced_row_fails(self):
         errors = gate.threshold_violations(BASE, BASE.replace(PATCH_ROW, ""))
         self.assertTrue(any("threshold-lowered" in e for e in errors), errors)
+
+    def test_enforced_row_deleted_with_unrelated_numbered_row_fails(self):
+        head = BASE.replace(
+            PATCH_ROW,
+            "| Docs links | Link-check timeout 90 seconds | `lychee`, `check` lane | every PR |\n",
+        )
+        errors = gate.threshold_violations(BASE, head)
+        self.assertTrue(any("threshold-lowered" in e for e in errors), errors)
+
+    def test_lowered_threshold_with_history_parenthetical_fails(self):
+        head = BASE.replace(">= 80% covered", ">= 50% covered (was 80%)")
+        errors = gate.threshold_violations(BASE, head)
+        self.assertTrue(any("threshold-lowered" in e for e in errors), errors)
+
+    def test_lowered_threshold_with_extra_count_fails(self):
+        head = BASE.replace(">= 80% covered", ">= 50% of 100 files covered")
+        errors = gate.threshold_violations(BASE, head)
+        self.assertTrue(any("threshold-lowered" in e for e in errors), errors)
+
+    def test_lowered_threshold_with_trailing_reference_fails(self):
+        head = BASE.replace(">= 80% covered", ">= 70% covered (see section 100)")
+        errors = gate.threshold_violations(BASE, head)
+        self.assertTrue(any("threshold-lowered" in e for e in errors), errors)
+
+    def test_raised_threshold_with_history_note_passes(self):
+        head = BASE.replace(">= 80% covered", ">= 90% covered (was 80%)")
+        self.assertEqual(gate.threshold_violations(BASE, head), [])
+
+    def test_warn_first_graduation_passes(self):
+        base = BASE.replace(
+            "Changed lines >= 80% covered",
+            "Changed lines >= 80% covered (WARN first)",
+        )
+        self.assertEqual(gate.threshold_violations(base, base.replace(" (WARN first)", "")), [])
+
+    def test_checked_by_cell_edit_passes(self):
+        head = BASE.replace(PATCH_ROW, PATCH_ROW.replace("llvm-cov", "llvm-cov, `check` job"))
+        self.assertEqual(gate.threshold_violations(BASE, head), [])
 
     def test_enforced_row_moved_to_measured_fails(self):
         head = ENFORCED_BASE.replace(LINT_ROW, "")
