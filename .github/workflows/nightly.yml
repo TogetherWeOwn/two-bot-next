@@ -280,6 +280,12 @@ jobs:
           --skip audit_cursor_persists_per_window_and_resumes_mid_window
           --skip audit_rows_hold_ids_timestamps_enums_only
           --skip audit_429_retry_after_pauses_without_losing_place
+          --skip event_users_paginate_through_rate_limit_client_with_max_100
+          --skip reaction_users_paginate_through_rate_limit_client
+          --skip pins_list_through_rate_limit_client_persists_metadata_only
+          --skip blocklisted_users_skipped_for_per_user_rows_while_aggregates_keep_counting
+          --skip persisted_rows_hold_ids_timestamps_enums_only
+          --skip resume_continues_from_persisted_cursors_per_family
       - name: Channel moderation ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:
