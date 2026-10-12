@@ -264,6 +264,12 @@ jobs:
           --skip post_apply_unreadable_ledger_is_unknown_not_empty
           --skip database::actions_persist_rows_and_preserve_other_events_and_guilds
           --skip a_restarted_worker_rediscovers_a_channel_whose_rollback_failed
+          --skip event_store_s5_message_update_persists_ids_without_body
+          --skip event_store_s5_message_delete_persists_ids_only
+          --skip event_store_s5_reaction_add_remove_persist_emoji_refs_only
+          --skip event_store_s5_bulk_delete_fans_out_one_row_per_id
+          --skip event_store_s5_unicode_reaction_stores_enum_ref_only
+          --skip event_store_s5_privacy_tripwire_rejects_message_bodies
       - name: Channel moderation ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:
