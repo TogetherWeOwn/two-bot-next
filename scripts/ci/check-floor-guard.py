@@ -218,9 +218,32 @@ def _scope_cells(line):
 
 
 def _checked_by_narrowed(base_cell, head_cell):
-    """Whether a Checked-by edit removes a command or one of its flags."""
+    """Whether a Checked-by edit removes a command, subcommand, flag or lane.
+
+    Every token of each base command must appear as a whole token in one
+    head command, so added flags pass while a swapped subcommand (``clippy``
+    to ``check``, ``check all`` to ``check advisories``, ``doc`` to
+    ``check``) fails. Tokens are compared whole: a substring never
+    satisfies. The bare ```check``` span names the required ``check`` lane,
+    not a command, so it is checked separately and kept out of the token
+    comparison. An interpreter swap around a script path (``python3
+    scripts/...`` to ``uv run scripts/...``) keeps its identity through
+    the script path.
+    """
     commands = re.findall(r"`([^`]+)`", base_cell)
     head_commands = re.findall(r"`([^`]+)`", head_cell)
+    base_spans = [command.strip() for command in commands]
+    head_spans = [command.strip() for command in head_commands]
+    if "check" in base_spans and "check" not in head_spans:
+        return True
+    commands = [command for command in commands if command.strip() != "check"]
+    head_commands = [command for command in head_commands if command.strip() != "check"]
+    head_token_sets = []
+    for candidate in head_commands:
+        try:
+            head_token_sets.append(set(shlex.split(candidate)))
+        except ValueError:
+            continue
     for command in commands:
         try:
             tokens = shlex.split(command)
@@ -229,43 +252,61 @@ def _checked_by_narrowed(base_cell, head_cell):
         if not tokens:
             continue
         script = next((token for token in tokens[1:] if "/" in token), None)
-        anchor = script or tokens[0]
-        if not any(anchor in candidate for candidate in head_commands):
+        if script is not None:
+            required = set(tokens[1:])
+        else:
+            required = set(tokens)
+        if not any(required <= head_tokens for head_tokens in head_token_sets):
             return True
-        for index, token in enumerate(tokens):
-            if not token.startswith("-"):
-                continue
-            required = token
-            if index + 1 < len(tokens) and not tokens[index + 1].startswith("-"):
-                required += " " + tokens[index + 1]
-            if not any(required in candidate for candidate in head_commands):
-                return True
     return False
 
 
+_RANK_WORDS = {"every", "rust", "pr", "nightly", "manual"}
+
+
 def _schedule_rank(cell):
-    """Rank the repository's supported CI schedules by breadth."""
-    text = " ".join(_words(cell))
-    if "every" in text and "rust" in text and "pr" in text:
+    """Rank the repository's supported CI schedules by breadth.
+
+    Words are compared whole: ``pr`` inside ``protected`` is not a PR
+    schedule.
+    """
+    words = _words(cell)
+    if {"every", "rust", "pr"} <= words:
         return 3
-    if "every" in text and "pr" in text:
+    if {"every", "pr"} <= words:
         return 4
-    if "nightly" in text:
+    if "nightly" in words:
         return 2
-    if "manual" in text:
+    if "manual" in words:
         return 1
     return None
 
 
 def _runs_at_narrowed(base_cell, head_cell):
+    """Whether a Runs-at edit narrows the schedule.
+
+    A lower rank fails, and so does a qualifier at the same rank:
+    ``every PR except docs-only`` keeps the top rank but no longer runs
+    everywhere, so any extra non-vocabulary word without a rank increase
+    fails.
+    """
     base_rank = _schedule_rank(base_cell)
     head_rank = _schedule_rank(head_cell)
     if base_rank is not None:
-        return head_rank is None or head_rank < base_rank
+        if head_rank is None or head_rank < base_rank:
+            return True
+        if head_rank > base_rank:
+            return False
+        return bool(_words(head_cell) - _words(base_cell) - _RANK_WORDS)
     if head_rank is not None:
         return False
     base_words = _words(base_cell)
-    return bool(base_words) and not (base_words & _words(head_cell))
+    head_words = _words(head_cell)
+    if not base_words:
+        return False
+    if not (base_words & head_words):
+        return True
+    return bool(head_words - base_words - _RANK_WORDS)
 
 
 def threshold_violations(base_text, head_text):
@@ -280,8 +321,10 @@ def threshold_violations(base_text, head_text):
     edit elsewhere on the row never reads as a lowered threshold. Dropping
     the ``(WARN first)`` marker graduates a gate to HARD and passes, but
     adding the marker back demotes the gate and fails; replacing the
-    Checked-by or Runs-at cell wholesale fails as a narrowed scope, while
-    rewording either cell around its substance passes.
+    Checked-by or Runs-at cell wholesale fails as a narrowed scope, as
+    does swapping a subcommand, dropping the ``check`` lane label, or
+    adding a schedule qualifier at the same rank, while adding flags
+    passes.
     """
     if base_text is None or head_text is None:
         return []

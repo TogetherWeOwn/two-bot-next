@@ -26,9 +26,12 @@ Checked by `scripts/ci/check-floor-guard.py` (HARD) on every PR, in milliseconds
   WARN-first gate to HARD (dropping the marker) and rewording its Checked-by
   cell pass; adding the marker back fails as a demotion, and replacing the
   Checked-by or Runs-at cell wholesale fails as a narrowed scope. The guard
-  also requires the Checked-by commands and flags to remain, and rejects a
-  Runs-at change from every PR to every Rust PR, nightly, or manual, or from
-  every Rust PR to nightly or manual.
+  also requires every Checked-by command token to remain: swapping a
+  subcommand, dropping a flag, or dropping the `check` lane label fails,
+  while adding flags passes. It rejects a Runs-at change from every PR to
+  every Rust PR, nightly, or manual, from every Rust PR to nightly or
+  manual, or any qualifier that keeps the rank (`except docs-only`,
+  `on main`, a trailing `never`).
 - No secrets in source (enforced by the `secret-scan` required check and
   gitleaks in the supply-chain lane, not the floor guard, so a leaked value
   never lands in a diff report).

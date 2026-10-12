@@ -44,6 +44,9 @@ PATCH_ROW = "| Patch coverage | Changed lines >= 80% covered | llvm-cov | every 
 LINT_ROW = "| Lint | Zero clippy warnings | `cargo clippy --workspace --all-targets -- -D warnings` | every Rust PR |\n"
 REAL_LINT_ROW = "| Lint | Zero clippy warnings | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, `check` lane | every Rust PR |\n"
 REAL_DEPENDENCIES_ROW = "| Dependencies | Nothing at high or above; advisories fail | `cargo-deny check all`, `check` lane | every PR |\n"
+REAL_DOCS_ROW = "| Docs build | Zero rustdoc warnings | `cargo doc --workspace --all-features --no-deps --locked` with `RUSTDOCFLAGS: -D warnings`, `check` lane | every Rust PR |\n"
+REAL_FORMAT_ROW = "| Format | `cargo fmt --all -- --check` clean | `check` lane | every PR |\n"
+REAL_FLOOR_ROW = "| Floor | No waivers, skips, deleted tests, stripped assertions, lowered thresholds; `#[expect(...)]` and `cfg_attr(..., allow/expect/ignore)` count as waivers | `python3 scripts/ci/check-floor-guard.py`, `check` lane | every PR |\n"
 FLOOR_RULE_ROW = "| Floor | No waivers, skips, deleted tests, stripped assertions, lowered thresholds | `python3 scripts/ci/check-floor-guard.py` | every PR |\n"
 ENFORCED_BASE = (
     "# Constraints\n\n## Enforced with numbers\n\n"
@@ -567,6 +570,79 @@ class ThresholdTests(unittest.TestCase):
         head = base.replace(
             REAL_LINT_ROW,
             REAL_LINT_ROW.replace("every Rust PR", "nightly"),
+        )
+        errors = gate.threshold_violations(base, head)
+        self.assertTrue(any("Runs-at scope narrowed" in e for e in errors), errors)
+
+    def test_checked_by_real_row_rejects_subcommand_swap(self):
+        base = ENFORCED_BASE.replace(LINT_ROW, REAL_LINT_ROW)
+        head = base.replace(
+            "`cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`",
+            "`cargo check --workspace --all-targets --all-features --locked -- -D warnings`",
+        )
+        errors = gate.threshold_violations(base, head)
+        self.assertTrue(any("Checked-by scope narrowed" in e for e in errors), errors)
+
+    def test_checked_by_real_row_rejects_dropped_deny_subcommand(self):
+        base = ENFORCED_BASE + REAL_DEPENDENCIES_ROW
+        for narrowed in (
+            REAL_DEPENDENCIES_ROW.replace("`cargo-deny check all`", "`cargo-deny check advisories`"),
+            REAL_DEPENDENCIES_ROW.replace("`cargo-deny check all`", "`cargo-deny help`"),
+        ):
+            with self.subTest(narrowed=narrowed):
+                errors = gate.threshold_violations(base, base.replace(REAL_DEPENDENCIES_ROW, narrowed))
+                self.assertTrue(any("Checked-by scope narrowed" in e for e in errors), errors)
+
+    def test_checked_by_real_row_rejects_doc_to_check_swap(self):
+        base = ENFORCED_BASE.replace(LINT_ROW, REAL_LINT_ROW) + REAL_DOCS_ROW
+        head = base.replace(
+            "`cargo doc --workspace --all-features --no-deps --locked`",
+            "`cargo check --workspace --all-features --no-deps --locked`",
+        )
+        errors = gate.threshold_violations(base, head)
+        self.assertTrue(any("Checked-by scope narrowed" in e for e in errors), errors)
+
+    def test_checked_by_real_row_rejects_dropped_check_lane(self):
+        base = ENFORCED_BASE.replace(LINT_ROW, REAL_LINT_ROW) + REAL_DEPENDENCIES_ROW
+        head = base.replace(
+            "`cargo-deny check all`, `check` lane",
+            "`cargo-deny check all`",
+        )
+        errors = gate.threshold_violations(base, head)
+        self.assertTrue(any("Checked-by scope narrowed" in e for e in errors), errors)
+
+    def test_runs_at_real_row_rejects_docs_only_qualifier(self):
+        base = ENFORCED_BASE + REAL_DEPENDENCIES_ROW
+        head = base.replace(
+            REAL_DEPENDENCIES_ROW,
+            REAL_DEPENDENCIES_ROW.replace("every PR", "every PR except docs-only"),
+        )
+        errors = gate.threshold_violations(base, head)
+        self.assertTrue(any("Runs-at scope narrowed" in e for e in errors), errors)
+
+    def test_runs_at_real_row_rejects_protected_branches_rewording(self):
+        base = ENFORCED_BASE + REAL_FORMAT_ROW
+        head = base.replace(
+            REAL_FORMAT_ROW,
+            REAL_FORMAT_ROW.replace("every PR", "every push to protected branches"),
+        )
+        errors = gate.threshold_violations(base, head)
+        self.assertTrue(any("Runs-at scope narrowed" in e for e in errors), errors)
+
+    def test_runs_at_real_row_rejects_trailing_never_qualifier(self):
+        base = ENFORCED_BASE.replace(LINT_ROW, REAL_LINT_ROW).replace(FLOOR_RULE_ROW, REAL_FLOOR_ROW)
+        head = base.replace(
+            REAL_FLOOR_ROW,
+            REAL_FLOOR_ROW.replace("| every PR |", "| every PR never |"),
+        )
+        errors = gate.threshold_violations(base, head)
+        self.assertTrue(any("Runs-at scope narrowed" in e for e in errors), errors)
+
+    def test_runs_at_real_row_rejects_on_main_qualifier(self):
+        base = ENFORCED_BASE.replace(LINT_ROW, REAL_LINT_ROW)
+        head = base.replace(
+            REAL_LINT_ROW,
+            REAL_LINT_ROW.replace("every Rust PR", "every Rust PR on main"),
         )
         errors = gate.threshold_violations(base, head)
         self.assertTrue(any("Runs-at scope narrowed" in e for e in errors), errors)
