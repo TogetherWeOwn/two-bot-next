@@ -7429,7 +7429,11 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
     stall.snapshot(worker, last_progress);
     let stop_watchdog = Arc::new(AtomicBool::new(false));
     let watchdog = {
-        let stall = Arc::clone(&stall);
+        // Weak, not a clone: the actor task owns the only strong ref. If a
+        // dispatch panics, the task unwinds past the stop code below, so the
+        // sibling must exit on the dead weak instead of alarming forever
+        // from the stale snapshot of a worker that no longer exists.
+        let weak = Arc::downgrade(&stall);
         let stop = Arc::clone(&stop_watchdog);
         let stuck_after = limits.watchdog_stuck_after;
         tokio::spawn(async move {
@@ -7441,6 +7445,7 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
+                let Some(stall) = weak.upgrade() else { break };
                 stall.observe(stuck_after, &mut last_fire);
             }
         })

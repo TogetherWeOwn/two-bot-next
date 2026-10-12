@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::json;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 
 #[path = "voice_delete_guard_tests.rs"]
@@ -755,6 +756,11 @@ struct Http {
     /// a hung-dispatch test can prove the age is observable mid-flight.
     /// Tokio clock: paused-time tests advance it deterministically.
     limit_in_flight: Mutex<Option<tokio::time::Instant>>,
+    /// How often the watchdog sibling republished the REST age through this
+    /// writer: per-instance proof the sibling's republish call runs while a
+    /// write is held (the process-global gauge is last-writer-wins and
+    /// cannot be asserted exactly under parallel libtest shards).
+    republish_calls: AtomicUsize,
     downloaded_urls: Mutex<Vec<String>>,
     download_results: DownloadResults,
     /// When set, renames run as detached requests answering after this
@@ -808,6 +814,7 @@ impl Http {
             overwrites_gate: None,
             limit_gate: None,
             limit_in_flight: Mutex::new(None),
+            republish_calls: AtomicUsize::new(0),
             reorder_errors: Mutex::new(VecDeque::new()),
             reorders: Mutex::new(Vec::new()),
             echo_positions: Mutex::new(false),
@@ -824,6 +831,8 @@ impl RoomWrites for Http {
     fn republish_rest_age(&self) {
         // Mirror the production slot: the age of the held `/limit` write,
         // or 0 when none is live.
+        self.republish_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let age_secs = self
             .limit_in_flight
             .lock()
@@ -12928,6 +12937,12 @@ async fn watchdog_fires_while_a_dispatch_is_hung_mid_write() {
     }
     // One full stuck window passes with the dispatch hung: exactly one fire,
     // and the held write is still live (Tokio clock, so deterministic).
+    // The sibling's REST-age republish is pinned per-instance: the count
+    // must rise while the write is held, so deleting the republish call
+    // fails this test (the global gauge itself stays unasserted).
+    let republished_before = http_probe
+        .republish_calls
+        .load(Ordering::Relaxed);
     tokio::time::advance(Duration::from_secs(6)).await;
     for _ in 0..10 {
         tokio::task::yield_now().await;
@@ -12935,6 +12950,10 @@ async fn watchdog_fires_while_a_dispatch_is_hung_mid_write() {
     assert_eq!(
         global_series("two_bot_voice_watchdog_stucks_total"),
         stuck_before + 1
+    );
+    assert!(
+        http_probe.republish_calls.load(Ordering::Relaxed) > republished_before,
+        "the sibling republishes the REST age while the write is held"
     );
     let held_age_secs = http_probe
         .limit_in_flight
@@ -12959,6 +12978,74 @@ async fn watchdog_fires_while_a_dispatch_is_hung_mid_write() {
         .any(|entry| entry == "limit:500:3"));
     drop(tx);
     handle.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn watchdog_sibling_exits_when_its_actor_dies() {
+    // The sibling must not outlive a panicked actor: its stop flag and
+    // abort run only after the loop exits normally, but a panic unwinds
+    // past them. The sibling holds only a weak ref, so it exits when the
+    // actor task drops the last strong ref instead of alarming forever
+    // from the dead worker's snapshot.
+    let _serial = STUCK_COUNTER_SERIAL.lock().await;
+    let (live, store, mut http, _) = owned_room();
+    http.before_limit = Some(Arc::new(|| panic!("probe panic: actor dies")));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let super::limit::LimitReply::Queued { .. } =
+        worker.apply_limit(MEMBER, false, LimitCommand::Limit(LimitArg::Value(3)))
+    else {
+        panic!("the limit must queue");
+    };
+    // A second action stays queued: the snapshot has pending work with no
+    // progress, so a leaked sibling would fire the stuck alarm.
+    worker.queue.enqueue(
+        GUILD,
+        RoomAction::RenameRoom {
+            channel_id: 500,
+            name: "den".to_owned(),
+        },
+    );
+    let (tx, rx) = mpsc::unbounded_channel();
+    let limits = ActorLimits {
+        watchdog_stuck_after: Duration::from_secs(5),
+        halt_reprobe_interval: Duration::from_secs(3600),
+        ..ActorLimits::default()
+    };
+    let handle = tokio::spawn(async move {
+        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+    });
+    // Drive the actor until the panicking write kills it: the unwind drops
+    // the inbox receiver, which closes the sender's side.
+    let mut ticks = 0;
+    while !tx.is_closed() {
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        ticks += 1;
+        assert!(ticks < 200, "the actor never reached the panicking write");
+    }
+    handle.await.expect_err("the actor task must die on the panic");
+    // Two full stuck windows pass with queued work and no progress: a
+    // leaked sibling would fire twice, so the counter must not move.
+    let stuck = global_series("two_bot_voice_watchdog_stucks_total");
+    tokio::time::advance(Duration::from_secs(6)).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        global_series("two_bot_voice_watchdog_stucks_total"),
+        stuck,
+        "no stuck alarm after the actor died"
+    );
+    tokio::time::advance(Duration::from_secs(6)).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        global_series("two_bot_voice_watchdog_stucks_total"),
+        stuck,
+        "no stuck alarm on the second window either"
+    );
+    drop(tx);
 }
 
 #[tokio::test]
