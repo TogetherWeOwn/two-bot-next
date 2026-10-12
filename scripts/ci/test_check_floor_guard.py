@@ -471,6 +471,57 @@ class ThresholdTests(unittest.TestCase):
         head = BASE.replace(PATCH_ROW, PATCH_ROW.replace("llvm-cov", "llvm-cov, `check` job"))
         self.assertEqual(gate.threshold_violations(BASE, head), [])
 
+    def test_checked_by_command_change_is_not_a_lowered_threshold(self):
+        head = ENFORCED_BASE.replace(
+            "`python3 scripts/ci/check-floor-guard.py`",
+            "`uv run scripts/ci/check-floor-guard.py`",
+        )
+        self.assertEqual(gate.threshold_violations(ENFORCED_BASE, head), [])
+
+    def test_checked_by_flag_addition_is_not_a_lowered_threshold(self):
+        head = BASE.replace(PATCH_ROW, PATCH_ROW.replace("llvm-cov", "llvm-cov --jobs=2"))
+        self.assertEqual(gate.threshold_violations(BASE, head), [])
+
+    def test_lowered_rule_with_stray_checked_by_operator_still_fails(self):
+        head = BASE.replace(
+            "Changed lines >= 80% covered", "Changed lines at least 50% covered"
+        ).replace("llvm-cov", "llvm-cov --fail-under-lines=90")
+        errors = gate.threshold_violations(BASE, head)
+        self.assertTrue(any("threshold-lowered" in e for e in errors), errors)
+
+    def test_adding_warn_first_to_an_enforced_row_fails(self):
+        head = ENFORCED_BASE.replace(
+            "Zero clippy warnings", "Zero clippy warnings (WARN first)"
+        )
+        errors = gate.threshold_violations(ENFORCED_BASE, head)
+        self.assertTrue(any("threshold-lowered" in e for e in errors), errors)
+
+    def test_adding_warn_first_to_the_floor_row_fails(self):
+        head = ENFORCED_BASE.replace("lowered thresholds", "lowered thresholds (WARN first)")
+        errors = gate.threshold_violations(ENFORCED_BASE, head)
+        self.assertTrue(any("threshold-lowered" in e for e in errors), errors)
+
+    def test_runs_at_replacement_fails(self):
+        head = ENFORCED_BASE.replace(LINT_ROW, LINT_ROW.replace("every Rust PR", "manual"))
+        errors = gate.threshold_violations(ENFORCED_BASE, head)
+        self.assertTrue(any("threshold-lowered" in e for e in errors), errors)
+
+    def test_checked_by_replacement_fails(self):
+        head = ENFORCED_BASE.replace(
+            "`cargo clippy --workspace --all-targets -- -D warnings`", "`true`"
+        )
+        errors = gate.threshold_violations(ENFORCED_BASE, head)
+        self.assertTrue(any("threshold-lowered" in e for e in errors), errors)
+
+    def test_measured_promotion_with_flagged_checked_by_passes(self):
+        measured = "| Project-wide line coverage | >= 70% on main | must not fall |\n"
+        base = BASE.replace(MEASURED_ROW, measured)
+        head = base.replace(measured, "").replace(
+            PATCH_ROW,
+            PATCH_ROW + "| Line coverage | Project-wide line coverage >= 70% | llvm-cov --jobs=2 | every PR |\n",
+        )
+        self.assertEqual(gate.threshold_violations(base, head), [])
+
     def test_enforced_row_moved_to_measured_fails(self):
         head = ENFORCED_BASE.replace(LINT_ROW, "")
         head += (

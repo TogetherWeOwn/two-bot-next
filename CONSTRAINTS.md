@@ -21,8 +21,11 @@ Checked by `scripts/ci/check-floor-guard.py` (HARD) on every PR, in milliseconds
   or assertions dropped from test code with nothing added back in the same diff.
 - No lowered number in this file. Raising a threshold is silent; lowering one
   fails the PR, and so does removing a row unless the metric is promoted at
-  least as strictly. Graduating a WARN-first gate to HARD (dropping the
-  marker) and fixing its Checked-by cell pass; only the Rule cell is compared.
+  least as strictly. The Rule cell carries the numbers, so a command or flag
+  edit elsewhere on the row never reads as a lowered threshold. Graduating a
+  WARN-first gate to HARD (dropping the marker) and rewording its Checked-by
+  cell pass; adding the marker back fails as a demotion, and replacing the
+  Checked-by or Runs-at cell wholesale fails as a narrowed scope.
 - No secrets in source (enforced by the `secret-scan` required check and
   gitleaks in the supply-chain lane, not the floor guard, so a leaked value
   never lands in a diff report).

@@ -179,13 +179,18 @@ def _lowered(old, new):
 
 
 def _promoted(old, head_rows, base_keys):
-    """A measured row may move to Enforced under a new name if it is no looser."""
+    """A measured row may move to Enforced under a new name if it is no looser.
+
+    The bar lives in the Measured Today cell and the Enforced Rule cell
+    (both the second column), so only those cells are compared: a command
+    or flag in the new Checked-by cell must not read as a lowered bar.
+    """
     if not _numbers(old):
         return False
     return any(
         section.startswith("enforced")
         and key not in base_keys
-        and not _lowered(old, line)
+        and not _lowered(_rule_cell(old), _rule_cell(line))
         for section, key, line in head_rows
     )
 
@@ -196,6 +201,30 @@ def _rule_cell(line):
     return cells[1] if len(cells) >= 2 else line
 
 
+def _warn_first_added(old_rule, head_rule):
+    """Whether the head Rule cell gains a WARN-first demotion marker."""
+    return bool((_words(head_rule) - _words(old_rule)) & {"warn", "first"})
+
+
+def _scope_cells(line):
+    """The (Checked-by, Runs-at) cells of an Enforced table row."""
+    cells = _cells(line)
+    if len(cells) < 4:
+        return "", ""
+    return cells[2], cells[3]
+
+
+def _cell_gutted(base_cell, head_cell):
+    """Whether a cell rewrite keeps none of the base cell's words.
+
+    Rewording a command or lane keeps its substance, so it passes; replacing
+    the cell wholesale drops the check or schedule it named, so it fails as
+    a narrowed scope.
+    """
+    base_words = _words(base_cell)
+    return bool(base_words) and not (base_words & _words(head_cell))
+
+
 def threshold_violations(base_text, head_text):
     """Compare CONSTRAINTS.md rows across the diff; a deleted file is scan()'s job.
 
@@ -204,9 +233,12 @@ def threshold_violations(base_text, head_text):
     unrelated Enforced row is added (a rename must keep its key). An
     Enforced row that keeps its key but drops words from its Rule cell is a
     rewording and fails, while added words alone pass so tightening stays
-    silent. Dropping the ``(WARN first)`` marker graduates a gate to HARD
-    and passes, as do edits to the Checked-by cell; only the Rule cell is
-    compared.
+    silent. Numbers are compared on the Rule cell only, so a command or flag
+    edit elsewhere on the row never reads as a lowered threshold. Dropping
+    the ``(WARN first)`` marker graduates a gate to HARD and passes, but
+    adding the marker back demotes the gate and fails; replacing the
+    Checked-by or Runs-at cell wholesale fails as a narrowed scope, while
+    rewording either cell around its substance passes.
     """
     if base_text is None or head_text is None:
         return []
@@ -225,10 +257,15 @@ def threshold_violations(base_text, head_text):
             ]
             if enforced_match:
                 head_line = enforced_match[0]
-                if _lowered(old, head_line):
+                if _lowered(_rule_cell(old), _rule_cell(head_line)):
                     errors.append(
                         "threshold-lowered: CONSTRAINTS.md weakened: "
                         f"{old.strip()[:80]} -> {head_line.strip()[:80]}"
+                    )
+                elif _warn_first_added(_rule_cell(old), _rule_cell(head_line)):
+                    errors.append(
+                        "threshold-lowered: CONSTRAINTS.md Enforced row demoted "
+                        f"to WARN-first: {old.strip()[:80]} -> {head_line.strip()[:80]}"
                     )
                 elif _words(_rule_cell(old)) - _words(_rule_cell(head_line)) - {
                     "warn",
@@ -238,6 +275,21 @@ def threshold_violations(base_text, head_text):
                         "threshold-lowered: CONSTRAINTS.md Enforced row reworded: "
                         f"{old.strip()[:80]} -> {head_line.strip()[:80]}"
                     )
+                else:
+                    old_checked, old_runs = _scope_cells(old)
+                    head_checked, head_runs = _scope_cells(head_line)
+                    if _cell_gutted(old_runs, head_runs):
+                        errors.append(
+                            "threshold-lowered: CONSTRAINTS.md Enforced row "
+                            "Runs-at scope narrowed: "
+                            f"{old.strip()[:80]} -> {head_line.strip()[:80]}"
+                        )
+                    elif _cell_gutted(old_checked, head_checked):
+                        errors.append(
+                            "threshold-lowered: CONSTRAINTS.md Enforced row "
+                            "Checked-by scope narrowed: "
+                            f"{old.strip()[:80]} -> {head_line.strip()[:80]}"
+                        )
             elif any(k == key for _, k, _ in head_rows):
                 errors.append(
                     "threshold-lowered: CONSTRAINTS.md Enforced row demoted "
@@ -250,7 +302,7 @@ def threshold_violations(base_text, head_text):
             continue
         same_key = [line for _, k, line in head_rows if k == key]
         if same_key:
-            if _lowered(old, same_key[0]):
+            if _lowered(_rule_cell(old), _rule_cell(same_key[0])):
                 errors.append(
                     "threshold-lowered: CONSTRAINTS.md weakened: "
                     f"{old.strip()[:80]} -> {same_key[0].strip()[:80]}"
