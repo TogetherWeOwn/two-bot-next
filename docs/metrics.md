@@ -363,8 +363,9 @@ proxies them with the same 6 s deadline and 64 KiB body cap as the scrape.
 
 - `GET /ops/summary`: readiness (`ready`, `components`), gateway state and
   failure, the informational `jobs` map, pool gauges (`size`/`idle`/`max`),
-  event-store lag (`restorable_point`, `max_lag`) and backfill progress
-  (`tables_total`, `tables_at_point`), plus the build revision/id.
+  event-store lag (`restorable_point`, `max_lag`: the largest per-table lag)
+  and backfill progress (`tables_total`, `tables_at_point`: tables whose
+  lag is exactly 0), plus the build revision/id.
 - `GET /ops/gateway`: shard state (`unconfigured`/`armed`/`connected`/
   `draining`), gateway status, the last gateway-task failure, reconnect /
   resume / disconnect / missed-event counters, `last_ready_unix` and
@@ -372,8 +373,10 @@ proxies them with the same 6 s deadline and 64 KiB body cap as the scrape.
   dispatch), per-event counts, per-stage checkpoint failures, and the
   `session_checkpoint` job's last success.
 - `GET /ops/backfill`: the global restorable point plus every covered
-  journal table's durable cursor (`watermark`) and signed `lag` behind the
-  point; a table with no committed watermark reports `null`, never zero.
+  journal table's durable cursor (`watermark`) and signed per-table `lag`:
+  the table's own newest journal id minus its watermark, so 0 means fully
+  journaled no matter how much other tables have written since. A table
+  with no journal rows or no committed watermark reports `null`, never zero.
 
 Every database-backed section degrades to an explicit `available: false`
 with `200`, never a 500 or an error string: a database outage must not hide

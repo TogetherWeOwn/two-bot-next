@@ -44,12 +44,14 @@ fn gateway_state_name(state: GatewayState) -> &'static str {
     }
 }
 
-/// Signed journal lag behind the restorable point. `None` while the table
-/// has no committed watermark: reconcile from the baseline, never assume
-/// zero writes. Negative means the watermark observes a newer commit than
-/// the sampled point (concurrent writers commit out of order).
-fn cursor_lag(restorable_point: i64, watermark: Option<i64>) -> Option<i64> {
-    watermark.map(|id| restorable_point - id)
+/// Signed per-table journal lag: the table's own newest journal id minus
+/// its committed watermark. `None` while the table has no journal rows or
+/// no committed watermark: reconcile from the baseline, never assume zero
+/// writes. Zero means fully journaled. Negative means the watermark
+/// observes a newer commit than the table's newest sampled row (concurrent
+/// writers commit out of order, or a cursor advanced past the tip).
+fn cursor_lag(tip: Option<i64>, watermark: Option<i64>) -> Option<i64> {
+    tip.zip(watermark).map(|(tip, mark)| tip - mark)
 }
 
 #[derive(serde::Serialize)]
@@ -90,43 +92,56 @@ struct BackfillDetail {
     tables: Vec<TableCursor>,
 }
 
-/// Two bounded reads: the global restorable point plus every committed
-/// per-table cursor. `None` when the database is absent, unreadable, or
-/// slower than the probe budget — never an error string.
-async fn store_snapshot(pool: Option<&sqlx::PgPool>) -> Option<(i64, BTreeMap<String, i64>)> {
+/// Bounded event-store reads behind every database-backed ops section:
+/// the global restorable point, every committed per-table cursor, and
+/// every table's newest journal id. `None` when the database is absent,
+/// unreadable, or slower than the probe budget — never an error string.
+struct StoreSnapshot {
+    point: i64,
+    cursors: BTreeMap<String, i64>,
+    tips: BTreeMap<String, i64>,
+}
+
+async fn store_snapshot(pool: Option<&sqlx::PgPool>) -> Option<StoreSnapshot> {
     let pool = pool?;
     let fetch = async {
         let point = two_bot_store::journal::restorable_point(pool).await.ok()?;
         let cursors = two_bot_store::journal::watermarks(pool).await.ok()?;
-        Some((point, cursors))
+        let tips = two_bot_store::journal::table_tips(pool).await.ok()?;
+        Some(StoreSnapshot {
+            point,
+            cursors,
+            tips,
+        })
     };
     tokio::time::timeout(EVENT_STORE_TIMEOUT, fetch)
         .await
         .unwrap_or(None)
 }
 
-fn backfill_tables(point: i64, cursors: &BTreeMap<String, i64>) -> Vec<TableCursor> {
+fn backfill_tables(snapshot: &StoreSnapshot) -> Vec<TableCursor> {
     two_bot_store::journal::COVERED_TABLES
         .iter()
         .map(|table| {
-            let watermark = cursors.get(*table).copied();
+            let watermark = snapshot.cursors.get(*table).copied();
+            let tip = snapshot.tips.get(*table).copied();
             TableCursor {
                 table,
                 watermark,
-                lag: cursor_lag(point, watermark),
+                lag: cursor_lag(tip, watermark),
             }
         })
         .collect()
 }
 
-fn backfill_detail(snapshot: Option<(i64, BTreeMap<String, i64>)>) -> BackfillDetail {
+fn backfill_detail(snapshot: Option<StoreSnapshot>) -> BackfillDetail {
     match snapshot {
-        Some((point, cursors)) => {
-            let tables = backfill_tables(point, &cursors);
+        Some(ref snapshot) => {
+            let tables = backfill_tables(snapshot);
             let max_lag = tables.iter().filter_map(|row| row.lag).max();
             BackfillDetail {
                 available: true,
-                restorable_point: Some(point),
+                restorable_point: Some(snapshot.point),
                 max_lag,
                 tables,
             }
@@ -170,37 +185,29 @@ async fn summary(
     let pool =
         crate::metrics_http::pool_sample().map(|(size, idle, max)| PoolGauges { size, idle, max });
     let snapshot = store_snapshot(state.database.as_ref()).await;
-    let max_lag = snapshot
-        .as_ref()
-        .map(|(point, cursors)| {
-            backfill_tables(*point, cursors)
-                .iter()
-                .filter_map(|row| row.lag)
-                .max()
-        })
-        .unwrap_or(None);
-    let (event_store, backfill) = match &snapshot {
-        Some((point, cursors)) => {
-            let tables_at_point = backfill_tables(*point, cursors)
-                .iter()
-                .filter(|row| row.lag == Some(0))
-                .count();
+    let tables = snapshot.as_ref().map(backfill_tables);
+    let max_lag = tables
+        .as_deref()
+        .and_then(|rows| rows.iter().filter_map(|row| row.lag).max());
+    let (event_store, backfill) = match (&snapshot, &tables) {
+        (Some(snapshot), Some(rows)) => {
+            let tables_at_point = rows.iter().filter(|row| row.lag == Some(0)).count();
             (
                 EventStoreRollup {
                     available: true,
-                    restorable_point: Some(*point),
+                    restorable_point: Some(snapshot.point),
                     max_lag,
                 },
                 BackfillSummary {
                     available: true,
-                    restorable_point: Some(*point),
+                    restorable_point: Some(snapshot.point),
                     tables_total: two_bot_store::journal::COVERED_TABLES.len(),
                     tables_at_point,
                     max_lag,
                 },
             )
         }
-        None => (
+        _ => (
             EventStoreRollup {
                 available: false,
                 restorable_point: None,
@@ -337,19 +344,36 @@ mod tests {
 
     #[test]
     fn cursor_lag_reports_unknown_as_none_and_keeps_sign() {
-        assert_eq!(cursor_lag(10, None), None);
-        assert_eq!(cursor_lag(10, Some(10)), Some(0));
-        assert_eq!(cursor_lag(10, Some(4)), Some(6));
-        // A watermark past the sampled point is data, not an error.
-        assert_eq!(cursor_lag(10, Some(12)), Some(-2));
+        assert_eq!(cursor_lag(None, None), None);
+        assert_eq!(cursor_lag(Some(10), None), None);
+        assert_eq!(cursor_lag(None, Some(10)), None);
+        assert_eq!(cursor_lag(Some(10), Some(10)), Some(0));
+        assert_eq!(cursor_lag(Some(10), Some(4)), Some(6));
+        // A watermark past the table tip is data, not an error.
+        assert_eq!(cursor_lag(Some(10), Some(12)), Some(-2));
+    }
+
+    fn snapshot(point: i64, cursors: &[(&str, i64)], tips: &[(&str, i64)]) -> StoreSnapshot {
+        StoreSnapshot {
+            point,
+            cursors: cursors
+                .iter()
+                .map(|(table, id)| ((*table).to_owned(), *id))
+                .collect(),
+            tips: tips
+                .iter()
+                .map(|(table, id)| ((*table).to_owned(), *id))
+                .collect(),
+        }
     }
 
     #[test]
     fn backfill_detail_covers_every_table_with_max_lag() {
-        let cursors: BTreeMap<String, i64> = [("events".to_owned(), 7), ("members".to_owned(), 10)]
-            .into_iter()
-            .collect();
-        let detail = backfill_detail(Some((10, cursors)));
+        let detail = backfill_detail(Some(snapshot(
+            10,
+            &[("events", 7), ("members", 10)],
+            &[("events", 10), ("members", 10)],
+        )));
         assert!(detail.available);
         assert_eq!(detail.restorable_point, Some(10));
         assert_eq!(
@@ -371,6 +395,37 @@ mod tests {
         assert_eq!(unknown.watermark, None);
         assert_eq!(unknown.lag, None);
         assert_eq!(detail.max_lag, Some(3));
+    }
+
+    #[test]
+    fn backfill_lag_ignores_other_tables_writes() {
+        // `events` journaled id 1, then `members` journaled ids 2..=1001.
+        // Every table is fully journaled, so every lag reads 0 even though
+        // the global point is 1001: lag is tip minus watermark, never the
+        // point minus the watermark.
+        let detail = backfill_detail(Some(snapshot(
+            1001,
+            &[("events", 1), ("members", 1001)],
+            &[("events", 1), ("members", 1001)],
+        )));
+        assert!(detail.available);
+        assert_eq!(detail.restorable_point, Some(1001));
+        assert_eq!(detail.max_lag, Some(0));
+        assert_eq!(
+            detail
+                .tables
+                .iter()
+                .filter(|row| row.lag == Some(0))
+                .count(),
+            2
+        );
+        let events = detail
+            .tables
+            .iter()
+            .find(|row| row.table == "events")
+            .unwrap();
+        assert_eq!(events.watermark, Some(1));
+        assert_eq!(events.lag, Some(0));
     }
 
     #[test]

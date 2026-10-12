@@ -301,6 +301,19 @@ pub async fn watermarks(pool: &Pool<Postgres>) -> Result<BTreeMap<String, i64>, 
     Ok(rows.into_iter().collect())
 }
 
+/// Newest journal id per table, for the read-only `/ops` roll-ups. One
+/// grouped read served by `idx_rollback_journal_table_seq`; tables with no
+/// journal rows are absent from the map. Per-table lag is tip minus
+/// watermark: the global point minus the watermark would count other
+/// tables' writes, not this table's backlog.
+pub async fn table_tips(pool: &Pool<Postgres>) -> Result<BTreeMap<String, i64>, JournalError> {
+    let rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT table_name, MAX(id) FROM rollback_journal GROUP BY table_name")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().collect())
+}
+
 /// The global restorable point: the newest journal id across all tables.
 /// Rollback replays every row after the pre-window baseline up to this id.
 /// Zero on an empty journal. `BIGSERIAL` ids commit out of order under
