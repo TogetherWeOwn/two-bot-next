@@ -62,10 +62,10 @@ pub(crate) fn router_with_guard(
         .with_state((state.clone(), jobs.clone()))
         .layer(axum::Extension(Arc::clone(&guard)))
         // Metrics and readiness sample the same guard as production executors.
-        .merge(crate::metrics_http::router_with_guard(guard))
+        .merge(crate::metrics_http::router_with_guard(Arc::clone(&guard)))
         // Read-only operator roll-ups; the Worker gates off-container reads
         // behind the scrape bearer, as with `/metrics`.
-        .merge(crate::ops_http::router_with_state(state, jobs))
+        .merge(crate::ops_http::router_with_state(state, jobs, guard))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(RedactedHttpMakeSpan)

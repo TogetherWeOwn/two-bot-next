@@ -20,12 +20,17 @@ use crate::server::{readiness, SharedState};
 /// Bound for the event-store reads; mirrors the `/readyz` probe budget.
 const EVENT_STORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-pub(crate) fn router_with_state(state: SharedState, jobs: SharedStatus) -> Router {
+pub(crate) fn router_with_state(
+    state: SharedState,
+    jobs: SharedStatus,
+    guard: Arc<RateLimitGuard>,
+) -> Router {
     Router::new()
         .route("/ops/summary", get(summary))
         .route("/ops/gateway", get(gateway))
         .route("/ops/backfill", get(backfill))
         .with_state((state, jobs))
+        .layer(Extension(guard))
 }
 
 /// Fixed-vocabulary gateway phase for JSON; never the Debug string by
