@@ -298,6 +298,63 @@ pub struct MessageRef {
     pub message_id: Snowflake,
 }
 
+/// A global rate-limit wait longer than this never parks the guild actor:
+/// the call returns RateLimited so the action queue backs off tick-driven
+/// (visible in gauges) instead of sleeping silently inside the worker loop.
+const GLOBAL_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// In-flight voice REST attempts, for the in-flight-age gauge.
+#[derive(Debug, Default)]
+struct InFlightRest {
+    next_id: u64,
+    live: std::collections::HashMap<u64, Instant>,
+}
+
+impl InFlightRest {
+    fn begin(slots: &Arc<Mutex<Self>>) -> InFlightGuard {
+        let (id, slots) = {
+            let mut inner = slots.lock().expect("in-flight lock");
+            inner.next_id += 1;
+            let id = inner.next_id;
+            inner.live.insert(id, Instant::now());
+            (id, Arc::clone(slots))
+        };
+        publish_rest_age(&slots);
+        InFlightGuard {
+            slots: Some(slots),
+            id,
+        }
+    }
+}
+
+fn publish_rest_age(slots: &Arc<Mutex<InFlightRest>>) {
+    let age_secs = slots
+        .lock()
+        .expect("in-flight lock")
+        .live
+        .values()
+        .map(|started| started.elapsed().as_secs())
+        .max()
+        .unwrap_or(0);
+    two_bot_core::metrics::global().set_voice_rest_in_flight_age_secs(age_secs);
+}
+
+/// Removes one in-flight attempt and republishes the gauge on drop, so
+/// timeouts and early returns cannot leak the slot.
+struct InFlightGuard {
+    slots: Option<Arc<Mutex<InFlightRest>>>,
+    id: u64,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let Some(slots) = self.slots.take() {
+            slots.lock().expect("in-flight lock").live.remove(&self.id);
+            publish_rest_age(&slots);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RoomHttp {
     // Twilight builds and validates requests, but its ResponseFuture retries
@@ -309,6 +366,7 @@ pub struct RoomHttp {
     origin: String,
     global_not_before: Arc<Mutex<Option<Instant>>>,
     unauthorized: Arc<AtomicBool>,
+    in_flight: Arc<Mutex<InFlightRest>>,
 }
 
 impl std::fmt::Debug for RoomHttp {
@@ -345,6 +403,7 @@ impl RoomHttp {
             origin,
             global_not_before: Arc::new(Mutex::new(None)),
             unauthorized: Arc::new(AtomicBool::new(false)),
+            in_flight: Arc::new(Mutex::new(InFlightRest::default())),
         })
     }
 
@@ -364,6 +423,10 @@ impl RoomHttp {
     ) -> Result<Bytes, RoomHttpError> {
         // Interaction callbacks/webhooks use their own token, not the bot
         // credential or its global rate limit. Never log their request paths.
+        // A stale join must not sleep out a backoff it will never use.
+        if !still_valid() {
+            return Err(RoomHttpError::Cancelled);
+        }
         loop {
             if !bot_authenticated {
                 break;
@@ -373,12 +436,33 @@ impl RoomHttp {
             }
             let until = *self.global_not_before.lock().expect("global backoff lock");
             match until {
-                Some(until) if until > Instant::now() => tokio::time::sleep_until(until).await,
+                Some(until) if until > Instant::now() => {
+                    let wait = until.saturating_duration_since(Instant::now());
+                    if wait > GLOBAL_BACKOFF_MAX {
+                        // Never park the guild actor on a far-future global
+                        // limit: hand the remaining wait to the action queue,
+                        // which backs off tick-driven (gauges stay live)
+                        // instead of sleeping silently in the worker loop.
+                        two_bot_core::metrics::global().voice_global_backoff_capped();
+                        tracing::warn!(
+                            wait_secs = wait.as_secs(),
+                            "voice global backoff capped; returning RateLimited for queue backoff"
+                        );
+                        return Err(RoomHttpError::RateLimited {
+                            retry_after_ms: wait.as_millis().min(u128::from(u64::MAX)) as u64,
+                            global: true,
+                        });
+                    }
+                    if wait > Duration::from_secs(1) {
+                        tracing::info!(wait_secs = wait.as_secs(), "voice global backoff wait");
+                    }
+                    tokio::time::sleep_until(until).await;
+                    if !still_valid() {
+                        return Err(RoomHttpError::Cancelled);
+                    }
+                }
                 _ => break,
             }
-        }
-        if !still_valid() {
-            return Err(RoomHttpError::Cancelled);
         }
         let mut wire = Request::builder()
             .method(request.method().name())
@@ -403,6 +487,9 @@ impl RoomHttp {
         // body is broken; transport failures and outer timeouts fall back to
         // `transport` via `Drop`.
         let mut attempt = crate::executor_metrics::Attempt::new(&request);
+        // Tracked for the in-flight-age gauge; the guard removes the slot on
+        // drop so timeouts cannot leak it.
+        let _in_flight = InFlightRest::begin(&self.in_flight);
         let response = tokio::time::timeout(Duration::from_secs(10), async {
             let response = self
                 .transport
@@ -1454,5 +1541,72 @@ mod tests {
         }]);
         assert_eq!(companion_overwrites(&planned_bot, 999).len(), 1);
         assert_eq!(companion_overwrites(&plan, 0).len(), 1);
+    }
+
+    /// Read one counter series from the process-global metrics exposition.
+    fn global_series(prefix: &str) -> u64 {
+        two_bot_core::metrics::global()
+            .render(None)
+            .lines()
+            .filter(|line| line.starts_with(prefix))
+            .map(|line| {
+                line.rsplit_once(' ')
+                    .unwrap_or_else(|| panic!("bad sample: {line}"))
+                    .1
+                    .parse::<u64>()
+                    .unwrap_or_else(|_| panic!("bad sample: {line}"))
+            })
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn far_future_global_backoff_returns_bounded_ratelimited() {
+        // Stall regression (TOG prod stall follow-up): a far-future global
+        // `retry-after` must never park the guild actor in a silent sleep.
+        // The call returns `RateLimited { global: true }` immediately so the
+        // action queue backs off tick-driven, and the cap is counted.
+        let http = RoomHttp::new("test-token".to_owned()).unwrap();
+        *http.global_not_before.lock().expect("global backoff lock") =
+            Some(Instant::now() + Duration::from_secs(3600));
+        let capped_before = global_series("two_bot_voice_global_backoff_capped_total");
+        let request = Client::new("Bot test-token".to_owned())
+            .create_message(Id::<twilight_model::id::marker::ChannelMarker>::new(1))
+            .content("ping")
+            .try_into_request()
+            .expect("request builds offline");
+        let started = Instant::now();
+        let error = http
+            .send_request(request, || true, true)
+            .await
+            .expect_err("far-future backoff never sends");
+        assert!(
+            started.elapsed() < Duration::from_secs(GLOBAL_BACKOFF_MAX.as_secs()),
+            "returned promptly instead of sleeping out the backoff"
+        );
+        match error {
+            RoomHttpError::RateLimited {
+                retry_after_ms,
+                global,
+            } => {
+                assert!(global);
+                assert!(retry_after_ms > 0);
+            }
+            other => panic!("expected global RateLimited, got {other:?}"),
+        }
+        assert_eq!(
+            global_series("two_bot_voice_global_backoff_capped_total"),
+            capped_before + 1
+        );
+        // A stale join still cancels before touching the backoff at all.
+        let request = Client::new("Bot test-token".to_owned())
+            .create_message(Id::<twilight_model::id::marker::ChannelMarker>::new(1))
+            .content("ping")
+            .try_into_request()
+            .expect("request builds offline");
+        let error = http
+            .send_request(request, || false, true)
+            .await
+            .expect_err("stale join cancels");
+        assert_eq!(error, RoomHttpError::Cancelled);
     }
 }

@@ -12551,3 +12551,254 @@ fn temp_voice_admission_has_no_cooldown() {
     assert_eq!(config.max_per_user(), 1);
     assert_eq!(config.cooldown_secs(), 0);
 }
+
+// ---- stall-observability regressions (TOG prod stall follow-up) ----
+//
+// Received-vs-handled accounting: every delivered creator-channel join bumps
+// `two_bot_voice_joins_received_total`, accepted or refused. Refusals carry a
+// stable reason label. Global counters are monotonic, so these tests assert
+// `after == before + expected` on the exact series.
+
+fn refused_with_reason(reason: &str) -> u64 {
+    global_series(&format!(
+        "two_bot_voice_join_refused_total{{reason=\"{reason}\"}}"
+    ))
+}
+
+fn join_command(ticket: JoinTicket) -> ActorCommand {
+    ActorCommand::Join {
+        ticket,
+        display: "new room".to_owned(),
+        seed: 7,
+        created_at: NOW.to_owned(),
+        received: tokio::time::Instant::now(),
+    }
+}
+
+#[tokio::test]
+async fn join_commands_count_received_on_accept_and_on_refusal() {
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let received_before = global_series("two_bot_voice_joins_received_total");
+    let duplicate_before = refused_with_reason("duplicate");
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(CREATOR), Some(false))
+        .unwrap();
+    assert!(apply_command(&mut worker, join_command(ticket), 0));
+    // Same ticket twice: the second delivery is refused as a duplicate, but
+    // both deliveries count as received.
+    assert!(!apply_command(&mut worker, join_command(ticket), 1));
+    assert_eq!(
+        global_series("two_bot_voice_joins_received_total"),
+        received_before + 2
+    );
+    assert_eq!(refused_with_reason("duplicate"), duplicate_before + 1);
+}
+
+#[tokio::test]
+async fn silent_join_refusals_carry_stable_reason_labels() {
+    // Halted latch.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.halted = true;
+    let halted_before = refused_with_reason("halted");
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(CREATOR), Some(false))
+        .unwrap();
+    assert!(!worker.accept_join_received(
+        ticket,
+        "new room",
+        7,
+        NOW.to_owned(),
+        tokio::time::Instant::now()
+    ));
+    assert_eq!(refused_with_reason("halted"), halted_before + 1);
+
+    // Access gate off.
+    let (live, store, http, _) = fixture();
+    *store.access.lock().unwrap() = AccessControls {
+        room_creation_enabled: false,
+        ..AccessControls::default()
+    };
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let access_before = refused_with_reason("access");
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(CREATOR), Some(false))
+        .unwrap();
+    assert!(!worker.accept_join_received(
+        ticket,
+        "new room",
+        7,
+        NOW.to_owned(),
+        tokio::time::Instant::now()
+    ));
+    assert_eq!(refused_with_reason("access"), access_before + 1);
+
+    // No creator row for the channel.
+    let (live, store, http, _) = fixture();
+    store.creators.lock().unwrap().clear();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let unknown_before = refused_with_reason("unknown_creator");
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(CREATOR), Some(false))
+        .expect("ticket for a joined channel");
+    assert!(!worker.accept_join_received(
+        ticket,
+        "new room",
+        7,
+        NOW.to_owned(),
+        tokio::time::Instant::now()
+    ));
+    assert_eq!(refused_with_reason("unknown_creator"), unknown_before + 1);
+
+    // Blocked room name.
+    let (mut worker, _) = filtering_worker(&["room"]).await;
+    let blocked_before = refused_with_reason("name_blocked");
+    assert!(!join_as(&mut worker, MEMBER, "Ava"));
+    assert_eq!(refused_with_reason("name_blocked"), blocked_before + 1);
+}
+
+#[test]
+fn watchdog_due_needs_a_queue_and_an_expired_window() {
+    let start = tokio::time::Instant::now();
+    let window = Duration::from_secs(120);
+    assert!(!watchdog_due(start, start, false, window));
+    assert!(!watchdog_due(start, start, true, window));
+    assert!(watchdog_due(start, start + window, true, window));
+    assert!(!watchdog_due(start, start + window, false, window));
+    assert!(!watchdog_due(
+        start,
+        start + window - Duration::from_nanos(1),
+        true,
+        window
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn halt_reprobe_clears_the_credential_latch_without_a_restart() {
+    let (live, store, http, _) = fixture();
+    store
+        .settle_errors
+        .lock()
+        .unwrap()
+        .push_back(StoreError::CredentialRefused);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert!(worker.halted());
+    let recoveries_before = global_series("two_bot_voice_halt_recoveries_total");
+    let (tx, rx) = mpsc::unbounded_channel();
+    let limits = ActorLimits {
+        halt_reprobe_interval: Duration::from_secs(5),
+        watchdog_stuck_after: Duration::from_secs(3600),
+        ..ActorLimits::default()
+    };
+    let handle = tokio::spawn(async move {
+        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+    });
+    // Pump the actor once so its probe baseline starts at t=0 (a Status
+    // round-trip also proves the halted actor is still alive to answer).
+    let (status_reply, status_rx) = oneshot::channel();
+    tx.send(ActorCommand::Status(status_reply)).unwrap();
+    assert!(status_rx.await.unwrap().halted);
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        global_series("two_bot_voice_halt_recoveries_total"),
+        recoveries_before + 1
+    );
+    // The recovery publishes on the next tick: the clearing tick already
+    // published the stale latched value before probing.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(global_series("two_bot_voice_worker_halted"), 0);
+    drop(tx);
+    handle.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn watchdog_fires_while_a_backed_off_queue_makes_no_progress() {
+    let (live, store, http, _) = fixture();
+    http.move_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::RateLimited {
+            retry_after_ms: 30_000,
+            global: true,
+        });
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 0).await;
+    let (urgent, deferred) = worker.queue.pending_counts(GUILD);
+    assert!(urgent + deferred > 0, "the 429 keeps the move queued");
+    let stuck_before = global_series("two_bot_voice_watchdog_stucks_total");
+    let (tx, rx) = mpsc::unbounded_channel();
+    let limits = ActorLimits {
+        watchdog_stuck_after: Duration::from_secs(5),
+        halt_reprobe_interval: Duration::from_secs(3600),
+        ..ActorLimits::default()
+    };
+    let handle = tokio::spawn(async move {
+        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+    });
+    // Liveness first: the actor answers Status probes while stalled.
+    let (reply, reply_rx) = oneshot::channel();
+    tx.send(ActorCommand::Status(reply)).unwrap();
+    let status = reply_rx.await.unwrap();
+    assert!(!status.halted);
+    // One window passes with the queue backed off: exactly one fire.
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        global_series("two_bot_voice_watchdog_stucks_total"),
+        stuck_before + 1
+    );
+    // A second full window fires once more (at most once per interval).
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        global_series("two_bot_voice_watchdog_stucks_total"),
+        stuck_before + 2
+    );
+    drop(tx);
+    handle.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn global_429_requeues_and_resumes_without_losing_the_move() {
+    let (live, store, http, trace) = fixture();
+    http.move_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::RateLimited {
+            retry_after_ms: 1_000,
+            global: true,
+        });
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 0).await;
+    // Still queued (not dead-lettered) while the backoff holds.
+    let (urgent, deferred) = worker.queue.pending_counts(GUILD);
+    assert_eq!((urgent, deferred), (1, 0));
+    assert!(worker.queue.oldest_pending_age(GUILD).is_some());
+    assert!(!worker.dispatch_one(500).await);
+    tokio::time::advance(Duration::from_secs(2)).await;
+    dispatch(&mut worker, 2_000).await;
+    // The move landed (the first `move` trace entry is the 429 attempt, the
+    // second the success). The success queues a deferred post-move respace;
+    // draining it leaves the queue empty.
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["create", "persist:500", "move:300:500", "move:300:500"]
+    );
+    assert_eq!(worker.queue.pending_counts(GUILD), (0, 1));
+    dispatch(&mut worker, 2_000).await;
+    assert_eq!(worker.queue.pending_counts(GUILD), (0, 0));
+    assert_eq!(worker.queue.oldest_pending_age(GUILD), None);
+}

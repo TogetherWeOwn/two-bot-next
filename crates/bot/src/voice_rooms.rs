@@ -25,7 +25,7 @@ use crate::voice_room_plan::{
     category_room_ids, plan_room_diagnosed, RoomPlanError, RoomPlanInput, BOT_ROOM_ACCESS,
 };
 use tokio::sync::{mpsc, oneshot};
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 use twilight_cache_inmemory::DefaultInMemoryCache;
 use twilight_gateway::Event;
 use twilight_model::{
@@ -2846,17 +2846,51 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         created_at: String,
         received: tokio::time::Instant,
     ) -> bool {
-        if self.halted
-            || !may_create_room(&self.access)
-            || !self.creators.contains_key(&ticket.creator_id)
-            || !self.live.read_state().ticket_valid(ticket)
-            || self
-                .accepted
-                .get(&ticket.member_id)
-                .is_some_and(|seen| *seen >= (ticket.generation, ticket.transition))
+        // Every refusal path is a metric plus a log line: silent drops
+        // caused the 2026-10-12 lobby stall to need guessing. No member,
+        // channel or name content is logged.
+        let refusal = if self.halted {
+            Some("halted")
+        } else if !may_create_room(&self.access) {
+            Some("access")
+        } else if !self.creators.contains_key(&ticket.creator_id) {
+            Some("unknown_creator")
+        } else if !self.live.read_state().ticket_valid(ticket) {
+            Some("stale_ticket")
+        } else if self
+            .accepted
+            .get(&ticket.member_id)
+            .is_some_and(|seen| *seen >= (ticket.generation, ticket.transition))
         {
+            Some("duplicate")
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            metrics::global().voice_join_refused(reason);
+            if reason == "halted" {
+                warn!(
+                    guild = self.live.guild_id.to_string(),
+                    reason, "voice creator join refused before queueing"
+                );
+            } else if reason == "duplicate" {
+                debug!(
+                    guild = self.live.guild_id.to_string(),
+                    reason, "voice creator join refused before queueing"
+                );
+            } else {
+                info!(
+                    guild = self.live.guild_id.to_string(),
+                    reason, "voice creator join refused before queueing"
+                );
+            }
             return false;
         }
+        info!(
+            voice_event = "voice_join_received",
+            guild = self.live.guild_id.to_string(),
+            "voice creator join accepted"
+        );
         let timing = JoinTiming::new(received);
         self.accepted
             .insert(ticket.member_id, (ticket.generation, ticket.transition));
@@ -2874,6 +2908,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     creator_id: ticket.creator_id,
                     error: blocked.error,
                 });
+                metrics::global().voice_join_refused("name_blocked");
+                info!(
+                    guild = self.live.guild_id.to_string(),
+                    reason = "name_blocked",
+                    "voice creator join refused before queueing"
+                );
                 timing.finish("name_blocked");
                 return false;
             }
@@ -4141,6 +4181,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     pub fn halted(&self) -> bool {
         self.halted
     }
+    /// Clear the CredentialRefused latch after a successful re-probe. Only
+    /// the actor loop calls this; every other halted write path sets it.
+    pub fn clear_halt(&mut self) {
+        self.halted = false;
+    }
     pub fn tracked(&self) -> &HashMap<Snowflake, VoiceRoom> {
         &self.rooms
     }
@@ -4256,6 +4301,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             creator_channel_id: self.creators.keys().min().copied(),
             setup_user_id: None,
         };
+        // Bounded by construction (TOG stall follow-up, verified): each
+        // iteration clears exactly one candidate facet and
+        // `resolve_log_target` returns `None` once all three are gone, so
+        // this runs at most three sends plus the configured-channel attempt
+        // above. Every send carries the RoomHttp wire timeout plus the
+        // global-backoff cap, so no unbounded await chain can park the actor
+        // here.
         while let Some(target) = resolve_log_target(candidates) {
             let (notice_target, role) = match target {
                 LogTarget::SystemChannel { channel_id, .. } => {
@@ -7129,8 +7181,78 @@ where
 
 async fn run_actor<S: RoomPersistence, H: RoomWrites>(
     worker: &mut GuildRoomWorker<S, H>,
+    inbox: mpsc::UnboundedReceiver<ActorCommand>,
+    tick: Duration,
+) {
+    run_actor_with_limits(worker, inbox, tick, ActorLimits::default()).await;
+}
+
+/// Bounds for the per-guild actor loop (TOG stall follow-up). All bounds are
+/// observe-and-recover, never future-dropping: abandoning a `dispatch_one`
+/// future mid-flight would leak its creation record and wedge the guild, so
+/// an over-budget dispatch is logged + counted and retried next turn.
+#[derive(Debug, Clone, Copy)]
+struct ActorLimits {
+    /// Dispatch turns slower than this count a `dispatch_timeout` (stuck
+    /// constituent await) but run to completion.
+    dispatch_observe_after: Duration,
+    /// Queue non-empty with no progress for this long fires the watchdog
+    /// (log + `watchdog_stucks_total`), at most once per interval.
+    watchdog_stuck_after: Duration,
+    /// While halted, re-probe store credentials this often.
+    halt_reprobe_interval: Duration,
+    /// Timeout for one halt re-probe.
+    halt_probe_timeout: Duration,
+}
+
+impl Default for ActorLimits {
+    fn default() -> Self {
+        Self {
+            dispatch_observe_after: Duration::from_secs(60),
+            watchdog_stuck_after: Duration::from_secs(120),
+            halt_reprobe_interval: Duration::from_secs(60),
+            halt_probe_timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+/// Pure watchdog predicate, unit-tested: the worker is stuck when actions are
+/// queued but nothing has completed since `stuck_after` ago. Tokio instants:
+/// the actor loop already runs on the Tokio clock (interval, timeouts), so
+/// paused-time tests can advance it deterministically.
+fn watchdog_due(
+    last_progress: tokio::time::Instant,
+    now: tokio::time::Instant,
+    queue_nonempty: bool,
+    stuck_after: Duration,
+) -> bool {
+    queue_nonempty && now.saturating_duration_since(last_progress) >= stuck_after
+}
+
+/// Publish the per-tick stall gauges: halt latch plus per-lane queue depth
+/// and oldest-pending age. Cheap atomics; called every actor tick so
+/// `/ops/metrics` always shows the worker's stall posture.
+fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(worker: &GuildRoomWorker<S, H>) {
+    let guild = worker.live.guild_id;
+    let (urgent, deferred) = worker.queue.pending_counts(guild);
+    let oldest_age_secs = worker
+        .queue
+        .oldest_pending_age(guild)
+        .map_or(0, |age| age.as_secs());
+    let gauges = metrics::global();
+    gauges.set_voice_halted(worker.halted());
+    gauges.set_voice_queue(
+        u64::try_from(urgent).unwrap_or(u64::MAX),
+        u64::try_from(deferred).unwrap_or(u64::MAX),
+        oldest_age_secs,
+    );
+}
+
+async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites>(
+    worker: &mut GuildRoomWorker<S, H>,
     mut inbox: mpsc::UnboundedReceiver<ActorCommand>,
     tick: Duration,
+    limits: ActorLimits,
 ) {
     let start = tokio::time::Instant::now();
     let mut timer = tokio::time::interval(tick);
@@ -7139,6 +7261,9 @@ async fn run_actor<S: RoomPersistence, H: RoomWrites>(
     let mut maintenance_ready = false;
     let mut dispatch_budget = 8u8;
     let mut complete_join_pair = false;
+    let mut last_progress = tokio::time::Instant::now();
+    let mut last_watchdog_fire: Option<tokio::time::Instant> = None;
+    let mut last_halt_probe = tokio::time::Instant::now();
     loop {
         tokio::select! {
             biased;
@@ -7148,7 +7273,11 @@ async fn run_actor<S: RoomPersistence, H: RoomWrites>(
                     .elapsed()
                     .as_millis()
                     .min(u128::from(u64::MAX)) as u64;
-                dispatch_ready |= apply_command(worker, command, now_ms);
+                let accepted = apply_command(worker, command, now_ms);
+                if accepted {
+                    last_progress = tokio::time::Instant::now();
+                }
+                dispatch_ready |= accepted;
             }
             // Inbox first between writes, but no timer between a persisted
             // create and its priority move. A backed-off/idle queue returns
@@ -7156,11 +7285,95 @@ async fn run_actor<S: RoomPersistence, H: RoomWrites>(
             _ = std::future::ready(()), if dispatch_ready && (dispatch_budget > 0 || complete_join_pair) => {
                 let now_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                 let pending_moves = worker.moves.len();
-                dispatch_ready = worker.dispatch_one(now_ms).await;
+                let dispatch_started = tokio::time::Instant::now();
+                let progressed = worker.dispatch_one(now_ms).await;
+                // Observe-only bound: the future runs to completion (dropping
+                // it would leak the creation record), but an over-budget turn
+                // means a constituent await has no cap — count it loudly.
+                if dispatch_started.elapsed() >= limits.dispatch_observe_after {
+                    metrics::global().voice_dispatch_timeout();
+                    warn!(
+                        guild = worker.live.guild_id.to_string(),
+                        elapsed_secs = dispatch_started.elapsed().as_secs(),
+                        "voice dispatch turn exceeded observe bound"
+                    );
+                }
+                if progressed {
+                    last_progress = tokio::time::Instant::now();
+                }
+                dispatch_ready = progressed;
                 complete_join_pair = worker.moves.len() > pending_moves;
                 dispatch_budget = dispatch_budget.saturating_sub(1);
             }
             _ = timer.tick() => {
+                publish_voice_gauges(worker);
+                // Stuck-worker watchdog: queued work with no completed turn
+                // for the full window. Log + metric only; the queue keeps its
+                // retries so a transient outage still drains on recovery.
+                let (urgent, deferred) = worker.queue.pending_counts(worker.live.guild_id);
+                let now = tokio::time::Instant::now();
+                let fire_cooled = last_watchdog_fire
+                    .is_none_or(|fired| now.saturating_duration_since(fired) >= limits.watchdog_stuck_after);
+                if fire_cooled
+                    && watchdog_due(
+                        last_progress,
+                        now,
+                        urgent + deferred > 0,
+                        limits.watchdog_stuck_after,
+                    )
+                {
+                    last_watchdog_fire = Some(now);
+                    metrics::global().voice_watchdog_stuck();
+                    error!(
+                        guild = worker.live.guild_id.to_string(),
+                        urgent,
+                        deferred,
+                        oldest_pending_age_secs = worker
+                            .queue
+                            .oldest_pending_age(worker.live.guild_id)
+                            .map_or(0, |age| age.as_secs()),
+                        halted = worker.halted(),
+                        "voice worker stuck: queued actions with no progress"
+                    );
+                }
+                // Halted-latch recovery: a CredentialRefused parks the worker
+                // silently. Re-probe credentials under a timeout; a healthy
+                // read clears the latch so the next join flows.
+                if worker.halted()
+                    && now.saturating_duration_since(last_halt_probe) >= limits.halt_reprobe_interval
+                {
+                    last_halt_probe = now;
+                    let guild = worker.live.guild_id;
+                    match tokio::time::timeout(
+                        limits.halt_probe_timeout,
+                        worker.store.creators(guild),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {
+                            worker.clear_halt();
+                            metrics::global().voice_halt_recovered();
+                            info!(
+                                guild = guild.to_string(),
+                                "voice worker halt cleared: store credentials healthy"
+                            );
+                            last_progress = tokio::time::Instant::now();
+                        }
+                        Ok(Err(error)) => {
+                            debug!(
+                                guild = guild.to_string(),
+                                ?error,
+                                "voice halt re-probe: store still refusing"
+                            );
+                        }
+                        Err(_) => {
+                            debug!(
+                                guild = guild.to_string(),
+                                "voice halt re-probe timed out"
+                            );
+                        }
+                    }
+                }
                 worker.reconcile();
                 let now_ms = start
                     .elapsed()
@@ -7229,6 +7442,11 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             created_at,
             received,
         } => {
+            // Received-vs-handled accounting (TOG stall follow-up): every
+            // creator-channel join the sink delivers bumps `received`, whether
+            // or not the worker accepts it. `handled` is the create/move
+            // success counters; received > handled for >2min means a stall.
+            metrics::global().voice_join_received();
             accepted_join =
                 worker.accept_join_received(ticket, &display, seed, created_at, received);
             worker.reconcile();
