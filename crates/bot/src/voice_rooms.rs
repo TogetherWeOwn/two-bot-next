@@ -6635,7 +6635,11 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
         ActorCommand::NameSettingsChanged(settings) => {
             worker.update_name_settings(settings);
             worker.name_settings_loaded = true;
-            worker.name_settings_read_ms = Some(now_ms);
+            // Creator rows refresh only via reload_name_settings. Clear the
+            // stamp so the next tick re-reads the same snapshot including
+            // creators, instead of pushing their refresh a full interval past
+            // an /import that changed a creator template.
+            worker.name_settings_read_ms = None;
         }
         #[cfg(test)]
         ActorCommand::NamingProbe(reply) => {

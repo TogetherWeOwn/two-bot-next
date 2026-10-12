@@ -10665,6 +10665,55 @@ async fn voice_name_settings_notification_invalidates_cached_renders() {
 }
 
 #[tokio::test]
+async fn voice_name_import_refreshes_creator_template_without_waiting_for_reload() {
+    let (live, mut store, http, trace) = fixture();
+    store.snapshot_uses_creator_rows = false;
+    let mut config = full_config();
+    config.creators[0].name_template = "old".to_owned();
+    store.creators.lock().unwrap()[0].name_template = "old".to_owned();
+    *store.config.lock().unwrap() = config;
+    slow_rename_room(&live, &store);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.wall_clock = || 0;
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    worker.reload_name_settings(0).await;
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(worker.desired_names[&700], "old");
+
+    // Simulate a successful in-bot /import that changes only the creator template.
+    worker.store.config.lock().unwrap().creators[0].name_template = "new".to_owned();
+    let settings = {
+        let config = worker.store.config.lock().unwrap().clone();
+        NameSettings::from_config(&config)
+    };
+    apply_command(
+        &mut worker,
+        ActorCommand::NameSettingsChanged(settings),
+        100_000,
+    );
+    assert_eq!(
+        worker.name_settings_read_ms, None,
+        "import must not push the creator reload a full interval out"
+    );
+
+    // The next tick must pick up the creator edit, not wait for the reload interval.
+    worker.reload_name_settings(100_001).await;
+    worker.refresh_template_names(100_001);
+    assert_eq!(
+        worker.creators[&CREATOR].name_template, "new",
+        "imported creator template must refresh on the next tick"
+    );
+    assert_eq!(worker.desired_names[&700], "new");
+    assert!(
+        !worker.dispatch_one(100_001).await,
+        "normal rename pacing still applies"
+    );
+    dispatch(&mut worker, 400_000).await;
+    assert_eq!(renames_sent(&trace), ["rename:700:old", "rename:700:new"]);
+}
+
+#[tokio::test]
 async fn voice_name_creator_notification_invalidates_cached_renders() {
     let (live, store, http, trace) = fixture();
     store.creators.lock().unwrap()[0].name_template = "old".to_owned();
@@ -10787,7 +10836,9 @@ async fn written_settings_reach_automatic_names() {
     );
     assert_eq!(worker.name_settings.no_game_label, "Hangout");
     assert!(worker.name_settings_loaded);
-    assert_eq!(worker.name_settings_read_ms, Some(5));
+    // The stamp stays clear so the next tick re-reads creators too; an
+    // /import must not push their refresh a full interval out.
+    assert_eq!(worker.name_settings_read_ms, None);
 }
 
 #[tokio::test]
