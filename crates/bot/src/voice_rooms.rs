@@ -2708,7 +2708,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         self.admission = config;
     }
 
-    fn queue_delete(&mut self, channel: Snowflake, compensate: bool) {
+    fn queue_delete(&mut self, channel: Snowflake, compensate: bool) -> bool {
         if compensate {
             self.compensation.insert(channel);
         }
@@ -2719,6 +2719,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     channel_id: channel,
                 },
             );
+            true
+        } else {
+            false
         }
     }
 
@@ -2844,8 +2847,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 continue;
             }
             if !live.channels.contains_key(&channel) {
-                self.queue.resume(self.live.guild_id, channel);
-                resumed = resumed.saturating_add(1);
+                if self.queue.resume(self.live.guild_id, channel) {
+                    resumed = resumed.saturating_add(1);
+                }
                 empty.push(channel);
                 continue;
             }
@@ -2865,12 +2869,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             // Pending moves must reach their failure/compensation path even if
             // Move Members was revoked between the create and move.
             if !accessible && !self.moves.contains_key(&channel) {
-                self.queue.suspend(self.live.guild_id, channel);
-                suspended = suspended.saturating_add(1);
+                if self.queue.suspend(self.live.guild_id, channel) {
+                    suspended = suspended.saturating_add(1);
+                }
                 continue;
             }
-            self.queue.resume(self.live.guild_id, channel);
-            resumed = resumed.saturating_add(1);
+            if self.queue.resume(self.live.guild_id, channel) {
+                resumed = resumed.saturating_add(1);
+            }
             let move_pending = self.moves.contains_key(&channel)
                 || self
                     .uncertain_moves
@@ -2929,9 +2935,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         drop(live);
         self.reconcile_privacy();
         self.scan_join_entries();
-        let delete_enqueued = empty.len() as u64;
+        let mut delete_enqueued: u64 = 0;
         for channel in empty {
-            self.queue_delete(channel, false);
+            if self.queue_delete(channel, false) {
+                delete_enqueued = delete_enqueued.saturating_add(1);
+            }
         }
         for (channel, text_channel_id, diff) in view_syncs {
             for member_id in diff.grants {

@@ -542,8 +542,8 @@ impl Metrics {
         *counter = counter.saturating_add(1);
     }
 
-    /// Add one reconcile plan size (TOG-13543). `count` is the number of
-    /// rooms in this pass for `action`; zero is a no-op.
+    /// Add actual reconcile transitions or newly queued actions in this pass.
+    /// Repeated unchanged room states contribute zero, which is a no-op.
     pub fn voice_reconcile(&self, action: &str, count: u64) {
         if count == 0 {
             return;
@@ -891,7 +891,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_reconcile_actions_total",
             "counter",
-            "Reconcile plan sizes by bounded action.",
+            "Reconcile transitions and new enqueues by bounded action.",
         );
         for (action, count) in VOICE_RECONCILE_ACTIONS.iter().zip(values.voice_reconcile) {
             writeln!(
