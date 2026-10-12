@@ -340,6 +340,10 @@
     "crates/cutover/migrations/0426_community_facts_guild_source.sql": {
       "sha256": "9da078d3f29430320b79d2d82cfa6e4b1d2d557384a98d7dddca97783429d2dd",
       "justification": "RSVP check-in capacity count index: cover (guild_id, source) so record_checkin counts the occurrence without scanning the guild message history while holding the occurrence lock."
+    },
+    "crates/cutover/migrations/0428_backfill_cursors.sql": {
+      "sha256": "5b11e04544f2d6c2f474cac874ab80e58305d3ee380c588b6bb967055ccc139f",
+      "justification": "TOG-22953: cutover-chain mirror of store 0408 backfill_cursors; same shape, IF NOT EXISTS, so the /ops/backfill route and worker cursors work on migrated databases."
     }
   }
 }

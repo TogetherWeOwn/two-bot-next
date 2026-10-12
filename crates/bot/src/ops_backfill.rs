@@ -222,8 +222,9 @@ fn authenticate(
     if !internal_actions::within_skew(timestamp, SKEW_SECONDS, guarded / 1000) {
         return Err(Denial::Stale);
     }
-    ring.nonces.sweep(now_ms);
-    if !ring.nonces.offer(nonce, now_ms) {
+    // Burn at the guarded mark, mirroring the receiver: `offer` already
+    // sweeps, so no separate sweep call.
+    if !ring.nonces.offer(nonce, guarded) {
         return Err(Denial::Replay);
     }
     Ok(())
@@ -588,6 +589,58 @@ mod tests {
         let (second, body) = get(&app, headers).await;
         assert_eq!(second, StatusCode::UNAUTHORIZED);
         assert_eq!(body["error"]["code"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn regressed_clock_burns_nonce_at_guarded_mark() {
+        // A 3 s regression sits inside the 5 s clock tolerance, so freshness
+        // still evaluates against the high-water mark. The nonce must burn at
+        // that mark: burning at the regressed read would expire the entry
+        // early and reopen a replay window for a capture near the +120 s edge.
+        fn headers_for(nonce: &str, timestamp: &str, signature: &str) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-two-key-id", "fixture-ops-key".parse().expect("key id"));
+            headers.insert("x-two-timestamp", timestamp.parse().expect("timestamp"));
+            headers.insert("x-two-nonce", nonce.parse().expect("nonce"));
+            headers.insert("x-two-signature", signature.parse().expect("signature"));
+            headers
+        }
+
+        let ring = test_ring();
+        // Millisecond clock with whole-second boundary for exact skew math.
+        let base_ms = 1_700_000_000_000u64;
+        // Near the +120 s future edge, so the capture stays fresh at replay.
+        let timestamp = ((base_ms / 1000) + 119).to_string();
+        let mut guard = ring
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // First read advances the high-water mark to base_ms.
+        let first_nonce = format!("{:032x}", 0xaaaau128);
+        let first_sig = mint_signature(&fixture_secret(), BACKFILL_PATH, &timestamp, &first_nonce);
+        authenticate(
+            &mut guard,
+            &headers_for(&first_nonce, &timestamp, &first_sig),
+            b"",
+            base_ms,
+        )
+        .expect("first read burns");
+        // Second read with the clock 3 s behind: freshness still passes
+        // against the mark, and the nonce must burn at the mark.
+        let regressed_ms = base_ms - 3_000;
+        let second_nonce = format!("{:032x}", 0xbbbbu128);
+        let second_sig =
+            mint_signature(&fixture_secret(), BACKFILL_PATH, &timestamp, &second_nonce);
+        let second_headers = headers_for(&second_nonce, &timestamp, &second_sig);
+        authenticate(&mut guard, &second_headers, b"", regressed_ms).expect("regressed read burns");
+        // Just past the regressed entry's TTL but inside the guarded entry's:
+        // the capture must still refuse as a replay.
+        let replay_ms = base_ms + 238_001;
+        let replay = authenticate(&mut guard, &second_headers, b"", replay_ms);
+        assert!(
+            matches!(replay, Err(Denial::Replay)),
+            "regressed nonce must stay live on the guarded timeline"
+        );
     }
 
     #[tokio::test]

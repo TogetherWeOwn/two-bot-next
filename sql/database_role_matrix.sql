@@ -88,6 +88,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'join_risk_flags', 'table'),
     ('public', 'containment_events', 'table'),
     ('public', 'containment_incidents', 'table'),
+    ('public', 'backfill_cursors', 'table'),
     ('public', 'member_erasure_audit', 'migrator'),
     ('public', 'invite_campaigns', 'migrator'),
     ('public', '_sqlx_migrations', 'ledger'),

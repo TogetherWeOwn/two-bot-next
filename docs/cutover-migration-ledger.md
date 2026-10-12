@@ -52,6 +52,7 @@ All migrations are up-only; there are no down files. The `direction` column is
 | 0405_timestamptz_and_boolean | up | events, members | backout-script | Type rewrite: backout is `is_bot USING is_bot::smallint` plus restoring the old defaults; `recorded_at` default must be set back explicitly. |
 | 0406_rollback_journal | up | rollback_journal, rollback_watermarks | re-runnable | Drop both tables; journal rows are cutover evidence, re-capturable. Both tables and the store chain's `_two_bot_migrations` ledger are excluded from backups (`EXCLUDED_TABLES`): journal rows are re-capturable watch-window evidence, and restoring old watermarks could mark post-backup writes as journaled. |
 | 0407_invite_campaigns | up | invite_campaigns | re-runnable | Drop the table; no other migration reads it. |
+| 0408_backfill_cursors | up | backfill_cursors | re-runnable | Drop the table; cursors re-checkpoint on the next worker run. |
 
 ## Cutover chain (`crates/cutover/migrations/`)
 
@@ -129,6 +130,7 @@ All migrations are up-only; there are no down files. The `direction` column is
 | 0422_voice_create_reservations | up | voice_create_reservations | re-runnable | Drop the table; room creates lose their rolling burst and cooldown history (in-flight creates stop holding cap slots). |
 | 0424_internal_action_outcome | up | internal_idempotency | backout-script | Unguarded `ADD COLUMN` with a closed-set `CHECK`. Backout: disable the receiver and deploy the previous binary, then drop the column; dropping it under the outcome-aware binary fails every finish and every success replay. No member PII in the column; no seed writes to the table. |
 | 0425_internal_action_audit_resources | up | internal_action_log | backout-script | Unguarded `ADD COLUMN` with format/closed-set `CHECK`s. Backout: drop the three columns (terminal audits lose their resource witness until re-recorded; the columns hold no member PII beyond the receipt's own snowflakes and counts). |
+| 0428_backfill_cursors | up | backfill_cursors | re-runnable | Drop the table; cutover mirror of store 0408, cursors re-checkpoint on the next worker run. |
 
 ## Notes
 
