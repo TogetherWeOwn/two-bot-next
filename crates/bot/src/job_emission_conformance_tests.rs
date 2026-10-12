@@ -108,6 +108,22 @@ const REGISTER_CALLS: [&str; 8] = [
     "automod_gateway::expiry_job(",
 ];
 
+/// Sinks that prove a scheduled job actually reaches `registered`, the vec
+/// that feeds `jobs::supervise`. Call text alone is not enough: `let _ = ...`
+/// or `drop(...)` keeps the call while the job never registers, so each entry
+/// pins the sink together with the call, matched against the source with
+/// full-line `//` comments removed.
+const REGISTER_SINKS: [&str; 8] = [
+    "registered.push(crate::settings_jobs::job(",
+    "registered.push(Job {",
+    "registered.extend(scheduled)",
+    "registered.push(member_runtime::sweep_job(",
+    "registered.extend(registration.jobs)",
+    "registered.push(crate::automod_gateway::expiry_job(",
+    "registered.push(service.recovery_job())",
+    "Some(job) => registered.push(job)",
+];
+
 /// Entries the shared `NAMES` loop schedules. Pinned inside the array block
 /// so a quiet removal fails here even when the name still appears elsewhere
 /// in the file.
@@ -116,6 +132,17 @@ const NAMES_ENTRIES: [&str; 4] = [
     "\"rank\"",
     "\"scheduled_events\"",
     "settings_jobs::NAME",
+];
+
+/// Rows of the `community_jobs.rs` register table, matched with all
+/// whitespace removed so reformatting cannot silently unpin them. The bare
+/// quoted name is not enough: `NAMES` and log fields repeat it, so each entry
+/// pins the name together with its `Kind`, which only the registering row
+/// keeps adjacent.
+const COMMUNITY_TABLE_ROWS: [&str; 3] = [
+    "\"presence_probe\",Kind::PresenceProbe",
+    "\"community_scorecard\",Kind::Scorecard",
+    "\"inactivity\",Kind::Inactivity",
 ];
 
 /// Direct emission outside the supervisor. `session_checkpoint` is the dispatch
@@ -191,6 +218,22 @@ fn source_by_name(name: &str) -> &'static str {
         .iter()
         .find_map(|(file, text)| (*file == name).then_some(*text))
         .unwrap_or_else(|| panic!("no emitter source for {name}"))
+}
+
+/// Source with full-line `//` comments removed, so a sink hidden in a
+/// comment cannot satisfy a registration pin.
+fn code_text(source: &str) -> String {
+    source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Source with all whitespace removed, so a registering row stays pinned
+/// across reformatting while staying adjacent-only.
+fn compacted(source: &str) -> String {
+    source.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 /// A new module that emits directly must fail here even though it is not in
@@ -292,6 +335,27 @@ fn every_scrape_job_has_a_live_emitter_or_parked_reason() {
         assert!(
             website.contains(snippet),
             "website_jobs.rs no longer calls {snippet}; a dropped registration must fail here"
+        );
+    }
+    let website_code = code_text(website);
+    for sink in REGISTER_SINKS {
+        assert!(
+            website_code.contains(sink),
+            "website_jobs.rs no longer registers via {sink}; a job that stops reaching `registered` must fail here"
+        );
+    }
+    // The feed and audit arms share the `registered.push(job)` shape: both
+    // must stay, so dropping either one fails here.
+    let push_job_sinks = website_code.matches("registered.push(job)").count();
+    assert!(
+        push_job_sinks >= 2,
+        "website_jobs.rs lost a `registered.push(job)` arm (feed/audit); found {push_job_sinks}, need 2"
+    );
+    let community_rows = compacted(&code_text(source_by_name("community_jobs.rs")));
+    for row in COMMUNITY_TABLE_ROWS {
+        assert!(
+            community_rows.contains(row),
+            "community_jobs.rs register table lost row {row}; a dropped table row must fail here"
         );
     }
     let names_block = website
