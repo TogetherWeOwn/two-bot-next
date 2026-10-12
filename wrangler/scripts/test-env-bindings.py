@@ -173,6 +173,75 @@ class AlertBindingTests(unittest.TestCase):
                     self.assertFalse(any("synthetic-secret" in e for e in errors))
         self.assertEqual(self.check_config(BASE), [])
 
+    def test_ops_config_writes_is_staging_only(self):
+        enabled = BASE.replace(
+            "[env.staging.vars]", '[env.staging.vars]\nOPS_CONFIG_WRITES_ENABLED = "1"', 1
+        )
+        self.assertEqual(self.check_config(enabled), [])
+        for section in ["vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(
+                    f"[{section}]", f'[{section}]\nOPS_CONFIG_WRITES_ENABLED = "1"', 1
+                )
+                errors = self.check_config(config)
+                self.assertTrue(
+                    any("OPS_CONFIG_WRITES_ENABLED is staging-only" in e for e in errors), errors
+                )
+        # Absent from staging is also fine: config writes stay dark.
+        self.assertEqual(self.check_config(BASE), [])
+
+    def test_ops_config_writes_value_must_be_exactly_one(self):
+        enabled = BASE.replace(
+            "[env.staging.vars]", '[env.staging.vars]\nOPS_CONFIG_WRITES_ENABLED = "1"', 1
+        )
+        for value in ['"0"', '"true"', '""', '"1 "', "1"]:
+            with self.subTest(value=value):
+                config = enabled.replace(
+                    'OPS_CONFIG_WRITES_ENABLED = "1"', f"OPS_CONFIG_WRITES_ENABLED = {value}"
+                )
+                self.assertTrue(any('must be exactly "1"' in e for e in self.check_config(config)))
+
+    def test_ops_killswitch_is_staging_only(self):
+        enabled = BASE.replace(
+            "[env.staging.vars]", '[env.staging.vars]\nOPS_KILLSWITCH_ENABLED = "1"', 1
+        )
+        self.assertEqual(self.check_config(enabled), [])
+        for section in ["vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(
+                    f"[{section}]", f'[{section}]\nOPS_KILLSWITCH_ENABLED = "1"', 1
+                )
+                errors = self.check_config(config)
+                self.assertTrue(
+                    any("OPS_KILLSWITCH_ENABLED is staging-only" in e for e in errors), errors
+                )
+        # Absent from staging is also fine: the kill-switch stays dark.
+        self.assertEqual(self.check_config(BASE), [])
+
+    def test_ops_killswitch_value_must_be_exactly_one(self):
+        enabled = BASE.replace(
+            "[env.staging.vars]", '[env.staging.vars]\nOPS_KILLSWITCH_ENABLED = "1"', 1
+        )
+        for value in ['"0"', '"true"', '""', '"1 "', "1"]:
+            with self.subTest(value=value):
+                config = enabled.replace(
+                    'OPS_KILLSWITCH_ENABLED = "1"', f"OPS_KILLSWITCH_ENABLED = {value}"
+                )
+                self.assertTrue(any('must be exactly "1"' in e for e in self.check_config(config)))
+
+    def test_ops_control_token_is_never_a_toml_var(self):
+        for section in ["vars", "env.staging.vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(
+                    f"[{section}]", f'[{section}]\nOPS_CONTROL_TOKEN = "synthetic-secret"', 1
+                )
+                errors = self.check_config(config)
+                self.assertTrue(
+                    any("OPS_CONTROL_TOKEN must be an optional Worker secret" in e for e in errors),
+                    errors,
+                )
+                self.assertFalse(any("synthetic-secret" in e for e in errors))
+
     def test_receiver_config_is_never_a_toml_var(self):
         for section in ["vars", "env.staging.vars", "env.production.vars"]:
             for key in ["TWO_INTERNAL_KEYS", "TWO_INTERNAL_ACTIONS", "TWO_INTERNAL_BIND", "TWO_INTERNAL_CONTAINER"]:

@@ -70,6 +70,21 @@ import {
   relayReceiverResponse,
 } from "./internal-actions.ts";
 import {
+  OPS_AUDIT_PATH,
+  OPS_CONFIG_PATH,
+  OPS_ENFORCEMENT_PENDING,
+  OPS_KILLSWITCH_PATH,
+  OpsControl,
+  configWritesEnabled,
+  gateOpsRequest,
+  isOpsPath,
+  killswitchEnabled,
+  opsRefused,
+  parseConfigPut,
+  parseKillswitchPost,
+  readOpsBody,
+} from "./ops-control.ts";
+import {
   EMPTY_STATE,
   evaluateMetrics,
   interruptDispatchDrops,
@@ -127,6 +142,15 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
    */
   OPS_DASHBOARD_CLIENT_ID?: string;
   OPS_DASHBOARD_CLIENT_SECRET?: string;
+  /** Dedicated least-privilege bearer for the admin control surface
+   * (GET /ops/config, /ops/kill-switch, /ops/audit). Absent/short → dark. */
+  OPS_CONTROL_TOKEN?: string;
+  /** Exact "1" admits PUT /ops/config. Staging-only; never production
+   * without the CISO review (AC4). Enforced by check-env-bindings.py. */
+  OPS_CONFIG_WRITES_ENABLED?: string;
+  /** Exact "1" admits POST /ops/kill-switch. Staging-only; never production
+   * without the CISO review (AC4). Enforced by check-env-bindings.py. */
+  OPS_KILLSWITCH_ENABLED?: string;
   /** Optional Hyperdrive binding to shared Postgres; absent → snapshot, clicks dropped. */
   REDIRECT_DB?: Hyperdrive;
   /** Invite code for `/` and DB outages. Optional but recommended. */
@@ -497,6 +521,9 @@ export class TwoBotContainer extends Container<Env> {
     const url = new URL(request.url);
     if (url.pathname === CONTROL_PATH) return this.control(request);
     if (url.pathname === ACTIONS_PATH) return this.internalActions(request);
+    if (url.pathname === OPS_CONFIG_PATH || url.pathname === OPS_KILLSWITCH_PATH || url.pathname === OPS_AUDIT_PATH) {
+      return this.opsControl(request);
+    }
     if (url.pathname !== "/health" && url.pathname !== "/readyz" && url.pathname !== OPS_METRICS_PATH && url.pathname !== OPS_SUMMARY_PATH) {
       return new Response("not found", { status: 404, headers: withSecurityHeaders() });
     }
@@ -682,6 +709,96 @@ export class TwoBotContainer extends Container<Env> {
         });
       });
     } catch (error) { return refused(error); }
+  }
+
+  /**
+   * Admin control surface (TOG-22862). Defense in depth: the Worker gate
+   * already authenticated and checked the write switches, but the DO
+   * re-checks both — the DO is the authority for stored state. All state
+   * transitions run inside the DO concurrency gate; enforcement in the Rust
+   * runtime lands after the CISO review (AC4).
+   */
+  private async opsControl(request: Request): Promise<Response> {
+    if (!await authenticated(request, this.env.OPS_CONTROL_TOKEN)) {
+      return new Response("unauthorized", { status: 401, headers: withSecurityHeaders() });
+    }
+    const url = new URL(request.url);
+    const isConfig = url.pathname === OPS_CONFIG_PATH;
+    const isKillswitch = url.pathname === OPS_KILLSWITCH_PATH;
+    const isAudit = url.pathname === OPS_AUDIT_PATH;
+    if (!isOpsPath(request, url.pathname)) {
+      return new Response("not found", { status: 404, headers: withSecurityHeaders() });
+    }
+    if (isConfig && request.method !== "GET" && request.method !== "PUT") {
+      return new Response("method not allowed", { status: 405, headers: withSecurityHeaders({ allow: "GET, PUT" }) });
+    }
+    if (isKillswitch && request.method !== "GET" && request.method !== "POST") {
+      return new Response("method not allowed", { status: 405, headers: withSecurityHeaders({ allow: "GET, POST" }) });
+    }
+    if (isAudit && request.method !== "GET") {
+      return new Response("method not allowed", { status: 405, headers: withSecurityHeaders({ allow: "GET" }) });
+    }
+    if (isConfig && request.method === "PUT" && !configWritesEnabled(this.env)) {
+      return new Response("not found", { status: 404, headers: withSecurityHeaders() });
+    }
+    if (isKillswitch && request.method === "POST" && !killswitchEnabled(this.env)) {
+      return new Response("not found", { status: 404, headers: withSecurityHeaders() });
+    }
+    let put: unknown = null;
+    if ((isConfig && request.method === "PUT") || (isKillswitch && request.method === "POST")) {
+      put = await readOpsBody(request);
+      if (put === null || put === undefined) {
+        return new Response("invalid ops change", { status: 400, headers: withSecurityHeaders() });
+      }
+    }
+    try {
+      return await this.gated(async () => {
+        const id = this.id();
+        if (request.headers.get(DEPLOYMENT_HEADER) !== id) throw new OwnershipRefused("deployment_mismatch");
+        const ops = new OpsControl(this.ctx.storage, this.env as unknown as Record<string, unknown>);
+        if (isConfig && request.method === "GET") {
+          const config = await ops.readConfig();
+          return Response.json({ deploymentId: id, ...config }, {
+            headers: withSecurityHeaders({ "cache-control": "no-store" }),
+          });
+        }
+        if (isConfig) {
+          const change = parseConfigPut(put);
+          if (!change) {
+            return new Response("invalid ops change", { status: 400, headers: withSecurityHeaders() });
+          }
+          const record = await ops.putConfig(change);
+          console.log(JSON.stringify({ event: "ops_config_put", epoch: record.epoch, actor: record.actor }));
+          return Response.json({ deploymentId: id, record, enforcement: OPS_ENFORCEMENT_PENDING }, {
+            headers: withSecurityHeaders({ "cache-control": "no-store" }),
+          });
+        }
+        if (isKillswitch && request.method === "GET") {
+          const record = await ops.readKillswitch();
+          return Response.json({ deploymentId: id, record, enforcement: OPS_ENFORCEMENT_PENDING }, {
+            headers: withSecurityHeaders({ "cache-control": "no-store" }),
+          });
+        }
+        if (isKillswitch) {
+          const change = parseKillswitchPost(put);
+          if (!change) {
+            return new Response("invalid ops change", { status: 400, headers: withSecurityHeaders() });
+          }
+          const record = await ops.postKillswitch(change);
+          console.log(JSON.stringify({ event: "ops_kill_switch", epoch: record.epoch, actor: record.actor }));
+          return Response.json({ deploymentId: id, record, enforcement: OPS_ENFORCEMENT_PENDING }, {
+            headers: withSecurityHeaders({ "cache-control": "no-store" }),
+          });
+        }
+        const rows = await ops.listAudit();
+        return Response.json({ deploymentId: id, rows }, {
+          headers: withSecurityHeaders({ "cache-control": "no-store" }),
+        });
+      });
+    } catch (error) {
+      if (error instanceof OwnershipRefused) return refused(error);
+      return opsRefused(error);
+    }
   }
 
   // SDK 0.3.7 containerFetch auto-starts via startAndWaitForPorts, NOT start.
@@ -1001,6 +1118,19 @@ export default {
           return env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
         },
       );
+    }
+
+    // Admin control surface (TOG-22862). The gate authenticates, enforces the
+    // write switches and rate-caps guessing; the fenced DO owns state below.
+    // CONTROL_PATH keeps its own gate and shares nothing here.
+    if (url.pathname === OPS_CONFIG_PATH || url.pathname === OPS_KILLSWITCH_PATH || url.pathname === OPS_AUDIT_PATH) {
+      const gate = await gateOpsRequest(request, env);
+      if (gate) return gate;
+      try {
+        const forwarded = new Request(request);
+        forwarded.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
+        return await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(forwarded);
+      } catch (error) { return refused(error); }
     }
 
     if (url.pathname === "/health" || url.pathname === "/readyz") {
