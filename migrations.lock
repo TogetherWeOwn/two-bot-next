@@ -336,6 +336,10 @@
     "crates/cutover/migrations/0426_community_facts_guild_source.sql": {
       "sha256": "9da078d3f29430320b79d2d82cfa6e4b1d2d557384a98d7dddca97783429d2dd",
       "justification": "RSVP check-in capacity count index: cover (guild_id, source) so record_checkin counts the occurrence without scanning the guild message history while holding the occurrence lock."
+    },
+    "crates/cutover/migrations/0427_retention_queues.sql": {
+      "sha256": "f6a0051c79a461da70a8d3736c20e50a4a5691f95ac093a6449e694514a322e3",
+      "justification": "Retention rolling-window queues: guild-purge queue and user-deletion request ledger backing 30-day raw and 45-day audit roll-off with under-72-hour deletion receipts; additive, backout drops both tables."
     }
   }
 }
