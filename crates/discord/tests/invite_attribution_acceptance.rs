@@ -74,6 +74,9 @@ fn snap(code: &str, uses: u64, inviter: Option<Snowflake>) -> InviteState {
         uses,
         inviter_id: inviter,
         channel_id: Some(CH_TEXT),
+        // Assertion-neutral (module docs): scripted counters carry no cap.
+        max_uses: 0,
+        temporary: false,
     }
 }
 

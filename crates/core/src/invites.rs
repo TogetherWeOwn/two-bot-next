@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::Snowflake;
+use crate::{EventType, FunnelEvent, Snowflake};
 
 /// One invite counter reading.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +21,12 @@ pub struct InviteState {
     pub uses: u64,
     pub inviter_id: Option<Snowflake>,
     pub channel_id: Option<Snowflake>,
+    /// Creation-time cap (`max_uses`; 0 = unlimited). Retained from the
+    /// `InviteCreate` witness so the seed baseline pins the code's terms;
+    /// attribution itself diffs only `uses`.
+    pub max_uses: u64,
+    /// Creation-time temporariness. Retained with `max_uses`, same reason.
+    pub temporary: bool,
 }
 
 /// How much each invite code was used between two counter readings.
@@ -154,6 +160,39 @@ pub fn summarize_attribution_split(rows: &[(&str, u64)]) -> AttributionSplit {
             AttributionCategory::Unknown => out.unknown += n,
             AttributionCategory::Other => {}
         }
+    }
+    out
+}
+
+/// Per-inviter referral counts over recorded join facts (referral-rewards
+/// seam): count `MemberJoin` rows by their `metadata["inviterId"]`.
+///
+/// Only singly-credited joins carry that key (`on_join` writes it exactly
+/// when `inviter_id` is `Some`), so `vanity`/`unknown`/`ambiguous` rows and
+/// non-join rows contribute nothing. An unparseable inviter id is ignored,
+/// never attributed.
+#[must_use]
+pub fn referral_counts(events: &[FunnelEvent]) -> HashMap<Snowflake, u64> {
+    let mut out: HashMap<Snowflake, u64> = HashMap::new();
+    for event in events {
+        if event.event_type != EventType::MemberJoin {
+            continue;
+        }
+        let Some(inviter) = event
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("inviterId"))
+            .and_then(|v| {
+                if let Some(s) = v.as_str() {
+                    s.parse::<Snowflake>().ok()
+                } else {
+                    v.as_u64()
+                }
+            })
+        else {
+            continue;
+        };
+        *out.entry(inviter).or_default() += 1;
     }
     out
 }
@@ -361,6 +400,9 @@ impl<S: InviteSnapshotStore> InviteTracker<S> {
     }
 
     /// Attribution string for a join, given the codes that grew.
+    ///
+    /// Multi-code growth files `ambiguous:a+b` with the codes SORTED, so the
+    /// filed string never depends on the snapshot read order.
     #[must_use]
     pub fn attribute(&self, grew: &[String], guild_has_vanity: bool) -> String {
         match grew {
@@ -368,6 +410,7 @@ impl<S: InviteSnapshotStore> InviteTracker<S> {
             [first, rest @ ..] => {
                 let mut codes = vec![first.as_str()];
                 codes.extend(rest.iter().map(String::as_str));
+                codes.sort_unstable();
                 format!("ambiguous:{}", codes.join("+"))
             }
             [] => {
@@ -443,6 +486,8 @@ mod tests {
             uses,
             inviter_id: Some(7),
             channel_id: None,
+            max_uses: 0,
+            temporary: false,
         }
     }
 

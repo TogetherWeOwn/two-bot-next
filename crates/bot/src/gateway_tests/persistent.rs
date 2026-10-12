@@ -11,6 +11,8 @@ fn invite(uses: u64) -> InviteState {
         uses,
         inviter_id: Some(9),
         channel_id: Some(8),
+        max_uses: 0,
+        temporary: false,
     }
 }
 

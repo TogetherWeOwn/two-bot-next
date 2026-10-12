@@ -1616,6 +1616,8 @@ impl InviteSource for HttpInvites {
                                 uses: i.uses?,
                                 inviter_id: i.inviter.map(|u| u.id.get()),
                                 channel_id: i.channel.map(|c| c.id.get()),
+                                max_uses: i.max_uses.unwrap_or(0),
+                                temporary: i.temporary.unwrap_or(false),
                             })
                         })
                         .collect::<Option<Vec<_>>>()

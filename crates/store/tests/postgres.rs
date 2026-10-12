@@ -375,6 +375,8 @@ async fn invite_snapshots_survive_reconstruction_and_delete_is_guild_scoped() {
         uses: 5,
         inviter_id: Some(789),
         channel_id: Some(321),
+        max_uses: 0,
+        temporary: false,
     };
     snapshots.store_all(123, &[invite.clone()]);
     snapshots.store_all(124, &[invite.clone()]);
@@ -389,6 +391,8 @@ async fn invite_snapshots_survive_reconstruction_and_delete_is_guild_scoped() {
             uses: 0,
             inviter_id: None,
             channel_id: None,
+            max_uses: 0,
+            temporary: false,
         },
     );
     assert_eq!(
@@ -513,6 +517,8 @@ async fn mock_gateway_join_records_funnel_and_persisted_attribution() {
         uses: 5,
         inviter_id: Some(789),
         channel_id: None,
+        max_uses: 0,
+        temporary: false,
     };
     pipeline.invite_source().push(123, vec![invite.clone()]);
     pipeline.prime_invite_snapshot(123);

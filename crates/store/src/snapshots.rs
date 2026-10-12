@@ -74,11 +74,18 @@ impl InviteSnapshotStore for PgInviteSnapshots {
         })
         .expect("invite snapshot load failed")
         .into_iter()
+        // `max_uses`/`temporary` are in-memory baseline pins for this slice:
+        // the `invite_snapshots` table carries no such columns yet, so a
+        // Postgres round-trip defaults them (a follow-up migration persists
+        // them if rewards/fraud ever reads the cap). Attribution diffs only
+        // `uses`, so the default loses nothing it diffs on.
         .map(|(code, uses, inviter_id, channel_id)| InviteState {
             code,
             uses: u64::try_from(uses).unwrap_or(0),
             inviter_id: inviter_id.and_then(|s| s.parse().ok()),
             channel_id: channel_id.and_then(|s| s.parse().ok()),
+            max_uses: 0,
+            temporary: false,
         })
         .collect()
     }
