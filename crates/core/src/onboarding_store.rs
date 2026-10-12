@@ -120,11 +120,16 @@ impl PromptGuard {
 
 /// Acquire the per-guild/member prompt lock, then re-check the legacy marker.
 /// `None` means another welcome already succeeded; do not post again.
+/// A suppressed (opted-out) pair also yields `None`: no welcome is sent and
+/// no per-user row is written for a member who opted out.
 pub async fn begin_prompt(
     pool: &Pool<Postgres>,
     guild_id: &str,
     member_id: &str,
 ) -> Result<Option<PromptGuard>, OnboardingStoreError> {
+    if crate::privacy::suppressed(pool, guild_id, member_id).await? {
+        return Ok(None);
+    }
     let mut transaction = pool.begin().await?;
     // Stable across processes, independent of Rust's randomized hash seed.
     // Hash collisions only serialize unrelated members; they never skip one.
@@ -160,6 +165,9 @@ pub async fn record_prompted(
 }
 
 /// Record granted game roles after the executor's role writes succeed.
+/// A suppressed (opted-out) pair records nothing and reports `false`: the
+/// Discord role effect itself is outside this store's scope, but no
+/// per-user row is persisted for it.
 pub async fn record_game_selected(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -167,14 +175,20 @@ pub async fn record_game_selected(
     keys: &[String],
     occurred_at: &str,
 ) -> Result<bool, OnboardingStoreError> {
+    let mut connection = pool.acquire().await?;
+    if crate::privacy::suppressed_in(&mut connection, guild_id, member_id).await? {
+        return Ok(false);
+    }
     Ok(insert_row(
-        &mut *pool.acquire().await?,
+        &mut connection,
         &game_selected_row(guild_id, member_id, keys, occurred_at),
     )
     .await?)
 }
 
 /// Record the destinations re-resolved after successful role writes.
+/// A suppressed (opted-out) pair records nothing and reports `false` (see
+/// [`record_game_selected`]).
 pub async fn record_channel_routed(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -182,8 +196,12 @@ pub async fn record_channel_routed(
     selection: &GameSelection,
     occurred_at: &str,
 ) -> Result<bool, OnboardingStoreError> {
+    let mut connection = pool.acquire().await?;
+    if crate::privacy::suppressed_in(&mut connection, guild_id, member_id).await? {
+        return Ok(false);
+    }
     Ok(insert_row(
-        &mut *pool.acquire().await?,
+        &mut connection,
         &channel_routed_row(
             guild_id,
             member_id,
@@ -208,6 +226,11 @@ pub async fn record_game_selection_in_transaction(
     selection: &GameSelection,
     occurred_at: &str,
 ) -> Result<(), OnboardingStoreError> {
+    // Suppressed pairs persist nothing, even inside the caller's role-write
+    // transaction (see [`record_game_selected`]).
+    if crate::privacy::suppressed_in(transaction, guild_id, member_id).await? {
+        return Ok(());
+    }
     insert_row(
         transaction,
         &game_selected_row(guild_id, member_id, keys, occurred_at),
@@ -238,6 +261,9 @@ pub async fn record_session_routed_in_transaction(
     plan: &SessionPlan,
     occurred_at: &str,
 ) -> Result<bool, OnboardingStoreError> {
+    if crate::privacy::suppressed_in(transaction, guild_id, member_id).await? {
+        return Ok(false);
+    }
     Ok(insert_row(
         transaction,
         &session_routed_row(guild_id, member_id, plan, occurred_at),
@@ -246,6 +272,8 @@ pub async fn record_session_routed_in_transaction(
 }
 
 /// Record roleless session routing; repeated picks at new timestamps count.
+/// A suppressed (opted-out) pair records nothing and reports `false` (see
+/// [`record_game_selected`]).
 pub async fn record_session_routed(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -253,8 +281,12 @@ pub async fn record_session_routed(
     plan: &SessionPlan,
     occurred_at: &str,
 ) -> Result<bool, OnboardingStoreError> {
+    let mut connection = pool.acquire().await?;
+    if crate::privacy::suppressed_in(&mut connection, guild_id, member_id).await? {
+        return Ok(false);
+    }
     Ok(insert_row(
-        &mut *pool.acquire().await?,
+        &mut connection,
         &session_routed_row(guild_id, member_id, plan, occurred_at),
     )
     .await?)

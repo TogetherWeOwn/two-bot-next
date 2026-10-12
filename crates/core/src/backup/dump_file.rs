@@ -73,6 +73,12 @@ pub const DUMP_TABLES: &[&str] = &[
     "automod_delivery_claims",
     "gateway_boot_directives",
     "member_erasure_audit",
+    // Opt-out control plane (0427/0428): suppression tombstones must survive
+    // backup/restore, or a restore would silently resume per-user persistence
+    // members refused. No foreign keys, so order is free.
+    "privacy_opt_outs",
+    "guild_analytics_settings",
+    "privacy_opt_out_audit",
     "member_levels",
     "xp_awards",
     "level_role_rewards",

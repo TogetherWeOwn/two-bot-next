@@ -91,7 +91,21 @@ impl InviteSnapshotStore for PgInviteSnapshots {
         let stamp = snapshot_stamp();
         self.block_on(async {
             let mut tx = self.pool.begin().await?;
+            // Suppressed inviters keep the aggregate `uses` count but lose
+            // the per-user attribution; the set is fetched once for the batch.
+            let suppressed: std::collections::HashSet<String> = sqlx::query_scalar(
+                "SELECT member_id FROM privacy_opt_outs WHERE guild_id = $1",
+            )
+            .bind(&guild_id)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .collect();
             for s in states {
+                let inviter = s
+                    .inviter_id
+                    .map(|id| id.to_string())
+                    .filter(|id| !suppressed.contains(id.as_str()));
                 sqlx::query(
                     "INSERT INTO invite_snapshots (guild_id, code, uses, inviter_id, channel_id, updated_at)
                      VALUES ($1, $2, $3, $4, $5, $6::timestamptz)
@@ -102,7 +116,7 @@ impl InviteSnapshotStore for PgInviteSnapshots {
                 .bind(&guild_id)
                 .bind(&s.code)
                 .bind(i32::try_from(s.uses).expect("invite uses exceeds Postgres INTEGER range"))
-                .bind(s.inviter_id.map(|id| id.to_string()))
+                .bind(inviter)
                 .bind(s.channel_id.map(|id| id.to_string()))
                 .bind(&stamp)
                 .execute(&mut *tx)

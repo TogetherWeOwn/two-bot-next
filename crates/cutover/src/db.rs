@@ -308,12 +308,28 @@ fn idempotency_key(e: &FunnelWrite) -> String {
 
 /// Insert-first arbitration: the unique index decides the winner atomically,
 /// then the members projection is applied for the winner only.
+///
+/// The privacy gate runs first, inside the same transaction: a suppressed
+/// `(guild_id, member_id)` pair or a guild-disabled analytics family drops
+/// the write as `(false, None)` with no event row and no members projection.
+/// Anonymous writes (`member_id = None`) are never gated.
 pub async fn record_event(
     db: &CutoverDb,
     e: &FunnelWrite,
 ) -> Result<(bool, Option<i64>), sqlx::Error> {
     let key = idempotency_key(e);
     let mut tx = db.pool.begin().await?;
+    if two_bot_core::privacy::ingestion_blocked_in(
+        &mut tx,
+        &e.guild_id,
+        e.member_id.as_deref(),
+        &e.event_type,
+    )
+    .await?
+    {
+        tx.rollback().await?;
+        return Ok((false, None));
+    }
     let inserted: Option<(i64,)> = sqlx::query_as(
         "INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
          VALUES ($1, $2, $3, $4::timestamptz, $5, $6, $7)
@@ -447,13 +463,17 @@ pub(crate) async fn advance_activity(
 }
 
 /// Bump activity without emitting an event; forward-only (legacy
-/// `touchActivity`).
+/// `touchActivity`). A suppressed pair is a no-op: the bump would create or
+/// refresh a per-user `members` row for a member who opted out.
 pub async fn touch_activity(
     db: &CutoverDb,
     guild_id: &str,
     member_id: &str,
     at: &str,
 ) -> Result<(), sqlx::Error> {
+    if two_bot_core::privacy::suppressed(db.pool(), guild_id, member_id).await? {
+        return Ok(());
+    }
     sqlx::query(
         "INSERT INTO members (guild_id, member_id, last_active_at) VALUES ($1, $2, $3::timestamptz)
          ON CONFLICT (guild_id, member_id) DO UPDATE SET last_active_at = excluded.last_active_at
@@ -467,8 +487,13 @@ pub async fn touch_activity(
     Ok(())
 }
 
-/// Mark a member row as a bot (legacy `markBot`).
+/// Mark a member row as a bot (legacy `markBot`). A suppressed pair is a
+/// no-op: the flag write would create a per-user `members` row for a member
+/// who opted out.
 pub async fn mark_bot(db: &CutoverDb, guild_id: &str, member_id: &str) -> Result<(), sqlx::Error> {
+    if two_bot_core::privacy::suppressed(db.pool(), guild_id, member_id).await? {
+        return Ok(());
+    }
     sqlx::query(
         "INSERT INTO members (guild_id, member_id, is_bot) VALUES ($1, $2, TRUE)
          ON CONFLICT (guild_id, member_id) DO UPDATE SET is_bot = TRUE",
@@ -487,6 +512,19 @@ pub async fn record_earliest(
     db: &CutoverDb,
     e: &FunnelWrite,
 ) -> Result<(bool, Option<i64>), sqlx::Error> {
+    // Gate before the insert AND before the pull-back below: for a
+    // suppressed pair or a disabled family even reconfirming an existing row
+    // would refresh per-user state, so the whole call is a no-op.
+    if two_bot_core::privacy::ingestion_blocked(
+        db.pool(),
+        &e.guild_id,
+        e.member_id.as_deref(),
+        &e.event_type,
+    )
+    .await?
+    {
+        return Ok((false, None));
+    }
     let (inserted, id) = record_event(db, e).await?;
     if inserted {
         return Ok((true, id));
@@ -728,6 +766,10 @@ mod message_scan_write_tests {
         let db = CutoverDb { pool };
         let result = async {
             sqlx::raw_sql(include_str!("../migrations/0001_funnel.sql"))
+                .execute(db.pool())
+                .await?;
+            // The ladder writer consults the opt-out suppression table.
+            sqlx::raw_sql(include_str!("../migrations/0427_privacy_opt_out.sql"))
                 .execute(db.pool())
                 .await?;
             let member = "100000000000000001";

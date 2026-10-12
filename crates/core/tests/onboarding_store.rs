@@ -14,6 +14,8 @@ const AT: &str = "2026-08-24T00:00:00.000Z";
 const LATER: &str = "2026-08-25T00:00:00.000Z";
 const BASE: &str = include_str!("../../cutover/migrations/0001_funnel.sql");
 const MIGRATION: &str = include_str!("../../cutover/migrations/0190_onboarding.sql");
+// The onboarding writers consult the opt-out suppression table.
+const PRIVACY: &str = include_str!("../../cutover/migrations/0427_privacy_opt_out.sql");
 
 async fn isolated_pool(schema: &str) -> PgPool {
     assert!(schema
@@ -81,6 +83,7 @@ async fn onboarding_migration_store_and_mock_delivery() {
         sqlx::raw_sql(BASE).execute(pool).await.unwrap();
         sqlx::raw_sql(MIGRATION).execute(pool).await.unwrap();
         sqlx::raw_sql(MIGRATION).execute(pool).await.unwrap();
+        sqlx::raw_sql(PRIVACY).execute(pool).await.unwrap();
         let (constraint_count,): (i64,) = sqlx::query_as(
             "SELECT count(*) FROM pg_constraint WHERE conrelid = 'events'::regclass
              AND conname = 'chk_events_onboarding_vocabulary'",

@@ -3,11 +3,14 @@
 //!
 //! sqlx 0.9 transaction executor: <https://docs.rs/sqlx/0.9.0/sqlx/struct.Transaction.html>
 
+use std::collections::HashSet;
+
 use sqlx::{PgConnection, PgPool};
 use two_bot_core::gateway_funnel::{FunnelBatch, SnapshotWrite};
 use two_bot_core::gateway_session::{
     dispatch_action, BootDirective, DispatchAction, GatewaySession,
 };
+use two_bot_core::privacy::{category_of_event, AnalyticsCategory};
 use two_bot_core::{format_iso_millis, idempotency_key, FunnelEvent};
 
 use crate::db::{project_event, FunnelWrite};
@@ -234,11 +237,40 @@ impl GatewaySessionStore {
         } else {
             None
         };
+        // Privacy gate, prefetched once for the whole batch: the suppressed
+        // member set plus the guild's analytics switches. A missing settings
+        // row means every category is enabled. Suppressed members drop every
+        // per-user write below; disabled families drop their events while
+        // other members' rows keep the aggregates counting.
+        let suppressed: HashSet<String> =
+            sqlx::query_scalar("SELECT member_id FROM privacy_opt_outs WHERE guild_id = $1")
+                .bind(&self.guild_id)
+                .fetch_all(&mut *tx)
+                .await?
+                .into_iter()
+                .collect();
+        let switches: Option<(bool, bool, bool)> = sqlx::query_as(
+            "SELECT presence_enabled, activity_enabled, voice_enabled
+             FROM guild_analytics_settings WHERE guild_id = $1",
+        )
+        .bind(&self.guild_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (presence_on, activity_on, voice_on) = switches.unwrap_or((true, true, true));
+        let family_off = |event_type: &str| match category_of_event(event_type) {
+            Some(AnalyticsCategory::Presence) => !presence_on,
+            Some(AnalyticsCategory::Activity) => !activity_on,
+            Some(AnalyticsCategory::Voice) => !voice_on,
+            None => false,
+        };
         for (guild_id, member_id) in batch.bots {
             if guild_id.to_string() != self.guild_id {
                 return Err(sqlx::Error::InvalidArgument(
                     "gateway bot belongs to another guild".into(),
                 ));
+            }
+            if suppressed.contains(&member_id.to_string()) {
+                continue;
             }
             sqlx::query(
                 "INSERT INTO members (guild_id, member_id, is_bot) VALUES ($1, $2, TRUE)
@@ -262,6 +294,12 @@ impl GatewaySessionStore {
             match snapshot {
                 SnapshotWrite::StoreAll(_, states) => {
                     for state in states {
+                        // Suppressed inviters keep the aggregate `uses` count
+                        // but lose the per-user attribution.
+                        let inviter = state
+                            .inviter_id
+                            .map(|id| id.to_string())
+                            .filter(|id| !suppressed.contains(id.as_str()));
                         sqlx::query(
                             "INSERT INTO invite_snapshots (guild_id, code, uses, inviter_id, channel_id, updated_at)
                              VALUES ($1, $2, $3, $4, $5, to_timestamp($6::double precision / 1000))
@@ -269,7 +307,7 @@ impl GatewaySessionStore {
                              inviter_id = EXCLUDED.inviter_id, channel_id = EXCLUDED.channel_id, updated_at = EXCLUDED.updated_at",
                         ).bind(&self.guild_id).bind(state.code)
                             .bind(i32::try_from(state.uses).map_err(|e| sqlx::Error::Decode(Box::new(e)))?)
-                            .bind(state.inviter_id.map(|id| id.to_string()))
+                            .bind(inviter)
                             .bind(state.channel_id.map(|id| id.to_string()))
                             .bind(session.updated_at_ms).execute(&mut *tx).await?;
                     }
@@ -300,6 +338,14 @@ impl GatewaySessionStore {
                 source: event.source.clone(),
                 metadata,
             };
+            if write
+                .member_id
+                .as_deref()
+                .is_some_and(|member| suppressed.contains(member))
+                || family_off(&write.event_type)
+            {
+                continue;
+            }
             let inserted = sqlx::query(
                 "INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
                  VALUES ($1, $2, $3, $4::timestamptz, $5, $6, $7)
@@ -317,6 +363,9 @@ impl GatewaySessionStore {
                     "gateway activity belongs to another guild".into(),
                 ));
             }
+            if suppressed.contains(member_id.to_string().as_str()) {
+                continue;
+            }
             sqlx::query(
                 "INSERT INTO members (guild_id, member_id, last_active_at) VALUES ($1, $2, $3::timestamptz)
                  ON CONFLICT (guild_id, member_id) DO UPDATE SET last_active_at = EXCLUDED.last_active_at
@@ -333,6 +382,12 @@ impl GatewaySessionStore {
             for state in snapshot.states {
                 let uses =
                     i32::try_from(state.uses).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+                // Suppressed inviters keep the aggregate `uses` count but
+                // lose the per-user attribution.
+                let inviter = state
+                    .inviter_id
+                    .map(|id| id.to_string())
+                    .filter(|id| !suppressed.contains(id.as_str()));
                 sqlx::query(
                     "INSERT INTO invite_snapshots (guild_id, code, uses, inviter_id, channel_id, updated_at)
                      VALUES ($1, $2, $3, $4, $5, $6::timestamptz)
@@ -343,7 +398,7 @@ impl GatewaySessionStore {
                 .bind(&self.guild_id)
                 .bind(&state.code)
                 .bind(uses)
-                .bind(state.inviter_id.map(|id| id.to_string()))
+                .bind(inviter)
                 .bind(state.channel_id.map(|id| id.to_string()))
                 .bind(&snapshot.observed_at)
                 .execute(&mut *tx)

@@ -336,6 +336,14 @@
     "crates/cutover/migrations/0426_community_facts_guild_source.sql": {
       "sha256": "9da078d3f29430320b79d2d82cfa6e4b1d2d557384a98d7dddca97783429d2dd",
       "justification": "RSVP check-in capacity count index: cover (guild_id, source) so record_checkin counts the occurrence without scanning the guild message history while holding the occurrence lock."
+    },
+    "crates/cutover/migrations/0427_privacy_opt_out.sql": {
+      "sha256": "d5f452771a49f88bb16ef44d5119ca65df454a72ffe225e729bb079a64f9209b",
+      "justification": "Per-user opt-out suppression plus per-guild presence/activity/voice toggles plus one audit receipt row per purge; cutover chain copy, additive with IF NOT EXISTS."
+    },
+    "crates/store/migrations/0428_privacy_opt_out.sql": {
+      "sha256": "7a73f12f891b30d35f07198f0ff7ec8ce2ddf3a5e3f4cf3434ef87675852867b",
+      "justification": "Per-user opt-out suppression plus per-guild presence/activity/voice toggles plus one audit receipt row per purge; store chain copy, additive with IF NOT EXISTS."
     }
   }
 }

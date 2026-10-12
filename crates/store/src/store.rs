@@ -119,6 +119,20 @@ async fn record_async(
     let guild_id = snowflake_text(new_row.guild_id);
     let metadata = new_row.metadata.as_ref().map(|v| v.to_string());
     let mut tx = pool.begin().await?;
+    // Privacy gate, inside the write transaction: a suppressed pair or a
+    // guild-disabled analytics family drops the write (and any duplicate
+    // reconfirmation below) with no event row and no members projection.
+    if two_bot_core::privacy::ingestion_blocked_in(
+        &mut tx,
+        &guild_id,
+        member_id.as_deref(),
+        event.event_type.as_str(),
+    )
+    .await?
+    {
+        tx.rollback().await?;
+        return Ok(RecordOutcome { inserted: false });
+    }
     let inserted: Option<(i64,)> = sqlx::query_as(
         "INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
          VALUES ($1, $2, $3, $4::timestamptz, $5, $6, $7)
@@ -380,6 +394,17 @@ async fn advance_activity(
 impl FunnelStore for PgFunnelStore {
     fn mark_bot(&self, guild_id: Snowflake, member_id: Snowflake) {
         self.block_on(async {
+            // Suppressed pairs stay unwritten: the flag would create a
+            // per-user `members` row for a member who opted out.
+            if two_bot_core::privacy::suppressed(
+                &self.pool,
+                &snowflake_text(guild_id),
+                &snowflake_text(member_id),
+            )
+            .await?
+            {
+                return Ok::<(), sqlx::Error>(());
+            }
             sqlx::query(
                 "INSERT INTO members (guild_id, member_id, is_bot) VALUES ($1, $2, TRUE)
                  ON CONFLICT (guild_id, member_id) DO UPDATE SET is_bot = TRUE",
@@ -387,7 +412,8 @@ impl FunnelStore for PgFunnelStore {
             .bind(snowflake_text(guild_id))
             .bind(snowflake_text(member_id))
             .execute(&self.pool)
-            .await
+            .await?;
+            Ok::<(), sqlx::Error>(())
         })
         .expect("funnel mark_bot failed");
     }
@@ -412,6 +438,11 @@ impl FunnelStore for PgFunnelStore {
         let member_id = snowflake_text(member_id);
         let at = at.to_owned();
         self.block_on(async {
+            // Suppressed pairs stay untouched: the bump would create or
+            // refresh a per-user `members` row for a member who opted out.
+            if two_bot_core::privacy::suppressed(&self.pool, &guild_id, &member_id).await? {
+                return Ok::<(), sqlx::Error>(());
+            }
             sqlx::query(
                 "INSERT INTO members (guild_id, member_id, last_active_at) VALUES ($1, $2, $3::timestamptz)
                  ON CONFLICT (guild_id, member_id) DO UPDATE SET last_active_at = excluded.last_active_at
@@ -421,7 +452,8 @@ impl FunnelStore for PgFunnelStore {
             .bind(&member_id)
             .bind(&at)
             .execute(&self.pool)
-            .await
+            .await?;
+            Ok::<(), sqlx::Error>(())
         })
         .expect("funnel touch_activity failed");
     }
