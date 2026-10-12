@@ -136,9 +136,8 @@ impl ContainmentSettings {
 fn seconds_to_ms(seconds: f64) -> Option<i64> {
     // Upper bound is 2^63: the first f64 that no longer fits in an i64.
     let ms = seconds * 1000.0;
-    (1.0..9_223_372_036_854_775_808.0)
-        .contains(&ms)
-        .then_some(ms as i64)
+    let upper = (1_u64 << 63) as f64;
+    (1.0..upper).contains(&ms).then_some(ms as i64)
 }
 
 fn is_snowflake(value: &str) -> bool {
