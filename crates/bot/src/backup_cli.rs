@@ -280,84 +280,6 @@ pub async fn dispatch(args: &[String]) -> i32 {
 // backup
 // ---------------------------------------------------------------------------
 
-/// Finite budget for one external upload-helper invocation, shared by the
-/// `backup` and `guild-config-snapshot` paths. Thirty minutes fits the
-/// nightly timer window while still bounding a hung helper.
-const UPLOAD_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-
-/// Outcome of one bounded external upload-helper invocation. The failure
-/// lines built by [`upload_failure_message`] name only the program and the
-/// budget: argv (which may carry credentials) and the child's own output
-/// are never echoed.
-#[derive(Debug)]
-enum UploadOutcome {
-    Success,
-    ExitNonzero(std::process::ExitStatus),
-    SpawnFailed(String),
-    WaitFailed(String),
-    TimedOut,
-}
-
-/// Render the stderr line for a failed upload, or `None` on success.
-/// `scope` is the caller's fixed prefix (`backup`, `guild-config-snapshot`);
-/// `cmd` is the program name only, never the argument vector.
-fn upload_failure_message(
-    scope: &str,
-    cmd: &str,
-    outcome: &UploadOutcome,
-    budget: std::time::Duration,
-) -> Option<String> {
-    match outcome {
-        UploadOutcome::Success => None,
-        UploadOutcome::ExitNonzero(status) => {
-            Some(format!("{scope}: upload failed: {cmd} exited {status}"))
-        }
-        UploadOutcome::SpawnFailed(err) => {
-            Some(format!("{scope}: upload failed to start ({cmd}): {err}"))
-        }
-        UploadOutcome::WaitFailed(err) => {
-            Some(format!("{scope}: upload wait failed ({cmd}): {err}"))
-        }
-        UploadOutcome::TimedOut => Some(format!(
-            "{scope}: upload timed out after {budget:?}; terminated upload child ({cmd})"
-        )),
-    }
-}
-
-/// Run one external upload helper to completion within `deadline`.
-///
-/// On timeout the direct child this invocation spawned is terminated
-/// (`start_kill`) and reaped (`wait`) before returning [`UploadOutcome::TimedOut`],
-/// so no owned child outlives the call. The deadline covers that direct
-/// child only: a helper that detaches grandchildren is outside this
-/// guarantee (no process-group policy; killing by name or group would risk
-/// unrelated processes). Stdio is inherited, never captured, so remote
-/// output cannot leak through the returned outcome.
-async fn run_upload_command(
-    cmd: &str,
-    args: &[String],
-    deadline: std::time::Duration,
-) -> UploadOutcome {
-    let mut child = match tokio::process::Command::new(cmd)
-        .args(args)
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(err) => return UploadOutcome::SpawnFailed(err.to_string()),
-    };
-    match tokio::time::timeout(deadline, child.wait()).await {
-        Ok(Ok(status)) if status.success() => UploadOutcome::Success,
-        Ok(Ok(status)) => UploadOutcome::ExitNonzero(status),
-        Ok(Err(err)) => UploadOutcome::WaitFailed(err.to_string()),
-        Err(_) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            UploadOutcome::TimedOut
-        }
-    }
-}
-
 async fn cmd_backup() -> i32 {
     let url = match env_var("TWO_DATABASE_URL") {
         Some(url) if url.starts_with("postgres://") || url.starts_with("postgresql://") => url,
@@ -459,6 +381,10 @@ async fn cmd_backup() -> i32 {
         &out.to_string_lossy(),
     ) {
         Some((cmd, upload_args)) => {
+            // Bounded upload: the shared helper gives a hung helper a finite
+            // 30-minute budget, then terminates and reaps the direct child it
+            // spawned and fails the run without deleting the archive. Argv and
+            // child output are never echoed (see docs/backup.md).
             match run_upload_command(&cmd, &upload_args, UPLOAD_COMMAND_TIMEOUT).await {
                 UploadOutcome::Success => println!("backup: uploaded via {cmd}"),
                 outcome => {
@@ -865,6 +791,88 @@ async fn cmd_backup_upload(args: &[String]) -> i32 {
         Err(err) => {
             eprintln!("backup-upload-s3: PUT failed: {err}");
             1
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bounded command upload (shared by `backup` and `guild-config-snapshot`)
+// ---------------------------------------------------------------------------
+
+/// Finite budget for one external upload-helper invocation, shared by the
+/// `backup` and `guild-config-snapshot` paths. Thirty minutes fits the
+/// nightly timer window while still bounding a hung helper.
+const UPLOAD_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Outcome of one bounded external upload-helper invocation. The failure
+/// lines built by [`upload_failure_message`] name only the program and the
+/// budget: argv (which may carry credentials) and the child's own output
+/// are never echoed.
+#[derive(Debug)]
+enum UploadOutcome {
+    Success,
+    ExitNonzero(std::process::ExitStatus),
+    SpawnFailed(String),
+    WaitFailed(String),
+    TimedOut,
+}
+
+/// Render the stderr line for a failed upload, or `None` on success.
+/// `scope` is the caller's fixed prefix (`backup`, `guild-config-snapshot`);
+/// `cmd` is the program name only, never the argument vector.
+fn upload_failure_message(
+    scope: &str,
+    cmd: &str,
+    outcome: &UploadOutcome,
+    budget: std::time::Duration,
+) -> Option<String> {
+    match outcome {
+        UploadOutcome::Success => None,
+        UploadOutcome::ExitNonzero(status) => {
+            Some(format!("{scope}: upload failed: {cmd} exited {status}"))
+        }
+        UploadOutcome::SpawnFailed(err) => {
+            Some(format!("{scope}: upload failed to start ({cmd}): {err}"))
+        }
+        UploadOutcome::WaitFailed(err) => {
+            Some(format!("{scope}: upload wait failed ({cmd}): {err}"))
+        }
+        UploadOutcome::TimedOut => Some(format!(
+            "{scope}: upload timed out after {budget:?}; terminated upload child ({cmd})"
+        )),
+    }
+}
+
+/// Run one external upload helper to completion within `deadline`.
+///
+/// On timeout the direct child this invocation spawned is terminated
+/// (`start_kill`) and reaped (`wait`) before returning [`UploadOutcome::TimedOut`],
+/// so no owned child outlives the call. The deadline covers that direct
+/// child only: a helper that detaches grandchildren is outside this
+/// guarantee (no process-group policy; killing by name or group would risk
+/// unrelated processes). Stdio is inherited, never captured, so remote
+/// output cannot leak through the returned outcome.
+async fn run_upload_command(
+    cmd: &str,
+    args: &[String],
+    deadline: std::time::Duration,
+) -> UploadOutcome {
+    let mut child = match tokio::process::Command::new(cmd)
+        .args(args)
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => return UploadOutcome::SpawnFailed(err.to_string()),
+    };
+    match tokio::time::timeout(deadline, child.wait()).await {
+        Ok(Ok(status)) if status.success() => UploadOutcome::Success,
+        Ok(Ok(status)) => UploadOutcome::ExitNonzero(status),
+        Ok(Err(err)) => UploadOutcome::WaitFailed(err.to_string()),
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            UploadOutcome::TimedOut
         }
     }
 }
