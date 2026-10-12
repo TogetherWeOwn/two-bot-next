@@ -240,6 +240,11 @@ def section_rows(text: str, start_heading: str, end_heading: str) -> set:
     return rows
 
 
+def catalog_series_families(catalog: str) -> set:
+    """Tokenized `two_bot_` series families named anywhere in the catalog."""
+    return {HISTOGRAM_CHILD.sub("", n) for n in SERIES.findall(catalog)}
+
+
 class CatalogCompletenessTests(unittest.TestCase):
     def test_exemptions_carry_reasons(self):
         for name, table in [
@@ -255,11 +260,26 @@ class CatalogCompletenessTests(unittest.TestCase):
                         reason.strip(), f"{name}[{key}] needs a reason it stays out"
                     )
 
+    def test_exempt_keys_are_still_emitted(self):
+        emitted_series = emitted_series_families() | alert_input_series()
+        for name, stale in [
+            ("EXEMPT_SERIES", set(EXEMPT_SERIES) - emitted_series),
+            ("EXEMPT_JOB_LABELS", set(EXEMPT_JOB_LABELS) - job_labels()),
+            ("EXEMPT_RULES", set(EXEMPT_RULES) - rule_ids()),
+        ]:
+            with self.subTest(table=name):
+                self.assertEqual(
+                    stale,
+                    set(),
+                    f"{name} holds stale keys no longer emitted: {sorted(stale)}; "
+                    "remove them or fix the spelling",
+                )
+
     def test_emitted_series_families_are_cataloged_or_exempt(self):
-        catalog = CATALOG.read_text()
+        cataloged = catalog_series_families(CATALOG.read_text())
         for family in sorted(emitted_series_families()):
             with self.subTest(series=family):
-                covered = family in catalog
+                covered = family in cataloged
                 exempt = family in EXEMPT_SERIES
                 if exempt:
                     self.assertFalse(
@@ -275,10 +295,10 @@ class CatalogCompletenessTests(unittest.TestCase):
                     )
 
     def test_alert_input_series_are_cataloged_or_exempt(self):
-        catalog = CATALOG.read_text()
+        cataloged = catalog_series_families(CATALOG.read_text())
         for family in sorted(alert_input_series()):
             with self.subTest(series=family):
-                covered = family in catalog
+                covered = family in cataloged
                 exempt = family in EXEMPT_SERIES
                 if exempt:
                     self.assertFalse(
