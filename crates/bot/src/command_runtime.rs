@@ -88,6 +88,9 @@ use two_bot_discord::{
 };
 
 use crate::activation::BootActivation;
+use crate::db_log::{
+    channel_response_class, db_class, discord_class, feed_store_class, leveling_class,
+};
 use crate::interaction_admission::{
     accepts_busy_reply, is_privileged, UserSlots, BUSY_REPLY, PER_USER_IN_FLIGHT,
 };
@@ -402,7 +405,7 @@ impl CommandRuntime {
         let features = match FeatureGates::from_env() {
             Ok(features) => features,
             Err(err) => {
-                warn!(error = %err, "feature gates invalid; command runtime disabled");
+                warn!(reason = %err, "feature gates invalid; command runtime disabled");
                 return None;
             }
         };
@@ -414,7 +417,7 @@ impl CommandRuntime {
                 match ModerationGates::from_env() {
                     Ok(moderation) => moderation,
                     Err(err) => {
-                        warn!(error = %err, "moderation gates invalid; command runtime disabled");
+                        warn!(reason = %err, "moderation gates invalid; command runtime disabled");
                         return None;
                     }
                 }
@@ -448,14 +451,14 @@ impl CommandRuntime {
             match two_bot_core::send_admission::PgSendAdmission::new(pool.clone(), token) {
                 Ok(admission) => Arc::new(admission),
                 Err(err) => {
-                    warn!(error = %err, "send admission invalid; command runtime disabled");
+                    warn!(reason = %err, "send admission invalid; command runtime disabled");
                     return None;
                 }
             };
         let executor = match ActionExecutor::with_admission(token.to_owned(), proxy, admission) {
             Ok(executor) => executor,
             Err(err) => {
-                warn!(error = %err, "REST executor failed to build; command runtime disabled");
+                warn!(reason = %err, "REST executor failed to build; command runtime disabled");
                 return None;
             }
         };
@@ -800,7 +803,11 @@ impl CommandRuntime {
                 .answer_interaction(target.interaction_id, &target.token, &ephemeral(BUSY_REPLY))
                 .await
             {
-                warn!(interaction_id = target.interaction_id.to_string(), %error, "busy reply failed");
+                warn!(
+                    interaction_id = target.interaction_id.to_string(),
+                    reason = discord_class(&error),
+                    "busy reply failed"
+                );
             }
         });
     }
@@ -1255,7 +1262,7 @@ impl CommandRuntime {
                 .respond(&self.interactions.router, interaction)
                 .await
             {
-                warn!(interaction_id = %interaction.id.get(), error = %error, "channel response failed; no effect retry");
+                warn!(interaction_id = %interaction.id.get(), reason = channel_response_class(&error), "channel response failed; no effect retry");
             }
             return;
         }
@@ -1349,7 +1356,7 @@ impl CommandRuntime {
             // Leveling owns its immediate rank-ephemeral/leaderboard-public
             // callback. Never send the generic ephemeral defer as well.
             if let Err(error) = self.leveling.handle_interaction(interaction, handler).await {
-                warn!(interaction_id = %interaction.id.get(), command = %name, error = %error, "leveling interaction failed");
+                warn!(interaction_id = %interaction.id.get(), command = %name, reason = leveling_class(&error), "leveling interaction failed");
             }
             return;
         }
@@ -1527,7 +1534,10 @@ impl CommandRuntime {
         let state = match store::get_sticky(&self.pool, &guild_id, &channel_id).await {
             Ok(state) => state,
             Err(err) => {
-                warn!(error = %err, "sticky lookup failed; skipping activity");
+                warn!(
+                    reason = db_class(&err),
+                    "sticky lookup failed; skipping activity"
+                );
                 return ActivityOutcome::None;
             }
         };
@@ -1547,7 +1557,10 @@ impl CommandRuntime {
             {
                 Ok(grant) => grant,
                 Err(err) => {
-                    warn!(error = %err, "sticky claim failed; skipping activity");
+                    warn!(
+                        reason = db_class(&err),
+                        "sticky claim failed; skipping activity"
+                    );
                     return ActivityOutcome::None;
                 }
             })
@@ -1603,7 +1616,10 @@ impl CommandRuntime {
                         // Record failed — the post may be live but unrecorded,
                         // so roll back what we can: release our claim and
                         // delete the orphan, then audit post_failed.
-                        warn!(error = %err, "sticky record failed; rolling back");
+                        warn!(
+                            reason = db_class(&err),
+                            "sticky record failed; rolling back"
+                        );
                         self.release(&guild_id, &channel_id, &claim_token).await;
                         self.delete_quiet(&channel_id, &message_id, ORPHAN_REASON)
                             .await;
@@ -1726,7 +1742,7 @@ impl CommandRuntime {
                 self.finish(interaction, reply).await;
             }
             Err(err) => {
-                warn!(error = %err, "sticky put failed");
+                warn!(reason = db_class(&err), "sticky put failed");
                 self.finish(interaction, STORE_FAILURE_REPLY).await;
             }
         }
@@ -1774,7 +1790,7 @@ impl CommandRuntime {
                 self.finish(interaction, sticky_removed_reply(false)).await;
             }
             Err(err) => {
-                warn!(error = %err, "sticky delete failed");
+                warn!(reason = db_class(&err), "sticky delete failed");
                 self.finish(interaction, STORE_FAILURE_REPLY).await;
             }
         }
@@ -1814,7 +1830,7 @@ impl CommandRuntime {
                     if let two_bot_core::feeds_store::FeedStoreError::Capacity(quota) = err {
                         self.finish(interaction, quota.to_string()).await;
                     } else {
-                        warn!(error = %err, "feed insert failed");
+                        warn!(reason = feed_store_class(&err), "feed insert failed");
                         self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
                     }
                     return;
@@ -1858,7 +1874,7 @@ impl CommandRuntime {
                         self.finish(interaction, feed_removed_text(removed)).await;
                     }
                     Err(err) => {
-                        warn!(error = %err, "feed remove failed");
+                        warn!(reason = feed_store_class(&err), "feed remove failed");
                         self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
                     }
                 }
@@ -1882,7 +1898,7 @@ impl CommandRuntime {
                 match list_feeds(&self.pool, &guild_id, false).await {
                     Ok(feeds) => self.finish(interaction, feed_list_text(&feeds)).await,
                     Err(err) => {
-                        warn!(error = %err, "feed list failed");
+                        warn!(reason = feed_store_class(&err), "feed list failed");
                         self.finish(interaction, FEED_STORE_FAILURE_REPLY).await;
                     }
                 }
@@ -1927,7 +1943,12 @@ impl CommandRuntime {
             now_ms: now_millis_for_test(),
         };
         if let Err(err) = write_audit(&self.pool, &row).await {
-            warn!(action, outcome, error = %err, "feed audit write failed");
+            warn!(
+                action,
+                outcome,
+                reason = feed_store_class(&err),
+                "feed audit write failed"
+            );
         }
     }
 
@@ -1951,7 +1972,7 @@ impl CommandRuntime {
         {
             Ok(()) => true,
             Err(err) => {
-                warn!(interaction_id = %interaction.id.get(), command, error = %err, "command defer failed");
+                warn!(interaction_id = %interaction.id.get(), command, reason = discord_class(&err), "command defer failed");
                 false
             }
         }
@@ -1967,7 +1988,7 @@ impl CommandRuntime {
             )
             .await
         {
-            warn!(interaction_id = %interaction.id.get(), error = %err, "sticky reply failed");
+            warn!(interaction_id = %interaction.id.get(), reason = discord_class(&err), "sticky reply failed");
         }
     }
 
@@ -1982,7 +2003,7 @@ impl CommandRuntime {
             )
             .await
         {
-            warn!(interaction_id = %interaction.id.get(), error = %err, "sticky reply edit failed");
+            warn!(interaction_id = %interaction.id.get(), reason = discord_class(&err), "sticky reply edit failed");
         }
     }
 
@@ -1994,7 +2015,10 @@ impl CommandRuntime {
             .delete_message(channel_id, message_id, reason)
             .await
         {
-            warn!(error = %err, "sticky cleanup delete failed; continuing");
+            warn!(
+                reason = discord_class(&err),
+                "sticky cleanup delete failed; continuing"
+            );
         }
     }
 
@@ -2003,7 +2027,10 @@ impl CommandRuntime {
         if let Err(err) =
             store::release_sticky_post(&self.pool, guild_id, channel_id, claim_token).await
         {
-            warn!(error = %err, "sticky claim release failed; expiry will clear it");
+            warn!(
+                reason = db_class(&err),
+                "sticky claim release failed; expiry will clear it"
+            );
         }
     }
 
@@ -2029,7 +2056,12 @@ impl CommandRuntime {
             at_ms: now_millis_for_test(),
         };
         if let Err(err) = store::audit_sticky(&self.pool, &row).await {
-            warn!(action = action.as_str(), outcome = outcome.as_str(), error = %err, "sticky audit write failed");
+            warn!(
+                action = action.as_str(),
+                outcome = outcome.as_str(),
+                reason = db_class(&err),
+                "sticky audit write failed"
+            );
         }
     }
 }

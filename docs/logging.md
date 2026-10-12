@@ -130,7 +130,14 @@ binding names, allowlisted identifiers, counts, status codes, and bounded reason
 Do not add `%error`/`?error` for SQL/HTTP/provider failures: their display/debug
 chains can contain URLs. HTTP tracing records only the method and an allowlisted path. Existing settings
 reports log only catalog-approved hot-key values; never add env-only/secret values
-to those reports. Database URL query keys are validated before SQLx parses them:
+to those reports. The command surface classifies database and Discord failures with
+`crates/bot/src/db_log.rs`, logged under `reason`: `db_class` yields
+`unique_violation`, `foreign_key_violation`, `not_null_violation`,
+`check_violation`, `exclusion_violation`, `database` (any other server error),
+`pool_timeout`, `pool_closed`, `worker_crashed`, `connection`, `row_not_found` or
+`query`; `discord_class` yields the `DiscordError::cause` vocabulary plus
+`admission_storage_unavailable`, `admission_configuration_invalid` and
+`admission_stale_claim`. `scripts/ci/test_db_error_lints.py` enforces it. Database URL query keys are validated before SQLx parses them:
 unsupported keys (including `sslpassword`) are rejected without logging keys or
 values. Parse-scoped passfile diagnostics are suppressed by the existing core
 `database_url` helper; do not bypass that helper with direct SQLx URL parsing.

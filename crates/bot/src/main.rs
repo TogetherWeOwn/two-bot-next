@@ -26,6 +26,7 @@ mod containment_runtime;
 #[cfg(test)]
 mod containment_runtime_tests;
 mod database_roles_cli;
+mod db_log;
 #[cfg(test)]
 #[allow(dead_code)]
 #[path = "../../discord/tests/common/mod.rs"]
@@ -156,7 +157,7 @@ async fn run(cli_args: &[String]) {
             );
             std::process::exit(1);
         }
-        tracing::warn!(msg = "config_invalid", error = %err, "config invalid; continuing with safe defaults");
+        tracing::warn!(msg = "config_invalid", reason = %err, "config invalid; continuing with safe defaults");
         Config {
             discord_token: None,
             database_url: None,
@@ -217,7 +218,7 @@ async fn run(cli_args: &[String]) {
     // no-op and preserves existing server behavior.
     if let Ok((token, _, guild_id)) = gateway_prerequisites(&config) {
         if let Err(error) = commands_cli::publish_on_boot(token, guild_id).await {
-            tracing::error!(error = %error, "boot command registry synchronization failed");
+            tracing::error!(reason = %error, "boot command registry synchronization failed");
             std::process::exit(1);
         }
     }
@@ -685,7 +686,7 @@ fn build_interaction_runtime(
     let features = match two_bot_core::FeatureGates::from_env() {
         Ok(features) => features,
         Err(err) => {
-            tracing::warn!(error = %err, "feature gates invalid; ordered interaction surface parked");
+            tracing::warn!(reason = %err, "feature gates invalid; ordered interaction surface parked");
             return None;
         }
     };
@@ -696,7 +697,7 @@ fn build_interaction_runtime(
         match two_bot_core::ModerationGates::from_env() {
             Ok(moderation) => moderation,
             Err(err) => {
-                tracing::warn!(error = %err, "moderation gates invalid; ordered interaction surface parked");
+                tracing::warn!(reason = %err, "moderation gates invalid; ordered interaction surface parked");
                 return None;
             }
         }
