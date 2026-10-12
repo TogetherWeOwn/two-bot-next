@@ -1704,7 +1704,7 @@ mod tests {
         assert_eq!(names, expected);
         assert_eq!(
             contents.manifest.missing_tables(),
-            ["voice_create_reservations"]
+            ["voice_create_reservations", "event_store"]
         );
         assert_eq!(contents.buffers["voice_rooms"][0]["channel_id"], "500");
         let mut manifest = serde_json::to_value(&contents.manifest).unwrap();
