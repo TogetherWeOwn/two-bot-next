@@ -3504,7 +3504,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 overwrites.iter().any(|overwrite| {
                     overwrite.kind == PermissionOverwriteType::Member
                         && overwrite.id.get() == owner_id
-                        && overwrite.allow.intersects(owner_mask)
+                        && overwrite.allow.contains(owner_mask & !overwrite.deny)
                 })
             });
         if !granted {

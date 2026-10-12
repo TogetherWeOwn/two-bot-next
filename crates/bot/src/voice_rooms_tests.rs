@@ -2082,7 +2082,16 @@ fn owner_overwrite_delta_orders_trimmed_grants_before_the_incoming_owner() {
 async fn denied_incoming_grant_after_successful_revoke_remains_owed_without_access() {
     let (live, store, http, _) = owned_room();
     let mut room_channel = channel(500, 2, Some(CATEGORY));
-    room_channel.permission_overwrites = Some(vec![owner_overwrite(MEMBER)]);
+    // The incoming owner joined through an approved join request, so they
+    // already hold a Connect-only overwrite (Connect is an owner bit).
+    // Partial bits must not count as a completed grant.
+    let connect_only_joiner = PermissionOverwrite {
+        id: Id::new(301),
+        kind: PermissionOverwriteType::Member,
+        allow: Permissions::CONNECT,
+        deny: Permissions::empty(),
+    };
+    room_channel.permission_overwrites = Some(vec![owner_overwrite(MEMBER), connect_only_joiner]);
     live.upsert_channel(room_channel);
     http.put_overwrite_errors
         .lock()
@@ -2111,23 +2120,32 @@ async fn denied_incoming_grant_after_successful_revoke_remains_owed_without_acce
     assert!(worker.grants_owed.lock().unwrap().contains(&500));
     let state = live.inner.read().unwrap();
     let overwrites = state.channels[&500].permission_overwrites.as_ref().unwrap();
+    let owner_mask = Permissions::from_bits_retain(OWNER_ALLOW_BITS);
     assert!(!overwrites
         .iter()
         .any(|overwrite| overwrite.id.get() == MEMBER
-            && overwrite
-                .allow
-                .intersects(Permissions::from_bits_retain(OWNER_ALLOW_BITS))));
+            && overwrite.allow.contains(owner_mask & !overwrite.deny)));
+    // The incoming owner still holds only Connect: partial bits are not a grant.
     assert!(!overwrites.iter().any(|overwrite| overwrite.id.get() == 301
-        && overwrite
-            .allow
-            .intersects(Permissions::from_bits_retain(OWNER_ALLOW_BITS))));
+        && overwrite.allow.contains(owner_mask & !overwrite.deny)));
+    assert!(overwrites.iter().any(
+        |overwrite| overwrite.id.get() == 301 && overwrite.allow.contains(Permissions::CONNECT)
+    ));
 }
 
 #[tokio::test]
 async fn transient_grant_failure_after_revoke_remains_owed_without_access() {
     let (live, store, http, _) = owned_room();
     let mut room_channel = channel(500, 2, Some(CATEGORY));
-    room_channel.permission_overwrites = Some(vec![owner_overwrite(MEMBER)]);
+    // Same Connect-only joiner setup as the 403 case: partial bits must not
+    // count as a completed grant.
+    let connect_only_joiner = PermissionOverwrite {
+        id: Id::new(301),
+        kind: PermissionOverwriteType::Member,
+        allow: Permissions::CONNECT,
+        deny: Permissions::empty(),
+    };
+    room_channel.permission_overwrites = Some(vec![owner_overwrite(MEMBER), connect_only_joiner]);
     live.upsert_channel(room_channel);
     // The former owner's revoke succeeds; the incoming owner's PUT hits a
     // transient failure, not a 403.
@@ -2156,6 +2174,18 @@ async fn transient_grant_failure_after_revoke_remains_owed_without_access() {
         "a half-applied handoff must not close the journal without the grant"
     );
     assert!(worker.grants_owed.lock().unwrap().contains(&500));
+    let state = live.inner.read().unwrap();
+    let overwrites = state.channels[&500].permission_overwrites.as_ref().unwrap();
+    let owner_mask = Permissions::from_bits_retain(OWNER_ALLOW_BITS);
+    assert!(!overwrites
+        .iter()
+        .any(|overwrite| overwrite.id.get() == MEMBER
+            && overwrite.allow.contains(owner_mask & !overwrite.deny)));
+    assert!(!overwrites.iter().any(|overwrite| overwrite.id.get() == 301
+        && overwrite.allow.contains(owner_mask & !overwrite.deny)));
+    assert!(overwrites.iter().any(
+        |overwrite| overwrite.id.get() == 301 && overwrite.allow.contains(Permissions::CONNECT)
+    ));
 }
 
 #[tokio::test]
