@@ -104,7 +104,7 @@ Scalar gateway series pair with the labels above:
 | `two_bot_gateway_missed_events_total` | Sequence gaps inside one session; any nonzero increase fails the zero-missed-events acceptance |
 | `two_bot_gateway_latency_seconds` | Last heartbeat ACK round-trip; `NaN` until measured |
 | `two_bot_gateway_prefix_trigger_refused_total{reason="verdict"}` | In-scope prefix candidates refused by the automod verdict; the worker records candidates even when its capture-only gate prevents detached dispatch. Unmatched content, scope mismatches, bot/webhook messages and disabled text-command gates never increment it |
-| `two_bot_presence_capture_total{outcome}` | Presence-update capture decisions on the hot path (`crates/core/src/metrics.rs` `presence_capture`); `outcome` is `inserted` (first delivery stored a row), `duplicate` (resume redelivery absorbed by the dedup key) or `rejected` (refused before the insert) |
+| `two_bot_presence_capture_total{outcome}` | Presence-update capture decisions on the hot path; `outcome` is `inserted` (first delivery stored a row), `duplicate` (resume redelivery absorbed by the dedup key) or `rejected` (refused before the insert) |
 
 ## Scheduled job labels
 
