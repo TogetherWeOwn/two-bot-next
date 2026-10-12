@@ -590,12 +590,25 @@ impl HyperTransport {
             response.headers(),
             !is_interaction_token_request(request),
         );
+        // Learn per-route bucket state from this response's `X-RateLimit-*`
+        // headers before the body is read: the next admission gates on it.
+        self.guard
+            .observe_bucket(request.path(), response.headers());
         attempt.finish(Some(status));
-        let retry_after_header = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
+        // The 429 wait honors `retry-after` first, then the bucket
+        // `reset-after` hint: on a 429 both name the same pause, and the reset
+        // hint is the only timing when `retry-after` is absent (official
+        // rate-limits page, verified 2026-10-12). Body `retry_after` still
+        // wins inside `retry_after_wait_ms`.
+        let retry_after_header = ["retry-after", "x-ratelimit-reset-after"]
+            .into_iter()
+            .find_map(|name| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+            });
         // Reads cannot mutate; a complete failure may be retried independently.
         // Mutation success needs its caller's validated receipt. 5xx, redirects
         // and request-timeout responses remain uncertain even with a full body.
@@ -1031,8 +1044,10 @@ impl ActionExecutor {
     async fn admit(&self, request: &Request, lane: Option<bool>) -> Result<(), GuardError> {
         let guard = &self.inner.transport.guard;
         let essential = is_interaction_callback(request);
+        // Route-aware admission: the guard paces all callers sharing it and
+        // holds same-bucket reads until the header reset (see admit_route).
         let Some(kick_lane) = lane else {
-            return guard.admit(essential).await;
+            return guard.admit_route(request.path(), essential).await;
         };
         let (lock, interval) = if kick_lane {
             (&self.inner.kick_last_at, self.inner.kick_interval)
@@ -1042,13 +1057,13 @@ impl ActionExecutor {
         // Keep the lane reservation through cooldown and pacing. Timestamp only
         // the actual dispatch, not each queued caller's pre-cooldown admission.
         let mut last = lock.lock().await;
-        guard.admit(essential).await?;
+        guard.admit_route(request.path(), essential).await?;
         let earliest = *last + interval;
         if earliest > tokio::time::Instant::now() {
             tokio::time::sleep_until(earliest).await;
         }
         // A global response/breaker may arrive during the lane sleep.
-        guard.admit(essential).await?;
+        guard.admit_route(request.path(), essential).await?;
         self.stamp_paced_lane(&mut last, kick_lane);
         Ok(())
     }
@@ -1720,10 +1735,11 @@ impl ActionExecutor {
         .map_err(|e| e.to_string())
     }
 
-    /// Paced GET: 110 ms lane, 403/404 → `None`, 429 waits (`retry-after +
-    /// 250 ms`; a global 429 rides the shared pause at next admission) and
-    /// retries within the same 5-try budget as 5xx/transport, other statuses
-    /// → `None` (legacy `DiscordRest::get`). Supported paths cover the
+    /// Paced GET: 110 ms lane, 403/404 → `None`, 429 sleeps-then-retries under
+    /// the same admission (`retry-after`/`reset-after` + 250 ms; a global 429
+    /// additionally rides out the shared pause) within the same 5-try budget
+    /// as 5xx/transport, other statuses → `None` (legacy `DiscordRest::get`).
+    /// Supported paths cover the
     /// parity §6 reads —
     /// guild, guild members (+`after`/`limit`), guild scheduled-events
     /// (+`with_user_count`), single channel and the channel-messages list
@@ -1749,12 +1765,20 @@ impl ActionExecutor {
     ) -> Result<Option<(serde_json::Value, String)>, String> {
         let route = raw_get_route(path)?;
         let mut attempt: u32 = 0;
+        // A 429 proves the attempt reached Discord, so its sleep-then-retry
+        // reuses this read's admission instead of re-admitting: a breaker the
+        // tally just opened must not refuse the in-flight read's own retry.
+        // New reads still admit (and refuse) as usual.
+        let mut admitted_retry = false;
         loop {
             let request = Request::from_route(&route);
             // Guard refusals are terminal; pacing completes before the stamp.
-            self.admit(&request, Some(false))
-                .await
-                .map_err(|error| error.to_string())?;
+            if !admitted_retry {
+                self.admit(&request, Some(false))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            admitted_retry = false;
             let observed_at = two_bot_core::now_iso();
             // Each attempt gets the moderation bound across headers and body,
             // so a response that never answers cannot park the caller (the
@@ -1784,15 +1808,23 @@ impl ActionExecutor {
                 429 => {
                     // Every 429 spends one read attempt, like 5xx/transport:
                     // a steady 429 stream exhausts the budget instead of
-                    // parking the read until a separate guard refuses it. A
-                    // global 429 installs the shared pause at next admission,
-                    // so only route-local 429s sleep here.
+                    // parking the read until a separate guard refuses it. The
+                    // retry re-sends under this read's admission (see
+                    // `admitted_retry`): no request leaves during the wait.
                     if attempt >= MAX_HTTP_TRIES - 1 {
                         return Ok(None);
                     }
-                    if !global {
-                        tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
+                    let wait = Duration::from_millis(res.retry_after_wait_ms());
+                    if global {
+                        // Ride out the shared pause the 429 installed at
+                        // headers receipt (it derives from the same numbers,
+                        // but concurrent traffic may have extended it).
+                        let pause = self.inner.transport.guard.snapshot().global_pause_remaining;
+                        tokio::time::sleep(wait.max(pause)).await;
+                    } else {
+                        tokio::time::sleep(wait).await;
                     }
+                    admitted_retry = true;
                     attempt += 1;
                 }
                 403 | 404 => return Ok(None),
@@ -1852,12 +1884,18 @@ impl ActionExecutor {
     ) -> Result<Option<serde_json::Value>, String> {
         let route = raw_get_route(path)?;
         let mut attempt: u32 = 0;
+        // Same reuse as the observed read: a 429 retries under the covering
+        // admission instead of re-admitting past a just-opened breaker.
+        let mut admitted_retry = false;
         loop {
             let request = Request::from_route(&route);
             // Guard refusals are terminal; pacing completes before the send.
-            self.admit(&request, Some(false))
-                .await
-                .map_err(|error| error.to_string())?;
+            if !admitted_retry {
+                self.admit(&request, Some(false))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            admitted_retry = false;
             let (res, global) = match self.send_admitted(&request).await {
                 Ok(r) => r,
                 Err(detail) => {
@@ -1885,8 +1923,8 @@ impl ActionExecutor {
                     // spends one attempt, so persistent rate limiting ends in
                     // the fixed transient-exhaustion error for checked reads
                     // (absence for unchecked ones), never an open-ended park.
-                    // Global pauses apply at next admission; only
-                    // route-local 429s sleep here.
+                    // The retry re-sends under the covering admission after
+                    // sleeping out the wait (plus any shared pause).
                     if attempt >= MAX_HTTP_TRIES - 1 {
                         return if checked {
                             Err("Discord evidence unavailable".to_owned())
@@ -1894,9 +1932,14 @@ impl ActionExecutor {
                             Ok(None)
                         };
                     }
-                    if !global {
-                        tokio::time::sleep(Duration::from_millis(res.retry_after_wait_ms())).await;
+                    let wait = Duration::from_millis(res.retry_after_wait_ms());
+                    if global {
+                        let pause = self.inner.transport.guard.snapshot().global_pause_remaining;
+                        tokio::time::sleep(wait.max(pause)).await;
+                    } else {
+                        tokio::time::sleep(wait).await;
                     }
+                    admitted_retry = true;
                     attempt += 1;
                 }
                 403 | 404 => return Ok(None),
