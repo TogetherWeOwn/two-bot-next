@@ -21,7 +21,6 @@ jobs:
     timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
-      FUZZ_OUTPUT_DIR: ${{ runner.temp }}/vote-kick-smoke
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -37,6 +36,8 @@ jobs:
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fetch --locked
       - name: Record host and toolchain versions
+        env:
+          FUZZ_OUTPUT_DIR: ${{ runner.temp }}/vote-kick-smoke
         run: |
           set -euo pipefail
           mkdir -p "$FUZZ_OUTPUT_DIR/logs"
@@ -51,6 +52,8 @@ jobs:
             grep -A1 'name = "libfuzzer-sys"' fuzz/Cargo.lock
           } | tee "$FUZZ_OUTPUT_DIR/logs/versions.txt"
       - name: vote_kick 60 s smoke
+        env:
+          FUZZ_OUTPUT_DIR: ${{ runner.temp }}/vote-kick-smoke
         run: |
           set -euo pipefail
           FUZZ_SECONDS=60
@@ -69,6 +72,8 @@ jobs:
           exit "$status"
       - name: Summarize smoke result
         if: always()
+        env:
+          FUZZ_OUTPUT_DIR: ${{ runner.temp }}/vote-kick-smoke
         run: |
           {
             echo "### vote_kick 60 s smoke"
