@@ -239,7 +239,7 @@ and a loopback verifier that rejects noncanonical order before re-deriving HMAC.
 
 | Variable | Required | Meaning |
 |---|---|---|
-| `TWO_BACKUP_S3_ENDPOINT` | yes | `https://…` with a host, no userinfo/query/fragment, valid port (plain `http` only to loopback, path prefixes kept, else refused) |
+| `TWO_BACKUP_S3_ENDPOINT` | yes | `https://…` with a host, no userinfo/query/fragment/backslash, valid port (plain `http` only to loopback, path prefixes kept, else refused) |
 | `TWO_BACKUP_S3_BUCKET` | yes | validated bucket name (a stray slash would retarget the write) |
 | `TWO_BACKUP_S3_ACCESS_KEY_ID` | yes | — |
 | `TWO_BACKUP_S3_SECRET_ACCESS_KEY` | yes | never logged; only `bucket/key` + etag reach the journal |
