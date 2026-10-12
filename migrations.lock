@@ -336,6 +336,10 @@
     "crates/cutover/migrations/0426_community_facts_guild_source.sql": {
       "sha256": "9da078d3f29430320b79d2d82cfa6e4b1d2d557384a98d7dddca97783429d2dd",
       "justification": "RSVP check-in capacity count index: cover (guild_id, source) so record_checkin counts the occurrence without scanning the guild message history while holding the occurrence lock."
+    },
+    "crates/cutover/migrations/0428_event_store_presence_capture.sql": {
+      "sha256": "fd8ed8dbc484952fdd84b56565fe7d8407a42a0b8d78fdecb5d7820f93fbb664",
+      "justification": "Append-only event_store for presence capture: ids/timestamps plus status/activity enums only, dedup_key UNIQUE for resume-safe redelivery; no free-text columns."
     }
   }
 }

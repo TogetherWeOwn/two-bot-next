@@ -139,6 +139,9 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_vote_kick_audit",
     // V5 adds accepted-create history; see [`V5_ADDED_TABLES`].
     "voice_create_reservations",
+    // Event-store S3 presence capture (0428): append-only, guild-keyed, no
+    // foreign keys, so order after the vote-kick audit trail is free.
+    "event_store",
 ];
 
 /// Tables first covered by v5. A v4 archive predates them and need not declare
