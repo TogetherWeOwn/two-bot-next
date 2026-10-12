@@ -1068,8 +1068,17 @@ impl ActionExecutor {
             .await
             .map_err(|_| GuardError::AdmissionTimeout)??;
         // Backstop past the transport's inner header deadline so a GET lane
-        // release inside `send_request_headers` wins the race.
-        let send_deadline = deadline + Duration::from_millis(WIRE_BACKSTOP_MS);
+        // release inside `send_request_headers` wins the race — but only when
+        // the attempt carries the full moderation budget. The inner header
+        // timer is fixed at MODERATION_TIMEOUT_MS, so a shorter caller budget
+        // (the receipt/boot absolute windows) can never let it win; extending
+        // there would only overrun the absolute budget the caller enforces
+        // (the receipt window refuses to land past it).
+        let send_deadline = if timeout >= Duration::from_millis(MODERATION_TIMEOUT_MS) {
+            deadline + Duration::from_millis(WIRE_BACKSTOP_MS)
+        } else {
+            deadline
+        };
         tokio::time::timeout_at(send_deadline, self.send_admitted(request))
             .await
             .map_err(|_| DiscordError::Timeout)?
