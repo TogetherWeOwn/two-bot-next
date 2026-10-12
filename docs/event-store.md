@@ -7,8 +7,8 @@ role matrix, the backup inventory, the member-erasure plan and the docs.
 Until a slice's registration lands, this note describes the wired end-state
 each slice must reach, not current `main`. It changes no behavior, installs
 no retention policy and grants no operator command. The privacy dispositions
-live in [privacy.md](privacy.md); the alert responses live in the
-[operations runbook](runbook.md#alert-event-store-capture-gaps-and-lag).
+live in [privacy.md](privacy.md); the operator responses live in the
+[operations runbook](runbook.md#event-store-capture-gaps-and-lag).
 
 ## Privacy fence: ids, timestamps and enums only
 
@@ -20,7 +20,7 @@ must appear in no stored row.
 
 | Slice | Stored besides identity + timestamps | Never stored |
 | --- | --- | --- |
-| Member add/remove/update | Membership deltas only: `premium_since`, `nick`, role-id list | Bio, about, username |
+| Member add/remove/update | Membership deltas only: `premium_since`, `nick_changed` flag, role-id list | Bio, about, username, nickname |
 | Presence | Status and activity-TYPE enums plus application id | Custom-status text; activity name, details, state, URL, emoji |
 | Voice state/server | Channel/session ids plus mute, deaf, self-mute, self-deaf, self-video, self-stream and suppress flags | Audio, transcripts, voice tokens, endpoints |
 | Message update/delete + reactions | Channel/message ids plus emoji id/name reference (a unicode reaction persists as a codepoint reference such as `U+1F44D`, never as text) | Content, embeds, attachments, username |
@@ -70,12 +70,13 @@ them. Handle it exactly like the existing missed-events alert in the
 [runbook](runbook.md#alert-gateway-missed-events).
 
 Capture lag is the spread between `received_at` and `event_time` per
-`event_type` over a window. Treat a spread that stays above one keepalive
-window (about 60 s) across consecutive windows, or sustained growth in a
-slice's capture-outcome failure counter, as a missed-events-equivalent:
-scrape the authorized `/ops/metrics` path, correlate disconnects and recent
-deploys, and do not restart the container to clear the counter. A
-replacement resets baselines without recovering the gap.
+`event_type` over a window. No counter tracks it yet: until a slice ships a
+real counter and rule, the staging verify query below is the only detector.
+Treat a spread that stays above one keepalive window (about 60 s) across
+consecutive windows as a missed-events-equivalent: scrape the authorized
+`/ops/metrics` path, correlate disconnects and recent deploys, and do not
+restart the container to clear the counter. A replacement resets baselines
+without recovering the gap.
 
 ### Backfill-no-replay rule
 
