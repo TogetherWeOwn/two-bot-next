@@ -37,8 +37,8 @@ pub fn init() {
     let format = std::env::var("LOG_FORMAT").ok();
     let rust_log = std::env::var("RUST_LOG").ok();
     let log_level = std::env::var("LOG_LEVEL").ok();
-    let rust_log_invalid = rust_log_unparsable(rust_log.as_deref());
-    let log_level_invalid = log_level_unparsable(log_level.as_deref());
+    let (rust_log_invalid, log_level_invalid) =
+        boot_warning_flags(rust_log.as_deref(), log_level.as_deref());
     subscriber(
         LogFormat::from_setting(format.as_deref()),
         filter(rust_log.as_deref(), log_level.as_deref()),
@@ -122,6 +122,24 @@ fn rust_log_unparsable(rust_log: Option<&str>) -> bool {
     )
 }
 
+/// Valid `RUST_LOG` that takes precedence over `LOG_LEVEL`: nonempty (after
+/// trim) and accepted by `EnvFilter::try_new`, mirroring `filter()`.
+fn rust_log_valid(rust_log: Option<&str>) -> bool {
+    matches!(
+        rust_log.filter(|value| !value.trim().is_empty()),
+        Some(value) if EnvFilter::try_new(value).is_ok()
+    )
+}
+
+/// Boot-warning flags as `init()` computes them: each present-but-unparsable
+/// key warns, except an invalid `LOG_LEVEL` stays quiet when a valid
+/// `RUST_LOG` takes precedence (then `LOG_LEVEL` is ignored entirely).
+fn boot_warning_flags(rust_log: Option<&str>, log_level: Option<&str>) -> (bool, bool) {
+    let rust_log_invalid = rust_log_unparsable(rust_log);
+    let log_level_invalid = log_level_unparsable(log_level) && !rust_log_valid(rust_log);
+    (rust_log_invalid, log_level_invalid)
+}
+
 /// Present-but-unparsable `LOG_LEVEL`: nonempty (after trim) yet rejected by
 /// `LevelFilter` parsing. Absent, empty and valid values stay quiet. The parse
 /// runs on the raw value so the fallback filter stays exactly as today.
@@ -141,7 +159,12 @@ fn filter(rust_log: Option<&str>, log_level: Option<&str>) -> EnvFilter {
             return filter;
         }
     }
+    // Empty/blank levels count as missing: `LevelFilter` parses `""` as
+    // ERROR, which would silently hide info/warn lines (including boot
+    // warnings). Skip empties so absent, empty and whitespace-only all fall
+    // back to INFO, matching the detectors and docs.
     let level = log_level
+        .filter(|value| !value.trim().is_empty())
         .and_then(|value| value.parse::<LevelFilter>().ok())
         .unwrap_or(LevelFilter::INFO);
     // Scope verbosity to our crates (`EnvFilter` matches target prefixes, so
@@ -562,6 +585,10 @@ mod tests {
             ),
             (None, None, vec![]),
             (Some(""), Some("warn"), vec![]),
+            // Valid RUST_LOG wins: an invalid LOG_LEVEL is ignored entirely,
+            // so it stays quiet instead of claiming the INFO fallback is in use.
+            (Some("warn"), Some("debgu"), vec![]),
+            (Some("two_bot=debug"), Some("debgu"), vec![]),
         ] {
             let capture = Capture::default();
             tracing::subscriber::with_default(
@@ -571,10 +598,9 @@ mod tests {
                     capture.clone(),
                 ),
                 || {
-                    emit_boot_warnings(
-                        rust_log_unparsable(rust_log),
-                        log_level_unparsable(log_level),
-                    );
+                    let (rust_log_invalid, log_level_invalid) =
+                        boot_warning_flags(rust_log, log_level);
+                    emit_boot_warnings(rust_log_invalid, log_level_invalid);
                 },
             );
             let lines = capture.lines();
@@ -607,6 +633,10 @@ mod tests {
     fn log_level_and_rust_log_precedence_are_respected() {
         for (rust_log, log_level, expected) in [
             (None, None, 2),
+            // Empty/blank LOG_LEVEL counts as missing (INFO fallback): `""`
+            // must not silently parse as ERROR.
+            (None, Some(""), 2),
+            (None, Some("   "), 2),
             (None, Some("error"), 0),
             (None, Some("WARN"), 1),
             (Some("info"), Some("error"), 2),

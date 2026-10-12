@@ -18,7 +18,9 @@ Docker explicitly sets `LOG_FORMAT=json`; native runs also default to JSON.
 - `LOG_LEVEL`: `trace`, `debug`, `info`, `warn`, `error`, `off` (case-insensitive).
   Missing/empty levels default to `info` silently. A present, nonempty,
   unparsable level emits `log_level_invalid` (warn, naming the key but never the
-  value; subject to the `info` fallback filter), then defaults to `info`.
+  value; subject to the `info` fallback filter), then defaults to `info`,
+  unless a valid `RUST_LOG` takes precedence (then `LOG_LEVEL` is ignored and
+  stays quiet).
   The level applies to the `two_bot`
   target prefix (all workspace crates); anything else logs at ERROR only
   unless `RUST_LOG` opts in. `/readyz` 503s log at DEBUG, not ERROR.
@@ -91,7 +93,7 @@ draining state is observable via `/readyz` and `shutdown_started/completed`.
 | `config_invalid` | Invalid runtime config; safe, value-free config error |
 | `log_format_invalid` | Unsupported format; falls back to JSON |
 | `rust_log_invalid` | Present, nonempty, unparsable `RUST_LOG`; falls back to `LOG_LEVEL` |
-| `log_level_invalid` | Present, nonempty, unparsable `LOG_LEVEL`; defaults to `info` |
+| `log_level_invalid` | Present, nonempty, unparsable `LOG_LEVEL` while no valid `RUST_LOG` wins; defaults to `info` |
 | `gateway_parked` | Missing prerequisite; `missing`, `status` |
 | `gateway_connecting` | Durable store loaded, before connecting; `resume` |
 | `gateway_started` | Gateway loop begins; `shard` |
