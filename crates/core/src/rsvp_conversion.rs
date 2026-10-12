@@ -79,7 +79,7 @@ pub fn assign_variant(event_id: &str) -> AnnouncementVariant {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    if hash % 2 == 0 {
+    if hash.is_multiple_of(2) {
         AnnouncementVariant::EventEntityWithReminders
     } else {
         AnnouncementVariant::AnnouncementPostOnly
