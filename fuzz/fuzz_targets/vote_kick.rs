@@ -99,32 +99,37 @@ fn check_progress(progress: VoteProgress) {
     assert!(progress.yes <= progress.total);
 }
 
+fn observe(
+    id: u64,
+    update: VoteKickUpdate,
+    emitted: &mut BTreeSet<u64>,
+    terminal: &mut BTreeMap<u64, VoteKickStatus>,
+) {
+    check_progress(update.progress);
+    if let Some(kick) = update.kick {
+        // The kick emits once, on the first Active -> Passed transition,
+        // scoped to the vote's own guild, room and target.
+        assert_eq!(update.status, VoteKickStatus::Passed);
+        assert_eq!(kick.guild_id, update.vote.guild_id);
+        assert_eq!(kick.room_id, update.vote.room_id);
+        assert_eq!(kick.target_id, update.vote.target_id);
+        assert!(emitted.insert(id), "kick emitted twice");
+        terminal.insert(id, VoteKickStatus::Passed);
+    } else if let Some(previous) = terminal.get(&id) {
+        // Terminal votes stay terminal: replay reads the status, never a
+        // new kick, and a rejoining target cannot revive a cancelled vote.
+        assert_eq!(update.status, *previous);
+    } else if update.status != VoteKickStatus::Active {
+        terminal.insert(id, update.status);
+    }
+}
+
 fn drive(data: &[u8]) {
     let mut core = VoteKickCore::new();
     let clock = FuzzClock(Cell::new(1_000));
     let mut started: BTreeSet<u64> = BTreeSet::new();
     let mut emitted: BTreeSet<u64> = BTreeSet::new();
     let mut terminal: BTreeMap<u64, VoteKickStatus> = BTreeMap::new();
-
-    let mut check_update = |id: u64, update: VoteKickUpdate| {
-        check_progress(update.progress);
-        if let Some(kick) = update.kick {
-            // The kick emits once, on the first Active -> Passed transition,
-            // scoped to the vote's own guild, room and target.
-            assert_eq!(update.status, VoteKickStatus::Passed);
-            assert_eq!(kick.guild_id, update.vote.guild_id);
-            assert_eq!(kick.room_id, update.vote.room_id);
-            assert_eq!(kick.target_id, update.vote.target_id);
-            assert!(emitted.insert(id), "kick emitted twice");
-            terminal.insert(id, VoteKickStatus::Passed);
-        } else if let Some(previous) = terminal.get(&id) {
-            // Terminal votes stay terminal: replay reads the status, never a
-            // new kick, and a rejoining target cannot revive a cancelled vote.
-            assert_eq!(update.status, *previous);
-        } else if update.status != VoteKickStatus::Active {
-            terminal.insert(id, update.status);
-        }
-    };
 
     for step in data.chunks_exact(STRIDE) {
         clock.0.set(apply_clock_jump(clock.0.get(), step[1]));
@@ -163,6 +168,9 @@ fn drive(data: &[u8]) {
                     assert_eq!(update.vote.target_id, reference.target_id);
                     check_progress(update.progress);
                     started.insert(id);
+                    // Eviction past the retention horizon lets an ID begin a new generation.
+                    terminal.remove(&id);
+                    emitted.remove(&id);
                 }
                 Err(VoteKickError::ReusedVoteId) => {
                     // Replay refused: the ID must come from an earlier start.
@@ -171,11 +179,11 @@ fn drive(data: &[u8]) {
                 Err(_) => {}
             },
             1 => match core.cast(reference, facts, actor, ballot, &clock) {
-                Ok(update) => check_update(id, update),
+                Ok(update) => observe(id, update, &mut emitted, &mut terminal),
                 Err(_) => {}
             },
             _ => match core.refresh(reference, facts, &clock) {
-                Ok(update) => check_update(id, update),
+                Ok(update) => observe(id, update, &mut emitted, &mut terminal),
                 Err(_) => {}
             },
         }
