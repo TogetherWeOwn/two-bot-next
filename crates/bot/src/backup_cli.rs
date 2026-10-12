@@ -1862,10 +1862,13 @@ mod tests {
     }
 
     /// A hung helper is terminated and reaped within the injected deadline:
-    /// the fixture records its own PID, `exec`s into `sleep` so the recorded
-    /// PID *is* the owned direct child, and the test proves that PID no
-    /// longer runs afterwards (a leaked zombie would still own a `/proc`
-    /// entry until reaped).
+    /// the fixture records its own PID, `exec`s into `sleep 3600` so the
+    /// recorded PID *is* the owned direct child and natural exit cannot
+    /// explain a quick return. The elapsed bound pins the kill (without it
+    /// the call would hang until the fixture exits) and the immediate
+    /// `/proc` absence pins the reap before the orphan reaper can hide a
+    /// zombie. (A leaked zombie would still own a `/proc` entry until
+    /// reaped.)
     #[cfg(unix)]
     #[tokio::test]
     async fn upload_helper_timeout_terminates_and_reaps_owned_child() {
@@ -1875,16 +1878,26 @@ mod tests {
             &dir,
             "upload-hang.sh",
             &format!(
-                "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 3600\n",
                 pidfile.to_string_lossy()
             ),
         );
-        let outcome = super::run_upload_command(
-            &helper.to_string_lossy(),
-            &secret_argv("archive.ndjson.gz"),
-            std::time::Duration::from_millis(300),
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            super::run_upload_command(
+                &helper.to_string_lossy(),
+                &secret_argv("archive.ndjson.gz"),
+                std::time::Duration::from_millis(300),
+            ),
         )
-        .await;
+        .await
+        .expect("bounded helper must return well before the fixture natural exit");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "hung helper must be terminated within seconds, took {elapsed:?}"
+        );
         assert!(
             matches!(outcome, super::UploadOutcome::TimedOut),
             "hung helper must report TimedOut, got {outcome:?}"
@@ -1918,6 +1931,10 @@ mod tests {
         let pid = pid.trim().to_owned();
         assert!(!pid.is_empty(), "hung fixture must record its PID");
         let proc = PathBuf::from(format!("/proc/{pid}"));
+        assert!(
+            !proc.exists(),
+            "timed-out upload child {pid} must already be reaped on return"
+        );
         let quiet_until = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while proc.exists() && std::time::Instant::now() < quiet_until {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
