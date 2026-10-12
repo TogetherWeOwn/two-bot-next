@@ -153,24 +153,26 @@ def _pct_numbers(line):
 
 
 def _lowered(old, new):
-    # Operative thresholds carry an operator (``>= 80%``); history notes and
-    # bare counts do not. Compare operator thresholds when the old row has
-    # them so a lowered bar cannot hide behind its own history note; fall
-    # back to percents, then to all numbers, for rows without one. Sorted
-    # ascending so a reordered pair compares like-for-like, while a lowered
-    # threshold plus a large history number still reads as lowered.
-    old_ops = sorted(_op_numbers(old))
-    if old_ops:
-        new_ops = sorted(_op_numbers(new))
-        if len(new_ops) < len(old_ops):
-            return True
-        return any(n < o for o, n in zip(old_ops, new_ops))
+    # Thresholds are percents (``>= 80%``, ``at least 50%``); a bare
+    # operator count like ``>= 100 files`` is context, not the bar. Compare
+    # percents when the old row has them so a lowered bar cannot hide behind
+    # a large reference number; fall back to operator numbers, then to all
+    # numbers, for rows without one. A parenthetical like ``(was 80%)``
+    # keeps its number, so lowering plus a history note still reads as
+    # lowered, while raising with a note passes. Sorted ascending so a
+    # reordered pair compares like-for-like.
     old_pct = sorted(_pct_numbers(old))
     if old_pct:
         new_pct = sorted(_pct_numbers(new))
         if len(new_pct) < len(old_pct):
             return True
         return any(n < o for o, n in zip(old_pct, new_pct))
+    old_ops = sorted(_op_numbers(old))
+    if old_ops:
+        new_ops = sorted(_op_numbers(new))
+        if len(new_ops) < len(old_ops):
+            return True
+        return any(n < o for o, n in zip(old_ops, new_ops))
     old_nums = sorted(_numbers(old))
     new_nums = sorted(_numbers(new))
     if len(new_nums) < len(old_nums):

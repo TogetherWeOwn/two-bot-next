@@ -489,6 +489,14 @@ class ThresholdTests(unittest.TestCase):
         errors = gate.threshold_violations(BASE, head)
         self.assertTrue(any("threshold-lowered" in e for e in errors), errors)
 
+    def test_lowered_percent_masked_by_reference_count_still_fails(self):
+        head = BASE.replace(
+            "Changed lines >= 80% covered",
+            "Changed lines at least 50% covered (of >= 100 files)",
+        )
+        errors = gate.threshold_violations(BASE, head)
+        self.assertTrue(any("threshold-lowered" in e for e in errors), errors)
+
     def test_adding_warn_first_to_an_enforced_row_fails(self):
         head = ENFORCED_BASE.replace(
             "Zero clippy warnings", "Zero clippy warnings (WARN first)"
