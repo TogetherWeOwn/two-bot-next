@@ -7,18 +7,23 @@ status. All mutations stay on their existing API routes.
 
 ## Access (Operator setup)
 
-Human auth is Cloudflare Access service tokens, enforced twice:
+The static page (`GET /ops/dashboard`) holds no data and is ungated so a
+browser can open it directly. Human auth is Cloudflare Access service tokens
+on the summary (`GET /ops/summary`), enforced twice:
 
-1. **Edge (authoritative):** the Access app fronting these paths carries a
+1. **Edge (authoritative):** the Access app fronting the summary carries a
    Service Auth rule permitting the dashboard token, with organization
    **strict service-token mode** on: solely Service Auth rules count, no
-   authorization cookie is issued, and every call repeats both headers.
+   authorization cookie is issued, and every summary call repeats both headers.
    https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/
 2. **Worker (defense in depth):** the Worker re-validates both
    `CF-Access-Client-Id` and `CF-Access-Client-Secret` against its own
-   secrets on every request, so a direct `workers.dev` hit cannot bypass the
-   gate. Unconfigured/short secrets → 404; missing/wrong → 401 (never a
-   login redirect). Attempts are per-caller throttled (10-burst, 1/sec).
+   secrets on every summary request, so a direct `workers.dev` hit cannot
+   bypass the gate. Unconfigured/short secrets → 404; missing/wrong → 401
+   (never a login redirect). Attempts are per-caller throttled (10-burst, 1/sec).
+
+Open the page in any browser, then paste the service-token pair into its
+Connect form; the page sends the headers on its `GET /ops/summary` fetches.
 
 Install the pair as Worker secrets (never `wrangler.toml` vars):
 
@@ -27,7 +32,8 @@ wrangler secret put --env staging OPS_DASHBOARD_CLIENT_ID
 wrangler secret put --env staging OPS_DASHBOARD_CLIENT_SECRET  # >= 32 chars
 ```
 
-Same for `--env production`. Removing either secret closes both routes (404).
+Same for `--env production`. Removing either secret closes the summary (404);
+the static page stays reachable (it holds no data).
 
 ## Break-glass
 
@@ -41,9 +47,11 @@ Same for `--env production`. Removing either secret closes both routes (404).
     https://two-bot-next-staging.<subdomain>.workers.dev/ops/summary
   ```
 
-- **Production** never serves `workers.dev` (`workers_dev = false`): the
-  dashboard and summary are only reachable on the Access-fronted custom
-  domain. Pinned by `wrangler/scripts/check-env-bindings.py`.
+- **Production** keeps its `workers.dev` route (`workers_dev = true`) until
+  a custom domain and Access app exist: production has no custom domain or
+  route today, so `workers.dev` is its only origin. Flipping it to `false`
+  moves production to the Access-fronted custom domain in a separate change.
+  Pinned by `wrangler/scripts/check-env-bindings.py`.
 
 ## Read-only guarantee
 
@@ -57,7 +65,8 @@ Same for `--env production`. Removing either secret closes both routes (404).
 ## Rollback
 
 1. Delete the Worker secrets (`wrangler secret delete --env <name>
-   OPS_DASHBOARD_CLIENT_ID OPS_DASHBOARD_CLIENT_SECRET`) → both routes 404.
+   OPS_DASHBOARD_CLIENT_ID OPS_DASHBOARD_CLIENT_SECRET`) → the summary 404s
+   (the static page stays reachable).
 2. If the routes themselves must go, revert `wrangler/src/ops-dashboard.ts`
    and its wiring in `wrangler/src/index.ts`, then redeploy.
 3. `workers.dev` flips back by reverting the three `workers_dev` lines in

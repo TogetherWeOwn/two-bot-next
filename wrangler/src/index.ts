@@ -1134,15 +1134,24 @@ export default {
       } catch (error) { return refused(error); }
     }
 
-    // Read-only ops dashboard (TOG-22861). Human auth is Cloudflare Access
-    // service tokens: both CF-Access-Client-Id and CF-Access-Client-Secret on
-    // every request (strict mode — no cookies or sessions). Unconfigured or
-    // short Operator secrets, or any non-GET method → 404 (the route does not
-    // exist); missing/wrong credentials → 401. Attempts are per-caller
-    // throttled before any comparison, on a separate budget from the metrics
-    // scrape. The page serves static HTML (no container touch); the summary
-    // forwards to the fenced DO route, which proxies the container's /readyz.
-    if (url.pathname === OPS_DASHBOARD_PATH || url.pathname === OPS_SUMMARY_PATH) {
+    // Read-only ops dashboard (TOG-22861). The static page holds no data
+    // and is ungated so a browser can open it; only the summary needs human
+    // auth (Cloudflare Access service tokens: both CF-Access-Client-Id and
+    // CF-Access-Client-Secret on every summary request, strict mode — no
+    // cookies or sessions). Unconfigured or short Operator secrets, or any
+    // non-GET summary method → 404 (the route does not exist);
+    // missing/wrong summary credentials → 401. Summary attempts are
+    // per-caller throttled before any comparison, on a separate budget from
+    // the metrics scrape. The page serves static HTML (no container touch);
+    // the summary forwards to the fenced DO route, which proxies the
+    // container's /readyz (200 and JSON 503 both proxy with their status).
+    if (url.pathname === OPS_DASHBOARD_PATH) {
+      if (request.method !== "GET") {
+        return new Response("not found", { status: 404, headers: withSecurityHeaders() });
+      }
+      return dashboardPageResponse();
+    }
+    if (url.pathname === OPS_SUMMARY_PATH) {
       if (request.method !== "GET") {
         return new Response("not found", { status: 404, headers: withSecurityHeaders() });
       }
@@ -1159,9 +1168,6 @@ export default {
       }
       const refusal = await dashboardRefusal(request, env);
       if (refusal) return refusal;
-      if (url.pathname === OPS_DASHBOARD_PATH) {
-        return dashboardPageResponse();
-      }
       try {
         const forwarded = new Request(request);
         forwarded.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));

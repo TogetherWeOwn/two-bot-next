@@ -1,10 +1,10 @@
 /**
- * Read-only ops dashboard (TOG-22861): static Worker-served page polling
- * `GET /ops/summary`, human auth via Cloudflare Access service tokens
- * (both headers, strict mode), strictly read-only, staging workers.dev
- * break-glass with production workers.dev disabled (pinned by
- * scripts/test-env-bindings.py). Synthetic bindings only — no endpoint,
- * database or secret is contacted.
+ * Read-only ops dashboard (TOG-22861): static ungated Worker-served page
+ * polling the gated `GET /ops/summary`, human auth via Cloudflare Access
+ * service tokens on the summary only (both headers, strict mode),
+ * strictly read-only, staging + production workers.dev break-glass until a
+ * custom domain exists (pinned by scripts/test-env-bindings.py). Synthetic
+ * bindings only — no endpoint, database or secret is contacted.
  *
  * Run: node --import ./test/cloudflare-loader.mjs --test test/ops-dashboard.test.ts
  */
@@ -37,10 +37,13 @@ function workerEnv(secrets?: { id?: string; secret?: string }) {
       getByName: () => ({
         fetch: async (r: Request) => {
           calls.push(r);
-          return new Response('{"ready":false}', {
-            status: 503,
-            headers: { "content-type": "application/json" },
-          });
+          return new Response(
+            '{"components":[["process","ready"],["gateway","down"]],"jobs":{},"build_revision":"synthetic","build_id":"synthetic"}',
+            {
+              status: 503,
+              headers: { "content-type": "application/json" },
+            },
+          );
         },
       }),
     },
@@ -64,57 +67,79 @@ const get = (env: Env, path: string, init?: RequestInit) => {
   return worker.fetch(new Request(`https://w.invalid${path}`, { ...init, headers }), env, ctx);
 };
 
-for (const path of [OPS_DASHBOARD_PATH, OPS_SUMMARY_PATH]) {
-  test(`${path}: 404 when the service-token pair is not configured`, async () => {
-    for (const secrets of [
-      undefined,
-      { id: CLIENT_ID },
-      { secret: CLIENT_SECRET },
-      { id: "short", secret: CLIENT_SECRET },
-      { id: CLIENT_ID, secret: "short" },
-    ]) {
-      const { env, calls } = workerEnv(secrets);
-      const res = await get(env, path, { headers: creds });
-      assert.equal(res.status, 404, `${path} ${JSON.stringify(secrets)} must 404`);
-      await res.text();
-      assert.equal(calls.length, 0, "unconfigured routes never reach the container");
-    }
-  });
+test(`${OPS_SUMMARY_PATH}: 404 when the service-token pair is not configured`, async () => {
+  for (const secrets of [
+    undefined,
+    { id: CLIENT_ID },
+    { secret: CLIENT_SECRET },
+    { id: "short", secret: CLIENT_SECRET },
+    { id: CLIENT_ID, secret: "short" },
+  ]) {
+    const { env, calls } = workerEnv(secrets);
+    const res = await get(env, OPS_SUMMARY_PATH, { headers: creds });
+    assert.equal(res.status, 404, `${OPS_SUMMARY_PATH} ${JSON.stringify(secrets)} must 404`);
+    await res.text();
+    assert.equal(calls.length, 0, "unconfigured routes never reach the container");
+  }
+});
 
-  test(`${path}: 401 without or with wrong service-token headers`, async () => {
-    const { env, calls } = configured();
-    assert.equal((await get(env, path)).status, 401);
-    assert.equal((await get(env, path, { headers: { [DASHBOARD_CLIENT_ID_HEADER]: CLIENT_ID } })).status, 401);
-    assert.equal((await get(env, path, { headers: { [DASHBOARD_CLIENT_SECRET_HEADER]: CLIENT_SECRET } })).status, 401);
-    assert.equal(
-      (await get(env, path, { headers: { [DASHBOARD_CLIENT_ID_HEADER]: "wrong", [DASHBOARD_CLIENT_SECRET_HEADER]: CLIENT_SECRET } })).status,
-      401,
-    );
-    assert.equal(
-      (await get(env, path, { headers: { [DASHBOARD_CLIENT_ID_HEADER]: CLIENT_ID, [DASHBOARD_CLIENT_SECRET_HEADER]: "wrong" } })).status,
-      401,
-    );
-    assert.equal(
-      (await get(env, path, { headers: { [DASHBOARD_CLIENT_ID_HEADER]: "x".repeat(4097), [DASHBOARD_CLIENT_SECRET_HEADER]: CLIENT_SECRET } })).status,
-      401,
-    );
-    assert.equal(calls.length, 0, "unauthenticated requests never reach the container");
-  });
+test(`${OPS_SUMMARY_PATH}: 401 without or with wrong service-token headers`, async () => {
+  const { env, calls } = configured();
+  assert.equal((await get(env, OPS_SUMMARY_PATH)).status, 401);
+  assert.equal((await get(env, OPS_SUMMARY_PATH, { headers: { [DASHBOARD_CLIENT_ID_HEADER]: CLIENT_ID } })).status, 401);
+  assert.equal((await get(env, OPS_SUMMARY_PATH, { headers: { [DASHBOARD_CLIENT_SECRET_HEADER]: CLIENT_SECRET } })).status, 401);
+  assert.equal(
+    (await get(env, OPS_SUMMARY_PATH, { headers: { [DASHBOARD_CLIENT_ID_HEADER]: "wrong", [DASHBOARD_CLIENT_SECRET_HEADER]: CLIENT_SECRET } })).status,
+    401,
+  );
+  assert.equal(
+    (await get(env, OPS_SUMMARY_PATH, { headers: { [DASHBOARD_CLIENT_ID_HEADER]: CLIENT_ID, [DASHBOARD_CLIENT_SECRET_HEADER]: "wrong" } })).status,
+    401,
+  );
+  assert.equal(
+    (await get(env, OPS_SUMMARY_PATH, { headers: { [DASHBOARD_CLIENT_ID_HEADER]: "x".repeat(4097), [DASHBOARD_CLIENT_SECRET_HEADER]: CLIENT_SECRET } })).status,
+    401,
+  );
+  assert.equal(calls.length, 0, "unauthenticated requests never reach the container");
+});
 
-  test(`${path}: non-GET methods 404 and never reach the container`, async () => {
-    const { env, calls } = configured();
-    for (const method of ["POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]) {
-      const res = await get(env, path, { method, headers: creds });
-      assert.equal(res.status, 404, `${method} ${path} must 404`);
-      await res.text();
-    }
-    assert.equal(calls.length, 0, "mutations must never reach the container");
-  });
-}
+test(`${OPS_SUMMARY_PATH}: non-GET methods 404 and never reach the container`, async () => {
+  const { env, calls } = configured();
+  for (const method of ["POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]) {
+    const res = await get(env, OPS_SUMMARY_PATH, { method, headers: creds });
+    assert.equal(res.status, 404, `${method} ${OPS_SUMMARY_PATH} must 404`);
+    await res.text();
+  }
+  assert.equal(calls.length, 0, "mutations must never reach the container");
+});
+
+test(`${OPS_DASHBOARD_PATH}: static page is ungated so a browser can open it`, async () => {
+  const { env, calls } = configured();
+  for (const init of [{}, { headers: creds }]) {
+    const res = await get(env, OPS_DASHBOARD_PATH, init);
+    assert.equal(res.status, 200, "page must load with or without headers");
+    await res.text();
+  }
+  assert.equal(calls.length, 0, "serving the page must not touch the container");
+  const { env: bare } = workerEnv(undefined);
+  const unconfigured = await get(bare, OPS_DASHBOARD_PATH);
+  assert.equal(unconfigured.status, 200, "page stays reachable when secrets are unset");
+  await unconfigured.text();
+});
+
+test(`${OPS_DASHBOARD_PATH}: non-GET methods 404 and never reach the container`, async () => {
+  const { env, calls } = configured();
+  for (const method of ["POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]) {
+    const res = await get(env, OPS_DASHBOARD_PATH, { method });
+    assert.equal(res.status, 404, `${method} ${OPS_DASHBOARD_PATH} must 404`);
+    await res.text();
+  }
+  assert.equal(calls.length, 0, "mutations must never reach the container");
+});
 
 test(`${OPS_DASHBOARD_PATH}: serves the static read-only page with the right headers`, async () => {
   const { env, calls } = configured();
-  const res = await get(env, OPS_DASHBOARD_PATH, { headers: creds });
+  const res = await get(env, OPS_DASHBOARD_PATH);
   assert.equal(res.status, 200);
   assert.equal(res.headers.get("content-type"), "text/html; charset=utf-8");
   assert.equal(res.headers.get("cache-control"), "no-store");
@@ -129,6 +154,12 @@ test(`${OPS_DASHBOARD_PATH}: serves the static read-only page with the right hea
   for (const token of ['"POST"', '"PUT"', '"DELETE"', '"PATCH"', "method:"]) {
     assert.ok(!html.includes(token), `page must be strictly read-only (found ${token})`);
   }
+  // Pins the /readyz shape: readiness comes from components (or the 200 vs
+  // 503 status), never a `ready` field the bot never sends.
+  assert.ok(!html.includes("data.ready"), "page must not read a ready field");
+  assert.ok(html.includes("application/json"), "page must check the JSON content type");
+  assert.ok(html.includes("res.status === 503"), "page must render the 503 readiness report");
+  assert.ok(html.includes("status === 200"), "page must derive readiness from the status");
   assert.equal(calls.length, 0, "serving the page must not touch the container");
 });
 
@@ -251,7 +282,15 @@ function summaryRequest(): Request {
 test("DO /ops/summary: proxies readiness JSON with its status, hardened", async (t) => {
   const { bot } = await summaryDoHarness(t);
   for (const status of [200, 503]) {
-    const body = JSON.stringify({ ready: status === 200, components: [["process", "ready"]] });
+    const components = status === 200
+      ? [["process", "ready"]]
+      : [["process", "ready"], ["gateway", "down"]];
+    const body = JSON.stringify({
+      components,
+      jobs: {},
+      build_revision: "synthetic",
+      build_id: "synthetic",
+    });
     t.mock.method(bot, "containerFetch", async () => new Response(body, {
       status,
       headers: { "content-type": "application/json" },

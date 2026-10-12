@@ -298,8 +298,9 @@ class RequiredEnvironmentTests(unittest.TestCase):
 
 
 class WorkersDevBreakGlassTests(unittest.TestCase):
-    """TOG-22861: staging is the workers.dev break-glass origin; every other
-    route (including bare deploys) must not serve the public suffix."""
+    """TOG-22861: staging + production are the workers.dev break-glass
+    origins until a custom domain exists; every other route (including bare
+    deploys) must not serve the public suffix."""
 
     def check_config(self, content):
         with tempfile.TemporaryDirectory() as directory:
@@ -307,10 +308,10 @@ class WorkersDevBreakGlassTests(unittest.TestCase):
             path.write_text(content)
             return checker.check(path)
 
-    def test_base_declares_staging_only_break_glass(self):
+    def test_base_declares_staging_and_production_break_glass(self):
         self.assertEqual(self.check_config(BASE), [])
         self.assertIn("workers_dev = true", BASE.split("[env.staging]", 1)[1].split("[env.staging.", 1)[0])
-        self.assertIn("workers_dev = false", BASE.split("[env.production]", 1)[1])
+        self.assertIn("workers_dev = true", BASE.split("[env.production]", 1)[1].split("[env.production.", 1)[0])
 
     def test_top_level_workers_dev_must_be_explicitly_false(self):
         for variant in ['workers_dev = true', '']:
@@ -327,13 +328,13 @@ class WorkersDevBreakGlassTests(unittest.TestCase):
                 errors = self.check_config(config)
                 self.assertTrue(any("[env.staging]: workers_dev must be explicitly true" in e for e in errors), errors)
 
-    def test_production_workers_dev_must_be_explicitly_false(self):
-        for variant in ['workers_dev = true', '']:
+    def test_production_workers_dev_must_be_explicitly_true(self):
+        for variant in ['workers_dev = false', '']:
             with self.subTest(variant=variant or "absent"):
                 production = BASE.split("[env.production]\n", 1)
-                config = production[0] + "[env.production]\n" + production[1].replace("workers_dev = false\n", f"{variant}\n" if variant else "", 1)
+                config = production[0] + "[env.production]\n" + production[1].replace("workers_dev = true\n", f"{variant}\n" if variant else "", 1)
                 errors = self.check_config(config)
-                self.assertTrue(any("[env.production]: workers_dev must be explicitly false" in e for e in errors), errors)
+                self.assertTrue(any("[env.production]: workers_dev must be explicitly true" in e for e in errors), errors)
 
     def test_additional_env_must_declare_workers_dev_false(self):
         config = BASE + '\n[env.preview.vars]\nTWO_GUILD_NAME = "Preview"\n'

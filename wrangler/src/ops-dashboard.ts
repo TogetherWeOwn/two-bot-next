@@ -2,20 +2,22 @@
  * Read-only ops dashboard (TOG-22861): a static Worker-served page polling
  * `GET /ops/summary`.
  *
- * - Human auth is Cloudflare Access service tokens: every request to the page
- *   and the summary must carry both `CF-Access-Client-Id` and
- *   `CF-Access-Client-Secret` headers. The edge Access app (Service Auth rule,
- *   strict mode) validates them first; the Worker re-validates against its own
+ * - Human auth is Cloudflare Access service tokens on the summary: every
+ *   request to `GET /ops/summary` must carry both `CF-Access-Client-Id` and
+ *   `CF-Access-Client-Secret` headers. The page itself is static and ungated
+ *   so a browser can open it; it holds no data and only fetches the summary.
+ *   The edge Access app (Service Auth rule, strict mode) validates the
+ *   summary first; the Worker re-validates against its own
  *   `OPS_DASHBOARD_CLIENT_ID` / `OPS_DASHBOARD_CLIENT_SECRET` Worker secrets
  *   so a direct `workers.dev` hit cannot bypass the gate either. Strict mode
- *   semantics: both headers on every request, no cookies or sessions, and
- *   failures are 401 text (never a login redirect).
+ *   semantics: both headers on every summary request, no cookies or
+ *   sessions, and failures are 401 text (never a login redirect).
  * - Strictly read-only: the page issues only `GET /ops/summary` fetches and
  *   the summary proxies only the container's `GET /readyz` JSON. All mutations
  *   stay on their existing API routes; nothing here accepts POST/PUT/DELETE.
- * - Break-glass: staging keeps its `workers.dev` route (see wrangler.toml);
- *   production `workers.dev` is disabled, so only the Access-fronted custom
- *   domain serves these paths there.
+ * - Break-glass: staging and production both keep their `workers.dev` routes
+ *   (see wrangler.toml) until a custom domain and Access app exist; either
+ *   flips to the custom domain in a separate change.
  *
  * Secrets live only as Worker secrets (never wrangler.toml vars — enforced by
  * scripts/check-env-bindings.py) and are never logged.
@@ -63,8 +65,9 @@ async function tokenMatches(provided: string, expected: string): Promise<boolean
 let dashboardShortSecretLogged = false;
 
 /**
- * Service-token gate for the dashboard page and summary. Returns `null` when
- * the request is authorized, else the refusal to send:
+ * Service-token gate for the summary. The static page is ungated (it holds
+ * no data); only `/ops/summary` calls this. Returns `null` when the request
+ * is authorized, else the refusal to send:
  * - unconfigured or short Operator secrets → 404 (the route does not exist);
  * - missing/wrong/oversize credentials → 401.
  * Never throws and never echoes secrets.
@@ -155,20 +158,37 @@ async function poll() {
     status.textContent = "fetch failed";
     return;
   }
-  if (!res.ok) {
+  const contentType = res.headers.get("content-type") || "";
+  const isReadinessJson = contentType.indexOf("application/json") !== -1
+    && (res.status === 200 || res.status === 503);
+  if (!isReadinessJson) {
     status.textContent = "summary " + res.status;
     el.innerHTML = "<p class=\"bad\">summary request failed: " + res.status + "</p>";
     return;
   }
-  const data = await res.json();
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    status.textContent = "summary " + res.status;
+    el.innerHTML = "<p class=\"bad\">summary request failed: " + res.status + "</p>";
+    return;
+  }
   status.textContent = "updated " + new Date().toISOString();
-  el.innerHTML = render(data);
+  el.innerHTML = render(data, res.status);
 }
 function esc(s) {
   return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
-function render(data) {
-  const ready = data && data.ready === true;
+function render(data, status) {
+  const comps0 = Array.isArray(data && data.components) ? data.components : [];
+  // Readiness mirrors the server HealthReport ready rule: every listed
+  // component reports "ready" (vacuous truth when none are listed). The
+  // readyz body carries no ready field, so never read one. When the poll
+  // status is known it decides directly (200 vs 503).
+  const ready = typeof status === "number"
+    ? status === 200
+    : comps0.every(function (c) { return c && c[1] === "ready"; });
   let html = "<h2 class=\"" + (ready ? "ok" : "bad") + "\">" + (ready ? "READY" : "NOT READY") + "</h2>";
   const comps = Array.isArray(data && data.components) ? data.components : [];
   html += "<h3>Components</h3><table><tr><th>name</th><th>state</th></tr>";
