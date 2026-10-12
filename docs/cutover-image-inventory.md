@@ -1,19 +1,20 @@
-# Cutover container image inventory (offline, read-only)
+# Cutover container image inventory (measured)
 
 Read-only record of the cutover runtime image. No registry push, no deploy,
-no secret access. Values come from static files at the baseline inventory
-commit, except for the separately sourced builder-row refresh below. No image
-was built or pulled for this note; the refresh adds no measured evidence.
+no secret access. Static rows come from the `Dockerfile` at sample source SHA
+`4d183937`; byte counts below are measured from a CI-built sample image of
+that main head, described under Measured sample image.
 
 - Baseline inventory commit: `7797b1e166d2aa7b28725cdddc1b8f0c097a5ed5` (2026-10-03)
 - Builder-row refresh (2026-10-04): [`Dockerfile:10` at `723663df9c74fd24734170a981cf59908aadd33a`](https://github.com/TogetherWeOwn/two-bot-next/blob/723663df9c74fd24734170a981cf59908aadd33a/Dockerfile#L10).
   The baseline used `rust:1.94-trixie`; only the builder row now records the
-  Rust 1.98 tag and digest. Runtime, layer, SBOM and size notes remain the
-  baseline record, with unmeasured values still TBD.
+  Rust 1.98 tag and digest. Runtime, layer, SBOM and size notes below are measured on a CI-built
+  main-head sample, not the cutover candidate and not the baseline estimate.
 - Source files: `Dockerfile`, `.github/workflows/sbom.yml`,
   `docs/supply-chain.md`, `scripts/container-smoke.py`, `.trivyignore.yaml`
-- Method: read the files above only. Byte sizes are TBD until the CI-built
-  image for the cutover candidate is inspected.
+- Method: files above plus a CI-built sample image of main head (build logs,
+  `supply-chain` artifact, saved `image.tar`). No image was built or pulled
+  offline for this note.
 
 ## Base images
 
@@ -26,28 +27,65 @@ Both stages are Debian 13, so the binary links against the glibc it runs on.
 Tags stay readable for automated Docker updates while the digests make both
 stages immutable. There is no build-arg override for either base.
 
-## Runtime layer breakdown (static, sizes TBD)
+## Runtime layer breakdown (measured)
 
 The shipped image is the `runtime` stage only. Builder layers are cache
-scaffolding and never ship. Exact byte counts need `docker history` /
-`docker inspect` against the CI-built image and were not measured offline.
+scaffolding and never ship. Byte counts are measured from the CI-built
+sample image named under Measured sample image.
 
 | # | Dockerfile step | Ships a layer? | Notes |
 |---|---|---|---|
-| R1 | `FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792…` | Base layers (count/size TBD) | Debian trust bundle plus 14 documented OS packages; no shell, package manager, or OpenSSL CLI |
+| R1 | `FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792…` | 21 base layers, 29,128,192 bytes (27.78 MiB) as saved-tar blobs | Debian trust bundle plus 14 documented OS packages; no shell, package manager, or OpenSSL CLI |
 | R2 | `LABEL org.opencontainers.image.revision`, `com.togetherweown.build-id` | Metadata only | Non-secret build provenance; zero bytes |
-| R3 | `USER 65532:65532`, `WORKDIR /home/nonroot` | Metadata only | Config, no filesystem delta |
-| R4 | `COPY --from=builder /app/target/release/two-bot ./two-bot` | Yes, one file layer (size TBD) | The only added content: the stripped release binary (`opt-level=z`, LTO, stripped). Budget: 16 MiB per `scripts/container-smoke.py` |
-| R5 | `EXPOSE 8080`, `ENV LISTEN_ADDR=0.0.0.0:8080` | Metadata only | Liveness/readiness port and bind address |
+| R3 | `USER 65532:65532`, `WORKDIR /home/nonroot` | One empty layer (no tar entries), 1,024 bytes as saved-tar blob; `USER` is config-only | Config; the layer is empty because `/home/nonroot` already exists in base layer 7 |
+| R4 | `COPY --from=builder --chown=65532:65532 /app/target/release/two-bot ./two-bot` | Yes, one file layer, 16,065,536 bytes (15.32 MiB) as saved-tar blob; file itself 16,062,800 bytes (15.32 MiB) | The only added file content: the stripped release binary (`opt-level=z`, LTO, stripped). Budget: 16 MiB per `scripts/container-smoke.py` |
+| R5 | `EXPOSE 8080`, `ENV LISTEN_ADDR=0.0.0.0:8080 LOG_FORMAT=json` | Metadata only | Liveness/readiness port, bind address and JSON log format |
 | R6 | `HEALTHCHECK CMD ["/home/nonroot/two-bot", "--healthcheck"]` | Metadata only | Exec-form probe; needs no shell |
 | R7 | `ENTRYPOINT ["/home/nonroot/two-bot"]` | Metadata only | Exec form so PID 1 receives SIGTERM |
 
-Effective layer delta over the distroless base: one file layer (R4).
+Effective layer delta over the distroless base: two layers, an empty
+`WORKDIR` layer (R3, 1,024 bytes, no tar entries) and the binary (R4, one
+file layer).
 Builder-only steps (`COPY` manifests, `cargo fetch`, `COPY . .`,
 `cargo build --release --locked`) affect build cache, not the shipped layer
 count. Size gate for the whole runtime image: 112 MiB per
 `scripts/container-smoke.py`; release profile targets the 256 MiB `lite`
 ceiling from ADR 0001.
+
+## Measured sample image
+
+Built and measured in hosted CI on the merged main head, not offline. This is
+a sample of main, not the pinned cutover candidate.
+
+- Source SHA: `4d183937e22105675fe4d876f5d5249d81f14bf7` (main, 2026-10-11)
+- Check run: [38155009694](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/38155009694);
+  container smoke job: [114516108721](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/38155009694/job/114516108721)
+- Image ID (`sbom/image-id.txt`, from the `sbom.yml` build): `sha256:2257060a144068838731183bf151bc5ffb2a7aec8beff6dbb1e20fc90a859813`
+  (`amd64`/`linux`, user `65532:65532`, entrypoint `/home/nonroot/two-bot`)
+- Budget metric (gate): summed uncompressed `docker history` layer bytes
+  `43,772,940` bytes (41.75 MiB) against `117,440,512` bytes (112 MiB) — PASS.
+  Headroom `73,667,572` bytes (70.25 MiB, 62.7%). This was measured on the
+  container smoke job's own build of the same source SHA, a separate build
+  from the `sbom.yml` build above. This note does not record that build's
+  image ID, so the figure is not measured on `sha256:2257060a…`.
+- Layer blobs of image `sha256:2257060a…`: the saved `image.tar` totals
+  `45,194,752` bytes (see the saved-tar diagnostic), `72,245,760` bytes under
+  the same 112 MiB budget.
+- Binary metric (gate): release binary `16,062,800` bytes (15.32 MiB) against
+  `16,777,216` bytes (16 MiB) — PASS. Headroom `714,416` bytes (0.68 MiB,
+  4.3%). The binary exceeds the old 15 MiB ceiling by `334,160` bytes, so the
+  16 MiB tripwire in `scripts/container-smoke.py` is required.
+- Cross-check: `sbom/runtime-image-evidence.json` (schema 2, `complete: true`)
+  records the same source SHA, image ID, and binary size `16,062,800` with
+  SHA-256 `4d41c4fb7fbfa1d7d6752a0503491a2b6672407a1d4488107fb8ead9b764116a`,
+  14 installed packages, no setid files, no file capabilities, no shell or
+  package-manager tools.
+- Saved-tar diagnostic (`sbom-partial` `image.tar`, 23 layers): R1 base blobs
+  0–20 sum `29,128,192` bytes (27.78 MiB); WORKDIR blob `1,024` bytes; R4
+  binary blob `16,065,536` bytes (15.32 MiB, `2,736` bytes tar overhead over
+  the file); total blobs `45,194,752` bytes (43.10 MiB). The `1,421,812`-byte
+  gap to the history-sum budget metric is tar overhead and accounting, not a
+  second budget.
 
 ## SBOM tool output location
 
@@ -83,10 +121,16 @@ Fetch the SBOMs for a cutover candidate run (no deploy secrets needed):
 gh run download <run-id> -n supply-chain -D <run-owned-scratch-directory>
 ```
 
-Status for this note: TBD per-image. No `supply-chain` artifact was
-downloaded for this offline inventory, so there is no SBOM pointer to a
-specific run yet. The cutover evidence manifest should name the
-candidate's run ID and attach or link its two `.cdx.json` files.
+Status for this note: sample measurement of main head, not the cutover
+candidate. The `supply-chain` artifact for run `38155009694` holds
+`container-image.cdx.json`, `rust-workspace.cdx.json`, `SHA256SUMS`,
+`source-sha.txt`, `image-id.txt`, `runtime-image-evidence.json`, and
+`vulnerability-preflight.json` for source SHA
+`4d183937e22105675fe4d876f5d5249d81f14bf7` and image ID
+`sha256:2257060a144068838731183bf151bc5ffb2a7aec8beff6dbb1e20fc90a859813`.
+It expires 2026-10-25; the `sbom-partial` artifact (`image.tar`) expires
+2026-10-12. Fetch `supply-chain` before then with
+`gh run download 38155009694 -n supply-chain -D <run-owned-scratch-directory>`.
 
 ## Baseline stale-vs-main notes
 
@@ -114,10 +158,23 @@ or the current PR diff.
 
 ## What remains for cutover readiness
 
-1. Build the merged cutover candidate in CI and record its immutable image ID.
+The numbers above come from sample run 38155009694 on main head, not from the
+pinned cutover candidate, and the sample artifacts expire (see Status above).
+Before the deployment digest is pinned:
+
+1. Build the merged cutover candidate in CI on a push to main, so the container
+   smoke job runs, and record its immutable image ID and source SHA.
 2. Download that run's `supply-chain` artifact; file the two `.cdx.json`
-   names, `SHA256SUMS`, and both gate results in the cutover evidence
-   manifest.
-3. Run `docker history` / `docker inspect` on the recorded image ID to fill
-   in the TBD byte counts for R1 and R4 and confirm the 112 MiB / 16 MiB
-   budgets before pinning the deployment digest.
+   names, `SHA256SUMS`, and both gate results under the Releases receipt of
+   the B4 evidence manifest (`docs/cutover.md` B4). That receipt does not list
+   SBOMs yet, so add them there.
+3. Re-measure on the candidate's image ID, and confirm the 112 MiB / 16 MiB
+   budgets pass. CI keeps the candidate image only as the
+   `sbom-partial-<run_id>-<attempt>` artifact (`image.tar`, 1-day retention),
+   so download it within that window. R1 and R4 are saved-tar layer-blob
+   sizes: read them from the archive's `manifest.json` layers, not from
+   `docker history`. The budget metric is summed `docker history` layer bytes,
+   so `docker load` the archive for that. The container-smoke job log of the
+   same push-to-main run gives the budget lines, but for that job's own build,
+   not the image ID. Pinning the deployment digest is tracked separately and
+   is not part of this inventory note.
