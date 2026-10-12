@@ -338,6 +338,31 @@ async fn promoted_target_after_pass_is_not_touched_on_dispatch() {
 }
 
 #[tokio::test]
+async fn unavailable_authority_after_pass_is_not_touched_on_dispatch() {
+    // An authority lookup going unavailable between the pass and the Discord
+    // writes must still produce zero writes: the enforcement recheck fails
+    // closed.
+    let (mut worker, trace) = setup().await;
+    pass_vote(&mut worker);
+    worker.live.set_member_roles(TARGET, None);
+    dispatch(&mut worker, 3).await;
+    assert!(trace.lock().unwrap().is_empty());
+    assert!(worker.failures().is_empty());
+    assert!(worker.flush_kick_audit(4).await);
+    let enforcement: Vec<_> = worker
+        .store
+        .kick_audit
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|row| row.event == KickAuditEvent::Enforcement)
+        .cloned()
+        .collect();
+    assert_eq!(enforcement.len(), 1);
+    assert_eq!(enforcement[0].outcome, "skipped_target_protected");
+}
+
+#[tokio::test]
 async fn ordinary_target_remains_votable_end_to_end() {
     // An occupant with no privilege, who is not owner/creator/self, still
     // passes and enforces on that room only.
