@@ -8,17 +8,20 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import worker, { type Env } from "../src/index.ts";
+import { DatabaseSync } from "node:sqlite";
+import worker, { TwoBotContainer, type Env } from "../src/index.ts";
 import {
   MAX_AUDIT_ROWS,
   OPS_AUDIT_PATH,
   OPS_CONFIG_PATH,
+  OPS_ENFORCEMENT_PENDING,
   OPS_KILLSWITCH_PATH,
   OpsControl,
   OpsRefused,
   parseConfigPut,
   parseKillswitchPost,
 } from "../src/ops-control.ts";
+import { DEPLOYMENT_HEADER, OWNER_KEY } from "../src/ownership.ts";
 
 const TOKEN = "synthetic-ops-control-token-0123456789";
 
@@ -316,7 +319,9 @@ test("config PUT commits at old+1 with an audit row; stale epochs conflict with 
   const { storage, ops } = opsControl();
   const pristine = await ops.readConfig();
   assert.equal(pristine.epoch, 0);
-  assert.deepEqual(pristine.effective, { TWO_AUTOMATIONS: "1" });
+  assert.deepEqual(pristine.overrides, {});
+  assert.deepEqual(pristine.baseline, { TWO_AUTOMATIONS: "1" });
+  assert.equal(pristine.enforcement, "pending");
   const record = await ops.putConfig({
     overrides: { TWO_AUTOMATIONS: "0" },
     expectedEpoch: 0,
@@ -327,7 +332,10 @@ test("config PUT commits at old+1 with an audit row; stale epochs conflict with 
   assert.ok(Number.isFinite(Date.parse(record.timestamp)));
   const after = await ops.readConfig();
   assert.equal(after.epoch, 1);
-  assert.deepEqual(after.effective, { TWO_AUTOMATIONS: "0" });
+  assert.deepEqual(after.overrides, { TWO_AUTOMATIONS: "0" });
+  assert.deepEqual(after.baseline, { TWO_AUTOMATIONS: "1" });
+  assert.equal(after.enforcement, "pending");
+  assert.ok(!("effective" in after), "stored overrides must never read as applied");
   const audit = await ops.listAudit();
   assert.equal(audit.length, 1);
   assert.equal(audit[0]!.actor, "fixture-operator");
@@ -397,4 +405,213 @@ test("corrupt or unreadable state fails closed with no token in the refusal", as
     failing.putConfig({ overrides: {}, expectedEpoch: 0, actor: "a" }),
     (error: unknown) => error instanceof OpsRefused && error.reason === "storage_unavailable",
   );
+});
+
+// ---------------------------------------------------------------- DO half
+//
+// The Worker-gate tests above stub the DO fetch, so they never run the
+// container's own re-checks. These tests call the Durable Object directly:
+// the DO is the authority for stored state and re-checks the bearer, the
+// write switches and the deployment fence itself (defense in depth).
+
+const DO_ID = "synthetic-ops-do-deployment";
+const DO_OWNER = {
+  deploymentId: DO_ID,
+  epoch: 1,
+  phase: "active",
+  actor: "fixture-operator",
+  timestamp: "2026-10-03T00:00:00.000Z",
+  oldEpoch: 0,
+  oldDeploymentId: null,
+};
+const DO_FENCES = { automation: true, automod: false, publish: false, gateway_park: false };
+
+// The Container base class keeps its schedules table in DO SQLite; the ops
+// paths under test never read it, so one shared in-memory database serves
+// every DO harness in this file.
+const doDatabase = new DatabaseSync(":memory:");
+
+function doHarness(env: Record<string, unknown>) {
+  const storage = memoryStorage();
+  storage.map.set(OWNER_KEY, DO_OWNER);
+  const backing = storage as unknown as Record<string, unknown>;
+  const ctx = {
+    id: { toString: () => DO_ID },
+    container: { running: false },
+    storage: {
+      ...backing,
+      delete: async (key: string) => { storage.map.delete(key); },
+      kv: {
+        get: (key: string) => storage.map.get(key),
+        put: (key: string, value: unknown) => { storage.map.set(key, value); },
+        delete: (key: string) => { storage.map.delete(key); },
+      },
+      sql: {
+        exec: (query: string, ...bindings: (string | number | null)[]) =>
+          doDatabase.prepare(query).all(...bindings),
+      },
+      setAlarm: async () => {},
+      deleteAlarm: async () => {},
+      sync: async () => {},
+    } as unknown as DurableObjectStorage,
+    blockConcurrencyWhile<T>(callback: () => Promise<T>) { return callback(); },
+  };
+  const bot = new TwoBotContainer(ctx as unknown as DurableObjectState<{}>, env as unknown as Env);
+  return { bot, storage };
+}
+
+function doEnv(extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    CF_VERSION_METADATA: { id: DO_ID },
+    TWO_AUTOMATIONS: "1",
+    OPS_CONTROL_TOKEN: TOKEN,
+    OPS_CONFIG_WRITES_ENABLED: "1",
+    OPS_KILLSWITCH_ENABLED: "1",
+    ...extra,
+  };
+}
+
+function doRequest(path: string, init: RequestInit = {}, deploymentId: string = DO_ID): Request {
+  return new Request(`https://do.invalid${path}`, {
+    ...init,
+    headers: {
+      authorization: `Bearer ${TOKEN}`,
+      [DEPLOYMENT_HEADER]: deploymentId,
+      ...(init.headers ?? {}),
+    },
+  });
+}
+
+function doPutBody(body: unknown): RequestInit {
+  return {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: typeof body === "string" ? body : JSON.stringify(body),
+  };
+}
+
+function doPostBody(body: unknown): RequestInit {
+  return {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: typeof body === "string" ? body : JSON.stringify(body),
+  };
+}
+
+test("DO re-checks the bearer: wrong or missing token is 401 with no state change", async () => {
+  const { bot, storage } = doHarness(doEnv());
+  const put = doPutBody({ overrides: {}, expectedEpoch: 0, actor: "fixture-operator" });
+  const wrong = await bot.fetch(doRequest(OPS_CONFIG_PATH, {
+    ...put,
+    headers: { ...put.headers, authorization: "Bearer wrong" },
+  }));
+  assert.equal(wrong.status, 401);
+  await wrong.text();
+  const missing = await bot.fetch(new Request(`https://do.invalid${OPS_CONFIG_PATH}`, {
+    headers: { [DEPLOYMENT_HEADER]: DO_ID },
+  }));
+  assert.equal(missing.status, 401);
+  await missing.text();
+  assert.equal(storage.map.has("two-bot:ops-config:v1"), false, "refused calls store nothing");
+});
+
+test("DO re-checks the write switches: dark mutating routes are 404", async () => {
+  const dark = doHarness(doEnv({ OPS_CONFIG_WRITES_ENABLED: "0", OPS_KILLSWITCH_ENABLED: "0" }));
+  const put = await dark.bot.fetch(doRequest(
+    OPS_CONFIG_PATH,
+    doPutBody({ overrides: {}, expectedEpoch: 0, actor: "fixture-operator" }),
+  ));
+  assert.equal(put.status, 404);
+  await put.text();
+  const post = await dark.bot.fetch(doRequest(
+    OPS_KILLSWITCH_PATH,
+    doPostBody({ fences: DO_FENCES, expectedEpoch: 0, actor: "fixture-operator" }),
+  ));
+  assert.equal(post.status, 404);
+  await post.text();
+  assert.equal(dark.storage.map.has("two-bot:ops-config:v1"), false);
+  assert.equal(dark.storage.map.has("two-bot:ops-killswitch:v1"), false);
+});
+
+test("DO re-checks the deployment fence: a mismatched id stores nothing", async () => {
+  const { bot, storage } = doHarness(doEnv());
+  const res = await bot.fetch(doRequest(
+    OPS_CONFIG_PATH,
+    doPutBody({ overrides: {}, expectedEpoch: 0, actor: "fixture-operator" }),
+    "another-deployment",
+  ));
+  assert.equal(res.status, 503);
+  const body = await res.json() as { error: string; reason: string };
+  assert.equal(body.error, "ownership_fenced");
+  assert.equal(body.reason, "deployment_mismatch");
+  assert.equal(storage.map.has("two-bot:ops-config:v1"), false);
+});
+
+test("DO refuses invalid mutating bodies with 400", async () => {
+  const { bot } = doHarness(doEnv());
+  const garbage = await bot.fetch(doRequest(OPS_CONFIG_PATH, doPutBody("not json{{{")));
+  assert.equal(garbage.status, 400);
+  await garbage.text();
+  const badShape = await bot.fetch(doRequest(
+    OPS_CONFIG_PATH,
+    doPutBody({ overrides: { TWO_NOPE: "1" }, expectedEpoch: 0, actor: "a" }),
+  ));
+  assert.equal(badShape.status, 400);
+  await badShape.text();
+  const badFences = await bot.fetch(doRequest(
+    OPS_KILLSWITCH_PATH,
+    doPostBody({ fences: { automation: true }, expectedEpoch: 0, actor: "a" }),
+  ));
+  assert.equal(badFences.status, 400);
+  await badFences.text();
+});
+
+test("DO serves the full state machine: PUT, GET, kill-switch and audit", async () => {
+  const { bot } = doHarness(doEnv());
+  const put = await bot.fetch(doRequest(
+    OPS_CONFIG_PATH,
+    doPutBody({ overrides: { TWO_AUTOMATIONS: "0" }, expectedEpoch: 0, actor: "fixture-operator" }),
+  ));
+  assert.equal(put.status, 200);
+  const stored = await put.json() as {
+    deploymentId: string;
+    record: { epoch: number };
+    enforcement: string;
+  };
+  assert.equal(stored.deploymentId, DO_ID);
+  assert.equal(stored.record.epoch, 1);
+  assert.equal(stored.enforcement, OPS_ENFORCEMENT_PENDING);
+  const get = await bot.fetch(doRequest(OPS_CONFIG_PATH));
+  assert.equal(get.status, 200);
+  const config = await get.json() as {
+    epoch: number;
+    overrides: Record<string, string>;
+    baseline: Record<string, string>;
+    enforcement: string;
+  };
+  assert.equal(config.epoch, 1);
+  assert.deepEqual(config.overrides, { TWO_AUTOMATIONS: "0" });
+  assert.deepEqual(config.baseline, { TWO_AUTOMATIONS: "1" });
+  assert.equal(config.enforcement, OPS_ENFORCEMENT_PENDING);
+  assert.ok(!("effective" in config), "stored overrides must never read as applied");
+  const post = await bot.fetch(doRequest(
+    OPS_KILLSWITCH_PATH,
+    doPostBody({ fences: DO_FENCES, expectedEpoch: 0, actor: "fixture-operator" }),
+  ));
+  assert.equal(post.status, 200);
+  const switched = await post.json() as { record: { epoch: number }; enforcement: string };
+  assert.equal(switched.record.epoch, 1);
+  assert.equal(switched.enforcement, OPS_ENFORCEMENT_PENDING);
+  const fences = await bot.fetch(doRequest(OPS_KILLSWITCH_PATH));
+  assert.equal(fences.status, 200);
+  const fenced = await fences.json() as {
+    record: { fences: Record<string, boolean> };
+    enforcement: string;
+  };
+  assert.deepEqual(fenced.record.fences, DO_FENCES);
+  assert.equal(fenced.enforcement, OPS_ENFORCEMENT_PENDING);
+  const audit = await bot.fetch(doRequest(OPS_AUDIT_PATH));
+  assert.equal(audit.status, 200);
+  const rows = await audit.json() as { rows: { action: string; epoch: number }[] };
+  assert.deepEqual(rows.rows.map((r) => r.action), ["kill_switch", "config_put"]);
 });

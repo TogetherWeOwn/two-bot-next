@@ -72,6 +72,7 @@ import {
 import {
   OPS_AUDIT_PATH,
   OPS_CONFIG_PATH,
+  OPS_ENFORCEMENT_PENDING,
   OPS_KILLSWITCH_PATH,
   OpsControl,
   configWritesEnabled,
@@ -707,13 +708,13 @@ export class TwoBotContainer extends Container<Env> {
           }
           const record = await ops.putConfig(change);
           console.log(JSON.stringify({ event: "ops_config_put", epoch: record.epoch, actor: record.actor }));
-          return Response.json({ deploymentId: id, record }, {
+          return Response.json({ deploymentId: id, record, enforcement: OPS_ENFORCEMENT_PENDING }, {
             headers: withSecurityHeaders({ "cache-control": "no-store" }),
           });
         }
         if (isKillswitch && request.method === "GET") {
           const record = await ops.readKillswitch();
-          return Response.json({ deploymentId: id, record }, {
+          return Response.json({ deploymentId: id, record, enforcement: OPS_ENFORCEMENT_PENDING }, {
             headers: withSecurityHeaders({ "cache-control": "no-store" }),
           });
         }
@@ -724,7 +725,7 @@ export class TwoBotContainer extends Container<Env> {
           }
           const record = await ops.postKillswitch(change);
           console.log(JSON.stringify({ event: "ops_kill_switch", epoch: record.epoch, actor: record.actor }));
-          return Response.json({ deploymentId: id, record }, {
+          return Response.json({ deploymentId: id, record, enforcement: OPS_ENFORCEMENT_PENDING }, {
             headers: withSecurityHeaders({ "cache-control": "no-store" }),
           });
         }

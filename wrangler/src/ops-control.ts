@@ -1,10 +1,12 @@
 /**
- * Admin control endpoints (TOG-22862): read-only effective config plus
+ * Admin control endpoints (TOG-22862): read-only stored config plus
  * default-dark mutating controls, behind a least-privilege control-scope
  * token that is distinct from the ownership and metrics tokens.
  *
  * Routes (all exact path, no query):
- * - GET  /ops/config      effective TWO_* toggles (env baseline + overrides)
+ * - GET  /ops/config      stored TWO_* overrides (env baseline plus pending
+ *                          overrides; nothing here is applied to the running
+ *                          bot yet, see `enforcement` below)
  * - PUT  /ops/config      replace overrides (gated, epoch-checked, audited)
  * - GET  /ops/kill-switch current fences (same auth as config)
  * - POST /ops/kill-switch replace fences (gated, epoch-checked, audited)
@@ -14,6 +16,9 @@
  * (held/disabled/parked); `false` (the default) means active. Enforcement in
  * the Rust runtime is a follow-up after the CISO review (AC4); this module
  * owns the control-plane state machine, its epoch semantics and its audit.
+ * Until that follow-up lands, every config and kill-switch response carries
+ * `enforcement: "pending"`: stored overrides are not in effect on the
+ * running bot, and no response field may claim otherwise.
  *
  * Epoch semantics mirror wrangler/src/ownership.ts: every mutating call posts
  * the epoch it saw, the DO checks it optimistically, persists the new record
@@ -44,6 +49,13 @@ export const OPS_KILLSWITCH_KEY = "two-bot:ops-killswitch:v1";
 export const OPS_AUDIT_SEQ_KEY = "two-bot:ops-audit-seq:v1";
 /** Append-only audit rows; extends the two-bot:ownership-audit:v1 pattern. */
 export const OPS_AUDIT_PREFIX = "two-bot:ops-audit:v1:";
+/**
+ * Enforcement marker on every config and kill-switch response. Stored
+ * overrides are control-plane state only until the Rust runtime reads them
+ * (CISO review AC4 follow-up); the marker keeps operators from mistaking a
+ * stored override for an applied one.
+ */
+export const OPS_ENFORCEMENT_PENDING = "pending" as const;
 
 /** Same floor as the ownership control and metrics scrape tokens. */
 export const MIN_OPS_TOKEN_LENGTH = 32;
@@ -335,10 +347,20 @@ export class OpsControl {
     this.env = env;
   }
 
-  async readConfig(): Promise<{ epoch: number; overrides: Record<string, string>; effective: Record<string, string> }> {
+  async readConfig(): Promise<{
+    epoch: number;
+    overrides: Record<string, string>;
+    baseline: Record<string, string>;
+    enforcement: typeof OPS_ENFORCEMENT_PENDING;
+  }> {
     const stored = await this.getConfig();
     const overrides = stored?.overrides ?? {};
-    return { epoch: stored?.epoch ?? 0, overrides, effective: this.effective(overrides) };
+    return {
+      epoch: stored?.epoch ?? 0,
+      overrides,
+      baseline: this.baseline(),
+      enforcement: OPS_ENFORCEMENT_PENDING,
+    };
   }
 
   async putConfig(put: ConfigPut): Promise<OpsConfigRecord> {
@@ -403,8 +425,8 @@ export class OpsControl {
     return [...rows.values()];
   }
 
-  private effective(overrides: Record<string, string>): Record<string, string> {
-    return { ...forwardedFlagVars(this.env), ...overrides };
+  private baseline(): Record<string, string> {
+    return { ...forwardedFlagVars(this.env) };
   }
 
   private async getConfig(): Promise<OpsConfigRecord | undefined> {
