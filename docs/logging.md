@@ -10,10 +10,16 @@ Docker explicitly sets `LOG_FORMAT=json`; native runs also default to JSON.
   Missing/unknown values use JSON. Unknown values emit `log_format_invalid`
   without echoing the value (subject to the level filter).
 - `RUST_LOG`: valid, nonempty tracing EnvFilter directives take precedence, e.g.
-  `warn,two_bot=debug,two_bot_discord=info`. Malformed/empty directives fall back
-  to `LOG_LEVEL` without plain-text stderr diagnostics.
+  `warn,two_bot=debug,two_bot_discord=info`. Empty/absent directives fall back
+  to `LOG_LEVEL` silently without plain-text stderr diagnostics. A present,
+  nonempty, unparsable directive emits `rust_log_invalid` (warn, naming the key
+  but never the value; subject to the fallback filter), then falls back to
+  `LOG_LEVEL`.
 - `LOG_LEVEL`: `trace`, `debug`, `info`, `warn`, `error`, `off` (case-insensitive).
-  Missing/invalid levels default to `info`. The level applies to the `two_bot`
+  Missing/empty levels default to `info` silently. A present, nonempty,
+  unparsable level emits `log_level_invalid` (warn, naming the key but never the
+  value; subject to the `info` fallback filter), then defaults to `info`.
+  The level applies to the `two_bot`
   target prefix (all workspace crates); anything else logs at ERROR only
   unless `RUST_LOG` opts in. `/readyz` 503s log at DEBUG, not ERROR.
 - `--help`, backup/export CLI stdout, and the silent `--healthcheck` probe are
@@ -84,6 +90,8 @@ draining state is observable via `/readyz` and `shutdown_started/completed`.
 | --- | --- |
 | `config_invalid` | Invalid runtime config; safe, value-free config error |
 | `log_format_invalid` | Unsupported format; falls back to JSON |
+| `rust_log_invalid` | Present, nonempty, unparsable `RUST_LOG`; falls back to `LOG_LEVEL` |
+| `log_level_invalid` | Present, nonempty, unparsable `LOG_LEVEL`; defaults to `info` |
 | `gateway_parked` | Missing prerequisite; `missing`, `status` |
 | `gateway_connecting` | Durable store loaded, before connecting; `resume` |
 | `gateway_started` | Gateway loop begins; `shard` |
