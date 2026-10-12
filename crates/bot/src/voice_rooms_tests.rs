@@ -12596,7 +12596,7 @@ async fn join_commands_count_received_on_accept_and_on_refusal() {
         "both deliveries count as received"
     );
     assert!(
-        refused_with_reason("duplicate") >= duplicate_before + 1,
+        refused_with_reason("duplicate") > duplicate_before,
         "the repeat delivery refuses as a duplicate"
     );
 }
@@ -12623,7 +12623,7 @@ async fn silent_join_refusals_carry_stable_reason_labels() {
         tokio::time::Instant::now()
     ));
     assert!(
-        refused_with_reason("halted") >= halted_before + 1,
+        refused_with_reason("halted") > halted_before,
         "halted joins refuse with the halted label"
     );
 
@@ -12647,7 +12647,7 @@ async fn silent_join_refusals_carry_stable_reason_labels() {
         tokio::time::Instant::now()
     ));
     assert!(
-        refused_with_reason("access") >= access_before + 1,
+        refused_with_reason("access") > access_before,
         "gated joins refuse with the access label"
     );
 
@@ -12668,7 +12668,7 @@ async fn silent_join_refusals_carry_stable_reason_labels() {
         tokio::time::Instant::now()
     ));
     assert!(
-        refused_with_reason("unknown_creator") >= unknown_before + 1,
+        refused_with_reason("unknown_creator") > unknown_before,
         "creator-less joins refuse with the unknown_creator label"
     );
 
@@ -12677,7 +12677,7 @@ async fn silent_join_refusals_carry_stable_reason_labels() {
     let blocked_before = refused_with_reason("name_blocked");
     assert!(!join_as(&mut worker, MEMBER, "Ava"));
     assert!(
-        refused_with_reason("name_blocked") >= blocked_before + 1,
+        refused_with_reason("name_blocked") > blocked_before,
         "blocked names refuse with the name_blocked label"
     );
 }
