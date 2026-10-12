@@ -145,6 +145,23 @@ const COMMUNITY_TABLE_ROWS: [&str; 3] = [
     "\"inactivity\",Kind::Inactivity",
 ];
 
+/// Pins that turn a community table row into a registered job, matched with
+/// all whitespace removed (full-line `//` comments stripped first) so
+/// reformatting cannot silently unpin them. The table rows alone are not
+/// enough: `out.push(Job {` builds each `Job`, `Registration { jobs: out,`
+/// returns them, the `if !enabled { continue; }` gate keeps disabled jobs
+/// parked, and each row's trailing `enabled` expression decides the default.
+/// Any of these silently changing must fail here, the same way a dropped
+/// `registered.*` sink fails for `website_jobs.rs`.
+const COMMUNITY_REGISTER_PINS: [&str; 6] = [
+    "out.push(Job{",
+    "Registration{jobs:out,",
+    "if!enabled{continue;}",
+    "\"presence_probe\",Kind::PresenceProbe,gates.presence",
+    "\"community_scorecard\",Kind::Scorecard,gates.scorecard.is_some()",
+    "\"inactivity\",Kind::Inactivity,gates.inactivity_days.is_some()",
+];
+
 /// Direct emission outside the supervisor. `session_checkpoint` is the dispatch
 /// commit marker recorded by DispatchTimer on every durable gateway commit:
 /// success-only, no failure path, never a scheduled tick.
@@ -356,6 +373,12 @@ fn every_scrape_job_has_a_live_emitter_or_parked_reason() {
         assert!(
             community_rows.contains(row),
             "community_jobs.rs register table lost row {row}; a dropped table row must fail here"
+        );
+    }
+    for pin in COMMUNITY_REGISTER_PINS {
+        assert!(
+            community_rows.contains(pin),
+            "community_jobs.rs register lost pin {pin}; a job that stops being built, returned, gated, or enabled must fail here"
         );
     }
     let names_block = website
