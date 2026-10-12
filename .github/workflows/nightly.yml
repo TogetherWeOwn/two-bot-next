@@ -264,6 +264,9 @@ jobs:
           --skip post_apply_unreadable_ledger_is_unknown_not_empty
           --skip database::actions_persist_rows_and_preserve_other_events_and_guilds
           --skip a_restarted_worker_rediscovers_a_channel_whose_rollback_failed
+          --skip blocklisted_members_skip_per_user_rows_but_count_in_aggregates
+          --skip persisted_member_rows_hold_ids_timestamps_enums_only
+          --skip resume_continues_from_the_persisted_cursor
           --skip backfill_cursors_persist_per_family_insert_and_update
           --skip backfill_cursor_survives_crash_restart_and_never_resets_to_zero
           --skip concurrent_families_never_clobber_each_other

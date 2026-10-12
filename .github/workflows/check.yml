@@ -1137,6 +1137,9 @@ jobs:
       - name: invite store atomicity (CI service container only)
         run: cargo test -p two-bot-cutover --locked --test invite_store -- --ignored
 
+      - name: member-list catch-up acceptance (CI service container only)
+        run: cargo test -p two-bot-cutover --locked --test member_list_catchup -- --ignored
+
       - name: cutover reward ladder lib regression (CI service container only)
         run: cargo test -p two-bot-cutover --locked --lib -- --ignored
 
