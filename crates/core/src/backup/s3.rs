@@ -93,9 +93,9 @@ fn authority_of(endpoint: &str) -> &str {
 }
 
 /// Parse the endpoint structurally before signing. Refuses absent host,
-/// userinfo, query, fragment, invalid port and malformed bracketed authority.
-/// Valid HTTPS origins, valid explicit ports and path prefixes pass through;
-/// diagnostics are constants that never echo the input.
+/// userinfo, query, fragment, backslash, invalid port and malformed bracketed
+/// authority. Valid HTTPS origins, valid explicit ports and path prefixes pass
+/// through; diagnostics are constants that never echo the input.
 fn parse_endpoint(endpoint: &str) -> Result<ParsedEndpoint, S3ConfigError> {
     if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
         return Err(S3ConfigError(ERR_SCHEME.to_owned()));
