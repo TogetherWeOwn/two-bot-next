@@ -7,12 +7,17 @@ announcements-channel posting) is a separate reviewed slice.
 ## Twitch `stream.online` (confirmed 2026-10-12)
 
 - Subscription: `stream.online` version 1, condition `broadcaster_user_id`.
-- Authorization scope: none. The subscription call uses an app access token
-  from the client-credentials flow.
+- Authorization scope: none. Token type depends on the transport: webhook
+  and Conduit subscriptions use an app access token from the
+  client-credentials flow, while WebSocket subscriptions require a user
+  access token (no scope for `stream.online`) and fail with an app token.
+  A WebSocket transport therefore needs user-token handling and refresh;
+  webhook/Conduit do not.
 - Transports: webhook, WebSocket, Conduit.
 - Cost: EventSub delivery carries no per-event quota units.
 - References: `https://dev.twitch.tv/docs/eventsub/`,
-  `https://dev.twitch.tv/docs/authentication/`.
+  `https://dev.twitch.tv/docs/authentication/`,
+  `https://dev.twitch.tv/docs/eventsub/manage-subscriptions/`.
 
 The bot accepts only `type: stream.online` + `version: 1`, validates the
 broadcaster id/login/`started_at`, checks the condition against the event,
@@ -22,9 +27,10 @@ post is planned. See `crates/core/src/stream_funnel.rs`.
 
 ## YouTube VOD linking convention (confirmed 2026-10-12)
 
-- Uploads use `videos.insert`: 1,600 quota units per call against the
-  default 10,000 units/day project quota (about six uploads a day).
-  Increases go through the quota-extension form.
+- Uploads use `videos.insert`, which has its own quota bucket: by default
+  100 calls/day at a cost of 1 per call, separate from the default
+  10,000 units/day general project quota. Increases go through the
+  quota-extension form.
 - Every game-night VOD description ends with the footer from
   `vod_description_footer`, and the pinned comment uses
   `vod_pinned_comment`. Both carry the Discord invite link.
