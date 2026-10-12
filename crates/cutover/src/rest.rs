@@ -375,6 +375,36 @@ impl RestClient {
         Ok(Some(out))
     }
 
+    /// One member-list page as raw JSON for the member-catch-up slice
+    /// (TOG-22941): `limit` is the caller's 1-1000 page size, `after` is the
+    /// resume cursor carried verbatim onto the wire. Rides the same governed
+    /// transport as every page (pacing, retries, `requests()` counting), so
+    /// the catch-up proof that every request passed through the rate-limit
+    /// client holds. An unreadable page reads as empty (end of list for a
+    /// single-page read); strict traversal callers keep using
+    /// [`Self::fetch_all_members`].
+    pub async fn fetch_members_page_json(
+        &self,
+        guild_id: Id<GuildMarker>,
+        limit: u16,
+        after: Option<Id<UserMarker>>,
+    ) -> Result<Vec<serde_json::Value>, RestError> {
+        let page: ListPage<serde_json::Value> = self
+            .exec_list(|| {
+                let client = &self.inner.client;
+                let mut req = client.guild_members(guild_id).limit(limit);
+                if let Some(cursor) = after {
+                    req = req.after(cursor);
+                }
+                req.try_into_request()
+            })
+            .await?;
+        match page {
+            ListPage::Read(batch) => Ok(batch),
+            ListPage::Interrupted(_) => Ok(Vec::new()),
+        }
+    }
+
     /// Guild invites (attribution baseline / capture window counters).
     pub async fn guild_invites(
         &self,

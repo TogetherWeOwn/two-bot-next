@@ -49,7 +49,6 @@ use std::{
 };
 
 use axum::{
-    body::Bytes,
     extract::State,
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -324,15 +323,29 @@ fn now_ms() -> u64 {
 async fn handler(
     State((shared, _jobs)): State<(crate::server::SharedState, crate::jobs::SharedStatus)>,
     Extension(ring): Extension<SharedRing>,
-    headers: HeaderMap,
-    body: Bytes,
+    request: axum::extract::Request,
 ) -> Response {
+    // Single `Request` extractor (proven by `internal_action_http::handle`):
+    // the prior `HeaderMap + Bytes` pair never satisfied `Handler` for this
+    // state, blocking every cargo build on the branch.
+    let (parts, body) = request.into_parts();
+    let headers = parts.headers;
+    let body_bytes = match axum::body::to_bytes(body, 64 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            // Fail closed: an unreadable body can never authenticate.
+            return refusal(&internal_actions::new_request_id(
+                now_ms(),
+                &rand::random(),
+            ));
+        }
+    };
     let id = internal_actions::new_request_id(now_ms(), &rand::random());
     let mut guard = ring
         .0
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let denial = authenticate(&mut guard, &headers, &body, now_ms()).err();
+    let denial = authenticate(&mut guard, &headers, &body_bytes, now_ms()).err();
     drop(guard);
     if let Some(denial) = denial {
         tracing::debug!(
