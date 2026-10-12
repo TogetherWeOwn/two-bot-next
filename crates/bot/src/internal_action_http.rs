@@ -1452,9 +1452,10 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
     };
     match state.effect.execute(&decision.body).await {
         Effect::Terminal(response) => {
-            if state.store.finish(&claim, &response).await.is_err() {
+            if let Err(finish_error) = state.store.finish(&claim, &response).await {
                 // Do not return success before its audit/receipt is committed.
                 // An unavailable store leaves the existing claim occupied.
+                log_terminal_persist_failed(action, "finish", finish_error);
                 mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation(), action);
             }
@@ -1635,13 +1636,16 @@ async fn execute_member(
                 match RoleAssignRequest::validate(&decision.body, state.config.role_keys()) {
                     Ok(request) => request,
                     Err(_) => {
-                        let _ = state
+                        if let Err(error) = state
                             .store
                             .finish(
                                 &claim,
                                 &TerminalResponse::Failure(TerminalFailure::Malformed),
                             )
-                            .await;
+                            .await
+                        {
+                            log_terminal_persist_failed(action, "finish", error);
+                        }
                         return state.terminal(
                             TerminalResponse::Failure(TerminalFailure::Malformed),
                             false,
@@ -1660,13 +1664,16 @@ async fn execute_member(
             let request = match GuildAddMemberRequest::validate(&decision.body) {
                 Ok(request) => request,
                 Err(_) => {
-                    let _ = state
+                    if let Err(error) = state
                         .store
                         .finish(
                             &claim,
                             &TerminalResponse::Failure(TerminalFailure::Malformed),
                         )
-                        .await;
+                        .await
+                    {
+                        log_terminal_persist_failed(action, "finish", error);
+                    }
                     return state.terminal(
                         TerminalResponse::Failure(TerminalFailure::Malformed),
                         false,
@@ -1680,13 +1687,16 @@ async fn execute_member(
             let token = match require_field_str(&decision.body, "access_token") {
                 Ok(token) => token.to_owned(),
                 Err(_) => {
-                    let _ = state
+                    if let Err(error) = state
                         .store
                         .finish(
                             &claim,
                             &TerminalResponse::Failure(TerminalFailure::Malformed),
                         )
-                        .await;
+                        .await
+                    {
+                        log_terminal_persist_failed(action, "finish", error);
+                    }
                     return state.terminal(
                         TerminalResponse::Failure(TerminalFailure::Malformed),
                         false,
@@ -1713,7 +1723,8 @@ async fn execute_member(
                 affected,
                 outcome: None,
             };
-            if state.store.finish(&claim, &response).await.is_err() {
+            if let Err(finish_error) = state.store.finish(&claim, &response).await {
+                log_terminal_persist_failed(action, "finish", finish_error);
                 mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
             }
@@ -1721,7 +1732,8 @@ async fn execute_member(
         }
         Err(error) if error.code == ErrorCode::DiscordRejected => {
             let response = TerminalResponse::Failure(TerminalFailure::DiscordRejected);
-            if state.store.finish(&claim, &response).await.is_err() {
+            if let Err(finish_error) = state.store.finish(&claim, &response).await {
+                log_terminal_persist_failed(action, "finish", finish_error);
                 mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
             }
@@ -1824,7 +1836,8 @@ async fn moderation_member(
         .await
     {
         Ok(response) => {
-            if state.store.finish(&claim, &response).await.is_err() {
+            if let Err(finish_error) = state.store.finish(&claim, &response).await {
+                log_terminal_persist_failed(action, "finish", finish_error);
                 mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
             }
@@ -1850,7 +1863,8 @@ async fn moderation_member(
                 _ => TerminalFailure::DiscordRejected,
             };
             let response = TerminalResponse::Failure(failure);
-            if state.store.finish(&claim, &response).await.is_err() {
+            if let Err(finish_error) = state.store.finish(&claim, &response).await {
+                log_terminal_persist_failed(action, "finish", finish_error);
                 mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
             }
@@ -2038,7 +2052,8 @@ async fn moderate_channel(
                 affected: stored_affected,
                 outcome: None,
             };
-            if state.store.finish(&claim, &response).await.is_err() {
+            if let Err(finish_error) = state.store.finish(&claim, &response).await {
+                log_terminal_persist_failed(action, "finish", finish_error);
                 mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
             }
@@ -2066,7 +2081,8 @@ async fn moderate_channel(
                 _ => TerminalFailure::DiscordRejected,
             };
             let response = TerminalResponse::Failure(failure);
-            if state.store.finish(&claim, &response).await.is_err() {
+            if let Err(finish_error) = state.store.finish(&claim, &response).await {
+                log_terminal_persist_failed(action, "finish", finish_error);
                 mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
             }
@@ -2304,9 +2320,10 @@ async fn mutate_event(
                 affected: 1,
                 outcome: Some(outcome),
             };
-            if state.store.finish(&claim, &response).await.is_err() {
+            if let Err(finish_error) = state.store.finish(&claim, &response).await {
                 // Do not return success before its audit/receipt is committed.
                 // An unavailable store leaves the existing claim occupied.
+                log_terminal_persist_failed(action, "finish", finish_error);
                 mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
             }
@@ -2327,7 +2344,8 @@ async fn mutate_event(
                 || error.is_admission_storage()
             {
                 let wire = error.action_error();
-                if state.store.release_proven_not_sent(claim).await.is_err() {
+                if let Err(release_error) = state.store.release_proven_not_sent(claim).await {
+                    log_terminal_persist_failed(action, "release", release_error);
                     return reject(Failure::code(ErrorCode::Internal));
                 }
                 return reject(Failure::from_action(wire));
@@ -2337,7 +2355,8 @@ async fn mutate_event(
                     DiscordError::RateLimited | DiscordError::Rejected(_),
                 ) => {
                     let response = TerminalResponse::Failure(TerminalFailure::DiscordRejected);
-                    if state.store.finish(&claim, &response).await.is_err() {
+                    if let Err(finish_error) = state.store.finish(&claim, &response).await {
+                        log_terminal_persist_failed(action, "finish", finish_error);
                         mark_unknown_best_effort(&state.store, &claim, action).await;
                         return reject(Failure::reconciliation());
                     }
@@ -2436,7 +2455,8 @@ async fn write_setting(
                 affected: u32::from(!deleted),
                 outcome: None,
             };
-            if state.store.finish(&claim, &terminal).await.is_err() {
+            if let Err(finish_error) = state.store.finish(&claim, &terminal).await {
+                log_terminal_persist_failed(action, "finish", finish_error);
                 mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
             }
@@ -2455,7 +2475,8 @@ async fn write_setting(
                 _ => None,
             };
             if let Some(terminal) = terminal {
-                if state.store.finish(&claim, &terminal).await.is_err() {
+                if let Err(finish_error) = state.store.finish(&claim, &terminal).await {
+                    log_terminal_persist_failed(action, "finish", finish_error);
                     mark_unknown_best_effort(&state.store, &claim, action).await;
                     return reject(Failure::reconciliation());
                 }
@@ -2706,7 +2727,8 @@ async fn import_automations(
                 affected,
                 outcome: None,
             };
-            if state.store.finish(&claim, &terminal).await.is_err() {
+            if let Err(finish_error) = state.store.finish(&claim, &terminal).await {
+                log_terminal_persist_failed(action, "finish", finish_error);
                 mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
             }
@@ -2714,7 +2736,8 @@ async fn import_automations(
         }
         Err(ImportServiceError::OverwriteNotAllowed) => {
             let terminal = TerminalResponse::Failure(TerminalFailure::ActionNotAllowed);
-            if state.store.finish(&claim, &terminal).await.is_err() {
+            if let Err(finish_error) = state.store.finish(&claim, &terminal).await {
+                log_terminal_persist_failed(action, "finish", finish_error);
                 mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
             }
@@ -2726,7 +2749,8 @@ async fn import_automations(
             | ImportServiceError::Validation(_),
         ) => {
             let terminal = TerminalResponse::Failure(TerminalFailure::Malformed);
-            if state.store.finish(&claim, &terminal).await.is_err() {
+            if let Err(finish_error) = state.store.finish(&claim, &terminal).await {
+                log_terminal_persist_failed(action, "finish", finish_error);
                 mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
             }
@@ -3142,6 +3166,21 @@ async fn mark_unknown_best_effort(
             "internal action unknown-state persistence failed"
         );
     }
+}
+
+/// A failed terminal (`finish`) or proven-not-sent (`release`) write never
+/// releases the claim or resends; this only surfaces the gap. Mirrors
+/// [`mark_unknown_best_effort`]: fixed `msg`, bounded `action`, fixed
+/// `persist_op` (`finish` or `release`) and fixed `persist_class`. No store
+/// error text, claim, nonce, body, key, request ID or credential is logged.
+fn log_terminal_persist_failed(action: ActionLabel, op: &'static str, error: InternalStoreError) {
+    tracing::error!(
+        msg = "internal_action_terminal_persist_failed",
+        action = action.as_str(),
+        persist_op = op,
+        persist_class = unknown_persist_class(error),
+        "internal action terminal persistence failed"
+    );
 }
 
 fn unknown_persist_class(error: InternalStoreError) -> &'static str {

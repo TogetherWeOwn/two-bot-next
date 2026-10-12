@@ -241,6 +241,19 @@ class RedactionTests(unittest.TestCase):
         self.assertEqual(event["persist_class"], "storage_unavailable")
         self.assertNotIn("action", event)
 
+    def test_terminal_persist_op_is_kept_and_the_free_action_label_is_not(self):
+        for op in ("finish", "release"):
+            with self.subTest(op=op):
+                packet = self.packet_for("internal action terminal persistence failed",
+                                         msg="internal_action_terminal_persist_failed",
+                                         persist_op=op,
+                                         persist_class="storage_unavailable",
+                                         action="announcement.post")
+                event = packet["events"][0]
+                self.assertEqual(event["persist_op"], op)
+                self.assertEqual(event["persist_class"], "storage_unavailable")
+                self.assertNotIn("action", event)
+
     def test_a_real_run_id_survives_but_a_snowflake_does_not(self):
         packet = self.packet_for("guild " + HOSTILE["snowflake"], run_id="1791721100000000000-7")
         event = packet["events"][0]
