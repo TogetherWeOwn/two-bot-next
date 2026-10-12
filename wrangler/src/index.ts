@@ -78,6 +78,7 @@ import {
 } from "./alert-rules.ts";
 import { parseAlertScrape } from "./metrics-scrape.ts";
 import { applySecurityHeaders, withSecurityHeaders } from "./security-headers.ts";
+import { handleMcp } from "./mcp.ts";
 
 /**
  * Plus the optional reviewed TWO_* flags in container-env.ts (TOG-12020) and
@@ -114,6 +115,8 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   OPS_ALERT_FORWARDING?: string;
   /** Optional Worker secret: bearer token for GET /ops/metrics. Unset → route 404s. */
   METRICS_SCRAPE_TOKEN?: string;
+  /** Optional Worker secret: bearer token for POST /mcp (`mcp:read`). Unset → route 404s. */
+  MCP_TOKEN?: string;
   /** Optional Hyperdrive binding to shared Postgres; absent → snapshot, clicks dropped. */
   REDIRECT_DB?: Hyperdrive;
   /** Invite code for `/` and DB outages. Optional but recommended. */
@@ -184,6 +187,12 @@ const healthBuckets = new TokenBuckets();
 // gate whose token already requires 32 characters (see ownership.ts
 // authenticated()), and its lockout semantics belong to that fence.
 const metricsAuthBuckets = new TokenBuckets({ capacity: 10, refillPerSecond: 1 });
+// MCP bearer gate (phase 1: shared `mcp:read` bearer; DCR/PKCE is the
+// staging target in docs/mcp.md). Same brute-force shape as the scrape gate:
+// budget is taken synchronously before the digest comparison, and an
+// exhausted caller is refused without any comparison.
+const mcpAuthBuckets = new TokenBuckets({ capacity: 10, refillPerSecond: 1 });
+let mcpShortTokenLogged = false;
 // A short scrape token is an operator misconfiguration, not per-request
 // information: say so once per isolate so scanners cannot flood the logs.
 let metricsShortTokenLogged = false;
@@ -940,6 +949,51 @@ export default {
           return env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
         },
       );
+    }
+
+    // Bot HTTP MCP server (Streamable HTTP, read-only tools first). Exact
+    // path only: only POST is served (browser probes get 405, never tool
+    // execution). Unconfigured/short token → 404 (the route does not exist);
+    // missing/wrong bearer → 401 with WWW-Authenticate, before the Container
+    // is touched. Every tool call below is bounded (6 s / 64 KiB) in mcp.ts.
+    if (url.pathname === "/mcp") {
+      if (request.method !== "POST") {
+        return new Response("method not allowed", {
+          status: 405,
+          headers: withSecurityHeaders({ allow: "POST" }),
+        });
+      }
+      if (!env.MCP_TOKEN || env.MCP_TOKEN.length < MIN_SCRAPE_TOKEN_LENGTH) {
+        if (env.MCP_TOKEN && env.MCP_TOKEN.length < MIN_SCRAPE_TOKEN_LENGTH
+          && !mcpShortTokenLogged) {
+          mcpShortTokenLogged = true;
+          console.error(JSON.stringify({
+            event: "mcp_token_misconfigured",
+            reason: "token_below_minimum_length",
+            minimum_length: MIN_SCRAPE_TOKEN_LENGTH,
+          }));
+        }
+        return new Response("not found", { status: 404, headers: withSecurityHeaders() });
+      }
+      const caller = request.headers.get("cf-connecting-ip") ?? "unknown";
+      const verdict = mcpAuthBuckets.take(caller);
+      if (!verdict.allowed && !mcpAuthBuckets.peek(caller).allowed) {
+        return new Response("slow down\n", {
+          status: 429,
+          headers: withSecurityHeaders({
+            "content-type": "text/plain",
+            "retry-after": String(verdict.retryAfter),
+          }),
+        });
+      }
+      const m = /^Bearer (.+)$/.exec(request.headers.get("authorization") ?? "");
+      if (!m || m[1]!.length > 4096 || !(await tokenMatches(m[1]!, env.MCP_TOKEN))) {
+        return new Response("unauthorized", { status: 401, headers: withSecurityHeaders({ "www-authenticate": "Bearer" }) });
+      }
+      return handleMcp(request, env, {
+        BOT_PORT: env.BOT_PORT,
+        KEEPALIVE_SECONDS: env.KEEPALIVE_SECONDS,
+      });
     }
 
     if (url.pathname === "/health" || url.pathname === "/readyz") {

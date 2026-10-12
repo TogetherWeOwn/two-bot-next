@@ -1,0 +1,390 @@
+/**
+ * Bot HTTP MCP server (Streamable HTTP, read-only tools first).
+ *
+ * Stateless `POST /mcp` JSON-RPC handler on the Worker (ops host). No
+ * session state, no SSE stream, no McpAgent/Durable Object session: each
+ * request is an independent JSON-RPC message closed with its response.
+ * The bearer gate lives in `index.ts` (before this handler runs), so every
+ * call here is already authenticated with the `mcp:read` bearer.
+ *
+ * Phase 1 tools (all read-only, all bounded: 6 s timeout + 64 KiB body cap,
+ * same as the metrics scrape in `index.ts`):
+ * - `get_status` → `GET http://c/health` (single container read)
+ * - `get_gateway` → `GET http://c/readyz`, gateway excerpt only
+ * - `get_backfill_progress` → `GET http://c/readyz` jobs excerpt, with an
+ *   explicit `implemented: false` marker (no backfill JSON API exists yet)
+ * - `get_config` → redacted non-secret Worker snapshot (no container read,
+ *   never secrets)
+ * - `get_audit` → explicit `implemented: false` stub (no audit JSON API
+ *   exists yet; real audit read is follow-up work, never faked data)
+ *
+ * Control tools are out of scope (deferred behind step-up scope + control
+ * token + audit write). Unknown tool names return JSON-RPC `-32601`.
+ */
+
+import { DEPLOYMENT_HEADER, deploymentId } from "./ownership.ts";
+import { withSecurityHeaders } from "./security-headers.ts";
+
+/** Minimal view of the Worker env this handler needs. */
+export interface McpEnv {
+  TWO_BOT: DurableObjectNamespace;
+  CF_VERSION_METADATA?: { id: string };
+}
+
+export const MCP_PROTOCOL_VERSION = "2025-06-18";
+export const MCP_SERVER_NAME = "two-bot-next-mcp";
+export const MCP_SERVER_VERSION = "0.1.0";
+/** Container-fetch bound for every MCP tool call (mirrors the scrape bound). */
+export const MCP_FETCH_TIMEOUT_MS = 6000;
+export const MCP_MAX_BODY_BYTES = 64 * 1024;
+
+const SINGLETON_NAME = "two-bot";
+
+export const MCP_TOOL_NAMES = [
+  "get_status",
+  "get_gateway",
+  "get_backfill_progress",
+  "get_config",
+  "get_audit",
+] as const;
+
+export type McpToolName = (typeof MCP_TOOL_NAMES)[number];
+
+function isToolName(value: unknown): value is McpToolName {
+  return (
+    typeof value === "string" &&
+    (MCP_TOOL_NAMES as readonly string[]).includes(value)
+  );
+}
+
+const TOOL_DESCRIPTIONS: Record<McpToolName, string> = {
+  get_status: "Bot status (container /health, read-only)",
+  get_gateway: "Gateway connection state excerpt from /readyz (read-only)",
+  get_backfill_progress:
+    "Backfill jobs excerpt from /readyz (phase 1: implemented=false; no backfill JSON API yet)",
+  get_config: "Redacted non-secret Worker config snapshot (read-only, never secrets)",
+  get_audit: "Audit excerpt (phase 1: implemented=false; real audit read is follow-up)",
+};
+
+function toolEntries(): unknown[] {
+  return MCP_TOOL_NAMES.map((name) => ({
+    name,
+    description: TOOL_DESCRIPTIONS[name],
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  }));
+}
+
+/** Bound awaits even when the DO/container stream does not observe abort. */
+async function abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  let onAbort = () => {};
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(new Error("mcp container fetch aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+  try {
+    return await Promise.race([work, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
+/** Read at most `limit` bytes; oversize returns null without buffering. */
+async function readBoundedText(
+  response: Response,
+  limit: number,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  const reader = response.body?.getReader();
+  if (!reader) return "";
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  let complete = false;
+  try {
+    for (;;) {
+      const read = reader.read();
+      const { done, value } = await (signal ? abortable(read, signal) : read);
+      if (done) {
+        complete = true;
+        break;
+      }
+      size += value.byteLength;
+      if (size > limit) return null;
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return new TextDecoder().decode(bytes);
+  } finally {
+    if (!complete) void reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+
+function jsonHeaders(): Record<string, string> {
+  return withSecurityHeaders({
+    "content-type": "application/json",
+    "cache-control": "no-store",
+  });
+}
+
+function jsonResult(id: unknown, result: unknown): Response {
+  return Response.json({ jsonrpc: "2.0", id, result }, { status: 200, headers: jsonHeaders() });
+}
+
+function jsonError(id: unknown, code: number, message: string): Response {
+  return Response.json(
+    { jsonrpc: "2.0", id, error: { code, message } },
+    { status: 200, headers: jsonHeaders() },
+  );
+}
+
+function toolResult(id: unknown, data: unknown): Response {
+  const text = typeof data === "string" ? data : JSON.stringify(data);
+  const structuredContent =
+    typeof data === "object" && data !== null ? data : { text };
+  return jsonResult(id, {
+    content: [{ type: "text", text }],
+    structuredContent,
+  });
+}
+
+/** One bounded container GET through the fenced singleton DO. */
+async function containerGet(
+  env: McpEnv,
+  path: "/health" | "/readyz",
+  signal: AbortSignal,
+): Promise<Response> {
+  const deployment = deploymentId(
+    (env as { CF_VERSION_METADATA?: { id: string } }).CF_VERSION_METADATA?.id,
+  );
+  const stub = (env as unknown as Record<string, unknown>).TWO_BOT as {
+    getByName: (name: string) => { fetch: (r: Request) => Promise<Response> };
+  };
+  const upstream = stub
+    .getByName(SINGLETON_NAME)
+    .fetch(
+      new Request(`http://c${path}`, {
+        method: "GET",
+        headers: { [DEPLOYMENT_HEADER]: deployment },
+        signal,
+      }),
+    );
+  return abortable(upstream, signal);
+}
+
+function combineSignals(request: Request, timeoutMs: number): AbortSignal {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  const client = request.signal;
+  if (!client) return timeout;
+  const anySignal = (AbortSignal as unknown as {
+    any?: (signals: AbortSignal[]) => AbortSignal;
+  }).any;
+  if (typeof anySignal !== "function") return timeout;
+  try {
+    return anySignal.call(AbortSignal, [client, timeout]);
+  } catch {
+    return timeout;
+  }
+}
+
+async function readContainerJson(
+  env: McpEnv,
+  path: "/health" | "/readyz",
+  signal: AbortSignal,
+): Promise<{ ok: true; data: unknown } | { ok: false; oversize: boolean }> {
+  let upstream: Response;
+  try {
+    upstream = await containerGet(env, path, signal);
+  } catch {
+    return { ok: false, oversize: false };
+  }
+  if (signal.aborted || !upstream.ok) {
+    await upstream.body?.cancel().catch(() => {});
+    return { ok: false, oversize: false };
+  }
+  let body: string | null;
+  try {
+    body = await readBoundedText(upstream, MCP_MAX_BODY_BYTES, signal);
+  } catch {
+    return { ok: false, oversize: false };
+  }
+  if (body === null || signal.aborted) {
+    // Oversize (null) or a timeout that won the race during the read: never
+    // echo upstream bytes, just report the class.
+    await upstream.body?.cancel().catch(() => {});
+    return { ok: false, oversize: body === null };
+  }
+  try {
+    return { ok: true, data: JSON.parse(body) as unknown };
+  } catch {
+    return { ok: true, data: { text: body } };
+  }
+}
+
+function gatewayExcerpt(readyz: unknown): Record<string, unknown> {
+  if (typeof readyz !== "object" || readyz === null) return {};
+  const report = readyz as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  if ("gateway_failure" in report) out["gateway_failure"] = report["gateway_failure"];
+  const components = report["components"];
+  if (typeof components === "object" && components !== null) {
+    const gateway = (components as Record<string, unknown>)["gateway"];
+    if (gateway !== undefined) out["gateway"] = gateway;
+  }
+  return out;
+}
+
+function jobsExcerpt(readyz: unknown): Record<string, unknown> {
+  if (typeof readyz !== "object" || readyz === null) return {};
+  const jobs = (readyz as Record<string, unknown>)["jobs"];
+  if (typeof jobs === "object" && jobs !== null) {
+    return jobs as Record<string, unknown>;
+  }
+  return {};
+}
+
+async function callTool(
+  env: McpEnv,
+  request: Request,
+  id: unknown,
+  name: McpToolName,
+  fullEnv: Record<string, string | undefined>,
+): Promise<Response> {
+  const signal = combineSignals(request, MCP_FETCH_TIMEOUT_MS);
+  switch (name) {
+    case "get_status": {
+      const res = await readContainerJson(env, "/health", signal);
+      if (!res.ok) {
+        return jsonError(
+          id,
+          -32000,
+          res.oversize ? "container body exceeds limit" : "container request failed",
+        );
+      }
+      return toolResult(id, res.data);
+    }
+    case "get_gateway": {
+      const res = await readContainerJson(env, "/readyz", signal);
+      if (!res.ok) {
+        return jsonError(
+          id,
+          -32000,
+          res.oversize ? "container body exceeds limit" : "container request failed",
+        );
+      }
+      return toolResult(id, gatewayExcerpt(res.data));
+    }
+    case "get_backfill_progress": {
+      const res = await readContainerJson(env, "/readyz", signal);
+      if (!res.ok) {
+        return jsonError(
+          id,
+          -32000,
+          res.oversize ? "container body exceeds limit" : "container request failed",
+        );
+      }
+      // No backfill JSON API exists yet: pin the explicit stub shape around
+      // the /readyz jobs excerpt instead of faking progress data.
+      return toolResult(id, {
+        implemented: false,
+        source: "readyz.jobs",
+        jobs: jobsExcerpt(res.data),
+      });
+    }
+    case "get_config": {
+      // Worker-side redacted snapshot only: build identity plus non-secret
+      // routing/keepalive vars. Secrets are never read here by construction.
+      return toolResult(id, {
+        build_revision: fullEnv["CF_REVISION"] ?? "unknown",
+        bot_port: fullEnv["BOT_PORT"] ?? "8080",
+        keepalive_seconds: fullEnv["KEEPALIVE_SECONDS"] ?? "60",
+      });
+    }
+    case "get_audit": {
+      // No audit JSON API exists yet: pin the stub, never fake entries.
+      return toolResult(id, { implemented: false });
+    }
+  }
+}
+
+/**
+ * Stateless per-request JSON-RPC over POST. The caller is already
+ * authenticated; this function never touches auth state.
+ */
+export async function handleMcp(
+  request: Request,
+  env: McpEnv,
+  fullEnv?: Record<string, string | undefined>,
+): Promise<Response> {
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonError(null, -32700, "parse error");
+  }
+  if (typeof body !== "object" || body === null) {
+    return jsonError(null, -32600, "invalid request");
+  }
+  const msg = body as Record<string, unknown>;
+  if (msg["jsonrpc"] !== "2.0" || typeof msg["method"] !== "string") {
+    return jsonError(
+      (msg as { id?: unknown })["id"] ?? null,
+      -32600,
+      "invalid request",
+    );
+  }
+  const method = msg["method"] as string;
+  const id = ("id" in msg ? msg["id"] : undefined) as unknown;
+  const params = (msg["params"] ?? {}) as Record<string, unknown>;
+
+  // JSON-RPC notifications (no id) get a bare 202, never a result body.
+  if (id === undefined || id === null) {
+    if (method.startsWith("notifications/")) {
+      return new Response(null, { status: 202, headers: withSecurityHeaders() });
+    }
+    return jsonError(null, -32600, "invalid request");
+  }
+
+  switch (method) {
+    case "initialize": {
+      const requested =
+        typeof params["protocolVersion"] === "string" &&
+        (params["protocolVersion"] as string).length > 0
+          ? (params["protocolVersion"] as string)
+          : MCP_PROTOCOL_VERSION;
+      return jsonResult(id, {
+        protocolVersion: requested,
+        capabilities: { tools: {} },
+        serverInfo: { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION },
+      });
+    }
+    case "tools/list": {
+      return jsonResult(id, { tools: toolEntries() });
+    }
+    case "tools/call": {
+      const name = params["name"];
+      if (!isToolName(name)) {
+        return jsonError(id, -32601, "unknown tool");
+      }
+      const snapshot: Record<string, string | undefined> = {};
+      if (fullEnv) {
+        for (const [k, v] of Object.entries(fullEnv)) snapshot[k] = v;
+      }
+      return callTool(env, request, id, name, snapshot);
+    }
+    case "ping": {
+      return jsonResult(id, {});
+    }
+    default: {
+      if (method.startsWith("notifications/")) {
+        return new Response(null, { status: 202, headers: withSecurityHeaders() });
+      }
+      return jsonError(id, -32601, "method not found");
+    }
+  }
+}
