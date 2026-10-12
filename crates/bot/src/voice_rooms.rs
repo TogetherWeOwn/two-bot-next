@@ -7373,9 +7373,8 @@ impl<H: RoomWrites> StallShared<H> {
         // full window. Log + metric only; the queue keeps its retries so a
         // transient outage still drains on recovery.
         let now = tokio::time::Instant::now();
-        let fire_cooled = last_fire.is_none_or(|fired| {
-            now.saturating_duration_since(fired) >= stuck_after
-        });
+        let fire_cooled =
+            last_fire.is_none_or(|fired| now.saturating_duration_since(fired) >= stuck_after);
         if fire_cooled
             && watchdog_due(
                 snap.last_progress,

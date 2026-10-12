@@ -13059,7 +13059,9 @@ async fn halted_owner_prepare_refusal_requeues_the_handoff_after_recovery() {
     // the handoff instead of stranding the repair until a restart.
     let (live, store, http, trace) = owned_room();
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
-    worker.live.voice_update_at(MEMBER, None, Some(false), 1_000);
+    worker
+        .live
+        .voice_update_at(MEMBER, None, Some(false), 1_000);
     worker.reconcile();
     assert!(
         worker.ownership_queued.contains(&500),
@@ -13081,8 +13083,11 @@ async fn halted_owner_prepare_refusal_requeues_the_handoff_after_recovery() {
     assert!(!worker.ownership_queued.contains(&500));
     worker.dispatch_one(3_000).await;
     assert!(!worker.halted());
-    assert!(trace.lock().unwrap().iter().any(|entry| entry
-        .starts_with("update_ownership:500")));
+    assert!(trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.starts_with("update_ownership:500")));
     assert!(!worker.ownership_queued.contains(&500));
 }
 
@@ -13092,7 +13097,9 @@ async fn halted_owner_update_refusal_requeues_the_handoff_after_recovery() {
     // shape on the later halted branch.
     let (live, store, http, trace) = owned_room();
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
-    worker.live.voice_update_at(MEMBER, None, Some(false), 1_000);
+    worker
+        .live
+        .voice_update_at(MEMBER, None, Some(false), 1_000);
     worker.reconcile();
     assert!(
         worker.ownership_queued.contains(&500),
@@ -13113,8 +13120,11 @@ async fn halted_owner_update_refusal_requeues_the_handoff_after_recovery() {
     worker.clear_halt();
     worker.dispatch_one(3_000).await;
     assert!(!worker.halted());
-    assert!(trace.lock().unwrap().iter().any(|entry| entry
-        .starts_with("update_ownership:500")));
+    assert!(trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.starts_with("update_ownership:500")));
     assert!(!worker.ownership_queued.contains(&500));
 }
 
