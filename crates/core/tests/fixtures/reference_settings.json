@@ -37,7 +37,7 @@
   "TWO_AUTOMOD_BAD_WORDS": "Bad-word list normalized with NFKC and lowercase.",
   "TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS": "Blocked attachment extensions, lowercase without a leading dot.",
   "TWO_AUTOMOD_BYPASS_ROLE_IDS": "Roles exempt from automod inspection.",
-  "TWO_AUTOMOD_ENFORCE": "Enable automod enforcement; absent/disabled remains dry-run.",
+  "TWO_AUTOMOD_ENFORCE": "Enable automod enforcement; only exact `1` enforces. Absent or any other value is dry-run; a deployment value other than `0` or `1` logs one boot warning.",
   "TWO_AUTOMOD_EXEMPT_CHANNEL_IDS": "Channels exempt from automod inspection.",
   "TWO_AUTOMOD_MENTION_LIMIT": "Mention threshold for automod (validated from 1 to 50).",
   "TWO_AUTOMOD_REPEAT_COUNT": "Repeated-message threshold (validated from 2 to 20).",

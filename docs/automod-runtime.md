@@ -251,6 +251,12 @@ Staging soak remains a separate gate; this change supplies no live approval.
 ## Gates and evidence
 
 - `TWO_AUTOMOD=1` enables inspection; absent `TWO_AUTOMOD_ENFORCE=1` is dry-run.
+- Only exact `TWO_AUTOMOD_ENFORCE=1` enforces. A deployment value other than `0`
+  or `1` stays dry-run at boot and logs one warning that does not echo the
+  value. The "automod activation wired" line reports the boot-resolved `mode`
+  (`dry_run` or `enforce`); a later live override is not reflected in it. The
+  boot warning reads the deployment environment only, so a stored live value is
+  not warned.
 - Scope is staging `1545644954272137297`; live `326474832151838730` also requires
   explicit externally supplied approval. This code supplies no live approval.
 - Domain tests cover pre-delete protection, dry-run, sanction planning, blocked

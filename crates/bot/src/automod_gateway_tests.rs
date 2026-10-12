@@ -75,6 +75,36 @@ fn owen_and_protection_never_depend_on_the_enforce_flag() {
 }
 
 #[test]
+fn boot_warns_once_when_enforce_is_not_exactly_zero_or_one() {
+    let capture = crate::tracing_capture::global();
+    let warned = |enforce: Option<&str>| {
+        let mut env = vars(&[
+            ("TWO_AUTOMOD", "1"),
+            ("TWO_OWEN_USER_ID", OWEN),
+            ("TWO_MODERATION_PROTECTED_ROLE_IDS", ROLE),
+        ]);
+        if let Some(value) = enforce {
+            env.insert("TWO_AUTOMOD_ENFORCE".to_owned(), value.to_owned());
+        }
+        let start = capture.text().len();
+        let resolved = resolve(&env, GUILD).unwrap().unwrap();
+        let logged = capture.text();
+        let count = logged[start..]
+            .matches(two_bot_core::automod::enforce_value_warning(Some("true")).unwrap())
+            .count();
+        (resolved.mode(), count)
+    };
+    assert_eq!(warned(Some("true")), ("dry_run", 1));
+    assert_eq!(warned(Some("yes")), ("dry_run", 1));
+    assert_eq!(warned(Some("1")), ("enforce", 0));
+    assert_eq!(warned(None), ("dry_run", 0));
+
+    let start = capture.text().len();
+    assert_eq!(warned(Some("enforce-sentinel-7")).1, 1);
+    assert!(!capture.text()[start..].contains("enforce-sentinel-7"));
+}
+
+#[test]
 fn partial_message_update_decodes_before_twilight_parse() {
     let minimal = json!({
         "op": 0, "s": 7, "t": "MESSAGE_UPDATE",
