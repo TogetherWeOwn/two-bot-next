@@ -18,8 +18,12 @@ Environment contract (every value is a plain string):
   INTERNAL_ID_PREFIXES   regex alternation of internal ticket prefixes (default TOG|PAP|PAPA)
 
 Title format, an empty body and a missing required card reference are always errors: they are the
-standard the org already enforces. Everything new is `PR_STANDARDS_MODE` so a repo can land the
-gate in warn mode, clear its open PRs, then flip one line to `error`.
+standard the org already enforces. On a public repo the strict title/body subset (tracker ids,
+instance UI links, the internal host) is also always an error, regardless of PR_STANDARDS_MODE.
+Only the required template sections (beyond an empty body), the advisory title/body remainder
+(agent links, localhost, private-network addresses, tailnet names), branch names and commit
+history follow PR_STANDARDS_MODE, so a repo can land the gate in warn mode, clear its open
+PRs, then flip one line to `error`.
 """
 import json
 import os
@@ -66,15 +70,9 @@ OTHER_FIXED = [
      "a private-network address"),
     (re.compile(r"\b[\w-]+(?:\.[\w-]+)*\.ts\.net\b"), "a tailnet hostname"),
 ]
-FIXED_INTERNAL = [
-    (re.compile(r"\bagent://"), "an agent:// link"),
-    INSTANCE_UI,
-    (re.compile(r"\b(?:localhost|127\.0\.0\.1)\b"), "a localhost URL"),
-    (re.compile(r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b"),
-     "a private-network address"),
-    (re.compile(r"\b[\w-]+(?:\.[\w-]+)*\.ts\.net\b"), "a tailnet hostname"),
-    HOST_INTERNAL,
-]
+# Single source for the fixed patterns: the full scan is the strict subset plus
+# the advisory remainder, interleaved to keep the long-standing finding order.
+FIXED_INTERNAL = OTHER_FIXED[:1] + [INSTANCE_UI] + OTHER_FIXED[1:] + [HOST_INTERNAL]
 
 
 @dataclass
@@ -152,9 +150,10 @@ def internal_hits(text, prefixes, ignore_case=False):
 def strict_hits(text, prefixes):
     """Fail-closed subset for public title/body: tracker ids, instance UI links, internal host.
 
-    Always case-sensitive in prose. Returns label strings naming each strict hit,
-    without echoing the matched value."""
-    text = strip_comments(text)
+    Always case-sensitive in prose. Scans the raw text, including HTML comments:
+    comment text is still stored and served. Returns the ticket-id label with the
+    matched value and the other labels without echoing the matched value."""
+    text = text or ""
     hits = []
     m = re.search(rf"\b(?:{prefixes})-\d+\b", text)
     if m:

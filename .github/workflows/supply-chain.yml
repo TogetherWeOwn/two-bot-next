@@ -19,7 +19,8 @@ name: supply-chain
 #     .github/scripts/pr_standards.py with tests beside it; this job runs both.
 #   * This repo is public. No card reference is required (`REQUIRE_CARD_REF: "false"`), and an
 #     internal tracker ID (a `TOG-` or `PAP-` prefix followed by digits) must not appear in a
-#     title, body, commit subject or branch name. The new body/reference rules warn
+#     title, body, commit subject or branch name. The strict title/body subset (tracker id,
+#     instance UI link, internal host) always fails; the advisory remainder and branch names warn
 #     (`PR_STANDARDS_MODE: "warn"`); title format and an empty body always fail.
 #   * Repos are squash-merge only and the squash commit title is the PR title, so the history on
 #     main is one conventional commit per PR. The push job below flags any commit that bypasses it
@@ -44,8 +45,9 @@ on:
 permissions: {}
 
 env:
-  # Public repo: the body carries no card reference. New body/reference rules
-  # warn while open PRs migrate to the template, then flip to "error".
+  # Public repo: the body carries no card reference. The strict title/body subset
+  # (tracker id, instance UI link, internal host) always fails; the advisory remainder
+  # and branch names warn while open PRs migrate to the template, then flip to "error".
   # Title format and an empty body are errors in both modes.
   REQUIRE_CARD_REF: "false"
   PR_STANDARDS_MODE: "warn"
