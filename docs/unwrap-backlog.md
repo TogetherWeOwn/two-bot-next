@@ -10,7 +10,7 @@ The ast-grep rule itself only ignores test files/dirs, so its raw output
 still flags `.unwrap()` calls inside inline test modules; those flags are out
 of production scope. `unwrap` in tests is idiomatic.
 
-## Status: zero production hits (2026-10-12, `75e2498f`)
+## Status: zero production hits (2026-10-12, `20de46b2`)
 
 Every `.unwrap()` in a rule-scope file sits inside an inline `#[cfg(test)]`
 module: 50 hit lines across 9 files, none before its file's test-module
