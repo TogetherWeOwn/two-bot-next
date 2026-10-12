@@ -1725,6 +1725,23 @@ mod tests {
         }
     }
 
+    /// Serialises the fixture write-and-spawn window of the bounded
+    /// upload-helper tests. `write_upload_fixture` leaves the script open
+    /// for writing while a sibling test on another thread forks; the forked
+    /// child inherits the write fd until its own exec, so exec of the fresh
+    /// script fails with ETXTBSY and the helper reports a spurious
+    /// `SpawnFailed`. Holding this guard from the fixture write through
+    /// `run_upload_command` keeps those windows disjoint.
+    #[cfg(unix)]
+    static UPLOAD_FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(unix)]
+    fn lock_upload_fixture() -> std::sync::MutexGuard<'static, ()> {
+        UPLOAD_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Task-owned temporary executable fixtures for the bounded upload
     /// helper. Paths are baked into the scripts so tests never mutate
     /// process-global environment (the parallel suite shares it).
@@ -1763,6 +1780,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn upload_helper_success_reports_no_failure() {
+        let _fixture_guard = lock_upload_fixture();
         let dir = Credentials::new();
         let helper = write_upload_fixture(
             &dir,
@@ -1792,6 +1810,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn upload_helper_nonzero_exit_reports_status_without_args() {
+        let _fixture_guard = lock_upload_fixture();
         let dir = Credentials::new();
         let helper = write_upload_fixture(
             &dir,
@@ -1832,6 +1851,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn upload_helper_spawn_failure_reports_without_args() {
+        // No fixture write here, but this spawn would still fork while a
+        // sibling holds a fixture script open for writing, so join the same
+        // lock to keep the write-and-spawn windows disjoint.
+        let _fixture_guard = lock_upload_fixture();
         let program = "/nonexistent-fixture-upload-helper";
         let outcome = super::run_upload_command(
             program,
@@ -1872,6 +1895,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn upload_helper_timeout_terminates_and_reaps_owned_child() {
+        let _fixture_guard = lock_upload_fixture();
         let dir = Credentials::new();
         let pidfile = dir.0.join("hung.pid");
         let helper = write_upload_fixture(
