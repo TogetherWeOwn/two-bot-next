@@ -647,6 +647,30 @@ class ThresholdTests(unittest.TestCase):
         errors = gate.threshold_violations(base, head)
         self.assertTrue(any("Runs-at scope narrowed" in e for e in errors), errors)
 
+    def test_runs_at_rust_pr_row_rejects_qualifier_on_broader_rank(self):
+        base = ENFORCED_BASE.replace(LINT_ROW, REAL_LINT_ROW)
+        for narrowed in (
+            "every PR never",
+            "every PR on main",
+            "every PR except docs-only",
+            "every PR on release branches only",
+        ):
+            with self.subTest(narrowed=narrowed):
+                head = base.replace(
+                    REAL_LINT_ROW,
+                    REAL_LINT_ROW.replace("every Rust PR", narrowed),
+                )
+                errors = gate.threshold_violations(base, head)
+                self.assertTrue(any("Runs-at scope narrowed" in e for e in errors), errors)
+
+    def test_runs_at_rust_pr_row_allows_plain_broadening_to_every_pr(self):
+        base = ENFORCED_BASE.replace(LINT_ROW, REAL_LINT_ROW)
+        head = base.replace(
+            REAL_LINT_ROW,
+            REAL_LINT_ROW.replace("every Rust PR", "every PR"),
+        )
+        self.assertEqual(gate.threshold_violations(base, head), [])
+
     def test_measured_promotion_with_flagged_checked_by_passes(self):
         measured = "| Project-wide line coverage | >= 70% on main | must not fall |\n"
         base = BASE.replace(MEASURED_ROW, measured)

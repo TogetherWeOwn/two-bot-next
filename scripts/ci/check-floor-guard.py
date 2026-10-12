@@ -285,18 +285,18 @@ def _schedule_rank(cell):
 def _runs_at_narrowed(base_cell, head_cell):
     """Whether a Runs-at edit narrows the schedule.
 
-    A lower rank fails, and so does a qualifier at the same rank:
-    ``every PR except docs-only`` keeps the top rank but no longer runs
-    everywhere, so any extra non-vocabulary word without a rank increase
-    fails.
+    A lower rank fails, and so does a qualifier at the same rank or on a
+    broader one: ``every PR except docs-only`` keeps the top rank but no
+    longer runs everywhere, and ``every Rust PR`` to ``every PR never``
+    broadens the rank while adding a qualifier, so any extra
+    non-vocabulary word on a non-narrowing edit fails. Plain broadening
+    (``every Rust PR`` to ``every PR``) still passes.
     """
     base_rank = _schedule_rank(base_cell)
     head_rank = _schedule_rank(head_cell)
     if base_rank is not None:
         if head_rank is None or head_rank < base_rank:
             return True
-        if head_rank > base_rank:
-            return False
         return bool(_words(head_cell) - _words(base_cell) - _RANK_WORDS)
     if head_rank is not None:
         return False

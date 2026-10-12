@@ -30,8 +30,10 @@ Checked by `scripts/ci/check-floor-guard.py` (HARD) on every PR, in milliseconds
   subcommand, dropping a flag, or dropping the `check` lane label fails,
   while adding flags passes. It rejects a Runs-at change from every PR to
   every Rust PR, nightly, or manual, from every Rust PR to nightly or
-  manual, or any qualifier that keeps the rank (`except docs-only`,
-  `on main`, a trailing `never`).
+  manual, or any qualifier on the same or a broader rank (`except
+  docs-only`, `on main`, a trailing `never` — including every Rust PR to
+  every PR with such a qualifier). Plain broadening without a qualifier
+  passes.
 - No secrets in source (enforced by the `secret-scan` required check and
   gitleaks in the supply-chain lane, not the floor guard, so a leaked value
   never lands in a diff report).
