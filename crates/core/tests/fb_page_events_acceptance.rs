@@ -299,7 +299,7 @@ fn harness(
 }
 
 /// 1. challenge-stop-and-notify: a Meta challenge aborts the run with zero
-///   retries, zero mutating driver calls, and one queued CEO notification.
+///    retries, zero mutating driver calls, and one queued CEO notification.
 #[test]
 fn challenge_signal_aborts_run_with_zero_retries_and_ceo_notification_queued() {
     let driver = FakeDriver::challenging();
@@ -407,7 +407,7 @@ fn low_volume_single_action_per_event_and_bulk_refused() {
 }
 
 /// 3. idempotency: update reuses the mapped URL (never duplicates);
-///   Discord cancel deletes the mapped event and drops the entry.
+///    Discord cancel deletes the mapped event and drops the entry.
 #[test]
 fn idempotency_update_reuses_mapped_url_and_cancel_deletes() {
     let driver = FakeDriver::quiet();
@@ -475,7 +475,7 @@ fn idempotency_update_reuses_mapped_url_and_cancel_deletes() {
 }
 
 /// 4. verify: screenshot + readback per action; on readback failure the run
-///   falls back to the Graph API Page link-post path, auditing both.
+///    falls back to the Graph API Page link-post path, auditing both.
 #[test]
 fn verify_failure_falls_back_to_link_post_and_audits_both() {
     let driver = FakeDriver::unreadable();
@@ -530,7 +530,7 @@ fn verify_failure_falls_back_to_link_post_and_audits_both() {
 }
 
 /// 5. secret redaction: the secret store is mocked, and no log, error, or
-///   audit text carries secret material.
+///    audit text carries secret material.
 #[test]
 fn logs_and_errors_carry_no_secret_material_with_mocked_secret_store() {
     let driver = FakeDriver::quiet();
@@ -600,7 +600,7 @@ fn logs_and_errors_carry_no_secret_material_with_mocked_secret_store() {
 }
 
 /// 6. staging-first: a production Page target without the staging-evidence
-///   flag is refused before any driver call.
+///    flag is refused before any driver call.
 #[test]
 fn production_target_refused_without_staging_evidence() {
     let driver = FakeDriver::quiet();
