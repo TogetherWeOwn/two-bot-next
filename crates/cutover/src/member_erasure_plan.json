@@ -229,6 +229,11 @@
       "table": "members",
       "columns": ["member_id"],
       "predicate": "guild_id = $1 AND member_id = $2"
+    },
+    {
+      "table": "event_store",
+      "columns": ["user_id"],
+      "predicate": "guild_id = $1 AND user_id = $2"
     }
   ],
   "allowlist": [

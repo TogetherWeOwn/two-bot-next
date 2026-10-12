@@ -142,6 +142,9 @@ BEGIN
       INSERT INTO voice_vote_kick_audit
         (guild_id, vote_id, event, room_id, initiator_id, target_id, outcome, occurred_at)
         VALUES (g, 'vk-' || k, 'vote_started', 'v-' || k, u, u, 'started', '2026-10-01T00:00:00Z');
+      INSERT INTO event_store
+        (event_type, guild_id, thread_id, user_id, event_time, dedup_key)
+        VALUES ('THREAD_MEMBER_UPDATE', g, 't-' || k, u, '2026-10-01T00:00:00Z', 'es-' || k);
       -- Explicit exceptions are seeded too: erasure must not change safety policy.
       INSERT INTO guild_settings (guild_id, key, value, version, updated_by)
         VALUES (g, 'fixture_' || u, to_jsonb(u), 1, u);
