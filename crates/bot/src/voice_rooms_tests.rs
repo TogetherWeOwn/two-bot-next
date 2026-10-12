@@ -12940,9 +12940,7 @@ async fn watchdog_fires_while_a_dispatch_is_hung_mid_write() {
     // The sibling's REST-age republish is pinned per-instance: the count
     // must rise while the write is held, so deleting the republish call
     // fails this test (the global gauge itself stays unasserted).
-    let republished_before = http_probe
-        .republish_calls
-        .load(Ordering::Relaxed);
+    let republished_before = http_probe.republish_calls.load(Ordering::Relaxed);
     tokio::time::advance(Duration::from_secs(6)).await;
     for _ in 0..10 {
         tokio::task::yield_now().await;
@@ -13023,7 +13021,9 @@ async fn watchdog_sibling_exits_when_its_actor_dies() {
         ticks += 1;
         assert!(ticks < 200, "the actor never reached the panicking write");
     }
-    handle.await.expect_err("the actor task must die on the panic");
+    handle
+        .await
+        .expect_err("the actor task must die on the panic");
     // Two full stuck windows pass with queued work and no progress: a
     // leaked sibling would fire twice, so the counter must not move.
     let stuck = global_series("two_bot_voice_watchdog_stucks_total");
