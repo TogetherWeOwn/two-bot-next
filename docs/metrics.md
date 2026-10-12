@@ -53,7 +53,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_voice_tracked_rooms` | Rooms tracked in memory; compare with live Discord channels for ghosts |
 | `two_bot_voice_compensation_pending` | Tracked rooms awaiting compensating delete after a failed write |
 | `two_bot_voice_orphans_total` | Untracked creator-channel orphans needing manual deletion after failed `/create` compensation |
-| `two_bot_voice_names_total{outcome}` | Automatic room-name decisions: a room created with its template name, each template render, and each queued rename sent or dropped at dispatch; `outcome` is `created_with_template`, `proposed`, `unchanged`, `waiting_for_name`, `blocked`, `channel_unseen`, `rename_sent`, `rename_stale`, `rename_unseen`, `rename_no_access`, `rename_held`, `rename_duplicate` or `other` |
+| `two_bot_voice_names_total{outcome}` | Automatic room-name decisions: a room created with its template name, each template render, and each queued rename sent or dropped at dispatch; `outcome` is `created_with_template`, `proposed`, `unchanged`, `waiting_for_name`, `blocked`, `channel_unseen`, `rename_sent`, `rename_room_gone`, `rename_superseded`, `rename_already_applied`, `rename_unseen`, `rename_no_access`, `rename_held`, `rename_duplicate` or `other` |
 | `two_bot_voice_vote_kick_total{outcome}` | Vote-kick starts, refusals and terminal enforcements; `outcome` is `started`, a refusal code (`evidence_unavailable`, `not_a_room`, `initiator_not_occupant`, `target_not_occupant`, `self_target`, `protected_target`, `privileged_target`, `authority_unavailable`, `active_vote_exists`, `cooldown`, `initiator_limited`, `reused_vote_id`, `unknown_vote`, `wrong_vote_boundary`, `ineligible_voter`, `repeated_vote`, `invalid_time`), an enforcement code (`connect_denied_and_disconnected`, `connect_denied_target_absent`, `skipped_room_gone`, `skipped_target_protected`, `permission_missing`, `discord_error`, `gave_up`) or `other`; vote results (`passed`/`expired`/`cancelled`) are audit-only and never counted |
 | `two_bot_dispatch_drops_total{lane}` | Dispatch-lane saturation drops: every event refused because every attempted lane was full. `lane` is one of `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` (see label allowlists below). The `reactions` lane additionally counts per-member fairness refusals: a reaction refused because its member already holds `PER_USER_IN_FLIGHT` reaction slots, even while the lane has free slots. A single-lane refusal counts its lane once; a privileged spill refused by both lanes counts both. Logs sample the first drop per 60 s per runtime, so bursts are O(1) lines with N counter increments. `dispatch_drops:<lane>` raises a ticket after growth in 3 consecutive completed keepalive sample windows; the first valid sample only establishes a baseline. A flat sample or counter reset clears the streak; missing/invalid samples break growth but never falsely resolve an active ticket. A single burst never pages. `reactions`-lane growth can reflect per-member fairness rather than an undersized lane. Dispatch refusals are not proof of gateway packet loss |
 | `two_bot_gateway_checkpoint_failures_total{stage}` | Failed gateway checkpoint commits from `apply_dispatch` and failed checkpoint clears: every failure stops the dispatch worker and is recorded on `operation`. `stage` is `pre_commit` (commit skipped after a funnel/leveling/acknowledgement failure) or `commit` (the durable store write itself failed); failure causes are never labels. Alert rule `gateway_checkpoint_failures` fires on any increase summed over every `stage` between consecutive keepalive samples (the first sample is baseline-only; the failing process lingers 75 s so a scrape lands before the restart resets the counter); unlike bursty dispatch drops, a single checkpoint failure stops the worker, so there is no benign-singleton case |
@@ -185,6 +185,7 @@ as dynamic labels.
   `DELETE /guilds/:guild/members/:member`,
   `PUT /guilds/:guild/bans/:member`,
   `PATCH /guilds/:guild/members/:member`, `PATCH /channels/:channel`,
+  `PUT /channels/:channel/voice-status`,
   `PUT /channels/:channel/permissions/:overwrite`,
   `POST /channels/:channel/messages/bulk-delete`,
   `PUT /guilds/:guild/members/:member/roles/:role`,
@@ -225,8 +226,13 @@ as dynamic labels.
   contributes zero; `voice_reconcile` stays quiet when all four counts are zero.
 - `two_bot_voice_dead_letters_total{action}` — `action` is `create`, `move`,
   `delete`, `companion`, `ownership`, `kick`, `rename`, `limit` or `other`.
-- `two_bot_voice_names_total{outcome}` — `outcome` is `created_with_template`, `proposed`, `unchanged`, `waiting_for_name`, `blocked`, `channel_unseen`, `rename_sent`, `rename_stale`, `rename_unseen`, `rename_no_access`, `rename_held`, `rename_duplicate` or `other`
-  (`crates/core/src/metrics.rs` `VOICE_NAME_OUTCOMES`).
+- `two_bot_voice_names_total{outcome}` — `outcome` is `created_with_template`, `proposed`, `unchanged`, `waiting_for_name`, `blocked`, `channel_unseen`, `rename_sent`, `rename_room_gone`, `rename_superseded`, `rename_already_applied`, `rename_unseen`, `rename_no_access`, `rename_held`, `rename_duplicate` or `other`
+  (`crates/core/src/metrics.rs` `VOICE_NAME_OUTCOMES`). The former
+  `rename_stale` outcome is split into `rename_room_gone` (no tracked room),
+  `rename_superseded` (the queued name is no longer desired), and
+  `rename_already_applied` (the live channel already has that name). These
+  skips send no HTTP request; dashboards using the old label should sum the
+  three replacement outcomes.
 - `two_bot_voice_vote_kick_total{outcome}` — `outcome` is `started`,
   `evidence_unavailable`, `not_a_room`, `initiator_not_occupant`,
   `target_not_occupant`, `self_target`, `protected_target`,

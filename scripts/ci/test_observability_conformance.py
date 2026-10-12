@@ -197,6 +197,7 @@ class ObservabilityConformanceTests(unittest.TestCase):
         documented = rest_routes_from_doc()
         self.assertIn("POST /guilds/:guild/channels", documented)
         self.assertIn("DELETE /channels/:channel", documented)
+        self.assertIn("PUT /channels/:channel/voice-status", documented)
 
 
 if __name__ == "__main__":

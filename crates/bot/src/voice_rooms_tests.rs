@@ -152,6 +152,10 @@ struct Store {
     add_creator_error: Mutex<Option<StoreError>>,
     after_persist: Option<Hook>,
     config: Arc<Mutex<VoiceConfiguration>>,
+    /// Most lifecycle fixtures edit creator rows directly. Their snapshot must
+    /// describe those same rows; config-import/reload tests supply an explicit
+    /// snapshot instead, including intentional creator removals.
+    snapshot_uses_creator_rows: bool,
     config_error: Option<StoreError>,
     save_config_error: Option<StoreError>,
     /// Scripted durable-admission verdicts, consumed per claim; an empty
@@ -210,6 +214,7 @@ impl Store {
             add_creator_error: Mutex::new(None),
             after_persist: None,
             config: Arc::new(Mutex::new(empty_config())),
+            snapshot_uses_creator_rows: true,
             config_error: None,
             save_config_error: None,
             claim_script: Mutex::new(VecDeque::new()),
@@ -516,10 +521,40 @@ impl RoomPersistence for Store {
         Ok(true)
     }
     async fn config_snapshot(&self, _: u64) -> Result<VoiceConfiguration, StoreError> {
-        match self.config_error {
-            Some(error) => Err(error),
-            None => Ok(self.config.lock().unwrap().clone()),
+        if let Some(error) = self.config_error {
+            return Err(error);
         }
+        let mut config = self.config.lock().unwrap().clone();
+        if self.snapshot_uses_creator_rows {
+            config.creators = self
+                .creators
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|creator| config_codec::CreatorConfiguration {
+                    channel_id: creator.channel_id.to_string(),
+                    name_template: creator.name_template.clone(),
+                    status_template: None,
+                    default_limit: creator.default_limit.unwrap_or(0) as u16,
+                    always_private: creator.private_default,
+                    text_channels: creator.text_channels,
+                    position: match creator.position {
+                        RoomPosition::Above => config_codec::RoomPosition::Above,
+                        RoomPosition::Below => config_codec::RoomPosition::Below,
+                    },
+                    first_number: creator.first_room_number as u32,
+                    group_by_category: creator.group_by_category,
+                    permission_source: match creator.permission_source {
+                        PermissionSource::Creator => config_codec::PermissionSource::Creator {},
+                        PermissionSource::Category => config_codec::PermissionSource::Category {},
+                        PermissionSource::Channel(id) => config_codec::PermissionSource::Channel {
+                            channel_id: id.to_string(),
+                        },
+                    },
+                })
+                .collect();
+        }
+        Ok(config)
     }
     async fn config_apply(
         &self,
@@ -8680,6 +8715,7 @@ fn import_harness(
         move || {
             let mut store = Store::new(trace.clone());
             store.config = closure_config.clone();
+            store.snapshot_uses_creator_rows = false;
             let mut http = Http::new(trace.clone());
             http.download_results = shared_downloads.clone();
             (store, http)
@@ -10611,6 +10647,216 @@ async fn a_pool_too_small_to_vary_keeps_the_drawn_seed() {
 }
 
 #[tokio::test]
+async fn voice_name_reload_rerenders_unchanged_facts_after_list_edit() {
+    let (live, mut store, http, trace) = fixture();
+    store.snapshot_uses_creator_rows = false;
+    let mut config = full_config();
+    config.creators[0].name_template = "[[list:maps]]".to_owned();
+    config.lists[0].choices = vec!["old".to_owned()];
+    store.creators.lock().unwrap()[0].name_template = config.creators[0].name_template.clone();
+    *store.config.lock().unwrap() = config;
+    slow_rename_room(&live, &store);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.wall_clock = || 0;
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    worker.reload_name_settings(0).await;
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    let signatures = worker.name_signatures.clone();
+
+    worker.store.config.lock().unwrap().lists[0].choices = vec!["new".to_owned()];
+    worker.reload_name_settings(299_999).await;
+    worker.refresh_template_names(299_999);
+    assert_eq!(worker.desired_names[&700], "old", "reload remains paced");
+    worker.reload_name_settings(300_000).await;
+    worker.refresh_template_names(300_000);
+    assert_eq!(
+        worker.name_signatures, signatures,
+        "room facts did not change"
+    );
+    assert_eq!(worker.desired_names[&700], "new");
+    dispatch(&mut worker, 300_000).await;
+    assert_eq!(renames_sent(&trace), ["rename:700:old", "rename:700:new"]);
+
+    // An equal snapshot must not invalidate a successfully rendered room.
+    worker.reload_name_settings(600_000).await;
+    assert_eq!(worker.name_signatures, signatures);
+    worker.refresh_template_names(600_000);
+    assert!(!worker.dispatch_one(600_000).await);
+}
+
+#[tokio::test]
+async fn voice_name_reload_refreshes_creator_rows_from_the_same_snapshot() {
+    let (live, mut store, http, trace) = fixture();
+    store.snapshot_uses_creator_rows = false;
+    let mut config = full_config();
+    config.creators[0].name_template = "old".to_owned();
+    store.creators.lock().unwrap()[0].name_template = "old".to_owned();
+    store.creators.lock().unwrap()[0].text_channel_name = Some("keep-chat".to_owned());
+    store.creators.lock().unwrap()[0].text_viewer_role_id = Some(123);
+    *store.config.lock().unwrap() = config;
+    slow_rename_room(&live, &store);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.wall_clock = || 0;
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    worker.reload_name_settings(0).await;
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    {
+        let mut config = worker.store.config.lock().unwrap();
+        let creator = &mut config.creators[0];
+        creator.name_template = "new".to_owned();
+        creator.status_template = Some("new status".to_owned());
+        creator.position = config_codec::RoomPosition::Below;
+        creator.permission_source = config_codec::PermissionSource::Channel {
+            channel_id: CATEGORY.to_string(),
+        };
+        creator.always_private = true;
+        creator.text_channels = true;
+        creator.group_by_category = true;
+        let mut added = creator.clone();
+        added.channel_id = "201".to_owned();
+        added.default_limit = 5;
+        added.first_number = 10;
+        config.creators.push(added);
+    }
+    worker.reload_name_settings(300_000).await;
+    worker.refresh_template_names(300_000);
+    assert_eq!(
+        worker.desired_names[&700], "new",
+        "template-only edit must render"
+    );
+    assert_eq!(worker.pending_status[&700], "new status");
+    let creator = &worker.creators[&CREATOR];
+    assert_eq!(
+        creator.position,
+        two_bot_core::voice_rooms::RoomPosition::Below
+    );
+    assert_eq!(
+        creator.permission_source,
+        PermissionSource::Channel(CATEGORY)
+    );
+    assert_eq!(creator.permission_channel_id, Some(CATEGORY));
+    assert!(creator.private_default && creator.text_channels && creator.group_by_category);
+    assert_eq!(
+        creator.default_limit, None,
+        "the codec's zero preserves inheritance"
+    );
+    assert_eq!(creator.text_channel_name.as_deref(), Some("keep-chat"));
+    assert_eq!(creator.text_viewer_role_id, Some(123));
+    assert_eq!(worker.creators[&201].default_limit, Some(5));
+    assert_eq!(worker.creators[&201].first_room_number, 10);
+    assert!(worker.live.read_state().protected_channels.contains(&201));
+    dispatch(&mut worker, 300_000).await;
+    assert_eq!(renames_sent(&trace), ["rename:700:old", "rename:700:new"]);
+
+    worker.store.config.lock().unwrap().creators.clear();
+    worker.reload_name_settings(600_000).await;
+    assert!(
+        worker.creators.is_empty(),
+        "removed creators stop admitting joins"
+    );
+}
+
+#[tokio::test]
+async fn voice_name_settings_notification_invalidates_cached_renders() {
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "[[list:maps]]".to_owned();
+    store.config.lock().unwrap().lists = vec![config_codec::RandomList {
+        name: "maps".to_owned(),
+        choices: vec!["old".to_owned()],
+    }];
+    slow_rename_room(&live, &store);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.wall_clock = || 0;
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    let mut settings = worker.name_settings.clone();
+    settings
+        .lists
+        .insert("maps".to_owned(), vec!["new".to_owned()]);
+    apply_command(&mut worker, ActorCommand::NameSettingsChanged(settings), 1);
+    worker.refresh_template_names(1);
+    assert_eq!(worker.desired_names[&700], "new");
+    assert!(
+        !worker.dispatch_one(1).await,
+        "normal rename pacing still applies"
+    );
+    dispatch(&mut worker, RENAME_MIN_INTERVAL_MS).await;
+    assert_eq!(renames_sent(&trace), ["rename:700:old", "rename:700:new"]);
+}
+
+#[tokio::test]
+async fn voice_name_import_refreshes_creator_template_without_waiting_for_reload() {
+    let (live, mut store, http, trace) = fixture();
+    store.snapshot_uses_creator_rows = false;
+    let mut config = full_config();
+    config.creators[0].name_template = "old".to_owned();
+    store.creators.lock().unwrap()[0].name_template = "old".to_owned();
+    *store.config.lock().unwrap() = config;
+    slow_rename_room(&live, &store);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.wall_clock = || 0;
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    worker.reload_name_settings(0).await;
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(worker.desired_names[&700], "old");
+
+    // Simulate a successful in-bot /import that changes only the creator template.
+    worker.store.config.lock().unwrap().creators[0].name_template = "new".to_owned();
+    let settings = {
+        let config = worker.store.config.lock().unwrap().clone();
+        NameSettings::from_config(&config)
+    };
+    apply_command(
+        &mut worker,
+        ActorCommand::NameSettingsChanged(settings),
+        100_000,
+    );
+    assert_eq!(
+        worker.name_settings_read_ms, None,
+        "import must not push the creator reload a full interval out"
+    );
+
+    // The next tick must pick up the creator edit, not wait for the reload interval.
+    worker.reload_name_settings(100_001).await;
+    worker.refresh_template_names(100_001);
+    assert_eq!(
+        worker.creators[&CREATOR].name_template, "new",
+        "imported creator template must refresh on the next tick"
+    );
+    assert_eq!(worker.desired_names[&700], "new");
+    assert!(
+        !worker.dispatch_one(100_001).await,
+        "normal rename pacing still applies"
+    );
+    dispatch(&mut worker, 400_000).await;
+    assert_eq!(renames_sent(&trace), ["rename:700:old", "rename:700:new"]);
+}
+
+#[tokio::test]
+async fn voice_name_creator_notification_invalidates_cached_renders() {
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "old".to_owned();
+    slow_rename_room(&live, &store);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.wall_clock = || 0;
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    let mut creator = worker.creators[&CREATOR].clone();
+    creator.name_template = "new".to_owned();
+    apply_command(&mut worker, ActorCommand::CreatorAdded(creator), 1);
+    worker.refresh_template_names(1);
+    assert_eq!(worker.desired_names[&700], "new");
+    assert!(!worker.dispatch_one(1).await);
+    dispatch(&mut worker, RENAME_MIN_INTERVAL_MS).await;
+    assert_eq!(renames_sent(&trace), ["rename:700:old", "rename:700:new"]);
+}
+
+#[tokio::test]
 async fn template_names_rerender_only_when_their_facts_change() {
     let (live, store, http, trace) = fixture();
     store.creators.lock().unwrap()[0].name_template = "@@owner@@ · @@num@@".to_owned();
@@ -10713,7 +10959,9 @@ async fn written_settings_reach_automatic_names() {
     );
     assert_eq!(worker.name_settings.no_game_label, "Hangout");
     assert!(worker.name_settings_loaded);
-    assert_eq!(worker.name_settings_read_ms, Some(5));
+    // The stamp stays clear so the next tick re-reads creators too; an
+    // /import must not push their refresh a full interval out.
+    assert_eq!(worker.name_settings_read_ms, None);
 }
 
 #[tokio::test]
@@ -10847,6 +11095,108 @@ fn renames_sent(trace: &Trace) -> Vec<String> {
         .filter(|entry| entry.starts_with("rename:"))
         .cloned()
         .collect()
+}
+
+#[tokio::test]
+async fn voice_name_obsolete_detached_retry_cannot_replace_a_newer_queued_name() {
+    let (live, store, http, trace) = fixture();
+    slow_rename_room(&live, &store);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.desired_names.insert(700, "A".to_owned());
+    // Deliver a detached timeout through the real completion path.
+    worker
+        .rename_outcomes
+        .0
+        .send(RenameOutcome {
+            channel_id: 700,
+            name: "A".to_owned(),
+            result: Err(RoomHttpError::RenameDeferred),
+        })
+        .unwrap();
+    assert!(!worker.dispatch_one(0).await);
+    assert_eq!(worker.rename_retries[&700].1, RENAME_DEFERRED_RETRY_MS);
+
+    worker.propose_name(700, "B", 1);
+    // B has left the coalescer but waits in the deferred queue behind backoff.
+    for (channel_id, name) in worker.renames.take_due(1) {
+        worker
+            .queue
+            .enqueue(GUILD, RoomAction::RenameRoom { channel_id, name });
+    }
+    let queued = worker.queue.pop_due(GUILD, 1).unwrap();
+    worker.queue.mark_rate_limited(GUILD, 30_000, 1, queued);
+    assert!(!worker.dispatch_one(RENAME_DEFERRED_RETRY_MS).await);
+    assert_eq!(
+        worker.queue.queued_rename_for(GUILD, 700).as_deref(),
+        Some("B")
+    );
+    assert!(!worker.rename_retries.contains_key(&700));
+    dispatch(&mut worker, 30_001).await;
+    assert_eq!(renames_sent(&trace), ["rename:700:B"]);
+}
+
+#[tokio::test]
+async fn voice_name_a_b_a_cancellation_sends_no_needless_http() {
+    let (live, store, http, trace) = fixture();
+    slow_rename_room(&live, &store);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker
+        .live
+        .write_state()
+        .channels
+        .get_mut(&700)
+        .unwrap()
+        .name = Some("A".to_owned());
+    worker.propose_name(700, "B", 0);
+    for (channel_id, name) in worker.renames.take_due(0) {
+        worker
+            .queue
+            .enqueue(GUILD, RoomAction::RenameRoom { channel_id, name });
+    }
+    worker.rename_retries.insert(700, ("A".to_owned(), 1));
+    assert_eq!(
+        worker.propose_name(700, "A", 1),
+        Some(ProposeOutcome::Unchanged)
+    );
+    dispatch(&mut worker, 1).await;
+    assert!(!worker.dispatch_one(RENAME_MIN_INTERVAL_MS).await);
+    assert!(renames_sent(&trace).is_empty());
+}
+
+#[tokio::test]
+async fn voice_name_dispatch_distinguishes_gone_superseded_and_already_applied() {
+    for (reason, tracked, desired, current) in [
+        ("rename_room_gone", false, "B", "A"),
+        ("rename_superseded", true, "C", "A"),
+        ("rename_already_applied", true, "B", "B"),
+    ] {
+        let (live, store, http, trace) = fixture();
+        slow_rename_room(&live, &store);
+        let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        if !tracked {
+            worker.rooms.remove(&700);
+        }
+        worker
+            .live
+            .write_state()
+            .channels
+            .get_mut(&700)
+            .unwrap()
+            .name = Some(current.to_owned());
+        worker.desired_names.insert(700, desired.to_owned());
+        worker.queue.enqueue(
+            GUILD,
+            RoomAction::RenameRoom {
+                channel_id: 700,
+                name: "B".to_owned(),
+            },
+        );
+        let series = format!("two_bot_voice_names_total{{outcome=\"{reason}\"}}");
+        let before = global_series(&series);
+        dispatch(&mut worker, 0).await;
+        assert!(global_series(&series) > before, "missing outcome: {reason}");
+        assert!(renames_sent(&trace).is_empty());
+    }
 }
 
 #[tokio::test(start_paused = true)]
