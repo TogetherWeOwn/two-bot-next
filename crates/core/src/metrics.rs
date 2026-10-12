@@ -156,6 +156,12 @@ pub const VOICE_RECONCILE_ACTIONS: &[&str] = &[
     "resumed",
     "succession_enqueued",
 ];
+/// Occupancy-at-join buckets for `two_bot_voice_join_occupancy_total`
+/// (seeding TEST): joins by humans already present in the target channel when
+/// the join arrived, capped at `7+`. Fixed vocabulary, no channel/member/time
+/// labels: per-channel/hour curves are sliced downstream from log timestamps
+/// (see `docs/voice-occupancy-curve.md`).
+pub const VOICE_JOIN_OCCUPANCY_BUCKETS: [&str; 8] = ["0", "1", "2", "3", "4", "5", "6", "7+"];
 /// Dead-lettered queue actions by bounded family (TOG-13543). Companion
 /// grants/revokes share `companion`; all unknown shapes share `other`.
 pub const VOICE_DEAD_ACTIONS: &[&str] = &[
@@ -392,6 +398,7 @@ struct Values {
     latency_micros: Option<u64>,
     handler: Histogram,
     voice_join_to_move: Histogram,
+    voice_join_occupancy: [u64; 8],
     voice_ops: [[u64; 6]; 3],
     voice_reconcile: [u64; 4],
     voice_dead: [u64; 9],
@@ -539,6 +546,21 @@ impl Metrics {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .voice_join_to_move
             .observe(elapsed);
+    }
+
+    /// One VOICE_STATE_UPDATE join by occupancy-at-join (seeding TEST).
+    /// `occupancy` is the humans already present in the target channel when
+    /// the join arrived, capped into `VOICE_JOIN_OCCUPANCY_BUCKETS` (`7+`).
+    /// No member/channel labels; leaves and same-channel updates are not
+    /// samples (the caller only observes ticketed joins).
+    pub fn voice_join_occupancy(&self, occupancy: u64) {
+        let bucket = occupancy.min(7) as usize;
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.voice_join_occupancy[bucket];
+        *counter = counter.saturating_add(1);
     }
 
     /// One finished room lifecycle outcome (TOG-13543). Call once per
@@ -818,6 +840,22 @@ impl Metrics {
             "two_bot_voice_join_to_move_seconds",
             "Creator join gateway receipt to successful member move in seconds.",
         );
+        header(
+            &mut out,
+            "two_bot_voice_join_occupancy_total",
+            "counter",
+            "VOICE_STATE_UPDATE joins by humans already present in the target channel (7+ caps the tail).",
+        );
+        for (bucket, count) in VOICE_JOIN_OCCUPANCY_BUCKETS
+            .iter()
+            .zip(values.voice_join_occupancy)
+        {
+            writeln!(
+                out,
+                "two_bot_voice_join_occupancy_total{{occupancy=\"{bucket}\"}} {count}"
+            )
+            .unwrap();
+        }
         header(
             &mut out,
             "two_bot_rest_requests_total",
@@ -1499,6 +1537,24 @@ mod tests {
         assert!(text.contains("two_bot_voice_join_to_move_seconds_sum 0.5\n"));
         assert!(text.contains("two_bot_voice_join_to_move_seconds_bucket{le=\"0.1\"} 0\n"));
         assert!(text.contains("two_bot_voice_join_to_move_seconds_bucket{le=\"0.5\"} 2\n"));
+    }
+
+    #[test]
+    fn voice_join_occupancy_buckets_cap_without_new_series() {
+        // Seeding TEST (occupancy-to-join curve): one counter per occupancy
+        // bucket, capped at 7+ so cardinality stays fixed. No channel, member
+        // or time labels ever reach exposition.
+        let metrics = Metrics::default();
+        metrics.voice_join_occupancy(0);
+        metrics.voice_join_occupancy(1);
+        metrics.voice_join_occupancy(2);
+        metrics.voice_join_occupancy(7);
+        metrics.voice_join_occupancy(100);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_join_occupancy_total{occupancy=\"0\"} 1\n"));
+        assert!(text.contains("two_bot_voice_join_occupancy_total{occupancy=\"1\"} 1\n"));
+        assert!(text.contains("two_bot_voice_join_occupancy_total{occupancy=\"2\"} 1\n"));
+        assert!(text.contains("two_bot_voice_join_occupancy_total{occupancy=\"7+\"} 2\n"));
     }
 
     #[test]

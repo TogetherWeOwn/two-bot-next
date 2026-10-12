@@ -1868,7 +1868,20 @@ impl LiveGuild {
         channel: Option<Snowflake>,
         bot: Option<bool>,
     ) -> Option<JoinTicket> {
-        self.voice_update_at(member, channel, bot, wall_ms())
+        self.voice_update_with_occupancy(member, channel, bot)
+            .map(|(ticket, _)| ticket)
+    }
+
+    /// Ticket plus the seeding-TEST occupancy sample: the humans already
+    /// present in the target channel when the join arrived, excluding the
+    /// joiner. `None` for leaves, same-channel updates and pre-READY frames.
+    pub fn voice_update_with_occupancy(
+        &self,
+        member: Snowflake,
+        channel: Option<Snowflake>,
+        bot: Option<bool>,
+    ) -> Option<(JoinTicket, u64)> {
+        self.voice_update_at_with_occupancy(member, channel, bot, wall_ms())
     }
 
     /// Deterministic tenure seam: `voice_update` stamps the wall clock;
@@ -1880,6 +1893,20 @@ impl LiveGuild {
         bot: Option<bool>,
         now_ms: u64,
     ) -> Option<JoinTicket> {
+        self.voice_update_at_with_occupancy(member, channel, bot, now_ms)
+            .map(|(ticket, _)| ticket)
+    }
+
+    /// Tenure seam with the occupancy sample. The count is taken before the
+    /// insert, inside the same write lock, so concurrent joins cannot skew
+    /// it; the joiner is never in the target yet, so no self-count.
+    fn voice_update_at_with_occupancy(
+        &self,
+        member: Snowflake,
+        channel: Option<Snowflake>,
+        bot: Option<bool>,
+        now_ms: u64,
+    ) -> Option<(JoinTicket, u64)> {
         let mut live = self.write_state();
         let previous_channel = live
             .members
@@ -1894,6 +1921,7 @@ impl LiveGuild {
                 return None;
             }
         }
+        let occupancy_at_join = channel.map(|target| live.humans(target) as u64);
         let bot = bot.or_else(|| live.members.get(&member).and_then(|previous| previous.bot));
         live.next_transition += 1;
         let transition = live.next_transition;
@@ -1912,11 +1940,16 @@ impl LiveGuild {
         if let Some(channel) = channel {
             live.refresh_empty_since(channel);
         }
-        channel.filter(|_| live.ready).map(|creator_id| JoinTicket {
-            member_id: member,
-            creator_id,
-            generation: live.generation,
-            transition,
+        channel.filter(|_| live.ready).map(|creator_id| {
+            (
+                JoinTicket {
+                    member_id: member,
+                    creator_id,
+                    generation: live.generation,
+                    transition,
+                },
+                occupancy_at_join.unwrap_or_default(),
+            )
         })
     }
 
@@ -6601,14 +6634,25 @@ where
         let Some(actor) = self.live_actor(guild) else {
             return false;
         };
-        let command = match actor.live.voice_update(member, channel, bot) {
-            Some(ticket) => ActorCommand::Join {
-                ticket,
-                display,
-                seed: self.seeds.fetch_add(1, Ordering::Relaxed),
-                created_at: now_iso(),
-                received,
-            },
+        let command = match actor.live.voice_update_with_occupancy(member, channel, bot) {
+            Some((ticket, occupancy_at_join)) => {
+                // Seeding TEST (occupancy-to-join curve): one label-free
+                // counter sample plus a token-free log line per ticketed
+                // join. No member, channel or guild IDs are recorded.
+                metrics::global().voice_join_occupancy(occupancy_at_join);
+                info!(
+                    voice_event = "voice_join_occupancy",
+                    occupancy_at_join = occupancy_at_join,
+                    "voice join observed with occupancy-at-join"
+                );
+                ActorCommand::Join {
+                    ticket,
+                    display,
+                    seed: self.seeds.fetch_add(1, Ordering::Relaxed),
+                    created_at: now_iso(),
+                    received,
+                }
+            }
             None => {
                 if channel.is_some() {
                     let _ = actor.tx.send(ActorCommand::Display {

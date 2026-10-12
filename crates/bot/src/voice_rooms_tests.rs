@@ -1966,6 +1966,41 @@ async fn owner_leave_hands_room_to_earliest_joiner_and_persists() {
     assert_eq!(worker.queue.pending_counts(GUILD), queued);
 }
 
+#[test]
+fn join_reports_human_occupancy_at_join_before_insert() {
+    // Seeding TEST: occupancy-at-join counts the humans already present in
+    // the target channel, excluding the joiner.
+    let live = LiveGuild::new(GUILD);
+    live.publish(snapshot(
+        &[500],
+        vec![VoiceMember {
+            member_id: MEMBER,
+            channel_id: 500,
+            bot: Some(false),
+        }],
+    ));
+    let (_, occupancy) = live
+        .voice_update_at_with_occupancy(301, Some(500), Some(false), 1_000)
+        .expect("ticket");
+    assert_eq!(occupancy, 1);
+    let (_, occupancy) = live
+        .voice_update_at_with_occupancy(302, Some(500), Some(false), 2_000)
+        .expect("ticket");
+    assert_eq!(occupancy, 2);
+    // An empty creator sees zero.
+    let (_, occupancy) = live
+        .voice_update_at_with_occupancy(303, Some(CREATOR), Some(false), 3_000)
+        .expect("ticket");
+    assert_eq!(occupancy, 0);
+    // Leaves and same-channel updates are not join samples.
+    assert!(live
+        .voice_update_at_with_occupancy(MEMBER, None, Some(false), 4_000)
+        .is_none());
+    assert!(live
+        .voice_update_at_with_occupancy(301, Some(500), Some(false), 5_000)
+        .is_none());
+}
+
 #[tokio::test]
 async fn succession_skips_present_owners_and_pending_moves() {
     let (live, store, http, trace) = fixture();
@@ -4336,6 +4371,39 @@ fn runtime_drops_voice_frames_before_first_snapshot() {
     let trace = Trace::default();
     let runtime = test_runtime(trace);
     assert!(!runtime.voice_frame(GUILD, MEMBER, Some(CREATOR), Some(false), "x".to_owned()));
+}
+
+#[tokio::test]
+async fn voice_frame_logs_occupancy_at_join() {
+    // Seeding TEST AC(1): every VOICE_STATE_UPDATE join carries its channel
+    // occupancy-at-join; leaves carry no sample.
+    let (bytes, _subscriber) = capture_join_logs();
+    let trace = Trace::default();
+    let runtime = test_runtime(trace);
+    assert!(runtime.publish_snapshot(
+        GUILD,
+        snapshot(
+            &[500],
+            vec![VoiceMember {
+                member_id: MEMBER,
+                channel_id: 500,
+                bot: Some(false),
+            }],
+        ),
+    ));
+    assert!(runtime.voice_frame(GUILD, 301, Some(500), Some(false), "x".to_owned()));
+    assert!(runtime.voice_frame(GUILD, 302, Some(500), Some(false), "x".to_owned()));
+    assert!(runtime.voice_frame(GUILD, MEMBER, None, Some(false), "x".to_owned()));
+    let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+    let joins: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["fields"]["voice_event"] == "voice_join_occupancy")
+        .collect();
+    assert_eq!(joins.len(), 2, "{text}");
+    assert_eq!(joins[0]["fields"]["occupancy_at_join"].as_u64(), Some(1));
+    assert_eq!(joins[1]["fields"]["occupancy_at_join"].as_u64(), Some(2));
+    runtime.remove_guild(GUILD);
 }
 
 #[tokio::test]
