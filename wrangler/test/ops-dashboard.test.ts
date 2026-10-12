@@ -11,6 +11,7 @@
 
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
+import vm from "node:vm";
 import { DatabaseSync } from "node:sqlite";
 import worker, { TwoBotContainer, type Env } from "../src/index.ts";
 import {
@@ -161,6 +162,132 @@ test(`${OPS_DASHBOARD_PATH}: serves the static read-only page with the right hea
   assert.ok(html.includes("res.status === 503"), "page must render the 503 readiness report");
   assert.ok(html.includes("status === 200"), "page must derive readiness from the status");
   assert.equal(calls.length, 0, "serving the page must not touch the container");
+});
+
+function extractPageScript(html: string): string {
+  const match = html.match(/<script>([\s\S]*?)<\/script>/);
+  assert.ok(match, "page must contain one inline script");
+  return match![1]!;
+}
+
+test(`${OPS_DASHBOARD_PATH}: served inline page script parses`, async () => {
+  const { env } = configured();
+  const html = await (await get(env, OPS_DASHBOARD_PATH)).text();
+  const script = extractPageScript(html);
+  assert.doesNotThrow(
+    () => new vm.Script(script),
+    "served page script must parse (a SyntaxError leaves Connect dead)",
+  );
+});
+
+type StubFetch = (url: string, init?: RequestInit) => Promise<{
+  status: number;
+  headers: { get: (name: string) => string | null };
+  json: () => Promise<unknown>;
+}>;
+
+function runPageScript(script: string, fetchImpl: StubFetch) {
+  const listeners = new Map<string, () => void>();
+  const elements: Record<string, {
+    value?: string;
+    textContent?: string;
+    innerHTML?: string;
+    addEventListener?: (event: string, fn: () => void) => void;
+  }> = {
+    summary: { innerHTML: "" },
+    status: { textContent: "" },
+    clientId: { value: "test-id" },
+    clientSecret: { value: "test-secret" },
+    connect: {},
+    disconnect: {},
+  };
+  for (const id of ["connect", "disconnect"]) {
+    elements[id]!.addEventListener = (event: string, fn: () => void) => {
+      listeners.set(`${id}:${event}`, fn);
+    };
+  }
+  const sandbox: Record<string, unknown> = {
+    document: {
+      getElementById: (id: string) => elements[id] ?? null,
+    },
+    fetch: fetchImpl,
+    setInterval: () => 0,
+    clearInterval: () => {},
+    console,
+  };
+  vm.createContext(sandbox);
+  // Expose poll/render for the drive below; the parse test above covers the
+  // raw served script, so appending a hook here cannot hide a SyntaxError.
+  vm.runInContext(`${script}\n;globalThis.__hook = { poll, render };`, sandbox);
+  const hook = vm.runInContext("__hook", sandbox) as {
+    poll: () => Promise<void>;
+    render: (data: unknown, status: unknown) => string;
+  };
+  return { elements, listeners, hook, sandbox };
+}
+
+function readinessFetch(
+  status: number,
+  contentType: string,
+  data?: unknown,
+): StubFetch {
+  return async () => ({
+    status,
+    headers: { get: (name: string) => name.toLowerCase() === "content-type" ? contentType : null },
+    json: async () => {
+      if (data === undefined) throw new Error("no json body");
+      return data;
+    },
+  });
+}
+
+test(`${OPS_DASHBOARD_PATH}: page poll renders 200 ready, 503 report, 401 and 504 failures`, async () => {
+  const { env } = configured();
+  const html = await (await get(env, OPS_DASHBOARD_PATH)).text();
+  const script = extractPageScript(html);
+
+  {
+    const { elements, hook } = runPageScript(
+      script,
+      readinessFetch(200, "application/json", {
+        components: [["process", "ready"]],
+        jobs: {},
+        build_revision: "r",
+        build_id: "b",
+      }),
+    );
+    await hook.poll();
+    assert.ok(elements["summary"]!.innerHTML!.includes(">READY<"), "200 must show READY");
+    assert.ok(!elements["summary"]!.innerHTML!.includes("NOT READY"), "200 must not show NOT READY");
+    assert.ok(elements["status"]!.textContent!.startsWith("updated "), "200 must stamp updated");
+  }
+
+  {
+    const { elements, hook } = runPageScript(
+      script,
+      readinessFetch(503, "application/json", {
+        components: [["process", "ready"], ["gateway", "down"]],
+        jobs: {},
+        gateway_failure: { phase: "connect", class: "timeout" },
+        build_revision: "r",
+        build_id: "b",
+      }),
+    );
+    await hook.poll();
+    assert.ok(elements["summary"]!.innerHTML!.includes("NOT READY"), "503 must show NOT READY");
+    assert.ok(elements["summary"]!.innerHTML!.includes("gateway"), "503 must list the down component");
+    assert.ok(elements["summary"]!.innerHTML!.includes("down"), "503 must show the down state");
+  }
+
+  for (const status of [401, 504]) {
+    const { elements, hook } = runPageScript(script, readinessFetch(status, "text/plain"));
+    await hook.poll();
+    assert.equal(elements["status"]!.textContent, `summary ${status}`);
+    assert.ok(
+      elements["summary"]!.innerHTML!.includes(`summary request failed: ${status}`),
+      `${status} must render the failure line`,
+    );
+  }
 });
 
 test(`${OPS_SUMMARY_PATH}: forwards to the DO with the stamped deployment id`, async () => {

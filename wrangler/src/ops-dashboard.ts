@@ -163,7 +163,7 @@ async function poll() {
     && (res.status === 200 || res.status === 503);
   if (!isReadinessJson) {
     status.textContent = "summary " + res.status;
-    el.innerHTML = "<p class=\"bad\">summary request failed: " + res.status + "</p>";
+    el.innerHTML = '<p class="bad">summary request failed: ' + res.status + '</p>';
     return;
   }
   let data;
@@ -171,7 +171,7 @@ async function poll() {
     data = await res.json();
   } catch (e) {
     status.textContent = "summary " + res.status;
-    el.innerHTML = "<p class=\"bad\">summary request failed: " + res.status + "</p>";
+    el.innerHTML = '<p class="bad">summary request failed: ' + res.status + '</p>';
     return;
   }
   status.textContent = "updated " + new Date().toISOString();
@@ -189,7 +189,7 @@ function render(data, status) {
   const ready = typeof status === "number"
     ? status === 200
     : comps0.every(function (c) { return c && c[1] === "ready"; });
-  let html = "<h2 class=\"" + (ready ? "ok" : "bad") + "\">" + (ready ? "READY" : "NOT READY") + "</h2>";
+  let html = '<h2 class="' + (ready ? 'ok' : 'bad') + '">' + (ready ? 'READY' : 'NOT READY') + '</h2>';
   const comps = Array.isArray(data && data.components) ? data.components : [];
   html += "<h3>Components</h3><table><tr><th>name</th><th>state</th></tr>";
   for (const [name, state] of comps) html += "<tr><td>" + esc(name) + "</td><td>" + esc(state) + "</td></tr>";
@@ -203,7 +203,7 @@ function render(data, status) {
   if (data && data.gateway_failure) {
     html += "<p>gateway failure: " + esc(data.gateway_failure.phase) + " / " + esc(data.gateway_failure.class) + "</p>";
   }
-  html += "<p class=\"muted\">build " + esc((data && data.build_revision) || "?") + " / " + esc((data && data.build_id) || "?") + "</p>";
+  html += '<p class="muted">build ' + esc((data && data.build_revision) || '?') + ' / ' + esc((data && data.build_id) || '?') + '</p>';
   return html;
 }
 document.getElementById("connect").addEventListener("click", () => {
