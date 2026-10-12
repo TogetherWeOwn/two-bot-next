@@ -301,6 +301,10 @@
       "sha256": "18f81ad0a9f98008cb975ef469f1d52f5c10100b31b14bf63693bb2a4f731abc",
       "justification": "TOG-12415: S6 target DDL for the go.two.gg redirect store; legacy 0006 shape with timestamptz."
     },
+    "crates/store/migrations/0408_backfill_cursors.sql": {
+      "sha256": "5b51e4a320368ca9bc68834dfd4ade19e910aa46129b5e1940bec919fd3d067c",
+      "justification": "Resumable per-family backfill cursors so a crash resumes from the persisted cursor, never from zero; ids/cursors/timestamps only."
+    },
     "crates/cutover/migrations/0418_voice_join_grants.sql": {
       "sha256": "e0f7419d2526a36b822892b5206619f24684f3edfa0231ac43262c1116fcfb03",
       "justification": "Voice V3 approved Connect grants: durable voice_join_grants witness per approved room member, written before the Discord grant and retired only after revocation, so a restart cannot strand a Connect allow past /public."
