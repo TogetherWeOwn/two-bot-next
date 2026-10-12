@@ -34,8 +34,10 @@ the step itself.
 - Floor guard (HARD): `scripts/ci/check-floor-guard.py` fails when a diff
   adds a checker waiver, adds a test skip, deletes a test file, drops
   assertions from test code, or lowers a number in `CONSTRAINTS.md`. Two
-  waivers are allowed: a database ignore that names the agent test DB in an
-  integration target, and a row in the `CONSTRAINTS.md` Exceptions table. The
+  waivers are allowed: a database ignore that names the agent test DB (or a
+  disposable test database) in an integration target or a crate `src` tree,
+  and a row in the `CONSTRAINTS.md` Exceptions table. `#[expect(...)]` and
+  `cfg_attr(..., allow/expect/ignore)` count as waivers. The
   guard reads that table from the base branch, so a PR cannot exempt itself.
 
 ## Semgrep backlog (41 `panic!` hits, WARN)

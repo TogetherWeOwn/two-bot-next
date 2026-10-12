@@ -41,6 +41,16 @@ SUPPORT_EXCEPTION = ("crates/*/tests/support/*.rs", "allow(dead_code)", date(202
 SUPPORT_PATH = "crates/core/tests/support/tracing_capture.rs"
 
 PATCH_ROW = "| Patch coverage | Changed lines >= 80% covered | llvm-cov | every Rust PR |\n"
+LINT_ROW = "| Lint | Zero clippy warnings | `cargo clippy --workspace --all-targets -- -D warnings` | every Rust PR |\n"
+FLOOR_RULE_ROW = "| Floor | No waivers, skips, deleted tests, stripped assertions, lowered thresholds | `python3 scripts/ci/check-floor-guard.py` | every PR |\n"
+ENFORCED_BASE = (
+    "# Constraints\n\n## Enforced with numbers\n\n"
+    "| Dimension | Rule | Checked by | Runs at |\n"
+    "|-----------|------|-----------|---------|\n"
+    + PATCH_ROW
+    + LINT_ROW
+    + FLOOR_RULE_ROW
+)
 MEASURED_ROW = "| Project-wide line coverage | 71.3% | must not fall |\n"
 EXCEPTION_ROW = (
     "| crates/*/tests/support/*.rs | `allow(dead_code)` | CI maintainers "
@@ -93,6 +103,46 @@ class ScanTests(unittest.TestCase):
         )
         self.assertTrue(any("silenced-checker" in e for e in errors), errors)
 
+    def test_expect_attribute_fails(self):
+        errors = gate.scan(
+            added("src/handler.rs", "#[expect(clippy::too_many_arguments)]"),
+            [],
+            [],
+        )
+        self.assertTrue(any("silenced-checker" in e for e in errors), errors)
+
+    def test_crate_level_expect_attribute_fails(self):
+        errors = gate.scan(
+            added("src/lib.rs", "#![expect(dead_code)]"),
+            [],
+            [],
+        )
+        self.assertTrue(any("silenced-checker" in e for e in errors), errors)
+
+    def test_cfg_attr_allow_fails(self):
+        errors = gate.scan(
+            added("src/handler.rs", "#[cfg_attr(test, allow(dead_code))]"),
+            [],
+            [],
+        )
+        self.assertTrue(any("silenced-checker" in e for e in errors), errors)
+
+    def test_cfg_attr_ignore_fails(self):
+        errors = gate.scan(
+            added("src/handler.rs", '#[cfg_attr(not(feature = "db"), ignore)]'),
+            [],
+            [],
+        )
+        self.assertTrue(any("silenced-checker" in e for e in errors), errors)
+
+    def test_prose_mention_of_cfg_attr_is_not_a_suppression(self):
+        errors = gate.scan(
+            added("src/handler.rs", "// cfg_attr allowlist goes through review"),
+            [],
+            [],
+        )
+        self.assertEqual(errors, [])
+
     def test_prose_mention_of_allow_is_not_a_suppression(self):
         errors = gate.scan(
             added("src/handler.rs", "// prefer expect() over allow attributes"),
@@ -141,7 +191,7 @@ class ScanTests(unittest.TestCase):
         )
         self.assertEqual(errors, [])
 
-    def test_routed_db_ignore_outside_an_integration_target_fails(self):
+    def test_routed_db_ignore_in_src_test_module_passes(self):
         errors = gate.scan(
             added(
                 "crates/bot/src/gateway_tests/rsvp.rs",
@@ -150,7 +200,33 @@ class ScanTests(unittest.TestCase):
             [],
             [],
         )
+        self.assertEqual(errors, [])
+
+    def test_routed_db_ignore_outside_any_crate_target_fails(self):
+        errors = gate.scan(
+            added(
+                "tools/harness.rs",
+                '#[ignore = "requires agent-testdb or CI service"]',
+            ),
+            [],
+            [],
+        )
         self.assertTrue(any("test-made-easier" in e for e in errors), errors)
+
+    def test_disposable_database_wording_passes_in_src(self):
+        for path, line in (
+            (
+                "crates/core/src/community_store.rs",
+                '#[ignore = "needs a disposable test database; routed to a check step"]',
+            ),
+            (
+                "crates/bot/src/gateway_tests/voice.rs",
+                '#[ignore = "requires an authorized disposable gateway test database"]',
+            ),
+        ):
+            with self.subTest(path=path):
+                errors = gate.scan(added(path, line), [], [])
+                self.assertEqual(errors, [])
 
     def test_reasoned_ignore_without_a_routing_marker_fails(self):
         errors = gate.scan(
@@ -345,6 +421,39 @@ class ThresholdTests(unittest.TestCase):
     def test_removed_enforced_row_fails(self):
         errors = gate.threshold_violations(BASE, BASE.replace(PATCH_ROW, ""))
         self.assertTrue(any("threshold-lowered" in e for e in errors), errors)
+
+    def test_enforced_row_moved_to_measured_fails(self):
+        head = ENFORCED_BASE.replace(LINT_ROW, "")
+        head += (
+            "\n## Measured, not yet enforced\n\n"
+            "| Metric | Today | Direction |\n"
+            "|--------|-------|-----------|\n"
+            "| Lint | Zero clippy warnings | - | watch |\n"
+        )
+        errors = gate.threshold_violations(ENFORCED_BASE, head)
+        self.assertTrue(any("threshold-lowered" in e for e in errors), errors)
+
+    def test_enforced_row_reworded_fails(self):
+        head = ENFORCED_BASE.replace(
+            "Zero clippy warnings", "Clippy warnings are advisory"
+        )
+        errors = gate.threshold_violations(ENFORCED_BASE, head)
+        self.assertTrue(any("threshold-lowered" in e for e in errors), errors)
+
+    def test_floor_row_rule_text_changed_fails(self):
+        head = ENFORCED_BASE.replace(
+            "No waivers, skips, deleted tests, stripped assertions, lowered thresholds",
+            "Anything goes",
+        )
+        errors = gate.threshold_violations(ENFORCED_BASE, head)
+        self.assertTrue(any("threshold-lowered" in e for e in errors), errors)
+
+    def test_reference_number_before_threshold_passes(self):
+        head = BASE.replace(
+            "Changed lines >= 80% covered",
+            "Per RFC 7, changed lines >= 80% covered",
+        )
+        self.assertEqual(gate.threshold_violations(BASE, head), [])
 
     def test_measured_row_promoted_at_least_as_strict_passes(self):
         head = BASE.replace(MEASURED_ROW, "").replace(

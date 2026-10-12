@@ -11,13 +11,14 @@ the verdict, and the floor guard fails the PR when the bar itself is lowered.
 Checked by `scripts/ci/check-floor-guard.py` (HARD) on every PR, in milliseconds:
 
 - No new checker waivers: Rust `#[allow(...)]` / `#![allow(...)]`,
-  `#[rustfmt::skip]`, JS `eslint-disable`, Python `# noqa` / `# type: ignore`,
+  `#[expect(...)]`, `cfg_attr(..., allow/expect/ignore)`, `#[rustfmt::skip]`,
+  JS `eslint-disable`, Python `# noqa` / `# type: ignore`,
   `nosemgrep`, `gitleaks:allow`, `Stryker disable`, and the like. A waiver the
   Exceptions table names is allowed until that row expires.
 - No test made easier to get green: a newly added test skip (a bare
-  `#[ignore]`, an `#[ignore = "..."]` that does not name the agent test DB,
-  focused-test calls), a deleted test file, or assertions dropped from test
-  code with nothing added back in the same diff.
+  `#[ignore]`, an `#[ignore = "..."]` that names neither the agent test DB
+  nor a disposable test database, focused-test calls), a deleted test file,
+  or assertions dropped from test code with nothing added back in the same diff.
 - No lowered number in this file. Raising a threshold is silent; lowering one
   fails the PR, and so does removing a row unless the metric is promoted at
   least as strictly.
@@ -34,7 +35,7 @@ not adding one.
 |-----------|------|-----------|---------|
 | Format | `cargo fmt --all -- --check` clean | `check` lane | every PR |
 | Lint | Zero clippy warnings | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, `check` lane | every Rust PR |
-| Floor | No waivers, skips, deleted tests, stripped assertions, lowered thresholds | `python3 scripts/ci/check-floor-guard.py`, `check` lane | every PR |
+| Floor | No waivers, skips, deleted tests, stripped assertions, lowered thresholds; `#[expect(...)]` and `cfg_attr(..., allow/expect/ignore)` count as waivers | `python3 scripts/ci/check-floor-guard.py`, `check` lane | every PR |
 | Patch coverage | Changed lines >= 80% covered (WARN first) | `cargo llvm-cov` + `scripts/ci/check-patch-coverage.py`, `check` lane | every Rust PR |
 | Dependencies | Nothing at high or above; advisories fail | `cargo-deny check all`, `check` lane | every PR |
 | Request-path unwrap | No new `.unwrap()` in route/handler/interaction/command/webhook files (WARN first) | ast-grep rule + `scripts/ci/check-unwrap-request-paths.py`, `check` lane | every Rust PR |

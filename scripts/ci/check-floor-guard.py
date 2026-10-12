@@ -14,8 +14,10 @@ Contract (reference: constraint-driven-development floor-guard):
 - Exceptions come from the merge base's CONSTRAINTS.md, never the head's, so
   a PR cannot exempt its own waiver. A row names a path glob, the waiver text,
   an owner and an expiry date, and stops covering after that date.
-- A database ignore that names the agent test DB is accepted in an integration
-  target. check-test-inventory.py requires a CI lane to run each such target.
+- A database ignore that names the agent test DB (or a disposable test
+  database) is accepted in an integration target or a crate src tree, where
+  the onboarding and gateway test lanes run the ignored DB scenarios.
+  check-test-inventory.py requires a CI lane to run each such target.
 - Assertions are counted across the whole diff: a moved assertion passes, a
   dropped one without a replacement fails.
 
@@ -45,13 +47,21 @@ class NoMergeBase(Exception):
 
 # A waiver attribute only takes effect at the start of a line, so only that
 # position is flagged. Doc prose and fixture strings never sit there.
-ATTR_ALLOW = re.compile(r"^\s*#\s*!?\s*\[\s*allow")
+# `expect` silences the same lints as `allow`, and a `cfg_attr` wrapper
+# silences them conditionally, so all three forms are waivers here. A
+# conditional ignore is reported as a waiver (one violation, not two).
+ATTR_ALLOW = re.compile(r"^\s*#\s*!?\s*\[\s*(?:allow|expect)\b")
+ATTR_CFG_WAIVER = re.compile(
+    r"^\s*#\s*!?\s*\[.*cfg_attr\s*\(.*\b(?:allow|expect|ignore)\b"
+)
 ATTR_RUSTFMT_SKIP = re.compile(r"^\s*#\s*\[\s*rustfmt::skip")
 ATTR_IGNORE = re.compile(r"^\s*#\s*\[\s*ignore")
 ROUTED_DB_IGNORE = re.compile(
-    r'^\s*#\s*\[\s*ignore\s*=\s*"[^"]*(?:agent-testdb|TEST_DATABASE_URL)[^"]*"\s*\]'
+    r'^\s*#\s*\[\s*ignore\s*=\s*"[^"]*(?:agent-testdb|TEST_DATABASE_URL|disposable[^"]*database)[^"]*"\s*\]',
+    re.IGNORECASE,
 )
 INTEGRATION_TARGET = re.compile(r"^crates/[^/]+/tests/[^/]+\.rs$")
+SRC_ROUTED_TARGET = re.compile(r"^crates/[^/]+/src/.*\.rs$")
 
 # Trailing-comment waivers take effect mid-line, so they match anywhere.
 INLINE_SUPPRESSIONS = re.compile(
@@ -93,6 +103,18 @@ def _numbers(line):
     return [float(n) for n in re.findall(r"\d+(?:\.\d+)?", without_dates)]
 
 
+def _words(line):
+    """Lowercase words with dates and numbers stripped out.
+
+    Used to tell a reworded Enforced row apart from a tightened number:
+    ``Zero clippy warnings`` -> ``Clippy warnings are advisory`` drops the
+    word ``zero``, while ``Per RFC 7, ... >= 80%`` only adds words.
+    """
+    text = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", " ", line)
+    text = re.sub(r"\d+(?:\.\d+)?%?", " ", text)
+    return set(re.findall(r"[a-z]+", text.lower()))
+
+
 def _cells(line):
     return [cell.strip() for cell in line.strip().strip("|").split("|")]
 
@@ -117,10 +139,14 @@ def _table_rows(text):
 
 
 def _lowered(old, new):
-    old_nums, new_nums = _numbers(old), _numbers(new)
-    return len(new_nums) < len(old_nums) or any(
-        new_nums[i] < number for i, number in enumerate(old_nums)
-    )
+    # Largest-first so an added reference number (``Per RFC 7, ... >= 80%``)
+    # cannot read as a lowered threshold, and so a reordered pair of
+    # thresholds compares like-for-like instead of by position.
+    old_nums = sorted(_numbers(old), reverse=True)
+    new_nums = sorted(_numbers(new), reverse=True)
+    if len(new_nums) < len(old_nums):
+        return True
+    return any(new_nums[i] < number for i, number in enumerate(old_nums))
 
 
 def _promoted(old, head_rows, base_keys):
@@ -136,7 +162,13 @@ def _promoted(old, head_rows, base_keys):
 
 
 def threshold_violations(base_text, head_text):
-    """Compare CONSTRAINTS.md rows across the diff; a deleted file is scan()'s job."""
+    """Compare CONSTRAINTS.md rows across the diff; a deleted file is scan()'s job.
+
+    An Enforced key must stay in an enforced section: moving it under
+    Measured is a demotion and fails. An Enforced row that keeps its key but
+    drops words from its rule text is a rewording and fails, while added
+    words alone pass so tightening stays silent.
+    """
     if base_text is None or head_text is None:
         return []
     base_rows = _table_rows(base_text)
@@ -145,6 +177,34 @@ def threshold_violations(base_text, head_text):
     errors = []
     for section, key, old in base_rows:
         if section == "exceptions":
+            continue
+        if section.startswith("enforced"):
+            enforced_match = [
+                line
+                for head_section, k, line in head_rows
+                if k == key and head_section.startswith("enforced")
+            ]
+            if enforced_match:
+                head_line = enforced_match[0]
+                if _lowered(old, head_line):
+                    errors.append(
+                        "threshold-lowered: CONSTRAINTS.md weakened: "
+                        f"{old.strip()[:80]} -> {head_line.strip()[:80]}"
+                    )
+                elif _words(old) - _words(head_line):
+                    errors.append(
+                        "threshold-lowered: CONSTRAINTS.md Enforced row reworded: "
+                        f"{old.strip()[:80]} -> {head_line.strip()[:80]}"
+                    )
+            elif any(k == key for _, k, _ in head_rows):
+                errors.append(
+                    "threshold-lowered: CONSTRAINTS.md Enforced row demoted "
+                    f"out of Enforced: {old.strip()[:80]}"
+                )
+            elif not _promoted(old, head_rows, base_keys):
+                errors.append(
+                    f"threshold-lowered: CONSTRAINTS.md row removed: {old.strip()[:80]}"
+                )
             continue
         same_key = [line for _, k, line in head_rows if k == key]
         if same_key:
@@ -183,7 +243,9 @@ def _exempt(path, line, exceptions, today):
 
 
 def _is_routed_db_ignore(path, line):
-    return bool(INTEGRATION_TARGET.match(path) and ROUTED_DB_IGNORE.match(line))
+    if not ROUTED_DB_IGNORE.match(line):
+        return False
+    return bool(INTEGRATION_TARGET.match(path) or SRC_ROUTED_TARGET.match(path))
 
 
 def _is_test_skip(path, line):
@@ -203,6 +265,7 @@ def _is_test_skip(path, line):
 def _is_silenced(line):
     return bool(
         ATTR_ALLOW.match(line)
+        or ATTR_CFG_WAIVER.match(line)
         or ATTR_RUSTFMT_SKIP.match(line)
         or INLINE_SUPPRESSIONS.search(line)
     )
