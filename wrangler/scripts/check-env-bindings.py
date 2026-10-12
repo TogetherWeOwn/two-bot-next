@@ -42,7 +42,7 @@ def missing_env_error(missing: list[str]) -> str:
 EXTRA_REQUIRED_VARS = {"TWO_GUILD_NAME"}
 # Worker secrets live outside wrangler.toml and are optional per environment.
 # Never require this binding (absence is log-only), or accept a plaintext URL.
-OPTIONAL_SECRET_BINDINGS = {"OPS_ALERT_WEBHOOK_URL", "METRICS_SCRAPE_TOKEN"}
+OPTIONAL_SECRET_BINDINGS = {"OPS_ALERT_WEBHOOK_URL", "METRICS_SCRAPE_TOKEN", "OPS_CONTROL_TOKEN"}
 # Absent tuning uses the code default; a named env may opt in independently.
 OPTIONAL_VARS = {"UNREADY_ALERT_FAILURES"}
 # TOG-12980 (CISO TOG-12979 C1/C10): the default-dark POST /internal/actions
@@ -70,6 +70,14 @@ VOICE_GATE_ENVS = {"staging"}
 # Operator-set Worker binding after the app's Presence Intent is on.
 VOICE_PRESENCE_VAR = "TWO_VOICE_PRESENCE"
 VOICE_PRESENCE_ENVS = {"staging"}
+# TOG-22862 (CISO AC4): the mutating admin controls (PUT /ops/config,
+# POST /ops/kill-switch) stay dark unless the environment opts in with these
+# exact-"1" switches. A top-level var would be required in every environment,
+# so it is denied there too; production stays dark until the CISO review.
+OPS_CONFIG_WRITES_VAR = "OPS_CONFIG_WRITES_ENABLED"
+OPS_CONFIG_WRITES_ENVS = {"staging"}
+OPS_KILLSWITCH_VAR = "OPS_KILLSWITCH_ENABLED"
+OPS_KILLSWITCH_ENVS = {"staging"}
 
 
 def check(path: Path) -> list[str]:
@@ -136,6 +144,20 @@ def _collect_errors(cfg: dict) -> list[str]:
             )
         if variables.get(VOICE_PRESENCE_VAR, "1") != "1":
             errors.append(f'{prefix}: {VOICE_PRESENCE_VAR} must be exactly "1" or absent')
+        if OPS_CONFIG_WRITES_VAR in variables and env_name not in OPS_CONFIG_WRITES_ENVS:
+            errors.append(
+                f"{prefix}: {OPS_CONFIG_WRITES_VAR} is staging-only "
+                "(top-level vars are required in every env; production writes need the CISO review)"
+            )
+        if variables.get(OPS_CONFIG_WRITES_VAR, "1") != "1":
+            errors.append(f'{prefix}: {OPS_CONFIG_WRITES_VAR} must be exactly "1" or absent')
+        if OPS_KILLSWITCH_VAR in variables and env_name not in OPS_KILLSWITCH_ENVS:
+            errors.append(
+                f"{prefix}: {OPS_KILLSWITCH_VAR} is staging-only "
+                "(top-level vars are required in every env; production kill-switch needs the CISO review)"
+            )
+        if variables.get(OPS_KILLSWITCH_VAR, "1") != "1":
+            errors.append(f'{prefix}: {OPS_KILLSWITCH_VAR} must be exactly "1" or absent')
         for key in sorted(k for k in variables if k.startswith(RECEIVER_CONFIG_PREFIX)):
             errors.append(f"{prefix}: {key} is an Operator-set Worker secret, never a wrangler.toml var")
         threshold = variables.get("UNREADY_ALERT_FAILURES")
