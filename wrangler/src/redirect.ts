@@ -97,6 +97,19 @@ export interface RedirectResult {
   click?: RedirectClick;
 }
 
+/**
+ * Worker response hardening, mirrored from security-headers.ts (TOG-22701).
+ * This file embeds standalone in the Miniflare acceptance
+ * (redirect-cache.test.ts builds its fixture from this file's text), so it
+ * cannot import that module. The security-headers test pins both to the same
+ * values; update them together.
+ */
+const SECURITY_HEADERS: Record<string, string> = {
+  "x-content-type-options": "nosniff",
+  "referrer-policy": "no-referrer",
+  "x-frame-options": "DENY",
+};
+
 // Absolute end assertions: `$` alone also accepts a trailing line terminator.
 const SLUG = /^[a-z0-9][a-z0-9-]{0,38}[a-z0-9](?![\s\S])/;
 const INVITE_CODE = /^[A-Za-z0-9-]{1,64}(?![\s\S])/;
@@ -484,6 +497,9 @@ function redirect(location: string): RedirectResult {
       "cache-control": "no-store, no-cache, must-revalidate",
       "referrer-policy": "no-referrer",
       "content-type": "text/plain",
+      // Hardening mirrored from security-headers.ts: this file embeds
+      // standalone in the Miniflare acceptance and cannot import it.
+      ...SECURITY_HEADERS,
     },
     body: `redirecting to ${location}\n`,
   };
@@ -491,7 +507,8 @@ function redirect(location: string): RedirectResult {
 
 const text = (status: number, body: string, extra?: Record<string, string>): RedirectResult => ({
   status,
-  headers: { "content-type": "text/plain", ...extra },
+  // The decided set wins on collision; retry-after/allow pass through.
+  headers: { "content-type": "text/plain", ...extra, ...SECURITY_HEADERS },
   body,
 });
 
