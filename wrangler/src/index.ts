@@ -77,6 +77,7 @@ import {
   type MetricsAlertState,
 } from "./alert-rules.ts";
 import { parseAlertScrape } from "./metrics-scrape.ts";
+import { applySecurityHeaders, withSecurityHeaders } from "./security-headers.ts";
 
 /**
  * Plus the optional reviewed TWO_* flags in container-env.ts (TOG-12020) and
@@ -263,7 +264,7 @@ async function tokenMatches(provided: string, expected: string): Promise<boolean
 // arbitrary exception text (or claim stderr crossed the Container boundary).
 function containerUnavailable(): Response {
   console.error(JSON.stringify({ event: "container_probe_failed", error_class: "container_unavailable" }));
-  return Response.json({ ready: false, error_class: "container_unavailable" }, { status: 500 });
+  return Response.json({ ready: false, error_class: "container_unavailable" }, { status: 500, headers: withSecurityHeaders() });
 }
 
 // Allowlist, not denylist: only the bot's own answers may reach the public
@@ -474,7 +475,7 @@ export class TwoBotContainer extends Container<Env> {
     if (url.pathname === CONTROL_PATH) return this.control(request);
     if (url.pathname === ACTIONS_PATH) return this.internalActions(request);
     if (url.pathname !== "/health" && url.pathname !== "/readyz" && url.pathname !== OPS_METRICS_PATH) {
-      return new Response("not found", { status: 404 });
+      return new Response("not found", { status: 404, headers: withSecurityHeaders() });
     }
     try {
       return await this.owned(async () => {
@@ -490,7 +491,7 @@ export class TwoBotContainer extends Container<Env> {
           const metricsUnavailable = (status: number) =>
             new Response("metrics unavailable\n", {
               status,
-              headers: { "content-type": "text/plain", "cache-control": "no-store" },
+              headers: withSecurityHeaders({ "content-type": "text/plain", "cache-control": "no-store" }),
             });
           let upstream: Response;
           try {
@@ -512,18 +513,18 @@ export class TwoBotContainer extends Container<Env> {
           } catch {
             return new Response("metrics unavailable\n", {
               status: 504,
-              headers: { "content-type": "text/plain", "cache-control": "no-store" },
+              headers: withSecurityHeaders({ "content-type": "text/plain", "cache-control": "no-store" }),
             });
           }
           if (body === null) {
             return new Response("metrics unavailable\n", {
               status: 502,
-              headers: { "content-type": "text/plain", "cache-control": "no-store" },
+              headers: withSecurityHeaders({ "content-type": "text/plain", "cache-control": "no-store" }),
             });
           }
           return new Response(body, {
             status: upstream.status,
-            headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8", "cache-control": "no-store" },
+            headers: withSecurityHeaders({ "content-type": "text/plain; version=0.0.4; charset=utf-8", "cache-control": "no-store" }),
           });
         }
         // Bound the entire probe, including auto-start, below the 30s DO gate.
@@ -583,14 +584,14 @@ export class TwoBotContainer extends Container<Env> {
 
   private async control(request: Request): Promise<Response> {
     if (!await authenticated(request, this.env.OWNERSHIP_CONTROL_TOKEN)) {
-      return new Response("unauthorized", { status: 401 });
+      return new Response("unauthorized", { status: 401, headers: withSecurityHeaders() });
     }
     if (request.method !== "GET" && request.method !== "POST") {
-      return new Response("method not allowed", { status: 405, headers: { allow: "GET, POST" } });
+      return new Response("method not allowed", { status: 405, headers: withSecurityHeaders({ allow: "GET, POST" }) });
     }
     const change = request.method === "POST" ? await readChange(request) : null;
     if (request.method === "POST" && !change) {
-      return new Response("invalid ownership change", { status: 400 });
+      return new Response("invalid ownership change", { status: 400, headers: withSecurityHeaders() });
     }
     try {
       return await this.gated(async () => {
@@ -600,7 +601,7 @@ export class TwoBotContainer extends Container<Env> {
           const owner = await this.ownership.read();
           // Takeover does not start the gateway. A subsequent owned probe does.
           return Response.json({ deploymentId: id, owner: owner ?? null, running: this.ctx.container?.running ?? false }, {
-            headers: { "cache-control": "no-store" },
+            headers: withSecurityHeaders({ "cache-control": "no-store" }),
           });
         }
         // Recovery re-runs the full write/destroy/write sequence even for a
@@ -616,7 +617,7 @@ export class TwoBotContainer extends Container<Env> {
         }
         // Takeover does not start the gateway. A subsequent owned probe does.
         return Response.json({ deploymentId: id, owner, running: this.ctx.container?.running ?? false }, {
-          headers: { "cache-control": "no-store" },
+          headers: withSecurityHeaders({ "cache-control": "no-store" }),
         });
       });
     } catch (error) { return refused(error); }
@@ -915,7 +916,7 @@ export default {
 
     if (url.pathname === CONTROL_PATH) {
       if (!await authenticated(request, env.OWNERSHIP_CONTROL_TOKEN)) {
-        return new Response("unauthorized", { status: 401 });
+        return new Response("unauthorized", { status: 401, headers: withSecurityHeaders() });
       }
       try {
         const forwarded = new Request(request);
@@ -948,7 +949,7 @@ export default {
       if (request.method !== "GET" && request.method !== "HEAD") {
         return new Response("method not allowed", {
           status: 405,
-          headers: { allow: "GET, HEAD" },
+          headers: withSecurityHeaders({ allow: "GET, HEAD" }),
         });
       }
       // Per-caller budget before the Container is touched. The key picks a
@@ -959,10 +960,10 @@ export default {
       if (!probe.allowed) {
         return new Response("slow down\n", {
           status: 429,
-          headers: {
+          headers: withSecurityHeaders({
             "content-type": "text/plain",
             "retry-after": String(probe.retryAfter),
-          },
+          }),
         });
       }
       // Sanitize the forwarded probe: keep the origin (Host) the Container
@@ -1005,6 +1006,8 @@ export default {
       } else {
         result.headers.delete("x-two-worker-version");
       }
+      // Harden the Worker-owned edge copy; body and status pass through.
+      applySecurityHeaders(result.headers);
       return result;
     }
 
@@ -1033,7 +1036,7 @@ export default {
             minimum_length: MIN_SCRAPE_TOKEN_LENGTH,
           }));
         }
-        return new Response("not found", { status: 404 });
+        return new Response("not found", { status: 404, headers: withSecurityHeaders() });
       }
       const caller = request.headers.get("cf-connecting-ip") ?? "unknown";
       // Take budget synchronously before the secret comparison: no guess —
@@ -1051,15 +1054,15 @@ export default {
         // one-time scanners can never lock out the authenticated scraper.
         return new Response("slow down\n", {
           status: 429,
-          headers: {
+          headers: withSecurityHeaders({
             "content-type": "text/plain",
             "retry-after": String(verdict.retryAfter),
-          },
+          }),
         });
       }
       const m = /^Bearer (.+)$/.exec(request.headers.get("authorization") ?? "");
       if (!m || m[1]!.length > 4096 || !(await tokenMatches(m[1]!, env.METRICS_SCRAPE_TOKEN))) {
-        return new Response("unauthorized", { status: 401, headers: { "www-authenticate": "Bearer" } });
+        return new Response("unauthorized", { status: 401, headers: withSecurityHeaders({ "www-authenticate": "Bearer" }) });
       }
       try {
         // The fenced DO route requires the deployment header (see fetch);
@@ -1073,7 +1076,7 @@ export default {
     // Internal metrics and healthz aliases never become invite campaigns.
     // The exact /healthz redirect probe is handled below after config validation.
     if (url.pathname !== "/healthz" && isReservedInternal(url.pathname)) {
-      return new Response("not found", { status: 404 });
+      return new Response("not found", { status: 404, headers: withSecurityHeaders() });
     }
 
     // B3: everything else is a go.two.gg tracked link. Clicks record after
@@ -1086,7 +1089,7 @@ export default {
       console.error(`invite_redirect_invalid_config ${JSON.stringify({ errorClass })}`);
       return new Response("redirect service misconfigured\n", {
         status: 503,
-        headers: { "content-type": "text/plain", "retry-after": "30" },
+        headers: withSecurityHeaders({ "content-type": "text/plain", "retry-after": "30" }),
       });
     };
     if (!isValidFallback(env.REDIRECT_FALLBACK_CODE)) return invalidConfig("invalid_fallback");
