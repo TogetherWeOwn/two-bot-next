@@ -205,6 +205,19 @@ function isReadyzBotResponse(status: number, contentType: string | null): boolea
   );
 }
 
+/** A parsed /readyz body is only a readiness report when it carries the
+ * HealthReport shape (components is an array of [name, status] pairs). The
+ * Worker's ownership/storage fence also answers 503 application/json with
+ * `{error:"ownership_fenced"}` (see ownership.ts refused()); that body must
+ * stay a generic failure, never an empty gateway/jobs success. */
+function isReadyzReport(data: unknown): boolean {
+  return (
+    typeof data === "object" &&
+    data !== null &&
+    Array.isArray((data as Record<string, unknown>)["components"])
+  );
+}
+
 async function readContainerJson(
   env: McpEnv,
   path: "/health" | "/readyz",
@@ -235,8 +248,17 @@ async function readContainerJson(
     return { ok: false, oversize: body === null };
   }
   try {
-    return { ok: true, data: JSON.parse(body) as unknown };
+    const data = JSON.parse(body) as unknown;
+    if (path === "/readyz" && !isReadyzReport(data)) {
+      return { ok: false, oversize: false };
+    }
+    return { ok: true, data };
   } catch {
+    if (path === "/readyz") {
+      // Non-JSON 200/503 bodies (plain text, arrays-as-text, junk) are not
+      // readiness reports.
+      return { ok: false, oversize: false };
+    }
     return { ok: true, data: { text: body } };
   }
 }
