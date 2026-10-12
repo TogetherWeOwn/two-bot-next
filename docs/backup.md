@@ -67,12 +67,12 @@ has 83 table entries. A missing current table refuses a dump/restore: migrate
 the target first.
 A v4 archive must declare every covered table except the ones v5 added
 (`V5_ADDED_TABLES`), so recovery points written before create-reservation
-persistence remain inspectable and restorable. A v4 archive written before any
+persistence or event-store voice capture remain inspectable and restorable. A v4 archive written before any
 other table joined the inventory is refused at inspect ("manifest is missing
 tables"); take a fresh dump after upgrading. V5 requires the full current
 inventory; an incomplete new archive refuses at inspection. Restoring a
-pre-reservation archive clears the destination's reservation table, as with
-other tables absent from an older version.
+pre-reservation archive clears the destination's reservation and event-store
+tables, as with other tables absent from an older version.
 An optional legacy table may be absent only when there are no archived rows for
 it. Nonempty legacy data without a matching target table refuses **before any
 truncate**, rather than silently discarding it.

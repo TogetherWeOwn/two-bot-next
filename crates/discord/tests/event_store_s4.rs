@@ -64,6 +64,23 @@ const EFFECT_SENTINEL: &str = "s4-effect-sentinel-must-never-persist";
 /// the store must refuse to persist.
 const STATUS_SENTINEL: &str = "s4-status-sentinel-must-never-persist";
 
+/// Voice identity plus session and mute/deaf/video/stream flags read back
+/// from `event_store`: kept as one alias so clippy's `type_complexity`
+/// lint stays quiet.
+type VoiceStateRow = (
+    String,
+    String,
+    Option<String>,
+    String,
+    bool,
+    bool,
+    bool,
+    bool,
+    bool,
+    bool,
+    bool,
+);
+
 struct TestDb {
     fixture: TestDatabase,
     pool: PgPool,
@@ -350,19 +367,7 @@ async fn event_store_s4_voice_state_join_persists_ids_session_and_flags_only() {
     assert_eq!(stored.len(), 1, "exactly one row for the voice join");
     assert_no_voice_free_text(&stored[0]);
 
-    let row: (
-        String,
-        String,
-        Option<String>,
-        String,
-        bool,
-        bool,
-        bool,
-        bool,
-        bool,
-        bool,
-        bool,
-    ) = sqlx::query_as(
+    let row: VoiceStateRow = sqlx::query_as(
         "SELECT guild_id, user_id, channel_id, session_id,
                 mute, deaf, self_mute, self_deaf, self_video, self_stream, suppress
          FROM event_store WHERE dedup_key = $1",
