@@ -102,9 +102,12 @@ struct ThreadMemberEvent {
 
 impl ThreadMemberEvent {
     fn dedup_key(&self) -> String {
+        // Member deltas key guild-first like every other S6 row
+        // (`<TYPE>:<guild>:<thread>:<time>:<user>`), matching the 0429 header
+        // and the backup seed; keys in one shape deduplicate against each other.
         format!(
-            "{}:{}:{}:{}",
-            self.event_type, self.thread_id, self.user_id, self.event_time
+            "{}:{GUILD}:{}:{}:{}",
+            self.event_type, self.thread_id, self.event_time, self.user_id
         )
     }
 }
@@ -299,51 +302,39 @@ async fn table_columns(pool: &PgPool) -> Vec<String> {
     .expect("event_store columns readable")
 }
 
-const REQUIRED_COLUMNS: &[&str] = &[
+/// The exact reviewed column set for the shared `event_store` table after the
+/// S6 migration: ids, timestamps, the resume-safe key and the thread-state
+/// enums only. A denylist cannot fail on a new free-text name, so this asserts
+/// the full set instead. Later slices extend this allowlist when they add
+/// their own reviewed columns (`ADD COLUMN IF NOT EXISTS` per 0429).
+const ALLOWED_COLUMNS: &[&str] = &[
+    "archived",
+    "dedup_key",
+    "event_time",
     "event_type",
     "guild_id",
-    "thread_id",
-    "parent_id",
-    "user_id",
-    "event_time",
-    "received_at",
-    "dedup_key",
-    "archived",
-    "locked",
+    "id",
     "invitable",
-];
-
-const FORBIDDEN_COLUMNS: &[&str] = &[
-    "name",
-    "thread_name",
-    "topic",
-    "content",
-    "message_body",
-    "body",
-    "text",
-    "embeds",
-    "username",
-    "bio",
-    "about",
+    "locked",
+    "parent_id",
+    "received_at",
+    "thread_id",
+    "user_id",
 ];
 
 fn assert_thread_schema(columns: &[String]) {
-    assert!(
-        !columns.is_empty(),
-        "S6 creates the thread columns on the append-only event_store table"
+    let mut actual = columns.to_vec();
+    actual.sort();
+    let mut expected: Vec<String> = ALLOWED_COLUMNS
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+    expected.sort();
+    assert_eq!(
+        actual, expected,
+        "event_store holds exactly the reviewed S6 columns; extend the allowlist \
+         only with a reviewed slice column"
     );
-    for required in REQUIRED_COLUMNS {
-        assert!(
-            columns.iter().any(|column| column == required),
-            "event_store keeps thread column {required}; has {columns:?}"
-        );
-    }
-    for forbidden in FORBIDDEN_COLUMNS {
-        assert!(
-            !columns.iter().any(|column| column == forbidden),
-            "event_store must not gain a {forbidden} column; has {columns:?}"
-        );
-    }
 }
 
 async fn assert_dedup_key_is_unique(pool: &PgPool) {
@@ -776,18 +767,9 @@ async fn event_store_s6_duplicate_delivery_inserts_once() {
 #[tokio::test]
 async fn event_store_s6_privacy_tripwire_rejects_thread_names_and_bodies() {
     let db = TestDb::new().await;
-    // Tripwire part 1: no free-text column may exist to hold the payload.
-    let columns = table_columns(&db.pool).await;
-    assert!(
-        !columns.is_empty(),
-        "S6 creates the thread columns on the append-only event_store table"
-    );
-    for forbidden in FORBIDDEN_COLUMNS {
-        assert!(
-            !columns.iter().any(|column| column == forbidden),
-            "privacy fence: no {forbidden} column; has {columns:?}"
-        );
-    }
+    // Tripwire part 1: the table holds exactly the reviewed columns, so no
+    // free-text column exists to hold the payload.
+    assert_thread_schema(&table_columns(&db.pool).await);
     // Tripwire part 2: fixtures carrying name + topic + username free text
     // persist their ids, timestamps and enums only; the sentinels appear in no
     // stored row.
