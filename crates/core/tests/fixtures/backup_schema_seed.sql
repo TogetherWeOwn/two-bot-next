@@ -493,3 +493,14 @@ VALUES ('100000000000000001', '100000000000000050', 'vote_started', '10000000000
        ('100000000000000001', '100000000000000051', 'vote_refused', '100000000000000033',
         '100000000000000003', '100000000000000002', 'protected_target',
         NULL, NULL, NULL, '2026-08-03T10:05:00Z');
+-- Event-store thread lifecycle + member deltas (0429 S6): one lifecycle row
+-- with state enums and no member id, one member-delta row with a member id.
+INSERT INTO event_store (event_type, guild_id, thread_id, parent_id, user_id,
+  event_time, dedup_key, archived, locked, invitable)
+VALUES ('THREAD_CREATE', '100000000000000001', '100000000000000060',
+        '100000000000000033', NULL, '2026-08-03T10:00:00Z',
+        'THREAD_CREATE:100000000000000001:100000000000000060:2026-08-03T10:00:00Z',
+        FALSE, FALSE, TRUE),
+       ('THREAD_MEMBER_UPDATE', '100000000000000001', '100000000000000060',
+        NULL, '100000000000000002', '2026-08-03T10:01:00Z',
+        'THREAD_MEMBER_UPDATE:100000000000000001:100000000000000060:2026-08-03T10:01:00Z:100000000000000002');
