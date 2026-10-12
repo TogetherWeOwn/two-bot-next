@@ -1664,13 +1664,16 @@ async fn execute_member(
             let request = match GuildAddMemberRequest::validate(&decision.body) {
                 Ok(request) => request,
                 Err(_) => {
-                    let _ = state
+                    if let Err(error) = state
                         .store
                         .finish(
                             &claim,
                             &TerminalResponse::Failure(TerminalFailure::Malformed),
                         )
-                        .await;
+                        .await
+                    {
+                        log_terminal_persist_failed(action, "finish", error);
+                    }
                     return state.terminal(
                         TerminalResponse::Failure(TerminalFailure::Malformed),
                         false,
@@ -1684,13 +1687,16 @@ async fn execute_member(
             let token = match require_field_str(&decision.body, "access_token") {
                 Ok(token) => token.to_owned(),
                 Err(_) => {
-                    let _ = state
+                    if let Err(error) = state
                         .store
                         .finish(
                             &claim,
                             &TerminalResponse::Failure(TerminalFailure::Malformed),
                         )
-                        .await;
+                        .await
+                    {
+                        log_terminal_persist_failed(action, "finish", error);
+                    }
                     return state.terminal(
                         TerminalResponse::Failure(TerminalFailure::Malformed),
                         false,
