@@ -21,6 +21,9 @@ OTHER_GUILD = "9999999999999999999"
 STAGING_APP = "1469137636663758888"
 OTHER_APP = "1111111111111111111"
 TOKEN = "RAW_SECRET_SENTINEL_never_disclose_bot_token"
+# Both bodies fit BODY_CAP, so the decoder, not the size cap, must refuse them.
+DEEP_ARRAY = b"[" * 32768 + b"]" * 32768
+DEEP_OBJECT = b'{"":' * 13000 + b"{}" + b"}" * 13000
 
 COMMANDS = [
     {"id": "1549621908675366953", "name": "rank", "type": 1,
@@ -170,6 +173,17 @@ class AutomationReadSmokeTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertNotIn(TOKEN, out)
         self.assertNotIn(TOKEN, Path(self.evidence).read_text())
+
+    def test_deep_json_at_identity_refuses_without_traceback(self):
+        for body in (DEEP_ARRAY, DEEP_OBJECT):
+            with self.subTest(opener=body[:1]):
+                code, out = self.run_main(STAGING_GUILD, {f"{smoke.API}/users/@me": (200, body)})
+                self.assertEqual(code, 1)
+                self.assertNotIn("Traceback", out)
+                self.assertNotIn(body[:8].decode(), out)
+                self.assertNotIn(TOKEN, out)
+                self.assertEqual([row for row in out.splitlines() if row.startswith("FAIL ")],
+                                 ["FAIL interactions: interactions endpoint answered 200 with invalid JSON"])
 
 
 class BodyCapRefusalTests(unittest.TestCase):

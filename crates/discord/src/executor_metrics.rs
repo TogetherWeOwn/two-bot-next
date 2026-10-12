@@ -22,6 +22,9 @@ pub(crate) fn route(request: &Request) -> &'static str {
     match (request.method(), parts) {
         (Get, [Some("channels"), Some(_), None, None, None, None]) => "GET /channels/:channel",
         (Patch, [Some("channels"), Some(_), None, None, None, None]) => "PATCH /channels/:channel",
+        (Put, [Some("channels"), Some(_), Some("voice-status"), None, None, None]) => {
+            "PUT /channels/:channel/voice-status"
+        }
         (Get, [Some("channels"), Some(_), Some("messages"), None, None, None]) => {
             "GET /channels/:channel/messages"
         }
@@ -355,9 +358,33 @@ mod tests {
     }
 
     #[test]
+    fn voice_status_route_is_bounded_and_allowlisted() {
+        for id in [1, 987654321098765432u64] {
+            let request = RequestBuilder::raw(
+                Method::Put,
+                format!("channels/{id}/voice-status?private={id}"),
+            )
+            .build()
+            .unwrap();
+            assert_eq!(route(&request), "PUT /channels/:channel/voice-status");
+            assert!(metrics::REST_ROUTES.contains(&route(&request)));
+        }
+        for (method, path) in [
+            (Method::Patch, "channels/1/voice-status"),
+            (Method::Put, "channels/1/voice-status/extra"),
+        ] {
+            let request = RequestBuilder::raw(method, path.to_owned())
+                .build()
+                .unwrap();
+            assert_eq!(route(&request), "other");
+        }
+    }
+
+    #[test]
     fn every_emitted_template_is_allowlisted() {
         let paths = [
             "channels/1",
+            "channels/1/voice-status",
             "channels/1/messages",
             "channels/1/messages/2",
             "channels/1/messages/bulk-delete",

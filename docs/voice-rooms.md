@@ -402,8 +402,21 @@ library code with no Discord dependency and can start immediately.
   - Rename backlogs must never delay creating or deleting rooms.
   - Voice-status updates are much less limited, so route fast-changing information
     there.
-- Create the channel with its overrides already included, then move the member.
+- Creator joins wake the guild queue immediately. Create the channel with its
+  overrides already included, durably bind and persist it, then move the member
+  before companion creation or unrelated queued writes; no 250 ms tick separates
+  those stages. Earlier writes scoped to the same room retain their order.
   If the member left before the move, delete the room.
+- Rename and status requests detach immediately, keeping one request in flight
+  per channel and collecting outcomes for coalescing and 429 retries.
+- The voice-only database pool keeps one warm connection and retains acquisition
+  health checks so a dead idle connection is replaced, not handed to a join.
+  Other database pools keep their existing settings.
+- Measure actual gateway-to-move latency with
+  `two_bot_voice_join_to_move_seconds`; `voice join completed` reports queue
+  dwell, dispatch wait, claim, reorder, POST, persist and move stage seconds.
+  Packed-category respacing still runs before creation and is included in the
+  reorder stage. HTTP/SQL latency and required rate-limit waits still apply.
 - Handle channel create, move and delete events idempotently.
   - Use per-guild ordered queues and honour retry-after on 429 responses.
   - At startup and after reconnects, reconcile tracked rooms against the actual

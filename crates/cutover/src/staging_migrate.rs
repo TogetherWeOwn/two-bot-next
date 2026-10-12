@@ -765,6 +765,21 @@ fn ledger_json(rows: &[LedgerRow]) -> Value {
     )
 }
 
+/// Recorded in place of a ledger that could not be read after a run. Never an
+/// empty list: `[]` reads as "nothing applied".
+const LEDGER_UNKNOWN: &str = "unknown: ledger unreadable";
+
+/// `None` when no connection or the read fails, so the caller records
+/// [`LEDGER_UNKNOWN`] instead of an empty ledger.
+async fn read_ledger_after_run(pool: &PgPool) -> Option<Vec<LedgerRow>> {
+    let mut conn = pool.acquire().await.ok()?;
+    read_ledger(&mut conn).await.ok()
+}
+
+fn ledger_or_unknown(rows: Option<&[LedgerRow]>) -> Value {
+    rows.map_or_else(|| json!(LEDGER_UNKNOWN), ledger_json)
+}
+
 fn source_manifest(migrator: &Migrator) -> Value {
     Value::Array(
         migrator
@@ -953,20 +968,22 @@ async fn run_on_pool(
     let mut after = before.clone();
     if req.apply && !pending.is_empty() {
         let outcome = MIGRATOR.run(pool).await;
-        let mut conn = pool
-            .acquire()
-            .await
-            .map_err(|_| failed("pool acquire failed"))?;
-        after = read_ledger(&mut conn).await.unwrap_or_default();
-        drop(conn);
+        let read_back = read_ledger_after_run(pool).await;
         if let Err(e) = outcome {
-            let evidence = json!({"ledger_after_failure": ledger_json(&after),
+            let evidence = json!({"ledger_after_failure": ledger_or_unknown(read_back.as_deref()),
                                   "error": e.to_string()});
             return Err(RunError::Failed(
                 "migration execution failed".to_owned(),
                 evidence,
             ));
         }
+        let Some(rows) = read_back else {
+            return Err(RunError::Failed(
+                "ledger unreadable after apply".to_owned(),
+                json!({"ledger_after": LEDGER_UNKNOWN}),
+            ));
+        };
+        after = rows;
         applied = after.len().saturating_sub(before.len());
         let leftover = reconcile(&after, &MIGRATOR)
             .map_err(|m| RunError::Failed(m, json!({"ledger_after": ledger_json(&after)})))?;

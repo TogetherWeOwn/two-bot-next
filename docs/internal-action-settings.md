@@ -39,6 +39,9 @@ at the action boundary because database errors can include row values. Decoded
 U+0000 in any value string or nested object key is refused before SQL with a
 non-retryable `malformed`/400 result; Postgres JSONB cannot store it. The refusal
 contains no submitted value. A literal backslash-u escape is not a decoded NUL.
+`TWO_ONBOARDING_DRY_RUN` and `TWO_SELF_ROLE_DRY_RUN` accept only a boolean, `0`
+or `1`; any other value is refused before SQL with a non-retryable
+`malformed`/400 result (`settings_value_invalid`) that names no submitted value.
 
 ## Execution and optimistic concurrency
 

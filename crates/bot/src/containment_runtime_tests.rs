@@ -13,7 +13,7 @@ use twilight_model::gateway::payload::incoming::GuildAuditLogEntryCreate;
 use twilight_model::guild::audit_log::{AuditLogEntry, AuditLogEventType};
 use twilight_model::id::Id;
 use two_bot_core::backup::guild_config::STAGING_BOT_APPLICATION_ID;
-use two_bot_core::containment::DestructiveAction;
+use two_bot_core::containment::{ContainmentPolicy, DestructiveAction};
 use two_bot_core::containment_store::ContainmentStore;
 use two_bot_cutover::parse::date_to_snowflake;
 use two_bot_discord::{ActionExecutor, AuditEntryObserver, AuditLogObservation, MemPipeline};
@@ -122,6 +122,47 @@ fn containment_settings_defaults_and_bad_values() {
         let parsed =
             ContainmentSettings::from_vars(&vars(&[("DISCORD_STAFF_ALERT_CHANNEL_ID", bad)]));
         assert_eq!(parsed.staff_channel, None, "{bad}");
+    }
+}
+
+#[test]
+fn containment_seconds_refuse_values_that_are_not_whole_positive_milliseconds() {
+    let defaults = ContainmentSettings::from_vars(&vars(&[]));
+    let cases: [(&str, Option<i64>); 13] = [
+        ("0.0004", None),
+        ("1e-9", None),
+        ("0.0009999", None),
+        ("0.001", Some(1)),
+        ("0.0015", Some(1)),
+        ("1.0005", Some(1_000)),
+        ("9223372036854774", Some(((1_u64 << 63) - 2_048) as i64)),
+        ("9223372036854775.808", None),
+        ("9200000000000000", Some(9_200 * 10_i64.pow(15))),
+        ("9300000000000000", None),
+        ("1e300", None),
+        ("1e306", None),
+        ("1e308", None),
+    ];
+    for (raw, expected) in cases {
+        let parsed = ContainmentSettings::from_vars(&vars(&[
+            ("TWO_ANTI_NUKE_WINDOW_SECONDS", raw),
+            ("TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS", raw),
+        ]));
+        assert_eq!(
+            parsed.window_ms,
+            expected.unwrap_or(defaults.window_ms),
+            "window {raw}"
+        );
+        assert_eq!(
+            parsed.max_age_ms,
+            expected.unwrap_or(defaults.max_age_ms),
+            "max age {raw}"
+        );
+        assert!(
+            ContainmentPolicy::new(parsed.window_ms, parsed.max_age_ms, parsed.heat_threshold)
+                .is_ok(),
+            "{raw}"
+        );
     }
 }
 

@@ -20,6 +20,7 @@ DISPOSITION_HEADERS = ("Disposition", "Next boundary / disposition")
 LEDGER_HEADER = ("Legacy commit", "Area", "Change", "Status", "Disposition")
 LEDGER_STATUSES = ("ported", "carded", "gap", "dropped")
 CARD = re.compile(r"\bTOG-\d+\b")
+SCRIPT_REF = re.compile(r"(?<![\w/.-])((?:\.{1,2}/)*(?:\.github/)?scripts/[\w./-]+\.\w+)")
 # Automated rows run Cargo through the controller cache wrapper only.
 WRAPPER = ("python3", "scripts/cargo_cache.py", "run", "--")
 CARGO_VALUE_OPTIONS = ("-p", "--package", "--test", "-F", "--features", "--target",
@@ -428,6 +429,41 @@ def check_verification(entry_id, verification, root=ROOT):
         raise ValueError(f"{entry_id}: {error}") from error
 
 
+def strings(value):
+    """Every string in a checklist entry, except the historical exemptions."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, list):
+        for item in value:
+            yield from strings(item)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if key != "historical":
+                yield from strings(item)
+
+
+def script_exists(path, root):
+    """True when a cited script path is a file inside the repository."""
+    target = (root / path).resolve()
+    return target.is_file() and target.is_relative_to(root.resolve())
+
+
+def check_script_refs(entry, root=ROOT):
+    """Offline guard: operative script paths in an entry must exist unless marked historical."""
+    exempt = {}
+    for item in entry.get("historical", []):
+        if not all(isinstance(item.get(k), str) and item[k].strip() for k in ("path", "reason")):
+            raise ValueError(f"{entry['id']}: historical script reference requires path and reason")
+        exempt[item["path"]] = item["reason"]
+    cited = {path for text in strings(entry) for path in SCRIPT_REF.findall(text)}
+    for path in sorted(exempt):
+        if path not in cited or script_exists(path, root):
+            raise ValueError(f"{entry['id']}: stale historical exemption {path}")
+    for path in sorted(cited - set(exempt)):
+        if not script_exists(path, root):
+            raise ValueError(f"{entry['id']}: missing script {path} is cited as operative")
+
+
 def validate(markdown, checklist, root=ROOT):
     owners = delta_rows(markdown)
     expected = set(parity_rows(markdown)) | set(owners)
@@ -454,6 +490,7 @@ def validate(markdown, checklist, root=ROOT):
             raise ValueError(f"{entry['id']}: automated requires verification")
         if entry["status"] == "automated":
             check_verification(entry["id"], entry["verification"], root)
+        check_script_refs(entry, root)
         # Voice-sensitive rows are cross-links, never a second voice procedure.
         voice = any("voice" in c.lower() for c in key[1])
         voice = voice or (key[0] == 3 and "ShardResume" in key[1][0])
@@ -504,6 +541,8 @@ def render(checklist):
             for field in ("verification", "reason", "approver", "reference"):
                 if entry.get(field):
                     lines.append(f"- **{field.title()}:** {entry[field]}")
+            for item in entry.get("historical", []):
+                lines.append(f"- **Historical:** `{item['path']}` — {item['reason']}")
             lines.append("")
     return "\n".join(lines)
 

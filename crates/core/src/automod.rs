@@ -877,6 +877,16 @@ impl AutomodConfig {
     }
 }
 
+/// Boot warning for a TWO_AUTOMOD_ENFORCE value other than 0 or 1; never echoes it.
+pub fn enforce_value_warning(value: Option<&str>) -> Option<&'static str> {
+    match value {
+        None | Some("0" | "1") => None,
+        Some(_) => Some(
+            "TWO_AUTOMOD_ENFORCE is set to a value other than 0 or 1; dry-run is in effect at boot, so no sanction is applied. Only the exact value 1 enforces.",
+        ),
+    }
+}
+
 /// One validated export rule: `id` + `name` are required, everything else
 /// passes through (legacy `AutomodExportRule`, whose index signature keeps
 /// every extra field). `raw` is the rule object unchanged, so a validated
@@ -1426,6 +1436,32 @@ mod tests {
         assert_eq!(config.policy.repeated_message_window_seconds, 30);
         assert_eq!(config.policy.mention_limit, 5);
         assert_eq!(config.policy.sanctions, DEFAULT_SANCTIONS.to_vec());
+    }
+
+    #[test]
+    fn enforce_warning_fires_only_for_values_other_than_zero_or_one() {
+        let config_for = |value: Option<&str>| {
+            let vars: HashMap<String, String> = value
+                .map(|v| ("TWO_AUTOMOD_ENFORCE".to_owned(), v.to_owned()))
+                .into_iter()
+                .collect();
+            AutomodConfig::from_map(&vars).expect("parses")
+        };
+        for value in ["true", "yes", "TRUE", "", " 1"] {
+            let warning = enforce_value_warning(Some(value)).expect(value);
+            assert!(warning.contains("TWO_AUTOMOD_ENFORCE"), "{value:?}");
+            assert!(warning.contains("dry-run"), "{value:?}");
+            assert!(config_for(Some(value)).dry_run, "{value:?}");
+        }
+        assert!(!enforce_value_warning(Some("sentinel-9"))
+            .expect("warns")
+            .contains("sentinel"));
+        for value in ["0", "1"] {
+            assert_eq!(enforce_value_warning(Some(value)), None, "{value}");
+        }
+        assert_eq!(enforce_value_warning(None), None);
+        assert!(config_for(None).dry_run);
+        assert!(!config_for(Some("1")).dry_run);
     }
 
     #[test]

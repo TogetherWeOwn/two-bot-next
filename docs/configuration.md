@@ -17,7 +17,7 @@ The Container registers a `guild_settings` poll job
 (`crates/bot/src/website_jobs.rs:152`) publishing through
 `settings_jobs::live` (`crates/bot/src/settings_jobs.rs:53`). Message-path
 automod refreshes its lists, thresholds and enforce flag from that snapshot
-on every delivery (`automod_gateway.rs:192-203`, `:273`); the feed poller
+on every delivery (`automod_gateway.rs:211-222`, `:292`); the feed poller
 re-reads its interval from the snapshot before every tick
 (`feed_jobs.rs:232-259`). Other stored reads happen through per-runtime
 store refreshes (`raid_runtime.rs:136`,
@@ -44,7 +44,7 @@ instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECON
 `CONFIG_KEYS` from the snapshot on each relevant
 event (`crates/bot/src/onboarding.rs:21-30`, `:175-182`); message-path automod
 applies its ten live lists, thresholds and the enforce flag from the snapshot
-on every delivery (`crates/bot/src/automod_gateway.rs:192-203`, `:273`);
+on every delivery (`crates/bot/src/automod_gateway.rs:211-222`, `:292`);
 the feed poller applies `TWO_FEED_POLL_SECONDS` from the snapshot before
 every tick (`crates/bot/src/feed_jobs.rs:232-259`); the audit mirror applies
 `DISCORD_AUDIT_LOG_CHANNEL_ID`, `DISCORD_VOICE_LOG_CHANNEL_ID` and
@@ -165,7 +165,7 @@ Catalog entries: 123.
 | `TWO_AUTOMOD_BAD_WORDS` | hot | `[]` | stored, applied live by runtime refresh (reload-report hot) | Bad-word list normalized with NFKC and lowercase. |
 | `TWO_AUTOMOD_BLOCKED_ATTACHMENT_EXTENSIONS` | hot | `["bat","cmd","com","exe","js","jse","msi","ps1","scr","vbs","wsf"]` | stored, applied live by runtime refresh (reload-report hot) | Blocked attachment extensions, lowercase without a leading dot. |
 | `TWO_AUTOMOD_BYPASS_ROLE_IDS` | hot | `[]` | stored, applied live by runtime refresh (reload-report hot) | Roles exempt from automod inspection. |
-| `TWO_AUTOMOD_ENFORCE` | hot | `false` | stored, applied live by runtime refresh (reload-report hot) | Enable automod enforcement; absent/disabled remains dry-run. |
+| `TWO_AUTOMOD_ENFORCE` | hot | `false` | stored, applied live by runtime refresh (reload-report hot) | Enable automod enforcement; only exact &#96;1&#96; enforces. Absent or any other value is dry-run; a deployment value other than &#96;0&#96; or &#96;1&#96; logs one boot warning. |
 | `TWO_AUTOMOD_EXEMPT_CHANNEL_IDS` | hot | `[]` | stored, applied live by runtime refresh (reload-report hot) | Channels exempt from automod inspection. |
 | `TWO_AUTOMOD_MENTION_LIMIT` | hot | `5` | stored, applied live by runtime refresh (reload-report hot) | Mention threshold for automod (validated from 1 to 50). |
 | `TWO_AUTOMOD_REPEAT_COUNT` | hot | `3` | stored, applied live by runtime refresh (reload-report hot) | Repeated-message threshold (validated from 2 to 20). |
@@ -215,7 +215,7 @@ Catalog entries: 123.
 | `TWO_MODERATION` | env_only | `false` | environment only | Enable moderation command publication/routing; enabled mode requires Owen ID. |
 | `TWO_MODERATION_AUDIT_SECRET` | env_only | Not rendered (secret) | environment only | Authentication secret for moderation audit handoff; never rendered. |
 | `TWO_MODERATION_PROTECTED_ROLE_IDS` | env_only | `[]` | environment only | Roles moderation may not target; environment-only reach boundary. |
-| `TWO_ONBOARDING_DRY_RUN` | hot | `false` | stored, applied live by runtime refresh | Suppress onboarding role writes, legacy/anchor welcomes and session goodbyes. |
+| `TWO_ONBOARDING_DRY_RUN` | hot | `false` | stored, applied live by runtime refresh | Suppress onboarding role writes, legacy/anchor welcomes and session goodbyes. A stored non-0/1 rendering is ignored (deployment wins). |
 | `TWO_ONBOARDING_MODE` | env_only | `"legacy"` | environment only | Onboarding selector: legacy, session or anchor; session suppresses role writes. |
 | `TWO_ONBOARDING_ROTA_MEASUREMENT` | env_only | Not specified in Next | environment only | Dropped staging rota measurement gate; env-only refusal is retained. |
 | `TWO_ONBOARDING_ROTA_NOTICE` | env_only | Not specified in Next | environment only | Dropped staging rota notice gate; env-only refusal is retained. |

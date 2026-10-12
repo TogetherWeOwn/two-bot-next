@@ -1415,7 +1415,8 @@ does not prove a live binding.
 Use literal `durable gateway failed; checkpoint unchanged, readiness unavailable`
 (no underlying SQL error), `periodic job failed` (`job`, `error_class=database`),
 and `sticky lookup failed; skipping activity` /
-`sticky claim failed; skipping activity` (`error`, redact before sharing).
+`sticky claim failed; skipping activity` (`reason`, a fixed database class
+from `crates/bot/src/db_log.rs` such as `pool_timeout` or `connection`).
 The informational
 `jobs` readiness object records `last_error_class`, `consecutive_failures` and
 `last_success` (epoch **milliseconds**); job failures do not change the HTTP

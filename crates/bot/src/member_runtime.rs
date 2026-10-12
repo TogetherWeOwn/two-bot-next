@@ -158,14 +158,12 @@ impl MemberRuntime {
         self.store.clone()
     }
 
-    /// Policy stamped with the resolved bot identity. `None` keeps the
-    /// service's owner fallback for sweep audit rows; commands always pass
-    /// the resolved id (an unresolvable bot refuses instead).
-    fn policy(&self, bot_id: Option<&str>) -> ModerationPolicy {
+    /// Policy stamped with the resolved bot identity; callers resolve it first.
+    fn policy(&self, bot_id: &str) -> ModerationPolicy {
         ModerationPolicy {
             owen_user_id: self.policy.owen_user_id.clone(),
             protected_role_ids: self.policy.protected_role_ids.clone(),
-            bot_user_id: bot_id.map(str::to_owned),
+            bot_user_id: Some(bot_id.to_owned()),
         }
     }
 
@@ -378,7 +376,7 @@ fn error_text(err: MemberError) -> String {
             format!("Discord refused the request: {detail}")
         }
         MemberError::Discord(_) => UNCERTAIN_REPLY.to_owned(),
-        MemberError::Store(_) => FAILURE_REPLY.to_owned(),
+        MemberError::Store(_) | MemberError::BotIdentityUnknown => FAILURE_REPLY.to_owned(),
     }
 }
 
@@ -465,7 +463,7 @@ async fn execute(
     let service = MemberModerationService::new(
         executor.clone(),
         member.store(),
-        member.policy(Some(bot_id)),
+        member.policy(bot_id),
         now_millis_i64,
     );
     let execution = MemberExecution {
@@ -538,9 +536,8 @@ pub(crate) fn sweep_job(member: Arc<MemberRuntime>, rest: ActionExecutor) -> Job
 }
 
 async fn tick(member: &MemberRuntime, rest: &ActionExecutor) -> Result<(), ErrorClass> {
-    // Best-effort bot identity for sweep audit rows; dispatch itself needs no
-    // hierarchy decision, so an unresolvable bot still sweeps.
-    let bot_id = member.bot_id(rest).await.ok();
+    // Scheduled unbans are attributed to the bot, so no identity means no sweep.
+    let bot_id = member.bot_id(rest).await.map_err(|()| ErrorClass::Rest)?;
     let service = MemberModerationService::new(
         rest.clone(),
         member.store(),
