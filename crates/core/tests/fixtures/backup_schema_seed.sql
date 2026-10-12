@@ -493,3 +493,13 @@ VALUES ('100000000000000001', '100000000000000050', 'vote_started', '10000000000
        ('100000000000000001', '100000000000000051', 'vote_refused', '100000000000000033',
         '100000000000000003', '100000000000000002', 'protected_target',
         NULL, NULL, NULL, '2026-08-03T10:05:00Z');
+-- S5 message/reaction capture (0429): append-only gateway deltas, one message
+-- update plus one unicode reaction (NULL custom id, codepoint reference).
+INSERT INTO event_store (event_type, guild_id, channel_id, message_id, user_id,
+  emoji_id, emoji_name, event_time, received_at, dedup_key)
+VALUES ('MESSAGE_UPDATE', '100000000000000001', '100000000000000003',
+        '100000000000000006', '100000000000000002', NULL, NULL,
+        '2026-08-01T10:00:00Z', '2026-08-01T10:00:01Z', 'backup:event-store:message-update'),
+       ('REACTION_ADD', '100000000000000001', '100000000000000003',
+        '100000000000000006', '100000000000000004', NULL, 'U+1F44D',
+        '2026-08-02T10:00:00Z', '2026-08-02T10:00:01Z', 'backup:event-store:reaction-add');
