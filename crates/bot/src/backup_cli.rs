@@ -1824,8 +1824,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn upload_helper_spawn_failure_reports_without_args() {
+        let program = "/nonexistent-fixture-upload-helper";
         let outcome = super::run_upload_command(
-            "/nonexistent-fixture-upload-helper",
+            program,
             &secret_argv("archive.ndjson.gz"),
             std::time::Duration::from_secs(30),
         )
@@ -1835,19 +1836,19 @@ mod tests {
         };
         let message = super::upload_failure_message(
             "backup",
-            "nonexistent-fixture-upload-helper",
+            program,
             &outcome,
             std::time::Duration::from_secs(30),
         )
         .unwrap();
-        for leaked in [
-            UPLOAD_SECRET_MARKER,
-            "/nonexistent-fixture-upload-helper",
-            "archive.ndjson.gz",
-        ] {
+        assert!(
+            message.contains(program),
+            "spawn failure must name the configured program: {message}"
+        );
+        for leaked in [UPLOAD_SECRET_MARKER, "archive.ndjson.gz"] {
             assert!(
                 !message.contains(leaked),
-                "spawn failure must not echo the command path or argv: {message}"
+                "spawn failure must not echo argv: {message}"
             );
         }
     }
