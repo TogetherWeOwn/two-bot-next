@@ -39,9 +39,11 @@ use sqlx::PgPool;
 
 use super::funnel::{format_iso_millis, parse_iso_millis};
 use super::leveling::{
-    clamp_leaderboard_limit, level_for_xp, normalize_role_rewards, voice_minutes, LeaderboardEntry,
-    LevelProfile, LevelRoleReward, RewardConfigError, XpAward, XpSource, AWARD_COOLDOWN_SECONDS,
-    MAX_STORED_XP, MESSAGE_XP, VOICE_XP_PER_MINUTE,
+    adjudicate_message_award, clamp_leaderboard_limit, current_season_id, level_for_xp,
+    normalize_role_rewards, seasonal_xp_after_decay, voice_xp_for_duration, LeaderboardEntry,
+    LevelProfile, LevelRoleReward, MessageAwardInput, RewardConfigError, XpAward, XpSource,
+    AWARD_COOLDOWN_SECONDS, MAX_STORED_XP, MESSAGE_DAILY_CAP_XP, MESSAGE_SHORT_MIN_LEN, MESSAGE_XP,
+    VOICE_DAILY_CAP_XP,
 };
 
 /// Leveling runtime failure: invalid input vs database error.
@@ -170,7 +172,163 @@ pub async fn award(
     })
 }
 
-/// Award message XP (legacy `awardMessage`: always [`MESSAGE_XP`]).
+/// UTC day bounds `[start, end)` in epoch millis for `at_ms`: anti-gaming
+/// daily caps are per guild+member+source UTC day (AC2).
+fn utc_day_bounds(at_ms: i64) -> (i64, i64) {
+    let start = at_ms.div_euclid(86_400_000) * 86_400_000;
+    (start, start + 86_400_000)
+}
+
+/// Seconds since the last award from one source, if any (AC2 policy input).
+/// Future-dated rows (clock skew) read as 0, i.e. cooldown-blocked. Reads
+/// epoch millis out of Postgres (`EXTRACT EPOCH`, floored) rather than
+/// parsing `timestamptz::text`, whose `"YYYY-MM-DD HH:MM:SS+ZZ"` rendering is
+/// not the ISO form [`parse_iso_millis`] accepts.
+async fn seconds_since_last_award(
+    pool: &PgPool,
+    guild_id: &str,
+    member_id: &str,
+    source: XpSource,
+    at_ms: i64,
+) -> Result<Option<u64>, LevelingStoreError> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT FLOOR(EXTRACT(EPOCH FROM last_awarded_at) * 1000)::bigint
+         FROM xp_cooldowns WHERE guild_id = $1 AND member_id = $2 AND source = $3",
+    )
+    .bind(guild_id)
+    .bind(member_id)
+    .bind(source.as_str())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(last_ms,)| (at_ms - last_ms).max(0) as u64 / 1000))
+}
+
+/// Today's (UTC day of the award) granted-award count and XP sum for one
+/// source: the daily-counter inputs for the anti-gaming policy (AC2).
+/// Derived from the `xp_awards` audit trail on every award, so no second
+/// table can drift from it. Zero-XP audit rows inflate the count but never
+/// the total, and the ladder is already 0 past ten awards either way.
+async fn day_counters(
+    pool: &PgPool,
+    guild_id: &str,
+    member_id: &str,
+    source: XpSource,
+    day_start_iso: &str,
+    day_end_iso: &str,
+) -> Result<(u64, u64), LevelingStoreError> {
+    let (count, total): (i64, Option<i64>) = sqlx::query_as(
+        "SELECT COUNT(*), SUM(xp) FROM xp_awards
+         WHERE guild_id = $1 AND member_id = $2 AND source = $3
+           AND occurred_at >= $4::text::timestamptz
+           AND occurred_at < $5::text::timestamptz",
+    )
+    .bind(guild_id)
+    .bind(member_id)
+    .bind(source.as_str())
+    .bind(day_start_iso)
+    .bind(day_end_iso)
+    .fetch_one(pool)
+    .await?;
+    Ok((count as u64, total.unwrap_or(0) as u64))
+}
+
+/// Prior message awards from one channel in the trailing 10 minutes (AC2
+/// burst input). `None` channels match only `NULL` rows
+/// (`IS NOT DISTINCT FROM`).
+async fn same_channel_recent(
+    pool: &PgPool,
+    guild_id: &str,
+    member_id: &str,
+    channel_id: Option<&str>,
+    window_start_iso: &str,
+) -> Result<u64, LevelingStoreError> {
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM xp_awards
+         WHERE guild_id = $1 AND member_id = $2 AND source = 'message'
+           AND channel_id IS NOT DISTINCT FROM $3
+           AND occurred_at > $4::text::timestamptz",
+    )
+    .bind(guild_id)
+    .bind(member_id)
+    .bind(channel_id)
+    .bind(window_start_iso)
+    .fetch_one(pool)
+    .await?;
+    Ok(count as u64)
+}
+
+/// Mirror a granted award into the seasonal projection (AC3): append-only
+/// upsert paralleling the lifetime write, same ceiling guard shape. Runs
+/// after the lifetime award commits; a crash between the two leaves lifetime
+/// ahead, which no later award repairs — accepted for this slice (a backfill
+/// owns historical gaps).
+async fn upsert_seasonal(
+    pool: &PgPool,
+    guild_id: &str,
+    season_id: &str,
+    member_id: &str,
+    amount: u64,
+    at_norm: &str,
+) -> Result<(), LevelingStoreError> {
+    sqlx::query(
+        "INSERT INTO member_season_xp (guild_id, season_id, member_id, seasonal_xp, updated_at)
+         VALUES ($1, $2, $3, $4, $5::text::timestamptz)
+         ON CONFLICT (guild_id, season_id, member_id) DO UPDATE SET
+           seasonal_xp = member_season_xp.seasonal_xp + excluded.seasonal_xp,
+           updated_at = excluded.updated_at
+         WHERE member_season_xp.seasonal_xp <= $6",
+    )
+    .bind(guild_id)
+    .bind(season_id)
+    .bind(member_id)
+    .bind(amount as i64)
+    .bind(at_norm)
+    .bind((MAX_STORED_XP - amount) as i64)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Leave the decision-marked 0-XP audit row for a policy-capped attempt
+/// (AC2): capped attempts are observable — unlike cooldown rejections, which
+/// write nothing — without granting XP or consuming extra state (no
+/// cooldown, level or projection write).
+async fn record_capped_attempt(
+    pool: &PgPool,
+    guild_id: &str,
+    member_id: &str,
+    source: XpSource,
+    at_norm: &str,
+    channel_id: Option<&str>,
+    decision: &str,
+) -> Result<XpAward, LevelingStoreError> {
+    sqlx::query(
+        "INSERT INTO xp_awards (guild_id, member_id, source, xp, occurred_at, channel_id, decision)
+         VALUES ($1, $2, $3, 0, $4::text::timestamptz, $5, $6)",
+    )
+    .bind(guild_id)
+    .bind(member_id)
+    .bind(source.as_str())
+    .bind(at_norm)
+    .bind(channel_id)
+    .bind(decision)
+    .execute(pool)
+    .await?;
+    current_award(pool, guild_id, member_id).await
+}
+
+/// Award message XP (legacy `awardMessage` base [`MESSAGE_XP`]) through the
+/// anti-gaming policy (AC2): the 15/5/0 daily ladder, the 150 XP UTC-day cap
+/// and same-channel burst halving adjudicate every attempt via
+/// [`adjudicate_message_award`]; granted awards mirror into the seasonal
+/// projection (AC3). Lifetime XP, the MEE6 curve and role grants are
+/// unchanged; capped attempts leave a decision-marked 0-XP audit row while
+/// cooldown and ceiling rejections stay silent like legacy.
+///
+/// The store carries no message content, so short-message filtering cannot
+/// apply here: attempts arrive as normal-length bodies and the content rule
+/// lives in the pure policy, where the gateway (which owns content) can
+/// supply it.
 pub async fn award_message(
     pool: &PgPool,
     guild_id: &str,
@@ -178,21 +336,108 @@ pub async fn award_message(
     at_iso: &str,
     channel_id: Option<&str>,
 ) -> Result<XpAward, LevelingStoreError> {
-    award(
+    let at_ms = validate_at(at_iso)?;
+    let at_norm = format_iso_millis(at_ms);
+    let current = current_award(pool, guild_id, member_id).await?;
+    let since =
+        seconds_since_last_award(pool, guild_id, member_id, XpSource::Message, at_ms).await?;
+    let (day_start, day_end) = utc_day_bounds(at_ms);
+    let (day_count, day_total) = day_counters(
         pool,
         guild_id,
         member_id,
         XpSource::Message,
-        MESSAGE_XP,
-        at_iso,
+        &format_iso_millis(day_start),
+        &format_iso_millis(day_end),
+    )
+    .await?;
+    let channel_recent = same_channel_recent(
+        pool,
+        guild_id,
+        member_id,
         channel_id,
+        &format_iso_millis(at_ms - 600_000),
+    )
+    .await?;
+    let policy = adjudicate_message_award(MessageAwardInput {
+        previous_xp: current.total_xp,
+        daily_award_index: day_count as usize,
+        day_total_xp: day_total,
+        seconds_since_last_award: since,
+        content_len: MESSAGE_SHORT_MIN_LEN,
+        has_embed_or_attachment: false,
+        same_channel_awards_in_10min: channel_recent as usize,
+        headroom: MAX_STORED_XP - current.total_xp,
+    });
+    if policy.awarded > 0 {
+        let out = award(
+            pool,
+            guild_id,
+            member_id,
+            XpSource::Message,
+            policy.awarded,
+            at_iso,
+            channel_id,
+        )
+        .await?;
+        if out.awarded > 0 {
+            upsert_seasonal(
+                pool,
+                guild_id,
+                &current_season_id(),
+                member_id,
+                out.awarded,
+                &at_norm,
+            )
+            .await?;
+        }
+        return Ok(out);
+    }
+    // Policy zero: cooldown and ceiling rejections stay silent like legacy
+    // (no row, no state); cap and ladder exhaustion leave the
+    // decision-marked 0-XP audit row.
+    let cooldown_blocked = since.is_some_and(|s| s < AWARD_COOLDOWN_SECONDS);
+    let ladder: u64 = if day_count < 5 {
+        MESSAGE_XP
+    } else if day_count < 10 {
+        5
+    } else {
+        0
+    };
+    let burst = if channel_recent >= 2 {
+        ladder / 2
+    } else {
+        ladder
+    };
+    let ceiling = burst > 0 && burst > MAX_STORED_XP - current.total_xp;
+    if cooldown_blocked || ceiling {
+        return current_award(pool, guild_id, member_id).await;
+    }
+    // The only other reachable zeros are the day cap and ladder exhaustion
+    // (short-message cannot fire without content; halving never zeroes a
+    // nonzero ladder rung).
+    let decision = if day_total >= MESSAGE_DAILY_CAP_XP {
+        "daily_cap"
+    } else {
+        "daily_ladder_exhausted"
+    };
+    record_capped_attempt(
+        pool,
+        guild_id,
+        member_id,
+        XpSource::Message,
+        &at_norm,
+        channel_id,
+        decision,
     )
     .await
 }
 
 /// Award voice XP for a session duration (legacy `awardVoice`: whole minutes
-/// × [`VOICE_XP_PER_MINUTE`]; sub-minute sessions award nothing and touch no
-/// cooldown row).
+/// × 5 XP per minute; sub-minute sessions award nothing and touch no
+/// cooldown row) through the anti-gaming UTC-day cap (AC2, 120 XP):
+/// attempts past the cap leave a decision-marked 0-XP audit row, and granted
+/// awards mirror into the seasonal projection (AC3).
 pub async fn award_voice(
     pool: &PgPool,
     guild_id: &str,
@@ -201,8 +446,56 @@ pub async fn award_voice(
     at_iso: &str,
     channel_id: Option<&str>,
 ) -> Result<XpAward, LevelingStoreError> {
-    let amount = voice_minutes(duration_seconds) * VOICE_XP_PER_MINUTE;
-    award(
+    let base = voice_xp_for_duration(duration_seconds);
+    if base == 0 {
+        // Sub-minute sessions award nothing and touch no state (legacy).
+        return award(
+            pool,
+            guild_id,
+            member_id,
+            XpSource::Voice,
+            0,
+            at_iso,
+            channel_id,
+        )
+        .await;
+    }
+    let at_ms = validate_at(at_iso)?;
+    let at_norm = format_iso_millis(at_ms);
+    let since = seconds_since_last_award(pool, guild_id, member_id, XpSource::Voice, at_ms).await?;
+    if since.is_some_and(|s| s < AWARD_COOLDOWN_SECONDS) {
+        return current_award(pool, guild_id, member_id).await;
+    }
+    let (day_start, day_end) = utc_day_bounds(at_ms);
+    let (_, day_total) = day_counters(
+        pool,
+        guild_id,
+        member_id,
+        XpSource::Voice,
+        &format_iso_millis(day_start),
+        &format_iso_millis(day_end),
+    )
+    .await?;
+    let remaining = VOICE_DAILY_CAP_XP.saturating_sub(day_total);
+    if remaining == 0 {
+        return record_capped_attempt(
+            pool,
+            guild_id,
+            member_id,
+            XpSource::Voice,
+            &at_norm,
+            channel_id,
+            "daily_cap",
+        )
+        .await;
+    }
+    let amount = base.min(remaining);
+    let current = current_award(pool, guild_id, member_id).await?;
+    if amount > MAX_STORED_XP - current.total_xp {
+        // Ceiling rejection stays silent like legacy (no row, no state).
+        return current_award(pool, guild_id, member_id).await;
+    }
+    let out = award(
         pool,
         guild_id,
         member_id,
@@ -211,7 +504,77 @@ pub async fn award_voice(
         at_iso,
         channel_id,
     )
-    .await
+    .await?;
+    if out.awarded > 0 {
+        upsert_seasonal(
+            pool,
+            guild_id,
+            &current_season_id(),
+            member_id,
+            out.awarded,
+            &at_norm,
+        )
+        .await?;
+    }
+    Ok(out)
+}
+
+/// Monday seasonal-decay tick (AC2): decay every seasonal row in
+/// `(guild_id, season_id)` inactive more than 28 days as of `as_of_iso`, 10 %
+/// per overdue week (multiplicative, via [`seasonal_xp_after_decay`]).
+/// Each decayed member gets one `source='decay'` audit row carrying the
+/// decayed amount; lifetime XP is never touched. Returns the number of
+/// members decayed.
+pub async fn apply_seasonal_decay(
+    pool: &PgPool,
+    guild_id: &str,
+    season_id: &str,
+    as_of_iso: &str,
+) -> Result<u64, LevelingStoreError> {
+    let as_of_ms = validate_at(as_of_iso)?;
+    let as_of_norm = format_iso_millis(as_of_ms);
+    let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT member_id, seasonal_xp,
+                FLOOR(EXTRACT(EPOCH FROM updated_at) * 1000)::bigint
+         FROM member_season_xp WHERE guild_id = $1 AND season_id = $2",
+    )
+    .bind(guild_id)
+    .bind(season_id)
+    .fetch_all(pool)
+    .await?;
+    let mut tx = pool.begin().await?;
+    let mut decayed = 0u64;
+    for (member_id, seasonal_xp, updated_ms) in rows {
+        let days_inactive = (as_of_ms - updated_ms).max(0) as u64 / 86_400_000;
+        let next = seasonal_xp_after_decay(seasonal_xp as u64, days_inactive);
+        let lost = seasonal_xp as u64 - next;
+        if lost == 0 {
+            continue;
+        }
+        sqlx::query(
+            "UPDATE member_season_xp SET seasonal_xp = $3
+             WHERE guild_id = $1 AND season_id = $2 AND member_id = $4",
+        )
+        .bind(guild_id)
+        .bind(season_id)
+        .bind(next as i64)
+        .bind(&member_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO xp_awards (guild_id, member_id, source, xp, occurred_at, channel_id, decision)
+             VALUES ($1, $2, 'decay', $3, $4::text::timestamptz, NULL, 'seasonal_decay')",
+        )
+        .bind(guild_id)
+        .bind(&member_id)
+        .bind(lost as i64)
+        .bind(&as_of_norm)
+        .execute(&mut *tx)
+        .await?;
+        decayed += 1;
+    }
+    tx.commit().await?;
+    Ok(decayed)
 }
 
 /// Current award view with nothing granted (legacy `currentAward`).

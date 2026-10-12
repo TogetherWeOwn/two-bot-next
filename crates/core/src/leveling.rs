@@ -26,6 +26,15 @@ pub const AWARD_COOLDOWN_SECONDS: u64 = 60;
 pub const VOICE_XP_PER_MINUTE: u64 = 5;
 /// Storage ceiling (legacy `MAX_STORED_XP` = `Number.MAX_SAFE_INTEGER`).
 pub const MAX_STORED_XP: u64 = 9_007_199_254_740_991;
+/// Anti-gaming daily cap: message XP per guild+member UTC day (AC2).
+pub const MESSAGE_DAILY_CAP_XP: u64 = 150;
+/// Anti-gaming daily cap: voice XP per guild+member UTC day, 24 min × 5 XP (AC2).
+pub const VOICE_DAILY_CAP_XP: u64 = 120;
+/// Anti-gaming short-message floor: trimmed bodies below this length earn 0 XP
+/// unless they carry an embed or attachment (AC2).
+pub const MESSAGE_SHORT_MIN_LEN: usize = 8;
+/// Seasonal decay grace: no decay within this many inactive days (AC2).
+pub const SEASONAL_DECAY_GRACE_DAYS: u64 = 28;
 
 /// XP source channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +125,86 @@ pub fn adjudicate_award(
     }
 }
 
+/// Anti-gaming inputs for one message award attempt (AC2). The store derives
+/// the day-scoped counters (`daily_award_index`, `day_total_xp`), the
+/// cooldown clock (`seconds_since_last_award`) and the trailing channel
+/// history (`same_channel_awards_in_10min`) from its tables; the gateway
+/// supplies the content shape. Every counter is an explicit input so the
+/// policy stays pure and unit-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageAwardInput {
+    pub previous_xp: u64,
+    /// 0-based count of message awards already granted today (UTC,
+    /// per guild+member day). Drives the 15/5/0 ladder.
+    pub daily_award_index: usize,
+    /// Message XP already granted today (UTC). At/above the daily cap the
+    /// award is 0.
+    pub day_total_xp: u64,
+    pub seconds_since_last_award: Option<u64>,
+    /// Trimmed message chars (embeds/attachments excluded; see next field).
+    pub content_len: usize,
+    pub has_embed_or_attachment: bool,
+    /// Prior awards from the same channel in the trailing 10 minutes.
+    /// At >= 2 the ladder amount halves (floor).
+    pub same_channel_awards_in_10min: usize,
+    pub headroom: u64,
+}
+
+/// Pure anti-gaming message adjudication (AC2). Evaluation order: cooldown
+/// (< 60 s → 0) → short-message (`content_len` below the floor with no
+/// embed/attachment → 0; the store still records cooldown) → daily cap
+/// (`day_total_xp` at/above cap → 0) → ladder (index < 5 → 15, < 10 → 5,
+/// else 0) → burst halving (same-channel history >= 2 → halve, floor) →
+/// ceiling (`amount > headroom` → 0). Lifetime XP is never decayed here;
+/// seasonal decay is [`seasonal_xp_after_decay`].
+#[must_use]
+pub fn adjudicate_message_award(input: MessageAwardInput) -> XpAward {
+    let previous_level = level_for_xp(input.previous_xp);
+    let zero = || XpAward {
+        awarded: 0,
+        total_xp: input.previous_xp,
+        level: previous_level,
+        previous_level,
+        leveled_up: false,
+    };
+    if input
+        .seconds_since_last_award
+        .is_some_and(|s| s < AWARD_COOLDOWN_SECONDS)
+    {
+        return zero();
+    }
+    if input.content_len < MESSAGE_SHORT_MIN_LEN && !input.has_embed_or_attachment {
+        return zero();
+    }
+    if input.day_total_xp >= MESSAGE_DAILY_CAP_XP {
+        return zero();
+    }
+    let ladder = if input.daily_award_index < 5 {
+        MESSAGE_XP
+    } else if input.daily_award_index < 10 {
+        5
+    } else {
+        return zero();
+    };
+    let amount = if input.same_channel_awards_in_10min >= 2 {
+        ladder / 2
+    } else {
+        ladder
+    };
+    if amount == 0 || amount > input.headroom {
+        return zero();
+    }
+    let total_xp = input.previous_xp + amount;
+    let level = level_for_xp(total_xp);
+    XpAward {
+        awarded: amount,
+        total_xp,
+        level,
+        previous_level,
+        leveled_up: level > previous_level,
+    }
+}
+
 /// Whole minutes of voice credit for a session duration (legacy floors after
 /// clamping negatives to zero; here the input is already `u64` seconds).
 #[must_use]
@@ -123,10 +212,53 @@ pub fn voice_minutes(duration_seconds: u64) -> u64 {
     duration_seconds / 60
 }
 
-/// Voice XP for a session duration.
+/// Voice XP for a session duration, clamped to the anti-gaming daily cap
+/// (AC2: 24 min × 5 XP = 120 XP per guild+member UTC day). The per-day fence
+/// itself lives in the store, which tracks the day total; this clamp keeps
+/// the pure conversion honest for a full-rate day.
 #[must_use]
 pub fn voice_xp_for_duration(duration_seconds: u64) -> u64 {
-    voice_minutes(duration_seconds) * VOICE_XP_PER_MINUTE
+    (voice_minutes(duration_seconds) * VOICE_XP_PER_MINUTE).min(VOICE_DAILY_CAP_XP)
+}
+
+/// Seasonal XP after inactivity decay (AC2): no decay within the 28-day
+/// grace window, then 10 % per overdue week, multiplicative
+/// (`value = value * 9 / 10` per week, integer floor). Lifetime XP is never
+/// decayed — decay applies to the seasonal projection only, written by a
+/// batch job alongside `source='decay'` audit rows.
+#[must_use]
+pub fn seasonal_xp_after_decay(seasonal_xp: u64, days_inactive: u64) -> u64 {
+    if days_inactive <= SEASONAL_DECAY_GRACE_DAYS {
+        return seasonal_xp;
+    }
+    let weeks = (days_inactive - SEASONAL_DECAY_GRACE_DAYS) / 7;
+    let mut value = seasonal_xp;
+    for _ in 0..weeks {
+        value = value * 9 / 10;
+    }
+    value
+}
+
+/// Season scope (`YYYY-QN`, calendar quarters) for epoch millis (AC3).
+/// Seasons start Monday 00:00 UTC on/after the quarter's first day so every
+/// season boundary coincides with a Monday scorecard week boundary.
+#[must_use]
+pub fn season_id_for_ms(ms: i64) -> String {
+    let iso = super::funnel::format_iso_millis(ms);
+    let year: i64 = iso[..4].parse().unwrap_or(1970);
+    let month: u32 = iso[5..7].parse().unwrap_or(1);
+    format!("{year:04}-Q{}", (month - 1) / 3 + 1)
+}
+
+/// Current season scope by wall clock (AC3). The award path and the weekly
+/// scorecard stamp new rows with this; explicit timestamps stay with
+/// [`season_id_for_ms`].
+#[must_use]
+pub fn current_season_id() -> String {
+    let iso = super::funnel::now_iso();
+    let year: i64 = iso[..4].parse().unwrap_or(1970);
+    let month: u32 = iso[5..7].parse().unwrap_or(1);
+    format!("{year:04}-Q{}", (month - 1) / 3 + 1)
 }
 
 /// Format a count the way legacy `Number.toLocaleString()` (en-US) does:
@@ -281,6 +413,29 @@ pub fn leaderboard_reply(entries: &[LeaderboardEntry]) -> LeaderboardReply {
         .collect();
     LeaderboardReply {
         content: leaderboard_text(&rows),
+        suppress_mentions: true,
+    }
+}
+
+/// Build the seasonal `/leaderboard` reply (AC3): same 1–25 clamp and top-10
+/// public shape as [`leaderboard_reply`], scoped to one season. Lifetime
+/// stays behind an explicit flag owned by a later slice.
+#[must_use]
+pub fn leaderboard_reply_for_season(
+    entries: &[LeaderboardEntry],
+    season_id: &str,
+) -> LeaderboardReply {
+    let rows: Vec<String> = entries
+        .iter()
+        .map(|e| leaderboard_line(e.rank, &e.member_id, e.level, e.xp))
+        .collect();
+    let body = if rows.is_empty() {
+        "No XP has been earned yet.".to_owned()
+    } else {
+        rows.join("\n")
+    };
+    LeaderboardReply {
+        content: format!("**TWO XP Leaderboard ({season_id})**\n{body}"),
         suppress_mentions: true,
     }
 }
