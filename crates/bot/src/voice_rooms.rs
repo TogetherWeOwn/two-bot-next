@@ -811,6 +811,14 @@ pub trait RoomWrites: Send + Sync {
         let _ = (guild, positions);
         async { Ok(()) }
     }
+    /// Whether the writer latched a Discord 401. Writers without a
+    /// credential latch never refuse on auth, so the default is false.
+    fn is_unauthorized(&self) -> bool {
+        false
+    }
+    /// Recompute the in-flight REST age gauge from live attempts. Writers
+    /// without in-flight tracking publish at begin/drop only.
+    fn republish_rest_age(&self) {}
     /// V4 vote-kick enforcement: disconnect the member from voice
     /// (`channel_id: null`); 404 (already left) is success.
     fn disconnect(
@@ -1041,6 +1049,14 @@ impl RoomWrites for RoomHttp {
         positions: &[(Snowflake, u64)],
     ) -> Result<(), RoomHttpError> {
         RoomHttp::reorder_channels(self, guild, positions).await
+    }
+
+    fn is_unauthorized(&self) -> bool {
+        RoomHttp::is_unauthorized(self)
+    }
+
+    fn republish_rest_age(&self) {
+        RoomHttp::republish_rest_age(self)
     }
 
     fn detached_rename(&self, channel: Snowflake, name: &str) -> Option<DetachedRename> {
@@ -2508,6 +2524,10 @@ pub struct GuildRoomWorker<S, H> {
     rename_timeouts: HashMap<Snowflake, u32>,
     notices: Vec<NoticeState>,
     halted: bool,
+    /// Why the latch tripped: a Discord 401 needs a token fix and a restart
+    /// (the writer's auth latch never clears in-process), so a healthy store
+    /// re-probe must not clear it.
+    halted_by_discord: bool,
     votes: VoteKickCore,
     /// Every vote started this session, by its initiating interaction ID. A
     /// button carries only that ID; guild, room and target come from here, never
@@ -2788,6 +2808,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             rename_timeouts: HashMap::new(),
             notices: Vec::new(),
             halted: false,
+            halted_by_discord: false,
             votes: VoteKickCore::new(),
             vote_refs: HashMap::new(),
             active_votes: Vec::new(),
@@ -4181,10 +4202,17 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     pub fn halted(&self) -> bool {
         self.halted
     }
-    /// Clear the CredentialRefused latch after a successful re-probe. Only
-    /// the actor loop calls this; every other halted write path sets it.
+    /// Whether a Discord 401 tripped the latch. Store-credential re-probes
+    /// never clear these halts: they need a token fix and a restart.
+    pub fn halted_by_discord(&self) -> bool {
+        self.halted_by_discord
+    }
+    /// Clear the store-credential latch after a successful re-probe. Only
+    /// the actor loop calls this, and only for non-Discord halts; every
+    /// other halted write path sets the latch.
     pub fn clear_halt(&mut self) {
         self.halted = false;
+        self.halted_by_discord = false;
     }
     pub fn tracked(&self) -> &HashMap<Snowflake, VoiceRoom> {
         &self.rooms
@@ -5186,6 +5214,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         {
                             if !self.settle_reservation(&held, Some(channel_id)).await {
                                 if self.halted {
+                                    // Keep the hold but drop the delete marker:
+                                    // the next post-recovery reconcile re-queues
+                                    // the delete (queue_delete dedups on
+                                    // `deletes`), retrying the unsettled hold
+                                    // instead of counting it against admission
+                                    // caps until a restart.
+                                    self.deletes.remove(&channel_id);
                                     self.queue.mark_succeeded(&action);
                                 } else {
                                     // The channel is known gone; retry only SQL,
@@ -5498,7 +5533,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             );
                         }
                         RoomHttpError::Unauthorized => {
+                            // Discord-credential halt: the writer's auth latch
+                            // never clears in-process, so the store re-probe
+                            // must not clear this either.
                             self.halted = true;
+                            self.halted_by_discord = true;
                             self.record(LifecycleFailure::Discord { channel_id, error });
                             self.queue.mark_succeeded(&action);
                         }
@@ -6188,7 +6227,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         write: Option<RefusedWrite>,
     ) {
         if error == RoomHttpError::Unauthorized {
+            // A 401 needs a token fix and a restart: record the cause so the
+            // store re-probe never clears this latch.
             self.halted = true;
+            self.halted_by_discord = true;
         }
         if error == RoomHttpError::Cancelled {
             return;
@@ -7241,6 +7283,10 @@ fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(worker: &GuildRoomWor
         .map_or(0, |age| age.as_secs());
     let gauges = metrics::global();
     gauges.set_voice_halted(worker.halted());
+    // Recompute the in-flight REST age from attempts still live, so the
+    // gauge shows a currently-stalled request instead of the begin/drop
+    // snapshots (0 at begin, already removed at drop).
+    worker.http.republish_rest_age();
     gauges.set_voice_queue(
         u64::try_from(urgent).unwrap_or(u64::MAX),
         u64::try_from(deferred).unwrap_or(u64::MAX),
@@ -7344,7 +7390,16 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites>(
                 {
                     last_halt_probe = now;
                     let guild = worker.live.guild_id;
-                    match tokio::time::timeout(
+                    // A Discord-401 halt needs a token fix and a restart: the
+                    // writer's auth latch never clears in-process, so a store
+                    // re-probe must not report recovery here.
+                    if worker.halted_by_discord() || worker.http.is_unauthorized() {
+                        debug!(
+                            guild = guild.to_string(),
+                            "voice halt re-probe skipped: Discord credential latch set"
+                        );
+                    } else {
+                        match tokio::time::timeout(
                         limits.halt_probe_timeout,
                         worker.store.creators(guild),
                     )
@@ -7371,6 +7426,7 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites>(
                                 guild = guild.to_string(),
                                 "voice halt re-probe timed out"
                             );
+                        }
                         }
                     }
                 }

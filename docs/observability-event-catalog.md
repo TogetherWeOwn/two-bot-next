@@ -200,7 +200,12 @@ past the observe bound; the turn ran to completion and the queue keeps its
 retries; bumps `two_bot_voice_dispatch_timeouts_total`.
 `voice worker halt cleared: store credentials healthy` (info): a halted
 worker's credential re-probe read the store under timeout, so the
-CredentialRefused latch cleared; bumps `two_bot_voice_halt_recoveries_total`.
+store-CredentialRefused latch cleared; bumps `two_bot_voice_halt_recoveries_total`.
+Discord-401 halts never reach the probe (see below), so this line always
+means a store recovery, never a token recovery.
+`voice halt re-probe skipped: Discord credential latch set` (debug): the
+worker halted on a Discord 401 (or the writer latched one); the probe stays
+out because only a token fix and a restart clear that halt.
 `voice halt re-probe: store still refusing` / `voice halt re-probe timed out`
 (debug): the latch stays set; the next probe runs after the re-probe interval.
 

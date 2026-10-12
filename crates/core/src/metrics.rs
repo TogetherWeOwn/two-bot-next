@@ -714,8 +714,8 @@ impl Metrics {
         values.voice_global_backoff_capped = values.voice_global_backoff_capped.saturating_add(1);
     }
 
-    /// One actor dispatch that exceeded the per-dispatch timeout and was
-    /// dropped so the actor could keep processing.
+    /// One actor dispatch turn that ran past the observe bound (run to
+    /// completion; counted after the fact). The queue keeps its retries.
     pub fn voice_dispatch_timeout(&self) {
         let mut values = self
             .0

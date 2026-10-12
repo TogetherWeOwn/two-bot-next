@@ -76,7 +76,7 @@ const SHUTDOWN_RS_EVENTS: [&str; 2] = [
 const JOBS_RS_EVENTS: [&str; 1] = ["periodic job failed"];
 
 /// `crates/bot/src/voice_rooms.rs`: the cataloged voice messages.
-const VOICE_RS_CATALOG_MESSAGES: [&str; 10] = [
+const VOICE_RS_CATALOG_MESSAGES: [&str; 11] = [
     "voice join completed",
     "voice_operation succeeded",
     "voice_operation failed",
@@ -87,6 +87,7 @@ const VOICE_RS_CATALOG_MESSAGES: [&str; 10] = [
     "voice creator orphan needs manual deletion",
     "voice creator join accepted",
     "voice creator join refused before queueing",
+    "voice halt re-probe skipped: Discord credential latch set",
 ];
 
 /// `voice_event` field values (`crates/bot/src/voice_rooms.rs`), the bounded

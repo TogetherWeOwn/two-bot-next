@@ -380,6 +380,20 @@ impl RoomHttp {
         Self::with_origin(token, "https://discord.com/api/v10".to_owned(), false)
     }
 
+    /// Whether a 401 permanently latched this writer: every later write
+    /// refuses immediately until a restart rebuilds the client, so a healthy
+    /// store re-probe must never clear a halt this latch caused.
+    pub fn is_unauthorized(&self) -> bool {
+        self.unauthorized.load(Ordering::Relaxed)
+    }
+
+    /// Recompute the in-flight-age gauge from attempts still live, so a
+    /// per-tick publish shows a currently-stalled request instead of the age
+    /// at begin (always 0) or after drop (already removed).
+    pub fn republish_rest_age(&self) {
+        publish_rest_age(&self.in_flight);
+    }
+
     fn with_origin(token: String, origin: String, allow_http: bool) -> Result<Self, RoomHttpError> {
         let mut authorization = HeaderValue::from_str(&format!("Bot {token}"))
             .map_err(|_| RoomHttpError::InvalidRequest)?;
@@ -1608,5 +1622,26 @@ mod tests {
             .await
             .expect_err("stale join cancels");
         assert_eq!(error, RoomHttpError::Cancelled);
+    }
+
+    #[test]
+    fn republish_rest_age_reports_a_live_stalled_attempt() {
+        // The gauge must reflect attempts still live, not just the begin
+        // (always 0) and drop (already removed) snapshots: backdate one
+        // attempt 7 s and republish mid-flight.
+        let slots = Arc::new(Mutex::new(InFlightRest::default()));
+        {
+            let mut inner = slots.lock().expect("in-flight lock");
+            inner.next_id += 1;
+            let id = inner.next_id;
+            inner.live.insert(
+                id,
+                Instant::now()
+                    .checked_sub(Duration::from_secs(7))
+                    .expect("stalled start 7s ago"),
+            );
+        }
+        publish_rest_age(&slots);
+        assert_eq!(global_series("two_bot_voice_rest_in_flight_age_seconds"), 7);
     }
 }

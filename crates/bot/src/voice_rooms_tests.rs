@@ -12587,17 +12587,25 @@ async fn join_commands_count_received_on_accept_and_on_refusal() {
         .unwrap();
     assert!(apply_command(&mut worker, join_command(ticket), 0));
     // Same ticket twice: the second delivery is refused as a duplicate, but
-    // both deliveries count as received.
+    // both deliveries count as received. Lower bounds, not exact diffs: these
+    // counters are process-global and sink tests deliver joins through the
+    // same Join arm concurrently, so concurrent runs can only add.
     assert!(!apply_command(&mut worker, join_command(ticket), 1));
-    assert_eq!(
-        global_series("two_bot_voice_joins_received_total"),
-        received_before + 2
+    assert!(
+        global_series("two_bot_voice_joins_received_total") >= received_before + 2,
+        "both deliveries count as received"
     );
-    assert_eq!(refused_with_reason("duplicate"), duplicate_before + 1);
+    assert!(
+        refused_with_reason("duplicate") >= duplicate_before + 1,
+        "the repeat delivery refuses as a duplicate"
+    );
 }
 
 #[tokio::test]
 async fn silent_join_refusals_carry_stable_reason_labels() {
+    // Refusal counters are process-global and other tests refuse joins
+    // concurrently, so every assert below is a lower bound: our own refusal
+    // guarantees at least +1 and concurrent runs can only add.
     // Halted latch.
     let (live, store, http, _) = fixture();
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
@@ -12614,7 +12622,10 @@ async fn silent_join_refusals_carry_stable_reason_labels() {
         NOW.to_owned(),
         tokio::time::Instant::now()
     ));
-    assert_eq!(refused_with_reason("halted"), halted_before + 1);
+    assert!(
+        refused_with_reason("halted") >= halted_before + 1,
+        "halted joins refuse with the halted label"
+    );
 
     // Access gate off.
     let (live, store, http, _) = fixture();
@@ -12635,7 +12646,10 @@ async fn silent_join_refusals_carry_stable_reason_labels() {
         NOW.to_owned(),
         tokio::time::Instant::now()
     ));
-    assert_eq!(refused_with_reason("access"), access_before + 1);
+    assert!(
+        refused_with_reason("access") >= access_before + 1,
+        "gated joins refuse with the access label"
+    );
 
     // No creator row for the channel.
     let (live, store, http, _) = fixture();
@@ -12653,13 +12667,19 @@ async fn silent_join_refusals_carry_stable_reason_labels() {
         NOW.to_owned(),
         tokio::time::Instant::now()
     ));
-    assert_eq!(refused_with_reason("unknown_creator"), unknown_before + 1);
+    assert!(
+        refused_with_reason("unknown_creator") >= unknown_before + 1,
+        "creator-less joins refuse with the unknown_creator label"
+    );
 
     // Blocked room name.
     let (mut worker, _) = filtering_worker(&["room"]).await;
     let blocked_before = refused_with_reason("name_blocked");
     assert!(!join_as(&mut worker, MEMBER, "Ava"));
-    assert_eq!(refused_with_reason("name_blocked"), blocked_before + 1);
+    assert!(
+        refused_with_reason("name_blocked") >= blocked_before + 1,
+        "blocked names refuse with the name_blocked label"
+    );
 }
 
 #[test]
@@ -12711,13 +12731,115 @@ async fn halt_reprobe_clears_the_credential_latch_without_a_restart() {
         global_series("two_bot_voice_halt_recoveries_total"),
         recoveries_before + 1
     );
-    // The recovery publishes on the next tick: the clearing tick already
-    // published the stale latched value before probing.
-    tokio::time::advance(Duration::from_secs(1)).await;
-    tokio::task::yield_now().await;
-    assert_eq!(global_series("two_bot_voice_worker_halted"), 0);
+    // Worker-direct proof the latch cleared: the halted gauge is
+    // process-global and other actor tests publish it concurrently, so an
+    // exact gauge read would flake under parallel runs.
+    let (status_reply, status_rx) = oneshot::channel();
+    tx.send(ActorCommand::Status(status_reply)).unwrap();
+    assert!(!status_rx.await.unwrap().halted);
     drop(tx);
     handle.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn halt_reprobe_keeps_a_discord_401_latch_set() {
+    // A move refused with 401 halts with a Discord cause. The store stays
+    // healthy, but the re-probe must not report recovery: the writer's auth
+    // latch never clears in-process, so this halt needs a token fix and a
+    // restart.
+    let (live, store, http, _) = fixture();
+    http.move_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::Unauthorized);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    assert!(worker.halted());
+    assert!(worker.halted_by_discord());
+    // Worker-direct evidence only below: the halted gauge and the recovery
+    // counter are process-global, and the sibling store-halt test publishes
+    // both while running in parallel in this binary.
+    let (tx, rx) = mpsc::unbounded_channel();
+    let limits = ActorLimits {
+        halt_reprobe_interval: Duration::from_secs(5),
+        watchdog_stuck_after: Duration::from_secs(3600),
+        ..ActorLimits::default()
+    };
+    let handle = tokio::spawn(async move {
+        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+    });
+    // Pump the actor once so its probe baseline starts at t=0 (a Status
+    // round-trip also proves the halted actor is still alive to answer).
+    let (status_reply, status_rx) = oneshot::channel();
+    tx.send(ActorCommand::Status(status_reply)).unwrap();
+    assert!(status_rx.await.unwrap().halted);
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::task::yield_now().await;
+    // No recovery: a full re-probe interval passes and the latch stays set.
+    // (A store re-probe would have cleared a store halt and answered
+    // unhalted here, as the sibling test proves.)
+    let (status_reply, status_rx) = oneshot::channel();
+    tx.send(ActorCommand::Status(status_reply)).unwrap();
+    assert!(status_rx.await.unwrap().halted);
+    drop(tx);
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn halted_compensation_settle_requeues_the_delete_after_recovery() {
+    // CredentialRefused mid-compensation parks the worker with the hold
+    // unsettled. Recovery must retry the delete (re-queued by reconcile),
+    // not count the hold against admission caps until a restart.
+    let (live, mut store, http, _) = fixture();
+    store.persist_error = Some(StoreError::Unavailable);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    // Create lands on Discord but the persist fails: the hold is kept and a
+    // compensation delete is queued immediately (no move is queued).
+    dispatch(&mut worker, 0).await;
+    assert_eq!(
+        worker
+            .compensation_reservations
+            .get(&500)
+            .map(String::as_str),
+        Some("r1")
+    );
+    assert!(worker.deletes.contains(&500));
+    // The Discord delete lands but the settle is refused: halted with the
+    // hold retained and the delete marker dropped for re-queue.
+    worker
+        .store
+        .settle_errors
+        .lock()
+        .unwrap()
+        .push_back(StoreError::CredentialRefused);
+    dispatch(&mut worker, 1).await;
+    assert!(worker.halted());
+    assert!(!worker.halted_by_discord());
+    assert!(worker.store.settled.lock().unwrap().is_empty());
+    assert_eq!(
+        worker
+            .compensation_reservations
+            .get(&500)
+            .map(String::as_str),
+        Some("r1")
+    );
+    assert!(!worker.deletes.contains(&500));
+    // Recovery clears the latch; reconcile re-queues the delete; the next
+    // dispatch settles the held reservation.
+    worker.clear_halt();
+    worker.reconcile();
+    let (urgent, deferred) = worker.queue.pending_counts(GUILD);
+    assert!(
+        urgent + deferred > 0,
+        "reconcile re-queues the unsettled delete"
+    );
+    dispatch(&mut worker, 2).await;
+    assert!(!worker.store.settled.lock().unwrap().is_empty());
+    assert!(worker.compensation_reservations.is_empty());
+    assert!(!worker.deletes.contains(&500));
 }
 
 #[tokio::test(start_paused = true)]
