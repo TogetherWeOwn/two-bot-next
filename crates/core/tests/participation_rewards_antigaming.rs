@@ -10,13 +10,51 @@
 //!
 //! Design reference: AC2 (caps + decay + diminishing returns), AC3 (seasonal
 //! reset aligned with leaderboards), AC4 (observe-only abuse monitoring).
+//!
+//! ## Pinned Builder API (names the Builder must implement in `leveling`)
+//!
+//! ```rust,ignore
+//! pub struct MessageAwardInput {
+//!     pub previous_xp: u64,
+//!     /// 0-based count of message awards already granted today (UTC,
+//!     /// per guild+member+source day). Drives the 15/5/0 ladder.
+//!     pub daily_award_index: usize,
+//!     /// Message XP already granted today (UTC). At/above 150 the award is 0.
+//!     pub day_total_xp: u64,
+//!     pub seconds_since_last_award: Option<u64>,
+//!     /// Trimmed message chars (embeds/attachments excluded; see next field).
+//!     pub content_len: usize,
+//!     pub has_embed_or_attachment: bool,
+//!     /// Prior awards from the same channel in the trailing 10 minutes.
+//!     /// At >=2 the ladder amount halves (floor).
+//!     pub same_channel_awards_in_10min: usize,
+//!     pub headroom: u64,
+//! }
+//! pub fn adjudicate_message_award(input: MessageAwardInput) -> XpAward;
+//! pub fn seasonal_xp_after_decay(seasonal_xp: u64, days_inactive: u64) -> u64;
+//! pub fn leaderboard_reply_for_season(
+//!     entries: &[LeaderboardEntry],
+//!     season_id: &str,
+//! ) -> LeaderboardReply;
+//! ```
+//!
+//! Rules in evaluation order: cooldown (<60 s → 0) → short-message
+//! (`content_len < 8 && !has_embed_or_attachment` → 0, cooldown still
+//! recorded by the store) → daily cap (`day_total_xp >= 150` → 0) → ladder
+//! (`daily_award_index < 5` → 15, `< 10` → 5, else 0) → burst halving
+//! (`same_channel_awards_in_10min >= 2` → halve, floor) → ceiling
+//! (`amount > headroom` → 0). Lifetime adjudication (`adjudicate_award`)
+//! never decays; seasonal decay is the separate `seasonal_xp_after_decay`
+//! fn (10 %/week past 28 d inactivity, multiplicative). Voice daily cap
+//! (120 XP) stays on `voice_xp_for_duration`, which must clamp there.
 
 use two_bot_core::community::{
     build_scorecard, FactRow, ScorecardInputs, StreamCoverage, COMMUNITY_FACT_TYPES,
 };
 use two_bot_core::leveling::{
-    adjudicate_award, leaderboard_reply, voice_xp_for_duration, LeaderboardEntry, MAX_STORED_XP,
-    MESSAGE_XP,
+    adjudicate_award, adjudicate_message_award, leaderboard_reply_for_season,
+    seasonal_xp_after_decay, voice_xp_for_duration, LeaderboardEntry, MessageAwardInput,
+    MAX_STORED_XP, MESSAGE_XP,
 };
 use two_bot_core::{format_iso_millis, parse_iso_millis, week_start_ms};
 
@@ -26,6 +64,11 @@ const VERSION: &str = "community-v1";
 const WEEK_START: &str = "2026-08-31T00:00:00.000Z";
 const WEEK_END: &str = "2026-09-07T00:00:00.000Z";
 const GENERATED_AT: &str = "2026-09-07T06:15:00.000Z";
+const SEASON_ID: &str = "2026-Q4";
+/// Message XP already granted before the ladder test's UTC day starts.
+const DAY_TOTAL_FRESH: u64 = 0;
+/// Normal-length message body (well above the 8-char short-message floor).
+const NORMAL_LEN: usize = 40;
 
 /// SPEC AC2: awards 1-5/day earn full 15 XP, 6-10/day earn 5 XP, beyond
 /// 10/day earn 0 (daily cap reached).
@@ -39,12 +82,31 @@ fn spec_message_xp_for_daily_award_index(index: usize) -> u64 {
     }
 }
 
+fn message_input(
+    prev: u64,
+    daily_award_index: usize,
+    since: Option<u64>,
+    content_len: usize,
+    same_channel_awards_in_10min: usize,
+) -> MessageAwardInput {
+    MessageAwardInput {
+        previous_xp: prev,
+        daily_award_index,
+        day_total_xp: DAY_TOTAL_FRESH,
+        seconds_since_last_award: since,
+        content_len,
+        has_embed_or_attachment: false,
+        same_channel_awards_in_10min,
+        headroom: MAX_STORED_XP - prev,
+    }
+}
+
 #[test]
 fn diminishing_return_ladder_15_5_0() {
     let mut prev = 0u64;
     for index in 0..11usize {
         let since = if index == 0 { None } else { Some(61) };
-        let award = adjudicate_award(prev, MESSAGE_XP, since, MAX_STORED_XP - prev);
+        let award = adjudicate_message_award(message_input(prev, index, since, NORMAL_LEN, 0));
         assert_eq!(
             award.awarded,
             spec_message_xp_for_daily_award_index(index),
@@ -58,34 +120,43 @@ fn diminishing_return_ladder_15_5_0() {
 fn short_message_zero_consumes_cooldown() {
     // SPEC AC2: messages shorter than 8 chars (after trim, no embed or
     // attachment) earn 0 XP but still consume the 60 s cooldown, so "+1"
-    // farming cannot spin the award clock. The award path takes no content
-    // length today, so a short-message attempt still adjudicates to full XP.
-    let short_attempt = adjudicate_award(0, MESSAGE_XP, None, MAX_STORED_XP);
+    // farming cannot spin the award clock. Content length is an explicit
+    // policy input, so this no longer collides with the ladder test.
+    let short_attempt = adjudicate_message_award(message_input(0, 0, None, 5, 0));
     assert_eq!(
         short_attempt.awarded, 0,
         "short message (<8 chars) must earn 0 XP while consuming cooldown"
     );
-    // Cooldown consumed: the next attempt 30 s later stays blocked.
-    let follow_up = adjudicate_award(
+    // Cooldown consumed: the next attempt 30 s later stays blocked even with
+    // a normal-length body.
+    let follow_up = adjudicate_message_award(message_input(
         short_attempt.total_xp,
-        MESSAGE_XP,
+        1,
         Some(30),
-        MAX_STORED_XP - short_attempt.total_xp,
-    );
+        NORMAL_LEN,
+        0,
+    ));
     assert_eq!(follow_up.awarded, 0, "short-message cooldown must hold");
+    // Same position with a normal body and no cooldown pays full price, so
+    // the zero above is pinned to the content-length rule, not the ladder.
+    let normal_first = adjudicate_message_award(message_input(0, 0, None, NORMAL_LEN, 0));
+    assert_eq!(
+        normal_first.awarded, 15,
+        "normal-length first award pays 15"
+    );
 }
 
 #[test]
 fn same_channel_burst_halving() {
     // SPEC AC2: the 3rd+ award from one channel within 10 minutes earns half
     // (floor). Three awards 3 minutes apart in one channel must read
-    // [15, 15, 7]; the runtime has no channel history, so the 3rd still pays
-    // full price.
+    // [15, 15, 7]; channel history is an explicit policy input, so this no
+    // longer collides with the ladder test (which passes 0 channel history).
     let mut prev = 0u64;
     let expected = [15u64, 15, 7];
     for (step, want) in expected.iter().enumerate() {
         let since = if step == 0 { None } else { Some(180) };
-        let award = adjudicate_award(prev, MESSAGE_XP, since, MAX_STORED_XP - prev);
+        let award = adjudicate_message_award(message_input(prev, step, since, NORMAL_LEN, step));
         assert_eq!(
             award.awarded,
             *want,
@@ -100,13 +171,17 @@ fn same_channel_burst_halving() {
 fn daily_caps_message_150_voice_120_utc() {
     // SPEC AC2: per guild+member+source UTC day, message XP caps at 150 and
     // voice XP at 120 (24 min). The 11th message award in one UTC day must be
-    // 0 and the day total must stay within cap; the runtime caps nothing, so
-    // the 11th still pays 15 and the total reaches 165.
+    // 0; the day-total input (not lifetime XP) drives the cap.
     let mut prev = 0u64;
+    let mut day_total = 0u64;
     for index in 0..11usize {
         let since = if index == 0 { None } else { Some(61) };
-        let award = adjudicate_award(prev, MESSAGE_XP, since, MAX_STORED_XP - prev);
+        let mut input = message_input(prev, index, since, NORMAL_LEN, 0);
+        input.day_total_xp = day_total;
+        let award = adjudicate_message_award(input);
         if index < 10 {
+            assert!(award.awarded > 0, "award #{index} inside cap must grant XP");
+            day_total += award.awarded;
             prev = award.total_xp;
         } else {
             assert_eq!(
@@ -116,8 +191,19 @@ fn daily_caps_message_150_voice_120_utc() {
         }
     }
     assert!(
-        prev <= 150,
-        "message day total must stay within the 150 XP cap, got {prev}"
+        day_total <= 150,
+        "message day total must stay within the 150 XP cap, got {day_total}"
+    );
+    // Day-total fence independent of the ladder: an already-capped day pays 0
+    // even for an early ladder position.
+    let capped_day = MessageAwardInput {
+        day_total_xp: 150,
+        ..message_input(prev, 0, None, NORMAL_LEN, 0)
+    };
+    assert_eq!(
+        adjudicate_message_award(capped_day).awarded,
+        0,
+        "capped message day total must force 0 XP"
     );
     // Voice leg: a full-rate day tops out at 24 min x 5 XP = 120 XP.
     assert_eq!(
@@ -135,21 +221,36 @@ fn daily_caps_message_150_voice_120_utc() {
 fn seasonal_decay_28d_10pct_weekly_lifetime_untouched() {
     // SPEC AC2: lifetime XP is never decayed. Seasonal XP decays 10 % per week
     // past 28 days without an award (multiplicative, floor 0) via a batch job
-    // writing `source='decay'` audit rows. A 1000 XP base idle 35 days (one
-    // week overdue) must decay to 900 before the next 15 XP award lands
-    // (total 915); the runtime never decays, so the award lands on 1000
-    // (total 1015).
+    // writing `source='decay'` audit rows. Decay lives in the seasonal fn, not
+    // the lifetime adjudicator.
+    assert_eq!(
+        seasonal_xp_after_decay(1000, 28),
+        1000,
+        "seasonal base idle exactly 28d must not decay yet"
+    );
+    assert_eq!(
+        seasonal_xp_after_decay(1000, 35),
+        900,
+        "seasonal base idle 35d must decay 10 % for one overdue week"
+    );
+    assert_eq!(
+        seasonal_xp_after_decay(1000, 42),
+        810,
+        "seasonal decay must compound multiplicatively per overdue week"
+    );
+    // Lifetime adjudication never decays: 1000 XP idle 35 days still awards on
+    // top of the full 1000.
     let idle_35d_seconds = 35 * 86_400;
-    let award = adjudicate_award(
+    let lifetime = adjudicate_award(
         1000,
         MESSAGE_XP,
         Some(idle_35d_seconds),
         MAX_STORED_XP - 1000,
     );
     assert_eq!(
-        award.total_xp,
-        900 + MESSAGE_XP,
-        "seasonal base idle 35d must decay 10 % for one overdue week before awarding"
+        lifetime.total_xp,
+        1000 + MESSAGE_XP,
+        "lifetime adjudication must never decay, even after 35d idle"
     );
 }
 
@@ -339,16 +440,17 @@ fn season_boundary_monday_alignment_reports_both_watermarks() {
 fn seasonal_leaderboard_defaults_to_current_season() {
     // SPEC AC3: `/leaderboard` defaults to current-season XP (same 1-25 clamp,
     // same top-10 public shape); lifetime stays behind an explicit flag owned
-    // by a later slice. The reply carries no season scope today.
+    // by a later slice. The season scope is an explicit argument so the test
+    // never depends on the wall clock.
     let entries = vec![LeaderboardEntry {
         member_id: MEMBER.to_owned(),
         xp: 1200,
         level: 5,
         rank: 1,
     }];
-    let reply = leaderboard_reply(&entries);
+    let reply = leaderboard_reply_for_season(&entries, SEASON_ID);
     assert!(
-        reply.content.contains("2026-Q4"),
+        reply.content.contains(SEASON_ID),
         "seasonal leaderboard must scope to the current season by default"
     );
 }
