@@ -29,7 +29,6 @@
 //! disposable test database (`TestDatabase` refuses anything but
 //! agent-testdb), never staging or production.
 #![cfg(feature = "db")]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -168,7 +167,7 @@ fn assert_minimal_schema(columns: &[String]) {
 /// Pending: no `event_store` table exists until the S1 migration lands, so
 /// run with `-- --ignored` to see the gap.
 #[tokio::test]
-#[ignore = "pending: S1 migration missing; run with --ignored to see the gap"]
+#[ignore = "requires agent-testdb or CI service; pending: S1 migration missing; run with --ignored to see the gap"]
 async fn event_store_s1_append_only_insert_uses_minimal_fields() {
     let db = TestDb::new().await;
     assert_minimal_schema(&table_columns(&db.pool).await);
@@ -210,7 +209,7 @@ async fn event_store_s1_append_only_insert_uses_minimal_fields() {
 /// Pending: no `event_store` table exists until the S1 migration lands, so
 /// run with `-- --ignored` to see the gap.
 #[tokio::test]
-#[ignore = "pending: S1 migration missing; run with --ignored to see the gap"]
+#[ignore = "requires agent-testdb or CI service; pending: S1 migration missing; run with --ignored to see the gap"]
 async fn event_store_s1_duplicate_delivery_inserts_once() {
     let db = TestDb::new().await;
     let fixture = message_create_fixture("dup-1", "2026-10-12T12:00:00.000Z");
@@ -238,7 +237,7 @@ async fn event_store_s1_duplicate_delivery_inserts_once() {
 /// Pending: no `event_store` table exists until the S1 migration lands, so
 /// run with `-- --ignored` to see the gap.
 #[tokio::test]
-#[ignore = "pending: S1 migration missing; run with --ignored to see the gap"]
+#[ignore = "requires agent-testdb or CI service; pending: S1 migration missing; run with --ignored to see the gap"]
 async fn event_store_s1_replayed_message_create_does_not_duplicate() {
     let db = TestDb::new().await;
     // Original delivery wins; a late replay carrying an earlier event_time
@@ -275,7 +274,7 @@ async fn event_store_s1_replayed_message_create_does_not_duplicate() {
 /// Pending: no lag series exists until the S1 metrics seam lands, so run
 /// with `-- --ignored` to see the gap.
 #[test]
-#[ignore = "pending: S1 lag gauge missing; run with --ignored to see the gap"]
+#[ignore = "requires agent-testdb or CI service; pending: S1 lag gauge missing; run with --ignored to see the gap"]
 fn event_store_s1_consumer_lag_gauge_has_fixed_cardinality() {
     let name = "two_bot_event_store_consumer_lag_seconds";
     let text = two_bot_core::metrics::Metrics::default().render(None);
@@ -329,7 +328,7 @@ fn event_store_s1_consumer_lag_gauge_has_fixed_cardinality() {
 /// Pending: no `event_store` table exists until the S1 migration lands, so
 /// run with `-- --ignored` to see the gap.
 #[tokio::test]
-#[ignore = "pending: S1 migration missing; run with --ignored to see the gap"]
+#[ignore = "requires agent-testdb or CI service; pending: S1 migration missing; run with --ignored to see the gap"]
 async fn event_store_s1_privacy_tripwire_rejects_body_text() {
     let db = TestDb::new().await;
     // Tripwire part 1: no free-text column may exist to hold the payload.
