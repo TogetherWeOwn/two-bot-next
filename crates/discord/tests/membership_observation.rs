@@ -520,6 +520,69 @@ async fn transport_stalled_body_times_out_and_releases_lane() {
     mock.shutdown().await;
 }
 
+/// A stalled mutation's outcome is unknown, so its lane stays held and a
+/// follow-up send is `Blocked` until the uncertainty is resolved.
+async fn post_stall_holds_lane(response: ScriptedResponse, expected: &str) {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mock = MockRest::start(vec![], response).await;
+    let lane = Arc::new(SingleFlightLane {
+        key: TokenKey::for_bot_token("fixture-token").unwrap(),
+        held: Arc::new(Mutex::new(false)),
+        admits: AtomicU32::new(0),
+        blocked: AtomicU32::new(0),
+        released: Arc::new(AtomicU32::new(0)),
+    });
+    let transport = HyperTransport::with_admission(
+        "fixture-token".to_owned(),
+        Some(mock.origin()),
+        Arc::clone(&lane) as Arc<dyn SendAdmission>,
+    )
+    .expect("governed transport builds against loopback");
+    let request = Request::builder(&Route::CreateMessage { channel_id: 3333 })
+        .body(b"{}".to_vec())
+        .build()
+        .expect("message request builds");
+    let result = transport
+        .send_request(
+            &request,
+            Some(tokio::time::Instant::now() + Duration::from_millis(600)),
+        )
+        .await;
+    assert_eq!(result.map(|_| ()), Err(expected.to_owned()));
+    assert_eq!(
+        lane.released.load(Ordering::SeqCst),
+        0,
+        "an unanswered mutation must not release its permit"
+    );
+    assert!(
+        *lane.held.lock().unwrap(),
+        "an unanswered mutation must keep the lane held"
+    );
+    assert!(
+        matches!(lane.admit().await, Err(AdmissionError::Blocked)),
+        "a follow-up send must stay Blocked while the mutation is uncertain"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn transport_post_stalled_headers_keeps_lane_held() {
+    post_stall_holds_lane(
+        ScriptedResponse::json(200, serde_json::json!({})).delayed(Duration::from_secs(30)),
+        "read headers timed out",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn transport_post_stalled_body_keeps_lane_held() {
+    post_stall_holds_lane(
+        ScriptedResponse::json(200, serde_json::json!({})).delayed_body(Duration::from_secs(30)),
+        "read body timed out",
+    )
+    .await;
+}
+
 /// A GET whose body is truncated on the wire (fewer bytes than declared, then
 /// close) must take the body-unavailable arm and release the lane, like a
 /// stalled body. Deleting the release in that arm orphans the permit. An
