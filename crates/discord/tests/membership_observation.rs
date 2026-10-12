@@ -666,6 +666,87 @@ async fn transport_truncated_body_releases_lane() {
     handle.abort();
 }
 
+/// A POST whose body is truncated on the wire (fewer bytes than declared, then
+/// close) must take the body-unavailable arm — and because a mutation's
+/// outcome is unknown, the lane stays held. Deleting the mutation guard in
+/// that arm orphans certainty: a follow-up send could go out while the first
+/// may already have taken effect. An inline server drives this: it closes
+/// with a byte missing, so the body read errors instead of timing out.
+/// (The scripted mock keeps a short connection open, which lands in the
+/// timeout arm — not this one.)
+#[tokio::test]
+async fn transport_post_truncated_body_keeps_lane_held() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind truncate");
+    let origin = format!("http://{}", listener.local_addr().expect("addr"));
+    let handle = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut buf = Vec::with_capacity(1024);
+        let mut chunk = [0u8; 1024];
+        while let Ok(n) = stream.read(&mut chunk).await {
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let body = b"{}";
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len() + 1,
+        );
+        let _ = stream.write_all(head.as_bytes()).await;
+        let _ = stream.write_all(body).await;
+        // Drop the socket with a byte missing: the body read errors.
+    });
+    let lane = Arc::new(SingleFlightLane {
+        key: TokenKey::for_bot_token("fixture-token").unwrap(),
+        held: Arc::new(Mutex::new(false)),
+        admits: AtomicU32::new(0),
+        blocked: AtomicU32::new(0),
+        released: Arc::new(AtomicU32::new(0)),
+    });
+    let transport = HyperTransport::with_admission(
+        "fixture-token".to_owned(),
+        Some(origin),
+        Arc::clone(&lane) as Arc<dyn SendAdmission>,
+    )
+    .expect("governed transport builds against loopback");
+    let request = Request::builder(&Route::CreateMessage { channel_id: 3333 })
+        .body(b"{}".to_vec())
+        .build()
+        .expect("message request builds");
+    let result = transport
+        .send_request(
+            &request,
+            Some(tokio::time::Instant::now() + Duration::from_secs(10)),
+        )
+        .await;
+    assert_eq!(
+        result.map(|_| ()),
+        Err("Discord response body unavailable".to_owned()),
+        "a truncated body must report unavailability, not a partial read"
+    );
+    assert_eq!(
+        lane.released.load(Ordering::SeqCst),
+        0,
+        "a truncated mutation must not release its permit"
+    );
+    assert!(
+        *lane.held.lock().unwrap(),
+        "a truncated mutation must keep the lane held"
+    );
+    assert!(
+        matches!(lane.admit().await, Err(AdmissionError::Blocked)),
+        "a follow-up send must stay Blocked while the mutation is uncertain"
+    );
+    handle.abort();
+}
+
 /// The self-role GET travels the budgeted wire path without an outer timer:
 /// a stall must time out inside the permit scope and release the lane.
 /// Single attempt, so exactly one wire request, one admission, one release.
