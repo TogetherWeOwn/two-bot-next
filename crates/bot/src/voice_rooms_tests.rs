@@ -10553,11 +10553,14 @@ fn dead_letter_families_cover_every_queue_action_shape() {
             },
             "limit",
         ),
+        // Post-move respace repairs share the unknown-shape family so the
+        // bounded metric label set stays unchanged (never a create/move/
+        // delete, and never failed, so never dead-lettered).
         (
             RoomAction::RespaceChannels {
                 room_channel_id: 500,
             },
-            "respace",
+            "other",
         ),
     ];
     for (action, family) in &cases {
@@ -12093,6 +12096,47 @@ async fn a_post_move_respace_repairs_only_the_suffix() {
     assert_eq!(live.channels[&210].position, Some(34));
     assert_eq!(live.channels[&501].position, Some(50));
     assert_eq!(worker.queue.pending_counts(GUILD), (0, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_post_move_respace_never_reports_a_lifecycle_outcome() {
+    // Telemetry guard: the deferred post-move repair is cosmetic, not a
+    // room lifecycle outcome. It used to feed `voice_operation` with
+    // op="respace", which `bounded_index` folds into the `delete` series,
+    // so every gapped join added one phantom delete. Log capture is
+    // thread-local, so these assertions stay exact under parallel tests
+    // (the shared global counters cannot pin "unchanged" exactly).
+    let (bytes, _subscriber) = capture_join_logs();
+    let (live, store, http, _) = two_creator_worker_parts(2, 3);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join_creator(&mut worker, MEMBER, CREATOR);
+    dispatch(&mut worker, 0).await;
+    join_creator(&mut worker, MEMBER + 1, 210);
+    for now in 1..8 {
+        worker.dispatch_one(now).await;
+    }
+    // The repair ran exactly once and nothing lingers queued.
+    assert_eq!(worker.http.reorders.lock().unwrap().len(), 1);
+    assert_eq!(worker.queue.pending_counts(GUILD), (0, 0));
+    // It reported exactly one respace line, and no lifecycle outcome line
+    // ever carried op="respace".
+    let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect();
+    let respaces: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event["fields"]["voice_event"] == "voice_respace")
+        .collect();
+    assert_eq!(respaces.len(), 1, "{text}");
+    assert_eq!(respaces[0]["fields"]["outcome"], "success");
+    assert!(
+        events
+            .iter()
+            .all(|event| event["fields"]["op"] != "respace"),
+        "{text}"
+    );
 }
 
 #[tokio::test(start_paused = true)]

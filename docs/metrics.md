@@ -217,7 +217,9 @@ as dynamic labels.
 - `two_bot_voice_operations_total{op,outcome}` — `op` is `create`, `move`
   or `delete`; `outcome` is `success`, `category_full`, `discord`,
   `persistence`, `cancelled` or `refused` (create admission refused the join). `Rejected` status/code values never become
-  labels; all store variants share `persistence`.
+  labels; all store variants share `persistence`. Post-move respace repairs
+  are cosmetic and never increment these counters; each repair emits only a
+  `voice_event="voice_respace"` log line.
 - `two_bot_voice_reconcile_actions_total{action}` — `action` is
   `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued`.
   `suspended` counts active-to-suspended transitions and `resumed` counts
@@ -326,8 +328,10 @@ as dynamic labels.
   an accepted join, with bounded `outcome`, `queue_dwell_seconds`,
   `wait_before_dispatch_seconds`, `claim_seconds`, `reorder_seconds`,
   `post_seconds`, `persist_seconds`, `move_seconds` and `elapsed_seconds`.
-  Stage durations accumulate across 429 retries. The reorder stage includes
-  pre-create respacing when no free position exists.
+  Stage durations accumulate across 429 retries. `reorder_seconds` is
+  retained for log-schema compatibility and is always 0: packed-category
+  respacing no longer runs before the create, it runs as a post-move repair
+  after the join-to-move measurement (see the `voice_respace` log line).
   No guild/member/channel identifiers or user content are attached.
 - `two_bot_handler_duration_seconds` histogram buckets (`le`, seconds):
   `0.001`, `0.005`, `0.01`, `0.05`, `0.1`, `0.5`, `1`, `5`, `+Inf`, plus

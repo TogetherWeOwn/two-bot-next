@@ -692,7 +692,12 @@ fn voice_dead_action(action: &RoomAction) -> &'static str {
         | RoomAction::RevokeJoinAccess { .. }
         | RoomAction::RetireJoinPrompt { .. } => "other",
         RoomAction::SetUserLimit { .. } => "limit",
-        RoomAction::RespaceChannels { .. } => "respace",
+        // Post-move respace repairs share the unknown-shape family so the
+        // bounded metric label set stays unchanged. Every dispatch path
+        // marks the repair succeeded or rate-limited, never failed, so it
+        // cannot dead-letter today; if it ever could, it would read as
+        // `other`, not as a room lifecycle family.
+        RoomAction::RespaceChannels { .. } => "other",
     }
 }
 
@@ -716,6 +721,28 @@ fn observe_voice_operation(op: &'static str, outcome: &'static str) {
             op = op,
             outcome = outcome,
             "voice_operation failed"
+        );
+    }
+}
+
+/// One finished post-move respace repair: a token-free log line only, never
+/// a `voice_operation` counter. The repair is cosmetic, not a room lifecycle
+/// outcome, and an unknown op folds into the `delete` series via
+/// `bounded_index`, which once made every gapped join add one phantom
+/// delete. Event name `voice_respace` with a bounded `outcome`: no IDs,
+/// bodies, tokens or member data, only the outcome.
+fn observe_voice_respace(outcome: &'static str) {
+    if outcome == "success" {
+        info!(
+            voice_event = "voice_respace",
+            outcome = outcome,
+            "voice respace succeeded"
+        );
+    } else {
+        warn!(
+            voice_event = "voice_respace",
+            outcome = outcome,
+            "voice respace failed"
         );
     }
 }
@@ -2294,6 +2321,9 @@ struct JoinTiming {
     queue_dwell: Duration,
     wait_before_dispatch: Duration,
     claim: Duration,
+    /// Retained for the voice-join log line's schema compatibility; always
+    /// zero since packed-category respacing moved out of the join path into
+    /// the post-move repair, which runs after the join-to-move measurement.
     reorder: Duration,
     post: Duration,
     persist: Duration,
@@ -4967,7 +4997,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 match self.http.reorder_channels(self.live.guild_id, &patch).await {
                     Ok(()) => {
                         self.live.set_channel_positions(&patch);
-                        observe_voice_operation("respace", "success");
+                        observe_voice_respace("success");
                         self.queue.mark_succeeded(&action);
                     }
                     Err(RoomHttpError::RateLimited { retry_after_ms, .. }) => {
@@ -4985,7 +5015,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         // repair without touching the room. The create used
                         // the fallback tie, which renders on the correct
                         // side; the next move rechecks the slot.
-                        observe_voice_operation("respace", voice_outcome_from_http(&error));
+                        observe_voice_respace(voice_outcome_from_http(&error));
                         self.queue.mark_succeeded(&action);
                     }
                 }
