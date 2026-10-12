@@ -87,7 +87,7 @@
   "TWO_MODERATION": "Enable moderation command publication/routing; enabled mode requires Owen ID.",
   "TWO_MODERATION_AUDIT_SECRET": "Authentication secret for moderation audit handoff; never rendered.",
   "TWO_MODERATION_PROTECTED_ROLE_IDS": "Roles moderation may not target; environment-only reach boundary.",
-  "TWO_ONBOARDING_DRY_RUN": "Suppress onboarding role writes, legacy/anchor welcomes and session goodbyes.",
+  "TWO_ONBOARDING_DRY_RUN": "Suppress onboarding role writes, legacy/anchor welcomes and session goodbyes. A stored non-0/1 rendering is ignored (deployment wins).",
   "TWO_ONBOARDING_MODE": "Onboarding selector: legacy, session or anchor; session suppresses role writes.",
   "TWO_ONBOARDING_ROTA_MEASUREMENT": "Dropped staging rota measurement gate; env-only refusal is retained.",
   "TWO_ONBOARDING_ROTA_NOTICE": "Dropped staging rota notice gate; env-only refusal is retained.",

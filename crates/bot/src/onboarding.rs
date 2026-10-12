@@ -827,7 +827,7 @@ mod tests {
             let mut vars = HashMap::new();
             assert!(apply_stored_dry_run(&mut vars, Some(raw)));
             assert!(
-                vars.get("TWO_ONBOARDING_DRY_RUN").is_none(),
+                !vars.contains_key("TWO_ONBOARDING_DRY_RUN"),
                 "{raw:?} must not invent a value"
             );
         }
