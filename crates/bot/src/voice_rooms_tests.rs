@@ -11401,6 +11401,38 @@ async fn a_grouped_repair_sends_no_patch_when_the_create_found_a_free_slot() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_burst_grouped_repair_keeps_the_room_above_its_creator() {
+    // A grouped Above repair must not anchor on a newer room from another
+    // creator queued before the repair runs: both joins land correctly, so
+    // the burst must converge on the sequential order, keeping the grouped
+    // room above its creator.
+    let (live, store, http, _) = two_creator_worker_parts(1, 2);
+    {
+        let mut creators = store.creators.lock().unwrap();
+        for creator in creators.iter_mut() {
+            creator.position = two_bot_core::voice_rooms::RoomPosition::Above;
+            if creator.channel_id == CREATOR {
+                creator.group_by_category = true;
+            }
+        }
+    }
+    let mut extra = channel(450, 2, Some(CATEGORY));
+    extra.position = Some(0);
+    live.upsert_channel(extra);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join_creator(&mut worker, MEMBER, CREATOR);
+    join_creator(&mut worker, MEMBER + 1, 210);
+    for now in 0..12 {
+        worker.dispatch_one(now).await;
+    }
+    let live = worker.live.read_state();
+    let mut order = [450, 500, 200, 501, 210];
+    order.sort_by_key(|id| (live.channels[id].position.unwrap_or(0), *id));
+    assert_eq!(order, [450, 500, 200, 501, 210]);
+    assert_eq!(worker.queue.pending_counts(GUILD), (0, 0));
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_respace_429_holds_the_route_while_joins_flow() {
     // A 429 on one room's reorder holds every pending reorder on the route,
     // while creates and moves for other rooms keep flowing past it.

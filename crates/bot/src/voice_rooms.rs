@@ -4253,8 +4253,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         // edge. A bare min-rank plus seniority count assumes a contiguous
         // block and repairs rooms the create already placed; a bare
         // `plan_placement` on the rest frame moves older rooms behind newer
-        // ones. The rest frame without the room is what the create saw
-        // before the POST.
+        // ones. The repair plans from the frame the create saw: rooms newer
+        // than the repaired room (a second join queued before this repair
+        // ran) are left out of the block and out of the `plan_placement`
+        // call, then the slot is mapped back into the live order for
+        // `suffix_respace`, so a burst converges on the sequential order.
         let group_room_ids: Vec<Snowflake> = if settings.group_by_category {
             category_room_ids(creator, &live.channels, &self.rooms)
                 .into_iter()
@@ -4281,22 +4284,64 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             )
         };
         let room_senior = (room.created_at.clone(), room_channel_id);
-        let index = if group_room_ids.is_empty() {
+        // Only rooms the create saw: a room created after this one belongs
+        // to a later frame and must not anchor this repair. Missing rooms
+        // fail the lookup and are left out rather than misplaced.
+        let visible_group_ids: Vec<Snowflake> = group_room_ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.rooms
+                    .get(id)
+                    .is_some_and(|mate| (mate.created_at.clone(), mate.channel_id) <= room_senior)
+            })
+            .collect();
+        // The create-time frame: the live order without rooms newer than the
+        // repaired room. `rest` stays sorted, so the filtered frame is too.
+        let frame: Vec<CategoryChannel> = rest
+            .iter()
+            .copied()
+            .filter(|entry| {
+                entry.kind != CategoryEntryKind::Room
+                    || self.rooms.get(&entry.id).is_none_or(|mate| {
+                        (mate.created_at.clone(), mate.channel_id) <= room_senior
+                    })
+            })
+            .collect();
+        let index = if visible_group_ids.is_empty() {
             // First room in its block: creator-adjacent, as the create plan.
+            // Planned on the create-time frame, then mapped back so newer
+            // rooms keep their side: Above lands before the successor, Below
+            // after the predecessor.
             let side = match settings.position {
                 RoomPosition::Above => PlacementSide::Above,
                 RoomPosition::Below => PlacementSide::Below,
             };
-            plan_placement(PlacementRequest {
+            let empty: Vec<Snowflake> = Vec::new();
+            let filtered_index = plan_placement(PlacementRequest {
                 creator_id: room.creator_channel_id,
                 side,
                 grouped: settings.group_by_category,
-                group_room_ids: &group_room_ids,
-                category_order: &rest,
+                group_room_ids: &empty,
+                category_order: &frame,
             })
-            .ok()?
+            .ok()?;
+            match settings.position {
+                RoomPosition::Above => match frame.get(filtered_index) {
+                    Some(successor) => rest.iter().position(|entry| entry.id == successor.id)?,
+                    None => rest.len(),
+                },
+                RoomPosition::Below => {
+                    match filtered_index.checked_sub(1).and_then(|i| frame.get(i)) {
+                        Some(predecessor) => {
+                            rest.iter().position(|entry| entry.id == predecessor.id)? + 1
+                        }
+                        None => 0,
+                    }
+                }
+            }
         } else {
-            let mate_ranks: Vec<(Snowflake, usize)> = group_room_ids
+            let mate_ranks: Vec<(Snowflake, usize)> = visible_group_ids
                 .iter()
                 .filter_map(|id| {
                     rest.iter()
