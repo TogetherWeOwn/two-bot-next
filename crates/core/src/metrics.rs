@@ -64,6 +64,7 @@ pub const REST_ROUTES: &[&str] = &[
     "PUT /guilds/:guild/bans/:member",
     "PATCH /guilds/:guild/members/:member",
     "PATCH /channels/:channel",
+    "PUT /channels/:channel/voice-status",
     "PUT /channels/:channel/permissions/:overwrite",
     "POST /channels/:channel/messages/bulk-delete",
     "PUT /guilds/:guild/members/:member/roles/:role",
@@ -198,7 +199,9 @@ pub const VOICE_NAME_OUTCOMES: &[&str] = &[
     "blocked",
     "channel_unseen",
     "rename_sent",
-    "rename_stale",
+    "rename_room_gone",
+    "rename_superseded",
+    "rename_already_applied",
     "rename_unseen",
     "rename_no_access",
     "rename_held",
@@ -553,8 +556,8 @@ impl Metrics {
         *counter = counter.saturating_add(1);
     }
 
-    /// Add one reconcile plan size (TOG-13543). `count` is the number of
-    /// rooms in this pass for `action`; zero is a no-op.
+    /// Add actual reconcile transitions or newly queued actions in this pass.
+    /// Repeated unchanged room states contribute zero, which is a no-op.
     pub fn voice_reconcile(&self, action: &str, count: u64) {
         if count == 0 {
             return;
@@ -909,7 +912,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_reconcile_actions_total",
             "counter",
-            "Reconcile plan sizes by bounded action.",
+            "Reconcile transitions and new enqueues by bounded action.",
         );
         for (action, count) in VOICE_RECONCILE_ACTIONS.iter().zip(values.voice_reconcile) {
             writeln!(

@@ -877,8 +877,73 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
         self.name_settings_read_ms = Some(now_ms);
         if let Ok(config) = self.store.config_snapshot(self.live.guild_id).await {
-            self.name_settings = NameSettings::from_config(&config);
+            // Use the same snapshot for creator templates and naming settings.
+            // The export codec omits per-creator companion overrides and folds
+            // an inherited limit into zero; preserve those just as config_apply
+            // does, rather than resetting them on every naming reload.
+            let creators: Option<HashMap<_, _>> = config
+                .creators
+                .iter()
+                .map(|config| {
+                    let channel_id = config.channel_id.parse::<Snowflake>().ok()?;
+                    let mut creator =
+                        self.creators.get(&channel_id).cloned().unwrap_or_else(|| {
+                            let mut creator = CreatorChannel::new(self.live.guild_id, channel_id);
+                            creator.default_limit = Some(0);
+                            creator
+                        });
+                    creator.name_template = config.name_template.clone();
+                    creator.permission_source = match &config.permission_source {
+                        two_bot_core::voice_config::PermissionSource::Creator {} => {
+                            PermissionSource::Creator
+                        }
+                        two_bot_core::voice_config::PermissionSource::Category {} => {
+                            PermissionSource::Category
+                        }
+                        two_bot_core::voice_config::PermissionSource::Channel { channel_id } => {
+                            PermissionSource::Channel(channel_id.parse().ok()?)
+                        }
+                    };
+                    creator.permission_channel_id = match creator.permission_source {
+                        PermissionSource::Channel(id) => Some(id),
+                        _ => None,
+                    };
+                    if config.default_limit != 0 || creator.default_limit.is_some() {
+                        creator.default_limit = Some(i64::from(config.default_limit));
+                    }
+                    creator.private_default = config.always_private;
+                    creator.text_channels = config.text_channels;
+                    creator.position = match config.position {
+                        two_bot_core::voice_config::RoomPosition::Above => RoomPosition::Above,
+                        two_bot_core::voice_config::RoomPosition::Below => RoomPosition::Below,
+                    };
+                    creator.first_room_number = i64::from(config.first_number);
+                    creator.group_by_category = config.group_by_category;
+                    Some((channel_id, creator))
+                })
+                .collect();
+            let Some(creators) = creators else {
+                self.name_settings_loaded = false;
+                return;
+            };
+            if self.creators != creators {
+                self.live.protect_channels(creators.keys().copied());
+                self.creators = creators;
+                self.name_signatures.clear();
+                self.name_inputs = None;
+            }
+            self.update_name_settings(NameSettings::from_config(&config));
             self.name_settings_loaded = true;
+        }
+    }
+
+    /// Facts-only signatures cannot detect list or template/settings edits.
+    /// Invalidate both caches, but leave proposals on the paced rename lane.
+    pub(super) fn update_name_settings(&mut self, settings: NameSettings) {
+        if self.name_settings != settings {
+            self.name_settings = settings;
+            self.name_signatures.clear();
+            self.name_inputs = None;
         }
     }
 

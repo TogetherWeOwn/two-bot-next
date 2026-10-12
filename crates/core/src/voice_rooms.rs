@@ -1259,21 +1259,23 @@ impl ActionQueue {
     }
 
     /// Access lost on a room (spec V1): its actions wait, nothing retries.
-    pub fn suspend(&self, guild_id: Snowflake, channel_id: Snowflake) {
+    /// Returns true only when the lane changes from active to suspended.
+    pub fn suspend(&self, guild_id: Snowflake, channel_id: Snowflake) -> bool {
         self.inner
             .lock()
             .expect("queue lock")
             .suspended
-            .insert((guild_id, channel_id));
+            .insert((guild_id, channel_id))
     }
 
     /// Access restored: pending actions for the room may run again.
-    pub fn resume(&self, guild_id: Snowflake, channel_id: Snowflake) {
+    /// Returns true only when the lane changes from suspended to active.
+    pub fn resume(&self, guild_id: Snowflake, channel_id: Snowflake) -> bool {
         self.inner
             .lock()
             .expect("queue lock")
             .suspended
-            .remove(&(guild_id, channel_id));
+            .remove(&(guild_id, channel_id))
     }
 
     #[must_use]
@@ -1765,12 +1767,14 @@ mod tests {
     use super::*;
     use crate::commands::merge_commands;
     use crate::feature_commands::feature_commands;
-    use crate::funnel::now_iso;
     use crate::moderation::moderation_commands;
 
     const GUILD: Snowflake = 100;
     const CREATOR: Snowflake = 200;
     const MEMBER: Snowflake = 300;
+    /// One creation stamp for every fixture, so two builds of the same
+    /// fixture stay equal.
+    const NOW: &str = "2026-01-01T00:00:00.000Z";
 
     fn creator() -> CreatorChannel {
         CreatorChannel::new(GUILD, CREATOR)
@@ -1785,7 +1789,7 @@ mod tests {
             category_id: Some(400),
             category_channel_count: 3,
             seed,
-            now: now_iso(),
+            now: NOW.to_owned(),
         }
     }
 
@@ -1797,8 +1801,19 @@ mod tests {
             owner_id: owner,
             original_creator_id: owner,
             name_seed: 7,
-            created_at: now_iso(),
+            created_at: NOW.to_owned(),
         }
+    }
+
+    #[test]
+    fn fixtures_do_not_read_the_clock() {
+        // Equality assertions build the same fixture more than once; a
+        // wall-clock stamp made them differ when a millisecond ticked over.
+        let room = tracked(500, MEMBER);
+        let join = join_req(MEMBER, 1);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert_eq!(tracked(500, MEMBER), room);
+        assert_eq!(join_req(MEMBER, 1), join);
     }
 
     #[test]
@@ -2082,7 +2097,9 @@ mod tests {
             },
         );
         q.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 501 });
-        q.suspend(GUILD, 501);
+        assert!(!q.resume(GUILD, 501));
+        assert!(q.suspend(GUILD, 501));
+        assert!(!q.suspend(GUILD, 501));
         assert!(q.is_suspended(GUILD, 501));
         // The suspended delete waits; the rename still runs.
         assert_eq!(
@@ -2096,7 +2113,8 @@ mod tests {
             })
         );
         assert_eq!(q.pop_due(GUILD, 0), None);
-        q.resume(GUILD, 501);
+        assert!(q.resume(GUILD, 501));
+        assert!(!q.resume(GUILD, 501));
         assert_eq!(
             q.pop_due(GUILD, 0).map(|a| {
                 q.mark_succeeded(&a);
@@ -2566,7 +2584,7 @@ mod tests {
                 configured_name: Some("Lounge".to_owned()),
                 viewer_role_id: Some(GUILD),
             },
-            created_at: crate::funnel::now_iso(),
+            created_at: NOW.to_owned(),
         };
         assert_eq!(store.companion_for(GUILD, 500), None);
         store.add_companion(companion.clone());

@@ -16,6 +16,8 @@ mod name;
 mod private;
 #[path = "voice_rooms_sink_tests.rs"]
 mod sink;
+#[path = "../../core/tests/support/tracing_capture.rs"]
+mod tracing_capture;
 
 const GUILD: u64 = 100;
 const CREATOR: u64 = 200;
@@ -24,6 +26,7 @@ const MEMBER: u64 = 300;
 const NOW: &str = "2026-09-30T00:00:00.000000+00:00";
 type Trace = Arc<Mutex<Vec<String>>>;
 type Hook = Arc<dyn Fn() + Send + Sync>;
+type OverwriteHook = Arc<dyn Fn(u64, u64, Option<PermissionOverwrite>) + Send + Sync>;
 
 fn permissions() -> Permissions {
     Permissions::VIEW_CHANNEL
@@ -150,6 +153,10 @@ struct Store {
     add_creator_error: Mutex<Option<StoreError>>,
     after_persist: Option<Hook>,
     config: Arc<Mutex<VoiceConfiguration>>,
+    /// Most lifecycle fixtures edit creator rows directly. Their snapshot must
+    /// describe those same rows; config-import/reload tests supply an explicit
+    /// snapshot instead, including intentional creator removals.
+    snapshot_uses_creator_rows: bool,
     config_error: Option<StoreError>,
     config_reads: Arc<AtomicU64>,
     save_config_error: Option<StoreError>,
@@ -209,6 +216,7 @@ impl Store {
             add_creator_error: Mutex::new(None),
             after_persist: None,
             config: Arc::new(Mutex::new(empty_config())),
+            snapshot_uses_creator_rows: true,
             config_error: None,
             config_reads: Arc::new(AtomicU64::new(0)),
             save_config_error: None,
@@ -517,10 +525,40 @@ impl RoomPersistence for Store {
     }
     async fn config_snapshot(&self, _: u64) -> Result<VoiceConfiguration, StoreError> {
         self.config_reads.fetch_add(1, Ordering::Relaxed);
-        match self.config_error {
-            Some(error) => Err(error),
-            None => Ok(self.config.lock().unwrap().clone()),
+        if let Some(error) = self.config_error {
+            return Err(error);
         }
+        let mut config = self.config.lock().unwrap().clone();
+        if self.snapshot_uses_creator_rows {
+            config.creators = self
+                .creators
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|creator| config_codec::CreatorConfiguration {
+                    channel_id: creator.channel_id.to_string(),
+                    name_template: creator.name_template.clone(),
+                    status_template: None,
+                    default_limit: creator.default_limit.unwrap_or(0) as u16,
+                    always_private: creator.private_default,
+                    text_channels: creator.text_channels,
+                    position: match creator.position {
+                        RoomPosition::Above => config_codec::RoomPosition::Above,
+                        RoomPosition::Below => config_codec::RoomPosition::Below,
+                    },
+                    first_number: creator.first_room_number as u32,
+                    group_by_category: creator.group_by_category,
+                    permission_source: match creator.permission_source {
+                        PermissionSource::Creator => config_codec::PermissionSource::Creator {},
+                        PermissionSource::Category => config_codec::PermissionSource::Category {},
+                        PermissionSource::Channel(id) => config_codec::PermissionSource::Channel {
+                            channel_id: id.to_string(),
+                        },
+                    },
+                })
+                .collect();
+        }
+        Ok(config)
     }
     async fn config_apply(
         &self,
@@ -691,6 +729,8 @@ struct Http {
     /// Scripted failures for the V4 enforcement's Connect deny.
     kick_errors: Mutex<VecDeque<RoomHttpError>>,
     overwrite_errors: Mutex<VecDeque<RoomHttpError>>,
+    put_overwrite_errors: Mutex<VecDeque<RoomHttpError>>,
+    after_overwrite: Option<OverwriteHook>,
     join_errors: Mutex<VecDeque<RoomHttpError>>,
     written_overwrites: Mutex<Vec<(u64, PermissionOverwrite)>>,
     notices: Mutex<Vec<(NoticeTarget, String, Option<u64>)>>,
@@ -743,6 +783,8 @@ impl Http {
             view_errors: Mutex::new(VecDeque::new()),
             kick_errors: Mutex::new(VecDeque::new()),
             overwrite_errors: Mutex::new(VecDeque::new()),
+            put_overwrite_errors: Mutex::new(VecDeque::new()),
+            after_overwrite: None,
             join_errors: Mutex::new(VecDeque::new()),
             written_overwrites: Mutex::new(Vec::new()),
             notices: Mutex::new(Vec::new()),
@@ -811,30 +853,6 @@ impl RoomWrites for Http {
             hook();
         }
         Ok(result)
-    }
-    async fn update_overwrites(
-        &self,
-        channel_id: u64,
-        overwrites: &[PermissionOverwrite],
-        guard: WriteGuard,
-    ) -> Result<Channel, RoomHttpError> {
-        if !guard() {
-            return Err(RoomHttpError::Cancelled);
-        }
-        self.trace
-            .lock()
-            .unwrap()
-            .push(format!("overwrites:{channel_id}"));
-        if let Some(error) = self.view_errors.lock().unwrap().pop_front() {
-            return Err(error);
-        }
-        let mut updated = channel(channel_id, 2, Some(CATEGORY));
-        updated.permission_overwrites = Some(overwrites.to_vec());
-        if let Some(gate) = &self.overwrites_gate {
-            gate.sent.notify_one();
-            gate.release.notified().await;
-        }
-        Ok(updated)
     }
     async fn move_member(
         &self,
@@ -1088,13 +1106,26 @@ impl RoomWrites for Http {
             overwrite.id.get(),
             overwrite.kind
         ));
-        if let Some(error) = self.overwrite_errors.lock().unwrap().pop_front() {
+        if let Some(gate) = &self.overwrites_gate {
+            gate.sent.notify_one();
+            gate.release.notified().await;
+        }
+        if let Some(error) = self
+            .put_overwrite_errors
+            .lock()
+            .unwrap()
+            .pop_front()
+            .or_else(|| self.overwrite_errors.lock().unwrap().pop_front())
+        {
             return Err(error);
         }
         self.written_overwrites
             .lock()
             .unwrap()
             .push((channel, overwrite));
+        if let Some(hook) = &self.after_overwrite {
+            hook(channel, overwrite.id.get(), Some(overwrite));
+        }
         Ok(())
     }
     async fn create_join_channel(
@@ -1138,10 +1169,17 @@ impl RoomWrites for Http {
             .lock()
             .unwrap()
             .push(format!("delete_overwrite:{channel}:{member}"));
-        match self.overwrite_errors.lock().unwrap().pop_front() {
-            Some(error) => Err(error),
-            None => Ok(()),
+        if let Some(gate) = &self.overwrites_gate {
+            gate.sent.notify_one();
+            gate.release.notified().await;
         }
+        if let Some(error) = self.overwrite_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        if let Some(hook) = &self.after_overwrite {
+            hook(channel, member, None);
+        }
+        Ok(())
     }
     async fn send_component_message(
         &self,
@@ -1230,13 +1268,6 @@ async fn dispatch(worker: &mut GuildRoomWorker<Store, Http>, now: u64) {
     assert!(worker.dispatch_one(now).await);
 }
 
-// A stable global subscriber keeps tracing callsite interest enabled even
-// when another test thread first registers the event. The local JSON writer
-// below captures only this current-thread runtime's events.
-#[allow(dead_code)]
-#[path = "../../core/tests/support/tracing_capture.rs"]
-mod join_tracing_capture;
-
 #[derive(Clone)]
 struct JoinLogWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -1252,7 +1283,9 @@ impl std::io::Write for JoinLogWriter {
 }
 
 fn capture_join_logs() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
-    let _global = join_tracing_capture::global();
+    // Share the reconcile tests' global subscriber to keep callsite interest
+    // stable; the local JSON writer captures only this runtime's events.
+    let _global = tracing_capture::global();
     let bytes = Arc::new(Mutex::new(Vec::new()));
     let output = Arc::clone(&bytes);
     let subscriber = tracing_subscriber::fmt()
@@ -2117,7 +2150,7 @@ fn owner_overwrite(member: u64) -> PermissionOverwrite {
 
 #[tokio::test]
 async fn transfer_rewrites_only_this_rooms_owner_grants_before_persistence() {
-    let (live, store, http, trace) = owned_room();
+    let (live, store, mut http, trace) = owned_room();
     let unrelated = PermissionOverwrite {
         id: Id::new(701),
         kind: PermissionOverwriteType::Role,
@@ -2132,6 +2165,23 @@ async fn transfer_rewrites_only_this_rooms_owner_grants_before_persistence() {
     live.upsert_channel(room_channel);
     let untouched = channel(501, 2, Some(CATEGORY));
     live.upsert_channel(untouched.clone());
+    let echo_live = live.clone();
+    http.after_overwrite = Some(Arc::new(move |channel_id, member_id, overwrite| {
+        let mut echoed = echo_live
+            .read_state()
+            .channels
+            .get(&channel_id)
+            .cloned()
+            .expect("echoed channel exists");
+        let overwrites = echoed.permission_overwrites.as_mut().unwrap();
+        overwrites.retain(|existing| {
+            !(existing.kind == PermissionOverwriteType::Member && existing.id.get() == member_id)
+        });
+        if let Some(overwrite) = overwrite {
+            overwrites.push(overwrite);
+        }
+        echo_live.upsert_channel(echoed);
+    }));
     let mut worker = GuildRoomWorker::load(live.clone(), store, http)
         .await
         .unwrap();
@@ -2149,8 +2199,149 @@ async fn transfer_rewrites_only_this_rooms_owner_grants_before_persistence() {
     assert_eq!(state.channels[&501], untouched);
     assert_eq!(
         *trace.lock().unwrap(),
-        ["overwrites:500", "update_ownership:500:301"]
+        [
+            format!("overwrite:500:{MEMBER}:Member"),
+            "overwrite:500:301:Member".to_owned(),
+            "update_ownership:500:301".to_owned(),
+        ]
     );
+}
+
+#[test]
+fn owner_overwrite_delta_orders_trimmed_grants_before_the_incoming_owner() {
+    let mut former_owner = owner_overwrite(MEMBER);
+    former_owner.allow |= Permissions::EMBED_LINKS;
+    let mut incoming_owner = PermissionOverwrite {
+        id: Id::new(301),
+        kind: PermissionOverwriteType::Member,
+        allow: Permissions::SEND_MESSAGES,
+        deny: Permissions::empty(),
+    };
+    let before = vec![incoming_owner, former_owner];
+    former_owner.allow = Permissions::EMBED_LINKS;
+    incoming_owner.allow |= Permissions::from_bits_retain(OWNER_ALLOW_BITS);
+    let after = vec![incoming_owner, former_owner];
+
+    let (deletes, puts) = owner_overwrite_delta(&before, &after, 301);
+
+    assert!(deletes.is_empty());
+    assert_eq!(
+        puts.iter()
+            .map(|overwrite| overwrite.id.get())
+            .collect::<Vec<_>>(),
+        [MEMBER, 301],
+        "revoke the former owner's bits before granting the incoming owner"
+    );
+}
+
+#[tokio::test]
+async fn denied_incoming_grant_after_successful_revoke_remains_owed_without_access() {
+    let (live, store, http, _) = owned_room();
+    let mut room_channel = channel(500, 2, Some(CATEGORY));
+    // The incoming owner joined through an approved join request, so they
+    // already hold a Connect-only overwrite (Connect is an owner bit).
+    // Partial bits must not count as a completed grant.
+    let connect_only_joiner = PermissionOverwrite {
+        id: Id::new(301),
+        kind: PermissionOverwriteType::Member,
+        allow: Permissions::CONNECT,
+        deny: Permissions::empty(),
+    };
+    room_channel.permission_overwrites = Some(vec![owner_overwrite(MEMBER), connect_only_joiner]);
+    live.upsert_channel(room_channel);
+    http.put_overwrite_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::AccessDenied);
+    let worker = GuildRoomWorker::load(live.clone(), store, http)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        worker.rewrite_owner_grant(500, &[MEMBER], 301).await,
+        Err(RoomHttpError::AccessDenied)
+    );
+    let access = live.inner.read().unwrap().bot.clone().unwrap();
+    let mut without_manage_roles = access.clone();
+    for role in &mut without_manage_roles.roles {
+        role.permissions &= !Permissions::MANAGE_ROLES;
+    }
+    live.refresh_bot(without_manage_roles);
+
+    assert_eq!(
+        worker.rewrite_owner_grant(500, &[MEMBER], 301).await,
+        Err(RoomHttpError::AccessDenied),
+        "the denied grant must not let the ownership journal close"
+    );
+    assert!(worker.grants_owed.lock().unwrap().contains(&500));
+    let state = live.inner.read().unwrap();
+    let overwrites = state.channels[&500].permission_overwrites.as_ref().unwrap();
+    let owner_mask = Permissions::from_bits_retain(OWNER_ALLOW_BITS);
+    assert!(!overwrites
+        .iter()
+        .any(|overwrite| overwrite.id.get() == MEMBER
+            && overwrite.allow.contains(owner_mask & !overwrite.deny)));
+    // The incoming owner still holds only Connect: partial bits are not a grant.
+    assert!(!overwrites.iter().any(|overwrite| overwrite.id.get() == 301
+        && overwrite.allow.contains(owner_mask & !overwrite.deny)));
+    assert!(overwrites.iter().any(
+        |overwrite| overwrite.id.get() == 301 && overwrite.allow.contains(Permissions::CONNECT)
+    ));
+}
+
+#[tokio::test]
+async fn transient_grant_failure_after_revoke_remains_owed_without_access() {
+    let (live, store, http, _) = owned_room();
+    let mut room_channel = channel(500, 2, Some(CATEGORY));
+    // Same Connect-only joiner setup as the 403 case: partial bits must not
+    // count as a completed grant.
+    let connect_only_joiner = PermissionOverwrite {
+        id: Id::new(301),
+        kind: PermissionOverwriteType::Member,
+        allow: Permissions::CONNECT,
+        deny: Permissions::empty(),
+    };
+    room_channel.permission_overwrites = Some(vec![owner_overwrite(MEMBER), connect_only_joiner]);
+    live.upsert_channel(room_channel);
+    // The former owner's revoke succeeds; the incoming owner's PUT hits a
+    // transient failure, not a 403.
+    http.put_overwrite_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::UnknownOutcome);
+    let worker = GuildRoomWorker::load(live.clone(), store, http)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        worker.rewrite_owner_grant(500, &[MEMBER], 301).await,
+        Err(RoomHttpError::UnknownOutcome)
+    );
+    let access = live.inner.read().unwrap().bot.clone().unwrap();
+    let mut without_manage_roles = access.clone();
+    for role in &mut without_manage_roles.roles {
+        role.permissions &= !Permissions::MANAGE_ROLES;
+    }
+    live.refresh_bot(without_manage_roles);
+
+    assert_eq!(
+        worker.rewrite_owner_grant(500, &[MEMBER], 301).await,
+        Err(RoomHttpError::AccessDenied),
+        "a half-applied handoff must not close the journal without the grant"
+    );
+    assert!(worker.grants_owed.lock().unwrap().contains(&500));
+    let state = live.inner.read().unwrap();
+    let overwrites = state.channels[&500].permission_overwrites.as_ref().unwrap();
+    let owner_mask = Permissions::from_bits_retain(OWNER_ALLOW_BITS);
+    assert!(!overwrites
+        .iter()
+        .any(|overwrite| overwrite.id.get() == MEMBER
+            && overwrite.allow.contains(owner_mask & !overwrite.deny)));
+    assert!(!overwrites.iter().any(|overwrite| overwrite.id.get() == 301
+        && overwrite.allow.contains(owner_mask & !overwrite.deny)));
+    assert!(overwrites.iter().any(
+        |overwrite| overwrite.id.get() == 301 && overwrite.allow.contains(Permissions::CONNECT)
+    ));
 }
 
 #[tokio::test]
@@ -2161,7 +2352,7 @@ async fn denied_handoff_falls_back_to_revoke_only_then_retries_the_grant() {
     live.upsert_channel(room_channel);
     // The combined revoke+grant PATCH is refused; the revoke-only fallback
     // must still clear the former owner's bits and defer the grant.
-    http.view_errors
+    http.overwrite_errors
         .lock()
         .unwrap()
         .push_back(RoomHttpError::AccessDenied);
@@ -2194,7 +2385,7 @@ async fn denied_handoff_falls_back_to_revoke_only_then_retries_the_grant() {
             .lock()
             .unwrap()
             .iter()
-            .filter(|call| call.as_str() == "overwrites:500")
+            .filter(|call| call.as_str() == format!("delete_overwrite:500:{MEMBER}"))
             .count(),
         2,
         "combined attempt plus the revoke-only fallback"
@@ -2221,7 +2412,7 @@ async fn revoked_fallback_keeps_handoff_pending_until_access_returns() {
     live.upsert_channel(room_channel);
     // The combined revoke+grant PATCH is refused; the revoke-only fallback
     // clears the former owner and defers the new-owner grant.
-    http.view_errors
+    http.overwrite_errors
         .lock()
         .unwrap()
         .push_back(RoomHttpError::AccessDenied);
@@ -2342,11 +2533,14 @@ async fn fallback_patch_propagates_rate_limit_and_unauthorized() {
         let mut room_channel = channel(500, 2, Some(CATEGORY));
         room_channel.permission_overwrites = Some(vec![owner_overwrite(MEMBER)]);
         live.upsert_channel(room_channel);
-        http.view_errors
+        http.overwrite_errors
             .lock()
             .unwrap()
             .push_back(RoomHttpError::AccessDenied);
-        http.view_errors.lock().unwrap().push_back(fallback_error);
+        http.overwrite_errors
+            .lock()
+            .unwrap()
+            .push_back(fallback_error);
         let worker = GuildRoomWorker::load(live.clone(), store, http)
             .await
             .unwrap();
@@ -2603,7 +2797,7 @@ async fn exhausted_owner_cleanup_is_retained_and_recovers_after_access_restorati
 #[tokio::test]
 async fn owner_grant_rewrite_rate_limit_retries_before_saving_the_handoff() {
     let (live, store, http, trace) = owned_room();
-    http.view_errors
+    http.overwrite_errors
         .lock()
         .unwrap()
         .push_back(RoomHttpError::RateLimited {
@@ -7362,6 +7556,33 @@ async fn gateway_sink_routes_setup_without_blocking_and_ignores_other_commands()
     assert!(response_text(&replies.completed.lock().unwrap()[0]).contains("Voice rooms"));
 }
 
+/// Production wires `VoiceResponder`, not the bare runtime: a presence fed
+/// to the responder must reach the live guild's naming facts.
+#[tokio::test]
+async fn gateway_responder_forwards_presence_to_the_runtime() {
+    let trace = Trace::default();
+    let runtime = Arc::new(test_runtime(trace.clone()));
+    assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
+    let replies = Arc::new(Replies::new(trace));
+    let sink = VoiceResponder::new(Arc::clone(&runtime), replies);
+    let update: twilight_model::gateway::payload::incoming::PresenceUpdate =
+        serde_json::from_value(serde_json::json!({
+            "user": {"id": MEMBER.to_string()},
+            "guild_id": GUILD.to_string(),
+            "status": "online",
+            "activities": [{"type": 0, "name": "Apex Legends"}],
+            "client_status": {"desktop": "online"}
+        }))
+        .expect("presence");
+    VoiceEventSink::presence(&sink, &update);
+    let actor = runtime.live_actor(GUILD).expect("live actor");
+    let live = actor.live.read_state();
+    assert!(
+        live.presences.contains_key(&MEMBER),
+        "the responder dropped the presence update"
+    );
+}
+
 #[tokio::test]
 async fn disabled_gateway_responder_does_not_acknowledge() {
     use twilight_model::gateway::payload::incoming::InteractionCreate;
@@ -8819,6 +9040,7 @@ fn import_harness(
         move || {
             let mut store = Store::new(trace.clone());
             store.config = closure_config.clone();
+            store.snapshot_uses_creator_rows = false;
             let mut http = Http::new(trace.clone());
             http.download_results = shared_downloads.clone();
             (store, http)
@@ -10323,8 +10545,106 @@ async fn terminal_queue_failure_dead_letters_exactly_once_per_family() {
     assert_eq!(worker.queue.failed()[0].action.attempts, QUEUE_MAX_ATTEMPTS);
 }
 
+fn reconcile_signals(worker: &mut GuildRoomWorker<Store, Http>) -> Vec<String> {
+    // Keep callsite interest stable while other test threads also reconcile.
+    tracing_capture::global();
+    let capture = tracing_capture::Capture::default();
+    tracing::subscriber::with_default(capture.clone(), || worker.reconcile());
+    capture
+        .text()
+        .lines()
+        .filter(|line| line.contains("voice_event=\"voice_reconcile\""))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn assert_reconcile_signal(signals: &[String], counts: [u64; 4]) {
+    assert_eq!(signals.len(), 1, "{signals:?}");
+    for (name, count) in [
+        "delete_enqueued",
+        "suspended",
+        "resumed",
+        "succession_enqueued",
+    ]
+    .into_iter()
+    .zip(counts)
+    {
+        assert!(
+            signals[0].contains(&format!(" {name}={count}")),
+            "{signals:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reconcile_reports_access_transitions_once_and_keeps_stable_rooms_quiet() {
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live.clone(), store, http)
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        assert!(reconcile_signals(&mut worker).is_empty());
+    }
+
+    live.refresh_bot(BotAccess {
+        roles: vec![role(Permissions::empty())],
+        ..snapshot(&[], vec![]).bot
+    });
+    let suspended_before =
+        global_series("two_bot_voice_reconcile_actions_total{action=\"suspended\"}");
+    assert_reconcile_signal(&reconcile_signals(&mut worker), [0, 1, 0, 0]);
+    assert!(worker.queue.is_suspended(GUILD, 500));
+    assert!(
+        global_series("two_bot_voice_reconcile_actions_total{action=\"suspended\"}")
+            > suspended_before
+    );
+    for _ in 0..3 {
+        assert!(reconcile_signals(&mut worker).is_empty());
+    }
+
+    live.refresh_bot(snapshot(&[], vec![]).bot);
+    let resumed_before = global_series("two_bot_voice_reconcile_actions_total{action=\"resumed\"}");
+    assert_reconcile_signal(&reconcile_signals(&mut worker), [0, 0, 1, 0]);
+    assert!(!worker.queue.is_suspended(GUILD, 500));
+    assert!(
+        global_series("two_bot_voice_reconcile_actions_total{action=\"resumed\"}") > resumed_before
+    );
+    for _ in 0..3 {
+        assert!(reconcile_signals(&mut worker).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn reconcile_missing_room_only_resumes_a_suspended_lane() {
+    for was_suspended in [false, true] {
+        let (live, store, http, _) = fixture();
+        store.rooms.lock().unwrap().insert(500, room(500));
+        let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        if was_suspended {
+            worker.queue.suspend(GUILD, 500);
+        }
+        assert_reconcile_signal(
+            &reconcile_signals(&mut worker),
+            [1, 0, u64::from(was_suspended), 0],
+        );
+        assert!(!worker.queue.is_suspended(GUILD, 500));
+        assert!(reconcile_signals(&mut worker).is_empty());
+        assert_eq!(worker.queue.pending_counts(GUILD), (1, 0));
+    }
+}
+
+#[tokio::test]
+async fn reconcile_still_reports_succession_without_an_access_transition() {
+    let (live, store, http, _) = owned_room();
+    live.voice_update(MEMBER, None, Some(false));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    assert_reconcile_signal(&reconcile_signals(&mut worker), [0, 0, 0, 1]);
+    assert_eq!(worker.tracked()[&500].owner_id, 301);
+    assert!(reconcile_signals(&mut worker).is_empty());
+}
+
 #[tokio::test(start_paused = true)]
-async fn reconcile_pass_reports_its_plan_sizes() {
+async fn reconcile_reports_only_new_delete_enqueues() {
     let (live, store, http, _) = fixture();
     store.rooms.lock().unwrap().insert(500, room(500));
     store.rooms.lock().unwrap().insert(501, room(501));
@@ -10332,20 +10652,16 @@ async fn reconcile_pass_reports_its_plan_sizes() {
     live.upsert_channel(channel(501, 2, Some(CATEGORY)));
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     tokio::time::advance(EMPTY_ROOM_GRACE).await;
-    let resumed_before = global_series("two_bot_voice_reconcile_actions_total{action=\"resumed\"}");
     let enqueued_before =
         global_series("two_bot_voice_reconcile_actions_total{action=\"delete_enqueued\"}");
-    worker.reconcile();
-    // Both tracked rooms are present, accessible and empty: each pass
-    // resumes its lane and enqueues its delete.
-    assert!(
-        global_series("two_bot_voice_reconcile_actions_total{action=\"resumed\"}")
-            >= resumed_before + 2
-    );
+    // Both rooms are accessible and empty, but neither lane was suspended.
+    assert_reconcile_signal(&reconcile_signals(&mut worker), [2, 0, 0, 0]);
     assert!(
         global_series("two_bot_voice_reconcile_actions_total{action=\"delete_enqueued\"}")
             >= enqueued_before + 2
     );
+    assert!(reconcile_signals(&mut worker).is_empty());
+    assert_eq!(worker.queue.pending_counts(GUILD), (2, 0));
 }
 
 #[tokio::test]
@@ -10656,6 +10972,216 @@ async fn a_pool_too_small_to_vary_keeps_the_drawn_seed() {
 }
 
 #[tokio::test]
+async fn voice_name_reload_rerenders_unchanged_facts_after_list_edit() {
+    let (live, mut store, http, trace) = fixture();
+    store.snapshot_uses_creator_rows = false;
+    let mut config = full_config();
+    config.creators[0].name_template = "[[list:maps]]".to_owned();
+    config.lists[0].choices = vec!["old".to_owned()];
+    store.creators.lock().unwrap()[0].name_template = config.creators[0].name_template.clone();
+    *store.config.lock().unwrap() = config;
+    slow_rename_room(&live, &store);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.wall_clock = || 0;
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    worker.reload_name_settings(0).await;
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    let signatures = worker.name_signatures.clone();
+
+    worker.store.config.lock().unwrap().lists[0].choices = vec!["new".to_owned()];
+    worker.reload_name_settings(299_999).await;
+    worker.refresh_template_names(299_999);
+    assert_eq!(worker.desired_names[&700], "old", "reload remains paced");
+    worker.reload_name_settings(300_000).await;
+    worker.refresh_template_names(300_000);
+    assert_eq!(
+        worker.name_signatures, signatures,
+        "room facts did not change"
+    );
+    assert_eq!(worker.desired_names[&700], "new");
+    dispatch(&mut worker, 300_000).await;
+    assert_eq!(renames_sent(&trace), ["rename:700:old", "rename:700:new"]);
+
+    // An equal snapshot must not invalidate a successfully rendered room.
+    worker.reload_name_settings(600_000).await;
+    assert_eq!(worker.name_signatures, signatures);
+    worker.refresh_template_names(600_000);
+    assert!(!worker.dispatch_one(600_000).await);
+}
+
+#[tokio::test]
+async fn voice_name_reload_refreshes_creator_rows_from_the_same_snapshot() {
+    let (live, mut store, http, trace) = fixture();
+    store.snapshot_uses_creator_rows = false;
+    let mut config = full_config();
+    config.creators[0].name_template = "old".to_owned();
+    store.creators.lock().unwrap()[0].name_template = "old".to_owned();
+    store.creators.lock().unwrap()[0].text_channel_name = Some("keep-chat".to_owned());
+    store.creators.lock().unwrap()[0].text_viewer_role_id = Some(123);
+    *store.config.lock().unwrap() = config;
+    slow_rename_room(&live, &store);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.wall_clock = || 0;
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    worker.reload_name_settings(0).await;
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    {
+        let mut config = worker.store.config.lock().unwrap();
+        let creator = &mut config.creators[0];
+        creator.name_template = "new".to_owned();
+        creator.status_template = Some("new status".to_owned());
+        creator.position = config_codec::RoomPosition::Below;
+        creator.permission_source = config_codec::PermissionSource::Channel {
+            channel_id: CATEGORY.to_string(),
+        };
+        creator.always_private = true;
+        creator.text_channels = true;
+        creator.group_by_category = true;
+        let mut added = creator.clone();
+        added.channel_id = "201".to_owned();
+        added.default_limit = 5;
+        added.first_number = 10;
+        config.creators.push(added);
+    }
+    worker.reload_name_settings(300_000).await;
+    worker.refresh_template_names(300_000);
+    assert_eq!(
+        worker.desired_names[&700], "new",
+        "template-only edit must render"
+    );
+    assert_eq!(worker.pending_status[&700], "new status");
+    let creator = &worker.creators[&CREATOR];
+    assert_eq!(
+        creator.position,
+        two_bot_core::voice_rooms::RoomPosition::Below
+    );
+    assert_eq!(
+        creator.permission_source,
+        PermissionSource::Channel(CATEGORY)
+    );
+    assert_eq!(creator.permission_channel_id, Some(CATEGORY));
+    assert!(creator.private_default && creator.text_channels && creator.group_by_category);
+    assert_eq!(
+        creator.default_limit, None,
+        "the codec's zero preserves inheritance"
+    );
+    assert_eq!(creator.text_channel_name.as_deref(), Some("keep-chat"));
+    assert_eq!(creator.text_viewer_role_id, Some(123));
+    assert_eq!(worker.creators[&201].default_limit, Some(5));
+    assert_eq!(worker.creators[&201].first_room_number, 10);
+    assert!(worker.live.read_state().protected_channels.contains(&201));
+    dispatch(&mut worker, 300_000).await;
+    assert_eq!(renames_sent(&trace), ["rename:700:old", "rename:700:new"]);
+
+    worker.store.config.lock().unwrap().creators.clear();
+    worker.reload_name_settings(600_000).await;
+    assert!(
+        worker.creators.is_empty(),
+        "removed creators stop admitting joins"
+    );
+}
+
+#[tokio::test]
+async fn voice_name_settings_notification_invalidates_cached_renders() {
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "[[list:maps]]".to_owned();
+    store.config.lock().unwrap().lists = vec![config_codec::RandomList {
+        name: "maps".to_owned(),
+        choices: vec!["old".to_owned()],
+    }];
+    slow_rename_room(&live, &store);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.wall_clock = || 0;
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    let mut settings = worker.name_settings.clone();
+    settings
+        .lists
+        .insert("maps".to_owned(), vec!["new".to_owned()]);
+    apply_command(&mut worker, ActorCommand::NameSettingsChanged(settings), 1);
+    worker.refresh_template_names(1);
+    assert_eq!(worker.desired_names[&700], "new");
+    assert!(
+        !worker.dispatch_one(1).await,
+        "normal rename pacing still applies"
+    );
+    dispatch(&mut worker, RENAME_MIN_INTERVAL_MS).await;
+    assert_eq!(renames_sent(&trace), ["rename:700:old", "rename:700:new"]);
+}
+
+#[tokio::test]
+async fn voice_name_import_refreshes_creator_template_without_waiting_for_reload() {
+    let (live, mut store, http, trace) = fixture();
+    store.snapshot_uses_creator_rows = false;
+    let mut config = full_config();
+    config.creators[0].name_template = "old".to_owned();
+    store.creators.lock().unwrap()[0].name_template = "old".to_owned();
+    *store.config.lock().unwrap() = config;
+    slow_rename_room(&live, &store);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.wall_clock = || 0;
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    worker.reload_name_settings(0).await;
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(worker.desired_names[&700], "old");
+
+    // Simulate a successful in-bot /import that changes only the creator template.
+    worker.store.config.lock().unwrap().creators[0].name_template = "new".to_owned();
+    let settings = {
+        let config = worker.store.config.lock().unwrap().clone();
+        NameSettings::from_config(&config)
+    };
+    apply_command(
+        &mut worker,
+        ActorCommand::NameSettingsChanged(settings),
+        100_000,
+    );
+    assert_eq!(
+        worker.name_settings_read_ms, None,
+        "import must not push the creator reload a full interval out"
+    );
+
+    // The next tick must pick up the creator edit, not wait for the reload interval.
+    worker.reload_name_settings(100_001).await;
+    worker.refresh_template_names(100_001);
+    assert_eq!(
+        worker.creators[&CREATOR].name_template, "new",
+        "imported creator template must refresh on the next tick"
+    );
+    assert_eq!(worker.desired_names[&700], "new");
+    assert!(
+        !worker.dispatch_one(100_001).await,
+        "normal rename pacing still applies"
+    );
+    dispatch(&mut worker, 400_000).await;
+    assert_eq!(renames_sent(&trace), ["rename:700:old", "rename:700:new"]);
+}
+
+#[tokio::test]
+async fn voice_name_creator_notification_invalidates_cached_renders() {
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "old".to_owned();
+    slow_rename_room(&live, &store);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.wall_clock = || 0;
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    let mut creator = worker.creators[&CREATOR].clone();
+    creator.name_template = "new".to_owned();
+    apply_command(&mut worker, ActorCommand::CreatorAdded(creator), 1);
+    worker.refresh_template_names(1);
+    assert_eq!(worker.desired_names[&700], "new");
+    assert!(!worker.dispatch_one(1).await);
+    dispatch(&mut worker, RENAME_MIN_INTERVAL_MS).await;
+    assert_eq!(renames_sent(&trace), ["rename:700:old", "rename:700:new"]);
+}
+
+#[tokio::test]
 async fn template_names_rerender_only_when_their_facts_change() {
     let (live, store, http, trace) = fixture();
     store.creators.lock().unwrap()[0].name_template = "@@owner@@ · @@num@@".to_owned();
@@ -10758,7 +11284,9 @@ async fn written_settings_reach_automatic_names() {
     );
     assert_eq!(worker.name_settings.no_game_label, "Hangout");
     assert!(worker.name_settings_loaded);
-    assert_eq!(worker.name_settings_read_ms, Some(5));
+    // The stamp stays clear so the next tick re-reads creators too; an
+    // /import must not push their refresh a full interval out.
+    assert_eq!(worker.name_settings_read_ms, None);
 }
 
 #[tokio::test]
@@ -10903,6 +11431,108 @@ async fn finish_detached_after(delay: Duration) {
     tokio::time::advance(delay).await;
     for _ in 0..4 {
         tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test]
+async fn voice_name_obsolete_detached_retry_cannot_replace_a_newer_queued_name() {
+    let (live, store, http, trace) = fixture();
+    slow_rename_room(&live, &store);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.desired_names.insert(700, "A".to_owned());
+    // Deliver a detached timeout through the real completion path.
+    worker
+        .rename_outcomes
+        .0
+        .send(RenameOutcome {
+            channel_id: 700,
+            name: "A".to_owned(),
+            result: Err(RoomHttpError::RenameDeferred),
+        })
+        .unwrap();
+    assert!(!worker.dispatch_one(0).await);
+    assert_eq!(worker.rename_retries[&700].1, RENAME_DEFERRED_RETRY_MS);
+
+    worker.propose_name(700, "B", 1);
+    // B has left the coalescer but waits in the deferred queue behind backoff.
+    for (channel_id, name) in worker.renames.take_due(1) {
+        worker
+            .queue
+            .enqueue(GUILD, RoomAction::RenameRoom { channel_id, name });
+    }
+    let queued = worker.queue.pop_due(GUILD, 1).unwrap();
+    worker.queue.mark_rate_limited(GUILD, 30_000, 1, queued);
+    assert!(!worker.dispatch_one(RENAME_DEFERRED_RETRY_MS).await);
+    assert_eq!(
+        worker.queue.queued_rename_for(GUILD, 700).as_deref(),
+        Some("B")
+    );
+    assert!(!worker.rename_retries.contains_key(&700));
+    dispatch(&mut worker, 30_001).await;
+    assert_eq!(renames_sent(&trace), ["rename:700:B"]);
+}
+
+#[tokio::test]
+async fn voice_name_a_b_a_cancellation_sends_no_needless_http() {
+    let (live, store, http, trace) = fixture();
+    slow_rename_room(&live, &store);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker
+        .live
+        .write_state()
+        .channels
+        .get_mut(&700)
+        .unwrap()
+        .name = Some("A".to_owned());
+    worker.propose_name(700, "B", 0);
+    for (channel_id, name) in worker.renames.take_due(0) {
+        worker
+            .queue
+            .enqueue(GUILD, RoomAction::RenameRoom { channel_id, name });
+    }
+    worker.rename_retries.insert(700, ("A".to_owned(), 1));
+    assert_eq!(
+        worker.propose_name(700, "A", 1),
+        Some(ProposeOutcome::Unchanged)
+    );
+    dispatch(&mut worker, 1).await;
+    assert!(!worker.dispatch_one(RENAME_MIN_INTERVAL_MS).await);
+    assert!(renames_sent(&trace).is_empty());
+}
+
+#[tokio::test]
+async fn voice_name_dispatch_distinguishes_gone_superseded_and_already_applied() {
+    for (reason, tracked, desired, current) in [
+        ("rename_room_gone", false, "B", "A"),
+        ("rename_superseded", true, "C", "A"),
+        ("rename_already_applied", true, "B", "B"),
+    ] {
+        let (live, store, http, trace) = fixture();
+        slow_rename_room(&live, &store);
+        let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        if !tracked {
+            worker.rooms.remove(&700);
+        }
+        worker
+            .live
+            .write_state()
+            .channels
+            .get_mut(&700)
+            .unwrap()
+            .name = Some(current.to_owned());
+        worker.desired_names.insert(700, desired.to_owned());
+        worker.queue.enqueue(
+            GUILD,
+            RoomAction::RenameRoom {
+                channel_id: 700,
+                name: "B".to_owned(),
+            },
+        );
+        let series = format!("two_bot_voice_names_total{{outcome=\"{reason}\"}}");
+        let before = global_series(&series);
+        dispatch(&mut worker, 0).await;
+        assert!(global_series(&series) > before, "missing outcome: {reason}");
+        assert!(renames_sent(&trace).is_empty());
     }
 }
 

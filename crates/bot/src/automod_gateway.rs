@@ -59,6 +59,16 @@ pub(crate) struct Resolved {
     protected_role_ids: HashSet<String>,
 }
 
+impl Resolved {
+    pub(crate) fn mode(&self) -> &'static str {
+        if self.config.dry_run {
+            "dry_run"
+        } else {
+            "enforce"
+        }
+    }
+}
+
 fn is_snowflake(value: &str) -> bool {
     (17..=20).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_digit())
 }
@@ -71,6 +81,15 @@ pub(crate) fn resolve(
     vars: &HashMap<String, String>,
     guild_id: u64,
 ) -> Result<Option<Resolved>, &'static str> {
+    if let Some(warning) = two_bot_core::automod::enforce_value_warning(
+        vars.get("TWO_AUTOMOD_ENFORCE").map(String::as_str),
+    ) {
+        warn!(
+            variable = "TWO_AUTOMOD_ENFORCE",
+            mode = "dry_run",
+            "{warning}"
+        );
+    }
     let config = AutomodConfig::from_map(vars).map_err(|_| "TWO_AUTOMOD configuration invalid")?;
     if !config.enabled {
         return Ok(None);

@@ -174,6 +174,23 @@ fn orphans_accumulate_until_manual_cleanup() {
         .contains("two_bot_voice_orphans_total 2\n"));
 }
 
+#[test]
+fn voice_name_skip_outcomes_are_distinct_and_bounded() {
+    let metrics = Metrics::default();
+    for reason in [
+        "rename_room_gone",
+        "rename_superseded",
+        "rename_already_applied",
+    ] {
+        assert!(two_bot_core::metrics::VOICE_NAME_OUTCOMES.contains(&reason));
+        metrics.voice_name(reason);
+        assert!(metrics.render(None).contains(&format!(
+            "two_bot_voice_names_total{{outcome=\"{reason}\"}} 1\n"
+        )));
+    }
+    assert!(!two_bot_core::metrics::VOICE_NAME_OUTCOMES.contains(&"rename_stale"));
+}
+
 // ---- (5) REST outcomes under the voice templates ----
 
 /// The RoomHttp send path records one `rest_response` per wire send; the
@@ -185,6 +202,7 @@ fn voice_rest_outcomes_land_under_allowlisted_templates() {
         "POST /guilds/:guild/channels",
         "DELETE /channels/:channel",
         "PATCH /guilds/:guild/members/:member",
+        "PUT /channels/:channel/voice-status",
     ] {
         assert!(
             REST_ROUTES.contains(&template),
@@ -199,6 +217,8 @@ fn voice_rest_outcomes_land_under_allowlisted_templates() {
         ("DELETE /channels/:channel", Some(403), "4xx"),
         ("DELETE /channels/:channel", Some(503), "5xx"),
         ("PATCH /guilds/:guild/members/:member", None, "transport"),
+        ("PUT /channels/:channel/voice-status", Some(200), "2xx"),
+        ("PUT /channels/:channel/voice-status", Some(429), "429"),
     ];
     for (route, status, _) in exchanges {
         metrics.rest_response(route, *status);
