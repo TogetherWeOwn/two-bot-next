@@ -269,10 +269,6 @@ const FRESH_SEED_TRIES: u64 = 8;
 /// Least time between two voice status writes for one room.
 pub(super) const STATUS_MIN_INTERVAL_MS: u64 = 10_000;
 
-/// Longest the guild actor waits on a status write before leaving it to
-/// finish on its own task (interactions it answers have 3 s).
-pub(super) const STATUS_INLINE_WAIT_MS: u64 = 1_000;
-
 /// Render a creator's voice status template against the room's facts. Unlike a
 /// name, an empty render clears the status; text the name filter blocks (links,
 /// configured words) clears it too, and Discord's 500-character cap applies.
@@ -730,8 +726,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// Write one due voice status line (the latest render per room), at most
     /// once per [`STATUS_MIN_INTERVAL_MS`] per room. The caller runs it only
     /// when no lifecycle write is due and the guild is not rate limited. The
-    /// actor waits at most [`STATUS_INLINE_WAIT_MS`]; a slower request
-    /// finishes on its own task and reports back on a later dispatch.
+    /// production request detaches immediately and reports its outcome on
+    /// a later dispatch, never blocking creator joins.
     /// Returns true when a write was attempted.
     pub(super) async fn dispatch_voice_status(&mut self, now_ms: u64) -> bool {
         self.collect_status_outcomes(now_ms);
@@ -760,23 +756,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .insert(room_id, now_ms + STATUS_MIN_INTERVAL_MS);
         let result = match self.http.detached_voice_status(room_id, &status) {
             Some(request) => {
-                let mut task = tokio::spawn(request);
-                match tokio::time::timeout(Duration::from_millis(STATUS_INLINE_WAIT_MS), &mut task)
-                    .await
-                {
-                    Ok(joined) => joined.unwrap_or(Err(RoomHttpError::UnknownOutcome)),
-                    Err(_) => {
-                        let outcomes = self.status_outcomes.0.clone();
-                        let detached = status.clone();
-                        tokio::spawn(async move {
-                            let result = task.await.unwrap_or(Err(RoomHttpError::UnknownOutcome));
-                            let _ = outcomes.send((room_id, detached, result));
-                        });
-                        self.status_in_flight.insert(room_id);
-                        self.room_status.insert(room_id, status);
-                        return true;
-                    }
-                }
+                let task = tokio::spawn(request);
+                let outcomes = self.status_outcomes.0.clone();
+                let detached = status.clone();
+                tokio::spawn(async move {
+                    let result = task.await.unwrap_or(Err(RoomHttpError::UnknownOutcome));
+                    let _ = outcomes.send((room_id, detached, result));
+                });
+                self.status_in_flight.insert(room_id);
+                self.room_status.insert(room_id, status);
+                return true;
             }
             None => self.http.set_voice_status(room_id, &status).await,
         };
@@ -784,7 +773,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         true
     }
 
-    /// Apply the outcomes of status writes that outlived the inline wait.
+    /// Collect immediately detached status writes before coalescing the next value.
     fn collect_status_outcomes(&mut self, now_ms: u64) {
         while let Ok((room_id, status, result)) = self.status_outcomes.1.try_recv() {
             self.status_in_flight.remove(&room_id);
@@ -888,8 +877,73 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
         self.name_settings_read_ms = Some(now_ms);
         if let Ok(config) = self.store.config_snapshot(self.live.guild_id).await {
-            self.name_settings = NameSettings::from_config(&config);
+            // Use the same snapshot for creator templates and naming settings.
+            // The export codec omits per-creator companion overrides and folds
+            // an inherited limit into zero; preserve those just as config_apply
+            // does, rather than resetting them on every naming reload.
+            let creators: Option<HashMap<_, _>> = config
+                .creators
+                .iter()
+                .map(|config| {
+                    let channel_id = config.channel_id.parse::<Snowflake>().ok()?;
+                    let mut creator =
+                        self.creators.get(&channel_id).cloned().unwrap_or_else(|| {
+                            let mut creator = CreatorChannel::new(self.live.guild_id, channel_id);
+                            creator.default_limit = Some(0);
+                            creator
+                        });
+                    creator.name_template = config.name_template.clone();
+                    creator.permission_source = match &config.permission_source {
+                        two_bot_core::voice_config::PermissionSource::Creator {} => {
+                            PermissionSource::Creator
+                        }
+                        two_bot_core::voice_config::PermissionSource::Category {} => {
+                            PermissionSource::Category
+                        }
+                        two_bot_core::voice_config::PermissionSource::Channel { channel_id } => {
+                            PermissionSource::Channel(channel_id.parse().ok()?)
+                        }
+                    };
+                    creator.permission_channel_id = match creator.permission_source {
+                        PermissionSource::Channel(id) => Some(id),
+                        _ => None,
+                    };
+                    if config.default_limit != 0 || creator.default_limit.is_some() {
+                        creator.default_limit = Some(i64::from(config.default_limit));
+                    }
+                    creator.private_default = config.always_private;
+                    creator.text_channels = config.text_channels;
+                    creator.position = match config.position {
+                        two_bot_core::voice_config::RoomPosition::Above => RoomPosition::Above,
+                        two_bot_core::voice_config::RoomPosition::Below => RoomPosition::Below,
+                    };
+                    creator.first_room_number = i64::from(config.first_number);
+                    creator.group_by_category = config.group_by_category;
+                    Some((channel_id, creator))
+                })
+                .collect();
+            let Some(creators) = creators else {
+                self.name_settings_loaded = false;
+                return;
+            };
+            if self.creators != creators {
+                self.live.protect_channels(creators.keys().copied());
+                self.creators = creators;
+                self.name_signatures.clear();
+                self.name_inputs = None;
+            }
+            self.update_name_settings(NameSettings::from_config(&config));
             self.name_settings_loaded = true;
+        }
+    }
+
+    /// Facts-only signatures cannot detect list or template/settings edits.
+    /// Invalidate both caches, but leave proposals on the paced rename lane.
+    pub(super) fn update_name_settings(&mut self, settings: NameSettings) {
+        if self.name_settings != settings {
+            self.name_settings = settings;
+            self.name_signatures.clear();
+            self.name_inputs = None;
         }
     }
 

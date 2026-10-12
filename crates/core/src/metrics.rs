@@ -64,6 +64,7 @@ pub const REST_ROUTES: &[&str] = &[
     "PUT /guilds/:guild/bans/:member",
     "PATCH /guilds/:guild/members/:member",
     "PATCH /channels/:channel",
+    "PUT /channels/:channel/voice-status",
     "PUT /channels/:channel/permissions/:overwrite",
     "POST /channels/:channel/messages/bulk-delete",
     "PUT /guilds/:guild/members/:member/roles/:role",
@@ -198,7 +199,9 @@ pub const VOICE_NAME_OUTCOMES: &[&str] = &[
     "blocked",
     "channel_unseen",
     "rename_sent",
-    "rename_stale",
+    "rename_room_gone",
+    "rename_superseded",
+    "rename_already_applied",
     "rename_unseen",
     "rename_no_access",
     "rename_held",
@@ -353,8 +356,8 @@ impl Histogram {
         }
     }
 
-    fn render(&self, out: &mut String, name: &str) {
-        header(out, name, "histogram", "Handler elapsed time in seconds.");
+    fn render(&self, out: &mut String, name: &str, help: &str) {
+        header(out, name, "histogram", help);
         for (bucket, bound) in self.buckets.iter().zip(BUCKETS_MICROS) {
             writeln!(
                 out,
@@ -388,6 +391,7 @@ struct Values {
     missed_events: u64,
     latency_micros: Option<u64>,
     handler: Histogram,
+    voice_join_to_move: Histogram,
     voice_ops: [[u64; 6]; 3],
     voice_reconcile: [u64; 4],
     voice_dead: [u64; 9],
@@ -527,6 +531,16 @@ impl Metrics {
         current.last_error_class = Some(error_class);
     }
 
+    /// Gateway receipt of a creator join to a confirmed successful member move.
+    /// No member/channel labels; failed or uncertain moves are not samples.
+    pub fn voice_join_to_move(&self, elapsed: Duration) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .voice_join_to_move
+            .observe(elapsed);
+    }
+
     /// One finished room lifecycle outcome (TOG-13543). Call once per
     /// terminal create/move/delete: retries and rate-limit backoffs are not
     /// outcomes. Unknown `op`/`outcome` collapse to the trailing `other`
@@ -542,8 +556,8 @@ impl Metrics {
         *counter = counter.saturating_add(1);
     }
 
-    /// Add one reconcile plan size (TOG-13543). `count` is the number of
-    /// rooms in this pass for `action`; zero is a no-op.
+    /// Add actual reconcile transitions or newly queued actions in this pass.
+    /// Repeated unchanged room states contribute zero, which is a no-op.
     pub fn voice_reconcile(&self, action: &str, count: u64) {
         if count == 0 {
             return;
@@ -794,9 +808,16 @@ impl Metrics {
             .unwrap(),
             None => writeln!(out, "two_bot_gateway_latency_seconds NaN").unwrap(),
         }
-        values
-            .handler
-            .render(&mut out, "two_bot_handler_duration_seconds");
+        values.handler.render(
+            &mut out,
+            "two_bot_handler_duration_seconds",
+            "Handler elapsed time in seconds.",
+        );
+        values.voice_join_to_move.render(
+            &mut out,
+            "two_bot_voice_join_to_move_seconds",
+            "Creator join gateway receipt to successful member move in seconds.",
+        );
         header(
             &mut out,
             "two_bot_rest_requests_total",
@@ -891,7 +912,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_reconcile_actions_total",
             "counter",
-            "Reconcile plan sizes by bounded action.",
+            "Reconcile transitions and new enqueues by bounded action.",
         );
         for (action, count) in VOICE_RECONCILE_ACTIONS.iter().zip(values.voice_reconcile) {
             writeln!(
@@ -1466,6 +1487,18 @@ mod tests {
         let text = metrics.render(None);
         assert!(text.contains("two_bot_job_last_error_class{job=\"rank\",class=\"database\"} 0\n"));
         assert!(text.contains("two_bot_job_last_error_class{job=\"rank\",class=\"rest\"} 1\n"));
+    }
+
+    #[test]
+    fn voice_join_latency_is_a_label_free_seconds_histogram() {
+        let metrics = Metrics::default();
+        metrics.voice_join_to_move(Duration::from_millis(125));
+        metrics.voice_join_to_move(Duration::from_millis(375));
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_join_to_move_seconds_count 2\n"));
+        assert!(text.contains("two_bot_voice_join_to_move_seconds_sum 0.5\n"));
+        assert!(text.contains("two_bot_voice_join_to_move_seconds_bucket{le=\"0.1\"} 0\n"));
+        assert!(text.contains("two_bot_voice_join_to_move_seconds_bucket{le=\"0.5\"} 2\n"));
     }
 
     #[test]

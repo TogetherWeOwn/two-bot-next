@@ -17,6 +17,10 @@ Discord action is included here.
 The new switch accepts `legacy`, `session`, or `anchor` through
 `TWO_ONBOARDING_MODE`; legacy selected anchor separately by channel-config
 presence. This is the card-directed mode change. Unset/empty remains legacy.
+`TWO_ONBOARDING_DRY_RUN` accepts only unset, `0` or `1`; any other deployment
+value is a fatal startup failure (`onboarding_gates_invalid`). A legacy stored
+row with any other rendering is ignored (the deployment value wins, logged
+without the value); new stored writes with other values are refused.
 
 Dry run is deliberately per-mode, not a universal mute: game role writes,
 legacy/anchor welcomes and session goodbyes are suppressed; roleless session

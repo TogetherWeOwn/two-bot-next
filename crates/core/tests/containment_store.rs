@@ -397,6 +397,55 @@ async fn two_incidents_cannot_start_concurrently_for_one_guild_executor() -> Tes
 
 #[tokio::test]
 #[ignore = "requires the agent-testdb or CI Postgres service"]
+async fn cooldown_past_the_store_range_is_capped_and_still_blocks() -> TestResult {
+    /// 9999-12-31T23:59:59.999Z: the last instant the store records.
+    const LAST_ISO_MS: i64 = 253_402_300_799_999;
+    let db = TestDb::new(&[MIGRATION]).await?;
+    // The largest window the loader can produce: now + window leaves the store range.
+    let policy = ContainmentPolicy::new(i64::MAX, 120_000, 5)?;
+    let store = db.store();
+    let guild = db.guild("capped");
+    let mut burst = Vec::new();
+    for n in 0..6 {
+        let event = audit(
+            &format!("cap-{n}"),
+            &guild,
+            Some("executor"),
+            DestructiveAction::ChannelDelete,
+            NOW,
+        );
+        burst.push(claimed(&store, &policy, &event, NOW).await?);
+    }
+    let (trigger, heat) = burst[5].clone();
+    let IncidentClaim::Started(incident) =
+        store.begin_incident(&policy, &trigger, heat, NOW).await?
+    else {
+        return Err("incident past the store range must still start".into());
+    };
+    assert_eq!(incident.cooldown_until_ms, LAST_ISO_MS);
+    let stored: (String,) =
+        sqlx::query_as("SELECT cooldown_until FROM containment_incidents WHERE id = $1")
+            .bind(&incident.id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(stored.0, "9999-12-31T23:59:59.999Z");
+
+    // A later same-executor trigger stays suppressed through the capped cooldown.
+    let (other, _) = burst[0].clone();
+    assert_eq!(
+        store
+            .begin_incident(&policy, &other, heat, NOW + 600_000)
+            .await?,
+        IncidentClaim::Blocked {
+            incident_id: incident.id.clone(),
+            state: ContainmentIncidentState::Containing,
+        }
+    );
+    db.finish().await
+}
+
+#[tokio::test]
+#[ignore = "requires the agent-testdb or CI Postgres service"]
 async fn blocker_recheck_inside_the_incident_transaction_refuses() -> TestResult {
     let db = TestDb::new(&[MIGRATION]).await?;
     let policy = ContainmentPolicy::default();

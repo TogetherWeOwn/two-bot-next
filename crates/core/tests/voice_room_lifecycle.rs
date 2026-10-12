@@ -22,6 +22,34 @@ const MEMBER: u64 = 102;
 
 const STAMP: &str = "2026-10-03T00:00:00.000Z";
 
+#[test]
+fn creator_move_has_priority_but_cannot_bypass_a_guild_429() {
+    let queue = ActionQueue::new();
+    queue.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 50 });
+    let deletion = queue.pop_due(GUILD, 0).unwrap();
+    assert!(queue.mark_rate_limited(GUILD, 1_000, 0, deletion));
+    queue.enqueue(
+        GUILD,
+        RoomAction::MoveMember {
+            member_id: OWNER,
+            channel_id: 60,
+        },
+    );
+    assert!(queue.pop_due(GUILD, 999).is_none());
+    let movement = queue.pop_due(GUILD, 1_000).unwrap();
+    assert!(matches!(
+        movement.action,
+        RoomAction::MoveMember { channel_id: 60, .. }
+    ));
+    // The one-writer fence remains intact even for a priority move.
+    assert!(queue.pop_due(GUILD, 1_000).is_none());
+    assert!(queue.mark_succeeded(&movement));
+    assert!(matches!(
+        queue.pop_due(GUILD, 1_000).unwrap().action,
+        RoomAction::DeleteRoom { channel_id: 50 }
+    ));
+}
+
 fn creator() -> CreatorChannel {
     CreatorChannel::new(GUILD, CREATOR)
 }

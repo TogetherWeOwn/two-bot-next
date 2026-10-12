@@ -93,12 +93,17 @@ fn authority_of(endpoint: &str) -> &str {
 }
 
 /// Parse the endpoint structurally before signing. Refuses absent host,
-/// userinfo, query, fragment, invalid port and malformed bracketed authority.
-/// Valid HTTPS origins, valid explicit ports and path prefixes pass through;
-/// diagnostics are constants that never echo the input.
+/// userinfo, query, fragment, backslash, invalid port and malformed bracketed
+/// authority. Valid HTTPS origins, valid explicit ports and path prefixes pass
+/// through; diagnostics are constants that never echo the input.
 fn parse_endpoint(endpoint: &str) -> Result<ParsedEndpoint, S3ConfigError> {
     if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
         return Err(S3ConfigError(ERR_SCHEME.to_owned()));
+    }
+    // WHATWG parsing reads `\` as `/` for http(s); the raw prefix split does not.
+    // Refusing it keeps both readings on the same host and path.
+    if endpoint.contains('\\') {
+        return Err(S3ConfigError(ERR_AUTHORITY.to_owned()));
     }
     // `https:///prefix` parses but has no authority at all: no destination.
     if authority_of(endpoint).is_empty() {
@@ -909,6 +914,9 @@ mod tests {
             "http://localhost:9000@remote.invalid/",
             "http://127.0.0.1:9000?x=1",
             "http://[::1]:9000#frag",
+            "https://acct.r2.cloudflarestorage.com\\s3-prefix",
+            "https://proxy.example.com/s3-prefix\\nested",
+            "http://127.0.0.1:9000\\s3-prefix",
         ];
         for endpoint in invalid {
             let vars = env_of(&[

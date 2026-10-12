@@ -18,7 +18,7 @@ No channel, member, token, body or ID leaves the process in any field
 | `voice_event` name | Emission site | Level / condition |
 | --- | --- | --- |
 | `voice_operation` | `crates/bot/src/voice_rooms.rs` (`observe_voice_operation`) | `info` on `success`, `warn` otherwise; carries `op`/`outcome` |
-| `voice_reconcile` | `crates/bot/src/voice_rooms.rs` (reconcile plan) | `info`, only when at least one of `delete_enqueued`, `suspended`, `resumed`, `succession_enqueued` is nonzero; carries plan counts |
+| `voice_reconcile` | `crates/bot/src/voice_rooms.rs` (`reconcile`) | `info`, only when at least one of `delete_enqueued`, `suspended`, `resumed`, `succession_enqueued` is nonzero; counts new enqueues and actual access-state transitions, not rooms scanned |
 | `voice_dead_letter` | `crates/bot/src/voice_rooms.rs` (`mark_failed_observed`) | `warn`, only when a queued action exhausts `QUEUE_MAX_ATTEMPTS`; carries `action`/`attempts` |
 | `voice_creator_orphan` | `crates/bot/src/voice_rooms.rs` (creator compensation) | `warn` with `outcome = "manual_needed"`, only when compensation delete failed |
 

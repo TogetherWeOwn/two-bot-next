@@ -23,7 +23,8 @@ it does **not** enable live Discord dispatch.
 
 1. Respect the staging allowlist before registering any picker. An empty
    `TWO_SELF_ROLE_PANELS` disables the feature. `TWO_SELF_ROLE_DRY_RUN=1`
-   must audit without emitting role mutations.
+   must audit without emitting role mutations. `TWO_SELF_ROLE_DRY_RUN` accepts
+   only unset, `0` or `1`; any other value parks self-roles at boot.
 2. Resolve configured roles/channels and revalidate live permission masks and
    hierarchy before mutation. A configured role whose id is the guild id (the
    @everyone role) is rejected at catalogue validation when guild context is

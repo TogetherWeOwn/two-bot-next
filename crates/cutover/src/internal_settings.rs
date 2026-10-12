@@ -53,6 +53,13 @@ fn action_error(error: SettingsWriteError) -> ActionError {
                         "settings_value_nul",
                     );
                 }
+                WriteRefusal::InvalidGateValue(_) => {
+                    return ActionError::new(
+                        ErrorCode::Malformed,
+                        "\"value\" must be a boolean, 0 or 1 for this setting",
+                        "settings_value_invalid",
+                    );
+                }
             };
             ActionError::new(
                 ErrorCode::ActionNotAllowed,
@@ -90,5 +97,12 @@ mod tests {
         assert_eq!(malformed.status(), 400);
         assert!(!malformed.code.retryable());
         assert_eq!(malformed.log_reason, "settings_value_nul");
+        let invalid_gate = action_error(SettingsWriteError::Refused(
+            WriteRefusal::InvalidGateValue("TWO_SELF_ROLE_DRY_RUN".to_owned()),
+        ));
+        assert_eq!(invalid_gate.code, ErrorCode::Malformed);
+        assert_eq!(invalid_gate.status(), 400);
+        assert!(!invalid_gate.code.retryable());
+        assert_eq!(invalid_gate.log_reason, "settings_value_invalid");
     }
 }
