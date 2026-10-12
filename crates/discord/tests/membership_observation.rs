@@ -459,6 +459,8 @@ async fn governed_observed_read_with_stalled_body_releases_lane() {
 /// arm and release the lane: headers land in milliseconds on loopback, so a
 /// short real-time deadline proves the error is the body bound (not the header
 /// one) and that the wait stays near the deadline instead of the 30 s stall.
+/// The 600 ms deadline also pins the body-phase cap: the body may take at most
+/// what is left of the absolute deadline, not the fixed 5 s allowance.
 /// Deleting the release in the body-timeout arm orphans the permit (a second
 /// admit is `Blocked`, the lane stays held).
 #[tokio::test]
@@ -485,7 +487,7 @@ async fn transport_stalled_body_times_out_and_releases_lane() {
     let request = Request::from_route(&Route::GetGuildRoles { guild_id: 2222 });
     let started = tokio::time::Instant::now();
     let result = transport
-        .send_request(&request, Some(started + Duration::from_secs(2)))
+        .send_request(&request, Some(started + Duration::from_millis(600)))
         .await;
     let elapsed = started.elapsed();
     assert_eq!(
@@ -494,8 +496,8 @@ async fn transport_stalled_body_times_out_and_releases_lane() {
         "headers arrived, so the stall must report the body bound"
     );
     assert!(
-        elapsed < Duration::from_secs(15),
-        "the body bound must win near the 2 s deadline, not the 30 s stall: {elapsed:?}"
+        elapsed < Duration::from_secs(3),
+        "the body bound must win near the 600 ms deadline, not the 30 s stall: {elapsed:?}"
     );
     assert_eq!(mock.requests().len(), 1, "one wire request");
     assert!(
