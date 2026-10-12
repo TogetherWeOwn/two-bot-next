@@ -36,6 +36,7 @@ pub mod parse;
 pub mod raid_tools;
 pub mod reengagement;
 pub mod rest;
+pub mod retention;
 pub mod rollback_delta;
 pub mod self_role_store;
 pub mod settings;

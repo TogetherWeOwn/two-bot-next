@@ -95,9 +95,14 @@ identity-bearing field require source review and an explicit manifest update.
 
 ## Retention and explicit exceptions
 
-No new automatic age-based purger is installed by this change. Covered activity
-persists until an authorized erasure or a separate existing feature lifecycle
-removes it. Do not claim a 30/90-day TTL where no enforcing timer exists.
+The retention job (`two-bot-cutover::retention`, migration `0427`) enforces the
+rolling windows: raw presence/voice rows roll off at 30 days, the audit-log
+cache expires at 45 days, and user deletion requests complete in under 72
+hours with a receipt. Long-term aggregates (counts, streaks) are never
+time-purged, and a departed guild's rows go only through the guild-purge
+queue keyed on a true guild removal. Every run reports per-class metrics and
+supports a dry run that deletes nothing. Do not claim a TTL beyond these
+enforced windows.
 
 The manifest explicitly retains these control-plane records:
 
