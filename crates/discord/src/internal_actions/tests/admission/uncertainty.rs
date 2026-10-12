@@ -224,7 +224,7 @@ async fn admission_caller_authorization_cannot_bypass_another_tokens_held_lane()
         .build()
         .unwrap();
     assert_eq!(
-        transport.send_request(&request).await.unwrap_err(),
+        transport.send_request(&request, None).await.unwrap_err(),
         "caller-supplied authorization is forbidden"
     );
     assert_eq!(mock.count(), 0);

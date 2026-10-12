@@ -2,7 +2,7 @@
 #[allow(dead_code)]
 mod common;
 
-use common::{MockRest, ScriptedResponse};
+use common::{MockRest, ScriptedResponse, APP_ID, GUILD_ID};
 use std::sync::{
     atomic::{AtomicU32, Ordering},
     Arc, Mutex,
@@ -222,6 +222,14 @@ impl SendAdmission for SingleFlightLane {
             let held = Arc::clone(&self.held);
             let released = Arc::clone(&self.released);
             Box::pin(async move {
+                // Real admission pays latency (a DB round trip) before
+                // granting. An instant grant lets nested wire timers tie and
+                // hides a missing outer margin: the outer abort would win the
+                // tie and orphan the permit, but the test would still pass.
+                // This pause pins the ordering — only a header timer that
+                // lives inside the permit scope (where a GET releases the
+                // lane) keeps the retries `Blocked`-free.
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 Ok(AdmissionPermit::new(Box::new(SingleFlightRelease {
                     held,
                     released,
@@ -295,6 +303,65 @@ async fn governed_observed_read_with_stalled_headers_retries_each_attempt_and_re
         .admit()
         .await
         .expect("the lane must admit once the timed-out GETs release it");
+    permit.complete(None).await.expect("test lane completion");
+    mock.shutdown().await;
+}
+
+/// The registry GET (`guild_commands`) travels the same budgeted wire path as
+/// the observed reads: a stall must time out inside the permit scope and
+/// release the lane instead of orphaning it. Single attempt (no retry on
+/// timeouts there), so exactly one wire request, one admission, one release.
+#[tokio::test(start_paused = true)]
+async fn governed_guild_commands_with_stalled_headers_releases_lane() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mock = MockRest::start(
+        vec![],
+        ScriptedResponse::json(200, serde_json::json!([])).delayed(Duration::from_secs(600)),
+    )
+    .await;
+    let lane = Arc::new(SingleFlightLane {
+        key: TokenKey::for_bot_token("fixture-token").unwrap(),
+        held: Arc::new(Mutex::new(false)),
+        admits: AtomicU32::new(0),
+        blocked: AtomicU32::new(0),
+        released: Arc::new(AtomicU32::new(0)),
+    });
+    let exec = ActionExecutor::with_admission(
+        "fixture-token".to_owned(),
+        Some(mock.origin()),
+        Arc::clone(&lane) as Arc<dyn SendAdmission>,
+    )
+    .expect("governed executor builds against loopback");
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        exec.guild_commands(APP_ID, GUILD_ID),
+    )
+    .await
+    .expect("a stalled registry read must not outlive the moderation bound");
+    assert!(
+        result.is_err(),
+        "stall is an error, not an empty registry: {result:?}"
+    );
+    assert_eq!(mock.requests().len(), 1, "one wire request");
+    assert_eq!(lane.admits.load(Ordering::SeqCst), 1, "one admission");
+    assert_eq!(
+        lane.blocked.load(Ordering::SeqCst),
+        0,
+        "no Blocked on the read's own permit"
+    );
+    assert!(
+        !*lane.held.lock().unwrap(),
+        "a timed-out registry GET must release the lane"
+    );
+    assert_eq!(
+        lane.released.load(Ordering::SeqCst),
+        1,
+        "the timed-out GET attempt releases its permit"
+    );
+    let permit = lane
+        .admit()
+        .await
+        .expect("the lane must admit once the timed-out GET releases it");
     permit.complete(None).await.expect("test lane completion");
     mock.shutdown().await;
 }

@@ -353,7 +353,7 @@ async fn read_discord<T: serde::de::DeserializeOwned>(
         request.map_err(|_| Check::fail(check, "Discord request invalid (checks stopped)"))?;
     let (response, _) = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        transport.send_request(&request),
+        transport.send_request(&request, None),
     )
     .await
     .map_err(|_| Check::fail(check, "Discord request timed out (lane held)"))?

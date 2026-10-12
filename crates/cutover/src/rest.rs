@@ -252,11 +252,13 @@ impl RestClient {
             self.pace().await;
             let request = make()?;
             self.inner.requests.fetch_add(1, Ordering::Relaxed);
-            let (res, _) =
-                tokio::time::timeout(Duration::from_secs(30), transport.send_request(&request))
-                    .await
-                    .map_err(|_| RestError::Wire("request timed out; lane held".to_owned()))?
-                    .map_err(RestError::Wire)?;
+            let (res, _) = tokio::time::timeout(
+                Duration::from_secs(30),
+                transport.send_request(&request, None),
+            )
+            .await
+            .map_err(|_| RestError::Wire("request timed out; lane held".to_owned()))?
+            .map_err(RestError::Wire)?;
             match res.status {
                 200..=299 => return Ok(ListPage::Read(serde_json::from_slice(&res.body)?)),
                 403 | 404 => return Ok(ListPage::Interrupted(ScanCompletion::Unreadable)),
@@ -287,11 +289,13 @@ impl RestClient {
             self.pace().await;
             let request = make()?;
             self.inner.requests.fetch_add(1, Ordering::Relaxed);
-            let (res, _) =
-                tokio::time::timeout(Duration::from_secs(30), transport.send_request(&request))
-                    .await
-                    .map_err(|_| RestError::Wire("request timed out; lane held".to_owned()))?
-                    .map_err(RestError::Wire)?;
+            let (res, _) = tokio::time::timeout(
+                Duration::from_secs(30),
+                transport.send_request(&request, None),
+            )
+            .await
+            .map_err(|_| RestError::Wire("request timed out; lane held".to_owned()))?
+            .map_err(RestError::Wire)?;
             match res.status {
                 200..=299 => return Ok(Some(serde_json::from_slice(&res.body)?)),
                 403 | 404 => return Ok(None),
@@ -422,11 +426,13 @@ impl RestClient {
                 .reason(reason)
                 .try_into_request()?;
             self.inner.requests.fetch_add(1, Ordering::Relaxed);
-            let (res, _) =
-                tokio::time::timeout(Duration::from_secs(30), transport.send_request(&request))
-                    .await
-                    .map_err(|_| RestError::Wire("request timed out; lane held".to_owned()))?
-                    .map_err(RestError::Wire)?;
+            let (res, _) = tokio::time::timeout(
+                Duration::from_secs(30),
+                transport.send_request(&request, None),
+            )
+            .await
+            .map_err(|_| RestError::Wire("request timed out; lane held".to_owned()))?
+            .map_err(RestError::Wire)?;
             match res.status {
                 200..=299 => return Ok(DeleteOutcome::Deleted),
                 404 => return Ok(DeleteOutcome::AlreadyGone),
