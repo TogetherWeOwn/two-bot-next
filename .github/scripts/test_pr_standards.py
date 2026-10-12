@@ -165,11 +165,28 @@ class CardAndInternalRefs(unittest.TestCase):
             f = ps.evaluate(env(BODY=clean, REPO_PRIVATE="false", HEAD_REF=ref))
             self.assertEqual([], f, ref)
 
+    def test_public_branch_all_fixed_patterns_follow_mode(self):
+        # FIXED_INTERNAL is now consumed only by the branch/commit gates (title/body
+        # go through strict_hits/other_hits), so the branch gate must pin every
+        # non-ticket-id pattern. Each ref carries only its own pattern.
+        clean = GOOD_BODY.replace("Refs: TOG-1234", "Fixes #12")
+        refs = ("fix/x-agent://abc", "fix/x-(/TOG/issues/abc)", "fix/x-localhost-y",
+                "fix/x-10.0.0.5-y", "fix/x-box.tail1234.ts.net-y",
+                "fix/x-workforce.infextion.net-y")
+        for mode, level in (("warn", "warning"), ("error", "error")):
+            for ref in refs:
+                f = ps.evaluate(env(BODY=clean, REPO_PRIVATE="false",
+                                    PR_STANDARDS_MODE=mode, HEAD_REF=ref))
+                self.assertEqual([(level, "Internal reference")], levels(f), (mode, ref))
+                self.assertIn("branch name", f[0].message, (mode, ref))
+
     def test_public_title_body_strict_subset_always_errors(self):
         # Tracker id, instance UI link and internal host fail the title/body even in warn mode.
         # Each fixture carries only its own pattern, so demoting one strict pattern fails this test.
+        # Hostnames are case-insensitive and instance links stay links inside inline code.
         clean = GOOD_BODY.replace("Refs: TOG-1234", "Fixes #12")
-        for leak in ("TOG-123", "(/TOG/issues/abc)", "https://workforce.infextion.net/x"):
+        for leak in ("TOG-123", "(/TOG/issues/abc)", "`/TOG/issues/abc`",
+                     "https://workforce.infextion.net/x", "https://WORKFORCE.INFEXTION.NET/x"):
             for where in ("TITLE", "BODY"):
                 body = clean if where == "TITLE" else GOOD_BODY.replace("Refs: TOG-1234", leak)
                 title = "fix(auth): refresh the key " + leak if where == "TITLE" else "fix(auth): refresh the key"
@@ -241,6 +258,19 @@ class Push(unittest.TestCase):
         self.assertEqual([("error", "Internal reference")],
                          levels(ps.evaluate(env(EVENT="push", COMMITS=c, REPO_PRIVATE="false"))))
         self.assertEqual([], ps.evaluate(env(EVENT="push", COMMITS=c, REPO_PRIVATE="true")))
+
+    def test_public_history_all_fixed_patterns_follow_mode(self):
+        # Same pin as the branch gate: every non-ticket-id entry in FIXED_INTERNAL
+        # must warn/error on push. Each message carries only its own pattern.
+        leaks = ("agent://abc", "(/TOG/issues/abc)", "http://localhost:3100/x",
+                 "http://10.0.0.5/x", "https://box.tail1234.ts.net/x",
+                 "https://workforce.infextion.net/x")
+        for leak in leaks:
+            c = self.commits(f"fix(auth): refresh the key (#12)\n\nSee {leak}")
+            for mode, level in (("warn", "warning"), ("error", "error")):
+                f = ps.evaluate(env(EVENT="push", COMMITS=c, REPO_PRIVATE="false",
+                                    PR_STANDARDS_MODE=mode))
+                self.assertEqual([(level, "Internal reference")], levels(f), (mode, leak))
 
     def test_garbage_commits_json_does_not_crash(self):
         self.assertEqual([], ps.evaluate(env(EVENT="push", COMMITS="not json")))

@@ -60,8 +60,8 @@ COMMENT = re.compile(r"<!--.*?-->", re.S)
 # title/body check, regardless of PR_STANDARDS_MODE.
 # The remaining fixed patterns (agent links, localhost, private-network addresses, tailnet names)
 # stay at PR_STANDARDS_MODE: they are common in legitimate verification prose.
-INSTANCE_UI = (re.compile(r"(?:^|[\s(<\[])/[A-Z]{2,6}/(?:issues|agents|projects|approvals|runs)/"), "an instance UI link")
-HOST_INTERNAL = (re.compile(r"\binfextion\.net\b"), "the internal Paperclip host")
+INSTANCE_UI = (re.compile(r'(?:^|[\s(<\[`"\'])/[A-Z]{2,6}/(?:issues|agents|projects|approvals|runs)/'), "an instance UI link")
+HOST_INTERNAL = (re.compile(r"\binfextion\.net\b", re.I), "the internal Paperclip host")
 STRICT_FIXED = [INSTANCE_UI, HOST_INTERNAL]
 OTHER_FIXED = [
     (re.compile(r"\bagent://"), "an agent:// link"),
@@ -150,7 +150,8 @@ def internal_hits(text, prefixes, ignore_case=False):
 def strict_hits(text, prefixes):
     """Fail-closed subset for public title/body: tracker ids, instance UI links, internal host.
 
-    Always case-sensitive in prose. Scans the raw text, including HTML comments:
+    Tracker ids stay case-sensitive in prose; the internal host matches in any case
+    (hostnames are case-insensitive). Scans the raw text, including HTML comments:
     comment text is still stored and served. Returns the ticket-id label with the
     matched value and the other labels without echoing the matched value."""
     text = text or ""
