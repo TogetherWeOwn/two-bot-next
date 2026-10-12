@@ -538,10 +538,7 @@ async fn transport_truncated_body_releases_lane() {
         let (mut stream, _) = listener.accept().await.expect("accept");
         let mut buf = Vec::with_capacity(1024);
         let mut chunk = [0u8; 1024];
-        loop {
-            let Ok(n) = stream.read(&mut chunk).await else {
-                break;
-            };
+        while let Ok(n) = stream.read(&mut chunk).await {
             if n == 0 {
                 break;
             }

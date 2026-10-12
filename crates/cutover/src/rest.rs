@@ -1254,10 +1254,7 @@ mod tests {
                     accepted.fetch_add(1, Ordering::SeqCst);
                     let mut buf = Vec::with_capacity(1024);
                     let mut chunk = [0u8; 1024];
-                    loop {
-                        let Ok(n) = stream.read(&mut chunk).await else {
-                            break;
-                        };
+                    while let Ok(n) = stream.read(&mut chunk).await {
                         if n == 0 {
                             break;
                         }

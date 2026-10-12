@@ -984,7 +984,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// A preflight read whose headers never arrive must fail at the 30 s
     /// absolute deadline instead of parking the check sequence: the deadline
     /// lives in the transport call, so reverting it to `None` hangs here.
@@ -999,14 +998,11 @@ mod tests {
             .expect("bind stall");
         let origin = format!("http://{}", listener.local_addr().expect("addr"));
         let handle = tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            use tokio::io::AsyncReadExt as _;
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut buf = Vec::with_capacity(1024);
             let mut chunk = [0u8; 1024];
-            loop {
-                let Ok(n) = stream.read(&mut chunk).await else {
-                    break;
-                };
+            while let Ok(n) = stream.read(&mut chunk).await {
                 if n == 0 {
                     break;
                 }
@@ -1036,6 +1032,7 @@ mod tests {
         handle.abort();
     }
 
+    #[test]
     fn target_collection_deduplicates_and_combines_channel_requirements() {
         let mut env = vars("2222", "session");
         env.insert("DISCORD_LANDING_CHANNEL_IDS".into(), "6666,7777".into());
