@@ -111,6 +111,39 @@ fn apply_stored_dry_run(vars: &mut HashMap<String, String>, stored: Option<&str>
     }
 }
 
+/// Merge a stored settings snapshot over the boot-validated deployment map.
+///
+/// This owns both halves of the dry-run handling: the generic stored-key loop
+/// deliberately excludes `TWO_ONBOARDING_DRY_RUN` (plus boot-only identity and
+/// mode keys), and `apply_stored_dry_run` then merges that key only when it is
+/// exactly `"0"`/`"1"`. Keeping the filter and the helper in one function keeps
+/// a `CONFIG_KEYS` refactor from silently re-copying a legacy `"true"` row into
+/// `vars`, which would fail `OnboardingConfig::from_map` closed and poison the
+/// job row. Returns the merged map plus whether a present-but-invalid stored
+/// dry-run value was refused (the caller logs the key, never the value).
+/// No database access: pure merge, directly unit-testable.
+fn merge_stored_vars(
+    deployment: &HashMap<String, String>,
+    stored: &HashMap<String, String>,
+) -> (HashMap<String, String>, bool) {
+    let mut vars = deployment.clone();
+    for key in CONFIG_KEYS.iter().filter(|key| {
+        !matches!(
+            **key,
+            "DISCORD_GUILD_ID" | "TWO_ONBOARDING_MODE" | "TWO_ONBOARDING_DRY_RUN"
+        )
+    }) {
+        if let Some(value) = stored.get(*key) {
+            vars.insert((*key).to_owned(), value.clone());
+        }
+    }
+    let refused = apply_stored_dry_run(
+        &mut vars,
+        stored.get("TWO_ONBOARDING_DRY_RUN").map(String::as_str),
+    );
+    (vars, refused)
+}
+
 impl OnboardingRuntime {
     pub async fn from_env(
         pool: PgPool,
@@ -189,26 +222,13 @@ impl OnboardingRuntime {
         .map_err(|_| RuntimeError::Settings)?;
         let cache = SettingsCache::load(&snapshot);
         let stored = cache.env_snapshot(Some(&self.guild_id.to_string()));
-        let mut vars = self.deployment.clone();
-        for key in CONFIG_KEYS.iter().filter(|key| {
-            !matches!(
-                **key,
-                "DISCORD_GUILD_ID" | "TWO_ONBOARDING_MODE" | "TWO_ONBOARDING_DRY_RUN"
-            )
-        }) {
-            if let Some(value) = stored.get(*key) {
-                vars.insert((*key).to_owned(), value.clone());
-            }
-        }
-        // A legacy stored dry-run row must not fail the worker closed: only
-        // an exact "0"/"1" overrides the boot-validated deployment value. A
-        // refused row keeps deployment and logs the key (never the value), so
-        // the job keeps running instead of poisoning itself into `failed` and
-        // blocking every later boot in `recover_onboarding_jobs`.
-        if apply_stored_dry_run(
-            &mut vars,
-            stored.get("TWO_ONBOARDING_DRY_RUN").map(String::as_str),
-        ) {
+        // A legacy stored dry-run row must not fail the worker closed: see
+        // `merge_stored_vars`. A refused row keeps deployment and logs the key
+        // (never the value), so the job keeps running instead of poisoning
+        // itself into `failed` and blocking every later boot in
+        // `recover_onboarding_jobs`.
+        let (vars, refused) = merge_stored_vars(&self.deployment, &stored);
+        if refused {
             tracing::error!(
                 "stored TWO_ONBOARDING_DRY_RUN must be exactly \"0\" or \"1\" when set; keeping deployment value"
             );
@@ -831,5 +851,38 @@ mod tests {
                 "{raw:?} must not invent a value"
             );
         }
+    }
+
+    /// The filter exclusion and the helper must hold together: a stored
+    /// `"true"` next to another stored key must keep the deployment dry-run
+    /// value and still merge the other key, and the merged map must parse.
+    /// Deleting `"TWO_ONBOARDING_DRY_RUN"` from the exclusion filter copies
+    /// `"true"` into the map and fails this test (mutant check).
+    #[test]
+    fn stored_merge_excludes_legacy_dry_run_but_merges_other_keys() {
+        let deployment = HashMap::from([
+            ("DISCORD_GUILD_ID".to_owned(), "2222".to_owned()),
+            ("TWO_ONBOARDING_DRY_RUN".to_owned(), "0".to_owned()),
+        ]);
+        let stored = HashMap::from([
+            ("TWO_ONBOARDING_DRY_RUN".to_owned(), "true".to_owned()),
+            ("DISCORD_LANDING_CHANNEL_IDS".to_owned(), "12".to_owned()),
+        ]);
+        let (vars, refused) = merge_stored_vars(&deployment, &stored);
+        assert!(refused, "legacy stored dry-run must report refusal");
+        assert_eq!(
+            vars.get("TWO_ONBOARDING_DRY_RUN").map(String::as_str),
+            Some("0"),
+            "legacy stored dry-run must keep deployment"
+        );
+        assert_eq!(
+            vars.get("DISCORD_LANDING_CHANNEL_IDS").map(String::as_str),
+            Some("12"),
+            "other stored keys must still merge"
+        );
+        let config = OnboardingConfig::from_map(&vars)
+            .expect("merged map must parse")
+            .expect("guild present");
+        assert!(!config.gates.dry_run);
     }
 }
