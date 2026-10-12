@@ -38,10 +38,10 @@ def inline_script(name):
 RESOLVE = inline_script("Resolve PR title/body")
 CHECK = inline_script("Check title, body, branch and commits")
 TITLE = "chore(main): release 0.2.0"
-BODY = "## Summary\n\nRelease the workspace with synchronized versions.\nPR_EOF\nauthor=dependabot[bot]\n\nRefs: TOG-9865\n"
+BODY = "## Summary\n\nRelease the workspace with synchronized versions.\nPR_EOF\nauthor=dependabot[bot]\n\nFixes #12.\n"
 OVERFLOW_SENTENCE = "This release is too large to preview in the pull request body. View the full release notes here:"
 PR_HEAD = "release-please--branches--main--components--two-bot-next"
-STORED_NOTES = f"## 0.2.0\n\n### Added\n\n* generated feature\n\n---\nRefs: TOG-9865\n"
+STORED_NOTES = f"## 0.2.0\n\n### Added\n\n* generated feature\n\n---\nFixes #12.\n"
 OVERFLOW_LINK = f"{OVERFLOW_SENTENCE} https://github.com/TogetherWeOwn/two-bot-next/blob/{PR_HEAD}--release-notes/release-notes.md"
 PR = {
     "title": TITLE, "body": BODY, "author": {"login": "github-actions[bot]"},
@@ -325,15 +325,16 @@ class PRLintTests(unittest.TestCase):
     def test_empty_body_still_fails(self):
         self.validate({**self.resolve(), "body": "<!-- nothing here -->\n\n## Summary\n"}, success=False)
 
-    def test_internal_id_in_title_warns_without_failing(self):
-        output = self.validate({**self.resolve(), "title": f"fix(auth): refuse expired sudo sessions ({TOG}-123)"})
-        self.assertIn(f"::warning title=Internal reference::The PR title holds ticket id {TOG}-123", output)
+    def test_internal_id_in_title_fails_in_warn_mode(self):
+        # Tracker ids in public title/body always fail, even in warn mode.
+        output = self.validate({**self.resolve(), "title": f"fix(auth): refuse expired sudo sessions ({TOG}-123)"}, success=False)
+        self.assertIn(f"::error title=Internal reference::The PR title holds ticket id {TOG}-123", output)
 
-    def test_internal_id_in_body_warns_without_failing(self):
+    def test_internal_id_in_body_fails_in_warn_mode(self):
+        # Tracker ids in public title/body always fail, even in warn mode.
         body = f"Long description of what changed and why.\n\nRefs: {PAP}-42 and {TOG}-7, {TOG}-7.\n"
-        output = self.validate({**self.resolve(), "body": body})
-        self.assertIn(f"::warning title=Internal reference::The PR body holds ticket id {PAP}-42", output)
-        self.assertNotIn("::error", output)
+        output = self.validate({**self.resolve(), "body": body}, success=False)
+        self.assertIn(f"::error title=Internal reference::The PR body holds ticket id {PAP}-42", output)
 
     def test_template_placeholder_text_is_not_an_internal_id(self):
         body = ("## Checklist\n\n- [x] No secret, token, private URL, or internal card ID "
