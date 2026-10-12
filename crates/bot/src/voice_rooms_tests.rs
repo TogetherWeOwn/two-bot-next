@@ -4458,6 +4458,32 @@ async fn wait_trace(trace: &Trace, entry: &str) {
     }
 }
 
+/// Wait for any trace entry starting with `prefix`. The actor path runs the
+/// deferred post-move respace concurrently with ownership commands, so a
+/// Join created after the respace carries the respaced room position
+/// (`Some(16)` with `POSITION_STEP = 16`) while one created before it
+/// carries none. Pinning the exact position makes the test racy; the name
+/// and category prefix is the stable assertion.
+async fn wait_trace_prefix(trace: &Trace, prefix: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if trace
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|value| value.starts_with(prefix))
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "lifecycle trace deadline waiting for prefix {prefix}: {:?}",
+            trace.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// Runtime with one tracked room (channel 500, owner/creator `MEMBER`) and a
 /// second occupant 301. Drives the real actor so ownership commands run
 /// against live worker state. The trailing voice frames are Discord reporting
