@@ -360,6 +360,38 @@ impl<S: InviteSnapshotStore> InviteTracker<S> {
         self.store.store_all(guild_id, &[state]);
     }
 
+    /// Rotate one permanent invite code without dropping its funnel row.
+    ///
+    /// Drops the `old_code` snapshot row and stores the `new_code` row
+    /// carrying the old row's inviter and channel with `uses` reset to zero:
+    /// a rotated permanent invite is fresh in Discord but keeps its funnel
+    /// attribution. Returns the stored row, or `None` (storing nothing) when
+    /// `old_code` is unknown.
+    pub fn rotate_code(
+        &self,
+        guild_id: Snowflake,
+        old_code: &str,
+        new_code: &str,
+    ) -> Option<InviteState> {
+        let current = self.store.load(guild_id);
+        let old = current.iter().find(|state| state.code == old_code)?.clone();
+        let rotated = InviteState {
+            code: new_code.to_owned(),
+            uses: 0,
+            inviter_id: old.inviter_id,
+            channel_id: old.channel_id,
+        };
+        self.store.store_all(guild_id, &[rotated.clone()]);
+        let live: HashSet<String> = current
+            .iter()
+            .map(|state| state.code.clone())
+            .filter(|code| code != old_code)
+            .chain(std::iter::once(new_code.to_owned()))
+            .collect();
+        self.store.delete_missing(guild_id, &live);
+        Some(rotated)
+    }
+
     /// Attribution string for a join, given the codes that grew.
     #[must_use]
     pub fn attribute(&self, grew: &[String], guild_has_vanity: bool) -> String {
