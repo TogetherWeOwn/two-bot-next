@@ -16,6 +16,7 @@
 //! The runtime pipeline calls from one ordered blocking dispatch worker;
 //! the shard is polled independently on the multi-thread Tokio runtime.
 
+pub mod backfill_audit;
 pub mod backfill_cursors;
 pub mod backfill_history;
 pub mod journal;

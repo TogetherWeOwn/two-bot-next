@@ -305,6 +305,10 @@
       "sha256": "5b51e4a320368ca9bc68834dfd4ade19e910aa46129b5e1940bec919fd3d067c",
       "justification": "Resumable per-family backfill cursors so a crash resumes from the persisted cursor, never from zero; ids/cursors/timestamps only."
     },
+    "crates/store/migrations/0409_backfill_history.sql": {
+      "sha256": "3ec60c7b6c7b98448125631d8857513eee0d23e9487334ebfac9ed0db0963f10",
+      "justification": "Channel-history metadata catch-up: message, channel and author ids plus send timestamp only, no body column; resume via backfill_cursors family history."
+    },
     "crates/cutover/migrations/0418_voice_join_grants.sql": {
       "sha256": "e0f7419d2526a36b822892b5206619f24684f3edfa0231ac43262c1116fcfb03",
       "justification": "Voice V3 approved Connect grants: durable voice_join_grants witness per approved room member, written before the Discord grant and retired only after revocation, so a restart cannot strand a Connect allow past /public."
@@ -340,6 +344,10 @@
     "crates/cutover/migrations/0426_community_facts_guild_source.sql": {
       "sha256": "9da078d3f29430320b79d2d82cfa6e4b1d2d557384a98d7dddca97783429d2dd",
       "justification": "RSVP check-in capacity count index: cover (guild_id, source) so record_checkin counts the occurrence without scanning the guild message history while holding the occurrence lock."
+    },
+    "crates/store/migrations/0427_backfill_audit_entries.sql": {
+      "sha256": "3aa25c0a25db05206c600726f3b948c2b21379e0bd9b9bcc978ea542b6e74943",
+      "justification": "Audit-log 45d catch-up: guild and entry ids, action-type enum, user ids and occurrence timestamp only, no reason or body columns; resume via backfill_cursors family audit."
     }
   }
 }

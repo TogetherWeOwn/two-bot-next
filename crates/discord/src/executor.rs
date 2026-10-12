@@ -3776,6 +3776,39 @@ fn raw_get_route(path: &str) -> Result<Route<'static>, String> {
                     with_user_count: false,
                 })
             }
+            Some("audit-logs") => {
+                // Audit-log catch-up (backfill slice 3): `GET
+                // /guilds/{guild}/audit-logs` with `limit` 1-100 plus
+                // `before`/`after` cursors (official audit-log page, verified
+                // 2026-10-12). The limit is required and range-checked here
+                // so an out-of-range read is refused without I/O; the
+                // builder clamps before sending, so live traffic never hits
+                // this refusal. Every wait arrives in a response header,
+                // never a literal.
+                let limit: u16 = query_param(query, "limit")
+                    .and_then(|v| v.parse().ok())
+                    .filter(|n| (1..=100).contains(n))
+                    .ok_or_else(err)?;
+                let opt_id = |key: &str| -> Result<Option<u64>, String> {
+                    match query_param(query, key) {
+                        None => Ok(None),
+                        Some(v) => v
+                            .parse::<u64>()
+                            .ok()
+                            .filter(|id| *id != 0)
+                            .map(Some)
+                            .ok_or_else(err),
+                    }
+                };
+                Ok(Route::GetAuditLogs {
+                    action_type: opt_id("action_type")?,
+                    after: opt_id("after")?,
+                    before: opt_id("before")?,
+                    guild_id,
+                    limit: Some(limit),
+                    user_id: opt_id("user_id")?,
+                })
+            }
             _ => Err(err()),
         };
     }
