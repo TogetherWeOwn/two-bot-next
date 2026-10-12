@@ -66,6 +66,7 @@ pub mod gateway_session;
 pub mod handlers;
 pub mod health;
 pub mod help;
+pub mod hotzone;
 pub mod inactivity;
 #[cfg(feature = "db")]
 pub mod inactivity_store;
