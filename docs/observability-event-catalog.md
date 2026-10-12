@@ -171,6 +171,7 @@ sink attaches to the gateway writer on the cutover path.
 
 | Field value | Callsite (stable anchor) | Meaning |
 | --- | --- | --- |
+| `voice_event="voice_join"` | `crates/bot/src/voice_rooms.rs` (`JoinTiming::finish`: `voice join completed`) | One terminal accepted creator join; bounded `outcome` and seconds for gateway/actor `queue_dwell`, `wait_before_dispatch`, `claim`, `reorder`, `post`, `persist`, `move`, and total `elapsed`. Stage times accumulate retries; the label-free `two_bot_voice_join_to_move_seconds` histogram samples confirmed successful moves only. |
 | `voice_event="voice_operation"` | `crates/bot/src/voice_rooms.rs` (`observe_voice_operation`: `voice_operation succeeded` / `voice_operation failed`) | One finished room create/move/delete outcome with bounded `op`/`outcome` |
 | `voice_event="voice_reconcile"` | `crates/bot/src/voice_rooms.rs` (`reconcile`: `voice_reconcile planned`) | One reconcile pass plan size with per-action counts |
 | `voice_event="voice_dead_letter"` | `crates/bot/src/voice_rooms.rs` (`mark_failed_observed`: `voice action dead-lettered`) | Queue write exhausted retries with bounded `action` and attempts |

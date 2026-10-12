@@ -318,6 +318,17 @@ as dynamic labels.
   variant in `crates/bot/src/gateway_failure.rs`). Only `[a-z0-9_]{1,32}`
   tokens are ever logged; anything else is dropped. See
   [startup diagnostics](startup-diagnostics.md#self-diagnosing-gateway-failures-readyz-gateway_failure).
+- `two_bot_voice_join_to_move_seconds` is a label-free histogram from creator
+  join gateway receipt to successful member move. Cancelled/failed joins do not
+  add samples. Its buckets (`le`, seconds) are `0.001`, `0.005`, `0.01`, `0.05`,
+  `0.1`, `0.5`, `1`, `5`, `+Inf`, plus `_sum` and `_count`.
+  `voice_event="voice_join"` / `voice join completed` emits one terminal log for
+  an accepted join, with bounded `outcome`, `queue_dwell_seconds`,
+  `wait_before_dispatch_seconds`, `claim_seconds`, `reorder_seconds`,
+  `post_seconds`, `persist_seconds`, `move_seconds` and `elapsed_seconds`.
+  Stage durations accumulate across 429 retries. The reorder stage includes
+  pre-create respacing when no free position exists.
+  No guild/member/channel identifiers or user content are attached.
 - `two_bot_handler_duration_seconds` histogram buckets (`le`, seconds):
   `0.001`, `0.005`, `0.01`, `0.05`, `0.1`, `0.5`, `1`, `5`, `+Inf`, plus
   `_sum` and `_count`.

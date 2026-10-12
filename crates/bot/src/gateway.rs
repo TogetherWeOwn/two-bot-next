@@ -31,7 +31,7 @@ use two_bot_core::gateway_session::{
 };
 use two_bot_core::{AutomodPolicy, ComponentStatus, Config, InviteState, Snowflake};
 use two_bot_cutover::gateway_session::{GatewayJob, GatewaySessionStore};
-use two_bot_cutover::{connect, DB_POOL_MAX_DEFAULT};
+use two_bot_cutover::{db::connect_voice, DB_POOL_MAX_DEFAULT};
 use two_bot_discord::{
     gateway_intents, needs_message_content, InviteSource, LevelingRuntime, OrderedLevelingPipeline,
 };
@@ -532,6 +532,7 @@ async fn join_rsvp_drain(
 struct ReceivedDispatch {
     event: Event,
     observed_at: String,
+    received: tokio::time::Instant,
     completion: Option<tokio::sync::oneshot::Receiver<bool>>,
 }
 #[cfg(test)]
@@ -540,6 +541,7 @@ impl ReceivedDispatch {
         Self {
             event,
             observed_at: two_bot_core::now_iso(),
+            received: tokio::time::Instant::now(),
             completion: None,
         }
     }
@@ -711,7 +713,7 @@ fn apply_dispatch<I: InviteSource>(
         // at reception after this dispatch must still win over any
         // snapshot it just published.
         if let Some(voice) = worker_voice.as_ref() {
-            voice.handle(&dispatch.event, pipeline.cache());
+            voice.handle_received(&dispatch.event, pipeline.cache(), dispatch.received);
             if generation.load(Ordering::Acquire) != observed_generation {
                 voice.disconnect();
             }
@@ -1133,7 +1135,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             Err(_) => return Err(sqlx::Error::InvalidArgument("gateway dispatch parse failed".into())),
                         };
                         received = Some(checkpoint.clone());
-                        let mut dispatch = parsed.map(|parsed| Box::new(ReceivedDispatch { event: Event::from(parsed), observed_at, completion: None }));
+                        let mut dispatch = parsed.map(|parsed| Box::new(ReceivedDispatch { event: Event::from(parsed), observed_at, received: received_at, completion: None }));
                         // Detached command ingress must not wait behind the
                         // serial funnel writer's REST/SQL latency. Main's
                         // command claims remain independent of this checkpoint.
@@ -1711,7 +1713,7 @@ pub async fn build_voice_runtime(
     };
     // Migrations belong to the operator's migrator role, never the DML-only
     // runtime credential. Voice consumes the already-migrated schema.
-    let db = match connect(database_url, DB_POOL_MAX_DEFAULT, true).await {
+    let db = match connect_voice(database_url, DB_POOL_MAX_DEFAULT, true).await {
         Ok(db) => db,
         Err(_) => {
             warn!("voice database unavailable; voice rooms disabled");

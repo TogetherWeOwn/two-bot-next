@@ -20,7 +20,7 @@ high-rate event without a cap row fails the suite.
   guild/member/channel ID, token, query string, body or message content ever
   becomes a label or a log field.
 
-## Cardinality budget: 575 samples
+## Cardinality budget: 586 samples
 
 `GET /metrics` renders this many non-comment samples from process start,
 before any traffic. Adding any series fails the pinned count until this
@@ -32,6 +32,7 @@ table and the test are updated together.
 | reconnects, resumes, disconnects, missed | 4 | scalar counters |
 | `two_bot_gateway_latency_seconds` | 1 | gauge, `NaN` until measured |
 | `two_bot_handler_duration_seconds` | 11 | 8 buckets + `+Inf` + sum + count |
+| `two_bot_voice_join_to_move_seconds` | 11 | label-free; 8 buckets + `+Inf` + sum + count |
 | `two_bot_rest_requests_total{route,result}` | 180 | 30 route templates x 6 results |
 | `two_bot_rest_guard_*` | 11 | Fixed, label-free shared admission-guard counters and gauges |
 | job runs, timestamps, failure streaks | 64 | 16 jobs x (2 outcomes + timestamp + streak) |
@@ -48,7 +49,7 @@ table and the test are updated together.
 | `two_bot_internal_actions_total{family,outcome}` | 72 | 6 families x 12 outcomes (`announcement`, `event`, `settings`, `moderation`, `membership`, `other` x `executed` + 11 refusal classes) |
 | `two_bot_community_facts_drain_failures_total{reason}` | 3 | `error`, `timeout`, `other` |
 | `two_bot_audit_delivery_halt` | 1 | label-free gauge: 1 engaged, 0 cleared |
-| `# HELP` / `# TYPE` headers | 86 | 43 families x 2 |
+| `# HELP` / `# TYPE` headers | 88 | 44 families x 2 |
 
 ## Per-event caps (gateway metric labels)
 
