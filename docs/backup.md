@@ -53,16 +53,17 @@ selectors ignore it.
 ### Coverage and recovery semantics (v4 and v5)
 
 `DUMP_TABLES` in `crates/core/src/backup/dump_file.rs` is the single ordered
-inventory for both dump and restore. It includes **82 durable tables from the
+inventory for both dump and restore. It includes **83 durable tables from the
 current cutover migrations**, including the bot-owned website-contract backing
 tables, the member-moderation ledger, the self-role send receipts
 (`self_role_exchanges`) plus their uncertainty baselines
 (`self_role_exchange_baselines`), the automod delivery claims, the gateway
 boot directives, the member-erasure audit, the internal clock high-water
-mark, the voice configuration tables and the accepted voice-room create history
-(`voice_create_reservations`). `OPTIONAL_LEGACY_TABLES` is empty: the coverage
+mark, the voice configuration tables, the accepted voice-room create history
+(`voice_create_reservations`) and the event-store voice capture
+(`event_store`). `OPTIONAL_LEGACY_TABLES` is empty: the coverage
 test fails if a covered table is not migrated. A dump from a fresh Rust schema
-has 82 table entries. A missing current table refuses a dump/restore: migrate
+has 83 table entries. A missing current table refuses a dump/restore: migrate
 the target first.
 A v4 archive must declare every covered table except the ones v5 added
 (`V5_ADDED_TABLES`), so recovery points written before create-reservation
