@@ -249,10 +249,13 @@ pub fn top_slots(dist: &[f64; CELLS_PER_WEEK], n: usize) -> Vec<HotzoneSlot> {
         })
         .collect();
     slots.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| (a.weekday_sun0, a.hour).cmp(&(b.weekday_sun0, b.hour)))
+        match (a.score.is_nan(), b.score.is_nan()) {
+            // Both finite: descending score via a total order.
+            (false, false) => b.score.total_cmp(&a.score),
+            // Exactly one NaN: NaN sorts last.
+            (a_nan, b_nan) => a_nan.cmp(&b_nan),
+        }
+        .then_with(|| (a.weekday_sun0, a.hour).cmp(&(b.weekday_sun0, b.hour)))
     });
     slots.truncate(n.min(CELLS_PER_WEEK));
     slots
@@ -398,6 +401,25 @@ mod tests {
         assert_eq!((top[1].weekday_sun0, top[1].hour), (0, 20));
         assert!(top_slots(&dist, 10_000).len() <= CELLS_PER_WEEK);
         assert!(top_slots(&dist, 0).is_empty());
+    }
+
+    #[test]
+    fn top_slots_ranks_nan_last_without_panicking() {
+        // One NaN cell in an otherwise finite grid: the NaN handling must be
+        // a total order (no `sort_by` panic) and the finite maximum still
+        // ranks first.
+        let mut dist = [0.001_f64; CELLS_PER_WEEK];
+        dist[10] = 0.5;
+        dist[5] = f64::NAN;
+        let top = top_slots(&dist, 5);
+        assert_eq!(top.len(), 5);
+        assert_eq!((top[0].weekday_sun0, top[0].hour), (0, 10));
+        assert!(top[..5].iter().all(|slot| slot.score.is_finite()));
+        let full = top_slots(&dist, CELLS_PER_WEEK);
+        assert_eq!(full.len(), CELLS_PER_WEEK);
+        let last = full.last().expect("non-empty grid");
+        assert!(last.score.is_nan());
+        assert_eq!((last.weekday_sun0, last.hour), (0, 5));
     }
 
     #[test]
