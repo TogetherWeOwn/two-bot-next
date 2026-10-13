@@ -41,6 +41,11 @@
       "predicate": "guild_id = $1 AND member_id = $2"
     },
     {
+      "table": "member_season_xp",
+      "columns": ["member_id"],
+      "predicate": "guild_id = $1 AND member_id = $2"
+    },
+    {
       "table": "xp_awards",
       "columns": ["member_id"],
       "predicate": "guild_id = $1 AND member_id = $2"
