@@ -271,15 +271,18 @@ const REQUIRED_COLUMNS: &[&str] = &[
 ];
 
 /// The reviewed column allowlist for the shared `event_store` table: the union
-/// of the slices' columns (S2 member deltas, S4 voice, S5 message/reaction,
-/// S6 threads, S8 stage/interaction) plus the `id` primary key. Every actual
-/// column must be a member, so any new free-form column (a body-carrying
-/// `raw_payload`, `message_content`, or similar) fails the suite. A denylist
-/// cannot fail on a new name, so this asserts the closed set instead. Later
-/// slices extend this list when they add their own reviewed columns
+/// of the slices' columns (S2 member deltas, S3 presence, S4 voice, S5
+/// message/reaction, S6 threads, S8 stage/interaction) plus the `id` primary
+/// key. Every actual column must be a member, so any new free-form column (a
+/// body-carrying `raw_payload`, `message_content`, or similar) fails the suite.
+/// A denylist cannot fail on a new name, so this asserts the closed set instead.
+/// The S3 (`presence_status`, `activity_type`) and S2 (`nick_changed`) entries
+/// are pre-seeded from the open sibling migrations, so a landing slice only
+/// changes this list for a genuinely new reviewed column
 /// (`ADD COLUMN IF NOT EXISTS` per 0430).
 const ALLOWED_COLUMNS: &[&str] = &[
     "action_type",
+    "activity_type",
     "actor_id",
     "application_id",
     "archived",
@@ -300,9 +303,10 @@ const ALLOWED_COLUMNS: &[&str] = &[
     "locked",
     "message_id",
     "mute",
-    "nick",
+    "nick_changed",
     "parent_id",
     "premium_since",
+    "presence_status",
     "privacy_level",
     "received_at",
     "roles",
