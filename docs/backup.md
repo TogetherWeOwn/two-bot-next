@@ -1,7 +1,7 @@
 # Backups, restore drills, and sealed guild-config snapshots (TOG-9881)
 
 Rust port of the legacy `two-bot` cutover-data surface (frozen source
-`two-bot` `main @ d5d11793`): v4 dump format with v3 read compatibility,
+`two-bot` `main @ d5d11793`): v6 dump format with v3/v4/v5 read compatibility,
 SigV4 off-box upload, retention
 math, sealed guild-config snapshot + restore planner, and the three timer
 equivalents. Code: `crates/core/src/backup/`, CLI: `two-bot backup |
@@ -17,10 +17,10 @@ require `--force`. This confirmation is not authorization to target production.
 ## The format
 
 Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
-write **v6** (including durable voice-create reservations, member-capture
-deltas and the event-store voice capture); the reader also accepts frozen
-**v3**, pre-reservation **v4** and pre-member-capture/event-store **v5**.
-Other versions refuse.
+write **v6** (including durable voice-create reservations and event-store
+capture: voice, presence and member-capture deltas); the reader also accepts
+frozen **v3**, pre-reservation **v4** and pre-event-store **v5**. Other versions
+refuse.
 The manifest carries per-table `{name, columns, column_types, count}` taken
 inside one `REPEATABLE READ` transaction, the `events` high-water mark, the
 source's applied migrations and `sequenceMarks`: for every serial, identity and
@@ -62,7 +62,7 @@ tables, the member-moderation ledger, the self-role send receipts
 (`self_role_exchange_baselines`), the automod delivery claims, the gateway
 boot directives, the member-erasure audit, the internal clock high-water
 mark, the voice configuration tables, the accepted voice-room create history
-(`voice_create_reservations`) and the event-store voice capture
+(`voice_create_reservations`) and the event-store voice/presence capture
 (`event_store`). `OPTIONAL_LEGACY_TABLES` is empty: the coverage
 test fails if a covered table is not migrated. A dump from a fresh Rust schema
 has 83 table entries. A missing current table refuses a dump/restore: migrate
@@ -73,11 +73,12 @@ points written before create-reservation persistence remain inspectable and
 restorable. A v4 archive written before any other table joined the inventory
 is refused at inspect ("manifest is missing tables"); take a fresh dump after
 upgrading. V5 requires everything except `V6_ADDED_TABLES`, so recovery points
-written before member-capture/event-store persistence stay readable; V6
-requires the full current inventory, and an incomplete new archive refuses at
-inspection. Restoring a pre-reservation archive clears the destination's
-reservation table, as with other tables absent from an older version. A
-pre-v6 archive likewise clears the destination's event_store table.
+written before event-store persistence (0427 voice, 0428 presence, 0432 member
+deltas) stay readable; V6 requires the full current inventory, and an
+incomplete new archive refuses at inspection. Restoring a pre-reservation
+archive clears the destination's reservation table, as with other tables
+absent from an older version. A pre-v6 archive likewise clears the
+destination's event_store table.
 An optional legacy table may be absent only when there are no archived rows for
 it. Nonempty legacy data without a matching target table refuses **before any
 truncate**, rather than silently discarding it.

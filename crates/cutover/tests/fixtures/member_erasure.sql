@@ -13,12 +13,16 @@ BEGIN
       INSERT INTO members (guild_id, member_id) VALUES (g, u);
       INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
         VALUES ('member_join', u, g, now(), 'fixture', '{}', k);
-      -- event_store is shared by the S1/S2/S4 slices: exactly one seed row per
-      -- member, so the erasure suites' exactly-one-row-per-table invariant holds.
-      -- Later slices must extend this row's columns, never add a second row.
-      INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key)
-        VALUES ('GUILD_MEMBER_ADD', g, u, '2026-10-01T00:00:00Z',
-                'GUILD_MEMBER_ADD:' || g || ':' || u || ':2026-10-01T00:00:00Z');
+      -- event_store is shared by the S1/S2/S3/S4 slices: exactly one seed row
+      -- per member, so the erasure suites' exactly-one-row-per-table
+      -- invariant holds. Later slices must extend this row's columns, never
+      -- add a second row. Voice columns stay NULL here; the backup seed
+      -- covers the S4 voice shape.
+      INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key,
+        presence_status, activity_type, application_id, nick_changed, roles)
+        VALUES ('PRESENCE_UPDATE', g, u, '2026-10-01T00:00:00Z',
+        'PRESENCE_UPDATE:' || g || ':' || u || ':2026-10-01T00:00:00Z',
+        'online', 0, NULL, FALSE, '[]');
       INSERT INTO invite_snapshots (guild_id, code, uses, inviter_id, updated_at)
         VALUES (g, u, 1, u, now());
       INSERT INTO member_levels (guild_id, member_id, xp, message_xp, updated_at)
