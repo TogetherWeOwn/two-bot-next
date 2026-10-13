@@ -3,7 +3,7 @@
 //! Slow, resumable catch-up of channel history metadata the bot did not
 //! capture live. The wire half rides the slice-1 rate-limit client as-is:
 //! `GET /channels/{channel}/messages?limit={1-100}` with `before`/`after`/
-//! `around` cursors through [`two_bot_discord::ActionExecutor::get_json_observed`]
+//! `around` cursors through `ActionExecutor::get_json_observed`
 //! (the route already exists in `raw_get_route`; every wait arrives in a
 //! response header, never a literal). This module owns the two halves the
 //! acceptance target pins:
