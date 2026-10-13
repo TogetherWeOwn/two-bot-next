@@ -991,9 +991,7 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
                     && !V7_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
-            Some(6) => {
-                !V7_ADDED_TABLES.contains(name) && !OPTIONAL_LEGACY_TABLES.contains(name)
-            }
+            Some(6) => !V7_ADDED_TABLES.contains(name) && !OPTIONAL_LEGACY_TABLES.contains(name),
             _ => !OPTIONAL_LEGACY_TABLES.contains(name),
         })
         .map(|(_, name)| name)

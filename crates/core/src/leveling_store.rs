@@ -41,10 +41,9 @@ use super::funnel::{format_iso_millis, parse_iso_millis};
 use super::leveling::{
     adjudicate_message_award, clamp_leaderboard_limit, current_season_id, level_for_xp,
     normalize_role_rewards, seasonal_decay_new_weeks, seasonal_xp_after_decay_weeks,
-    voice_xp_for_duration, LeaderboardEntry,
-    LevelProfile, LevelRoleReward, MessageAwardInput, RewardConfigError, XpAward, XpSource,
-    AWARD_COOLDOWN_SECONDS, MAX_STORED_XP, MESSAGE_DAILY_CAP_XP, MESSAGE_SHORT_MIN_LEN, MESSAGE_XP,
-    VOICE_DAILY_CAP_XP,
+    voice_xp_for_duration, LeaderboardEntry, LevelProfile, LevelRoleReward, MessageAwardInput,
+    RewardConfigError, XpAward, XpSource, AWARD_COOLDOWN_SECONDS, MAX_STORED_XP,
+    MESSAGE_DAILY_CAP_XP, MESSAGE_SHORT_MIN_LEN, MESSAGE_XP, VOICE_DAILY_CAP_XP,
 };
 
 /// Leveling runtime failure: invalid input vs database error.
@@ -552,8 +551,7 @@ pub async fn apply_seasonal_decay(
     let mut decayed = 0u64;
     for (member_id, seasonal_xp, decayed_weeks, updated_ms) in rows {
         let days_inactive = (as_of_ms - updated_ms).max(0) as u64 / 86_400_000;
-        let new_weeks =
-            seasonal_decay_new_weeks(days_inactive, decayed_weeks.max(0) as u64);
+        let new_weeks = seasonal_decay_new_weeks(days_inactive, decayed_weeks.max(0) as u64);
         if new_weeks == 0 {
             continue;
         }
