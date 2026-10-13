@@ -45,6 +45,11 @@ are outside this implementation's scope.
   outcome codes and no names, text or interaction tokens) stores the initiator
   and target member IDs, so erasure removes every row where the member is
   either one. It records a room-scoped disconnect, never a guild kick.
+  The event-store voice shape (`event_store`) is provisioned by the S4 migration
+  for a future gateway writer (guild / member / channel / session IDs plus a
+  nullable `message_id` for S1 message-row coexistence, timestamps and enum
+  mute/deaf/video/stream flags, no audio, transcripts, tokens or endpoints);
+  erasure already removes every row for the member.
 - Thread lifecycle and membership history (`event_store`: one row per
   THREAD_CREATE / UPDATE / DELETE, one row per listed thread per
   THREAD_LIST_SYNC fan-out, one row per THREAD_MEMBER_UPDATE / REMOVE delta).

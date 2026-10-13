@@ -522,6 +522,14 @@ VALUES ('PRESENCE_UPDATE', '100000000000000001', '100000000000000002',
         '2026-08-03T10:05:00Z',
         'PRESENCE_UPDATE:100000000000000001:100000000000000003:2026-08-03T10:05:00Z',
         'idle', 2, '123456789012345678');
+-- Event-store S4 voice capture (0427): one voice-state row with session and
+-- enum flags; token/endpoint/audio columns never exist. Distinct dedup key
+-- from the presence rows above, so both slices seed together.
+INSERT INTO event_store (event_type, guild_id, user_id, channel_id, session_id,
+  event_time, dedup_key, mute, deaf, self_mute, self_deaf, self_video, self_stream, suppress)
+VALUES ('voice_state_update', '100000000000000001', '100000000000000002', '100000000000000033',
+        'session-fixture-1', '2026-08-03T10:00:00Z', 'event-store-seed-1',
+        FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE);
 -- Event-store thread lifecycle + member deltas (0429 S6): one lifecycle row
 -- with state enums and no member id, one member-delta row with a member id.
 INSERT INTO event_store (event_type, guild_id, thread_id, parent_id, user_id,
