@@ -443,6 +443,14 @@ fn set_moderation_flags(on: bool) {
     }
 }
 
+/// Tests that assert on the process-wide tracing capture serialize here.
+/// The capture is global to the test binary and each reader slices from its
+/// own start offset, so a parallel test emitting the same diagnostic lines
+/// pollutes the slice (seen as `left: 1` vs `0` in the pre-claim test).
+/// Hold this lock for the whole test, before any flag lock, in every test
+/// that reads or writes these diagnostics.
+static TRACING_DIAGNOSTIC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn moderation_payload(action: &str) -> String {
     let mut body = serde_json::json!({
         "action": action,
@@ -971,8 +979,9 @@ fn unknown_persist_class_is_a_fixed_vocabulary() {
     );
 }
 
-#[test]
-fn terminal_persist_helper_emits_one_fixed_vocabulary_line_per_op() {
+#[tokio::test]
+async fn terminal_persist_helper_emits_one_fixed_vocabulary_line_per_op() {
+    let _tracing = TRACING_DIAGNOSTIC_LOCK.lock().await;
     let start = crate::tracing_capture::global().text().len();
     // The post-claim `Malformed` revalidations in `execute_member` use the
     // same deterministic inputs as their pre-claim checks, so no signed HTTP
@@ -1021,6 +1030,7 @@ fn terminal_persist_helper_emits_one_fixed_vocabulary_line_per_op() {
 #[tokio::test]
 async fn finish_failure_after_effect_is_not_success_or_permission_to_resend() {
     let Some(db) = database().await else { return };
+    let _tracing = TRACING_DIAGNOSTIC_LOCK.lock().await;
     let start = crate::tracing_capture::global().text().len();
     let mut mock = MockEffect::new(MockOutcome::Success);
     mock.break_finish = Some(db.pool().clone());
@@ -1134,6 +1144,7 @@ impl EventMutateEffect for CountedScriptedMutate {
 #[tokio::test]
 async fn event_release_failure_is_logged_without_releasing_claim() {
     let Some(db) = database().await else { return };
+    let _tracing = TRACING_DIAGNOSTIC_LOCK.lock().await;
     let _flag = INTERNAL_FLAG_LOCK.lock().await;
     set_event_cancel_flag(false);
     let start = crate::tracing_capture::global().text().len();
@@ -1241,6 +1252,7 @@ async fn event_release_failure_is_logged_without_releasing_claim() {
 #[tokio::test]
 async fn member_preclaim_malformed_emits_no_terminal_diagnostic() {
     let Some(db) = database().await else { return };
+    let _tracing = TRACING_DIAGNOSTIC_LOCK.lock().await;
     let _flag = ADD_MEMBER_FLAG_LOCK.lock().await;
     set_add_member_flag(true);
     let start = crate::tracing_capture::global().text().len();
