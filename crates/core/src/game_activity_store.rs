@@ -1,17 +1,17 @@
 //! Game-activity guild-aggregate sqlx store.
 //!
 //! Ports the durable half of the game-activity analytics pipeline onto the
-//! `0439`/`0440` table: [`upsert_guild_aggregates`] adds one flush of
-//! [`GuildGameAggregate`](crate::game_activity::GuildGameAggregate) rows into
+//! `0440`/`0441` table: [`upsert_guild_aggregates`] adds one flush of
+//! [`GuildGameAggregate`] rows into
 //! the per-(guild, game) counters, and
-//! [`read_guild_aggregates`](read_guild_aggregates) reads a guild's rows back
+//! [`read_guild_aggregates`] reads a guild's rows back
 //! for the operator trend report. There is deliberately no per-member row,
 //! no per-member reader and no public-surface view: the table carries no
 //! member column at all (presence-probe containment precedent).
 //!
 //! Behind the `db` feature so domain unit tests never need a Postgres driver.
-//! The pure pipeline ([`sessionize`](crate::game_activity::sessionize) /
-//! [`aggregate_guild`](crate::game_activity::aggregate_guild)) stays in
+//! The pure pipeline ([`sessionize`] /
+//! [`aggregate_guild`]) stays in
 //! [`crate::game_activity`]; this module only moves guild-level rows, plus
 //! the opt-out gate ([`aggregate_filtered`]) that keeps opted-out members'
 //! deltas and spans out of the persisted aggregates.
@@ -39,7 +39,7 @@ use super::privacy::{category_off_in, AnalyticsCategory};
 
 /// Game-activity store failure: transport only. A malformed aggregate can
 /// never come back — the column CHECKs plus the domain's
-/// [`aggregate_guild`](crate::game_activity::aggregate_guild) clamp keep
+/// [`aggregate_guild`] clamp keep
 /// rows clean.
 #[derive(Debug, thiserror::Error)]
 pub enum GameActivityStoreError {
@@ -371,7 +371,7 @@ mod tests {
         .execute(&pool)
         .await?;
         sqlx::raw_sql(include_str!(
-            "../../cutover/migrations/0439_game_activity_guild_aggregates.sql"
+            "../../cutover/migrations/0440_game_activity_guild_aggregates.sql"
         ))
         .execute(&pool)
         .await?;
