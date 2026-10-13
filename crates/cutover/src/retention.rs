@@ -8,20 +8,29 @@
 //! ## Reuse boundary (adjacent consent-driven work, not re-implemented here)
 //!
 //! Per-member suppression/purge semantics belong to the [`crate::member_erasure`]
-//! predicate set. The user-deletion path reuses its full footprint: it deletes
-//! every plan table's `(guild_id, member_id)` rows for the requesting user in
-//! the same transaction that settles the receipt, excluding only the in-flight
-//! `retention_deletion_requests` row itself. The time-driven deletes never
-//! touch the member-scoped audit tables (`moderation_audit` and friends) beyond
-//! that user-deletion path, which stays under the erasure predicates. Guild
-//! analytics toggles and opt-out suppression live elsewhere and are not
-//! duplicated here.
+//! predicate set. The user-deletion path reuses its full footprint AND its
+//! safety gates: it shares the schema-coverage check and the unresolved
+//! replay-guard refusal with `erase_member`, so an in-flight idempotency
+//! intent, unsettled self-role/automod claim, or active containment leaves
+//! the request pending with no receipt. Every pending request drains in its
+//! own savepoint, so one refusal never rolls back the time-window deletes.
+//! The user-deletion deletes run in the same transaction that settles the
+//! receipt, excluding only the in-flight `retention_deletion_requests` row
+//! itself. The time-driven deletes never touch the member-scoped audit tables
+//! (`moderation_audit` and friends) beyond that user-deletion path, which
+//! stays under the erasure predicates. Guild analytics toggles and opt-out
+//! suppression live elsewhere and are not duplicated here.
 //!
 //! ## Coverage limits (do not silently claim more)
 //!
 //! * Voice-raw coverage is pinned to `events` rows with a voice-session
-//!   `event_type`; no append-only gateway event-store tables exist on the
-//!   current schema.
+//!   `event_type`; the append-only `event_store` capture (0428/0432) persists
+//!   with no age-based TTL and is removed per-user via the erasure plan and
+//!   per-guild via the guild purge below.
+//! * Guild purges cover every guild-keyed erasure-plan table (plus
+//!   `presence_probe`) and leave `retention_deletion_requests` to the receipt
+//!   path, so a pending deletion for a departed guild still completes with a
+//!   receipt instead of vanishing.
 //! * Long-term aggregates (`member_levels` counts, `member_ranks` streaks)
 //!   are never time-purged; a departed guild's aggregates go only through
 //!   the guild-purge queue, and a rejoin cancels the queued purge via
@@ -124,10 +133,15 @@ fn next_request_id() -> String {
     format!("del-{nanos:x}-{seq:x}")
 }
 
-/// Run the retention job: rolling-window deletes, guild-purge drain, and
-/// pending user-deletion completion. Dry run reports counts and changes
+/// Run the retention job: rolling-window deletes, pending user-deletion
+/// completion, then guild-purge drain. Dry run reports counts and changes
 /// nothing. Deletion and queue writes happen in ONE transaction with the
-/// same lock/timeout discipline as `erase_member`.
+/// same lock/timeout discipline as `erase_member`; each pending deletion
+/// runs in its own savepoint so one guard refusal leaves that request
+/// pending without rolling back the time-window deletes. Pending deletions
+/// drain before guild purges so a departed guild's pending receipts complete
+/// against pre-purge rows, and purges leave the deletion ledger to the
+/// receipt path.
 pub async fn run_retention(
     pool: &PgPool,
     mode: RetentionMode,
@@ -165,14 +179,28 @@ pub async fn run_retention(
             sqlx::query("SET LOCAL statement_timeout = '15s'")
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query(
-                "LOCK TABLE events, member_levels, member_ranks, members, \
-                 operational_audit_log, presence_probe, \
-                 retention_deletion_requests, retention_guild_purge_queue \
-                 IN SHARE ROW EXCLUSIVE MODE",
-            )
-            .execute(&mut *tx)
-            .await?;
+            // Same sorted-lock discipline as erase_member, covering every
+            // table the time-window deletes, guild purges, and per-user
+            // deletions can touch. The plan tables plus the raw probe and
+            // the purge queue, sorted so concurrent erasures lock in the
+            // same order.
+            let erasure_plan = crate::member_erasure::plan();
+            let mut lock_tables: Vec<&str> = erasure_plan
+                .tables
+                .iter()
+                .map(|entry| entry.table.as_str())
+                .collect();
+            lock_tables.push("presence_probe");
+            lock_tables.push("retention_guild_purge_queue");
+            lock_tables.sort_unstable();
+            lock_tables.dedup();
+            let lock_sql = format!(
+                "LOCK TABLE {} IN SHARE ROW EXCLUSIVE MODE",
+                lock_tables.join(", ")
+            );
+            sqlx::query(sqlx::AssertSqlSafe(lock_sql))
+                .execute(&mut *tx)
+                .await?;
             let presence =
                 sqlx::query("DELETE FROM presence_probe WHERE observed_at < to_char(now() - make_interval(days => $1), 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')")
                     .bind(PRESENCE_RAW_RETENTION_DAYS)
@@ -193,14 +221,11 @@ pub async fn run_retention(
             .execute(&mut *tx)
             .await?
             .rows_affected();
-            let guilds: Vec<String> =
-                sqlx::query_scalar("SELECT guild_id FROM retention_guild_purge_queue")
-                    .fetch_all(&mut *tx)
-                    .await?;
-            let mut guild_rows = 0u64;
-            for guild in &guilds {
-                guild_rows += purge_guild(&mut tx, guild).await?;
-            }
+            // Pending deletions drain BEFORE guild purges so a departed
+            // guild's pending receipts complete against pre-purge rows.
+            // Each request runs in its own savepoint: a guard refusal rolls
+            // back only that request, leaving it pending, while other
+            // failures abort the run.
             let pendings: Vec<(String, String, String)> = sqlx::query_as(
                 "SELECT request_id, guild_id, user_id FROM retention_deletion_requests WHERE status = 'pending'",
             )
@@ -208,8 +233,34 @@ pub async fn run_retention(
             .await?;
             let mut completed = 0u64;
             for (request_id, guild_id, user_id) in &pendings {
-                complete_request(&mut tx, request_id, guild_id, user_id).await?;
-                completed += 1;
+                sqlx::query("SAVEPOINT retention_pending")
+                    .execute(&mut *tx)
+                    .await?;
+                match complete_request(&mut tx, request_id, guild_id, user_id).await {
+                    Ok(_) => {
+                        sqlx::query("RELEASE SAVEPOINT retention_pending")
+                            .execute(&mut *tx)
+                            .await?;
+                        completed += 1;
+                    }
+                    Err(err) if is_guard_refusal(&err) => {
+                        sqlx::query("ROLLBACK TO SAVEPOINT retention_pending")
+                            .execute(&mut *tx)
+                            .await?;
+                        sqlx::query("RELEASE SAVEPOINT retention_pending")
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            let guilds: Vec<String> =
+                sqlx::query_scalar("SELECT guild_id FROM retention_guild_purge_queue")
+                    .fetch_all(&mut *tx)
+                    .await?;
+            let mut guild_rows = 0u64;
+            for guild in &guilds {
+                guild_rows += purge_guild(&mut tx, guild).await?;
             }
             tx.commit().await?;
             RetentionReport {
@@ -283,7 +334,9 @@ pub async fn request_user_deletion(
 }
 
 /// Fulfil one queued deletion request and return its receipt. Completion is
-/// immediate, so the under-72-hour SLA holds by construction.
+/// immediate, so the under-72-hour SLA holds by construction. Shares
+/// `erase_member`'s locks and replay-guard refusal via [`complete_request`]:
+/// a refused request returns an error with no receipt and stays pending.
 pub async fn fulfill_user_deletion(
     pool: &PgPool,
     request_id: &str,
@@ -303,7 +356,20 @@ pub async fn fulfill_user_deletion(
     sqlx::query("SET LOCAL statement_timeout = '15s'")
         .execute(&mut *tx)
         .await?;
-    sqlx::query("LOCK TABLE members, retention_deletion_requests IN SHARE ROW EXCLUSIVE MODE")
+    // Same sorted-lock discipline as erase_member for the tables
+    // complete_request touches (every plan table, including the ledger).
+    let erasure_plan = crate::member_erasure::plan();
+    let mut tables: Vec<&str> = erasure_plan
+        .tables
+        .iter()
+        .map(|entry| entry.table.as_str())
+        .collect();
+    tables.sort_unstable();
+    let lock_sql = format!(
+        "LOCK TABLE {} IN SHARE ROW EXCLUSIVE MODE",
+        tables.join(", ")
+    );
+    sqlx::query(sqlx::AssertSqlSafe(lock_sql))
         .execute(&mut *tx)
         .await?;
     let row: Option<(String, String)> = sqlx::query_as(
@@ -328,15 +394,41 @@ pub async fn fulfill_user_deletion(
     })
 }
 
+/// True when the error is the shared replay-guard refusal (the request must
+/// stay pending, not fail the run). Matches on the message text so both the
+/// erasure and retention paths stay in sync without coupling to sqlx internals.
+fn is_guard_refusal(err: &sqlx::Error) -> bool {
+    format!("{err}").contains("unresolved erasure replay guard")
+        || format!("{err:?}").contains("unresolved erasure replay guard")
+}
+
 /// Delete the requesting member's full footprint and settle the request,
 /// returning the receipt fields. Shared by [`fulfill_user_deletion`] and the
-/// [`run_retention`] pending drain so both paths honor the same receipt.
+/// [`run_retention`] pending drain so both paths honor the same receipt and
+/// the same safety gates as `erase_member`.
 async fn complete_request(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     request_id: &str,
     guild_id: &str,
     user_id: &str,
 ) -> Result<(String, i64, i64), sqlx::Error> {
+    // Share erase_member's safety gates: refuse on schema drift or unresolved
+    // replay fences, leaving the request pending with no receipt. The caller
+    // (single fulfilment or per-request savepoint) decides whether a refusal
+    // is swallowed or fatal.
+    if !crate::member_erasure::schema_gaps(&mut *tx)
+        .await?
+        .is_empty()
+    {
+        return Err(sqlx::Error::InvalidArgument(
+            "erasure schema coverage incomplete".into(),
+        ));
+    }
+    if crate::member_erasure::has_unresolved_guards(&mut *tx, guild_id, user_id).await? {
+        return Err(sqlx::Error::InvalidArgument(
+            "unresolved erasure replay guard".into(),
+        ));
+    }
     // Full erasure-plan footprint in the same transaction: every plan table's
     // (guild, member) rows for this user go, not just the `members` row, so
     // the receipt certifies an actual deletion. The plan also covers
@@ -375,7 +467,41 @@ async fn complete_request(
     Ok((receipt_id, requested_at_unix, completed_at_unix))
 }
 
+/// Guild-scoped delete for one erasure-plan table: child tables without
+/// their own `guild_id` purge via their parent's guild scope. Table names
+/// come from the reviewed embedded plan, never caller input.
+fn guild_purge_sql(table: &str) -> String {
+    match table {
+        "lfg_signups" | "lfg_roles" => format!(
+            "DELETE FROM {table} WHERE lfg_id IN (SELECT id FROM lfg_posts WHERE guild_id = $1)"
+        ),
+        "feed_deliveries" => {
+            "DELETE FROM feed_deliveries WHERE feed_id IN (SELECT id FROM feed_relays WHERE guild_id = $1)"
+                .to_owned()
+        }
+        _ => format!("DELETE FROM {table} WHERE guild_id = $1"),
+    }
+}
+
+/// Guild-scoped count for one erasure-plan table, mirroring [`guild_purge_sql`].
+fn guild_purge_count_sql(table: &str) -> String {
+    match table {
+        "lfg_signups" | "lfg_roles" => format!(
+            "SELECT count(*) FROM {table} WHERE lfg_id IN (SELECT id FROM lfg_posts WHERE guild_id = $1)"
+        ),
+        "feed_deliveries" => {
+            "SELECT count(*) FROM feed_deliveries WHERE feed_id IN (SELECT id FROM feed_relays WHERE guild_id = $1)"
+                .to_owned()
+        }
+        _ => format!("SELECT count(*) FROM {table} WHERE guild_id = $1"),
+    }
+}
+
 /// Purge one departed guild's rows and dequeue it, returning rows purged.
+/// Covers every guild-keyed erasure-plan table (in plan order, child before
+/// parent) plus the raw `presence_probe`, and leaves
+/// `retention_deletion_requests` to the receipt path so a pending deletion
+/// for a departed guild still completes with a receipt instead of vanishing.
 /// Re-checks the queue row under the caller's lock: a guild whose purge was
 /// cancelled via [`cancel_guild_purge`] (rejoin before the run) keeps its rows.
 async fn purge_guild(
@@ -396,36 +522,19 @@ async fn purge_guild(
         .execute(&mut **tx)
         .await?
         .rows_affected();
-    purged += sqlx::query("DELETE FROM events WHERE guild_id = $1")
-        .bind(guild_id)
-        .execute(&mut **tx)
-        .await?
-        .rows_affected();
-    purged += sqlx::query("DELETE FROM operational_audit_log WHERE guild_id = $1")
-        .bind(guild_id)
-        .execute(&mut **tx)
-        .await?
-        .rows_affected();
-    purged += sqlx::query("DELETE FROM member_levels WHERE guild_id = $1")
-        .bind(guild_id)
-        .execute(&mut **tx)
-        .await?
-        .rows_affected();
-    purged += sqlx::query("DELETE FROM member_ranks WHERE guild_id = $1")
-        .bind(guild_id)
-        .execute(&mut **tx)
-        .await?
-        .rows_affected();
-    purged += sqlx::query("DELETE FROM retention_deletion_requests WHERE guild_id = $1")
-        .bind(guild_id)
-        .execute(&mut **tx)
-        .await?
-        .rows_affected();
-    purged += sqlx::query("DELETE FROM members WHERE guild_id = $1")
-        .bind(guild_id)
-        .execute(&mut **tx)
-        .await?
-        .rows_affected();
+    let erasure = crate::member_erasure::plan();
+    for entry in &erasure.tables {
+        if entry.table == "retention_deletion_requests" {
+            continue;
+        }
+        // Table names come from the reviewed embedded plan, never caller input.
+        let sql = guild_purge_sql(&entry.table);
+        purged += sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(guild_id)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+    }
     sqlx::query("DELETE FROM retention_guild_purge_queue WHERE guild_id = $1")
         .bind(guild_id)
         .execute(&mut **tx)
@@ -468,6 +577,8 @@ async fn count_audit_cache(
 }
 
 /// Rows the queued guild purges would delete, without deleting anything.
+/// Mirrors [`purge_guild`]: every plan table except the deletion ledger, plus
+/// the raw probe.
 async fn count_queued_guild_rows(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<u64, sqlx::Error> {
@@ -475,19 +586,21 @@ async fn count_queued_guild_rows(
         sqlx::query_scalar("SELECT guild_id FROM retention_guild_purge_queue")
             .fetch_all(&mut **tx)
             .await?;
+    let erasure = crate::member_erasure::plan();
     let mut total = 0u64;
     for guild in &guilds {
-        for table in [
-            "presence_probe",
-            "events",
-            "operational_audit_log",
-            "member_levels",
-            "member_ranks",
-            "retention_deletion_requests",
-            "members",
-        ] {
-            // Table names are a fixed list above, never caller input.
-            let sql = format!("SELECT count(*) FROM {table} WHERE guild_id = $1");
+        // Table names come from the reviewed embedded plan, never caller input.
+        let sql = "SELECT count(*) FROM presence_probe WHERE guild_id = $1".to_owned();
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .bind(guild)
+            .fetch_one(&mut **tx)
+            .await?;
+        total += count as u64;
+        for entry in &erasure.tables {
+            if entry.table == "retention_deletion_requests" {
+                continue;
+            }
+            let sql = guild_purge_count_sql(&entry.table);
             let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
                 .bind(guild)
                 .fetch_one(&mut **tx)

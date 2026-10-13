@@ -639,3 +639,374 @@ async fn second_retention_run_is_a_noop() {
     assert_eq!(second.guild_rows_purged, 0);
     db.close().await.unwrap();
 }
+
+/// A user deletion with an unresolved replay guard stays pending with no
+/// receipt: the rows and the request survive until the guard settles.
+#[tokio::test]
+async fn user_deletion_with_unresolved_guard_stays_pending_without_receipt() {
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    for (guild, member) in [(GUILD_A, MEMBER), (GUILD_A, OTHER_MEMBER)] {
+        sqlx::query("INSERT INTO members (guild_id, member_id) VALUES ($1, $2)")
+            .bind(guild)
+            .bind(member)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO member_levels (guild_id, member_id, xp, message_xp, updated_at)
+             VALUES ($1, $2, 150, 150, now())",
+        )
+        .bind(guild)
+        .bind(member)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
+             VALUES ('voice_session_started', $2, $1, now(), 'fixture', '{}', $3)",
+        )
+        .bind(guild)
+        .bind(member)
+        .bind(format!("ret-guard-{member}"))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    // In-flight replay fence for the requesting user only.
+    sqlx::query(
+        "INSERT INTO internal_idempotency
+           (caller_hash, key_hash, action, payload_hash, state, guild_id, actor_id, target_id)
+         VALUES (repeat('a', 64), repeat('b', 64), 'role.assign', repeat('c', 64), 'unknown', $1, $2, $2)",
+    )
+    .bind(GUILD_A)
+    .bind(MEMBER)
+    .execute(pool)
+    .await
+    .unwrap();
+    // Active anti-nuke containment for the same user.
+    sqlx::query(
+        "INSERT INTO containment_events
+           (audit_entry_id, guild_id, executor_id, action, target_id, weight, occurred_at, state, reason, created_at)
+         VALUES ('ret-guard-evt-1', $1, $2, 'ban', $2, 1, '2026-10-01T00:00:00Z', 'contain', 'fixture', '2026-10-01T00:00:00Z')",
+    )
+    .bind(GUILD_A)
+    .bind(MEMBER)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO containment_incidents
+           (id, guild_id, executor_id, trigger_audit_entry_id, heat, state, result_json, started_at)
+         VALUES ('ret-guard-inc-1', $1, $2, 'ret-guard-evt-1', 3, 'containing', '{}', '2026-10-01T00:00:00Z')",
+    )
+    .bind(GUILD_A)
+    .bind(MEMBER)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let request_id = request_user_deletion(pool, GUILD_A, MEMBER).await.unwrap();
+    let err = fulfill_user_deletion(pool, &request_id).await.unwrap_err();
+    assert!(
+        format!("{err}").contains("unresolved erasure replay guard")
+            || format!("{err:?}").contains("unresolved erasure replay guard"),
+        "fulfilment must refuse on the guard, got {err:?}"
+    );
+    assert_eq!(
+        count(
+            pool,
+            "SELECT count(*) FROM member_levels WHERE guild_id = '111111111111111111' AND member_id = '444444444444444444'"
+        )
+        .await,
+        1,
+        "the guarded user's rows must survive the refusal"
+    );
+    assert_eq!(
+        count(pool, "SELECT count(*) FROM internal_idempotency").await,
+        1,
+        "the in-flight fence must survive"
+    );
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM retention_deletion_requests WHERE request_id = $1 AND status = 'pending'",
+    )
+    .bind(&request_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(pending, 1, "the refused request must stay pending");
+    let receipted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM retention_deletion_requests WHERE request_id = $1 AND status = 'completed'",
+    )
+    .bind(&request_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(receipted, 0, "no receipt may be issued while guarded");
+
+    // The scheduled drain must also skip the guarded request, not roll back
+    // the run: no deletion completes, user rows survive.
+    let report: RetentionReport = run_retention(pool, RetentionMode::Execute).await.unwrap();
+    assert_eq!(
+        report.deletions_completed, 0,
+        "a guarded request must not count as completed, got {report:?}"
+    );
+    assert_eq!(
+        count(
+            pool,
+            "SELECT count(*) FROM member_levels WHERE guild_id = '111111111111111111' AND member_id = '444444444444444444'"
+        )
+        .await,
+        1,
+        "the guarded user's rows must survive the scheduled run"
+    );
+
+    // Settle both fences; fulfilment must then succeed with a receipt.
+    sqlx::query(
+        "UPDATE internal_idempotency SET state = 'completed', response_code = 'success',
+         http_status = 200, resource_id = actor_id, affected = 1 WHERE guild_id = $1 AND actor_id = $2",
+    )
+    .bind(GUILD_A)
+    .bind(MEMBER)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE containment_incidents SET state = 'contained', completed_at = '2026-10-01T00:00:01Z'
+         WHERE guild_id = $1 AND executor_id = $2",
+    )
+    .bind(GUILD_A)
+    .bind(MEMBER)
+    .execute(pool)
+    .await
+    .unwrap();
+    let receipt: DeletionReceipt = fulfill_user_deletion(pool, &request_id).await.unwrap();
+    assert_eq!(receipt.request_id, request_id);
+    assert_eq!(
+        count(
+            pool,
+            "SELECT count(*) FROM member_levels WHERE guild_id = '111111111111111111' AND member_id = '444444444444444444'"
+        )
+        .await,
+        0,
+        "the settled user's rows must go with the receipt"
+    );
+    assert_eq!(
+        count(
+            pool,
+            "SELECT count(*) FROM member_levels WHERE guild_id = '111111111111111111' AND member_id = '555555555555555555'"
+        )
+        .await,
+        1,
+        "the other member's rows must survive"
+    );
+    db.close().await.unwrap();
+}
+
+/// A departed guild's purge covers every plan table (including `event_store`)
+/// while the other guild is untouched, and a pending deletion for the
+/// departed guild completes with a receipt instead of vanishing.
+#[tokio::test]
+async fn guild_purge_covers_every_plan_table_and_preserves_receipts() {
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    sqlx::raw_sql(include_str!("fixtures/member_erasure.sql"))
+        .execute(pool)
+        .await
+        .unwrap();
+    // Clear the fixture's auto-seeded ledger so the pending drain is exactly
+    // the one request below; otherwise the drain would complete four requests
+    // before the purge runs.
+    sqlx::query("DELETE FROM retention_deletion_requests")
+        .execute(pool)
+        .await
+        .unwrap();
+    const FIX_GONE: &str = "1545644954272137297";
+    const FIX_OTHER: &str = "1545644954272137298";
+    const FIX_USER: &str = "123456789012345678";
+    for guild in [FIX_GONE, FIX_OTHER] {
+        sqlx::query(
+            "INSERT INTO presence_probe (guild_id, observed_at, approximate_presence_count, bot_floor)
+             VALUES ($1, to_char(now() - interval '1 day', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), 10, NULL)",
+        )
+        .bind(guild)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    // Snapshot the surviving guild's per-table counts before the purge.
+    let plan = two_bot_cutover::member_erasure::plan();
+    let mut other_before: Vec<(String, i64)> = Vec::new();
+    for entry in &plan.tables {
+        let guild_count: i64 = if entry.table == "lfg_signups" || entry.table == "lfg_roles" {
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM {} WHERE lfg_id IN (SELECT id FROM lfg_posts WHERE guild_id = $1)",
+                entry.table
+            )))
+            .bind(FIX_OTHER)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        } else if entry.table == "feed_deliveries" {
+            sqlx::query_scalar(sqlx::AssertSqlSafe(
+                "SELECT count(*) FROM feed_deliveries WHERE feed_id IN (SELECT id FROM feed_relays WHERE guild_id = $1)".to_owned(),
+            ))
+            .bind(FIX_OTHER)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        } else if entry.table == "retention_deletion_requests" {
+            0
+        } else {
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM {} WHERE guild_id = $1",
+                entry.table
+            )))
+            .bind(FIX_OTHER)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        };
+        other_before.push((entry.table.clone(), guild_count));
+    }
+
+    let request_id = request_user_deletion(pool, FIX_GONE, FIX_USER)
+        .await
+        .unwrap();
+    assert!(
+        handle_guild_delete(pool, FIX_GONE, None).await.unwrap(),
+        "a real removal enqueues a purge"
+    );
+    let report: RetentionReport = run_retention(pool, RetentionMode::Execute).await.unwrap();
+    assert_eq!(
+        report.deletions_completed, 1,
+        "the departed guild's pending deletion must complete, not vanish, got {report:?}"
+    );
+    assert!(
+        report.guild_rows_purged > 0,
+        "the purge must delete rows, got {report:?}"
+    );
+    let receipted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM retention_deletion_requests WHERE request_id = $1 AND status = 'completed'",
+    )
+    .bind(&request_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        receipted, 1,
+        "the pending request for the departed guild must have a receipt"
+    );
+    // Every plan table except the ledger must hold zero rows for the gone guild.
+    for entry in &plan.tables {
+        if entry.table == "retention_deletion_requests" {
+            continue;
+        }
+        let gone_count: i64 = if entry.table == "lfg_signups" || entry.table == "lfg_roles" {
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM {} WHERE lfg_id IN (SELECT id FROM lfg_posts WHERE guild_id = $1)",
+                entry.table
+            )))
+            .bind(FIX_GONE)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        } else if entry.table == "feed_deliveries" {
+            sqlx::query_scalar(sqlx::AssertSqlSafe(
+                "SELECT count(*) FROM feed_deliveries WHERE feed_id IN (SELECT id FROM feed_relays WHERE guild_id = $1)".to_owned(),
+            ))
+            .bind(FIX_GONE)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        } else {
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM {} WHERE guild_id = $1",
+                entry.table
+            )))
+            .bind(FIX_GONE)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        };
+        assert_eq!(
+            gone_count, 0,
+            "purged guild must leave zero rows in {}",
+            entry.table
+        );
+    }
+    let event_store_gone: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM event_store WHERE guild_id = $1")
+            .bind(FIX_GONE)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        event_store_gone, 0,
+        "the purged guild's event_store rows must go"
+    );
+    let event_store_other: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM event_store WHERE guild_id = $1")
+            .bind(FIX_OTHER)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        event_store_other, 2,
+        "the surviving guild's event_store rows must stay"
+    );
+    assert_eq!(
+        count(
+            pool,
+            "SELECT count(*) FROM presence_probe WHERE guild_id = '1545644954272137297'"
+        )
+        .await,
+        0,
+        "the purged guild's probe rows must go"
+    );
+    assert_eq!(
+        count(
+            pool,
+            "SELECT count(*) FROM presence_probe WHERE guild_id = '1545644954272137298'"
+        )
+        .await,
+        1,
+        "the surviving guild's probe rows must stay"
+    );
+    // The surviving guild's plan-table rows must be byte-identical in count.
+    for (table, before) in &other_before {
+        if table == "retention_deletion_requests" {
+            continue;
+        }
+        let after: i64 = if table == "lfg_signups" || table == "lfg_roles" {
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM {table} WHERE lfg_id IN (SELECT id FROM lfg_posts WHERE guild_id = $1)"
+            )))
+            .bind(FIX_OTHER)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        } else if table == "feed_deliveries" {
+            sqlx::query_scalar(sqlx::AssertSqlSafe(
+                "SELECT count(*) FROM feed_deliveries WHERE feed_id IN (SELECT id FROM feed_relays WHERE guild_id = $1)".to_owned(),
+            ))
+            .bind(FIX_OTHER)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        } else {
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM {table} WHERE guild_id = $1"
+            )))
+            .bind(FIX_OTHER)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        };
+        assert_eq!(
+            after, *before,
+            "surviving guild's {table} must be untouched"
+        );
+    }
+    db.close().await.unwrap();
+}
