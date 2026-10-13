@@ -66,8 +66,9 @@ are outside this implementation's scope.
   IDs, reasons and metadata. Some legacy-compatible payload columns are arbitrary
   TEXT, not database-validated JSON. The event-store capture (`event_store`:
   stage-instance, interaction-observe and audit-log-entry rows with IDs and
-  enum fields only, no free text) stores actor/target member IDs, erased as
-  either one.
+  enum fields only, no free text, plus invite rows with the code hash and the
+  inviter ID and scheduled-event rows with IDs and status/entity-type enums)
+  stores actor/target/user/inviter member IDs, erased as any one of them.
 - Automod violation counts and once-per-message ledgers store member and message
   IDs and filter names, never content (`automod_violations`,
   `automod_processed_messages`). Per-delivery replay claims may keep a matched
