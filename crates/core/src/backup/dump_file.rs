@@ -73,6 +73,12 @@ pub const DUMP_TABLES: &[&str] = &[
     "automod_delivery_claims",
     "gateway_boot_directives",
     "member_erasure_audit",
+    // Opt-out control plane (0433/0434): suppression tombstones must survive
+    // backup/restore, or a restore would silently resume per-user persistence
+    // members refused. No foreign keys, so order is free.
+    "privacy_opt_outs",
+    "guild_analytics_settings",
+    "privacy_opt_out_audit",
     "member_levels",
     // Seasonal XP projection (0100): append-only mirror of lifetime XP per
     // quarter, guild-keyed with no foreign keys, so order beside
@@ -156,8 +162,15 @@ pub const DUMP_TABLES: &[&str] = &[
 /// Tables first covered by v5. A v4 archive predates them and need not declare
 /// them; every other covered table is still required, so a v4 recovery point
 /// written before create-reservation persistence (0422) stays readable
-/// without waiving arbitrary missing tables.
-pub const V5_ADDED_TABLES: &[&str] = &["voice_create_reservations"];
+/// without waiving arbitrary missing tables. The privacy opt-out control plane
+/// (0433/0434) is v5 for the same reason: v4 archives predate suppression
+/// tombstones, toggle rows and opt-out receipts.
+pub const V5_ADDED_TABLES: &[&str] = &[
+    "voice_create_reservations",
+    "privacy_opt_outs",
+    "guild_analytics_settings",
+    "privacy_opt_out_audit",
+];
 
 /// Tables first covered by v6. A v4 or v5 archive predates them and need not
 /// declare them; v6 archives must cover everything except the v7 addition, so
@@ -1751,9 +1764,13 @@ mod tests {
             })
             .collect();
         assert_eq!(names, expected);
+        // The frozen v4 archive predates every v5 table, in DUMP_TABLES order.
         assert_eq!(
             contents.manifest.missing_tables(),
             [
+                "privacy_opt_outs",
+                "guild_analytics_settings",
+                "privacy_opt_out_audit",
                 "member_season_xp",
                 "voice_create_reservations",
                 "event_store"

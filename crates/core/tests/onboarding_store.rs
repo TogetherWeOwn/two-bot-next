@@ -14,6 +14,8 @@ const AT: &str = "2026-08-24T00:00:00.000Z";
 const LATER: &str = "2026-08-25T00:00:00.000Z";
 const BASE: &str = include_str!("../../cutover/migrations/0001_funnel.sql");
 const MIGRATION: &str = include_str!("../../cutover/migrations/0190_onboarding.sql");
+// The onboarding writers consult the opt-out suppression table.
+const PRIVACY: &str = include_str!("../../cutover/migrations/0433_privacy_opt_out.sql");
 
 async fn isolated_pool(schema: &str) -> PgPool {
     assert!(schema
@@ -81,6 +83,7 @@ async fn onboarding_migration_store_and_mock_delivery() {
         sqlx::raw_sql(BASE).execute(pool).await.unwrap();
         sqlx::raw_sql(MIGRATION).execute(pool).await.unwrap();
         sqlx::raw_sql(MIGRATION).execute(pool).await.unwrap();
+        sqlx::raw_sql(PRIVACY).execute(pool).await.unwrap();
         let (constraint_count,): (i64,) = sqlx::query_as(
             "SELECT count(*) FROM pg_constraint WHERE conrelid = 'events'::regclass
              AND conname = 'chk_events_onboarding_vocabulary'",
@@ -254,4 +257,51 @@ async fn onboarding_migration_store_and_mock_delivery() {
             .await
             .unwrap();
     assert_eq!(remaining, 0, "test schemas cleaned");
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb; explicitly run with --features db --ignored"]
+async fn suppressed_pair_gets_no_welcome_and_writes_no_rows() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let schema = format!("tog23150_suppressed_{stamp}");
+    let mut admin = PgConnection::connect(TEST_DATABASE)
+        .await
+        .expect("agent-testdb");
+    // Identifiers contain only this fixed prefix and the numeric clock.
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&mut admin)
+        .await
+        .unwrap();
+    let pool = isolated_pool(&schema).await;
+    sqlx::raw_sql(BASE).execute(&pool).await.unwrap();
+    sqlx::raw_sql(MIGRATION).execute(&pool).await.unwrap();
+    sqlx::raw_sql(PRIVACY).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO privacy_opt_outs (guild_id, member_id) VALUES ('1', '2')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // No welcome is sent: the guard never arrives, so no per-user row exists.
+    assert!(begin_prompt(&pool, "1", "2").await.unwrap().is_none());
+    assert!(!record_prompted(&pool, "1", "2", "3", AT).await.unwrap());
+    assert!(
+        !record_game_selected(&pool, "1", "2", &["shooters".to_owned()], AT)
+            .await
+            .unwrap()
+    );
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE guild_id = '1' AND member_id = '2'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, 0, "no per-user rows for the suppressed pair");
+    // The other member is unaffected.
+    assert!(record_prompted(&pool, "1", "3", "3", AT).await.unwrap());
+    pool.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&mut admin)
+        .await
+        .unwrap();
 }

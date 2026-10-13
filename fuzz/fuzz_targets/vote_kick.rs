@@ -99,32 +99,40 @@ fn check_progress(progress: VoteProgress) {
     assert!(progress.yes <= progress.total);
 }
 
+fn observe(
+    id: u64,
+    update: VoteKickUpdate,
+    emitted: &mut BTreeSet<u64>,
+    terminal: &mut BTreeMap<u64, VoteKickStatus>,
+) {
+    check_progress(update.progress);
+    if let Some(kick) = update.kick {
+        // The kick emits once, on the first Active -> Passed transition,
+        // scoped to the vote's own guild, room and target.
+        assert_eq!(update.status, VoteKickStatus::Passed);
+        assert_eq!(kick.guild_id, update.vote.guild_id);
+        assert_eq!(kick.room_id, update.vote.room_id);
+        assert_eq!(kick.target_id, update.vote.target_id);
+        assert!(emitted.insert(id), "kick emitted twice");
+        terminal.insert(id, VoteKickStatus::Passed);
+    } else if let Some(previous) = terminal.get(&id) {
+        // Terminal votes stay terminal: replay reads the status, never a
+        // new kick, and a rejoining target cannot revive a cancelled vote.
+        assert_eq!(update.status, *previous);
+    } else if update.status != VoteKickStatus::Active {
+        terminal.insert(id, update.status);
+    }
+}
+
 fn drive(data: &[u8]) {
     let mut core = VoteKickCore::new();
     let clock = FuzzClock(Cell::new(1_000));
     let mut started: BTreeSet<u64> = BTreeSet::new();
     let mut emitted: BTreeSet<u64> = BTreeSet::new();
     let mut terminal: BTreeMap<u64, VoteKickStatus> = BTreeMap::new();
-
-    let mut check_update = |id: u64, update: VoteKickUpdate| {
-        check_progress(update.progress);
-        if let Some(kick) = update.kick {
-            // The kick emits once, on the first Active -> Passed transition,
-            // scoped to the vote's own guild, room and target.
-            assert_eq!(update.status, VoteKickStatus::Passed);
-            assert_eq!(kick.guild_id, update.vote.guild_id);
-            assert_eq!(kick.room_id, update.vote.room_id);
-            assert_eq!(kick.target_id, update.vote.target_id);
-            assert!(emitted.insert(id), "kick emitted twice");
-            terminal.insert(id, VoteKickStatus::Passed);
-        } else if let Some(previous) = terminal.get(&id) {
-            // Terminal votes stay terminal: replay reads the status, never a
-            // new kick, and a rejoining target cannot revive a cancelled vote.
-            assert_eq!(update.status, *previous);
-        } else if update.status != VoteKickStatus::Active {
-            terminal.insert(id, update.status);
-        }
-    };
+    // IDs the core evicted past the retention horizon and reported via
+    // `drain_evicted`, not yet consumed by a new generation's start.
+    let mut evicted: BTreeSet<u64> = BTreeSet::new();
 
     for step in data.chunks_exact(STRIDE) {
         clock.0.set(apply_clock_jump(clock.0.get(), step[1]));
@@ -151,33 +159,57 @@ fn drive(data: &[u8]) {
             VoteBallot::No
         };
         match step[0] % 3 {
-            0 => match core.start(id, facts, actor, reference.target_id, &clock) {
-                Ok(update) => {
-                    // Starting never casts a ballot or emits a kick; the vote
-                    // opens Active and binds the facts' own scope.
-                    assert_eq!(update.status, VoteKickStatus::Active);
-                    assert_eq!(update.kick, None);
-                    assert_eq!(update.vote.id, id);
-                    assert_eq!(update.vote.guild_id, facts.guild_id);
-                    assert_eq!(update.vote.room_id, facts.room_id);
-                    assert_eq!(update.vote.target_id, reference.target_id);
-                    check_progress(update.progress);
-                    started.insert(id);
+            0 => {
+                let result = core.start(id, facts, actor, reference.target_id, &clock);
+                evicted.extend(core.drain_evicted());
+                match result {
+                    Ok(update) => {
+                        // Starting never casts a ballot or emits a kick; the vote
+                        // opens Active and binds the facts' own scope.
+                        assert_eq!(update.status, VoteKickStatus::Active);
+                        assert_eq!(update.kick, None);
+                        assert_eq!(update.vote.id, id);
+                        assert_eq!(update.vote.guild_id, facts.guild_id);
+                        assert_eq!(update.vote.room_id, facts.room_id);
+                        assert_eq!(update.vote.target_id, reference.target_id);
+                        check_progress(update.progress);
+                        // A repeated ID must be a new generation: the core must
+                        // have evicted it past the retention horizon. Without
+                        // this check the reset below would hide a dropped or
+                        // narrowed `ReusedVoteId` guard (or an eviction-horizon
+                        // off-by-one) as a clean restart.
+                        assert!(
+                            !started.contains(&id) || evicted.remove(&id),
+                            "retained ID restarted"
+                        );
+                        started.insert(id);
+                        // Eviction past the retention horizon lets an ID begin a new generation.
+                        terminal.remove(&id);
+                        emitted.remove(&id);
+                    }
+                    Err(VoteKickError::ReusedVoteId) => {
+                        // Replay refused: the ID must come from an earlier start.
+                        assert!(started.contains(&id));
+                    }
+                    Err(_) => {}
                 }
-                Err(VoteKickError::ReusedVoteId) => {
-                    // Replay refused: the ID must come from an earlier start.
-                    assert!(started.contains(&id));
+            }
+            1 => {
+                let result = core.cast(reference, facts, actor, ballot, &clock);
+                evicted.extend(core.drain_evicted());
+                match result {
+                    Ok(update) => observe(id, update, &mut emitted, &mut terminal),
+                    Err(_) => {}
                 }
-                Err(_) => {}
-            },
-            1 => match core.cast(reference, facts, actor, ballot, &clock) {
-                Ok(update) => check_update(id, update),
-                Err(_) => {}
-            },
-            _ => match core.refresh(reference, facts, &clock) {
-                Ok(update) => check_update(id, update),
-                Err(_) => {}
-            },
+            }
+            _ => {
+                let result = core.refresh(reference, facts, &clock);
+                evicted.extend(core.drain_evicted());
+                match result {
+                    Ok(update) => observe(id, update, &mut emitted, &mut terminal),
+                    Err(_) => {}
+                }
+            }
         }
     }
 }
