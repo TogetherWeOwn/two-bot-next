@@ -387,7 +387,7 @@ mod tests {
         .execute(&pool)
         .await?;
         sqlx::raw_sql(include_str!(
-            "../../cutover/migrations/0440_game_activity_guild_aggregates.sql"
+            "../../cutover/migrations/0441_game_activity_guild_aggregates.sql"
         ))
         .execute(&pool)
         .await?;

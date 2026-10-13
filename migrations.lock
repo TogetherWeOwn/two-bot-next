@@ -404,14 +404,19 @@
     "crates/cutover/migrations/0439_event_store_invite_scheduled_event_capture.sql": {
       "sha256": "ec8fa9475530ab759dafa3d2963e9465796daa7e05f8d500d001aa2a13721312",
       "justification": "Event-store S7 invite + scheduled-event capture: order-independent event_store invite columns (invite_code_hash as hex sha256, never the raw code, plus inviter_id) and scheduled-event columns (scheduled_event_id plus event_status/entity_type integer enums) with nullable convergence and the shared UNIQUE dedup index; ids+hash+timestamps+enums only, no description/name/location/username columns. Renumbered to 0439 because the merged retention migration owns 0438; the S7 migration has not merged."
+
     },
-    "crates/cutover/migrations/0440_game_activity_guild_aggregates.sql": {
-      "sha256": "b208398e0ca388e197658a404664f4a0d9be6056375bf5ae7a396a6afec7e698",
-      "justification": "Guild-level game-activity aggregates (no member columns): additive table with nonnegativity plus voice-within-total checks; cutover chain copy, IF NOT EXISTS. Renumbered 0439 to 0440 after main's cutover 0439 S7 invite/scheduled-event capture; global migration numbers remain unique across both chains."
+    "crates/cutover/migrations/0440_stream_live_claims.sql": {
+      "sha256": "c34223b642a8c626281eef8fecef96f165a9d96be4acf510bff550f5d5e50c72",
+      "justification": "Durable Twitch go-live dedup ledger keyed by live_dedup_key: claim-before-post insert, release-on-failed-send delete, delivered rows stamped and kept as the restart-proof fence. Renumbered 0435 to 0438 on the merge past main's 0435/0436 backfill and 0437 event-store S1 core, then to 0439 after main added 0438 retention queues, then to 0440 after main added 0439 event-store S7 invite/scheduled-event capture."
     },
-    "crates/store/migrations/0441_game_activity_guild_aggregates.sql": {
+    "crates/cutover/migrations/0441_game_activity_guild_aggregates.sql": {
       "sha256": "fb64d28a044ed67813fc4056aa964df52a15c3010405c2394c8da01feebb25db",
-      "justification": "Guild-level game-activity aggregates (no member columns): additive table with nonnegativity plus voice-within-total checks; store chain copy, IF NOT EXISTS. Renumbered 0440 to 0441 after main's cutover 0439 S7 invite/scheduled-event capture; global migration numbers remain unique across both chains."
+      "justification": "Guild-level game-activity aggregates (no member columns): additive table with nonnegativity plus voice-within-total checks; cutover chain copy, IF NOT EXISTS. Renumbered 0440 to 0441 after main's cutover 0440 stream-live claims; global migration numbers remain unique across both chains."
+    },
+    "crates/store/migrations/0442_game_activity_guild_aggregates.sql": {
+      "sha256": "1fccfea2ca41d6047c4ac2af17b955c3f76b2fa108bfe648f6e22dc8845a6f60",
+      "justification": "Guild-level game-activity aggregates (no member columns): additive table with nonnegativity plus voice-within-total checks; store chain copy, IF NOT EXISTS. Renumbered 0441 to 0442 after main's cutover 0440 stream-live claims; global migration numbers remain unique across both chains."
     }
   }
 }

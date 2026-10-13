@@ -1653,6 +1653,7 @@ jobs:
       - run: cargo clippy -p two-bot-core --all-targets --features db --locked -- -D warnings
       - run: cargo test -p two-bot-core --features db --test feeds --locked
       - run: cargo test -p two-bot-core --features db --test feeds_store --locked -- --ignored
+      - run: cargo test -p two-bot-core --features db --test stream_live_store --locked -- --ignored
 
   tickets-postgres:
     name: tickets postgres

@@ -71,6 +71,16 @@ import {
   relayReceiverResponse,
 } from "./internal-actions.ts";
 import {
+  EVENTSUB_PATH,
+  EVENTSUB_RECEIVER_PORT,
+  allowlistedHeaders as eventsubAllowlistedHeaders,
+  eventsubIngressEnabled,
+  handleEventsubIngress,
+  isEventsubRequest,
+  readBody as readEventsubBody,
+  relayEventsubResponse,
+} from "./eventsub.ts";
+import {
   OPS_AUDIT_PATH,
   OPS_CONFIG_PATH,
   OPS_ENFORCEMENT_PENDING,
@@ -165,6 +175,10 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   REDIRECT_MAPPINGS_JSON?: string;
   /** Staging-only var (wrangler.toml [env.staging.vars]); see internal-actions.ts. */
   INTERNAL_ACTIONS_INGRESS?: string;
+  /** Staging-only var (wrangler.toml [env.staging.vars]); see eventsub.ts. */
+  EVENTSUB_INGRESS?: string;
+  /** Operator-set Worker secret enabling the EventSub forward. Never flag-forwarded. */
+  TWO_EVENTSUB?: string;
   /** Operator-set Worker secrets for the private receiver. Never flag-forwarded. */
   TWO_INTERNAL_ACTIONS?: string;
   TWO_INTERNAL_CALLERS?: string;
@@ -625,6 +639,7 @@ export class TwoBotContainer extends Container<Env> {
     const url = new URL(request.url);
     if (url.pathname === CONTROL_PATH) return this.control(request);
     if (url.pathname === ACTIONS_PATH) return this.internalActions(request);
+    if (url.pathname === EVENTSUB_PATH) return this.internalEventsub(request);
     if (url.pathname === OPS_CONFIG_PATH || url.pathname === OPS_KILLSWITCH_PATH || url.pathname === OPS_AUDIT_PATH) {
       return this.opsControl(request);
     }
@@ -821,6 +836,43 @@ export class TwoBotContainer extends Container<Env> {
         if (!this.ctx.container?.running) return envelope(503, "unavailable", true);
         try {
           return await relayReceiverResponse(await this.containerFetch(forward, RECEIVER_PORT));
+        } catch {
+          return envelope(503, "unavailable", true);
+        }
+      });
+    } catch (error) {
+      // Logs the closed ownership reason; the caller only sees the envelope.
+      refused(error);
+      return envelope(503, "unavailable", true);
+    }
+  }
+
+  /**
+   * Staging-only EventSub ingress behind the ownership fence. Re-checks the
+   * Worker's gate, then forwards the exact bytes to the EventSub receiver
+   * port. Public ingress never starts the Container: probes and keepalive own
+   * that, so an unauthenticated flood cannot cause a cold start. Until the
+   * receiver slice lands nothing listens on that port and every forward fails
+   * closed to the 503 envelope below.
+   */
+  private async internalEventsub(request: Request): Promise<Response> {
+    if (!eventsubIngressEnabled(this.env) || !isEventsubRequest(request)) return notFound();
+    const checked = eventsubAllowlistedHeaders(request.headers);
+    if ("refusal" in checked) return checked.refusal;
+    const body = await readEventsubBody(request);
+    if ("refusal" in body) return body.refusal;
+    const forward = forwardRequest(
+      `http://c${EVENTSUB_PATH}`,
+      checked.headers,
+      body.bytes,
+      AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    );
+    try {
+      return await this.owned(async () => {
+        await this.ownership.require(this.id(), request.headers.get(DEPLOYMENT_HEADER) ?? "");
+        if (!this.ctx.container?.running) return envelope(503, "unavailable", true);
+        try {
+          return await relayEventsubResponse(await this.containerFetch(forward, EVENTSUB_RECEIVER_PORT));
         } catch {
           return envelope(503, "unavailable", true);
         }
@@ -1271,6 +1323,21 @@ export default {
     // unless INTERNAL_ACTIONS_INGRESS and TWO_INTERNAL_ACTIONS are both "1".
     if (url.pathname === ACTIONS_PATH && ingressEnabled(env)) {
       return handleActionsIngress(
+        request,
+        request.headers.get("cf-connecting-ip") ?? "unknown",
+        async (sanitized) => {
+          // Stamp the fence id server-side; a caller-supplied one was already
+          // dropped by the header allowlist.
+          sanitized.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
+          return env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
+        },
+      );
+    }
+
+    // Staging-only EventSub ingress. Dark (no match here, today's behavior)
+    // unless EVENTSUB_INGRESS and TWO_EVENTSUB are both "1".
+    if (url.pathname === EVENTSUB_PATH && eventsubIngressEnabled(env)) {
+      return handleEventsubIngress(
         request,
         request.headers.get("cf-connecting-ip") ?? "unknown",
         async (sanitized) => {

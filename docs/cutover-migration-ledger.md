@@ -134,6 +134,7 @@ All migrations are up-only; there are no down files. The `direction` column is
 | 0435_backfill_cursors | up | backfill_cursors | re-runnable | Drop the table; cutover mirror of store 0408, cursors re-checkpoint on the next worker run. |
 | 0436_member_catchup | up | member_catchup_members, member_catchup_cursors | re-runnable | Drop both tables; per-guild member rows and resume cursors re-capture from the Discord API on the next worker run, and the members frontier re-checkpoints into backfill_cursors. |
 | 0438_retention_queues | up | retention_guild_purge_queue, retention_deletion_requests | re-runnable | Drop both tables; queued guild purges and pending deletion requests are lost and must be re-enqueued, completed receipts are the only durable record. |
+| 0440_stream_live_claims | up | stream_live_claims | re-runnable | Drop the table; go-live dedup claims re-claim on the next `stream.online` event (delivered rows lose their restart-proof fence until re-posted). |
 
 ## Notes
 

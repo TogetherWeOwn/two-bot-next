@@ -257,7 +257,7 @@ INSERT INTO presence_probe
     (guild_id, observed_at, approximate_presence_count, bot_floor, bot_floor_scan_truncated)
 VALUES ('100000000000000001', '2026-08-01T10:00:00.000Z', 31, 3, TRUE),
        ('100000000000000001', '2026-08-01T10:01:00.000Z', 30, NULL, FALSE);
--- Game-activity guild aggregates (0435/0436): one titled row, one untitled
+-- Game-activity guild aggregates (0441/0442): one titled row, one untitled
 -- row (`''` game key), and one row in another guild. Guild keys only, so the
 -- roundtrip asserts archive coverage, not an empty seed.
 INSERT INTO game_activity_guild_aggregates
@@ -344,6 +344,11 @@ VALUES (repeat('3', 64), '2026-08-01T10:00:00.123456Z');
 INSERT INTO internal_event_keys (guild_id, event_key, event_id, created_at, updated_at)
 VALUES ('100000000000000001', 'backup:launch', '100000000000000002',
         '2026-08-01T10:00:00.123456Z', '2026-08-01T10:00:00.123456Z');
+INSERT INTO stream_live_claims
+    (dedup_key, broadcaster_id, started_at, channel_id, content, claimed_at, delivered_at, message_id)
+VALUES (repeat('a', 64), '123456', '2026-08-01T10:00:00Z', '100000000000000003',
+        'LIVE: backup is live on Twitch!', '2026-08-01T10:00:01Z', '2026-08-01T10:00:02Z',
+        '100000000000000006');
 
 INSERT INTO self_role_audit
     (event_id, guild_id, panel_id, member_id, source_id, option_key, role_id, source,
