@@ -13,6 +13,11 @@ BEGIN
       INSERT INTO members (guild_id, member_id) VALUES (g, u);
       INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
         VALUES ('member_join', u, g, now(), 'fixture', '{}', k);
+      -- event_store is shared by the S1-S8 slices: one presence row per member
+      -- here plus three S8 rows per member below (actor-only / target-only /
+      -- user-only), so the erasure suites expect four event_store rows per
+      -- member. Voice columns stay NULL here; the backup seed covers the S4
+      -- voice shape.
       INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key,
         presence_status, activity_type, application_id, nick_changed, roles)
         VALUES ('PRESENCE_UPDATE', g, u, '2026-10-01T00:00:00Z',
