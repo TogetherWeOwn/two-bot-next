@@ -17,9 +17,9 @@ require `--force`. This confirmation is not authorization to target production.
 ## The format
 
 Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
-write **v6** (including durable voice-create reservations and the retention
-queues); the reader also accepts frozen **v3**, pre-reservation **v4** and
-pre-retention **v5**. Other versions refuse.
+write **v6** (including durable voice-create reservations, the retention
+queues and member-capture deltas); the reader also accepts frozen **v3**,
+pre-reservation **v4** and pre-v6 **v5**. Other versions refuse.
 The manifest carries per-table `{name, columns, column_types, count}` taken
 inside one `REPEATABLE READ` transaction, the `events` high-water mark, the
 source's applied migrations and `sequenceMarks`: for every serial, identity and
@@ -54,30 +54,32 @@ selectors ignore it.
 ### Coverage and recovery semantics (v4, v5 and v6)
 
 `DUMP_TABLES` in `crates/core/src/backup/dump_file.rs` is the single ordered
-inventory for both dump and restore. It includes **88 durable tables from the
+inventory for both dump and restore. It includes **89 durable tables from the
 current cutover migrations**, including the bot-owned website-contract backing
 tables, the member-moderation ledger, the self-role send receipts
 (`self_role_exchanges`) plus their uncertainty baselines
 (`self_role_exchange_baselines`), the automod delivery claims, the gateway
 boot directives, the member-erasure audit, the internal clock high-water
 mark, the voice configuration tables, the accepted voice-room create history
-(`voice_create_reservations`) and the retention queues
-(`retention_guild_purge_queue`, `retention_deletion_requests`).
+(`voice_create_reservations`), the retention queues
+(`retention_guild_purge_queue`, `retention_deletion_requests`) and the
+member-capture deltas (`event_store`).
 `OPTIONAL_LEGACY_TABLES` is empty: the coverage test fails if a covered table
-is not migrated. A dump from a fresh Rust schema has 88 table entries.
+is not migrated. A dump from a fresh Rust schema has 89 table entries.
 A missing current table refuses a dump/restore: migrate the target first.
 A v4 archive must declare every covered table except the ones v5 added
 (`V5_ADDED_TABLES`) and the ones v6 added (`V6_ADDED_TABLES`), so recovery
 points written before create-reservation persistence remain inspectable and
 restorable. A v5 archive must declare every covered table except the v6
-retention queues, so recovery points written before retention queues remain
-inspectable and restorable. A v4 or v5 archive written before any other table
-joined the inventory is refused at inspect ("manifest is missing tables");
-take a fresh dump after upgrading. V6 requires the full current inventory; an
-incomplete new archive refuses at inspection. Restoring a pre-reservation
-archive clears the destination's reservation table, and restoring a v4 or v5
-archive clears the destination's retention queues, as with other tables absent
-from an older version.
+tables, so recovery points written before the retention queues or
+member-capture persistence remain inspectable and restorable. A v4 or v5
+archive written before any other table joined the inventory is refused at
+inspect ("manifest is missing tables"); take a fresh dump after upgrading.
+V6 requires the full current inventory; an incomplete new archive refuses at
+inspection. Restoring a pre-reservation archive clears the destination's
+reservation table, and restoring a v4 or v5 archive clears the destination's
+retention queues and `event_store`, as with other tables absent from an older
+version.
 An optional legacy table may be absent only when there are no archived rows for
 it. Nonempty legacy data without a matching target table refuses **before any
 truncate**, rather than silently discarding it.

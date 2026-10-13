@@ -623,6 +623,7 @@ async fn assert_default_inserts(
         ("internal_idempotency", "intent_id", "INSERT INTO internal_idempotency (caller_hash, key_hash, action, payload_hash, state) VALUES (repeat('4', 64), repeat('5', 64), 'event.read', repeat('6', 64), 'in_flight') RETURNING intent_id"),
         ("internal_action_log", "audit_id", "INSERT INTO internal_action_log (intent_id, phase, caller_hash, action, resolved_role_id) VALUES (83, 'intent', repeat('b', 64), 'role.assign', '100000000000000010') RETURNING audit_id"),
         ("moderation_member_bans", "generation", "INSERT INTO moderation_member_bans (request_id, guild_id, user_id, state, created_at) VALUES ('post-restore:ban', '100000000000000001', '100000000000000012', 'prepared', now()) RETURNING generation"),
+        ("event_store", "id", "INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key) VALUES ('GUILD_MEMBER_ADD', '100000000000000001', '100000000000000002', now(), 'post-restore:event-store') RETURNING id"),
     ];
     let cases: BTreeSet<(String, String)> = inserts
         .iter()
@@ -1428,7 +1429,11 @@ async fn pre_reservation_v4_restores_and_clears_newer_reservation_rows() {
         count, 0,
         "old archives must not retain newer target history"
     );
-    for table in ["retention_guild_purge_queue", "retention_deletion_requests"] {
+    for table in [
+        "retention_guild_purge_queue",
+        "retention_deletion_requests",
+        "event_store",
+    ] {
         let sql = format!("SELECT COUNT(*) FROM {table}");
         let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
             .fetch_one(pool)
@@ -1436,7 +1441,7 @@ async fn pre_reservation_v4_restores_and_clears_newer_reservation_rows() {
             .unwrap();
         assert_eq!(
             count, 0,
-            "v4 archives predate the retention queues; restore must clear newer {table} rows"
+            "v4 archives predate the v6 tables; restore must clear newer {table} rows"
         );
     }
     let channel: String = sqlx::query_scalar("SELECT channel_id FROM voice_rooms")

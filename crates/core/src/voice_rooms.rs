@@ -1009,6 +1009,10 @@ struct QueueInner {
     /// Dead letters evicted by the [`MAX_FAILED_ACTIONS`] cap (oldest first).
     /// Monotonic; `clear_failed` leaves it set.
     failed_dropped: u64,
+    /// First-enqueue time by action id, for the oldest-pending-age gauge.
+    /// Entries survive dispatch and requeue (age spans retries) and are
+    /// removed at terminal completion or channel drain.
+    enqueued_at: HashMap<u64, std::time::Instant>,
 }
 
 impl QueueInner {
@@ -1080,6 +1084,10 @@ impl ActionQueue {
             }
         }
         inner.next_id += 1;
+        let enqueued_id = inner.next_id;
+        inner
+            .enqueued_at
+            .insert(enqueued_id, std::time::Instant::now());
         let queued = QueuedAction {
             id: inner.next_id,
             dispatch_id: 0,
@@ -1194,7 +1202,11 @@ impl ActionQueue {
     /// Release a successful write. Duplicate/stale completions are ignored.
     pub fn mark_succeeded(&self, action: &QueuedAction) -> bool {
         let mut inner = self.inner.lock().expect("queue lock");
-        Self::release(&mut inner, action)
+        let ok = Self::release(&mut inner, action);
+        if ok {
+            inner.enqueued_at.remove(&action.id);
+        }
+        ok
     }
 
     fn release(inner: &mut QueueInner, action: &QueuedAction) -> bool {
@@ -1242,6 +1254,7 @@ impl ActionQueue {
         }
         let attempts = action.attempts.saturating_add(1);
         if attempts >= QUEUE_MAX_ATTEMPTS {
+            inner.enqueued_at.remove(&action.id);
             inner.failed.push(FailedAction {
                 action: QueuedAction { attempts, ..action },
                 reason,
@@ -1356,6 +1369,9 @@ impl ActionQueue {
             }
             *queue = kept;
         }
+        for id in &dropped {
+            inner.enqueued_at.remove(id);
+        }
         dropped
     }
 
@@ -1396,6 +1412,22 @@ impl ActionQueue {
             m.get(&guild_id).map_or(0, VecDeque::len)
         };
         (len(&inner.urgent), len(&inner.deferred))
+    }
+
+    /// Age of the oldest still-queued (not in-flight) action for the guild,
+    /// measured from first enqueue across retries. `None` when nothing is
+    /// queued. Feeds the queue-age gauge and the stuck-worker watchdog.
+    #[must_use]
+    pub fn oldest_pending_age(&self, guild_id: Snowflake) -> Option<std::time::Duration> {
+        let inner = self.inner.lock().expect("queue lock");
+        let now = std::time::Instant::now();
+        [&inner.urgent, &inner.deferred]
+            .iter()
+            .filter_map(|lanes| lanes.get(&guild_id))
+            .flat_map(|queue| queue.iter())
+            .filter_map(|queued| inner.enqueued_at.get(&queued.id))
+            .map(|at| now.saturating_duration_since(*at))
+            .max()
     }
 
     /// Dead-lettered writes for `/setup` recent failures (V10): the newest
@@ -3159,5 +3191,31 @@ mod tests {
             .into_iter()
             .collect();
         assert!(VoiceGates::from_map(&vars).enabled);
+    }
+
+    #[test]
+    fn oldest_pending_age_tracks_first_enqueue_across_retries() {
+        // Stall-observability (TOG prod stall follow-up): the queue-age gauge
+        // must reflect the oldest still-queued action, measured from its
+        // first enqueue, so a requeued-but-never-dispatched action keeps
+        // ageing instead of looking fresh.
+        let queue = ActionQueue::new();
+        assert_eq!(queue.oldest_pending_age(GUILD), None);
+        queue.enqueue(GUILD, RoomAction::DeleteRoom { channel_id: 501 });
+        let age = queue
+            .oldest_pending_age(GUILD)
+            .expect("queued action has an age");
+        assert!(age < std::time::Duration::from_secs(60));
+        // A pop/requeue cycle (the retry path) does not reset the age, and
+        // completing the action after a second pop clears it.
+        let action = queue.pop_due(GUILD, 0).expect("action is due");
+        assert!(queue.mark_rate_limited(GUILD, 1_000, 0, action));
+        assert!(queue.oldest_pending_age(GUILD).is_some());
+        let action = queue
+            .pop_due(GUILD, 1_001)
+            .expect("action is due after the backoff");
+        assert!(queue.mark_succeeded(&action));
+        assert_eq!(queue.oldest_pending_age(GUILD), None);
+        assert_eq!(queue.pending_counts(GUILD), (0, 0));
     }
 }

@@ -340,6 +340,10 @@
     "crates/cutover/migrations/0427_retention_queues.sql": {
       "sha256": "f6a0051c79a461da70a8d3736c20e50a4a5691f95ac093a6449e694514a322e3",
       "justification": "Retention rolling-window queues: guild-purge queue and user-deletion request ledger backing 30-day raw and 45-day audit roll-off with under-72-hour deletion receipts; additive, backout drops both tables."
+    },
+    "crates/cutover/migrations/0432_event_store_member_capture.sql": {
+      "sha256": "81e51abeda792b6e8dfa4ad714e744fcc09b96f9d857ca70bf4080ef8ce46faf",
+      "justification": "Event-store S2 member capture: order-independent event_store table plus premium_since, nick_changed flag and role-id columns for GUILD_MEMBER_ADD/REMOVE/UPDATE, idempotent on the shared UNIQUE dedup_key index, no free-text columns."
     }
   }
 }

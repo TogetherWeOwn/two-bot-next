@@ -107,6 +107,17 @@ live enforcement where no enforcing timer exists. Gateway wiring for
 `GUILD_DELETE`/`GUILD_CREATE` and a schedule are follow-up work. Every run
 reports per-class metrics and supports a dry run that deletes nothing.
 
+The append-only event-store capture (`event_store`, when its slices land)
+follows the same rule: its rows persist until erasure, and its TTL policy is
+an explicit placeholder awaiting a reviewed migration, not an installed
+timer. The per-user purge path is this procedure plus one manifest entry per
+landing slice, deleting by guild plus user; rows without a user id purge per
+guild (and per message or thread where the columns exist) instead. The
+capture fence is ids, timestamps and enums only: no message bodies and no
+custom free text are ever stored. See the
+[event-store wiring note](event-store.md) for the per-slice fence table,
+the backfill-no-replay rule and the read-only staging verify steps.
+
 The manifest explicitly retains these control-plane records:
 
 | Record/columns | Reason and operator follow-up |

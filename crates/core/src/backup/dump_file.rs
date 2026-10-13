@@ -139,13 +139,16 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_vote_kick_audit",
     // V5 adds accepted-create history; see [`V5_ADDED_TABLES`].
     "voice_create_reservations",
-    // V6 adds retention queues (0427): guild-purge intent and user-deletion
-    // ledger with receipts; see [`V6_ADDED_TABLES`]. Both must survive restore
-    // (a lost purge resurrects departed guild data; a lost request breaches
-    // the deletion SLA and drops receipts), so they are dumped, not excluded.
-    // No foreign keys, order among them free.
+    // V6 adds retention queues (0427) and member capture (0432); see
+    // [`V6_ADDED_TABLES`]. The retention queues are guild-purge intent and
+    // user-deletion ledger with receipts: both must survive restore (a lost
+    // purge resurrects departed guild data; a lost request breaches the
+    // deletion SLA and drops receipts), so they are dumped, not excluded.
+    // Member capture is append-only gateway deltas, guild-keyed. No foreign
+    // keys on any of them, so order among the appended tables is free.
     "retention_guild_purge_queue",
     "retention_deletion_requests",
+    "event_store",
 ];
 
 /// Tables first covered by v5. A v4 archive predates them and need not declare
@@ -154,12 +157,17 @@ pub const DUMP_TABLES: &[&str] = &[
 /// waiving arbitrary missing tables.
 pub const V5_ADDED_TABLES: &[&str] = &["voice_create_reservations"];
 
-/// Tables first covered by v6 (retention queues, migration 0427). A v4 or v5
-/// archive predates them and need not declare them; every other covered table
-/// is still required. Restore clears these tables when restoring an older
-/// archive, as with other tables absent from an older version.
-pub const V6_ADDED_TABLES: &[&str] =
-    &["retention_guild_purge_queue", "retention_deletion_requests"];
+/// Tables first covered by v6 (retention queues, migration 0427, plus member
+/// capture, migration 0432). A v4 or v5 archive predates them and need not
+/// declare them; every other covered table is still required, so recovery
+/// points written before either persistence stay readable without waiving
+/// arbitrary missing tables. Restore clears these tables when restoring an
+/// older archive, as with other tables absent from an older version.
+pub const V6_ADDED_TABLES: &[&str] = &[
+    "retention_guild_purge_queue",
+    "retention_deletion_requests",
+    "event_store",
+];
 
 /// Covered tables not created by the current cutover migration set, if any.
 /// Keep legacy data when such tables exist, but do not require nonexistent
@@ -953,8 +961,9 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
         let _ = count;
     }
     // Historical inventories are pinned by fixtures. New v6 archives must cover
-    // reservations and retention queues too; v5 recovery points remain readable
-    // without the retention queues, and v4 points without reservations either.
+    // reservations, retention queues and member capture too; v5 recovery points
+    // remain readable without the v6 tables, and v4 points without reservations
+    // either.
     let version = obj.get("version").and_then(Value::as_u64);
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
@@ -1728,7 +1737,8 @@ mod tests {
             [
                 "voice_create_reservations",
                 "retention_guild_purge_queue",
-                "retention_deletion_requests"
+                "retention_deletion_requests",
+                "event_store"
             ]
         );
         assert_eq!(contents.buffers["voice_rooms"][0]["channel_id"], "500");
@@ -1737,6 +1747,7 @@ mod tests {
         let err = validate_manifest(&manifest).unwrap_err().to_string();
         assert!(err.contains("voice_create_reservations"), "{err}");
         assert!(err.contains("retention_guild_purge_queue"), "{err}");
+        assert!(err.contains("event_store"), "{err}");
         // V4 has a fixed complete inventory, not a blanket missing-table waiver.
         manifest["version"] = serde_json::json!(4);
         manifest["tables"].as_array_mut().unwrap().remove(0);
@@ -1747,9 +1758,10 @@ mod tests {
     }
 
     #[test]
-    fn v5_archives_without_retention_queues_validate_but_v6_requires_them() {
-        // A v5 archive carries reservations but predates the retention queues
-        // (0427): it must validate at version 5 and fail at version 6.
+    fn v5_archives_without_v6_tables_validate_but_v6_requires_them() {
+        // A v5 archive carries reservations but predates the v6 tables
+        // (retention queues 0427 plus member capture 0432): it must validate
+        // at version 5 and fail at version 6.
         let tables: Vec<Value> = DUMP_TABLES
             .iter()
             .copied()
@@ -1765,14 +1777,15 @@ mod tests {
             .collect();
         let mut v5 = manifest(tables);
         v5["version"] = serde_json::json!(5);
-        validate_manifest(&v5).expect("v5 without retention queues must validate");
+        validate_manifest(&v5).expect("v5 without v6 tables must validate");
         let mut v6 = v5.clone();
         v6["version"] = serde_json::json!(DUMP_VERSION);
         let err = validate_manifest(&v6).unwrap_err().to_string();
         assert!(err.contains("retention_guild_purge_queue"), "{err}");
         assert!(err.contains("retention_deletion_requests"), "{err}");
+        assert!(err.contains("event_store"), "{err}");
         // A v5 archive missing reservations is still refused: only the v6
-        // retention tables are waived at version 5.
+        // tables are waived at version 5.
         let mut v5_missing_reservation = v5.clone();
         v5_missing_reservation["tables"]
             .as_array_mut()
@@ -1782,6 +1795,66 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("voice_create_reservations"));
+    }
+
+    #[test]
+    fn v5_archives_read_without_event_store_but_v6_requires_it() {
+        fn without(tables: Vec<Value>, name: &str) -> Vec<Value> {
+            tables
+                .into_iter()
+                .filter(|t| t.get("name").and_then(Value::as_str) != Some(name))
+                .collect()
+        }
+        // A v5 manifest without event_store stays readable: v5 predates
+        // member-capture persistence (and the v5 waiver covers every v6 table).
+        let mut v5 = manifest(without(complete_tables(&BTreeMap::new()), "event_store"));
+        v5["version"] = serde_json::json!(5);
+        assert!(
+            validate_manifest(&v5).is_ok(),
+            "v5 without event_store reads"
+        );
+        // Dropping a v5-covered table from a v5 manifest still refuses.
+        let mut v5_gap = v5.clone();
+        v5_gap["tables"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|t| t.get("name").and_then(Value::as_str) != Some("voice_create_reservations"));
+        assert!(validate_manifest(&v5_gap)
+            .unwrap_err()
+            .to_string()
+            .contains("voice_create_reservations"));
+        // v6 without event_store refuses.
+        let v6_gap = manifest(without(complete_tables(&BTreeMap::new()), "event_store"));
+        assert_eq!(v6_gap["version"], serde_json::json!(DUMP_VERSION));
+        assert!(validate_manifest(&v6_gap)
+            .unwrap_err()
+            .to_string()
+            .contains("event_store"));
+    }
+
+    #[test]
+    fn inspect_still_reads_v5_archives_and_refuses_unknown_versions() {
+        // The version gate in `inspect_reader` is a second half of the v6
+        // bump: `validate_manifest` waives the v6 tables for v5, but the gate
+        // must also let a v5 archive reach it.
+        let mut v5 = good_dump();
+        v5[0]["version"] = serde_json::json!(5);
+        v5[0]["tables"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|t| t.get("name").and_then(Value::as_str) != Some("event_store"));
+        let contents = inspect_bytes(&gzip_lines(&v5)).expect("a v5 archive stays readable");
+        assert_eq!(contents.manifest.version, 5);
+        assert_eq!(contents.rows, 1);
+        assert_eq!(contents.manifest.missing_tables(), ["event_store"]);
+
+        let mut future = good_dump();
+        future[0]["version"] = serde_json::json!(DUMP_VERSION + 1);
+        let message = inspect_bytes(&gzip_lines(&future)).unwrap_err().to_string();
+        assert!(
+            message.contains(&format!("reads 3, 4, 5 and {DUMP_VERSION}")),
+            "unknown versions are refused with the readable list: {message}"
+        );
     }
 
     #[test]
