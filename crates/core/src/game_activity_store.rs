@@ -24,9 +24,10 @@
 //!
 //! Upserts are additive and the flush buffers drain before the write, so each
 //! interval persists at most once: a retried tick after a drained buffer
-//! aggregates nothing and writes nothing, and a persist failure must requeue
-//! the drained buffers (see the bot flush loop) rather than retry the
-//! upsert, which would double-count.
+//! aggregates nothing and writes nothing. A persist failure requeues the
+//! drained buffers (see the bot flush loop); the batch itself is atomic, so
+//! the retried whole batch counts exactly once and never double-counts a
+//! partially written prefix.
 
 use std::collections::BTreeSet;
 
@@ -68,10 +69,18 @@ pub fn split_game_key(game: &str) -> Option<String> {
 /// counters. Empty input writes nothing and reports zero rows; every row
 /// adds its play millis, in-voice millis and session count onto the stored
 /// totals and refreshes `updated_at`.
+///
+/// The batch is atomic: all rows commit together inside one transaction, so
+/// a mid-batch failure leaves every covered row exactly as it was and the
+/// flush loop's whole-batch retry (via requeue) counts exactly once.
 pub async fn upsert_guild_aggregates(
     pool: &Pool<Postgres>,
     aggregates: &[GuildGameAggregate],
 ) -> Result<u64, GameActivityStoreError> {
+    if aggregates.is_empty() {
+        return Ok(0);
+    }
+    let mut tx = pool.begin().await?;
     let mut written = 0u64;
     for aggregate in aggregates {
         written = written.saturating_add(
@@ -98,11 +107,12 @@ pub async fn upsert_guild_aggregates(
                     .min(aggregate.total_play_ms.max(0)),
             )
             .bind(i64::try_from(aggregate.session_count).unwrap_or(i64::MAX))
-            .execute(pool)
+            .execute(&mut *tx)
             .await?
             .rows_affected(),
         );
     }
+    tx.commit().await?;
     Ok(written)
 }
 
