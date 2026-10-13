@@ -1,8 +1,10 @@
 # Stream funnel: Twitch live alerts + YouTube VOD links
 
-Pure-helper slice. No network, secrets, database, Discord client or polling
-loops. Transport wiring (EventSub receiver, secret handling,
-announcements-channel posting) is a separate reviewed slice.
+Pure-core slices. No network, secrets, database, Discord client or polling
+loops live in `crates/core`. The wiring that touches them (Worker route and
+container receiver, Helix client, credential loading, durable dedup ledger,
+announcements-channel send) is split into separate reviewed slices; see
+[Transport](#transport-webhook).
 
 ## Twitch `stream.online` (confirmed 2026-10-12)
 
@@ -47,3 +49,48 @@ post is planned. See `crates/core/src/stream_funnel.rs`.
 - VOD discovery reuses the existing no-quota Atom/RSS polling in `feeds`.
   No `youtube.search` loop (search calls are quota-expensive).
 - This slice adds no interval, job, or background task.
+
+## Transport: webhook
+
+Decision: **webhook** (`crates/core/src/twitch_eventsub.rs`).
+
+- Webhook subscriptions authenticate with an app access token from the
+  client-credentials flow. There is no user token to store or refresh, which
+  a WebSocket transport would need.
+- Delivery is an inbound HTTPS push. The Worker can wake the sleeping
+  container for it; a WebSocket would need a connection that outlives
+  container idle. Conduit adds shard management for no benefit here.
+- Twitch requires the callback to be HTTPS on port 443 with no userinfo,
+  query or fragment. `CallbackUrl` refuses anything else.
+
+What the core does, in order, for every delivery:
+
+1. Cap the body (`MAX_BODY_BYTES`, 64 KiB) before hashing.
+2. Verify `sha256=` HMAC-SHA256 over `message-id + timestamp + raw body`
+   with the subscription secret, in constant time, then require a timestamp
+   within 10 minutes of now. Nothing is parsed before this passes.
+3. Classify `webhook_callback_verification` (echo the challenge as
+   `text/plain`), `notification` and `revocation`. Only `stream.online`
+   version 1 is accepted; unknown message types are acknowledged and ignored.
+4. For a go-live: check the broadcaster allowlist, render the post from the
+   validated invite, then claim the go-live key. A retry or replay of the same
+   `broadcaster + started_at` is skipped. If the send fails the caller
+   releases the claim and answers 5xx so Twitch retries.
+
+Subscription management is pure request building plus a diff
+(`create_subscription_body`, `parse_subscriptions`, `reconcile`). It runs at
+boot and after a `revocation`, never on a timer, and it only touches
+subscriptions on the bot's own callback. Deletes precede creates because
+Twitch answers 409 to a duplicate create.
+
+Secret handling: the signing secret is a `WebhookSecret` (10-100 ASCII, as
+Twitch requires) wrapping `Secret<String>`; its `Debug` is `[REDACTED]`. It is
+exposed only inside the HMAC and inside the create-subscription body, which is
+itself returned as a `Secret`. The Operator provisions the signing secret and
+the Twitch client id/secret; they never appear in code, logs or PR text.
+
+Not in this slice (each its own card): the public Worker route and container
+receiver, the Helix client with app-token refresh, Operator secret
+provisioning, and a durable dedup ledger. Until the ledger lands, dedup is
+in-memory (`RecentKeys`), so a crash between the post and the 2xx can post
+once more after restart.
