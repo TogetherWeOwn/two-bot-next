@@ -727,6 +727,52 @@ class ConfigTests(unittest.TestCase):
             self.assertTrue(Path(ref).exists(), ref)
 
 
+class LagToleranceTests(unittest.TestCase):
+    def test_wait_ready_probes_during_active_lag(self):
+        # Run-7 diagnosis: the platform steady state is the lag shape, so
+        # wait_ready must probe it like verify() does instead of demanding
+        # strict converged() with probes=0.
+        world = World()
+        lag_row = rollout_row(world, "r-lag", BACKOUT_IMAGE)
+        lag_row["health"] = {"instances": {"active": 0, "healthy": 1,
+                                           "failed": 0, "starting": 0,
+                                           "scheduling": 0}}
+        world.rollouts = [lag_row]
+        world.serving_image = BACKOUT_IMAGE
+        world.history = [BACKOUT_WORKER, PRE]
+        world.ready_polls = 0
+        logs = []
+        instance = container_drill.Drill(
+            FakeClient(world), make_control(world), URL, "1",
+            ("x", lambda p: 0, "y"),
+            now=lambda: world.t, sleep=world.tick, log=logs.append)
+        instance.evidence["rollout_ids_before"] = []
+        moment, counts, timeline = instance.wait_ready(
+            BACKOUT_WORKER, BACKOUT_SHA, BACKOUT_BUILD, BACKOUT_IMAGE,
+            world.t)
+        self.assertGreaterEqual(counts["probes"], 1)
+        self.assertTrue(any(entry[2] and entry[3] for entry in timeline))
+
+    def test_failed_wait_preserves_timeline_and_last_observation(self):
+        # A ready_timeout must keep the wait timeline plus the last
+        # observation in the leg evidence, so probes=0 separates a missing
+        # rollout from an unconverged one.
+        world = World()
+        world.never_converge = True
+        world.ready_polls = 0
+        instance, failures, _ = run_drill(world)
+        self.assertTrue(failures[0].startswith("drill:ready_timeout"))
+        leg = instance.evidence["drill"]
+        self.assertIn("wait_timeline", leg)
+        self.assertIn("last_observation", leg)
+        self.assertTrue(len(leg["wait_timeline"]) > 0)
+        # Secret-safe: ISO times, integers and booleans only.
+        blob = json.dumps(leg)
+        self.assertNotIn(SENTINEL, blob)
+        self.assertIn("probes=", leg["last_observation"])
+        self.assertIn("pinned=", leg["last_observation"])
+
+
 class MainTests(unittest.TestCase):
     def environ(self, **changes):
         env = {"STAGING_WORKER_URL": URL, "OWNERSHIP_CONTROL_TOKEN": SENTINEL,
