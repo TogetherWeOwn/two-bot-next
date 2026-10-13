@@ -412,6 +412,22 @@ VALUES ('100000000000000001', '100000000000000002', '2026-08-01T09:59:58Z',
         NULL, '2026-08-02T10:00:00Z'),
        ('100000000000000001', '100000000000000002', '2026-08-03T10:00:00Z',
         NULL, NULL);
+-- S2 member capture (0432): append-only gateway deltas; one ADD with the
+-- nick_changed flag and role ids, one REMOVE without deltas. The REMOVE keys
+-- on the gateway envelope (session + sequence) because the dispatch carries
+-- no timestamp; nicknames are never stored, only the flag.
+INSERT INTO event_store
+    (event_type, guild_id, user_id, event_time, received_at, dedup_key,
+     premium_since, nick_changed, roles)
+VALUES ('GUILD_MEMBER_ADD', '100000000000000001', '100000000000000002',
+        '2026-08-01T10:00:00Z', '2026-08-01T10:00:01Z',
+        'GUILD_MEMBER_ADD:100000000000000001:100000000000000002:2026-08-01T10:00:00Z',
+        NULL, FALSE,
+        '["100000000000000010"]'),
+       ('GUILD_MEMBER_REMOVE', '100000000000000001', '100000000000000004',
+        '2026-08-02T10:00:00Z', '2026-08-02T10:00:01Z',
+        'GUILD_MEMBER_REMOVE:100000000000000001:100000000000000004:seed-session:7',
+        NULL, NULL, '[]');
 -- V3 privacy (0416): the second room is private with a Join channel and one
 -- blocked member; the first stays public with an empty block list.
 UPDATE voice_rooms

@@ -53,6 +53,16 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_voice_tracked_rooms` | Rooms tracked in memory; compare with live Discord channels for ghosts |
 | `two_bot_voice_compensation_pending` | Tracked rooms awaiting compensating delete after a failed write |
 | `two_bot_voice_orphans_total` | Untracked creator-channel orphans needing manual deletion after failed `/create` compensation |
+| `two_bot_voice_joins_received_total` | Creator joins received by the guild actor; compare with create/move/refused outcomes — received persistently above handled means the actor is not processing joins |
+| `two_bot_voice_join_refused_total{reason}` | Actor-received creator joins refused before queueing; `reason` is `halted`, `access`, `unknown_creator`, `stale_ticket`, `duplicate`, `name_blocked` or `other` |
+| `two_bot_voice_worker_halted` | Guild-actor halt latch: 1 while a store CredentialRefused or Discord 401 halted join processing (only store halts auto-recover; 401s need a token fix + restart) |
+| `two_bot_voice_queue_pending{lane}` | Queued (not in-flight) voice actions; `lane` is `urgent` or `deferred` |
+| `two_bot_voice_queue_oldest_age_seconds` | Age of the oldest queued voice action in seconds; 0 when empty |
+| `two_bot_voice_rest_in_flight_age_seconds` | Age of the oldest in-flight voice REST attempt in seconds; 0 when idle |
+| `two_bot_voice_global_backoff_capped_total` | Global-backoff waits capped (returned RateLimited for tick-driven backoff) instead of parking the actor |
+| `two_bot_voice_dispatch_timeouts_total` | Actor dispatch turns that ran past the observe bound (run to completion; counted after the fact); the queue keeps its retries |
+| `two_bot_voice_watchdog_stucks_total` | Watchdog firings: queued work with no dispatch progress inside the window |
+| `two_bot_voice_halt_recoveries_total` | Halt-latch recoveries via store-credential re-probe (Discord-401 halts never auto-recover) |
 | `two_bot_voice_names_total{outcome}` | Automatic room-name decisions: a room created with its template name, each template render, and each queued rename sent or dropped at dispatch; `outcome` is `created_with_template`, `proposed`, `unchanged`, `waiting_for_name`, `blocked`, `channel_unseen`, `rename_sent`, `rename_room_gone`, `rename_superseded`, `rename_already_applied`, `rename_unseen`, `rename_no_access`, `rename_held`, `rename_duplicate` or `other` |
 | `two_bot_voice_vote_kick_total{outcome}` | Vote-kick starts, refusals and terminal enforcements; `outcome` is `started`, a refusal code (`evidence_unavailable`, `not_a_room`, `initiator_not_occupant`, `target_not_occupant`, `self_target`, `protected_target`, `privileged_target`, `authority_unavailable`, `active_vote_exists`, `cooldown`, `initiator_limited`, `reused_vote_id`, `unknown_vote`, `wrong_vote_boundary`, `ineligible_voter`, `repeated_vote`, `invalid_time`), an enforcement code (`connect_denied_and_disconnected`, `connect_denied_target_absent`, `skipped_room_gone`, `skipped_target_protected`, `permission_missing`, `discord_error`, `gave_up`) or `other`; vote results (`passed`/`expired`/`cancelled`) are audit-only and never counted |
 | `two_bot_dispatch_drops_total{lane}` | Dispatch-lane saturation drops: every event refused because every attempted lane was full. `lane` is one of `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` (see label allowlists below). The `reactions` lane additionally counts per-member fairness refusals: a reaction refused because its member already holds `PER_USER_IN_FLIGHT` reaction slots, even while the lane has free slots. A single-lane refusal counts its lane once; a privileged spill refused by both lanes counts both. Logs sample the first drop per 60 s per runtime, so bursts are O(1) lines with N counter increments. `dispatch_drops:<lane>` raises a ticket after growth in 3 consecutive completed keepalive sample windows; the first valid sample only establishes a baseline. A flat sample or counter reset clears the streak; missing/invalid samples break growth but never falsely resolve an active ticket. A single burst never pages. `reactions`-lane growth can reflect per-member fairness rather than an undersized lane. Dispatch refusals are not proof of gateway packet loss |
@@ -350,6 +360,51 @@ as dynamic labels.
 - The `jobs` map is informational supervisor status; it does not change the
   readiness code. Supervisor outcomes and alert rules are separately owned
   and not part of this contract.
+
+## Read-only ops roll-ups (`/ops/summary`, `/ops/gateway`, `/ops/backfill`)
+
+Three JSON roll-ups on the same listener reuse the `/readyz`, gateway,
+job, pool and event-store sources above. Like `/metrics` they are served
+openly on the container port. The off-container path is the Worker, which
+exact-matches the three paths before the invite-redirect lookup:
+`/ops/gateway` and `/ops/backfill` stay gated by the scrape bearer
+(`METRICS_SCRAPE_TOKEN`, 404 when unset or short, 401 on a wrong bearer,
+429 per-caller attempt budget), while `/ops/summary` accepts either the
+scrape bearer or the dashboard service-token pair
+(`OPS_DASHBOARD_CLIENT_ID` / `OPS_DASHBOARD_CLIENT_SECRET`, same 404/401/429
+shape). The scrape gate runs first and its 429 is a hard fence; a
+non-throttled scrape refusal falls through to the dashboard gate.
+Doubly-unconfigured still 404s, otherwise a failed attempt is 401 with the
+Bearer challenge. The DO proxies the roll-ups with the same 6 s deadline and
+64 KiB body cap as the scrape, fetching the container's `/ops/summary`
+(never `/readyz`) and rewriting a 200 whose body has `ready: false` into the
+503 the dashboard renders (the roll-up itself always answers 200). Closing
+the summary requires removing both `METRICS_SCRAPE_TOKEN` and the dashboard
+pair; removing only one leaves the other credential open.
+
+- `GET /ops/summary`: readiness (`ready`, `components`), gateway state and
+  failure, the informational `jobs` map, pool gauges (`size`/`idle`/`max`),
+  event-store lag (`restorable_point`, `max_lag`: the largest per-table lag)
+  and backfill progress (`tables_total`, `tables_at_point`: tables whose
+  lag is exactly 0), plus the build revision/id.
+- `GET /ops/gateway`: shard state (`unconfigured`/`armed`/`connected`/
+  `draining`), gateway status, the last gateway-task failure, reconnect /
+  resume / disconnect / missed-event counters, `last_ready_unix` and
+  `last_resume_unix` (Unix seconds of the last observed READY/RESUMED
+  dispatch), per-event counts, per-stage checkpoint failures, and the
+  `session_checkpoint` job's last success.
+- `GET /ops/backfill`: the global restorable point plus every covered
+  journal table's durable cursor (`watermark`) and signed per-table `lag`:
+  the table's own newest journal id minus its watermark, so 0 means fully
+  journaled no matter how much other tables have written since. A table
+  with no journal rows or no committed watermark reports `null`, never zero.
+
+Every database-backed section degrades to an explicit `available: false`
+with `200`, never a 500 or an error string: a database outage must not hide
+gateway and job health. Event-store reads share the 2 s `/readyz` probe
+budget and run as one statement over the covered tables (per-table index
+seeks, one snapshot), so a commit cannot pair a new tip with an old
+watermark. Responses carry `no-store`; bodies are `application/json`.
 
 ## Cardinality and memory
 

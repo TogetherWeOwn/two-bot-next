@@ -24,6 +24,34 @@ pub struct RestGuardSnapshot {
 }
 
 pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
+/// Unix seconds; 0 when the clock is unreadable (never in practice).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// Point-in-time gateway roll-up for the read-only `/ops/gateway` JSON
+/// endpoint (TOG-22860). Fixed vocabulary: event and stage names come from
+/// the same allowlists as the Prometheus exposition, so a rename there
+/// renames here. No IDs, tokens or bodies are retained.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GatewaySnapshot {
+    pub reconnects: u64,
+    pub resumes: u64,
+    pub disconnects: u64,
+    pub missed_events: u64,
+    /// `(event, count)` pairs in [`EVENTS`] order.
+    pub events: Vec<(String, u64)>,
+    /// `(stage, count)` pairs in [`CHECKPOINT_FAILURE_STAGES`] order.
+    pub checkpoint_failures: Vec<(String, u64)>,
+    /// Unix seconds of the last observed READY dispatch, if any.
+    pub last_ready_unix: Option<u64>,
+    /// Unix seconds of the last observed RESUME dispatch, if any.
+    pub last_resume_unix: Option<u64>,
+}
 pub const EVENTS: &[&str] = &[
     "READY",
     "RESUMED",
@@ -208,6 +236,20 @@ pub const VOICE_NAME_OUTCOMES: &[&str] = &[
     "rename_duplicate",
     "other",
 ];
+/// Creator-join accept refusals for `two_bot_voice_join_refused_total{reason}`:
+/// every actor-received creator join that never becomes a queued CreateRoom.
+/// Unknown reasons collapse to the trailing `other`.
+pub const VOICE_JOIN_REFUSAL_REASONS: &[&str] = &[
+    "halted",
+    "access",
+    "unknown_creator",
+    "stale_ticket",
+    "duplicate",
+    "name_blocked",
+    "other",
+];
+/// Action-queue lanes for the `two_bot_voice_queue_pending{lane}` gauge.
+pub const VOICE_QUEUE_LANES: &[&str] = &["urgent", "deferred"];
 /// Vote-kick outcomes for `two_bot_voice_vote_kick_total{outcome}` (M4.30):
 /// one `started` per successful `kick_start`, one refusal code per refused
 /// `kick_start` (the worker-level `evidence_unavailable` / `not_a_room` plus
@@ -398,6 +440,26 @@ struct Values {
     voice_tracked: u64,
     voice_compensation: u64,
     voice_orphans: u64,
+    /// Creator joins received by the guild actor (every Join command).
+    voice_joins_received: u64,
+    /// Actor-received creator joins refused before queueing, by reason.
+    voice_join_refused: [u64; VOICE_JOIN_REFUSAL_REASONS.len()],
+    /// Guild-actor halt latch (CredentialRefused): 1 while halted.
+    voice_worker_halted: u64,
+    /// Queued (not in-flight) action depth by lane; last writer wins.
+    voice_queue_pending: [u64; VOICE_QUEUE_LANES.len()],
+    /// Age of the oldest queued action in seconds; 0 when the queue is empty.
+    voice_queue_oldest_age_secs: u64,
+    /// Age of the oldest in-flight voice REST attempt in seconds; 0 when idle.
+    voice_rest_in_flight_age_secs: u64,
+    /// Global-backoff waits refused (capped) instead of parking the actor.
+    voice_global_backoff_capped: u64,
+    /// Actor dispatches that exceeded the per-dispatch timeout.
+    voice_dispatch_timeouts: u64,
+    /// Watchdog firings: pending work with no dispatch progress.
+    voice_watchdog_stucks: u64,
+    /// Halt-latch recoveries via credential re-probe.
+    voice_halt_recoveries: u64,
     voice_vote_kick: [u64; VOICE_VOTE_KICK_OUTCOMES.len()],
     voice_names: [u64; VOICE_NAME_OUTCOMES.len()],
     db_errors: [u64; DB_ERROR_OPS.len()],
@@ -405,6 +467,8 @@ struct Values {
     prefix_trigger_refused: [u64; PREFIX_TRIGGER_REFUSED_REASONS.len()],
     dispatch_drops: [u64; DISPATCH_LANES.len()],
     checkpoint_failures: [u64; CHECKPOINT_FAILURE_STAGES.len()],
+    last_ready_unix: Option<u64>,
+    last_resume_unix: Option<u64>,
     internal_actions: [[u64; INTERNAL_ACTION_OUTCOMES.len()]; INTERNAL_ACTION_FAMILIES.len()],
     community_facts_drain_failures: [u64; COMMUNITY_FACTS_DRAIN_REASONS.len()],
     /// Audit mirror delivery halt (M4.48): 1 while the persistent kill switch
@@ -432,8 +496,39 @@ impl Metrics {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let counter = &mut values.events[bounded_index(name, EVENTS)];
         *counter = counter.saturating_add(1);
+        if name == "READY" {
+            values.last_ready_unix = Some(unix_now());
+        }
         if name == "RESUMED" {
             values.resumes = values.resumes.saturating_add(1);
+            values.last_resume_unix = Some(unix_now());
+        }
+    }
+
+    /// Copy the gateway counters for the read-only `/ops/gateway` JSON
+    /// endpoint. Lock is held only for the copy; no network I/O.
+    pub fn gateway_snapshot(&self) -> GatewaySnapshot {
+        let values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        GatewaySnapshot {
+            reconnects: values.reconnects,
+            resumes: values.resumes,
+            disconnects: values.disconnects,
+            missed_events: values.missed_events,
+            events: EVENTS
+                .iter()
+                .zip(values.events)
+                .map(|(name, count)| ((*name).to_owned(), count))
+                .collect(),
+            checkpoint_failures: CHECKPOINT_FAILURE_STAGES
+                .iter()
+                .zip(values.checkpoint_failures)
+                .map(|(stage, count)| ((*stage).to_owned(), count))
+                .collect(),
+            last_ready_unix: values.last_ready_unix,
+            last_resume_unix: values.last_resume_unix,
         }
     }
 
@@ -616,6 +711,98 @@ impl Metrics {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let counter = &mut values.voice_names[bounded_index(outcome, VOICE_NAME_OUTCOMES)];
         *counter = counter.saturating_add(1);
+    }
+
+    /// One creator join received by the guild actor (Join command). Compare
+    /// with create/move/refused outcomes: received persistently above handled
+    /// means the actor is not processing joins.
+    pub fn voice_join_received(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.voice_joins_received = values.voice_joins_received.saturating_add(1);
+    }
+
+    /// One actor-received creator join refused before queueing (see
+    /// [`VOICE_JOIN_REFUSAL_REASONS`]). Unknown reasons collapse to `other`.
+    pub fn voice_join_refused(&self, reason: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter =
+            &mut values.voice_join_refused[bounded_index(reason, VOICE_JOIN_REFUSAL_REASONS)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// Guild-actor halt latch state: 1 while CredentialRefused halted the
+    /// worker, 0 otherwise. Last writer wins.
+    pub fn set_voice_halted(&self, halted: bool) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .voice_worker_halted = u64::from(halted);
+    }
+
+    /// Queued action depth by lane plus the oldest pending item's age.
+    /// Last writer wins; render 0 age when the queue is empty.
+    pub fn set_voice_queue(&self, urgent: u64, deferred: u64, oldest_age_secs: u64) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.voice_queue_pending = [urgent, deferred];
+        values.voice_queue_oldest_age_secs = oldest_age_secs;
+    }
+
+    /// Age of the oldest in-flight voice REST attempt in seconds; 0 idles it.
+    /// Last writer wins.
+    pub fn set_voice_rest_in_flight_age_secs(&self, age_secs: u64) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .voice_rest_in_flight_age_secs = age_secs;
+    }
+
+    /// One global-backoff wait capped instead of parking the actor: the call
+    /// returned RateLimited so the queue backs off tick-driven instead.
+    pub fn voice_global_backoff_capped(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.voice_global_backoff_capped = values.voice_global_backoff_capped.saturating_add(1);
+    }
+
+    /// One actor dispatch turn that ran past the observe bound (run to
+    /// completion; counted after the fact). The queue keeps its retries.
+    pub fn voice_dispatch_timeout(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.voice_dispatch_timeouts = values.voice_dispatch_timeouts.saturating_add(1);
+    }
+
+    /// One watchdog firing: queued work with no dispatch progress inside the
+    /// watchdog window.
+    pub fn voice_watchdog_stuck(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.voice_watchdog_stucks = values.voice_watchdog_stucks.saturating_add(1);
+    }
+
+    /// One halt-latch recovery: the credential re-probe succeeded and the
+    /// worker resumed processing joins.
+    pub fn voice_halt_recovered(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.voice_halt_recoveries = values.voice_halt_recoveries.saturating_add(1);
     }
 
     /// One untracked creator-channel orphan needing manual deletion after
@@ -958,6 +1145,101 @@ impl Metrics {
             "two_bot_voice_orphans_total",
             "counter",
             values.voice_orphans,
+        );
+        scalar(
+            &mut out,
+            "two_bot_voice_joins_received_total",
+            "counter",
+            values.voice_joins_received,
+        );
+        header(
+            &mut out,
+            "two_bot_voice_join_refused_total",
+            "counter",
+            "Actor-received creator joins refused before queueing, by bounded reason.",
+        );
+        for (reason, count) in VOICE_JOIN_REFUSAL_REASONS
+            .iter()
+            .zip(values.voice_join_refused)
+        {
+            writeln!(
+                out,
+                "two_bot_voice_join_refused_total{{reason=\"{reason}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_voice_worker_halted",
+            "gauge",
+            "Guild-actor halt latch: 1 while CredentialRefused halted join processing.",
+        );
+        writeln!(
+            out,
+            "two_bot_voice_worker_halted {}",
+            values.voice_worker_halted
+        )
+        .unwrap();
+        header(
+            &mut out,
+            "two_bot_voice_queue_pending",
+            "gauge",
+            "Queued (not in-flight) voice actions by lane.",
+        );
+        for (lane, count) in VOICE_QUEUE_LANES.iter().zip(values.voice_queue_pending) {
+            writeln!(
+                out,
+                "two_bot_voice_queue_pending{{lane=\"{lane}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_voice_queue_oldest_age_seconds",
+            "gauge",
+            "Age of the oldest queued voice action in seconds; 0 when empty.",
+        );
+        writeln!(
+            out,
+            "two_bot_voice_queue_oldest_age_seconds {}",
+            values.voice_queue_oldest_age_secs
+        )
+        .unwrap();
+        header(
+            &mut out,
+            "two_bot_voice_rest_in_flight_age_seconds",
+            "gauge",
+            "Age of the oldest in-flight voice REST attempt in seconds; 0 when idle.",
+        );
+        writeln!(
+            out,
+            "two_bot_voice_rest_in_flight_age_seconds {}",
+            values.voice_rest_in_flight_age_secs
+        )
+        .unwrap();
+        scalar(
+            &mut out,
+            "two_bot_voice_global_backoff_capped_total",
+            "counter",
+            values.voice_global_backoff_capped,
+        );
+        scalar(
+            &mut out,
+            "two_bot_voice_dispatch_timeouts_total",
+            "counter",
+            values.voice_dispatch_timeouts,
+        );
+        scalar(
+            &mut out,
+            "two_bot_voice_watchdog_stucks_total",
+            "counter",
+            values.voice_watchdog_stucks,
+        );
+        scalar(
+            &mut out,
+            "two_bot_voice_halt_recoveries_total",
+            "counter",
+            values.voice_halt_recoveries,
         );
         header(
             &mut out,
@@ -1719,6 +2001,67 @@ mod tests {
         assert_eq!(text.lines().count(), before);
         assert!(!text.contains("secret"));
         assert!(text.contains("two_bot_gateway_checkpoint_failures_total{stage=\"commit\"} 100\n"));
+    }
+
+    #[test]
+    fn gateway_snapshot_reports_counters_and_last_ready_resume() {
+        let metrics = Metrics::default();
+        let fresh = metrics.gateway_snapshot();
+        assert_eq!(fresh.reconnects, 0);
+        assert_eq!(fresh.resumes, 0);
+        assert_eq!(fresh.disconnects, 0);
+        assert_eq!(fresh.missed_events, 0);
+        assert_eq!(fresh.last_ready_unix, None);
+        assert_eq!(fresh.last_resume_unix, None);
+        // Vocabulary matches the exposition allowlists, in order.
+        let names: Vec<&str> = fresh.events.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, EVENTS);
+        let stages: Vec<&str> = fresh
+            .checkpoint_failures
+            .iter()
+            .map(|(stage, _)| stage.as_str())
+            .collect();
+        assert_eq!(stages, CHECKPOINT_FAILURE_STAGES);
+
+        metrics.gateway_event("READY");
+        metrics.gateway_event("RESUMED");
+        metrics.gateway_event("RESUMED");
+        metrics.gateway_reconnect();
+        metrics.gateway_disconnect();
+        metrics.gateway_missed_events(3);
+        metrics.checkpoint_failure("pre_commit");
+        let snapshot = metrics.gateway_snapshot();
+        assert_eq!(snapshot.reconnects, 1);
+        assert_eq!(snapshot.resumes, 2);
+        assert_eq!(snapshot.disconnects, 1);
+        assert_eq!(snapshot.missed_events, 3);
+        let ready = snapshot
+            .events
+            .iter()
+            .find(|(name, _)| name == "READY")
+            .map(|(_, count)| *count);
+        assert_eq!(ready, Some(1));
+        let resumed = snapshot
+            .events
+            .iter()
+            .find(|(name, _)| name == "RESUMED")
+            .map(|(_, count)| *count);
+        assert_eq!(resumed, Some(2));
+        let pre_commit = snapshot
+            .checkpoint_failures
+            .iter()
+            .find(|(stage, _)| stage == "pre_commit")
+            .map(|(_, count)| *count);
+        assert_eq!(pre_commit, Some(1));
+        let before = unix_now();
+        assert!(snapshot.last_ready_unix.is_some());
+        assert!(snapshot.last_resume_unix.is_some());
+        assert!(snapshot.last_ready_unix.unwrap() <= before);
+        assert!(snapshot.last_resume_unix.unwrap() <= before);
+        // The snapshot serializes for the JSON endpoint.
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["reconnects"], 1);
+        assert_eq!(json["resumes"], 2);
     }
 
     #[test]
