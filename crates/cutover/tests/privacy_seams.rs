@@ -902,7 +902,7 @@ async fn touch_activity_deterministic_race_never_persists() {
     });
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     opt_tx.commit().await.expect("opt-out commit");
-    let _ = writer.await.expect("writer task").expect("writer ok");
+    writer.await.expect("writer task").expect("writer ok");
     let rows: i64 =
         sqlx::query_scalar("SELECT count(*) FROM members WHERE guild_id = $1 AND member_id = $2")
             .bind(GUILD)
@@ -926,7 +926,7 @@ async fn mark_bot_deterministic_race_never_persists() {
     let writer = tokio::spawn(async move { mark_bot(&writer_db, GUILD, MEMBER_A).await });
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     opt_tx.commit().await.expect("opt-out commit");
-    let _ = writer.await.expect("writer task").expect("writer ok");
+    writer.await.expect("writer task").expect("writer ok");
     let rows: i64 =
         sqlx::query_scalar("SELECT count(*) FROM members WHERE guild_id = $1 AND member_id = $2")
             .bind(GUILD)
