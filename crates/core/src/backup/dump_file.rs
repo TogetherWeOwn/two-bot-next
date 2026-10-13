@@ -1,4 +1,4 @@
-//! The v5 backup envelope (also reads v3/v4): manifest / rows / end marker, gzipped NDJSON.
+//! The v6 backup envelope (also reads v3/v4/v5): manifest / rows / end marker, gzipped NDJSON.
 //!
 //! Port of the file half of legacy `src/store/dump.ts`. The writer side lives
 //! in [`super::dump`]; everything here touches no database, so every refusal
@@ -139,24 +139,24 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_vote_kick_audit",
     // V5 adds accepted-create history; see [`V5_ADDED_TABLES`].
     "voice_create_reservations",
-    // V6 adds the event store (0431 S8 stage/interaction-observe/audit-log
-    // capture plus 0432 S2 member capture; shared table for S1-S8 slices);
-    // see [`V6_ADDED_TABLES`]. Guild-keyed, no foreign keys, so order among
-    // the tail is free.
+    // V6 adds the event store (0428 S3 presence plus 0431 S8
+    // stage/interaction-observe/audit-log capture plus 0432 S2 member capture;
+    // shared table for S1-S8 slices); see [`V6_ADDED_TABLES`]. Guild-keyed, no
+    // foreign keys, so order among the tail is free.
     "event_store",
 ];
 
 /// Tables first covered by v5. A v4 archive predates them and need not declare
 /// them; every other covered table is still required, so a v4 recovery point
-/// written before create-reservation persistence stays readable without
+/// written before create-reservation persistence (0422) stays readable without
 /// waiving arbitrary missing tables.
 pub const V5_ADDED_TABLES: &[&str] = &["voice_create_reservations"];
 
 /// Tables first covered by v6. A v4 or v5 archive predates them and need not
 /// declare them; v6 archives must cover the full inventory, so a pre-event-store
-/// recovery point (before S2 member capture and S8 stage/interaction/audit
-/// capture) stays readable without waiving arbitrary missing tables. v5 still
-/// requires every other covered table.
+/// recovery point (before 0428 presence, S2 member capture and S8
+/// stage/interaction/audit capture) stays readable without waiving arbitrary
+/// missing tables. v5 still requires every other covered table.
 pub const V6_ADDED_TABLES: &[&str] = &["event_store"];
 
 /// Covered tables not created by the current cutover migration set, if any.
@@ -951,9 +951,9 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
         let _ = count;
     }
     // Historical inventories are pinned by fixtures. New v6 archives must cover
-    // reservations and the event store (S2 member capture plus S8
-    // stage/interaction/audit capture) too; v5 recovery points remain readable
-    // without the event store, and v4 ones without either addition.
+    // reservations and the event store (0428 presence plus S2 member capture
+    // plus S8 stage/interaction/audit capture) too; v5 recovery points remain
+    // readable without the event store, and v4 ones without either addition.
     let version = obj.get("version").and_then(Value::as_u64);
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
@@ -1766,6 +1766,41 @@ mod tests {
         assert_eq!(DUMP_VERSION, 6);
         let mut v6 = v5;
         v6["version"] = serde_json::json!(DUMP_VERSION);
+        assert!(validate_manifest(&v6)
+            .unwrap_err()
+            .to_string()
+            .contains("event_store"));
+    }
+
+    #[test]
+    fn inspects_frozen_v5_without_event_store_but_v6_requires_it() {
+        // A v5 recovery point written before event-store capture (0428 presence, 0432 member deltas) declares every covered table except the v6 addition and stays
+        // readable; promoting it to v6 without the event store is refused.
+        let tables: Vec<Value> = DUMP_TABLES
+            .iter()
+            .copied()
+            .filter(|name| !V6_ADDED_TABLES.contains(name))
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "columns": [],
+                    "column_types": [],
+                    "count": 0,
+                })
+            })
+            .collect();
+        let mut v5 = manifest(tables);
+        v5["version"] = serde_json::json!(5);
+        assert!(
+            validate_manifest(&v5).is_ok(),
+            "frozen v5 without event_store stays readable"
+        );
+        let bytes = gzip_lines(&[v5.clone(), serde_json::json!({"kind":"end","rows":0})]);
+        let contents = inspect_bytes(&bytes).expect("frozen v5 inspects");
+        assert_eq!(contents.manifest.version, 5);
+        let mut v6 = v5;
+        v6["version"] = serde_json::json!(DUMP_VERSION);
+        assert_eq!(DUMP_VERSION, 6, "frozen v5 test pins the v6 bump");
         assert!(validate_manifest(&v6)
             .unwrap_err()
             .to_string()

@@ -94,8 +94,8 @@ async fn dry_run_execute_counts_scope_survivors_and_second_run_zero() {
         )))
         .bind(GUILD).bind(USER).fetch_all(db.pool()).await.unwrap();
         // The other member and both members in the other guild survive.
-        // event_store seeds four rows per member: one S2 member-capture row
-        // (user_id) plus three S8 rows (actor-only, target-only, user-only),
+        // event_store seeds four rows per member: one presence row binding
+        // user_id plus three S8 rows (actor-only, target-only, user-only),
         // so each erasure predicate branch is exercised independently.
         let expected_survivors = if entry.table == "event_store" { 12 } else { 3 };
         assert_eq!(

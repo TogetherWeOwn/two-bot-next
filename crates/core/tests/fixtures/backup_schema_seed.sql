@@ -524,3 +524,16 @@ VALUES ('stage_instance', '100000000000000001', '100000000000000033',
         'audit-100000000000000064', 3, '100000000000000003', '100000000000000004',
         '2026-08-03T10:00:00.123456Z', '2026-08-03T10:00:02Z',
         'AUDIT_LOG_ENTRY:100000000000000001:audit-100000000000000064:2026-08-03T10:00:00.123456Z');
+-- Event-store S3 presence capture (0428): append-only presence rows with the
+-- best-effort dedup key PRESENCE_UPDATE:<guild_id>:<user_id>:<event_time>
+-- (receive time; same-key retries insert nothing).
+INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key,
+  presence_status, activity_type, application_id)
+VALUES ('PRESENCE_UPDATE', '100000000000000001', '100000000000000002',
+        '2026-08-03T10:00:00Z',
+        'PRESENCE_UPDATE:100000000000000001:100000000000000002:2026-08-03T10:00:00Z',
+        'online', 0, NULL),
+       ('PRESENCE_UPDATE', '100000000000000001', '100000000000000003',
+        '2026-08-03T10:05:00Z',
+        'PRESENCE_UPDATE:100000000000000001:100000000000000003:2026-08-03T10:05:00Z',
+        'idle', 2, '123456789012345678');
