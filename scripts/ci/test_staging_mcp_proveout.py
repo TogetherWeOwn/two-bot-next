@@ -13,13 +13,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-import staging_mcp_proveout as proveout  # noqa: E402
+import staging_mcp_proveout as proveout
 
 
 class _Target(BaseHTTPRequestHandler):
     hits = []
 
-    def do_GET(self):  # noqa: N802
+    def do_GET(self):
         _Target.hits.append(
             (self.headers.get("Authorization"), self.path)
         )
@@ -29,7 +29,7 @@ class _Target(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, *args):  # noqa: D102
+    def log_message(self, *args):
         pass
 
 
@@ -37,7 +37,7 @@ class _Redirector(BaseHTTPRequestHandler):
     target_port = 0
     code = 302
 
-    def do_POST(self):  # noqa: N802
+    def do_POST(self):
         length = int(self.headers.get("Content-Length", "0") or "0")
         if length:
             self.rfile.read(length)
@@ -47,7 +47,7 @@ class _Redirector(BaseHTTPRequestHandler):
         )
         self.end_headers()
 
-    def log_message(self, *args):  # noqa: D102
+    def log_message(self, *args):
         pass
 
 
