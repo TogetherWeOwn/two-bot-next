@@ -647,7 +647,7 @@ async fn audit_log_pagination_limit_1_to_100_before_after_covers_45d_window() {
 // admitted requests, and the guard accounts the run without high-cardinality
 // detail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires the audit-logs route on the rate-limit client (TOG-22948)"]
+#[ignore = "requires authorized TEST_DATABASE_URL; also requires the audit-logs route on the rate-limit client (TOG-22948)"]
 async fn audit_log_requests_ride_rate_limit_client_never_direct_rest() {
     let mock = FakeAuditLog::start(vec![audit_page(vec![entry_1004()])]).await;
     let (exec, guard) = executor_for(&mock.origin);

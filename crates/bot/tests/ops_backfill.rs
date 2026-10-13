@@ -106,11 +106,14 @@ fn spawn_bot() -> (Bot, SocketAddr) {
     assert_ne!(addr.port(), 8080);
     drop(reserved);
 
+    // Parked boot: OMIT DATABASE_URL so gateway prerequisites fail and the
+    // store stays None (empty-baseline 200). A synthetic non-postgres URL
+    // with all three prerequisites present exits 1 via database_init
+    // (see startup.rs configured_*_exits_nonzero), it never parks.
     let mut bot = Bot(Command::new(env!("CARGO_BIN_EXE_two-bot"))
         .env_clear()
         .env("LISTEN_ADDR", format!("127.0.0.1:{}", addr.port()))
         .env("DISCORD_TOKEN", "INVALID")
-        .env("DATABASE_URL", "synthetic-database-must-not-connect")
         .env("GUILD_ID", "123")
         .env(
             "TWO_INTERNAL_KEYS",
