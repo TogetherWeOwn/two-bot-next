@@ -25,7 +25,7 @@
 //!   `revocation`, never on a timer.
 //!
 //! The HTTP receiver, Helix client, credential loading and durable dedup
-//! ledger are separate reviewed slices; every caller of [`WebhookSecret::expose`]
+//! ledger are separate reviewed slices; every caller of `WebhookSecret::expose()`
 //! stays at the signing boundary and never logs the value.
 
 use std::collections::{HashSet, VecDeque};
@@ -98,7 +98,7 @@ pub enum EventSubError {
 
 /// The EventSub signing secret handed to Twitch at subscription creation.
 /// Twitch requires 10-100 ASCII characters. The value only leaves through
-/// [`WebhookSecret::expose`] at the HMAC and subscription-body boundaries.
+/// `WebhookSecret::expose()` at the HMAC and subscription-body boundaries.
 #[derive(Clone, PartialEq, Eq)]
 pub struct WebhookSecret(Secret<String>);
 
@@ -238,7 +238,10 @@ fn valid_subscription_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// Classify a **verified** delivery. Call [`verify_delivery`] first.
+/// Classify a **verified** delivery. Call [`verify_delivery`] first. For a
+/// verified notification, classification errors are deterministic; the receiver
+/// must acknowledge them with 2xx rather than invite Twitch retries. Reserve
+/// non-2xx responses for transient send or durable-ledger failures.
 pub fn classify(message_type: &str, body: &[u8]) -> Result<Delivery, EventSubError> {
     if !matches!(
         message_type,
@@ -373,7 +376,8 @@ pub enum NotificationPlan {
 
 /// Decide what one verified go-live does. The allowlist is checked first (a
 /// valid signature proves Twitch sent it, not that we asked for it), then the
-/// claim, and only then is the post rendered from the validated invite.
+/// post is rendered from the validated invite, and only then is the claim taken
+/// so an invalid invite never burns it.
 pub fn plan_live_post(
     stream: &StreamOnline,
     discord_invite_url: &str,
@@ -394,8 +398,9 @@ pub fn plan_live_post(
 }
 
 /// The public HTTPS callback Twitch posts to. Twitch requires HTTPS on port
-/// 443. The parsed form must equal the trimmed input, so nothing the URL
-/// parser would rewrite (userinfo, odd ports, query, fragment) slips through.
+/// 443. The input must be canonical: the parsed form must equal the trimmed
+/// input, so explicit `:443` and other parser-normalized forms are rejected
+/// along with userinfo, odd ports, query and fragment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallbackUrl(String);
 
@@ -561,22 +566,33 @@ pub fn reconcile(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use super::*;
     use serde_json::json;
 
-    // codeql[rust/hard-coded-cryptographic-value]: test-only HMAC fixture; production secret is Operator-managed env, never code.
-    const SECRET: &str = "fixture-signing-secret";
+    static NEXT_TEST_SECRET: AtomicU64 = AtomicU64::new(1);
+
     const NOW_MS: i64 = 1_760_000_000_000;
     const TS: &str = "2025-10-09T08:53:20.123456789Z";
     const ID: &str = "e76c6bd4-55c9-4987-8304-da1588d8988b";
     const INVITE: &str = "https://discord.gg/example";
 
-    fn secret() -> WebhookSecret {
-        WebhookSecret::new(SECRET.to_owned()).unwrap()
+    fn test_secret() -> WebhookSecret {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is after the Unix epoch")
+            .as_nanos();
+        let nonce = NEXT_TEST_SECRET.fetch_add(1, Ordering::Relaxed);
+        WebhookSecret::new(format!("{timestamp:032x}{nonce:016x}"))
+            .expect("generated test secret is valid")
     }
 
-    fn sign(secret: &str, id: &str, ts: &str, body: &[u8]) -> String {
-        let mut mac = <Hmac<Sha256>>::new_from_slice(secret.as_bytes()).unwrap();
+    fn sign(secret: &WebhookSecret, id: &str, ts: &str, body: &[u8]) -> String {
+        let mut mac = <Hmac<Sha256>>::new_from_slice(secret.expose().as_bytes()).unwrap();
         mac.update(id.as_bytes());
         mac.update(ts.as_bytes());
         mac.update(body);
@@ -618,27 +634,29 @@ mod tests {
     #[test]
     fn valid_signature_and_fresh_timestamp_verify() {
         let body = live_body();
-        let sig = sign(SECRET, ID, TS, &body);
+        let signing_secret = test_secret();
+        let sig = sign(&signing_secret, ID, TS, &body);
         let h = headers(ID, TS, &sig, "notification");
-        assert_eq!(verify_delivery(&secret(), &h, &body, NOW_MS), Ok(()));
+        assert_eq!(verify_delivery(&signing_secret, &h, &body, NOW_MS), Ok(()));
     }
 
     #[test]
     fn tampered_body_wrong_secret_and_bad_formats_fail() {
         let body = live_body();
-        let sig = sign(SECRET, ID, TS, &body);
+        let signing_secret = test_secret();
+        let sig = sign(&signing_secret, ID, TS, &body);
         let h = headers(ID, TS, &sig, "notification");
         let mut tampered = body.clone();
         tampered.push(b' ');
         assert_eq!(
-            verify_delivery(&secret(), &h, &tampered, NOW_MS),
+            verify_delivery(&signing_secret, &h, &tampered, NOW_MS),
             Err(EventSubError::BadSignature)
         );
-        // codeql[rust/hard-coded-cryptographic-value]: test-only wrong-key fixture; production secret is Operator-managed env, never code.
-        let other = sign("another-secret-value", ID, TS, &body);
+        let other_secret = test_secret();
+        let other = sign(&other_secret, ID, TS, &body);
         let h = headers(ID, TS, &other, "notification");
         assert_eq!(
-            verify_delivery(&secret(), &h, &body, NOW_MS),
+            verify_delivery(&signing_secret, &h, &body, NOW_MS),
             Err(EventSubError::BadSignature)
         );
         for bad in [
@@ -650,7 +668,7 @@ mod tests {
         ] {
             let h = headers(ID, TS, bad, "notification");
             assert_eq!(
-                verify_delivery(&secret(), &h, &body, NOW_MS),
+                verify_delivery(&signing_secret, &h, &body, NOW_MS),
                 Err(EventSubError::BadSignature),
                 "{bad}"
             );
@@ -658,7 +676,7 @@ mod tests {
         // The id and timestamp are part of the signed message.
         let h = headers("other-id", TS, &sig, "notification");
         assert_eq!(
-            verify_delivery(&secret(), &h, &body, NOW_MS),
+            verify_delivery(&signing_secret, &h, &body, NOW_MS),
             Err(EventSubError::BadSignature)
         );
     }
@@ -666,24 +684,25 @@ mod tests {
     #[test]
     fn stale_future_and_garbage_timestamps_fail_after_signature() {
         let body = live_body();
-        let sig = sign(SECRET, ID, TS, &body);
+        let signing_secret = test_secret();
+        let sig = sign(&signing_secret, ID, TS, &body);
         let h = headers(ID, TS, &sig, "notification");
         let sent = crate::funnel::parse_iso_millis(TS).unwrap();
         assert_eq!(sent, 1_760_000_000_123);
         let edge = sent + MAX_TIMESTAMP_SKEW_MS;
-        assert_eq!(verify_delivery(&secret(), &h, &body, edge), Ok(()));
+        assert_eq!(verify_delivery(&signing_secret, &h, &body, edge), Ok(()));
         assert_eq!(
-            verify_delivery(&secret(), &h, &body, edge + 1),
+            verify_delivery(&signing_secret, &h, &body, edge + 1),
             Err(EventSubError::StaleTimestamp)
         );
         assert_eq!(
-            verify_delivery(&secret(), &h, &body, sent - MAX_TIMESTAMP_SKEW_MS - 1),
+            verify_delivery(&signing_secret, &h, &body, sent - MAX_TIMESTAMP_SKEW_MS - 1),
             Err(EventSubError::StaleTimestamp)
         );
-        let sig = sign(SECRET, ID, "not-a-time", &body);
+        let sig = sign(&signing_secret, ID, "not-a-time", &body);
         let h = headers(ID, "not-a-time", &sig, "notification");
         assert_eq!(
-            verify_delivery(&secret(), &h, &body, NOW_MS),
+            verify_delivery(&signing_secret, &h, &body, NOW_MS),
             Err(EventSubError::InvalidTimestamp)
         );
     }
@@ -691,10 +710,11 @@ mod tests {
     #[test]
     fn oversize_body_is_refused_before_hashing() {
         let body = vec![b'x'; MAX_BODY_BYTES + 1];
-        let sig = sign(SECRET, ID, TS, &body);
+        let signing_secret = test_secret();
+        let sig = sign(&signing_secret, ID, TS, &body);
         let h = headers(ID, TS, &sig, "notification");
         assert_eq!(
-            verify_delivery(&secret(), &h, &body, NOW_MS),
+            verify_delivery(&signing_secret, &h, &body, NOW_MS),
             Err(EventSubError::BodyTooLarge)
         );
     }
@@ -746,9 +766,10 @@ mod tests {
         assert!(WebhookSecret::new("naïve-secret-é".to_owned()).is_err());
         assert!(WebhookSecret::new("a".repeat(10)).is_ok());
         assert!(WebhookSecret::new("a".repeat(100)).is_ok());
-        let shown = format!("{:?} {:#?}", secret(), Some(secret()));
+        let signing_secret = test_secret();
+        let shown = format!("{signing_secret:?} {:#?}", Some(signing_secret.clone()));
         assert!(
-            !shown.contains(SECRET),
+            !shown.contains(signing_secret.expose()),
             "WebhookSecret Debug must redact the signing secret"
         );
         assert!(shown.contains("[REDACTED]"));
@@ -990,7 +1011,8 @@ mod tests {
     #[test]
     fn create_body_matches_helix_shape_and_stays_secret() {
         let callback = CallbackUrl::new("https://bot.example.com/twitch/eventsub").unwrap();
-        let body = create_subscription_body("1337", &callback, &secret()).unwrap();
+        let signing_secret = test_secret();
+        let body = create_subscription_body("1337", &callback, &signing_secret).unwrap();
         assert_eq!(format!("{body:?}"), "[REDACTED]");
         let value: serde_json::Value = serde_json::from_str(body.expose()).unwrap();
         assert_eq!(
@@ -1002,13 +1024,13 @@ mod tests {
                 "transport": {
                     "method": "webhook",
                     "callback": "https://bot.example.com/twitch/eventsub",
-                    "secret": SECRET,
+                    "secret": signing_secret.expose(),
                 },
             })
         );
         for bad in ["", "abc", "13 37", "../x"] {
             assert_eq!(
-                create_subscription_body(bad, &callback, &secret()).unwrap_err(),
+                create_subscription_body(bad, &callback, &test_secret()).unwrap_err(),
                 EventSubError::InvalidBroadcasterId
             );
         }
