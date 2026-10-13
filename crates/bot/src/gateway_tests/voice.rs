@@ -11,6 +11,9 @@ use two_bot_core::{
 use two_bot_cutover::voice_rooms::PgRoomStore;
 use two_bot_discord::voice_rooms::{RoomChannelAttributes, RoomHttpError};
 
+#[path = "retention.rs"]
+mod retention;
+
 #[derive(Clone, Default)]
 struct DeleteOnly(Arc<AtomicU64>);
 
