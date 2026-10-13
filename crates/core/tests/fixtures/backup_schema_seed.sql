@@ -509,7 +509,7 @@ VALUES ('100000000000000001', '100000000000000050', 'vote_started', '10000000000
        ('100000000000000001', '100000000000000051', 'vote_refused', '100000000000000033',
         '100000000000000003', '100000000000000002', 'protected_target',
         NULL, NULL, NULL, '2026-08-03T10:05:00Z');
--- Retention queues (0427): one queued guild purge plus one pending and one
+-- Retention queues (0433): one queued guild purge plus one pending and one
 -- completed user-deletion request, so the dump/restore round trip covers both
 -- the pending-NULL and completed-receipt shapes.
 INSERT INTO retention_guild_purge_queue (guild_id, enqueued_at)
@@ -534,3 +534,11 @@ VALUES ('PRESENCE_UPDATE', '100000000000000001', '100000000000000002',
         '2026-08-03T10:05:00Z',
         'PRESENCE_UPDATE:100000000000000001:100000000000000003:2026-08-03T10:05:00Z',
         'idle', 2, '123456789012345678');
+-- Event-store S4 voice capture (0427): one voice-state row with session and
+-- enum flags; token/endpoint/audio columns never exist. Distinct dedup key
+-- from the presence rows above, so both slices seed together.
+INSERT INTO event_store (event_type, guild_id, user_id, channel_id, session_id,
+  event_time, dedup_key, mute, deaf, self_mute, self_deaf, self_video, self_stream, suppress)
+VALUES ('voice_state_update', '100000000000000001', '100000000000000002', '100000000000000033',
+        'session-fixture-1', '2026-08-03T10:00:00Z', 'event-store-seed-1',
+        FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE);

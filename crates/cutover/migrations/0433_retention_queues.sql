@@ -1,4 +1,4 @@
--- 0427_retention_queues: rolling-window retention queues.
+-- 0433_retention_queues: rolling-window retention queues.
 --
 -- Backs the retention job's rolling windows (raw presence/voice rows roll off
 -- at 30 days, audit-log cache at 45 days), the true-GUILD_DELETE purge queue,

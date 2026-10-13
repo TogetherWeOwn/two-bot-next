@@ -139,14 +139,14 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_vote_kick_audit",
     // V5 adds accepted-create history; see [`V5_ADDED_TABLES`].
     "voice_create_reservations",
-    // V6 adds retention queues (0427) and event-store capture (0428 presence +
-    // 0432 member deltas); see [`V6_ADDED_TABLES`]. The retention queues are
-    // guild-purge intent and user-deletion ledger with receipts: both must
-    // survive restore (a lost purge resurrects departed guild data; a lost
-    // request breaches the deletion SLA and drops receipts), so they are
-    // dumped, not excluded. Event-store capture is append-only gateway
-    // deltas, guild-keyed. No foreign keys on any of them, so order among
-    // the appended tables is free.
+    // V6 adds retention queues (0433) and event-store capture (0427 voice,
+    // 0428 presence + 0432 member deltas); see [`V6_ADDED_TABLES`]. The
+    // retention queues are guild-purge intent and user-deletion ledger with
+    // receipts: both must survive restore (a lost purge resurrects departed
+    // guild data; a lost request breaches the deletion SLA and drops
+    // receipts), so they are dumped, not excluded. Event-store capture is
+    // append-only gateway deltas, guild-keyed. No foreign keys on any of
+    // them, so order among the appended tables is free.
     "retention_guild_purge_queue",
     "retention_deletion_requests",
     "event_store",
@@ -158,8 +158,8 @@ pub const DUMP_TABLES: &[&str] = &[
 /// waiving arbitrary missing tables.
 pub const V5_ADDED_TABLES: &[&str] = &["voice_create_reservations"];
 
-/// Tables first covered by v6 (retention queues, migration 0427, plus
-/// event-store capture, migrations 0428 presence and 0432 member deltas).
+/// Tables first covered by v6 (retention queues, migration 0433, plus
+/// event-store capture: 0427 voice, 0428 presence and 0432 member deltas).
 /// A v4 or v5 archive predates them and need not declare them; every other
 /// covered table is still required, so recovery points written before any of
 /// those persistences stay readable without waiving arbitrary missing tables.
@@ -963,9 +963,9 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
         let _ = count;
     }
     // Historical inventories are pinned by fixtures. New v6 archives must cover
-    // reservations, retention queues and member capture too; v5 recovery points
-    // remain readable without the v6 tables, and v4 points without reservations
-    // either.
+    // reservations, retention queues, member capture and the event store too;
+    // v5 recovery points remain readable without the v6 tables, and v4 ones
+    // without those plus the v5 reservation history as well.
     let version = obj.get("version").and_then(Value::as_u64);
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
@@ -1762,8 +1762,8 @@ mod tests {
     #[test]
     fn v5_archives_without_v6_tables_validate_but_v6_requires_them() {
         // A v5 archive carries reservations but predates the v6 tables
-        // (retention queues 0427 plus member capture 0432): it must validate
-        // at version 5 and fail at version 6.
+        // (retention queues 0433 plus event-store voice/presence/member
+        // capture): it must validate at version 5 and fail at version 6.
         let tables: Vec<Value> = DUMP_TABLES
             .iter()
             .copied()
@@ -1808,13 +1808,19 @@ mod tests {
                 .collect()
         }
         // A v5 manifest without event_store stays readable: v5 predates
-        // member-capture persistence (and the v5 waiver covers every v6 table).
+        // member/presence/voice-capture persistence (and the v5 waiver covers
+        // every v6 table).
         let mut v5 = manifest(without(complete_tables(&BTreeMap::new()), "event_store"));
         v5["version"] = serde_json::json!(5);
         assert!(
             validate_manifest(&v5).is_ok(),
             "v5 without event_store reads"
         );
+        // The inspect read path accepts the frozen v5 envelope too.
+        let bytes = gzip_lines(&[v5.clone(), serde_json::json!({"kind":"end","rows":0})]);
+        let contents = inspect_bytes(&bytes).expect("v5 without event_store inspects");
+        assert_eq!(contents.manifest.version, 5);
+        assert_eq!(contents.manifest.missing_tables(), ["event_store"]);
         // Dropping a v5-covered table from a v5 manifest still refuses.
         let mut v5_gap = v5.clone();
         v5_gap["tables"]

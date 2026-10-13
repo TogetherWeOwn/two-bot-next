@@ -82,9 +82,9 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // Same shape as guild_counters: one read-time per count, no updated_at.
     TableSpec { table: "counter_snapshots", measure: TableMeasure::Columns(&["human_member_count_at", "online_count_at"]) },
     TableSpec { table: "event_rsvps", measure: TableMeasure::Columns(&["responded_at"]) },
-    // Append-only event-store capture (0428 presence + 0432 member deltas):
-    // `received_at` is the row write instant, `event_time` is the event time;
-    // the maximum across both is the row's last write.
+    // Append-only event-store capture (0427 voice + 0428 presence + 0432
+    // member deltas): `received_at` is the row write instant, `event_time`
+    // is the event time; the maximum across both is the row's last write.
     TableSpec { table: "event_store", measure: TableMeasure::Columns(&["received_at", "event_time"]) },
     TableSpec { table: "events", measure: TableMeasure::Columns(&["recorded_at"]) },
     TableSpec { table: "feed_deliveries", measure: TableMeasure::Columns(&["first_seen_at"]) },
@@ -178,14 +178,14 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         measure: TableMeasure::Unmeasurable("seed reference data with no timestamp column"),
     },
     TableSpec { table: "rank_snapshots", measure: TableMeasure::Columns(&["snapshot_at"]) },
-    // Retention deletion ledger (0427): request creation stamps requested_at,
+    // Retention deletion ledger (0433): request creation stamps requested_at,
     // completion rewrites completed_at without touching requested_at, so the
     // maximum across both is the row's last write (same shape as tickets).
     TableSpec {
         table: "retention_deletion_requests",
         measure: TableMeasure::Columns(&["requested_at", "completed_at"]),
     },
-    // Retention guild-purge queue (0427): insert-once per guild, stamped on
+    // Retention guild-purge queue (0433): insert-once per guild, stamped on
     // enqueue; a purge deletes the row, so only enqueues are measurable.
     TableSpec { table: "retention_guild_purge_queue", measure: TableMeasure::Columns(&["enqueued_at"]) },
     TableSpec { table: "scheduled_events", measure: TableMeasure::Columns(&["updated_at"]) },
