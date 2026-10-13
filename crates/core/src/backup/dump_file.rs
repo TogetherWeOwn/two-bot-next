@@ -119,6 +119,9 @@ pub const DUMP_TABLES: &[&str] = &[
     "internal_action_log",
     "internal_discord_events",
     "internal_event_keys",
+    // Stream go-live dedup ledger (0439): one row per go-live, no foreign
+    // keys, so order among the internal tables is free.
+    "stream_live_claims",
     "moderation_channel_executions",
     "moderation_member_bans",
     "invite_campaigns",
@@ -173,9 +176,11 @@ pub const DUMP_TABLES: &[&str] = &[
 /// written before create-reservation persistence (0422) stays readable
 /// without waiving arbitrary missing tables. The privacy opt-out control plane
 /// (0433/0434) is v5 for the same reason: v4 archives predate suppression
-/// tombstones, toggle rows and opt-out receipts.
+/// tombstones, toggle rows and opt-out receipts. The stream go-live ledger
+/// (0439) is v5 for the same reason: v4 archives predate claim rows.
 pub const V5_ADDED_TABLES: &[&str] = &[
     "voice_create_reservations",
+    "stream_live_claims",
     "privacy_opt_outs",
     "guild_analytics_settings",
     "privacy_opt_out_audit",
@@ -1804,6 +1809,7 @@ mod tests {
                 "guild_analytics_settings",
                 "privacy_opt_out_audit",
                 "member_season_xp",
+                "stream_live_claims",
                 "voice_create_reservations",
                 "retention_guild_purge_queue",
                 "retention_deletion_requests",

@@ -97,8 +97,32 @@ exposed only inside the HMAC and inside the create-subscription body, which is
 itself returned as a `Secret`. The Operator provisions the signing secret and
 the Twitch client id/secret; they never appear in code, logs or PR text.
 
-Not in this slice (each its own card): the public Worker route and container
-receiver, the Helix client with app-token refresh, Operator secret
-provisioning, and a durable dedup ledger. Until the ledger lands, dedup is
-in-memory (`RecentKeys`), so a crash between the post and the 2xx can post
-once more after restart.
+Not in this slice (each its own card): the container receiver, the Helix
+client with app-token refresh, and Operator secret provisioning. The public
+Worker route is staging-only and default-dark. The ledger below is present but
+is not called by a runtime receiver yet.
+
+## Durable go-live ledger
+
+- One `stream_live_claims` row per go-live, keyed by `live_dedup_key`.
+  `claim_live` inserts with `ON CONFLICT DO NOTHING`: the inserter owns
+  the post, while any existing claim is acknowledged with 2xx and skipped.
+- Claims have no expiry. A receiver crash after claiming but before sending
+  leaves an unposted row that suppresses Twitch retries indefinitely. The
+  receiver MUST add stale-claim recovery before wiring `claim_live` into the
+  runtime; this ledger alone is not a complete delivery/recovery protocol.
+- A Discord send may succeed while `mark_live_delivered` fails. The claim can
+  then remain `delivered_at IS NULL`; `release_live` deletes the targeted row
+  only when it is unstamped. Stale-claim recovery MUST NOT treat every stale
+  null-stamp row as unsent. It must preserve or distinguish deliveries that
+  may already have reached Discord, or a retry can double-post.
+- Delivered rows are retained indefinitely as dedup fences. This slice adds no
+  purge or retention policy; runtime wiring needs an explicit storage policy
+  that does not discard an active go-live's dedup fence.
+- The receiver MUST post with `allowed_mentions: { parse: [] }`. No sender
+  exists in this slice, so that no-ping contract has not been runtime-verified.
+- A send that provably never reached Discord deletes its unposted row
+  (`release_live`) and the receiver answers 5xx so Twitch retries; a
+  delivered row is stamped and never deleted, so retries after a successful
+  stamp cannot double-post. The claim → send → settle table is
+  `stream_live::disposition`; its async glue belongs with the receiver.
