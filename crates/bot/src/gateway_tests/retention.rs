@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Real websocket dispatch acceptance; no direct invocation of retention hooks
 //! substitutes for queue/cancel assertions. Nested under voice to reuse its
 //! no-network RoomWrites fixture without modifying any prior assertions.
