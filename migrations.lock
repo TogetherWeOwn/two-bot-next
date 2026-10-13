@@ -394,7 +394,7 @@
       "justification": "TOG-22941 member-list catch-up worker tables (member_catchup_members/cursors) plus the members-frontier checkpoint contract with backfill_cursors; ids/timestamps/enums only, IF NOT EXISTS, so catch-up writes work on migrated databases and progress reflects the worker. Renumbered 0434 to 0436 on the merge past main's 0433/0434 privacy opt-out."
     },
     "crates/cutover/migrations/0437_stream_live_claims.sql": {
-      "sha256": "7c86e572d04c99700aaa152c347a7898ae3b39b4754211abf957896c5269fa09",
+      "sha256": "b91ff5b0f75a32026f9a7b10725df5c50ef57525be0dc10410d718fbc93860b2",
       "justification": "Durable Twitch go-live dedup ledger keyed by live_dedup_key: claim-before-post insert, release-on-failed-send delete, delivered rows stamped and kept as the restart-proof fence. Renumbered 0435 to 0437 on the merge past main's 0435/0436 backfill."
     }
   }
