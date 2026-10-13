@@ -605,6 +605,52 @@ fn count_community_facts_drain_failure<T, E>(
 /// drive a failing dispatch through the real worker path: restoring a `panic!`
 /// at any failure site below fails the worker-level test instead of slipping
 /// through constructor-only coverage.
+/// Serial retention lifecycle for one gateway dispatch, ahead of the
+/// checkpoint commit. A real `GUILD_DELETE` queues a guild-data purge with
+/// the dispatch's `unavailable` flag preserved (`None`/available queues,
+/// outage `Some(true)` never queues); an available `GUILD_CREATE`/rejoin
+/// cancels the queued purge before the next retention run can erase the
+/// guild's rows, while an unavailable create is not a rejoin and cancels
+/// nothing. Voice cleanup is untouched: the sink already invalidated the
+/// live actor above for every deletion variant. Returns the SQL error when
+/// the queue/cancel write fails so the caller holds the cursor and the
+/// dispatch replays after restart; reception already skips duplicate
+/// sequences, and the write itself is idempotent, so a checkpoint failure
+/// after it still repairs on replay.
+async fn retention_lifecycle(store: &GatewaySessionStore, event: &Event) -> Option<sqlx::Error> {
+    let pool = store.pool();
+    match event {
+        Event::GuildDelete(deleted) => {
+            let guild_id = deleted.id.get().to_string();
+            match two_bot_cutover::retention::handle_guild_delete(
+                pool,
+                &guild_id,
+                deleted.unavailable,
+            )
+            .await
+            {
+                Ok(_) => None,
+                Err(error) => Some(error),
+            }
+        }
+        Event::GuildCreate(created) => {
+            if matches!(
+                created.as_ref(),
+                twilight_model::gateway::payload::incoming::GuildCreate::Available(_)
+            ) {
+                let guild_id = created.id().get().to_string();
+                match two_bot_cutover::retention::cancel_guild_purge(pool, &guild_id).await {
+                    Ok(_) => None,
+                    Err(error) => Some(error),
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_dispatch<I: InviteSource>(
     handle: &tokio::runtime::Handle,
@@ -716,6 +762,15 @@ fn apply_dispatch<I: InviteSource>(
             voice.handle_received(&dispatch.event, pipeline.cache(), dispatch.received);
             if generation.load(Ordering::Acquire) != observed_generation {
                 voice.disconnect();
+            }
+        }
+        // Retention lifecycle before the checkpoint commits: a failed
+        // queue/cancel write holds the cursor via `dispatch_error` so the
+        // dispatch (and any later dispatch) is never acknowledged, and the
+        // next process replays it from the last committed sequence.
+        if dispatch_error.is_none() {
+            if let Some(error) = handle.block_on(retention_lifecycle(store, &dispatch.event)) {
+                dispatch_error = Some(error);
             }
         }
         // Detached spawn from the blocking worker needs the runtime. A create

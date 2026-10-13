@@ -73,6 +73,7 @@ mod raid_runtime;
 #[cfg(test)]
 mod raid_runtime_tests;
 mod restore_drill;
+mod retention_jobs;
 #[cfg(test)]
 mod retention_runtime_tests;
 mod schedule_runtime;

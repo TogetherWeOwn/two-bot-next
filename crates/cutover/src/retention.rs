@@ -35,14 +35,16 @@
 //!   are never time-purged; a departed guild's aggregates go only through
 //!   the guild-purge queue, and a rejoin cancels the queued purge via
 //!   [`cancel_guild_purge`] before the next run.
-//! * Producer paths are NOT covered here: gateway ingestion cadence,
-//!   backfill/replay writes, and the live-voice in-memory `remove_guild`
-//!   handoff. The live gateway must invoke [`handle_guild_delete`] on real
-//!   dispatches (passing the dispatch's `unavailable` flag through) and
-//!   [`cancel_guild_purge`] on `GUILD_CREATE`/rejoin; wiring those call sites
-//!   and proving them against a live gateway is follow-up work. Nothing
-//!   schedules [`run_retention`] yet; the job runs when invoked (tests and
-//!   manual runs), not on a live timer.
+//! * Producer paths: the live gateway invokes [`handle_guild_delete`] on
+//!   real `GUILD_DELETE` dispatches (passing the dispatch's `unavailable`
+//!   flag through, so outage payloads never queue) and
+//!   [`cancel_guild_purge`] on available `GUILD_CREATE`/rejoin, ahead of the
+//!   dispatch checkpoint so a failed write replays after restart. The
+//!   supervised retention job (bounded cadence, dry run unless explicitly
+//!   configured to execute) schedules [`run_retention`]. Gateway ingestion
+//!   cadence, backfill/replay writes, and the live-voice in-memory
+//!   `remove_guild` handoff remain owned by their own paths, not duplicated
+//!   here.
 //! * Retained control-plane records stay retained: `guild_settings`,
 //!   `guild_settings_audit`, `audit_kill_switch`, `member_erasure_audit`,
 //!   and operator-released `moderation_idempotency` replay-fence rows are
