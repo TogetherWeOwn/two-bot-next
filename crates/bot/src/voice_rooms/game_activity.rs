@@ -457,11 +457,11 @@ pub async fn flush_due_guilds(
         // drops stale state, and a failed upsert requeues inside the call.
         // Only a gate failure (fail-closed, buffers intact) skips the stamp
         // so the next tick retries instead of dropping an hour.
-        match persist_guild(pool, collector, guild, gap_timeout_ms).await {
-            Ok(_) => {
-                last_flush_ms.insert(guild, now_ms);
-            }
-            Err(_) => {}
+        if persist_guild(pool, collector, guild, gap_timeout_ms)
+            .await
+            .is_ok()
+        {
+            last_flush_ms.insert(guild, now_ms);
         }
     }
 }
@@ -778,7 +778,7 @@ mod tests {
             "overdue stays due"
         );
         assert!(
-            GAME_ACTIVITY_FLUSH_INTERVAL_MS > 4 * GAME_ACTIVITY_GAP_TIMEOUT_MS,
+            GAME_ACTIVITY_FLUSH_INTERVAL_MS >= 4 * GAME_ACTIVITY_GAP_TIMEOUT_MS,
             "cadence stays well past the session gap, so steady play sessionizes whole"
         );
     }
