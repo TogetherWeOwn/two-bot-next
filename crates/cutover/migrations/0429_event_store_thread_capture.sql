@@ -7,8 +7,9 @@
 -- `dedup_key`) plus the thread-state enums (`archived`, `locked`,
 -- `invitable`) and the member-id delta (`user_id`). Ids, timestamps and
 -- enum fields only: no thread-name column, no topic column, no message-body
--- column, no username column (see the FORBIDDEN_COLUMNS tripwire in
--- crates/discord/tests/event_store_s6.rs). Resume-safe dedup is
+-- column, no username column (see the ALLOWED_COLUMNS union plus the
+-- json/jsonb type fence in crates/discord/tests/event_store_s6.rs).
+-- Resume-safe dedup is
 -- `ON CONFLICT (dedup_key) DO NOTHING` against the shared UNIQUE index
 -- below, with `dedup_key` shaped per event as
 -- `<EVENT_TYPE>:<guild_id>:<thread_id>:<event_time>` (member deltas append

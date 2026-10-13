@@ -302,39 +302,119 @@ async fn table_columns(pool: &PgPool) -> Vec<String> {
     .expect("event_store columns readable")
 }
 
-/// The exact reviewed column set for the shared `event_store` table after the
-/// S6 migration: ids, timestamps, the resume-safe key and the thread-state
-/// enums only. A denylist cannot fail on a new free-text name, so this asserts
-/// the full set instead. Later slices extend this allowlist when they add
-/// their own reviewed columns (`ADD COLUMN IF NOT EXISTS` per 0429).
-const ALLOWED_COLUMNS: &[&str] = &[
-    "archived",
+async fn table_column_types(pool: &PgPool) -> Vec<(String, String)> {
+    sqlx::query_as(
+        "SELECT column_name, data_type FROM information_schema.columns
+         WHERE table_name = 'event_store' ORDER BY column_name",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("event_store column types readable")
+}
+
+/// S6 required columns: the thread-lifecycle/member-delta contract. Every one
+/// of the 7 tests calls `assert_thread_schema`, so these must be present
+/// whatever sibling slices have landed.
+const REQUIRED_COLUMNS: &[&str] = &[
+    "event_type",
+    "guild_id",
+    "thread_id",
+    "parent_id",
+    "user_id",
+    "event_time",
+    "received_at",
     "dedup_key",
+    "archived",
+    "locked",
+    "invitable",
+];
+
+/// The reviewed column allowlist for the shared `event_store` table: the union
+/// of the slices' columns (S1 message ids, S2 member deltas, S3 presence, S4
+/// voice, S5 message/reaction, S6 threads, S8 stage/interaction) plus the `id`
+/// primary key. Every actual column must be a member, so any new free-text
+/// column (a body-carrying `raw_payload`, `thread_title`, or similar) fails
+/// the suite. A denylist cannot fail on a new name, so this asserts the closed
+/// union instead. Later slices extend this list when they add their own
+/// reviewed columns (`ADD COLUMN IF NOT EXISTS` per 0429).
+const ALLOWED_COLUMNS: &[&str] = &[
+    "action_type",
+    "activity_type",
+    "actor_id",
+    "application_id",
+    "archived",
+    "audit_log_entry_id",
+    "channel_id",
+    "command_id",
+    "deaf",
+    "dedup_key",
+    "emoji_id",
+    "emoji_name",
     "event_time",
     "event_type",
     "guild_id",
     "id",
+    "interaction_id",
+    "interaction_type",
     "invitable",
     "locked",
+    "message_id",
+    "mute",
+    "nick_changed",
     "parent_id",
+    "premium_since",
+    "presence_status",
+    "privacy_level",
     "received_at",
+    "roles",
+    "self_deaf",
+    "self_mute",
+    "self_stream",
+    "self_video",
+    "session_id",
+    "stage_instance_id",
+    "suppress",
+    "target_id",
     "thread_id",
     "user_id",
 ];
 
 fn assert_thread_schema(columns: &[String]) {
-    let mut actual = columns.to_vec();
-    actual.sort();
-    let mut expected: Vec<String> = ALLOWED_COLUMNS
-        .iter()
-        .map(|name| (*name).to_owned())
-        .collect();
-    expected.sort();
-    assert_eq!(
-        actual, expected,
-        "event_store holds exactly the reviewed S6 columns; extend the allowlist \
-         only with a reviewed slice column"
+    assert!(
+        !columns.is_empty(),
+        "S6 creates the thread columns on the append-only event_store table"
     );
+    for required in REQUIRED_COLUMNS {
+        assert!(
+            columns.iter().any(|column| column == required),
+            "event_store keeps thread column {required}; has {columns:?}"
+        );
+    }
+    for column in columns {
+        assert!(
+            ALLOWED_COLUMNS.contains(&column.as_str()),
+            "event_store holds only reviewed slice columns; unexpected {column}; \
+             has {columns:?} (extend ALLOWED_COLUMNS only with a reviewed slice column)"
+        );
+    }
+}
+
+/// No `json`/`jsonb` column may exist except the reviewed `roles` role-id
+/// array (S2): free-text payloads (raw thread payloads, member blobs) have no
+/// schema home whatever the column name. The writers below bind ids/enums
+/// only, so this type fence plus the name allowlist above is what makes the
+/// privacy tripwire fail on a scratch `raw_payload JSONB` migration.
+async fn assert_no_json_columns(pool: &PgPool) {
+    for (column, data_type) in table_column_types(pool).await {
+        if column == "roles" {
+            continue;
+        }
+        assert!(
+            data_type != "json" && data_type != "jsonb",
+            "event_store column {column} has free-text type {data_type}; \
+             thread capture persists ids+enums only"
+        );
+    }
 }
 
 async fn assert_dedup_key_is_unique(pool: &PgPool) {
@@ -767,9 +847,10 @@ async fn event_store_s6_duplicate_delivery_inserts_once() {
 #[tokio::test]
 async fn event_store_s6_privacy_tripwire_rejects_thread_names_and_bodies() {
     let db = TestDb::new().await;
-    // Tripwire part 1: the table holds exactly the reviewed columns, so no
+    // Tripwire part 1: the table holds only reviewed slice columns, so no
     // free-text column exists to hold the payload.
     assert_thread_schema(&table_columns(&db.pool).await);
+    assert_no_json_columns(&db.pool).await;
     // Tripwire part 2: fixtures carrying name + topic + username free text
     // persist their ids, timestamps and enums only; the sentinels appear in no
     // stored row.

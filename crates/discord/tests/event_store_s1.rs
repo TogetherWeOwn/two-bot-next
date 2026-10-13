@@ -130,20 +130,20 @@ async fn table_columns(pool: &PgPool) -> Vec<String> {
     .expect("event_store columns readable")
 }
 
-const FORBIDDEN_COLUMNS: &[&str] = &[
-    "body",
-    "content",
-    "message_body",
-    "message_content",
-    "custom_status_text",
-    "status_text",
-];
+async fn table_column_types(pool: &PgPool) -> Vec<(String, String)> {
+    sqlx::query_as(
+        "SELECT column_name, data_type FROM information_schema.columns
+         WHERE table_name = 'event_store' ORDER BY column_name",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("event_store column types readable")
+}
 
-/// Exact S1 column set: `id` plus the eight metadata columns. Any added
-/// column (a raw payload or free-text column included) fails here, so an S1
-/// build that stores the gateway dispatch outside these columns cannot pass.
-const EXPECTED_COLUMNS: &[&str] = &[
-    "id",
+/// S1 required columns: the append-only core plus message-create metadata.
+/// Every S1 test that checks the schema calls `assert_minimal_schema`, so
+/// these must be present whatever sibling slices have landed.
+const REQUIRED_COLUMNS: &[&str] = &[
     "event_type",
     "guild_id",
     "channel_id",
@@ -154,26 +154,88 @@ const EXPECTED_COLUMNS: &[&str] = &[
     "dedup_key",
 ];
 
+/// The reviewed column allowlist for the shared `event_store` table: the union
+/// of the slices' columns (S1 message ids, S2 member deltas, S3 presence, S4
+/// voice, S5 message/reaction, S6 threads, S8 stage/interaction) plus the `id`
+/// primary key. Shared with the S6 suite so either slice lands first: every
+/// actual column must be a member, so any new free-text column (a
+/// body-carrying `message_content`, `raw_payload`, or similar) fails the
+/// suite. Later slices extend this list when they add their own reviewed
+/// columns.
+const ALLOWED_COLUMNS: &[&str] = &[
+    "action_type",
+    "activity_type",
+    "actor_id",
+    "application_id",
+    "archived",
+    "audit_log_entry_id",
+    "channel_id",
+    "command_id",
+    "deaf",
+    "dedup_key",
+    "emoji_id",
+    "emoji_name",
+    "event_time",
+    "event_type",
+    "guild_id",
+    "id",
+    "interaction_id",
+    "interaction_type",
+    "invitable",
+    "locked",
+    "message_id",
+    "mute",
+    "nick_changed",
+    "parent_id",
+    "premium_since",
+    "presence_status",
+    "privacy_level",
+    "received_at",
+    "roles",
+    "self_deaf",
+    "self_mute",
+    "self_stream",
+    "self_video",
+    "session_id",
+    "stage_instance_id",
+    "suppress",
+    "target_id",
+    "thread_id",
+    "user_id",
+];
+
 fn assert_minimal_schema(columns: &[String]) {
     assert!(
         !columns.is_empty(),
         "S1 creates the append-only event_store table"
     );
-    let mut actual = columns.to_vec();
-    actual.sort();
-    let mut expected: Vec<String> = EXPECTED_COLUMNS
-        .iter()
-        .map(|column| column.to_string())
-        .collect();
-    expected.sort();
-    assert_eq!(
-        actual, expected,
-        "event_store keeps exactly the S1 column set; has {columns:?}"
-    );
-    for forbidden in FORBIDDEN_COLUMNS {
+    for required in REQUIRED_COLUMNS {
         assert!(
-            !columns.iter().any(|column| column == forbidden),
-            "event_store must not gain a {forbidden} column; has {columns:?}"
+            columns.iter().any(|column| column == required),
+            "event_store keeps S1 column {required}; has {columns:?}"
+        );
+    }
+    for column in columns {
+        assert!(
+            ALLOWED_COLUMNS.contains(&column.as_str()),
+            "event_store holds only reviewed slice columns; unexpected {column}; \
+             has {columns:?} (extend ALLOWED_COLUMNS only with a reviewed slice column)"
+        );
+    }
+}
+
+/// No `json`/`jsonb` column may exist except the reviewed `roles` role-id
+/// array (S2): free-text payloads (message bodies, raw payloads) have no
+/// schema home whatever the column name.
+async fn assert_no_json_columns(pool: &PgPool) {
+    for (column, data_type) in table_column_types(pool).await {
+        if column == "roles" {
+            continue;
+        }
+        assert!(
+            data_type != "json" && data_type != "jsonb",
+            "event_store column {column} has free-text type {data_type}; \
+             message capture persists ids+timestamps only"
         );
     }
 }
@@ -348,7 +410,7 @@ fn event_store_s1_consumer_lag_gauge_has_fixed_cardinality() {
 #[ignore = "pending: S1 migration missing; CONSTRAINTS exception expires 2026-11-12; run with --ignored to see the gap"]
 async fn event_store_s1_privacy_tripwire_rejects_body_text() {
     let db = TestDb::new().await;
-    // Tripwire part 1: the table holds exactly the S1 column set, so no
+    // Tripwire part 1: the table holds only reviewed slice columns, so no
     // free-text or raw-payload column exists to hold the sentinels.
     let columns = table_columns(&db.pool).await;
     assert!(
@@ -356,6 +418,7 @@ async fn event_store_s1_privacy_tripwire_rejects_body_text() {
         "S1 creates the append-only event_store table"
     );
     assert_minimal_schema(&columns);
+    assert_no_json_columns(&db.pool).await;
     // Tripwire part 2: a fixture carrying body + custom-status text persists
     // its ids only; the sentinels appear in no stored row.
     let fixture = message_create_fixture("trip-1", "2026-10-12T12:00:00.000Z");
