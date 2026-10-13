@@ -1,6 +1,7 @@
 -- Reviewed object allowlist. No wildcard grants to other services' relations.
 SELECT schema_name, name, kind FROM (VALUES
     ('public', 'events', 'table'),
+    ('public', 'event_store', 'table'),
     ('public', 'members', 'table'),
     ('public', 'invite_snapshots', 'table'),
     ('public', 'member_levels', 'table'),
@@ -88,11 +89,11 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'join_risk_flags', 'table'),
     ('public', 'containment_events', 'table'),
     ('public', 'containment_incidents', 'table'),
-    ('public', 'event_store', 'table'),
     ('public', 'member_erasure_audit', 'migrator'),
     ('public', 'invite_campaigns', 'migrator'),
     ('public', '_sqlx_migrations', 'ledger'),
     ('public', 'events_id_seq', 'sequence'),
+    ('public', 'event_store_id_seq', 'sequence'),
     ('public', 'gateway_onboarding_jobs_id_seq', 'sequence'),
     ('public', 'xp_awards_id_seq', 'sequence'),
     ('public', 'level_import_runs_id_seq', 'sequence'),
@@ -104,7 +105,6 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'internal_action_log_audit_id_seq', 'sequence'),
     ('public', 'guild_settings_version_seq', 'sequence'),
     ('public', 'guild_settings_cas_seq', 'sequence'),
-    ('public', 'event_store_id_seq', 'sequence'),
     ('public', 'guild_settings_assign_version()', 'function'),
     ('public', 'guild_settings_advance_revision()', 'function'),
     ('public', 'guild_settings_audit_append_only()', 'function'),

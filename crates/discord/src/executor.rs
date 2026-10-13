@@ -1179,12 +1179,19 @@ impl ActionExecutor {
         Ok(pending.settle_status().await)
     }
 
+    /// Twilight request factory for sibling Discord-native modules (funnel
+    /// invites): keeps method/path/body encoding twilight-owned, like the
+    /// moderation verbs below.
+    pub(crate) fn request_factory(&self) -> &TwilightClient {
+        &self.inner.factory
+    }
+
     /// Build a twilight [`Request`] from a builder without sending (keeps
     /// every method/path/body/audit encoding twilight-owned). Build failures
     /// (bad ids, out-of-range fields, failed validation) happen before any
     /// I/O, so they map to [`DiscordError::Rejected`] — provably no mutation
     /// happened and the claim fence is safe to release.
-    fn request_of<T>(build: T) -> Result<Request, DiscordError>
+    pub(crate) fn request_of<T>(build: T) -> Result<Request, DiscordError>
     where
         T: TryIntoRequest,
     {

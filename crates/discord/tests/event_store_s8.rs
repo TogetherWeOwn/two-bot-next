@@ -397,6 +397,7 @@ const ALLOWED_COLUMNS: &[&str] = &[
     "message_id",
     "mute",
     "nick",
+    "nick_changed",
     "parent_id",
     "premium_since",
     "privacy_level",

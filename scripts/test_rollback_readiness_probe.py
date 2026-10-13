@@ -273,7 +273,7 @@ class RollbackReadinessProbeTests(unittest.TestCase):
 
     def test_current_dump_version_6_manifest_passes(self):
         self.fx.write_archive("two-funnel-20261002T051700Z.ndjson.gz", archive_lines(manifest(version=6)),
-                              mtime=2_050_000_000)
+                              mtime=2_060_000_000)
         code, results, _ = self.probe()
         self.assertEqual(code, 0, results)
         self.assertIn("two-funnel-20261002T051700Z.ndjson.gz v6", results["PASS manifest"])

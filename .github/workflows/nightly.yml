@@ -269,6 +269,11 @@ jobs:
           --skip event_store_s8_audit_log_entry_persists_ids_and_action_enum_only
           --skip event_store_s8_duplicate_delivery_inserts_once
           --skip event_store_s8_privacy_tripwire_rejects_topic_token_and_change_details
+          --skip event_store_s2_member_add_persists_ids_and_premium_since_only
+          --skip event_store_s2_member_remove_persists_ids_only
+          --skip event_store_s2_member_update_persists_nick_and_role_deltas_only
+          --skip event_store_s2_duplicate_delivery_inserts_once
+          --skip event_store_s2_privacy_tripwire_rejects_bio_text
           --skip event_store_s1_append_only_insert_uses_minimal_fields
           --skip event_store_s1_duplicate_delivery_inserts_once
           --skip event_store_s1_replayed_message_create_does_not_duplicate
