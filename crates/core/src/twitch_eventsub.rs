@@ -16,9 +16,11 @@
 //!   10-minute freshness window (Twitch's replay guard).
 //! - [`classify`]: the three message types (`webhook_callback_verification`,
 //!   `notification`, `revocation`), strict about subscription type/version.
-//! - [`plan_live_post`] with [`RecentKeys`]: broadcaster allowlist plus
-//!   claim-before-post dedup so EventSub retries and replays collapse to one
-//!   announcements-channel post.
+//! - [`plan_live_post`]: broadcaster allowlist plus rendering of the
+//!   announcements-channel post with its stable [`live_dedup_key`]. The
+//!   planner never dedups: claim-before-post arbitration lives in the
+//!   `stream_live_claims` ledger ([`crate::stream_live_store::claim_live`]),
+//!   so EventSub retries and replays collapse to one post even across restarts.
 //! - [`CallbackUrl`], [`create_subscription_body`], [`parse_subscriptions`] and
 //!   [`reconcile`]: subscription management as pure request bodies and a
 //!   create/delete plan. No Helix polling: reconcile runs at boot and after a
@@ -28,7 +30,7 @@
 //! ledger are separate reviewed slices; every caller of `WebhookSecret::expose()`
 //! stays at the signing boundary and never logs the value.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
@@ -63,10 +65,6 @@ const SECRET_MAX: usize = 100;
 const CHALLENGE_MAX: usize = 256;
 const SUBSCRIPTION_ID_MAX: usize = 64;
 const CALLBACK_MAX: usize = 200;
-/// How many distinct go-lives the dedup window remembers.
-const RECENT_CAPACITY: usize = 1024;
-/// A claimed go-live is remembered this long (retries land within minutes).
-const RECENT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum EventSubError {
@@ -300,70 +298,23 @@ pub fn classify(message_type: &str, body: &[u8]) -> Result<Delivery, EventSubErr
     }
 }
 
-/// Bounded, time-limited set of claimed go-live keys. Claim before posting;
-/// [`RecentKeys::release`] a key when the post failed and a Twitch retry
-/// should be allowed to try again. In-memory only: a durable ledger is a
-/// separate slice, so a crash between post and acknowledgement can still
-/// double-post once.
-#[derive(Debug, Default)]
-pub struct RecentKeys {
-    order: VecDeque<(String, i64)>,
-    keys: HashSet<String>,
-}
-
-impl RecentKeys {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    fn evict(&mut self, now_ms: i64) {
-        while let Some((key, claimed_at)) = self.order.front() {
-            if self.order.len() > RECENT_CAPACITY
-                || now_ms.saturating_sub(*claimed_at) > RECENT_TTL_MS
-            {
-                self.keys.remove(key);
-                self.order.pop_front();
-            } else {
-                break;
-            }
-        }
-    }
-
-    /// Returns `true` when `key` was not already claimed (the caller owns the
-    /// post), `false` for a retry or replay.
-    pub fn claim(&mut self, key: &str, now_ms: i64) -> bool {
-        self.evict(now_ms);
-        if self.keys.contains(key) {
-            return false;
-        }
-        self.keys.insert(key.to_owned());
-        self.order.push_back((key.to_owned(), now_ms));
-        self.evict(now_ms);
-        true
-    }
-
-    /// Forget a claim whose post failed so a retry can try again.
-    pub fn release(&mut self, key: &str) {
-        if self.keys.remove(key) {
-            self.order.retain(|(k, _)| k != key);
-        }
-    }
-}
-
 /// Why a notification produced no post.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
     /// The broadcaster is not in the configured allowlist.
     BroadcasterNotAllowed,
-    /// This go-live was already claimed (retry or replay).
+    /// The `stream_live_claims` ledger already holds this go-live (retry,
+    /// replay, or restart). Emitted by the receiver's claim, never by the
+    /// planner below.
     Duplicate,
 }
 
 /// A rendered post. Send with mentions suppressed (empty `allowed_mentions`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LivePost {
-    /// Claim key; pass to [`RecentKeys::release`] if the send fails.
+    /// Stable `live_dedup_key`: the receiver claims it in `stream_live_claims`
+    /// before posting, and releases it when the send provably never reached
+    /// Discord.
     pub dedup_key: String,
     pub content: String,
 }
@@ -376,24 +327,19 @@ pub enum NotificationPlan {
 
 /// Decide what one verified go-live does. The allowlist is checked first (a
 /// valid signature proves Twitch sent it, not that we asked for it), then the
-/// post is rendered from the validated invite, and only then is the claim taken
-/// so an invalid invite never burns it.
+/// post is rendered from the validated invite. There is no claim step: an
+/// invalid invite errors before the receiver can claim the ledger row, and
+/// retries plan the same post with the same key — the ledger collapses them.
 pub fn plan_live_post(
     stream: &StreamOnline,
     discord_invite_url: &str,
     allowed_broadcasters: &[String],
-    recent: &mut RecentKeys,
-    now_ms: i64,
 ) -> Result<NotificationPlan, StreamFunnelError> {
     if !allowed_broadcasters.contains(&stream.broadcaster_user_id) {
         return Ok(NotificationPlan::Skip(SkipReason::BroadcasterNotAllowed));
     }
-    // Render first so an invalid invite never burns the claim.
     let content = live_announcement(stream, None, discord_invite_url)?;
     let dedup_key = live_dedup_key(stream);
-    if !recent.claim(&dedup_key, now_ms) {
-        return Ok(NotificationPlan::Skip(SkipReason::Duplicate));
-    }
     Ok(NotificationPlan::Post(LivePost { dedup_key, content }))
 }
 
@@ -875,111 +821,58 @@ mod tests {
     }
 
     #[test]
-    fn one_post_per_go_live_across_retries_and_replays() {
+    fn planner_is_pure_duplicates_post_with_a_stable_key() {
+        // The planner never dedups: every validated delivery plans a post with
+        // the same `live_dedup_key`, and the `stream_live_claims` ledger owns
+        // claim-before-post (see `stream_live_store::claim_live`).
         let allowed = vec!["1337".to_owned()];
-        let mut recent = RecentKeys::new();
-        let first = plan_live_post(
-            &stream("2025-10-09T08:50:00Z"),
-            INVITE,
-            &allowed,
-            &mut recent,
-            NOW_MS,
-        )
-        .unwrap();
-        let NotificationPlan::Post(post) = first else {
+        let s = stream("2025-10-09T08:50:00Z");
+        let first = plan_live_post(&s, INVITE, &allowed).unwrap();
+        let NotificationPlan::Post(first_post) = first else {
             panic!("first delivery must post");
         };
-        assert!(post.content.contains("https://www.twitch.tv/cool_user"));
-        assert!(post.content.contains(INVITE));
+        assert!(first_post
+            .content
+            .contains("https://www.twitch.tv/cool_user"));
+        assert!(first_post.content.contains(INVITE));
         for _ in 0..3 {
-            assert_eq!(
-                plan_live_post(
-                    &stream("2025-10-09T08:50:00Z"),
-                    INVITE,
-                    &allowed,
-                    &mut recent,
-                    NOW_MS + 1000
-                )
-                .unwrap(),
-                NotificationPlan::Skip(SkipReason::Duplicate)
-            );
+            let retry = plan_live_post(&s, INVITE, &allowed).unwrap();
+            let NotificationPlan::Post(retry_post) = retry else {
+                panic!("retries must also plan a post; the ledger skips them");
+            };
+            assert_eq!(retry_post.dedup_key, first_post.dedup_key);
+            assert_eq!(retry_post.content, first_post.content);
         }
-        // A new stream start is a new go-live.
-        assert!(matches!(
-            plan_live_post(
-                &stream("2025-10-09T20:00:00Z"),
-                INVITE,
-                &allowed,
-                &mut recent,
-                NOW_MS + 2000
-            )
-            .unwrap(),
-            NotificationPlan::Post(_)
-        ));
-    }
-
-    #[test]
-    fn failed_send_releases_the_claim_for_the_retry() {
-        let allowed = vec!["1337".to_owned()];
-        let mut recent = RecentKeys::new();
-        let s = stream("2025-10-09T08:50:00Z");
-        let NotificationPlan::Post(post) =
-            plan_live_post(&s, INVITE, &allowed, &mut recent, NOW_MS).unwrap()
+        // A new stream start is a new go-live with a new key.
+        let NotificationPlan::Post(later) =
+            plan_live_post(&stream("2025-10-09T20:00:00Z"), INVITE, &allowed).unwrap()
         else {
-            panic!("post");
+            panic!("new instant must post");
         };
-        recent.release(&post.dedup_key);
-        assert!(matches!(
-            plan_live_post(&s, INVITE, &allowed, &mut recent, NOW_MS + 1).unwrap(),
-            NotificationPlan::Post(_)
-        ));
+        assert_ne!(later.dedup_key, first_post.dedup_key);
     }
 
     #[test]
-    fn unlisted_broadcaster_and_bad_invite_do_not_claim() {
-        let mut recent = RecentKeys::new();
+    fn unlisted_broadcaster_and_bad_invite_never_post() {
         let s = stream("2025-10-09T08:50:00Z");
         assert_eq!(
-            plan_live_post(&s, INVITE, &["42".to_owned()], &mut recent, NOW_MS).unwrap(),
+            plan_live_post(&s, INVITE, &["42".to_owned()]).unwrap(),
             NotificationPlan::Skip(SkipReason::BroadcasterNotAllowed)
         );
         assert_eq!(
-            plan_live_post(&s, INVITE, &[], &mut recent, NOW_MS).unwrap(),
+            plan_live_post(&s, INVITE, &[]).unwrap(),
             NotificationPlan::Skip(SkipReason::BroadcasterNotAllowed)
         );
         let allowed = vec!["1337".to_owned()];
         assert_eq!(
-            plan_live_post(
-                &s,
-                "http://not-https.example",
-                &allowed,
-                &mut recent,
-                NOW_MS
-            ),
+            plan_live_post(&s, "http://not-https.example", &allowed),
             Err(StreamFunnelError::InvalidInviteUrl)
         );
-        // Neither refusal burned the claim.
+        // Refusals precede any ledger claim, so the valid call still posts.
         assert!(matches!(
-            plan_live_post(&s, INVITE, &allowed, &mut recent, NOW_MS).unwrap(),
+            plan_live_post(&s, INVITE, &allowed).unwrap(),
             NotificationPlan::Post(_)
         ));
-    }
-
-    #[test]
-    fn recent_keys_expire_and_stay_bounded() {
-        let mut recent = RecentKeys::new();
-        assert!(recent.claim("a", 0));
-        assert!(!recent.claim("a", RECENT_TTL_MS));
-        assert!(recent.claim("a", RECENT_TTL_MS + 1));
-        let mut recent = RecentKeys::new();
-        for i in 0..RECENT_CAPACITY + 10 {
-            assert!(recent.claim(&format!("k{i}"), 0));
-        }
-        assert_eq!(recent.keys.len(), RECENT_CAPACITY);
-        assert_eq!(recent.order.len(), RECENT_CAPACITY);
-        // The oldest were evicted; the newest are still deduped.
-        assert!(recent.claim("k0", 0));
-        assert!(!recent.claim(&format!("k{}", RECENT_CAPACITY + 9), 0));
     }
 
     #[test]

@@ -101,9 +101,12 @@ The public Worker route (`POST /hooks/twitch`, `wrangler/src/eventsub.ts`)
 is dark unless `EVENTSUB_INGRESS` and `TWO_EVENTSUB` are both exactly `"1"`
 (staging-only). The private container receiver below lands in this slice;
 Operator secret provisioning stays an Operator action. The durable dedup
-ledger store lives in this branch (see [Durable go-live ledger](#durable-go-live-ledger));
-until the receiver wires it, runtime dedup is in-memory (`RecentKeys`), so a
-crash between the post and the 2xx can post once more after restart.
+ledger store lives in this branch (see [Durable go-live ledger](#durable-go-live-ledger)).
+The planner is pure: every validated delivery plans a post with a stable
+`live_dedup_key` and never dedups in memory. Until the receiver wires the
+ledger claim before posting, duplicate deliveries are each acknowledged
+without a fence; once wired, the claim collapses retries, replays and
+restarts to one post.
 
 ## Private container receiver
 
