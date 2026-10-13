@@ -8,23 +8,25 @@
 //!
 //! Containment (presence-probe precedent, `crate` core `presence`): the only
 //! output is guild-level aggregates keyed by (guild, game). No per-member
-//! row, no per-member reader, no publication. Buffers are in-memory,
-//! per-guild bounded, and never leave the process. Durable writes, flush
-//! cadence and opt-out gating are a follow-up slice: there is deliberately
-//! no migration, store, reader or metric label here.
+//! row, no per-member reader, no publication. Buffers are in-memory and
+//! per-guild bounded; the hourly [`flush_loop`] persists each due guild
+//! through the opt-out gate ([`persist_guild`]) into the core store, with
+//! label-free count-only telemetry and no metric label.
 //!
 //! [`sessionize`]: two_bot_core::game_activity::sessionize
 //! [`aggregate_guild`]: two_bot_core::game_activity::aggregate_guild
 //! [`PresenceUpdate`]: twilight_model::gateway::payload::incoming::PresenceUpdate
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use twilight_model::gateway::payload::incoming::PresenceUpdate;
 use twilight_model::gateway::presence::{Activity, ActivityButton, ActivityType};
 use two_bot_core::game_activity::{
     self, ActivitySnapshot, GuildGameAggregate, PresenceDelta, VoiceSpan,
 };
+use two_bot_core::game_activity_store::{self, GameActivityStoreError};
 
 use super::presence::member_id;
 use super::Snowflake;
@@ -34,6 +36,28 @@ use super::Snowflake;
 /// Matches the core tests' practice (15 minutes): observations for the same
 /// member and game merge while each step stays within this gap.
 pub const GAME_ACTIVITY_GAP_TIMEOUT_MS: i64 = 15 * 60 * 1000;
+
+/// Persist cadence per guild, in millis: hourly, four times the session gap.
+///
+/// Well past [`GAME_ACTIVITY_GAP_TIMEOUT_MS`] on purpose, so steady play
+/// sessionizes whole while an interval spanning a flush boundary honestly
+/// splits there (see [`GameActivityCollector::flush`]).
+pub const GAME_ACTIVITY_FLUSH_INTERVAL_MS: i64 = 60 * 60 * 1000;
+
+/// How often the flush loop wakes to check per-guild due times. Wakeups are
+/// cheap integer compares; persists still happen at most hourly per guild.
+const FLUSH_POLL_INTERVAL: Duration = Duration::from_secs(300);
+
+/// True when `guild` is due for a persist: never flushed, or its last flush
+/// is at least [`GAME_ACTIVITY_FLUSH_INTERVAL_MS`] ago. Pure, so the loop
+/// below and its tests share one definition of due.
+#[must_use]
+pub fn flush_due(last_flush_ms: Option<i64>, now_ms: i64) -> bool {
+    match last_flush_ms {
+        None => true,
+        Some(last) => now_ms.saturating_sub(last) >= GAME_ACTIVITY_FLUSH_INTERVAL_MS,
+    }
+}
 
 /// Per-guild cap on buffered presence deltas. Past the cap the oldest deltas
 /// are evicted first, so a hot guild cannot grow memory without bound. The
@@ -233,16 +257,66 @@ impl GameActivityCollector {
     /// [`GAME_ACTIVITY_GAP_TIMEOUT_MS`].
     #[must_use]
     pub fn flush(&self, guild: Snowflake, gap_timeout_ms: i64) -> Vec<GuildGameAggregate> {
-        let (deltas, spans) = {
-            let Ok(mut inner) = self.inner.lock() else {
-                return Vec::new();
-            };
-            let deltas = inner.deltas.remove(&guild).unwrap_or_default();
-            let spans = inner.spans.remove(&guild).unwrap_or_default();
-            (deltas, spans)
-        };
+        let (deltas, spans) = self.drain_guild(guild);
         let sessions = game_activity::sessionize(&deltas, &spans, gap_timeout_ms);
         game_activity::aggregate_guild(&guild.to_string(), &sessions)
+    }
+
+    /// Every guild holding buffered deltas, closed spans or open spans, for
+    /// the flush loop's per-guild due check.
+    #[must_use]
+    pub fn guilds(&self) -> Vec<Snowflake> {
+        let Ok(inner) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let mut guilds: Vec<Snowflake> = inner
+            .deltas
+            .keys()
+            .chain(inner.spans.keys())
+            .chain(inner.open.keys().map(|(guild, _)| guild))
+            .copied()
+            .collect();
+        guilds.sort_unstable();
+        guilds.dedup();
+        guilds
+    }
+
+    /// Remove and return one guild's buffered deltas and closed spans. Open
+    /// spans stay until their member leaves.
+    fn drain_guild(&self, guild: Snowflake) -> (Vec<PresenceDelta>, Vec<VoiceSpan>) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return (Vec::new(), Vec::new());
+        };
+        (
+            inner.deltas.remove(&guild).unwrap_or_default(),
+            inner.spans.remove(&guild).unwrap_or_default(),
+        )
+    }
+
+    /// Push drained buffers back to the front of the guild's queues, oldest
+    /// first, evicting past the caps like a fresh observation. The persist
+    /// path requeues after an upsert failure so a database outage loses
+    /// nothing: the next due tick re-aggregates the same buffers.
+    fn requeue(&self, guild: Snowflake, mut deltas: Vec<PresenceDelta>, mut spans: Vec<VoiceSpan>) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        let buffer = inner.deltas.entry(guild).or_default();
+        deltas.extend(std::mem::take(buffer));
+        if deltas.len() > MAX_DELTAS_PER_GUILD {
+            let overflow = deltas.len() - MAX_DELTAS_PER_GUILD;
+            deltas.drain(..overflow);
+            inner.dropped_deltas += overflow as u64;
+        }
+        *buffer = deltas;
+        let buffer = inner.spans.entry(guild).or_default();
+        spans.extend(std::mem::take(buffer));
+        if spans.len() > MAX_SPANS_PER_GUILD {
+            let overflow = spans.len() - MAX_SPANS_PER_GUILD;
+            spans.drain(..overflow);
+            inner.dropped_spans += overflow as u64;
+        }
+        *buffer = spans;
     }
 
     /// Evicted-buffer counters `(deltas, spans)` for tests and operators.
@@ -269,6 +343,150 @@ impl GameActivityCollector {
             .filter(|(span_guild, _)| *span_guild == guild)
             .count();
         (deltas, spans, open)
+    }
+}
+
+/// What one persist attempt did: counts only, never games or members.
+///
+/// The flush loop logs these counts without labels (see [`persist_guild`]):
+/// no game title and no member key ever leaves the process in telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistOutcome {
+    /// Rows added to the guild counters, with the session count they carry.
+    Persisted { rows: u64, sessions: u64 },
+    /// The presence toggle is off for the guild: buffers drained and
+    /// dropped, nothing written, so a re-enable starts fresh.
+    SkippedDisabled,
+    /// Nothing buffered, or every buffered member opted out: nothing written.
+    Empty,
+}
+
+/// Drain one guild's buffers through the opt-out gate into the store.
+///
+/// Consults the per-user opt-out plus the guild presence toggle (privacy
+/// precedent) before anything persists: a disabled guild drains and drops
+/// its buffers unwritten, and opted-out members' deltas and spans are
+/// filtered before sessionization so they neither persist nor influence
+/// another member's aggregates. Gate queries fail closed — a database error
+/// leaves the buffers untouched for the next due tick. An upsert failure
+/// requeues the drained buffers instead, so the outage loses nothing; the
+/// upsert itself stays additive and drained buffers never flush twice, so a
+/// tick persists each interval at most once.
+///
+/// Telemetry is label-free: counts only, no game or member labels.
+pub async fn persist_guild(
+    pool: &sqlx::PgPool,
+    collector: &GameActivityCollector,
+    guild: Snowflake,
+    gap_timeout_ms: i64,
+) -> Result<PersistOutcome, GameActivityStoreError> {
+    let guild_text = guild.to_string();
+    if game_activity_store::game_analytics_disabled(pool, &guild_text).await? {
+        let (deltas, spans) = collector.drain_guild(guild);
+        tracing::info!(
+            deltas = deltas.len(),
+            spans = spans.len(),
+            "game_activity_flush_skipped"
+        );
+        return Ok(PersistOutcome::SkippedDisabled);
+    }
+    let opted_out = game_activity_store::opted_out_user_keys(pool, &guild_text).await?;
+    let (deltas, spans) = collector.drain_guild(guild);
+    let rows = game_activity_store::aggregate_filtered(
+        &guild_text,
+        &deltas,
+        &spans,
+        gap_timeout_ms,
+        &opted_out,
+    );
+    if rows.is_empty() {
+        tracing::debug!(
+            deltas = deltas.len(),
+            spans = spans.len(),
+            "game_activity_flush_empty"
+        );
+        return Ok(PersistOutcome::Empty);
+    }
+    let sessions: u64 = rows.iter().map(|row| row.session_count).sum();
+    match game_activity_store::upsert_guild_aggregates(pool, &rows).await {
+        Ok(written) => {
+            tracing::info!(rows = written, sessions = sessions, "game_activity_flushed");
+            Ok(PersistOutcome::Persisted {
+                rows: written,
+                sessions,
+            })
+        }
+        Err(error) => {
+            collector.requeue(guild, deltas, spans);
+            tracing::warn!("game_activity_persist_failed");
+            Err(error)
+        }
+    }
+}
+
+/// Persist every due guild in `collector`, tracking per-guild last-flush
+/// times in `last_flush_ms`. A guild seen for the first time stamps `now_ms`
+/// and waits a full interval, so a fresh boot never flushes partial minutes.
+pub async fn flush_due_guilds(
+    pool: &sqlx::PgPool,
+    collector: &GameActivityCollector,
+    last_flush_ms: &mut HashMap<Snowflake, i64>,
+    now_ms: i64,
+    gap_timeout_ms: i64,
+) {
+    for guild in collector.guilds() {
+        let last = last_flush_ms.get(&guild).copied();
+        if last.is_none() {
+            last_flush_ms.insert(guild, now_ms);
+            continue;
+        }
+        if !flush_due(last, now_ms) {
+            continue;
+        }
+        // The buffers drain whether or not the write lands: a disabled guild
+        // drops stale state, and a failed upsert requeues inside the call.
+        // Only a gate failure (fail-closed, buffers intact) skips the stamp
+        // so the next tick retries instead of dropping an hour.
+        match persist_guild(pool, collector, guild, gap_timeout_ms).await {
+            Ok(_) => {
+                last_flush_ms.insert(guild, now_ms);
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+fn now_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX)
+}
+
+/// Hourly per-guild persist loop for the voice runtime's collector.
+///
+/// Wakes every [`FLUSH_POLL_INTERVAL`] and persists each guild due per
+/// [`flush_due`]. Detached on purpose: the voice sink owns no shutdown
+/// handle, and each tick persists at most once per interval, so a deploy
+/// boundary at worst drops the current partial interval — the next tick
+/// continues from drained buffers, never double-counting.
+pub async fn flush_loop(pool: sqlx::PgPool, collector: Arc<GameActivityCollector>) {
+    let mut last_flush_ms: HashMap<Snowflake, i64> = HashMap::new();
+    let mut tick = tokio::time::interval(FLUSH_POLL_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        flush_due_guilds(
+            &pool,
+            &collector,
+            &mut last_flush_ms,
+            now_ms(),
+            GAME_ACTIVITY_GAP_TIMEOUT_MS,
+        )
+        .await;
     }
 }
 
@@ -532,6 +750,262 @@ mod tests {
         collector.observe_leave(7, 42, T0 + MIN);
         let rows = collector.flush(7, 15 * MIN);
         assert_eq!(rows[0].in_voice_ms, MIN);
+    }
+
+    #[test]
+    fn flush_due_needs_a_full_hour() {
+        assert!(flush_due(None, T0), "never flushed is due");
+        assert!(
+            !flush_due(Some(T0), T0 + GAME_ACTIVITY_FLUSH_INTERVAL_MS - 1),
+            "one millisecond early is not due"
+        );
+        assert!(
+            flush_due(Some(T0), T0 + GAME_ACTIVITY_FLUSH_INTERVAL_MS),
+            "exactly one interval is due"
+        );
+        assert!(
+            flush_due(Some(T0), T0 + 2 * GAME_ACTIVITY_FLUSH_INTERVAL_MS),
+            "overdue stays due"
+        );
+        assert!(
+            GAME_ACTIVITY_FLUSH_INTERVAL_MS > 4 * GAME_ACTIVITY_GAP_TIMEOUT_MS,
+            "cadence stays well past the session gap, so steady play sessionizes whole"
+        );
+    }
+
+    #[test]
+    fn guilds_lists_every_guild_with_buffered_or_open_state() {
+        let collector = GameActivityCollector::new();
+        assert!(collector.guilds().is_empty());
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0),
+        );
+        collector.observe_join(9, 42, T0);
+        assert_eq!(
+            collector.guilds(),
+            vec![7, 9],
+            "deltas and open spans both list"
+        );
+        collector.observe_leave(9, 42, T0 + MIN);
+        assert_eq!(
+            collector.guilds(),
+            vec![7, 9],
+            "closed spans keep their guild listed"
+        );
+        let _ = collector.flush(7, 15 * MIN);
+        let _ = collector.flush(9, 15 * MIN);
+        assert_eq!(
+            collector.buffered_counts(7),
+            (0, 0, 0),
+            "flush drains what guilds listed"
+        );
+    }
+
+    #[test]
+    fn requeue_restores_drained_buffers_oldest_first() {
+        let collector = GameActivityCollector::new();
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0),
+        );
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0 + 30 * MIN),
+        );
+        collector.observe_join(7, 42, T0);
+        collector.observe_leave(7, 42, T0 + MIN);
+        // Simulate a failed upsert: drain, then requeue like persist_guild does.
+        let direct = collector.flush(7, 60 * MIN);
+        assert_eq!(direct.len(), 1);
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0),
+        );
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0 + 30 * MIN),
+        );
+        collector.observe_join(7, 42, T0);
+        collector.observe_leave(7, 42, T0 + MIN);
+        let (deltas, spans) = collector.drain_guild(7);
+        // A newer arrival lands while the upsert is in flight.
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Zelda")])), T0 + 90 * MIN),
+        );
+        collector.requeue(7, deltas, spans);
+        let rows = collector.flush(7, 60 * MIN);
+        assert_eq!(
+            rows.len(),
+            2,
+            "requeued buffers persist oldest first, got {rows:?}"
+        );
+        let apex = rows
+            .iter()
+            .find(|row| row.game.as_deref() == Some("Apex"))
+            .expect("requeued Apex row");
+        assert_eq!(apex.total_play_ms, 30 * MIN);
+        assert_eq!(apex.in_voice_ms, MIN);
+    }
+
+    #[tokio::test]
+    async fn persist_guild_writes_then_reports_empty_with_opt_out_and_toggle_gates() {
+        let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+            assert!(
+                std::env::var("GITHUB_ACTIONS").is_err(),
+                "CI must supply the guarded test database"
+            );
+            eprintln!("SKIP game-activity persist integration: TWO_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let fixture = two_bot_testsupport::TestDatabase::create(
+            &url,
+            &sqlx::migrate!("../cutover/migrations"),
+        )
+        .await
+        .expect("create migrated agent-testdb fixture");
+        let pool = fixture.pool();
+        let collector = GameActivityCollector::new();
+        // Guild 7 plays Apex for 30 minutes with a 1-minute voice overlap.
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0),
+        );
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0 + 30 * MIN),
+        );
+        collector.observe_join(7, 42, T0);
+        collector.observe_leave(7, 42, T0 + MIN);
+        let outcome = persist_guild(pool, &collector, 7, 60 * MIN)
+            .await
+            .expect("first persist writes");
+        assert_eq!(
+            outcome,
+            PersistOutcome::Persisted {
+                rows: 1,
+                sessions: 1
+            }
+        );
+        let rows = two_bot_core::game_activity_store::read_guild_aggregates(pool, "7")
+            .await
+            .expect("read back");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].total_play_ms, 30 * MIN);
+        assert_eq!(rows[0].in_voice_ms, MIN);
+        // A second persist drains nothing and writes nothing: at most once.
+        assert_eq!(
+            persist_guild(pool, &collector, 7, 60 * MIN)
+                .await
+                .expect("second persist"),
+            PersistOutcome::Empty
+        );
+        // Guild 9's only member opted out: filtered before sessionization,
+        // so nothing persists and the outcome is empty, not skipped.
+        collector.observe_presence(
+            9,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0),
+        );
+        sqlx::query("INSERT INTO privacy_opt_outs (guild_id, member_id) VALUES ('9', '42')")
+            .execute(pool)
+            .await
+            .expect("suppress pair");
+        assert_eq!(
+            persist_guild(pool, &collector, 9, 60 * MIN)
+                .await
+                .expect("opted-out persist"),
+            PersistOutcome::Empty
+        );
+        assert!(
+            two_bot_core::game_activity_store::read_guild_aggregates(pool, "9")
+                .await
+                .expect("opted-out read")
+                .is_empty()
+        );
+        // Guild 11 disabled the presence family: buffers drain and drop.
+        collector.observe_presence(
+            11,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0),
+        );
+        sqlx::query(
+            "INSERT INTO guild_analytics_settings (guild_id, presence_enabled)
+             VALUES ('11', FALSE)",
+        )
+        .execute(pool)
+        .await
+        .expect("disable presence");
+        assert_eq!(
+            persist_guild(pool, &collector, 11, 60 * MIN)
+                .await
+                .expect("disabled persist"),
+            PersistOutcome::SkippedDisabled
+        );
+        assert!(
+            two_bot_core::game_activity_store::read_guild_aggregates(pool, "11")
+                .await
+                .expect("disabled read")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_due_guilds_stamps_first_sight_and_persists_when_due() {
+        let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+            assert!(
+                std::env::var("GITHUB_ACTIONS").is_err(),
+                "CI must supply the guarded test database"
+            );
+            eprintln!("SKIP game-activity cadence integration: TWO_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let fixture = two_bot_testsupport::TestDatabase::create(
+            &url,
+            &sqlx::migrate!("../cutover/migrations"),
+        )
+        .await
+        .expect("create migrated agent-testdb fixture");
+        let pool = fixture.pool();
+        let collector = GameActivityCollector::new();
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0),
+        );
+        let mut last = std::collections::HashMap::new();
+        flush_due_guilds(pool, &collector, &mut last, T0, 60 * MIN).await;
+        assert_eq!(
+            last.get(&7),
+            Some(&T0),
+            "first sight stamps without persisting"
+        );
+        assert!(
+            two_bot_core::game_activity_store::read_guild_aggregates(pool, "7")
+                .await
+                .expect("nothing persisted yet")
+                .is_empty()
+        );
+        flush_due_guilds(pool, &collector, &mut last, T0 + 59 * MIN, 60 * MIN).await;
+        assert_eq!(last.get(&7), Some(&T0), "early tick keeps the stamp");
+        flush_due_guilds(
+            pool,
+            &collector,
+            &mut last,
+            T0 + GAME_ACTIVITY_FLUSH_INTERVAL_MS,
+            60 * MIN,
+        )
+        .await;
+        assert_eq!(
+            last.get(&7),
+            Some(&(T0 + GAME_ACTIVITY_FLUSH_INTERVAL_MS)),
+            "due tick persists and restamps"
+        );
+        assert_eq!(
+            two_bot_core::game_activity_store::read_guild_aggregates(pool, "7")
+                .await
+                .expect("due tick wrote")
+                .len(),
+            1
+        );
     }
 
     #[test]

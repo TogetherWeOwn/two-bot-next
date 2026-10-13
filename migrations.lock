@@ -368,6 +368,14 @@
     "crates/store/migrations/0434_privacy_opt_out.sql": {
       "sha256": "798f514afa6cc212a10aba9fb769ba56dd43a7dfcde31983a114421b81dabf7e",
       "justification": "Per-user opt-out suppression plus per-guild presence/activity/voice toggles plus one audit receipt row per purge; store chain copy, additive with IF NOT EXISTS."
+    },
+    "crates/cutover/migrations/0435_game_activity_guild_aggregates.sql": {
+      "sha256": "2b2731a7f83037f82107c8eaba5a5f5ca303c59d92aa73cdf4ef15bd11ac2af9",
+      "justification": "Guild-level game-activity aggregates (no member columns): additive table with nonnegativity plus voice-within-total checks; cutover chain copy, IF NOT EXISTS."
+    },
+    "crates/store/migrations/0436_game_activity_guild_aggregates.sql": {
+      "sha256": "2f3b79e8bc28c7aca0233bcf937577d017d4aefd184d705da6126e379e97955e",
+      "justification": "Guild-level game-activity aggregates (no member columns): additive table with nonnegativity plus voice-within-total checks; store chain copy, IF NOT EXISTS."
     }
   }
 }

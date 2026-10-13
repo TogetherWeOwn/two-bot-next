@@ -94,6 +94,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'privacy_opt_outs', 'table'),
     ('public', 'guild_analytics_settings', 'table'),
     ('public', 'privacy_opt_out_audit', 'table'),
+    ('public', 'game_activity_guild_aggregates', 'table'),
     ('public', '_sqlx_migrations', 'ledger'),
     ('public', 'events_id_seq', 'sequence'),
     ('public', 'event_store_id_seq', 'sequence'),

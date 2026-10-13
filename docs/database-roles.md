@@ -55,6 +55,12 @@ hot write paths, and operator opt-outs execute through the app pool, so the
 runtime needs SELECT/INSERT/UPDATE/DELETE there. See `docs/privacy.md` for
 what those rows mean.
 
+The game-activity aggregates table (`game_activity_guild_aggregates`) is
+ordinary `table` kind for the same reason: the hourly voice-boot flush loop
+upserts per-(guild, game) counters through the app pool, and the operator
+trend report reads them back through it. The table carries no member column,
+so there is nothing to erase and no reader grant beyond the app pool.
+
 The reader cannot read bot base tables, including through inherited/public or
 column-level grants. Normal PostgreSQL views deliberately run with their owner's
 base-table privileges: only the reviewed `web_v1` projection is exposed. Do not

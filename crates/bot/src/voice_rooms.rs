@@ -11402,6 +11402,13 @@ where
         Self { runtime, replies }
     }
 
+    /// The wrapped lifecycle runtime, for boot-owned background work (the
+    /// game-activity flush loop) that needs the same handles as dispatch.
+    #[must_use]
+    pub fn runtime(&self) -> &Arc<VoiceRuntime<S, H>> {
+        &self.runtime
+    }
+
     /// [`Self::respond_named`] with no display-name directory: every member
     /// renders as "member" in a `/name` template.
     #[cfg(test)]
@@ -11656,7 +11663,10 @@ where
     }
 }
 
-pub(crate) mod game_activity;
+/// Game-activity analytics feeds and the hourly guild-aggregate persist loop.
+/// Public so the binary's voice boot can spawn [`flush_loop`](game_activity::flush_loop);
+/// the aggregates stay guild-level-only (never a per-member row, reader or view).
+pub mod game_activity;
 #[path = "voice_rooms_limit.rs"]
 mod limit;
 mod presence;

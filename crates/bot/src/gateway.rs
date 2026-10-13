@@ -1726,6 +1726,14 @@ pub async fn build_voice_runtime(
     match build_production_runtime(token, db.pool().clone(), name_policy) {
         Ok(runtime) => {
             info!("voice rooms enabled; gateway sink attached");
+            // Hourly guild-aggregate persist for the game-activity collector
+            // fed by the presence/voice frames below. Detached: each tick
+            // persists at most once per interval, so a deploy boundary drops
+            // at worst the current partial interval, never double-counts.
+            tokio::spawn(two_bot::voice_rooms::game_activity::flush_loop(
+                db.pool().clone(),
+                runtime.runtime().game_activity_collector().clone(),
+            ));
             Some(Arc::new(runtime))
         }
         Err(err) => {
