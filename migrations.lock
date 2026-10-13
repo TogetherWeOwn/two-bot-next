@@ -337,9 +337,9 @@
       "sha256": "9da078d3f29430320b79d2d82cfa6e4b1d2d557384a98d7dddca97783429d2dd",
       "justification": "RSVP check-in capacity count index: cover (guild_id, source) so record_checkin counts the occurrence without scanning the guild message history while holding the occurrence lock."
     },
-    "crates/cutover/migrations/0427_event_store_member_capture.sql": {
-      "sha256": "0fefbcfc60a1a4e6209fc0b5096af3b37a6171b25f3a635e528e03e15ba070b3",
-      "justification": "Event-store S2 member capture: order-independent event_store table plus premium_since, nick and role-id columns for GUILD_MEMBER_ADD/REMOVE/UPDATE, idempotent on UNIQUE dedup_key, no free-text columns."
+    "crates/cutover/migrations/0431_event_store_member_capture.sql": {
+      "sha256": "c434fc918b3f083a63e21fc69fc919e74eb48422d5c9e39bc99e46ca98a6b1db",
+      "justification": "Event-store S2 member capture: order-independent event_store table plus premium_since, nick_changed flag and role-id columns for GUILD_MEMBER_ADD/REMOVE/UPDATE, idempotent on the shared UNIQUE dedup_key index, no free-text columns."
     }
   }
 }

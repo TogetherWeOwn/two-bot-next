@@ -139,7 +139,7 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_vote_kick_audit",
     // V5 adds accepted-create history; see [`V5_ADDED_TABLES`].
     "voice_create_reservations",
-    // S2 member capture (0427): append-only gateway deltas, guild-keyed, no
+    // S2 member capture (0431): append-only gateway deltas, guild-keyed, no
     // foreign keys, so order among the appended tables is free.
     "event_store",
 ];
@@ -148,7 +148,13 @@ pub const DUMP_TABLES: &[&str] = &[
 /// them; every other covered table is still required, so a v4 recovery point
 /// written before create-reservation persistence stays readable without
 /// waiving arbitrary missing tables.
-pub const V5_ADDED_TABLES: &[&str] = &["voice_create_reservations", "event_store"];
+pub const V5_ADDED_TABLES: &[&str] = &["voice_create_reservations"];
+
+/// Tables first covered by v6. A v4 or v5 archive predates them and need not
+/// declare them; v5 still requires every other covered table, so recovery
+/// points written before member-capture persistence stay readable without
+/// waiving arbitrary missing tables.
+pub const V6_ADDED_TABLES: &[&str] = &["event_store"];
 
 /// Covered tables not created by the current cutover migration set, if any.
 /// Keep legacy data when such tables exist, but do not require nonexistent
@@ -208,8 +214,8 @@ pub fn is_destination_owned(table: &str, column: &str) -> bool {
         .any(|(owned_table, owned_column)| *owned_table == table && *owned_column == column)
 }
 
-/// Write complete v5 coverage; the reader also accepts frozen v3/v4 coverage.
-pub const DUMP_VERSION: u32 = 5;
+/// Write complete v6 coverage; the reader also accepts frozen v3/v4/v5 coverage.
+pub const DUMP_VERSION: u32 = 6;
 
 /// A table name in the dump, validated against [`DUMP_TABLES`].
 pub type DumpTable = String;
@@ -733,9 +739,13 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                     .get("version")
                     .and_then(Value::as_u64)
                     .ok_or_else(|| refuse("manifest has an invalid version"))?;
-                if version != 3 && version != 4 && version != u64::from(DUMP_VERSION) {
+                if version != 3
+                    && version != 4
+                    && version != 5
+                    && version != u64::from(DUMP_VERSION)
+                {
                     return Err(refuse(format!(
-                        "dump version {version}, this build reads 3, 4 and {DUMP_VERSION}"
+                        "dump version {version}, this build reads 3, 4, 5 and {DUMP_VERSION}"
                     )));
                 }
                 retain_within_cap(&mut retained, &obj, limits.retained)?;
@@ -937,8 +947,9 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             .ok_or_else(|| refuse(format!("manifest table {name} has an invalid row count")))?;
         let _ = count;
     }
-    // Historical inventories are pinned by fixtures. New v5 archives must cover
-    // reservations too; v4 recovery points remain readable without them.
+    // Historical inventories are pinned by fixtures. New v6 archives must cover
+    // member capture too; v5 recovery points remain readable without it, and
+    // v4 recovery points without the v5 reservation history as well.
     let version = obj.get("version").and_then(Value::as_u64);
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
@@ -946,7 +957,12 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
         .enumerate()
         .filter(|(index, name)| match version {
             Some(3) => *index < 22,
-            Some(4) => !V5_ADDED_TABLES.contains(name) && !OPTIONAL_LEGACY_TABLES.contains(name),
+            Some(4) => {
+                !V5_ADDED_TABLES.contains(name)
+                    && !V6_ADDED_TABLES.contains(name)
+                    && !OPTIONAL_LEGACY_TABLES.contains(name)
+            }
+            Some(5) => !V6_ADDED_TABLES.contains(name) && !OPTIONAL_LEGACY_TABLES.contains(name),
             _ => !OPTIONAL_LEGACY_TABLES.contains(name),
         })
         .map(|(_, name)| name)
@@ -1699,7 +1715,7 @@ mod tests {
         let expected: Vec<&str> = DUMP_TABLES
             .iter()
             .copied()
-            .filter(|name| !V5_ADDED_TABLES.contains(name))
+            .filter(|name| !V5_ADDED_TABLES.contains(name) && !V6_ADDED_TABLES.contains(name))
             .collect();
         assert_eq!(names, expected);
         assert_eq!(
@@ -1720,6 +1736,41 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("missing tables: events"));
+    }
+
+    #[test]
+    fn v5_archives_read_without_event_store_but_v6_requires_it() {
+        fn without(tables: Vec<Value>, name: &str) -> Vec<Value> {
+            tables
+                .into_iter()
+                .filter(|t| t.get("name").and_then(Value::as_str) != Some(name))
+                .collect()
+        }
+        // A main-shaped v5 manifest (full v5 inventory, no event_store) stays
+        // readable: v5 predates member-capture persistence.
+        let mut v5 = manifest(without(complete_tables(&BTreeMap::new()), "event_store"));
+        v5["version"] = serde_json::json!(5);
+        assert!(
+            validate_manifest(&v5).is_ok(),
+            "v5 without event_store reads"
+        );
+        // Dropping a v5-covered table from a v5 manifest still refuses.
+        let mut v5_gap = v5.clone();
+        v5_gap["tables"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|t| t.get("name").and_then(Value::as_str) != Some("voice_create_reservations"));
+        assert!(validate_manifest(&v5_gap)
+            .unwrap_err()
+            .to_string()
+            .contains("voice_create_reservations"));
+        // v6 without event_store refuses.
+        let v6_gap = manifest(without(complete_tables(&BTreeMap::new()), "event_store"));
+        assert_eq!(v6_gap["version"], serde_json::json!(DUMP_VERSION));
+        assert!(validate_manifest(&v6_gap)
+            .unwrap_err()
+            .to_string()
+            .contains("event_store"));
     }
 
     #[test]
