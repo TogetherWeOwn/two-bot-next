@@ -145,10 +145,10 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_vote_kick_audit",
     // V5 adds accepted-create history; see [`V5_ADDED_TABLES`].
     "voice_create_reservations",
-    // V6 adds the shared event-store capture: 0427 voice, 0428 presence,
-    // 0432 member deltas plus 0429 thread lifecycle + member deltas; one
-    // table for the S1-S8 slices, see [`V6_ADDED_TABLES`]. Append-only,
-    // guild-keyed, no foreign keys, so order among the tail is free.
+    // V6 adds the event-store capture (0427 voice plus 0428 presence plus
+    // 0429 S6 thread lifecycle plus 0430 S5 message/reaction plus 0432 S2
+    // member deltas; shared table for S1-S8 slices); see [`V6_ADDED_TABLES`].
+    // Append-only, guild-keyed, no foreign keys, so order among the tail is free.
     "event_store",
 ];
 
@@ -165,12 +165,11 @@ pub const V5_ADDED_TABLES: &[&str] = &[
     "privacy_opt_out_audit",
 ];
 
-/// Tables first covered by v6. A v4 archive predates them along with the v5
-/// tables, and a v5 archive predates them; neither need declare them; v6
-/// archives must cover the full inventory, so a v5 recovery point written
-/// before event-store capture (0427 voice, 0428 presence, 0432 member deltas,
-/// 0429 thread lifecycle) stays readable without waiving arbitrary missing
-/// tables.
+/// Tables first covered by v6. A v4 or v5 archive predates them and need not
+/// declare them; v5 still requires every other covered table, so recovery
+/// points written before event-store persistence (0427 voice, 0428 presence,
+/// 0429 thread lifecycle, 0430 message/reaction capture and 0432 member
+/// deltas) stay readable without waiving arbitrary missing tables.
 pub const V6_ADDED_TABLES: &[&str] = &["event_store"];
 
 /// Covered tables not created by the current cutover migration set, if any.
@@ -965,9 +964,8 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
         let _ = count;
     }
     // Historical inventories are pinned by fixtures. New v6 archives must cover
-    // reservations, member capture and the event store too; v5 recovery points
-    // remain readable without member-capture/event-store, and v4 ones without
-    // those plus the v5 reservation history as well.
+    // reservations and the event store too; v5 recovery points remain readable
+    // without the event store, and v4 ones without either addition.
     let version = obj.get("version").and_then(Value::as_u64);
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
@@ -1764,9 +1762,41 @@ mod tests {
     }
 
     #[test]
+    fn pre_event_store_v5_archives_stay_readable_but_v6_requires_event_store() {
+        // A v5 recovery point written before the event-store slice declares
+        // every covered table except event_store; v6 made that table mandatory.
+        let v5_tables: Vec<Value> = complete_tables(&BTreeMap::new())
+            .into_iter()
+            .filter(|table| table["name"] != "event_store")
+            .collect();
+        let mut v5 = manifest(v5_tables);
+        v5["version"] = serde_json::json!(5);
+        assert!(
+            validate_manifest(&v5).is_ok(),
+            "v5 predates the event store and stays readable"
+        );
+        // The inspect read path accepts the frozen v5 envelope too.
+        let bytes = gzip_lines(&[v5.clone(), serde_json::json!({"kind":"end","rows":0})]);
+        let contents = inspect_bytes(&bytes).expect("v5 without event_store inspects");
+        assert_eq!(contents.manifest.version, 5);
+        assert_eq!(contents.manifest.missing_tables(), ["event_store"]);
+        // The same inventory at the current version refuses: new archives must
+        // cover the event store.
+        assert_eq!(DUMP_VERSION, 6);
+        let mut v6 = v5;
+        v6["version"] = serde_json::json!(DUMP_VERSION);
+        assert!(validate_manifest(&v6)
+            .unwrap_err()
+            .to_string()
+            .contains("event_store"));
+    }
+
+    #[test]
     fn inspects_frozen_v5_without_event_store_but_v6_requires_it() {
-        // A v5 recovery point written before event-store capture (0427 voice, 0428 presence, 0432 member deltas) declares every covered table except the v6 addition and stays
-        // readable; promoting it to v6 without the event store is refused.
+        // A v5 recovery point written before event-store capture (0427 voice,
+        // 0428 presence, 0432 member deltas, 0430 message/reaction) declares
+        // every covered table except the v6 addition and stays readable;
+        // promoting it to v6 without the event store is refused.
         let tables: Vec<Value> = DUMP_TABLES
             .iter()
             .copied()
