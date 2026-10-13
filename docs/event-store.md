@@ -20,6 +20,7 @@ must appear in no stored row.
 
 | Slice | Stored besides identity + timestamps | Never stored |
 | --- | --- | --- |
+| Message create | Message/channel/guild/author ids only (`message_id` plus the shared identity columns) | Content/body, embeds, attachments, username, custom-status text |
 | Member add/remove/update | Membership deltas only: `premium_since`, `nick_changed` flag, role-id list | Bio, about, username, nickname |
 | Presence | Status and activity-TYPE enums plus application id | Custom-status text; activity name, details, state, URL, emoji |
 | Voice state/server | Channel/session ids plus mute, deaf, self-mute, self-deaf, self-video, self-stream and suppress flags | Audio, transcripts, voice tokens, endpoints |

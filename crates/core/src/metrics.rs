@@ -494,6 +494,12 @@ struct Values {
     /// so the vocabulary is the single series name — no actor ID, timestamp,
     /// error text or row content ever reaches exposition.
     audit_delivery_halt: u64,
+    /// Event-store consumer lag (S1): `received_at - event_time` spread in
+    /// seconds for the newest observed capture row. Last writer wins; 0 when
+    /// no row has been observed. Single label-free series — no message,
+    /// channel, user, dedup-key, content or body label ever reaches
+    /// exposition.
+    event_store_consumer_lag_secs: f64,
 }
 
 /// All storage is fixed-size. Unknown labels collapse to `other`, including hostile input.
@@ -970,6 +976,24 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .audit_delivery_halt = u64::from(halted);
+    }
+
+    /// Current event-store consumer lag in seconds (S1): the `received_at -
+    /// event_time` spread for the newest observed capture row. Call once per
+    /// scrape window from the store read; last writer wins. Non-finite or
+    /// negative input clears to 0 so exposition stays a finite
+    /// non-negative duration. No IDs, dedup keys, content or body text are
+    /// retained.
+    pub fn set_event_store_consumer_lag_secs(&self, lag_secs: f64) {
+        let clamped = if lag_secs.is_finite() && lag_secs >= 0.0 {
+            lag_secs
+        } else {
+            0.0
+        };
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .event_store_consumer_lag_secs = clamped;
     }
 
     /// Pool samples are supplied at scrape time; this function never opens a DB connection.
@@ -1453,6 +1477,18 @@ impl Metrics {
             out,
             "two_bot_audit_delivery_halt {}",
             values.audit_delivery_halt
+        )
+        .unwrap();
+        header(
+            &mut out,
+            "two_bot_event_store_consumer_lag_seconds",
+            "gauge",
+            "Event-store consumer lag in seconds (received_at minus event_time for the newest observed capture row); 0 when unobserved. Single label-free series.",
+        );
+        writeln!(
+            out,
+            "two_bot_event_store_consumer_lag_seconds {}",
+            values.event_store_consumer_lag_secs
         )
         .unwrap();
         for (name, count) in [
