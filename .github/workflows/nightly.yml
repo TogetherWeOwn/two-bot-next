@@ -283,6 +283,12 @@ jobs:
           --skip event_store_s4_voice_server_update_persists_ids_without_token_or_endpoint
           --skip event_store_s4_duplicate_delivery_inserts_once
           --skip event_store_s4_privacy_tripwire_rejects_effect_and_status_text
+          --skip event_store_s5_message_update_persists_ids_without_body
+          --skip event_store_s5_message_delete_persists_ids_only
+          --skip event_store_s5_reaction_add_remove_persist_emoji_refs_only
+          --skip event_store_s5_bulk_delete_fans_out_one_row_per_id
+          --skip event_store_s5_unicode_reaction_stores_enum_ref_only
+          --skip event_store_s5_privacy_tripwire_rejects_message_bodies
           --skip event_store_s6_thread_create_persists_ids_and_flag_enums_only
           --skip event_store_s6_thread_update_persists_changed_flags_only
           --skip event_store_s6_thread_delete_persists_ids_only
