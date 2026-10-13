@@ -133,6 +133,48 @@ pub enum DriverCall {
     },
 }
 
+/// Typed FB event content carried from the Discord mirror row to the driver.
+///
+/// This is what lets updates sync content (start time, description) instead
+/// of URLs alone: [`BrowserDriver::create_event_full`] and
+/// [`BrowserDriver::update_event_full`] take this draft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FbEventDraft {
+    pub discord_event_id: String,
+    pub name: String,
+    pub starts_at: String,
+    pub channel_id: Option<String>,
+    pub description: Option<String>,
+}
+
+impl FbEventDraft {
+    /// Build the draft the funnel acts on from a normalized mirror row.
+    #[must_use]
+    pub fn from_scheduled(event: &ScheduledEvent) -> Self {
+        Self {
+            discord_event_id: event.id.clone(),
+            name: event.name.clone(),
+            starts_at: event.starts_at.clone(),
+            channel_id: event.channel_id.clone(),
+            description: event.description.clone(),
+        }
+    }
+}
+
+/// Observed event-page state for control-5 verification.
+///
+/// URL-only drivers return `name: None, starts_at: None` (the default
+/// [`BrowserDriver::readback_event`] does exactly this) and are verified on
+/// URL alone. Drivers that can observe content fill the fields in, and any
+/// observed field that mismatches the [`FbEventDraft`] fails verification
+/// into the link-post fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventReadback {
+    pub url: String,
+    pub name: Option<String>,
+    pub starts_at: Option<String>,
+}
+
 /// Browser-automation boundary. Implementations must be non-evasive: a stock
 /// browser session, headed so screenshots and readbacks work, with no
 /// anti-detection add-ons.
@@ -143,7 +185,35 @@ pub trait BrowserDriver: Send + Sync {
     fn screenshot_png(&self) -> Vec<u8>;
     fn readback_url(&self, fb_url: &str) -> Option<String>;
     fn link_post_fallback(&self, discord_event_id: &str, name: &str)
-        -> Result<String, DriverError>;
+    -> Result<String, DriverError>;
+
+    /// Create carrying the full [`FbEventDraft`] (start time, description,
+    /// channel). Defaults to the narrowing [`BrowserDriver::create_event`]
+    /// so existing fakes keep working; real drivers must override so FB
+    /// events are created with a start time.
+    fn create_event_full(&self, draft: &FbEventDraft) -> Result<String, DriverError> {
+        self.create_event(&draft.discord_event_id, &draft.name)
+    }
+
+    /// Update carrying the full [`FbEventDraft`] so Discord time/description
+    /// changes sync. Defaults to the field-less
+    /// [`BrowserDriver::update_event`] so existing fakes keep working; real
+    /// drivers must override.
+    fn update_event_full(&self, fb_url: &str, draft: &FbEventDraft) -> Result<(), DriverError> {
+        self.update_event(fb_url, &draft.discord_event_id)
+    }
+
+    /// Read back the event page with observed content. Defaults to URL-only
+    /// via [`BrowserDriver::readback_url`]; drivers that can observe content
+    /// must override and fill `name` / `starts_at` so verification compares
+    /// more than the URL.
+    fn readback_event(&self, fb_url: &str) -> Option<EventReadback> {
+        self.readback_url(fb_url).map(|url| EventReadback {
+            url,
+            name: None,
+            starts_at: None,
+        })
+    }
 }
 
 /// Page credential handle. The inner secret is never rendered: [`PageToken`]
@@ -209,6 +279,11 @@ pub struct AuditRow {
     pub target_key: String,
     pub outcome: String,
     pub fb_url: Option<String>,
+    /// Control-5 evidence: the screenshot bytes captured for this action.
+    /// `None` where no screenshot was taken (refusals and no-mapping no-ops
+    /// take none) or where the terminal row of the same fallback carries it
+    /// (the intermediate verify/driver-failure row).
+    pub screenshot_png: Option<Vec<u8>>,
 }
 
 /// Audit sink.
@@ -291,6 +366,14 @@ pub enum RunOutcome {
     Updated { url: String },
     Deleted,
     LinkPostFallback { url: String },
+    /// Delete failed: the FB event is still live, so the mapping is kept and
+    /// a later cancel can retry. Never reported as [`RunOutcome::Deleted`]
+    /// (control 4, never silent success).
+    DeleteFailed { fb_url: String },
+    /// Primary action and the link-post fallback both failed: nothing new
+    /// reached Facebook. `stage` is `"create"` or `"update"`. Never shaped
+    /// as [`RunOutcome::LinkPostFallback`] (never silent success).
+    FallbackFailed { stage: &'static str },
     ChallengeAborted { retries: u32, ceo_notified: bool },
     Disabled,
 }
@@ -340,13 +423,20 @@ pub fn plan_actions(
     Ok(vec![action])
 }
 
-fn audit_create(url: &str, target_key: &str, outcome: &str, fb_url: Option<String>) -> AuditRow {
+fn audit_create(
+    url: &str,
+    target_key: &str,
+    outcome: &str,
+    fb_url: Option<String>,
+    screenshot_png: Option<Vec<u8>>,
+) -> AuditRow {
     let _ = url;
     AuditRow {
         action: "fb_page_event_create".to_owned(),
         target_key: target_key.to_owned(),
         outcome: outcome.to_owned(),
         fb_url,
+        screenshot_png,
     }
 }
 
@@ -357,12 +447,17 @@ fn challenge_detail(discord_event_id: &str, signal: &ChallengeSignal) -> String 
     )
 }
 
-fn abort_on_challenge<N: NotifySink, A: AuditSink>(
+/// Stop on a Meta challenge: capture screenshot evidence, notify the owner
+/// through the CEO, audit the abort (control 2). Every challenge site routes
+/// through here so none can skip the notification.
+fn abort_on_challenge<D: BrowserDriver, N: NotifySink, A: AuditSink>(
+    driver: &D,
     notify: &N,
     audit: &A,
     discord_event_id: &str,
     signal: &ChallengeSignal,
 ) -> RunOutcome {
+    let shot = driver.screenshot_png();
     notify.notify(CeoNotification::challenge(challenge_detail(
         discord_event_id,
         signal,
@@ -372,6 +467,7 @@ fn abort_on_challenge<N: NotifySink, A: AuditSink>(
         target_key: discord_event_id.to_owned(),
         outcome: format!("challenge_aborted_{signal:?}_zero_retries"),
         fb_url: None,
+        screenshot_png: Some(shot),
     });
     RunOutcome::ChallengeAborted {
         retries: 0,
@@ -379,54 +475,78 @@ fn abort_on_challenge<N: NotifySink, A: AuditSink>(
     }
 }
 
+/// Why the primary action gave way to the link-post fallback. Drives the
+/// audit outcome string so a driver failure is never mislabeled as a
+/// readback mismatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FallbackPrior {
+    ReadbackMismatch,
+    CreateFailed,
+    UpdateFailed,
+}
+
 fn fallback_to_link_post<D: BrowserDriver, A: AuditSink>(
     driver: &D,
     audit: &A,
-    discord_event_id: &str,
-    name: &str,
-    created_fb_url: &str,
+    draft: &FbEventDraft,
+    created_fb_url: Option<&str>,
     update: bool,
-) -> Result<RunOutcome, (ChallengeSignal, RunOutcome)> {
+    screenshot: Option<Vec<u8>>,
+    prior: FallbackPrior,
+) -> Result<RunOutcome, ChallengeSignal> {
     let action = if update {
         "fb_page_event_update"
     } else {
         "fb_page_event_create"
     };
+    let prior_outcome = match prior {
+        FallbackPrior::ReadbackMismatch => "verify_failed_readback_mismatch",
+        FallbackPrior::CreateFailed => "create_failed_driver_error",
+        FallbackPrior::UpdateFailed => "update_failed_driver_error",
+    };
     audit.push(AuditRow {
         action: action.to_owned(),
-        target_key: discord_event_id.to_owned(),
-        outcome: "verify_failed_readback_mismatch".to_owned(),
-        fb_url: Some(created_fb_url.to_owned()),
+        target_key: draft.discord_event_id.clone(),
+        outcome: prior_outcome.to_owned(),
+        fb_url: created_fb_url.map(str::to_owned),
+        screenshot_png: None,
     });
-    match driver.link_post_fallback(discord_event_id, name) {
+    match driver.link_post_fallback(&draft.discord_event_id, &draft.name) {
         Ok(link_url) => {
             audit.push(AuditRow {
                 action: "fb_page_event_link_post_fallback".to_owned(),
-                target_key: discord_event_id.to_owned(),
+                target_key: draft.discord_event_id.clone(),
                 outcome: "link_post_created_via_pages_manage_posts".to_owned(),
                 fb_url: Some(link_url.clone()),
+                screenshot_png: screenshot,
             });
             Ok(RunOutcome::LinkPostFallback { url: link_url })
         }
-        Err(DriverError::Challenge(signal)) => Err((
-            signal,
-            RunOutcome::ChallengeAborted {
-                retries: 0,
-                ceo_notified: true,
-            },
-        )),
+        Err(DriverError::Challenge(signal)) => Err(signal),
         Err(DriverError::Failed(_)) => {
             audit.push(AuditRow {
                 action: "fb_page_event_link_post_fallback".to_owned(),
-                target_key: discord_event_id.to_owned(),
+                target_key: draft.discord_event_id.clone(),
                 outcome: "link_post_failed_driver_error".to_owned(),
                 fb_url: None,
+                screenshot_png: screenshot,
             });
-            Ok(RunOutcome::LinkPostFallback {
-                url: created_fb_url.to_owned(),
+            Ok(RunOutcome::FallbackFailed {
+                stage: if update { "update" } else { "create" },
             })
         }
     }
+}
+
+/// Check an event-page readback against the draft. The URL must match, and
+/// every content field the driver observed (`Some`) must match too;
+/// unobserved (`None`) fields are skipped so URL-only drivers keep working.
+fn readback_matches(draft: &FbEventDraft, observed: &EventReadback) -> bool {
+    observed.name.as_deref().is_none_or(|name| name == draft.name)
+        && observed
+            .starts_at
+            .as_deref()
+            .is_none_or(|starts_at| starts_at == draft.starts_at)
 }
 
 /// Run one funnel step: at most one automated action (control 3).
@@ -437,14 +557,18 @@ fn fallback_to_link_post<D: BrowserDriver, A: AuditSink>(
 /// 2. production target without staging evidence -> [`Refused::StagingEvidenceMissing`]
 ///    before the credential fetch and before any driver call;
 /// 3. credential fetch exactly once; rotation/failure -> [`Refused::SecretUnavailable`]
-///    (fail closed, no secret in the error);
+///    (fail closed, no secret in the error). The Updated-without-mapping case
+///    heals forward inside [`execute`] without a second fetch (control 6);
 /// 4. exactly one mutating driver call for create/update/delete; challenges
 ///    abort with zero retries + one CEO notification (control 2);
-/// 5. every mutating path captures a screenshot artifact and a readback; a
-///    failed readback falls back to the link-post path and audits both
-///    (control 5);
+/// 5. every mutating path captures a screenshot artifact, persisted on the
+///    audit row, plus a readback; a failed readback falls back to the
+///    link-post path and audits both (control 5);
 /// 6. every automated action emits exactly one audit row on success
-///    (control 8); the fallback path emits two (verify failure + link post).
+///    (control 8); the fallback path emits two (prior failure + link post).
+///    Failures are never success-shaped: a failed delete keeps the mapping
+///    and reports [`RunOutcome::DeleteFailed`], and a failed fallback
+///    reports [`RunOutcome::FallbackFailed`].
 pub fn run_once<D: BrowserDriver, S: SecretStore, A: AuditSink, N: NotifySink>(
     driver: &D,
     secrets: &S,
@@ -465,50 +589,68 @@ pub fn run_once<D: BrowserDriver, S: SecretStore, A: AuditSink, N: NotifySink>(
         Err(_) => return Err(Refused::SecretUnavailable),
     };
 
+    Ok(execute(driver, pages, audit, notify, request))
+}
+
+/// Dispatch one funnel step after the gates in [`run_once`] have passed.
+/// Separated so the Updated-without-mapping heal-forward path recurses here,
+/// never through [`run_once`], keeping the exactly-one-fetch guarantee.
+fn execute<D: BrowserDriver, A: AuditSink, N: NotifySink>(
+    driver: &D,
+    pages: &mut IdempotencyMap,
+    audit: &A,
+    notify: &N,
+    request: &RunRequest,
+) -> RunOutcome {
     let event_id = request.discord_event.id.clone();
-    let event_name = request.discord_event.name.clone();
+    let draft = FbEventDraft::from_scheduled(&request.discord_event);
 
     match request.change {
         ChangeKind::Created => {
-            let fb_url = match driver.create_event(&event_id, &event_name) {
+            let fb_url = match driver.create_event_full(&draft) {
                 Ok(url) => url,
                 Err(DriverError::Challenge(signal)) => {
-                    return Ok(abort_on_challenge(notify, audit, &event_id, &signal));
+                    return abort_on_challenge(driver, notify, audit, &event_id, &signal);
                 }
                 Err(DriverError::Failed(_)) => {
-                    return fallback_after_create_failure(
-                        driver,
-                        audit,
-                        notify,
-                        &event_id,
-                        &event_name,
-                        "",
-                    );
+                    return fallback_after_create_failure(driver, audit, notify, &draft);
                 }
             };
-            let _shot = driver.screenshot_png();
-            match driver.readback_url(&fb_url) {
-                Some(back) if back == fb_url => {
+            let shot = driver.screenshot_png();
+            match driver.readback_event(&fb_url) {
+                Some(observed)
+                    if observed.url == fb_url && readback_matches(&draft, &observed) =>
+                {
                     pages.record(&event_id, &fb_url);
                     audit.push(audit_create(
                         &fb_url,
                         &event_id,
                         "created",
                         Some(fb_url.clone()),
+                        Some(shot),
                     ));
-                    Ok(RunOutcome::Created { url: fb_url })
+                    RunOutcome::Created { url: fb_url }
                 }
-                _ => match fallback_to_link_post(
-                    driver,
-                    audit,
-                    &event_id,
-                    &event_name,
-                    &fb_url,
-                    false,
-                ) {
-                    Ok(outcome) => Ok(outcome),
-                    Err((signal, _)) => Ok(abort_on_challenge(notify, audit, &event_id, &signal)),
-                },
+                _ => {
+                    // The event may exist but is unverified: record its URL
+                    // so the next delivery updates (or deletes) it instead of
+                    // minting a duplicate (control 4).
+                    pages.record(&event_id, &fb_url);
+                    match fallback_to_link_post(
+                        driver,
+                        audit,
+                        &draft,
+                        Some(&fb_url),
+                        false,
+                        Some(shot),
+                        FallbackPrior::ReadbackMismatch,
+                    ) {
+                        Ok(outcome) => outcome,
+                        Err(signal) => {
+                            abort_on_challenge(driver, notify, audit, &event_id, &signal)
+                        }
+                    }
+                }
             }
         }
         ChangeKind::Updated => {
@@ -518,50 +660,58 @@ pub fn run_once<D: BrowserDriver, S: SecretStore, A: AuditSink, N: NotifySink>(
                     discord_event: request.discord_event.clone(),
                     change: ChangeKind::Created,
                 };
-                return run_once(driver, secrets, pages, audit, notify, config, &created);
+                return execute(driver, pages, audit, notify, &created);
             };
-            match driver.update_event(&fb_url, &event_id) {
+            match driver.update_event_full(&fb_url, &draft) {
                 Ok(()) => {}
                 Err(DriverError::Challenge(signal)) => {
-                    return Ok(abort_on_challenge(notify, audit, &event_id, &signal));
+                    return abort_on_challenge(driver, notify, audit, &event_id, &signal);
                 }
                 Err(DriverError::Failed(_)) => {
+                    let shot = driver.screenshot_png();
                     return match fallback_to_link_post(
                         driver,
                         audit,
-                        &event_id,
-                        &event_name,
-                        &fb_url,
+                        &draft,
+                        Some(&fb_url),
                         true,
+                        Some(shot),
+                        FallbackPrior::UpdateFailed,
                     ) {
-                        Ok(outcome) => Ok(outcome),
-                        Err((signal, _)) => {
-                            Ok(abort_on_challenge(notify, audit, &event_id, &signal))
+                        Ok(outcome) => outcome,
+                        Err(signal) => {
+                            abort_on_challenge(driver, notify, audit, &event_id, &signal)
                         }
                     };
                 }
             }
-            let _shot = driver.screenshot_png();
-            match driver.readback_url(&fb_url) {
-                Some(back) if back == fb_url => {
+            let shot = driver.screenshot_png();
+            match driver.readback_event(&fb_url) {
+                Some(observed)
+                    if observed.url == fb_url && readback_matches(&draft, &observed) =>
+                {
                     audit.push(AuditRow {
                         action: "fb_page_event_update".to_owned(),
                         target_key: event_id.clone(),
                         outcome: "updated".to_owned(),
                         fb_url: Some(fb_url.clone()),
+                        screenshot_png: Some(shot),
                     });
-                    Ok(RunOutcome::Updated { url: fb_url })
+                    RunOutcome::Updated { url: fb_url }
                 }
                 _ => match fallback_to_link_post(
                     driver,
                     audit,
-                    &event_id,
-                    &event_name,
-                    &fb_url,
+                    &draft,
+                    Some(&fb_url),
                     true,
+                    Some(shot),
+                    FallbackPrior::ReadbackMismatch,
                 ) {
-                    Ok(outcome) => Ok(outcome),
-                    Err((signal, _)) => Ok(abort_on_challenge(notify, audit, &event_id, &signal)),
+                    Ok(outcome) => outcome,
+                    Err(signal) => {
+                        abort_on_challenge(driver, notify, audit, &event_id, &signal)
+                    }
                 },
             }
         }
@@ -572,34 +722,40 @@ pub fn run_once<D: BrowserDriver, S: SecretStore, A: AuditSink, N: NotifySink>(
                     target_key: event_id.clone(),
                     outcome: "deleted_noop_no_mapping".to_owned(),
                     fb_url: None,
+                    screenshot_png: None,
                 });
-                return Ok(RunOutcome::Deleted);
+                return RunOutcome::Deleted;
             };
             match driver.delete_event(&fb_url) {
                 Ok(()) => {}
                 Err(DriverError::Challenge(signal)) => {
-                    return Ok(abort_on_challenge(notify, audit, &event_id, &signal));
+                    return abort_on_challenge(driver, notify, audit, &event_id, &signal);
                 }
                 Err(DriverError::Failed(message)) => {
                     let _ = message;
+                    let shot = driver.screenshot_png();
                     audit.push(AuditRow {
                         action: "fb_page_event_delete".to_owned(),
                         target_key: event_id.clone(),
                         outcome: "delete_failed_driver_error".to_owned(),
                         fb_url: Some(fb_url.clone()),
+                        screenshot_png: Some(shot),
                     });
-                    pages.remove(&event_id);
-                    return Ok(RunOutcome::Deleted);
+                    // The FB event is still live: keep the mapping so a later
+                    // cancel can retry the delete (control 4).
+                    return RunOutcome::DeleteFailed { fb_url };
                 }
             }
+            let shot = driver.screenshot_png();
             pages.remove(&event_id);
             audit.push(AuditRow {
                 action: "fb_page_event_delete".to_owned(),
                 target_key: event_id.clone(),
                 outcome: "deleted".to_owned(),
                 fb_url: Some(fb_url),
+                screenshot_png: Some(shot),
             });
-            Ok(RunOutcome::Deleted)
+            RunOutcome::Deleted
         }
     }
 }
@@ -608,31 +764,36 @@ fn fallback_after_create_failure<D: BrowserDriver, A: AuditSink, N: NotifySink>(
     driver: &D,
     audit: &A,
     notify: &N,
-    event_id: &str,
-    event_name: &str,
-    created_fb_url: &str,
-) -> Result<RunOutcome, Refused> {
-    let _ = notify;
-    match fallback_to_link_post(driver, audit, event_id, event_name, created_fb_url, false) {
-        Ok(outcome) => Ok(outcome),
-        Err((signal, _)) => {
-            audit.push(AuditRow {
-                action: "fb_page_event_challenge_abort".to_owned(),
-                target_key: event_id.to_owned(),
-                outcome: format!("challenge_aborted_{signal:?}_zero_retries"),
-                fb_url: None,
-            });
-            Ok(RunOutcome::ChallengeAborted {
-                retries: 0,
-                ceo_notified: true,
-            })
-        }
+    draft: &FbEventDraft,
+) -> RunOutcome {
+    let shot = driver.screenshot_png();
+    match fallback_to_link_post(
+        driver,
+        audit,
+        draft,
+        None,
+        false,
+        Some(shot),
+        FallbackPrior::CreateFailed,
+    ) {
+        Ok(outcome) => outcome,
+        Err(signal) => abort_on_challenge(
+            driver,
+            notify,
+            audit,
+            &draft.discord_event_id,
+            &signal,
+        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[test]
     fn change_kind_routes_cancelled_to_delete_without_map() {
@@ -655,5 +816,341 @@ mod tests {
                 "{rendered}"
             );
         }
+    }
+
+    const TEST_START: &str = "2026-09-06T18:00:00.000Z";
+    const TEST_PAGE_URL: &str = "https://www.facebook.com/events/1234567890";
+    const TEST_LINK_URL: &str = "https://www.facebook.com/fixture-page/posts/abcdef";
+
+    fn scheduled(id: &str) -> ScheduledEvent {
+        ScheduledEvent {
+            id: id.to_owned(),
+            name: "Sunday Squad".to_owned(),
+            starts_at: TEST_START.to_owned(),
+            channel_id: Some("voice-1".to_owned()),
+            description: Some("Join the weekly games night.".to_owned()),
+            status: EventStatus::Scheduled,
+        }
+    }
+
+    fn staging() -> FbPageEventsConfig {
+        FbPageEventsConfig {
+            kill_switch_on: true,
+            staging_evidence: true,
+            target: PageTarget::StagingTestPage,
+        }
+    }
+
+    /// Scriptable fake covering the failure branches the acceptance suite
+    /// does not reach: per-operation results plus observed readback fields.
+    #[derive(Debug)]
+    struct FakeInner {
+        create: Result<String, DriverError>,
+        update: Result<(), DriverError>,
+        delete: Result<(), DriverError>,
+        link: Result<String, DriverError>,
+        readback: Option<EventReadback>,
+        rows: Vec<AuditRow>,
+        notes: Vec<CeoNotification>,
+    }
+
+    impl Default for FakeInner {
+        fn default() -> Self {
+            Self {
+                create: Ok(TEST_PAGE_URL.to_owned()),
+                update: Ok(()),
+                delete: Ok(()),
+                link: Ok(TEST_LINK_URL.to_owned()),
+                readback: Some(EventReadback {
+                    url: TEST_PAGE_URL.to_owned(),
+                    name: None,
+                    starts_at: None,
+                }),
+                rows: Vec::new(),
+                notes: Vec::new(),
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct Fake {
+        inner: Mutex<FakeInner>,
+    }
+
+    impl Fake {
+        fn edit(&self, f: impl FnOnce(&mut FakeInner)) {
+            f(&mut self.inner.lock().expect("fake lock"));
+        }
+
+        fn rows(&self) -> Vec<AuditRow> {
+            self.inner.lock().expect("fake lock").rows.clone()
+        }
+
+        fn notes(&self) -> Vec<CeoNotification> {
+            self.inner.lock().expect("fake lock").notes.clone()
+        }
+    }
+
+    impl BrowserDriver for Fake {
+        fn create_event(&self, _id: &str, _name: &str) -> Result<String, DriverError> {
+            self.inner.lock().expect("fake lock").create.clone()
+        }
+
+        fn update_event(&self, _url: &str, _id: &str) -> Result<(), DriverError> {
+            self.inner.lock().expect("fake lock").update.clone()
+        }
+
+        fn delete_event(&self, _url: &str) -> Result<(), DriverError> {
+            self.inner.lock().expect("fake lock").delete.clone()
+        }
+
+        fn screenshot_png(&self) -> Vec<u8> {
+            vec![0x89, b'P', b'N', b'G']
+        }
+
+        fn readback_url(&self, _fb_url: &str) -> Option<String> {
+            self.inner
+                .lock()
+                .expect("fake lock")
+                .readback
+                .clone()
+                .map(|observed| observed.url)
+        }
+
+        fn link_post_fallback(&self, _id: &str, _name: &str) -> Result<String, DriverError> {
+            self.inner.lock().expect("fake lock").link.clone()
+        }
+
+        fn readback_event(&self, _fb_url: &str) -> Option<EventReadback> {
+            self.inner.lock().expect("fake lock").readback.clone()
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeSecrets {
+        fetches: AtomicUsize,
+    }
+
+    impl SecretStore for FakeSecrets {
+        fn fetch_page_token(&self) -> Result<PageToken, SecretError> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            Ok(PageToken::new("fixture-fb-page-credential".to_owned()))
+        }
+    }
+
+    impl AuditSink for Fake {
+        fn push(&self, row: AuditRow) {
+            self.inner.lock().expect("fake lock").rows.push(row);
+        }
+    }
+
+    impl NotifySink for Fake {
+        fn notify(&self, notification: CeoNotification) {
+            self.inner.lock().expect("fake lock").notes.push(notification);
+        }
+    }
+
+    fn run(
+        fake: &Fake,
+        secrets: &FakeSecrets,
+        pages: &mut IdempotencyMap,
+        change: ChangeKind,
+    ) -> Result<RunOutcome, Refused> {
+        run_once(
+            fake,
+            secrets,
+            pages,
+            fake,
+            fake,
+            &staging(),
+            &RunRequest {
+                discord_event: scheduled("event-1"),
+                change,
+            },
+        )
+    }
+
+    #[test]
+    fn failed_delete_keeps_mapping_and_reports_delete_failed() {
+        let fake = Fake::default();
+        fake.edit(|inner| {
+            inner.delete = Err(DriverError::Failed("boom".to_owned()));
+        });
+        let secrets = FakeSecrets::default();
+        let mut pages = IdempotencyMap::new();
+        pages.record("event-1", TEST_PAGE_URL);
+
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Cancelled)
+            .expect("delete failure is an outcome");
+        assert!(
+            matches!(outcome, RunOutcome::DeleteFailed { .. }),
+            "a failed delete must not report Deleted: {outcome:?}"
+        );
+        assert_eq!(
+            pages.lookup("event-1").as_deref(),
+            Some(TEST_PAGE_URL),
+            "the mapping is kept so a later cancel can retry"
+        );
+
+        fake.edit(|inner| inner.delete = Ok(()));
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Cancelled)
+            .expect("retry runs");
+        assert!(
+            matches!(outcome, RunOutcome::Deleted),
+            "retry after recovery deletes: {outcome:?}"
+        );
+        assert_eq!(
+            pages.lookup("event-1"),
+            None,
+            "the entry drops only after a successful delete"
+        );
+    }
+
+    #[test]
+    fn challenge_in_create_fallback_notifies_ceo() {
+        let fake = Fake::default();
+        fake.edit(|inner| {
+            inner.create = Err(DriverError::Failed("no event".to_owned()));
+            inner.link = Err(DriverError::Challenge(ChallengeSignal::Captcha));
+        });
+        let secrets = FakeSecrets::default();
+        let mut pages = IdempotencyMap::new();
+
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Created)
+            .expect("challenge abort is an outcome");
+        assert!(
+            matches!(
+                outcome,
+                RunOutcome::ChallengeAborted {
+                    ceo_notified: true,
+                    ..
+                }
+            ),
+            "challenge aborts: {outcome:?}"
+        );
+        assert_eq!(
+            fake.notes().len(),
+            1,
+            "the fallback challenge notifies the CEO exactly once"
+        );
+    }
+
+    #[test]
+    fn double_failure_reports_fallback_failed_never_success_shaped() {
+        let fake = Fake::default();
+        fake.edit(|inner| {
+            inner.create = Err(DriverError::Failed("no event".to_owned()));
+            inner.link = Err(DriverError::Failed("no link".to_owned()));
+        });
+        let secrets = FakeSecrets::default();
+        let mut pages = IdempotencyMap::new();
+
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Created)
+            .expect("double failure is an outcome");
+        assert!(
+            matches!(outcome, RunOutcome::FallbackFailed { stage: "create" }),
+            "nothing reached Facebook: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn readback_mismatch_records_url_so_redelivery_updates() {
+        let fake = Fake::default();
+        fake.edit(|inner| inner.readback = None);
+        let secrets = FakeSecrets::default();
+        let mut pages = IdempotencyMap::new();
+
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Created)
+            .expect("fallback is an outcome");
+        assert!(
+            matches!(outcome, RunOutcome::LinkPostFallback { .. }),
+            "unreadable create falls back: {outcome:?}"
+        );
+        assert_eq!(
+            pages.lookup("event-1").as_deref(),
+            Some(TEST_PAGE_URL),
+            "the unverified event is mapped so redelivery updates it"
+        );
+    }
+
+    #[test]
+    fn readback_content_mismatch_fails_verification() {
+        let fake = Fake::default();
+        fake.edit(|inner| {
+            inner.readback = Some(EventReadback {
+                url: TEST_PAGE_URL.to_owned(),
+                name: Some("Renamed Squad".to_owned()),
+                starts_at: None,
+            });
+        });
+        let secrets = FakeSecrets::default();
+        let mut pages = IdempotencyMap::new();
+
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Created)
+            .expect("fallback is an outcome");
+        assert!(
+            matches!(outcome, RunOutcome::LinkPostFallback { .. }),
+            "an observed content mismatch must not verify: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn challenge_abort_persists_screenshot_evidence() {
+        let fake = Fake::default();
+        fake.edit(|inner| {
+            inner.create = Err(DriverError::Challenge(ChallengeSignal::Checkpoint));
+        });
+        let secrets = FakeSecrets::default();
+        let mut pages = IdempotencyMap::new();
+
+        run(&fake, &secrets, &mut pages, ChangeKind::Created).expect("abort runs");
+        let rows = fake.rows();
+        assert_eq!(rows.len(), 1, "one abort row: {rows:?}");
+        assert!(
+            rows[0]
+                .screenshot_png
+                .as_ref()
+                .is_some_and(|png| !png.is_empty()),
+            "the challenge abort records screenshot evidence"
+        );
+    }
+
+    #[test]
+    fn update_without_mapping_heals_forward_with_one_credential_fetch() {
+        let fake = Fake::default();
+        let secrets = FakeSecrets::default();
+        let mut pages = IdempotencyMap::new();
+
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Updated)
+            .expect("heal-forward runs");
+        assert!(
+            matches!(outcome, RunOutcome::Created { .. }),
+            "an unmapped update heals forward into a create: {outcome:?}"
+        );
+        assert_eq!(
+            secrets.fetches.load(Ordering::SeqCst),
+            1,
+            "exactly one credential fetch per run"
+        );
+    }
+
+    #[test]
+    fn full_draft_methods_default_to_narrowing_calls() {
+        // The `_full` defaults narrow to the legacy calls so existing fakes
+        // keep working; real drivers override them to sync content.
+        let fake = Fake::default();
+        let draft = FbEventDraft::from_scheduled(&scheduled("event-7"));
+        assert_eq!(draft.starts_at, TEST_START);
+        assert_eq!(
+            draft.description.as_deref(),
+            Some("Join the weekly games night.")
+        );
+        assert_eq!(fake.create_event_full(&draft), Ok(TEST_PAGE_URL.to_owned()));
+        assert_eq!(fake.update_event_full(TEST_PAGE_URL, &draft), Ok(()));
+        assert_eq!(
+            fake.readback_event(TEST_PAGE_URL)
+                .map(|observed| observed.url),
+            Some(TEST_PAGE_URL.to_owned())
+        );
     }
 }
