@@ -174,6 +174,16 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         measure: TableMeasure::Unmeasurable("seed reference data with no timestamp column"),
     },
     TableSpec { table: "rank_snapshots", measure: TableMeasure::Columns(&["snapshot_at"]) },
+    // Retention deletion ledger (0427): request creation stamps requested_at,
+    // completion rewrites completed_at without touching requested_at, so the
+    // maximum across both is the row's last write (same shape as tickets).
+    TableSpec {
+        table: "retention_deletion_requests",
+        measure: TableMeasure::Columns(&["requested_at", "completed_at"]),
+    },
+    // Retention guild-purge queue (0427): insert-once per guild, stamped on
+    // enqueue; a purge deletes the row, so only enqueues are measurable.
+    TableSpec { table: "retention_guild_purge_queue", measure: TableMeasure::Columns(&["enqueued_at"]) },
     TableSpec { table: "scheduled_events", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "scheduled_messages", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "self_role_audit", measure: TableMeasure::Columns(&["created_at"]) },
