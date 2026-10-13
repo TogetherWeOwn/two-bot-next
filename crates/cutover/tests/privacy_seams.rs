@@ -985,7 +985,9 @@ async fn rsvp_checkin_deterministic_race_never_persists() {
 /// guarded `record_sent`), the game/channel/session writers and both
 /// in-transaction variants. Each writer runs once while the opt-out holds its
 /// locks open; without the writer's lock its gate passes and the `INSERT`
-/// lands after the purge.
+/// lands after the purge. The two in-transaction writers race in separate
+/// rounds: a combined round would let the first writer absorb the wait and
+/// leave the second writer's lock unpinned.
 #[tokio::test]
 async fn onboarding_writers_deterministic_race_never_persist() {
     let Some((test_db, db)) = database().await else {
@@ -1157,7 +1159,8 @@ async fn onboarding_writers_deterministic_race_never_persist() {
             .unwrap();
     }
 
-    // In-transaction variants share the caller's role-write transaction.
+    // In-transaction game selection races the opt-out alone in the caller's
+    // role-write transaction, so its own lock absorbs the wait.
     {
         let opt_tx = hold_opt_out_open(db.pool(), GUILD, MEMBER_A).await;
         let writer_pool = pool.clone();
@@ -1174,6 +1177,45 @@ async fn onboarding_writers_deterministic_race_never_persist() {
             )
             .await
             .expect("in-tx game write");
+            caller_tx.commit().await.expect("caller commit");
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        opt_tx.commit().await.expect("opt-out commit");
+        writer.await.expect("writer task");
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE guild_id = $1 AND member_id = $2",
+        )
+        .bind(GUILD)
+        .bind(MEMBER_A)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows, 0,
+            "in-transaction game selection racing the opt-out writes no row"
+        );
+        sqlx::query("DELETE FROM privacy_opt_outs WHERE guild_id = $1 AND member_id = $2")
+            .bind(GUILD)
+            .bind(MEMBER_A)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM events WHERE guild_id = $1 AND member_id = $2")
+            .bind(GUILD)
+            .bind(MEMBER_A)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    // In-transaction session routing races the opt-out alone: a combined
+    // round would let the game write absorb the wait, so the session lock
+    // gets its own round to stay pinned.
+    {
+        let opt_tx = hold_opt_out_open(db.pool(), GUILD, MEMBER_A).await;
+        let writer_pool = pool.clone();
+        let writer = tokio::spawn(async move {
+            let mut caller_tx = writer_pool.begin().await.expect("caller tx");
             let picks = build_session_picks("10", "11");
             let session = plan_session(&["find-players"], &|_| true, &picks);
             let _ = record_session_routed_in_transaction(
@@ -1200,8 +1242,20 @@ async fn onboarding_writers_deterministic_race_never_persist() {
         .unwrap();
         assert_eq!(
             rows, 0,
-            "in-transaction writes racing the opt-out write no row"
+            "in-transaction session routing racing the opt-out writes no row"
         );
+        sqlx::query("DELETE FROM privacy_opt_outs WHERE guild_id = $1 AND member_id = $2")
+            .bind(GUILD)
+            .bind(MEMBER_A)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM events WHERE guild_id = $1 AND member_id = $2")
+            .bind(GUILD)
+            .bind(MEMBER_A)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     db.close().await;
