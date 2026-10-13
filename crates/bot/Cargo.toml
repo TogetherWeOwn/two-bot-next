@@ -24,7 +24,7 @@ two-bot-cutover = { version = "0.4.0", path = "../cutover" }
 # internal_actions nonces).
 hex = { workspace = true }
 # ops_backfill verifies the existing listener's path-bound HMAC signatures
-# (same envelope as the internal-action receiver, bound to GET /ops/backfill).
+# (same envelope as the internal-action receiver, bound to GET /ops/backfill/progress).
 hmac = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }

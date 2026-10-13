@@ -1,6 +1,6 @@
-//! Failing acceptance for the backfill `/ops/backfill` progress and ETA route.
+//! Failing acceptance for the backfill `/ops/backfill/progress` progress and ETA route.
 //!
-//! Paired failing-tests card for the `/ops/backfill` build
+//! Paired failing-tests card for the `/ops/backfill/progress` build
 //! ([TOG-22953](/TOG/issues/TOG-22953), slice 8 of TOG-22852 AC3). Every test
 //! below FAILS against the current binary (the route does not exist, so the
 //! listener answers 404) and passes once the builder lands the route. Test
@@ -24,10 +24,10 @@
 //!    and enum tokens never do) and no `message`/`body`/`text`-shaped keys.
 //!
 //! Pinned choices the builder (and the CISO review) must honor or renegotiate
-//! on this card: `GET /ops/backfill` with a JSON `{"families": {...}}` body
+//! on this card: `GET /ops/backfill/progress` with a JSON `{"families": {...}}` body
 //! (Prometheus already has `/metrics`; this read joins `/readyz`-style JSON
 //! on the same listener), and a path-bound canonical string
-//! `GET\n/ops/backfill\n{ts}\n{nonce}\n{sha256_hex(body)}` so a signature cut
+//! `GET\n/ops/backfill/progress\n{ts}\n{nonce}\n{sha256_hex(body)}` so a signature cut
 //! for `/internal/actions` never authorizes a backfill read.
 //!
 //! Fakes only: the binary boots parked (`DISCORD_TOKEN=INVALID`, an
@@ -49,7 +49,10 @@ use serde_json::Value;
 use sha2::Digest as _;
 
 /// Route under test. Absent until the builder lands it (today: 404).
-const BACKFILL_PATH: &str = "/ops/backfill";
+/// Moved from `/ops/backfill` to `/ops/backfill/progress`: the open
+/// `/ops/backfill` table roll-up from #918 already owns that path, and
+/// registering both panics the listener (`Overlapping method route`).
+const BACKFILL_PATH: &str = "/ops/backfill/progress";
 
 /// The nine backfill families from the TOG-22852 plan (CEO decision); also the
 /// bounded exposition vocabulary. Mirrors
@@ -176,7 +179,7 @@ fn body_json(response: &str) -> Value {
 
 /// Mint the existing surface's signature, bound to the backfill path: the
 /// same `x-two-*` headers and `sha256=` HMAC envelope as `/internal/actions`,
-/// over `GET\n/ops/backfill\n{ts}\n{nonce}\n{sha256_hex(body)}`.
+/// over `GET\n/ops/backfill/progress\n{ts}\n{nonce}\n{sha256_hex(body)}`.
 fn backfill_auth_headers(key_id: &str, secret: &str) -> Vec<(&'static str, String)> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

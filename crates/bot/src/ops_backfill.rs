@@ -1,13 +1,13 @@
-//! Private backfill progress route: `GET /ops/backfill` on the existing listener.
+//! Private backfill progress route: `GET /ops/backfill/progress` on the existing listener.
 //!
 //! Slice 8 of TOG-22852, covering its AC3 ("progress + ETA exposed for
-//! `/ops/backfill`"). Follows the [`crate::metrics_http`] pattern: a private
+//! `/ops/backfill/progress`"). Follows the [`crate::metrics_http`] pattern: a private
 //! route on the health/metrics listener (never the internal-action receiver),
 //! rendering JSON like `/readyz` instead of Prometheus text.
 //!
 //! ## Contract (pinned by `crates/bot/tests/ops_backfill.rs`)
 //!
-//! * `GET /ops/backfill` with a `{"families": {...}}` body: one entry per
+//! * `GET /ops/backfill/progress` with a `{"families": {...}}` body: one entry per
 //!   family of the bounded nine-family vocabulary from
 //!   [`two_bot_store::backfill_cursors::BACKFILL_FAMILIES`]. Family keys never
 //!   come from cursors or request-unique values (fixed cardinality), and bodies
@@ -15,7 +15,7 @@
 //!   custom-status text (privacy fence, same as event-store S1).
 //! * Auth reuses the existing `TWO_INTERNAL_KEYS` ring and `x-two-*` signed
 //!   headers, but over a path-bound canonical string
-//!   `GET\n/ops/backfill\n{ts}\n{nonce}\n{sha256_hex(body)}`, so a signature
+//!   `GET\n/ops/backfill/progress\n{ts}\n{nonce}\n{sha256_hex(body)}`, so a signature
 //!   cut for `/internal/actions` never authorizes a backfill read (and vice
 //!   versa). Every auth failure — missing, malformed, unknown-key, forged,
 //!   stale or replayed — is one indistinguishable `401` carrying exactly the
@@ -63,7 +63,7 @@ use two_bot_core::{
 };
 
 /// Route under test. Keep in sync with `crate::server::TRACED_PATHS`.
-pub const BACKFILL_PATH: &str = "/ops/backfill";
+pub const BACKFILL_PATH: &str = "/ops/backfill/progress";
 
 /// Failure class for the debug log only: every class renders the same 401, so
 /// these tokens never reach the wire.

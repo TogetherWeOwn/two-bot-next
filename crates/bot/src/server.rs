@@ -128,7 +128,7 @@ pub(crate) fn router_with_guard(
 /// Routes the public listener serves; the only paths a span may record.
 /// Keep in sync with `router_with_guard`, `metrics_http::router_with_guard`
 /// `ops_backfill::router` and `ops_http::router_with_state`.
-const TRACED_PATHS: [&str; 7] = [
+const TRACED_PATHS: [&str; 8] = [
     "/health",
     "/healthz",
     "/readyz",
@@ -136,6 +136,7 @@ const TRACED_PATHS: [&str; 7] = [
     "/ops/summary",
     "/ops/gateway",
     "/ops/backfill",
+    "/ops/backfill/progress",
 ];
 
 /// Recorded for every path that is not an exact `TRACED_PATHS` entry.
@@ -489,6 +490,7 @@ mod tests {
             ("/ops/summary", "/ops/summary"),
             ("/ops/gateway", "/ops/gateway"),
             ("/ops/backfill", "/ops/backfill"),
+            ("/ops/backfill/progress", "/ops/backfill/progress"),
             ("/ops/summary?token=fixture-query-secret", "/ops/summary"),
             ("/readyz?token=fixture-query-secret", "/readyz"),
             ("/health?key=fixture-query-secret", "/health"),
@@ -564,9 +566,10 @@ mod tests {
             ),
             ("/Health", StatusCode::NOT_FOUND),
             ("/metrics?token=fixture-query-secret", StatusCode::OK),
-            // The backfill route is signed: a bare read refuses without
-            // leaking whether any key exists.
-            ("/ops/backfill", StatusCode::UNAUTHORIZED),
+            // The backfill progress route is signed: a bare read refuses without
+            // leaking whether any key exists. The open `/ops/backfill`
+            // roll-up stays unauthenticated (see `ops_http`).
+            ("/ops/backfill/progress", StatusCode::UNAUTHORIZED),
             ("/ops/summary?token=fixture-query-secret", StatusCode::OK),
         ];
         let recorder = SpanRecorder::default();
