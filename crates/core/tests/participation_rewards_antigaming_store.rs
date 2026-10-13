@@ -156,7 +156,7 @@ async fn decay_job_writes_audit_rows_leaves_lifetime(
         decayed_members, 1,
         "one inactive seasonal row must decay after 36 d"
     );
-    let decayed: Vec<(i64,)> =
+    let decayed: Vec<(i32,)> =
         sqlx::query_as("SELECT xp FROM xp_awards WHERE guild_id = $1 AND source = 'decay'")
             .bind(GUILD)
             .fetch_all(&pool)
