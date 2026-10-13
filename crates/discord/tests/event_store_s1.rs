@@ -1,10 +1,5 @@
-//! Event-store S1 acceptance tests (paired failing-tests card for the S1 build).
-//!
-//! Test files ONLY: this suite pins the S1 acceptance criteria before the
-//! builder starts, so every test here FAILS until the S1 build lands its
-//! migration, its MESSAGE_CREATE capture path and its lag gauge. The builder
-//! makes these tests pass; nothing outside `#[cfg(test)]` changes on this
-//! card.
+//! Event-store S1 acceptance tests for the append-only core slice
+//! (0437 migration on the shared append-only `event_store` table).
 //!
 //! Contract under test (event-store P1 slice 1: append-only core +
 //! message-create metadata + idempotent keys + lag metric):
@@ -16,25 +11,19 @@
 //!   the schema check; sibling slices' reviewed columns pass.
 //!   `dedup_key` is UNIQUE.
 //! - Resume-safe idempotent inserts: `dedup_key = "MESSAGE_CREATE:<id>"`,
-//!   `ON CONFLICT (dedup_key) DO NOTHING`, first-wins on replay. AC 2/3 pin
-//!   only this UNIQUE-key behaviour: the insert below is test-side SQL until
-//!   the S1 build routes the fixture through its real capture function.
+//!   `ON CONFLICT (dedup_key) DO NOTHING`, first-wins on replay. The insert
+//!   helpers bind ids only; live gateway dispatch wiring stays with the
+//!   parent event-store scope.
 //! - Out-of-order / replayed MESSAGE_CREATE fixtures never add a row.
 //! - Consumer lag gauge `two_bot_event_store_consumer_lag_seconds` in the
 //!   `/ops/metrics` exposition with fixed cardinality (no unbounded labels).
 //! - Privacy tripwire: a fixture carrying a body / custom-status text leaves
 //!   no such text persisted anywhere in the table.
 //!
-//! Pending-test routing: every test is `#[ignore]`d with a truthful
-//! `pending: S1 ...` reason, covered by a `CONSTRAINTS.md` exception row
-//! (owner: S1 build card, expires 2026-11-12) and a
-//! `check-test-inventory.py` exemption, and skipped in the nightly broad
-//! sweep, so this card's CI stays green while the S1 build is outstanding;
-//! run with `-- --ignored` to see the gap. The S1 build card un-ignores
-//! these tests, drops the exemption rows and wires a `check.yml` lane once
-//! the migration, capture path and gauge land. DB tests run only against the
-//! disposable test database (`TestDatabase` refuses anything but
-//! agent-testdb), never staging or production.
+//! Routing: these tests run in the `ignored db (stores)` CI lane and are
+//! skipped in the nightly broad sweep to avoid a double run. DB tests run
+//! only against the disposable test database (`TestDatabase` refuses
+//! anything but agent-testdb), never staging or production.
 #![cfg(feature = "db")]
 
 use serde_json::{json, Value};
@@ -200,10 +189,8 @@ async fn assert_no_json_columns(pool: &PgPool) {
 /// S1 AC 1: append-only insert with minimal fields (ids + timestamps +
 /// enums), and no body / custom-text column or field anywhere.
 ///
-/// Pending: no `event_store` table exists until the S1 migration lands, so
-/// run with `-- --ignored` to see the gap.
+/// Runs in the `ignored db (stores)` CI lane against the disposable test database.
 #[tokio::test]
-#[ignore = "pending: S1 migration missing; CONSTRAINTS exception expires 2026-11-12; run with --ignored to see the gap"]
 async fn event_store_s1_append_only_insert_uses_minimal_fields() {
     let db = TestDb::new().await;
     assert_minimal_schema(&table_columns(&db.pool).await);
@@ -242,10 +229,8 @@ async fn event_store_s1_append_only_insert_uses_minimal_fields() {
 /// S1 AC 2: duplicate delivery with the same `dedup_key` inserts once
 /// (resume-safe, `ON CONFLICT DO NOTHING`).
 ///
-/// Pending: no `event_store` table exists until the S1 migration lands, so
-/// run with `-- --ignored` to see the gap.
+/// Runs in the `ignored db (stores)` CI lane against the disposable test database.
 #[tokio::test]
-#[ignore = "pending: S1 migration missing; CONSTRAINTS exception expires 2026-11-12; run with --ignored to see the gap"]
 async fn event_store_s1_duplicate_delivery_inserts_once() {
     let db = TestDb::new().await;
     let fixture = message_create_fixture("dup-1", "2026-10-12T12:00:00.000Z");
@@ -270,10 +255,8 @@ async fn event_store_s1_duplicate_delivery_inserts_once() {
 /// S1 AC 3: an out-of-order / replayed MESSAGE_CREATE fixture does not
 /// duplicate (first-wins on the idempotent key).
 ///
-/// Pending: no `event_store` table exists until the S1 migration lands, so
-/// run with `-- --ignored` to see the gap.
+/// Runs in the `ignored db (stores)` CI lane against the disposable test database.
 #[tokio::test]
-#[ignore = "pending: S1 migration missing; CONSTRAINTS exception expires 2026-11-12; run with --ignored to see the gap"]
 async fn event_store_s1_replayed_message_create_does_not_duplicate() {
     let db = TestDb::new().await;
     // Original delivery wins; a late replay carrying an earlier event_time
@@ -307,10 +290,8 @@ async fn event_store_s1_replayed_message_create_does_not_duplicate() {
 /// S1 AC 4: the consumer lag gauge appears in the `/ops/metrics` exposition
 /// with fixed cardinality (no unbounded labels).
 ///
-/// Pending: no lag series exists until the S1 metrics seam lands, so run
-/// with `-- --ignored` to see the gap.
+/// Runs in the `ignored db (stores)` CI lane against the disposable test database.
 #[test]
-#[ignore = "pending: S1 lag gauge missing; CONSTRAINTS exception expires 2026-11-12; run with --ignored to see the gap"]
 fn event_store_s1_consumer_lag_gauge_has_fixed_cardinality() {
     let name = "two_bot_event_store_consumer_lag_seconds";
     let text = two_bot_core::metrics::Metrics::default().render(None);
@@ -361,10 +342,8 @@ fn event_store_s1_consumer_lag_gauge_has_fixed_cardinality() {
 /// S1 AC 5 (privacy tripwire): a fixture containing a message body /
 /// custom-status text is rejected or never persisted.
 ///
-/// Pending: no `event_store` table exists until the S1 migration lands, so
-/// run with `-- --ignored` to see the gap.
+/// Runs in the `ignored db (stores)` CI lane against the disposable test database.
 #[tokio::test]
-#[ignore = "pending: S1 migration missing; CONSTRAINTS exception expires 2026-11-12; run with --ignored to see the gap"]
 async fn event_store_s1_privacy_tripwire_rejects_body_text() {
     let db = TestDb::new().await;
     // Tripwire part 1: the table holds the S1 columns and only reviewed

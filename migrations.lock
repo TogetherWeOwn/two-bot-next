@@ -392,6 +392,10 @@
     "crates/cutover/migrations/0436_member_catchup.sql": {
       "sha256": "272b679ab44fa9b84621e5c9fbb07e2b11455e18f29c8709c553b0f955ed771f",
       "justification": "TOG-22941 member-list catch-up worker tables (member_catchup_members/cursors) plus the members-frontier checkpoint contract with backfill_cursors; ids/timestamps/enums only, IF NOT EXISTS, so catch-up writes work on migrated databases and progress reflects the worker. Renumbered 0434 to 0436 on the merge past main's 0433/0434 privacy opt-out."
+    },
+    "crates/cutover/migrations/0437_event_store_s1_core.sql": {
+      "sha256": "9e1c4d2f46f3a36e1e155de83a41a2bcd1d5c4dd2f68ab47dbdd304082e8a1ef",
+      "justification": "Event-store S1 append-only core: order-independent event_store table with MESSAGE_CREATE metadata columns (event_type, guild_id, channel_id, message_id, user_id, event_time, received_at, dedup_key) plus nullable convergence and the shared UNIQUE dedup index; ids+timestamps only, no body columns."
     }
   }
 }
