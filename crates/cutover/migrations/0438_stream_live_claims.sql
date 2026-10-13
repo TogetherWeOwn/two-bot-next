@@ -1,4 +1,4 @@
--- 0437_stream_live_claims: durable go-live dedup ledger for Twitch
+-- 0438_stream_live_claims: durable go-live dedup ledger for Twitch
 -- `stream.online` announcements.
 --
 -- One row per go-live keyed by `live_dedup_key` (sha256 hex of
