@@ -150,8 +150,15 @@ pub const DUMP_TABLES: &[&str] = &[
 /// Tables first covered by v5. A v4 archive predates them and need not declare
 /// them; every other covered table is still required, so a v4 recovery point
 /// written before create-reservation persistence stays readable without
-/// waiving arbitrary missing tables.
-pub const V5_ADDED_TABLES: &[&str] = &["voice_create_reservations"];
+/// waiving arbitrary missing tables. The privacy opt-out control plane
+/// (0427/0428) is v5 for the same reason: v4 archives predate suppression
+/// tombstones, toggle rows and opt-out receipts.
+pub const V5_ADDED_TABLES: &[&str] = &[
+    "voice_create_reservations",
+    "privacy_opt_outs",
+    "guild_analytics_settings",
+    "privacy_opt_out_audit",
+];
 
 /// Covered tables not created by the current cutover migration set, if any.
 /// Keep legacy data when such tables exist, but do not require nonexistent
@@ -1705,9 +1712,15 @@ mod tests {
             .filter(|name| !V5_ADDED_TABLES.contains(name))
             .collect();
         assert_eq!(names, expected);
+        // The frozen v4 archive predates every v5 table, in DUMP_TABLES order.
         assert_eq!(
             contents.manifest.missing_tables(),
-            ["voice_create_reservations"]
+            [
+                "privacy_opt_outs",
+                "guild_analytics_settings",
+                "privacy_opt_out_audit",
+                "voice_create_reservations"
+            ]
         );
         assert_eq!(contents.buffers["voice_rooms"][0]["channel_id"], "500");
         let mut manifest = serde_json::to_value(&contents.manifest).unwrap();
