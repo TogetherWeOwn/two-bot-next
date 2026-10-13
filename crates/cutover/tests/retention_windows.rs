@@ -231,7 +231,7 @@ async fn long_term_aggregates_survive_the_raw_purge() {
     let report: RetentionReport = run_retention(pool, RetentionMode::Execute).await.unwrap();
     assert_eq!(report.presence_raw_deleted, 0);
     assert_eq!(report.voice_raw_deleted, 0);
-    let (xp, message_xp): (i32, i32) = sqlx::query_as(
+    let (xp, message_xp): (i64, i64) = sqlx::query_as(
         "SELECT xp, message_xp FROM member_levels WHERE guild_id = $1 AND member_id = $2",
     )
     .bind(GUILD_A)
