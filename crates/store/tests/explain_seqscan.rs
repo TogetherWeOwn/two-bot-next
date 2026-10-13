@@ -177,7 +177,15 @@ async fn web_contract_views_report_unindexed_seq_scans() {
         findings.len()
     ));
     for (view, relation) in &findings {
-        eprintln!("::warning title=EXPLAIN seq scan::web_v1.{view} seq-scans {relation} even with seq scans disabled");
+        // Direct fd write on purpose: libtest captures `eprintln!` output for
+        // passing tests, and this check is report-only (it always passes), so
+        // the `::warning` lines would never reach the CI log or annotations.
+        // `writeln!` to `Stderr` bypasses that capture. Do not switch back to
+        // `eprintln!` without adding `--nocapture` to the CI step.
+        let _ = writeln!(
+            std::io::stderr(),
+            "::warning title=EXPLAIN seq scan::web_v1.{view} seq-scans {relation} even with seq scans disabled"
+        );
         summary.push_str(&format!("- `web_v1.{view}` seq-scans `{relation}`\n"));
     }
     if let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY") {
