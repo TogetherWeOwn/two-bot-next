@@ -337,9 +337,9 @@
       "sha256": "9da078d3f29430320b79d2d82cfa6e4b1d2d557384a98d7dddca97783429d2dd",
       "justification": "RSVP check-in capacity count index: cover (guild_id, source) so record_checkin counts the occurrence without scanning the guild message history while holding the occurrence lock."
     },
-    "crates/cutover/migrations/0427_privacy_opt_out.sql": {
-      "sha256": "d5f452771a49f88bb16ef44d5119ca65df454a72ffe225e729bb079a64f9209b",
-      "justification": "Per-user opt-out suppression plus per-guild presence/activity/voice toggles plus one audit receipt row per purge; cutover chain copy, additive with IF NOT EXISTS."
+    "crates/cutover/migrations/0427_event_store_voice_capture.sql": {
+      "sha256": "7b96ea3478d398853a32690e248b3350944ef0267e90ca89a338ba9eb5c39397",
+      "justification": "Event-store S4 voice capture: create the append-only event_store table (or add its voice columns) with ids including nullable message_id for S1 coexistence, session, timestamps and enum mute/deaf/video/stream flags plus the shared UNIQUE dedup index; additive, backout drops the table."
     },
     "crates/cutover/migrations/0428_event_store_presence_capture.sql": {
       "sha256": "5be88c0d2541613d571f30cdb1108c42e17532541f8bf6eb1f99181ad87b05ef",
@@ -352,6 +352,10 @@
     "crates/cutover/migrations/0432_event_store_member_capture.sql": {
       "sha256": "81e51abeda792b6e8dfa4ad714e744fcc09b96f9d857ca70bf4080ef8ce46faf",
       "justification": "Event-store S2 member capture: order-independent event_store table plus premium_since, nick_changed flag and role-id columns for GUILD_MEMBER_ADD/REMOVE/UPDATE, idempotent on the shared UNIQUE dedup_key index, no free-text columns."
+    },
+    "crates/cutover/migrations/0433_privacy_opt_out.sql": {
+      "sha256": "c60803ccfb20a7748d43dc2630653950c894953cf8010347b4ad6f681b3197d0",
+      "justification": "Per-user opt-out suppression plus per-guild presence/activity/voice toggles plus one audit receipt row per purge; cutover chain copy, additive with IF NOT EXISTS."
     }
   }
 }

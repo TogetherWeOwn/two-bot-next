@@ -15,7 +15,7 @@ const LATER: &str = "2026-08-25T00:00:00.000Z";
 const BASE: &str = include_str!("../../cutover/migrations/0001_funnel.sql");
 const MIGRATION: &str = include_str!("../../cutover/migrations/0190_onboarding.sql");
 // The onboarding writers consult the opt-out suppression table.
-const PRIVACY: &str = include_str!("../../cutover/migrations/0427_privacy_opt_out.sql");
+const PRIVACY: &str = include_str!("../../cutover/migrations/0433_privacy_opt_out.sql");
 
 async fn isolated_pool(schema: &str) -> PgPool {
     assert!(schema

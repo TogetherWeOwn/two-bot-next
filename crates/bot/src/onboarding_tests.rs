@@ -51,7 +51,7 @@ impl TestSchema {
             include_str!("../../cutover/migrations/0333_guild_settings_revision.sql"),
             include_str!("../../cutover/migrations/0334_guild_settings_cas.sql"),
             // The onboarding writers consult the opt-out suppression table.
-            include_str!("../../cutover/migrations/0427_privacy_opt_out.sql"),
+            include_str!("../../cutover/migrations/0433_privacy_opt_out.sql"),
         ] {
             sqlx::raw_sql(migration).execute(&pool).await.unwrap();
         }

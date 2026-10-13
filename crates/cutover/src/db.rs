@@ -792,7 +792,7 @@ mod message_scan_write_tests {
                 .execute(db.pool())
                 .await?;
             // The ladder writer consults the opt-out suppression table.
-            sqlx::raw_sql(include_str!("../migrations/0427_privacy_opt_out.sql"))
+            sqlx::raw_sql(include_str!("../migrations/0433_privacy_opt_out.sql"))
                 .execute(db.pool())
                 .await?;
             let member = "100000000000000001";
