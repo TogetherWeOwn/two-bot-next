@@ -437,6 +437,12 @@ fn assert_stage_schema(columns: &[String]) {
     }
 }
 
+/// Only the reviewed S2 `roles` role-id array may use `jsonb`: free-text
+/// payloads (raw stage/interaction/audit blobs) have no other schema home
+/// whatever the column name. The writer below binds ids/enums only, so this
+/// type fence plus the shared allowlist above is what makes the privacy
+/// tripwire fail on a scratch `raw_payload JSONB` migration while the sibling
+/// S2 `roles` column passes.
 async fn assert_no_free_form_types(pool: &PgPool) {
     let types: Vec<(String, String)> = sqlx::query_as(
         "SELECT column_name, data_type FROM information_schema.columns
@@ -446,6 +452,13 @@ async fn assert_no_free_form_types(pool: &PgPool) {
     .await
     .expect("event_store column types readable");
     for (column, data_type) in &types {
+        if column == "roles" {
+            assert_eq!(
+                data_type, "jsonb",
+                "reviewed roles column keeps its jsonb role-id array type"
+            );
+            continue;
+        }
         assert!(
             data_type != "json" && data_type != "jsonb",
             "privacy fence: no free-form {column} {data_type} column; ids+enums only"
