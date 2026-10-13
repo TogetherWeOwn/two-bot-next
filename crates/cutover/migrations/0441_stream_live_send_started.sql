@@ -1,0 +1,36 @@
+-- 0441_stream_live_send_started: fence ambiguous Discord sends for stale-claim recovery.
+--
+-- `stream_live_claims` (0440) never expires, so a crash after `claim_live`
+-- but before the Discord POST suppresses EventSub retries forever. Recovery
+-- must reclaim provably-unsent claims without double-posting a send that may
+-- already have reached Discord while `mark_live_delivered` failed. The two
+-- outcomes are indistinguishable from `delivered_at IS NULL` alone, and
+-- `release_live` deletes any unstamped row, so bulk-deleting stale
+-- unstamped rows is forbidden.
+--
+-- This migration adds `send_started_at`, committed by the receiver BEFORE
+-- the first Discord POST (`mark_live_send_started`, mirroring
+-- `automod_delivery_claims.mutation_started`: no lease automatically retries
+-- a mutation whose Discord outcome is uncertain). State machine:
+-- claimed (`send_started_at IS NULL`, `delivered_at IS NULL`) -> sending
+-- (`send_started_at NOT NULL`) -> delivered (`delivered_at NOT NULL`).
+-- Stale takeover (`reclaim_stale_live`) only rewrites claimed rows whose
+-- `claimed_at` is older than the bounded lease (300 s, see
+-- `STALE_CLAIM_LEASE_SECS`): atomic single-statement UPDATE with
+-- `delivered_at IS NULL AND send_started_at IS NULL`, so concurrent retries
+-- cannot both win and delivered/ambiguous rows are never reclaimed.
+-- `release_live` keeps its shape for the same-process provably-unsent path
+-- (`SendFailed` disposition) and must never be used as stale recovery.
+-- One-row-per-go-live retention is unchanged: delivered rows are kept
+-- indefinitely as dedup fences; this slice adds no purge.
+-- No member identity (same shape as 0440), so the member erasure plan needs
+-- no entry. Additive only: one nullable column, no backfill (existing rows
+-- stay NULL = never-started, hence reclaimable once stale, matching their
+-- pre-recovery meaning). `IF NOT EXISTS` throughout, matching the S6
+-- convention. Rollback is `ALTER TABLE stream_live_claims DROP COLUMN IF
+-- EXISTS send_started_at` (in-flight sending markers are lost; delivered
+-- fences survive).
+-- Bot schema range: 0001-0999. Database tests use test containers only.
+
+ALTER TABLE IF EXISTS stream_live_claims
+    ADD COLUMN IF NOT EXISTS send_started_at TIMESTAMPTZ;

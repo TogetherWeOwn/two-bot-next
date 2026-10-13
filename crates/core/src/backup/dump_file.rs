@@ -119,7 +119,7 @@ pub const DUMP_TABLES: &[&str] = &[
     "internal_action_log",
     "internal_discord_events",
     "internal_event_keys",
-    // Stream go-live dedup ledger (0440, v8): one row per go-live, no
+    // Stream go-live dedup ledger (0440-0441, v8): one row per go-live, no
     // foreign keys, so order among the internal tables is free; see
     // [`V8_ADDED_TABLES`].
     "stream_live_claims",
@@ -210,7 +210,7 @@ pub const V7_ADDED_TABLES: &[&str] = &[
     "retention_deletion_requests",
 ];
 
-/// Tables first covered by v8 (stream go-live dedup ledger, migration 0440).
+/// Tables first covered by v8 (stream go-live dedup ledger, migrations 0440-0441).
 /// A v7 or older archive predates claim rows and need not declare them; v8
 /// archives must cover the full inventory, so recovery points written before
 /// the ledger stay readable without waiving arbitrary missing tables. Restore
@@ -1030,7 +1030,7 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
     // projection (0100, v7), the event store (0427 voice plus 0428
     // presence plus 0429 thread lifecycle plus 0430 message/reaction plus
     // 0431 stage/interaction/audit capture plus 0432 member capture, v6)
-    // and the stream go-live ledger (0440, v8) too; v7 recovery points remain
+    // and the stream go-live ledger (0440-0441, v8) too; v7 recovery points remain
     // readable without the ledger, v6 ones without the ledger and the v7
     // seasonal projection and retention queues, v5 ones without those and the
     // v6 event store, and v4 ones without any of the v5/v6/v7/v8 additions.
@@ -2095,7 +2095,7 @@ mod tests {
                 .filter(|t| t.get("name").and_then(Value::as_str) != Some(name))
                 .collect()
         }
-        // A v7 recovery point written before the stream go-live ledger (0440)
+        // A v7 recovery point written before the stream go-live ledger (0440-0441)
         // declares every covered table except stream_live_claims and stays
         // readable; promoting it to v8 without the table is refused. This is
         // the frozen-manifest guard for the v8 bump: building the old manifest

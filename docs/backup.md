@@ -75,7 +75,7 @@ invite/scheduled-event capture)
 (`event_store`: 0427 voice, 0428 presence, 0429 thread lifecycle, 0430
 message/reaction capture, 0431 stage/interaction-observe/audit-log capture
 plus 0432 member-capture deltas plus 0439 invite/scheduled-event capture)
-and the stream go-live ledger (`stream_live_claims`: 0440).
+and the stream go-live ledger (`stream_live_claims`: 0440-0441).
 `OPTIONAL_LEGACY_TABLES` is empty: the coverage
 test fails if a covered table is not migrated. A dump from a fresh Rust schema
 has 94 table entries. A missing current table refuses a dump/restore: migrate
@@ -86,9 +86,9 @@ A v4 archive must declare every covered table except the ones v5 added
 capture, 0431 stage/interaction-observe/audit-log capture and 0432 member
 deltas), the ones v7 added (`V7_ADDED_TABLES`: seasonal XP projection
 0100 plus retention queues 0438) and the one v8 added (`V8_ADDED_TABLES`:
-stream go-live ledger 0440), so recovery points written before
+stream go-live ledger 0440-0441), so recovery points written before
 create-reservation persistence, event-store capture, the seasonal XP
-projection (0100), the retention queues (0438) and the stream ledger (0440)
+projection (0100), the retention queues (0438) and the stream ledger (0440-0441)
 remain inspectable and restorable.
 A v4 archive written before any other table joined the inventory is refused at
 inspect ("manifest is missing tables"); take a fresh dump after upgrading. V5
@@ -97,7 +97,7 @@ requires everything except `V6_ADDED_TABLES`, `V7_ADDED_TABLES` and
 (0427 voice, 0428 presence, 0429 thread lifecycle, 0430 message/reaction
 capture, 0431 stage/interaction-observe/audit-log capture, 0432 member deltas
 and 0439 invite/scheduled-event capture), before the seasonal XP projection
-(0100) and retention queues (0438) and before the stream ledger (0440) stay
+(0100) and retention queues (0438) and before the stream ledger (0440-0441) stay
 readable; V6 requires everything except `V7_ADDED_TABLES` and
 `V8_ADDED_TABLES`, so recovery points written before the seasonal XP
 projection, the retention queues and the stream ledger stay readable; V7

@@ -9,12 +9,17 @@
 //! that sender, so the no-ping guarantee is a receiver contract, not verified
 //! behavior. On a provable send failure release the claim and answer 5xx so
 //! Twitch retries; a retry of any existing claim is acknowledged with 2xx and
-//! skipped. Claims do not expire, so the receiver must add stale-claim
-//! recovery before wiring this core path into the runtime.
+//! skipped. Never-started claims expire on a bounded lease
+//! (`STALE_CLAIM_LEASE_SECS`, 300 s) via atomic stale takeover; started and
+//! delivered rows never expire and are never reclaimed.
 //!
 //! [`disposition`] is the table the receiver executes; every row is pinned
-//! below. The async glue (claim → post → stamp-or-release) belongs with the
-//! receiver, which is not implemented in this slice.
+//! below. The async glue (claim → start → post → stamp-or-release, with
+//! stale takeover of never-started claims via
+//! [`crate::stream_live_store::reclaim_stale_live`]) belongs with the
+//! receiver, which is not implemented in this slice. The receiver MUST call
+//! `mark_live_send_started` before the first Discord POST so an ambiguous
+//! send (posted but unstamped) stays fenced as `Duplicate` forever.
 
 /// What one pipeline stage decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

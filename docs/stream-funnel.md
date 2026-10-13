@@ -107,18 +107,23 @@ receiver yet.
 - One `stream_live_claims` row per go-live, keyed by `live_dedup_key`.
   `claim_live` inserts with `ON CONFLICT DO NOTHING`: the inserter owns
   the post, while any existing claim is acknowledged with 2xx and skipped.
-- Claims have no expiry. A receiver crash after claiming but before sending
-  leaves an unposted row that suppresses Twitch retries indefinitely. The
-  receiver MUST add stale-claim recovery before wiring `claim_live` into the
-  runtime; this ledger alone is not a complete delivery/recovery protocol.
+- Crash recovery is a bounded lease over never-started claims only
+  (migration 0441, `send_started_at`, `STALE_CLAIM_LEASE_SECS = 300 s`).
+  The receiver MUST call `mark_live_send_started` before the first Discord
+  POST; `reclaim_stale_live` atomically takes over one stale row with
+  `delivered_at IS NULL AND send_started_at IS NULL` and restarts its
+  `claimed_at` lease, so concurrent retries cannot both win. A crash before
+  send recovers on the next stale retry; the route stays dark until a
+  receiver wires this flow.
 - A Discord send may succeed while `mark_live_delivered` fails. The claim can
-  then remain `delivered_at IS NULL`; `release_live` deletes the targeted row
-  only when it is unstamped. Stale-claim recovery MUST NOT treat every stale
-  null-stamp row as unsent. It must preserve or distinguish deliveries that
-  may already have reached Discord, or a retry can double-post.
+  then remain `delivered_at IS NULL` with `send_started_at NOT NULL`;
+  `release_live` deletes the targeted row only when it is unstamped, so it
+  must never be used as stale recovery. Started and delivered rows are never
+  reclaimed, even when stale, or a retry can double-post a delivery that may
+  already have reached Discord.
 - Delivered rows are retained indefinitely as dedup fences. This slice adds no
-  purge or retention policy; runtime wiring needs an explicit storage policy
-  that does not discard an active go-live's dedup fence.
+  purge; the retained policy is one row per go-live, kept forever, which never
+  weakens the active dedup fence.
 - The receiver MUST post with `allowed_mentions: { parse: [] }`. No sender
   exists in this slice, so that no-ping contract has not been runtime-verified.
 - A send that provably never reached Discord deletes its unposted row

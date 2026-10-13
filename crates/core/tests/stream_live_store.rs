@@ -83,20 +83,41 @@ async fn setup() -> (Pool<Postgres>, String) {
         .unwrap();
     pool.close().await;
     let pool = connect(&schema).await;
-    // The ledger migration is `IF NOT EXISTS` throughout: run it twice to
-    // prove re-runnability inside one schema.
-    sqlx::raw_sql(include_str!(
-        "../../cutover/migrations/0440_stream_live_claims.sql"
-    ))
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::raw_sql(include_str!(
-        "../../cutover/migrations/0440_stream_live_claims.sql"
-    ))
-    .execute(&pool)
-    .await
-    .unwrap();
+    // The ledger migrations are `IF NOT EXISTS` throughout: run each twice
+    // to prove re-runnability inside one schema.
+    for migration in [
+        "../../cutover/migrations/0440_stream_live_claims.sql",
+        "../../cutover/migrations/0441_stream_live_send_started.sql",
+    ] {
+        // `include_str!` needs a literal path, so match the two known files.
+        if migration.ends_with("0440_stream_live_claims.sql") {
+            sqlx::raw_sql(include_str!(
+                "../../cutover/migrations/0440_stream_live_claims.sql"
+            ))
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::raw_sql(include_str!(
+                "../../cutover/migrations/0440_stream_live_claims.sql"
+            ))
+            .execute(&pool)
+            .await
+            .unwrap();
+        } else {
+            sqlx::raw_sql(include_str!(
+                "../../cutover/migrations/0441_stream_live_send_started.sql"
+            ))
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::raw_sql(include_str!(
+                "../../cutover/migrations/0441_stream_live_send_started.sql"
+            ))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    }
     (pool, schema)
 }
 
@@ -174,9 +195,113 @@ async fn failed_send_releases_the_claim_for_the_retry() {
     cleanup(pool, &schema).await;
 }
 
+async fn age_claim(pool: &Pool<Postgres>, key: &str, seconds_ago: i64) {
+    sqlx::query(
+        "UPDATE stream_live_claims SET claimed_at = clock_timestamp() - make_interval(secs => $2) WHERE dedup_key = $1",
+    )
+    .bind(key)
+    .bind(seconds_ago as f64)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 #[ignore = "needs the disposable agent-testdb container"]
-async fn delivered_rows_are_never_released() {
+async fn fresh_claim_cannot_be_reclaimed() {
+    let (pool, schema) = setup().await;
+    let key = format!("{:064x}", 0x51e551u64);
+    assert_eq!(
+        claim_live(&pool, &claim(&key)).await.expect("claim"),
+        ClaimOutcome::Claimed
+    );
+    // Fresh (unexpired) unposted claim: concurrent retry stays Duplicate.
+    assert_eq!(
+        reclaim_stale_live(&pool, &claim(&key), STALE_CLAIM_LEASE_SECS)
+            .await
+            .expect("reclaim fresh"),
+        ClaimOutcome::Duplicate
+    );
+    assert_eq!(
+        claim_live(&pool, &claim(&key)).await.expect("retry"),
+        ClaimOutcome::Duplicate
+    );
+    cleanup(pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "needs the disposable agent-testdb container"]
+async fn stale_unposted_claim_is_taken_over_atomically() {
+    let (pool, schema) = setup().await;
+    let key = format!("{:064x}", 0x57a1eu64);
+    assert_eq!(
+        claim_live(&pool, &claim(&key)).await.expect("claim"),
+        ClaimOutcome::Claimed
+    );
+    age_claim(&pool, &key, STALE_CLAIM_LEASE_SECS + 60).await;
+    // Crash-before-send: never started, lease expired, so the retry owns it.
+    assert_eq!(
+        reclaim_stale_live(&pool, &claim(&key), STALE_CLAIM_LEASE_SECS)
+            .await
+            .expect("takeover"),
+        ClaimOutcome::Claimed
+    );
+    // Takeover refreshes the lease: an immediate second retry loses.
+    assert_eq!(
+        reclaim_stale_live(&pool, &claim(&key), STALE_CLAIM_LEASE_SECS)
+            .await
+            .expect("second reclaim"),
+        ClaimOutcome::Duplicate
+    );
+    assert_eq!(
+        claim_live(&pool, &claim(&key)).await.expect("retry"),
+        ClaimOutcome::Duplicate
+    );
+    // The new owner completes the normal path: start, then stamp.
+    assert!(mark_live_send_started(&pool, &key).await.expect("start"));
+    assert!(mark_live_delivered(&pool, &key, "100000000000000006")
+        .await
+        .expect("stamp"));
+    cleanup(pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "needs the disposable agent-testdb container"]
+async fn started_claim_is_never_reclaimed_even_when_stale() {
+    let (pool, schema) = setup().await;
+    let key = format!("{:064x}", 0x9ead1e55u64);
+    assert_eq!(
+        claim_live(&pool, &claim(&key)).await.expect("claim"),
+        ClaimOutcome::Claimed
+    );
+    assert!(mark_live_send_started(&pool, &key).await.expect("start"));
+    assert!(
+        !mark_live_send_started(&pool, &key).await.expect("restart"),
+        "send start must be idempotent"
+    );
+    // Send-succeeded/stamp-failed: Discord may already have the post, so
+    // ageing the row must NOT make it reclaimable.
+    age_claim(&pool, &key, STALE_CLAIM_LEASE_SECS + 3600).await;
+    assert_eq!(
+        reclaim_stale_live(&pool, &claim(&key), STALE_CLAIM_LEASE_SECS)
+            .await
+            .expect("reclaim started"),
+        ClaimOutcome::Duplicate
+    );
+    assert_eq!(
+        claim_live(&pool, &claim(&key)).await.expect("retry"),
+        ClaimOutcome::Duplicate
+    );
+    // The ambiguous row stays stampable by its owner; it never auto-frees.
+    assert!(mark_live_delivered(&pool, &key, "100000000000000006")
+        .await
+        .expect("late stamp"));
+    cleanup(pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "needs the disposable agent-testdb container"]
+async fn delivered_rows_are_never_reclaimed() {
     let (pool, schema) = setup().await;
     let key = format!("{:064x}", 0x9e17bfa9a053696fu64);
     assert_eq!(
@@ -199,6 +324,20 @@ async fn delivered_rows_are_never_released() {
             .await
             .expect("restamp"),
         "a delivered row must not restamp"
+    );
+    // Ageing a delivered fence must never make it reclaimable.
+    age_claim(&pool, &key, STALE_CLAIM_LEASE_SECS + 3600).await;
+    assert_eq!(
+        reclaim_stale_live(&pool, &claim(&key), STALE_CLAIM_LEASE_SECS)
+            .await
+            .expect("reclaim delivered"),
+        ClaimOutcome::Duplicate
+    );
+    assert!(
+        !mark_live_send_started(&pool, &key)
+            .await
+            .expect("start delivered"),
+        "a delivered row must not start sending"
     );
     cleanup(pool, &schema).await;
 }
