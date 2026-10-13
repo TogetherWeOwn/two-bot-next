@@ -1,4 +1,4 @@
-//! The v5 backup envelope (also reads v3/v4): manifest / rows / end marker, gzipped NDJSON.
+//! The v6 backup envelope (also reads v3/v4/v5): manifest / rows / end marker, gzipped NDJSON.
 //!
 //! Port of the file half of legacy `src/store/dump.ts`. The writer side lives
 //! in [`super::dump`]; everything here touches no database, so every refusal
