@@ -326,9 +326,19 @@ impl GameActivityCollector {
             Entry::Occupied(_) => {}
         }
         if !pending.is_empty() {
+            let pending_len = pending.len();
             let overflow = {
                 let buffer = inner.deltas.entry(guild).or_default();
                 buffer.extend(pending);
+                // Game-change close-out must sort before the change delta:
+                // stable sort keeps buffer order for equal timestamps, so
+                // [delta, syns] would interleave the new game between the
+                // old game's closing points and split it into floors.
+                // Rotate to [syns, delta] so sessionize closes old first.
+                let len = buffer.len();
+                if len >= pending_len + 1 {
+                    buffer[len - pending_len - 1..].rotate_left(1);
+                }
                 let overflow = buffer.len().saturating_sub(MAX_DELTAS_PER_GUILD);
                 if overflow > 0 {
                     buffer.drain(..overflow);
@@ -1481,11 +1491,12 @@ mod tests {
         collector.observe_join(7, 42, T0);
         collector.observe_leave(7, 42, T0 + MIN);
         let (deltas, spans) = collector.drain_guild_at(7, T0 + 30 * MIN);
-        // A newer arrival lands while the upsert is in flight.
-        collector.observe_presence(
-            7,
-            presence_delta(&update(json!([playing_activity("Zelda")])), T0 + 90 * MIN),
-        );
+        // A newer arrival lands while the upsert is in flight. Different
+        // member on purpose: a same-member Zelda would close Apex via the
+        // game-change path, while this test isolates requeue ordering.
+        let mut newer = presence_delta(&update(json!([playing_activity("Zelda")])), T0 + 90 * MIN);
+        newer.user_key = "99".to_owned();
+        collector.observe_presence(7, newer);
         collector.requeue(7, deltas, spans);
         let rows = collector.flush(7, 60 * MIN, T0 + 90 * MIN);
         assert_eq!(
