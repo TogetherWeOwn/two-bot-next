@@ -183,8 +183,7 @@ pub async fn run_retention(
             .await?;
             let mut deferred = 0u64;
             for (guild_id, user_id) in &pendings {
-                if crate::member_erasure::has_unresolved_guards(&mut *tx, guild_id, user_id).await?
-                {
+                if crate::member_erasure::has_unresolved_guards(&mut tx, guild_id, user_id).await? {
                     deferred += 1;
                 }
             }
@@ -485,7 +484,7 @@ async fn complete_request(
     // replay fences, leaving the request pending with no receipt. The caller
     // (single fulfilment or per-request savepoint) decides whether a refusal
     // is swallowed or fatal.
-    if !crate::member_erasure::schema_gaps(&mut *tx)
+    if !crate::member_erasure::schema_gaps(&mut tx)
         .await?
         .is_empty()
     {
@@ -493,7 +492,7 @@ async fn complete_request(
             "erasure schema coverage incomplete".into(),
         ));
     }
-    if crate::member_erasure::has_unresolved_guards(&mut *tx, guild_id, user_id).await? {
+    if crate::member_erasure::has_unresolved_guards(&mut tx, guild_id, user_id).await? {
         return Err(sqlx::Error::InvalidArgument(
             "unresolved erasure replay guard".into(),
         ));
