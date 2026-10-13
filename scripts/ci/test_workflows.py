@@ -41,6 +41,9 @@ JOB_INVENTORY = {
     "sbom.yml": {"image", "verify"},
     # Live staging voice synthetic (docs/voice-synthetic.md); pinned shape below.
     "voice-synthetic.yml": {"synthetic"},
+    # SDLC separation gate (org test-guard reusable, warn mode): one
+    # reusable call, least-privilege grant pinned below.
+    "test-guard.yml": {"test-guard"},
 }
 # Reusable-workflow calls are allowed only to these non-deploy workflows.
 # TOG-10893 registers the read-only sbom.yml calls alongside the benchmark one.
@@ -48,7 +51,9 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
                    ("check.yml", "supply-chain"): "./.github/workflows/sbom.yml",
                    ("release.yml", "release-sbom"): "./.github/workflows/sbom.yml",
                    # After every staging deploy; its failure fails deploy-staging (promotion gate).
-                   ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml"}
+                   ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml",
+                   # SDLC separation gate: org reusable, warn mode, pinned SHA.
+                   ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95"}
 # Main's runner routing (#265, 2026-10-02): the repo is public and the org's
 # self-hosted runner group refuses public repos, so every job routes through
 # one expression — public repo -> GitHub-hosted, private -> CI_OVERFLOW_* switch
@@ -1747,6 +1752,9 @@ class WorkflowTests(unittest.TestCase):
                 with self.subTest(workflow=name, job=job_id):
                     expected = {"contents": "read"}
                     if (name, job_id) == ("supply-chain.yml", "pr-lint"):
+                        expected["pull-requests"] = "read"
+                    elif (name, job_id) == ("test-guard.yml", "test-guard"):
+                        # Marker-label actor audit via the issue-events API.
                         expected["pull-requests"] = "read"
                     elif (name, job_id) in (("staging-migrate.yml", "apply"),
                                                  ("production-migrate.yml", "apply")):

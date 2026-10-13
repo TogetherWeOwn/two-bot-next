@@ -21,7 +21,7 @@ separate authorization.
    returning success alone does not prove recovery.
 
 All npm commands below run **from the repository root** and use the pinned
-Wrangler 4.148.0 through `wrangler/package.json`. Use only the already-authorized
+Wrangler 4.149.0 through `wrangler/package.json`. Use only the already-authorized
 Cloudflare connection. An authentication/permission failure is a stop: report
 it, do not try another credential, elevate access, or use a personal token.
 Examples target `staging`; do not substitute `production` without its own gate.
@@ -112,7 +112,7 @@ invocation, unsampled; production traces are off (`wrangler/wrangler.toml`).
 
 `logs` is **Worker/DO tail**, not Rust stdout. Stop it when the bounded incident
 observation is complete. For Rust stdout/stderr, use the affected container's
-logs in the Cloudflare dashboard. Wrangler 4.148.0 has no `containers logs`
+logs in the Cloudflare dashboard. Wrangler 4.149.0 has no `containers logs`
 subcommand; do not invent one. Container inspection may list account-wide
 resources: match the affected environment/application before taking any action.
 Container stdout is also in the Workers Observability `containers` dataset, which a
@@ -588,6 +588,32 @@ as `(ticket)` and supplies this runbook. Persist sanitized incident evidence and
 route a continuing dispatch problem to the on-call engineer through the normal
 triage path. No new webhook, production activation or live load test is authorized.
 
+### Event-store capture gaps and lag
+
+This is operator guidance, not a metrics alert: no rule in
+`wrangler/src/alert-rules.ts` watches this table, so nothing here fires or
+pages. The append-only capture table (`event_store`) only sees what the
+gateway received, so its gaps follow the gateway counters, not a separate
+store alert. A `two_bot_gateway_missed_events_total` increase between
+keepalive samples is a capture gap: those dispatches never arrived, RESUME
+does not replay them, and no backfill can reconstruct them. First response
+is the same as [gateway missed events](#alert-gateway-missed-events):
+scrape the authorized `/ops/metrics` path, compare the disconnect and
+recovery counters, correlate recent deploys, and do not restart the
+container to clear the counter.
+
+Capture lag is the spread between `received_at` and `event_time` per event
+family. No counter tracks it yet: lag is only detected by the read-only
+staging verify query ([event-store wiring
+note](event-store.md#staging-verify-steps-read-only)) until a slice ships a
+real counter and rule. A spread that stays above one keepalive window
+(about 60 s) across consecutive windows gets the same first response as a
+missed-events increase. Backfills and repairs against this table are
+insert-only with fresh dedup keys: never rewrite history with `UPDATE` or
+`DELETE`, and never replay an uncertain Discord effect from a capture row.
+Full wiring, fence and staging steps live in the [event-store wiring
+note](event-store.md).
+
 ## Persisted ownership control
 
 The Worker/DO fence is implemented, not implicitly released by deployment.
@@ -913,7 +939,7 @@ npm --prefix wrangler run deployments -- list --env staging
 ```
 
 Read the interactive target and confirm the incident's known-good version.
-Do not add `--yes` or override warnings. Wrangler 4.148 updates Durable Object
+Do not add `--yes` or override warnings. Wrangler 4.149 updates Durable Object
 code with `deferred` mode and a 300 s maximum delay by default, so a bare
 rollback can leave the old code serving for up to five minutes. For a manual
 incident rollback add `--durable-objects-code-update-mode immediate`, and expect
