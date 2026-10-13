@@ -9,8 +9,8 @@
 //! Containment (presence-probe precedent, `crate` core `presence`): the only
 //! output is guild-level aggregates keyed by (guild, game). No per-member
 //! row, no per-member reader, no publication. Buffers are in-memory and
-//! per-guild bounded; the hourly [`flush_loop`] persists each due guild
-//! through the opt-out gate ([`persist_guild`]) into the core store, with
+//! per-guild bounded; the hourly `flush_loop` persists each due guild
+//! through the opt-out gate (`persist_guild`) into the core store, with
 //! label-free count-only telemetry and no metric label.
 //!
 //! [`sessionize`]: two_bot_core::game_activity::sessionize
@@ -79,6 +79,8 @@ pub const MAX_SPANS_PER_GUILD: usize = 8_192;
 /// survives only for Twitch / YouTube. Activity-local timestamps are
 /// intentionally ignored: sessionization is poller-observation semantics, so
 /// `observed_at_ms` (the gateway receipt clock) is the observation time.
+///
+/// [`sessionize`]: game_activity::sessionize
 #[must_use]
 pub fn presence_delta(update: &PresenceUpdate, observed_at_ms: i64) -> PresenceDelta {
     PresenceDelta {
@@ -478,7 +480,7 @@ fn now_ms() -> i64 {
 
 /// Hourly per-guild persist loop for the voice runtime's collector.
 ///
-/// Wakes every [`FLUSH_POLL_INTERVAL`] and persists each guild due per
+/// Wakes every `FLUSH_POLL_INTERVAL` and persists each guild due per
 /// [`flush_due`]. Detached on purpose: the voice sink owns no shutdown
 /// handle, and each tick persists at most once per interval, so a deploy
 /// boundary at worst drops the current partial interval — the next tick
