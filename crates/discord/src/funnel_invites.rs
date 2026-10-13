@@ -5,8 +5,8 @@
 //! the replacement through [`ActionExecutor::create_permanent_invite`] and
 //! hands the old/new pair to the invite tracker's rotation; no campaign slot
 //! is added. [`ActionExecutor::check_vanity_url`] reports whether the guild
-//! can show a vanity URL at all — a refusal there is a capability gate, never
-//! a funnel failure.
+//! can show a vanity URL at all — the guild-side refusal (no vanity feature)
+//! is a capability gate, never a funnel failure; any other refusal fails.
 
 use twilight_http::request::Request;
 use twilight_http::routing::Route;
@@ -29,9 +29,10 @@ pub enum VanityStatus {
     Active { code: String },
     /// The read succeeded and no vanity code is set.
     Absent,
-    /// Discord refused the read (forbidden, unknown endpoint): this guild
-    /// cannot have a vanity URL. The check reports the gate; it never fails
-    /// the funnel.
+    /// Discord refused the read with code 50001 (Missing Access: the guild
+    /// has no vanity feature). The check reports the gate; it never fails
+    /// the funnel. Any other refusal (missing permission, unknown guild) is
+    /// a caller-side fault and fails as [`InviteActionError::Discord`].
     CapabilityGated,
 }
 
@@ -53,23 +54,27 @@ pub enum InviteActionError {
 impl ActionExecutor {
     /// Create a permanent invite in `channel_id`.
     ///
-    /// Sends `POST /channels/{channel_id}/invites` with an empty body (an
-    /// empty body is valid and requests Discord's defaults, which the caller
-    /// must still verify). A reply with `max_age` 0 and `max_uses` 0 reports
-    /// the code; any other expiry reports [`InviteActionError::NotPermanent`].
-    /// No automatic retry: an unreadable success keeps the execution fence
-    /// (fail closed), exactly like the scheduled-event executors.
+    /// Sends `POST /channels/{channel_id}/invites` with
+    /// `{max_age: 0, max_uses: 0, unique: true}` built through the twilight
+    /// request factory. Discord requires a JSON body and defaults an empty
+    /// one to a 24-hour expiry (`max_age` 86400, `unique` false), so an empty
+    /// body can never yield a permanent invite. A reply with `max_age` 0 and
+    /// `max_uses` 0 reports the code; any other expiry reports
+    /// [`InviteActionError::NotPermanent`]. No automatic retry: an unreadable
+    /// success keeps the execution fence (fail closed), exactly like the
+    /// scheduled-event executors.
     pub async fn create_permanent_invite(
         &self,
         channel_id: &str,
     ) -> Result<PermanentInvite, InviteActionError> {
         let channel = snowflake::<ChannelMarker>(channel_id)?;
-        let route = Route::CreateInvite {
-            channel_id: channel.get(),
-        };
-        let request = Request::builder(&route)
-            .build()
-            .map_err(|error| DiscordError::Rejected(format!("build: {error}")))?;
+        let request = Self::request_of(
+            self.request_factory()
+                .create_invite(channel)
+                .max_age(0)
+                .max_uses(0)
+                .unique(true),
+        )?;
         let mut response = self.call_once_raw(request, &[200, 201]).await?;
         let body: serde_json::Value = serde_json::from_slice(&response.body)
             .map_err(|_| InviteActionError::InvalidResponse)?;
@@ -93,10 +98,14 @@ impl ActionExecutor {
 
     /// Check the guild's vanity URL.
     ///
-    /// Sends `GET /guilds/{guild_id}/vanity-url`. A set code reports
-    /// [`VanityStatus::Active`], a null code reports [`VanityStatus::Absent`],
-    /// and a refusal (forbidden, unknown endpoint) reports
-    /// [`VanityStatus::CapabilityGated`] instead of failing.
+    /// Sends `GET /guilds/{guild_id}/vanity-url`, which requires
+    /// `MANAGE_GUILD`. A set code reports [`VanityStatus::Active`], a null
+    /// code reports [`VanityStatus::Absent`], and the guild-side refusal
+    /// (Discord code 50001: the guild has no vanity feature) reports
+    /// [`VanityStatus::CapabilityGated`] instead of failing. Any other
+    /// refusal — 50013 (the bot lacks `MANAGE_GUILD`), 10004 (unknown guild
+    /// or the bot was removed), or an unreadable refusal — is a fixable
+    /// caller-side problem and fails as [`InviteActionError::Discord`].
     pub async fn check_vanity_url(
         &self,
         guild_id: &str,
@@ -105,15 +114,30 @@ impl ActionExecutor {
         let route = Route::GetGuildVanityUrl {
             guild_id: guild.get(),
         };
-        // Forbidden and unknown-endpoint are accepted outcomes, not transport
-        // errors: they ARE the capability answer, so they consume completion
-        // like any validated read instead of holding the lane.
+        // Only the guild-side "no vanity feature" refusal is a capability
+        // answer that consumes completion like a validated read. Every other
+        // refusal is a fixable setup problem: it fails instead of reporting
+        // a silent gate, so a misconfigured bot is never mistaken for a
+        // guild that cannot have a vanity URL.
         let mut response = self
             .call_once_raw(Request::from_route(&route), &[200, 403, 404])
             .await?;
         if response.status == 403 || response.status == 404 {
+            let discord_code = serde_json::from_slice::<serde_json::Value>(&response.body)
+                .ok()
+                .and_then(|body| body.get("code").and_then(serde_json::Value::as_i64));
             response.complete().await;
-            return Ok(VanityStatus::CapabilityGated);
+            if discord_code == Some(50001) {
+                return Ok(VanityStatus::CapabilityGated);
+            }
+            let detail = match discord_code {
+                Some(code) => format!(
+                    "vanity URL refused: HTTP {} Discord code {code}",
+                    response.status
+                ),
+                None => format!("vanity URL refused: HTTP {}", response.status),
+            };
+            return Err(InviteActionError::Discord(DiscordError::Rejected(detail)));
         }
         let body: serde_json::Value = serde_json::from_slice(&response.body)
             .map_err(|_| InviteActionError::InvalidResponse)?;

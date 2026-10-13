@@ -21,9 +21,13 @@
 //! * On `ActionExecutor`:
 //!   * `pub async fn create_permanent_invite(
 //!       &self, channel_id: &str) -> Result<PermanentInvite, InviteActionError>`:
-//!     `POST /channels/{channel_id}/invites` with an empty body; a reply with
+//!     `POST /channels/{channel_id}/invites` with
+//!     `{max_age: 0, max_uses: 0, unique: true}` (Discord requires a JSON
+//!     body and defaults an empty one to a 24-hour expiry, so only an
+//!     explicit permanent body yields a permanent invite); a reply with
 //!     `max_age` 0 and `max_uses` 0 reports the code, any other expiry
-//!     reports `NotPermanent`.
+//!     reports `NotPermanent`. (Review amendment on PR #936: the empty-body
+//!     contract could never succeed against real Discord.)
 //!   * `pub async fn check_vanity_url(
 //!       &self, guild_id: &str) -> Result<VanityStatus, InviteActionError>`:
 //!     `GET /guilds/{guild_id}/vanity-url`; a set code reports `Active`, a
@@ -232,7 +236,7 @@ fn json_script(status: u16, body: serde_json::Value) -> Scripted {
 }
 
 #[tokio::test]
-async fn create_permanent_invite_posts_an_empty_body_and_reports_the_code() {
+async fn create_permanent_invite_posts_a_permanent_body_and_reports_the_code() {
     let loopback = Loopback::start(vec![
         json_script(
             200,
@@ -267,9 +271,14 @@ async fn create_permanent_invite_posts_an_empty_body_and_reports_the_code() {
             "unexpected invite path: {}",
             request.path
         );
-        assert!(
-            request.body.is_empty(),
-            "permanent invites post an empty body"
+        let body: serde_json::Value = match serde_json::from_slice(&request.body) {
+            Ok(body) => body,
+            Err(_) => panic!("permanent invites post a JSON body"),
+        };
+        assert_eq!(
+            body,
+            serde_json::json!({"max_age": 0, "max_uses": 0, "unique": true}),
+            "permanent invites request a never-expiring unique invite"
         );
     }
 }

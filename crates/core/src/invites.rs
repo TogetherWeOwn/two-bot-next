@@ -374,6 +374,13 @@ impl<S: InviteSnapshotStore> InviteTracker<S> {
         new_code: &str,
     ) -> Option<InviteState> {
         let current = self.store.load(guild_id);
+        // A rotation that hands back the same code (Discord reusing an invite
+        // when `unique` is false) must not zero the live row: the next full
+        // diff would count the whole history as growth and misattribute a
+        // join. Returning the stored row unchanged keeps attribution.
+        if old_code == new_code {
+            return current.into_iter().find(|state| state.code == old_code);
+        }
         let old = current.iter().find(|state| state.code == old_code)?.clone();
         let rotated = InviteState {
             code: new_code.to_owned(),
@@ -504,6 +511,17 @@ mod tests {
         assert!(grew.is_empty());
         let grew = t.diff_and_store(1, &[state("a", 6), state("new", 9)]);
         assert!(grew.is_empty());
+    }
+
+    #[test]
+    fn rotate_same_code_keeps_row_and_uses() {
+        let t = InviteTracker::new(MemSnapshots::new());
+        t.diff_and_store(1, &[state("a", 5)]);
+        // Same-code rotation stores nothing and keeps the live uses: the next
+        // full diff credits only real growth instead of the whole history.
+        assert_eq!(t.rotate_code(1, "a", "a"), Some(state("a", 5)));
+        assert!(t.diff_and_store(1, &[state("a", 5)]).is_empty());
+        assert_eq!(t.rotate_code(1, "missing", "missing"), None);
     }
 
     #[test]
