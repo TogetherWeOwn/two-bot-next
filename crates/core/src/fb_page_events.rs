@@ -303,12 +303,26 @@ impl IdempotencyMap {
         Self::default()
     }
 
+    /// Returns the mapped FB URL, if any. An empty stored value is treated
+    /// as unmapped so every caller (`plan_actions`, `execute`,
+    /// `change_kind_for` via the map) shares one empty-URL rule (control 4).
+    /// Empty values only arise from a buggy driver or a corrupted persisted
+    /// map; [`IdempotencyMap::record`] refuses them and an empty
+    /// `create_event_full` result is treated as a driver failure.
     #[must_use]
     pub fn lookup(&self, discord_event_id: &str) -> Option<String> {
-        self.inner.get(discord_event_id).cloned()
+        self.inner
+            .get(discord_event_id)
+            .filter(|url| !url.is_empty())
+            .cloned()
     }
 
+    /// Record a verified or unverified FB URL. Empty URLs are refused (no
+    /// insert) so one bad create can never poison later update/delete calls.
     pub fn record(&mut self, discord_event_id: &str, fb_url: &str) {
+        if fb_url.is_empty() {
+            return;
+        }
         self.inner
             .insert(discord_event_id.to_owned(), fb_url.to_owned());
     }
@@ -420,7 +434,9 @@ pub fn plan_actions(
     let id = latest.discord_event.id.clone();
     let action = match latest.change {
         ChangeKind::Created => match known.lookup(&id) {
-            Some(fb_url) if !fb_url.is_empty() => PlannedAction::Update {
+            // `lookup` never returns an empty URL (see `IdempotencyMap`), so
+            // any known value plans an update, never a second create.
+            Some(fb_url) => PlannedAction::Update {
                 discord_event_id: id,
                 fb_url,
             },
@@ -638,14 +654,15 @@ fn execute<D: BrowserDriver, A: AuditSink, N: NotifySink>(
             // must not mint a second FB event and orphan the first
             // (control 4). Mirror the `Updated`-without-mapping heal-forward
             // below by re-dispatching as `Updated` when a URL is known.
-            if let Some(known_url) = pages.lookup(&event_id) {
-                if !known_url.is_empty() {
-                    let updated = RunRequest {
-                        discord_event: request.discord_event.clone(),
-                        change: ChangeKind::Updated,
-                    };
-                    return execute(driver, pages, audit, notify, &updated);
-                }
+            // `lookup` filters empty values, so any known URL redispatches
+            // as `Updated`; an empty/corrupted entry behaves as unmapped and
+            // heals through the create path below.
+            if pages.lookup(&event_id).is_some() {
+                let updated = RunRequest {
+                    discord_event: request.discord_event.clone(),
+                    change: ChangeKind::Updated,
+                };
+                return execute(driver, pages, audit, notify, &updated);
             }
             let fb_url = match driver.create_event_full(&draft) {
                 Ok(url) => url,
@@ -656,6 +673,12 @@ fn execute<D: BrowserDriver, A: AuditSink, N: NotifySink>(
                     return fallback_after_create_failure(driver, audit, notify, &draft);
                 }
             };
+            // A driver that reports success with an empty URL created nothing
+            // addressable: never store it, and fall back honestly instead of
+            // reporting `Created { url: "" }` and poisoning the map.
+            if fb_url.is_empty() {
+                return fallback_after_create_failure(driver, audit, notify, &draft);
+            }
             let shot = driver.screenshot_png();
             match driver.readback_event(&fb_url) {
                 Some(observed) if observed.url == fb_url && readback_matches(&draft, &observed) => {
@@ -1428,7 +1451,14 @@ mod tests {
         assert!(matches!(outcome, RunOutcome::Created { .. }));
         let rows = fake.rows();
         assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].action, "fb_page_event_create");
+        assert_eq!(rows[0].target_key, "event-1");
         assert_eq!(rows[0].outcome, "created");
+        assert_eq!(
+            rows[0].fb_url.as_deref(),
+            Some(TEST_PAGE_URL),
+            "the created row records the event URL"
+        );
         assert!(
             rows[0]
                 .screenshot_png
@@ -1445,7 +1475,14 @@ mod tests {
         assert!(matches!(outcome, RunOutcome::Updated { .. }));
         let rows = fake.rows();
         assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].action, "fb_page_event_update");
+        assert_eq!(rows[0].target_key, "event-1");
         assert_eq!(rows[0].outcome, "updated");
+        assert_eq!(
+            rows[0].fb_url.as_deref(),
+            Some(TEST_PAGE_URL),
+            "the updated row records the event URL"
+        );
         assert!(
             rows[0]
                 .screenshot_png
@@ -1462,7 +1499,14 @@ mod tests {
         assert!(matches!(outcome, RunOutcome::Deleted));
         let rows = fake.rows();
         assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].action, "fb_page_event_delete");
+        assert_eq!(rows[0].target_key, "event-1");
         assert_eq!(rows[0].outcome, "deleted");
+        assert_eq!(
+            rows[0].fb_url.as_deref(),
+            Some(TEST_PAGE_URL),
+            "the deleted row records the event URL"
+        );
         assert!(
             rows[0]
                 .screenshot_png
@@ -1483,6 +1527,7 @@ mod tests {
         assert!(matches!(outcome, RunOutcome::DeleteFailed { .. }));
         let rows = fake.rows();
         assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].action, "fb_page_event_delete");
         assert_eq!(rows[0].outcome, "delete_failed_driver_error");
         assert_eq!(rows[0].fb_url.as_deref(), Some(TEST_PAGE_URL));
         assert!(
@@ -1492,6 +1537,32 @@ mod tests {
                 .is_some_and(|png| !png.is_empty()),
             "the delete-failed row carries screenshot evidence"
         );
+
+        // No-mapping delete: the noop outcome label is pinned.
+        let fake = Fake::default();
+        let mut pages = IdempotencyMap::new();
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Cancelled).expect("noop runs");
+        assert!(matches!(outcome, RunOutcome::Deleted));
+        let rows = fake.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].action, "fb_page_event_delete");
+        assert_eq!(rows[0].outcome, "deleted_noop_no_mapping");
+        assert_eq!(rows[0].fb_url, None);
+
+        // Update-failure fallback: the prior row carries the update action
+        // label, not the create one.
+        let fake = Fake::default();
+        fake.edit(|inner| {
+            inner.update = Err(DriverError::Failed("no update".to_owned()));
+        });
+        let mut pages = IdempotencyMap::new();
+        pages.record("event-1", TEST_PAGE_URL);
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Updated).expect("fallback runs");
+        assert!(matches!(outcome, RunOutcome::LinkPostFallback { .. }));
+        let rows = fake.rows();
+        assert_eq!(rows.len(), 2, "prior row + link-post row: {rows:?}");
+        assert_eq!(rows[0].action, "fb_page_event_update");
+        assert_eq!(rows[0].outcome, "update_failed_driver_error");
     }
 
     #[test]
@@ -1914,6 +1985,131 @@ mod tests {
             Some(TEST_PAGE_URL),
             "the unverified event stays mapped"
         );
+    }
+
+    #[test]
+    fn verified_create_writes_mapping_so_redelivery_updates() {
+        let fake = Fake::default();
+        let secrets = FakeSecrets::default();
+        let mut pages = IdempotencyMap::new();
+
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Created).expect("create runs");
+        assert!(
+            matches!(outcome, RunOutcome::Created { .. }),
+            "verified create reports Created: {outcome:?}"
+        );
+        assert_eq!(
+            pages.lookup("event-1").as_deref(),
+            Some(TEST_PAGE_URL),
+            "a verified create must remember the event URL (idempotency map)"
+        );
+
+        // Redeliver the same Created: the map is authoritative, so it must
+        // update in place instead of minting a second FB event.
+        let outcome =
+            run(&fake, &secrets, &mut pages, ChangeKind::Created).expect("redelivery runs");
+        assert!(
+            matches!(outcome, RunOutcome::Updated { .. }),
+            "a redelivered Created for a mapped event must update: {outcome:?}"
+        );
+        assert_eq!(
+            fake.full_creates().len(),
+            1,
+            "exactly the first create ran; the redelivery must not create again"
+        );
+        assert_eq!(
+            fake.full_updates().len(),
+            1,
+            "the redelivery updates the mapped event in place"
+        );
+        assert_eq!(
+            pages.lookup("event-1").as_deref(),
+            Some(TEST_PAGE_URL),
+            "the mapping is unchanged by the redelivery"
+        );
+    }
+
+    #[test]
+    fn empty_url_is_treated_as_unmapped_everywhere() {
+        // `record` refuses empty URLs so a bad create can never poison the map.
+        let mut pages = IdempotencyMap::new();
+        pages.record("event-1", "");
+        assert_eq!(
+            pages.lookup("event-1"),
+            None,
+            "an empty stored URL reads back as unmapped"
+        );
+        assert!(
+            pages.is_empty(),
+            "refused entries leave no residue in the map"
+        );
+
+        // Planning + classification treat it as unmapped.
+        assert_eq!(
+            change_kind_for(EventStatus::Scheduled, Some("")),
+            ChangeKind::Created,
+            "an empty known URL classifies as Created"
+        );
+        let planned = plan_actions(
+            &[RunRequest {
+                discord_event: scheduled("event-1"),
+                change: ChangeKind::Created,
+            }],
+            &pages,
+        )
+        .expect("plannable");
+        assert!(
+            matches!(planned[0], PlannedAction::Create { .. }),
+            "an empty mapping still plans a create: {:?}",
+            planned[0]
+        );
+
+        // A driver that reports success with an empty URL falls back honestly
+        // and leaves the map empty (no poisoning for later calls).
+        let fake = Fake::default();
+        fake.edit(|inner| {
+            inner.create = Ok(String::new());
+        });
+        let secrets = FakeSecrets::default();
+        let mut pages = IdempotencyMap::new();
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Created).expect("fallback runs");
+        assert!(
+            matches!(
+                outcome,
+                RunOutcome::LinkPostFallback { .. } | RunOutcome::FallbackFailed { .. }
+            ),
+            "an empty create URL must never verify as Created: {outcome:?}"
+        );
+        assert_eq!(
+            pages.lookup("event-1"),
+            None,
+            "the empty URL is never stored"
+        );
+
+        // With no mapping, an update heals forward and a cancel is a noop —
+        // neither calls the driver with an empty URL.
+        let fake = Fake::default();
+        let mut pages = IdempotencyMap::new();
+        pages.record("event-1", "");
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Updated).expect("heal runs");
+        assert!(
+            matches!(outcome, RunOutcome::Created { .. }),
+            "an update with an empty mapping heals forward to create: {outcome:?}"
+        );
+        assert_eq!(
+            fake.full_updates().len(),
+            0,
+            "no update may run against an empty URL"
+        );
+
+        let fake = Fake::default();
+        let mut pages = IdempotencyMap::new();
+        pages.record("event-1", "");
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Cancelled).expect("noop runs");
+        assert!(matches!(outcome, RunOutcome::Deleted));
+        let rows = fake.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, "deleted_noop_no_mapping");
     }
 
     #[test]
