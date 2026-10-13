@@ -80,6 +80,10 @@ pub const DUMP_TABLES: &[&str] = &[
     "guild_analytics_settings",
     "privacy_opt_out_audit",
     "member_levels",
+    // Seasonal XP projection (0100): append-only mirror of lifetime XP per
+    // quarter, guild-keyed with no foreign keys, so order beside
+    // member_levels is free.
+    "member_season_xp",
     "xp_awards",
     "level_role_rewards",
     "level_import_runs",
@@ -143,7 +147,9 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_command_role_members",
     // V4 vote-kick audit trail (0417): append-only, guild-keyed, no foreign keys.
     "voice_vote_kick_audit",
-    // V5 adds accepted-create history; see [`V5_ADDED_TABLES`].
+    // V5 adds accepted-create history; see [`V5_ADDED_TABLES`]. The seasonal
+    // XP projection beside `member_levels` is a v7 addition; see
+    // [`V7_ADDED_TABLES`].
     "voice_create_reservations",
     // V6 adds retention queues (0435) and the shared event-store table for the
     // S1-S8 slices (0427 S4 voice capture plus 0428 S3 presence plus 0429 S6
@@ -163,8 +169,8 @@ pub const DUMP_TABLES: &[&str] = &[
 
 /// Tables first covered by v5. A v4 archive predates them and need not declare
 /// them; every other covered table is still required, so a v4 recovery point
-/// written before create-reservation persistence stays readable without
-/// waiving arbitrary missing tables. The privacy opt-out control plane
+/// written before create-reservation persistence (0422) stays readable
+/// without waiving arbitrary missing tables. The privacy opt-out control plane
 /// (0433/0434) is v5 for the same reason: v4 archives predate suppression
 /// tombstones, toggle rows and opt-out receipts.
 pub const V5_ADDED_TABLES: &[&str] = &[
@@ -188,6 +194,12 @@ pub const V6_ADDED_TABLES: &[&str] = &[
     "retention_deletion_requests",
     "event_store",
 ];
+
+/// Tables first covered by v7. A v4, v5 or v6 archive predates them and need
+/// not declare them; v7 archives must cover the full inventory, so recovery
+/// points written before the seasonal XP projection (0100) stay readable
+/// without waiving arbitrary missing tables.
+pub const V7_ADDED_TABLES: &[&str] = &["member_season_xp"];
 
 /// Covered tables not created by the current cutover migration set, if any.
 /// Keep legacy data when such tables exist, but do not require nonexistent
@@ -247,8 +259,8 @@ pub fn is_destination_owned(table: &str, column: &str) -> bool {
         .any(|(owned_table, owned_column)| *owned_table == table && *owned_column == column)
 }
 
-/// Write complete v6 coverage; the reader also accepts frozen v3/v4 and v5 coverage.
-pub const DUMP_VERSION: u32 = 6;
+/// Write complete v7 coverage; the reader also accepts frozen v3/v4/v5/v6 coverage.
+pub const DUMP_VERSION: u32 = 7;
 
 /// A table name in the dump, validated against [`DUMP_TABLES`].
 pub type DumpTable = String;
@@ -775,10 +787,11 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                 if version != 3
                     && version != 4
                     && version != 5
+                    && version != 6
                     && version != u64::from(DUMP_VERSION)
                 {
                     return Err(refuse(format!(
-                        "dump version {version}, this build reads 3, 4, 5 and {DUMP_VERSION}"
+                        "dump version {version}, this build reads 3, 4, 5, 6 and {DUMP_VERSION}"
                     )));
                 }
                 retain_within_cap(&mut retained, &obj, limits.retained)?;
@@ -980,12 +993,13 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             .ok_or_else(|| refuse(format!("manifest table {name} has an invalid row count")))?;
         let _ = count;
     }
-    // Historical inventories are pinned by fixtures. New v6 archives must cover
-    // reservations, retention queues and the event store (0427 voice plus
-    // 0428 presence plus 0429 thread lifecycle plus 0430 message/reaction
-    // plus 0431 stage/interaction/audit capture plus 0432 member capture)
-    // too; v5 recovery points remain readable without the v6 tables, and v4
-    // ones without reservations either.
+    // Historical inventories are pinned by fixtures. New v7 archives must cover
+    // reservations, the retention queues, the seasonal XP projection (0100)
+    // and the event store (0427 voice plus 0428 presence plus 0429 thread
+    // lifecycle plus 0430 message/reaction plus 0431 stage/interaction/audit
+    // capture plus 0432 member capture) too; v6 recovery points remain
+    // readable without the seasonal projection, v5 ones without it and the
+    // v6 tables, and v4 ones without any of the three additions.
     let version = obj.get("version").and_then(Value::as_u64);
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
@@ -996,9 +1010,15 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             Some(4) => {
                 !V5_ADDED_TABLES.contains(name)
                     && !V6_ADDED_TABLES.contains(name)
+                    && !V7_ADDED_TABLES.contains(name)
                     && !OPTIONAL_LEGACY_TABLES.contains(name)
             }
-            Some(5) => !V6_ADDED_TABLES.contains(name) && !OPTIONAL_LEGACY_TABLES.contains(name),
+            Some(5) => {
+                !V6_ADDED_TABLES.contains(name)
+                    && !V7_ADDED_TABLES.contains(name)
+                    && !OPTIONAL_LEGACY_TABLES.contains(name)
+            }
+            Some(6) => !V7_ADDED_TABLES.contains(name) && !OPTIONAL_LEGACY_TABLES.contains(name),
             _ => !OPTIONAL_LEGACY_TABLES.contains(name),
         })
         .map(|(_, name)| name)
@@ -1751,7 +1771,11 @@ mod tests {
         let expected: Vec<&str> = DUMP_TABLES
             .iter()
             .copied()
-            .filter(|name| !V5_ADDED_TABLES.contains(name) && !V6_ADDED_TABLES.contains(name))
+            .filter(|name| {
+                !V5_ADDED_TABLES.contains(name)
+                    && !V6_ADDED_TABLES.contains(name)
+                    && !V7_ADDED_TABLES.contains(name)
+            })
             .collect();
         assert_eq!(names, expected);
         // The frozen v4 archive predates every v5 table, in DUMP_TABLES order.
@@ -1761,6 +1785,7 @@ mod tests {
                 "privacy_opt_outs",
                 "guild_analytics_settings",
                 "privacy_opt_out_audit",
+                "member_season_xp",
                 "voice_create_reservations",
                 "retention_guild_purge_queue",
                 "retention_deletion_requests",
@@ -1806,10 +1831,10 @@ mod tests {
         assert_eq!(contents.manifest.missing_tables(), ["event_store"]);
         // The same inventory at the current version refuses: new archives must
         // cover the event store.
-        assert_eq!(DUMP_VERSION, 6);
-        let mut v6 = v5;
-        v6["version"] = serde_json::json!(DUMP_VERSION);
-        assert!(validate_manifest(&v6)
+        assert_eq!(DUMP_VERSION, 7);
+        let mut current = v5;
+        current["version"] = serde_json::json!(DUMP_VERSION);
+        assert!(validate_manifest(&current)
             .unwrap_err()
             .to_string()
             .contains("event_store"));
@@ -1837,7 +1862,7 @@ mod tests {
         v5["version"] = serde_json::json!(5);
         validate_manifest(&v5).expect("v5 without v6 tables must validate");
         let mut v6 = v5.clone();
-        v6["version"] = serde_json::json!(DUMP_VERSION);
+        v6["version"] = serde_json::json!(6);
         let err = validate_manifest(&v6).unwrap_err().to_string();
         assert!(err.contains("retention_guild_purge_queue"), "{err}");
         assert!(err.contains("retention_deletion_requests"), "{err}");
@@ -1853,6 +1878,101 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("voice_create_reservations"));
+    }
+
+    #[test]
+    fn inspects_frozen_v5_without_event_store_but_v6_requires_it() {
+        // A v5 recovery point written before event-store capture (0427 voice,
+        // 0428 presence, 0432 member deltas, 0430 message/reaction) declares
+        // every covered table except the v6 addition and stays readable;
+        // promoting it to v6 without the event store is refused.
+        let tables: Vec<Value> = DUMP_TABLES
+            .iter()
+            .copied()
+            .filter(|name| !V6_ADDED_TABLES.contains(name))
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "columns": [],
+                    "column_types": [],
+                    "count": 0,
+                })
+            })
+            .collect();
+        let mut v5 = manifest(tables);
+        v5["version"] = serde_json::json!(5);
+        assert!(
+            validate_manifest(&v5).is_ok(),
+            "frozen v5 without event_store stays readable"
+        );
+        let bytes = gzip_lines(&[v5.clone(), serde_json::json!({"kind":"end","rows":0})]);
+        let contents = inspect_bytes(&bytes).expect("frozen v5 inspects");
+        assert_eq!(contents.manifest.version, 5);
+        // v6 still requires the event store; so does the current version.
+        let mut v6 = v5.clone();
+        v6["version"] = serde_json::json!(6);
+        assert!(validate_manifest(&v6)
+            .unwrap_err()
+            .to_string()
+            .contains("event_store"));
+        let mut current = v5;
+        current["version"] = serde_json::json!(DUMP_VERSION);
+        assert_eq!(DUMP_VERSION, 7, "frozen v5 test pins the v7 bump");
+        assert!(validate_manifest(&current)
+            .unwrap_err()
+            .to_string()
+            .contains("event_store"));
+    }
+
+    #[test]
+    fn v6_archives_read_without_seasonal_but_v7_requires_it() {
+        fn without(tables: Vec<Value>, name: &str) -> Vec<Value> {
+            tables
+                .into_iter()
+                .filter(|t| t.get("name").and_then(Value::as_str) != Some(name))
+                .collect()
+        }
+        // A v6 recovery point written before the seasonal XP projection (0100)
+        // declares every covered table except member_season_xp and stays
+        // readable; promoting it to v7 without the table is refused. This is
+        // the frozen-manifest guard for the v7 bump: building the old manifest
+        // from today's inventory (as the v5 tests do) would silently include
+        // the new table and miss the refusal.
+        let mut v6 = manifest(without(
+            complete_tables(&BTreeMap::new()),
+            "member_season_xp",
+        ));
+        v6["version"] = serde_json::json!(6);
+        assert!(
+            validate_manifest(&v6).is_ok(),
+            "v6 without member_season_xp reads"
+        );
+        // The inspect read path accepts the frozen v6 envelope too.
+        let bytes = gzip_lines(&[v6.clone(), serde_json::json!({"kind":"end","rows":0})]);
+        let contents = inspect_bytes(&bytes).expect("v6 without member_season_xp inspects");
+        assert_eq!(contents.manifest.version, 6);
+        assert_eq!(contents.manifest.missing_tables(), ["member_season_xp"]);
+        // Dropping a v6-covered table from a v6 manifest still refuses.
+        let mut v6_gap = v6.clone();
+        v6_gap["tables"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|t| t.get("name").and_then(Value::as_str) != Some("event_store"));
+        assert!(validate_manifest(&v6_gap)
+            .unwrap_err()
+            .to_string()
+            .contains("event_store"));
+        // v7 without member_season_xp refuses.
+        let v7_gap = manifest(without(
+            complete_tables(&BTreeMap::new()),
+            "member_season_xp",
+        ));
+        assert_eq!(v7_gap["version"], serde_json::json!(DUMP_VERSION));
+        assert_eq!(DUMP_VERSION, 7, "frozen v6 test pins the v7 bump");
+        assert!(validate_manifest(&v7_gap)
+            .unwrap_err()
+            .to_string()
+            .contains("member_season_xp"));
     }
 
     #[test]
@@ -1888,10 +2008,10 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("voice_create_reservations"));
-        // v6 without event_store refuses.
-        let v6_gap = manifest(without(complete_tables(&BTreeMap::new()), "event_store"));
-        assert_eq!(v6_gap["version"], serde_json::json!(DUMP_VERSION));
-        assert!(validate_manifest(&v6_gap)
+        // The current version without event_store refuses.
+        let current_gap = manifest(without(complete_tables(&BTreeMap::new()), "event_store"));
+        assert_eq!(current_gap["version"], serde_json::json!(DUMP_VERSION));
+        assert!(validate_manifest(&current_gap)
             .unwrap_err()
             .to_string()
             .contains("event_store"));
@@ -1899,8 +2019,8 @@ mod tests {
 
     #[test]
     fn inspect_still_reads_v5_archives_and_refuses_unknown_versions() {
-        // The version gate in `inspect_reader` is a second half of the v6
-        // bump: `validate_manifest` waives the v6 tables for v5, but the gate
+        // The version gate in `inspect_reader` is a second half of the v7
+        // bump: `validate_manifest` waives newer tables for v5, but the gate
         // must also let a v5 archive reach it.
         let mut v5 = good_dump();
         v5[0]["version"] = serde_json::json!(5);
@@ -1917,7 +2037,7 @@ mod tests {
         future[0]["version"] = serde_json::json!(DUMP_VERSION + 1);
         let message = inspect_bytes(&gzip_lines(&future)).unwrap_err().to_string();
         assert!(
-            message.contains(&format!("reads 3, 4, 5 and {DUMP_VERSION}")),
+            message.contains(&format!("reads 3, 4, 5, 6 and {DUMP_VERSION}")),
             "unknown versions are refused with the readable list: {message}"
         );
     }

@@ -291,11 +291,11 @@ pub use invites::{
 };
 #[cfg(feature = "db")]
 pub use leveling_store::{
-    award as award_leveling_xp, award_message as award_leveling_message,
-    award_voice as award_leveling_voice, current_award as current_leveling_award,
-    leaderboard as leveling_leaderboard, profile as leveling_profile,
-    replace_role_rewards as replace_leveling_role_rewards, role_rewards as leveling_role_rewards,
-    LevelingStoreError,
+    apply_seasonal_decay as apply_leveling_seasonal_decay, award as award_leveling_xp,
+    award_message as award_leveling_message, award_voice as award_leveling_voice,
+    current_award as current_leveling_award, leaderboard as leveling_leaderboard,
+    profile as leveling_profile, replace_role_rewards as replace_leveling_role_rewards,
+    role_rewards as leveling_role_rewards, LevelingStoreError,
 };
 pub use lfg::{
     adjudicate_signup, close_reply, created_reply, iso_millis_utc, leave_reply, lfg_content,
