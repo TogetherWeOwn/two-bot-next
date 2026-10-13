@@ -1,4 +1,4 @@
--- 0428_backfill_cursors: cutover-chain target DDL for the resumable
+-- 0433_backfill_cursors: cutover-chain target DDL for the resumable
 -- per-family backfill cursors (TOG-22852 AC4; route slice TOG-22953).
 --
 -- Same table shape as the store chain's 0408; the two chains cross-run
@@ -9,9 +9,9 @@
 -- production migrators embed only `crates/cutover/migrations`, so without
 -- this mirror the `/ops/backfill` route (and the worker's
 -- `put_backfill_cursor`) always answers 503 on a configured database with
--- "relation does not exist". Numbered 0428 to stay clear of the store
+-- "relation does not exist". Numbered 0433 to stay clear of the store
 -- chain's 0427 (`backfill_audit_entries`), which already occupies 0427 on
--- the stacked worker branch.
+-- the stacked worker branch, and of main's 0428 presence capture.
 --
 -- Privacy fence (hard, same as event-store S1): rows carry ids, cursors and
 -- timestamps only — family (TEXT PK), cursor (opaque Discord id TEXT),

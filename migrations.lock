@@ -345,13 +345,17 @@
       "sha256": "9da078d3f29430320b79d2d82cfa6e4b1d2d557384a98d7dddca97783429d2dd",
       "justification": "RSVP check-in capacity count index: cover (guild_id, source) so record_checkin counts the occurrence without scanning the guild message history while holding the occurrence lock."
     },
-    "crates/cutover/migrations/0428_backfill_cursors.sql": {
-      "sha256": "5b11e04544f2d6c2f474cac874ab80e58305d3ee380c588b6bb967055ccc139f",
-      "justification": "TOG-22953: cutover-chain mirror of store 0408 backfill_cursors; same shape, IF NOT EXISTS, so the /ops/backfill route and worker cursors work on migrated databases."
+    "crates/cutover/migrations/0428_event_store_presence_capture.sql": {
+      "sha256": "5be88c0d2541613d571f30cdb1108c42e17532541f8bf6eb1f99181ad87b05ef",
+      "justification": "Append-only event_store for presence capture: nullable user_id for sibling slices, best-effort dedup key, ids/enums only with no free-text columns."
     },
     "crates/cutover/migrations/0432_event_store_member_capture.sql": {
       "sha256": "81e51abeda792b6e8dfa4ad714e744fcc09b96f9d857ca70bf4080ef8ce46faf",
       "justification": "Event-store S2 member capture: order-independent event_store table plus premium_since, nick_changed flag and role-id columns for GUILD_MEMBER_ADD/REMOVE/UPDATE, idempotent on the shared UNIQUE dedup_key index, no free-text columns."
+    },
+    "crates/cutover/migrations/0433_backfill_cursors.sql": {
+      "sha256": "e75760083876c93b1c0e75d64c4f548685b6da9cc590bf9d5bd975cae035bb8a",
+      "justification": "TOG-22953: cutover-chain mirror of store 0408 backfill_cursors; same shape, IF NOT EXISTS, so the /ops/backfill route and worker cursors work on migrated databases."
     }
   }
 }
