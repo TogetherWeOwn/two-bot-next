@@ -343,59 +343,61 @@ async fn table_columns(pool: &PgPool) -> Vec<String> {
     .expect("event_store columns readable")
 }
 
-const REQUIRED_COLUMNS: &[&str] = &[
-    "event_type",
-    "guild_id",
-    "channel_id",
-    "stage_instance_id",
-    "privacy_level",
-    "interaction_id",
-    "interaction_type",
-    "application_id",
-    "command_id",
-    "audit_log_entry_id",
+/// The exact reviewed column set for the shared `event_store` table after the
+/// S8 migration in isolation: ids, timestamps, the resume-safe key, the member
+/// id relaxed for sibling order-independence, and the stage/interaction/audit
+/// enums only. A denylist cannot fail on a new free-text name (raw_payload,
+/// stage_topic, ...), so this asserts the full set instead. Later slices
+/// extend this allowlist when they add their own reviewed columns
+/// (`ADD COLUMN IF NOT EXISTS` per 0431).
+const ALLOWED_COLUMNS: &[&str] = &[
     "action_type",
     "actor_id",
-    "target_id",
-    "event_time",
-    "received_at",
+    "application_id",
+    "audit_log_entry_id",
+    "channel_id",
+    "command_id",
     "dedup_key",
-];
-
-const FORBIDDEN_COLUMNS: &[&str] = &[
-    "topic",
-    "token",
-    "interaction_token",
-    "changes",
-    "change_details",
-    "options",
-    "reason",
-    "content",
-    "message_body",
-    "body",
-    "text",
-    "embeds",
-    "description",
-    "name",
-    "location",
-    "username",
+    "event_time",
+    "event_type",
+    "guild_id",
+    "id",
+    "interaction_id",
+    "interaction_type",
+    "privacy_level",
+    "received_at",
+    "stage_instance_id",
+    "target_id",
+    "user_id",
 ];
 
 fn assert_stage_schema(columns: &[String]) {
-    assert!(
-        !columns.is_empty(),
-        "S8 creates the stage/interaction/audit-log columns on the append-only event_store table"
+    let mut actual = columns.to_vec();
+    actual.sort();
+    let mut expected: Vec<String> = ALLOWED_COLUMNS
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+    expected.sort();
+    assert_eq!(
+        actual, expected,
+        "event_store holds exactly the reviewed S8 columns; extend the allowlist \
+         only with a reviewed slice column"
     );
-    for required in REQUIRED_COLUMNS {
+}
+
+async fn assert_no_free_form_types(pool: &PgPool) {
+    let types: Vec<(String, String)> = sqlx::query_as(
+        "SELECT column_name, data_type FROM information_schema.columns
+         WHERE table_name = 'event_store'",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("event_store column types readable");
+    for (column, data_type) in &types {
         assert!(
-            columns.iter().any(|column| column == required),
-            "event_store keeps stage/interaction/audit-log column {required}; has {columns:?}"
-        );
-    }
-    for forbidden in FORBIDDEN_COLUMNS {
-        assert!(
-            !columns.iter().any(|column| column == forbidden),
-            "event_store must not gain a {forbidden} column; has {columns:?}"
+            data_type != "json" && data_type != "jsonb",
+            "privacy fence: no free-form {column} {data_type} column; ids+enums only"
         );
     }
 }
@@ -771,19 +773,13 @@ async fn event_store_s8_duplicate_delivery_inserts_once() {
 #[tokio::test]
 async fn event_store_s8_privacy_tripwire_rejects_topic_token_and_change_details() {
     let db = TestDb::new().await;
-    // Tripwire part 1: no free-text or secret column may exist to hold the
-    // payload.
-    let columns = table_columns(&db.pool).await;
-    assert!(
-        !columns.is_empty(),
-        "S8 creates the stage/interaction/audit-log columns on the append-only event_store table"
-    );
-    for forbidden in FORBIDDEN_COLUMNS {
-        assert!(
-            !columns.iter().any(|column| column == forbidden),
-            "privacy fence: no {forbidden} column; has {columns:?}"
-        );
-    }
+    // Tripwire part 1: the table holds exactly the reviewed columns, so no
+    // free-text or secret column exists to hold the payload; a later migration
+    // adding raw_payload, stage_topic or any other column fails here. Free-form
+    // json/jsonb types are refused too, so a payload column cannot hide behind
+    // a reviewed-looking name.
+    assert_stage_schema(&table_columns(&db.pool).await);
+    assert_no_free_form_types(&db.pool).await;
     // Tripwire part 2: fixtures carrying topic + token + options + username +
     // change-detail + reason free text persist their ids, timestamps and enums
     // only; the sentinels appear in no stored row.

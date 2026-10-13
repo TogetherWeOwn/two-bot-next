@@ -493,7 +493,7 @@ VALUES ('100000000000000001', '100000000000000050', 'vote_started', '10000000000
        ('100000000000000001', '100000000000000051', 'vote_refused', '100000000000000033',
         '100000000000000003', '100000000000000002', 'protected_target',
         NULL, NULL, NULL, '2026-08-03T10:05:00Z');
--- Event-store S8 stage/interaction-observe/audit-log capture (0429): one
+-- Event-store S8 stage/interaction-observe/audit-log capture (0431): one
 -- stage-instance row and one audit-log-entry row, ids and enums only.
 INSERT INTO event_store (event_type, guild_id, channel_id, stage_instance_id,
   privacy_level, interaction_id, interaction_type, application_id, command_id,

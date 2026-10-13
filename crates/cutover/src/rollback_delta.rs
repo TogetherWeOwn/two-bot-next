@@ -82,7 +82,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // Same shape as guild_counters: one read-time per count, no updated_at.
     TableSpec { table: "counter_snapshots", measure: TableMeasure::Columns(&["human_member_count_at", "online_count_at"]) },
     TableSpec { table: "event_rsvps", measure: TableMeasure::Columns(&["responded_at"]) },
-    // Append-only event-store S8 capture (migration 0429); `event_time` is the
+    // Append-only event-store S8 capture (migration 0431); `event_time` is the
     // event time and `received_at` the capture time, both written once per row.
     TableSpec { table: "event_store", measure: TableMeasure::Columns(&["event_time", "received_at"]) },
     TableSpec { table: "events", measure: TableMeasure::Columns(&["recorded_at"]) },
