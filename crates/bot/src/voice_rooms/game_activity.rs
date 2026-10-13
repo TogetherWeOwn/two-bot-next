@@ -700,6 +700,9 @@ fn plan_flush(
                 None => {
                     // A stop closes the member's interval, but the run-up to
                     // it still counts: presence only re-asserts on change.
+                    // The trailing leg needs a playing observation at the
+                    // stop clock (mirroring the still-playing tail below),
+                    // or the session ends at the last bridge tick instead.
                     if let Some((started_ms, open_game, open_streaming)) = open.take() {
                         fill_ticks(
                             &mut input,
@@ -710,6 +713,14 @@ fn plan_flush(
                             delta.observed_at_ms,
                             gap_timeout_ms,
                         );
+                        if delta.observed_at_ms > started_ms {
+                            input.push(synthetic_delta(
+                                user_key,
+                                &open_game,
+                                open_streaming,
+                                delta.observed_at_ms,
+                            ));
+                        }
                     }
                     input.push(delta.clone());
                 }
