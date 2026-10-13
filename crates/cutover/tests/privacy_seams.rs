@@ -17,6 +17,8 @@ use two_bot_core::community_store::{
 use two_bot_core::database_tls::TlsPolicy;
 use two_bot_core::gateway_funnel::{FunnelBatch, InviteSnapshotWrite};
 use two_bot_core::gateway_session::{DispatchAction, GatewaySession};
+use two_bot_core::rsvp::{checkin_classification, AttendanceProof};
+use two_bot_core::rsvp_store::{record_checkin, CheckinWrite};
 use two_bot_core::{EventType, FunnelEvent, InviteState};
 use two_bot_cutover::db::{
     mark_bot, record_earliest, record_event, touch_activity, CutoverDb, FunnelWrite,
@@ -605,6 +607,243 @@ async fn concurrent_write_during_opt_out_never_persists() {
     .await
     .unwrap();
     assert_eq!(suppression, 1, "the suppression itself installed");
+
+    db.close().await;
+    test_db.close().await.unwrap();
+}
+
+/// Host check-in drops suppressed pairs while other members still check in:
+/// the next check-in after an opt-out must not undo the purge.
+#[tokio::test]
+async fn rsvp_checkin_drops_suppressed_pairs() {
+    let Some((test_db, db)) = database().await else {
+        return;
+    };
+    suppress(&db, GUILD, MEMBER_A).await;
+
+    let human = checkin_classification(false);
+    let checkin = |member: &str, occurrence: &str| CheckinWrite {
+        guild_id: GUILD.to_owned(),
+        event_occurrence_id: occurrence.to_owned(),
+        member_id: member.to_owned(),
+        occurred_at: "2026-10-13T00:00:00.000Z".to_owned(),
+        proof: AttendanceProof::HostCheckin,
+        classifier_version: "privacy-seams-v1".to_owned(),
+        classification: human.classification.to_owned(),
+        matched_rule: human.matched_rule.to_owned(),
+    };
+    assert!(
+        !record_checkin(db.pool(), &checkin(MEMBER_A, "occ-suppressed"))
+            .await
+            .unwrap(),
+        "suppressed check-in drops"
+    );
+    assert!(
+        record_checkin(db.pool(), &checkin(MEMBER_B, "occ-suppressed"))
+            .await
+            .unwrap(),
+        "other members still check in"
+    );
+
+    let facts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM community_facts WHERE guild_id = $1 AND actor_id = $2",
+    )
+    .bind(GUILD)
+    .bind(MEMBER_A)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(facts, 0, "no attendance fact for the suppressed pair");
+
+    db.close().await;
+    test_db.close().await.unwrap();
+}
+
+/// A community-fact writer in flight while the opt-out runs never lands
+/// after the purge: removing the `record_fact` table lock lets rows survive,
+/// so this race pins it.
+#[tokio::test]
+async fn concurrent_fact_write_during_opt_out_never_persists() {
+    let Some((test_db, db)) = database().await else {
+        return;
+    };
+
+    let pool = db.pool().clone();
+    let writer = tokio::spawn(async move {
+        for i in 0..30 {
+            let fact = message_fact(
+                GUILD,
+                &format!("race-{i}"),
+                "chan-1",
+                "human",
+                &ClassifyInput {
+                    guild_id: GUILD.to_owned(),
+                    actor_id: MEMBER_A.to_owned(),
+                    is_bot: false,
+                    webhook_id: None,
+                    is_staff_automation: false,
+                    is_raid: false,
+                    is_staging: false,
+                    is_test: false,
+                },
+                &format!("2026-10-13T00:{i:02}:00.000Z"),
+                Classification {
+                    classification: "eligible_human".to_owned(),
+                    classifier_version: "privacy-seams-v1".to_owned(),
+                    matched_rule: "fixture".to_owned(),
+                },
+            );
+            // Suppression drops return `Ok(false)`; a purge racing the
+            // insert surfaces as a serialization/deadlock error on rare
+            // timing — either way the pair must not survive below.
+            let _ = record_fact(&pool, &fact).await;
+        }
+    });
+    let racer_db = db.clone();
+    let opt_out = tokio::spawn(async move {
+        opt_out_member(&racer_db, GUILD, MEMBER_A, "operator:privacy-race-fact")
+            .await
+            .expect("racing opt-out commits")
+    });
+    let (writer_out, opt_out_out) = tokio::join!(writer, opt_out);
+    writer_out.unwrap();
+    assert_eq!(
+        opt_out_out.unwrap().len(),
+        4,
+        "racing opt-out reports all purge tables"
+    );
+
+    let facts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM community_facts WHERE guild_id = $1 AND actor_id = $2",
+    )
+    .bind(GUILD)
+    .bind(MEMBER_A)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(facts, 0, "no in-flight fact survives the opt-out");
+
+    db.close().await;
+    test_db.close().await.unwrap();
+}
+
+/// A gateway batch in flight while the opt-out runs never lands after the
+/// purge: removing the batch commit's table lock lets event rows survive, so
+/// this race pins it.
+#[tokio::test]
+async fn concurrent_gateway_batch_during_opt_out_never_persists() {
+    let Some((test_db, db)) = database().await else {
+        return;
+    };
+
+    let pool = db.pool().clone();
+    let writer = tokio::spawn(async move {
+        let store = GatewaySessionStore::new(pool, GUILD.to_owned(), 0);
+        for i in 0..20_u64 {
+            let session = GatewaySession {
+                session_id: format!("race-batch-{i}"),
+                sequence: 1,
+                resume_url: "ws://race".into(),
+                updated_at_ms: 1_760_000_000_000_i64 + i as i64,
+            };
+            let batch = FunnelBatch {
+                events: vec![FunnelEvent {
+                    guild_id: guild_u64(),
+                    member_id: Some(member_u64(MEMBER_A)),
+                    event_type: EventType::MemberJoin,
+                    occurred_at: format!("2026-10-13T00:{i:02}:00.000Z"),
+                    source: "gateway-race".to_owned(),
+                    metadata: None,
+                    dedupe_token: None,
+                }],
+                activity: vec![],
+                bots: vec![],
+                snapshots: vec![],
+                invite_snapshots: vec![],
+            };
+            let _ = store.commit_dispatch(&session, batch).await;
+        }
+    });
+    let racer_db = db.clone();
+    let opt_out = tokio::spawn(async move {
+        opt_out_member(&racer_db, GUILD, MEMBER_A, "operator:privacy-race-batch")
+            .await
+            .expect("racing opt-out commits")
+    });
+    let (writer_out, opt_out_out) = tokio::join!(writer, opt_out);
+    writer_out.unwrap();
+    assert_eq!(
+        opt_out_out.unwrap().len(),
+        4,
+        "racing opt-out reports all purge tables"
+    );
+
+    let events: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE guild_id = $1 AND member_id = $2")
+            .bind(GUILD)
+            .bind(MEMBER_A)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(events, 0, "no in-flight batch event survives the opt-out");
+
+    db.close().await;
+    test_db.close().await.unwrap();
+}
+
+/// A counter baseline in flight while the opt-out runs never re-attributes
+/// the member: removing the `store_counters` table lock (or its suppression
+/// filter) leaves a row naming the suppressed inviter, so this race pins
+/// both.
+#[tokio::test]
+async fn concurrent_counter_write_during_opt_out_never_attributing() {
+    let Some((test_db, db)) = database().await else {
+        return;
+    };
+
+    let pool = db.pool().clone();
+    let writer = tokio::spawn(async move {
+        for i in 0..30 {
+            let _ = store_counters(
+                &pool,
+                GUILD,
+                &[CounterRow {
+                    code: "race".to_owned(),
+                    uses: i,
+                    inviter_id: Some(MEMBER_A.to_owned()),
+                    channel_id: None,
+                }],
+                "2026-10-13T00:00:00Z",
+            )
+            .await;
+        }
+    });
+    let racer_db = db.clone();
+    let opt_out = tokio::spawn(async move {
+        opt_out_member(&racer_db, GUILD, MEMBER_A, "operator:privacy-race-counters")
+            .await
+            .expect("racing opt-out commits")
+    });
+    let (writer_out, opt_out_out) = tokio::join!(writer, opt_out);
+    writer_out.unwrap();
+    assert_eq!(
+        opt_out_out.unwrap().len(),
+        4,
+        "racing opt-out reports all purge tables"
+    );
+
+    let attributed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM invite_snapshots WHERE guild_id = $1 AND inviter_id = $2",
+    )
+    .bind(GUILD)
+    .bind(MEMBER_A)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        attributed, 0,
+        "no counter row names the suppressed inviter after the race"
+    );
 
     db.close().await;
     test_db.close().await.unwrap();

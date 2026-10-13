@@ -487,14 +487,23 @@ pub(crate) async fn advance_activity(
 
 /// Bump activity without emitting an event; forward-only (legacy
 /// `touchActivity`). A suppressed pair is a no-op: the bump would create or
-/// refresh a per-user `members` row for a member who opted out.
+/// refresh a per-user `members` row for a member who opted out. The gate
+/// runs inside the write transaction under the shared table lock, so a bump
+/// that passes the gate can never land after a concurrent opt-out purge.
 pub async fn touch_activity(
     db: &CutoverDb,
     guild_id: &str,
     member_id: &str,
     at: &str,
 ) -> Result<(), sqlx::Error> {
-    if two_bot_core::privacy::suppressed(db.pool(), guild_id, member_id).await? {
+    let mut tx = db.pool().begin().await?;
+    // Lock order matches `opt_out_member`'s sorted order; ROW EXCLUSIVE
+    // never blocks other writers.
+    sqlx::query("LOCK TABLE members, privacy_opt_outs IN ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    if two_bot_core::privacy::suppressed_in(&mut tx, guild_id, member_id).await? {
+        tx.rollback().await?;
         return Ok(());
     }
     sqlx::query(
@@ -505,16 +514,24 @@ pub async fn touch_activity(
     .bind(guild_id)
     .bind(member_id)
     .bind(at)
-    .execute(db.pool())
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
 /// Mark a member row as a bot (legacy `markBot`). A suppressed pair is a
 /// no-op: the flag write would create a per-user `members` row for a member
-/// who opted out.
+/// who opted out. Like [`touch_activity`], the gate runs under the shared
+/// table lock so a concurrent opt-out purge cannot slip between gate and
+/// write.
 pub async fn mark_bot(db: &CutoverDb, guild_id: &str, member_id: &str) -> Result<(), sqlx::Error> {
-    if two_bot_core::privacy::suppressed(db.pool(), guild_id, member_id).await? {
+    let mut tx = db.pool().begin().await?;
+    sqlx::query("LOCK TABLE members, privacy_opt_outs IN ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    if two_bot_core::privacy::suppressed_in(&mut tx, guild_id, member_id).await? {
+        tx.rollback().await?;
         return Ok(());
     }
     sqlx::query(
@@ -523,8 +540,9 @@ pub async fn mark_bot(db: &CutoverDb, guild_id: &str, member_id: &str) -> Result
     )
     .bind(guild_id)
     .bind(member_id)
-    .execute(db.pool())
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 

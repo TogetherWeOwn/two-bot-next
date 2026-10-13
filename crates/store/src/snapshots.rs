@@ -150,3 +150,150 @@ impl InviteSnapshotStore for PgInviteSnapshots {
         .expect("invite snapshot delete_missing failed");
     }
 }
+
+#[cfg(test)]
+mod privacy_lock_tests {
+    //! Pin the `store_all` table lock against concurrent opt-outs.
+    //!
+    //! The simulated opt-out takes the same SHARE ROW EXCLUSIVE lock the
+    //! real `opt_out_member` takes, then purges and suppresses. Without the
+    //! writer's ROW EXCLUSIVE lock the suppressed set is stale and the
+    //! attribution lands after the purge: removing the lock (or the
+    //! suppression filter) leaves a row naming the suppressed inviter.
+
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    use sqlx::{Pool, Postgres};
+
+    use two_bot_core::{InviteSnapshotStore, InviteState};
+
+    use super::PgInviteSnapshots;
+
+    const GUILD: &str = "1545644954272137297";
+    const MEMBER_A: &str = "123456789012345678";
+
+    async fn test_pool(prefix: &str) -> Option<(Pool<Postgres>, String)> {
+        let url = match std::env::var("TWO_TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) => {
+                assert_ne!(
+                    std::env::var("GITHUB_ACTIONS").as_deref(),
+                    Ok("true"),
+                    "CI must configure the store privacy database suite"
+                );
+                eprintln!("SKIP snapshot privacy lock test: TWO_TEST_DATABASE_URL not set");
+                return None;
+            }
+        };
+        let options: PgConnectOptions = url.parse().expect("test database URL");
+        let host = options.get_host();
+        assert!(
+            host == "agent-testdb"
+                || (host == "localhost"
+                    && std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")),
+            "test-container-only URL"
+        );
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let schema = format!("{prefix}_{nonce}_{}", std::process::id());
+        assert!(
+            !schema.is_empty()
+                && schema.len() <= 63
+                && schema
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+            "safe unique test schema"
+        );
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
+            .await
+            .expect("test database admin");
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&admin)
+            .await
+            .expect("create owned test schema");
+        admin.close().await;
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect_with(options.options([("search_path", schema.as_str())]))
+            .await
+            .expect("test database pool");
+        sqlx::migrate!("../cutover/migrations")
+            .run(&pool)
+            .await
+            .expect("cutover migrations");
+        Some((pool, schema))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn store_all_races_opt_out_never_attributing() {
+        let Some((pool, schema)) = test_pool("snapshot_privacy_race").await else {
+            return;
+        };
+        let guild: u64 = GUILD.parse().unwrap();
+        let member: u64 = MEMBER_A.parse().unwrap();
+
+        let writer_pool = pool.clone();
+        let writer = tokio::spawn(async move {
+            let store = PgInviteSnapshots::new(writer_pool);
+            for i in 0..30_u64 {
+                store.store_all(
+                    guild,
+                    &[InviteState {
+                        code: "race".to_owned(),
+                        uses: i,
+                        inviter_id: Some(member),
+                        channel_id: None,
+                    }],
+                );
+            }
+        });
+        let racer_pool = pool.clone();
+        let opt_out = tokio::spawn(async move {
+            let mut tx = racer_pool.begin().await.expect("opt-out tx");
+            sqlx::query(
+                "LOCK TABLE community_facts, events, invite_snapshots, members, \
+                 privacy_opt_outs, privacy_opt_out_audit IN SHARE ROW EXCLUSIVE MODE",
+            )
+            .execute(&mut *tx)
+            .await
+            .expect("opt-out lock");
+            sqlx::query("DELETE FROM invite_snapshots WHERE guild_id = $1 AND inviter_id = $2")
+                .bind(GUILD)
+                .bind(MEMBER_A)
+                .execute(&mut *tx)
+                .await
+                .expect("opt-out purge");
+            sqlx::query("INSERT INTO privacy_opt_outs (guild_id, member_id) VALUES ($1, $2)")
+                .bind(GUILD)
+                .bind(MEMBER_A)
+                .execute(&mut *tx)
+                .await
+                .expect("suppression install");
+            tx.commit().await.expect("opt-out commit");
+        });
+        let (writer_out, _) = tokio::join!(writer, opt_out);
+        writer_out.expect("writer task");
+
+        let attributed: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM invite_snapshots WHERE guild_id = $1 AND inviter_id = $2",
+        )
+        .bind(GUILD)
+        .bind(MEMBER_A)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            attributed, 0,
+            "no snapshot row names the suppressed inviter after the race"
+        );
+
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&pool)
+            .await
+            .expect("clean up owned test schema");
+        pool.close().await;
+    }
+}

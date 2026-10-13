@@ -215,17 +215,21 @@ any `presence_update` row a backfill or replay would otherwise write.
 Gated seams: the cutover event writer (`record_event`, with `record_earliest`
 and the backfill/community replays that call them), the runtime funnel
 store, the gateway batch commit, the community-facts writer (`record_fact`,
-including the leveling-runtime flush), invite snapshots (suppressed inviters
-keep the aggregate use count with a blanked inviter field, including the
-standalone capture's counter baseline), and the onboarding writers. Every
-gated writer serializes with concurrent opt-outs (a shared table lock, so a
-write that passes the gate can never land after the purge), and `member_join`
-rows strip a suppressed inviter's `inviterId` from metadata while keeping the
-joiner's own row. `touch_activity` / `mark_bot` honor suppression; under a
-disabled toggle they may still refresh `last_active_at` for non-suppressed
-members, which is a known residual for a follow-up, not silent per-user
-analytics. Duplicate reconfirmations for suppressed pairs advance nothing:
-the gate runs before the observation-maximum path too.
+including the leveling-runtime flush and the RSVP host check-in, which is
+suppression-only like other lifecycle facts), invite snapshots (suppressed
+inviters keep the aggregate use count with a blanked inviter field, in the
+standalone capture's counter baseline and the backfill baseline alike, which
+share one writer), the onboarding writers (including the prompt guard, which
+re-gates before the insert for opt-outs that land while the welcome is in
+flight), and `touch_activity` / `mark_bot`. Every gated writer serializes
+with concurrent opt-outs (a shared table lock, so a write that passes the
+gate can never land after the purge), and `member_join` rows strip a
+suppressed inviter's `inviterId` from metadata while keeping the joiner's
+own row. Under a disabled toggle `touch_activity` / `mark_bot` may still
+refresh `last_active_at` for non-suppressed members, which is a known
+residual for a follow-up, not silent per-user analytics. Duplicate
+reconfirmations for suppressed pairs advance nothing: the gate runs before
+the observation-maximum path too.
 
 Backups follow the existing [backup runbook](backup.md): retention is measured
 in retained snapshots (default 14 newest), **not 14 days**. Historical snapshots
