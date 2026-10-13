@@ -188,6 +188,7 @@ pub async fn serve(
     self_roles: Option<Arc<SelfRoleService>>,
     automod: crate::automod_gateway::Slot,
     receiver: Option<crate::internal_action_http::BoundReceiver>,
+    eventsub_receiver: Option<crate::eventsub_http::BoundEventsubReceiver>,
     member: Option<Arc<MemberRuntime>>,
 ) -> std::io::Result<()> {
     let mut registered = Vec::new();
@@ -301,8 +302,19 @@ pub async fn serve(
     let status = registered_statuses(&registered, &parked).await;
     let public = server::serve(listener, gateway, status.clone(), shutdown.clone());
     let http = async {
-        match receiver {
-            Some(receiver) => {
+        match (receiver, eventsub_receiver) {
+            (Some(receiver), Some(eventsub)) => {
+                // Three listeners: combine the two private receivers first,
+                // then supervise the pair against the public listener. First
+                // termination still stops admission everywhere.
+                let private = serve_listeners(
+                    receiver.serve(shutdown.subscribe()),
+                    eventsub.serve(shutdown.subscribe()),
+                    shutdown.clone(),
+                );
+                serve_listeners(public, private, shutdown.clone()).await
+            }
+            (Some(receiver), None) => {
                 serve_listeners(
                     public,
                     receiver.serve(shutdown.subscribe()),
@@ -310,7 +322,15 @@ pub async fn serve(
                 )
                 .await
             }
-            None => public.await,
+            (None, Some(eventsub)) => {
+                serve_listeners(
+                    public,
+                    eventsub.serve(shutdown.subscribe()),
+                    shutdown.clone(),
+                )
+                .await
+            }
+            (None, None) => public.await,
         }
     };
     serve_jobs(registered, status, shutdown.clone(), http).await

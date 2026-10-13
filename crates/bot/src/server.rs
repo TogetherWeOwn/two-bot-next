@@ -480,6 +480,10 @@ mod tests {
             ("/health/fixture-unknown-segment", "[REDACTED]"),
             ("/%68ealth", "[REDACTED]"),
             ("/", "[REDACTED]"),
+            // EventSub deliveries land on the private receiver, never the
+            // public listener: the callback path must stay out of spans.
+            ("/hooks/twitch", "[REDACTED]"),
+            ("/hooks/twitch?token=fixture-query-secret", "[REDACTED]"),
             (
                 "/fixture-unknown-path?token=fixture-query-secret",
                 "[REDACTED]",
@@ -506,13 +510,16 @@ mod tests {
             "fixture-header-secret",
             "fixture-encoded-token",
         ];
-        let cases: [(&str, StatusCode); 14] = [
+        let cases: [(&str, StatusCode); 15] = [
             (
                 "/readyz?token=fixture-query-secret",
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
             ("/health?key=fixture-query-secret", StatusCode::OK),
             ("/healthz", StatusCode::OK),
+            // Private EventSub callback: the public listener 404s and the
+            // span carries the marker, never the path.
+            ("/hooks/twitch", StatusCode::NOT_FOUND),
             (
                 "/api/webhooks/1/fixture-webhook-token",
                 StatusCode::NOT_FOUND,
@@ -595,7 +602,7 @@ mod tests {
             .filter(|l| l.ends_with("http.request.path=[REDACTED]"))
             .count();
         assert_eq!(spans, cases.len(), "one span per request");
-        assert_eq!(marked, 9, "unknown paths must carry the marker");
+        assert_eq!(marked, 10, "unknown paths must carry the marker");
         for secret in SENTINELS {
             assert!(!text.contains(secret), "credential reached traces");
         }

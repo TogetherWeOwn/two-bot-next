@@ -97,6 +97,10 @@ async function harness(t: TestContext, env: Record<string, unknown>, options: { 
       listening.add(Number(config.env?.LISTEN_ADDR?.split(":").at(-1) ?? 8080));
       const bind = config.env?.TWO_INTERNAL_BIND;
       if (bind) listening.add(Number(bind.split(":").at(-1)));
+      // TOG-23387: the real container binds the EventSub receiver at startup
+      // while TWO_EVENTSUB is "1"; model it so `requiredPorts` checks pass.
+      const eventsubBind = config.env?.TWO_EVENTSUB_BIND;
+      if (eventsubBind) listening.add(Number(eventsubBind.split(":").at(-1)));
       this.running = true;
     },
     monitor: () => new Promise<void>(() => {}),
@@ -169,10 +173,9 @@ async function harness(t: TestContext, env: Record<string, unknown>, options: { 
     setReceiver: (fn: typeof receiver) => { receiver = fn; },
     receiverCalls: () => seen.filter((r) => r.port === EVENTSUB_RECEIVER_PORT && r.pathname === EVENTSUB_PATH),
     /**
-     * Stand-in for the follow-up receiver slice: the real container binds
-     * EVENTSUB_RECEIVER_PORT only once that slice (plus Operator secret
-     * provisioning) lands. Until then production has nothing listening there
-     * and every forward fails closed to 503 (see the cold-instance test).
+     * TOG-23387: the container binds EVENTSUB_RECEIVER_PORT at startup while
+     * TWO_EVENTSUB is "1" (see `start` above). This only swaps the scripted
+     * receiver logic; the port is already listening after `warm`.
      */
     serveEventsubReceiver: () => { listening.add(EVENTSUB_RECEIVER_PORT); },
   };

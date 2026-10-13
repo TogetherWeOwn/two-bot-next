@@ -69,6 +69,10 @@ EVENTSUB_INGRESS_VAR = "EVENTSUB_INGRESS"
 EVENTSUB_INGRESS_ENVS = {"staging"}
 # Private-receiver config is Operator-set Worker secrets, never wrangler.toml.
 RECEIVER_CONFIG_PREFIX = "TWO_INTERNAL_"
+# TOG-23387: the EventSub receiver enable, bind and signing secret are
+# Operator-set Worker secrets, never wrangler.toml (same rule as above).
+EVENTSUB_RECEIVER_PREFIX = "TWO_EVENTSUB"
+TWITCH_SECRET_PREFIX = "TWO_TWITCH_"
 # Boot publication of the guild command registry is a full replacement of the
 # guild's commands. wrangler.toml may opt in for staging only; production
 # publication stays an Operator-approved Worker binding, never a committed var.
@@ -206,6 +210,12 @@ def _collect_errors(cfg: dict) -> list[str]:
         if variables.get(OPS_KILLSWITCH_VAR, "1") != "1":
             errors.append(f'{prefix}: {OPS_KILLSWITCH_VAR} must be exactly "1" or absent')
         for key in sorted(k for k in variables if k.startswith(RECEIVER_CONFIG_PREFIX)):
+            errors.append(f"{prefix}: {key} is an Operator-set Worker secret, never a wrangler.toml var")
+        for key in sorted(
+            k
+            for k in variables
+            if k.startswith(EVENTSUB_RECEIVER_PREFIX) or k.startswith(TWITCH_SECRET_PREFIX)
+        ):
             errors.append(f"{prefix}: {key} is an Operator-set Worker secret, never a wrangler.toml var")
         threshold = variables.get("UNREADY_ALERT_FAILURES")
         if threshold is not None and (

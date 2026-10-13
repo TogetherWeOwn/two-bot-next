@@ -71,9 +71,11 @@ import {
 } from "./internal-actions.ts";
 import {
   EVENTSUB_PATH,
+  EVENTSUB_RECEIVER_BIND,
   EVENTSUB_RECEIVER_PORT,
   allowlistedHeaders as eventsubAllowlistedHeaders,
   eventsubIngressEnabled,
+  eventsubReceiverEnabled,
   handleEventsubIngress,
   isEventsubRequest,
   readBody as readEventsubBody,
@@ -178,6 +180,8 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   EVENTSUB_INGRESS?: string;
   /** Operator-set Worker secret enabling the EventSub forward. Never flag-forwarded. */
   TWO_EVENTSUB?: string;
+  /** Operator-set Worker secret carrying the Twitch signing secret. Never flag-forwarded. */
+  TWO_TWITCH_WEBHOOK_SECRET?: string;
   /** Operator-set Worker secrets for the private receiver. Never flag-forwarded. */
   TWO_INTERNAL_ACTIONS?: string;
   TWO_INTERNAL_CALLERS?: string;
@@ -533,6 +537,20 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
     if (env.TWO_INTERNAL_CHANNEL_KEYS) vars["TWO_INTERNAL_CHANNEL_KEYS"] = env.TWO_INTERNAL_CHANNEL_KEYS;
     if (env.TWO_INTERNAL_KEYS) vars["TWO_INTERNAL_KEYS"] = env.TWO_INTERNAL_KEYS;
   }
+  // Private EventSub receiver (TOG-23387). Dark unless the Operator sets
+  // TWO_EVENTSUB to exactly "1"; any other value forwards nothing, so a typo
+  // cannot crash-loop the gateway (the receiver boots all-or-nothing). The
+  // bind and the container marker are the Worker's constants, never
+  // Operator-set values. The signing secret travels on its own explicit line
+  // and is never logged.
+  if (eventsubReceiverEnabled(env)) {
+    if (port === EVENTSUB_RECEIVER_PORT) throw new Error("BOT_PORT must differ from the EventSub receiver port");
+    if (port === RECEIVER_PORT) throw new Error("BOT_PORT must differ from the internal-actions receiver port");
+    vars["TWO_EVENTSUB"] = "1";
+    vars["TWO_EVENTSUB_BIND"] = EVENTSUB_RECEIVER_BIND;
+    vars[CONTAINER_MARKER] = CONTAINER_MARKER_VALUE;
+    if (env.TWO_TWITCH_WEBHOOK_SECRET) vars["TWO_TWITCH_WEBHOOK_SECRET"] = env.TWO_TWITCH_WEBHOOK_SECRET;
+  }
   return vars;
 }
 
@@ -554,10 +572,13 @@ export class TwoBotContainer extends Container<Env> {
 
   constructor(ctx: DurableObjectState<{}>, env: Env) {
     super(ctx, env);
-    // The receiver port joins startup port checks only while the receiver is
+    // Each receiver port joins startup port checks only while its receiver is
     // enabled. Dark never touches the property, so the SDK resolves exactly
     // the ports it does on base main (`requiredPorts` stays undefined).
-    if (receiverEnabled(env)) this.requiredPorts = [this.defaultPort, RECEIVER_PORT];
+    const wanted = [this.defaultPort];
+    if (receiverEnabled(env)) wanted.push(RECEIVER_PORT);
+    if (eventsubReceiverEnabled(env)) wanted.push(EVENTSUB_RECEIVER_PORT);
+    if (wanted.length > 1) this.requiredPorts = [...new Set(wanted)];
     // A deployment can reattach to a running old process. Reconcile before
     // ingress or alarms are delivered, not just before the next cold start.
     this.initialization = ctx.blockConcurrencyWhile(async () => {
@@ -956,12 +977,16 @@ export class TwoBotContainer extends Container<Env> {
   }
 
   override async startAndWaitForPorts(...args: Parameters<Container<Env>["startAndWaitForPorts"]>): Promise<void> {
-    // containerFetch always names one port. While the receiver is enabled its
+    // containerFetch always names one port. While a receiver is enabled its
     // port is checked with it; the explicit port stays first for the SDK.
     const [ports, ...rest] = args;
-    const checked = typeof ports === "number" && receiverEnabled(this.env)
-      ? [...new Set([ports, this.defaultPort ?? ports, RECEIVER_PORT])]
-      : ports;
+    let checked = ports;
+    if (typeof ports === "number" && (receiverEnabled(this.env) || eventsubReceiverEnabled(this.env))) {
+      const extra = [ports, this.defaultPort ?? ports];
+      if (receiverEnabled(this.env)) extra.push(RECEIVER_PORT);
+      if (eventsubReceiverEnabled(this.env)) extra.push(EVENTSUB_RECEIVER_PORT);
+      checked = [...new Set(extra)];
+    }
     return this.owned(() => super.startAndWaitForPorts(checked, ...rest));
   }
 
@@ -1281,6 +1306,7 @@ export default {
           return env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
         },
       );
+    }
     // Bot HTTP MCP server (Streamable HTTP, read-only tools first). Exact
     // path only: only POST is served (browser probes get 405, never tool
     // execution). Unconfigured/short token → 404 (the route does not exist);

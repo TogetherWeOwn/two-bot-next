@@ -97,11 +97,42 @@ exposed only inside the HMAC and inside the create-subscription body, which is
 itself returned as a `Secret`. The Operator provisions the signing secret and
 the Twitch client id/secret; they never appear in code, logs or PR text.
 
-Not in this slice (each its own card): the public Worker route and container
-receiver, and Operator secret provisioning. The durable dedup ledger store
-lives in this branch (see [Durable go-live ledger](#durable-go-live-ledger));
+The public Worker route (`POST /hooks/twitch`, `wrangler/src/eventsub.ts`)
+is dark unless `EVENTSUB_INGRESS` and `TWO_EVENTSUB` are both exactly `"1"`
+(staging-only). The private container receiver below lands in this slice;
+Operator secret provisioning stays an Operator action. The durable dedup
+ledger store lives in this branch (see [Durable go-live ledger](#durable-go-live-ledger));
 until the receiver wires it, runtime dedup is in-memory (`RecentKeys`), so a
 crash between the post and the 2xx can post once more after restart.
+
+## Private container receiver
+
+`crates/bot/src/eventsub_http.rs` plus
+`crates/core/src/eventsub_receiver_config.rs`:
+
+- Binds `0.0.0.0:8092` (`EVENTSUB_RECEIVER_PORT` in `wrangler/src/eventsub.ts`)
+  when `TWO_EVENTSUB` is exactly `"1"` with a valid `TWO_EVENTSUB_BIND` and
+  the Operator-provisioned `TWO_TWITCH_WEBHOOK_SECRET`. Any other state is
+  dark; an enabled-but-invalid config stops startup, never downgrades.
+- Runs `verify_delivery` plus `classify` with the Operator secret. Nothing
+  is parsed before verification passes.
+- Echoes `Delivery::Challenge` as `200 text/plain`; acknowledges
+  `Notification`, `Revocation`, `Ignored` and deterministic classification
+  errors (`WrongSubscription`, `InvalidBody`) as `200 {"ok":true}` so Twitch
+  does not retry what will never succeed. Only a transient send or
+  durable-ledger failure is retriable (`5xx`); this slice has neither, so it
+  never emits `5xx` for a verified delivery.
+- Answers `401` for a missing or mismatched signature, stale timestamp or
+  malformed delivery headers, `415` for a wrong content type, `413` for an
+  oversize body, `405` for a non-POST and `404` for a wrong path. No header
+  value, challenge, body byte or query is ever logged; only scalar
+  `event`/`status`/`error_class`.
+- Keeps the callback path out of trace spans: `/hooks/twitch` is not in
+  `TRACED_PATHS` (`crates/bot/src/server.rs`) and renders as `[REDACTED]`.
+- The DO adds `8092` to `requiredPorts` plus the container bind only while
+  `TWO_EVENTSUB` is `"1"`; the Worker forwards the Operator secret on its
+  own explicit line. `scripts/check-env-bindings.py` rejects any
+  `TWO_EVENTSUB*` or `TWO_TWITCH_*` var in `wrangler.toml`.
 
 ## Helix client with app-token refresh
 
