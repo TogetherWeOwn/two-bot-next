@@ -102,6 +102,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "gateway_sessions", measure: TableMeasure::Columns(&["updated_at"]) },
     // Collector read-times ride the same row write, so their maximum is the
     // row's last write.
+    TableSpec { table: "guild_analytics_settings", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "guild_counters", measure: TableMeasure::Columns(&["human_member_count_at", "online_count_at"]) },
     TableSpec { table: "guild_settings", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "guild_settings_audit", measure: TableMeasure::Columns(&["at"]) },
@@ -178,6 +179,8 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "moderation_warnings", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec { table: "operational_audit_log", measure: TableMeasure::Columns(&["occurred_at"]) },
     TableSpec { table: "presence_probe", measure: TableMeasure::Columns(&["observed_at"]) },
+    TableSpec { table: "privacy_opt_out_audit", measure: TableMeasure::Columns(&["opted_out_at"]) },
+    TableSpec { table: "privacy_opt_outs", measure: TableMeasure::Columns(&["opted_out_at"]) },
     TableSpec {
         table: "rank_ladder",
         measure: TableMeasure::Unmeasurable("seed reference data with no timestamp column"),

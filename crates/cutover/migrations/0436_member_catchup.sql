@@ -1,4 +1,4 @@
--- 0434_member_catchup: cutover-chain target DDL for the member-list catch-up
+-- 0436_member_catchup: cutover-chain target DDL for the member-list catch-up
 -- worker slice (TOG-22941, TOG-22852 slice 8 companion).
 --
 -- The catch-up worker persists per-user rows (`member_catchup_members`) and
@@ -6,7 +6,7 @@
 -- migration every write on a migrated database fails with
 -- "relation does not exist" (the tables previously existed only in the
 -- acceptance fixture DDL). The members frontier is additionally checkpointed
--- into `backfill_cursors` under the `members` family (0433 mirror of store
+-- into `backfill_cursors` under the `members` family (0435 mirror of store
 -- 0408), which is what `GET /ops/backfill/progress` reads — the per-guild
 -- cursor table alone never reaches the route.
 --

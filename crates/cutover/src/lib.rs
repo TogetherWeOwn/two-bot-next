@@ -34,6 +34,7 @@ pub mod member_catchup;
 pub mod member_erasure;
 pub mod message_scan;
 pub mod parse;
+pub mod privacy;
 pub mod raid_tools;
 pub mod reengagement;
 pub mod rest;

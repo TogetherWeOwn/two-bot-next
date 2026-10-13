@@ -369,13 +369,21 @@
       "sha256": "81e51abeda792b6e8dfa4ad714e744fcc09b96f9d857ca70bf4080ef8ce46faf",
       "justification": "Event-store S2 member capture: order-independent event_store table plus premium_since, nick_changed flag and role-id columns for GUILD_MEMBER_ADD/REMOVE/UPDATE, idempotent on the shared UNIQUE dedup_key index, no free-text columns."
     },
-    "crates/cutover/migrations/0433_backfill_cursors.sql": {
-      "sha256": "e75760083876c93b1c0e75d64c4f548685b6da9cc590bf9d5bd975cae035bb8a",
-      "justification": "TOG-22953: cutover-chain mirror of store 0408 backfill_cursors; same shape, IF NOT EXISTS, so the /ops/backfill route and worker cursors work on migrated databases."
+    "crates/cutover/migrations/0433_privacy_opt_out.sql": {
+      "sha256": "c60803ccfb20a7748d43dc2630653950c894953cf8010347b4ad6f681b3197d0",
+      "justification": "Per-user opt-out suppression plus per-guild presence/activity/voice toggles plus one audit receipt row per purge; cutover chain copy, additive with IF NOT EXISTS."
     },
-    "crates/cutover/migrations/0434_member_catchup.sql": {
-      "sha256": "10cd6d7ac5143667b2b2af5ad1d29962f1bed26034c2eb4271dd9ba84768da5f",
-      "justification": "TOG-22941 member-list catch-up worker tables (member_catchup_members/cursors) plus the members-frontier checkpoint contract with backfill_cursors; ids/timestamps/enums only, IF NOT EXISTS, so catch-up writes work on migrated databases and progress reflects the worker."
+    "crates/store/migrations/0434_privacy_opt_out.sql": {
+      "sha256": "798f514afa6cc212a10aba9fb769ba56dd43a7dfcde31983a114421b81dabf7e",
+      "justification": "Per-user opt-out suppression plus per-guild presence/activity/voice toggles plus one audit receipt row per purge; store chain copy, additive with IF NOT EXISTS."
+    },
+    "crates/cutover/migrations/0435_backfill_cursors.sql": {
+      "sha256": "f6a7789c4c56fb6002b20f5a3f683913212a125385e62d0467d23b669e2a504d",
+      "justification": "TOG-22953: cutover-chain mirror of store 0408 backfill_cursors; same shape, IF NOT EXISTS, so the /ops/backfill route and worker cursors work on migrated databases. Renumbered 0433 to 0435 on the merge past main's 0433/0434 privacy opt-out."
+    },
+    "crates/cutover/migrations/0436_member_catchup.sql": {
+      "sha256": "272b679ab44fa9b84621e5c9fbb07e2b11455e18f29c8709c553b0f955ed771f",
+      "justification": "TOG-22941 member-list catch-up worker tables (member_catchup_members/cursors) plus the members-frontier checkpoint contract with backfill_cursors; ids/timestamps/enums only, IF NOT EXISTS, so catch-up writes work on migrated databases and progress reflects the worker. Renumbered 0434 to 0436 on the merge past main's 0433/0434 privacy opt-out."
     }
   }
 }

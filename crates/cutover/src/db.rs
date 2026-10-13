@@ -308,12 +308,51 @@ fn idempotency_key(e: &FunnelWrite) -> String {
 
 /// Insert-first arbitration: the unique index decides the winner atomically,
 /// then the members projection is applied for the winner only.
+///
+/// The privacy gate runs first, inside the same transaction: a suppressed
+/// `(guild_id, member_id)` pair or a guild-disabled analytics family drops
+/// the write as `(false, None)` with no event row and no members projection.
+/// Anonymous writes (`member_id = None`) are never gated.
 pub async fn record_event(
     db: &CutoverDb,
     e: &FunnelWrite,
 ) -> Result<(bool, Option<i64>), sqlx::Error> {
     let key = idempotency_key(e);
     let mut tx = db.pool.begin().await?;
+    // Serialize with concurrent opt-outs (which take SHARE ROW EXCLUSIVE
+    // over these tables): whoever locks first wins, so a write that passes
+    // the gate can never land after the purge. Lock order matches
+    // `opt_out_member`'s sorted order, and ROW EXCLUSIVE never blocks other
+    // writers.
+    sqlx::query("LOCK TABLE events, members, privacy_opt_outs IN ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    if two_bot_core::privacy::ingestion_blocked_in(
+        &mut tx,
+        &e.guild_id,
+        e.member_id.as_deref(),
+        &e.event_type,
+    )
+    .await?
+    {
+        tx.rollback().await?;
+        return Ok((false, None));
+    }
+    // A suppressed inviter's attribution never re-enters through a join they
+    // did not perform: strip `inviterId` from `member_join` metadata when the
+    // inviter is suppressed, keeping the joiner's own row (and every other
+    // metadata key) intact.
+    let mut metadata = e.metadata.clone();
+    if e.event_type == "member_join" {
+        if let Some(inviter) = two_bot_core::privacy::inviter_in_metadata(metadata.as_deref()) {
+            if two_bot_core::privacy::suppressed_in(&mut tx, &e.guild_id, &inviter).await? {
+                metadata = two_bot_core::privacy::scrubbed_member_join_metadata(
+                    metadata.as_deref(),
+                    &inviter,
+                );
+            }
+        }
+    }
     let inserted: Option<(i64,)> = sqlx::query_as(
         "INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
          VALUES ($1, $2, $3, $4::timestamptz, $5, $6, $7)
@@ -324,7 +363,7 @@ pub async fn record_event(
     .bind(&e.guild_id)
     .bind(&e.occurred_at)
     .bind(&e.source)
-    .bind(&e.metadata)
+    .bind(&metadata)
     .bind(&key)
     .fetch_optional(&mut *tx)
     .await?;
@@ -447,13 +486,26 @@ pub(crate) async fn advance_activity(
 }
 
 /// Bump activity without emitting an event; forward-only (legacy
-/// `touchActivity`).
+/// `touchActivity`). A suppressed pair is a no-op: the bump would create or
+/// refresh a per-user `members` row for a member who opted out. The gate
+/// runs inside the write transaction under the shared table lock, so a bump
+/// that passes the gate can never land after a concurrent opt-out purge.
 pub async fn touch_activity(
     db: &CutoverDb,
     guild_id: &str,
     member_id: &str,
     at: &str,
 ) -> Result<(), sqlx::Error> {
+    let mut tx = db.pool().begin().await?;
+    // Lock order matches `opt_out_member`'s sorted order; ROW EXCLUSIVE
+    // never blocks other writers.
+    sqlx::query("LOCK TABLE members, privacy_opt_outs IN ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    if two_bot_core::privacy::suppressed_in(&mut tx, guild_id, member_id).await? {
+        tx.rollback().await?;
+        return Ok(());
+    }
     sqlx::query(
         "INSERT INTO members (guild_id, member_id, last_active_at) VALUES ($1, $2, $3::timestamptz)
          ON CONFLICT (guild_id, member_id) DO UPDATE SET last_active_at = excluded.last_active_at
@@ -462,21 +514,35 @@ pub async fn touch_activity(
     .bind(guild_id)
     .bind(member_id)
     .bind(at)
-    .execute(db.pool())
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
-/// Mark a member row as a bot (legacy `markBot`).
+/// Mark a member row as a bot (legacy `markBot`). A suppressed pair is a
+/// no-op: the flag write would create a per-user `members` row for a member
+/// who opted out. Like [`touch_activity`], the gate runs under the shared
+/// table lock so a concurrent opt-out purge cannot slip between gate and
+/// write.
 pub async fn mark_bot(db: &CutoverDb, guild_id: &str, member_id: &str) -> Result<(), sqlx::Error> {
+    let mut tx = db.pool().begin().await?;
+    sqlx::query("LOCK TABLE members, privacy_opt_outs IN ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    if two_bot_core::privacy::suppressed_in(&mut tx, guild_id, member_id).await? {
+        tx.rollback().await?;
+        return Ok(());
+    }
     sqlx::query(
         "INSERT INTO members (guild_id, member_id, is_bot) VALUES ($1, $2, TRUE)
          ON CONFLICT (guild_id, member_id) DO UPDATE SET is_bot = TRUE",
     )
     .bind(guild_id)
     .bind(member_id)
-    .execute(db.pool())
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -487,6 +553,19 @@ pub async fn record_earliest(
     db: &CutoverDb,
     e: &FunnelWrite,
 ) -> Result<(bool, Option<i64>), sqlx::Error> {
+    // Gate before the insert AND before the pull-back below: for a
+    // suppressed pair or a disabled family even reconfirming an existing row
+    // would refresh per-user state, so the whole call is a no-op.
+    if two_bot_core::privacy::ingestion_blocked(
+        db.pool(),
+        &e.guild_id,
+        e.member_id.as_deref(),
+        &e.event_type,
+    )
+    .await?
+    {
+        return Ok((false, None));
+    }
     let (inserted, id) = record_event(db, e).await?;
     if inserted {
         return Ok((true, id));
@@ -728,6 +807,10 @@ mod message_scan_write_tests {
         let db = CutoverDb { pool };
         let result = async {
             sqlx::raw_sql(include_str!("../migrations/0001_funnel.sql"))
+                .execute(db.pool())
+                .await?;
+            // The ladder writer consults the opt-out suppression table.
+            sqlx::raw_sql(include_str!("../migrations/0433_privacy_opt_out.sql"))
                 .execute(db.pool())
                 .await?;
             let member = "100000000000000001";
