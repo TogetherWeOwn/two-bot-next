@@ -254,10 +254,18 @@ async fn refused_deletion_is_deferred_and_overdue() {
         dry.deletions_overdue, 1,
         "dry run must report the backdated request as overdue, got {dry:?}"
     );
+    assert_eq!(
+        dry.deletions_completed, 0,
+        "dry run must report what the live run will delete: a guarded request is deferred, not completed, got {dry:?}"
+    );
     let live = run_retention(pool, RetentionMode::Execute).await.unwrap();
     assert_eq!(
         live.deletions_completed, 0,
         "guarded request must not complete"
+    );
+    assert_eq!(
+        dry.deletions_completed, live.deletions_completed,
+        "dry and live runs must agree on completions for a guarded request, got dry {dry:?} live {live:?}"
     );
     assert_eq!(
         live.deletions_deferred, 1,
@@ -275,5 +283,88 @@ async fn refused_deletion_is_deferred_and_overdue() {
     .await
     .unwrap();
     assert_eq!(pending, 1, "refused request must stay pending");
+    db.close().await.unwrap();
+}
+
+/// A failing guild purge returns `Ok` with a failure counter, not a silent
+/// warn-only success: the guild stays queued with its rows intact, and the
+/// next run reports the failure again instead of an all-zero success.
+#[tokio::test]
+async fn failing_guild_purge_is_counted_and_stays_queued() {
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    sqlx::query("INSERT INTO members (guild_id, member_id) VALUES ($1, $2)")
+        .bind(GONE_GUILD)
+        .bind(MEMBER)
+        .execute(pool)
+        .await
+        .unwrap();
+    // Wedge: a NO ACTION foreign key onto the departed guild's member row so
+    // the purge's member delete fails with 23503. The wedge table is outside
+    // the erasure plan, so the purge never deletes the blocking row itself.
+    sqlx::query(
+        "CREATE TABLE retention_purge_wedge (
+           id SERIAL PRIMARY KEY,
+           guild_id TEXT NOT NULL,
+           member_id TEXT NOT NULL,
+           FOREIGN KEY (guild_id, member_id) REFERENCES members (guild_id, member_id)
+         )",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO retention_purge_wedge (guild_id, member_id) VALUES ($1, $2)")
+        .bind(GONE_GUILD)
+        .bind(MEMBER)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    assert!(handle_guild_delete(pool, GONE_GUILD, None).await.unwrap());
+    let dry = run_retention(pool, RetentionMode::DryRun).await.unwrap();
+    assert_eq!(
+        dry.guild_purges_failed, 0,
+        "dry run attempts no purges, so it reports no failures, got {dry:?}"
+    );
+    assert!(
+        dry.guild_rows_purged > 0,
+        "dry run must still report the wedged guild's pending rows, got {dry:?}"
+    );
+
+    let first = run_retention(pool, RetentionMode::Execute).await.unwrap();
+    assert_eq!(
+        first.guild_purges_failed, 1,
+        "a wedged guild purge must be counted, got {first:?}"
+    );
+    assert_eq!(
+        first.guild_rows_purged, 0,
+        "the failed guild contributes no purged rows, got {first:?}"
+    );
+    let queued: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM retention_guild_purge_queue WHERE guild_id = $1")
+            .bind(GONE_GUILD)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(queued, 1, "a failed purge must stay queued");
+    let members: i64 = sqlx::query_scalar("SELECT count(*) FROM members WHERE guild_id = $1")
+        .bind(GONE_GUILD)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        members, 1,
+        "a failed purge must leave the guild's rows intact"
+    );
+
+    let second = run_retention(pool, RetentionMode::Execute).await.unwrap();
+    assert_eq!(
+        second.guild_purges_failed, 1,
+        "the stuck guild must fail again instead of reporting an all-zero success, got {second:?}"
+    );
+    assert_eq!(
+        second.guild_rows_purged, 0,
+        "no rows are purged while the wedge holds, got {second:?}"
+    );
     db.close().await.unwrap();
 }

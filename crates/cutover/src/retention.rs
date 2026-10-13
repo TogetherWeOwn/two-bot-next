@@ -81,6 +81,10 @@ pub struct RetentionReport {
     pub audit_cache_deleted: u64,
     /// Guild-scoped rows purged for departed guilds.
     pub guild_rows_purged: u64,
+    /// Queued guild purges that failed in this run, leaving the guild queued.
+    /// A nonzero value with an `Ok` return is the signal that a departed
+    /// guild's rows survived the run (see the warn log for the guild id).
+    pub guild_purges_failed: u64,
     /// User-deletion requests completed by this run.
     pub deletions_completed: u64,
     /// Pending deletion requests refused by a replay guard in this run,
@@ -99,7 +103,8 @@ impl RetentionReport {
     /// Rows deleted across the time-window and guild-purge classes.
     /// Completed user deletions are receipts, not row counts, and are
     /// reported separately in `deletions_completed`; deferred and overdue
-    /// requests are pending-work signals, not deletions, and are excluded.
+    /// requests are pending-work signals, not deletions, and are excluded,
+    /// as are failed guild purges (`guild_purges_failed`).
     #[must_use]
     pub fn total_deleted(&self) -> u64 {
         self.presence_raw_deleted
@@ -193,7 +198,10 @@ pub async fn run_retention(
                 voice_raw_deleted: voice,
                 audit_cache_deleted: audit,
                 guild_rows_purged: guild_rows,
-                deletions_completed: pending as u64,
+                // The dry run reports what the live run will delete: guarded
+                // requests stay pending, so they are deferred, not completed.
+                guild_purges_failed: 0,
+                deletions_completed: (pending as u64).saturating_sub(deferred),
                 deletions_deferred: deferred,
                 deletions_overdue: overdue,
                 duration_ms: started.elapsed().as_millis() as u64,
@@ -299,6 +307,7 @@ pub async fn run_retention(
                     .fetch_all(&mut *tx)
                     .await?;
             let mut guild_rows = 0u64;
+            let mut guild_failed = 0u64;
             for guild in &guilds {
                 sqlx::query("SAVEPOINT retention_guild")
                     .execute(&mut *tx)
@@ -317,6 +326,7 @@ pub async fn run_retention(
                         sqlx::query("RELEASE SAVEPOINT retention_guild")
                             .execute(&mut *tx)
                             .await?;
+                        guild_failed += 1;
                         tracing::warn!(
                             guild_id = %guild,
                             error = %format!("{err:?}"),
@@ -331,6 +341,7 @@ pub async fn run_retention(
                 voice_raw_deleted: voice,
                 audit_cache_deleted: audit,
                 guild_rows_purged: guild_rows,
+                guild_purges_failed: guild_failed,
                 deletions_completed: completed,
                 deletions_deferred: deferred,
                 deletions_overdue: overdue,

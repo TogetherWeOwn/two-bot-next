@@ -78,26 +78,28 @@ test fails if a covered table is not migrated. A dump from a fresh Rust schema
 has 93 table entries. A missing current table refuses a dump/restore: migrate
 the target first.
 A v4 archive must declare every covered table except the ones v5 added
-(`V5_ADDED_TABLES`), the ones v6 added (`V6_ADDED_TABLES`) and the ones v7
-added (`V7_ADDED_TABLES`), so recovery points written before
-create-reservation persistence, the retention queues (0437) and event-store
-capture (0427 voice, 0428 presence, 0429 thread lifecycle, 0430
-message/reaction capture, 0431 stage/interaction-observe/audit-log capture
-and 0432 member deltas), and the seasonal XP projection (0100) remain
-inspectable and restorable.
+(`V5_ADDED_TABLES`), the one v6 added (`V6_ADDED_TABLES`: event-store capture
+0427 voice, 0428 presence, 0429 thread lifecycle, 0430 message/reaction
+capture, 0431 stage/interaction-observe/audit-log capture and 0432 member
+deltas) and the ones v7 added (`V7_ADDED_TABLES`: seasonal XP projection
+0100 plus retention queues 0437), so recovery points written before
+create-reservation persistence, event-store capture, the seasonal XP
+projection (0100) and the retention queues (0437) remain inspectable and
+restorable.
 A v4 archive written before any other table joined the inventory is refused at
 inspect ("manifest is missing tables"); take a fresh dump after upgrading. V5
 requires everything except `V6_ADDED_TABLES` and `V7_ADDED_TABLES`, so recovery
-points written before the retention queues and event-store capture and before
-the seasonal XP projection (0100) stay readable; V6 requires everything except
-`V7_ADDED_TABLES`, so recovery points written before the seasonal XP
-projection stay readable; V7 requires the full current inventory, and an
-incomplete new archive refuses at inspection. Restoring a pre-reservation
-archive clears the destination's reservation, retention, seasonal and
-event-store tables, as with other tables absent from an older version;
-restoring a pre-v6-tables archive clears the destination's retention,
-seasonal and event-store tables the same way; restoring a pre-seasonal v6
-archive clears only the destination's seasonal table.
+points written before event-store capture and before the seasonal XP
+projection (0100) and retention queues (0437) stay readable; V6 requires
+everything except `V7_ADDED_TABLES`, so recovery points written before the
+seasonal XP projection and the retention queues stay readable; V7 requires
+the full current inventory, and an incomplete new archive refuses at
+inspection. Restoring a pre-reservation archive clears the destination's
+reservation, retention, seasonal and event-store tables, as with other tables
+absent from an older version; restoring a pre-event-store archive clears the
+destination's retention, seasonal and event-store tables the same way;
+restoring a pre-retention v6 archive clears only the destination's seasonal
+and retention tables.
 An optional legacy table may be absent only when there are no archived rows for
 it. Nonempty legacy data without a matching target table refuses **before any
 truncate**, rather than silently discarding it.

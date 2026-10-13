@@ -1442,7 +1442,7 @@ async fn pre_reservation_v4_restores_and_clears_newer_reservation_rows() {
             .unwrap();
         assert_eq!(
             count, 0,
-            "v4 archives predate the v6 tables; restore must clear newer {table} rows"
+            "v4 archives predate the v6/v7 tables; restore must clear newer {table} rows"
         );
     }
     let channel: String = sqlx::query_scalar("SELECT channel_id FROM voice_rooms")
