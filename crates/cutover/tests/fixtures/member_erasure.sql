@@ -15,10 +15,11 @@ BEGIN
         VALUES ('member_join', u, g, now(), 'fixture', '{}', k);
       -- event_store is shared by the S1-S8 slices: one presence row per member
       -- here (S5 message/reaction columns ride along) plus three S8 rows per
-      -- member below (actor-only / target-only / user-only), so the erasure
-      -- suites expect four event_store rows per member. Voice columns stay
-      -- NULL here; the backup seed covers the S4 voice, S5 message/reaction
-      -- and S6 thread shapes.
+      -- member below (actor-only / target-only / user-only) plus one S7
+      -- invite row binding the member as inviter only, so the erasure suites
+      -- expect five event_store rows per member. Voice columns stay NULL
+      -- here; the backup seed covers the S4 voice, S5 message/reaction and
+      -- S6 thread shapes.
       INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key,
         presence_status, activity_type, application_id, nick_changed, roles,
         channel_id, message_id)
@@ -163,6 +164,10 @@ BEGIN
       -- independently; with the presence row above that is four rows per
       -- member. The THREAD_MEMBER_UPDATE shape stays covered by the backup
       -- seed, so no thread row is added here.
+      -- One S7 event_store invite row per member, binding the member as
+      -- inviter_id only (actor/target/user NULL) with a code hash, never the
+      -- raw code; with the rows above that is five rows per member, so the
+      -- inviter predicate branch is exercised independently too.
       INSERT INTO event_store
         (event_type, guild_id, stage_instance_id, privacy_level, interaction_id,
          interaction_type, application_id, command_id, audit_log_entry_id, action_type,
@@ -187,6 +192,15 @@ BEGIN
           1, 'app-' || k, 'cmd-' || k, 'audit-user-' || k, 1,
           NULL, NULL, u, '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z',
           'AUDIT_LOG_ENTRY:' || g || ':audit-user-' || k || ':2026-10-01T00:00:00Z');
+      INSERT INTO event_store
+        (event_type, guild_id, channel_id, invite_code_hash, inviter_id,
+         actor_id, target_id, user_id, event_time, received_at, dedup_key)
+        VALUES ('INVITE_CREATE', g, 'c-' || k,
+          repeat(md5('invite-' || k), 2),
+          u, NULL, NULL, NULL, '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z',
+          'INVITE_CREATE:' || g || ':c-' || k || ':' ||
+            repeat(md5('invite-' || k), 2) ||
+            ':2026-10-01T00:00:00Z');
       -- Explicit exceptions are seeded too: erasure must not change safety policy.
       INSERT INTO guild_settings (guild_id, key, value, version, updated_by)
         VALUES (g, 'fixture_' || u, to_jsonb(u), 1, u);

@@ -154,7 +154,8 @@ pub const DUMP_TABLES: &[&str] = &[
     // V6 adds the shared event-store table for the S1-S8 slices (0427 S4 voice
     // capture plus 0428 S3 presence plus 0429 S6 thread lifecycle plus 0430 S5
     // message/reaction capture plus 0431 S8 stage/interaction-observe/audit-log
-    // capture plus 0432 S2 member capture); see [`V6_ADDED_TABLES`].
+    // capture plus 0432 S2 member capture plus 0438 S7 invite/scheduled-event
+    // capture); see [`V6_ADDED_TABLES`].
     // Append-only, guild-keyed, no foreign keys, so order among the tail is free.
     "event_store",
 ];
@@ -176,7 +177,8 @@ pub const V5_ADDED_TABLES: &[&str] = &[
 /// declare them; v6 archives must cover everything except the v7 addition, so
 /// recovery points written before event-store persistence (0427 voice, 0428
 /// presence, 0429 thread lifecycle, 0430 message/reaction capture, 0431
-/// stage/interaction/audit capture, 0432 member deltas) stay readable without
+/// stage/interaction/audit capture, 0432 member deltas, 0438
+/// invite/scheduled-event capture) stay readable without
 /// waiving arbitrary missing tables. v5 still requires every other covered
 /// table except the v7 addition.
 pub const V6_ADDED_TABLES: &[&str] = &["event_store"];

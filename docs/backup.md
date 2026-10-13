@@ -20,7 +20,8 @@ Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
 write **v7** (including durable voice-create reservations, the seasonal XP
 projection and the event store: voice capture plus presence capture plus
 member-capture deltas plus message/reaction capture plus thread lifecycle plus
-stage/interaction-observe/audit-log capture); the reader also accepts frozen
+stage/interaction-observe/audit-log capture plus invite/scheduled-event
+capture); the reader also accepts frozen
 **v3**, pre-reservation **v4**, pre-event-store **v5** and pre-seasonal **v6**.
 Other versions refuse.
 The manifest carries per-table `{name, columns, column_types, count}` taken
@@ -67,10 +68,11 @@ mark, the voice configuration tables, the accepted voice-room create history
 (`voice_create_reservations`), the seasonal XP projection (`member_season_xp`)
 and the event store (voice capture plus presence capture plus member-capture
 deltas plus message/reaction capture plus thread lifecycle plus
-stage/interaction-observe/audit-log capture)
+stage/interaction-observe/audit-log capture plus invite/scheduled-event
+capture)
 (`event_store`: 0427 voice, 0428 presence, 0429 thread lifecycle, 0430
 message/reaction capture, 0431 stage/interaction-observe/audit-log capture
-plus 0432 member-capture deltas).
+plus 0432 member-capture deltas plus 0438 invite/scheduled-event capture).
 `OPTIONAL_LEGACY_TABLES` is empty: the coverage
 test fails if a covered table is not migrated. A dump from a fresh Rust schema
 has 84 table entries. A missing current table refuses a dump/restore: migrate
@@ -85,7 +87,8 @@ inspect ("manifest is missing tables"); take a fresh dump after upgrading. V5
 requires everything except `V6_ADDED_TABLES` and `V7_ADDED_TABLES`, so recovery
 points written before event-store capture (0427 voice, 0428 presence, 0429
 thread lifecycle, 0430 message/reaction capture, 0431
-stage/interaction-observe/audit-log capture and 0432 member deltas) and before
+stage/interaction-observe/audit-log capture, 0432 member deltas and 0438
+invite/scheduled-event capture) and before
 the seasonal XP projection (0100) stay readable; V6 requires everything except
 `V7_ADDED_TABLES`, so recovery points written before the seasonal XP
 projection stay readable; V7 requires the full current inventory, and an
