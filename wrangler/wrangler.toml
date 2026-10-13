@@ -15,6 +15,13 @@ compatibility_date = "2026-09-29"
 # through `env`, as they were before nodejs_compat. Inherited by every [env.*].
 compatibility_flags = ["nodejs_compat", "nodejs_compat_do_not_populate_process_env"]
 
+# workers.dev break-glass (TOG-22861): bare deploys never serve the public
+# suffix. [env.staging] and [env.production] both re-enable it as the
+# Access-independent break-glass origin for the read-only ops dashboard until
+# a custom domain and Access app exist; flipping either to false moves that
+# env to the custom domain in a separate change.
+workers_dev = false
+
 # Identity is supplied by Cloudflare, not a hand-edited env flag. Ownership
 # must be explicitly transferred after each new version is deployed.
 [version_metadata]
@@ -22,7 +29,7 @@ binding = "CF_VERSION_METADATA"
 
 # Default-environment bindings. Named environments do NOT inherit these —
 # every [env.*] below repeats the full Container/DO wiring explicitly.
-# Verified against wrangler 4.148.0 (`deploy --dry-run --env <name>` warns on
+# Verified against wrangler 4.149.0 (`deploy --dry-run --env <name>` warns on
 # any omission); enforced in CI by scripts/check-env-bindings.py, which also
 # requires both [env.staging] and [env.production] to be declared.
 [[containers]]
@@ -74,6 +81,10 @@ KEEPALIVE_SECONDS = "60"
 #   wrangler secret put --env staging DISCORD_TOKEN      # staging bot token
 #   wrangler secret put --env staging GUILD_ID           # TWO Staging guild
 #   wrangler secret put --env production DISCORD_TOKEN   # B4 only
+[env.staging]
+# Staging break-glass origin for the read-only ops dashboard (TOG-22861).
+workers_dev = true
+
 [env.staging.version_metadata]
 binding = "CF_VERSION_METADATA"
 
@@ -145,6 +156,12 @@ TWO_VOICE = "1"
 # (docs/voice-presence.md). The staging app's Presence Intent is on
 # (GATEWAY_PRESENCE_LIMITED, 2026-10-10). Rollback: delete the line, redeploy.
 TWO_VOICE_PRESENCE = "1"
+
+[env.production]
+# Production keeps workers.dev enabled (TOG-22861): it has no custom domain
+# or route yet, so workers.dev is the only origin. Flip to false in a
+# separate change once a custom domain and Access app exist.
+workers_dev = true
 
 [env.production.version_metadata]
 binding = "CF_VERSION_METADATA"

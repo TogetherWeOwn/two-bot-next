@@ -143,6 +143,17 @@ No new automatic age-based purger is installed by this change. Covered activity
 persists until an authorized erasure or a separate existing feature lifecycle
 removes it. Do not claim a 30/90-day TTL where no enforcing timer exists.
 
+The append-only event-store capture (`event_store`, when its slices land)
+follows the same rule: its rows persist until erasure, and its TTL policy is
+an explicit placeholder awaiting a reviewed migration, not an installed
+timer. The per-user purge path is this procedure plus one manifest entry per
+landing slice, deleting by guild plus user; rows without a user id purge per
+guild (and per message or thread where the columns exist) instead. The
+capture fence is ids, timestamps and enums only: no message bodies and no
+custom free text are ever stored. See the
+[event-store wiring note](event-store.md) for the per-slice fence table,
+the backfill-no-replay rule and the read-only staging verify steps.
+
 The manifest explicitly retains these control-plane records:
 
 | Record/columns | Reason and operator follow-up |

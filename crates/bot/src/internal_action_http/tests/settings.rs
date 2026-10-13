@@ -321,6 +321,11 @@ async fn unwired_membership_verb_stays_refused_with_settings_flag_on() {
     // test cannot flip the verdict mid-assertion.
     let _moderation_flag = MODERATION_FLAG_LOCK.lock().await;
     let _add_member_flag = ADD_MEMBER_FLAG_LOCK.lock().await;
+    // Holding the locks blocks parallel setters, but a sibling that panicked
+    // before restoring leaves its var on, flipping this verdict to 200.
+    // Pin the required off-state explicitly while the locks are held.
+    set_moderation_flags(false);
+    set_add_member_flag(false);
     set_settings_flag(true);
     let app = settings_app(db.pool().clone());
     // `role.assign` and `event.upsert` are wired and unconditional (Phase 1),
