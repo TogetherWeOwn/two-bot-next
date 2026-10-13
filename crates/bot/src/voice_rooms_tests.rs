@@ -3642,8 +3642,13 @@ async fn delayed_compensation_keeps_capacity_until_the_delete_succeeds() {
     );
     dispatch(&mut worker, 1).await;
     assert!(worker.store.settled.lock().unwrap().is_empty());
+    // The 429 retry is scheduled from the 429 response time (dispatch start
+    // plus wall-clock dispatch cost), so the lower bound pins
+    // not_before >= now + retry_after while the retry itself is awaited with
+    // wall-clock margin: asserting the exact 600_001 instant flakes whenever
+    // dispatch costs >= 1 ms under load.
     assert!(!worker.dispatch_one(300_001).await);
-    dispatch(&mut worker, 600_001).await;
+    dispatch(&mut worker, 610_000).await;
     assert_eq!(
         *worker.store.settled.lock().unwrap(),
         [("r1".to_owned(), None)]

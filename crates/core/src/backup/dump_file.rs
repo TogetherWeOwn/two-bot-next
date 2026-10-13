@@ -119,7 +119,7 @@ pub const DUMP_TABLES: &[&str] = &[
     "internal_action_log",
     "internal_discord_events",
     "internal_event_keys",
-    // Stream go-live dedup ledger (0435): one row per go-live, no foreign
+    // Stream go-live dedup ledger (0437): one row per go-live, no foreign
     // keys, so order among the internal tables is free.
     "stream_live_claims",
     "moderation_channel_executions",
@@ -168,7 +168,7 @@ pub const DUMP_TABLES: &[&str] = &[
 /// without waiving arbitrary missing tables. The privacy opt-out control plane
 /// (0433/0434) is v5 for the same reason: v4 archives predate suppression
 /// tombstones, toggle rows and opt-out receipts. The stream go-live ledger
-/// (0435) is v5 for the same reason: v4 archives predate claim rows.
+/// (0437) is v5 for the same reason: v4 archives predate claim rows.
 pub const V5_ADDED_TABLES: &[&str] = &[
     "voice_create_reservations",
     "stream_live_claims",
@@ -222,6 +222,20 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     // and silently break rollback coverage.
     "rollback_journal",
     "rollback_watermarks",
+    // Resumable Discord backfill progress (store 0408/0409, cutover 0433
+    // mirror, cutover 0434 member catch-up): per-family pagination cursors,
+    // channel-history metadata catch-up, per-guild member rows and resume
+    // cursors. Rows are re-capturable from the Discord API on the next worker
+    // run (the cutover ledger marks 0408/0433/0434 re-runnable: drop and
+    // re-checkpoint). Never replay a pre-restore cursor into a recovered
+    // process: a restored cursor could mark post-backup messages as already
+    // backfilled and silently skip them, the same watermark hazard as
+    // rollback_watermarks above.
+    "backfill_cursors",
+    "backfill_history_messages",
+    "backfill_history_counts",
+    "member_catchup_cursors",
+    "member_catchup_members",
     // Migration ledgers describe target DDL; replacing them would falsely mark
     // unapplied migrations as applied. Legacy schema_migrations is diagnostic
     // manifest metadata only, never restored application data. The store

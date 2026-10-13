@@ -65,6 +65,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "automod_delivery_claims", measure: TableMeasure::Columns(&["claimed_at", "completed_at"]) },
     TableSpec { table: "automod_processed_messages", measure: TableMeasure::Columns(&["processed_at"]) },
     TableSpec { table: "automod_violations", measure: TableMeasure::Columns(&["updated_at"]) },
+    TableSpec { table: "backfill_cursors", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "community_facts", measure: TableMeasure::Columns(&["recorded_at"]) },
     TableSpec { table: "community_scorecard_alerts", measure: TableMeasure::Columns(&["created_at"]) },
     // Retry reservation (TOG-11145): next_attempt_at is a BIGINT epoch-ms
@@ -144,6 +145,8 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         ),
     },
     TableSpec { table: "lfg_signups", measure: TableMeasure::Columns(&["joined_at"]) },
+    TableSpec { table: "member_catchup_cursors", measure: TableMeasure::Columns(&["updated_at"]) },
+    TableSpec { table: "member_catchup_members", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "member_erasure_audit", measure: TableMeasure::Columns(&["erased_at"]) },
     TableSpec { table: "member_exclusions", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "member_levels", measure: TableMeasure::Columns(&["updated_at"]) },
@@ -207,7 +210,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "sticky_messages", measure: TableMeasure::Columns(&["updated_at"]) },
     // Claim/stamp transitions rewrite delivered_at without touching
     // claimed_at, so the maximum across both is the row's last write (same
-    // shape as tickets). Migration 0435.
+    // shape as tickets). Migration 0437.
     TableSpec { table: "stream_live_claims", measure: TableMeasure::Columns(&["claimed_at", "delivered_at"]) },
     TableSpec { table: "ticket_transcripts", measure: TableMeasure::Columns(&["created_at"]) },
     // Status/close transitions rewrite these columns without touching

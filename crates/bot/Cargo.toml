@@ -23,6 +23,10 @@ two-bot-cutover = { version = "0.4.0", path = "../cutover" }
 # Relay/audit ids: 16 CSPRNG bytes hex-encoded (same shape as core's
 # internal_actions nonces).
 hex = { workspace = true }
+# ops_backfill verifies the existing listener's path-bound HMAC signatures
+# (same envelope as the internal-action receiver, bound to GET /ops/backfill/progress).
+hmac = { workspace = true }
+sha2 = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 time = { workspace = true }
@@ -52,3 +56,7 @@ futures-util = { workspace = true, features = ["sink"] }
 two-bot-testsupport = { version = "0.4.0", path = "../testsupport" }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-websockets = { workspace = true }
+# ops_backfill acceptance mints the existing listener's path-bound HMAC
+# signatures in-test (test-only signing; versions already locked via core).
+hmac = { workspace = true }
+sha2 = { workspace = true }
