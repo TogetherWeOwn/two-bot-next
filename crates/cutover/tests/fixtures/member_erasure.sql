@@ -17,6 +17,8 @@ BEGIN
         VALUES (g, u, 1, u, now());
       INSERT INTO member_levels (guild_id, member_id, xp, message_xp, updated_at)
         VALUES (g, u, 15, 15, now());
+      INSERT INTO member_season_xp (guild_id, season_id, member_id, seasonal_xp, updated_at)
+        VALUES (g, '2026-Q4', u, 15, now());
       INSERT INTO xp_awards (guild_id, member_id, source, xp, occurred_at)
         VALUES (g, u, 'message', 15, now());
       INSERT INTO xp_cooldowns (guild_id, member_id, source, last_awarded_at)
