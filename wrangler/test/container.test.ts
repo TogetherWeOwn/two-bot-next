@@ -1118,7 +1118,7 @@ test("Worker and DO private scrape preserve the bounded REST guard fixture", asy
   assert.equal(upstream.mock.callCount(), 1);
 });
 
-for (const path of ["/ops/summary", "/ops/gateway", "/ops/backfill"]) {
+for (const path of ["/ops/summary", "/ops/gateway", "/ops/backfill-rollup"]) {
   test(`DO ${path}: small JSON body proxies with the JSON content type`, async (t) => {
     const h = await harness(t);
     t.mock.method(h.bot, "containerFetch", async () => new Response('{"ready":true}\n', { status: 200 }));
@@ -1144,10 +1144,10 @@ test("DO /ops/gateway: oversized body returns 502 with a generic body", async (t
   assert.equal(await response.text(), "ops unavailable\n");
 });
 
-test("DO /ops/backfill: rejected container fetch returns 504 with a generic body", async (t) => {
+test("DO /ops/backfill-rollup: rejected container fetch returns 504 with a generic body", async (t) => {
   const h = await harness(t);
   t.mock.method(h.bot, "containerFetch", async () => { throw new Error("fixture transport failure"); });
-  const response = await h.bot.fetch(probeRequest("https://worker.invalid/ops/backfill"));
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/ops/backfill-rollup"));
   assert.equal(response.status, 504);
   assert.equal(await response.text(), "ops unavailable\n");
 });
@@ -1177,7 +1177,7 @@ test("Worker gates the ops JSON roll-ups behind the scrape bearer, before the re
       headers: { "cf-connecting-ip": `10.99.0.${caller}`, ...(init?.headers ?? {}) },
     }), env, ctx);
   };
-  for (const path of ["/ops/summary", "/ops/gateway", "/ops/backfill"]) {
+  for (const path of ["/ops/summary", "/ops/gateway", "/ops/backfill-rollup"]) {
     assert.equal((await gated(path)).status, 401);
     const wrong = await gated(path, {
       headers: { authorization: "Bearer wrong-bearer-not-a-secret-0123456789" },
@@ -1192,7 +1192,7 @@ test("Worker gates the ops JSON roll-ups behind the scrape bearer, before the re
   }
   // No token configured: the routes do not exist.
   const unconfigured = { ...env, METRICS_SCRAPE_TOKEN: undefined } as unknown as Env;
-  for (const path of ["/ops/summary", "/ops/gateway", "/ops/backfill"]) {
+  for (const path of ["/ops/summary", "/ops/gateway", "/ops/backfill-rollup"]) {
     caller += 1;
     const response = await worker.fetch(new Request(`https://worker.invalid${path}`, {
       headers: { authorization: `Bearer ${token}`, "cf-connecting-ip": `10.99.0.${caller}` },
@@ -1208,7 +1208,7 @@ test("Worker gates the ops JSON roll-ups behind the scrape bearer, before the re
     CF_VERSION_METADATA: { id: ID },
     TWO_BOT: { getByName: () => ({ fetch: (request: Request) => h.bot.fetch(request) }) },
   } as unknown as Env;
-  for (const path of ["/ops/summary", "/ops/gateway", "/ops/backfill"]) {
+  for (const path of ["/ops/summary", "/ops/gateway", "/ops/backfill-rollup"]) {
     caller += 1;
     const response = await worker.fetch(new Request(`https://worker.invalid${path}`, {
       headers: { authorization: `Bearer ${token}`, "cf-connecting-ip": `10.99.0.${caller}` },
@@ -1229,6 +1229,102 @@ test("Worker gates the ops JSON roll-ups behind the scrape bearer, before the re
   assert.equal(unknown.status, 404);
   assert.equal(unknown.headers.get("location"), null);
   assert.equal(upstream.mock.callCount(), before);
+});
+
+test("DO /ops/backfill-rollup: journal payload proxies untouched with the JSON content type", async (t) => {
+  // Payload pin: the roll-up still carries journal cursors and lag on the
+  // new path; the DO proxies the container body byte for byte.
+  const h = await harness(t);
+  const journal = '{"available":true,"restorable_point":7,"max_lag":3,"tables":[{"table":"events","watermark":4,"lag":3}]}\n';
+  t.mock.method(h.bot, "containerFetch", async () => new Response(journal, { status: 200 }));
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/ops/backfill-rollup"));
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "application/json");
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.equal(await response.text(), journal);
+});
+
+test("Worker /ops/backfill does not serve the journal roll-up", async (t) => {
+  // No-alias pin: a scrape-bearer read of the signed worker-progress path
+  // is never a journal read. It must not answer 200 with the roll-up body.
+  const token = "synthetic-ops-no-alias-token-0123456789ab";
+  const journal = '{"available":true,"restorable_point":7,"max_lag":3,"tables":[]}\n';
+  const h = await harness(t, { METRICS_SCRAPE_TOKEN: token });
+  t.mock.method(h.bot, "containerFetch", async () => new Response(journal));
+  const env = {
+    ...WORKER_ENV,
+    METRICS_SCRAPE_TOKEN: token,
+    CF_VERSION_METADATA: { id: ID },
+    TWO_BOT: { getByName: () => ({ fetch: (request: Request) => h.bot.fetch(request) }) },
+  } as unknown as Env;
+  const ctx = { waitUntil: () => {} } as ExecutionContext;
+  const response = await worker.fetch(new Request("https://worker.invalid/ops/backfill", {
+    headers: { authorization: `Bearer ${token}`, "cf-connecting-ip": "10.99.2.7" },
+  }), env, ctx);
+  assert.ok(
+    response.status === 404 || response.status === 401,
+    `signed path must not proxy the journal roll-up, got ${response.status}`,
+  );
+});
+
+test("/ops/backfill-rollup: scrape-bearer auth outcomes match the roll-up contract", async (t) => {
+  // Auth pin: disabled, unauthorized, throttled and authorized requests keep
+  // the existing scrape-bearer behaviors on the renamed path, with the same
+  // take-before-compare budget as the metrics scrape.
+  const token = "synthetic-ops-rollup-auth-token-0123456789";
+  const body = '{"available":false,"restorable_point":null,"max_lag":null,"tables":[]}\n';
+  const h = await harness(t, { METRICS_SCRAPE_TOKEN: token });
+  const upstream = t.mock.method(h.bot, "containerFetch", async () => new Response(body));
+  const gated = {
+    ...WORKER_ENV,
+    METRICS_SCRAPE_TOKEN: token,
+    CF_VERSION_METADATA: { id: ID },
+    TWO_BOT: { getByName: () => { throw new Error("unauthenticated calls must not reach the DO"); } },
+  } as unknown as Env;
+  const open = {
+    ...gated,
+    TWO_BOT: { getByName: () => ({ fetch: (request: Request) => h.bot.fetch(request) }) },
+  } as unknown as Env;
+  const ctx = { waitUntil: () => {} } as ExecutionContext;
+  const read = (env: Env, ip: string, auth?: string) =>
+    worker.fetch(new Request("https://worker.invalid/ops/backfill-rollup", {
+      headers: { ...(auth ? { authorization: auth } : {}), "cf-connecting-ip": ip },
+    }), env, ctx);
+  // Disabled: no token configured, the route does not exist.
+  const disabled = await read(
+    { ...gated, METRICS_SCRAPE_TOKEN: undefined } as unknown as Env,
+    "10.99.3.1",
+    `Bearer ${token}`,
+  );
+  assert.equal(disabled.status, 404);
+  // Unauthorized: missing and wrong bearers, with the Bearer challenge.
+  assert.equal((await read(gated, "10.99.3.2")).status, 401);
+  const wrong = await read(gated, "10.99.3.2", "Bearer wrong-bearer-not-a-secret-0123456789");
+  assert.equal(wrong.status, 401);
+  assert.equal(wrong.headers.get("www-authenticate"), "Bearer");
+  // Throttled: ten failures spend the burst, the next guess is refused
+  // without a comparison, and even the correct bearer waits out the budget.
+  for (let i = 0; i < 10; i++) {
+    const res = await read(gated, "10.99.3.7", "Bearer wrong-bearer-value");
+    assert.equal(res.status, 401, `failure ${i} must stay 401`);
+    await res.text();
+  }
+  const throttled = await read(gated, "10.99.3.7", "Bearer wrong-bearer-value");
+  assert.equal(throttled.status, 429);
+  assert.ok(Number(throttled.headers.get("retry-after")) >= 1);
+  assert.equal(await throttled.text(), "slow down\n");
+  const guessedRight = await read(gated, "10.99.3.7", `Bearer ${token}`);
+  assert.equal(guessedRight.status, 429);
+  await guessedRight.text();
+  // Another caller is unaffected: wrong bearer is 401, the correct bearer
+  // proxies the container JSON untouched.
+  assert.equal((await read(gated, "10.99.3.8", "Bearer wrong-bearer-value")).status, 401);
+  const ok = await read(open, "10.99.3.8", `Bearer ${token}`);
+  assert.equal(ok.status, 200);
+  assert.equal(ok.headers.get("content-type"), "application/json");
+  assert.equal(ok.headers.get("cache-control"), "no-store");
+  assert.equal(await ok.text(), body);
+  assert.equal(upstream.mock.callCount(), 1, "only the authorized read reaches the container");
 });
 
 // Readiness monitoring uses synthetic responses only. Global fetch is stubbed

@@ -466,6 +466,7 @@ mod tests {
             ("/ops/summary", "/ops/summary"),
             ("/ops/gateway", "/ops/gateway"),
             ("/ops/backfill", "/ops/backfill"),
+            ("/ops/backfill-rollup", "/ops/backfill-rollup"),
             ("/ops/summary?token=fixture-query-secret", "/ops/summary"),
             ("/readyz?token=fixture-query-secret", "/readyz"),
             ("/health?key=fixture-query-secret", "/health"),

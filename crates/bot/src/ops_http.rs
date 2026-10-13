@@ -529,13 +529,15 @@ mod tests {
 
     #[tokio::test]
     async fn backfill_without_database_is_unavailable() {
+        // Route-correction pin: the journal roll-up lives at the roll-up
+        // path with its unchanged payload (cursors, lag, restorable point).
         let (status, json) = get(
             app(
                 GatewayState::Connected,
                 None,
                 crate::jobs::statuses(&[], true),
             ),
-            "/ops/backfill",
+            "/ops/backfill-rollup",
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -543,12 +545,47 @@ mod tests {
         assert_eq!(json["tables"], serde_json::json!([]));
     }
 
+    /// Route-correction pin: the signed worker-progress path must never
+    /// serve the journal roll-up. Any 200 JSON carrying the journal
+    /// `tables` section at the signed path is a journal alias and fails.
+    /// A non-200 (unconfigured signed route or signed refusal) or a 200
+    /// without a journal section satisfies the pin. Constructing the
+    /// composed router here is itself the no-duplicate-registration pin:
+    /// a duplicated route would panic before any assertion runs.
+    #[tokio::test]
+    async fn signed_path_serves_no_journal_alias() {
+        let response = app(
+            GatewayState::Connected,
+            None,
+            crate::jobs::statuses(&[], true),
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/ops/backfill")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        if response.status() == StatusCode::OK {
+            let bytes = axum::body::to_bytes(response.into_body(), 1_048_576)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(
+                json.get("tables").is_none(),
+                "journal alias at the signed path"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn unreachable_database_degrades_to_unavailable_not_500() {
         // `connect_lazy` performs no I/O, so the queries fail and the
         // endpoints must report unavailable sections with 200, never 500.
         let pool = lazy_pool();
-        for uri in ["/ops/summary", "/ops/backfill"] {
+        // Route-correction pin: the roll-up path degrades like the old one.
+        for uri in ["/ops/summary", "/ops/backfill-rollup"] {
             let (status, json) = get(
                 app(
                     GatewayState::Connected,
