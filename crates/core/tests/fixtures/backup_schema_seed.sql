@@ -598,7 +598,7 @@ VALUES ('THREAD_CREATE', '100000000000000001', '100000000000000060',
         NULL, '100000000000000002', '2026-08-03T10:01:00Z',
         'THREAD_MEMBER_UPDATE:100000000000000001:100000000000000060:2026-08-03T10:01:00Z:100000000000000002',
         NULL, NULL, NULL);
--- Event-store S7 invite + scheduled-event capture (0438): one invite row
+-- Event-store S7 invite + scheduled-event capture (0439): one invite row
 -- with the code hash (never the raw code) plus the inviter id, and one
 -- scheduled-event lifecycle row with the status/entity-type enums. The hash
 -- below is hash-shaped seed data; the sha256 property itself is pinned by
