@@ -336,7 +336,7 @@ impl GameActivityCollector {
                 // old game's closing points and split it into floors.
                 // Rotate to [syns, delta] so sessionize closes old first.
                 let len = buffer.len();
-                if len >= pending_len + 1 {
+                if len > pending_len {
                     buffer[len - pending_len - 1..].rotate_left(1);
                 }
                 let overflow = buffer.len().saturating_sub(MAX_DELTAS_PER_GUILD);
