@@ -225,7 +225,9 @@ inviters keep the aggregate use count with a blanked inviter field, in the
 standalone capture's counter baseline and the backfill baseline alike, which
 share one writer), the onboarding writers (including the prompt guard, which
 re-gates before the insert for opt-outs that land while the welcome is in
-flight), and `touch_activity` / `mark_bot`. Every gated writer serializes
+flight), `touch_activity` / `mark_bot`, and the inactivity sweep (suppression-only:
+a suppressed pair is skipped inside the per-member transaction, so the sweep
+never recreates the purged `member_inactive` row). Every gated writer serializes
 with concurrent opt-outs (a shared table lock, so a write that passes the
 gate can never land after the purge), and `member_join` rows strip a
 suppressed inviter's `inviterId` from metadata while keeping the joiner's

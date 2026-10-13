@@ -235,6 +235,10 @@ mod privacy_lock_tests {
         let guild: u64 = GUILD.parse().unwrap();
         let member: u64 = MEMBER_A.parse().unwrap();
 
+        // Distinct codes so a late write cannot be overwritten by a later
+        // iteration that sees the suppression; any post-commit iteration
+        // leaves a row naming the inviter. The deterministic test below is
+        // the true lock pin (single write, no timing dependence).
         let writer_pool = pool.clone();
         let writer = tokio::spawn(async move {
             let store = PgInviteSnapshots::new(writer_pool);
@@ -242,7 +246,7 @@ mod privacy_lock_tests {
                 store.store_all(
                     guild,
                     &[InviteState {
-                        code: "race".to_owned(),
+                        code: format!("race-{i}"),
                         uses: i,
                         inviter_id: Some(member),
                         channel_id: None,
@@ -288,6 +292,71 @@ mod privacy_lock_tests {
         assert_eq!(
             attributed, 0,
             "no snapshot row names the suppressed inviter after the race"
+        );
+
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&pool)
+            .await
+            .expect("clean up owned test schema");
+        pool.close().await;
+    }
+
+    /// Deterministic pin for the `store_all` table lock: hold the opt-out's
+    /// lock set open with the suppression installed but uncommitted, run one
+    /// snapshot write (its gate reads before the commit, then it blocks on
+    /// the table lock), commit, and assert nothing names the inviter. Without
+    /// the writer's `LOCK TABLE` the gate passes and the upsert lands after
+    /// the purge — a single iteration fails with no timing dependence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn store_all_deterministic_race_never_attributing() {
+        let Some((pool, schema)) = test_pool("snapshot_privacy_deterministic").await else {
+            return;
+        };
+        let guild: u64 = GUILD.parse().unwrap();
+        let member: u64 = MEMBER_A.parse().unwrap();
+
+        let mut opt_tx = pool.begin().await.expect("opt-out tx");
+        sqlx::query(
+            "LOCK TABLE community_facts, events, invite_snapshots, members, \
+             privacy_opt_outs, privacy_opt_out_audit IN SHARE ROW EXCLUSIVE MODE",
+        )
+        .execute(&mut *opt_tx)
+        .await
+        .expect("opt-out lock");
+        sqlx::query("INSERT INTO privacy_opt_outs (guild_id, member_id) VALUES ($1, $2)")
+            .bind(GUILD)
+            .bind(MEMBER_A)
+            .execute(&mut *opt_tx)
+            .await
+            .expect("suppression install");
+        let writer_pool = pool.clone();
+        let writer = tokio::spawn(async move {
+            let store = PgInviteSnapshots::new(writer_pool);
+            store.store_all(
+                guild,
+                &[InviteState {
+                    code: "race-single".to_owned(),
+                    uses: 7,
+                    inviter_id: Some(member),
+                    channel_id: None,
+                }],
+            );
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        opt_tx.commit().await.expect("opt-out commit");
+        writer.await.expect("writer task");
+
+        let attributed: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM invite_snapshots WHERE guild_id = $1 AND inviter_id = $2",
+        )
+        .bind(GUILD)
+        .bind(MEMBER_A)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            attributed, 0,
+            "single snapshot write racing the opt-out never attributes"
         );
 
         sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))

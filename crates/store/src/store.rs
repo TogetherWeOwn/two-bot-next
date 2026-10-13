@@ -851,4 +851,106 @@ mod privacy_lock_tests {
 
         drop_schema(&pool, &schema).await;
     }
+
+    /// Deterministic pin for the `touch_activity` / `mark_bot` table locks:
+    /// hold the opt-out's lock set open with the suppression installed but
+    /// uncommitted, run one bump plus one flag (their gates read before the
+    /// commit, then they block on the table lock), commit, and assert no row.
+    /// Without either lock the gate passes and the upsert lands after the
+    /// purge — a single iteration fails with no timing dependence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn touch_and_mark_deterministic_race_create_no_row() {
+        let Some((pool, schema)) = test_pool("store_privacy_touch_deterministic").await else {
+            return;
+        };
+        let guild: u64 = GUILD.parse().unwrap();
+        let member: u64 = MEMBER_A.parse().unwrap();
+
+        let mut opt_tx = pool.begin().await.expect("opt-out tx");
+        sqlx::query(
+            "LOCK TABLE community_facts, events, invite_snapshots, members, \
+             privacy_opt_outs, privacy_opt_out_audit IN SHARE ROW EXCLUSIVE MODE",
+        )
+        .execute(&mut *opt_tx)
+        .await
+        .expect("opt-out lock");
+        sqlx::query("INSERT INTO privacy_opt_outs (guild_id, member_id) VALUES ($1, $2)")
+            .bind(GUILD)
+            .bind(MEMBER_A)
+            .execute(&mut *opt_tx)
+            .await
+            .expect("suppression install");
+        let writer_pool = pool.clone();
+        let writer = tokio::spawn(async move {
+            let store = PgFunnelStore::new(writer_pool);
+            store.touch_activity(guild, member, "2026-10-13T00:00:00.000Z");
+            store.mark_bot(guild, member);
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        opt_tx.commit().await.expect("opt-out commit");
+        writer.await.expect("writer task");
+
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM members WHERE guild_id = $1 AND member_id = $2",
+        )
+        .bind(GUILD)
+        .bind(MEMBER_A)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows, 0,
+            "single bump plus flag racing the opt-out create no row"
+        );
+
+        drop_schema(&pool, &schema).await;
+    }
+
+    /// Deterministic pin for the `record_async` table lock: one event while
+    /// the opt-out holds its locks open. Without the lock the gate passes and
+    /// the insert lands after the purge.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn record_deterministic_race_never_persists() {
+        let Some((pool, schema)) = test_pool("store_privacy_record_deterministic").await else {
+            return;
+        };
+        let guild: u64 = GUILD.parse().unwrap();
+        let member: u64 = MEMBER_A.parse().unwrap();
+
+        let mut opt_tx = pool.begin().await.expect("opt-out tx");
+        sqlx::query(
+            "LOCK TABLE community_facts, events, invite_snapshots, members, \
+             privacy_opt_outs, privacy_opt_out_audit IN SHARE ROW EXCLUSIVE MODE",
+        )
+        .execute(&mut *opt_tx)
+        .await
+        .expect("opt-out lock");
+        sqlx::query("INSERT INTO privacy_opt_outs (guild_id, member_id) VALUES ($1, $2)")
+            .bind(GUILD)
+            .bind(MEMBER_A)
+            .execute(&mut *opt_tx)
+            .await
+            .expect("suppression install");
+        let writer_pool = pool.clone();
+        let writer = tokio::spawn(async move {
+            let store = PgFunnelStore::new(writer_pool);
+            let event = join_event(guild, member, "2026-10-13T00:00:00.000Z");
+            let _ = store.try_record(&event).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        opt_tx.commit().await.expect("opt-out commit");
+        writer.await.expect("writer task");
+
+        let events: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE guild_id = $1 AND member_id = $2",
+        )
+        .bind(GUILD)
+        .bind(MEMBER_A)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(events, 0, "single record racing the opt-out never persists");
+
+        drop_schema(&pool, &schema).await;
+    }
 }
