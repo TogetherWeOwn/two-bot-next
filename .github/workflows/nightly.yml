@@ -11,7 +11,7 @@ permissions: {}
 
 concurrency:
   group: nightly-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   changes:
@@ -295,6 +295,11 @@ jobs:
           --skip reset_after_header_drives_sleep_then_retry_with_no_request_during_pause
           --skip shared_scope_429_does_not_spend_invalid_budget_while_others_do
           --skip header_absent_responses_keep_conservative_spacing
+          --skip event_store_s1_append_only_insert_uses_minimal_fields
+          --skip event_store_s1_duplicate_delivery_inserts_once
+          --skip event_store_s1_replayed_message_create_does_not_duplicate
+          --skip event_store_s1_consumer_lag_gauge_has_fixed_cardinality
+          --skip event_store_s1_privacy_tripwire_rejects_body_text
       - name: Channel moderation ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:

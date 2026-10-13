@@ -82,3 +82,4 @@ its date, and the waiver fails again until someone renews the row.
 | Path glob | Waiver | Owner | Expires | Why |
 |-----------|--------|-------|---------|-----|
 | crates/*/tests/support/*.rs | `allow(dead_code)` | CI maintainers | 2027-10-11 | shared test-support module compiled into several test binaries, so each binary uses only part of it |
+| crates/discord/tests/event_store_s1.rs | `pending: S1` | S1 build card | 2026-11-12 | S1 acceptance suite pending migration, capture path and lag gauge; un-ignore and route to a lane when the S1 build lands |
