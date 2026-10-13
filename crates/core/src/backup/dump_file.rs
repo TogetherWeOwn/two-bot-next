@@ -1,4 +1,4 @@
-//! The v5 backup envelope (also reads v3/v4): manifest / rows / end marker, gzipped NDJSON.
+//! The v6 backup envelope (also reads v3/v4/v5): manifest / rows / end marker, gzipped NDJSON.
 //!
 //! Port of the file half of legacy `src/store/dump.ts`. The writer side lives
 //! in [`super::dump`]; everything here touches no database, so every refusal
@@ -139,10 +139,11 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_vote_kick_audit",
     // V5 adds accepted-create history; see [`V5_ADDED_TABLES`].
     "voice_create_reservations",
-    // Retention queues (0427): guild-purge intent and user-deletion ledger with
-    // receipts. Both must survive restore (a lost purge resurrects departed
-    // guild data; a lost request breaches the deletion SLA and drops receipts),
-    // so they are dumped, not excluded. No foreign keys, order among them free.
+    // V6 adds retention queues (0427): guild-purge intent and user-deletion
+    // ledger with receipts; see [`V6_ADDED_TABLES`]. Both must survive restore
+    // (a lost purge resurrects departed guild data; a lost request breaches
+    // the deletion SLA and drops receipts), so they are dumped, not excluded.
+    // No foreign keys, order among them free.
     "retention_guild_purge_queue",
     "retention_deletion_requests",
 ];
@@ -150,13 +151,15 @@ pub const DUMP_TABLES: &[&str] = &[
 /// Tables first covered by v5. A v4 archive predates them and need not declare
 /// them; every other covered table is still required, so a v4 recovery point
 /// written before create-reservation persistence stays readable without
-/// waiving arbitrary missing tables. The retention queues (0427) postdate v4
-/// like reservations, so they are waived alongside them.
-pub const V5_ADDED_TABLES: &[&str] = &[
-    "voice_create_reservations",
-    "retention_guild_purge_queue",
-    "retention_deletion_requests",
-];
+/// waiving arbitrary missing tables.
+pub const V5_ADDED_TABLES: &[&str] = &["voice_create_reservations"];
+
+/// Tables first covered by v6 (retention queues, migration 0427). A v4 or v5
+/// archive predates them and need not declare them; every other covered table
+/// is still required. Restore clears these tables when restoring an older
+/// archive, as with other tables absent from an older version.
+pub const V6_ADDED_TABLES: &[&str] =
+    &["retention_guild_purge_queue", "retention_deletion_requests"];
 
 /// Covered tables not created by the current cutover migration set, if any.
 /// Keep legacy data when such tables exist, but do not require nonexistent
@@ -216,8 +219,8 @@ pub fn is_destination_owned(table: &str, column: &str) -> bool {
         .any(|(owned_table, owned_column)| *owned_table == table && *owned_column == column)
 }
 
-/// Write complete v5 coverage; the reader also accepts frozen v3/v4 coverage.
-pub const DUMP_VERSION: u32 = 5;
+/// Write complete v6 coverage; the reader also accepts frozen v3/v4 and v5 coverage.
+pub const DUMP_VERSION: u32 = 6;
 
 /// A table name in the dump, validated against [`DUMP_TABLES`].
 pub type DumpTable = String;
@@ -741,9 +744,13 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                     .get("version")
                     .and_then(Value::as_u64)
                     .ok_or_else(|| refuse("manifest has an invalid version"))?;
-                if version != 3 && version != 4 && version != u64::from(DUMP_VERSION) {
+                if version != 3
+                    && version != 4
+                    && version != 5
+                    && version != u64::from(DUMP_VERSION)
+                {
                     return Err(refuse(format!(
-                        "dump version {version}, this build reads 3, 4 and {DUMP_VERSION}"
+                        "dump version {version}, this build reads 3, 4, 5 and {DUMP_VERSION}"
                     )));
                 }
                 retain_within_cap(&mut retained, &obj, limits.retained)?;
@@ -945,8 +952,9 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             .ok_or_else(|| refuse(format!("manifest table {name} has an invalid row count")))?;
         let _ = count;
     }
-    // Historical inventories are pinned by fixtures. New v5 archives must cover
-    // reservations too; v4 recovery points remain readable without them.
+    // Historical inventories are pinned by fixtures. New v6 archives must cover
+    // reservations and retention queues too; v5 recovery points remain readable
+    // without the retention queues, and v4 points without reservations either.
     let version = obj.get("version").and_then(Value::as_u64);
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
@@ -954,7 +962,12 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
         .enumerate()
         .filter(|(index, name)| match version {
             Some(3) => *index < 22,
-            Some(4) => !V5_ADDED_TABLES.contains(name) && !OPTIONAL_LEGACY_TABLES.contains(name),
+            Some(4) => {
+                !V5_ADDED_TABLES.contains(name)
+                    && !V6_ADDED_TABLES.contains(name)
+                    && !OPTIONAL_LEGACY_TABLES.contains(name)
+            }
+            Some(5) => !V6_ADDED_TABLES.contains(name) && !OPTIONAL_LEGACY_TABLES.contains(name),
             _ => !OPTIONAL_LEGACY_TABLES.contains(name),
         })
         .map(|(_, name)| name)
@@ -1707,7 +1720,7 @@ mod tests {
         let expected: Vec<&str> = DUMP_TABLES
             .iter()
             .copied()
-            .filter(|name| !V5_ADDED_TABLES.contains(name))
+            .filter(|name| !V5_ADDED_TABLES.contains(name) && !V6_ADDED_TABLES.contains(name))
             .collect();
         assert_eq!(names, expected);
         assert_eq!(
@@ -1721,10 +1734,9 @@ mod tests {
         assert_eq!(contents.buffers["voice_rooms"][0]["channel_id"], "500");
         let mut manifest = serde_json::to_value(&contents.manifest).unwrap();
         manifest["version"] = serde_json::json!(DUMP_VERSION);
-        assert!(validate_manifest(&manifest)
-            .unwrap_err()
-            .to_string()
-            .contains("voice_create_reservations"));
+        let err = validate_manifest(&manifest).unwrap_err().to_string();
+        assert!(err.contains("voice_create_reservations"), "{err}");
+        assert!(err.contains("retention_guild_purge_queue"), "{err}");
         // V4 has a fixed complete inventory, not a blanket missing-table waiver.
         manifest["version"] = serde_json::json!(4);
         manifest["tables"].as_array_mut().unwrap().remove(0);
@@ -1732,6 +1744,44 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("missing tables: events"));
+    }
+
+    #[test]
+    fn v5_archives_without_retention_queues_validate_but_v6_requires_them() {
+        // A v5 archive carries reservations but predates the retention queues
+        // (0427): it must validate at version 5 and fail at version 6.
+        let tables: Vec<Value> = DUMP_TABLES
+            .iter()
+            .copied()
+            .filter(|name| !V6_ADDED_TABLES.contains(name))
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "columns": [],
+                    "column_types": [],
+                    "count": 0,
+                })
+            })
+            .collect();
+        let mut v5 = manifest(tables);
+        v5["version"] = serde_json::json!(5);
+        validate_manifest(&v5).expect("v5 without retention queues must validate");
+        let mut v6 = v5.clone();
+        v6["version"] = serde_json::json!(DUMP_VERSION);
+        let err = validate_manifest(&v6).unwrap_err().to_string();
+        assert!(err.contains("retention_guild_purge_queue"), "{err}");
+        assert!(err.contains("retention_deletion_requests"), "{err}");
+        // A v5 archive missing reservations is still refused: only the v6
+        // retention tables are waived at version 5.
+        let mut v5_missing_reservation = v5.clone();
+        v5_missing_reservation["tables"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|t| t["name"] != "voice_create_reservations");
+        assert!(validate_manifest(&v5_missing_reservation)
+            .unwrap_err()
+            .to_string()
+            .contains("voice_create_reservations"));
     }
 
     #[test]

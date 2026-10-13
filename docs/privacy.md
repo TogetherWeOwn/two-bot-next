@@ -95,14 +95,17 @@ identity-bearing field require source review and an explicit manifest update.
 
 ## Retention and explicit exceptions
 
-The retention job (`two-bot-cutover::retention`, migration `0427`) enforces the
-rolling windows: raw presence/voice rows roll off at 30 days, the audit-log
-cache expires at 45 days, and user deletion requests complete in under 72
-hours with a receipt. Long-term aggregates (counts, streaks) are never
-time-purged, and a departed guild's rows go only through the guild-purge
-queue keyed on a true guild removal. Every run reports per-class metrics and
-supports a dry run that deletes nothing. Do not claim a TTL beyond these
-enforced windows.
+The retention module (`two-bot-cutover::retention`, migration `0427`)
+implements the rolling windows when invoked: raw presence/voice rows roll off
+at 30 days, the audit-log cache expires at 45 days, and user deletion requests
+complete in under 72 hours with a receipt. Long-term aggregates (counts,
+streaks) are never time-purged, and a departed guild's rows go only through
+the guild-purge queue keyed on a true guild removal (a rejoin cancels the
+queued purge). No scheduler, CLI, or gateway hook calls the job yet, and no
+automatic age-based purger is installed: do not claim a live 30/90-day TTL or
+live enforcement where no enforcing timer exists. Gateway wiring for
+`GUILD_DELETE`/`GUILD_CREATE` and a schedule are follow-up work. Every run
+reports per-class metrics and supports a dry run that deletes nothing.
 
 The manifest explicitly retains these control-plane records:
 

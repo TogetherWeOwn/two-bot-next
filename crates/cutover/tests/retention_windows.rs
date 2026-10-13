@@ -85,8 +85,8 @@
 
 use sqlx::PgPool;
 use two_bot_cutover::retention::{
-    fulfill_user_deletion, handle_guild_delete, request_user_deletion, run_retention,
-    DeletionReceipt, RetentionMode, RetentionReport,
+    cancel_guild_purge, fulfill_user_deletion, handle_guild_delete, request_user_deletion,
+    run_retention, DeletionReceipt, RetentionMode, RetentionReport,
 };
 use two_bot_testsupport::TestDatabase;
 
@@ -346,6 +346,63 @@ async fn real_guild_delete_enqueues_purge_but_outage_payload_does_not() {
     db.close().await.unwrap();
 }
 
+/// A rejoin cancels the queued purge: the guild's new and long-term rows survive
+/// the next run.
+#[tokio::test]
+async fn cancelled_guild_purge_keeps_guild_rows() {
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    sqlx::query("INSERT INTO members (guild_id, member_id) VALUES ($1, $2)")
+        .bind(GONE_GUILD)
+        .bind(MEMBER)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO member_levels (guild_id, member_id, xp, message_xp, updated_at)
+         VALUES ($1, $2, 150, 150, now())",
+    )
+    .bind(GONE_GUILD)
+    .bind(MEMBER)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    assert!(
+        handle_guild_delete(pool, GONE_GUILD, None).await.unwrap(),
+        "a real removal enqueues a purge"
+    );
+    assert!(
+        cancel_guild_purge(pool, GONE_GUILD).await.unwrap(),
+        "a rejoin cancels the queued purge"
+    );
+    assert!(
+        !cancel_guild_purge(pool, GONE_GUILD).await.unwrap(),
+        "a second cancel removes nothing"
+    );
+
+    let report: RetentionReport = run_retention(pool, RetentionMode::Execute).await.unwrap();
+    assert_eq!(
+        report.guild_rows_purged, 0,
+        "a cancelled purge must delete nothing, got {report:?}"
+    );
+    assert_eq!(
+        count(
+            pool,
+            "SELECT count(*) FROM members WHERE guild_id = '333333333333333333'"
+        )
+        .await,
+        1,
+        "the rejoined guild's rows must survive"
+    );
+    assert_eq!(
+        count(pool, "SELECT count(*) FROM member_levels").await,
+        1,
+        "the rejoined guild's aggregates must survive"
+    );
+    db.close().await.unwrap();
+}
+
 /// A user deletion request completes in under 72 hours and yields a receipt.
 #[tokio::test]
 async fn user_deletion_request_completes_within_72h_and_yields_receipt() {
@@ -362,6 +419,40 @@ async fn user_deletion_request_completes_within_72h_and_yields_receipt() {
             .execute(pool)
             .await
             .unwrap();
+    }
+    // Full-footprint fixture: the receipt must cover more than the members
+    // row (member_levels counts and member events for the requesting user).
+    for (guild, member, xp) in [
+        (GUILD_A, MEMBER, 150),
+        (GUILD_A, OTHER_MEMBER, 250),
+        (GUILD_B, MEMBER, 350),
+    ] {
+        sqlx::query(
+            "INSERT INTO member_levels (guild_id, member_id, xp, message_xp, updated_at)
+             VALUES ($1, $2, $3, $3, now())",
+        )
+        .bind(guild)
+        .bind(member)
+        .bind(xp)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    for (guild, member, key) in [
+        (GUILD_A, MEMBER, "ret-del-own"),
+        (GUILD_A, OTHER_MEMBER, "ret-del-other"),
+        (GUILD_B, MEMBER, "ret-del-elsewhere"),
+    ] {
+        sqlx::query(
+            "INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
+             VALUES ('voice_session_started', $2, $1, now(), 'fixture', '{}', $3)",
+        )
+        .bind(guild)
+        .bind(member)
+        .bind(key)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     let request_id: String = request_user_deletion(pool, GUILD_A, MEMBER).await.unwrap();
@@ -397,6 +488,42 @@ async fn user_deletion_request_completes_within_72h_and_yields_receipt() {
         .await,
         1,
         "the other guild's rows survive"
+    );
+    assert_eq!(
+        count(
+            pool,
+            "SELECT count(*) FROM member_levels WHERE guild_id = '111111111111111111' AND member_id = '444444444444444444'"
+        )
+        .await,
+        0,
+        "the requesting user's aggregate counts must go with the receipt"
+    );
+    assert_eq!(
+        count(
+            pool,
+            "SELECT count(*) FROM member_levels WHERE guild_id = '111111111111111111' AND member_id = '555555555555555555'"
+        )
+        .await,
+        1,
+        "the other member's aggregates survive"
+    );
+    assert_eq!(
+        count(
+            pool,
+            "SELECT count(*) FROM events WHERE guild_id = '111111111111111111' AND member_id = '444444444444444444'"
+        )
+        .await,
+        0,
+        "the requesting user's events must go with the receipt"
+    );
+    assert_eq!(
+        count(
+            pool,
+            "SELECT count(*) FROM events WHERE guild_id = '111111111111111111' AND member_id = '555555555555555555'"
+        )
+        .await,
+        1,
+        "the other member's events survive"
     );
     db.close().await.unwrap();
 }

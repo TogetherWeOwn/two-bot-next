@@ -8,12 +8,14 @@
 //! ## Reuse boundary (adjacent consent-driven work, not re-implemented here)
 //!
 //! Per-member suppression/purge semantics belong to the [`crate::member_erasure`]
-//! predicate set. This job reuses only its row identity: the user-deletion
-//! path deletes the same `(guild_id, member_id)` row the erasure plan's
-//! `members` entry names, and the time-driven deletes never touch the
-//! member-scoped audit tables (`moderation_audit` and friends), which stay
-//! under the per-member erasure path. Guild analytics toggles and opt-out
-//! suppression live elsewhere and are not duplicated here.
+//! predicate set. The user-deletion path reuses its full footprint: it deletes
+//! every plan table's `(guild_id, member_id)` rows for the requesting user in
+//! the same transaction that settles the receipt, excluding only the in-flight
+//! `retention_deletion_requests` row itself. The time-driven deletes never
+//! touch the member-scoped audit tables (`moderation_audit` and friends) beyond
+//! that user-deletion path, which stays under the erasure predicates. Guild
+//! analytics toggles and opt-out suppression live elsewhere and are not
+//! duplicated here.
 //!
 //! ## Coverage limits (do not silently claim more)
 //!
@@ -22,12 +24,16 @@
 //!   current schema.
 //! * Long-term aggregates (`member_levels` counts, `member_ranks` streaks)
 //!   are never time-purged; a departed guild's aggregates go only through
-//!   the guild-purge queue.
+//!   the guild-purge queue, and a rejoin cancels the queued purge via
+//!   [`cancel_guild_purge`] before the next run.
 //! * Producer paths are NOT covered here: gateway ingestion cadence,
 //!   backfill/replay writes, and the live-voice in-memory `remove_guild`
 //!   handoff. The live gateway must invoke [`handle_guild_delete`] on real
-//!   dispatches (passing the dispatch's `unavailable` flag through); wiring
-//!   that call site and proving it against a live gateway is follow-up work.
+//!   dispatches (passing the dispatch's `unavailable` flag through) and
+//!   [`cancel_guild_purge`] on `GUILD_CREATE`/rejoin; wiring those call sites
+//!   and proving them against a live gateway is follow-up work. Nothing
+//!   schedules [`run_retention`] yet; the job runs when invoked (tests and
+//!   manual runs), not on a live timer.
 //! * Retained control-plane records stay retained: `guild_settings`,
 //!   `guild_settings_audit`, `audit_kill_switch`, `member_erasure_audit`,
 //!   and operator-released `moderation_idempotency` replay-fence rows are
@@ -222,7 +228,8 @@ pub async fn run_retention(
 /// Record a guild removal. A dispatch with no `unavailable` flag (or an
 /// explicit available flag) is a real removal and enqueues a guild-data
 /// purge; an unavailable/outage payload never purges. Returns true when a
-/// purge was enqueued.
+/// purge was enqueued. A later rejoin must call [`cancel_guild_purge`] so the
+/// next run does not wipe the guild's new and long-term rows.
 pub async fn handle_guild_delete(
     pool: &PgPool,
     guild_id: &str,
@@ -239,6 +246,20 @@ pub async fn handle_guild_delete(
     .execute(pool)
     .await?;
     Ok(true)
+}
+
+/// Cancel a queued guild purge (e.g. on `GUILD_CREATE`/rejoin before the next
+/// run). Returns true when a queued purge was removed; the guild's rows are
+/// left untouched. Wire this to the gateway rejoin path alongside
+/// [`handle_guild_delete`].
+pub async fn cancel_guild_purge(pool: &PgPool, guild_id: &str) -> Result<bool, sqlx::Error> {
+    validate_snowflake(guild_id)?;
+    let removed = sqlx::query("DELETE FROM retention_guild_purge_queue WHERE guild_id = $1")
+        .bind(guild_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(removed > 0)
 }
 
 /// Queue a user deletion request. Returns the request id.
@@ -307,8 +328,8 @@ pub async fn fulfill_user_deletion(
     })
 }
 
-/// Delete the requesting member's row and settle the request, returning the
-/// receipt fields. Shared by [`fulfill_user_deletion`] and the
+/// Delete the requesting member's full footprint and settle the request,
+/// returning the receipt fields. Shared by [`fulfill_user_deletion`] and the
 /// [`run_retention`] pending drain so both paths honor the same receipt.
 async fn complete_request(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -316,13 +337,26 @@ async fn complete_request(
     guild_id: &str,
     user_id: &str,
 ) -> Result<(String, i64, i64), sqlx::Error> {
-    // Same (guild, member) identity as the erasure plan's `members` entry;
-    // broader per-member tables stay on the erasure path.
-    sqlx::query("DELETE FROM members WHERE guild_id = $1 AND member_id = $2")
-        .bind(guild_id)
-        .bind(user_id)
-        .execute(&mut **tx)
-        .await?;
+    // Full erasure-plan footprint in the same transaction: every plan table's
+    // (guild, member) rows for this user go, not just the `members` row, so
+    // the receipt certifies an actual deletion. The plan also covers
+    // `retention_deletion_requests`, but the in-flight request row is excluded
+    // here and settled into a completed receipt below; other pending requests
+    // for the same user stay pending for their own fulfilment.
+    let erasure = crate::member_erasure::plan();
+    for entry in &erasure.tables {
+        if entry.table == "retention_deletion_requests" {
+            continue;
+        }
+        // Table names and predicates come from the reviewed embedded plan,
+        // never caller input; predicates bind $1 = guild, $2 = member.
+        let sql = format!("DELETE FROM {} WHERE {}", entry.table, entry.predicate);
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(guild_id)
+            .bind(user_id)
+            .execute(&mut **tx)
+            .await?;
+    }
     let receipt_id = format!("rcpt-{request_id}");
     let row: Option<(i64, i64)> = sqlx::query_as(
         "UPDATE retention_deletion_requests SET status = 'completed', completed_at = clock_timestamp(), receipt_id = $2 \
@@ -342,10 +376,20 @@ async fn complete_request(
 }
 
 /// Purge one departed guild's rows and dequeue it, returning rows purged.
+/// Re-checks the queue row under the caller's lock: a guild whose purge was
+/// cancelled via [`cancel_guild_purge`] (rejoin before the run) keeps its rows.
 async fn purge_guild(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     guild_id: &str,
 ) -> Result<u64, sqlx::Error> {
+    let still_queued: Option<String> =
+        sqlx::query_scalar("SELECT guild_id FROM retention_guild_purge_queue WHERE guild_id = $1")
+            .bind(guild_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if still_queued.is_none() {
+        return Ok(0);
+    }
     let mut purged = 0u64;
     purged += sqlx::query("DELETE FROM presence_probe WHERE guild_id = $1")
         .bind(guild_id)
