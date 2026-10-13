@@ -475,7 +475,7 @@ fn is_guard_refusal(err: &sqlx::Error) -> bool {
 /// [`run_retention`] pending drain so both paths honor the same receipt and
 /// the same safety gates as `erase_member`.
 async fn complete_request(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    mut tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     request_id: &str,
     guild_id: &str,
     user_id: &str,
