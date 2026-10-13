@@ -97,10 +97,10 @@ exposed only inside the HMAC and inside the create-subscription body, which is
 itself returned as a `Secret`. The Operator provisions the signing secret and
 the Twitch client id/secret; they never appear in code, logs or PR text.
 
-Not in this slice (each its own card): the container receiver, the Helix
-client with app-token refresh, and Operator secret provisioning. The public
-Worker route is staging-only and default-dark. The ledger below is present but
-is not called by a runtime receiver yet.
+Not in this slice (each its own card): the container receiver and Operator
+secret provisioning. The public Worker route is staging-only and
+default-dark. The ledger below is present but is not called by a runtime
+receiver yet.
 
 ## Durable go-live ledger
 
@@ -126,3 +126,21 @@ is not called by a runtime receiver yet.
   delivered row is stamped and never deleted, so retries after a successful
   stamp cannot double-post. The claim → send → settle table is
   `stream_live::disposition`; its async glue belongs with the receiver.
+
+## Helix client with app-token refresh
+
+`crates/core/src/twitch_helix.rs` drives the plan from `twitch_eventsub`:
+
+- Credentials are Operator-provisioned (`TWO_TWITCH_CLIENT_ID`,
+  `TWO_TWITCH_CLIENT_SECRET`, `TWO_TWITCH_WEBHOOK_SECRET`); the Container
+  reads them from its own environment, never from forwarded Worker vars.
+  Every value travels inside `Secret`, so even a `Debug` dump renders
+  `[REDACTED]`.
+- The app token is cached and refreshed 60 s before its `expires_in`
+  instant, plus once on a 401 with a single retry. No timers: reconcile
+  runs at boot and after a `revocation` only.
+- `list_subscriptions` follows every `stream.online` page (up to a bounded
+  limit); pass its complete result to `plan_boot_actions` for the deletes-first
+  plan, then `execute_actions` runs it in order. A create that answers 409
+  counts as done only after a follow-up listing confirms a healthy subscription
+  for that broadcaster on the configured callback.

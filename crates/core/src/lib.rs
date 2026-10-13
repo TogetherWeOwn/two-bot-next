@@ -129,6 +129,7 @@ pub mod stream_live;
 pub mod stream_live_store;
 pub mod tickets;
 pub mod twitch_eventsub;
+pub mod twitch_helix;
 pub mod voice;
 pub mod voice_access;
 pub mod voice_alias;
