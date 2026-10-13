@@ -45,14 +45,18 @@ are outside this implementation's scope.
   outcome codes and no names, text or interaction tokens) stores the initiator
   and target member IDs, so erasure removes every row where the member is
   either one. It records a room-scoped disconnect, never a guild kick.
-  The event-store voice table (`event_store`) is provisioned by the S4 migration
-  for a future gateway writer; this slice creates the append-only shape (guild /
-  member / channel / session IDs plus a nullable `message_id` for S1 message-row
-  coexistence, timestamps and enum mute/deaf/video/stream flags, no audio,
-  transcripts, tokens or endpoints) but wires no runtime writer, so no voice
-  deliveries are captured yet. Once the writer lands, one row per voice
-  state/server delivery is kept; erasure already removes every row for
-  the member.
+  The event-store voice shape (`event_store`) is provisioned by the S4 migration
+  for a future gateway writer (guild / member / channel / session IDs plus a
+  nullable `message_id` for S1 message-row coexistence, timestamps and enum
+  mute/deaf/video/stream flags, no audio, transcripts, tokens or endpoints);
+  erasure already removes every row for the member.
+- Thread lifecycle and membership history (`event_store`: one row per
+  THREAD_CREATE / UPDATE / DELETE, one row per listed thread per
+  THREAD_LIST_SYNC fan-out, one row per THREAD_MEMBER_UPDATE / REMOVE delta).
+  Rows hold guild, thread and parent IDs, the archived / locked / invitable
+  state enums and member IDs on member-delta rows (also embedded in
+  `dedup_key`), with no names, topics or message content. Member erasure
+  deletes the member's rows by guild ID plus user ID.
 - Event RSVPs and attendance/community facts, including attribution and compound
   voice-session/event keys (`event_rsvps`, `community_facts`). Scorecards normally
   store aggregates; the erasure plan also checks their serialized payloads.

@@ -144,10 +144,10 @@ pub const DUMP_TABLES: &[&str] = &[
     // V5 adds accepted-create history and the seasonal XP projection;
     // see [`V5_ADDED_TABLES`].
     "voice_create_reservations",
-    // Shared event-store table for the S1-S8 slices; see [`V6_ADDED_TABLES`].
-    // S2 member capture (0432), S3 presence capture (0428) and S4 voice
-    // capture (0427): append-only gateway deltas. Guild-keyed, no foreign
-    // keys, so order beside the other logs is free.
+    // V6 adds the shared event-store capture: 0427 voice, 0428 presence,
+    // 0432 member deltas plus 0429 thread lifecycle + member deltas; one
+    // table for the S1-S8 slices, see [`V6_ADDED_TABLES`]. Append-only,
+    // guild-keyed, no foreign keys, so order among the tail is free.
     "event_store",
 ];
 
@@ -157,10 +157,12 @@ pub const DUMP_TABLES: &[&str] = &[
 /// projection stays readable without waiving arbitrary missing tables.
 pub const V5_ADDED_TABLES: &[&str] = &["voice_create_reservations", "member_season_xp"];
 
-/// Tables first covered by v6. A v4 or v5 archive predates them and need not
-/// declare them; v6 archives must cover the full inventory, so recovery
-/// points written before event-store persistence (0427 voice, 0428 presence,
-/// 0432 member deltas) stay readable without waiving arbitrary missing tables.
+/// Tables first covered by v6. A v4 archive predates them along with the v5
+/// tables, and a v5 archive predates them; neither need declare them; v6
+/// archives must cover the full inventory, so a v5 recovery point written
+/// before event-store capture (0427 voice, 0428 presence, 0432 member deltas,
+/// 0429 thread lifecycle) stays readable without waiving arbitrary missing
+/// tables.
 pub const V6_ADDED_TABLES: &[&str] = &["event_store"];
 
 /// Covered tables not created by the current cutover migration set, if any.
@@ -1793,8 +1795,9 @@ mod tests {
                 .filter(|t| t.get("name").and_then(Value::as_str) != Some(name))
                 .collect()
         }
-        // A main-shaped v5 manifest (full v5 inventory, no event_store) stays
-        // readable: v5 predates member/presence/voice-capture persistence.
+        // A v5 manifest (full v5 inventory, no event_store) stays readable:
+        // v5 predates event-store capture (voice, presence, member deltas,
+        // thread lifecycle).
         let mut v5 = manifest(without(complete_tables(&BTreeMap::new()), "event_store"));
         v5["version"] = serde_json::json!(5);
         assert!(
