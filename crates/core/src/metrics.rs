@@ -979,11 +979,12 @@ impl Metrics {
     }
 
     /// Current event-store consumer lag in seconds (S1): the `received_at -
-    /// event_time` spread for the newest observed capture row. Call once per
-    /// scrape window from the store read; last writer wins. Non-finite or
-    /// negative input clears to 0 so exposition stays a finite
-    /// non-negative duration. No IDs, dedup keys, content or body text are
-    /// retained.
+    /// event_time` spread for the newest observed capture row. S1 exposes
+    /// the setter contract; the periodic store-read caller lands with the
+    /// consumer slice, so until then the series reads 0 (unobserved).
+    /// Last writer wins. Non-finite or negative input clears to 0 so
+    /// exposition stays a finite non-negative duration. No IDs, dedup keys,
+    /// content or body text are retained.
     pub fn set_event_store_consumer_lag_secs(&self, lag_secs: f64) {
         let clamped = if lag_secs.is_finite() && lag_secs >= 0.0 {
             lag_secs
@@ -2324,6 +2325,51 @@ mod tests {
             assert!(unique.insert(key), "duplicate series: {key}");
             assert!(sample.parse::<f64>().is_ok(), "bad sample: {line}");
         }
+    }
+
+    #[test]
+    fn event_store_consumer_lag_gauge_is_a_label_free_duration() {
+        // S1 AC 4: the consumer lag setter renders as one label-free gauge
+        // series — the newest observed `received_at - event_time` spread, 0
+        // when unobserved — so no message, channel, user, dedup-key, content
+        // or body label can reach exposition. Non-finite or negative input
+        // clears to 0 so exposition stays a finite non-negative duration.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_event_store_consumer_lag_seconds gauge\n"));
+        assert!(text.contains("two_bot_event_store_consumer_lag_seconds 0\n"));
+        metrics.set_event_store_consumer_lag_secs(1.5);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_event_store_consumer_lag_seconds 1.5\n"));
+        assert!(!text.contains("two_bot_event_store_consumer_lag_seconds{"));
+        // The clamp is pinned: NaN, negative and infinite input must clear
+        // to 0 rather than pass through to exposition.
+        for bad in [f64::NAN, -0.25, f64::NEG_INFINITY, f64::INFINITY] {
+            metrics.set_event_store_consumer_lag_secs(bad);
+            let text = metrics.render(None);
+            assert!(
+                text.contains("two_bot_event_store_consumer_lag_seconds 0\n"),
+                "clamp must clear {bad:?} to 0"
+            );
+        }
+        // Last writer wins.
+        metrics.set_event_store_consumer_lag_secs(2.25);
+        metrics.set_event_store_consumer_lag_secs(0.5);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_event_store_consumer_lag_seconds 0.5\n"));
+        // Fixed cardinality: exactly one series, a finite non-negative number.
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("two_bot_event_store_consumer_lag_seconds "))
+            .collect();
+        assert_eq!(series.len(), 1);
+        let (_, value) = series[0].rsplit_once(' ').unwrap();
+        let parsed: f64 = value.parse().expect("bad sample");
+        assert!(
+            parsed.is_finite() && parsed >= 0.0,
+            "bad sample: {}",
+            series[0]
+        );
     }
 
     #[test]
