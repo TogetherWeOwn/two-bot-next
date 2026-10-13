@@ -13,11 +13,18 @@ BEGIN
       INSERT INTO members (guild_id, member_id) VALUES (g, u);
       INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
         VALUES ('member_join', u, g, now(), 'fixture', '{}', k);
+      -- event_store is shared by the S1-S8 slices: one presence row per member
+      -- here (S5 message/reaction columns ride along) plus three S8 rows per
+      -- member below (actor-only / target-only / user-only), so the erasure
+      -- suites expect four event_store rows per member. Voice columns stay
+      -- NULL here; the backup seed covers the S4 voice, S5 message/reaction
+      -- and S6 thread shapes.
       INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key,
-        presence_status, activity_type, application_id, nick_changed, roles)
+        presence_status, activity_type, application_id, nick_changed, roles,
+        channel_id, message_id)
         VALUES ('PRESENCE_UPDATE', g, u, '2026-10-01T00:00:00Z',
         'PRESENCE_UPDATE:' || g || ':' || u || ':2026-10-01T00:00:00Z',
-        'online', 0, NULL, FALSE, '[]');
+        'online', 0, NULL, FALSE, '[]', 'c-' || k, 'm-' || k);
       INSERT INTO invite_snapshots (guild_id, code, uses, inviter_id, updated_at)
         VALUES (g, u, 1, u, now());
       INSERT INTO member_levels (guild_id, member_id, xp, message_xp, updated_at)
@@ -149,6 +156,36 @@ BEGIN
         VALUES (g, 'vk-' || k, 'vote_started', 'v-' || k, u, u, 'started', '2026-10-01T00:00:00Z');
       INSERT INTO retention_deletion_requests (request_id, guild_id, user_id)
         VALUES (k, g, u);
+      -- Three S8 event_store rows per member, each binding the member in exactly
+      -- one of actor_id, target_id and user_id (the others NULL) with distinct
+      -- dedup_keys, so each erasure predicate branch is exercised
+      -- independently; with the presence row above that is four rows per
+      -- member. The THREAD_MEMBER_UPDATE shape stays covered by the backup
+      -- seed, so no thread row is added here.
+      INSERT INTO event_store
+        (event_type, guild_id, stage_instance_id, privacy_level, interaction_id,
+         interaction_type, application_id, command_id, audit_log_entry_id, action_type,
+         actor_id, target_id, user_id, event_time, received_at, dedup_key)
+        VALUES ('audit_log_entry', g, 'stage-actor-' || k, 1, 'interaction-actor-' || k,
+          1, 'app-' || k, 'cmd-' || k, 'audit-actor-' || k, 1,
+          u, NULL, NULL, '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z',
+          'AUDIT_LOG_ENTRY:' || g || ':audit-actor-' || k || ':2026-10-01T00:00:00Z');
+      INSERT INTO event_store
+        (event_type, guild_id, stage_instance_id, privacy_level, interaction_id,
+         interaction_type, application_id, command_id, audit_log_entry_id, action_type,
+         actor_id, target_id, user_id, event_time, received_at, dedup_key)
+        VALUES ('audit_log_entry', g, 'stage-target-' || k, 1, 'interaction-target-' || k,
+          1, 'app-' || k, 'cmd-' || k, 'audit-target-' || k, 1,
+          NULL, u, NULL, '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z',
+          'AUDIT_LOG_ENTRY:' || g || ':audit-target-' || k || ':2026-10-01T00:00:00Z');
+      INSERT INTO event_store
+        (event_type, guild_id, stage_instance_id, privacy_level, interaction_id,
+         interaction_type, application_id, command_id, audit_log_entry_id, action_type,
+         actor_id, target_id, user_id, event_time, received_at, dedup_key)
+        VALUES ('audit_log_entry', g, 'stage-user-' || k, 1, 'interaction-user-' || k,
+          1, 'app-' || k, 'cmd-' || k, 'audit-user-' || k, 1,
+          NULL, NULL, u, '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z',
+          'AUDIT_LOG_ENTRY:' || g || ':audit-user-' || k || ':2026-10-01T00:00:00Z');
       -- Explicit exceptions are seeded too: erasure must not change safety policy.
       INSERT INTO guild_settings (guild_id, key, value, version, updated_by)
         VALUES (g, 'fixture_' || u, to_jsonb(u), 1, u);

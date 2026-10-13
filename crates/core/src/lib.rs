@@ -54,6 +54,7 @@ pub mod e2e_matrix;
 pub mod events;
 pub mod evidence;
 pub mod expected_joins;
+pub mod fb_page_events;
 pub mod feature_commands;
 pub mod feeds;
 pub mod feeds_connector;
@@ -101,6 +102,8 @@ pub mod onboarding_store;
 pub mod presence;
 #[cfg(feature = "db")]
 pub mod presence_store;
+#[cfg(feature = "db")]
+pub mod privacy;
 pub mod raid;
 pub mod raid_removal;
 pub mod referral_rewards;

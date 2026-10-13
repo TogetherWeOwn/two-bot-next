@@ -509,7 +509,7 @@ VALUES ('100000000000000001', '100000000000000050', 'vote_started', '10000000000
        ('100000000000000001', '100000000000000051', 'vote_refused', '100000000000000033',
         '100000000000000003', '100000000000000002', 'protected_target',
         NULL, NULL, NULL, '2026-08-03T10:05:00Z');
--- Retention queues (0427): one queued guild purge plus one pending and one
+-- Retention queues (0435): one queued guild purge plus one pending and one
 -- completed user-deletion request, so the dump/restore round trip covers both
 -- the pending-NULL and completed-receipt shapes.
 INSERT INTO retention_guild_purge_queue (guild_id, enqueued_at)
@@ -521,6 +521,37 @@ VALUES ('backup-del-pending', '100000000000000001', '100000000000000002',
        ('backup-del-completed', '100000000000000001', '100000000000000003',
         '2026-08-01T09:00:00Z', 'completed', '2026-08-01T10:00:00Z',
         'rcpt-backup-del-completed');
+-- Privacy opt-out control plane (0433/0434): one suppressed pair plus one
+-- untouched pair, per-guild toggles with one category disabled, and one
+-- audit receipt per suppression. Every table carries rows so the roundtrip
+-- asserts archive coverage, not an empty seed.
+INSERT INTO privacy_opt_outs (guild_id, member_id, opted_out_at)
+VALUES ('100000000000000001', '100000000000000005', '2026-08-03T10:00:00Z'),
+       ('100000000000000002', '100000000000000005', '2026-08-03T11:00:00Z');
+INSERT INTO guild_analytics_settings (guild_id, presence_enabled, activity_enabled,
+  voice_enabled, updated_at)
+VALUES ('100000000000000001', TRUE, FALSE, TRUE, '2026-08-03T10:00:00Z'),
+       ('100000000000000002', TRUE, TRUE, TRUE, '2026-08-03T11:00:00Z');
+INSERT INTO privacy_opt_out_audit (guild_id, member_id, actor, opted_out_at)
+VALUES ('100000000000000001', '100000000000000005', 'backup-operator',
+        '2026-08-03T10:00:00Z'),
+       ('100000000000000002', '100000000000000005', 'backup-operator',
+        '2026-08-03T11:00:00Z');
+-- Event-store S8 stage/interaction-observe/audit-log capture (0431): one
+-- stage-instance row and one audit-log-entry row, ids and enums only.
+INSERT INTO event_store (event_type, guild_id, channel_id, stage_instance_id,
+  privacy_level, interaction_id, interaction_type, application_id, command_id,
+  audit_log_entry_id, action_type, actor_id, target_id, event_time, received_at,
+  dedup_key)
+VALUES ('stage_instance', '100000000000000001', '100000000000000033',
+        'stage-100000000000000060', 1, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+        NULL, '2026-08-03T10:00:00.123456Z', '2026-08-03T10:00:01Z',
+        'STAGE_INSTANCE:100000000000000001:stage-100000000000000060:2026-08-03T10:00:00.123456Z'),
+       ('audit_log_entry', '100000000000000001', NULL, NULL, NULL,
+        '100000000000000061', 2, '100000000000000062', '100000000000000063',
+        'audit-100000000000000064', 3, '100000000000000003', '100000000000000004',
+        '2026-08-03T10:00:00.123456Z', '2026-08-03T10:00:02Z',
+        'AUDIT_LOG_ENTRY:100000000000000001:audit-100000000000000064:2026-08-03T10:00:00.123456Z');
 -- Event-store S3 presence capture (0428): append-only presence rows with the
 -- best-effort dedup key PRESENCE_UPDATE:<guild_id>:<user_id>:<event_time>
 -- (receive time; same-key retries insert nothing).
@@ -534,3 +565,33 @@ VALUES ('PRESENCE_UPDATE', '100000000000000001', '100000000000000002',
         '2026-08-03T10:05:00Z',
         'PRESENCE_UPDATE:100000000000000001:100000000000000003:2026-08-03T10:05:00Z',
         'idle', 2, '123456789012345678');
+-- Event-store S4 voice capture (0427): one voice-state row with session and
+-- enum flags; token/endpoint/audio columns never exist. Distinct dedup key
+-- from the presence rows above, so both slices seed together.
+INSERT INTO event_store (event_type, guild_id, user_id, channel_id, session_id,
+  event_time, dedup_key, mute, deaf, self_mute, self_deaf, self_video, self_stream, suppress)
+VALUES ('voice_state_update', '100000000000000001', '100000000000000002', '100000000000000033',
+        'session-fixture-1', '2026-08-03T10:00:00Z', 'event-store-seed-1',
+        FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE);
+-- S5 message/reaction capture (0430): append-only gateway deltas, one message
+-- update plus one unicode reaction (NULL custom id, codepoint reference).
+INSERT INTO event_store (event_type, guild_id, channel_id, message_id, user_id,
+  emoji_id, emoji_name, event_time, received_at, dedup_key)
+VALUES ('MESSAGE_UPDATE', '100000000000000001', '100000000000000003',
+        '100000000000000006', '100000000000000002', NULL, NULL,
+        '2026-08-01T10:00:00Z', '2026-08-01T10:00:01Z', 'backup:event-store:message-update'),
+       ('REACTION_ADD', '100000000000000001', '100000000000000003',
+        '100000000000000006', '100000000000000004', NULL, 'U+1F44D',
+        '2026-08-02T10:00:00Z', '2026-08-02T10:00:01Z', 'backup:event-store:reaction-add');
+-- Event-store thread lifecycle + member deltas (0429 S6): one lifecycle row
+-- with state enums and no member id, one member-delta row with a member id.
+INSERT INTO event_store (event_type, guild_id, thread_id, parent_id, user_id,
+  event_time, dedup_key, archived, locked, invitable)
+VALUES ('THREAD_CREATE', '100000000000000001', '100000000000000060',
+        '100000000000000033', NULL, '2026-08-03T10:00:00Z',
+        'THREAD_CREATE:100000000000000001:100000000000000060:2026-08-03T10:00:00Z',
+        FALSE, FALSE, TRUE),
+       ('THREAD_MEMBER_UPDATE', '100000000000000001', '100000000000000060',
+        NULL, '100000000000000002', '2026-08-03T10:01:00Z',
+        'THREAD_MEMBER_UPDATE:100000000000000001:100000000000000060:2026-08-03T10:01:00Z:100000000000000002',
+        NULL, NULL, NULL);

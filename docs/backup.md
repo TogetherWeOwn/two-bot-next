@@ -18,9 +18,11 @@ require `--force`. This confirmation is not authorization to target production.
 
 Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
 write **v6** (including durable voice-create reservations, the retention
-queues and event-store capture: presence capture plus member-capture deltas);
-the reader also accepts frozen **v3**, pre-reservation **v4** and pre-v6
-**v5**. Other versions refuse.
+queues and the event store: voice capture plus presence capture plus
+member-capture deltas plus message/reaction capture plus thread lifecycle
+plus stage/interaction-observe/audit-log capture); the reader also
+accepts frozen **v3**, pre-reservation **v4** and pre-v6 **v5**.
+Other versions refuse.
 The manifest carries per-table `{name, columns, column_types, count}` taken
 inside one `REPEATABLE READ` transaction, the `events` high-water mark, the
 source's applied migrations and `sequenceMarks`: for every serial, identity and
@@ -64,17 +66,20 @@ boot directives, the member-erasure audit, the internal clock high-water
 mark, the voice configuration tables, the accepted voice-room create history
 (`voice_create_reservations`), the retention queues
 (`retention_guild_purge_queue`, `retention_deletion_requests`) and the
-event-store presence capture plus member-capture deltas (`event_store`).
+event store (voice capture plus presence capture plus member-capture deltas
+plus message/reaction capture plus thread lifecycle plus
+stage/interaction-observe/audit-log capture) (`event_store`).
 `OPTIONAL_LEGACY_TABLES` is empty: the coverage test fails if a covered table
-is not migrated. A dump from a fresh Rust schema has 89 table entries.
+is not migrated. A dump from a fresh Rust schema has 92 table entries.
 A missing current table refuses a dump/restore: migrate the target first.
 A v4 archive must declare every covered table except the ones v5 added
 (`V5_ADDED_TABLES`) and the ones v6 added (`V6_ADDED_TABLES`), so recovery
 points written before create-reservation persistence remain inspectable and
 restorable. A v5 archive must declare every covered table except the v6
-tables, so recovery points written before the retention queues or
-event-store capture (0428 presence, 0432 member deltas) remain inspectable
-and restorable. A v4 or v5
+tables, so recovery points written before the retention queues (0435) or
+event-store capture (0427 voice, 0428 presence, 0429 thread lifecycle,
+0430 message/reaction, 0431 stage/interaction/audit capture and 0432 member
+deltas) remain inspectable and restorable. A v4 or v5
 archive written before any other table joined the inventory is refused at
 inspect ("manifest is missing tables"); take a fresh dump after upgrading.
 V6 requires the full current inventory; an incomplete new archive refuses at
