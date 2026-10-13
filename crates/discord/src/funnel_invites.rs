@@ -7,6 +7,10 @@
 //! is added. [`ActionExecutor::check_vanity_url`] reports whether the guild
 //! can show a vanity URL at all — the guild-side refusal (no vanity feature)
 //! is a capability gate, never a funnel failure; any other refusal fails.
+//! Callers must confirm the bot is a member of the guild before calling:
+//! Discord returns 50001 and 10004 inconsistently for unauthorized guild
+//! access, so the 50001 mapping below is only a "no vanity feature" answer
+//! under that precondition.
 
 use twilight_http::request::Request;
 use twilight_http::routing::Route;
@@ -29,10 +33,14 @@ pub enum VanityStatus {
     Active { code: String },
     /// The read succeeded and no vanity code is set.
     Absent,
-    /// Discord refused the read with code 50001 (Missing Access: the guild
-    /// has no vanity feature). The check reports the gate; it never fails
-    /// the funnel. Any other refusal (missing permission, unknown guild) is
-    /// a caller-side fault and fails as [`InviteActionError::Discord`].
+    /// Discord refused the read with code 50001 (Missing Access) while the
+    /// caller has confirmed the bot is a member of the guild. Under that
+    /// precondition the refusal means the guild has no vanity feature; the
+    /// check reports the gate and never fails the funnel. Discord returns
+    /// 50001 and 10004 inconsistently for unauthorized guild access (see
+    /// discord-api-docs#5840), so without confirmed membership a 50001
+    /// cannot be told apart from a removed bot. Any other refusal is a
+    /// caller-side fault and fails as [`InviteActionError::Discord`].
     CapabilityGated,
 }
 
@@ -100,11 +108,14 @@ impl ActionExecutor {
     ///
     /// Sends `GET /guilds/{guild_id}/vanity-url`, which requires
     /// `MANAGE_GUILD`. A set code reports [`VanityStatus::Active`], a null
-    /// code reports [`VanityStatus::Absent`], and the guild-side refusal
-    /// (Discord code 50001: the guild has no vanity feature) reports
-    /// [`VanityStatus::CapabilityGated`] instead of failing. Any other
-    /// refusal — 50013 (the bot lacks `MANAGE_GUILD`), 10004 (unknown guild
-    /// or the bot was removed), or an unreadable refusal — is a fixable
+    /// code reports [`VanityStatus::Absent`], and a Missing Access refusal
+    /// (Discord code 50001) reports [`VanityStatus::CapabilityGated`]
+    /// instead of failing — but only when the caller has confirmed the bot
+    /// is a member of the guild, in which case the refusal means the guild
+    /// has no vanity feature. Discord returns 50001 and 10004
+    /// inconsistently for unauthorized guild access, so no error code on
+    /// its own proves the removed-bot case; every other refusal, including
+    /// any other Discord code or an unreadable refusal, is a fixable
     /// caller-side problem and fails as [`InviteActionError::Discord`].
     pub async fn check_vanity_url(
         &self,
@@ -114,11 +125,13 @@ impl ActionExecutor {
         let route = Route::GetGuildVanityUrl {
             guild_id: guild.get(),
         };
-        // Only the guild-side "no vanity feature" refusal is a capability
-        // answer that consumes completion like a validated read. Every other
-        // refusal is a fixable setup problem: it fails instead of reporting
-        // a silent gate, so a misconfigured bot is never mistaken for a
-        // guild that cannot have a vanity URL.
+        // Only the Missing Access refusal observed while the caller has
+        // confirmed bot membership is a capability answer that consumes
+        // completion like a validated read. Every other refusal is a fixable
+        // setup problem: it fails instead of reporting a silent gate, so a
+        // misconfigured or removed bot is never mistaken for a guild that
+        // cannot have a vanity URL without the caller first confirming
+        // membership.
         let mut response = self
             .call_once_raw(Request::from_route(&route), &[200, 403, 404])
             .await?;
