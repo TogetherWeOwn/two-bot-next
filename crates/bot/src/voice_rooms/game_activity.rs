@@ -17,14 +17,16 @@
 //! [`aggregate_guild`]: two_bot_core::game_activity::aggregate_guild
 //! [`PresenceUpdate`]: twilight_model::gateway::payload::incoming::PresenceUpdate
 
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use twilight_model::gateway::payload::incoming::PresenceUpdate;
 use twilight_model::gateway::presence::{Activity, ActivityButton, ActivityType};
 use two_bot_core::game_activity::{
-    self, ActivitySnapshot, GuildGameAggregate, PresenceDelta, VoiceSpan,
+    self, ActivitySnapshot, ActivityType as CoreActivityType, GuildGameAggregate, PresenceDelta,
+    VoiceSpan,
 };
 use two_bot_core::game_activity_store::{self, GameActivityStoreError};
 
@@ -67,6 +69,22 @@ pub const MAX_DELTAS_PER_GUILD: usize = 8_192;
 /// Per-guild cap on buffered closed voice spans, same eviction contract as
 /// deltas.
 pub const MAX_SPANS_PER_GUILD: usize = 8_192;
+
+/// How long a member's carried play state survives with no fresh observation.
+///
+/// The gateway only sends presence on change, so a silent member is assumed
+/// still playing and each flush carries their open interval forward. Past
+/// this bound the carry is dropped instead: a much later same-game delta
+/// starts a new interval rather than retroactively crediting the whole gap.
+/// A full day of uninterrupted play with zero presence updates is
+/// implausible (any status or activity change re-asserts), while a missed
+/// stop event plus a replay inside the bound still sessionizes whole.
+pub const GAME_ACTIVITY_CARRY_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Cap on carried play states across all guilds. Past the cap an observation
+/// first sweeps TTL-stale entries; the map otherwise only holds members with
+/// no stop observed yet, so steady state stays far below this.
+const MAX_CARRY_ENTRIES: usize = 16_384;
 
 /// Map one gateway presence into an analytics delta.
 ///
@@ -140,11 +158,31 @@ struct OpenSpan {
     self_stream: bool,
 }
 
+/// One member's play state carried across flushes.
+///
+/// Gateway presence is change-driven, not polled: the absence of updates
+/// means "unchanged", so a member whose last delta asserted a game is
+/// assumed still playing it until a stop (or different game) arrives. The
+/// next flush reopens their interval from `from_ms` instead of starting
+/// over, and drops the carry past [`GAME_ACTIVITY_CARRY_TTL_MS`] with no
+/// fresh observation.
+#[derive(Debug, Clone)]
+struct PlayCarry {
+    game: String,
+    is_streaming: bool,
+    /// The instant the next window resumes from (last flush, or the last
+    /// real observation when the flush clock ran behind it).
+    from_ms: i64,
+    /// The last real observation time, guarding against out-of-order frames.
+    last_ms: i64,
+}
+
 #[derive(Default)]
 struct CollectorInner {
     deltas: HashMap<Snowflake, Vec<PresenceDelta>>,
     spans: HashMap<Snowflake, Vec<VoiceSpan>>,
     open: HashMap<(Snowflake, Snowflake), OpenSpan>,
+    carry: HashMap<(Snowflake, String), PlayCarry>,
     dropped_deltas: u64,
     dropped_spans: u64,
 }
@@ -153,9 +191,13 @@ struct CollectorInner {
 ///
 /// Fed from the voice runtime's presence and voice frames; [`flush`] runs
 /// the core pipeline and drains the consumed buffers. Open voice spans are
-/// retained across flushes until the member leaves. `user_key`s never leave
-/// this struct except inside the ephemeral [`sessionize`] call; the returned
-/// aggregates carry no member key.
+/// clipped at each flush (the pre-flush portion sessionizes now, the open
+/// restarts at the flush clock) and retained until the member leaves. Each
+/// member's current game is carried across flushes the same way: a still
+/// playing tail closes at the flush clock and reopens for the next window,
+/// so change-driven presence with hours between updates sessionizes whole.
+/// `user_key`s never leave this struct except inside the ephemeral
+/// [`sessionize`] call; the returned aggregates carry no member key.
 ///
 /// [`flush`]: GameActivityCollector::flush
 /// [`sessionize`]: game_activity::sessionize
@@ -172,17 +214,73 @@ impl GameActivityCollector {
     }
 
     /// Buffer one mapped presence delta for `guild`, evicting oldest first
-    /// past [`MAX_DELTAS_PER_GUILD`].
+    /// past [`MAX_DELTAS_PER_GUILD`]. Also tracks the member's current game
+    /// as a state transition: a game delta opens (or refreshes) their carry,
+    /// an empty delta stamps it for the flush to close (the run-up to the
+    /// stop still bridges there). Out-of-order frames older than the tracked
+    /// state still buffer (sessionize sorts) but never clobber it.
     pub fn observe_presence(&self, guild: Snowflake, delta: PresenceDelta) {
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
+        let observed_at_ms = delta.observed_at_ms;
+        let user_key = delta.user_key.clone();
+        let asserted = game_activity::session_game(&delta);
         let buffer = inner.deltas.entry(guild).or_default();
         buffer.push(delta);
         if buffer.len() > MAX_DELTAS_PER_GUILD {
             let overflow = buffer.len() - MAX_DELTAS_PER_GUILD;
             buffer.drain(..overflow);
             inner.dropped_deltas += overflow as u64;
+        }
+        match inner.carry.entry((guild, user_key)) {
+            Entry::Occupied(mut stated) if observed_at_ms >= stated.get().last_ms => {
+                match asserted {
+                    Some((game, is_streaming)) => {
+                        let prev = stated.get();
+                        // The same game continuing (even across a stop) keeps
+                        // the earlier reopen point, so the pre-stop span still
+                        // bridges at flush time. A changed game restarts it.
+                        let from_ms = if prev.game == game && prev.is_streaming == is_streaming {
+                            prev.from_ms.min(observed_at_ms)
+                        } else {
+                            observed_at_ms
+                        };
+                        stated.insert(PlayCarry {
+                            game,
+                            is_streaming,
+                            from_ms,
+                            last_ms: observed_at_ms,
+                        });
+                    }
+                    None => {
+                        // A stop closes the interval at flush time; the carry
+                        // stays so the run-up to the stop still bridges there
+                        // (the flush drops it once closed).
+                        let prev = stated.get().clone();
+                        stated.insert(PlayCarry {
+                            last_ms: observed_at_ms,
+                            ..prev
+                        });
+                    }
+                }
+            }
+            Entry::Vacant(slot) => {
+                if let Some((game, is_streaming)) = asserted {
+                    slot.insert(PlayCarry {
+                        game,
+                        is_streaming,
+                        from_ms: observed_at_ms,
+                        last_ms: observed_at_ms,
+                    });
+                }
+            }
+            Entry::Occupied(_) => {}
+        }
+        if inner.carry.len() > MAX_CARRY_ENTRIES {
+            inner.carry.retain(|_, stated| {
+                observed_at_ms.saturating_sub(stated.from_ms) <= GAME_ACTIVITY_CARRY_TTL_MS
+            });
         }
     }
 
@@ -252,16 +350,39 @@ impl GameActivityCollector {
         }
     }
 
-    /// Run the core pipeline over `guild`'s buffered deltas and closed spans
-    /// and drain them. Returns guild-level aggregates only. Open spans stay
-    /// until their member leaves; an interval spanning a flush boundary
-    /// splits there, so production cadence should flush well past
-    /// [`GAME_ACTIVITY_GAP_TIMEOUT_MS`].
+    /// Run the core pipeline over `guild`'s buffered deltas and voice spans
+    /// at `now_ms` and drain them. Returns guild-level aggregates only.
+    ///
+    /// Each open span is clipped at `now_ms`: the pre-flush portion
+    /// sessionizes in this window and the open restarts at `now_ms`, so a
+    /// member still in voice counts their time instead of persisting zero.
+    /// Each still-playing member's interval closes at `now_ms` and reopens
+    /// from there via the carry map, so an interval spanning a flush
+    /// boundary splits there honestly (production cadence should flush well
+    /// past [`GAME_ACTIVITY_GAP_TIMEOUT_MS`]). Members with no fresh delta
+    /// in this window contribute nothing; their carry waits for the next
+    /// window, subject to [`GAME_ACTIVITY_CARRY_TTL_MS`]. When nothing
+    /// sessionizes but a carry is still open, the drained spans are requeued
+    /// rather than dropped: overlap is an intersection, so they can only
+    /// count against a future bridged session, never twice.
     #[must_use]
-    pub fn flush(&self, guild: Snowflake, gap_timeout_ms: i64) -> Vec<GuildGameAggregate> {
-        let (deltas, spans) = self.drain_guild(guild);
-        let sessions = game_activity::sessionize(&deltas, &spans, gap_timeout_ms);
-        game_activity::aggregate_guild(&guild.to_string(), &sessions)
+    pub fn flush(
+        &self,
+        guild: Snowflake,
+        gap_timeout_ms: i64,
+        now_ms: i64,
+    ) -> Vec<GuildGameAggregate> {
+        let (deltas, spans) = self.drain_guild_at(guild, now_ms);
+        let carry = self.guild_carry(guild);
+        let (input, set, drop) = plan_flush(&deltas, &carry, gap_timeout_ms, now_ms);
+        self.apply_carry_plan(guild, set, drop);
+        let sessions = game_activity::sessionize(&input, &spans, gap_timeout_ms);
+        let rows = game_activity::aggregate_guild(&guild.to_string(), &sessions);
+        if rows.is_empty() && !spans.is_empty() && !self.guild_carry(guild).is_empty() {
+            self.requeue(guild, Vec::new(), spans);
+            return Vec::new();
+        }
+        rows
     }
 
     /// Every guild holding buffered deltas, closed spans or open spans, for
@@ -283,16 +404,87 @@ impl GameActivityCollector {
         guilds
     }
 
-    /// Remove and return one guild's buffered deltas and closed spans. Open
-    /// spans stay until their member leaves.
-    fn drain_guild(&self, guild: Snowflake) -> (Vec<PresenceDelta>, Vec<VoiceSpan>) {
+    /// Remove and return one guild's buffered deltas and voice spans at
+    /// `now_ms`, clipping each open span there.
+    ///
+    /// The pre-flush portion of every open span is returned as a closed span
+    /// for this window, and the open restarts at `now_ms` so the next window
+    /// keeps continuity. Opens already at or past `now_ms` (clock skew) are
+    /// left alone. On a persist failure the caller requeues the returned
+    /// spans, so the clipped portion is preserved in the buffer while the
+    /// opens continue from the clip point: no time is lost and none counts
+    /// twice.
+    fn drain_guild_at(
+        &self,
+        guild: Snowflake,
+        now_ms: i64,
+    ) -> (Vec<PresenceDelta>, Vec<VoiceSpan>) {
         let Ok(mut inner) = self.inner.lock() else {
             return (Vec::new(), Vec::new());
         };
-        (
-            inner.deltas.remove(&guild).unwrap_or_default(),
-            inner.spans.remove(&guild).unwrap_or_default(),
-        )
+        let deltas = inner.deltas.remove(&guild).unwrap_or_default();
+        let mut spans = inner.spans.remove(&guild).unwrap_or_default();
+        for ((span_guild, member), open) in inner.open.iter_mut() {
+            if *span_guild != guild || now_ms <= open.join_ms {
+                continue;
+            }
+            spans.push(VoiceSpan {
+                user_key: member.to_string(),
+                join_ms: open.join_ms,
+                leave_ms: now_ms,
+                self_stream: open.self_stream,
+            });
+            open.join_ms = now_ms;
+        }
+        (deltas, spans)
+    }
+
+    /// This guild's carried play states, keyed by member key.
+    fn guild_carry(&self, guild: Snowflake) -> BTreeMap<String, PlayCarry> {
+        let Ok(inner) = self.inner.lock() else {
+            return BTreeMap::new();
+        };
+        inner
+            .carry
+            .iter()
+            .filter(|((carry_guild, _), _)| *carry_guild == guild)
+            .map(|((_, user_key), stated)| (user_key.clone(), stated.clone()))
+            .collect()
+    }
+
+    /// Apply one flush's carry updates: still-playing members reopen from
+    /// the flush clock, stopped members (and TTL-stale ones) are dropped.
+    fn apply_carry_plan(&self, guild: Snowflake, set: Vec<(String, PlayCarry)>, drop: Vec<String>) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        for user_key in drop {
+            inner.carry.remove(&(guild, user_key));
+        }
+        for (user_key, stated) in set {
+            inner.carry.insert((guild, user_key), stated);
+        }
+    }
+
+    /// Forget every carried play state for `guild`: a presence-disabled
+    /// flush drains and drops, so a re-enable starts fresh.
+    fn clear_guild_carry(&self, guild: Snowflake) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        inner.carry.retain(|(carry_guild, _)| *carry_guild != guild);
+    }
+
+    /// Forget the carried play states of opted-out members: their future
+    /// deltas are filtered before sessionization, so a stale carry must
+    /// never bridge pre-opt-out play into a later window.
+    fn drop_carry_users(&self, guild: Snowflake, users: &std::collections::BTreeSet<String>) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        inner.carry.retain(|(carry_guild, user_key), _| {
+            *carry_guild != guild || !users.contains(user_key)
+        });
     }
 
     /// Push drained buffers back to the front of the guild's queues, oldest
@@ -358,6 +550,217 @@ impl GameActivityCollector {
     }
 }
 
+/// One synthetic observation asserting `user_key` still plays `game` at
+/// `at_ms`: the materialized form of "no change reported". Carries only the
+/// fields [`sessionize`](game_activity::sessionize) reads (type and title);
+/// everything else is empty, so a synthetic never invents details, party,
+/// assets or URLs.
+fn synthetic_delta(user_key: &str, game: &str, is_streaming: bool, at_ms: i64) -> PresenceDelta {
+    PresenceDelta {
+        user_key: user_key.to_owned(),
+        observed_at_ms: at_ms,
+        activities: vec![ActivitySnapshot {
+            activity_type: if is_streaming {
+                CoreActivityType::Streaming
+            } else {
+                CoreActivityType::Playing
+            },
+            name: game.to_owned(),
+            application_id: None,
+            details: None,
+            state: None,
+            party_size: None,
+            assets: false,
+            button_labels: Vec::new(),
+            button_urls: Vec::new(),
+            stream_url: None,
+        }],
+    }
+}
+
+/// Bridge `(from_ms, to_ms)` for one member and game with synthetic ticks no
+/// more than `gap_timeout_ms` apart, so [`sessionize`](game_activity::sessionize)
+/// merges the span whole instead of splitting it into floored singletons.
+/// `to_ms` itself is emitted by the caller (the real delta or the flush
+/// clock); a non-positive gap emits nothing rather than looping.
+fn fill_ticks(
+    out: &mut Vec<PresenceDelta>,
+    user_key: &str,
+    game: &str,
+    is_streaming: bool,
+    from_ms: i64,
+    to_ms: i64,
+    gap_timeout_ms: i64,
+) {
+    if gap_timeout_ms <= 0 {
+        return;
+    }
+    let mut tick = from_ms.saturating_add(gap_timeout_ms);
+    while tick < to_ms {
+        out.push(synthetic_delta(user_key, game, is_streaming, tick));
+        tick = tick.saturating_add(gap_timeout_ms);
+    }
+}
+
+/// Plan one guild's flush window: the [`sessionize`](game_activity::sessionize)
+/// input plus the carry updates to apply.
+///
+/// Groups `reals` per member (time order), prepends each member's carried
+/// open interval, fills same-game gaps wider than `gap_timeout_ms` — and the
+/// run-up to a stop delta — with synthetic ticks, and extends a still-playing
+/// tail to `now_ms`, reopening it there for the next window. Returns the
+/// sessionize input, the carries to set, and the carries to drop.
+///
+/// A member with no fresh delta in this window contributes nothing: their
+/// carry waits untouched for a later window. A carry whose first fresh
+/// observation changed games is dropped rather than floored to a phantom
+/// minute. A carry with no fresh observation past
+/// [`GAME_ACTIVITY_CARRY_TTL_MS`] is dropped, so a much later same-game
+/// delta starts a new interval instead of retroactively crediting the gap.
+fn plan_flush(
+    reals: &[PresenceDelta],
+    carry: &BTreeMap<String, PlayCarry>,
+    gap_timeout_ms: i64,
+    now_ms: i64,
+) -> (Vec<PresenceDelta>, Vec<(String, PlayCarry)>, Vec<String>) {
+    let mut by_user: BTreeMap<&str, Vec<&PresenceDelta>> = BTreeMap::new();
+    for delta in reals {
+        by_user
+            .entry(delta.user_key.as_str())
+            .or_default()
+            .push(delta);
+    }
+    let mut input: Vec<PresenceDelta> = Vec::new();
+    let mut set: Vec<(String, PlayCarry)> = Vec::new();
+    let mut drop: Vec<String> = Vec::new();
+    for (user_key, stated) in carry {
+        if !by_user.contains_key(user_key.as_str())
+            && stated.from_ms <= now_ms
+            && now_ms.saturating_sub(stated.from_ms) > GAME_ACTIVITY_CARRY_TTL_MS
+        {
+            drop.push(user_key.clone());
+        }
+    }
+    for (user_key, items) in &by_user {
+        let mut sequence: Vec<PresenceDelta> = Vec::with_capacity(items.len() + 1);
+        let mut ordered: Vec<&PresenceDelta> = items.clone();
+        ordered.sort_by_key(|delta| delta.observed_at_ms);
+        if let Some(stated) = carry.get(*user_key) {
+            if stated.from_ms <= now_ms
+                && now_ms.saturating_sub(stated.from_ms) > GAME_ACTIVITY_CARRY_TTL_MS
+            {
+                drop.push((*user_key).to_owned());
+            } else {
+                // Reopen the carried interval ahead of the fresh deltas. A
+                // carried game met by a different game was already over:
+                // skip the reopened point instead of flooring a phantom
+                // minute for it. A stop still bridges the run-up to it.
+                let bridge = match ordered
+                    .first()
+                    .and_then(|delta| game_activity::session_game(delta))
+                {
+                    Some((game, is_streaming)) => {
+                        game == stated.game && is_streaming == stated.is_streaming
+                    }
+                    None => true,
+                };
+                if bridge {
+                    sequence.push(synthetic_delta(
+                        user_key,
+                        &stated.game,
+                        stated.is_streaming,
+                        stated.from_ms.min(now_ms),
+                    ));
+                }
+            }
+        }
+        sequence.extend(ordered.into_iter().cloned());
+        let mut open: Option<(i64, String, bool)> = None;
+        for delta in &sequence {
+            match game_activity::session_game(delta) {
+                Some((game, is_streaming)) => {
+                    if let Some((started_ms, open_game, open_streaming)) = open.take() {
+                        if game == open_game && is_streaming == open_streaming {
+                            fill_ticks(
+                                &mut input,
+                                user_key,
+                                &game,
+                                is_streaming,
+                                started_ms,
+                                delta.observed_at_ms,
+                                gap_timeout_ms,
+                            );
+                        }
+                    }
+                    open = Some((delta.observed_at_ms, game, is_streaming));
+                    input.push(delta.clone());
+                }
+                None => {
+                    // A stop closes the member's interval, but the run-up to
+                    // it still counts: presence only re-asserts on change.
+                    if let Some((started_ms, open_game, open_streaming)) = open.take() {
+                        fill_ticks(
+                            &mut input,
+                            user_key,
+                            &open_game,
+                            open_streaming,
+                            started_ms,
+                            delta.observed_at_ms,
+                            gap_timeout_ms,
+                        );
+                    }
+                    input.push(delta.clone());
+                }
+            }
+        }
+        match open {
+            Some((started_ms, open_game, open_streaming)) if now_ms > started_ms => {
+                fill_ticks(
+                    &mut input,
+                    user_key,
+                    &open_game,
+                    open_streaming,
+                    started_ms,
+                    now_ms,
+                    gap_timeout_ms,
+                );
+                input.push(synthetic_delta(
+                    user_key,
+                    &open_game,
+                    open_streaming,
+                    now_ms,
+                ));
+                set.push((
+                    (*user_key).to_owned(),
+                    PlayCarry {
+                        game: open_game,
+                        is_streaming: open_streaming,
+                        from_ms: now_ms,
+                        last_ms: now_ms,
+                    },
+                ));
+            }
+            Some((started_ms, open_game, open_streaming)) => {
+                // The flush clock runs behind the last observation (skew):
+                // carry from the observation, extending nothing.
+                set.push((
+                    (*user_key).to_owned(),
+                    PlayCarry {
+                        game: open_game,
+                        is_streaming: open_streaming,
+                        from_ms: started_ms,
+                        last_ms: started_ms,
+                    },
+                ));
+            }
+            None => {
+                drop.push((*user_key).to_owned());
+            }
+        }
+    }
+    (input, set, drop)
+}
+
 /// What one persist attempt did: counts only, never games or members.
 ///
 /// The flush loop logs these counts without labels (see [`persist_guild`]):
@@ -377,13 +780,19 @@ pub enum PersistOutcome {
 ///
 /// Consults the per-user opt-out plus the guild presence toggle (privacy
 /// precedent) before anything persists: a disabled guild drains and drops
-/// its buffers unwritten, and opted-out members' deltas and spans are
-/// filtered before sessionization so they neither persist nor influence
-/// another member's aggregates. Gate queries fail closed — a database error
-/// leaves the buffers untouched for the next due tick. An upsert failure
-/// requeues the drained buffers instead, so the outage loses nothing; the
-/// upsert itself stays additive and drained buffers never flush twice, so a
-/// tick persists each interval at most once.
+/// its buffers unwritten and forgets its carries, so a re-enable starts
+/// fresh; opted-out members' deltas, spans and carries are filtered before
+/// sessionization so they neither persist nor influence another member's
+/// aggregates. The guild voice toggle is independent per `docs/privacy.md`:
+/// when it is off, voice spans drain and drop while play aggregates still
+/// persist, so `in_voice_ms` stays 0. Gate queries fail closed — a database
+/// error leaves the buffers untouched for the next due tick. An upsert failure
+/// requeues the drained (bridged) buffers instead, so the outage loses
+/// nothing; the clip and carry points already advanced stay advanced, and
+/// the requeued spans cover the pre-flush portion, so the retry continues
+/// the same intervals without loss or double-count. The upsert itself stays
+/// additive and drained buffers never flush twice, so a tick persists each
+/// interval at most once.
 ///
 /// Telemetry is label-free: counts only, no game or member labels.
 pub async fn persist_guild(
@@ -391,10 +800,12 @@ pub async fn persist_guild(
     collector: &GameActivityCollector,
     guild: Snowflake,
     gap_timeout_ms: i64,
+    now_ms: i64,
 ) -> Result<PersistOutcome, GameActivityStoreError> {
     let guild_text = guild.to_string();
     if game_activity_store::game_analytics_disabled(pool, &guild_text).await? {
-        let (deltas, spans) = collector.drain_guild(guild);
+        let (deltas, spans) = collector.drain_guild_at(guild, now_ms);
+        collector.clear_guild_carry(guild);
         tracing::info!(
             deltas = deltas.len(),
             spans = spans.len(),
@@ -403,33 +814,50 @@ pub async fn persist_guild(
         return Ok(PersistOutcome::SkippedDisabled);
     }
     let opted_out = game_activity_store::opted_out_user_keys(pool, &guild_text).await?;
-    let (deltas, spans) = collector.drain_guild(guild);
-    let rows = game_activity_store::aggregate_filtered(
-        &guild_text,
-        &deltas,
-        &spans,
-        gap_timeout_ms,
-        &opted_out,
-    );
+    let voice_off = game_activity_store::voice_analytics_disabled(pool, &guild_text).await?;
+    let (deltas, spans) = collector.drain_guild_at(guild, now_ms);
+    if !opted_out.is_empty() {
+        collector.drop_carry_users(guild, &opted_out);
+    }
+    let (deltas, spans) = game_activity_store::filter_opted_out(&deltas, &spans, &opted_out);
+    let carry = collector.guild_carry(guild);
+    let (input, set, drop) = plan_flush(&deltas, &carry, gap_timeout_ms, now_ms);
+    collector.apply_carry_plan(guild, set, drop);
+    // A disabled voice family drops its spans after the drain: the opens
+    // already restarted at the flush clock, so disabled-period voice is
+    // forgotten and `in_voice_ms` stays 0 while play still persists.
+    let spans = if voice_off { Vec::new() } else { spans };
+    let sessions = game_activity::sessionize(&input, &spans, gap_timeout_ms);
+    let rows = game_activity::aggregate_guild(&guild_text, &sessions);
     if rows.is_empty() {
         tracing::debug!(
-            deltas = deltas.len(),
+            deltas = input.len(),
             spans = spans.len(),
             "game_activity_flush_empty"
         );
+        // Same span retention as [`GameActivityCollector::flush`]: with play
+        // still carried, drained spans wait for the bridged session instead
+        // of dropping covered voice time. Voice-off drops them above.
+        if !voice_off && !spans.is_empty() && !collector.guild_carry(guild).is_empty() {
+            collector.requeue(guild, Vec::new(), spans);
+        }
         return Ok(PersistOutcome::Empty);
     }
-    let sessions: u64 = rows.iter().map(|row| row.session_count).sum();
+    let session_total: u64 = rows.iter().map(|row| row.session_count).sum();
     match game_activity_store::upsert_guild_aggregates(pool, &rows).await {
         Ok(written) => {
-            tracing::info!(rows = written, sessions = sessions, "game_activity_flushed");
+            tracing::info!(
+                rows = written,
+                sessions = session_total,
+                "game_activity_flushed"
+            );
             Ok(PersistOutcome::Persisted {
                 rows: written,
-                sessions,
+                sessions: session_total,
             })
         }
         Err(error) => {
-            collector.requeue(guild, deltas, spans);
+            collector.requeue(guild, input, spans);
             tracing::warn!("game_activity_persist_failed");
             Err(error)
         }
@@ -459,7 +887,7 @@ pub async fn flush_due_guilds(
         // drops stale state, and a failed upsert requeues inside the call.
         // Only a gate failure (fail-closed, buffers intact) skips the stamp
         // so the next tick retries instead of dropping an hour.
-        if persist_guild(pool, collector, guild, gap_timeout_ms)
+        if persist_guild(pool, collector, guild, gap_timeout_ms, now_ms)
             .await
             .is_ok()
         {
@@ -634,7 +1062,7 @@ mod tests {
         );
         collector.observe_join(7, 42, T0);
         collector.observe_leave(7, 42, T0 + MIN);
-        let rows = collector.flush(7, 60 * MIN);
+        let rows = collector.flush(7, 60 * MIN, T0 + 30 * MIN);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].guild_id, "7");
         assert_eq!(rows[0].game.as_deref(), Some("Apex"));
@@ -670,7 +1098,7 @@ mod tests {
         }
         collector.observe_join(7, 44, T0 - MIN);
         collector.observe_leave(7, 44, T0 + 20 * MIN);
-        let rows = collector.flush(7, 15 * MIN);
+        let rows = collector.flush(7, 15 * MIN, T0 + 10 * MIN);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].session_count, 2, "one session per member");
         assert_eq!(
@@ -690,7 +1118,7 @@ mod tests {
         let mut delta = presence_delta(&update(json!([playing_activity("Apex")])), T0);
         delta.user_key = "42".to_owned();
         collector.observe_presence(7, delta);
-        let rows = collector.flush(7, 15 * MIN);
+        let rows = collector.flush(7, 15 * MIN, T0);
         assert_eq!(rows.len(), 1);
         let debug = format!("{:?}", rows[0]);
         assert!(
@@ -731,7 +1159,7 @@ mod tests {
             7,
             presence_delta(&update(json!([playing_activity("Apex")])), T0 + 30 * MIN),
         );
-        let rows = collector.flush(7, 60 * MIN);
+        let rows = collector.flush(7, 60 * MIN, T0 + 30 * MIN);
         assert_eq!(
             rows[0].in_voice_ms,
             10 * MIN,
@@ -750,7 +1178,7 @@ mod tests {
         collector.observe_join(7, 42, T0 + 60 * MIN);
         collector.observe_self_stream(7, 42, true, T0 + 60 * MIN);
         collector.observe_leave(7, 42, T0 + 70 * MIN);
-        let rows = collector.flush(7, 15 * MIN);
+        let rows = collector.flush(7, 15 * MIN, T0);
         assert_eq!(rows[0].in_voice_ms, 0);
         // Overlapping self-stream span counts like any span.
         collector.observe_presence(
@@ -760,7 +1188,7 @@ mod tests {
         collector.observe_join(7, 42, T0 - MIN);
         collector.observe_self_stream(7, 42, true, T0);
         collector.observe_leave(7, 42, T0 + MIN);
-        let rows = collector.flush(7, 15 * MIN);
+        let rows = collector.flush(7, 15 * MIN, T0);
         assert_eq!(rows[0].in_voice_ms, MIN);
     }
 
@@ -807,8 +1235,8 @@ mod tests {
             vec![7, 9],
             "closed spans keep their guild listed"
         );
-        let _ = collector.flush(7, 15 * MIN);
-        let _ = collector.flush(9, 15 * MIN);
+        let _ = collector.flush(7, 15 * MIN, T0);
+        let _ = collector.flush(9, 15 * MIN, T0);
         assert_eq!(
             collector.buffered_counts(7),
             (0, 0, 0),
@@ -830,7 +1258,7 @@ mod tests {
         collector.observe_join(7, 42, T0);
         collector.observe_leave(7, 42, T0 + MIN);
         // Simulate a failed upsert: drain, then requeue like persist_guild does.
-        let direct = collector.flush(7, 60 * MIN);
+        let direct = collector.flush(7, 60 * MIN, T0 + 30 * MIN);
         assert_eq!(direct.len(), 1);
         collector.observe_presence(
             7,
@@ -842,14 +1270,14 @@ mod tests {
         );
         collector.observe_join(7, 42, T0);
         collector.observe_leave(7, 42, T0 + MIN);
-        let (deltas, spans) = collector.drain_guild(7);
+        let (deltas, spans) = collector.drain_guild_at(7, T0 + 30 * MIN);
         // A newer arrival lands while the upsert is in flight.
         collector.observe_presence(
             7,
             presence_delta(&update(json!([playing_activity("Zelda")])), T0 + 90 * MIN),
         );
         collector.requeue(7, deltas, spans);
-        let rows = collector.flush(7, 60 * MIN);
+        let rows = collector.flush(7, 60 * MIN, T0 + 90 * MIN);
         assert_eq!(
             rows.len(),
             2,
@@ -861,6 +1289,171 @@ mod tests {
             .expect("requeued Apex row");
         assert_eq!(apex.total_play_ms, 30 * MIN);
         assert_eq!(apex.in_voice_ms, MIN);
+    }
+
+    #[test]
+    fn open_voice_span_clipped_at_flush_counts_time() {
+        let collector = GameActivityCollector::new();
+        // Member 42 plays Apex at T0 and T0+55m while staying in voice the
+        // whole hour: the flush clips the open span at the flush clock
+        // instead of persisting zero in-voice time.
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0),
+        );
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0 + 55 * MIN),
+        );
+        collector.observe_join(7, 42, T0);
+        let rows = collector.flush(7, 15 * MIN, T0 + 60 * MIN);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].total_play_ms,
+            60 * MIN,
+            "sparse play bridges to the flush clock, got {:?}",
+            rows[0]
+        );
+        assert_eq!(
+            rows[0].in_voice_ms,
+            60 * MIN,
+            "open span clipped at flush, got {:?}",
+            rows[0]
+        );
+        assert_eq!(
+            collector.buffered_counts(7),
+            (0, 0, 1),
+            "open span retained across the flush"
+        );
+        // A later window with no fresh presence persists nothing: the carry
+        // waits for the eventual stop instead of flooring a phantom minute.
+        let rows = collector.flush(7, 15 * MIN, T0 + 120 * MIN);
+        assert!(
+            rows.is_empty(),
+            "idle window persists nothing, got {rows:?}"
+        );
+    }
+
+    #[test]
+    fn sparse_start_stop_sessionizes_whole_across_flushes() {
+        let collector = GameActivityCollector::new();
+        // Two hours of play with only a start and a stop frame: change-driven
+        // presence sends nothing in between, so the first flush must close
+        // the open interval at its clock and the second must run to the stop.
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0),
+        );
+        let rows = collector.flush(7, 15 * MIN, T0 + 60 * MIN);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].total_play_ms,
+            60 * MIN,
+            "first hour closes at the flush clock, got {:?}",
+            rows[0]
+        );
+        collector.observe_presence(7, presence_delta(&update(json!([])), T0 + 120 * MIN));
+        let rows = collector.flush(7, 15 * MIN, T0 + 120 * MIN);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].total_play_ms,
+            60 * MIN,
+            "second hour runs to the stop, got {:?}",
+            rows[0]
+        );
+    }
+
+    #[test]
+    fn carry_drops_when_the_game_changes() {
+        let collector = GameActivityCollector::new();
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0),
+        );
+        let rows = collector.flush(7, 15 * MIN, T0 + 10 * MIN);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].total_play_ms, 10 * MIN);
+        // The carried Apex meets Zelda: the reopened point is dropped rather
+        // than floored to a phantom minute, and Zelda starts its own
+        // interval at its first sighting.
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Zelda")])), T0 + 20 * MIN),
+        );
+        let rows = collector.flush(7, 15 * MIN, T0 + 20 * MIN);
+        assert_eq!(rows.len(), 1, "no Apex row survives, got {rows:?}");
+        assert_eq!(rows[0].game.as_deref(), Some("Zelda"));
+        assert_eq!(
+            rows[0].total_play_ms, MIN,
+            "Zelda starts at its first sighting, got {:?}",
+            rows[0]
+        );
+    }
+
+    #[test]
+    fn stale_out_of_order_game_change_skips_the_bridge() {
+        let collector = GameActivityCollector::new();
+        // Apex at T0+10m opens the carry; a stale Zelda frame stamped T0+5m
+        // still buffers (sessionize sorts) but never clobbers the newer
+        // carry, and the flush refuses to bridge Apex into the older game.
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0 + 10 * MIN),
+        );
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Zelda")])), T0 + 5 * MIN),
+        );
+        let rows = collector.flush(7, 15 * MIN, T0 + 10 * MIN);
+        assert_eq!(rows.len(), 2, "both sightings stand alone, got {rows:?}");
+        let zelda = rows
+            .iter()
+            .find(|row| row.game.as_deref() == Some("Zelda"))
+            .expect("Zelda row");
+        assert_eq!(
+            zelda.total_play_ms, MIN,
+            "stale frame floors, got {zelda:?}"
+        );
+        let apex = rows
+            .iter()
+            .find(|row| row.game.as_deref() == Some("Apex"))
+            .expect("Apex row");
+        assert_eq!(
+            apex.total_play_ms, MIN,
+            "no reopened point ahead of the older game, got {apex:?}"
+        );
+    }
+
+    #[test]
+    fn stale_carry_starts_a_new_interval() {
+        let collector = GameActivityCollector::new();
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0),
+        );
+        let rows = collector.flush(7, 15 * MIN, T0);
+        assert_eq!(rows.len(), 1, "singleton floor opens the carry");
+        // A day later with nothing in between, the idle flush ages the carry
+        // out instead of persisting anything for it.
+        let later = T0 + 25 * 60 * MIN;
+        let rows = collector.flush(7, 15 * MIN, later);
+        assert!(
+            rows.is_empty(),
+            "idle window persists nothing, got {rows:?}"
+        );
+        // The next sighting starts a new interval rather than retroactively
+        // crediting the whole silent day.
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), later + 5 * MIN),
+        );
+        let rows = collector.flush(7, 15 * MIN, later + 5 * MIN);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].total_play_ms, MIN,
+            "stale carry must not bridge, got {:?}",
+            rows[0]
+        );
     }
 
     #[tokio::test]
@@ -892,7 +1485,7 @@ mod tests {
         );
         collector.observe_join(7, 42, T0);
         collector.observe_leave(7, 42, T0 + MIN);
-        let outcome = persist_guild(pool, &collector, 7, 60 * MIN)
+        let outcome = persist_guild(pool, &collector, 7, 60 * MIN, T0 + 30 * MIN)
             .await
             .expect("first persist writes");
         assert_eq!(
@@ -909,8 +1502,10 @@ mod tests {
         assert_eq!(rows[0].total_play_ms, 30 * MIN);
         assert_eq!(rows[0].in_voice_ms, MIN);
         // A second persist drains nothing and writes nothing: at most once.
+        // The still-playing carry lives in the map, not the buffers, so an
+        // idle tick stays empty until fresh presence arrives.
         assert_eq!(
-            persist_guild(pool, &collector, 7, 60 * MIN)
+            persist_guild(pool, &collector, 7, 60 * MIN, T0 + 30 * MIN)
                 .await
                 .expect("second persist"),
             PersistOutcome::Empty
@@ -926,7 +1521,7 @@ mod tests {
             .await
             .expect("suppress pair");
         assert_eq!(
-            persist_guild(pool, &collector, 9, 60 * MIN)
+            persist_guild(pool, &collector, 9, 60 * MIN, T0)
                 .await
                 .expect("opted-out persist"),
             PersistOutcome::Empty
@@ -950,7 +1545,7 @@ mod tests {
         .await
         .expect("disable presence");
         assert_eq!(
-            persist_guild(pool, &collector, 11, 60 * MIN)
+            persist_guild(pool, &collector, 11, 60 * MIN, T0)
                 .await
                 .expect("disabled persist"),
             PersistOutcome::SkippedDisabled
@@ -960,6 +1555,44 @@ mod tests {
                 .await
                 .expect("disabled read")
                 .is_empty()
+        );
+        // Guild 13 disabled only the voice family: play persists while
+        // voice-derived in-voice time stays 0 (independent toggles).
+        collector.observe_presence(
+            13,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0),
+        );
+        collector.observe_presence(
+            13,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0 + 30 * MIN),
+        );
+        collector.observe_join(13, 42, T0);
+        collector.observe_leave(13, 42, T0 + MIN);
+        sqlx::query(
+            "INSERT INTO guild_analytics_settings
+                 (guild_id, presence_enabled, activity_enabled, voice_enabled)
+             VALUES ('13', TRUE, TRUE, FALSE)",
+        )
+        .execute(pool)
+        .await
+        .expect("disable voice");
+        assert_eq!(
+            persist_guild(pool, &collector, 13, 60 * MIN, T0 + 30 * MIN)
+                .await
+                .expect("voice-disabled persist"),
+            PersistOutcome::Persisted {
+                rows: 1,
+                sessions: 1
+            }
+        );
+        let rows = two_bot_core::game_activity_store::read_guild_aggregates(pool, "13")
+            .await
+            .expect("voice-disabled read");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].total_play_ms, 30 * MIN, "play still persists");
+        assert_eq!(
+            rows[0].in_voice_ms, 0,
+            "voice toggle off zeroes in-voice time"
         );
     }
 
@@ -1036,7 +1669,7 @@ mod tests {
         let (deltas, _, _) = collector.buffered_counts(7);
         assert_eq!(deltas, MAX_DELTAS_PER_GUILD, "oldest deltas evicted first");
         assert_eq!(collector.dropped_counts().0, 100);
-        let rows = collector.flush(7, 15 * MIN);
+        let rows = collector.flush(7, 15 * MIN, T0);
         assert!(!rows.is_empty(), "bounded buffers still sessionize");
     }
 }

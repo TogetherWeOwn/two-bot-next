@@ -165,6 +165,22 @@ pub async fn game_analytics_disabled(
     .await?)
 }
 
+/// True when the guild disabled the voice analytics family. Each toggle is
+/// independent per `docs/privacy.md`: with voice off but presence on, play
+/// aggregates still persist while voice-derived `in_voice_ms` must stay 0.
+/// A missing settings row means enabled.
+pub async fn voice_analytics_disabled(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+) -> Result<bool, GameActivityStoreError> {
+    Ok(category_off_in(
+        &mut *pool.acquire().await?,
+        guild_id,
+        AnalyticsCategory::Voice,
+    )
+    .await?)
+}
+
 /// Drop every delta and span whose member opted out. Both sides filter on
 /// the same key set so an opted-out member's voice time can never leak into
 /// another member's session overlap.
