@@ -337,6 +337,10 @@
       "sha256": "9da078d3f29430320b79d2d82cfa6e4b1d2d557384a98d7dddca97783429d2dd",
       "justification": "RSVP check-in capacity count index: cover (guild_id, source) so record_checkin counts the occurrence without scanning the guild message history while holding the occurrence lock."
     },
+    "crates/cutover/migrations/0427_event_store_voice_capture.sql": {
+      "sha256": "7b96ea3478d398853a32690e248b3350944ef0267e90ca89a338ba9eb5c39397",
+      "justification": "Event-store S4 voice capture: create the append-only event_store table (or add its voice columns) with ids including nullable message_id for S1 coexistence, session, timestamps and enum mute/deaf/video/stream flags plus the shared UNIQUE dedup index; additive, backout drops the table."
+    },
     "crates/cutover/migrations/0428_event_store_presence_capture.sql": {
       "sha256": "5be88c0d2541613d571f30cdb1108c42e17532541f8bf6eb1f99181ad87b05ef",
       "justification": "Append-only event_store for presence capture: nullable user_id for sibling slices, best-effort dedup key, ids/enums only with no free-text columns."

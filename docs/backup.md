@@ -18,7 +18,7 @@ require `--force`. This confirmation is not authorization to target production.
 
 Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
 write **v6** (including durable voice-create reservations and event-store
-capture: presence capture plus member-capture deltas); the reader also accepts
+capture: voice, presence and member-capture deltas); the reader also accepts
 frozen **v3**, pre-reservation **v4** and pre-event-store **v5**. Other versions
 refuse.
 The manifest carries per-table `{name, columns, column_types, count}` taken
@@ -62,23 +62,23 @@ tables, the member-moderation ledger, the self-role send receipts
 (`self_role_exchange_baselines`), the automod delivery claims, the gateway
 boot directives, the member-erasure audit, the internal clock high-water
 mark, the voice configuration tables, the accepted voice-room create history
-(`voice_create_reservations`) and the event-store presence capture
+(`voice_create_reservations`) and the event-store voice/presence capture
 (`event_store`). `OPTIONAL_LEGACY_TABLES` is empty: the coverage
 test fails if a covered table is not migrated. A dump from a fresh Rust schema
 has 83 table entries. A missing current table refuses a dump/restore: migrate
 the target first.
 A v4 archive must declare every covered table except the ones v5 added
-(`V5_ADDED_TABLES`) and v6 added (`V6_ADDED_TABLES`), so recovery points
-written before create-reservation persistence remain inspectable and
-restorable. A v5 archive must declare everything except the v6 addition, so
-recovery points written before event-store capture (0428 presence, 0432 member
-deltas) remain inspectable and restorable. A v4 archive written before any
-other table joined the inventory is refused at inspect ("manifest is missing
-tables"); take a fresh dump after upgrading. V6 requires the full current
-inventory; an incomplete new archive refuses at inspection. Restoring a
-pre-reservation archive clears the destination's reservation table, as with
-other tables absent from an older version; restoring a pre-event-store
-archive clears the destination's event-store table the same way.
+(`V5_ADDED_TABLES`) and the ones v6 added (`V6_ADDED_TABLES`), so recovery
+points written before create-reservation persistence remain inspectable and
+restorable. A v4 archive written before any other table joined the inventory
+is refused at inspect ("manifest is missing tables"); take a fresh dump after
+upgrading. V5 requires everything except `V6_ADDED_TABLES`, so recovery points
+written before event-store persistence (0427 voice, 0428 presence, 0432 member
+deltas) stay readable; V6 requires the full current inventory, and an
+incomplete new archive refuses at inspection. Restoring a pre-reservation
+archive clears the destination's reservation table, as with other tables
+absent from an older version. A pre-v6 archive likewise clears the
+destination's event_store table.
 An optional legacy table may be absent only when there are no archived rows for
 it. Nonempty legacy data without a matching target table refuses **before any
 truncate**, rather than silently discarding it.
