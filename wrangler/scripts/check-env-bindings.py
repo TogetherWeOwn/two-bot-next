@@ -42,7 +42,20 @@ def missing_env_error(missing: list[str]) -> str:
 EXTRA_REQUIRED_VARS = {"TWO_GUILD_NAME"}
 # Worker secrets live outside wrangler.toml and are optional per environment.
 # Never require this binding (absence is log-only), or accept a plaintext URL.
-OPTIONAL_SECRET_BINDINGS = {"OPS_ALERT_WEBHOOK_URL", "METRICS_SCRAPE_TOKEN", "OPS_CONTROL_TOKEN"}
+OPTIONAL_SECRET_BINDINGS = {
+    "OPS_ALERT_WEBHOOK_URL",
+    "METRICS_SCRAPE_TOKEN",
+    "OPS_CONTROL_TOKEN",
+    # TOG-22861: the read-only ops dashboard service-token pair. Worker
+    # secrets only; a committed value would hand out dashboard access.
+    "OPS_DASHBOARD_CLIENT_ID",
+    "OPS_DASHBOARD_CLIENT_SECRET",
+}
+# TOG-22861 workers.dev break-glass: staging and production serve the public
+# suffix until a custom domain and Access app exist. Every named environment
+# must declare workers_dev explicitly; exactly the break-glass envs enable
+# it. The top level must disable it so bare deploys never serve it.
+WORKERS_DEV_ENVS = {"staging", "production"}
 # Absent tuning uses the code default; a named env may opt in independently.
 OPTIONAL_VARS = {"UNREADY_ALERT_FAILURES"}
 # TOG-12980 (CISO TOG-12979 C1/C10): the default-dark POST /internal/actions
@@ -110,6 +123,29 @@ def _collect_errors(cfg: dict) -> list[str]:
     missing = sorted(set(REQUIRED_ENVS) - set(envs))
     if missing:
         return [missing_env_error(missing)]
+
+    # TOG-22861: workers.dev break-glass is staging + production until a
+    # custom domain and Access app exist. Every named environment declares it
+    # explicitly so a new env cannot inherit the public suffix by accident;
+    # diagnostics name the section, never values.
+    if cfg.get("workers_dev") is not False:
+        errors.append(
+            "top-level workers_dev must be explicitly false "
+            "(only break-glass envs serve workers.dev)"
+        )
+    for env_name, env in envs.items():
+        workers_dev = env.get("workers_dev")
+        if env_name in WORKERS_DEV_ENVS:
+            if workers_dev is not True:
+                errors.append(
+                    f"[env.{env_name}]: workers_dev must be explicitly true "
+                    f"({env_name} is a dashboard break-glass origin)"
+                )
+        elif workers_dev is not False:
+            errors.append(
+                f"[env.{env_name}]: workers_dev must be explicitly false "
+                "(only break-glass envs serve workers.dev)"
+            )
 
     for prefix, section in [("[vars]", cfg), *[(f"[env.{name}.vars]", env) for name, env in envs.items()]]:
         variables = section.get("vars", {})
