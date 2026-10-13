@@ -2127,7 +2127,7 @@ mod tests {
             .to_string()
             .contains("member_season_xp"));
         // v8 without stream_live_claims refuses.
-        let mut v8_gap = manifest(without(
+        let v8_gap = manifest(without(
             complete_tables(&BTreeMap::new()),
             "stream_live_claims",
         ));
