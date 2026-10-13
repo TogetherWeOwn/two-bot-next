@@ -160,9 +160,20 @@ answer, open the live page and quote what it says that day.
 
 ## Retention and explicit exceptions
 
-No new automatic age-based purger is installed by this change. Covered activity
-persists until an authorized erasure or a separate existing feature lifecycle
-removes it. Do not claim a 30/90-day TTL where no enforcing timer exists.
+The retention module (`two-bot-cutover::retention`, migration `0438`)
+implements the rolling windows when invoked: raw presence/voice rows roll off
+at 30 days, the audit-log cache expires at 45 days, and user deletion requests
+complete in under 72 hours with a receipt unless a replay guard is unresolved,
+in which case the request stays pending with no receipt and is reported as
+deferred (with overdue requests older than 72 hours counted separately).
+Long-term aggregates (counts,
+streaks) are never time-purged, and a departed guild's rows go only through
+the guild-purge queue keyed on a true guild removal (a rejoin cancels the
+queued purge). No scheduler, CLI, or gateway hook calls the job yet, and no
+automatic age-based purger is installed: do not claim a live 30/90-day TTL or
+live enforcement where no enforcing timer exists. Gateway wiring for
+`GUILD_DELETE`/`GUILD_CREATE` and a schedule are follow-up work. Every run
+reports per-class metrics and supports a dry run that deletes nothing.
 
 The append-only event-store capture (`event_store`, when its slices land)
 follows the same rule: its rows persist until erasure, and its TTL policy is

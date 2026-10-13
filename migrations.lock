@@ -396,6 +396,10 @@
     "crates/cutover/migrations/0437_event_store_s1_core.sql": {
       "sha256": "9e1c4d2f46f3a36e1e155de83a41a2bcd1d5c4dd2f68ab47dbdd304082e8a1ef",
       "justification": "Event-store S1 append-only core: order-independent event_store table with MESSAGE_CREATE metadata columns (event_type, guild_id, channel_id, message_id, user_id, event_time, received_at, dedup_key) plus nullable convergence and the shared UNIQUE dedup index; ids+timestamps only, no body columns."
+    },
+    "crates/cutover/migrations/0438_retention_queues.sql": {
+      "sha256": "7ab729b1c4340ab962ef0b8beba6aff3ecd1962e2fb0f002d5e1e75b5c351f56",
+      "justification": "Retention rolling-window queues: guild-purge queue and user-deletion request ledger backing 30-day raw and 45-day audit roll-off with under-72-hour deletion receipts; additive, backout drops both tables. Renumbered from 0427 to 0437 and then 0438 after main claimed 0427 for event-store voice capture, 0435/0436 for backfill cursors and member catch-up, and 0437 for event-store S1 core; the 0427/0437 files never merged so no database has applied them under either number."
     }
   }
 }

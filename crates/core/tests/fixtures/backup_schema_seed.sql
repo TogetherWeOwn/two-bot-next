@@ -512,6 +512,18 @@ VALUES ('100000000000000001', '100000000000000050', 'vote_started', '10000000000
        ('100000000000000001', '100000000000000051', 'vote_refused', '100000000000000033',
         '100000000000000003', '100000000000000002', 'protected_target',
         NULL, NULL, NULL, '2026-08-03T10:05:00Z');
+-- Retention queues (0438): one queued guild purge plus one pending and one
+-- completed user-deletion request, so the dump/restore round trip covers both
+-- the pending-NULL and completed-receipt shapes.
+INSERT INTO retention_guild_purge_queue (guild_id, enqueued_at)
+VALUES ('100000000000000001', '2026-08-03T10:06:00.123456Z');
+INSERT INTO retention_deletion_requests
+  (request_id, guild_id, user_id, requested_at, status, completed_at, receipt_id)
+VALUES ('backup-del-pending', '100000000000000001', '100000000000000002',
+        '2026-08-01T10:00:00.123456Z', 'pending', NULL, NULL),
+       ('backup-del-completed', '100000000000000001', '100000000000000003',
+        '2026-08-01T09:00:00Z', 'completed', '2026-08-01T10:00:00Z',
+        'rcpt-backup-del-completed');
 -- Privacy opt-out control plane (0433/0434): one suppressed pair plus one
 -- untouched pair, per-guild toggles with one category disabled, and one
 -- audit receipt per suppression. Every table carries rows so the roundtrip
