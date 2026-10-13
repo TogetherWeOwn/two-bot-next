@@ -226,14 +226,23 @@ impl GameActivityCollector {
         let observed_at_ms = delta.observed_at_ms;
         let user_key = delta.user_key.clone();
         let asserted = game_activity::session_game(&delta);
-        let buffer = inner.deltas.entry(guild).or_default();
-        buffer.push(delta);
-        if buffer.len() > MAX_DELTAS_PER_GUILD {
-            let overflow = buffer.len() - MAX_DELTAS_PER_GUILD;
-            buffer.drain(..overflow);
+        let overflow = {
+            let buffer = inner.deltas.entry(guild).or_default();
+            buffer.push(delta);
+            let overflow = buffer.len().saturating_sub(MAX_DELTAS_PER_GUILD);
+            if overflow > 0 {
+                buffer.drain(..overflow);
+            }
+            overflow
+        };
+        if overflow > 0 {
             inner.dropped_deltas += overflow as u64;
         }
-        match inner.carry.entry((guild, user_key)) {
+        // Synthetic old-game close-out collected here and flushed into the
+        // delta buffer after the carry borrow ends, so no buffer borrow lives
+        // across a carry or counter mutation.
+        let mut pending: Vec<PresenceDelta> = Vec::new();
+        match inner.carry.entry((guild, user_key.clone())) {
             Entry::Occupied(mut stated) if observed_at_ms >= stated.get().last_ms => {
                 match asserted {
                     Some((game, is_streaming)) => {
@@ -262,14 +271,14 @@ impl GameActivityCollector {
                                 && observed_at_ms.saturating_sub(prev.from_ms)
                                     <= GAME_ACTIVITY_CARRY_TTL_MS
                             {
-                                buffer.push(synthetic_delta(
+                                pending.push(synthetic_delta(
                                     &user_key,
                                     &prev.game,
                                     prev.is_streaming,
                                     prev.from_ms,
                                 ));
                                 fill_ticks(
-                                    buffer,
+                                    &mut pending,
                                     &user_key,
                                     &prev.game,
                                     prev.is_streaming,
@@ -277,17 +286,12 @@ impl GameActivityCollector {
                                     observed_at_ms,
                                     GAME_ACTIVITY_GAP_TIMEOUT_MS,
                                 );
-                                buffer.push(synthetic_delta(
+                                pending.push(synthetic_delta(
                                     &user_key,
                                     &prev.game,
                                     prev.is_streaming,
                                     observed_at_ms,
                                 ));
-                                if buffer.len() > MAX_DELTAS_PER_GUILD {
-                                    let overflow = buffer.len() - MAX_DELTAS_PER_GUILD;
-                                    buffer.drain(..overflow);
-                                    inner.dropped_deltas += overflow as u64;
-                                }
                             }
                             stated.insert(PlayCarry {
                                 game,
@@ -320,6 +324,20 @@ impl GameActivityCollector {
                 }
             }
             Entry::Occupied(_) => {}
+        }
+        if !pending.is_empty() {
+            let overflow = {
+                let buffer = inner.deltas.entry(guild).or_default();
+                buffer.extend(pending);
+                let overflow = buffer.len().saturating_sub(MAX_DELTAS_PER_GUILD);
+                if overflow > 0 {
+                    buffer.drain(..overflow);
+                }
+                overflow
+            };
+            if overflow > 0 {
+                inner.dropped_deltas += overflow as u64;
+            }
         }
         if inner.carry.len() > MAX_CARRY_ENTRIES {
             inner.carry.retain(|_, stated| {
@@ -1023,19 +1041,21 @@ pub async fn persist_guild(
         }
         return Ok(PersistOutcome::Empty);
     }
-    // Busy-guild case (see `flush`): retain silent carried members' spans
-    // even though other members persisted rows.
-    if !voice_off && !spans.is_empty() && !collector.guild_carry(guild).is_empty() {
-        let (silent_spans, _): (Vec<VoiceSpan>, Vec<VoiceSpan>) = spans
-            .into_iter()
-            .partition(|span| silent.contains(&span.user_key));
-        if !silent_spans.is_empty() {
-            collector.requeue(guild, Vec::new(), silent_spans);
-        }
-    }
     let session_total: u64 = rows.iter().map(|row| row.session_count).sum();
     match game_activity_store::upsert_guild_aggregates(pool, &rows).await {
         Ok(written) => {
+            // Busy-guild case (see `flush`): retain silent carried members'
+            // spans even though other members persisted rows. Retention runs
+            // only on success so a failed upsert requeues the full drained
+            // buffers below without double-queueing the silent subset.
+            if !voice_off && !spans.is_empty() && !collector.guild_carry(guild).is_empty() {
+                let (silent_spans, _): (Vec<VoiceSpan>, Vec<VoiceSpan>) = spans
+                    .into_iter()
+                    .partition(|span| silent.contains(&span.user_key));
+                if !silent_spans.is_empty() {
+                    collector.requeue(guild, Vec::new(), silent_spans);
+                }
+            }
             tracing::info!(
                 rows = written,
                 sessions = session_total,
