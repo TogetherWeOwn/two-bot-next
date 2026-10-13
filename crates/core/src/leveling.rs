@@ -315,16 +315,6 @@ pub fn season_id_for_ms(ms: i64) -> String {
     }
 }
 
-/// Current season scope by wall clock (AC3), Monday-aligned like
-/// [`season_id_for_ms`]. The award path and the weekly scorecard stamp new
-/// rows with this; explicit timestamps stay with [`season_id_for_ms`].
-#[must_use]
-pub fn current_season_id() -> String {
-    let iso = super::funnel::now_iso();
-    let ms = super::funnel::parse_iso_millis(&iso).unwrap_or(0);
-    season_id_for_ms(ms)
-}
-
 /// Format a count the way legacy `Number.toLocaleString()` (en-US) does:
 /// thousands grouped with `,`, no decimals. Legacy groups XP/progress counts,
 /// but leaves level, rank and member count ungrouped.

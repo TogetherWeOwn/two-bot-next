@@ -39,8 +39,8 @@ use sqlx::PgPool;
 
 use super::funnel::{format_iso_millis, parse_iso_millis};
 use super::leveling::{
-    adjudicate_message_award, clamp_leaderboard_limit, current_season_id, level_for_xp,
-    normalize_role_rewards, seasonal_decay_new_weeks, seasonal_xp_after_decay_weeks,
+    adjudicate_message_award, clamp_leaderboard_limit, level_for_xp, normalize_role_rewards,
+    season_id_for_ms, seasonal_decay_new_weeks, seasonal_xp_after_decay_weeks,
     voice_xp_for_duration, LeaderboardEntry, LevelProfile, LevelRoleReward, MessageAwardInput,
     RewardConfigError, XpAward, XpSource, AWARD_COOLDOWN_SECONDS, MAX_STORED_XP,
     MESSAGE_DAILY_CAP_XP, MESSAGE_SHORT_MIN_LEN, MESSAGE_XP, VOICE_DAILY_CAP_XP,
@@ -386,7 +386,7 @@ pub async fn award_message(
             upsert_seasonal(
                 pool,
                 guild_id,
-                &current_season_id(),
+                &season_id_for_ms(at_ms),
                 member_id,
                 out.awarded,
                 &at_norm,
@@ -511,7 +511,7 @@ pub async fn award_voice(
         upsert_seasonal(
             pool,
             guild_id,
-            &current_season_id(),
+            &season_id_for_ms(at_ms),
             member_id,
             out.awarded,
             &at_norm,

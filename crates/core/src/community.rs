@@ -501,13 +501,13 @@ pub struct Scorecard {
     /// never a verdict.
     #[serde(rename = "abuse_data_quality")]
     pub abuse_data_quality: Vec<String>,
-    /// Current season scope (`YYYY-QN`) by wall clock (AC3).
+    /// Season scope (`YYYY-QN`) of the scorecard week start (event time, AC3).
     #[serde(rename = "season_id")]
     pub season_id: String,
-    /// Season transition watermarks. Every Monday-aligned scorecard week
-    /// reports both `season_close` and `season_open`: seasons start Monday
-    /// 00:00 UTC, so a season boundary always coincides with a week boundary
-    /// (AC3).
+    /// Season transition watermarks. Only the scorecard week whose Monday
+    /// start is a season boundary (Monday 00:00 UTC on/after a quarter's
+    /// first day) reports both `season_close` and `season_open`; every other
+    /// week carries neither (AC3).
     #[serde(rename = "season_watermarks")]
     pub season_watermarks: Vec<String>,
 }
@@ -1348,7 +1348,7 @@ pub fn build_scorecard(inputs: ScorecardInputs) -> Result<ScorecardOutcome, Scor
 
     let complete = coverage_state == "complete";
 
-    // Anti-gaming observe-only layer (AC3/AC4): the current season scope, the
+    // Anti-gaming observe-only layer (AC3/AC4): the event-time season scope, the
     // season transition watermarks, and the abuse detectors. Detectors run
     // only under complete coverage (fail-closed); voice-AFK without occupancy
     // data yields `insufficient_data`, never a verdict.
@@ -1357,8 +1357,14 @@ pub fn build_scorecard(inputs: ScorecardInputs) -> Result<ScorecardOutcome, Scor
     } else {
         (Vec::new(), Vec::new(), Vec::new())
     };
-    let season_id = super::leveling::current_season_id();
-    let season_watermarks = if crate::community::week_start_ms(week_start_ms) == week_start_ms {
+    // Event-time season (AC3): the scorecard stays in its week's season even
+    // when rebuilt after a quarter change. Watermarks fire only when the week
+    // start itself is a season boundary: seasons start Monday 00:00 UTC, so
+    // the instant before a boundary week still belongs to the old season.
+    let season_id = super::leveling::season_id_for_ms(week_start_ms);
+    let season_watermarks = if super::leveling::season_id_for_ms(week_start_ms)
+        != super::leveling::season_id_for_ms(week_start_ms.saturating_sub(1))
+    {
         vec!["season_close".to_owned(), "season_open".to_owned()]
     } else {
         Vec::new()
