@@ -120,6 +120,13 @@ EXEMPT_SERIES = {
     "two_bot_voice_queue_pending": _VOICE_SERIES_REASON,
     "two_bot_voice_queue_oldest_age_seconds": _VOICE_SERIES_REASON,
     "two_bot_voice_rest_in_flight_age_seconds": _VOICE_SERIES_REASON,
+    # Event-store S1 consumer-lag gauge: label-free manual check, not an
+    # alert input. Documented in docs/metrics.md; the catalog tracks event
+    # names, not this operational gauge.
+    "two_bot_event_store_consumer_lag_seconds": (
+        "manual check documented in docs/metrics.md, consumed by no alert "
+        "rule; label-free S1 consumer-lag gauge"
+    ),
 }
 
 _PREDATES_ROWS_REASON = (
