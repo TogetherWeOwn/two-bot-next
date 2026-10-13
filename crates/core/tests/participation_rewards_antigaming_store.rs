@@ -148,7 +148,14 @@ async fn decay_job_writes_audit_rows_leaves_lifetime(
     assert_eq!(first.awarded, 15);
     // The Monday decay tick (seasonal only, 10 %/week past 28 d inactivity)
     // must write `source='decay'` audit rows and never touch lifetime XP.
-    // No job exists yet, so this probes the audit trail directly.
+    // `at(0)` stamps the seasonal row; 36 d later is one full overdue week
+    // (grace 28 d + 7 d), so exactly one member must decay.
+    let decayed_members =
+        store::apply_seasonal_decay(&pool, GUILD, SEASON, &at(36 * 86400)).await?;
+    assert_eq!(
+        decayed_members, 1,
+        "one inactive seasonal row must decay after 36 d"
+    );
     let decayed: Vec<(i64,)> =
         sqlx::query_as("SELECT xp FROM xp_awards WHERE guild_id = $1 AND source = 'decay'")
             .bind(GUILD)
