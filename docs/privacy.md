@@ -64,7 +64,10 @@ are outside this implementation's scope.
   and delivery state. Sticky bodies and their creator/editor IDs are stored. Scheduled messages store creator/editor IDs and are erased with them.
 - Moderation, announcements, automation and operational audit rows, actor/target
   IDs, reasons and metadata. Some legacy-compatible payload columns are arbitrary
-  TEXT, not database-validated JSON.
+  TEXT, not database-validated JSON. The event-store capture (`event_store`:
+  stage-instance, interaction-observe and audit-log-entry rows with IDs and
+  enum fields only, no free text) stores actor/target member IDs, erased as
+  either one.
 - Automod violation counts and once-per-message ledgers store member and message
   IDs and filter names, never content (`automod_violations`,
   `automod_processed_messages`). Per-delivery replay claims may keep a matched
