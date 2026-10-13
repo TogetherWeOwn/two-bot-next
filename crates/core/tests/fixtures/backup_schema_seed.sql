@@ -409,7 +409,7 @@ VALUES ('100000000000000001', '100000000000000002', '2026-08-01T09:59:58Z',
         NULL, '2026-08-02T10:00:00Z'),
        ('100000000000000001', '100000000000000002', '2026-08-03T10:00:00Z',
         NULL, NULL);
--- S2 member capture (0431): append-only gateway deltas; one ADD with the
+-- S2 member capture (0432): append-only gateway deltas; one ADD with the
 -- nick_changed flag and role ids, one REMOVE without deltas. The REMOVE keys
 -- on the gateway envelope (session + sequence) because the dispatch carries
 -- no timestamp; nicknames are never stored, only the flag.

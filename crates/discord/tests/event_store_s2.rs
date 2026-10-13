@@ -26,9 +26,9 @@
 //!   dispatch, so a redelivered REMOVE/UPDATE replays the same key while a
 //!   later leave or update carries a new one. `event_time` on those rows is
 //!   receipt time, the writer's best-known time.
-//! - Privacy tripwire: the table keeps exactly the S1+S2 union column set,
-//!   so any added column (a raw payload or free-text column included) fails
-//!   the schema check; and a fixture carrying bio / about / nickname free
+//! - Privacy tripwire: the table holds every S1+S2 column and only columns on
+//!   the shared reviewed allowlist, so a sibling slice's columns pass while an
+//!   added raw payload or free-text column fails the schema check; and a fixture carrying bio / about / nickname free
 //!   text persists its ids and deltas only, the sentinels appearing in no
 //!   stored row.
 //!
@@ -40,7 +40,7 @@
 
 use serde_json::{json, Value};
 use sqlx::PgPool;
-use two_bot_testsupport::TestDatabase;
+use two_bot_testsupport::{assert_event_store_columns, TestDatabase};
 
 const GUILD: &str = "2222";
 const USER: &str = "77";
@@ -213,10 +213,12 @@ async fn table_columns(pool: &PgPool) -> Vec<String> {
     .expect("event_store columns readable")
 }
 
-/// Exact S1+S2 union column set: the S1 identity/timestamp core plus the S2
-/// member deltas. Any added column (a raw payload or free-text column
-/// included) fails here, so a build that stores the gateway dispatch outside
-/// these columns cannot pass.
+/// Columns this slice requires: the S1 identity/timestamp core plus the S2
+/// member deltas. The table is shared with the other capture slices, so the
+/// schema check pairs this required set with the reviewed allowlist in
+/// `two_bot_testsupport::EVENT_STORE_ALLOWED_COLUMNS`: a sibling slice adding
+/// its columns stays green, while a raw-payload or free-text column outside
+/// every reviewed slice fails.
 const EXPECTED_COLUMNS: &[&str] = &[
     "id",
     "event_type",
@@ -251,17 +253,7 @@ fn assert_member_schema(columns: &[String]) {
         !columns.is_empty(),
         "S2 creates the member columns on the append-only event_store table"
     );
-    let mut actual = columns.to_vec();
-    actual.sort();
-    let mut expected: Vec<String> = EXPECTED_COLUMNS
-        .iter()
-        .map(|column| column.to_string())
-        .collect();
-    expected.sort();
-    assert_eq!(
-        actual, expected,
-        "event_store keeps exactly the S1+S2 column set; has {columns:?}"
-    );
+    assert_event_store_columns(columns, EXPECTED_COLUMNS);
     for forbidden in FORBIDDEN_COLUMNS {
         assert!(
             !columns.iter().any(|column| column == forbidden),
@@ -597,14 +589,14 @@ async fn event_store_s2_duplicate_delivery_inserts_once() {
     db.cleanup().await;
 }
 
-/// S2 AC 3 (privacy tripwire): the table keeps exactly the S1+S2 column set,
-/// so no free-text column may exist to hold the payload; and a fixture
+/// S2 AC 3 (privacy tripwire): the table holds the S1+S2 columns and nothing
+/// outside the reviewed allowlist, so no free-text column may exist to hold the payload; and a fixture
 /// carrying free-text bio / about / nickname fields persists its ids and
 /// deltas only, the sentinels appearing in no stored row.
 #[tokio::test]
 async fn event_store_s2_privacy_tripwire_rejects_bio_text() {
     let db = TestDb::new().await;
-    // Tripwire part 1: the exact allowlist fails on any added column, so a
+    // Tripwire part 1: the allowlist fails on any unreviewed column, so a
     // raw-payload or free-text column cannot hide beside the contract.
     assert_member_schema(&table_columns(&db.pool).await);
     // Tripwire part 2: a fixture carrying bio + about free text plus a

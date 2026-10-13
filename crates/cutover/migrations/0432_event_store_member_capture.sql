@@ -1,5 +1,5 @@
--- 0431_event_store_member_capture: S2 member add/remove/update capture on the
--- append-only event_store table (parent scope TOG-22849 slice 2).
+-- 0432_event_store_member_capture: S2 member add/remove/update capture on the
+-- append-only event_store table (slice 2).
 --
 -- Stores one row per GUILD_MEMBER_ADD / REMOVE / UPDATE dispatch with ids,
 -- timestamps and membership enum deltas only: event_type, guild_id, user_id,
@@ -31,9 +31,10 @@
 -- re-runnable (`IF NOT EXISTS`). The shared dedup index name
 -- `idx_event_store_dedup_key` is created once via
 -- `CREATE UNIQUE INDEX IF NOT EXISTS`, never as an inline UNIQUE, so landing
--- after a sibling never leaves a second unique index on the column. Number
--- 0431 sits past the 0427-0430 sibling claims, so no two landed files share
--- a number. `id` is BIGSERIAL like the sibling slice tables. `roles` is
+-- after a sibling never leaves a second unique index on the column. Migration
+-- numbers are claimed per slice in the migration ledger (this slice holds
+-- 0432); `scripts/check-migrations.py` refuses a duplicate number, so a slice
+-- that lands second renumbers. `id` is BIGSERIAL like the sibling slice tables. `roles` is
 -- `NOT NULL DEFAULT '[]'::jsonb` so sibling rows that carry no role delta
 -- still insert; the ALTER path backfills existing NULLs before enforcing
 -- NOT NULL. No snowflake CHECK constraints on guild_id/user_id: fixtures and

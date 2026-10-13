@@ -9,10 +9,11 @@
 //! Contract under test (event-store P1 slice 1: append-only core +
 //! message-create metadata + idempotent keys + lag metric):
 //!
-//! - `event_store` table, append-only, exactly these columns: `id`,
+//! - `event_store` table, append-only, with at least these columns: `id`,
 //!   `event_type`, `guild_id`, `channel_id`, `message_id`, `user_id`,
-//!   `event_time`, `received_at`, `dedup_key`. Any added column (a raw
-//!   payload or free-text column included) fails the schema check.
+//!   `event_time`, `received_at`, `dedup_key`. A column outside the shared
+//!   reviewed allowlist (a raw payload or free-text column included) fails
+//!   the schema check; sibling slices' reviewed columns pass.
 //!   `dedup_key` is UNIQUE.
 //! - Resume-safe idempotent inserts: `dedup_key = "MESSAGE_CREATE:<id>"`,
 //!   `ON CONFLICT (dedup_key) DO NOTHING`, first-wins on replay. AC 2/3 pin
@@ -38,7 +39,7 @@
 
 use serde_json::{json, Value};
 use sqlx::PgPool;
-use two_bot_testsupport::TestDatabase;
+use two_bot_testsupport::{assert_event_store_columns, TestDatabase};
 
 const GUILD: &str = "2222";
 const CHANNEL_ID: &str = "4444";
@@ -139,9 +140,11 @@ const FORBIDDEN_COLUMNS: &[&str] = &[
     "status_text",
 ];
 
-/// Exact S1 column set: `id` plus the eight metadata columns. Any added
-/// column (a raw payload or free-text column included) fails here, so an S1
-/// build that stores the gateway dispatch outside these columns cannot pass.
+/// Required S1 columns: `id` plus the eight metadata columns. The table is
+/// shared with the other capture slices, so the check also requires every
+/// column to be on the reviewed allowlist in
+/// `two_bot_testsupport::EVENT_STORE_ALLOWED_COLUMNS`: a raw-payload or
+/// free-text column fails, while a sibling slice's reviewed columns pass.
 const EXPECTED_COLUMNS: &[&str] = &[
     "id",
     "event_type",
@@ -159,17 +162,7 @@ fn assert_minimal_schema(columns: &[String]) {
         !columns.is_empty(),
         "S1 creates the append-only event_store table"
     );
-    let mut actual = columns.to_vec();
-    actual.sort();
-    let mut expected: Vec<String> = EXPECTED_COLUMNS
-        .iter()
-        .map(|column| column.to_string())
-        .collect();
-    expected.sort();
-    assert_eq!(
-        actual, expected,
-        "event_store keeps exactly the S1 column set; has {columns:?}"
-    );
+    assert_event_store_columns(columns, EXPECTED_COLUMNS);
     for forbidden in FORBIDDEN_COLUMNS {
         assert!(
             !columns.iter().any(|column| column == forbidden),
@@ -348,8 +341,8 @@ fn event_store_s1_consumer_lag_gauge_has_fixed_cardinality() {
 #[ignore = "pending: S1 migration missing; CONSTRAINTS exception expires 2026-11-12; run with --ignored to see the gap"]
 async fn event_store_s1_privacy_tripwire_rejects_body_text() {
     let db = TestDb::new().await;
-    // Tripwire part 1: the table holds exactly the S1 column set, so no
-    // free-text or raw-payload column exists to hold the sentinels.
+    // Tripwire part 1: the table holds the S1 columns and only reviewed
+    // allowlist columns, so no free-text or raw-payload column exists to hold the sentinels.
     let columns = table_columns(&db.pool).await;
     assert!(
         !columns.is_empty(),

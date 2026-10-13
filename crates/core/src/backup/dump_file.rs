@@ -139,7 +139,7 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_vote_kick_audit",
     // V5 adds accepted-create history; see [`V5_ADDED_TABLES`].
     "voice_create_reservations",
-    // S2 member capture (0431): append-only gateway deltas, guild-keyed, no
+    // S2 member capture (0432): append-only gateway deltas, guild-keyed, no
     // foreign keys, so order among the appended tables is free.
     "event_store",
 ];
@@ -1771,6 +1771,31 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("event_store"));
+    }
+
+    #[test]
+    fn inspect_still_reads_v5_archives_and_refuses_unknown_versions() {
+        // The version gate in `inspect_reader` is a second half of the v6
+        // bump: `validate_manifest` waives event_store for v5, but the gate
+        // must also let a v5 archive reach it.
+        let mut v5 = good_dump();
+        v5[0]["version"] = serde_json::json!(5);
+        v5[0]["tables"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|t| t.get("name").and_then(Value::as_str) != Some("event_store"));
+        let contents = inspect_bytes(&gzip_lines(&v5)).expect("a v5 archive stays readable");
+        assert_eq!(contents.manifest.version, 5);
+        assert_eq!(contents.rows, 1);
+        assert_eq!(contents.manifest.missing_tables(), ["event_store"]);
+
+        let mut future = good_dump();
+        future[0]["version"] = serde_json::json!(DUMP_VERSION + 1);
+        let message = inspect_bytes(&gzip_lines(&future)).unwrap_err().to_string();
+        assert!(
+            message.contains(&format!("reads 3, 4, 5 and {DUMP_VERSION}")),
+            "unknown versions are refused with the readable list: {message}"
+        );
     }
 
     #[test]
