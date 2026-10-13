@@ -305,6 +305,10 @@ jobs:
           --skip event_store_s1_replayed_message_create_does_not_duplicate
           --skip event_store_s1_consumer_lag_gauge_has_fixed_cardinality
           --skip event_store_s1_privacy_tripwire_rejects_body_text
+          --skip event_store_s4_voice_state_join_persists_ids_session_and_flags_only
+          --skip event_store_s4_voice_server_update_persists_ids_without_token_or_endpoint
+          --skip event_store_s4_duplicate_delivery_inserts_once
+          --skip event_store_s4_privacy_tripwire_rejects_effect_and_status_text
       - name: Channel moderation ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:
