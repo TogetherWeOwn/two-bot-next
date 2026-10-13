@@ -855,6 +855,14 @@ async fn guild_purge_covers_every_plan_table_and_preserves_receipts() {
             .fetch_one(pool)
             .await
             .unwrap()
+        } else if entry.table == "self_role_exchanges" {
+            sqlx::query_scalar(sqlx::AssertSqlSafe(
+                "SELECT count(*) FROM self_role_exchanges WHERE event_id IN (SELECT event_id FROM self_role_audit WHERE guild_id = $1)".to_owned(),
+            ))
+            .bind(FIX_OTHER)
+            .fetch_one(pool)
+            .await
+            .unwrap()
         } else if entry.table == "retention_deletion_requests" {
             0
         } else {
@@ -914,6 +922,14 @@ async fn guild_purge_covers_every_plan_table_and_preserves_receipts() {
         } else if entry.table == "feed_deliveries" {
             sqlx::query_scalar(sqlx::AssertSqlSafe(
                 "SELECT count(*) FROM feed_deliveries WHERE feed_id IN (SELECT id FROM feed_relays WHERE guild_id = $1)".to_owned(),
+            ))
+            .bind(FIX_GONE)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        } else if entry.table == "self_role_exchanges" {
+            sqlx::query_scalar(sqlx::AssertSqlSafe(
+                "SELECT count(*) FROM self_role_exchanges WHERE event_id IN (SELECT event_id FROM self_role_audit WHERE guild_id = $1)".to_owned(),
             ))
             .bind(FIX_GONE)
             .fetch_one(pool)
@@ -989,6 +1005,14 @@ async fn guild_purge_covers_every_plan_table_and_preserves_receipts() {
         } else if table == "feed_deliveries" {
             sqlx::query_scalar(sqlx::AssertSqlSafe(
                 "SELECT count(*) FROM feed_deliveries WHERE feed_id IN (SELECT id FROM feed_relays WHERE guild_id = $1)".to_owned(),
+            ))
+            .bind(FIX_OTHER)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        } else if table == "self_role_exchanges" {
+            sqlx::query_scalar(sqlx::AssertSqlSafe(
+                "SELECT count(*) FROM self_role_exchanges WHERE event_id IN (SELECT event_id FROM self_role_audit WHERE guild_id = $1)".to_owned(),
             ))
             .bind(FIX_OTHER)
             .fetch_one(pool)

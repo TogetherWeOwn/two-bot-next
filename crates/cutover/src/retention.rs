@@ -183,8 +183,7 @@ pub async fn run_retention(
             .await?;
             let mut deferred = 0u64;
             for (guild_id, user_id) in &pendings {
-                if crate::member_erasure::has_unresolved_guards(&mut *tx, guild_id, user_id)
-                    .await?
+                if crate::member_erasure::has_unresolved_guards(&mut *tx, guild_id, user_id).await?
                 {
                     deferred += 1;
                 }

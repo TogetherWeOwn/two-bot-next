@@ -166,14 +166,19 @@ async fn guild_purge_deletes_fk_children_but_keeps_operator_fence() {
     .fetch_one(pool)
     .await
     .unwrap();
-    assert_eq!(exchanges, 0, "exchange child must be purged before its audit row");
-    let audits: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM self_role_audit WHERE event_id = 'fence-evt-1'",
-    )
-    .fetch_one(pool)
-    .await
-    .unwrap();
-    assert_eq!(audits, 0, "audit parent must be purged after its exchange child");
+    assert_eq!(
+        exchanges, 0,
+        "exchange child must be purged before its audit row"
+    );
+    let audits: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM self_role_audit WHERE event_id = 'fence-evt-1'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        audits, 0,
+        "audit parent must be purged after its exchange child"
+    );
     let ordinary: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM moderation_channel_executions WHERE channel_id = 'fence-chan-ordinary'",
     )
@@ -228,7 +233,9 @@ async fn refused_deletion_is_deferred_and_overdue() {
     .execute(pool)
     .await
     .unwrap();
-    let request_id = request_user_deletion(pool, OTHER_GUILD, MEMBER).await.unwrap();
+    let request_id = request_user_deletion(pool, OTHER_GUILD, MEMBER)
+        .await
+        .unwrap();
     // Backdate the request past the 72h SLA.
     sqlx::query(
         "UPDATE retention_deletion_requests SET requested_at = now() - make_interval(hours => 73) WHERE request_id = $1",
@@ -248,7 +255,10 @@ async fn refused_deletion_is_deferred_and_overdue() {
         "dry run must report the backdated request as overdue, got {dry:?}"
     );
     let live = run_retention(pool, RetentionMode::Execute).await.unwrap();
-    assert_eq!(live.deletions_completed, 0, "guarded request must not complete");
+    assert_eq!(
+        live.deletions_completed, 0,
+        "guarded request must not complete"
+    );
     assert_eq!(
         live.deletions_deferred, 1,
         "live run must report the refusal as deferred, got {live:?}"
