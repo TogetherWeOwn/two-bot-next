@@ -319,7 +319,7 @@ impl HyperHelixTransport {
         while let Some(frame) = stream.next().await {
             let frame =
                 frame.map_err(|err| HelixError::Transport(format!("helix body failed: {err}")))?;
-            if let Some(chunk) = frame.into_data() {
+            if let Ok(chunk) = frame.into_data() {
                 if buffered.len().saturating_add(chunk.len()) > HELIX_MAX_BODY_BYTES {
                     return Err(HelixError::Transport(format!(
                         "helix body exceeds {HELIX_MAX_BODY_BYTES} bytes"
@@ -593,9 +593,9 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    fn vars(
-        pairs: &[(&str, &str)],
-    ) -> impl FnMut(&'static str) -> Result<String, std::env::VarError> + '_ {
+    fn vars<'a>(
+        pairs: &'a [(&'a str, &'a str)],
+    ) -> impl FnMut(&'static str) -> Result<String, std::env::VarError> + 'a {
         move |name| {
             pairs
                 .iter()
