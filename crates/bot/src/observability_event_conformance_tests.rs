@@ -76,7 +76,7 @@ const SHUTDOWN_RS_EVENTS: [&str; 2] = [
 const JOBS_RS_EVENTS: [&str; 1] = ["periodic job failed"];
 
 /// `crates/bot/src/voice_rooms.rs`: the cataloged voice messages.
-const VOICE_RS_CATALOG_MESSAGES: [&str; 8] = [
+const VOICE_RS_CATALOG_MESSAGES: [&str; 11] = [
     "voice join completed",
     "voice_operation succeeded",
     "voice_operation failed",
@@ -85,12 +85,16 @@ const VOICE_RS_CATALOG_MESSAGES: [&str; 8] = [
     "voice_reconcile planned",
     "voice action dead-lettered",
     "voice creator orphan needs manual deletion",
+    "voice creator join accepted",
+    "voice creator join refused before queueing",
+    "voice halt re-probe skipped: Discord credential latch set",
 ];
 
 /// `voice_event` field values (`crates/bot/src/voice_rooms.rs`), the bounded
 /// voice vocabulary that rides the gateway sink.
-const VOICE_EVENT_VALUES: [&str; 6] = [
+const VOICE_EVENT_VALUES: [&str; 7] = [
     "voice_join",
+    "voice_join_received",
     "voice_operation",
     "voice_respace",
     "voice_reconcile",
@@ -180,7 +184,7 @@ const MAIN_RS_ADJACENT: [&str; 13] = [
 
 // `crates/bot/src/voice_rooms.rs`: per-command voice UX receipts, not gateway
 // session events.
-const VOICE_RS_ADJACENT: [&str; 11] = [
+const VOICE_RS_ADJACENT: [&str; 16] = [
     "voice succession refused",
     "voice actor load failed; actor respawns on the next guild snapshot",
     "voice notice settings unreadable",
@@ -192,6 +196,11 @@ const VOICE_RS_ADJACENT: [&str; 11] = [
     "voice name modal response failed; not retried",
     "voice acknowledgement failed; command not executed",
     "voice response completion failed; not retried",
+    "voice dispatch turn exceeded observe bound",
+    "voice halt re-probe timed out",
+    "voice halt re-probe: store still refusing",
+    "voice worker halt cleared: store credentials healthy",
+    "voice worker stuck: queued actions with no progress",
 ];
 
 // Test-only emissions inside the scanned files' `#[cfg(test)]` modules. They

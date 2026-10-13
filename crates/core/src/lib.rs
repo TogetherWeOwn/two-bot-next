@@ -54,6 +54,7 @@ pub mod e2e_matrix;
 pub mod events;
 pub mod evidence;
 pub mod expected_joins;
+pub mod fb_page_events;
 pub mod feature_commands;
 pub mod feeds;
 pub mod feeds_connector;
@@ -61,11 +62,13 @@ pub mod feeds_http;
 #[cfg(feature = "db")]
 pub mod feeds_store;
 pub mod funnel;
+pub mod game_activity;
 pub mod gateway_funnel;
 pub mod gateway_session;
 pub mod handlers;
 pub mod health;
 pub mod help;
+pub mod hotzone;
 pub mod inactivity;
 #[cfg(feature = "db")]
 pub mod inactivity_store;
@@ -99,11 +102,15 @@ pub mod onboarding_store;
 pub mod presence;
 #[cfg(feature = "db")]
 pub mod presence_store;
+#[cfg(feature = "db")]
+pub mod privacy;
 pub mod raid;
 pub mod raid_removal;
+pub mod referral_rewards;
 pub mod rejection_telemetry;
 pub mod router;
 pub mod rsvp;
+pub mod rsvp_conversion;
 #[cfg(feature = "db")]
 pub mod rsvp_store;
 pub mod scheduled;
@@ -121,6 +128,7 @@ pub mod stream_live;
 #[cfg(feature = "db")]
 pub mod stream_live_store;
 pub mod tickets;
+pub mod twitch_eventsub;
 pub mod voice;
 pub mod voice_access;
 pub mod voice_alias;
@@ -287,11 +295,11 @@ pub use invites::{
 };
 #[cfg(feature = "db")]
 pub use leveling_store::{
-    award as award_leveling_xp, award_message as award_leveling_message,
-    award_voice as award_leveling_voice, current_award as current_leveling_award,
-    leaderboard as leveling_leaderboard, profile as leveling_profile,
-    replace_role_rewards as replace_leveling_role_rewards, role_rewards as leveling_role_rewards,
-    LevelingStoreError,
+    apply_seasonal_decay as apply_leveling_seasonal_decay, award as award_leveling_xp,
+    award_message as award_leveling_message, award_voice as award_leveling_voice,
+    current_award as current_leveling_award, leaderboard as leveling_leaderboard,
+    profile as leveling_profile, replace_role_rewards as replace_leveling_role_rewards,
+    role_rewards as leveling_role_rewards, LevelingStoreError,
 };
 pub use lfg::{
     adjudicate_signup, close_reply, created_reply, iso_millis_utc, leave_reply, lfg_content,
@@ -369,6 +377,10 @@ pub use rsvp::{
     RsvpError, RsvpRecord, RsvpStatus, RsvpTotals, RsvpTransition, ATTENDANCE_EVENT_TYPE,
     AUDIT_RETENTION_DAYS, MAX_CHECKINS_PER_OCCURRENCE, MAX_RSVPS_PER_EVENT,
     MAX_RSVP_WRITES_PER_USER_PER_MINUTE, RSVP_AUDIT_ACTION, RSVP_RETENTION_DAYS,
+};
+pub use rsvp_conversion::{
+    assign_variant, compute_conversion, reminders_due, render_report_text, AnnouncementVariant,
+    ConversionReport, ReminderKind,
 };
 #[cfg(feature = "db")]
 pub use rsvp_store::{

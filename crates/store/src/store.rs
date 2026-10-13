@@ -117,8 +117,42 @@ async fn record_async(
     let key = new_row.idempotency_key.clone();
     let member_id = new_row.member_id.map(snowflake_text);
     let guild_id = snowflake_text(new_row.guild_id);
-    let metadata = new_row.metadata.as_ref().map(|v| v.to_string());
     let mut tx = pool.begin().await?;
+    // Serialize with concurrent opt-outs (which take SHARE ROW EXCLUSIVE
+    // over these tables): whoever locks first wins, so a write that passes
+    // the gate can never land after the purge. Lock order matches the
+    // opt-out's sorted order, and ROW EXCLUSIVE never blocks other writers.
+    sqlx::query("LOCK TABLE events, members, privacy_opt_outs IN ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    // Privacy gate, inside the write transaction: a suppressed pair or a
+    // guild-disabled analytics family drops the write (and any duplicate
+    // reconfirmation below) with no event row and no members projection.
+    if two_bot_core::privacy::ingestion_blocked_in(
+        &mut tx,
+        &guild_id,
+        member_id.as_deref(),
+        event.event_type.as_str(),
+    )
+    .await?
+    {
+        tx.rollback().await?;
+        return Ok(RecordOutcome { inserted: false });
+    }
+    // A suppressed inviter's attribution never re-enters through a join they
+    // did not perform: strip `inviterId` from `member_join` metadata when the
+    // inviter is suppressed, keeping the joiner's own row intact.
+    let mut metadata = new_row.metadata.as_ref().map(|v| v.to_string());
+    if event.event_type.as_str() == "member_join" {
+        if let Some(inviter) = two_bot_core::privacy::inviter_in_metadata(metadata.as_deref()) {
+            if two_bot_core::privacy::suppressed_in(&mut tx, &guild_id, &inviter).await? {
+                metadata = two_bot_core::privacy::scrubbed_member_join_metadata(
+                    metadata.as_deref(),
+                    &inviter,
+                );
+            }
+        }
+    }
     let inserted: Option<(i64,)> = sqlx::query_as(
         "INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
          VALUES ($1, $2, $3, $4::timestamptz, $5, $6, $7)
@@ -380,14 +414,35 @@ async fn advance_activity(
 impl FunnelStore for PgFunnelStore {
     fn mark_bot(&self, guild_id: Snowflake, member_id: Snowflake) {
         self.block_on(async {
+            // Suppressed pairs stay unwritten: the flag would create a
+            // per-user `members` row for a member who opted out. The gate
+            // runs inside the write transaction under the shared table lock
+            // so a concurrent opt-out purge cannot slip between gate and
+            // write.
+            let mut tx = self.pool.begin().await?;
+            sqlx::query("LOCK TABLE members, privacy_opt_outs IN ROW EXCLUSIVE MODE")
+                .execute(&mut *tx)
+                .await?;
+            if two_bot_core::privacy::suppressed_in(
+                &mut tx,
+                &snowflake_text(guild_id),
+                &snowflake_text(member_id),
+            )
+            .await?
+            {
+                tx.rollback().await?;
+                return Ok::<(), sqlx::Error>(());
+            }
             sqlx::query(
                 "INSERT INTO members (guild_id, member_id, is_bot) VALUES ($1, $2, TRUE)
                  ON CONFLICT (guild_id, member_id) DO UPDATE SET is_bot = TRUE",
             )
             .bind(snowflake_text(guild_id))
             .bind(snowflake_text(member_id))
-            .execute(&self.pool)
-            .await
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok::<(), sqlx::Error>(())
         })
         .expect("funnel mark_bot failed");
     }
@@ -412,6 +467,18 @@ impl FunnelStore for PgFunnelStore {
         let member_id = snowflake_text(member_id);
         let at = at.to_owned();
         self.block_on(async {
+            // Suppressed pairs stay untouched: the bump would create or
+            // refresh a per-user `members` row for a member who opted out.
+            // Like `mark_bot`, the gate runs under the shared table lock so
+            // a concurrent opt-out cannot slip between gate and write.
+            let mut tx = self.pool.begin().await?;
+            sqlx::query("LOCK TABLE members, privacy_opt_outs IN ROW EXCLUSIVE MODE")
+                .execute(&mut *tx)
+                .await?;
+            if two_bot_core::privacy::suppressed_in(&mut tx, &guild_id, &member_id).await? {
+                tx.rollback().await?;
+                return Ok::<(), sqlx::Error>(());
+            }
             sqlx::query(
                 "INSERT INTO members (guild_id, member_id, last_active_at) VALUES ($1, $2, $3::timestamptz)
                  ON CONFLICT (guild_id, member_id) DO UPDATE SET last_active_at = excluded.last_active_at
@@ -420,8 +487,10 @@ impl FunnelStore for PgFunnelStore {
             .bind(&guild_id)
             .bind(&member_id)
             .bind(&at)
-            .execute(&self.pool)
-            .await
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok::<(), sqlx::Error>(())
         })
         .expect("funnel touch_activity failed");
     }
@@ -536,4 +605,396 @@ pub async fn member_rungs(
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(|(t,)| t).collect())
+}
+
+#[cfg(test)]
+mod privacy_lock_tests {
+    //! Pin the writer-side table locks against concurrent opt-outs.
+    //!
+    //! The simulated opt-out below takes the same SHARE ROW EXCLUSIVE lock
+    //! the real `opt_out_member` takes, then purges and suppresses. Without
+    //! the writer's ROW EXCLUSIVE lock the gate check and the insert do not
+    //! serialize with it, and rows survive the race: removing any lock below
+    //! fails these tests.
+
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    use sqlx::{Pool, Postgres};
+
+    use two_bot_core::{EventType, FunnelEvent, FunnelStore};
+
+    use super::PgFunnelStore;
+
+    const GUILD: &str = "1545644954272137297";
+    const MEMBER_A: &str = "123456789012345678";
+    const MEMBER_B: &str = "123456789012345679";
+
+    async fn test_pool(prefix: &str) -> Option<(Pool<Postgres>, String)> {
+        let url = match std::env::var("TWO_TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) => {
+                assert_ne!(
+                    std::env::var("GITHUB_ACTIONS").as_deref(),
+                    Ok("true"),
+                    "CI must configure the store privacy database suite"
+                );
+                eprintln!("SKIP store privacy lock test: TWO_TEST_DATABASE_URL not set");
+                return None;
+            }
+        };
+        let options: PgConnectOptions = url.parse().expect("test database URL");
+        let host = options.get_host();
+        assert!(
+            host == "agent-testdb"
+                || (host == "localhost"
+                    && std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")),
+            "test-container-only URL"
+        );
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let schema = format!("{prefix}_{nonce}_{}", std::process::id());
+        assert!(
+            !schema.is_empty()
+                && schema.len() <= 63
+                && schema
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+            "safe unique test schema"
+        );
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
+            .await
+            .expect("test database admin");
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&admin)
+            .await
+            .expect("create owned test schema");
+        admin.close().await;
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect_with(options.options([("search_path", schema.as_str())]))
+            .await
+            .expect("test database pool");
+        sqlx::migrate!("../cutover/migrations")
+            .run(&pool)
+            .await
+            .expect("cutover migrations");
+        Some((pool, schema))
+    }
+
+    async fn drop_schema(pool: &Pool<Postgres>, schema: &str) {
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(pool)
+            .await
+            .expect("clean up owned test schema");
+        pool.close().await;
+    }
+
+    /// The opt-out's lock, purge and suppression in one transaction, without
+    /// the cutover crate (which this crate must not depend on).
+    async fn simulate_opt_out(pool: &Pool<Postgres>, guild: &str, member: &str) {
+        let mut tx = pool.begin().await.expect("opt-out tx");
+        sqlx::query(
+            "LOCK TABLE community_facts, events, invite_snapshots, members, \
+             privacy_opt_outs, privacy_opt_out_audit IN SHARE ROW EXCLUSIVE MODE",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("opt-out lock");
+        for (table, predicate) in [
+            ("events", "member_id = $2"),
+            ("members", "member_id = $2"),
+            ("community_facts", "actor_id = $2"),
+        ] {
+            let sql = format!("DELETE FROM {table} WHERE guild_id = $1 AND {predicate}");
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(guild)
+                .bind(member)
+                .execute(&mut *tx)
+                .await
+                .expect("opt-out purge");
+        }
+        sqlx::query("INSERT INTO privacy_opt_outs (guild_id, member_id) VALUES ($1, $2)")
+            .bind(guild)
+            .bind(member)
+            .execute(&mut *tx)
+            .await
+            .expect("suppression install");
+        sqlx::query(
+            "INSERT INTO privacy_opt_out_audit (guild_id, member_id, actor) VALUES ($1, $2, $3)",
+        )
+        .bind(guild)
+        .bind(member)
+        .bind("operator:store-privacy-lock-test")
+        .execute(&mut *tx)
+        .await
+        .expect("opt-out receipt");
+        tx.commit().await.expect("opt-out commit");
+    }
+
+    fn join_event(guild: u64, member: u64, at: &str) -> FunnelEvent {
+        FunnelEvent {
+            guild_id: guild,
+            member_id: Some(member),
+            event_type: EventType::MemberJoin,
+            occurred_at: at.to_owned(),
+            source: "store-privacy-lock-test".to_owned(),
+            metadata: None,
+            dedupe_token: None,
+        }
+    }
+
+    /// `record` racing an opt-out never leaves rows behind: removing the
+    /// `record_async` table lock lets the insert land after the purge.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn record_races_opt_out_never_persists() {
+        let Some((pool, schema)) = test_pool("store_privacy_record").await else {
+            return;
+        };
+        let guild: u64 = GUILD.parse().unwrap();
+        let member: u64 = MEMBER_A.parse().unwrap();
+
+        let writer_pool = pool.clone();
+        let writer = tokio::spawn(async move {
+            let store = PgFunnelStore::new(writer_pool);
+            for i in 0..30 {
+                let at = format!("2026-10-13T00:{i:02}:00.000Z");
+                // `try_record` is async (no sync bridge); serialization
+                // errors on the rarest timing are retried once.
+                let event = join_event(guild, member, &at);
+                if store.try_record(&event).await.is_err() {
+                    let _ = store.try_record(&event).await;
+                }
+            }
+        });
+        let racer_pool = pool.clone();
+        let opt_out = tokio::spawn(async move {
+            simulate_opt_out(&racer_pool, GUILD, MEMBER_A).await;
+        });
+        let (writer_out, _) = tokio::join!(writer, opt_out);
+        writer_out.expect("writer task");
+
+        let events: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE guild_id = $1 AND member_id = $2",
+        )
+        .bind(GUILD)
+        .bind(MEMBER_A)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(events, 0, "no in-flight record survives the opt-out");
+        let members: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM members WHERE guild_id = $1 AND member_id = $2",
+        )
+        .bind(GUILD)
+        .bind(MEMBER_A)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(members, 0, "no projection row survives either");
+
+        drop_schema(&pool, &schema).await;
+    }
+
+    /// `touch_activity` / `mark_bot` racing an opt-out create no `members`
+    /// row for the pair while other members still bump: removing either
+    /// table lock lets the write land after the purge.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn touch_and_mark_race_opt_out_create_no_row() {
+        let Some((pool, schema)) = test_pool("store_privacy_touch").await else {
+            return;
+        };
+        let guild: u64 = GUILD.parse().unwrap();
+        let member: u64 = MEMBER_A.parse().unwrap();
+        let other: u64 = MEMBER_B.parse().unwrap();
+
+        let writer_pool = pool.clone();
+        let writer = tokio::spawn(async move {
+            let store = PgFunnelStore::new(writer_pool);
+            for i in 0..20 {
+                let at = format!("2026-10-13T00:{i:02}:00.000Z");
+                store.touch_activity(guild, member, &at);
+                store.mark_bot(guild, member);
+            }
+        });
+        let racer_pool = pool.clone();
+        let opt_out = tokio::spawn(async move {
+            simulate_opt_out(&racer_pool, GUILD, MEMBER_A).await;
+        });
+        let (writer_out, _) = tokio::join!(writer, opt_out);
+        writer_out.expect("writer task");
+
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM members WHERE guild_id = $1 AND member_id = $2",
+        )
+        .bind(GUILD)
+        .bind(MEMBER_A)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 0, "no bump or flag row survives the opt-out");
+
+        // Other members still bump after the race.
+        let store = PgFunnelStore::new(pool.clone());
+        store.touch_activity(guild, other, "2026-10-13T01:00:00.000Z");
+        let other_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM members WHERE guild_id = $1 AND member_id = $2",
+        )
+        .bind(GUILD)
+        .bind(MEMBER_B)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(other_rows, 1, "other members still bump");
+
+        drop_schema(&pool, &schema).await;
+    }
+
+    /// Deterministic pin for the `touch_activity` table lock: hold the
+    /// opt-out's lock set open with the suppression installed but
+    /// uncommitted, run one bump (its gate reads before the commit, then it
+    /// blocks on the table lock), commit, and assert no row. Without the
+    /// lock the gate passes and the upsert lands after the purge — a single
+    /// iteration fails with no timing dependence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn touch_activity_deterministic_race_create_no_row() {
+        let Some((pool, schema)) = test_pool("store_privacy_touch_deterministic").await else {
+            return;
+        };
+        let guild: u64 = GUILD.parse().unwrap();
+        let member: u64 = MEMBER_A.parse().unwrap();
+
+        let mut opt_tx = pool.begin().await.expect("opt-out tx");
+        sqlx::query(
+            "LOCK TABLE community_facts, events, invite_snapshots, members, \
+             privacy_opt_outs, privacy_opt_out_audit IN SHARE ROW EXCLUSIVE MODE",
+        )
+        .execute(&mut *opt_tx)
+        .await
+        .expect("opt-out lock");
+        sqlx::query("INSERT INTO privacy_opt_outs (guild_id, member_id) VALUES ($1, $2)")
+            .bind(GUILD)
+            .bind(MEMBER_A)
+            .execute(&mut *opt_tx)
+            .await
+            .expect("suppression install");
+        let writer_pool = pool.clone();
+        let writer = tokio::spawn(async move {
+            let store = PgFunnelStore::new(writer_pool);
+            store.touch_activity(guild, member, "2026-10-13T00:00:00.000Z");
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        opt_tx.commit().await.expect("opt-out commit");
+        writer.await.expect("writer task");
+
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM members WHERE guild_id = $1 AND member_id = $2",
+        )
+        .bind(GUILD)
+        .bind(MEMBER_A)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 0, "single bump racing the opt-out creates no row");
+
+        drop_schema(&pool, &schema).await;
+    }
+
+    /// Deterministic pin for the `mark_bot` table lock: same shape as the
+    /// bump pin, racing only the flag so the `mark_bot` lock is the one that
+    /// absorbs the wait. A combined bump-plus-flag task would let the bump
+    /// absorb the wait and leave this lock unpinned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mark_bot_deterministic_race_create_no_row() {
+        let Some((pool, schema)) = test_pool("store_privacy_mark_deterministic").await else {
+            return;
+        };
+        let guild: u64 = GUILD.parse().unwrap();
+        let member: u64 = MEMBER_A.parse().unwrap();
+
+        let mut opt_tx = pool.begin().await.expect("opt-out tx");
+        sqlx::query(
+            "LOCK TABLE community_facts, events, invite_snapshots, members, \
+             privacy_opt_outs, privacy_opt_out_audit IN SHARE ROW EXCLUSIVE MODE",
+        )
+        .execute(&mut *opt_tx)
+        .await
+        .expect("opt-out lock");
+        sqlx::query("INSERT INTO privacy_opt_outs (guild_id, member_id) VALUES ($1, $2)")
+            .bind(GUILD)
+            .bind(MEMBER_A)
+            .execute(&mut *opt_tx)
+            .await
+            .expect("suppression install");
+        let writer_pool = pool.clone();
+        let writer = tokio::spawn(async move {
+            let store = PgFunnelStore::new(writer_pool);
+            store.mark_bot(guild, member);
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        opt_tx.commit().await.expect("opt-out commit");
+        writer.await.expect("writer task");
+
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM members WHERE guild_id = $1 AND member_id = $2",
+        )
+        .bind(GUILD)
+        .bind(MEMBER_A)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 0, "single flag racing the opt-out creates no row");
+
+        drop_schema(&pool, &schema).await;
+    }
+
+    /// Deterministic pin for the `record_async` table lock: one event while
+    /// the opt-out holds its locks open. Without the lock the gate passes and
+    /// the insert lands after the purge.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn record_deterministic_race_never_persists() {
+        let Some((pool, schema)) = test_pool("store_privacy_record_deterministic").await else {
+            return;
+        };
+        let guild: u64 = GUILD.parse().unwrap();
+        let member: u64 = MEMBER_A.parse().unwrap();
+
+        let mut opt_tx = pool.begin().await.expect("opt-out tx");
+        sqlx::query(
+            "LOCK TABLE community_facts, events, invite_snapshots, members, \
+             privacy_opt_outs, privacy_opt_out_audit IN SHARE ROW EXCLUSIVE MODE",
+        )
+        .execute(&mut *opt_tx)
+        .await
+        .expect("opt-out lock");
+        sqlx::query("INSERT INTO privacy_opt_outs (guild_id, member_id) VALUES ($1, $2)")
+            .bind(GUILD)
+            .bind(MEMBER_A)
+            .execute(&mut *opt_tx)
+            .await
+            .expect("suppression install");
+        let writer_pool = pool.clone();
+        let writer = tokio::spawn(async move {
+            let store = PgFunnelStore::new(writer_pool);
+            let event = join_event(guild, member, "2026-10-13T00:00:00.000Z");
+            let _ = store.try_record(&event).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        opt_tx.commit().await.expect("opt-out commit");
+        writer.await.expect("writer task");
+
+        let events: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE guild_id = $1 AND member_id = $2",
+        )
+        .bind(GUILD)
+        .bind(MEMBER_A)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(events, 0, "single record racing the opt-out never persists");
+
+        drop_schema(&pool, &schema).await;
+    }
 }

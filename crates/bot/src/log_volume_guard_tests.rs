@@ -556,6 +556,11 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
         "voice reconcile family grew; update the cardinality budget and the guard doc"
     );
     assert_eq!(
+        metrics::VOICE_JOIN_OCCUPANCY_BUCKETS.len(),
+        8,
+        "join-occupancy bucket family grew; update the cardinality budget and the guard doc"
+    );
+    assert_eq!(
         metrics::VOICE_DEAD_ACTIONS.len(),
         9,
         "voice dead-letter family grew; update the cardinality budget and the guard doc"
@@ -670,13 +675,13 @@ fn exposition_series_count_matches_the_cardinality_budget() {
         .lines()
         .filter(|line| line.starts_with("# TYPE "))
         .count();
-    assert_eq!(help_headers, 44, "rendered HELP family count changed");
-    assert_eq!(type_headers, 44, "rendered TYPE family count changed");
+    assert_eq!(help_headers, 56, "rendered HELP family count changed");
+    assert_eq!(type_headers, 56, "rendered TYPE family count changed");
     let series = text.lines().filter(|line| !line.starts_with('#')).count();
     assert_eq!(
-        series, 586,
-        "exposition grew past the 586-sample budget (21 events + 4 scalars + 1 latency \
-         + 22 histograms + 180 rest + 11 REST guard + 64 jobs + 112 job-last-error-class + 34 voice + 26 vote-kick + 15 voice-names + 2 db-errors + 4 send-admissions + 2 prefix-refused + 6 dispatch-drops + 2 checkpoint-failures + 72 internal-actions + 3 facts-drain + 4 pool + 1 audit-halt); \
+        series, 614,
+        "exposition grew past the 614-sample budget (21 events + 4 scalars + 1 latency \
+         + 22 histograms + 180 rest + 11 REST guard + 64 jobs + 112 job-last-error-class + 51 voice + 8 join-occupancy + 26 vote-kick + 15 voice-names + 2 db-errors + 4 send-admissions + 2 prefix-refused + 6 dispatch-drops + 2 checkpoint-failures + 72 internal-actions + 3 facts-drain + 3 presence-capture + 4 pool + 1 audit-halt); \
          update docs/log-volume-guard.md with the new series"
     );
 }

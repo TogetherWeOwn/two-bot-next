@@ -1,0 +1,35 @@
+name: test-guard
+
+# TogetherWeOwn SDLC standard, one-click template for active repos.
+# Calls the org reusable test-guard gate (Builder must not modify
+# acceptance tests written by the Test Author). Lands in warn mode:
+# it reports but never fails. Per-repo overrides go in
+# `.github/test-guard.json` (see TEST-GUARD.md in the .github repo).
+# Pinned to the org reusable merge SHA; repin the same way on later
+# updates — never a moving tag.
+# Do NOT add this check to any ruleset until the repo flips to enforce.
+
+on:
+  # labeled/unlabeled: the marker label is usually set after the PR
+  # exists; without these the gate never re-evaluates a fresh label.
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+
+# Repo policy (scripts/ci/test_workflows.py): top-level permissions stay
+# empty; the least-privilege grant lives on the job instead.
+permissions: {}
+
+concurrency:
+  group: test-guard-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Keep id and name byte-identical: a future org ruleset requires `test-guard`.
+  test-guard:
+    name: test-guard
+    # Least-privilege grant: contents for the diff, pull-requests for the
+    # marker-label actor audit via the issue-events API.
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95

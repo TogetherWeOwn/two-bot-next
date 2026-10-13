@@ -85,7 +85,8 @@ pub async fn run_sweep(
             },
         )
         .collect();
-    let outcome = flag_inactive(&candidates, now_ms, days);
+    let mut outcome = flag_inactive(&candidates, now_ms, days);
+    let mut written: Vec<(String, String)> = Vec::with_capacity(outcome.flagged.len());
     for flagged in &outcome.flagged {
         let key = super::inactivity::member_inactive_event_key(
             &flagged.guild_id,
@@ -93,6 +94,18 @@ pub async fn run_sweep(
             &flagged.occurred_at,
         );
         let mut tx = pool.begin().await?;
+        // Serialize with concurrent opt-outs so a sweep that selected the
+        // member before the opt-out cannot write after the purge. Lock order
+        // matches `opt_out_member`'s sorted order; ROW EXCLUSIVE never blocks
+        // other writers. A suppressed pair is skipped: the flag event would
+        // otherwise recreate per-user data the purge just removed.
+        sqlx::query("LOCK TABLE events, members, privacy_opt_outs IN ROW EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await?;
+        if crate::privacy::suppressed_in(&mut tx, &flagged.guild_id, &flagged.member_id).await? {
+            tx.rollback().await?;
+            continue;
+        }
         let inserted: Option<(i64,)> = sqlx::query_as(
             "INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
              VALUES ('member_inactive', $1, $2, $3::timestamptz, $4, $5, $6)
@@ -116,9 +129,24 @@ pub async fn run_sweep(
             .bind(&flagged.member_id)
             .execute(&mut *tx)
             .await?;
+            written.push((flagged.guild_id.clone(), flagged.member_id.clone()));
+        } else if sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM events WHERE idempotency_key = $1",
+        )
+        .bind(&key)
+        .fetch_one(&mut *tx)
+        .await?
+            > 0
+        {
+            // Already flagged in an earlier sweep: the outcome still reports
+            // the member, but there is no new write to gate.
+            written.push((flagged.guild_id.clone(), flagged.member_id.clone()));
         }
         tx.commit().await?;
     }
+    outcome
+        .flagged
+        .retain(|f| written.contains(&(f.guild_id.clone(), f.member_id.clone())));
     Ok(outcome)
 }
 
@@ -186,10 +214,22 @@ mod tests {
             .await?;
         // The sweep reads/writes the S6-owned funnel tables; this test needs
         // 0001 only (0310/0311 are unrelated). `members.is_bot` defaults
-        // FALSE per 0001, matching legacy.
+        // FALSE per 0001, matching legacy. The sweep's suppression gate
+        // needs the opt-out table too (suppression-only, like other
+        // lifecycle writers); no rows are seeded unless a test inserts one.
         sqlx::raw_sql(include_str!("../../cutover/migrations/0001_funnel.sql"))
             .execute(&pool)
             .await?;
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS privacy_opt_outs (
+               guild_id TEXT NOT NULL,
+               member_id TEXT NOT NULL,
+               opted_out_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+               PRIMARY KEY (guild_id, member_id)
+             )",
+        )
+        .execute(&pool)
+        .await?;
         Ok((pool, schema))
     }
 
