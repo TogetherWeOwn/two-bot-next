@@ -20,11 +20,13 @@ No per-event log line is emitted: `VOICE_STATE_UPDATE` is hot per
 `increase(two_bot_voice_join_occupancy_total[1h])`.
 
 Leaves, same-channel updates and pre-`READY` frames emit no sample.
-Mechanical transitions emit no sample either: joining a
-protected/creator channel (the join-to-create generator), and the bot's
-own move echo out of one into the new room. Both keep their ticket so
-room creation is unaffected. Bot joins (music bots) are ticketed samples
-too; filter them downstream if they pollute the curve.
+Mechanical transitions emit no sample either: joining a creator or
+generator channel, and the bot's own move echo out of one into the new
+room. Both keep their ticket so room creation is unaffected. Joins into
+the session lobby or permanent protected channels (lounges) still sample:
+those are places people choose to join, not room-creation steps. Bot joins
+(music bots) are ticketed samples too; filter them downstream if they
+pollute the curve.
 
 ## Join share by occupancy
 
@@ -69,9 +71,11 @@ needs an exposure denominator before claiming P(join | occupancy).
 
 - Samples are ticketed joins only: the bot must be live and the guild
   snapshotted. Downtime gaps are missing samples, not zero joins.
-- Mechanical transitions are excluded by design: generator joins and the
-  bot's move echo keep their ticket but emit no sample, so the 0 bucket
-  counts organic joins into empty channels, not room creations.
+- Mechanical transitions are excluded by design: creator and generator joins
+  and the bot's move echo keep their ticket but emit no sample, so the 0
+  bucket counts organic joins into empty channels, not room creations.
+  Session-lobby and permanent protected-channel joins are not mechanical
+  and still sample.
 - Occupancy counts humans (`counts_as_human`); unknown identities count
   as human, known bots do not, but bot *joiners* still sample.
 - `7+` hides the tail; if it exceeds ~10% of samples, raise the cap.
