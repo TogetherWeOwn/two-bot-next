@@ -16,6 +16,11 @@ BEGIN
       INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key)
         VALUES ('GUILD_MEMBER_ADD', g, u, '2026-10-01T00:00:00Z',
                 'GUILD_MEMBER_ADD:' || g || ':' || u || ':2026-10-01T00:00:00Z');
+      INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key,
+        presence_status, activity_type, application_id, nick_changed, roles)
+        VALUES ('PRESENCE_UPDATE', g, u, '2026-10-01T00:00:00Z',
+        'PRESENCE_UPDATE:' || g || ':' || u || ':2026-10-01T00:00:00Z',
+        'online', 0, NULL, FALSE, '[]');
       INSERT INTO event_store (event_type, guild_id, channel_id, message_id, user_id, event_time, dedup_key)
         VALUES ('MESSAGE_UPDATE', g, 'c-' || k, 'm-' || k, u, '2026-10-01T00:00:00Z',
                 'MESSAGE_UPDATE:' || g || ':' || u || ':2026-10-01T00:00:00Z');

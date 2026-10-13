@@ -337,6 +337,10 @@
       "sha256": "9da078d3f29430320b79d2d82cfa6e4b1d2d557384a98d7dddca97783429d2dd",
       "justification": "RSVP check-in capacity count index: cover (guild_id, source) so record_checkin counts the occurrence without scanning the guild message history while holding the occurrence lock."
     },
+    "crates/cutover/migrations/0428_event_store_presence_capture.sql": {
+      "sha256": "5be88c0d2541613d571f30cdb1108c42e17532541f8bf6eb1f99181ad87b05ef",
+      "justification": "Append-only event_store for presence capture: nullable user_id for sibling slices, best-effort dedup key, ids/enums only with no free-text columns."
+    },
     "crates/cutover/migrations/0430_event_store_message_capture.sql": {
       "sha256": "36a256cdb57fa5acaedfa1a0fa72a5442ef1c6fc91e23b9c64d25e99e9176ddc",
       "justification": "Event-store S5 message/reaction capture: order-independent event_store table plus emoji id/name reference columns for MESSAGE_UPDATE/DELETE/DELETE_BULK and MESSAGE_REACTION_ADD/REMOVE, idempotent on UNIQUE dedup_key, no message-body columns."
