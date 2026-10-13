@@ -98,11 +98,26 @@ itself returned as a `Secret`. The Operator provisions the signing secret and
 the Twitch client id/secret; they never appear in code, logs or PR text.
 
 Not in this slice (each its own card): the public Worker route and container
-receiver, the Helix client with app-token refresh, and Operator secret
-provisioning. The durable dedup ledger store lives in this branch (see
-[Durable go-live ledger](#durable-go-live-ledger)); until the receiver wires
-it, runtime dedup is in-memory (`RecentKeys`), so a crash between the post
-and the 2xx can post once more after restart.
+receiver, and Operator secret provisioning. The durable dedup ledger store
+lives in this branch (see [Durable go-live ledger](#durable-go-live-ledger));
+until the receiver wires it, runtime dedup is in-memory (`RecentKeys`), so a
+crash between the post and the 2xx can post once more after restart.
+
+## Helix client with app-token refresh
+
+`crates/core/src/twitch_helix.rs` drives the plan from `twitch_eventsub`:
+
+- Credentials are Operator-provisioned (`TWO_TWITCH_CLIENT_ID`,
+  `TWO_TWITCH_CLIENT_SECRET`, `TWO_TWITCH_WEBHOOK_SECRET`); the Container
+  reads them from its own environment, never from forwarded Worker vars.
+  Every value travels inside `Secret`, so even a `Debug` dump renders
+  `[REDACTED]`.
+- The app token is cached and refreshed 60 s before its `expires_in`
+  instant, plus once on a 401 with a single retry. No timers: reconcile
+  runs at boot and after a `revocation` only.
+- `plan_boot_actions` parses one `GET` subscriptions page and returns the
+  deletes-first plan; `execute_actions` runs it in order. A create that
+  answers 409 already matches the reconciled end state and counts as done.
 
 ## Durable go-live ledger
 
