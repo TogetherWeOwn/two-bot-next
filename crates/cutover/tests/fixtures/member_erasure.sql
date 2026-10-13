@@ -153,6 +153,7 @@ BEGIN
       INSERT INTO voice_owner_grants (guild_id, channel_id, member_id, revision, pending)
         VALUES (g, 'v-' || k, u, 'fixture-owner-revision', TRUE);
       INSERT INTO voice_logging_mention_members (guild_id, member_id) VALUES (g, u);
+      INSERT INTO member_catchup_members (guild_id, member_id) VALUES (g, u);
       INSERT INTO voice_vote_kick_audit
         (guild_id, vote_id, event, room_id, initiator_id, target_id, outcome, occurred_at)
         VALUES (g, 'vk-' || k, 'vote_started', 'v-' || k, u, u, 'started', '2026-10-01T00:00:00Z');
