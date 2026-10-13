@@ -200,7 +200,7 @@ FAIL; on a real restore require exit 0 and `RESTORE VERIFIED`, then separately
 verify canonical content and required table coverage. A v4 dump covers every
 table that either migration chain creates, except `xp_cooldowns`, the store
 chain's `rollback_journal`/`rollback_watermarks` and the migration ledgers
-([`EXCLUDED_TABLES`](../crates/core/src/backup/dump_file.rs#L167)),
+([`EXCLUDED_TABLES`](../crates/core/src/backup/dump_file.rs#L169)),
 plus retired legacy tables when the source still has them
 ([`DUMP_TABLES`](../crates/core/src/backup/dump_file.rs#L44)). Restore needs a
 target migrated to the dump's schema, and refuses before any write when a
@@ -355,7 +355,7 @@ alongside an unconfirmed Next gateway.
   `FORWARDED_DISCORD_IDS`:
   [configuration](../crates/core/src/config.rs#L24),
   [tool connection](../crates/cutover/src/cli.rs#L180),
-  [Worker environment](../wrangler/src/index.ts#L394).
+  [Worker environment](../wrangler/src/index.ts#L480).
 - Configured server startup runs embedded migrations; it is not a read-only
   preflight. Gateway boot wires the funnel pipeline, not the full feature/job
   stack. Domain/store libraries and command definitions are not activated

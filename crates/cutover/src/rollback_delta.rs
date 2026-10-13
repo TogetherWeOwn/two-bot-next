@@ -82,10 +82,10 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // Same shape as guild_counters: one read-time per count, no updated_at.
     TableSpec { table: "counter_snapshots", measure: TableMeasure::Columns(&["human_member_count_at", "online_count_at"]) },
     TableSpec { table: "event_rsvps", measure: TableMeasure::Columns(&["responded_at"]) },
-    // S5 message/reaction capture (0430): append-only gateway deltas; received_at
-    // is the row's write time (same shape as events.recorded_at), event_time is
-    // the gateway event time.
-    TableSpec { table: "event_store", measure: TableMeasure::Columns(&["received_at"]) },
+    // Event-store capture (0430 S5 message/reaction plus 0432 S2 member deltas):
+    // append-only gateway deltas; received_at is the row's write time (same
+    // shape as events.recorded_at), event_time is the gateway event time.
+    TableSpec { table: "event_store", measure: TableMeasure::Columns(&["event_time", "received_at"]) },
     TableSpec { table: "events", measure: TableMeasure::Columns(&["recorded_at"]) },
     TableSpec { table: "feed_deliveries", measure: TableMeasure::Columns(&["first_seen_at"]) },
     TableSpec { table: "feed_relays", measure: TableMeasure::Columns(&["updated_at"]) },
