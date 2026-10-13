@@ -127,7 +127,12 @@ class CheckTriggerSurfaceTests(unittest.TestCase):
         group = group_line.split("group:", 1)[1]
         self.assertIn("github.event.pull_request.number", group)
         cancel_line = next(line for line in concurrency_block if line.strip().startswith("cancel-in-progress:"))
-        self.assertEqual(cancel_line.split("cancel-in-progress:", 1)[1].strip(), "true")
+        # Cancel only PR runs: main pushes, the weekly schedule and manual
+        # dispatches share this workflow and must never cancel each other.
+        self.assertEqual(
+            cancel_line.split("cancel-in-progress:", 1)[1].strip(),
+            "${{ github.event_name == 'pull_request' }}",
+        )
 
 
 if __name__ == "__main__":

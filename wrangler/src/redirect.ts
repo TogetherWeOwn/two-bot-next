@@ -16,7 +16,7 @@
  * - HEAD redirects but is never counted (link previewers, incl. Discord's).
  * - Query strings are dropped, never parsed or recorded.
  * - `/healthz` → 200 `ok`; `/favicon.ico` + `/robots.txt` → 404, no DB touch.
- * - Reserved internal slugs (`metrics`, plus `metrics/*` subpaths) → 404 for
+ * - Reserved internal slugs (`metrics`/`ops`, plus `metrics/*` and `ops/*` subpaths) → 404 for
  *   every method, before lookup — canonical case/encoding/slash aliases
  *   included, never a redirect, never a click.
  * - Non-GET/HEAD on non-reserved paths → 405 with `Allow: GET, HEAD`.
@@ -114,7 +114,7 @@ const SECURITY_HEADERS: Record<string, string> = {
 const SLUG = /^[a-z0-9][a-z0-9-]{0,38}[a-z0-9](?![\s\S])/;
 const INVITE_CODE = /^[A-Za-z0-9-]{1,64}(?![\s\S])/;
 /** Internal slugs that are never invite campaigns (matched post-canonicalization). */
-const RESERVED_SLUGS = ["metrics", "healthz"];
+const RESERVED_SLUGS = ["metrics", "healthz", "ops"];
 
 export function isValidSlug(slug: string): boolean {
   return SLUG.test(slug) && !RESERVED_SLUGS.includes(slug);
@@ -519,7 +519,7 @@ const retryAfterSeconds = (seconds: number): number =>
 /**
  * Reserved internal paths that are never invite campaigns. Recognize only the
  * first segment, stripping literal/encoded leading slashes and decoding once.
- * A malformed suffix cannot unreserve a recognized `metrics`/`healthz` prefix;
+ * A malformed suffix cannot unreserve a recognized `metrics`/`healthz`/`ops` prefix;
  * near-miss campaign slugs like `metricsfoo` still do not match.
  * The ownership-fence control plane (`internal/ownership`, plus subpaths) is
  * likewise reserved: it is served by the Worker (TOG-11143), never a campaign.
