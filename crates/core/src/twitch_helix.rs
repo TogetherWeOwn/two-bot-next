@@ -29,6 +29,7 @@ use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use http::header::USER_AGENT;
 use http::{Method, StatusCode};
 use http_body_util::{BodyStream, Full};
 use hyper_rustls::HttpsConnectorBuilder;
@@ -284,7 +285,8 @@ impl HyperHelixTransport {
     fn build_request(req: &HelixRequest) -> Result<hyper::Request<Full<Bytes>>, HelixError> {
         let mut builder = hyper::Request::builder()
             .method(req.method.clone())
-            .uri(req.url.as_str());
+            .uri(req.url.as_str())
+            .header(USER_AGENT, HELIX_USER_AGENT);
         for (name, value) in &req.headers {
             builder = builder.header(name.as_str(), value.expose().as_str());
         }
@@ -978,5 +980,6 @@ mod tests {
         let built = HyperHelixTransport::build_request(&req).expect("build must work");
         assert_eq!(built.method(), Method::GET);
         assert_eq!(built.headers()["authorization"], "Bearer prove-no-tls");
+        assert_eq!(built.headers()[USER_AGENT], HELIX_USER_AGENT);
     }
 }
