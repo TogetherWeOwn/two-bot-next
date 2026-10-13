@@ -1166,6 +1166,24 @@ test("DO /ops/backfill/progress: forwards x-two-* signing headers to the contain
   assert.equal(forwarded.headers.get("x-two-signature"), "synthetic-progress-signature");
 });
 
+test("DO /ops/backfill/progress: container 401 stays 401 with a generic body", async (t) => {
+  // A bad signature, skew, replay or unknown key is the route's own 401, not
+  // an outage: the DO must not map it to 504 "ops unavailable".
+  const h = await harness(t);
+  t.mock.method(h.bot, "containerFetch", async () => new Response('{"error":"unauthorized"}\n', { status: 401 }));
+  const response = await h.bot.fetch(new Request("https://worker.invalid/ops/backfill/progress", {
+    headers: {
+      "x-two-key-id": "synthetic-progress-key",
+      "x-two-timestamp": "1700000000",
+      "x-two-nonce": "synthetic-nonce-0123456789abcdef",
+      "x-two-signature": "synthetic-progress-signature",
+      [DEPLOYMENT_HEADER]: ID,
+    },
+  }));
+  assert.equal(response.status, 401);
+  assert.equal(await response.text(), "unauthorized");
+});
+
 test("DO /ops/gateway: oversized body returns 502 with a generic body", async (t) => {
   const h = await harness(t);
   t.mock.method(h.bot, "containerFetch", async () => new Response('{"k":"v"}\n'.repeat(20000)));

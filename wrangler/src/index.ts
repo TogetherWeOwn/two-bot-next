@@ -739,10 +739,12 @@ export class TwoBotContainer extends Container<Env> {
    * an aborted signal or any non-2xx upstream as a 504 with a generic body,
    * and drain the SDK error text instead of proxying it. `unavailableBody`
    * is the only body a failure ever returns, so container error text cannot
-   * cross the boundary. When `headers` is given, the fetch goes out as a
-   * Request carrying them: a string URL builds a bare request and drops
-   * container-authenticated headers (x-two-*), turning every signed call
-   * into a 504.
+   * cross the boundary. When `headers` is given (the signed backfill-progress
+   * read), a 401 from the container is the route's own auth failure (bad key,
+   * signature, skew, replay) and stays a fixed 401 — never a 504 outage.
+   * When `headers` is given, the fetch goes out as a Request carrying them:
+   * a string URL builds a bare request and drops container-authenticated
+   * headers (x-two-*), turning every signed call into a 504.
    */
   private async proxyOpsBody(containerUrl: string, contentType: string, unavailableBody: string, headers?: Headers): Promise<Response> {
     const fetchSignal = AbortSignal.timeout(METRICS_FETCH_TIMEOUT_MS);
@@ -761,7 +763,20 @@ export class TwoBotContainer extends Container<Env> {
     } catch {
       return unavailable(504);
     }
-    if (fetchSignal.aborted || !upstream.ok) {
+    if (fetchSignal.aborted) {
+      await upstream.body?.cancel().catch(() => {});
+      return unavailable(504);
+    }
+    if (headers && upstream.status === 401) {
+      // Signed-read auth failure, not an outage: fixed 401 with the same body
+      // the Worker pre-check uses, so container error text cannot leak.
+      await upstream.body?.cancel().catch(() => {});
+      return new Response("unauthorized", {
+        status: 401,
+        headers: withSecurityHeaders({ "content-type": "text/plain", "cache-control": "no-store" }),
+      });
+    }
+    if (!upstream.ok) {
       // Cancel without reading: a huge non-2xx body must not bypass
       // the 64 KiB cap by being drained here.
       await upstream.body?.cancel().catch(() => {});

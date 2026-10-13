@@ -405,7 +405,8 @@ presence/length pre-check against the receiver's caps (the route's
 indistinguishable 401) — all before the singleton DO is touched — then stamps
 the deployment fence id and forwards the request. The DO proxies it with the
 `x-two-*` headers attached (a bare string-URL fetch would drop them and turn
-every call into a 504). Auth failures are the route's indistinguishable 401; see
+every call into a 504) and keeps the container's 401 as a fixed 401 — other
+non-2xx stay 504. Auth failures are the route's indistinguishable 401; see
 `crates/bot/src/ops_backfill.rs` for the contract.
 
 - `GET /ops/summary`: readiness (`ready`, `components`), gateway state and
