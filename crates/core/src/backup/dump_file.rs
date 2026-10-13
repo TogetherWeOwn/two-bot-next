@@ -139,6 +139,12 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_vote_kick_audit",
     // V5 adds accepted-create history; see [`V5_ADDED_TABLES`].
     "voice_create_reservations",
+    // Retention queues (0427): guild-purge intent and user-deletion ledger with
+    // receipts. Both must survive restore (a lost purge resurrects departed
+    // guild data; a lost request breaches the deletion SLA and drops receipts),
+    // so they are dumped, not excluded. No foreign keys, order among them free.
+    "retention_guild_purge_queue",
+    "retention_deletion_requests",
 ];
 
 /// Tables first covered by v5. A v4 archive predates them and need not declare
