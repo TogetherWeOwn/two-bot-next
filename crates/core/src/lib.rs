@@ -128,6 +128,7 @@ pub mod stream_live;
 #[cfg(feature = "db")]
 pub mod stream_live_store;
 pub mod tickets;
+pub mod twitch_eventsub;
 pub mod voice;
 pub mod voice_access;
 pub mod voice_alias;
