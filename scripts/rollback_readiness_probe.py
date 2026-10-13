@@ -54,7 +54,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "wrangler/wrangler.toml"
 ARCHIVE_PREFIX = "two-funnel-"
 ARCHIVE_SUFFIX = ".ndjson.gz"
-DUMP_VERSIONS = (3, 4, 5, 6)
+DUMP_VERSIONS = (3, 4, 5, 6, 7)
 # Same budgets as the Rust reader (crates/core/src/backup/dump_file.rs).
 COMPRESSED_CAP = 1 << 30
 LINE_CAP = 8 << 20

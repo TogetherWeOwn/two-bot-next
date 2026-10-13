@@ -228,10 +228,32 @@ pub fn voice_xp_for_duration(duration_seconds: u64) -> u64 {
 /// batch job alongside `source='decay'` audit rows.
 #[must_use]
 pub fn seasonal_xp_after_decay(seasonal_xp: u64, days_inactive: u64) -> u64 {
+    seasonal_xp_after_decay_weeks(seasonal_xp, seasonal_decay_total_weeks(days_inactive))
+}
+
+/// Overdue weeks for `days_inactive` under the seasonal-decay grace: 0 inside
+/// the 28-day grace, then one per full 7-day week past it. One definition for
+/// the pure curve above and the runtime tick, so the grace math cannot drift.
+#[must_use]
+pub fn seasonal_decay_total_weeks(days_inactive: u64) -> u64 {
     if days_inactive <= SEASONAL_DECAY_GRACE_DAYS {
-        return seasonal_xp;
+        0
+    } else {
+        (days_inactive - SEASONAL_DECAY_GRACE_DAYS) / 7
     }
-    let weeks = (days_inactive - SEASONAL_DECAY_GRACE_DAYS) / 7;
+}
+
+/// Newly overdue weeks since `already_applied` (the `decayed_weeks` watermark
+/// on the seasonal row): the tick applies only these, so a rerun of the same
+/// tick applies zero and consecutive Monday ticks apply exactly one each.
+#[must_use]
+pub fn seasonal_decay_new_weeks(days_inactive: u64, already_applied: u64) -> u64 {
+    seasonal_decay_total_weeks(days_inactive).saturating_sub(already_applied)
+}
+
+/// Apply `weeks` of 10 % multiplicative decay to `seasonal_xp`.
+#[must_use]
+pub fn seasonal_xp_after_decay_weeks(seasonal_xp: u64, weeks: u64) -> u64 {
     let mut value = seasonal_xp;
     for _ in 0..weeks {
         value = value * 9 / 10;
@@ -239,26 +261,68 @@ pub fn seasonal_xp_after_decay(seasonal_xp: u64, days_inactive: u64) -> u64 {
     value
 }
 
-/// Season scope (`YYYY-QN`, calendar quarters) for epoch millis (AC3).
-/// Seasons start Monday 00:00 UTC on/after the quarter's first day so every
-/// season boundary coincides with a Monday scorecard week boundary.
-#[must_use]
-pub fn season_id_for_ms(ms: i64) -> String {
-    let iso = super::funnel::format_iso_millis(ms);
-    let year: i64 = iso[..4].parse().unwrap_or(1970);
-    let month: u32 = iso[5..7].parse().unwrap_or(1);
-    format!("{year:04}-Q{}", (month - 1) / 3 + 1)
+/// Days since the Unix epoch for a civil date (Howard Hinnant's
+/// `days_from_civil`): integer math over the full i64 day range, no date crate.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
 }
 
-/// Current season scope by wall clock (AC3). The award path and the weekly
-/// scorecard stamp new rows with this; explicit timestamps stay with
-/// [`season_id_for_ms`].
+/// Civil `(year, month)` for days since the Unix epoch (the matching
+/// `civil_from_days` inverse).
+fn civil_year_month_from_days(days: i64) -> (i64, u32) {
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let year = if mp >= 10 { y + 1 } else { y };
+    let month = if mp >= 10 { mp - 9 } else { mp + 3 };
+    (year, month as u32)
+}
+
+/// First Monday 00:00 UTC on or after the first day of quarter `q` in `year`,
+/// as days since the epoch. 1970-01-01 was a Thursday, so Monday-zero
+/// weekday is `(days + 3) % 7`.
+fn monday_aligned_season_start_days(year: i64, quarter: u32) -> i64 {
+    let first = days_from_civil(year, (quarter - 1) * 3 + 1, 1);
+    let weekday_monday_zero = (first + 3).rem_euclid(7);
+    first + (7 - weekday_monday_zero) % 7
+}
+
+/// Season scope (`YYYY-QN`) for epoch millis (AC3). Seasons start Monday
+/// 00:00 UTC on/after the quarter's first day so every season boundary
+/// coincides with a Monday scorecard week boundary: days before a quarter's
+/// Monday start still belong to the previous season.
+#[must_use]
+pub fn season_id_for_ms(ms: i64) -> String {
+    let days = ms.div_euclid(86_400_000);
+    let (year, month) = civil_year_month_from_days(days);
+    let quarter = (month - 1) / 3 + 1;
+    if days >= monday_aligned_season_start_days(year, quarter) {
+        format!("{year:04}-Q{quarter}")
+    } else if quarter > 1 {
+        format!("{year:04}-Q{}", quarter - 1)
+    } else {
+        format!("{:04}-Q4", year - 1)
+    }
+}
+
+/// Current season scope by wall clock (AC3), Monday-aligned like
+/// [`season_id_for_ms`]. The award path and the weekly scorecard stamp new
+/// rows with this; explicit timestamps stay with [`season_id_for_ms`].
 #[must_use]
 pub fn current_season_id() -> String {
     let iso = super::funnel::now_iso();
-    let year: i64 = iso[..4].parse().unwrap_or(1970);
-    let month: u32 = iso[5..7].parse().unwrap_or(1);
-    format!("{year:04}-Q{}", (month - 1) / 3 + 1)
+    let ms = super::funnel::parse_iso_millis(&iso).unwrap_or(0);
+    season_id_for_ms(ms)
 }
 
 /// Format a count the way legacy `Number.toLocaleString()` (en-US) does:
@@ -940,5 +1004,52 @@ mod tests {
         assert!(!valid_text_trigger("faq"));
         assert!(!valid_text_trigger("!"));
         assert!(!valid_text_trigger("!HAS-SPACE"));
+    }
+
+    #[test]
+    fn decay_weeks_apply_only_newly_overdue_weeks() {
+        // Grace: 28 d or less never decays, whatever was applied before.
+        assert_eq!(seasonal_decay_total_weeks(0), 0);
+        assert_eq!(seasonal_decay_total_weeks(28), 0);
+        assert_eq!(seasonal_decay_total_weeks(34), 0);
+        assert_eq!(seasonal_decay_total_weeks(35), 1);
+        assert_eq!(seasonal_decay_total_weeks(42), 2);
+        // A rerun of the same tick applies nothing; consecutive Monday ticks
+        // apply exactly one week each; a missed Monday applies two at once.
+        assert_eq!(seasonal_decay_new_weeks(35, 1), 0);
+        assert_eq!(seasonal_decay_new_weeks(42, 1), 1);
+        assert_eq!(seasonal_decay_new_weeks(49, 2), 1);
+        assert_eq!(seasonal_decay_new_weeks(49, 1), 2);
+        assert_eq!(seasonal_decay_new_weeks(7, 3), 0);
+        // Weekly factors compose: two single-week ticks equal one double tick.
+        assert_eq!(
+            seasonal_xp_after_decay_weeks(seasonal_xp_after_decay_weeks(1000, 1), 1),
+            seasonal_xp_after_decay_weeks(1000, 2)
+        );
+        assert_eq!(seasonal_xp_after_decay_weeks(1000, 1), 900);
+        assert_eq!(seasonal_xp_after_decay(1000, 35), 900);
+        assert_eq!(seasonal_xp_after_decay(1000, 42), 810);
+    }
+
+    #[test]
+    fn season_ids_start_on_the_monday_on_or_after_each_quarter() {
+        // 2026-10-01 is a Thursday; Q4 starts the following Monday 2026-10-05.
+        let day = |y, m, d| days_from_civil(y, m, d) * 86_400_000;
+        assert_eq!(season_id_for_ms(day(2026, 10, 1)), "2026-Q3");
+        assert_eq!(season_id_for_ms(day(2026, 10, 4)), "2026-Q3");
+        assert_eq!(season_id_for_ms(day(2026, 10, 5)), "2026-Q4");
+        assert_eq!(season_id_for_ms(day(2026, 8, 15)), "2026-Q3");
+        assert_eq!(season_id_for_ms(day(2026, 8, 31)), "2026-Q3");
+        // 2026-01-01 is a Thursday; the first days of January still belong to
+        // 2025-Q4, and Q1 starts Monday 2026-01-05.
+        assert_eq!(season_id_for_ms(day(2026, 1, 1)), "2025-Q4");
+        assert_eq!(season_id_for_ms(day(2026, 1, 4)), "2025-Q4");
+        assert_eq!(season_id_for_ms(day(2026, 1, 5)), "2026-Q1");
+        // 2026-07-01 is a Wednesday; Q3 starts Monday 2026-07-06.
+        assert_eq!(season_id_for_ms(day(2026, 7, 5)), "2026-Q2");
+        assert_eq!(season_id_for_ms(day(2026, 7, 6)), "2026-Q3");
+        // Mid-quarter days keep their calendar quarter.
+        assert_eq!(season_id_for_ms(day(2026, 11, 20)), "2026-Q4");
+        assert_eq!(season_id_for_ms(day(2026, 2, 14)), "2026-Q1");
     }
 }

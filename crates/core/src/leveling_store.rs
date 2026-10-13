@@ -40,7 +40,8 @@ use sqlx::PgPool;
 use super::funnel::{format_iso_millis, parse_iso_millis};
 use super::leveling::{
     adjudicate_message_award, clamp_leaderboard_limit, current_season_id, level_for_xp,
-    normalize_role_rewards, seasonal_xp_after_decay, voice_xp_for_duration, LeaderboardEntry,
+    normalize_role_rewards, seasonal_decay_new_weeks, seasonal_xp_after_decay_weeks,
+    voice_xp_for_duration, LeaderboardEntry,
     LevelProfile, LevelRoleReward, MessageAwardInput, RewardConfigError, XpAward, XpSource,
     AWARD_COOLDOWN_SECONDS, MAX_STORED_XP, MESSAGE_DAILY_CAP_XP, MESSAGE_SHORT_MIN_LEN, MESSAGE_XP,
     VOICE_DAILY_CAP_XP,
@@ -261,7 +262,8 @@ async fn same_channel_recent(
 /// upsert paralleling the lifetime write, same ceiling guard shape. Runs
 /// after the lifetime award commits; a crash between the two leaves lifetime
 /// ahead, which no later award repairs — accepted for this slice (a backfill
-/// owns historical gaps).
+/// owns historical gaps). New activity restarts the decay grace window, so
+/// the upsert resets the `decayed_weeks` watermark to 0.
 async fn upsert_seasonal(
     pool: &PgPool,
     guild_id: &str,
@@ -275,7 +277,8 @@ async fn upsert_seasonal(
          VALUES ($1, $2, $3, $4, $5::text::timestamptz)
          ON CONFLICT (guild_id, season_id, member_id) DO UPDATE SET
            seasonal_xp = member_season_xp.seasonal_xp + excluded.seasonal_xp,
-           updated_at = excluded.updated_at
+           updated_at = excluded.updated_at,
+           decayed_weeks = 0
          WHERE member_season_xp.seasonal_xp <= $6",
     )
     .bind(guild_id)
@@ -521,10 +524,13 @@ pub async fn award_voice(
 
 /// Monday seasonal-decay tick (AC2): decay every seasonal row in
 /// `(guild_id, season_id)` inactive more than 28 days as of `as_of_iso`, 10 %
-/// per overdue week (multiplicative, via [`seasonal_xp_after_decay`]).
-/// Each decayed member gets one `source='decay'` audit row carrying the
-/// decayed amount; lifetime XP is never touched. Returns the number of
-/// members decayed.
+/// per newly overdue week (multiplicative). The `decayed_weeks` watermark
+/// records how many overdue weeks each row has already absorbed: a rerun of
+/// the same tick applies zero weeks (no write, no audit row) and consecutive
+/// Monday ticks apply exactly one week each, so the cumulative factor stays
+/// 0.9^n instead of compounding past decay. Each decayed member gets one
+/// `source='decay'` audit row carrying the decayed amount; lifetime XP is
+/// never touched. Returns the number of members decayed.
 pub async fn apply_seasonal_decay(
     pool: &PgPool,
     guild_id: &str,
@@ -533,8 +539,8 @@ pub async fn apply_seasonal_decay(
 ) -> Result<u64, LevelingStoreError> {
     let as_of_ms = validate_at(as_of_iso)?;
     let as_of_norm = format_iso_millis(as_of_ms);
-    let rows: Vec<(String, i64, i64)> = sqlx::query_as(
-        "SELECT member_id, seasonal_xp,
+    let rows: Vec<(String, i64, i32, i64)> = sqlx::query_as(
+        "SELECT member_id, seasonal_xp, decayed_weeks,
                 FLOOR(EXTRACT(EPOCH FROM updated_at) * 1000)::bigint
          FROM member_season_xp WHERE guild_id = $1 AND season_id = $2",
     )
@@ -544,20 +550,28 @@ pub async fn apply_seasonal_decay(
     .await?;
     let mut tx = pool.begin().await?;
     let mut decayed = 0u64;
-    for (member_id, seasonal_xp, updated_ms) in rows {
+    for (member_id, seasonal_xp, decayed_weeks, updated_ms) in rows {
         let days_inactive = (as_of_ms - updated_ms).max(0) as u64 / 86_400_000;
-        let next = seasonal_xp_after_decay(seasonal_xp as u64, days_inactive);
-        let lost = seasonal_xp as u64 - next;
+        let new_weeks =
+            seasonal_decay_new_weeks(days_inactive, decayed_weeks.max(0) as u64);
+        if new_weeks == 0 {
+            continue;
+        }
+        let next = seasonal_xp_after_decay_weeks(seasonal_xp as u64, new_weeks);
+        let lost = (seasonal_xp as u64).saturating_sub(next);
         if lost == 0 {
             continue;
         }
+        let total_weeks =
+            i32::try_from(decayed_weeks.max(0) as u64 + new_weeks).unwrap_or(i32::MAX);
         sqlx::query(
-            "UPDATE member_season_xp SET seasonal_xp = $3
-             WHERE guild_id = $1 AND season_id = $2 AND member_id = $4",
+            "UPDATE member_season_xp SET seasonal_xp = $3, decayed_weeks = $4
+             WHERE guild_id = $1 AND season_id = $2 AND member_id = $5",
         )
         .bind(guild_id)
         .bind(season_id)
         .bind(next as i64)
+        .bind(total_weeks)
         .bind(&member_id)
         .execute(&mut *tx)
         .await?;

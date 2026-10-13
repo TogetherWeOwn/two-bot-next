@@ -13,6 +13,10 @@
       "justification": "Add participation-rewards anti-gaming seasonal projection for TOG-22868; additive nullable-only migration.",
       "sha256": "757fbef0724e5abf37b0b8a10434800e4c3748c0f10d0fa8653c37c6dca6a34f"
     },
+    "crates/cutover/migrations/0101_seasonal_decay_watermark.sql": {
+      "justification": "Add seasonal-decay idempotency watermark for TOG-22868; additive column with backfill default.",
+      "sha256": "841a79fd528393f58fef6e5faf6b1d4f7a122aabe4cebf6a3aaed435729c1b98"
+    },
     "crates/cutover/migrations/0110_moderation_member.sql": {
       "sha256": "5cac88b239c9a38ead5318f0d1f75bc0ffc1abeaf414d2d8e7bccf6a2da327a4",
       "justification": "Add reserved member moderation ledger migration for TOG-10078; SQL unchanged during main reconciliation."

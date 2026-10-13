@@ -758,10 +758,19 @@ fn detect_burst(
 /// Copy/paste detector (AC4, observe-only): `copy_paste` fires on
 /// [`ABUSE_COPY_PASTE_COUNT`] or more same-channel messages with lengths
 /// within ±2 chars inside an hour. Lengths come from the `contentLength`
-/// metadata the message-fact writer records; facts without one cannot
-/// participate.
-fn detect_copy_paste(facts: &[ParsedFact<'_>], flags: &mut Vec<AbuseFlag>) {
+/// metadata on message facts; facts without one cannot participate. The live
+/// message-fact writer records no lengths yet, so a week of production facts
+/// reports `copy_paste:insufficient_data` instead of a verdict — the same
+/// fail-closed shape as the voice-AFK occupancy gap — while fixtures
+/// carrying lengths still exercise the detector.
+fn detect_copy_paste(
+    facts: &[ParsedFact<'_>],
+    flags: &mut Vec<AbuseFlag>,
+    quality: &mut Vec<String>,
+) {
     let mut groups: HashMap<(&str, String), Vec<(i64, u64)>> = HashMap::new();
+    let mut messages = 0usize;
+    let mut with_length = 0usize;
     for f in facts {
         if f.row.event_type != "message_created" || f.classification != "eligible_human" {
             continue;
@@ -773,13 +782,19 @@ fn detect_copy_paste(facts: &[ParsedFact<'_>], flags: &mut Vec<AbuseFlag>) {
         if channel.is_empty() {
             continue;
         }
+        messages += 1;
         let Some(len) = f.meta.get("contentLength").and_then(|v| v.as_u64()) else {
             continue;
         };
+        with_length += 1;
         let Some(ms) = parse_iso_millis(&f.row.occurred_at) else {
             continue;
         };
         groups.entry((actor, channel)).or_default().push((ms, len));
+    }
+    if messages > 0 && with_length == 0 {
+        quality.push("copy_paste:insufficient_data".to_owned());
+        return;
     }
     for ((actor, channel), mut items) in groups {
         items.sort_unstable();
@@ -884,7 +899,7 @@ fn detect_abuse(facts: &[ParsedFact<'_>]) -> (Vec<AbuseFlag>, Vec<String>, Vec<S
     let mut candidates = Vec::new();
     let mut quality = Vec::new();
     detect_burst(facts, &mut flags, &mut candidates);
-    detect_copy_paste(facts, &mut flags);
+    detect_copy_paste(facts, &mut flags, &mut quality);
     detect_voice_afk(facts, &mut flags, &mut quality);
     (flags, candidates, quality)
 }

@@ -147,8 +147,9 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "member_exclusions", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "member_levels", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "member_ranks", measure: TableMeasure::Columns(&["updated_at"]) },
-    // Seasonal projection (migration 0100): award upserts move updated_at;
-    // decay rewrites seasonal_xp but leave an occurred_at-stamped decay row
+    // Seasonal projection (migrations 0100/0101): award upserts move
+    // updated_at and reset the decayed_weeks watermark; decay rewrites
+    // seasonal_xp/decayed_weeks but leaves an occurred_at-stamped decay row
     // in xp_awards, mirroring the member_levels lifetime path.
     TableSpec { table: "member_season_xp", measure: TableMeasure::Columns(&["updated_at"]) },
     // Pure projection: any milestone/activity write must move the maximum.
