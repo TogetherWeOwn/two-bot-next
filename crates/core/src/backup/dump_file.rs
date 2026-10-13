@@ -139,23 +139,24 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_vote_kick_audit",
     // V5 adds accepted-create history; see [`V5_ADDED_TABLES`].
     "voice_create_reservations",
-    // V6 adds the shared event-store capture: S2 member deltas (0432) plus
-    // S6 thread lifecycle + member deltas (0429); one table for the S1-S8
-    // slices, see [`V6_ADDED_TABLES`]. Guild-keyed, no foreign keys, so order
-    // among the tail is free.
+    // V6 adds the shared event-store capture: 0428 presence, 0432 member
+    // deltas plus 0429 thread lifecycle + member deltas; one table for the
+    // S1-S8 slices, see [`V6_ADDED_TABLES`]. Append-only, guild-keyed, no
+    // foreign keys, so order among the tail is free.
     "event_store",
 ];
 
 /// Tables first covered by v5. A v4 archive predates them and need not declare
 /// them; every other covered table is still required, so a v4 recovery point
-/// written before create-reservation persistence stays readable without
+/// written before create-reservation persistence (0422) stays readable without
 /// waiving arbitrary missing tables.
 pub const V5_ADDED_TABLES: &[&str] = &["voice_create_reservations"];
 
-/// Tables first covered by v6. A v4 or v5 archive predates them and need not
-/// declare them; v5 still requires every other covered table, so recovery
-/// points written before event-store capture (member deltas, thread
-/// lifecycle) stay readable without waiving arbitrary missing tables.
+/// Tables first covered by v6. A v4 archive predates them along with the v5
+/// tables, and a v5 archive predates them; neither need declare them. A v5
+/// recovery point written before event-store capture (0428 presence, 0432
+/// member deltas, 0429 thread lifecycle) stays readable without waiving
+/// arbitrary missing tables.
 pub const V6_ADDED_TABLES: &[&str] = &["event_store"];
 
 /// Covered tables not created by the current cutover migration set, if any.
@@ -1738,6 +1739,41 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("missing tables: events"));
+    }
+
+    #[test]
+    fn inspects_frozen_v5_without_event_store_but_v6_requires_it() {
+        // A v5 recovery point written before event-store capture (0428 presence, 0432 member deltas) declares every covered table except the v6 addition and stays
+        // readable; promoting it to v6 without the event store is refused.
+        let tables: Vec<Value> = DUMP_TABLES
+            .iter()
+            .copied()
+            .filter(|name| !V6_ADDED_TABLES.contains(name))
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "columns": [],
+                    "column_types": [],
+                    "count": 0,
+                })
+            })
+            .collect();
+        let mut v5 = manifest(tables);
+        v5["version"] = serde_json::json!(5);
+        assert!(
+            validate_manifest(&v5).is_ok(),
+            "frozen v5 without event_store stays readable"
+        );
+        let bytes = gzip_lines(&[v5.clone(), serde_json::json!({"kind":"end","rows":0})]);
+        let contents = inspect_bytes(&bytes).expect("frozen v5 inspects");
+        assert_eq!(contents.manifest.version, 5);
+        let mut v6 = v5;
+        v6["version"] = serde_json::json!(DUMP_VERSION);
+        assert_eq!(DUMP_VERSION, 6, "frozen v5 test pins the v6 bump");
+        assert!(validate_manifest(&v6)
+            .unwrap_err()
+            .to_string()
+            .contains("event_store"));
     }
 
     #[test]
