@@ -73,7 +73,7 @@ fn event_string(event: &serde_json::Value, field: &str) -> Result<String, Stream
 }
 
 /// Validate a Twitch broadcaster user id: 1-32 ASCII digits.
-fn valid_broadcaster_id(value: &str) -> bool {
+pub(crate) fn valid_broadcaster_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 32 && value.bytes().all(|b| b.is_ascii_digit())
 }
 

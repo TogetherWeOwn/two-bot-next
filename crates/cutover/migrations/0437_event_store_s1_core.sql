@@ -1,4 +1,4 @@
--- 0435_event_store_s1_core: append-only core + MESSAGE_CREATE metadata for
+-- 0437_event_store_s1_core: append-only core + MESSAGE_CREATE metadata for
 -- event-store S1 (parent scope TOG-22849 slice 1).
 --
 -- Creates the append-only `event_store` table (if no sibling slice created it

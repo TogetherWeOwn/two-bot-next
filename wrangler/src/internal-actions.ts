@@ -65,8 +65,9 @@ export function ingressEnabled(env: IngressEnv): boolean {
 
 // [header, receiver's byte cap]. Every value must be one printable-ASCII token
 // without commas, so a duplicated header (which Headers joins with ", ") or an
-// injected list never reaches the receiver's singleton check.
-const SIGNING_HEADERS = [
+// injected list never reaches the receiver's singleton check. Exported so the
+// signed backfill-progress edge gate reuses the same caps (TOG-22953).
+export const SIGNING_HEADERS = [
   ["x-two-key-id", 128],
   ["x-two-timestamp", 15],
   ["x-two-nonce", 32],

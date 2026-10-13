@@ -375,6 +375,40 @@ impl RestClient {
         Ok(Some(out))
     }
 
+    /// One member-list page as raw JSON for the member-catch-up slice
+    /// (TOG-22941): `limit` is the caller's 1-1000 page size, `after` is the
+    /// resume cursor carried verbatim onto the wire. Rides the same governed
+    /// transport as every page (pacing, retries, `requests()` counting), so
+    /// the catch-up proof that every request passed through the rate-limit
+    /// client holds. An unreadable page (403/404) or a 5xx that is still
+    /// failing after the last retry is an error, never an empty page: only
+    /// a real `200 []` ends a walk, so a Discord outage mid-catch-up cannot
+    /// read as a finished walk. Strict traversal callers keep using
+    /// [`Self::fetch_all_members`].
+    pub async fn fetch_members_page_json(
+        &self,
+        guild_id: Id<GuildMarker>,
+        limit: u16,
+        after: Option<Id<UserMarker>>,
+    ) -> Result<Vec<serde_json::Value>, RestError> {
+        let page: ListPage<serde_json::Value> = self
+            .exec_list(|| {
+                let client = &self.inner.client;
+                let mut req = client.guild_members(guild_id).limit(limit);
+                if let Some(cursor) = after {
+                    req = req.after(cursor);
+                }
+                req.try_into_request()
+            })
+            .await?;
+        match page {
+            ListPage::Read(batch) => Ok(batch),
+            ListPage::Interrupted(reason) => Err(RestError::Wire(format!(
+                "member list page unreadable: {reason}"
+            ))),
+        }
+    }
+
     /// Guild invites (attribution baseline / capture window counters).
     pub async fn guild_invites(
         &self,
@@ -1395,5 +1429,98 @@ mod tests {
             .connect_lazy_with(options);
         assert_eq!(pool.size(), 0);
         pool.close().await;
+    }
+
+    /// Loopback member list serving one scripted HTTP status per request
+    /// (consumed in order; repeats the last once the script is spent), so
+    /// failure-path tests never touch Discord.
+    struct StatusMock {
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl StatusMock {
+        async fn start(mut script: Vec<u16>) -> (Self, String) {
+            if script.is_empty() {
+                script.push(200);
+            }
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("mock listen");
+            let origin = format!("http://{}", listener.local_addr().expect("addr"));
+            let handle = tokio::spawn(async move {
+                let mut script = script.into_iter();
+                let mut last = 200u16;
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = Vec::with_capacity(1024);
+                    let header_end = loop {
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos;
+                        }
+                        if buf.len() > 64 * 1024 {
+                            break usize::MAX;
+                        }
+                        match stream.read_buf(&mut buf).await {
+                            Ok(0) => break usize::MAX,
+                            Ok(_) => continue,
+                            Err(_) => break usize::MAX,
+                        }
+                    };
+                    if header_end == usize::MAX {
+                        continue;
+                    }
+                    if let Some(next) = script.next() {
+                        last = next;
+                    }
+                    let (reason, body) = match last {
+                        200 => ("OK", "[]".to_owned()),
+                        403 => ("Forbidden", r#"{"message": "403"}"#.to_owned()),
+                        404 => ("Not Found", r#"{"message": "404"}"#.to_owned()),
+                        _ => ("Service Unavailable", r#"{"retry_after": 1}"#.to_owned()),
+                    };
+                    let head = format!(
+                        "HTTP/1.1 {last} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(body.as_bytes()).await;
+                }
+            });
+            (Self { handle }, origin)
+        }
+
+        fn shutdown(self) {
+            self.handle.abort();
+        }
+    }
+
+    /// Paperclip Review #927: a failed member page is an error, never an
+    /// empty page. A 403 refuses at once; a 5xx that is still failing after
+    /// the last retry surfaces as retry-exhausted. Either way the caller —
+    /// and the catch-up walker — must not read it as end of list.
+    #[tokio::test]
+    async fn failed_member_pages_are_errors_not_empty_pages() {
+        let (mock, origin) = StatusMock::start(vec![403]).await;
+        let rest = client_for(&origin);
+        let err = rest
+            .fetch_members_page_json(Id::new(2222), 1000, None)
+            .await
+            .expect_err("a 403 member page is an error, not end of list");
+        assert!(
+            err.to_string().contains("unreadable"),
+            "unexpected error: {err:?}"
+        );
+        mock.shutdown();
+
+        // Five 503s (initial attempt plus four retries) exhaust the page
+        // budget: the sixth scripted status is never reached.
+        let (mock, origin) = StatusMock::start(vec![503, 503, 503, 503, 503, 200]).await;
+        let rest = client_for(&origin);
+        let err = rest
+            .fetch_members_page_json(Id::new(2222), 1000, None)
+            .await
+            .expect_err("an exhausted 5xx member page is an error, not end of list");
+        assert!(
+            err.to_string().contains("unreadable"),
+            "unexpected error: {err:?}"
+        );
+        mock.shutdown();
     }
 }

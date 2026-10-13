@@ -9,8 +9,8 @@ are outside this implementation's scope.
 
 - Discord guild/member IDs, join/leave/activity milestones, invitation attribution
   and event metadata (`members`, `events`, `invite_snapshots`).
-- XP totals, awards and cooldowns, rank projections and raid exclusions
-  (`member_levels`, `xp_awards`, `xp_cooldowns`, `member_ranks`, `member_exclusions`).
+- XP totals, awards and cooldowns, seasonal projections, rank projections and raid exclusions
+  (`member_levels`, `member_season_xp`, `xp_awards`, `xp_cooldowns`, `member_ranks`, `member_exclusions`).
 - Join-risk evidence copied from legacy anti-raid scoring: member ID, account
   age, join time, score and reasons (`join_risk_flags`). Erased by member ID; the
   legacy TEXT `event_id` and `reasons_json` are also checked for the snowflake.

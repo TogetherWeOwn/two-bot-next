@@ -9,6 +9,14 @@
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes.",
       "sha256": "e257889e79beb83896f686fecd2116ca653ce0ef9392c622618f720ccd9b712c"
     },
+    "crates/cutover/migrations/0100_participation_rewards_antigaming.sql": {
+      "justification": "Add participation-rewards anti-gaming seasonal projection for TOG-22868; additive nullable-only migration.",
+      "sha256": "757fbef0724e5abf37b0b8a10434800e4c3748c0f10d0fa8653c37c6dca6a34f"
+    },
+    "crates/cutover/migrations/0101_seasonal_decay_watermark.sql": {
+      "justification": "Add seasonal-decay idempotency watermark for TOG-22868; additive column with backfill default.",
+      "sha256": "841a79fd528393f58fef6e5faf6b1d4f7a122aabe4cebf6a3aaed435729c1b98"
+    },
     "crates/cutover/migrations/0110_moderation_member.sql": {
       "sha256": "5cac88b239c9a38ead5318f0d1f75bc0ffc1abeaf414d2d8e7bccf6a2da327a4",
       "justification": "Add reserved member moderation ledger migration for TOG-10078; SQL unchanged during main reconciliation."
@@ -301,6 +309,14 @@
       "sha256": "18f81ad0a9f98008cb975ef469f1d52f5c10100b31b14bf63693bb2a4f731abc",
       "justification": "TOG-12415: S6 target DDL for the go.two.gg redirect store; legacy 0006 shape with timestamptz."
     },
+    "crates/store/migrations/0408_backfill_cursors.sql": {
+      "sha256": "5b51e4a320368ca9bc68834dfd4ade19e910aa46129b5e1940bec919fd3d067c",
+      "justification": "Resumable per-family backfill cursors so a crash resumes from the persisted cursor, never from zero; ids/cursors/timestamps only."
+    },
+    "crates/store/migrations/0409_backfill_history.sql": {
+      "sha256": "3ec60c7b6c7b98448125631d8857513eee0d23e9487334ebfac9ed0db0963f10",
+      "justification": "Channel-history metadata catch-up tables for message, channel and author ids plus timestamps only; no bodies, additive IF NOT EXISTS."
+    },
     "crates/cutover/migrations/0418_voice_join_grants.sql": {
       "sha256": "e0f7419d2526a36b822892b5206619f24684f3edfa0231ac43262c1116fcfb03",
       "justification": "Voice V3 approved Connect grants: durable voice_join_grants witness per approved room member, written before the Discord grant and retired only after revocation, so a restart cannot strand a Connect allow past /public."
@@ -369,8 +385,16 @@
       "sha256": "798f514afa6cc212a10aba9fb769ba56dd43a7dfcde31983a114421b81dabf7e",
       "justification": "Per-user opt-out suppression plus per-guild presence/activity/voice toggles plus one audit receipt row per purge; store chain copy, additive with IF NOT EXISTS."
     },
-    "crates/cutover/migrations/0435_event_store_s1_core.sql": {
-      "sha256": "63008ba9997da496166d02aae68b25e1f5e46f3981175a1d72e14a86db1356b3",
+    "crates/cutover/migrations/0435_backfill_cursors.sql": {
+      "sha256": "f6a7789c4c56fb6002b20f5a3f683913212a125385e62d0467d23b669e2a504d",
+      "justification": "TOG-22953: cutover-chain mirror of store 0408 backfill_cursors; same shape, IF NOT EXISTS, so the /ops/backfill route and worker cursors work on migrated databases. Renumbered 0433 to 0435 on the merge past main's 0433/0434 privacy opt-out."
+    },
+    "crates/cutover/migrations/0436_member_catchup.sql": {
+      "sha256": "272b679ab44fa9b84621e5c9fbb07e2b11455e18f29c8709c553b0f955ed771f",
+      "justification": "TOG-22941 member-list catch-up worker tables (member_catchup_members/cursors) plus the members-frontier checkpoint contract with backfill_cursors; ids/timestamps/enums only, IF NOT EXISTS, so catch-up writes work on migrated databases and progress reflects the worker. Renumbered 0434 to 0436 on the merge past main's 0433/0434 privacy opt-out."
+    },
+    "crates/cutover/migrations/0437_event_store_s1_core.sql": {
+      "sha256": "9e1c4d2f46f3a36e1e155de83a41a2bcd1d5c4dd2f68ab47dbdd304082e8a1ef",
       "justification": "Event-store S1 append-only core: order-independent event_store table with MESSAGE_CREATE metadata columns (event_type, guild_id, channel_id, message_id, user_id, event_time, received_at, dedup_key) plus nullable convergence and the shared UNIQUE dedup index; ids+timestamps only, no body columns."
     }
   }
