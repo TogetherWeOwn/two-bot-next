@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::json;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 
 #[path = "voice_delete_guard_tests.rs"]
@@ -750,6 +751,16 @@ struct Http {
     before_limit: Option<Hook>,
     overwrites_gate: Option<Arc<OverwriteGate>>,
     limit_gate: Option<Arc<LimitGate>>,
+    /// Live `/limit` write start, mirroring the production in-flight REST
+    /// slot. The watchdog sibling republishes it while the write is held, so
+    /// a hung-dispatch test can prove the age is observable mid-flight.
+    /// Tokio clock: paused-time tests advance it deterministically.
+    limit_in_flight: Mutex<Option<tokio::time::Instant>>,
+    /// How often the watchdog sibling republished the REST age through this
+    /// writer: per-instance proof the sibling's republish call runs while a
+    /// write is held (the process-global gauge is last-writer-wins and
+    /// cannot be asserted exactly under parallel libtest shards).
+    republish_calls: AtomicUsize,
     downloaded_urls: Mutex<Vec<String>>,
     download_results: DownloadResults,
     /// When set, renames run as detached requests answering after this
@@ -802,6 +813,8 @@ impl Http {
             before_limit: None,
             overwrites_gate: None,
             limit_gate: None,
+            limit_in_flight: Mutex::new(None),
+            republish_calls: AtomicUsize::new(0),
             reorder_errors: Mutex::new(VecDeque::new()),
             reorders: Mutex::new(Vec::new()),
             echo_positions: Mutex::new(false),
@@ -815,6 +828,18 @@ impl Http {
 }
 
 impl RoomWrites for Http {
+    fn republish_rest_age(&self) {
+        // Mirror the production slot: the age of the held `/limit` write,
+        // or 0 when none is live.
+        self.republish_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let age_secs = self
+            .limit_in_flight
+            .lock()
+            .unwrap()
+            .map_or(0, |started| started.elapsed().as_secs());
+        metrics::global().set_voice_rest_in_flight_age_secs(age_secs);
+    }
     async fn create(
         &self,
         _: u64,
@@ -1008,14 +1033,19 @@ impl RoomWrites for Http {
             .lock()
             .unwrap()
             .push(format!("limit:{channel}:{user_limit}"));
+        // Mark the write live before any gate: the watchdog sibling reads
+        // this slot while the PATCH is held mid-flight.
+        *self.limit_in_flight.lock().unwrap() = Some(tokio::time::Instant::now());
         if let Some(gate) = &self.limit_gate {
             gate.sent.notify_one();
             gate.release.notified().await;
         }
-        match self.limit_errors.lock().unwrap().pop_front() {
+        let outcome = match self.limit_errors.lock().unwrap().pop_front() {
             Some(error) => Err(error),
             None => Ok(()),
-        }
+        };
+        self.limit_in_flight.lock().unwrap().take();
+        outcome
     }
     async fn download_attachment(
         &self,
@@ -1966,6 +1996,197 @@ async fn owner_leave_hands_room_to_earliest_joiner_and_persists() {
     assert_eq!(worker.queue.pending_counts(GUILD), queued);
 }
 
+#[test]
+fn join_reports_human_occupancy_at_join_before_insert() {
+    // Seeding TEST: occupancy-at-join counts the humans already present in
+    // the target channel, excluding the joiner.
+    let live = LiveGuild::new(GUILD);
+    live.publish(snapshot(
+        &[500],
+        vec![VoiceMember {
+            member_id: MEMBER,
+            channel_id: 500,
+            bot: Some(false),
+        }],
+    ));
+    let (_, occupancy) = live
+        .voice_update_at_with_occupancy(301, Some(500), Some(false), 1_000)
+        .expect("ticket");
+    assert_eq!(occupancy, Some(1));
+    let (_, occupancy) = live
+        .voice_update_at_with_occupancy(302, Some(500), Some(false), 2_000)
+        .expect("ticket");
+    assert_eq!(occupancy, Some(2));
+    // An empty creator sees zero.
+    let (_, occupancy) = live
+        .voice_update_at_with_occupancy(303, Some(CREATOR), Some(false), 3_000)
+        .expect("ticket");
+    assert_eq!(occupancy, Some(0));
+    // Leaves and same-channel updates are not join samples.
+    assert!(live
+        .voice_update_at_with_occupancy(MEMBER, None, Some(false), 4_000)
+        .is_none());
+    assert!(live
+        .voice_update_at_with_occupancy(301, Some(500), Some(false), 5_000)
+        .is_none());
+}
+
+#[test]
+fn mechanical_generator_and_move_echo_carry_no_occupancy_sample() {
+    // Review finding: one room creation emitted two occupancy-0 samples
+    // (the generator join and the bot's move echo into the new room),
+    // skewing the 0 bucket. Both keep their ticket so room creation is
+    // unaffected, but carry no sample.
+    const GENERATOR: u64 = 900;
+    let live = LiveGuild::new(GUILD);
+    live.publish(snapshot(
+        &[500],
+        vec![VoiceMember {
+            member_id: MEMBER,
+            channel_id: 500,
+            bot: Some(false),
+        }],
+    ));
+    live.protect_creators([GENERATOR]);
+    // Joining the creator-tracked generator keeps the ticket, samples nothing.
+    let (_, sample) = live
+        .voice_update_at_with_occupancy(301, Some(GENERATOR), Some(false), 1_000)
+        .expect("generator join keeps its ticket");
+    assert_eq!(sample, None);
+    // The move echo out of the generator into the new room also samples
+    // nothing, while an organic join into the same room still samples.
+    let (_, sample) = live
+        .voice_update_at_with_occupancy(301, Some(500), Some(false), 2_000)
+        .expect("move echo keeps its ticket");
+    assert_eq!(sample, None);
+    let (_, sample) = live
+        .voice_update_at_with_occupancy(302, Some(500), Some(false), 3_000)
+        .expect("organic join keeps its sample");
+    assert_eq!(sample, Some(2));
+}
+
+#[test]
+fn protected_lobby_and_lounge_joins_still_sample_occupancy() {
+    // Review finding: the mechanical filter tested the whole protected set,
+    // so organic joins into the session lobby and permanent protected
+    // channels (lounges) emitted no sample. Only creator/generator channels
+    // are mechanical; lobby and lounge joins are organic choices and sample.
+    const LOBBY: u64 = 600;
+    const LOUNGE: u64 = 700;
+    let live = LiveGuild::new(GUILD);
+    live.publish(snapshot(
+        &[500, LOBBY, LOUNGE],
+        vec![VoiceMember {
+            member_id: MEMBER,
+            channel_id: LOUNGE,
+            bot: Some(false),
+        }],
+    ));
+    live.protect_channels([LOBBY, LOUNGE]);
+    // Organic joins into protected-but-not-creator channels still sample.
+    let (_, sample) = live
+        .voice_update_at_with_occupancy(301, Some(LOUNGE), Some(false), 1_000)
+        .expect("lounge join keeps its ticket");
+    assert_eq!(sample, Some(1));
+    let (_, sample) = live
+        .voice_update_at_with_occupancy(302, Some(LOBBY), Some(false), 2_000)
+        .expect("lobby join keeps its ticket");
+    assert_eq!(sample, Some(0));
+    // A move out of the lounge into a plain channel is organic too.
+    let (_, sample) = live
+        .voice_update_at_with_occupancy(MEMBER, Some(500), Some(false), 3_000)
+        .expect("move out of lounge keeps its ticket");
+    assert_eq!(sample, Some(0));
+}
+
+#[tokio::test]
+async fn store_creators_reach_creator_channels_via_load() {
+    // Review finding: five store-creator sites feed `creator_channels`;
+    // reverting `GuildRoomWorker::load` to `protect_channels` reintroduced
+    // the two spurious occupancy-0 samples with no test failing. The
+    // fixture store holds CREATOR, so a join into it must carry no sample
+    // while an organic join still samples.
+    let (live, store, http, _) = fixture();
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let (_, sample) = worker
+        .live
+        .voice_update_with_occupancy(301, Some(CREATOR), Some(false))
+        .expect("store creator join keeps its ticket");
+    assert_eq!(
+        sample, None,
+        "store creator join carries no occupancy sample"
+    );
+    let (_, sample) = worker
+        .live
+        .voice_update_with_occupancy(302, Some(500), Some(false))
+        .expect("organic join keeps its sample");
+    assert_eq!(sample, Some(0));
+}
+
+#[tokio::test]
+async fn runtime_creator_added_and_updated_feed_creator_channels() {
+    // Review finding: `creator_added` and `creator_updated` are the live
+    // paths for newly saved creators; reverting either to
+    // `protect_channels` left all lib tests green. Both update the actor's
+    // `creator_channels` synchronously, so the seam check below is
+    // deterministic (no global counter, no background worker timing).
+    const ADDED: u64 = 901;
+    const UPDATED: u64 = 902;
+    let trace = Trace::default();
+    let runtime = test_runtime(trace);
+    assert!(runtime.publish_snapshot(GUILD, snapshot(&[], vec![])));
+    let added = CreatorChannel::new(GUILD, ADDED);
+    runtime.creator_added(&added, channel(ADDED, 2, Some(CATEGORY)));
+    let updated = CreatorChannel::new(GUILD, UPDATED);
+    runtime.creator_updated(&updated);
+    let actor = runtime.live_actor(GUILD).expect("live actor");
+    let (_, sample) = actor
+        .live
+        .voice_update_with_occupancy(301, Some(ADDED), Some(false))
+        .expect("added creator join keeps its ticket");
+    assert_eq!(
+        sample, None,
+        "added creator join carries no occupancy sample"
+    );
+    let (_, sample) = actor
+        .live
+        .voice_update_with_occupancy(302, Some(UPDATED), Some(false))
+        .expect("updated creator join keeps its ticket");
+    assert_eq!(
+        sample, None,
+        "updated creator join carries no occupancy sample"
+    );
+    let (_, sample) = actor
+        .live
+        .voice_update_with_occupancy(303, Some(500), Some(false))
+        .expect("organic join keeps its sample");
+    assert_eq!(sample, Some(0));
+    runtime.remove_guild(GUILD);
+}
+
+#[tokio::test]
+async fn actor_creator_added_command_feeds_creator_channels() {
+    // Review finding: the `ActorCommand::CreatorAdded` worker branch is the
+    // fourth store-creator path (the name-panel refresh shares this seam and
+    // needs no separate test). `apply_command` runs it synchronously.
+    const COMMANDED: u64 = 903;
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    apply_command(
+        &mut worker,
+        ActorCommand::CreatorAdded(CreatorChannel::new(GUILD, COMMANDED)),
+        0,
+    );
+    let (_, sample) = worker
+        .live
+        .voice_update_with_occupancy(301, Some(COMMANDED), Some(false))
+        .expect("commanded creator join keeps its ticket");
+    assert_eq!(
+        sample, None,
+        "commanded creator join carries no occupancy sample"
+    );
+}
+
 #[tokio::test]
 async fn succession_skips_present_owners_and_pending_moves() {
     let (live, store, http, trace) = fixture();
@@ -2597,7 +2818,11 @@ async fn late_owner_overwrite_response_never_replaces_newer_gateway_evidence() {
         };
         let (result, ()) = tokio::join!(worker.rewrite_owner_grant(500, &[MEMBER], 301), mutation);
         assert_eq!(result, Err(RoomHttpError::Cancelled), "{event}");
-        worker.http.overwrites_gate = None;
+        // The writer handle is shared with the watchdog sibling, so replace
+        // the gate through the sole owner instead of a direct field write.
+        Arc::get_mut(&mut worker.http)
+            .expect("sole writer handle")
+            .overwrites_gate = None;
         if event == "delete" {
             assert!(!live.inner.read().unwrap().channels.contains_key(&500));
             assert_eq!(
@@ -4336,6 +4561,68 @@ fn runtime_drops_voice_frames_before_first_snapshot() {
     let trace = Trace::default();
     let runtime = test_runtime(trace);
     assert!(!runtime.voice_frame(GUILD, MEMBER, Some(CREATOR), Some(false), "x".to_owned()));
+}
+
+#[tokio::test]
+async fn voice_frame_counts_occupancy_without_per_event_log() {
+    // Seeding TEST AC(1): organic VOICE_STATE_UPDATE joins increment the
+    // occupancy counter. VOICE_STATE_UPDATE is hot per
+    // docs/log-volume-guard.md, so no per-event log line is emitted.
+    // Joins still dispatch their ticket; leaves dispatch none. The counter
+    // reads below are the pin: replacing the `voice_join_occupancy` call in
+    // the frame handler with `let _ = occupancy` fails the growth assert.
+    const GENERATOR: u64 = 900;
+    let (bytes, _subscriber) = capture_join_logs();
+    let trace = Trace::default();
+    let runtime = VoiceRuntime::new(
+        move || (Store::new(trace.clone()), Http::new(trace.clone())),
+        Duration::from_millis(10),
+        true,
+    )
+    .with_creator_channels(HashSet::from([GENERATOR]));
+    assert!(runtime.publish_snapshot(
+        GUILD,
+        snapshot(
+            &[500],
+            vec![VoiceMember {
+                member_id: MEMBER,
+                channel_id: 500,
+                bot: Some(false),
+            }],
+        ),
+    ));
+    let series = "two_bot_voice_join_occupancy_total";
+    let before = global_series(series);
+    assert!(runtime.voice_frame(GUILD, 301, Some(500), Some(false), "x".to_owned()));
+    assert!(runtime.voice_frame(GUILD, 302, Some(500), Some(false), "x".to_owned()));
+    assert!(runtime.voice_frame(GUILD, MEMBER, None, Some(false), "x".to_owned()));
+    // Global counters are shared with parallel tests, so growth asserts a
+    // lower bound (see `global_series` convention); our own two organic joins
+    // guarantee it.
+    assert!(
+        global_series(series) >= before + 2,
+        "two organic joins increment the occupancy counter"
+    );
+    // The mechanical generator join keeps its ticket but emits no sample,
+    // pinned at the actor seam: the global counter is shared with parallel
+    // tests, so exact-equality reads flake (14/60 full-lib runs at 32
+    // threads). The seam check is per-actor and deterministic.
+    let actor = runtime.live_actor(GUILD).expect("live actor");
+    let (_, sample) = actor
+        .live
+        .voice_update_with_occupancy(401, Some(GENERATOR), Some(false))
+        .expect("generator join keeps its ticket");
+    assert_eq!(sample, None, "generator join carries no occupancy sample");
+    // The runtime path keeps the ticket too, so room creation is unaffected.
+    assert!(runtime.voice_frame(GUILD, 402, Some(GENERATOR), Some(false), "x".to_owned()));
+    let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+    let joins: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["fields"]["voice_event"] == "voice_join_occupancy")
+        .collect();
+    assert!(joins.is_empty(), "{text}");
+    runtime.remove_guild(GUILD);
 }
 
 #[tokio::test]
@@ -10441,6 +10728,12 @@ async fn sink_never_answers_kick_without_the_router() {
 // metric deltas. Global counters are monotonic, so the worker tests assert
 // `after >= before + expected`: safe under parallel test threads.
 
+/// Serializes the tests that fire the process-global stuck watchdog with
+/// exact `+1` asserts, so their windows never interleave under parallel
+/// test threads. Held across the whole test; an async mutex stays silent
+/// under clippy while held across awaits.
+static STUCK_COUNTER_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Read one counter series from the process-global metrics exposition.
 fn global_series(prefix: &str) -> u64 {
     metrics::global()
@@ -12006,6 +12299,21 @@ fn synthetic_humans_never_reach_the_live_guild() {
     assert_eq!(synthetic_humans_for(GUILD, &ids), ids);
 }
 
+#[test]
+fn generator_channel_config_takes_one_id_and_refuses_garbage() {
+    let channel = |value: &str| {
+        configured_generator_channel(|key| {
+            (key == "TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID").then(|| value.to_owned())
+        })
+    };
+    assert_eq!(channel("900"), Ok(Some(900)));
+    assert_eq!(channel(""), Ok(None));
+    assert_eq!(channel("   "), Ok(None));
+    for bad in ["900,901", "abc", "0", "-1", "0900", "9 00"] {
+        assert!(channel(bad).is_err(), "{bad}");
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_synthetic_human_bot_keeps_its_room_while_other_bots_leave_rooms_empty() {
     let (live, store, http, trace) = fixture();
@@ -12550,4 +12858,713 @@ fn temp_voice_admission_has_no_cooldown() {
     let config = temp_voice_admission();
     assert_eq!(config.max_per_user(), 1);
     assert_eq!(config.cooldown_secs(), 0);
+}
+
+// ---- stall-observability regressions (TOG prod stall follow-up) ----
+//
+// Received-vs-handled accounting: every delivered creator-channel join bumps
+// `two_bot_voice_joins_received_total`, accepted or refused. Refusals carry a
+// stable reason label. Global counters are monotonic, so these tests assert
+// `after == before + expected` on the exact series.
+
+fn refused_with_reason(reason: &str) -> u64 {
+    global_series(&format!(
+        "two_bot_voice_join_refused_total{{reason=\"{reason}\"}}"
+    ))
+}
+
+fn join_command(ticket: JoinTicket) -> ActorCommand {
+    ActorCommand::Join {
+        ticket,
+        display: "new room".to_owned(),
+        seed: 7,
+        created_at: NOW.to_owned(),
+        received: tokio::time::Instant::now(),
+    }
+}
+
+#[tokio::test]
+async fn join_commands_count_received_on_accept_and_on_refusal() {
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let received_before = global_series("two_bot_voice_joins_received_total");
+    let duplicate_before = refused_with_reason("duplicate");
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(CREATOR), Some(false))
+        .unwrap();
+    assert!(apply_command(&mut worker, join_command(ticket), 0));
+    // Same ticket twice: the second delivery is refused as a duplicate, but
+    // both deliveries count as received. Lower bounds, not exact diffs: these
+    // counters are process-global and sink tests deliver joins through the
+    // same Join arm concurrently, so concurrent runs can only add.
+    assert!(!apply_command(&mut worker, join_command(ticket), 1));
+    assert!(
+        global_series("two_bot_voice_joins_received_total") >= received_before + 2,
+        "both deliveries count as received"
+    );
+    assert!(
+        refused_with_reason("duplicate") > duplicate_before,
+        "the repeat delivery refuses as a duplicate"
+    );
+}
+
+#[tokio::test]
+async fn silent_join_refusals_carry_stable_reason_labels() {
+    // Refusal counters are process-global and other tests refuse joins
+    // concurrently, so every assert below is a lower bound: our own refusal
+    // guarantees at least +1 and concurrent runs can only add.
+    // Halted latch.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.halted = true;
+    let halted_before = refused_with_reason("halted");
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(CREATOR), Some(false))
+        .unwrap();
+    assert!(!worker.accept_join_received(
+        ticket,
+        "new room",
+        7,
+        NOW.to_owned(),
+        tokio::time::Instant::now()
+    ));
+    assert!(
+        refused_with_reason("halted") > halted_before,
+        "halted joins refuse with the halted label"
+    );
+
+    // Access gate off.
+    let (live, store, http, _) = fixture();
+    *store.access.lock().unwrap() = AccessControls {
+        room_creation_enabled: false,
+        ..AccessControls::default()
+    };
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let access_before = refused_with_reason("access");
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(CREATOR), Some(false))
+        .unwrap();
+    assert!(!worker.accept_join_received(
+        ticket,
+        "new room",
+        7,
+        NOW.to_owned(),
+        tokio::time::Instant::now()
+    ));
+    assert!(
+        refused_with_reason("access") > access_before,
+        "gated joins refuse with the access label"
+    );
+
+    // No creator row for the channel.
+    let (live, store, http, _) = fixture();
+    store.creators.lock().unwrap().clear();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let unknown_before = refused_with_reason("unknown_creator");
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(CREATOR), Some(false))
+        .expect("ticket for a joined channel");
+    assert!(!worker.accept_join_received(
+        ticket,
+        "new room",
+        7,
+        NOW.to_owned(),
+        tokio::time::Instant::now()
+    ));
+    assert!(
+        refused_with_reason("unknown_creator") > unknown_before,
+        "creator-less joins refuse with the unknown_creator label"
+    );
+
+    // Blocked room name.
+    let (mut worker, _) = filtering_worker(&["room"]).await;
+    let blocked_before = refused_with_reason("name_blocked");
+    assert!(!join_as(&mut worker, MEMBER, "Ava"));
+    assert!(
+        refused_with_reason("name_blocked") > blocked_before,
+        "blocked names refuse with the name_blocked label"
+    );
+}
+
+#[test]
+fn watchdog_due_needs_a_queue_and_an_expired_window() {
+    let start = tokio::time::Instant::now();
+    let window = Duration::from_secs(120);
+    assert!(!watchdog_due(start, start, false, window));
+    assert!(!watchdog_due(start, start, true, window));
+    assert!(watchdog_due(start, start + window, true, window));
+    assert!(!watchdog_due(start, start + window, false, window));
+    assert!(!watchdog_due(
+        start,
+        start + window - Duration::from_nanos(1),
+        true,
+        window
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn halt_reprobe_clears_the_credential_latch_without_a_restart() {
+    let (live, store, http, _) = fixture();
+    store
+        .settle_errors
+        .lock()
+        .unwrap()
+        .push_back(StoreError::CredentialRefused);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    assert!(worker.halted());
+    let recoveries_before = global_series("two_bot_voice_halt_recoveries_total");
+    let (tx, rx) = mpsc::unbounded_channel();
+    let limits = ActorLimits {
+        halt_reprobe_interval: Duration::from_secs(5),
+        watchdog_stuck_after: Duration::from_secs(3600),
+        ..ActorLimits::default()
+    };
+    let handle = tokio::spawn(async move {
+        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+    });
+    // Pump the actor once so its probe baseline starts at t=0 (a Status
+    // round-trip also proves the halted actor is still alive to answer).
+    let (status_reply, status_rx) = oneshot::channel();
+    tx.send(ActorCommand::Status(status_reply)).unwrap();
+    assert!(status_rx.await.unwrap().halted);
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        global_series("two_bot_voice_halt_recoveries_total"),
+        recoveries_before + 1
+    );
+    // Worker-direct proof the latch cleared: the halted gauge is
+    // process-global and other actor tests publish it concurrently, so an
+    // exact gauge read would flake under parallel runs.
+    let (status_reply, status_rx) = oneshot::channel();
+    tx.send(ActorCommand::Status(status_reply)).unwrap();
+    assert!(!status_rx.await.unwrap().halted);
+    drop(tx);
+    handle.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn halt_reprobe_keeps_a_discord_401_latch_set() {
+    // A move refused with 401 halts with a Discord cause. The store stays
+    // healthy, but the re-probe must not report recovery: the writer's auth
+    // latch never clears in-process, so this halt needs a token fix and a
+    // restart.
+    let (live, store, http, _) = fixture();
+    http.move_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::Unauthorized);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 1).await;
+    assert!(worker.halted());
+    assert!(worker.halted_by_discord());
+    // Worker-direct evidence only below: the halted gauge and the recovery
+    // counter are process-global, and the sibling store-halt test publishes
+    // both while running in parallel in this binary.
+    let (tx, rx) = mpsc::unbounded_channel();
+    let limits = ActorLimits {
+        halt_reprobe_interval: Duration::from_secs(5),
+        watchdog_stuck_after: Duration::from_secs(3600),
+        ..ActorLimits::default()
+    };
+    let handle = tokio::spawn(async move {
+        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+    });
+    // Pump the actor once so its probe baseline starts at t=0 (a Status
+    // round-trip also proves the halted actor is still alive to answer).
+    let (status_reply, status_rx) = oneshot::channel();
+    tx.send(ActorCommand::Status(status_reply)).unwrap();
+    assert!(status_rx.await.unwrap().halted);
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::task::yield_now().await;
+    // No recovery: a full re-probe interval passes and the latch stays set.
+    // (A store re-probe would have cleared a store halt and answered
+    // unhalted here, as the sibling test proves.)
+    let (status_reply, status_rx) = oneshot::channel();
+    tx.send(ActorCommand::Status(status_reply)).unwrap();
+    assert!(status_rx.await.unwrap().halted);
+    drop(tx);
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn halted_compensation_settle_requeues_the_delete_after_recovery() {
+    // CredentialRefused mid-compensation parks the worker with the hold
+    // unsettled. Recovery must retry the delete (re-queued by reconcile),
+    // not count the hold against admission caps until a restart.
+    let (live, mut store, http, _) = fixture();
+    store.persist_error = Some(StoreError::Unavailable);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    // Create lands on Discord but the persist fails: the hold is kept and a
+    // compensation delete is queued immediately (no move is queued).
+    dispatch(&mut worker, 0).await;
+    assert_eq!(
+        worker
+            .compensation_reservations
+            .get(&500)
+            .map(String::as_str),
+        Some("r1")
+    );
+    assert!(worker.deletes.contains(&500));
+    // The Discord delete lands but the settle is refused: halted with the
+    // hold retained and the delete marker dropped for re-queue.
+    worker
+        .store
+        .settle_errors
+        .lock()
+        .unwrap()
+        .push_back(StoreError::CredentialRefused);
+    dispatch(&mut worker, 1).await;
+    assert!(worker.halted());
+    assert!(!worker.halted_by_discord());
+    assert!(worker.store.settled.lock().unwrap().is_empty());
+    assert_eq!(
+        worker
+            .compensation_reservations
+            .get(&500)
+            .map(String::as_str),
+        Some("r1")
+    );
+    assert!(!worker.deletes.contains(&500));
+    // Recovery clears the latch; reconcile re-queues the delete; the next
+    // dispatch settles the held reservation.
+    worker.clear_halt();
+    worker.reconcile();
+    let (urgent, deferred) = worker.queue.pending_counts(GUILD);
+    assert!(
+        urgent + deferred > 0,
+        "reconcile re-queues the unsettled delete"
+    );
+    dispatch(&mut worker, 2).await;
+    assert!(!worker.store.settled.lock().unwrap().is_empty());
+    assert!(worker.compensation_reservations.is_empty());
+    assert!(!worker.deletes.contains(&500));
+}
+
+#[tokio::test(start_paused = true)]
+async fn watchdog_fires_while_a_dispatch_is_hung_mid_write() {
+    // The incident this PR chases (silent worker, no errors, healthy
+    // gateway) was a stall inside `dispatch_one`: the tick arm never ran,
+    // so no watchdog and no gauge moved. The sibling observes the shared
+    // snapshot on its own timer and must fire while the write is held.
+    let _serial = STUCK_COUNTER_SERIAL.lock().await;
+    let (live, store, mut http, trace) = owned_room();
+    let gate = Arc::new(LimitGate::default());
+    http.limit_gate = Some(gate.clone());
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let super::limit::LimitReply::Queued { .. } =
+        worker.apply_limit(MEMBER, false, LimitCommand::Limit(LimitArg::Value(3)))
+    else {
+        panic!("the limit must queue");
+    };
+    // A second action stays queued while the limit PATCH is held: the hung
+    // dispatch popped the limit, so without this the queue reads empty and
+    // the watchdog correctly stays silent. Deferred drains after urgent, so
+    // the limit is the one that hangs.
+    worker.queue.enqueue(
+        GUILD,
+        RoomAction::RenameRoom {
+            channel_id: 500,
+            name: "den".to_owned(),
+        },
+    );
+    let http_probe = Arc::clone(&worker.http);
+    let stuck_before = global_series("two_bot_voice_watchdog_stucks_total");
+    let (tx, rx) = mpsc::unbounded_channel();
+    let limits = ActorLimits {
+        watchdog_stuck_after: Duration::from_secs(5),
+        halt_reprobe_interval: Duration::from_secs(3600),
+        ..ActorLimits::default()
+    };
+    let handle = tokio::spawn(async move {
+        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+    });
+    // Drive the actor until the limit write is held mid-flight. The clock
+    // only moves here, so the waiter must be registered before advancing.
+    let mut sent = Box::pin(gate.sent.notified());
+    let mut ticks = 0;
+    loop {
+        tokio::select! {
+            biased;
+            () = &mut sent => break,
+            () = tokio::task::yield_now() => {
+                tokio::time::advance(Duration::from_millis(100)).await;
+            }
+        }
+        ticks += 1;
+        assert!(ticks < 200, "the limit write never went live");
+    }
+    // One full stuck window passes with the dispatch hung: exactly one fire,
+    // and the held write is still live (Tokio clock, so deterministic).
+    // The sibling's REST-age republish is pinned per-instance: the count
+    // must rise while the write is held, so deleting the republish call
+    // fails this test (the global gauge itself stays unasserted).
+    let republished_before = http_probe.republish_calls.load(Ordering::Relaxed);
+    tokio::time::advance(Duration::from_secs(6)).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        global_series("two_bot_voice_watchdog_stucks_total"),
+        stuck_before + 1
+    );
+    assert!(
+        http_probe.republish_calls.load(Ordering::Relaxed) > republished_before,
+        "the sibling republishes the REST age while the write is held"
+    );
+    let held_age_secs = http_probe
+        .limit_in_flight
+        .lock()
+        .unwrap()
+        .map(|started| started.elapsed().as_secs());
+    assert!(
+        held_age_secs.unwrap_or(0) >= 5,
+        "the hung write stays observable mid-flight"
+    );
+    // Release the PATCH: the held write lands (the worker moved into the
+    // actor, so prove the drain through the shared trace, not the worker).
+    gate.release.notify_one();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry == "limit:500:3"));
+    drop(tx);
+    handle.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn watchdog_sibling_exits_when_its_actor_dies() {
+    // The sibling must not outlive a panicked actor: its stop flag and
+    // abort run only after the loop exits normally, but a panic unwinds
+    // past them. The sibling holds only a weak ref, so it exits when the
+    // actor task drops the last strong ref instead of alarming forever
+    // from the dead worker's snapshot.
+    let _serial = STUCK_COUNTER_SERIAL.lock().await;
+    let (live, store, mut http, _) = owned_room();
+    http.before_limit = Some(Arc::new(|| panic!("probe panic: actor dies")));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let super::limit::LimitReply::Queued { .. } =
+        worker.apply_limit(MEMBER, false, LimitCommand::Limit(LimitArg::Value(3)))
+    else {
+        panic!("the limit must queue");
+    };
+    // A second action stays queued: the snapshot has pending work with no
+    // progress, so a leaked sibling would fire the stuck alarm.
+    worker.queue.enqueue(
+        GUILD,
+        RoomAction::RenameRoom {
+            channel_id: 500,
+            name: "den".to_owned(),
+        },
+    );
+    let (tx, rx) = mpsc::unbounded_channel();
+    let limits = ActorLimits {
+        watchdog_stuck_after: Duration::from_secs(5),
+        halt_reprobe_interval: Duration::from_secs(3600),
+        ..ActorLimits::default()
+    };
+    let handle = tokio::spawn(async move {
+        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+    });
+    // Drive the actor until the panicking write kills it: the unwind drops
+    // the inbox receiver, which closes the sender's side.
+    let mut ticks = 0;
+    while !tx.is_closed() {
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        ticks += 1;
+        assert!(ticks < 200, "the actor never reached the panicking write");
+    }
+    handle
+        .await
+        .expect_err("the actor task must die on the panic");
+    // Two full stuck windows pass with queued work and no progress: a
+    // leaked sibling would fire twice, so the counter must not move.
+    let stuck = global_series("two_bot_voice_watchdog_stucks_total");
+    tokio::time::advance(Duration::from_secs(6)).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        global_series("two_bot_voice_watchdog_stucks_total"),
+        stuck,
+        "no stuck alarm after the actor died"
+    );
+    tokio::time::advance(Duration::from_secs(6)).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        global_series("two_bot_voice_watchdog_stucks_total"),
+        stuck,
+        "no stuck alarm on the second window either"
+    );
+    drop(tx);
+}
+
+#[tokio::test]
+async fn halted_delete_provenance_refusal_requeues_the_delete_after_recovery() {
+    // The ordinary-delete provenance read refuses mid-dispatch: the worker
+    // halts with the delete marker left, so recovery must re-queue the
+    // delete instead of stranding the live room until a restart.
+    let (live, store, http, trace) = fixture();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.live.set_empty_grace(Duration::ZERO);
+    worker.queue_delete(500, false);
+    worker.reconcile();
+    assert_eq!(worker.queue.pending_counts(GUILD), (1, 0));
+    worker
+        .store
+        .rooms_errors
+        .lock()
+        .unwrap()
+        .push_back(StoreError::CredentialRefused);
+    worker.dispatch_one(0).await;
+    assert!(worker.halted());
+    assert!(!worker.halted_by_discord());
+    assert!(
+        worker.deletes.contains(&500),
+        "halt leaves the dedup marker"
+    );
+    // Recovery drops the marker; reconcile re-derives the delete from the
+    // still-live empty room and the retry forgets the row.
+    worker.clear_halt();
+    assert!(!worker.deletes.contains(&500));
+    worker.reconcile();
+    let (urgent, deferred) = worker.queue.pending_counts(GUILD);
+    assert!(
+        urgent + deferred > 0,
+        "reconcile re-queues the stranded delete"
+    );
+    worker.dispatch_one(1).await;
+    assert!(!worker.halted());
+    assert!(!worker.store.rooms.lock().unwrap().contains_key(&500));
+    assert!(!worker.deletes.contains(&500));
+    assert!(trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry == "delete:500"));
+}
+
+#[tokio::test]
+async fn halted_delete_forget_refusal_retries_forget_after_recovery() {
+    // The Discord delete lands but the row forget refuses: the worker halts
+    // with the marker left. Recovery must retry the forget, not leave the
+    // row tracked until a restart.
+    let (live, store, http, _) = fixture();
+    store.rooms.lock().unwrap().insert(500, room(500));
+    live.upsert_channel(channel(500, 2, Some(CATEGORY)));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.live.set_empty_grace(Duration::ZERO);
+    worker.queue_delete(500, false);
+    worker.reconcile();
+    worker
+        .store
+        .forget_errors
+        .lock()
+        .unwrap()
+        .push_back(StoreError::CredentialRefused);
+    worker.dispatch_one(0).await;
+    assert!(worker.halted());
+    assert!(worker.deletes.contains(&500));
+    assert!(
+        !worker
+            .live
+            .inner
+            .read()
+            .unwrap()
+            .channels
+            .contains_key(&500),
+        "the Discord delete already happened"
+    );
+    worker.clear_halt();
+    worker.reconcile();
+    let (urgent, deferred) = worker.queue.pending_counts(GUILD);
+    assert!(
+        urgent + deferred > 0,
+        "reconcile re-queues the stranded delete"
+    );
+    worker.dispatch_one(1).await;
+    assert!(!worker.halted());
+    assert!(!worker.store.rooms.lock().unwrap().contains_key(&500));
+    assert!(!worker.deletes.contains(&500));
+}
+
+#[tokio::test]
+async fn halted_owner_prepare_refusal_requeues_the_handoff_after_recovery() {
+    // Succession queues the handoff, then grant preparation refuses: the
+    // worker halts with the ownership marker left. Recovery must re-queue
+    // the handoff instead of stranding the repair until a restart.
+    let (live, store, http, trace) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker
+        .live
+        .voice_update_at(MEMBER, None, Some(false), 1_000);
+    worker.reconcile();
+    assert!(
+        worker.ownership_queued.contains(&500),
+        "succession queues the handoff"
+    );
+    worker
+        .store
+        .prepare_errors
+        .lock()
+        .unwrap()
+        .push_back(StoreError::CredentialRefused);
+    worker.dispatch_one(2_000).await;
+    assert!(worker.halted());
+    assert!(
+        worker.ownership_queued.contains(&500),
+        "halt leaves the handoff marker"
+    );
+    worker.clear_halt();
+    assert!(!worker.ownership_queued.contains(&500));
+    worker.dispatch_one(3_000).await;
+    assert!(!worker.halted());
+    assert!(trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.starts_with("update_ownership:500")));
+    assert!(!worker.ownership_queued.contains(&500));
+}
+
+#[tokio::test]
+async fn halted_owner_update_refusal_requeues_the_handoff_after_recovery() {
+    // Preparation succeeds but the ownership write refuses: same stranded
+    // shape on the later halted branch.
+    let (live, store, http, trace) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker
+        .live
+        .voice_update_at(MEMBER, None, Some(false), 1_000);
+    worker.reconcile();
+    assert!(
+        worker.ownership_queued.contains(&500),
+        "succession queues the handoff"
+    );
+    worker
+        .store
+        .ownership_errors
+        .lock()
+        .unwrap()
+        .push_back(StoreError::CredentialRefused);
+    worker.dispatch_one(2_000).await;
+    assert!(worker.halted());
+    assert!(
+        worker.ownership_queued.contains(&500),
+        "halt leaves the handoff marker"
+    );
+    worker.clear_halt();
+    worker.dispatch_one(3_000).await;
+    assert!(!worker.halted());
+    assert!(trace
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.starts_with("update_ownership:500")));
+    assert!(!worker.ownership_queued.contains(&500));
+}
+
+#[tokio::test(start_paused = true)]
+async fn watchdog_fires_while_a_backed_off_queue_makes_no_progress() {
+    // Exact counter asserts: serialized against the hung-dispatch sibling
+    // test (see `STUCK_COUNTER_SERIAL`).
+    let _serial = STUCK_COUNTER_SERIAL.lock().await;
+    let (live, store, http, _) = fixture();
+    http.move_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::RateLimited {
+            retry_after_ms: 30_000,
+            global: true,
+        });
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 0).await;
+    let (urgent, deferred) = worker.queue.pending_counts(GUILD);
+    assert!(urgent + deferred > 0, "the 429 keeps the move queued");
+    let stuck_before = global_series("two_bot_voice_watchdog_stucks_total");
+    let (tx, rx) = mpsc::unbounded_channel();
+    let limits = ActorLimits {
+        watchdog_stuck_after: Duration::from_secs(5),
+        halt_reprobe_interval: Duration::from_secs(3600),
+        ..ActorLimits::default()
+    };
+    let handle = tokio::spawn(async move {
+        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), limits).await;
+    });
+    // Liveness first: the actor answers Status probes while stalled.
+    let (reply, reply_rx) = oneshot::channel();
+    tx.send(ActorCommand::Status(reply)).unwrap();
+    let status = reply_rx.await.unwrap();
+    assert!(!status.halted);
+    // One window passes with the queue backed off: exactly one fire.
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        global_series("two_bot_voice_watchdog_stucks_total"),
+        stuck_before + 1
+    );
+    // A second full window fires once more (at most once per interval).
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        global_series("two_bot_voice_watchdog_stucks_total"),
+        stuck_before + 2
+    );
+    drop(tx);
+    handle.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn global_429_requeues_and_resumes_without_losing_the_move() {
+    let (live, store, http, trace) = fixture();
+    http.move_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::RateLimited {
+            retry_after_ms: 1_000,
+            global: true,
+        });
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut worker, MEMBER);
+    dispatch(&mut worker, 0).await;
+    dispatch(&mut worker, 0).await;
+    // Still queued (not dead-lettered) while the backoff holds.
+    let (urgent, deferred) = worker.queue.pending_counts(GUILD);
+    assert_eq!((urgent, deferred), (1, 0));
+    assert!(worker.queue.oldest_pending_age(GUILD).is_some());
+    assert!(!worker.dispatch_one(500).await);
+    tokio::time::advance(Duration::from_secs(2)).await;
+    dispatch(&mut worker, 2_000).await;
+    // The move landed (the first `move` trace entry is the 429 attempt, the
+    // second the success). The success queues a deferred post-move respace;
+    // draining it leaves the queue empty.
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["create", "persist:500", "move:300:500", "move:300:500"]
+    );
+    assert_eq!(worker.queue.pending_counts(GUILD), (0, 1));
+    dispatch(&mut worker, 2_000).await;
+    assert_eq!(worker.queue.pending_counts(GUILD), (0, 0));
+    assert_eq!(worker.queue.oldest_pending_age(GUILD), None);
 }

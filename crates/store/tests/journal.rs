@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Pool, Postgres};
 use two_bot_store::journal::{
-    advance_watermark, entries_since, identity, is_covered, record, restorable_point,
-    watermark_for, JournalEntry, JournalOp, COVERED_TABLES,
+    advance_watermark, entries_since, identity, is_covered, record, restorable_point, snapshot,
+    table_tips, watermark_for, watermarks, JournalEntry, JournalOp, COVERED_TABLES,
 };
 use two_bot_store::{migrate, DB_POOL_MAX};
 
@@ -224,5 +224,34 @@ async fn every_covered_table_accepts_a_journal_write() {
         restorable_point(&f.pool).await.unwrap(),
         f.journal_count().await
     );
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires authorized TEST_DATABASE_URL"]
+async fn snapshot_reads_point_cursors_and_tips_in_one_snapshot() {
+    let f = Fixture::new().await;
+    // `events` journals id 1, then `members` journals the later ids. Every
+    // table is fully journaled, so every covered lag is 0 even though the
+    // global point has moved past `events`: lag is tip minus watermark.
+    let first = record(&f.pool, &insert("events", "42:1")).await.unwrap();
+    let mut last = first;
+    for row in ["42:2", "42:3"] {
+        last = record(&f.pool, &insert("members", row)).await.unwrap();
+    }
+    assert!(first < last);
+
+    let snap = snapshot(&f.pool).await.unwrap();
+    assert_eq!(snap.point, last);
+    assert_eq!(snap.cursors.get("events"), Some(&first));
+    assert_eq!(snap.cursors.get("members"), Some(&last));
+    assert_eq!(snap.tips.get("events"), Some(&first));
+    assert_eq!(snap.tips.get("members"), Some(&last));
+    // A cold table with no journal rows stays absent, never zero.
+    assert!(!snap.tips.contains_key("rank_ladder"));
+    // The split readers agree with the single snapshot.
+    assert_eq!(watermarks(&f.pool).await.unwrap(), snap.cursors);
+    assert_eq!(table_tips(&f.pool).await.unwrap(), snap.tips);
+    assert_eq!(restorable_point(&f.pool).await.unwrap(), snap.point);
     f.finish().await;
 }

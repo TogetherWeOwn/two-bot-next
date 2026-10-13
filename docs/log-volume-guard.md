@@ -20,7 +20,7 @@ high-rate event without a cap row fails the suite.
   guild/member/channel ID, token, query string, body or message content ever
   becomes a label or a log field.
 
-## Cardinality budget: 586 samples
+## Cardinality budget: 614 samples
 
 `GET /metrics` renders this many non-comment samples from process start,
 before any traffic. Adding any series fails the pinned count until this
@@ -37,7 +37,8 @@ table and the test are updated together.
 | `two_bot_rest_guard_*` | 11 | Fixed, label-free shared admission-guard counters and gauges |
 | job runs, timestamps, failure streaks | 64 | 16 jobs x (2 outcomes + timestamp + streak) |
 | `two_bot_job_last_error_class{job,class}` | 112 | 16 jobs x 7 classes (`database`, `rest`, `configuration`, `timeout`, `panic`, `feed`, `recovery_required`) |
-| voice ops, reconcile, dead-letters, state | 34 | 3x6 ops + 4 reconcile + 9 dead-letter + tracked + compensation + orphans |
+| voice ops, reconcile, dead-letters, state | 51 | 3x6 ops + 4 reconcile + 9 dead-letter + tracked + compensation + orphans + 7 join-refused reasons + 2 queue lanes + halted + oldest-age + rest-age + backoff-capped + dispatch-timeouts + watchdog-stucks + halt-recoveries |
+| `two_bot_voice_join_occupancy_total{occupancy}` | 8 | seeding-TEST occupancy buckets `0`-`6` + `7+`; fixed vocabulary, no per-channel/member labels |
 | pool gauges | 4 | configured, size, idle, max |
 | `two_bot_db_errors_total{op}` | 2 | `admission`, `other` |
 | `two_bot_send_admissions_total{outcome}` | 4 | `admitted`, `blocked`, `storage_error`, `other` |
@@ -48,8 +49,9 @@ table and the test are updated together.
 | `two_bot_gateway_checkpoint_failures_total{stage}` | 2 | `pre_commit`, `commit` |
 | `two_bot_internal_actions_total{family,outcome}` | 72 | 6 families x 12 outcomes (`announcement`, `event`, `settings`, `moderation`, `membership`, `other` x `executed` + 11 refusal classes) |
 | `two_bot_community_facts_drain_failures_total{reason}` | 3 | `error`, `timeout`, `other` |
+| `two_bot_presence_capture_total{outcome}` | 3 | `inserted`, `duplicate`, `rejected` |
 | `two_bot_audit_delivery_halt` | 1 | label-free gauge: 1 engaged, 0 cleared |
-| `# HELP` / `# TYPE` headers | 88 | 44 families x 2 |
+| `# HELP` / `# TYPE` headers | 112 | 56 families x 2 |
 
 ## Per-event caps (gateway metric labels)
 

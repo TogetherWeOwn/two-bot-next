@@ -56,10 +56,48 @@ pub struct FactWrite {
 
 /// Insert one fact. Returns `true` when inserted, `false` when the idempotency
 /// key already held it (legacy `ON CONFLICT DO NOTHING RETURNING id`).
+///
+/// Privacy gate, inside the write transaction: a suppressed `(guild, actor)`
+/// pair drops the fact, and a guild-disabled analytics family drops
+/// message/voice facts ([`crate::privacy::community_category`]; join/rules
+/// facts are suppression-only, like other lifecycle rows). A suppressed
+/// inviter's attribution is stripped from `member_joined` metadata while the
+/// joiner's own fact still lands. Anonymous facts (`actor_id = None`) are
+/// never gated. Returns `false` for every dropped fact.
 pub async fn record_fact(
     pool: &Pool<Postgres>,
     fact: &FactWrite,
 ) -> Result<bool, CommunityStoreError> {
+    let mut tx = pool.begin().await?;
+    // Serialize with concurrent opt-outs (which take SHARE ROW EXCLUSIVE
+    // over these tables): the lock order matches `opt_out_member`, and ROW
+    // EXCLUSIVE never blocks other writers.
+    sqlx::query("LOCK TABLE community_facts, privacy_opt_outs IN ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    let mut metadata = fact.metadata.clone();
+    if let Some(actor) = fact.actor_id.as_deref() {
+        if crate::privacy::suppressed_in(&mut tx, &fact.guild_id, actor).await? {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        if let Some(category) = crate::privacy::community_category(&fact.event_type) {
+            if crate::privacy::category_off_in(&mut tx, &fact.guild_id, category).await? {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+        }
+        if fact.event_type == "member_joined" {
+            if let Some(inviter) = crate::privacy::inviter_in_metadata(metadata.as_deref()) {
+                if crate::privacy::suppressed_in(&mut tx, &fact.guild_id, &inviter).await? {
+                    metadata = crate::privacy::scrubbed_member_join_metadata(
+                        metadata.as_deref(),
+                        &inviter,
+                    );
+                }
+            }
+        }
+    }
     let inserted: Option<(i64,)> = sqlx::query_as(
         "INSERT INTO community_facts
            (guild_id, event_type, source_event_id, actor_id, occurred_at, source,
@@ -76,10 +114,11 @@ pub async fn record_fact(
     .bind(&fact.classification.classifier_version)
     .bind(&fact.classification.classification)
     .bind(&fact.classification.matched_rule)
-    .bind(&fact.metadata)
+    .bind(&metadata)
     .bind(&fact.idempotency_key)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(inserted.is_some())
 }
 

@@ -80,6 +80,21 @@ import {
   relayEventsubResponse,
 } from "./eventsub.ts";
 import {
+  OPS_AUDIT_PATH,
+  OPS_CONFIG_PATH,
+  OPS_ENFORCEMENT_PENDING,
+  OPS_KILLSWITCH_PATH,
+  OpsControl,
+  configWritesEnabled,
+  gateOpsRequest,
+  isOpsPath,
+  killswitchEnabled,
+  opsRefused,
+  parseConfigPut,
+  parseKillswitchPost,
+  readOpsBody,
+} from "./ops-control.ts";
+import {
   EMPTY_STATE,
   evaluateMetrics,
   interruptDispatchDrops,
@@ -88,6 +103,14 @@ import {
 } from "./alert-rules.ts";
 import { parseAlertScrape } from "./metrics-scrape.ts";
 import { applySecurityHeaders, withSecurityHeaders } from "./security-headers.ts";
+import { handleMcp } from "./mcp.ts";
+import {
+  OPS_DASHBOARD_PATH,
+  MIN_DASHBOARD_CLIENT_ID_LENGTH,
+  MIN_DASHBOARD_SECRET_LENGTH,
+  dashboardPageResponse,
+  dashboardRefusal,
+} from "./ops-dashboard.ts";
 
 /**
  * Plus the optional reviewed TWO_* flags in container-env.ts (TOG-12020) and
@@ -122,8 +145,27 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   OPS_ALERT_WEBHOOK_URL?: string;
   /** Worker-only forwarding switch. Only "on" posts; all other values are log-only. */
   OPS_ALERT_FORWARDING?: string;
-  /** Optional Worker secret: bearer token for GET /ops/metrics. Unset → route 404s. */
+  /** Optional Worker secret: bearer token for GET /ops/metrics and the
+   * read-only /ops JSON roll-ups below. Unset → those routes 404. */
   METRICS_SCRAPE_TOKEN?: string;
+  /** Optional Worker secret: bearer token for POST /mcp (`mcp:read`). Unset → route 404s. */
+  MCP_TOKEN?: string;
+  /**
+   * Optional Worker secrets: Cloudflare Access service-token pair gating the
+   * read-only ops dashboard page and summary. Either unset (or short) → both
+   * routes 404. Never committed as wrangler.toml vars.
+   */
+  OPS_DASHBOARD_CLIENT_ID?: string;
+  OPS_DASHBOARD_CLIENT_SECRET?: string;
+  /** Dedicated least-privilege bearer for the admin control surface
+   * (GET /ops/config, /ops/kill-switch, /ops/audit). Absent/short → dark. */
+  OPS_CONTROL_TOKEN?: string;
+  /** Exact "1" admits PUT /ops/config. Staging-only; never production
+   * without the CISO review (AC4). Enforced by check-env-bindings.py. */
+  OPS_CONFIG_WRITES_ENABLED?: string;
+  /** Exact "1" admits POST /ops/kill-switch. Staging-only; never production
+   * without the CISO review (AC4). Enforced by check-env-bindings.py. */
+  OPS_KILLSWITCH_ENABLED?: string;
   /** Optional Hyperdrive binding to shared Postgres; absent → snapshot, clicks dropped. */
   REDIRECT_DB?: Hyperdrive;
   /** Invite code for `/` and DB outages. Optional but recommended. */
@@ -198,9 +240,20 @@ const healthBuckets = new TokenBuckets();
 // gate whose token already requires 32 characters (see ownership.ts
 // authenticated()), and its lockout semantics belong to that fence.
 const metricsAuthBuckets = new TokenBuckets({ capacity: 10, refillPerSecond: 1 });
+// MCP bearer gate (phase 1: shared `mcp:read` bearer; DCR/PKCE is the
+// staging target in docs/mcp.md). Same brute-force shape as the scrape gate:
+// budget is taken synchronously before the digest comparison, and an
+// exhausted caller is refused without any comparison.
+const mcpAuthBuckets = new TokenBuckets({ capacity: 10, refillPerSecond: 1 });
+let mcpShortTokenLogged = false;
 // A short scrape token is an operator misconfiguration, not per-request
 // information: say so once per isolate so scanners cannot flood the logs.
 let metricsShortTokenLogged = false;
+
+// Attempt cap for the dashboard service-token gate. Separate budget from the
+// metrics scrape so guessing at one cannot throttle the other; otherwise the
+// same take-before-compare semantics (see metricsAuthBuckets above).
+const dashboardAuthBuckets = new TokenBuckets({ capacity: 10, refillPerSecond: 1 });
 
 // Store instances are request-scoped, but the lookup cache must survive
 // across requests to blunt repeated lookups — so it lives here beside the
@@ -249,6 +302,20 @@ const DEFAULT_UNREADY_SECONDS = 600;
 const READINESS_KEY = "two-bot:readiness";
 const METRICS_ALERT_KEY = "two-bot:metrics-alerts";
 const OPS_METRICS_PATH = "/ops/metrics";
+// Read-only operator roll-ups (TOG-22860), served by the container as JSON.
+// Gateway/backfill stay on the scrape bearer like /ops/metrics; the summary
+// serves two audiences (scrape bearer or dashboard pair — see the Worker
+// gate below), and the DO translates its `ready` bit into the 200-vs-503
+// status the dashboard renders. Same "/ops/summary" value as
+// ops-dashboard.ts (kept local so the JSON-path list stays in one place).
+// Exact paths only: unknown /ops/* subpaths still fall through to the
+// redirect lookup below, where the slug allowlist rejects them.
+const OPS_SUMMARY_PATH = "/ops/summary";
+const OPS_GATEWAY_PATH = "/ops/gateway";
+const OPS_BACKFILL_PATH = "/ops/backfill";
+const OPS_JSON_PATHS: string[] = [OPS_SUMMARY_PATH, OPS_GATEWAY_PATH, OPS_BACKFILL_PATH];
+const OPS_METRICS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8";
+const OPS_JSON_CONTENT_TYPE = "application/json";
 // The scrape token follows the ownership control token's floor: anything
 // shorter is treated as not configured. A short staging token must be
 // reissued, never padded (none is provisioned today).
@@ -259,6 +326,11 @@ const METRICS_FETCH_TIMEOUT_MS = 6000;
 // Prometheus exposition is small; cap the proxied body so a compromised or
 // wedged container cannot exhaust the isolate reading it.
 const MAX_METRICS_BODY_BYTES = 64 * 1024;
+// The DO serves the summary roll-up from inside blockConcurrencyWhile, so
+// the container fetch must be bounded well below the 30s DO gate.
+const SUMMARY_FETCH_TIMEOUT_MS = 6000;
+// The roll-up is small; cap the proxied body like the metrics scrape.
+const MAX_SUMMARY_BODY_BYTES = 64 * 1024;
 
 /** Compare via digests so length/prefix timing does not leak the token. */
 async function tokenMatches(provided: string, expected: string): Promise<boolean> {
@@ -272,6 +344,53 @@ async function tokenMatches(provided: string, expected: string): Promise<boolean
   let diff = 0;
   for (let i = 0; i < x.length; i++) diff |= x[i]! ^ y[i]!;
   return diff === 0;
+}
+
+// Shared read-scope gate for /ops/metrics and the JSON roll-ups. Returns
+// the refusal response, or null when the request is authorized. Only GET is
+// meaningful: anything else 404s like an unconfigured token, so method
+// probes cannot distinguish a missing route from a missing token.
+async function opsReadRefusal(request: Request, env: Env): Promise<Response | null> {
+  if (!env.METRICS_SCRAPE_TOKEN || env.METRICS_SCRAPE_TOKEN.length < MIN_SCRAPE_TOKEN_LENGTH
+    || request.method !== "GET") {
+    if (env.METRICS_SCRAPE_TOKEN && env.METRICS_SCRAPE_TOKEN.length < MIN_SCRAPE_TOKEN_LENGTH
+      && !metricsShortTokenLogged) {
+      metricsShortTokenLogged = true;
+      console.error(JSON.stringify({
+        event: "metrics_scrape_token_misconfigured",
+        reason: "token_below_minimum_length",
+        minimum_length: MIN_SCRAPE_TOKEN_LENGTH,
+      }));
+    }
+    return new Response("not found", { status: 404, headers: withSecurityHeaders() });
+  }
+  const caller = request.headers.get("cf-connecting-ip") ?? "unknown";
+  // Take budget synchronously before the secret comparison: no guess —
+  // right or wrong — is evaluated while throttled, and concurrent
+  // guesses each consume their own token instead of sharing one across
+  // the awaited digest comparison below. A correct bearer on a fresh
+  // budget is unaffected (one token of a 10-burst).
+  const verdict = metricsAuthBuckets.take(caller);
+  if (!verdict.allowed && !metricsAuthBuckets.peek(caller).allowed) {
+    // Tracked caller out of budget (or in terminal hold): refuse without
+    // any comparison, so guessing cannot confirm a bearer while
+    // exhausted. peek is synchronous, so this cannot race the take above.
+    // An untracked caller denied only because the caller table is full
+    // falls through to the comparison below instead, so a flood of
+    // one-time scanners can never lock out the authenticated scraper.
+    return new Response("slow down\n", {
+      status: 429,
+      headers: withSecurityHeaders({
+        "content-type": "text/plain",
+        "retry-after": String(verdict.retryAfter),
+      }),
+    });
+  }
+  const m = /^Bearer (.+)$/.exec(request.headers.get("authorization") ?? "");
+  if (!m || m[1]!.length > 4096 || !(await tokenMatches(m[1]!, env.METRICS_SCRAPE_TOKEN))) {
+    return new Response("unauthorized", { status: 401, headers: withSecurityHeaders({ "www-authenticate": "Bearer" }) });
+  }
+  return null;
 }
 
 // SDK failures do not carry a trustworthy Rust startup class. Never serialize
@@ -489,58 +608,78 @@ export class TwoBotContainer extends Container<Env> {
     if (url.pathname === CONTROL_PATH) return this.control(request);
     if (url.pathname === ACTIONS_PATH) return this.internalActions(request);
     if (url.pathname === EVENTSUB_PATH) return this.internalEventsub(request);
-    if (url.pathname !== "/health" && url.pathname !== "/readyz" && url.pathname !== OPS_METRICS_PATH) {
+    if (url.pathname === OPS_CONFIG_PATH || url.pathname === OPS_KILLSWITCH_PATH || url.pathname === OPS_AUDIT_PATH) {
+      return this.opsControl(request);
+    }
+    if (url.pathname !== "/health" && url.pathname !== "/readyz" && url.pathname !== OPS_METRICS_PATH
+      && !OPS_JSON_PATHS.includes(url.pathname)) {
       return new Response("not found", { status: 404, headers: withSecurityHeaders() });
     }
     try {
       return await this.owned(async () => {
         await this.ownership.require(this.id(), request.headers.get(DEPLOYMENT_HEADER) ?? "");
-        // Reached only through the Worker's bearer-token gate (see default export).
+        // Reached only through the Worker's ops gates (see default export).
         if (url.pathname === OPS_METRICS_PATH) {
           await this.armKeepalive();
-          // The SDK resolves fetch failures (including the abort timeout) as
-          // a 500/503/429 Response, so a catch alone never fires. Treat an
-          // aborted signal or any non-2xx upstream as a 504 with a generic
-          // body, and drain the SDK error text instead of proxying it.
-          const fetchSignal = AbortSignal.timeout(METRICS_FETCH_TIMEOUT_MS);
-          const metricsUnavailable = (status: number) =>
-            new Response("metrics unavailable\n", {
+          return this.proxyOpsBody("http://c/metrics", OPS_METRICS_CONTENT_TYPE, "metrics unavailable\n");
+        }
+        // The summary roll-up serves the scrape bearer and the dashboard page
+        // alike. Readiness is meaningful data for the dashboard, so the
+        // container's answer proxies with a readiness status: the roll-up
+        // always answers 200 with a `ready` bit, which becomes the 503 the
+        // dashboard renders — while a 503 JSON answer (or any 200) proxies
+        // with its own status, and anything else is a 504 with a generic
+        // body. Container error text never crosses the boundary.
+        if (url.pathname === OPS_SUMMARY_PATH) {
+          await this.armKeepalive();
+          const fetchSignal = AbortSignal.timeout(SUMMARY_FETCH_TIMEOUT_MS);
+          const summaryUnavailable = (status: number) =>
+            new Response("summary unavailable\n", {
               status,
               headers: withSecurityHeaders({ "content-type": "text/plain", "cache-control": "no-store" }),
             });
           let upstream: Response;
           try {
-            upstream = await this.containerFetch("http://c/metrics", {
+            upstream = await this.containerFetch(`http://c${OPS_SUMMARY_PATH}`, {
               signal: fetchSignal,
             });
           } catch {
-            return metricsUnavailable(504);
+            return summaryUnavailable(504);
           }
-          if (fetchSignal.aborted || !upstream.ok) {
-            // Cancel without reading: a huge non-2xx body must not bypass
-            // the 64 KiB cap by being drained here.
+          if (fetchSignal.aborted || !isBotProbeResponse(upstream)) {
             await upstream.body?.cancel().catch(() => {});
-            return metricsUnavailable(504);
+            return summaryUnavailable(504);
           }
           let body: string | null;
           try {
-            body = await readBoundedText(upstream, MAX_METRICS_BODY_BYTES);
+            body = await readBoundedText(upstream, MAX_SUMMARY_BODY_BYTES);
           } catch {
-            return new Response("metrics unavailable\n", {
-              status: 504,
-              headers: withSecurityHeaders({ "content-type": "text/plain", "cache-control": "no-store" }),
-            });
+            return summaryUnavailable(504);
           }
           if (body === null) {
-            return new Response("metrics unavailable\n", {
-              status: 502,
-              headers: withSecurityHeaders({ "content-type": "text/plain", "cache-control": "no-store" }),
-            });
+            return summaryUnavailable(502);
+          }
+          let status = upstream.status;
+          if (status === 200) {
+            try {
+              const parsed: unknown = JSON.parse(body);
+              if (typeof parsed === "object" && parsed !== null && "ready" in parsed
+                && (parsed as { ready: unknown }).ready === false) {
+                status = 503;
+              }
+            } catch {
+              // Not JSON the roll-up never sends: proxy untouched rather
+              // than invent a failure the container did not report.
+            }
           }
           return new Response(body, {
-            status: upstream.status,
-            headers: withSecurityHeaders({ "content-type": "text/plain; version=0.0.4; charset=utf-8", "cache-control": "no-store" }),
+            status,
+            headers: withSecurityHeaders({ "content-type": "application/json", "cache-control": "no-store" }),
           });
+        }
+        if (url.pathname === OPS_GATEWAY_PATH || url.pathname === OPS_BACKFILL_PATH) {
+          await this.armKeepalive();
+          return this.proxyOpsBody(`http://c${url.pathname}`, OPS_JSON_CONTENT_TYPE, "ops unavailable\n");
         }
         // Bound the entire probe, including auto-start, below the 30s DO gate.
         const probe = new Request(request, { signal: AbortSignal.timeout(6000) });
@@ -560,6 +699,51 @@ export class TwoBotContainer extends Container<Env> {
         }
       });
     } catch (error) { return refused(error); }
+  }
+
+  /**
+   * Bounded proxy for the read-only ops surfaces (Prometheus exposition and
+   * the JSON roll-ups). The SDK resolves fetch failures (including the abort
+   * timeout) as a 500/503/429 Response, so a catch alone never fires. Treat
+   * an aborted signal or any non-2xx upstream as a 504 with a generic body,
+   * and drain the SDK error text instead of proxying it. `unavailableBody`
+   * is the only body a failure ever returns, so container error text cannot
+   * cross the boundary.
+   */
+  private async proxyOpsBody(containerUrl: string, contentType: string, unavailableBody: string): Promise<Response> {
+    const fetchSignal = AbortSignal.timeout(METRICS_FETCH_TIMEOUT_MS);
+    const unavailable = (status: number) =>
+      new Response(unavailableBody, {
+        status,
+        headers: withSecurityHeaders({ "content-type": "text/plain", "cache-control": "no-store" }),
+      });
+    let upstream: Response;
+    try {
+      upstream = await this.containerFetch(containerUrl, {
+        signal: fetchSignal,
+      });
+    } catch {
+      return unavailable(504);
+    }
+    if (fetchSignal.aborted || !upstream.ok) {
+      // Cancel without reading: a huge non-2xx body must not bypass
+      // the 64 KiB cap by being drained here.
+      await upstream.body?.cancel().catch(() => {});
+      return unavailable(504);
+    }
+    let body: string | null;
+    try {
+      body = await readBoundedText(upstream, MAX_METRICS_BODY_BYTES);
+    } catch {
+      return unavailable(504);
+    }
+    if (body === null) {
+      return unavailable(502);
+    }
+    return new Response(body, {
+      status: upstream.status,
+      headers: withSecurityHeaders({ "content-type": contentType, "cache-control": "no-store" }),
+    });
   }
 
   /**
@@ -673,6 +857,96 @@ export class TwoBotContainer extends Container<Env> {
         });
       });
     } catch (error) { return refused(error); }
+  }
+
+  /**
+   * Admin control surface (TOG-22862). Defense in depth: the Worker gate
+   * already authenticated and checked the write switches, but the DO
+   * re-checks both — the DO is the authority for stored state. All state
+   * transitions run inside the DO concurrency gate; enforcement in the Rust
+   * runtime lands after the CISO review (AC4).
+   */
+  private async opsControl(request: Request): Promise<Response> {
+    if (!await authenticated(request, this.env.OPS_CONTROL_TOKEN)) {
+      return new Response("unauthorized", { status: 401, headers: withSecurityHeaders() });
+    }
+    const url = new URL(request.url);
+    const isConfig = url.pathname === OPS_CONFIG_PATH;
+    const isKillswitch = url.pathname === OPS_KILLSWITCH_PATH;
+    const isAudit = url.pathname === OPS_AUDIT_PATH;
+    if (!isOpsPath(request, url.pathname)) {
+      return new Response("not found", { status: 404, headers: withSecurityHeaders() });
+    }
+    if (isConfig && request.method !== "GET" && request.method !== "PUT") {
+      return new Response("method not allowed", { status: 405, headers: withSecurityHeaders({ allow: "GET, PUT" }) });
+    }
+    if (isKillswitch && request.method !== "GET" && request.method !== "POST") {
+      return new Response("method not allowed", { status: 405, headers: withSecurityHeaders({ allow: "GET, POST" }) });
+    }
+    if (isAudit && request.method !== "GET") {
+      return new Response("method not allowed", { status: 405, headers: withSecurityHeaders({ allow: "GET" }) });
+    }
+    if (isConfig && request.method === "PUT" && !configWritesEnabled(this.env)) {
+      return new Response("not found", { status: 404, headers: withSecurityHeaders() });
+    }
+    if (isKillswitch && request.method === "POST" && !killswitchEnabled(this.env)) {
+      return new Response("not found", { status: 404, headers: withSecurityHeaders() });
+    }
+    let put: unknown = null;
+    if ((isConfig && request.method === "PUT") || (isKillswitch && request.method === "POST")) {
+      put = await readOpsBody(request);
+      if (put === null || put === undefined) {
+        return new Response("invalid ops change", { status: 400, headers: withSecurityHeaders() });
+      }
+    }
+    try {
+      return await this.gated(async () => {
+        const id = this.id();
+        if (request.headers.get(DEPLOYMENT_HEADER) !== id) throw new OwnershipRefused("deployment_mismatch");
+        const ops = new OpsControl(this.ctx.storage, this.env as unknown as Record<string, unknown>);
+        if (isConfig && request.method === "GET") {
+          const config = await ops.readConfig();
+          return Response.json({ deploymentId: id, ...config }, {
+            headers: withSecurityHeaders({ "cache-control": "no-store" }),
+          });
+        }
+        if (isConfig) {
+          const change = parseConfigPut(put);
+          if (!change) {
+            return new Response("invalid ops change", { status: 400, headers: withSecurityHeaders() });
+          }
+          const record = await ops.putConfig(change);
+          console.log(JSON.stringify({ event: "ops_config_put", epoch: record.epoch, actor: record.actor }));
+          return Response.json({ deploymentId: id, record, enforcement: OPS_ENFORCEMENT_PENDING }, {
+            headers: withSecurityHeaders({ "cache-control": "no-store" }),
+          });
+        }
+        if (isKillswitch && request.method === "GET") {
+          const record = await ops.readKillswitch();
+          return Response.json({ deploymentId: id, record, enforcement: OPS_ENFORCEMENT_PENDING }, {
+            headers: withSecurityHeaders({ "cache-control": "no-store" }),
+          });
+        }
+        if (isKillswitch) {
+          const change = parseKillswitchPost(put);
+          if (!change) {
+            return new Response("invalid ops change", { status: 400, headers: withSecurityHeaders() });
+          }
+          const record = await ops.postKillswitch(change);
+          console.log(JSON.stringify({ event: "ops_kill_switch", epoch: record.epoch, actor: record.actor }));
+          return Response.json({ deploymentId: id, record, enforcement: OPS_ENFORCEMENT_PENDING }, {
+            headers: withSecurityHeaders({ "cache-control": "no-store" }),
+          });
+        }
+        const rows = await ops.listAudit();
+        return Response.json({ deploymentId: id, rows }, {
+          headers: withSecurityHeaders({ "cache-control": "no-store" }),
+        });
+      });
+    } catch (error) {
+      if (error instanceof OwnershipRefused) return refused(error);
+      return opsRefused(error);
+    }
   }
 
   // SDK 0.3.7 containerFetch auto-starts via startAndWaitForPorts, NOT start.
@@ -1009,6 +1283,64 @@ export default {
       );
     }
 
+    // Bot HTTP MCP server (Streamable HTTP, read-only tools first). Exact
+    // path only: only POST is served (browser probes get 405, never tool
+    // execution). Unconfigured/short token → 404 (the route does not exist);
+    // missing/wrong bearer → 401 with WWW-Authenticate, before the Container
+    // is touched. Every tool call below is bounded (6 s / 64 KiB) in mcp.ts.
+    if (url.pathname === "/mcp") {
+      if (request.method !== "POST") {
+        return new Response("method not allowed", {
+          status: 405,
+          headers: withSecurityHeaders({ allow: "POST" }),
+        });
+      }
+      if (!env.MCP_TOKEN || env.MCP_TOKEN.length < MIN_SCRAPE_TOKEN_LENGTH) {
+        if (env.MCP_TOKEN && env.MCP_TOKEN.length < MIN_SCRAPE_TOKEN_LENGTH
+          && !mcpShortTokenLogged) {
+          mcpShortTokenLogged = true;
+          console.error(JSON.stringify({
+            event: "mcp_token_misconfigured",
+            reason: "token_below_minimum_length",
+            minimum_length: MIN_SCRAPE_TOKEN_LENGTH,
+          }));
+        }
+        return new Response("not found", { status: 404, headers: withSecurityHeaders() });
+      }
+      const caller = request.headers.get("cf-connecting-ip") ?? "unknown";
+      const verdict = mcpAuthBuckets.take(caller);
+      if (!verdict.allowed && !mcpAuthBuckets.peek(caller).allowed) {
+        return new Response("slow down\n", {
+          status: 429,
+          headers: withSecurityHeaders({
+            "content-type": "text/plain",
+            "retry-after": String(verdict.retryAfter),
+          }),
+        });
+      }
+      const m = /^Bearer (.+)$/.exec(request.headers.get("authorization") ?? "");
+      if (!m || m[1]!.length > 4096 || !(await tokenMatches(m[1]!, env.MCP_TOKEN))) {
+        return new Response("unauthorized", { status: 401, headers: withSecurityHeaders({ "www-authenticate": "Bearer" }) });
+      }
+      return handleMcp(request, env, {
+        BOT_PORT: env.BOT_PORT,
+        KEEPALIVE_SECONDS: env.KEEPALIVE_SECONDS,
+      });
+    }
+
+    // Admin control surface (TOG-22862). The gate authenticates, enforces the
+    // write switches and rate-caps guessing; the fenced DO owns state below.
+    // CONTROL_PATH keeps its own gate and shares nothing here.
+    if (url.pathname === OPS_CONFIG_PATH || url.pathname === OPS_KILLSWITCH_PATH || url.pathname === OPS_AUDIT_PATH) {
+      const gate = await gateOpsRequest(request, env);
+      if (gate) return gate;
+      try {
+        const forwarded = new Request(request);
+        forwarded.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
+        return await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(forwarded);
+      } catch (error) { return refused(error); }
+    }
+
     if (url.pathname === "/health" || url.pathname === "/readyz") {
       // Public probes carry no credentials, so only GET/HEAD are meaningful.
       // Anything else cannot be a scraper or load-balancer check: refuse it
@@ -1078,59 +1410,27 @@ export default {
       return result;
     }
 
-    // Authenticated off-container scrape path. No configured token (or one
-    // shorter than the 32-character floor — same bar as the ownership
-    // control token) → 404 (the route does not exist); missing/wrong
-    // bearer → 401, with per-caller throttling of attempts (429 +
-    // retry-after). Every attempt takes a token synchronously before the
-    // secret comparison, so concurrent guesses cannot share one token; a
-    // throttled caller is refused without any comparison, so guessing cannot
-    // confirm a bearer while exhausted. Buckets are per caller, so someone
-    // else's guessing cannot throttle a correct bearer — and a caller shed
-    // only because the caller table is full is still compared, so a scanner
-    // flood cannot lock out the authenticated scraper. Exact path only.
+    // Authenticated off-container scrape paths: /ops/metrics plus the
+    // scrape-only JSON roll-ups (/ops/gateway, /ops/backfill). /ops/summary
+    // has its own dual gate below (scrape bearer or dashboard pair), so it
+    // is matched there, not here. No configured token (or one shorter than
+    // the 32-character floor — same bar as the ownership control token) →
+    // 404 (the route does not exist); missing/wrong bearer → 401, with
+    // per-caller throttling of attempts (429 + retry-after). Every attempt
+    // takes a token synchronously before the secret comparison, so
+    // concurrent guesses cannot share one token; a throttled caller is
+    // refused without any comparison, so guessing cannot confirm a bearer
+    // while exhausted. Buckets are per caller, so someone else's guessing
+    // cannot throttle a correct bearer — and a caller shed only because the
+    // caller table is full is still compared, so a scanner flood cannot lock
+    // out the authenticated scraper. Exact paths only: unknown /ops/*
+    // subpaths fall through to the redirect lookup below.
     // CONTROL_PATH keeps its own gate (ownership.ts authenticated()): it
     // shares neither this bucket nor its budget.
-    if (url.pathname === OPS_METRICS_PATH) {
-      if (!env.METRICS_SCRAPE_TOKEN || env.METRICS_SCRAPE_TOKEN.length < MIN_SCRAPE_TOKEN_LENGTH
-        || request.method !== "GET") {
-        if (env.METRICS_SCRAPE_TOKEN && env.METRICS_SCRAPE_TOKEN.length < MIN_SCRAPE_TOKEN_LENGTH
-          && !metricsShortTokenLogged) {
-          metricsShortTokenLogged = true;
-          console.error(JSON.stringify({
-            event: "metrics_scrape_token_misconfigured",
-            reason: "token_below_minimum_length",
-            minimum_length: MIN_SCRAPE_TOKEN_LENGTH,
-          }));
-        }
-        return new Response("not found", { status: 404, headers: withSecurityHeaders() });
-      }
-      const caller = request.headers.get("cf-connecting-ip") ?? "unknown";
-      // Take budget synchronously before the secret comparison: no guess —
-      // right or wrong — is evaluated while throttled, and concurrent
-      // guesses each consume their own token instead of sharing one across
-      // the awaited digest comparison below. A correct bearer on a fresh
-      // budget is unaffected (one token of a 10-burst).
-      const verdict = metricsAuthBuckets.take(caller);
-      if (!verdict.allowed && !metricsAuthBuckets.peek(caller).allowed) {
-        // Tracked caller out of budget (or in terminal hold): refuse without
-        // any comparison, so guessing cannot confirm a bearer while
-        // exhausted. peek is synchronous, so this cannot race the take above.
-        // An untracked caller denied only because the caller table is full
-        // falls through to the comparison below instead, so a flood of
-        // one-time scanners can never lock out the authenticated scraper.
-        return new Response("slow down\n", {
-          status: 429,
-          headers: withSecurityHeaders({
-            "content-type": "text/plain",
-            "retry-after": String(verdict.retryAfter),
-          }),
-        });
-      }
-      const m = /^Bearer (.+)$/.exec(request.headers.get("authorization") ?? "");
-      if (!m || m[1]!.length > 4096 || !(await tokenMatches(m[1]!, env.METRICS_SCRAPE_TOKEN))) {
-        return new Response("unauthorized", { status: 401, headers: withSecurityHeaders({ "www-authenticate": "Bearer" }) });
-      }
+    if (url.pathname === OPS_METRICS_PATH
+      || url.pathname === OPS_GATEWAY_PATH || url.pathname === OPS_BACKFILL_PATH) {
+      const refusal = await opsReadRefusal(request, env);
+      if (refusal) return refusal;
       try {
         // The fenced DO route requires the deployment header (see fetch);
         // stamp it here like the health/readyz forward above.
@@ -1140,7 +1440,78 @@ export default {
       } catch (error) { return refused(error); }
     }
 
-    // Internal metrics and healthz aliases never become invite campaigns.
+    // Read-only ops dashboard (TOG-22861). The static page holds no data
+    // and is ungated so a browser can open it. The page serves static HTML
+    // (no container touch).
+    if (url.pathname === OPS_DASHBOARD_PATH) {
+      if (request.method !== "GET") {
+        return new Response("not found", { status: 404, headers: withSecurityHeaders() });
+      }
+      return dashboardPageResponse();
+    }
+    // Read-only ops summary (TOG-22860 + TOG-22861): the roll-up serves two
+    // operator audiences, so either credential opens it — the metrics scrape
+    // bearer or the dashboard service-token pair (Cloudflare Access service
+    // tokens: both CF-Access-Client-Id and CF-Access-Client-Secret on every
+    // summary request, strict mode — no cookies or sessions). The scrape
+    // gate is consulted first and its 429 is a hard fence, never bypassed
+    // via the other gate; a non-throttled scrape refusal falls through to
+    // the dashboard gate. Non-GET and doubly-unconfigured still 404 (the
+    // route does not exist); otherwise a failed attempt is 401 with the
+    // Bearer challenge. Each gate throttles on its own budget before any
+    // comparison, so guessing at one cannot throttle the other.
+    if (url.pathname === OPS_SUMMARY_PATH) {
+      if (request.method !== "GET") {
+        return new Response("not found", { status: 404, headers: withSecurityHeaders() });
+      }
+      const forwardSummary = async () => {
+        // The fenced DO route requires the deployment header (see fetch);
+        // stamp it here like the health/readyz forward above.
+        const forwarded = new Request(request);
+        forwarded.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
+        try {
+          return await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(forwarded);
+        } catch (error) { return refused(error); }
+      };
+      const scrapeConfigured = !!env.METRICS_SCRAPE_TOKEN
+        && env.METRICS_SCRAPE_TOKEN.length >= MIN_SCRAPE_TOKEN_LENGTH;
+      if (scrapeConfigured) {
+        const refusal = await opsReadRefusal(request, env);
+        if (refusal === null) return forwardSummary();
+        if (refusal.status === 429) return refusal;
+      }
+      const caller = request.headers.get("cf-connecting-ip") ?? "unknown";
+      const dashboardConfigured = !!env.OPS_DASHBOARD_CLIENT_ID
+        && env.OPS_DASHBOARD_CLIENT_ID.length >= MIN_DASHBOARD_CLIENT_ID_LENGTH
+        && !!env.OPS_DASHBOARD_CLIENT_SECRET
+        && env.OPS_DASHBOARD_CLIENT_SECRET.length >= MIN_DASHBOARD_SECRET_LENGTH;
+      if (dashboardConfigured) {
+        const verdict = dashboardAuthBuckets.take(caller);
+        if (!verdict.allowed && !dashboardAuthBuckets.peek(caller).allowed) {
+          return new Response("slow down\n", {
+            status: 429,
+            headers: withSecurityHeaders({
+              "content-type": "text/plain",
+              "retry-after": String(verdict.retryAfter),
+            }),
+          });
+        }
+        if ((await dashboardRefusal(request, env)) === null) return forwardSummary();
+      }
+      if (!scrapeConfigured && !dashboardConfigured) {
+        return new Response("not found", { status: 404, headers: withSecurityHeaders() });
+      }
+      return new Response("unauthorized", {
+        status: 401,
+        headers: withSecurityHeaders({ "www-authenticate": "Bearer" }),
+      });
+    }
+
+    // Internal metrics, ops roll-ups, dashboard routes and healthz aliases
+    // never become invite campaigns. /ops/metrics, the scrape JSON paths,
+    // /ops/dashboard and /ops/summary are exact-matched above, so only
+    // unknown /ops/* subpaths reach this lookup, where the slug allowlist
+    // rejects them.
     // The exact /healthz redirect probe is handled below after config validation.
     if (url.pathname !== "/healthz" && isReservedInternal(url.pathname)) {
       return new Response("not found", { status: 404, headers: withSecurityHeaders() });

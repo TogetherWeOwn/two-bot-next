@@ -82,6 +82,12 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // Same shape as guild_counters: one read-time per count, no updated_at.
     TableSpec { table: "counter_snapshots", measure: TableMeasure::Columns(&["human_member_count_at", "online_count_at"]) },
     TableSpec { table: "event_rsvps", measure: TableMeasure::Columns(&["responded_at"]) },
+    // Append-only event-store capture (0427 voice + 0428 presence + 0429 thread
+    // lifecycle + 0430 message/reaction + 0431 stage/interaction/audit + 0432
+    // member deltas): `event_time` is the gateway event time and `received_at`
+    // the capture time (same shape as events.recorded_at), both written once
+    // per row; the maximum across both is the row's last write.
+    TableSpec { table: "event_store", measure: TableMeasure::Columns(&["event_time", "received_at"]) },
     TableSpec { table: "events", measure: TableMeasure::Columns(&["recorded_at"]) },
     TableSpec { table: "feed_deliveries", measure: TableMeasure::Columns(&["first_seen_at"]) },
     TableSpec { table: "feed_relays", measure: TableMeasure::Columns(&["updated_at"]) },
@@ -95,6 +101,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "gateway_sessions", measure: TableMeasure::Columns(&["updated_at"]) },
     // Collector read-times ride the same row write, so their maximum is the
     // row's last write.
+    TableSpec { table: "guild_analytics_settings", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "guild_counters", measure: TableMeasure::Columns(&["human_member_count_at", "online_count_at"]) },
     TableSpec { table: "guild_settings", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "guild_settings_audit", measure: TableMeasure::Columns(&["at"]) },
@@ -169,6 +176,8 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "moderation_warnings", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec { table: "operational_audit_log", measure: TableMeasure::Columns(&["occurred_at"]) },
     TableSpec { table: "presence_probe", measure: TableMeasure::Columns(&["observed_at"]) },
+    TableSpec { table: "privacy_opt_out_audit", measure: TableMeasure::Columns(&["opted_out_at"]) },
+    TableSpec { table: "privacy_opt_outs", measure: TableMeasure::Columns(&["opted_out_at"]) },
     TableSpec {
         table: "rank_ladder",
         measure: TableMeasure::Unmeasurable("seed reference data with no timestamp column"),

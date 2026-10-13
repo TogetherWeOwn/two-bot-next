@@ -337,6 +337,38 @@
       "sha256": "9da078d3f29430320b79d2d82cfa6e4b1d2d557384a98d7dddca97783429d2dd",
       "justification": "RSVP check-in capacity count index: cover (guild_id, source) so record_checkin counts the occurrence without scanning the guild message history while holding the occurrence lock."
     },
+    "crates/cutover/migrations/0427_event_store_voice_capture.sql": {
+      "sha256": "7b96ea3478d398853a32690e248b3350944ef0267e90ca89a338ba9eb5c39397",
+      "justification": "Event-store S4 voice capture: create the append-only event_store table (or add its voice columns) with ids including nullable message_id for S1 coexistence, session, timestamps and enum mute/deaf/video/stream flags plus the shared UNIQUE dedup index; additive, backout drops the table."
+    },
+    "crates/cutover/migrations/0428_event_store_presence_capture.sql": {
+      "sha256": "5be88c0d2541613d571f30cdb1108c42e17532541f8bf6eb1f99181ad87b05ef",
+      "justification": "Append-only event_store for presence capture: nullable user_id for sibling slices, best-effort dedup key, ids/enums only with no free-text columns."
+    },
+    "crates/cutover/migrations/0429_event_store_thread_capture.sql": {
+      "sha256": "a24111554362c07b2dc188c86daa4c80ff8ddd5a5e60e2e8952bdd2997cde78d",
+      "justification": "Event-store S6 thread capture, comment-only refresh: header now points at the ALLOWED_COLUMNS union plus json/jsonb type fence (review round 2), no DDL change; same order-independent table plus thread_id, parent_id and archived/locked/invitable with nullable user_id, UNIQUE dedup_key, no free-text columns."
+    },
+    "crates/cutover/migrations/0430_event_store_message_capture.sql": {
+      "sha256": "36a256cdb57fa5acaedfa1a0fa72a5442ef1c6fc91e23b9c64d25e99e9176ddc",
+      "justification": "Event-store S5 message/reaction capture: order-independent event_store table plus emoji id/name reference columns for MESSAGE_UPDATE/DELETE/DELETE_BULK and MESSAGE_REACTION_ADD/REMOVE, idempotent on UNIQUE dedup_key, no message-body columns."
+    },
+    "crates/cutover/migrations/0431_event_store_stage_interaction_audit_capture.sql": {
+      "sha256": "2d3d4725f66f7bbccca06d34c5552227aebb977cedee1222ba2e3dd20ce2782d",
+      "justification": "Event-store S8 stage/interaction-observe/audit-log capture: order-independent event_store table plus stage_instance_id/privacy_level, interaction_id/interaction_type/application_id/command_id and audit_log_entry_id/action_type/actor_id/target_id columns with nullable user_id and DROP NOT NULL for S2/S4 order-independence, idempotent on UNIQUE dedup_key, no free-text columns."
+    },
+    "crates/cutover/migrations/0432_event_store_member_capture.sql": {
+      "sha256": "81e51abeda792b6e8dfa4ad714e744fcc09b96f9d857ca70bf4080ef8ce46faf",
+      "justification": "Event-store S2 member capture: order-independent event_store table plus premium_since, nick_changed flag and role-id columns for GUILD_MEMBER_ADD/REMOVE/UPDATE, idempotent on the shared UNIQUE dedup_key index, no free-text columns."
+    },
+    "crates/cutover/migrations/0433_privacy_opt_out.sql": {
+      "sha256": "c60803ccfb20a7748d43dc2630653950c894953cf8010347b4ad6f681b3197d0",
+      "justification": "Per-user opt-out suppression plus per-guild presence/activity/voice toggles plus one audit receipt row per purge; cutover chain copy, additive with IF NOT EXISTS."
+    },
+    "crates/store/migrations/0434_privacy_opt_out.sql": {
+      "sha256": "798f514afa6cc212a10aba9fb769ba56dd43a7dfcde31983a114421b81dabf7e",
+      "justification": "Per-user opt-out suppression plus per-guild presence/activity/voice toggles plus one audit receipt row per purge; store chain copy, additive with IF NOT EXISTS."
+    },
     "crates/cutover/migrations/0435_stream_live_claims.sql": {
       "sha256": "7c86e572d04c99700aaa152c347a7898ae3b39b4754211abf957896c5269fa09",
       "justification": "Durable Twitch go-live dedup ledger keyed by live_dedup_key: claim-before-post insert, release-on-failed-send delete, delivered rows stamped and kept as the restart-proof fence."

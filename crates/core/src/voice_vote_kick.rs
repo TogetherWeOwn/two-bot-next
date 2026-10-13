@@ -868,6 +868,25 @@ mod tests {
     }
 
     #[test]
+    fn evicted_terminal_id_may_start_a_fresh_vote() {
+        let facts = room(&[2, 3, 4, 9]);
+        let clock = Clock::new();
+        let mut core = VoteKickCore::new();
+        let reference = start(&mut core, facts, &clock);
+        let left = room(&[2, 3, 4]);
+        core.refresh(reference, left, &clock).unwrap();
+        // Past the horizon the terminal vote is evicted, so its ID starts a fresh Active vote.
+        clock.set(1_000 + VOTE_KICK_COOLDOWN_MS + 1);
+        let fresh = core.start(100, facts, 2, 9, &clock).unwrap();
+        assert_eq!(fresh.status, VoteKickStatus::Active);
+        assert_eq!(fresh.kick, None);
+        assert_eq!(core.drain_evicted(), vec![100]);
+        let update = core.refresh(reference, facts, &clock).unwrap();
+        assert_eq!(update.status, VoteKickStatus::Active);
+        assert_eq!(update.kick, None);
+    }
+
+    #[test]
     fn new_owner_or_original_creator_is_protected_before_a_pass() {
         let facts = room(&[2, 3, 4, 9]);
         for new_facts in [
