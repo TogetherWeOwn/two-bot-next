@@ -50,6 +50,10 @@ OPTIONAL_VARS = {"UNREADY_ALERT_FAILURES"}
 # environment, so it is denied there too; production must never carry it.
 INGRESS_VAR = "INTERNAL_ACTIONS_INGRESS"
 INGRESS_ENVS = {"staging"}
+# TOG-23364: the default-dark POST /hooks/twitch EventSub ingress exists in
+# staging only, under the same rule as the internal-actions ingress above.
+EVENTSUB_INGRESS_VAR = "EVENTSUB_INGRESS"
+EVENTSUB_INGRESS_ENVS = {"staging"}
 # Private-receiver config is Operator-set Worker secrets, never wrangler.toml.
 RECEIVER_CONFIG_PREFIX = "TWO_INTERNAL_"
 # Boot publication of the guild command registry is a full replacement of the
@@ -115,6 +119,13 @@ def _collect_errors(cfg: dict) -> list[str]:
             )
         if variables.get(INGRESS_VAR, "1") != "1":
             errors.append(f'{prefix}: {INGRESS_VAR} must be exactly "1" or absent')
+        if EVENTSUB_INGRESS_VAR in variables and env_name not in EVENTSUB_INGRESS_ENVS:
+            errors.append(
+                f"{prefix}: {EVENTSUB_INGRESS_VAR} is staging-only "
+                "(top-level vars are required in every env; production must never set it)"
+            )
+        if variables.get(EVENTSUB_INGRESS_VAR, "1") != "1":
+            errors.append(f'{prefix}: {EVENTSUB_INGRESS_VAR} must be exactly "1" or absent')
         if BOOT_PUBLISH_VAR in variables and env_name not in BOOT_PUBLISH_ENVS:
             errors.append(
                 f"{prefix}: {BOOT_PUBLISH_VAR} is staging-only "

@@ -106,6 +106,26 @@ class AlertBindingTests(unittest.TestCase):
                 config = BASE.replace('INTERNAL_ACTIONS_INGRESS = "1"', f"INTERNAL_ACTIONS_INGRESS = {value}")
                 self.assertTrue(any('must be exactly "1"' in e for e in self.check_config(config)))
 
+    def test_eventsub_ingress_is_staging_only_and_deployed_dark(self):
+        staging = BASE.split("[env.staging.vars]", 1)[1].split("\n[", 1)[0]
+        self.assertIn('EVENTSUB_INGRESS = "1"', staging)
+        self.assertEqual(self.check_config(BASE), [])
+        for section in ["vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(f"[{section}]", f'[{section}]\nEVENTSUB_INGRESS = "1"', 1)
+                errors = self.check_config(config)
+                self.assertTrue(any("EVENTSUB_INGRESS is staging-only" in e for e in errors), errors)
+        # Absent from staging is also fine: the route is simply dark.
+        self.assertEqual(
+            self.check_config(BASE.replace('EVENTSUB_INGRESS = "1"\n', "")), []
+        )
+
+    def test_eventsub_ingress_value_must_be_exactly_one(self):
+        for value in ['"0"', '"true"', '""', '"1 "', "1"]:
+            with self.subTest(value=value):
+                config = BASE.replace('EVENTSUB_INGRESS = "1"', f"EVENTSUB_INGRESS = {value}")
+                self.assertTrue(any('must be exactly "1"' in e for e in self.check_config(config)))
+
     def test_boot_publish_is_staging_only(self):
         staging = BASE.split("[env.staging.vars]", 1)[1].split("\n[", 1)[0]
         self.assertIn('TWO_COMMANDS_PUBLISH_ON_BOOT = "1"', staging)
