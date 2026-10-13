@@ -18,10 +18,10 @@ require `--force`. This confirmation is not authorization to target production.
 
 Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
 write **v6** (including durable voice-create reservations and the event store:
-voice capture plus presence capture plus member-capture deltas plus
-stage/interaction-observe/audit-log capture); the reader also accepts frozen
-**v3**, pre-reservation **v4** and pre-event-store **v5**. Other versions
-refuse.
+voice capture plus presence capture plus member-capture deltas plus thread
+lifecycle plus stage/interaction-observe/audit-log capture); the reader also
+accepts frozen **v3**, pre-reservation **v4** and pre-event-store **v5**.
+Other versions refuse.
 The manifest carries per-table `{name, columns, column_types, count}` taken
 inside one `REPEATABLE READ` transaction, the `events` high-water mark, the
 source's applied migrations and `sequenceMarks`: for every serial, identity and
@@ -64,8 +64,8 @@ tables, the member-moderation ledger, the self-role send receipts
 boot directives, the member-erasure audit, the internal clock high-water
 mark, the voice configuration tables, the accepted voice-room create history
 (`voice_create_reservations`) and the event store (voice capture plus presence
-capture plus member-capture deltas plus stage/interaction-observe/audit-log
-capture)
+capture plus member-capture deltas plus thread lifecycle plus
+stage/interaction-observe/audit-log capture)
 (`event_store`). `OPTIONAL_LEGACY_TABLES` is empty: the coverage
 test fails if a covered table is not migrated. A dump from a fresh Rust schema
 has 83 table entries. A missing current table refuses a dump/restore: migrate
@@ -77,12 +77,12 @@ restorable. A v4 archive written before any other table joined the inventory
 is refused at inspect ("manifest is missing tables"); take a fresh dump after
 upgrading. A v5 archive must declare every covered table except the event store
 (`V6_ADDED_TABLES`), so recovery points written before event-store capture
-(0427 voice, 0428 presence, 0431 stage/interaction/audit capture and 0432 member
-deltas) remain inspectable and restorable. V6 requires the full current inventory;
-an incomplete new archive refuses at inspection. Restoring a pre-reservation
-archive clears the destination's reservation table, as with other tables absent
-from an older version; restoring a pre-event-store archive clears the
-destination's event-store table the same way.
+(0427 voice, 0428 presence, 0429 thread lifecycle, 0431 stage/interaction/audit
+capture and 0432 member deltas) remain inspectable and restorable. V6 requires
+the full current inventory; an incomplete new archive refuses at inspection.
+Restoring a pre-reservation archive clears the destination's reservation table,
+as with other tables absent from an older version; restoring a pre-event-store
+archive clears the destination's event-store table the same way.
 An optional legacy table may be absent only when there are no archived rows for
 it. Nonempty legacy data without a matching target table refuses **before any
 truncate**, rather than silently discarding it.

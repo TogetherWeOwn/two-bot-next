@@ -17,7 +17,7 @@ BEGIN
       -- here plus three S8 rows per member below (actor-only / target-only /
       -- user-only), so the erasure suites expect four event_store rows per
       -- member. Voice columns stay NULL here; the backup seed covers the S4
-      -- voice shape.
+      -- voice and S6 thread shapes.
       INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key,
         presence_status, activity_type, application_id, nick_changed, roles)
         VALUES ('PRESENCE_UPDATE', g, u, '2026-10-01T00:00:00Z',
@@ -152,9 +152,12 @@ BEGIN
       INSERT INTO voice_vote_kick_audit
         (guild_id, vote_id, event, room_id, initiator_id, target_id, outcome, occurred_at)
         VALUES (g, 'vk-' || k, 'vote_started', 'v-' || k, u, u, 'started', '2026-10-01T00:00:00Z');
-      -- Three event_store rows per member, each binding the member in exactly
+      -- Three S8 event_store rows per member, each binding the member in exactly
       -- one of actor_id, target_id and user_id (the others NULL) with distinct
-      -- dedup_keys, so each erasure predicate branch is exercised independently.
+      -- dedup_keys, so each erasure predicate branch is exercised
+      -- independently; with the presence row above that is four rows per
+      -- member. The THREAD_MEMBER_UPDATE shape stays covered by the backup
+      -- seed, so no thread row is added here.
       INSERT INTO event_store
         (event_type, guild_id, stage_instance_id, privacy_level, interaction_id,
          interaction_type, application_id, command_id, audit_log_entry_id, action_type,

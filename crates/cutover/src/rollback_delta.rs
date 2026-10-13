@@ -82,10 +82,10 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // Same shape as guild_counters: one read-time per count, no updated_at.
     TableSpec { table: "counter_snapshots", measure: TableMeasure::Columns(&["human_member_count_at", "online_count_at"]) },
     TableSpec { table: "event_rsvps", measure: TableMeasure::Columns(&["responded_at"]) },
-    // Append-only event-store capture (0427 voice + 0428 presence + 0431
-    // stage/interaction/audit + 0432 member deltas): `event_time` is the event
-    // time and `received_at` the capture time, both written once per row; the
-    // maximum across both is the row's last write.
+    // Append-only event-store capture (0427 voice + 0428 presence + 0429 thread
+    // lifecycle + 0431 stage/interaction/audit + 0432 member deltas):
+    // `event_time` is the event time and `received_at` the capture time, both
+    // written once per row; the maximum across both is the row's last write.
     TableSpec { table: "event_store", measure: TableMeasure::Columns(&["event_time", "received_at"]) },
     TableSpec { table: "events", measure: TableMeasure::Columns(&["recorded_at"]) },
     TableSpec { table: "feed_deliveries", measure: TableMeasure::Columns(&["first_seen_at"]) },
