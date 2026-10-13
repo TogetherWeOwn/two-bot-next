@@ -83,6 +83,14 @@ pub struct RetentionReport {
     pub guild_rows_purged: u64,
     /// User-deletion requests completed by this run.
     pub deletions_completed: u64,
+    /// Pending deletion requests refused by a replay guard in this run,
+    /// staying pending with no receipt. A stuck fence can keep a request
+    /// here beyond the deletion SLA; see `deletions_overdue`.
+    pub deletions_deferred: u64,
+    /// Pending deletion requests older than [`DELETION_SLA_HOURS`], whether
+    /// deferred or not. A nonzero value is the signal that the under-72-hour
+    /// wording does not hold for every request.
+    pub deletions_overdue: u64,
     /// Wall-clock run time.
     pub duration_ms: u64,
 }
@@ -90,7 +98,8 @@ pub struct RetentionReport {
 impl RetentionReport {
     /// Rows deleted across the time-window and guild-purge classes.
     /// Completed user deletions are receipts, not row counts, and are
-    /// reported separately in `deletions_completed`.
+    /// reported separately in `deletions_completed`; deferred and overdue
+    /// requests are pending-work signals, not deletions, and are excluded.
     #[must_use]
     pub fn total_deleted(&self) -> u64 {
         self.presence_raw_deleted
@@ -138,10 +147,14 @@ fn next_request_id() -> String {
 /// nothing. Deletion and queue writes happen in ONE transaction with the
 /// same lock/timeout discipline as `erase_member`; each pending deletion
 /// runs in its own savepoint so one guard refusal leaves that request
-/// pending without rolling back the time-window deletes. Pending deletions
-/// drain before guild purges so a departed guild's pending receipts complete
-/// against pre-purge rows, and purges leave the deletion ledger to the
-/// receipt path.
+/// pending without rolling back the time-window deletes, and each guild
+/// purge runs in its own savepoint so one bad guild stays queued without
+/// rolling back the rest of the run. Pending deletions drain before guild
+/// purges so a departed guild's pending receipts complete against pre-purge
+/// rows, and purges leave the deletion ledger to the receipt path.
+/// Guard-refused requests are counted in `deletions_deferred` (and logged at
+/// warn level) and SLA-breaching pendings in `deletions_overdue`, in both
+/// modes.
 pub async fn run_retention(
     pool: &PgPool,
     mode: RetentionMode,
@@ -162,6 +175,20 @@ pub async fn run_retention(
             )
             .fetch_one(&mut *tx)
             .await?;
+            let overdue = count_overdue_deletions(&mut tx).await?;
+            let pendings: Vec<(String, String)> = sqlx::query_as(
+                "SELECT guild_id, user_id FROM retention_deletion_requests WHERE status = 'pending'",
+            )
+            .fetch_all(&mut *tx)
+            .await?;
+            let mut deferred = 0u64;
+            for (guild_id, user_id) in &pendings {
+                if crate::member_erasure::has_unresolved_guards(&mut *tx, guild_id, user_id)
+                    .await?
+                {
+                    deferred += 1;
+                }
+            }
             tx.commit().await?;
             RetentionReport {
                 presence_raw_deleted: presence,
@@ -169,6 +196,8 @@ pub async fn run_retention(
                 audit_cache_deleted: audit,
                 guild_rows_purged: guild_rows,
                 deletions_completed: pending as u64,
+                deletions_deferred: deferred,
+                deletions_overdue: overdue,
                 duration_ms: started.elapsed().as_millis() as u64,
             }
         }
@@ -221,6 +250,7 @@ pub async fn run_retention(
             .execute(&mut *tx)
             .await?
             .rows_affected();
+            let overdue = count_overdue_deletions(&mut tx).await?;
             // Pending deletions drain BEFORE guild purges so a departed
             // guild's pending receipts complete against pre-purge rows.
             // Each request runs in its own savepoint: a guard refusal rolls
@@ -232,6 +262,8 @@ pub async fn run_retention(
             .fetch_all(&mut *tx)
             .await?;
             let mut completed = 0u64;
+            let mut deferred = 0u64;
+            let mut deferred_ids: Vec<String> = Vec::new();
             for (request_id, guild_id, user_id) in &pendings {
                 sqlx::query("SAVEPOINT retention_pending")
                     .execute(&mut *tx)
@@ -250,9 +282,19 @@ pub async fn run_retention(
                         sqlx::query("RELEASE SAVEPOINT retention_pending")
                             .execute(&mut *tx)
                             .await?;
+                        deferred += 1;
+                        deferred_ids.push(request_id.clone());
                     }
                     Err(err) => return Err(err),
                 }
+            }
+            if !deferred_ids.is_empty() {
+                tracing::warn!(
+                    deferred = deferred,
+                    overdue = overdue,
+                    requests = ?deferred_ids,
+                    "retention user deletions deferred by unresolved replay guard"
+                );
             }
             let guilds: Vec<String> =
                 sqlx::query_scalar("SELECT guild_id FROM retention_guild_purge_queue")
@@ -260,7 +302,30 @@ pub async fn run_retention(
                     .await?;
             let mut guild_rows = 0u64;
             for guild in &guilds {
-                guild_rows += purge_guild(&mut tx, guild).await?;
+                sqlx::query("SAVEPOINT retention_guild")
+                    .execute(&mut *tx)
+                    .await?;
+                match purge_guild(&mut tx, guild).await {
+                    Ok(rows) => {
+                        sqlx::query("RELEASE SAVEPOINT retention_guild")
+                            .execute(&mut *tx)
+                            .await?;
+                        guild_rows += rows;
+                    }
+                    Err(err) => {
+                        sqlx::query("ROLLBACK TO SAVEPOINT retention_guild")
+                            .execute(&mut *tx)
+                            .await?;
+                        sqlx::query("RELEASE SAVEPOINT retention_guild")
+                            .execute(&mut *tx)
+                            .await?;
+                        tracing::warn!(
+                            guild_id = %guild,
+                            error = %format!("{err:?}"),
+                            "retention guild purge failed, kept queued"
+                        );
+                    }
+                }
             }
             tx.commit().await?;
             RetentionReport {
@@ -269,6 +334,8 @@ pub async fn run_retention(
                 audit_cache_deleted: audit,
                 guild_rows_purged: guild_rows,
                 deletions_completed: completed,
+                deletions_deferred: deferred,
+                deletions_overdue: overdue,
                 duration_ms: started.elapsed().as_millis() as u64,
             }
         }
@@ -334,9 +401,12 @@ pub async fn request_user_deletion(
 }
 
 /// Fulfil one queued deletion request and return its receipt. Completion is
-/// immediate, so the under-72-hour SLA holds by construction. Shares
-/// `erase_member`'s locks and replay-guard refusal via `complete_request`:
-/// a refused request returns an error with no receipt and stays pending.
+/// immediate unless a replay guard is unresolved, in which case the request
+/// stays pending with no receipt and is reported as deferred by
+/// [`run_retention`]; the under-72-hour SLA holds for unguarded requests.
+/// Shares `erase_member`'s locks and replay-guard refusal via
+/// `complete_request`: a refused request returns an error with no receipt
+/// and stays pending.
 pub async fn fulfill_user_deletion(
     pool: &PgPool,
     request_id: &str,
@@ -468,8 +538,9 @@ async fn complete_request(
 }
 
 /// Guild-scoped delete for one erasure-plan table: child tables without
-/// their own `guild_id` purge via their parent's guild scope. Table names
-/// come from the reviewed embedded plan, never caller input.
+/// their own `guild_id` purge via their parent's guild scope, and the
+/// operator-released replay fence is never selected. Table names come from
+/// the reviewed embedded plan, never caller input.
 fn guild_purge_sql(table: &str) -> String {
     match table {
         "lfg_signups" | "lfg_roles" => format!(
@@ -477,6 +548,22 @@ fn guild_purge_sql(table: &str) -> String {
         ),
         "feed_deliveries" => {
             "DELETE FROM feed_deliveries WHERE feed_id IN (SELECT id FROM feed_relays WHERE guild_id = $1)"
+                .to_owned()
+        }
+        "self_role_exchanges" => {
+            "DELETE FROM self_role_exchanges WHERE event_id IN (SELECT event_id FROM self_role_audit WHERE guild_id = $1)"
+                .to_owned()
+        }
+        // Keep the operator-released replay fence: only executions whose
+        // parent idempotency row is itself purged go here.
+        "moderation_channel_executions" => {
+            "DELETE FROM moderation_channel_executions WHERE guild_id = $1 AND idempotency_key IN (SELECT idempotency_key FROM moderation_idempotency WHERE guild_id = $1 AND (state IS DISTINCT FROM 'done' OR outcome IS DISTINCT FROM 'operator_released'))"
+                .to_owned()
+        }
+        // Mirrors the erasure-plan predicate: done/operator_released rows are
+        // an indefinite replay fence and are never selected.
+        "moderation_idempotency" => {
+            "DELETE FROM moderation_idempotency WHERE guild_id = $1 AND (state IS DISTINCT FROM 'done' OR outcome IS DISTINCT FROM 'operator_released')"
                 .to_owned()
         }
         _ => format!("DELETE FROM {table} WHERE guild_id = $1"),
@@ -493,8 +580,34 @@ fn guild_purge_count_sql(table: &str) -> String {
             "SELECT count(*) FROM feed_deliveries WHERE feed_id IN (SELECT id FROM feed_relays WHERE guild_id = $1)"
                 .to_owned()
         }
+        "self_role_exchanges" => {
+            "SELECT count(*) FROM self_role_exchanges WHERE event_id IN (SELECT event_id FROM self_role_audit WHERE guild_id = $1)"
+                .to_owned()
+        }
+        "moderation_channel_executions" => {
+            "SELECT count(*) FROM moderation_channel_executions WHERE guild_id = $1 AND idempotency_key IN (SELECT idempotency_key FROM moderation_idempotency WHERE guild_id = $1 AND (state IS DISTINCT FROM 'done' OR outcome IS DISTINCT FROM 'operator_released'))"
+                .to_owned()
+        }
+        "moderation_idempotency" => {
+            "SELECT count(*) FROM moderation_idempotency WHERE guild_id = $1 AND (state IS DISTINCT FROM 'done' OR outcome IS DISTINCT FROM 'operator_released')"
+                .to_owned()
+        }
         _ => format!("SELECT count(*) FROM {table} WHERE guild_id = $1"),
     }
+}
+
+/// Pending deletion requests older than [`DELETION_SLA_HOURS`]: the overdue
+/// signal for both run modes. Uses the same clock as the request ledger.
+async fn count_overdue_deletions(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<u64, sqlx::Error> {
+    let overdue: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM retention_deletion_requests WHERE status = 'pending' AND requested_at < now() - make_interval(hours => $1::int)",
+    )
+    .bind(DELETION_SLA_HOURS)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(overdue as u64)
 }
 
 /// Purge one departed guild's rows and dequeue it, returning rows purged.

@@ -163,7 +163,10 @@ answer, open the live page and quote what it says that day.
 The retention module (`two-bot-cutover::retention`, migration `0435`)
 implements the rolling windows when invoked: raw presence/voice rows roll off
 at 30 days, the audit-log cache expires at 45 days, and user deletion requests
-complete in under 72 hours with a receipt. Long-term aggregates (counts,
+complete in under 72 hours with a receipt unless a replay guard is unresolved,
+in which case the request stays pending with no receipt and is reported as
+deferred (with overdue requests older than 72 hours counted separately).
+Long-term aggregates (counts,
 streaks) are never time-purged, and a departed guild's rows go only through
 the guild-purge queue keyed on a true guild removal (a rejoin cancels the
 queued purge). No scheduler, CLI, or gateway hook calls the job yet, and no
