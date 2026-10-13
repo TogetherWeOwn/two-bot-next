@@ -529,7 +529,7 @@ mod tests {
             "fixture-header-secret",
             "fixture-encoded-token",
         ];
-        let cases: [(&str, StatusCode); 14] = [
+        let cases: [(&str, StatusCode); 15] = [
             (
                 "/readyz?token=fixture-query-secret",
                 StatusCode::SERVICE_UNAVAILABLE,

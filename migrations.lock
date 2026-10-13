@@ -348,6 +348,10 @@
     "crates/cutover/migrations/0428_backfill_cursors.sql": {
       "sha256": "5b11e04544f2d6c2f474cac874ab80e58305d3ee380c588b6bb967055ccc139f",
       "justification": "TOG-22953: cutover-chain mirror of store 0408 backfill_cursors; same shape, IF NOT EXISTS, so the /ops/backfill route and worker cursors work on migrated databases."
+    },
+    "crates/cutover/migrations/0432_event_store_member_capture.sql": {
+      "sha256": "81e51abeda792b6e8dfa4ad714e744fcc09b96f9d857ca70bf4080ef8ce46faf",
+      "justification": "Event-store S2 member capture: order-independent event_store table plus premium_since, nick_changed flag and role-id columns for GUILD_MEMBER_ADD/REMOVE/UPDATE, idempotent on the shared UNIQUE dedup_key index, no free-text columns."
     }
   }
 }
