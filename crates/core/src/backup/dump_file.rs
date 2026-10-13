@@ -188,6 +188,17 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     // and silently break rollback coverage.
     "rollback_journal",
     "rollback_watermarks",
+    // Resumable Discord backfill progress (store 0408/0409, cutover 0433
+    // mirror): per-family pagination cursors plus channel-history metadata
+    // catch-up. Rows are re-capturable from the Discord API on the next worker
+    // run (the cutover ledger marks 0408/0433 re-runnable: drop and
+    // re-checkpoint). Never replay a pre-restore cursor into a recovered
+    // process: a restored cursor could mark post-backup messages as already
+    // backfilled and silently skip them, the same watermark hazard as
+    // rollback_watermarks above.
+    "backfill_cursors",
+    "backfill_history_messages",
+    "backfill_history_counts",
     // Migration ledgers describe target DDL; replacing them would falsely mark
     // unapplied migrations as applied. Legacy schema_migrations is diagnostic
     // manifest metadata only, never restored application data. The store
