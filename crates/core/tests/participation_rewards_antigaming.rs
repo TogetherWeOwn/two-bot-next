@@ -272,10 +272,6 @@ fn coverage_for_week(week_start: &str, week_end: &str) -> Vec<StreamCoverage> {
         .collect()
 }
 
-fn full_coverage() -> Vec<StreamCoverage> {
-    coverage_for_week(WEEK_START, WEEK_END)
-}
-
 fn fact(
     id: i64,
     event_type: &str,
@@ -320,10 +316,6 @@ fn scorecard_inputs_for_week(
         existing_revision_count: 0,
         existing_scorecard_json: None,
     }
-}
-
-fn scorecard_inputs(facts: Vec<FactRow>) -> ScorecardInputs {
-    scorecard_inputs_for_week(facts, WEEK_START, WEEK_END, GENERATED_AT)
 }
 
 fn build_json_for_week(
