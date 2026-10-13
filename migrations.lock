@@ -360,6 +360,10 @@
     "crates/cutover/migrations/0433_backfill_cursors.sql": {
       "sha256": "e75760083876c93b1c0e75d64c4f548685b6da9cc590bf9d5bd975cae035bb8a",
       "justification": "TOG-22953: cutover-chain mirror of store 0408 backfill_cursors; same shape, IF NOT EXISTS, so the /ops/backfill route and worker cursors work on migrated databases."
+    },
+    "crates/cutover/migrations/0434_member_catchup.sql": {
+      "sha256": "10cd6d7ac5143667b2b2af5ad1d29962f1bed26034c2eb4271dd9ba84768da5f",
+      "justification": "TOG-22941 member-list catch-up worker tables (member_catchup_members/cursors) plus the members-frontier checkpoint contract with backfill_cursors; ids/timestamps/enums only, IF NOT EXISTS, so catch-up writes work on migrated databases and progress reflects the worker."
     }
   }
 }

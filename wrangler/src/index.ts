@@ -299,7 +299,12 @@ const OPS_METRICS_PATH = "/ops/metrics";
 const OPS_SUMMARY_PATH = "/ops/summary";
 const OPS_GATEWAY_PATH = "/ops/gateway";
 const OPS_BACKFILL_PATH = "/ops/backfill";
-const OPS_JSON_PATHS: string[] = [OPS_SUMMARY_PATH, OPS_GATEWAY_PATH, OPS_BACKFILL_PATH];
+// Signed backfill-progress read (TOG-22953, slice 8 of TOG-22852): the
+// container owns the x-two-* HMAC, so this path never takes the scrape
+// bearer — the Worker forwards it with headers unchanged (see the gate
+// below) and the DO proxies it like the other JSON roll-ups.
+const OPS_BACKFILL_PROGRESS_PATH = "/ops/backfill/progress";
+const OPS_JSON_PATHS: string[] = [OPS_SUMMARY_PATH, OPS_GATEWAY_PATH, OPS_BACKFILL_PATH, OPS_BACKFILL_PROGRESS_PATH];
 const OPS_METRICS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8";
 const OPS_JSON_CONTENT_TYPE = "application/json";
 // The scrape token follows the ownership control token's floor: anything
@@ -662,7 +667,8 @@ export class TwoBotContainer extends Container<Env> {
             headers: withSecurityHeaders({ "content-type": "application/json", "cache-control": "no-store" }),
           });
         }
-        if (url.pathname === OPS_GATEWAY_PATH || url.pathname === OPS_BACKFILL_PATH) {
+        if (url.pathname === OPS_GATEWAY_PATH || url.pathname === OPS_BACKFILL_PATH
+          || url.pathname === OPS_BACKFILL_PROGRESS_PATH) {
           await this.armKeepalive();
           return this.proxyOpsBody(`http://c${url.pathname}`, OPS_JSON_CONTENT_TYPE, "ops unavailable\n");
         }
@@ -1341,6 +1347,19 @@ export default {
       // Harden the Worker-owned edge copy; body and status pass through.
       applySecurityHeaders(result.headers);
       return result;
+    }
+
+    // Signed backfill-progress read (TOG-22953): the container owns the
+    // x-two-* HMAC, so there is no scrape-bearer gate here — the Worker only
+    // stamps the deployment fence id and forwards the request unchanged
+    // (method, x-two-* headers, body). Exact path only: unknown /ops/*
+    // subpaths still fall through to the redirect lookup below.
+    if (url.pathname === OPS_BACKFILL_PROGRESS_PATH) {
+      try {
+        const forwarded = new Request(request);
+        forwarded.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));
+        return await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(forwarded);
+      } catch (error) { return refused(error); }
     }
 
     // Authenticated off-container scrape paths: /ops/metrics plus the

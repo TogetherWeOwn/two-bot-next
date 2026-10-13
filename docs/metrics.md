@@ -386,6 +386,13 @@ Bearer challenge. The DO proxies the roll-ups with the same 6 s deadline and
 the summary requires removing both `METRICS_SCRAPE_TOKEN` and the dashboard
 pair; removing only one leaves the other credential open.
 
+`GET /ops/backfill/progress` (TOG-22953, per-family progress/ETA) is forwarded
+exact-path too, but it is never scrape-gated: the container owns its `x-two-*`
+HMAC (same ring as the internal-action receiver, path-bound), so the Worker
+stamps only the deployment fence id and passes method, headers and body
+through unchanged. Auth failures are the route's indistinguishable 401; see
+`crates/bot/src/ops_backfill.rs` for the contract.
+
 - `GET /ops/summary`: readiness (`ready`, `components`), gateway state and
   failure, the informational `jobs` map, pool gauges (`size`/`idle`/`max`),
   event-store lag (`restorable_point`, `max_lag`: the largest per-table lag)

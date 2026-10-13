@@ -133,7 +133,8 @@ pub async fn apply_member_page(
              ON CONFLICT (guild_id, member_id) DO UPDATE SET
                joined_at = EXCLUDED.joined_at,
                pending = EXCLUDED.pending,
-               is_bot = EXCLUDED.is_bot",
+               is_bot = EXCLUDED.is_bot,
+               updated_at = now()",
         )
         .bind(guild_id)
         .bind(&row.member_id)
@@ -150,7 +151,16 @@ pub async fn apply_member_page(
     })
 }
 
-/// Persist the resume cursor (the last proven `after`, never zero).
+/// Persist the resume cursor (the last proven `after`, never zero) and
+/// checkpoint the members frontier where the progress route reads it.
+///
+/// The per-guild cursor above is the worker's resume state; `GET
+/// /ops/backfill/progress` reads only `backfill_cursors`, so this also
+/// upserts the `members` family there (same SQL shape as
+/// `two_bot_store::backfill_cursors::put_backfill_cursor`, inlined so this
+/// crate keeps no store dependency). An empty or zero `after` is refused by
+/// the tables' CHECKs and surfaces as a database error, never a persisted
+/// zero restart.
 pub async fn store_member_cursor(
     pool: &sqlx::PgPool,
     guild_id: &str,
@@ -164,6 +174,15 @@ pub async fn store_member_cursor(
            updated_at = now()",
     )
     .bind(guild_id)
+    .bind(after)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO backfill_cursors (family, cursor, updated_at)
+         VALUES ('members', $1, now())
+         ON CONFLICT (family) DO UPDATE
+           SET cursor = excluded.cursor, updated_at = now()",
+    )
     .bind(after)
     .execute(pool)
     .await?;

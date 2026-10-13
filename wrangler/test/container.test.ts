@@ -1118,7 +1118,7 @@ test("Worker and DO private scrape preserve the bounded REST guard fixture", asy
   assert.equal(upstream.mock.callCount(), 1);
 });
 
-for (const path of ["/ops/summary", "/ops/gateway", "/ops/backfill"]) {
+for (const path of ["/ops/summary", "/ops/gateway", "/ops/backfill", "/ops/backfill/progress"]) {
   test(`DO ${path}: small JSON body proxies with the JSON content type`, async (t) => {
     const h = await harness(t);
     t.mock.method(h.bot, "containerFetch", async () => new Response('{"ready":true}\n', { status: 200 }));
@@ -1229,6 +1229,49 @@ test("Worker gates the ops JSON roll-ups behind the scrape bearer, before the re
   assert.equal(unknown.status, 404);
   assert.equal(unknown.headers.get("location"), null);
   assert.equal(upstream.mock.callCount(), before);
+});
+
+test("Worker forwards /ops/backfill/progress with x-two-* headers and no scrape bearer", async () => {
+  // The signed progress read is container-authenticated (x-two-* HMAC), so
+  // unlike the scrape-gated roll-ups it forwards with no bearer and no
+  // configured token — and the signing headers must arrive unchanged.
+  const seen: Request[] = [];
+  const env = {
+    ...WORKER_ENV,
+    CF_VERSION_METADATA: { id: ID },
+    REDIRECT_FALLBACK_CODE: "synthetic0",
+    REDIRECT_MAPPINGS_JSON: "[]",
+    TWO_BOT: {
+      getByName: () => ({
+        fetch: async (r: Request) => {
+          seen.push(r);
+          return new Response('{"ok":true}\n', {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        },
+      }),
+    },
+  } as unknown as Env;
+  const ctx = { waitUntil: () => {} } as ExecutionContext;
+  const response = await worker.fetch(new Request("https://worker.invalid/ops/backfill/progress", {
+    headers: {
+      "cf-connecting-ip": "10.99.7.1",
+      "x-two-key-id": "synthetic-progress-key",
+      "x-two-timestamp": "1700000000",
+      "x-two-nonce": "synthetic-nonce-0123456789abcdef",
+      "x-two-signature": "sha256=synthetic-progress-signature",
+    },
+  }), env, ctx);
+  assert.equal(response.status, 200);
+  assert.equal(seen.length, 1);
+  const forwarded = seen[0]!;
+  assert.equal(new URL(forwarded.url).pathname, "/ops/backfill/progress");
+  assert.equal(forwarded.headers.get("x-two-key-id"), "synthetic-progress-key");
+  assert.equal(forwarded.headers.get("x-two-timestamp"), "1700000000");
+  assert.equal(forwarded.headers.get("x-two-nonce"), "synthetic-nonce-0123456789abcdef");
+  assert.equal(forwarded.headers.get("x-two-signature"), "sha256=synthetic-progress-signature");
+  assert.equal(forwarded.headers.get(DEPLOYMENT_HEADER), ID);
 });
 
 // Readiness monitoring uses synthetic responses only. Global fetch is stubbed

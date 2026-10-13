@@ -5,6 +5,11 @@
 //! route on the health/metrics listener (never the internal-action receiver),
 //! rendering JSON like `/readyz` instead of Prometheus text.
 //!
+//! Edge ingress: the Worker forwards this exact path to the container with
+//! the `x-two-*` headers passed through unchanged (the container owns the
+//! HMAC; the scrape bearer never applies here), so operators reach it at the
+//! same `/ops/backfill/progress` path they pin in tests.
+//!
 //! ## Contract (pinned by `crates/bot/tests/ops_backfill.rs`)
 //!
 //! * `GET /ops/backfill/progress` with a `{"families": {...}}` body: one entry per
@@ -744,5 +749,91 @@ mod tests {
                 "free-text content {text:?} must never be exposed"
             );
         }
+    }
+
+    /// Paperclip Review #927: the configured-database branch is pinned by a
+    /// real Postgres. Seeds one family and checks its cursor/updated_at come
+    /// back verbatim while untouched families stay null. Every other test
+    /// runs database-None and only exercises the empty baseline.
+    #[tokio::test]
+    #[ignore = "requires guarded agent-testdb; CI runs explicitly"]
+    async fn configured_database_reports_seeded_family_frontier() {
+        let url =
+            std::env::var("TWO_TEST_DATABASE_URL").expect("explicit guarded test URL required");
+        let db = two_bot_testsupport::TestDatabase::create(
+            &url,
+            &sqlx::migrate!("../cutover/migrations"),
+        )
+        .await
+        .expect("create guarded test fixture");
+        sqlx::query(
+            "INSERT INTO backfill_cursors (family, cursor)
+             VALUES ('members', '222222222222222222')",
+        )
+        .execute(db.pool())
+        .await
+        .expect("seed members frontier");
+        let app = Router::new().merge(router()).with_state((
+            crate::server::SharedState::new(
+                Arc::new(AsyncRwLock::new(GatewayState::Unconfigured)),
+                Some(db.pool().clone()),
+            )
+            .with_backfill_ring(test_ring()),
+            crate::jobs::statuses(&[], true),
+        ));
+        let (status, body) = get(&app, signed_headers(&fixture_secret())).await;
+        assert_eq!(status, StatusCode::OK);
+        let families = body["families"].as_object().expect("families map");
+        assert_eq!(families["members"]["cursor"], "222222222222222222");
+        assert!(
+            families["members"]["updated_at"].as_i64().unwrap_or(0) > 0,
+            "seeded frontier must carry its write instant"
+        );
+        assert!(
+            families["audit"]["cursor"].is_null(),
+            "untouched families stay null"
+        );
+    }
+
+    /// Paperclip Review #927: a configured-but-unreadable database is a 503
+    /// with no-store, never a zeroed 200. The lazy pool points at a refused
+    /// loopback port, so the first query fails at once and no database is
+    /// needed.
+    #[tokio::test]
+    async fn unreadable_database_is_503_never_zeroed_200() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://127.0.0.1:1/unreadable")
+            .expect("lazy pool");
+        let app = Router::new().merge(router()).with_state((
+            crate::server::SharedState::new(
+                Arc::new(AsyncRwLock::new(GatewayState::Unconfigured)),
+                Some(pool),
+            )
+            .with_backfill_ring(test_ring()),
+            crate::jobs::statuses(&[], true),
+        ));
+        let mut request = Request::builder().uri(BACKFILL_PATH).method("GET");
+        for (name, value) in &signed_headers(&fixture_secret()) {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).expect("test request"))
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .map(|v| v.to_str().unwrap_or("")),
+            Some("no-store"),
+            "the 503 must not be cached"
+        );
+        let body = to_bytes(response.into_body(), 65_536).await.expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["error"]["code"], "unavailable");
     }
 }

@@ -263,8 +263,11 @@ async fn every_member_request_passes_through_the_rate_limit_client() {
 
 // ── Disposable-DB fixtures (agent-testdb only) ──────────────────────────
 // Isolated schema per test, fixed table names the catch-up module owns:
-// `member_catchup_members` (per-user rows) and `member_catchup_cursors`
-// (resume state). Dropped on finish; never shared tables.
+// `member_catchup_members` (per-user rows), `member_catchup_cursors`
+// (resume state) and the shared `backfill_cursors` frontier the progress
+// route reads. Shapes mirror cutover migrations 0434 (`member_catchup_*`)
+// and 0433 (`backfill_cursors`); keep them in sync. Dropped on finish;
+// never shared tables.
 
 struct CatchupDb {
     admin: Pool<Postgres>,
@@ -304,9 +307,15 @@ impl CatchupDb {
                guild_id TEXT NOT NULL, member_id TEXT NOT NULL,
                joined_at timestamptz, pending BOOLEAN,
                is_bot BOOLEAN NOT NULL DEFAULT FALSE,
+               updated_at timestamptz NOT NULL DEFAULT now(),
                PRIMARY KEY (guild_id, member_id));
              CREATE TABLE member_catchup_cursors (
-               guild_id TEXT PRIMARY KEY, after_cursor TEXT NOT NULL,
+               guild_id TEXT PRIMARY KEY,
+               after_cursor TEXT NOT NULL CHECK (length(after_cursor) > 0 AND after_cursor <> '0'),
+               updated_at timestamptz NOT NULL DEFAULT now());
+             CREATE TABLE backfill_cursors (
+               family TEXT PRIMARY KEY,
+               cursor TEXT NOT NULL CHECK (length(cursor) > 0 AND cursor <> '0'),
                updated_at timestamptz NOT NULL DEFAULT now())",
         )
         .execute(&pool)
@@ -449,6 +458,10 @@ async fn persisted_member_rows_hold_ids_timestamps_enums_only() {
             ),
             ("member_id".to_owned(), "text".to_owned()),
             ("pending".to_owned(), "boolean".to_owned()),
+            (
+                "updated_at".to_owned(),
+                "timestamp with time zone".to_owned()
+            ),
         ],
         "member rows must hold exactly ids/timestamps/enums"
     );
@@ -472,6 +485,19 @@ async fn resume_continues_from_the_persisted_cursor() {
             .as_deref(),
         Some("222222222222222222"),
         "restart must resume from the persisted cursor, never zero"
+    );
+    // The members frontier is checkpointed where the progress route reads
+    // it: `GET /ops/backfill/progress` serves `backfill_cursors`, never the
+    // per-guild cursor table.
+    let frontier: Option<String> =
+        sqlx::query_scalar("SELECT cursor FROM backfill_cursors WHERE family = 'members'")
+            .fetch_optional(&f.pool)
+            .await
+            .expect("frontier read");
+    assert_eq!(
+        frontier.as_deref(),
+        Some("222222222222222222"),
+        "storing the resume cursor must checkpoint the members frontier"
     );
 
     let mock = MemberMock::start(vec![(

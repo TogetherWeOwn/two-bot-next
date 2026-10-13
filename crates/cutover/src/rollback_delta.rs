@@ -142,6 +142,8 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         ),
     },
     TableSpec { table: "lfg_signups", measure: TableMeasure::Columns(&["joined_at"]) },
+    TableSpec { table: "member_catchup_cursors", measure: TableMeasure::Columns(&["updated_at"]) },
+    TableSpec { table: "member_catchup_members", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "member_erasure_audit", measure: TableMeasure::Columns(&["erased_at"]) },
     TableSpec { table: "member_exclusions", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "member_levels", measure: TableMeasure::Columns(&["updated_at"]) },
