@@ -139,8 +139,10 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_vote_kick_audit",
     // V5 adds accepted-create history; see [`V5_ADDED_TABLES`].
     "voice_create_reservations",
-    // S2 member capture (0432): append-only gateway deltas, guild-keyed, no
-    // foreign keys, so order among the appended tables is free.
+    // Shared event-store table for the S1-S8 slices; see [`V6_ADDED_TABLES`].
+    // S2 member capture (0432): append-only gateway deltas; S4 voice capture
+    // (0427): append-only guild/member voice state rows. Guild-keyed, no
+    // foreign keys, so order beside the other logs is free.
     "event_store",
 ];
 
@@ -151,9 +153,9 @@ pub const DUMP_TABLES: &[&str] = &[
 pub const V5_ADDED_TABLES: &[&str] = &["voice_create_reservations"];
 
 /// Tables first covered by v6. A v4 or v5 archive predates them and need not
-/// declare them; v5 still requires every other covered table, so recovery
-/// points written before member-capture persistence stay readable without
-/// waiving arbitrary missing tables.
+/// declare them; v6 archives must cover the full inventory, so recovery
+/// points written before member-capture/event-store persistence stay readable
+/// without waiving arbitrary missing tables.
 pub const V6_ADDED_TABLES: &[&str] = &["event_store"];
 
 /// Covered tables not created by the current cutover migration set, if any.
@@ -948,8 +950,9 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
         let _ = count;
     }
     // Historical inventories are pinned by fixtures. New v6 archives must cover
-    // member capture too; v5 recovery points remain readable without it, and
-    // v4 recovery points without the v5 reservation history as well.
+    // reservations, member capture and the event store too; v5 recovery points
+    // remain readable without member-capture/event-store, and v4 ones without
+    // those plus the v5 reservation history as well.
     let version = obj.get("version").and_then(Value::as_u64);
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
@@ -1747,13 +1750,18 @@ mod tests {
                 .collect()
         }
         // A main-shaped v5 manifest (full v5 inventory, no event_store) stays
-        // readable: v5 predates member-capture persistence.
+        // readable: v5 predates member-capture/S4 voice-capture persistence.
         let mut v5 = manifest(without(complete_tables(&BTreeMap::new()), "event_store"));
         v5["version"] = serde_json::json!(5);
         assert!(
             validate_manifest(&v5).is_ok(),
             "v5 without event_store reads"
         );
+        // The inspect read path accepts the frozen v5 envelope too.
+        let bytes = gzip_lines(&[v5.clone(), serde_json::json!({"kind":"end","rows":0})]);
+        let contents = inspect_bytes(&bytes).expect("v5 without event_store inspects");
+        assert_eq!(contents.manifest.version, 5);
+        assert_eq!(contents.manifest.missing_tables(), ["event_store"]);
         // Dropping a v5-covered table from a v5 manifest still refuses.
         let mut v5_gap = v5.clone();
         v5_gap["tables"]

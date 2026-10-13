@@ -83,6 +83,10 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "counter_snapshots", measure: TableMeasure::Columns(&["human_member_count_at", "online_count_at"]) },
     TableSpec { table: "event_rsvps", measure: TableMeasure::Columns(&["responded_at"]) },
     TableSpec { table: "events", measure: TableMeasure::Columns(&["recorded_at"]) },
+    // Event-store S4 voice capture (0427) + S2 member capture (0432): shared
+    // append-only table keyed by dedup; received_at is the ingest instant and
+    // event_time the gateway event time, so the maximum across both is the
+    // row's last write.
     TableSpec { table: "event_store", measure: TableMeasure::Columns(&["event_time", "received_at"]) },
     TableSpec { table: "feed_deliveries", measure: TableMeasure::Columns(&["first_seen_at"]) },
     TableSpec { table: "feed_relays", measure: TableMeasure::Columns(&["updated_at"]) },
