@@ -179,6 +179,9 @@ VALUES ('100000000000000001', '100000000000000020', 'create', FALSE, repeat('7',
 INSERT INTO member_levels (guild_id, member_id, xp, message_xp, voice_xp, imported_xp, updated_at)
 VALUES ('100000000000000001', '100000000000000002', 9007199254740991,
         31, 60, 9007199254740900, '2026-08-01T10:00:00Z');
+-- Seasonal projection (0100): one quarter row mirroring the member above.
+INSERT INTO member_season_xp (guild_id, season_id, member_id, seasonal_xp, updated_at)
+VALUES ('100000000000000001', '2026-Q4', '100000000000000002', 91, '2026-08-01T10:00:00Z');
 -- Excluded: must be cleared by successful restore, preserved on failed restore.
 INSERT INTO xp_cooldowns (guild_id, member_id, source, last_awarded_at)
 VALUES ('100000000000000001', '100000000000000002', 'message', '2026-08-01T10:00:00Z');
