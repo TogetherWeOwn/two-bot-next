@@ -1,7 +1,7 @@
 # Backups, restore drills, and sealed guild-config snapshots (TOG-9881)
 
 Rust port of the legacy `two-bot` cutover-data surface (frozen source
-`two-bot` `main @ d5d11793`): v4 dump format with v3 read compatibility,
+`two-bot` `main @ d5d11793`): v6 dump format with v3/v4/v5 read compatibility,
 SigV4 off-box upload, retention
 math, sealed guild-config snapshot + restore planner, and the three timer
 equivalents. Code: `crates/core/src/backup/`, CLI: `two-bot backup |
@@ -17,8 +17,9 @@ require `--force`. This confirmation is not authorization to target production.
 ## The format
 
 Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
-write **v5** (including durable voice-create reservations); the reader also
-accepts frozen **v3** and pre-reservation **v4**. Other versions refuse.
+write **v6** (including durable voice-create reservations and event-store
+presence capture); the reader also accepts frozen **v3**, pre-reservation
+**v4** and pre-event-store **v5**. Other versions refuse.
 The manifest carries per-table `{name, columns, column_types, count}` taken
 inside one `REPEATABLE READ` transaction, the `events` high-water mark, the
 source's applied migrations and `sequenceMarks`: for every serial, identity and
