@@ -18,10 +18,11 @@ require `--force`. This confirmation is not authorization to target production.
 
 Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
 write **v6** (including durable voice-create reservations, the seasonal XP
-projection and event-store capture: voice plus presence plus member-capture
-deltas plus message/reaction capture plus thread lifecycle and member deltas);
-the reader also accepts frozen **v3**, pre-reservation **v4** and
-pre-event-store **v5**. Other versions refuse.
+projection and the event store: voice capture plus presence capture plus
+member-capture deltas plus message/reaction capture plus thread lifecycle plus
+stage/interaction-observe/audit-log capture); the reader also accepts frozen
+**v3**, pre-reservation **v4** and pre-event-store **v5**. Other versions
+refuse.
 The manifest carries per-table `{name, columns, column_types, count}` taken
 inside one `REPEATABLE READ` transaction, the `events` high-water mark, the
 source's applied migrations and `sequenceMarks`: for every serial, identity and
@@ -64,10 +65,12 @@ tables, the member-moderation ledger, the self-role send receipts
 boot directives, the member-erasure audit, the internal clock high-water
 mark, the voice configuration tables, the accepted voice-room create history
 (`voice_create_reservations`), the seasonal XP projection (`member_season_xp`)
-and the event-store capture (voice plus presence plus member-capture deltas
-plus message/reaction capture plus thread lifecycle and member deltas)
+and the event store (voice capture plus presence capture plus member-capture
+deltas plus message/reaction capture plus thread lifecycle plus
+stage/interaction-observe/audit-log capture)
 (`event_store`: 0427 voice, 0428 presence, 0429 thread lifecycle, 0430
-message/reaction capture plus 0432 member-capture deltas).
+message/reaction capture, 0431 stage/interaction-observe/audit-log capture
+plus 0432 member-capture deltas).
 `OPTIONAL_LEGACY_TABLES` is empty: the coverage
 test fails if a covered table is not migrated. A dump from a fresh Rust schema
 has 84 table entries. A missing current table refuses a dump/restore: migrate
@@ -80,11 +83,12 @@ A v4 archive written before any other table joined the inventory is refused at
 inspect ("manifest is missing tables"); take a fresh dump after upgrading. V5
 requires everything except `V6_ADDED_TABLES`, so recovery points written
 before event-store capture (0427 voice, 0428 presence, 0429 thread lifecycle,
-0430 message/reaction capture, 0432 member deltas) stay readable; V6 requires
-the full current inventory, and an incomplete new archive refuses at
-inspection. Restoring a pre-reservation archive clears the destination's
-reservation and seasonal tables, as with other tables absent from an older
-version. A pre-v6 archive likewise clears the destination's event_store table.
+0430 message/reaction capture, 0431 stage/interaction-observe/audit-log capture
+and 0432 member deltas) stay readable; V6 requires the full current inventory,
+and an incomplete new archive refuses at inspection. Restoring a
+pre-reservation archive clears the destination's reservation and seasonal
+tables, as with other tables absent from an older version; restoring a
+pre-event-store archive clears the destination's event-store table the same way.
 An optional legacy table may be absent only when there are no archived rows for
 it. Nonempty legacy data without a matching target table refuses **before any
 truncate**, rather than silently discarding it.

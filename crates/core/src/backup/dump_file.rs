@@ -144,9 +144,10 @@ pub const DUMP_TABLES: &[&str] = &[
     // V5 adds accepted-create history and the seasonal XP projection;
     // see [`V5_ADDED_TABLES`].
     "voice_create_reservations",
-    // V6 adds the event-store capture (0427 voice plus 0428 presence plus
-    // 0429 S6 thread lifecycle plus 0430 S5 message/reaction plus 0432 S2
-    // member deltas; shared table for S1-S8 slices); see [`V6_ADDED_TABLES`].
+    // V6 adds the shared event-store table for the S1-S8 slices (0427 S4 voice
+    // capture plus 0428 S3 presence plus 0429 S6 thread lifecycle plus 0430 S5
+    // message/reaction capture plus 0431 S8 stage/interaction-observe/audit-log
+    // capture plus 0432 S2 member capture); see [`V6_ADDED_TABLES`].
     // Append-only, guild-keyed, no foreign keys, so order among the tail is free.
     "event_store",
 ];
@@ -158,10 +159,11 @@ pub const DUMP_TABLES: &[&str] = &[
 pub const V5_ADDED_TABLES: &[&str] = &["voice_create_reservations", "member_season_xp"];
 
 /// Tables first covered by v6. A v4 or v5 archive predates them and need not
-/// declare them; v5 still requires every other covered table, so recovery
+/// declare them; v6 archives must cover the full inventory, so recovery
 /// points written before event-store persistence (0427 voice, 0428 presence,
-/// 0429 thread lifecycle, 0430 message/reaction capture and 0432 member
-/// deltas) stay readable without waiving arbitrary missing tables.
+/// 0429 thread lifecycle, 0430 message/reaction capture, 0431
+/// stage/interaction/audit capture, 0432 member deltas) stay readable without
+/// waiving arbitrary missing tables. v5 still requires every other covered table.
 pub const V6_ADDED_TABLES: &[&str] = &["event_store"];
 
 /// Covered tables not created by the current cutover migration set, if any.
@@ -956,8 +958,11 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
         let _ = count;
     }
     // Historical inventories are pinned by fixtures. New v6 archives must cover
-    // reservations and the event store too; v5 recovery points remain readable
-    // without the event store, and v4 ones without either addition.
+    // reservations and the event store (0427 voice plus 0428 presence plus
+    // 0429 thread lifecycle plus 0430 message/reaction plus 0431
+    // stage/interaction/audit capture plus 0432 member capture) too; v5 recovery
+    // points remain readable without the event store, and v4 ones without either
+    // addition.
     let version = obj.get("version").and_then(Value::as_u64);
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
