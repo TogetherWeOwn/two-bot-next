@@ -1174,6 +1174,48 @@ pub enum EventPlace {
     Location(String),
 }
 
+/// One game night awaiting its Discord-native scheduled event.
+///
+/// Timestamps render in UTC-millis ISO-8601, the same rendering
+/// [`EventInput`] carries; the location becomes the EXTERNAL event's written
+/// place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GameNight {
+    pub name: String,
+    pub starts_at: String,
+    pub ends_at: String,
+    pub location: String,
+}
+
+/// Discord cap on active scheduled events per guild.
+///
+/// Discord allows at most 100 active scheduled events per guild; the planner
+/// below truncates against this so a full calendar files nothing instead of
+/// failing halfway.
+pub const MAX_ACTIVE_SCHEDULED_EVENTS: usize = 100;
+
+/// Plan one EXTERNAL [`EventInput`] per game night.
+///
+/// Each night becomes an [`EventPlace::Location`] input with its name, times
+/// and location carried over and no description. The plan is truncated from
+/// the tail so that `active_count + returned.len() <=
+/// MAX_ACTIVE_SCHEDULED_EVENTS`: a guild at the cap files nothing.
+#[must_use]
+pub fn plan_game_night_creates(nights: &[GameNight], active_count: usize) -> Vec<EventInput> {
+    let capacity = MAX_ACTIVE_SCHEDULED_EVENTS.saturating_sub(active_count);
+    nights
+        .iter()
+        .take(capacity)
+        .map(|night| EventInput {
+            name: night.name.clone(),
+            starts_at: night.starts_at.clone(),
+            ends_at: night.ends_at.clone(),
+            description: None,
+            place: EventPlace::Location(night.location.clone()),
+        })
+        .collect()
+}
+
 pub fn validate_event_input(
     body: &Map<String, Value>,
     channel_keys: &HashMap<String, String>,
