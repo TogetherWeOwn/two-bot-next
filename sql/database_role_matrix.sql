@@ -93,6 +93,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'invite_campaigns', 'migrator'),
     ('public', '_sqlx_migrations', 'ledger'),
     ('public', 'events_id_seq', 'sequence'),
+    ('public', 'event_store_id_seq', 'sequence'),
     ('public', 'gateway_onboarding_jobs_id_seq', 'sequence'),
     ('public', 'xp_awards_id_seq', 'sequence'),
     ('public', 'level_import_runs_id_seq', 'sequence'),
