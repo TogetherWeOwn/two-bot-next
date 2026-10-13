@@ -61,6 +61,7 @@ pub mod feeds_http;
 #[cfg(feature = "db")]
 pub mod feeds_store;
 pub mod funnel;
+pub mod game_activity;
 pub mod gateway_funnel;
 pub mod gateway_session;
 pub mod handlers;

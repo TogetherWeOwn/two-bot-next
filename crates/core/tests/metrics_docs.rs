@@ -9,10 +9,10 @@ use std::path::{Path, PathBuf};
 use two_bot_core::metrics::{
     Metrics, CHECKPOINT_FAILURE_STAGES, COMMUNITY_FACTS_DRAIN_REASONS, DB_ERROR_OPS,
     DISPATCH_LANES, EVENTS, INTERNAL_ACTION_FAMILIES, INTERNAL_ACTION_OUTCOMES, JOBS,
-    JOB_ERROR_CLASSES, JOB_OUTCOMES, PREFIX_TRIGGER_REFUSED_REASONS, REST_ROUTES, RESULTS,
-    SEND_ADMISSION_OUTCOMES, VOICE_DEAD_ACTIONS, VOICE_JOIN_OCCUPANCY_BUCKETS,
-    VOICE_JOIN_REFUSAL_REASONS, VOICE_NAME_OUTCOMES, VOICE_OPERATIONS, VOICE_OUTCOMES,
-    VOICE_RECONCILE_ACTIONS, VOICE_VOTE_KICK_OUTCOMES,
+    JOB_ERROR_CLASSES, JOB_OUTCOMES, PREFIX_TRIGGER_REFUSED_REASONS, PRESENCE_CAPTURE_OUTCOMES,
+    REST_ROUTES, RESULTS, SEND_ADMISSION_OUTCOMES, VOICE_DEAD_ACTIONS,
+    VOICE_JOIN_OCCUPANCY_BUCKETS, VOICE_JOIN_REFUSAL_REASONS, VOICE_NAME_OUTCOMES,
+    VOICE_OPERATIONS, VOICE_OUTCOMES, VOICE_RECONCILE_ACTIONS, VOICE_VOTE_KICK_OUTCOMES,
 };
 
 fn repository_root() -> PathBuf {
@@ -132,6 +132,7 @@ fn allowlisted_labels(name: &str) -> Vec<&'static str> {
         "two_bot_internal_actions_total" => vec!["family", "outcome"],
         "two_bot_community_facts_drain_failures_total" => vec!["reason"],
         "two_bot_gateway_checkpoint_failures_total" => vec!["stage"],
+        "two_bot_presence_capture_total" => vec!["outcome"],
         _ => Vec::new(),
     }
 }
@@ -187,6 +188,9 @@ fn expected_values(name: &str) -> Vec<(&'static str, Vec<&'static str>)> {
         "two_bot_gateway_checkpoint_failures_total" => {
             vec![("stage", CHECKPOINT_FAILURE_STAGES.to_vec())]
         }
+        "two_bot_presence_capture_total" => {
+            vec![("outcome", PRESENCE_CAPTURE_OUTCOMES.to_vec())]
+        }
         _ => Vec::new(),
     }
 }
@@ -227,6 +231,7 @@ const KNOWN_COUNTERS: &[&str] = &[
     "two_bot_internal_actions_total",
     "two_bot_community_facts_drain_failures_total",
     "two_bot_gateway_checkpoint_failures_total",
+    "two_bot_presence_capture_total",
 ];
 
 fn check_docs_against_exposition(doc: &str, exposition: &str) -> Result<(), String> {

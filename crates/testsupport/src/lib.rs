@@ -291,9 +291,103 @@ impl Drop for TestDatabase {
     }
 }
 
+/// Every `event_store` column a reviewed capture slice may add: the S1 core
+/// plus the member, voice, presence, message/reaction, thread and
+/// stage/interaction/audit slices (the fence table in `docs/event-store.md`).
+/// The table is shared and grows by `ADD COLUMN IF NOT EXISTS`, so a slice
+/// suite checks "my columns are present and nothing outside this list
+/// exists" instead of an exact set that breaks when a sibling lands. A new
+/// slice extends this list in its own PR; a raw-payload or free-text column
+/// is in no slice and fails every suite.
+pub const EVENT_STORE_ALLOWED_COLUMNS: &[&str] = &[
+    "id",
+    "event_type",
+    "guild_id",
+    "channel_id",
+    "message_id",
+    "user_id",
+    "event_time",
+    "received_at",
+    "dedup_key",
+    "premium_since",
+    "nick_changed",
+    "roles",
+    "session_id",
+    "mute",
+    "deaf",
+    "self_mute",
+    "self_deaf",
+    "self_video",
+    "self_stream",
+    "suppress",
+    "presence_status",
+    "activity_type",
+    "application_id",
+    "thread_id",
+    "parent_id",
+    "archived",
+    "locked",
+    "invitable",
+    "emoji_id",
+    "emoji_name",
+    "stage_instance_id",
+    "privacy_level",
+    "interaction_id",
+    "interaction_type",
+    "command_id",
+    "audit_log_entry_id",
+    "action_type",
+    "actor_id",
+    "target_id",
+];
+
+/// Allowlist check for a shared `event_store`: every `required` column is
+/// present and every actual column is in [`EVENT_STORE_ALLOWED_COLUMNS`].
+/// Panics with the offending names so a suite failure is self-explaining.
+pub fn assert_event_store_columns(actual: &[String], required: &[&str]) {
+    for column in required {
+        assert!(
+            actual.iter().any(|name| name == column),
+            "event_store is missing the {column} column; has {actual:?}"
+        );
+    }
+    let unreviewed: Vec<&String> = actual
+        .iter()
+        .filter(|name| !EVENT_STORE_ALLOWED_COLUMNS.contains(&name.as_str()))
+        .collect();
+    assert!(
+        unreviewed.is_empty(),
+        "event_store has columns outside the reviewed allowlist {unreviewed:?}; \
+         add a column only through a reviewed slice that extends \
+         EVENT_STORE_ALLOWED_COLUMNS and docs/event-store.md"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn names(columns: &[&str]) -> Vec<String> {
+        columns.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn event_store_allowlist_accepts_a_subset_with_the_required_columns() {
+        assert_event_store_columns(&names(&["id", "dedup_key", "roles"]), &["id", "roles"]);
+        assert_event_store_columns(&names(EVENT_STORE_ALLOWED_COLUMNS), &["mute", "roles"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside the reviewed allowlist")]
+    fn event_store_allowlist_rejects_a_raw_payload_column() {
+        assert_event_store_columns(&names(&["id", "dedup_key", "raw_payload"]), &["id"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "missing the roles column")]
+    fn event_store_allowlist_requires_the_slice_columns() {
+        assert_event_store_columns(&names(&["id", "dedup_key"]), &["roles"]);
+    }
 
     const SAFE: &str = "postgres://agent_test:@agent-testdb:5432/two_bot_test_guard";
 

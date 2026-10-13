@@ -33,6 +33,11 @@ EXEMPT = {
     # Manual regen: rewrites docs/commands.md and docs/configuration.md in the
     # checkout, so CI must never run it (ignored-db-runtime documents this).
     "reference_docs": "manual doc regen; rewrites committed files",
+    # Pending S1 event-store acceptance suite: every test is ignored until the
+    # S1 build lands its migration, capture path and lag gauge (CONSTRAINTS.md
+    # Exceptions, expires 2026-11-12). The S1 build un-ignores it and routes
+    # it to a lane instead of this exemption.
+    "event_store_s1": "pending S1 build; un-ignore and route when migration lands",
 }
 
 WORKSPACE_LIB_BINS = "cargo test --workspace --lib --bins"

@@ -1,6 +1,7 @@
 -- Reviewed object allowlist. No wildcard grants to other services' relations.
 SELECT schema_name, name, kind FROM (VALUES
     ('public', 'events', 'table'),
+    ('public', 'event_store', 'table'),
     ('public', 'members', 'table'),
     ('public', 'invite_snapshots', 'table'),
     ('public', 'member_levels', 'table'),
@@ -34,6 +35,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'counter_snapshots', 'table'),
     ('public', 'member_exclusions', 'table'),
     ('public', 'presence_probe', 'table'),
+    ('public', 'event_store', 'table'),
     ('public', 'community_stream_heartbeats', 'table'),
     ('public', 'community_scorecard_runs', 'table'),
     ('public', 'community_scorecard_attempts', 'table'),
@@ -92,6 +94,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'invite_campaigns', 'migrator'),
     ('public', '_sqlx_migrations', 'ledger'),
     ('public', 'events_id_seq', 'sequence'),
+    ('public', 'event_store_id_seq', 'sequence'),
     ('public', 'gateway_onboarding_jobs_id_seq', 'sequence'),
     ('public', 'xp_awards_id_seq', 'sequence'),
     ('public', 'level_import_runs_id_seq', 'sequence'),
