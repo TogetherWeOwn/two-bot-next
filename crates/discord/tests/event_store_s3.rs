@@ -41,7 +41,7 @@
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use two_bot_core::metrics::Metrics;
-use two_bot_testsupport::TestDatabase;
+use two_bot_testsupport::{assert_event_store_columns, TestDatabase};
 
 const GUILD: &str = "3333";
 const USER: &str = "42";
@@ -201,52 +201,35 @@ const REQUIRED_COLUMNS: &[&str] = &[
     "application_id",
 ];
 
-/// Strict allowlist for the shared `event_store` table as S3 leaves it: the
-/// surrogate key plus the S3 presence contract. Sibling slices add their own
-/// columns with `ADD COLUMN IF NOT EXISTS`; when they land they must extend
-/// this list explicitly, so a free-text column (e.g. `raw_payload`,
-/// `custom_status`) fails here instead of slipping past a name denylist. The
-/// companion type fence below rejects `json`/`jsonb` whatever the name.
-const ALLOWED_COLUMNS: &[&str] = &[
-    "id",
-    "event_type",
-    "guild_id",
-    "user_id",
-    "event_time",
-    "received_at",
-    "dedup_key",
-    "presence_status",
-    "activity_type",
-    "application_id",
-];
-
+/// Shared-table schema check: the S3 presence columns must be present and every
+/// column must sit on the reviewed allowlist in
+/// `two_bot_testsupport::EVENT_STORE_ALLOWED_COLUMNS` (the fence table in
+/// `docs/event-store.md`). Sibling slices share `event_store` via
+/// `ADD COLUMN IF NOT EXISTS`, so an exact S3-only set would break when S1/S2
+/// land; a raw-payload or free-text column is in no slice and fails here.
 fn assert_presence_schema(columns: &[String]) {
     assert!(
         !columns.is_empty(),
         "S3 creates the presence columns on the append-only event_store table"
     );
-    for required in REQUIRED_COLUMNS {
-        assert!(
-            columns.iter().any(|column| column == required),
-            "event_store keeps presence column {required}; has {columns:?}"
-        );
-    }
-    for column in columns {
-        assert!(
-            ALLOWED_COLUMNS.contains(&column.as_str()),
-            "event_store has unexpected column {column}; extend ALLOWED_COLUMNS \
-             explicitly when a sibling slice lands it, has {columns:?}"
-        );
-    }
+    assert_event_store_columns(columns, REQUIRED_COLUMNS);
 }
 
-/// No `json`/`jsonb` column may exist: free-text payloads (raw presence
-/// payloads, activity blobs) have no schema home whatever the column name.
-/// The writer below binds ids/enums only, so this type fence plus the name
-/// allowlist above is what makes the privacy tripwire fail on a scratch
-/// `raw_payload JSONB` migration.
+/// Only the reviewed `roles` role-id array may use `jsonb`: free-text payloads
+/// (raw presence payloads, activity blobs) have no other schema home whatever
+/// the column name. The writer below binds ids/enums only, so this type fence
+/// plus the shared allowlist above is what makes the privacy tripwire fail on
+/// a scratch `raw_payload JSONB` migration while the sibling S2 `roles`
+/// column passes.
 async fn assert_no_json_columns(pool: &PgPool) {
     for (column, data_type) in table_column_types(pool).await {
+        if column == "roles" {
+            assert_eq!(
+                data_type, "jsonb",
+                "reviewed roles column keeps its jsonb role-id array type"
+            );
+            continue;
+        }
         assert!(
             data_type != "json" && data_type != "jsonb",
             "event_store column {column} has free-text type {data_type}; \
@@ -461,8 +444,9 @@ async fn event_store_s3_duplicate_delivery_inserts_once() {
 #[tokio::test]
 async fn event_store_s3_privacy_tripwire_rejects_custom_status_text() {
     let db = TestDb::new().await;
-    // Tripwire part 1: the schema is exactly the allowlisted ids/enums (plus
-    // the surrogate key) with no json/jsonb home for a free-text payload. A
+    // Tripwire part 1: the schema holds the S3 ids/enums plus only reviewed
+    // sibling columns, with no unreviewed json/jsonb home for a free-text
+    // payload (the reviewed S2 `roles` array is the sole jsonb exception). A
     // scratch migration adding `raw_payload JSONB` or `custom_status TEXT`
     // fails here even though the lean writer below would leave those columns
     // NULL.

@@ -1,6 +1,7 @@
 -- Reviewed object allowlist. No wildcard grants to other services' relations.
 SELECT schema_name, name, kind FROM (VALUES
     ('public', 'events', 'table'),
+    ('public', 'event_store', 'table'),
     ('public', 'members', 'table'),
     ('public', 'invite_snapshots', 'table'),
     ('public', 'member_levels', 'table'),
