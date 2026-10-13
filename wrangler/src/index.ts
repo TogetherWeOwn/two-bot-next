@@ -58,6 +58,7 @@ import {
   RECEIVER_BIND,
   RECEIVER_PORT,
   REQUEST_TIMEOUT_MS,
+  SIGNING_HEADERS,
   allowlistedHeaders,
   envelope,
   forwardRequest,
@@ -241,6 +242,15 @@ let metricsShortTokenLogged = false;
 // same take-before-compare semantics (see metricsAuthBuckets above).
 const dashboardAuthBuckets = new TokenBuckets({ capacity: 10, refillPerSecond: 1 });
 
+// Attempt cap for the signed backfill-progress read (TOG-22953). The
+// container owns the x-two-* HMAC, so the Worker cannot validate the
+// signature — but unauthenticated floods must still be cut before the
+// singleton DO's concurrency gate (armKeepalive + container auto-start wait up
+// to 6 s per request inside blockConcurrencyWhile). Same take-before-check
+// shape as the scrape gate: one token per attempt, 429 + retry-after when
+// exhausted, so a flood of one-time scanners can never lock out operators.
+const backfillProgressBuckets = new TokenBuckets({ capacity: 10, refillPerSecond: 1 });
+
 // Store instances are request-scoped, but the lookup cache must survive
 // across requests to blunt repeated lookups — so it lives here beside the
 // miss cache, keyed (and reset) on the same configuration identity. A changed
@@ -380,6 +390,23 @@ async function opsReadRefusal(request: Request, env: Env): Promise<Response | nu
   const m = /^Bearer (.+)$/.exec(request.headers.get("authorization") ?? "");
   if (!m || m[1]!.length > 4096 || !(await tokenMatches(m[1]!, env.METRICS_SCRAPE_TOKEN))) {
     return new Response("unauthorized", { status: 401, headers: withSecurityHeaders({ "www-authenticate": "Bearer" }) });
+  }
+  return null;
+}
+
+// Edge pre-check for the signed backfill-progress read (TOG-22953). The
+// signature itself is validated only in the container; this only keeps
+// unsigned or malformed floods from reaching the singleton DO. Refuses with
+// the route's indistinguishable 401 when any x-two-* header is missing, empty
+// or over its byte cap (caps reused from SIGNING_HEADERS, the receiver's own
+// limits — no Bearer challenge: this route never takes a bearer). Returns the
+// refusal, or null when the headers are present and within cap.
+function backfillProgressRefusal(request: Request): Response | null {
+  for (const [name, max] of SIGNING_HEADERS) {
+    const value = request.headers.get(name);
+    if (value === null || value === "" || value.length > max) {
+      return new Response("unauthorized", { status: 401, headers: withSecurityHeaders() });
+    }
   }
   return null;
 }
@@ -667,10 +694,23 @@ export class TwoBotContainer extends Container<Env> {
             headers: withSecurityHeaders({ "content-type": "application/json", "cache-control": "no-store" }),
           });
         }
-        if (url.pathname === OPS_GATEWAY_PATH || url.pathname === OPS_BACKFILL_PATH
-          || url.pathname === OPS_BACKFILL_PROGRESS_PATH) {
+        if (url.pathname === OPS_GATEWAY_PATH || url.pathname === OPS_BACKFILL_PATH) {
           await this.armKeepalive();
           return this.proxyOpsBody(`http://c${url.pathname}`, OPS_JSON_CONTENT_TYPE, "ops unavailable\n");
+        }
+        if (url.pathname === OPS_BACKFILL_PROGRESS_PATH) {
+          await this.armKeepalive();
+          // The route is container-authenticated (x-two-* HMAC): the SDK
+          // builds a bare request from a string URL, so the signing headers
+          // must cross explicitly or every call 401s into a 504. Only the
+          // allowlisted signing headers cross; the deployment fence header
+          // stays at the DO gate.
+          const signed = new Headers();
+          for (const [name] of SIGNING_HEADERS) {
+            const value = request.headers.get(name);
+            if (value !== null) signed.set(name, value);
+          }
+          return this.proxyOpsBody(`http://c${url.pathname}`, OPS_JSON_CONTENT_TYPE, "ops unavailable\n", signed);
         }
         // Bound the entire probe, including auto-start, below the 30s DO gate.
         const probe = new Request(request, { signal: AbortSignal.timeout(6000) });
@@ -699,9 +739,12 @@ export class TwoBotContainer extends Container<Env> {
    * an aborted signal or any non-2xx upstream as a 504 with a generic body,
    * and drain the SDK error text instead of proxying it. `unavailableBody`
    * is the only body a failure ever returns, so container error text cannot
-   * cross the boundary.
+   * cross the boundary. When `headers` is given, the fetch goes out as a
+   * Request carrying them: a string URL builds a bare request and drops
+   * container-authenticated headers (x-two-*), turning every signed call
+   * into a 504.
    */
-  private async proxyOpsBody(containerUrl: string, contentType: string, unavailableBody: string): Promise<Response> {
+  private async proxyOpsBody(containerUrl: string, contentType: string, unavailableBody: string, headers?: Headers): Promise<Response> {
     const fetchSignal = AbortSignal.timeout(METRICS_FETCH_TIMEOUT_MS);
     const unavailable = (status: number) =>
       new Response(unavailableBody, {
@@ -710,9 +753,11 @@ export class TwoBotContainer extends Container<Env> {
       });
     let upstream: Response;
     try {
-      upstream = await this.containerFetch(containerUrl, {
-        signal: fetchSignal,
-      });
+      upstream = headers
+        ? await this.containerFetch(new Request(containerUrl, { headers, signal: fetchSignal }))
+        : await this.containerFetch(containerUrl, {
+          signal: fetchSignal,
+        });
     } catch {
       return unavailable(504);
     }
@@ -1350,11 +1395,31 @@ export default {
     }
 
     // Signed backfill-progress read (TOG-22953): the container owns the
-    // x-two-* HMAC, so there is no scrape-bearer gate here — the Worker only
-    // stamps the deployment fence id and forwards the request unchanged
-    // (method, x-two-* headers, body). Exact path only: unknown /ops/*
-    // subpaths still fall through to the redirect lookup below.
+    // x-two-* HMAC, so there is no scrape-bearer gate here — but the request
+    // still never reaches the singleton DO unexamined. GET only (405
+    // otherwise), then a per-caller attempt budget (429 + retry-after when
+    // exhausted, taken before the header check so a flood cannot confirm
+    // anything while throttled), then the x-two-* presence/length pre-check
+    // (the route's 401, no Bearer challenge). Only then does the Worker stamp
+    // the deployment fence id and forward the request. Exact path only:
+    // unknown /ops/* subpaths still fall through to the redirect lookup below.
     if (url.pathname === OPS_BACKFILL_PROGRESS_PATH) {
+      if (request.method !== "GET") {
+        return new Response("method not allowed", { status: 405, headers: withSecurityHeaders({ allow: "GET" }) });
+      }
+      const caller = request.headers.get("cf-connecting-ip") ?? "unknown";
+      const verdict = backfillProgressBuckets.take(caller);
+      if (!verdict.allowed && !backfillProgressBuckets.peek(caller).allowed) {
+        return new Response("slow down\n", {
+          status: 429,
+          headers: withSecurityHeaders({
+            "content-type": "text/plain",
+            "retry-after": String(verdict.retryAfter),
+          }),
+        });
+      }
+      const refusal = backfillProgressRefusal(request);
+      if (refusal) return refusal;
       try {
         const forwarded = new Request(request);
         forwarded.headers.set(DEPLOYMENT_HEADER, deploymentId(env.CF_VERSION_METADATA?.id));

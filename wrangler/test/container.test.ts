@@ -1136,6 +1136,36 @@ for (const path of ["/ops/summary", "/ops/gateway", "/ops/backfill", "/ops/backf
   });
 }
 
+test("DO /ops/backfill/progress: forwards x-two-* signing headers to the container", async (t) => {
+  // Regression for the 504-every-call review finding: the SDK builds a bare
+  // request from a string URL, so the DO must attach the signing headers
+  // explicitly — the container 401s without them and the proxy maps that to
+  // 504. The mock asserts on the request the DO hands to containerFetch.
+  const h = await harness(t);
+  const seen: unknown[] = [];
+  t.mock.method(h.bot, "containerFetch", async (input: unknown) => {
+    seen.push(input);
+    return new Response('{"ok":true}\n', { status: 200 });
+  });
+  const response = await h.bot.fetch(new Request("https://worker.invalid/ops/backfill/progress", {
+    headers: {
+      "x-two-key-id": "synthetic-progress-key",
+      "x-two-timestamp": "1700000000",
+      "x-two-nonce": "synthetic-nonce-0123456789abcdef",
+      "x-two-signature": "synthetic-progress-signature",
+      [DEPLOYMENT_HEADER]: ID,
+    },
+  }));
+  assert.equal(response.status, 200);
+  assert.equal(seen.length, 1);
+  const forwarded = seen[0] as Request;
+  assert.ok(forwarded instanceof Request);
+  assert.equal(forwarded.headers.get("x-two-key-id"), "synthetic-progress-key");
+  assert.equal(forwarded.headers.get("x-two-timestamp"), "1700000000");
+  assert.equal(forwarded.headers.get("x-two-nonce"), "synthetic-nonce-0123456789abcdef");
+  assert.equal(forwarded.headers.get("x-two-signature"), "synthetic-progress-signature");
+});
+
 test("DO /ops/gateway: oversized body returns 502 with a generic body", async (t) => {
   const h = await harness(t);
   t.mock.method(h.bot, "containerFetch", async () => new Response('{"k":"v"}\n'.repeat(20000)));
@@ -1272,6 +1302,91 @@ test("Worker forwards /ops/backfill/progress with x-two-* headers and no scrape 
   assert.equal(forwarded.headers.get("x-two-nonce"), "synthetic-nonce-0123456789abcdef");
   assert.equal(forwarded.headers.get("x-two-signature"), "sha256=synthetic-progress-signature");
   assert.equal(forwarded.headers.get(DEPLOYMENT_HEADER), ID);
+});
+
+test("Worker /ops/backfill/progress: non-GET is 405 without reaching the DO", async () => {
+  const env = {
+    ...WORKER_ENV,
+    CF_VERSION_METADATA: { id: ID },
+    REDIRECT_FALLBACK_CODE: "synthetic0",
+    REDIRECT_MAPPINGS_JSON: "[]",
+    TWO_BOT: { getByName: () => { throw new Error("method-gated calls must not reach the DO"); } },
+  } as unknown as Env;
+  const ctx = { waitUntil: () => {} } as ExecutionContext;
+  const response = await worker.fetch(new Request("https://worker.invalid/ops/backfill/progress", {
+    method: "POST",
+    headers: {
+      "cf-connecting-ip": "10.99.7.2",
+      "x-two-key-id": "synthetic-progress-key",
+      "x-two-timestamp": "1700000000",
+      "x-two-nonce": "synthetic-nonce-0123456789abcdef",
+      "x-two-signature": "synthetic-progress-signature",
+    },
+  }), env, ctx);
+  assert.equal(response.status, 405);
+  assert.equal(response.headers.get("allow"), "GET");
+});
+
+test("Worker /ops/backfill/progress: missing or overlong x-two-* headers are 401 without reaching the DO", async () => {
+  const env = {
+    ...WORKER_ENV,
+    CF_VERSION_METADATA: { id: ID },
+    REDIRECT_FALLBACK_CODE: "synthetic0",
+    REDIRECT_MAPPINGS_JSON: "[]",
+    TWO_BOT: { getByName: () => { throw new Error("unsigned calls must not reach the DO"); } },
+  } as unknown as Env;
+  const ctx = { waitUntil: () => {} } as ExecutionContext;
+  const unsigned = await worker.fetch(new Request("https://worker.invalid/ops/backfill/progress", {
+    headers: { "cf-connecting-ip": "10.99.7.3" },
+  }), env, ctx);
+  assert.equal(unsigned.status, 401);
+  const overlong = await worker.fetch(new Request("https://worker.invalid/ops/backfill/progress", {
+    headers: {
+      "cf-connecting-ip": "10.99.7.4",
+      "x-two-key-id": "k".repeat(129),
+      "x-two-timestamp": "1700000000",
+      "x-two-nonce": "synthetic-nonce-0123456789abcdef",
+      "x-two-signature": "synthetic-progress-signature",
+    },
+  }), env, ctx);
+  assert.equal(overlong.status, 401);
+});
+
+test("Worker /ops/backfill/progress: over-budget caller is 429 without reaching the DO", async () => {
+  let reached = 0;
+  const env = {
+    ...WORKER_ENV,
+    CF_VERSION_METADATA: { id: ID },
+    REDIRECT_FALLBACK_CODE: "synthetic0",
+    REDIRECT_MAPPINGS_JSON: "[]",
+    TWO_BOT: {
+      getByName: () => ({
+        fetch: async () => {
+          reached += 1;
+          return new Response('{"ok":true}\n', {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        },
+      }),
+    },
+  } as unknown as Env;
+  const ctx = { waitUntil: () => {} } as ExecutionContext;
+  // Attempt buckets are module-level: one caller IP burns one 10-token budget.
+  const headers = {
+    "cf-connecting-ip": "10.99.7.5",
+    "x-two-key-id": "synthetic-progress-key",
+    "x-two-timestamp": "1700000000",
+    "x-two-nonce": "synthetic-nonce-0123456789abcdef",
+    "x-two-signature": "synthetic-progress-signature",
+  };
+  let last: Response | undefined;
+  for (let i = 0; i < 11; i++) {
+    last = await worker.fetch(new Request("https://worker.invalid/ops/backfill/progress", { headers }), env, ctx);
+  }
+  assert.equal(last!.status, 429);
+  assert.ok(last!.headers.get("retry-after"));
+  assert.equal(reached, 10);
 });
 
 // Readiness monitoring uses synthetic responses only. Global fetch is stubbed

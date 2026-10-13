@@ -137,7 +137,7 @@ never returns PASS. Verification checks missing groups/objects, group attributes
 and memberships, database/schema privileges, ownership/object kinds, effective
 table/column/sequence/function privileges (including PUBLIC), grant options, parsed
 boolean view invoker settings and unsafe future grants. Explicit grants cover the
-current migrations' 87 ordinary bot tables plus two restricted admission lanes,
+current migrations' 89 ordinary bot tables plus two restricted admission lanes,
 SQLx ledger, two migrator-only tables, twelve sequences,
 nine web views and six functions (three trigger helpers plus three `web_v1`
 helpers). The read-only migrator group additionally reads the ordinary tables,
