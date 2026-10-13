@@ -294,7 +294,7 @@ impl HyperHelixTransport {
             .body
             .as_ref()
             .map(|body| Bytes::copy_from_slice(body.expose().as_bytes()))
-            .unwrap_or_else(Bytes::new);
+            .unwrap_or_default();
         builder
             .body(Full::new(body))
             .map_err(|err| HelixError::Transport(format!("helix request build failed: {err}")))
