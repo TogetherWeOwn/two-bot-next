@@ -289,7 +289,7 @@ const READINESS_KEY = "two-bot:readiness";
 const METRICS_ALERT_KEY = "two-bot:metrics-alerts";
 const OPS_METRICS_PATH = "/ops/metrics";
 // Read-only operator roll-ups (TOG-22860), served by the container as JSON.
-// Gateway/backfill stay on the scrape bearer like /ops/metrics; the summary
+// Gateway/backfill-rollup stay on the scrape bearer like /ops/metrics; the summary
 // serves two audiences (scrape bearer or dashboard pair — see the Worker
 // gate below), and the DO translates its `ready` bit into the 200-vs-503
 // status the dashboard renders. Same "/ops/summary" value as
@@ -298,7 +298,7 @@ const OPS_METRICS_PATH = "/ops/metrics";
 // redirect lookup below, where the slug allowlist rejects them.
 const OPS_SUMMARY_PATH = "/ops/summary";
 const OPS_GATEWAY_PATH = "/ops/gateway";
-const OPS_BACKFILL_PATH = "/ops/backfill";
+const OPS_BACKFILL_PATH = "/ops/backfill-rollup";
 const OPS_JSON_PATHS: string[] = [OPS_SUMMARY_PATH, OPS_GATEWAY_PATH, OPS_BACKFILL_PATH];
 const OPS_METRICS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8";
 const OPS_JSON_CONTENT_TYPE = "application/json";
@@ -1344,7 +1344,7 @@ export default {
     }
 
     // Authenticated off-container scrape paths: /ops/metrics plus the
-    // scrape-only JSON roll-ups (/ops/gateway, /ops/backfill). /ops/summary
+    // scrape-only JSON roll-ups (/ops/gateway, /ops/backfill-rollup). /ops/summary
     // has its own dual gate below (scrape bearer or dashboard pair), so it
     // is matched there, not here. No configured token (or one shorter than
     // the 32-character floor — same bar as the ownership control token) →

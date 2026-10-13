@@ -105,7 +105,7 @@ pub(crate) fn router_with_guard(
 /// Routes the public listener serves; the only paths a span may record.
 /// Keep in sync with `router_with_guard`, `metrics_http::router_with_guard`
 /// and `ops_http::router_with_state`.
-const TRACED_PATHS: [&str; 7] = [
+const TRACED_PATHS: [&str; 8] = [
     "/health",
     "/healthz",
     "/readyz",
@@ -113,6 +113,7 @@ const TRACED_PATHS: [&str; 7] = [
     "/ops/summary",
     "/ops/gateway",
     "/ops/backfill",
+    "/ops/backfill-rollup",
 ];
 
 /// Recorded for every path that is not an exact `TRACED_PATHS` entry.

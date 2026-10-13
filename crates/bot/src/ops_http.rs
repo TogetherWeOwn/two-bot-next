@@ -1,4 +1,4 @@
-//! Read-only operator roll-ups: `/ops/summary`, `/ops/gateway`, `/ops/backfill`.
+//! Read-only operator roll-ups: `/ops/summary`, `/ops/gateway`, `/ops/backfill-rollup`.
 //!
 //! Served openly on the container listener like `/metrics`; the Worker gates
 //! off-container reads behind the scrape bearer (404 when unconfigured), so
@@ -28,7 +28,7 @@ pub(crate) fn router_with_state(
     Router::new()
         .route("/ops/summary", get(summary))
         .route("/ops/gateway", get(gateway))
-        .route("/ops/backfill", get(backfill))
+        .route("/ops/backfill-rollup", get(backfill))
         .with_state((state, jobs))
         .layer(Extension(guard))
 }

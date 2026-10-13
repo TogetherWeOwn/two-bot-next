@@ -375,13 +375,13 @@ as dynamic labels.
   readiness code. Supervisor outcomes and alert rules are separately owned
   and not part of this contract.
 
-## Read-only ops roll-ups (`/ops/summary`, `/ops/gateway`, `/ops/backfill`)
+## Read-only ops roll-ups (`/ops/summary`, `/ops/gateway`, `/ops/backfill-rollup`)
 
 Three JSON roll-ups on the same listener reuse the `/readyz`, gateway,
 job, pool and event-store sources above. Like `/metrics` they are served
 openly on the container port. The off-container path is the Worker, which
 exact-matches the three paths before the invite-redirect lookup:
-`/ops/gateway` and `/ops/backfill` stay gated by the scrape bearer
+`/ops/gateway` and `/ops/backfill-rollup` stay gated by the scrape bearer
 (`METRICS_SCRAPE_TOKEN`, 404 when unset or short, 401 on a wrong bearer,
 429 per-caller attempt budget), while `/ops/summary` accepts either the
 scrape bearer or the dashboard service-token pair
@@ -407,7 +407,7 @@ pair; removing only one leaves the other credential open.
   `last_resume_unix` (Unix seconds of the last observed READY/RESUMED
   dispatch), per-event counts, per-stage checkpoint failures, and the
   `session_checkpoint` job's last success.
-- `GET /ops/backfill`: the global restorable point plus every covered
+- `GET /ops/backfill-rollup`: the global restorable point plus every covered
   journal table's durable cursor (`watermark`) and signed per-table `lag`:
   the table's own newest journal id minus its watermark, so 0 means fully
   journaled no matter how much other tables have written since. A table
