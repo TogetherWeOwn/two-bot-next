@@ -242,7 +242,12 @@ async fn every_member_request_passes_through_the_rate_limit_client() {
             break;
         }
     }
-    assert_eq!(pages, 2, "walked both scripted pages");
+    assert_eq!(pages, 3, "two scripted pages plus the empty terminator");
+    assert_eq!(
+        mock.count.load(Ordering::SeqCst),
+        3,
+        "two scripted pages plus the empty terminator hit the wire"
+    );
     assert_eq!(
         rest.requests(),
         mock.count.load(Ordering::SeqCst) as u64,
