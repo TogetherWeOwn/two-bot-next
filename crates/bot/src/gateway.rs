@@ -622,16 +622,9 @@ async fn retention_lifecycle(store: &GatewaySessionStore, event: &Event) -> Opti
     match event {
         Event::GuildDelete(deleted) => {
             let guild_id = deleted.id.get().to_string();
-            match two_bot_cutover::retention::handle_guild_delete(
-                pool,
-                &guild_id,
-                deleted.unavailable,
-            )
-            .await
-            {
-                Ok(_) => None,
-                Err(error) => Some(error),
-            }
+            two_bot_cutover::retention::handle_guild_delete(pool, &guild_id, deleted.unavailable)
+                .await
+                .err()
         }
         Event::GuildCreate(created) => {
             if matches!(
@@ -639,10 +632,9 @@ async fn retention_lifecycle(store: &GatewaySessionStore, event: &Event) -> Opti
                 twilight_model::gateway::payload::incoming::GuildCreate::Available(_)
             ) {
                 let guild_id = created.id().get().to_string();
-                match two_bot_cutover::retention::cancel_guild_purge(pool, &guild_id).await {
-                    Ok(_) => None,
-                    Err(error) => Some(error),
-                }
+                two_bot_cutover::retention::cancel_guild_purge(pool, &guild_id)
+                    .await
+                    .err()
             } else {
                 None
             }

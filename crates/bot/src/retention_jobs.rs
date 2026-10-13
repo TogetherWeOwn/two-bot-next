@@ -33,7 +33,6 @@ const TIMEOUT: Duration = Duration::from_secs(120);
 /// Parse the [`MODE_SETTING`] value. Missing means an active dry run (never
 /// destructive); `off` parks the job; anything else but the exact `dry-run`
 /// and `execute` literals is a configuration refusal that also parks.
-#[must_use]
 pub fn mode_from_setting(value: Option<&str>) -> Result<Option<RetentionMode>, ErrorClass> {
     match value {
         None => Ok(Some(RetentionMode::DryRun)),
