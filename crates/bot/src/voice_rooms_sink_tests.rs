@@ -723,12 +723,12 @@ fn guild_delete_drops_unflushed_game_activity_state() {
     collector.observe_presence(GUILD, game_activity_delta(MEMBER, Some("Apex"), now));
     collector.observe_join(GUILD, MEMBER, now);
 
-    let deleted = Event::GuildDelete(Box::new(
+    let deleted = Event::GuildDelete(
         serde_json::from_value::<twilight_model::gateway::payload::incoming::GuildDelete>(json!({
             "id": GUILD.to_string(), "unavailable": false
         }))
         .unwrap(),
-    ));
+    );
     feed(&runtime, &pipeline, deleted);
     assert!(
         collector.guilds().is_empty(),
