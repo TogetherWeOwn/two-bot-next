@@ -67,15 +67,22 @@ function harness(respond: (req: Request) => Response | Promise<Response>) {
   return { env, ctx, forwarded, names };
 }
 
-const rpc = (method: string, params: unknown, auth: string | null = `Bearer ${MCP_TOKEN}`) =>
-  new Request("https://probe.invalid/mcp", {
+let rpcCallerSeq = 0;
+const rpc = (method: string, params: unknown, auth: string | null = `Bearer ${MCP_TOKEN}`) => {
+  // mcpAuthBuckets is keyed by cf-connecting-ip (fallback "unknown") with a
+  // 10-burst/1-per-second budget: isolate callers per request so budgets never
+  // bleed across cases. The cap itself is pinned by the 429 test below.
+  rpcCallerSeq += 1;
+  return new Request("https://probe.invalid/mcp", {
     method: "POST",
     headers: {
       ...(auth ? { authorization: auth } : {}),
       "content-type": "application/json",
+      "cf-connecting-ip": `198.51.100.${(rpcCallerSeq % 200) + 1}`,
     },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
   });
+};
 
 async function rpcBody(res: Response): Promise<any> {
   assert.match(res.headers.get("content-type") ?? "", /application\/json/);
@@ -148,6 +155,28 @@ test("missing/invalid bearer -> 401 with WWW-Authenticate, zero container fetche
   assert.deepEqual(h.forwarded, [], "unauthenticated calls must never reach the container");
 });
 
+test("exhausted per-caller budget -> 429 with retry-after", async () => {
+  const h = harness(() => Response.json({ synthetic: true }));
+  // Fixed caller on a separate TEST-NET-3 address, far from the rpc() pool.
+  const fixed = () =>
+    new Request("https://probe.invalid/mcp", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${MCP_TOKEN}`,
+        "content-type": "application/json",
+        "cf-connecting-ip": "203.0.113.7",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+    });
+  let last: Response | null = null;
+  for (let i = 0; i < 11; i++) {
+    last = await worker.fetch(fixed(), h.env, h.ctx);
+    await last.text();
+  }
+  assert.equal(last!.status, 429, "11th rapid call on a 10-burst must be shed");
+  assert.match(last!.headers.get("retry-after") ?? "", /[0-9]/);
+});
+
 test("GET /mcp -> 405 with Allow: POST", async () => {
   const h = harness(() => Response.json({ synthetic: true }));
   const res = await worker.fetch(
@@ -195,4 +224,245 @@ test("stub hang -> abort at 6s with a JSON-RPC error", async () => {
   assert.equal(res.status, 200);
   const body = await rpcBody(res);
   assert.ok(body.error, "hung stub must surface a JSON-RPC error");
+});
+
+// Real /readyz shapes, copied from crates/bot/src/server.rs readyz tests:
+// components is Vec<(String, ComponentStatus)>, serialized as [name, status]
+// pairs; gateway_failure is present only after a recorded failure.
+const READY_COMPONENTS = [
+  ["process", "ready"],
+  ["gateway", "ready"],
+  ["database", "ready"],
+  ["token_invalid", "ready"],
+];
+const DOWN_COMPONENTS = [
+  ["process", "ready"],
+  ["gateway", "down"],
+  ["database", "down"],
+  ["token_invalid", "ready"],
+];
+const JOBS_FIXTURE = {
+  backfill: {
+    parked: false,
+    running: false,
+    last_start: null,
+    last_success: null,
+    last_error_class: null,
+    consecutive_failures: 0,
+  },
+};
+
+test("tools/call get_gateway on ready 200 returns the gateway pair", async () => {
+  const h = harness(() =>
+    Response.json({ components: READY_COMPONENTS, jobs: JOBS_FIXTURE }),
+  );
+  const res = await worker.fetch(
+    rpc("tools/call", { name: "get_gateway", arguments: {} }),
+    h.env,
+    h.ctx,
+  );
+  assert.equal(res.status, 200);
+  const body = await rpcBody(res);
+  assert.equal(body.error, undefined);
+  assert.deepEqual(body.result?.structuredContent, { gateway: "ready" });
+});
+
+test("tools/call get_gateway on gateway-down 503 returns gateway plus failure", async () => {
+  const failure = { phase: "durable_gateway", class: "timeout" };
+  const h = harness(() =>
+    Response.json(
+      {
+        components: DOWN_COMPONENTS,
+        jobs: JOBS_FIXTURE,
+        gateway_failure: failure,
+      },
+      { status: 503 },
+    ),
+  );
+  const res = await worker.fetch(
+    rpc("tools/call", { name: "get_gateway", arguments: {} }),
+    h.env,
+    h.ctx,
+  );
+  assert.equal(res.status, 200);
+  const body = await rpcBody(res);
+  assert.equal(body.error, undefined);
+  assert.deepEqual(body.result?.structuredContent, {
+    gateway: "down",
+    gateway_failure: failure,
+  });
+});
+
+test("tools/call get_backfill_progress pins the jobs excerpt on 200 and 503", async () => {
+  for (const status of [200, 503] as const) {
+    const h = harness(() =>
+      Response.json({ components: status === 200 ? READY_COMPONENTS : DOWN_COMPONENTS, jobs: JOBS_FIXTURE }, { status }),
+    );
+    const res = await worker.fetch(
+      rpc("tools/call", { name: "get_backfill_progress", arguments: {} }),
+      h.env,
+      h.ctx,
+    );
+    assert.equal(res.status, 200);
+    const body = await rpcBody(res);
+    assert.equal(body.error, undefined, `503 readyz must parse, got error on ${status}`);
+    assert.deepEqual(body.result?.structuredContent, {
+      implemented: false,
+      source: "readyz.jobs",
+      jobs: JOBS_FIXTURE,
+    });
+  }
+});
+
+test("tools/call get_gateway rejects non-report /readyz bodies with an error", async () => {
+  const cases: { name: string; respond: () => Response }[] = [
+    {
+      name: "500 JSON stays a failure",
+      respond: () => Response.json({ synthetic: true }, { status: 500 }),
+    },
+    {
+      name: "text/plain 503 stays a failure",
+      respond: () =>
+        new Response("not ready", {
+          status: 503,
+          headers: { "content-type": "text/plain" },
+        }),
+    },
+    {
+      name: "ownership-fence 503 stays a failure",
+      respond: () =>
+        Response.json(
+          { error: "ownership_fenced", reason: "shutdown_unconfirmed" },
+          { status: 503 },
+        ),
+    },
+    {
+      name: "junk 200 array stays a failure",
+      respond: () => Response.json(["process", "ready"], { status: 200 }),
+    },
+  ];
+  for (const c of cases) {
+    const h = harness(c.respond);
+    const res = await worker.fetch(
+      rpc("tools/call", { name: "get_gateway", arguments: {} }),
+      h.env,
+      h.ctx,
+    );
+    assert.equal(res.status, 200);
+    const body = await rpcBody(res);
+    assert.ok(body.error, `${c.name}: must surface a JSON-RPC error`);
+    assert.equal(body.result, undefined, `${c.name}: must carry no result`);
+    assert.ok(
+      !JSON.stringify(body).includes("structuredContent"),
+      `${c.name}: must carry no structuredContent`,
+    );
+  }
+});
+
+test("tools/call get_backfill_progress rejects non-report /readyz bodies with an error", async () => {
+  const cases: { name: string; respond: () => Response }[] = [
+    {
+      name: "500 JSON stays a failure",
+      respond: () => Response.json({ synthetic: true }, { status: 500 }),
+    },
+    {
+      name: "text/plain 503 stays a failure",
+      respond: () =>
+        new Response("not ready", {
+          status: 503,
+          headers: { "content-type": "text/plain" },
+        }),
+    },
+    {
+      name: "ownership-fence 503 stays a failure",
+      respond: () =>
+        Response.json(
+          { error: "ownership_fenced", reason: "shutdown_unconfirmed" },
+          { status: 503 },
+        ),
+    },
+  ];
+  for (const c of cases) {
+    const h = harness(c.respond);
+    const res = await worker.fetch(
+      rpc("tools/call", { name: "get_backfill_progress", arguments: {} }),
+      h.env,
+      h.ctx,
+    );
+    assert.equal(res.status, 200);
+    const body = await rpcBody(res);
+    assert.ok(body.error, `${c.name}: must surface a JSON-RPC error`);
+    assert.equal(body.result, undefined, `${c.name}: must carry no result`);
+    assert.ok(
+      !JSON.stringify(body).includes("structuredContent"),
+      `${c.name}: must carry no structuredContent`,
+    );
+  }
+});
+
+test("tools/call get_status on a 503 stays a failure", async () => {
+  const h = harness(() => Response.json({ status: "degraded" }, { status: 503 }));
+  const res = await worker.fetch(
+    rpc("tools/call", { name: "get_status", arguments: {} }),
+    h.env,
+    h.ctx,
+  );
+  assert.equal(res.status, 200);
+  const body = await rpcBody(res);
+  assert.ok(body.error, "get_status 503 must surface a JSON-RPC error");
+  assert.equal(body.result, undefined);
+});
+
+test("tools/call get_config reports the Worker version, never unknown here", async () => {
+  const h = harness(() => Response.json({ synthetic: true }));
+  const res = await worker.fetch(
+    rpc("tools/call", { name: "get_config", arguments: {} }),
+    h.env,
+    h.ctx,
+  );
+  assert.equal(res.status, 200);
+  const body = await rpcBody(res);
+  assert.deepEqual(body.result?.structuredContent, {
+    build_revision: "synthetic-mcp-deployment",
+    bot_port: "8080",
+    keepalive_seconds: "60",
+  });
+  assert.deepEqual(h.forwarded, [], "get_config must not touch the container");
+});
+
+test("tools/call get_audit pins the implemented=false stub", async () => {
+  const h = harness(() => Response.json({ synthetic: true }));
+  const res = await worker.fetch(
+    rpc("tools/call", { name: "get_audit", arguments: {} }),
+    h.env,
+    h.ctx,
+  );
+  assert.equal(res.status, 200);
+  const body = await rpcBody(res);
+  assert.deepEqual(body.result?.structuredContent, { implemented: false });
+  assert.deepEqual(h.forwarded, [], "get_audit must not touch the container");
+});
+
+test("initialize falls back to a supported version for unknown requests", async () => {
+  const h = harness(() => Response.json({ synthetic: true }));
+  const supported = await worker.fetch(
+    rpc("initialize", {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "synthetic-acceptance", version: "0" },
+    }),
+    h.env,
+    h.ctx,
+  );
+  assert.equal((await rpcBody(supported)).result?.protocolVersion, "2025-03-26");
+  const unknown = await worker.fetch(
+    rpc("initialize", {
+      protocolVersion: "1999-01-01",
+      capabilities: {},
+      clientInfo: { name: "synthetic-acceptance", version: "0" },
+    }),
+    h.env,
+    h.ctx,
+  );
+  assert.equal((await rpcBody(unknown)).result?.protocolVersion, "2025-06-18");
 });

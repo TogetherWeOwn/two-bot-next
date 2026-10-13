@@ -123,7 +123,20 @@ async fn real_erasure_cli_dry_execute_and_second_execute_counts() {
         dry_lines.len(),
         two_bot_cutover::member_erasure::plan().tables.len()
     );
-    assert!(dry_lines.iter().all(|line| line.ends_with("\t1")));
+    // The fixture seeds four event_store rows for the member (one presence row
+    // plus three S8 actor-only/target-only/user-only rows) and one row in every
+    // other erasure table; see crates/cutover/tests/member_erasure.rs.
+    for line in &dry_lines {
+        let expected = if line.starts_with("event_store\t") {
+            "\t4"
+        } else {
+            "\t1"
+        };
+        assert!(
+            line.ends_with(expected),
+            "dry-run count for {line}; event_store seeds 4, others 1"
+        );
+    }
     let execute = cli(&execute_args, Some(&url), Some("fixture-privacy-operator")).await;
     assert_eq!(table_lines(&execute, "ERASURE COMMITTED"), dry_lines);
     let second = cli(&execute_args, Some(&url), Some("fixture-privacy-operator")).await;

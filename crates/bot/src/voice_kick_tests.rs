@@ -373,6 +373,8 @@ async fn owner_original_creator_and_self_cannot_be_targeted() {
 async fn kick_members_and_administrator_targets_are_refused_with_no_effect() {
     // VK-01 start path: each privileged class is denied separately in the
     // interaction's guild, creating no vote, ballot, or enforcement effect.
+    // Each refusal writes one `vote_refused` audit row with the
+    // `privileged_target` outcome and no disconnect or permission edit.
     for (role, permissions) in [
         (KICK_ROLE, Permissions::KICK_MEMBERS),
         (ADMIN_ROLE, Permissions::ADMINISTRATOR),
@@ -393,6 +395,7 @@ async fn kick_members_and_administrator_targets_are_refused_with_no_effect() {
         );
         assert!(worker.kick_refresh(2).is_empty());
         assert!(!worker.dispatch_one(3).await);
+        // No disconnect and no room permission edit (deny) was written.
         assert!(trace.lock().unwrap().is_empty());
         // The refusal is audited with its own code.
         assert!(worker.flush_kick_audit(4).await);
@@ -400,13 +403,21 @@ async fn kick_members_and_administrator_targets_are_refused_with_no_effect() {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].event, KickAuditEvent::VoteRefused);
         assert_eq!(rows[0].outcome, "privileged_target");
+        assert_eq!(
+            (rows[0].vote_id, rows[0].initiator_id, rows[0].target_id),
+            (VOTE, VOTER_A, TARGET),
+            "refusal row names the attempt, role {role}"
+        );
+        assert!(rows[0].progress.is_none());
     }
 }
 
 #[tokio::test]
 async fn unavailable_target_authority_fails_closed_with_no_effect() {
     // VK-01 fail-closed: losing the guild-authority lookup refuses the start
-    // with no vote, ballot, or Discord write.
+    // with no vote, ballot, or Discord write. The refusal writes one
+    // `vote_refused` audit row with the `authority_unavailable` outcome and
+    // no disconnect or permission edit.
     let (mut worker, trace) = setup().await;
     worker.live.set_member_roles(TARGET, None);
     assert_eq!(
@@ -421,16 +432,28 @@ async fn unavailable_target_authority_fails_closed_with_no_effect() {
     );
     assert!(worker.kick_refresh(2).is_empty());
     assert!(!worker.dispatch_one(3).await);
+    // No disconnect and no room permission edit (deny) was written.
     assert!(trace.lock().unwrap().is_empty());
     assert!(worker.flush_kick_audit(4).await);
     let rows = worker.store.kick_audit.lock().unwrap().clone();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].event, KickAuditEvent::VoteRefused);
     assert_eq!(rows[0].outcome, "authority_unavailable");
+    assert_eq!(
+        (rows[0].vote_id, rows[0].initiator_id, rows[0].target_id),
+        (VOTE, VOTER_A, TARGET),
+        "refusal row names the attempt"
+    );
+    assert!(rows[0].progress.is_none());
 }
 
 #[tokio::test]
 async fn promoted_target_mid_vote_cancels_and_enforces_nothing() {
     // VK-01 recheck: a Kick Members grant after the start cancels the vote;
-    // the would-be passing ballot produces no kick/disconnect effect.
+    // the would-be passing ballot produces no kick/disconnect effect. The
+    // cancellation audits `vote_started` then `vote_result`
+    // `cancelled_target_protected` with no enforcement row and no disconnect
+    // or permission edit.
     let (mut worker, trace) = setup().await;
     start(&mut worker, VOTER_A, TARGET).unwrap();
     worker.kick_cast(VOTE, VOTER_A, VoteBallot::Yes, 1).unwrap();
@@ -442,7 +465,65 @@ async fn promoted_target_mid_vote_cancels_and_enforces_nothing() {
     );
     assert_eq!(update.kick, None);
     assert!(!worker.dispatch_one(3).await);
+    // No disconnect and no room permission edit (deny) was written.
     assert!(trace.lock().unwrap().is_empty());
+    assert!(worker.flush_kick_audit(4).await);
+    assert_eq!(
+        audit_trail(&worker),
+        [
+            (KickAuditEvent::VoteStarted, "started"),
+            (KickAuditEvent::VoteResult, "cancelled_target_protected"),
+        ]
+    );
+    let rows = worker.store.kick_audit.lock().unwrap().clone();
+    assert_eq!(
+        (rows[1].vote_id, rows[1].initiator_id, rows[1].target_id),
+        (VOTE, VOTER_A, TARGET)
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row.event != KickAuditEvent::Enforcement),
+        "a mid-vote cancellation must not write an enforcement row"
+    );
+}
+
+#[tokio::test]
+async fn unavailable_authority_mid_vote_cancels_and_enforces_nothing() {
+    // VK-01 fail-closed mid-vote: losing the guild-authority lookup cancels
+    // the vote rather than letting a later ballot pass it. The cancellation
+    // audits `vote_started` then `vote_result` `cancelled_target_protected`
+    // with no enforcement row and no disconnect or permission edit.
+    let (mut worker, trace) = setup().await;
+    start(&mut worker, VOTER_A, TARGET).unwrap();
+    worker.kick_cast(VOTE, VOTER_A, VoteBallot::Yes, 1).unwrap();
+    worker.live.set_member_roles(TARGET, None);
+    let update = worker.kick_cast(VOTE, VOTER_B, VoteBallot::Yes, 2).unwrap();
+    assert_eq!(
+        update.status,
+        VoteKickStatus::Cancelled(VoteCancellation::TargetProtected)
+    );
+    assert_eq!(update.kick, None);
+    assert!(!worker.dispatch_one(3).await);
+    // No disconnect and no room permission edit (deny) was written.
+    assert!(trace.lock().unwrap().is_empty());
+    assert!(worker.flush_kick_audit(4).await);
+    assert_eq!(
+        audit_trail(&worker),
+        [
+            (KickAuditEvent::VoteStarted, "started"),
+            (KickAuditEvent::VoteResult, "cancelled_target_protected"),
+        ]
+    );
+    let rows = worker.store.kick_audit.lock().unwrap().clone();
+    assert_eq!(
+        (rows[1].vote_id, rows[1].initiator_id, rows[1].target_id),
+        (VOTE, VOTER_A, TARGET)
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row.event != KickAuditEvent::Enforcement),
+        "an unavailable-authority cancellation must not write an enforcement row"
+    );
 }
 
 #[tokio::test]
@@ -452,6 +533,31 @@ async fn promoted_target_after_pass_is_not_touched_on_dispatch() {
     let (mut worker, trace) = setup().await;
     pass_vote(&mut worker);
     grant_guild_role(&worker, TARGET, ADMIN_ROLE, Permissions::ADMINISTRATOR);
+    dispatch(&mut worker, 3).await;
+    assert!(trace.lock().unwrap().is_empty());
+    assert!(worker.failures().is_empty());
+    assert!(worker.flush_kick_audit(4).await);
+    let enforcement: Vec<_> = worker
+        .store
+        .kick_audit
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|row| row.event == KickAuditEvent::Enforcement)
+        .cloned()
+        .collect();
+    assert_eq!(enforcement.len(), 1);
+    assert_eq!(enforcement[0].outcome, "skipped_target_protected");
+}
+
+#[tokio::test]
+async fn unavailable_authority_after_pass_is_not_touched_on_dispatch() {
+    // An authority lookup going unavailable between the pass and the Discord
+    // writes must still produce zero writes: the enforcement recheck fails
+    // closed.
+    let (mut worker, trace) = setup().await;
+    pass_vote(&mut worker);
+    worker.live.set_member_roles(TARGET, None);
     dispatch(&mut worker, 3).await;
     assert!(trace.lock().unwrap().is_empty());
     assert!(worker.failures().is_empty());

@@ -23,6 +23,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_gateway_disconnects_total` | Observed transport losses funnelled through the shard supervisor (reconnect failures, close frames, invalid sessions, cold-resume IDENTIFY). Every disconnect must pair with a later RESUME or fresh READY in the same window; an unpaired disconnect means the gateway never came back |
 | `two_bot_gateway_missed_events_total` | Dispatches Discord assigned but this process never received (sequence gaps inside one session). Any nonzero increase over the watch window fails the zero-missed-events acceptance |
 | `two_bot_gateway_events_total{event}` | Received dispatches, including replays/duplicates, plus heartbeat ACKs and closes; fixed type allowlist, remainder `other` |
+| `two_bot_presence_capture_total{outcome}` | Presence-update capture decisions on the hot path; `outcome` is `inserted` (first delivery stored a row), `duplicate` (same-key retry absorbed by the dedup key) or `rejected` (refused before the insert). Fixed three series from process start; no user, activity, application or free-text labels |
 | `two_bot_handler_duration_seconds` | Cumulative histogram over nonduplicate dispatch parse/pipeline/durable commit, including failures; seconds |
 | `two_bot_rest_requests_total{route,result}` | Executor HTTP sends, including retries; result `2xx`, `3xx`, `4xx`, `429`, `5xx` at response headers or `transport` (failure/cancellation/timeout before headers); later body failures do not hide 429/5xx |
 | `two_bot_rest_guard_invalid_requests_total` | Shared guard observations of 401, 403 or 429 response headers, across guarded REST callers |
@@ -53,7 +54,18 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_voice_tracked_rooms` | Rooms tracked in memory; compare with live Discord channels for ghosts |
 | `two_bot_voice_compensation_pending` | Tracked rooms awaiting compensating delete after a failed write |
 | `two_bot_voice_orphans_total` | Untracked creator-channel orphans needing manual deletion after failed `/create` compensation |
+| `two_bot_voice_joins_received_total` | Creator joins received by the guild actor; compare with create/move/refused outcomes — received persistently above handled means the actor is not processing joins |
+| `two_bot_voice_join_refused_total{reason}` | Actor-received creator joins refused before queueing; `reason` is `halted`, `access`, `unknown_creator`, `stale_ticket`, `duplicate`, `name_blocked` or `other` |
+| `two_bot_voice_worker_halted` | Guild-actor halt latch: 1 while a store CredentialRefused or Discord 401 halted join processing (only store halts auto-recover; 401s need a token fix + restart) |
+| `two_bot_voice_queue_pending{lane}` | Queued (not in-flight) voice actions; `lane` is `urgent` or `deferred` |
+| `two_bot_voice_queue_oldest_age_seconds` | Age of the oldest queued voice action in seconds; 0 when empty |
+| `two_bot_voice_rest_in_flight_age_seconds` | Age of the oldest in-flight voice REST attempt in seconds; 0 when idle |
+| `two_bot_voice_global_backoff_capped_total` | Global-backoff waits capped (returned RateLimited for tick-driven backoff) instead of parking the actor |
+| `two_bot_voice_dispatch_timeouts_total` | Actor dispatch turns that ran past the observe bound (run to completion; counted after the fact); the queue keeps its retries |
+| `two_bot_voice_watchdog_stucks_total` | Watchdog firings: queued work with no dispatch progress inside the window |
+| `two_bot_voice_halt_recoveries_total` | Halt-latch recoveries via store-credential re-probe (Discord-401 halts never auto-recover) |
 | `two_bot_voice_names_total{outcome}` | Automatic room-name decisions: a room created with its template name, each template render, and each queued rename sent or dropped at dispatch; `outcome` is `created_with_template`, `proposed`, `unchanged`, `waiting_for_name`, `blocked`, `channel_unseen`, `rename_sent`, `rename_room_gone`, `rename_superseded`, `rename_already_applied`, `rename_unseen`, `rename_no_access`, `rename_held`, `rename_duplicate` or `other` |
+| `two_bot_voice_join_occupancy_total{occupancy}` | Organic VOICE_STATE_UPDATE joins by humans already present in the target channel when the join arrived, excluding the joiner; `occupancy` is `0`, `1`, `2`, `3`, `4`, `5`, `6` or `7+` (`7+` caps the tail). Leaves, same-channel updates, pre-READY frames and mechanical transitions (creator/generator target or previous channel: creator join, generator join, bot move echo) are not samples; joins into the session lobby or permanent protected channels still sample; no member, channel or time labels, so hourly curves use `increase(...[1h])` and there is no per-event log line |
 | `two_bot_voice_vote_kick_total{outcome}` | Vote-kick starts, refusals and terminal enforcements; `outcome` is `started`, a refusal code (`evidence_unavailable`, `not_a_room`, `initiator_not_occupant`, `target_not_occupant`, `self_target`, `protected_target`, `privileged_target`, `authority_unavailable`, `active_vote_exists`, `cooldown`, `initiator_limited`, `reused_vote_id`, `unknown_vote`, `wrong_vote_boundary`, `ineligible_voter`, `repeated_vote`, `invalid_time`), an enforcement code (`connect_denied_and_disconnected`, `connect_denied_target_absent`, `skipped_room_gone`, `skipped_target_protected`, `permission_missing`, `discord_error`, `gave_up`) or `other`; vote results (`passed`/`expired`/`cancelled`) are audit-only and never counted |
 | `two_bot_dispatch_drops_total{lane}` | Dispatch-lane saturation drops: every event refused because every attempted lane was full. `lane` is one of `messages`, `interactions`, `registry`, `privileged`, `busy`, `reactions` (see label allowlists below). The `reactions` lane additionally counts per-member fairness refusals: a reaction refused because its member already holds `PER_USER_IN_FLIGHT` reaction slots, even while the lane has free slots. A single-lane refusal counts its lane once; a privileged spill refused by both lanes counts both. Logs sample the first drop per 60 s per runtime, so bursts are O(1) lines with N counter increments. `dispatch_drops:<lane>` raises a ticket after growth in 3 consecutive completed keepalive sample windows; the first valid sample only establishes a baseline. A flat sample or counter reset clears the streak; missing/invalid samples break growth but never falsely resolve an active ticket. A single burst never pages. `reactions`-lane growth can reflect per-member fairness rather than an undersized lane. Dispatch refusals are not proof of gateway packet loss |
 | `two_bot_gateway_checkpoint_failures_total{stage}` | Failed gateway checkpoint commits from `apply_dispatch` and failed checkpoint clears: every failure stops the dispatch worker and is recorded on `operation`. `stage` is `pre_commit` (commit skipped after a funnel/leveling/acknowledgement failure) or `commit` (the durable store write itself failed); failure causes are never labels. Alert rule `gateway_checkpoint_failures` fires on any increase summed over every `stage` between consecutive keepalive samples (the first sample is baseline-only; the failing process lingers 75 s so a scrape lands before the restart resets the counter); unlike bursty dispatch drops, a single checkpoint failure stops the worker, so there is no benign-singleton case |
@@ -170,6 +182,9 @@ as dynamic labels.
   `MESSAGE_REACTION_ADD`, `MESSAGE_REACTION_REMOVE`,
   `VOICE_STATE_UPDATE`, `PRESENCE_UPDATE`, `INVITE_CREATE`, `INVITE_DELETE`,
   `INTERACTION_CREATE`, `HEARTBEAT_ACK`, `GATEWAY_CLOSE`, `other`.
+- `two_bot_presence_capture_total{outcome}` — `outcome` is one of `inserted`,
+  `duplicate`, `rejected`. Exactly three series; unrecognised outcomes collapse
+  to `rejected`, never to a new series.
 - `two_bot_rest_requests_total{route,result}` — `result` is one of `2xx`,
   `3xx`, `4xx`, `429`, `5xx`, `transport`. `route` is one of the fixed
   executor route templates (`GET /channels/:channel`,
@@ -249,6 +264,15 @@ as dynamic labels.
   terminal `KickMember` enforcement (`EnforcementOutcome::as_str`); vote
   results are audit-only. Refusal codes never become free-form text; unknown
   outcomes collapse to `other`.
+- `two_bot_voice_join_occupancy_total{occupancy}` — `occupancy` is `0`, `1`,
+  `2`, `3`, `4`, `5`, `6` or `7+` (`crates/core/src/metrics.rs`
+  `VOICE_JOIN_OCCUPANCY_BUCKETS`). Recorded once per organic ticketed join by
+  `Metrics::voice_join_occupancy` from the gateway frame handler; leaves,
+  same-channel updates, pre-READY frames and mechanical transitions
+  (creator/generator target or previous channel) are not samples, while
+  session-lobby and permanent protected-channel joins still sample. No member,
+  channel or time labels and no per-event log line; hourly curves use
+  `increase(...[1h])` (see `docs/voice-occupancy-curve.md`).
 - `two_bot_db_errors_total{op}` — `op` is `admission` or `other`. Recorded
   by `Metrics::db_error`; send-admission SQL (admit/extend/complete storage
   failures) reports as `admission`, and failed voice actor store loads
@@ -350,6 +374,51 @@ as dynamic labels.
 - The `jobs` map is informational supervisor status; it does not change the
   readiness code. Supervisor outcomes and alert rules are separately owned
   and not part of this contract.
+
+## Read-only ops roll-ups (`/ops/summary`, `/ops/gateway`, `/ops/backfill`)
+
+Three JSON roll-ups on the same listener reuse the `/readyz`, gateway,
+job, pool and event-store sources above. Like `/metrics` they are served
+openly on the container port. The off-container path is the Worker, which
+exact-matches the three paths before the invite-redirect lookup:
+`/ops/gateway` and `/ops/backfill` stay gated by the scrape bearer
+(`METRICS_SCRAPE_TOKEN`, 404 when unset or short, 401 on a wrong bearer,
+429 per-caller attempt budget), while `/ops/summary` accepts either the
+scrape bearer or the dashboard service-token pair
+(`OPS_DASHBOARD_CLIENT_ID` / `OPS_DASHBOARD_CLIENT_SECRET`, same 404/401/429
+shape). The scrape gate runs first and its 429 is a hard fence; a
+non-throttled scrape refusal falls through to the dashboard gate.
+Doubly-unconfigured still 404s, otherwise a failed attempt is 401 with the
+Bearer challenge. The DO proxies the roll-ups with the same 6 s deadline and
+64 KiB body cap as the scrape, fetching the container's `/ops/summary`
+(never `/readyz`) and rewriting a 200 whose body has `ready: false` into the
+503 the dashboard renders (the roll-up itself always answers 200). Closing
+the summary requires removing both `METRICS_SCRAPE_TOKEN` and the dashboard
+pair; removing only one leaves the other credential open.
+
+- `GET /ops/summary`: readiness (`ready`, `components`), gateway state and
+  failure, the informational `jobs` map, pool gauges (`size`/`idle`/`max`),
+  event-store lag (`restorable_point`, `max_lag`: the largest per-table lag)
+  and backfill progress (`tables_total`, `tables_at_point`: tables whose
+  lag is exactly 0), plus the build revision/id.
+- `GET /ops/gateway`: shard state (`unconfigured`/`armed`/`connected`/
+  `draining`), gateway status, the last gateway-task failure, reconnect /
+  resume / disconnect / missed-event counters, `last_ready_unix` and
+  `last_resume_unix` (Unix seconds of the last observed READY/RESUMED
+  dispatch), per-event counts, per-stage checkpoint failures, and the
+  `session_checkpoint` job's last success.
+- `GET /ops/backfill`: the global restorable point plus every covered
+  journal table's durable cursor (`watermark`) and signed per-table `lag`:
+  the table's own newest journal id minus its watermark, so 0 means fully
+  journaled no matter how much other tables have written since. A table
+  with no journal rows or no committed watermark reports `null`, never zero.
+
+Every database-backed section degrades to an explicit `available: false`
+with `200`, never a 500 or an error string: a database outage must not hide
+gateway and job health. Event-store reads share the 2 s `/readyz` probe
+budget and run as one statement over the covered tables (per-table index
+seeks, one snapshot), so a commit cannot pair a new tip with an old
+watermark. Responses carry `no-store`; bodies are `application/json`.
 
 ## Cardinality and memory
 
