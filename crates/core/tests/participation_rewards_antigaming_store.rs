@@ -14,16 +14,27 @@
 //! and unchanged concurrent first-award races. Each test FAILS today because
 //! the seasonal/daily-cap/decay schema and policy do not exist yet.
 
+use two_bot_core::leveling::season_id_for_ms;
 use two_bot_core::leveling_store as store;
+use two_bot_core::parse_iso_millis;
 use two_bot_testsupport::TestDatabase;
 
 const GUILD: &str = "1545644954272137297";
 const MEMBER: &str = "100000000000000001";
 const OTHER: &str = "100000000000000002";
-const SEASON: &str = "2026-Q4";
 
 fn at(seconds: i64) -> String {
     two_bot_core::format_iso_millis(1_786_771_200_000 + seconds * 1000)
+}
+
+fn expected_season_for_fixture() -> String {
+    let ms = parse_iso_millis(&at(0)).expect("fixture timestamp parses");
+    let season = season_id_for_ms(ms);
+    assert_eq!(
+        season, "2026-Q3",
+        "2026-08-15 fixture must resolve to 2026-Q3"
+    );
+    season
 }
 
 async fn database() -> TestDatabase {
@@ -120,13 +131,15 @@ async fn seasonal_upsert_parallels_lifetime() -> Result<(), two_bot_core::Leveli
     )
     .await?;
     let lifetime = store::profile(&pool, GUILD, MEMBER).await?;
-    // The seasonal projection must mirror every lifetime award in the current
-    // quarter (`season_id='2026-Q4'`), append-only, same transaction shape.
+    // The seasonal projection must mirror every lifetime award in the
+    // event-time season (`season_id_for_ms(at(0))` = `2026-Q3`),
+    // append-only, same transaction shape.
+    let expected_season = expected_season_for_fixture();
     let seasonal: (i64,) = sqlx::query_as(
         "SELECT seasonal_xp FROM member_season_xp WHERE guild_id = $1 AND season_id = $2 AND member_id = $3",
     )
     .bind(GUILD)
-    .bind(SEASON)
+    .bind(expected_season.as_str())
     .bind(MEMBER)
     .fetch_one(&pool)
     .await
@@ -150,8 +163,9 @@ async fn decay_job_writes_audit_rows_leaves_lifetime(
     // must write `source='decay'` audit rows and never touch lifetime XP.
     // `at(0)` stamps the seasonal row; 36 d later is one full overdue week
     // (grace 28 d + 7 d), so exactly one member must decay.
+    let expected_season = expected_season_for_fixture();
     let decayed_members =
-        store::apply_seasonal_decay(&pool, GUILD, SEASON, &at(36 * 86400)).await?;
+        store::apply_seasonal_decay(&pool, GUILD, &expected_season, &at(36 * 86400)).await?;
     assert_eq!(
         decayed_members, 1,
         "one inactive seasonal row must decay after 36 d"
@@ -194,11 +208,12 @@ async fn concurrent_first_award_race_with_seasonal() -> Result<(), two_bot_core:
     );
     let lifetime = store::profile(&pool, GUILD, OTHER).await?;
     assert_eq!(lifetime.xp, 15);
+    let expected_season = expected_season_for_fixture();
     let seasonal: (i64,) = sqlx::query_as(
         "SELECT seasonal_xp FROM member_season_xp WHERE guild_id = $1 AND season_id = $2 AND member_id = $3",
     )
     .bind(GUILD)
-    .bind(SEASON)
+    .bind(expected_season.as_str())
     .bind(OTHER)
     .fetch_one(&pool)
     .await

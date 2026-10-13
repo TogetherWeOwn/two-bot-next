@@ -52,7 +52,7 @@ use two_bot_core::community::{
     build_scorecard, FactRow, ScorecardInputs, StreamCoverage, COMMUNITY_FACT_TYPES,
 };
 use two_bot_core::leveling::{
-    adjudicate_award, adjudicate_message_award, leaderboard_reply_for_season,
+    adjudicate_award, adjudicate_message_award, leaderboard_reply_for_season, season_id_for_ms,
     seasonal_xp_after_decay, voice_xp_for_duration, LeaderboardEntry, MessageAwardInput,
     MAX_STORED_XP, MESSAGE_XP,
 };
@@ -64,7 +64,14 @@ const VERSION: &str = "community-v1";
 const WEEK_START: &str = "2026-08-31T00:00:00.000Z";
 const WEEK_END: &str = "2026-09-07T00:00:00.000Z";
 const GENERATED_AT: &str = "2026-09-07T06:15:00.000Z";
-const SEASON_ID: &str = "2026-Q4";
+const BOUNDARY_WEEK_START: &str = "2026-10-05T00:00:00.000Z";
+const BOUNDARY_WEEK_END: &str = "2026-10-12T00:00:00.000Z";
+const BOUNDARY_GENERATED_AT: &str = "2026-10-12T06:15:00.000Z";
+
+fn expected_season_for_week(week_start: &str) -> String {
+    let ms = parse_iso_millis(week_start).expect("week start parses");
+    season_id_for_ms(week_start_ms(ms))
+}
 /// Message XP already granted before the ladder test's UTC day starts.
 const DAY_TOTAL_FRESH: u64 = 0;
 /// Normal-length message body (well above the 8-char short-message floor).
@@ -254,15 +261,19 @@ fn seasonal_decay_28d_10pct_weekly_lifetime_untouched() {
     );
 }
 
-fn full_coverage() -> Vec<StreamCoverage> {
+fn coverage_for_week(week_start: &str, week_end: &str) -> Vec<StreamCoverage> {
     COMMUNITY_FACT_TYPES
         .iter()
         .map(|stream| StreamCoverage {
             stream: (*stream).to_owned(),
-            covered_from: WEEK_START.to_owned(),
-            covered_through: WEEK_END.to_owned(),
+            covered_from: week_start.to_owned(),
+            covered_through: week_end.to_owned(),
         })
         .collect()
+}
+
+fn full_coverage() -> Vec<StreamCoverage> {
+    coverage_for_week(WEEK_START, WEEK_END)
 }
 
 fn fact(
@@ -288,32 +299,60 @@ fn fact(
     }
 }
 
-fn scorecard_inputs(facts: Vec<FactRow>) -> ScorecardInputs {
+fn scorecard_inputs_for_week(
+    facts: Vec<FactRow>,
+    week_start: &str,
+    week_end: &str,
+    generated_at: &str,
+) -> ScorecardInputs {
     ScorecardInputs {
         guild_id: GUILD.to_owned(),
         classifier_version: VERSION.to_owned(),
-        week_start: WEEK_START.to_owned(),
-        week_end: WEEK_END.to_owned(),
+        week_start: week_start.to_owned(),
+        week_end: week_end.to_owned(),
         watermark: facts.iter().map(|f| f.id).max().unwrap_or(0),
-        generated_at: GENERATED_AT.to_owned(),
+        generated_at: generated_at.to_owned(),
         recommendations_enabled: true,
         correction_cycles: 0,
         facts,
-        coverage: full_coverage(),
+        coverage: coverage_for_week(week_start, week_end),
         duplicate_source_ids: false,
         existing_revision_count: 0,
         existing_scorecard_json: None,
     }
 }
 
-fn build_json(facts: Vec<FactRow>) -> serde_json::Value {
-    let outcome = build_scorecard(scorecard_inputs(facts)).expect("scorecard builds");
+fn scorecard_inputs(facts: Vec<FactRow>) -> ScorecardInputs {
+    scorecard_inputs_for_week(facts, WEEK_START, WEEK_END, GENERATED_AT)
+}
+
+fn build_json_for_week(
+    facts: Vec<FactRow>,
+    week_start: &str,
+    week_end: &str,
+    generated_at: &str,
+) -> serde_json::Value {
+    let outcome = build_scorecard(scorecard_inputs_for_week(
+        facts,
+        week_start,
+        week_end,
+        generated_at,
+    ))
+    .expect("scorecard builds");
     serde_json::from_str(&outcome.scorecard_json).expect("scorecard JSON parses")
 }
 
-fn at_offset(seconds: i64) -> String {
-    let base = parse_iso_millis(WEEK_START).expect("week start parses");
+fn build_json(facts: Vec<FactRow>) -> serde_json::Value {
+    build_json_for_week(facts, WEEK_START, WEEK_END, GENERATED_AT)
+}
+
+fn at_offset_for_week(week_start: &str, seconds: i64) -> String {
+    let base = parse_iso_millis(week_start).expect("week start parses");
     format_iso_millis(base + seconds * 1000)
+}
+
+fn at_offset(seconds: i64) -> String {
+    at_offset_for_week(WEEK_START, seconds)
 }
 
 #[test]
@@ -407,16 +446,60 @@ fn detector_voice_afk_needs_occupancy_else_insufficient_data() {
 
 #[test]
 fn season_boundary_monday_alignment_reports_both_watermarks() {
-    // SPEC AC3: seasons are calendar quarters starting Monday 00:00 UTC
-    // (`season_id='2026-Q4'`); the boundary coincides with a Monday scorecard
-    // week boundary, so the boundary week reports both `season_close` and
-    // `season_open` watermarks. The builder reports neither today.
-    let season_monday = "2026-10-05T00:00:00.000Z";
-    let season_ms = parse_iso_millis(season_monday).expect("season start parses");
+    // SPEC AC3: seasons are calendar quarters starting Monday 00:00 UTC; the
+    // Q4 boundary (2026-10-05, first Monday of Q4) coincides with a Monday
+    // scorecard week boundary, so the boundary week reports both
+    // `season_close` and `season_open` watermarks. The builder reports neither
+    // today.
+    let season_ms = parse_iso_millis(BOUNDARY_WEEK_START).expect("season start parses");
     assert_eq!(
         week_start_ms(season_ms),
         season_ms,
         "season start must itself be a Monday 00:00 UTC boundary"
+    );
+    let expected = expected_season_for_week(BOUNDARY_WEEK_START);
+    assert_eq!(
+        expected, "2026-Q4",
+        "2026-10-05 boundary week must resolve to 2026-Q4"
+    );
+    let json = build_json_for_week(
+        vec![fact(
+            1,
+            "message_created",
+            MEMBER,
+            &at_offset_for_week(BOUNDARY_WEEK_START, 60),
+            Some(r#"{"channelClass":"human"}"#.to_owned()),
+        )],
+        BOUNDARY_WEEK_START,
+        BOUNDARY_WEEK_END,
+        BOUNDARY_GENERATED_AT,
+    );
+    let text = json.to_string();
+    assert!(
+        text.contains(&expected),
+        "boundary week must carry the current season_id"
+    );
+    assert!(
+        text.contains("season_close") && text.contains("season_open"),
+        "boundary week must report both season_close and season_open watermarks"
+    );
+}
+
+#[test]
+fn non_boundary_week_reports_no_watermarks() {
+    // SPEC AC3: a non-boundary week starting 2026-08-31 (Monday, inside Q3)
+    // must emit neither `season_close` nor `season_open`; only the Q4
+    // boundary week carries both watermarks.
+    let week_ms = parse_iso_millis(WEEK_START).expect("week start parses");
+    assert_eq!(
+        week_start_ms(week_ms),
+        week_ms,
+        "non-boundary week must itself start Monday 00:00 UTC"
+    );
+    let expected = expected_season_for_week(WEEK_START);
+    assert_eq!(
+        expected, "2026-Q3",
+        "2026-08-31 week must resolve to 2026-Q3"
     );
     let json = build_json(vec![fact(
         1,
@@ -427,12 +510,12 @@ fn season_boundary_monday_alignment_reports_both_watermarks() {
     )]);
     let text = json.to_string();
     assert!(
-        text.contains("2026-Q4"),
-        "boundary week must carry the current season_id"
+        text.contains(&expected),
+        "non-boundary week must carry the current season_id"
     );
     assert!(
-        text.contains("season_close") && text.contains("season_open"),
-        "boundary week must report both season_close and season_open watermarks"
+        !text.contains("season_close") && !text.contains("season_open"),
+        "non-boundary week must emit neither season_close nor season_open"
     );
 }
 
@@ -440,17 +523,22 @@ fn season_boundary_monday_alignment_reports_both_watermarks() {
 fn seasonal_leaderboard_defaults_to_current_season() {
     // SPEC AC3: `/leaderboard` defaults to current-season XP (same 1-25 clamp,
     // same top-10 public shape); lifetime stays behind an explicit flag owned
-    // by a later slice. The season scope is an explicit argument so the test
-    // never depends on the wall clock.
+    // by a later slice. The season scope is an explicit argument derived from
+    // the boundary week start so the test never depends on the wall clock.
+    let expected = expected_season_for_week(BOUNDARY_WEEK_START);
+    assert_eq!(
+        expected, "2026-Q4",
+        "2026-10-05 boundary week must resolve to 2026-Q4"
+    );
     let entries = vec![LeaderboardEntry {
         member_id: MEMBER.to_owned(),
         xp: 1200,
         level: 5,
         rank: 1,
     }];
-    let reply = leaderboard_reply_for_season(&entries, SEASON_ID);
+    let reply = leaderboard_reply_for_season(&entries, &expected);
     assert!(
-        reply.content.contains(SEASON_ID),
+        reply.content.contains(&expected),
         "seasonal leaderboard must scope to the current season by default"
     );
 }
