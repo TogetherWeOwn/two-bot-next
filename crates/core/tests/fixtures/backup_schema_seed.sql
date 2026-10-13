@@ -512,6 +512,22 @@ VALUES ('100000000000000001', '100000000000000050', 'vote_started', '10000000000
        ('100000000000000001', '100000000000000051', 'vote_refused', '100000000000000033',
         '100000000000000003', '100000000000000002', 'protected_target',
         NULL, NULL, NULL, '2026-08-03T10:05:00Z');
+-- Privacy opt-out control plane (0433/0434): one suppressed pair plus one
+-- untouched pair, per-guild toggles with one category disabled, and one
+-- audit receipt per suppression. Every table carries rows so the roundtrip
+-- asserts archive coverage, not an empty seed.
+INSERT INTO privacy_opt_outs (guild_id, member_id, opted_out_at)
+VALUES ('100000000000000001', '100000000000000005', '2026-08-03T10:00:00Z'),
+       ('100000000000000002', '100000000000000005', '2026-08-03T11:00:00Z');
+INSERT INTO guild_analytics_settings (guild_id, presence_enabled, activity_enabled,
+  voice_enabled, updated_at)
+VALUES ('100000000000000001', TRUE, FALSE, TRUE, '2026-08-03T10:00:00Z'),
+       ('100000000000000002', TRUE, TRUE, TRUE, '2026-08-03T11:00:00Z');
+INSERT INTO privacy_opt_out_audit (guild_id, member_id, actor, opted_out_at)
+VALUES ('100000000000000001', '100000000000000005', 'backup-operator',
+        '2026-08-03T10:00:00Z'),
+       ('100000000000000002', '100000000000000005', 'backup-operator',
+        '2026-08-03T11:00:00Z');
 -- Event-store S8 stage/interaction-observe/audit-log capture (0431): one
 -- stage-instance row and one audit-log-entry row, ids and enums only.
 INSERT INTO event_store (event_type, guild_id, channel_id, stage_instance_id,

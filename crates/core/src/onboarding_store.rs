@@ -100,6 +100,15 @@ impl PromptGuard {
         occurred_at: &str,
         anchor: bool,
     ) -> Result<bool, OnboardingStoreError> {
+        // Re-gate under the guard's table lock: an opt-out that committed
+        // while the welcome was in flight drops the row instead of landing
+        // after the purge.
+        if crate::privacy::suppressed_in(&mut self.transaction, &self.guild_id, &self.member_id)
+            .await?
+        {
+            self.transaction.rollback().await?;
+            return Ok(false);
+        }
         let row = prompted_row(&self.guild_id, &self.member_id, channel_id, occurred_at);
         let inserted = insert_row(&mut self.transaction, &row).await?;
         if inserted && anchor {
@@ -120,6 +129,12 @@ impl PromptGuard {
 
 /// Acquire the per-guild/member prompt lock, then re-check the legacy marker.
 /// `None` means another welcome already succeeded; do not post again.
+/// A suppressed (opted-out) pair also yields `None`: no welcome is sent and
+/// no per-user row is written for a member who opted out. The suppression
+/// gate runs inside the guard transaction under the shared table lock (held
+/// until `record_sent` commits or the guard drops), so a concurrent opt-out
+/// purge cannot slip between gate and write; `record_success` re-gates
+/// before the insert for opt-outs that land while the welcome is in flight.
 pub async fn begin_prompt(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -133,6 +148,15 @@ pub async fn begin_prompt(
         .bind(key)
         .execute(&mut *transaction)
         .await?;
+    // Serialize with concurrent opt-outs (SHARE ROW EXCLUSIVE over these
+    // tables): whoever locks first wins. Lock order matches `opt_out_member`.
+    sqlx::query("LOCK TABLE events, privacy_opt_outs IN ROW EXCLUSIVE MODE")
+        .execute(&mut *transaction)
+        .await?;
+    if crate::privacy::suppressed_in(&mut transaction, guild_id, member_id).await? {
+        transaction.rollback().await?;
+        return Ok(None);
+    }
     if has_prompt(&mut transaction, guild_id, member_id).await? {
         transaction.rollback().await?;
         return Ok(None);
@@ -160,6 +184,10 @@ pub async fn record_prompted(
 }
 
 /// Record granted game roles after the executor's role writes succeed.
+/// A suppressed (opted-out) pair records nothing and reports `false`: the
+/// Discord role effect itself is outside this store's scope, but no
+/// per-user row is persisted for it. The gate runs under the shared table
+/// lock so a concurrent opt-out cannot slip between gate and write.
 pub async fn record_game_selected(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -167,14 +195,26 @@ pub async fn record_game_selected(
     keys: &[String],
     occurred_at: &str,
 ) -> Result<bool, OnboardingStoreError> {
-    Ok(insert_row(
-        &mut *pool.acquire().await?,
+    let mut tx = pool.begin().await?;
+    sqlx::query("LOCK TABLE events, privacy_opt_outs IN ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    if crate::privacy::suppressed_in(&mut tx, guild_id, member_id).await? {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let inserted = insert_row(
+        &mut tx,
         &game_selected_row(guild_id, member_id, keys, occurred_at),
     )
-    .await?)
+    .await?;
+    tx.commit().await?;
+    Ok(inserted)
 }
 
 /// Record the destinations re-resolved after successful role writes.
+/// A suppressed (opted-out) pair records nothing and reports `false` (see
+/// [`record_game_selected`]).
 pub async fn record_channel_routed(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -182,8 +222,16 @@ pub async fn record_channel_routed(
     selection: &GameSelection,
     occurred_at: &str,
 ) -> Result<bool, OnboardingStoreError> {
-    Ok(insert_row(
-        &mut *pool.acquire().await?,
+    let mut tx = pool.begin().await?;
+    sqlx::query("LOCK TABLE events, privacy_opt_outs IN ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    if crate::privacy::suppressed_in(&mut tx, guild_id, member_id).await? {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let inserted = insert_row(
+        &mut tx,
         &channel_routed_row(
             guild_id,
             member_id,
@@ -193,7 +241,9 @@ pub async fn record_channel_routed(
             occurred_at,
         ),
     )
-    .await?)
+    .await?;
+    tx.commit().await?;
+    Ok(inserted)
 }
 
 /// Stage both game success rows in the caller's role-write transaction.
@@ -208,6 +258,15 @@ pub async fn record_game_selection_in_transaction(
     selection: &GameSelection,
     occurred_at: &str,
 ) -> Result<(), OnboardingStoreError> {
+    // Suppressed pairs persist nothing, even inside the caller's role-write
+    // transaction (see [`record_game_selected`]). The shared table lock
+    // serializes with concurrent opt-outs inside the caller's transaction.
+    sqlx::query("LOCK TABLE events, privacy_opt_outs IN ROW EXCLUSIVE MODE")
+        .execute(&mut **transaction)
+        .await?;
+    if crate::privacy::suppressed_in(transaction, guild_id, member_id).await? {
+        return Ok(());
+    }
     insert_row(
         transaction,
         &game_selected_row(guild_id, member_id, keys, occurred_at),
@@ -238,6 +297,12 @@ pub async fn record_session_routed_in_transaction(
     plan: &SessionPlan,
     occurred_at: &str,
 ) -> Result<bool, OnboardingStoreError> {
+    sqlx::query("LOCK TABLE events, privacy_opt_outs IN ROW EXCLUSIVE MODE")
+        .execute(&mut **transaction)
+        .await?;
+    if crate::privacy::suppressed_in(transaction, guild_id, member_id).await? {
+        return Ok(false);
+    }
     Ok(insert_row(
         transaction,
         &session_routed_row(guild_id, member_id, plan, occurred_at),
@@ -246,6 +311,8 @@ pub async fn record_session_routed_in_transaction(
 }
 
 /// Record roleless session routing; repeated picks at new timestamps count.
+/// A suppressed (opted-out) pair records nothing and reports `false` (see
+/// [`record_game_selected`]).
 pub async fn record_session_routed(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -253,9 +320,19 @@ pub async fn record_session_routed(
     plan: &SessionPlan,
     occurred_at: &str,
 ) -> Result<bool, OnboardingStoreError> {
-    Ok(insert_row(
-        &mut *pool.acquire().await?,
+    let mut tx = pool.begin().await?;
+    sqlx::query("LOCK TABLE events, privacy_opt_outs IN ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    if crate::privacy::suppressed_in(&mut tx, guild_id, member_id).await? {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let inserted = insert_row(
+        &mut tx,
         &session_routed_row(guild_id, member_id, plan, occurred_at),
     )
-    .await?)
+    .await?;
+    tx.commit().await?;
+    Ok(inserted)
 }

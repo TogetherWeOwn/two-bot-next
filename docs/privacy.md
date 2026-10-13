@@ -108,6 +108,56 @@ to that snowflake also matches. This is not a general personal-data recognizer:
 encoded/hashed identities, names, arbitrary prose without the ID, or a novel
 identity-bearing field require source review and an explicit manifest update.
 
+## Member opt-out (per-user, per-guild)
+
+**For members:** you can opt out of analytics persistence for one server
+(guild) at a time. Opting out in guild A changes nothing in guild B.
+When your opt-out runs, the bot:
+
+1. Deletes your event-store rows for that guild: your `events` rows
+   (including rows that merely mention your ID in serialized metadata, with
+   the same guild+identity matching as member erasure), your `members`
+   projection row, any invite-snapshot rows attributing invites to you, and
+   your `community_facts` rows (message, voice and join facts, matched by
+   actor plus metadata/source-event/idempotency-key like member erasure).
+2. Installs a suppression entry for your (guild, member) pair. From then
+   on, every gated write seam drops future per-user persistence for that
+   pair: event writes, activity/bot-flag upserts, onboarding prompt and
+   selection rows (an opted-out member is not sent welcome prompts, because
+   sending one would persist per-user state), community-facts writes
+   (message facts follow the activity switch, voice facts the voice switch,
+   join/rules facts are suppression-only), invite-attribution writes
+   (invite use counts keep counting, with the inviter field blanked), and
+   the standalone capture's counter baseline. A join attributed to your
+   invite keeps the joiner's row but with your inviter field blanked.
+   Anonymous aggregate counters keep counting throughout.
+3. Writes exactly one audit receipt: the guild/member scope plus the
+   operator actor label and the database timestamp.
+
+Moderation, audit, XP/level, ticket, voice-room and settings rows are not
+part of an opt-out: they serve safety, delivery and accountability, not
+analytics. A member who needs full removal should request erasure (see
+Procedure below), which is a separate reviewed operation.
+
+Opting back in removes the suppression entry only; it does not restore
+already-purged rows. Afterwards the pair persists exactly as before, and
+the re-enable itself writes no purge receipt (the receipt table records
+purges, one row per purge).
+
+Until the member self-serve slash command lands, an opt-out is executed by
+a server operator through the reviewed `opt_out_member` service with an
+explicit operator actor label, against a disposable/staging binding first
+per the rollout gates. The actor label carries operator attribution only:
+never put a member ID, content, count or secret in it.
+
+**Policy note (verified 2026-10-12):** the live Discord Developer Policy
+now lives on Discord's developer support help center (the old
+`discord.com/developers/docs/...` URL redirects there). A direct fetch
+from this sandbox on 2026-10-12 was blocked after the redirect chain
+(301, then 307, then 403 bot detection), so this document makes no claim
+about the policy's current text. Before citing Discord policy in a member
+answer, open the live page and quote what it says that day.
+
 ## Retention and explicit exceptions
 
 No new automatic age-based purger is installed by this change. Covered activity
@@ -133,6 +183,9 @@ The manifest explicitly retains these control-plane records:
 | `guild_settings_audit.actor`, `old_value`, `new_value` | Immutable configuration history; the database refuses DELETE, UPDATE and TRUNCATE, even a zero-row DELETE. No trigger disabling or audit bypass is permitted. IDs in prior/current policy remain here. |
 | `audit_kill_switch.engaged_by` | Global incident-control attribution, with no guild scope. Member erasure never disengages or rewrites the halt. |
 | `member_erasure_audit.actor` | Minimal operator accountability, retained independently of member activity. It is not the erased subject field. |
+| `privacy_opt_outs` (guild, member, time) | Guild-scoped opt-out suppression tombstone. Deleting it would silently resume per-user persistence the member refused. Retained until the member opts back in; member erasure never removes suppression. |
+| `privacy_opt_out_audit` (scope, actor, time) | One receipt row per opt-out/purge, same accountability class as `member_erasure_audit`. The subject appears only in the scope columns, never in the actor label. |
+| `guild_analytics_settings` | Per-guild ingestion switches (presence/activity/voice). Guild configuration, not member activity; no member IDs stored. |
 | `moderation_idempotency` rows with `done` / `operator_released` | Indefinite replay fence for an uncertain Discord mutation. It retains the guild-scoped caller key, which may itself be a member snowflake and therefore remains as identity-bearing data, plus action, fixed `claim_token` and `request_hash` markers, generic result and timestamps. The obsolete ownership token and actor-derived request hash are replaced, and the original hash is redacted from inspection/audit snapshots. |
 
 These exceptions currently have **no enforced expiry**. This CLI is not a claim
@@ -141,6 +194,51 @@ needs a separate security/privacy disposition, not a silent exception or bypass.
 Guild-local erasure also does not delete NULL-guild internal records, global
 hashed nonce/event replay guards, other-guild activity, existing backups,
 external logs, or Discord messages/attachments.
+
+## Guild analytics toggles
+
+Operators can disable analytics ingestion per guild and per family with one
+row in `guild_analytics_settings` (see the `analytics_settings` /
+`set_analytics_settings` service calls). A guild with no row has every
+category enabled, matching the behavior from before the toggles existed.
+Each switch is independent: disabling presence never touches activity or
+voice.
+
+| Family | Switch | Gated event types |
+| --- | --- | --- |
+| Presence | `presence_enabled` | `presence_update` |
+| Activity | `activity_enabled` | `first/second/third_message`, community `message_created` facts |
+| Voice | `voice_enabled` | `voice_session_start/end`, `first_voice_session`, community `voice_session_started/ended` facts |
+
+Every other event type still persists: joins, leaves, gate clears,
+onboarding prompts, invite clicks and routing rows serve
+safety/moderation and onboarding delivery, not analytics. Membership
+lifecycle rows in particular stay unconditional, so a disabled analytics
+category can never blind moderation to a join or a leave. Presence updates
+already have no durable funnel effect at the gateway (they feed only
+in-memory voice-room name facts); the presence switch additionally drops
+any `presence_update` row a backfill or replay would otherwise write.
+
+Gated seams: the cutover event writer (`record_event`, with `record_earliest`
+and the backfill/community replays that call them), the runtime funnel
+store, the gateway batch commit, the community-facts writer (`record_fact`,
+including the leveling-runtime flush and the RSVP host check-in, which is
+suppression-only like other lifecycle facts), invite snapshots (suppressed
+inviters keep the aggregate use count with a blanked inviter field, in the
+standalone capture's counter baseline and the backfill baseline alike, which
+share one writer), the onboarding writers (including the prompt guard, which
+re-gates before the insert for opt-outs that land while the welcome is in
+flight), `touch_activity` / `mark_bot`, and the inactivity sweep (suppression-only:
+a suppressed pair is skipped inside the per-member transaction, so the sweep
+never recreates the purged `member_inactive` row). Every gated writer serializes
+with concurrent opt-outs (a shared table lock, so a write that passes the
+gate can never land after the purge), and `member_join` rows strip a
+suppressed inviter's `inviterId` from metadata while keeping the joiner's
+own row. Under a disabled toggle `touch_activity` / `mark_bot` may still
+refresh `last_active_at` for non-suppressed members, which is a known
+residual for a follow-up, not silent per-user analytics. Duplicate
+reconfirmations for suppressed pairs advance nothing: the gate runs before
+the observation-maximum path too.
 
 Backups follow the existing [backup runbook](backup.md): retention is measured
 in retained snapshots (default 14 newest), **not 14 days**. Historical snapshots
@@ -234,9 +332,19 @@ On the controller, use the approved cache wrapper (never direct compiling Cargo)
 ```sh
 TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_ci \
   python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test member_erasure
+TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_ci \
+  python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test privacy_opt_out
+TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_ci \
+  python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --test privacy_service
 python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot erasure_cli
 cargo fmt --all -- --check
 ```
+
+The `privacy_opt_out` suite is the failing-first acceptance contract for
+opt-out purge plus suppression plus toggles plus the audit receipt; the
+`privacy_service` suite covers the `opt_out_member` / `opt_back_in` /
+analytics-settings service calls. Neither suite may be edited to make the
+implementation pass: fix the implementation instead.
 
 The bootstrap database must already exist; the fixture creates/drops only its own
 unique test database. Never use a staging/production binding for these tests.

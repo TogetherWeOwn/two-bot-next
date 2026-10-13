@@ -291,6 +291,21 @@
       "table": "moderation_idempotency",
       "column": "request_hash",
       "reason": "An operator-released request replaces its actor-derived request hash with the fixed non-identity operator_released marker, redacted from inspection/audit snapshots."
+    },
+    {
+      "table": "privacy_opt_outs",
+      "column": "member_id",
+      "reason": "Guild-scoped opt-out suppression tombstone: deleting it would silently resume per-user persistence the member refused. Retained until the member opts back in; member erasure never removes suppression."
+    },
+    {
+      "table": "privacy_opt_out_audit",
+      "column": "member_id",
+      "reason": "Opt-out purge receipt scope: one row per purge with operator actor and database timestamp. Retained accountability in the same class as member_erasure_audit; the subject appears only in the scope columns, never in the actor label."
+    },
+    {
+      "table": "privacy_opt_out_audit",
+      "column": "actor",
+      "reason": "Operator accountability for opt-out purges: actor and time only, never subject content. Retained independently of member activity, like member_erasure_audit.actor."
     }
   ]
 }

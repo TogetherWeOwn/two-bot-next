@@ -200,7 +200,7 @@ FAIL; on a real restore require exit 0 and `RESTORE VERIFIED`, then separately
 verify canonical content and required table coverage. A v4 dump covers every
 table that either migration chain creates, except `xp_cooldowns`, the store
 chain's `rollback_journal`/`rollback_watermarks` and the migration ledgers
-([`EXCLUDED_TABLES`](../crates/core/src/backup/dump_file.rs#L172)),
+([`EXCLUDED_TABLES`](../crates/core/src/backup/dump_file.rs#L185)),
 plus retired legacy tables when the source still has them
 ([`DUMP_TABLES`](../crates/core/src/backup/dump_file.rs#L44)). Restore needs a
 target migrated to the dump's schema, and refuses before any write when a
@@ -527,7 +527,7 @@ the authorized migration procedure: no agent-run live test inserts, generic
 receipt is **NO-GO**. The same allocator gate applies to a rollback recovery target.
 
 Source example: [events BIGSERIAL](../crates/cutover/migrations/0001_funnel.sql#L14)
-is allocated by [gateway inserts](../crates/cutover/src/gateway_session.rs#L304)
+is allocated by [gateway inserts](../crates/cutover/src/gateway_session.rs#L374)
 that handle only idempotency-key conflicts, not primary-key collisions. The
 [restore's sequence restart](../crates/core/src/backup/dump.rs#L218)
 illustrates the hazard; it does not prove the planned copier covers every table.
