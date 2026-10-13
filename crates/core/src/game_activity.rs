@@ -316,20 +316,23 @@ fn finish_open(open: OpenSession, voices: &[VoiceSpan], out: &mut Vec<PlaySessio
 /// `self_stream` needs no special case because an overlapping span already
 /// contributes, whether or not the member streamed through Discord).
 /// Streaming sessions are flagged via the opening Streaming activity.
-/// Output is sorted by `(started_at_ms, ended_at_ms)` for determinism.
+/// Output is sorted by `(started_at_ms, ended_at_ms, game, is_streaming,
+/// in_voice_ms)` for determinism: ties on start and end (likely when a
+/// poller stamps many members with the same tick) still come out in the
+/// same order on every run.
 #[must_use]
 pub fn sessionize(
     deltas: &[PresenceDelta],
     voices: &[VoiceSpan],
     gap_timeout_ms: i64,
 ) -> Vec<PlaySession> {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     let mut ordered: Vec<&PresenceDelta> = deltas.iter().collect();
     ordered.sort_by_key(|delta| delta.observed_at_ms);
 
     let mut out: Vec<PlaySession> = Vec::new();
-    let mut open_by_user: HashMap<String, OpenSession> = HashMap::new();
+    let mut open_by_user: BTreeMap<String, OpenSession> = BTreeMap::new();
 
     for delta in ordered {
         let Some((game, is_streaming)) = session_game(delta) else {
@@ -371,11 +374,33 @@ pub fn sessionize(
         }
     }
     let mut remaining: Vec<OpenSession> = open_by_user.into_values().collect();
-    remaining.sort_by_key(|open| (open.started_at_ms, open.ended_at_ms));
+    remaining.sort_by(|a, b| {
+        (a.started_at_ms, a.ended_at_ms, &a.game, a.is_streaming).cmp(&(
+            b.started_at_ms,
+            b.ended_at_ms,
+            &b.game,
+            b.is_streaming,
+        ))
+    });
     for open in remaining {
         finish_open(open, voices, &mut out);
     }
-    out.sort_by_key(|session| (session.started_at_ms, session.ended_at_ms));
+    out.sort_by(|a, b| {
+        (
+            a.started_at_ms,
+            a.ended_at_ms,
+            &a.game,
+            a.is_streaming,
+            a.in_voice_ms,
+        )
+            .cmp(&(
+                b.started_at_ms,
+                b.ended_at_ms,
+                &b.game,
+                b.is_streaming,
+                b.in_voice_ms,
+            ))
+    });
     out
 }
 
@@ -505,6 +530,123 @@ mod tests {
             rows[0].in_voice_ms, MIN_MS,
             "in-voice time is the 1-minute overlap, got {:?}",
             rows[0]
+        );
+    }
+
+    #[test]
+    fn other_members_non_playing_delta_leaves_session_open() {
+        // Member A plays at t0, t0+5m, t0+10m; member B plays at t0+2m then
+        // sends an empty-activities delta at t0+3m. B's non-playing delta
+        // must close only B, leaving A as one 10-minute session.
+        let t0 = 1_750_000_000_000i64;
+        let deltas = vec![
+            user_delta("user-a", t0, "Apex"),
+            user_delta("user-b", t0 + 2 * MIN_MS, "Apex"),
+            PresenceDelta {
+                user_key: "user-b".to_owned(),
+                observed_at_ms: t0 + 3 * MIN_MS,
+                activities: Vec::new(),
+            },
+            user_delta("user-a", t0 + 5 * MIN_MS, "Apex"),
+            user_delta("user-a", t0 + 10 * MIN_MS, "Apex"),
+        ];
+        let sessions = sessionize(&deltas, &[], 15 * MIN_MS);
+        assert_eq!(
+            sessions.len(),
+            2,
+            "one session per member, got {sessions:?}"
+        );
+        let total: i64 = sessions
+            .iter()
+            .map(|s| s.ended_at_ms.saturating_sub(s.started_at_ms).max(0))
+            .sum();
+        assert_eq!(
+            total,
+            11 * MIN_MS,
+            "A spans 10 min plus B's 1-minute floor, got {sessions:?}"
+        );
+        assert!(
+            sessions
+                .iter()
+                .any(|s| s.ended_at_ms.saturating_sub(s.started_at_ms) == 10 * MIN_MS),
+            "A stays one 10-minute session, got {sessions:?}"
+        );
+        assert!(
+            sessions
+                .iter()
+                .any(|s| s.ended_at_ms.saturating_sub(s.started_at_ms) == MIN_MS),
+            "B is one floor-credited singleton, got {sessions:?}"
+        );
+    }
+
+    #[test]
+    fn overlapping_voice_spans_merge_and_boundary_is_zero() {
+        // Two overlapping spans for one member inside a 30-minute session
+        // must count their union once (5..20 = 15 min). A span ending
+        // exactly at the session start contributes zero (half-open).
+        let t0 = 1_750_000_000_000i64;
+        let deltas = vec![
+            user_delta("user-1", t0, "Apex"),
+            user_delta("user-1", t0 + 30 * MIN_MS, "Apex"),
+        ];
+        let voices = vec![
+            VoiceSpan {
+                user_key: "user-1".to_owned(),
+                join_ms: t0 + 5 * MIN_MS,
+                leave_ms: t0 + 15 * MIN_MS,
+                self_stream: false,
+            },
+            VoiceSpan {
+                user_key: "user-1".to_owned(),
+                join_ms: t0 + 10 * MIN_MS,
+                leave_ms: t0 + 20 * MIN_MS,
+                self_stream: false,
+            },
+            VoiceSpan {
+                user_key: "user-1".to_owned(),
+                join_ms: t0 - 10 * MIN_MS,
+                leave_ms: t0,
+                self_stream: false,
+            },
+        ];
+        let sessions = sessionize(&deltas, &voices, 60 * MIN_MS);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].in_voice_ms,
+            15 * MIN_MS,
+            "union of overlapping spans is 15 min, got {:?}",
+            sessions[0]
+        );
+        assert_eq!(
+            session_voice_overlap_ms(t0, t0 + 30 * MIN_MS, "user-1", &voices[2..3]),
+            0,
+            "span ending exactly at the session start contributes zero"
+        );
+    }
+
+    #[test]
+    fn tied_sessions_have_deterministic_total_order() {
+        // Two singletons stamped at the same tick tie on (start, end).
+        // The total sort key (game, streaming, voice) must order them the
+        // same way on every run.
+        let t0 = 1_750_000_000_000i64;
+        let deltas = vec![
+            user_delta("user-a", t0, "Zelda"),
+            user_delta("user-b", t0, "Apex"),
+        ];
+        let first = sessionize(&deltas, &[], 15 * MIN_MS);
+        let second = sessionize(&deltas, &[], 15 * MIN_MS);
+        assert_eq!(first.len(), 2);
+        assert_eq!(first, second, "tied sessions order every run");
+        assert_eq!(
+            first[0].game.as_deref(),
+            Some("Apex"),
+            "ties break by game, got {first:?}"
+        );
+        assert_eq!(
+            first[1].game.as_deref(),
+            Some("Zelda"),
+            "ties break by game, got {first:?}"
         );
     }
 }
