@@ -4,6 +4,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'members', 'table'),
     ('public', 'invite_snapshots', 'table'),
     ('public', 'member_levels', 'table'),
+    ('public', 'member_season_xp', 'table'),
     ('public', 'xp_cooldowns', 'table'),
     ('public', 'xp_awards', 'table'),
     ('public', 'level_role_rewards', 'table'),

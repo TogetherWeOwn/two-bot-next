@@ -9,6 +9,10 @@
       "justification": "Baseline existing bot migrations for TOG-10874; no SQL changes.",
       "sha256": "e257889e79beb83896f686fecd2116ca653ce0ef9392c622618f720ccd9b712c"
     },
+    "crates/cutover/migrations/0100_participation_rewards_antigaming.sql": {
+      "justification": "Add participation-rewards anti-gaming seasonal projection for TOG-22868; additive nullable-only migration.",
+      "sha256": "757fbef0724e5abf37b0b8a10434800e4c3748c0f10d0fa8653c37c6dca6a34f"
+    },
     "crates/cutover/migrations/0110_moderation_member.sql": {
       "sha256": "5cac88b239c9a38ead5318f0d1f75bc0ffc1abeaf414d2d8e7bccf6a2da327a4",
       "justification": "Add reserved member moderation ledger migration for TOG-10078; SQL unchanged during main reconciliation."

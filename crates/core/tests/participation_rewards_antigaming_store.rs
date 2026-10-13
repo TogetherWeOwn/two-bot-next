@@ -174,9 +174,10 @@ async fn concurrent_first_award_race_with_seasonal() -> Result<(), two_bot_core:
     let pool = fixture.pool().clone();
     // Same-member, same-instant first awards serialize on the cooldown row:
     // exactly one wins. The seasonal projection must mirror the winner.
+    let instant = at(0);
     let (first, second) = tokio::join!(
-        store::award_message(&pool, GUILD, OTHER, &at(0), None),
-        store::award_message(&pool, GUILD, OTHER, &at(0), None),
+        store::award_message(&pool, GUILD, OTHER, &instant, None),
+        store::award_message(&pool, GUILD, OTHER, &instant, None),
     );
     let (first, second) = (first?, second?);
     assert!(
