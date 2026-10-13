@@ -37,12 +37,11 @@
 //!   change-detail and reason free text persist their ids, timestamps and
 //!   enums only; the sentinels appear in no stored row.
 //!
-//! Pending-test routing (established pattern): every database test is ignored
-//! and skipped in the nightly broad sweep, so this card's CI stays green
-//! while the S8 build is outstanding; run with `-- --ignored` to see the gap.
-//! The S8 build card un-ignores these tests once the migration lands. DB tests
-//! run only against the disposable test database (`TestDatabase` refuses
-//! anything but agent-testdb), never staging or production.
+//! Test routing: the database tests below run enabled against the disposable
+//! test database (`TestDatabase` refuses anything but agent-testdb), never
+//! staging or production. They are skipped in the nightly broad sweep via
+//! `--skip` entries (see `.github/workflows/nightly.yml`), so the broad sweep
+//! stays green while slice suites run in their own lanes.
 #![cfg(feature = "db")]
 
 use serde_json::{json, Value};
@@ -343,14 +342,10 @@ async fn table_columns(pool: &PgPool) -> Vec<String> {
     .expect("event_store columns readable")
 }
 
-/// The exact reviewed column set for the shared `event_store` table after the
-/// S8 migration in isolation: ids, timestamps, the resume-safe key, the member
-/// id relaxed for sibling order-independence, and the stage/interaction/audit
-/// enums only. A denylist cannot fail on a new free-text name (raw_payload,
-/// stage_topic, ...), so this asserts the full set instead. Later slices
-/// extend this allowlist when they add their own reviewed columns
-/// (`ADD COLUMN IF NOT EXISTS` per 0431).
-const ALLOWED_COLUMNS: &[&str] = &[
+/// The S8 columns that must exist after the S8 migration: ids, timestamps,
+/// the resume-safe key, the member id relaxed for sibling order-independence,
+/// and the stage/interaction/audit enums only.
+const REQUIRED_COLUMNS: &[&str] = &[
     "action_type",
     "actor_id",
     "application_id",
@@ -371,19 +366,72 @@ const ALLOWED_COLUMNS: &[&str] = &[
     "user_id",
 ];
 
+/// The reviewed column allowlist for the shared `event_store` table: the union
+/// of the slices' columns (S2 member deltas, S4 voice, S5 message/reaction,
+/// S6 threads, S8 stage/interaction) plus the `id` primary key. Every actual
+/// column must be a member, so any new free-text column (a body-carrying
+/// `raw_payload`, `stage_topic`, or similar) fails the suite. A denylist
+/// cannot fail on a new name, so this asserts the closed set instead. Later
+/// slices extend this list when they add their own reviewed columns
+/// (`ADD COLUMN IF NOT EXISTS` per 0431).
+const ALLOWED_COLUMNS: &[&str] = &[
+    "action_type",
+    "actor_id",
+    "application_id",
+    "archived",
+    "audit_log_entry_id",
+    "channel_id",
+    "command_id",
+    "deaf",
+    "dedup_key",
+    "emoji_id",
+    "emoji_name",
+    "event_time",
+    "event_type",
+    "guild_id",
+    "id",
+    "interaction_id",
+    "interaction_type",
+    "invitable",
+    "locked",
+    "message_id",
+    "mute",
+    "nick",
+    "parent_id",
+    "premium_since",
+    "privacy_level",
+    "received_at",
+    "roles",
+    "self_deaf",
+    "self_mute",
+    "self_stream",
+    "self_video",
+    "session_id",
+    "stage_instance_id",
+    "suppress",
+    "target_id",
+    "thread_id",
+    "user_id",
+];
+
 fn assert_stage_schema(columns: &[String]) {
-    let mut actual = columns.to_vec();
-    actual.sort();
-    let mut expected: Vec<String> = ALLOWED_COLUMNS
-        .iter()
-        .map(|name| (*name).to_owned())
-        .collect();
-    expected.sort();
-    assert_eq!(
-        actual, expected,
-        "event_store holds exactly the reviewed S8 columns; extend the allowlist \
-         only with a reviewed slice column"
+    assert!(
+        !columns.is_empty(),
+        "S8 creates the stage/interaction/audit columns on the append-only event_store table"
     );
+    for required in REQUIRED_COLUMNS {
+        assert!(
+            columns.iter().any(|column| column == required),
+            "event_store keeps S8 column {required}; has {columns:?}"
+        );
+    }
+    for column in columns {
+        assert!(
+            ALLOWED_COLUMNS.contains(&column.as_str()),
+            "event_store holds only reviewed slice columns; unexpected {column}; \
+             has {columns:?} (extend ALLOWED_COLUMNS only with a reviewed slice column)"
+        );
+    }
 }
 
 async fn assert_no_free_form_types(pool: &PgPool) {
