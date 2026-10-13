@@ -1475,11 +1475,87 @@ mod tests {
             7,
             presence_delta(&update(json!([playing_activity("Apex")])), T0 + 30 * MIN),
         );
+        // Complete the interval: without a stop, a retry at +90m must extend
+        // Apex to that clock rather than preserve a 30-minute total.
+        collector.observe_presence(7, presence_delta(&update(json!([])), T0 + 30 * MIN));
         collector.observe_join(7, 42, T0);
         collector.observe_leave(7, 42, T0 + MIN);
-        // Simulate a failed upsert: drain, then requeue like persist_guild does.
-        let direct = collector.flush(7, 60 * MIN, T0 + 30 * MIN);
+        // Follow persist_guild's pre-upsert path, not a successful flush:
+        // materialize the input and apply the carry plan before requeueing.
+        let (deltas, spans) = collector.drain_guild_at(7, T0 + 30 * MIN);
+        let (input, set, drop) =
+            plan_flush(&deltas, &collector.guild_carry(7), 60 * MIN, T0 + 30 * MIN);
+        collector.apply_carry_plan(7, set, drop);
+        let sessions = game_activity::sessionize(&input, &spans, 60 * MIN);
+        let direct = game_activity::aggregate_guild("7", &sessions);
         assert_eq!(direct.len(), 1);
+        assert_eq!(direct[0].total_play_ms, 30 * MIN);
+        assert_eq!(direct[0].in_voice_ms, MIN);
+        assert!(collector.guild_carry(7).is_empty(), "the stop closes carry");
+
+        // A different member arrives while the upsert is in flight. Their
+        // newer presence and voice span must stay behind the failed input.
+        let mut newer = presence_delta(&update(json!([playing_activity("Zelda")])), T0 + 90 * MIN);
+        newer.user_key = "99".to_owned();
+        collector.observe_presence(7, newer);
+        collector.observe_join(7, 99, T0 + 89 * MIN);
+        collector.observe_leave(7, 99, T0 + 90 * MIN);
+        collector.requeue(7, input, spans);
+        {
+            let inner = collector.inner.lock().expect("collector lock");
+            assert_eq!(
+                inner.deltas[&7]
+                    .iter()
+                    .map(|delta| (
+                        delta.user_key.as_str(),
+                        delta.observed_at_ms,
+                        delta.activities.is_empty()
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("42", T0, false), // materialized carry
+                    ("42", T0, false), // original start
+                    ("42", T0 + 30 * MIN, false),
+                    ("42", T0 + 30 * MIN, true),
+                    ("99", T0 + 90 * MIN, false),
+                ],
+                "inspect queue order before sessionize can sort it"
+            );
+            assert_eq!(
+                inner.spans[&7]
+                    .iter()
+                    .map(|span| (span.user_key.as_str(), span.join_ms, span.leave_ms))
+                    .collect::<Vec<_>>(),
+                vec![("42", T0, T0 + MIN), ("99", T0 + 89 * MIN, T0 + 90 * MIN)],
+                "failed voice evidence precedes the newer member's span"
+            );
+        }
+        let rows = collector.flush(7, 60 * MIN, T0 + 90 * MIN);
+        assert_eq!(rows.len(), 2, "both members survive retry, got {rows:?}");
+        let apex = rows
+            .iter()
+            .find(|row| row.game.as_deref() == Some("Apex"))
+            .expect("requeued Apex row");
+        assert_eq!(apex.total_play_ms, 30 * MIN);
+        assert_eq!(apex.in_voice_ms, MIN);
+        assert_eq!(apex.session_count, 1);
+        let zelda = rows
+            .iter()
+            .find(|row| row.game.as_deref() == Some("Zelda"))
+            .expect("newer Zelda row");
+        assert_eq!(zelda.total_play_ms, MIN, "new sighting keeps its floor");
+        assert_eq!(
+            zelda.in_voice_ms, 0,
+            "voice ended at Zelda's first sighting"
+        );
+        assert_eq!(zelda.session_count, 1);
+        assert_eq!(collector.dropped_counts(), (0, 0));
+        assert_eq!(collector.buffered_counts(7), (0, 0, 0));
+    }
+
+    #[test]
+    fn requeue_continued_play_extends_to_retry_clock() {
+        let collector = GameActivityCollector::new();
         collector.observe_presence(
             7,
             presence_delta(&update(json!([playing_activity("Apex")])), T0),
@@ -1491,25 +1567,79 @@ mod tests {
         collector.observe_join(7, 42, T0);
         collector.observe_leave(7, 42, T0 + MIN);
         let (deltas, spans) = collector.drain_guild_at(7, T0 + 30 * MIN);
-        // A newer arrival lands while the upsert is in flight. Different
-        // member on purpose: a same-member Zelda would close Apex via the
-        // game-change path, while this test isolates requeue ordering.
-        let mut newer = presence_delta(&update(json!([playing_activity("Zelda")])), T0 + 90 * MIN);
-        newer.user_key = "99".to_owned();
-        collector.observe_presence(7, newer);
-        collector.requeue(7, deltas, spans);
+        let (input, set, drop) =
+            plan_flush(&deltas, &collector.guild_carry(7), 60 * MIN, T0 + 30 * MIN);
+        collector.apply_carry_plan(7, set, drop);
+        assert_eq!(collector.guild_carry(7)["42"].from_ms, T0 + 30 * MIN);
+        collector.requeue(7, input, spans);
+
+        // No stop arrived, and the failed attempt wrote nothing: retry owes
+        // all 90 minutes, not just the first 30 or the final 60.
         let rows = collector.flush(7, 60 * MIN, T0 + 90 * MIN);
-        assert_eq!(
-            rows.len(),
-            2,
-            "requeued buffers persist oldest first, got {rows:?}"
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].game.as_deref(), Some("Apex"));
+        assert_eq!(rows[0].total_play_ms, 90 * MIN);
+        assert_eq!(rows[0].in_voice_ms, MIN);
+        assert_eq!(rows[0].session_count, 1);
+        assert_eq!(collector.buffered_counts(7), (0, 0, 0));
+        assert!(
+            collector.flush(7, 60 * MIN, T0 + 120 * MIN).is_empty(),
+            "a successful retry consumes the replay; a silent carry adds no rows"
         );
-        let apex = rows
-            .iter()
-            .find(|row| row.game.as_deref() == Some("Apex"))
-            .expect("requeued Apex row");
-        assert_eq!(apex.total_play_ms, 30 * MIN);
-        assert_eq!(apex.in_voice_ms, MIN);
+    }
+
+    #[test]
+    fn requeue_overflow_evicts_oldest_and_preserves_new_arrivals() {
+        let collector = GameActivityCollector::new();
+        let idle = presence_delta(&update(json!([])), T0);
+        let deltas = (0..MAX_DELTAS_PER_GUILD)
+            .map(|step| PresenceDelta {
+                observed_at_ms: T0 + i64::try_from(step).expect("bounded delta index"),
+                ..idle.clone()
+            })
+            .collect();
+        let spans = (0..MAX_SPANS_PER_GUILD)
+            .map(|step| {
+                let join_ms = T0 + i64::try_from(step).expect("bounded span index");
+                VoiceSpan {
+                    user_key: "42".to_owned(),
+                    join_ms,
+                    leave_ms: join_ms + 1,
+                    self_stream: false,
+                }
+            })
+            .collect();
+        let newer_delta_ms = T0 + i64::try_from(MAX_DELTAS_PER_GUILD).expect("delta cap");
+        let newer_join_ms = T0 + i64::try_from(MAX_SPANS_PER_GUILD).expect("span cap");
+        collector.observe_presence(7, presence_delta(&update(json!([])), newer_delta_ms));
+        collector.observe_join(7, 42, newer_join_ms);
+        collector.observe_leave(7, 42, newer_join_ms + 1);
+        collector.requeue(7, deltas, spans);
+
+        assert_eq!(
+            collector.buffered_counts(7),
+            (MAX_DELTAS_PER_GUILD, MAX_SPANS_PER_GUILD, 0)
+        );
+        assert_eq!(collector.dropped_counts(), (1, 1));
+        let (deltas, spans) = collector.drain_guild_at(7, newer_join_ms + 1);
+        assert_eq!(
+            deltas
+                .iter()
+                .map(|delta| delta.observed_at_ms)
+                .collect::<Vec<_>>(),
+            ((T0 + 1)..=newer_delta_ms).collect::<Vec<_>>(),
+            "only the oldest delta is evicted; the new arrival remains last"
+        );
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| (span.join_ms, span.leave_ms))
+                .collect::<Vec<_>>(),
+            ((T0 + 1)..=newer_join_ms)
+                .map(|join_ms| (join_ms, join_ms + 1))
+                .collect::<Vec<_>>(),
+            "only the oldest span is evicted; the new arrival remains last"
+        );
     }
 
     #[test]
