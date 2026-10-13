@@ -1,4 +1,4 @@
--- 0428_privacy_opt_out: per-user opt-out suppression, per-guild analytics
+-- 0429_privacy_opt_out: per-user opt-out suppression, per-guild analytics
 -- toggles, and the opt-out audit receipt.
 --
 -- A member's opt-out installs a guild-scoped suppression row

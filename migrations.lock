@@ -341,8 +341,12 @@
       "sha256": "d5f452771a49f88bb16ef44d5119ca65df454a72ffe225e729bb079a64f9209b",
       "justification": "Per-user opt-out suppression plus per-guild presence/activity/voice toggles plus one audit receipt row per purge; cutover chain copy, additive with IF NOT EXISTS."
     },
-    "crates/store/migrations/0428_privacy_opt_out.sql": {
-      "sha256": "7a73f12f891b30d35f07198f0ff7ec8ce2ddf3a5e3f4cf3434ef87675852867b",
+    "crates/cutover/migrations/0428_event_store_presence_capture.sql": {
+      "sha256": "5be88c0d2541613d571f30cdb1108c42e17532541f8bf6eb1f99181ad87b05ef",
+      "justification": "Append-only event_store for presence capture: nullable user_id for sibling slices, best-effort dedup key, ids/enums only with no free-text columns."
+    },
+    "crates/store/migrations/0429_privacy_opt_out.sql": {
+      "sha256": "88c96fff37a316fac51e3655171621e49b97d177c64e81122a560b471bd09e09",
       "justification": "Per-user opt-out suppression plus per-guild presence/activity/voice toggles plus one audit receipt row per purge; store chain copy, additive with IF NOT EXISTS."
     },
     "crates/cutover/migrations/0432_event_store_member_capture.sql": {

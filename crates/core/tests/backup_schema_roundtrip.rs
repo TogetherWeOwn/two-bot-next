@@ -624,7 +624,7 @@ async fn assert_default_inserts(
         ("internal_action_log", "audit_id", "INSERT INTO internal_action_log (intent_id, phase, caller_hash, action, resolved_role_id) VALUES (83, 'intent', repeat('b', 64), 'role.assign', '100000000000000010') RETURNING audit_id"),
         ("moderation_member_bans", "generation", "INSERT INTO moderation_member_bans (request_id, guild_id, user_id, state, created_at) VALUES ('post-restore:ban', '100000000000000001', '100000000000000012', 'prepared', now()) RETURNING generation"),
         ("privacy_opt_out_audit", "id", "INSERT INTO privacy_opt_out_audit (guild_id, member_id) VALUES ('100000000000000001', '100000000000000002') RETURNING id"),
-        ("event_store", "id", "INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key) VALUES ('GUILD_MEMBER_ADD', '100000000000000001', '100000000000000002', now(), 'post-restore:event-store') RETURNING id"),
+        ("event_store", "id", "INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key, presence_status, activity_type) VALUES ('PRESENCE_UPDATE', '100000000000000001', 'post-restore-member', now(), 'post-restore:event-store', 'online', 0) RETURNING id"),
     ];
     let cases: BTreeSet<(String, String)> = inserts
         .iter()
