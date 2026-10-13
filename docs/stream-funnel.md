@@ -156,7 +156,7 @@ restarts to one post.
 ## Durable go-live ledger
 
 - One `stream_live_claims` row per go-live, keyed by `live_dedup_key`
-  (migration `0435`, `crates/core/src/stream_live_store.rs`). `claim_live`
+  (migration `0440`, `crates/core/src/stream_live_store.rs`). `claim_live`
   inserts with `ON CONFLICT DO NOTHING`: the inserter owns the post, a
   conflict is a retry/replay and is acknowledged with 2xx.
 - The LIVE post goes through `ActionExecutor::post_message`, whose body
