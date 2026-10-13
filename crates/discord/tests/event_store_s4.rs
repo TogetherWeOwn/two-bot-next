@@ -1,9 +1,5 @@
-//! Event-store S4 acceptance tests (paired failing-tests card for the S4 build).
-//!
-//! Test files ONLY: this suite pins the S4 acceptance criteria before the
-//! builder starts, so every test here FAILS until the S4 build lands its
-//! voice-capture migration on the append-only store. The builder makes these
-//! tests pass; nothing outside test code changes on this card.
+//! Event-store S4 acceptance tests: the S4 build's voice-capture migration on
+//! the append-only store, with the contract below asserted live.
 //!
 //! Contract under test (event-store P1 slice 4: VOICE_STATE_UPDATE plus
 //! voice-server-update / voice-effect / voice-status minimal capture into the
@@ -23,12 +19,10 @@
 //!   payload persists its ids and flags only; the sentinels appear in no
 //!   stored row.
 //!
-//! Pending-test routing (established pattern): every test is ignored and
-//! skipped in the nightly broad sweep, so this card's CI stays green while
-//! the S4 build is outstanding; run with `-- --ignored` to see the gap. The
-//! S4 build card un-ignores these tests once the migration lands. DB tests
-//! run only against the disposable test database (`TestDatabase` refuses
-//! anything but agent-testdb), never staging or production.
+//! Test routing (established pattern): this card's CI lane runs this file live
+//! against the disposable test database (`TestDatabase` refuses anything but
+//! agent-testdb), never staging or production; the nightly broad sweep skips
+//! the four tests by name.
 #![cfg(feature = "db")]
 
 use serde_json::{json, Value};
@@ -328,11 +322,7 @@ async fn stored_row(pool: &PgPool, key: &str) -> Vec<String> {
 /// S4 AC 1a: a VOICE_STATE_UPDATE join fixture persists user, guild, channel
 /// and session ids, timestamps and the mute/deaf/video/stream enum flags
 /// only — with NO audio and NO transcript fields.
-///
-/// Pending: no voice columns exist until the S4 migration lands, so run
-/// with `-- --ignored` against the disposable test database to see the gap.
 #[tokio::test]
-#[ignore = "pending S4 build: needs disposable test database event_store voice columns; run with --ignored to see the gap"]
 async fn event_store_s4_voice_state_join_persists_ids_session_and_flags_only() {
     let db = TestDb::new().await;
     assert_voice_schema(&table_columns(&db.pool).await);
@@ -398,11 +388,7 @@ async fn event_store_s4_voice_state_join_persists_ids_session_and_flags_only() {
 
 /// S4 AC 1b: a VOICE_SERVER_UPDATE fixture persists guild (and joining-user)
 /// ids and timestamps only — the handshake token and endpoint never persist.
-///
-/// Pending: no voice columns exist until the S4 migration lands, so run
-/// with `-- --ignored` against the disposable test database to see the gap.
 #[tokio::test]
-#[ignore = "pending S4 build: needs disposable test database event_store voice columns; run with --ignored to see the gap"]
 async fn event_store_s4_voice_server_update_persists_ids_without_token_or_endpoint() {
     let db = TestDb::new().await;
     assert_voice_schema(&table_columns(&db.pool).await);
@@ -454,11 +440,7 @@ async fn event_store_s4_voice_server_update_persists_ids_without_token_or_endpoi
 
 /// S4 AC 2: duplicate delivery with the same `dedup_key` inserts once
 /// (resume-safe, `ON CONFLICT DO NOTHING`).
-///
-/// Pending: no voice columns exist until the S4 migration lands, so run
-/// with `-- --ignored` against the disposable test database to see the gap.
 #[tokio::test]
-#[ignore = "pending S4 build: needs disposable test database event_store voice columns; run with --ignored to see the gap"]
 async fn event_store_s4_duplicate_delivery_inserts_once() {
     let db = TestDb::new().await;
     assert_voice_schema(&table_columns(&db.pool).await);
@@ -492,11 +474,7 @@ async fn event_store_s4_duplicate_delivery_inserts_once() {
 
 /// S4 AC 3 (privacy tripwire): a fixture carrying free-text voice-effect and
 /// channel-status payload is rejected or never persisted.
-///
-/// Pending: no voice columns exist until the S4 migration lands, so run
-/// with `-- --ignored` against the disposable test database to see the gap.
 #[tokio::test]
-#[ignore = "pending S4 build: needs disposable test database event_store voice columns; run with --ignored to see the gap"]
 async fn event_store_s4_privacy_tripwire_rejects_effect_and_status_text() {
     let db = TestDb::new().await;
     // Tripwire part 1: no free-text column may exist to hold the payload.
