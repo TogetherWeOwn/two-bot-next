@@ -33,6 +33,8 @@ JOB_INVENTORY = {
     "staging-container-drill.yml": {"container-drill"},
     # Manual read-only staging events read for the B2 soak; pinned shape below.
     "staging-events-read.yml": {"read"},
+    # Manual read-only authenticated MCP prove-out (TOG-23456); pinned shape below.
+    "staging-mcp-proveout.yml": {"proveout"},
     "supply-chain.yml": {"pr-lint", "gitleaks"},
     # TOG-10893: read-only SBOM inventory/gates shared by the PR dry-run and releases.
     # `image` builds/scans the untrusted ref with pinned actions only; `verify`
@@ -801,6 +803,90 @@ def staging_events_read_errors(workflow):
     return errors
 
 
+MCP_PROVEOUT_ENV = {
+    "STAGING_MCP_TOKEN": "${{ secrets.STAGING_MCP_TOKEN }}",
+    "STAGING_MCP_URL": "https://two-bot-next-staging.5150.workers.dev/mcp",
+    "RUN_ID": "${{ github.run_id }}",
+}
+MCP_PROVEOUT_COMMAND = ('python3 scripts/staging_mcp_proveout.py '
+                        '--output "staging-mcp-proveout-$RUN_ID.json"')
+
+
+def staging_mcp_proveout_errors(workflow):
+    """Manual staging-only read-only authenticated MCP prove-out (TOG-23456).
+
+    Dispatch-only with no inputs. The bearer arrives only as the `staging`
+    environment secret STAGING_MCP_TOKEN into one Run step (never echoed,
+    stored or uploaded; responses carry no credential). One job runs only
+    from main through the `staging` environment, on the routed runner for
+    job `proveout`, with its own non-cancelling concurrency group and a 10
+    minute timeout. Exactly three unconditional steps: pinned checkout
+    without persisted credentials, one Run step that calls the reviewed
+    stdlib script with the bearer via the environment only, and the 14 day
+    artifact upload of the sanitized prove-out file. No wrangler, no
+    production path, no staging Worker URL variable, no `set -x`.
+    """
+    name = "staging-mcp-proveout.yml"
+    errors = []
+    if "env" in workflow:
+        errors.append(f"{name}: workflow-level env must stay absent; secrets belong only on the Run step")
+    on = workflow.get("on") or {}
+    if set(on) != {"workflow_dispatch"}:
+        errors.append(f"{name}: must be dispatch-only (no push/pull_request/schedule)")
+    elif on.get("workflow_dispatch") not in (None, {}, ""):
+        errors.append(f"{name}: workflow_dispatch must take no inputs")
+    if workflow.get("permissions") != {}:
+        errors.append(f"{name}: top-level permissions must stay empty")
+    if workflow.get("concurrency") != {"group": "staging-mcp-proveout", "cancel-in-progress": "false"}:
+        errors.append(f"{name}: must use its own staging-mcp-proveout group without cancelling")
+    jobs = workflow.get("jobs") or {}
+    if set(jobs) != {"proveout"}:
+        errors.append(f"{name}: jobs must be exactly proveout")
+        return errors
+    job = jobs["proveout"]
+    if job.get("environment") != "staging":
+        errors.append(f"{name}:proveout: must read the staging Environment binding for STAGING_MCP_TOKEN")
+    if job.get("if") != "github.ref == 'refs/heads/main'":
+        errors.append(f"{name}:proveout: must run only from main")
+    if job.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:proveout: must keep contents:read only")
+    if job.get("timeout-minutes") != "10":
+        errors.append(f"{name}:proveout: timeout must stay 10 minutes")
+    if not runner_allowed("proveout", job.get("runs-on")):
+        errors.append(f"{name}:proveout: must use the routed runner expression for job 'proveout'")
+    for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+        if key in job:
+            errors.append(f"{name}:proveout: must not set {key} (bindings stay on the single Run step)")
+    text = str(job).lower().replace(" ", "")
+    for marker in ("wrangler", "production", "tojson(secrets", "secrets[", "set-x", "setx", "xtrace",
+                   "cloudflare_api_token", "ownership_control", "staging_worker_url",
+                   "production_worker_url", "/health", "/readyz", "vars.staging", "inputs."):
+        if marker in text:
+            errors.append(f"{name}:proveout: must not contain {marker!r}")
+    secrets = set(re.findall(r"secrets\.([a-z0-9_]+)", text))
+    if secrets != {"staging_mcp_token"}:
+        errors.append(f"{name}:proveout: must read exactly the STAGING_MCP_TOKEN secret")
+    steps = job.get("steps") or []
+    if len(steps) != 3 or any(key in step for step in steps for key in ("if", "continue-on-error")):
+        errors.append(f"{name}:proveout: must run exactly checkout, the prove-out and the upload, unconditionally")
+        return errors
+    checkout, run, upload = steps
+    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
+            or (checkout.get("with") or {}).get("persist-credentials") != "false" \
+            or (checkout.get("with") or {}).get("fetch-depth") != "1":
+        errors.append(f"{name}:proveout: checkout must be pinned, shallow and must not persist credentials")
+    if run.get("env") != MCP_PROVEOUT_ENV:
+        errors.append(f"{name}:proveout: Run step must bind exactly the bearer, the staging URL and the run id")
+    if run.get("run") != MCP_PROVEOUT_COMMAND or "uses" in run or "shell" in run:
+        errors.append(f"{name}:proveout: Run step must call the reviewed script with the run id via the environment only")
+    if not str(upload.get("uses", "")).startswith("actions/upload-artifact@") or upload.get("with") != {
+            "name": "staging-mcp-proveout-${{ github.run_id }}",
+            "path": "staging-mcp-proveout-${{ github.run_id }}.json",
+            "if-no-files-found": "error", "retention-days": "14"}:
+        errors.append(f"{name}:proveout: must upload only the run's json for 14 days and fail if absent")
+    return errors
+
+
 def production_errors(workflow):
     """deploy-production is the one live route: dispatch-only, human-gated, chained to staging."""
     name = "deploy-production.yml"
@@ -958,6 +1044,12 @@ def workflow_policy_errors(workflows):
             # Manual read-only events read: pinned shape above; the generic
             # environment scan below would flag its Environment binding.
             errors.extend(staging_events_read_errors(workflow))
+            continue
+        if name == "staging-mcp-proveout.yml":
+            # Manual read-only authenticated MCP prove-out: pinned shape
+            # above; the generic environment scan below would flag its
+            # staging Environment binding.
+            errors.extend(staging_mcp_proveout_errors(workflow))
             continue
         if name == "staging-migrate.yml":
             # Manual runner: pinned shape above, not the
