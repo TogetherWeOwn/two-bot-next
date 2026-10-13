@@ -245,7 +245,8 @@ fn small_guard(threshold: usize) -> Arc<RateLimitGuard> {
 }
 
 fn arrivals_span(seen: &[SeenRequest]) -> Duration {
-    let (mut min, mut max) = (None, None);
+    let (mut min, mut max): (Option<tokio::time::Instant>, Option<tokio::time::Instant>) =
+        (None, None);
     for request in seen {
         min = Some(min.map_or(request.received_at, |at| at.min(request.received_at)));
         max = Some(max.map_or(request.received_at, |at| at.max(request.received_at)));
@@ -287,7 +288,9 @@ async fn per_route_bucket_headers_gate_same_bucket_without_hardcoded_limits() {
 
     let seen = mock.requests();
     assert_eq!(seen.len(), 2);
-    assert!(seen.iter().all(|r| r.method == "GET" && r.path == path));
+    assert!(seen
+        .iter()
+        .all(|r| r.method == "GET" && r.path == format!("/api/v10{path}")));
     let gap = seen[1].received_at.duration_since(seen[0].received_at);
     assert!(
         gap >= Duration::from_millis(1900),

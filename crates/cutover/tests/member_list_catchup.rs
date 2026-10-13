@@ -397,13 +397,14 @@ async fn blocklisted_members_skip_per_user_rows_but_count_in_aggregates() {
 async fn persisted_member_rows_hold_ids_timestamps_enums_only() {
     let f = CatchupDb::new("fence").await;
     let written = row("444444444444444444", Some(false));
-    let keys: Vec<String> = serde_json::to_value(&written)
+    let mut keys: Vec<String> = serde_json::to_value(&written)
         .expect("row serializes")
         .as_object()
         .expect("row is an object")
         .keys()
         .cloned()
         .collect();
+    keys.sort();
     assert_eq!(
         keys,
         vec![

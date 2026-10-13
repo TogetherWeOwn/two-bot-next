@@ -290,6 +290,11 @@ jobs:
           --skip invite_rows_hold_metadata_only
           --skip onboarding_rows_hold_ids_enums_metadata_only
           --skip bans_invites_onboarding_resume_continues_from_persisted_cursors
+          --skip per_route_bucket_headers_gate_same_bucket_without_hardcoded_limits
+          --skip independent_workers_share_global_pacing
+          --skip reset_after_header_drives_sleep_then_retry_with_no_request_during_pause
+          --skip shared_scope_429_does_not_spend_invalid_budget_while_others_do
+          --skip header_absent_responses_keep_conservative_spacing
       - name: Channel moderation ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:

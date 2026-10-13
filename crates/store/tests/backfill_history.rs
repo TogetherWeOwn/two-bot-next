@@ -520,22 +520,24 @@ async fn history_pagination_honors_limit_range_and_before_after_around_cursors()
     assert_eq!(seen.len(), 4);
     assert!(seen.iter().all(|r| r.method == "GET"));
     assert!(
-        seen[0].path == format!("/channels/{CHANNEL}/messages?limit=2"),
+        seen[0].path == format!("/api/v10/channels/{CHANNEL}/messages?limit=2"),
         "first page must request newest history with an in-range limit: {}",
         seen[0].path
     );
     assert!(
-        seen[1].path == format!("/channels/{CHANNEL}/messages?limit=2&before={floor}"),
+        seen[1].path == format!("/api/v10/channels/{CHANNEL}/messages?before={floor}&limit=2"),
         "second page must continue from the first page floor: {}",
         seen[1].path
     );
     assert!(
-        seen[2].path.contains("&after=111111111111111111"),
+        seen[2].path
+            == format!("/api/v10/channels/{CHANNEL}/messages?after=111111111111111111&limit=2"),
         "after cursor must reach the wire: {}",
         seen[2].path
     );
     assert!(
-        seen[3].path.contains("&around=222222222222222222"),
+        seen[3].path
+            == format!("/api/v10/channels/{CHANNEL}/messages?around=222222222222222222&limit=2"),
         "around cursor must reach the wire: {}",
         seen[3].path
     );
@@ -603,7 +605,7 @@ async fn history_reads_all_pass_through_rate_limit_guard() {
     assert_eq!(seen.len(), 2);
     assert!(
         seen.iter()
-            .all(|r| r.method == "GET" && r.path.starts_with("/channels/")),
+            .all(|r| r.method == "GET" && r.path.starts_with("/api/v10/channels/")),
         "every history attempt must target the history endpoint through the client"
     );
     let gap = seen[1].received_at.duration_since(seen[0].received_at);
@@ -759,7 +761,7 @@ async fn history_resume_continues_from_persisted_cursor_after_restart() {
     let seen = mock.requests();
     assert_eq!(seen.len(), 1);
     assert!(
-        seen[0].path == format!("/channels/{CHANNEL}/messages?limit=2&before={cursor}"),
+        seen[0].path == format!("/api/v10/channels/{CHANNEL}/messages?before={cursor}&limit=2"),
         "resumed read must continue from the persisted cursor: {}",
         seen[0].path
     );

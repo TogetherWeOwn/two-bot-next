@@ -5199,10 +5199,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         }
                     }
                     Err(RoomHttpError::RateLimited { retry_after_ms, .. }) => {
+                        // Schedule from the logical clock: folding the
+                        // wall-clock dispatch cost in here pushes the retry
+                        // past the exact retry_after instant whenever dispatch
+                        // takes >=1ms, flaking exact-boundary tests under load.
                         self.queue.mark_rate_limited(
                             self.live.guild_id,
                             retry_after_ms,
-                            elapsed_ms(now_ms, started),
+                            now_ms,
                             action,
                         );
                     }
