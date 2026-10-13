@@ -521,3 +521,16 @@ VALUES ('backup-del-pending', '100000000000000001', '100000000000000002',
        ('backup-del-completed', '100000000000000001', '100000000000000003',
         '2026-08-01T09:00:00Z', 'completed', '2026-08-01T10:00:00Z',
         'rcpt-backup-del-completed');
+-- Event-store S3 presence capture (0428): append-only presence rows with the
+-- best-effort dedup key PRESENCE_UPDATE:<guild_id>:<user_id>:<event_time>
+-- (receive time; same-key retries insert nothing).
+INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key,
+  presence_status, activity_type, application_id)
+VALUES ('PRESENCE_UPDATE', '100000000000000001', '100000000000000002',
+        '2026-08-03T10:00:00Z',
+        'PRESENCE_UPDATE:100000000000000001:100000000000000002:2026-08-03T10:00:00Z',
+        'online', 0, NULL),
+       ('PRESENCE_UPDATE', '100000000000000001', '100000000000000003',
+        '2026-08-03T10:05:00Z',
+        'PRESENCE_UPDATE:100000000000000001:100000000000000003:2026-08-03T10:05:00Z',
+        'idle', 2, '123456789012345678');

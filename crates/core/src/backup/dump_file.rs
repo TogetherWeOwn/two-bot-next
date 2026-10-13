@@ -139,13 +139,14 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_vote_kick_audit",
     // V5 adds accepted-create history; see [`V5_ADDED_TABLES`].
     "voice_create_reservations",
-    // V6 adds retention queues (0427) and member capture (0432); see
-    // [`V6_ADDED_TABLES`]. The retention queues are guild-purge intent and
-    // user-deletion ledger with receipts: both must survive restore (a lost
-    // purge resurrects departed guild data; a lost request breaches the
-    // deletion SLA and drops receipts), so they are dumped, not excluded.
-    // Member capture is append-only gateway deltas, guild-keyed. No foreign
-    // keys on any of them, so order among the appended tables is free.
+    // V6 adds retention queues (0427) and event-store capture (0428 presence +
+    // 0432 member deltas); see [`V6_ADDED_TABLES`]. The retention queues are
+    // guild-purge intent and user-deletion ledger with receipts: both must
+    // survive restore (a lost purge resurrects departed guild data; a lost
+    // request breaches the deletion SLA and drops receipts), so they are
+    // dumped, not excluded. Event-store capture is append-only gateway
+    // deltas, guild-keyed. No foreign keys on any of them, so order among
+    // the appended tables is free.
     "retention_guild_purge_queue",
     "retention_deletion_requests",
     "event_store",
@@ -153,16 +154,17 @@ pub const DUMP_TABLES: &[&str] = &[
 
 /// Tables first covered by v5. A v4 archive predates them and need not declare
 /// them; every other covered table is still required, so a v4 recovery point
-/// written before create-reservation persistence stays readable without
+/// written before create-reservation persistence (0422) stays readable without
 /// waiving arbitrary missing tables.
 pub const V5_ADDED_TABLES: &[&str] = &["voice_create_reservations"];
 
-/// Tables first covered by v6 (retention queues, migration 0427, plus member
-/// capture, migration 0432). A v4 or v5 archive predates them and need not
-/// declare them; every other covered table is still required, so recovery
-/// points written before either persistence stay readable without waiving
-/// arbitrary missing tables. Restore clears these tables when restoring an
-/// older archive, as with other tables absent from an older version.
+/// Tables first covered by v6 (retention queues, migration 0427, plus
+/// event-store capture, migrations 0428 presence and 0432 member deltas).
+/// A v4 or v5 archive predates them and need not declare them; every other
+/// covered table is still required, so recovery points written before any of
+/// those persistences stay readable without waiving arbitrary missing tables.
+/// Restore clears these tables when restoring an older archive, as with other
+/// tables absent from an older version.
 pub const V6_ADDED_TABLES: &[&str] = &[
     "retention_guild_purge_queue",
     "retention_deletion_requests",

@@ -1,7 +1,7 @@
 # Backups, restore drills, and sealed guild-config snapshots (TOG-9881)
 
 Rust port of the legacy `two-bot` cutover-data surface (frozen source
-`two-bot` `main @ d5d11793`): v4 dump format with v3 read compatibility,
+`two-bot` `main @ d5d11793`): v6 dump format with v3/v4/v5 read compatibility,
 SigV4 off-box upload, retention
 math, sealed guild-config snapshot + restore planner, and the three timer
 equivalents. Code: `crates/core/src/backup/`, CLI: `two-bot backup |
@@ -18,8 +18,9 @@ require `--force`. This confirmation is not authorization to target production.
 
 Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
 write **v6** (including durable voice-create reservations, the retention
-queues and member-capture deltas); the reader also accepts frozen **v3**,
-pre-reservation **v4** and pre-v6 **v5**. Other versions refuse.
+queues and event-store capture: presence capture plus member-capture deltas);
+the reader also accepts frozen **v3**, pre-reservation **v4** and pre-v6
+**v5**. Other versions refuse.
 The manifest carries per-table `{name, columns, column_types, count}` taken
 inside one `REPEATABLE READ` transaction, the `events` high-water mark, the
 source's applied migrations and `sequenceMarks`: for every serial, identity and
@@ -63,7 +64,7 @@ boot directives, the member-erasure audit, the internal clock high-water
 mark, the voice configuration tables, the accepted voice-room create history
 (`voice_create_reservations`), the retention queues
 (`retention_guild_purge_queue`, `retention_deletion_requests`) and the
-member-capture deltas (`event_store`).
+event-store presence capture plus member-capture deltas (`event_store`).
 `OPTIONAL_LEGACY_TABLES` is empty: the coverage test fails if a covered table
 is not migrated. A dump from a fresh Rust schema has 89 table entries.
 A missing current table refuses a dump/restore: migrate the target first.
@@ -72,7 +73,8 @@ A v4 archive must declare every covered table except the ones v5 added
 points written before create-reservation persistence remain inspectable and
 restorable. A v5 archive must declare every covered table except the v6
 tables, so recovery points written before the retention queues or
-member-capture persistence remain inspectable and restorable. A v4 or v5
+event-store capture (0428 presence, 0432 member deltas) remain inspectable
+and restorable. A v4 or v5
 archive written before any other table joined the inventory is refused at
 inspect ("manifest is missing tables"); take a fresh dump after upgrading.
 V6 requires the full current inventory; an incomplete new archive refuses at
