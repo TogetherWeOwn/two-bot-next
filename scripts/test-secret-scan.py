@@ -115,7 +115,12 @@ class SecretScanSurfaceTests(unittest.TestCase):
         self.assertRegex(group, r"\|\|\s*github\.sha\s*\}\}\s*$")
         self.assertNotIn("github.ref", group)
         cancel_line = next(line for line in concurrency_block if line.strip().startswith("cancel-in-progress:"))
-        self.assertEqual(cancel_line.split("cancel-in-progress:", 1)[1].strip(), "true")
+        # Cancel only PR runs: main pushes key on their SHA but must never
+        # cancel each other, and manual dispatches must run to completion.
+        self.assertEqual(
+            cancel_line.split("cancel-in-progress:", 1)[1].strip(),
+            "${{ github.event_name == 'pull_request' }}",
+        )
 
     def test_job_still_named_gitleaks_required_check(self):
         self.assertRegex(self.text, r"(?m)^\s*name:\s*gitleaks\s*$")
