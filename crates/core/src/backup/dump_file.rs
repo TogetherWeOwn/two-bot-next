@@ -119,7 +119,7 @@ pub const DUMP_TABLES: &[&str] = &[
     "internal_action_log",
     "internal_discord_events",
     "internal_event_keys",
-    // Stream go-live dedup ledger (0439): one row per go-live, no foreign
+    // Stream go-live dedup ledger (0440): one row per go-live, no foreign
     // keys, so order among the internal tables is free.
     "stream_live_claims",
     "moderation_channel_executions",
@@ -158,7 +158,8 @@ pub const DUMP_TABLES: &[&str] = &[
     // voice capture plus 0428 S3 presence plus 0429 S6 thread lifecycle plus
     // 0430 S5 message/reaction capture plus 0431 S8
     // stage/interaction-observe/audit-log capture plus 0432 S2 member
-    // capture); see [`V6_ADDED_TABLES`]. V7 adds the retention queues (0438)
+    // capture plus 0439 S7 invite/scheduled-event capture); see
+    // [`V6_ADDED_TABLES`]. V7 adds the retention queues (0438)
     // alongside the seasonal XP projection; see [`V7_ADDED_TABLES`]. The
     // retention queues are guild-purge intent and user-deletion ledger with
     // receipts: both must survive restore (a lost purge resurrects departed
@@ -177,7 +178,7 @@ pub const DUMP_TABLES: &[&str] = &[
 /// without waiving arbitrary missing tables. The privacy opt-out control plane
 /// (0433/0434) is v5 for the same reason: v4 archives predate suppression
 /// tombstones, toggle rows and opt-out receipts. The stream go-live ledger
-/// (0439) is v5 for the same reason: v4 archives predate claim rows.
+/// (0440) is v5 for the same reason: v4 archives predate claim rows.
 pub const V5_ADDED_TABLES: &[&str] = &[
     "voice_create_reservations",
     "stream_live_claims",
@@ -188,7 +189,8 @@ pub const V5_ADDED_TABLES: &[&str] = &[
 
 /// Tables first covered by v6 (event-store capture: 0427 voice, 0428
 /// presence, 0429 thread lifecycle, 0430 message/reaction capture, 0431
-/// stage/interaction/audit capture, 0432 member deltas).
+/// stage/interaction/audit capture, 0432 member deltas, 0439
+/// invite/scheduled-event capture).
 /// A v4 or v5 archive predates them and need not declare them; every other
 /// covered table is still required, so recovery points written before any of
 /// those persistences stay readable without waiving arbitrary missing tables.

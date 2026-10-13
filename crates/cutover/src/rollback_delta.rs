@@ -85,7 +85,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "event_rsvps", measure: TableMeasure::Columns(&["responded_at"]) },
     // Append-only event-store capture (0427 voice + 0428 presence + 0429 thread
     // lifecycle + 0430 message/reaction + 0431 stage/interaction/audit + 0432
-    // member deltas): `event_time` is the gateway event time and `received_at`
+    // member deltas + 0439 invite/scheduled-event): `event_time` is the gateway event time and `received_at`
     // the capture time (same shape as events.recorded_at), both written once
     // per row; the maximum across both is the row's last write.
     TableSpec { table: "event_store", measure: TableMeasure::Columns(&["event_time", "received_at"]) },
@@ -220,7 +220,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "sticky_messages", measure: TableMeasure::Columns(&["updated_at"]) },
     // Claim/stamp transitions rewrite delivered_at without touching
     // claimed_at, so the maximum across both is the row's last write (same
-    // shape as tickets). Migration 0439.
+    // shape as tickets). Migration 0440.
     TableSpec { table: "stream_live_claims", measure: TableMeasure::Columns(&["claimed_at", "delivered_at"]) },
     TableSpec { table: "ticket_transcripts", measure: TableMeasure::Columns(&["created_at"]) },
     // Status/close transitions rewrite these columns without touching

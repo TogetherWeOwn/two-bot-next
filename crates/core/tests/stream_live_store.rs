@@ -86,13 +86,13 @@ async fn setup() -> (Pool<Postgres>, String) {
     // The ledger migration is `IF NOT EXISTS` throughout: run it twice to
     // prove re-runnability inside one schema.
     sqlx::raw_sql(include_str!(
-        "../../cutover/migrations/0439_stream_live_claims.sql"
+        "../../cutover/migrations/0440_stream_live_claims.sql"
     ))
     .execute(&pool)
     .await
     .unwrap();
     sqlx::raw_sql(include_str!(
-        "../../cutover/migrations/0439_stream_live_claims.sql"
+        "../../cutover/migrations/0440_stream_live_claims.sql"
     ))
     .execute(&pool)
     .await

@@ -401,9 +401,14 @@
       "sha256": "7ab729b1c4340ab962ef0b8beba6aff3ecd1962e2fb0f002d5e1e75b5c351f56",
       "justification": "Retention rolling-window queues: guild-purge queue and user-deletion request ledger backing 30-day raw and 45-day audit roll-off with under-72-hour deletion receipts; additive, backout drops both tables. Renumbered from 0427 to 0437 and then 0438 after main claimed 0427 for event-store voice capture, 0435/0436 for backfill cursors and member catch-up, and 0437 for event-store S1 core; the 0427/0437 files never merged so no database has applied them under either number."
     },
-    "crates/cutover/migrations/0439_stream_live_claims.sql": {
-      "sha256": "65a0484022650d62585c61767ea84f525aad4514a086a7649c0c4204ae13a37a",
-      "justification": "Durable Twitch go-live dedup ledger keyed by live_dedup_key: claim-before-post insert, release-on-failed-send delete, delivered rows stamped and kept as the restart-proof fence. Renumbered 0435 to 0438 on the merge past main's 0435/0436 backfill and 0437 event-store S1 core, then to 0439 after main added 0438 retention queues."
+    "crates/cutover/migrations/0439_event_store_invite_scheduled_event_capture.sql": {
+      "sha256": "ec8fa9475530ab759dafa3d2963e9465796daa7e05f8d500d001aa2a13721312",
+      "justification": "Event-store S7 invite + scheduled-event capture: order-independent event_store invite columns (invite_code_hash as hex sha256, never the raw code, plus inviter_id) and scheduled-event columns (scheduled_event_id plus event_status/entity_type integer enums) with nullable convergence and the shared UNIQUE dedup index; ids+hash+timestamps+enums only, no description/name/location/username columns. Renumbered to 0439 because the merged retention migration owns 0438; the S7 migration has not merged."
+
+    },
+    "crates/cutover/migrations/0440_stream_live_claims.sql": {
+      "sha256": "c34223b642a8c626281eef8fecef96f165a9d96be4acf510bff550f5d5e50c72",
+      "justification": "Durable Twitch go-live dedup ledger keyed by live_dedup_key: claim-before-post insert, release-on-failed-send delete, delivered rows stamped and kept as the restart-proof fence. Renumbered 0435 to 0438 on the merge past main's 0435/0436 backfill and 0437 event-store S1 core, then to 0439 after main added 0438 retention queues, then to 0440 after main added 0439 event-store S7 invite/scheduled-event capture."
     }
   }
 }
