@@ -26,13 +26,15 @@ import { DEPLOYMENT_HEADER, OWNER_KEY } from "../src/ownership.ts";
 const DEPLOYMENT = "synthetic-dashboard-deployment";
 const CLIENT_ID = "synthetic-dashboard-client-id-0123456789";
 const CLIENT_SECRET = "synthetic-dashboard-client-secret-0123456789abcdef";
+const SCRAPE_TOKEN = "synthetic-dual-scrape-token-0123456789abcdef";
 
-function workerEnv(secrets?: { id?: string; secret?: string }) {
+function workerEnv(secrets?: { id?: string; secret?: string; scrape?: string }) {
   const calls: Request[] = [];
   const env = {
     CF_VERSION_METADATA: { id: DEPLOYMENT },
     OPS_DASHBOARD_CLIENT_ID: secrets?.id,
     OPS_DASHBOARD_CLIENT_SECRET: secrets?.secret,
+    METRICS_SCRAPE_TOKEN: secrets?.scrape,
     REDIRECT_MAPPINGS_JSON: "[]",
     TWO_BOT: {
       getByName: () => ({
@@ -452,4 +454,106 @@ test("DO /ops/summary: failures are generic 504/502 bodies", async (t) => {
   const huge = await bot.fetch(summaryRequest());
   assert.equal(huge.status, 502);
   assert.equal(await huge.text(), "summary unavailable\n");
+});
+
+test("DO /ops/summary: fetches the summary roll-up and maps ready:false to 503", async (t) => {
+  const { bot } = await summaryDoHarness(t);
+  const urls: string[] = [];
+  let upstreamStatus = 200;
+  let upstreamBody = "";
+  t.mock.method(bot, "containerFetch", async (input: string | Request) => {
+    urls.push(typeof input === "string" ? input : input.url);
+    return new Response(upstreamBody, {
+      status: upstreamStatus,
+      headers: { "content-type": "application/json" },
+    });
+  });
+  // 200 + ready:false -> 503: the roll-up always answers 200, and the
+  // dashboard renders readiness from the HTTP status alone.
+  upstreamStatus = 200;
+  upstreamBody = JSON.stringify({
+    ready: false,
+    components: [["process", "ready"], ["gateway", "down"]],
+    jobs: {},
+  });
+  let res = await bot.fetch(summaryRequest());
+  assert.equal(res.status, 503);
+  assert.equal(res.headers.get("content-type"), "application/json");
+  assert.equal(await res.text(), upstreamBody);
+  // 200 + ready:true stays 200.
+  upstreamBody = JSON.stringify({
+    ready: true,
+    components: [["process", "ready"]],
+    jobs: {},
+  });
+  res = await bot.fetch(summaryRequest());
+  assert.equal(res.status, 200);
+  assert.equal(await res.text(), upstreamBody);
+  // 200 with a non-JSON body proxies untouched (the roll-up never sends it).
+  upstreamBody = "not-json-at-all";
+  res = await bot.fetch(summaryRequest());
+  assert.equal(res.status, 200);
+  assert.equal(await res.text(), "not-json-at-all");
+  // Every fetch hit the roll-up, never /readyz (which would silently drop
+  // the gateway, pool, event-store and backfill sections).
+  assert.equal(urls.length, 3);
+  for (const u of urls) {
+    assert.equal(new URL(u).pathname, OPS_SUMMARY_PATH);
+  }
+});
+
+test(`${OPS_SUMMARY_PATH}: accepts either credential with scrape 429 as hard fence`, async () => {
+  const both = workerEnv({ id: CLIENT_ID, secret: CLIENT_SECRET, scrape: SCRAPE_TOKEN });
+  // Bearer only opens the summary.
+  let res = await get(both.env, OPS_SUMMARY_PATH, {
+    headers: { authorization: `Bearer ${SCRAPE_TOKEN}` },
+  });
+  assert.equal(res.status, 503);
+  await res.text();
+  // Service-token creds only open the summary.
+  res = await get(both.env, OPS_SUMMARY_PATH, { headers: creds });
+  assert.equal(res.status, 503);
+  await res.text();
+  // Neither credential is 401 while either secret is configured (not 404).
+  res = await get(both.env, OPS_SUMMARY_PATH);
+  assert.equal(res.status, 401);
+  await res.text();
+  // Wrong bearer + valid creds falls through to the dashboard gate.
+  res = await get(both.env, OPS_SUMMARY_PATH, {
+    headers: { ...creds, authorization: "Bearer wrong-bearer-not-a-secret-0123456789" },
+  });
+  assert.equal(res.status, 503);
+  await res.text();
+  assert.equal(both.calls.length, 3, "only forwards reach the container");
+  // Scrape 429 is a hard fence: exhaust the scrape budget with 10 bearer
+  // forwards on one caller (dashboard budget untouched, since scrape success
+  // returns before it), then valid creds on the same caller still 429.
+  const ip = freshCaller();
+  const onIp = (headers: Record<string, string>) =>
+    get(both.env, OPS_SUMMARY_PATH, { headers: { ...headers, "cf-connecting-ip": ip } });
+  const bearer = { authorization: `Bearer ${SCRAPE_TOKEN}` };
+  for (let i = 0; i < 10; i++) {
+    const forwarded = await onIp(bearer);
+    assert.equal(forwarded.status, 503, `bearer forward ${i + 1} must succeed`);
+    await forwarded.text();
+  }
+  assert.equal(both.calls.length, 13);
+  const fenced = await onIp(creds);
+  assert.equal(fenced.status, 429);
+  await fenced.text();
+  assert.equal(both.calls.length, 13, "fenced attempts never reach the container");
+  // Scrape-only configured + dashboard creds is 401.
+  const scrapeOnly = workerEnv({ scrape: SCRAPE_TOKEN });
+  res = await get(scrapeOnly.env, OPS_SUMMARY_PATH, { headers: creds });
+  assert.equal(res.status, 401);
+  await res.text();
+  assert.equal(scrapeOnly.calls.length, 0);
+  // Dashboard-only configured + bearer is 401.
+  const dashOnly = workerEnv({ id: CLIENT_ID, secret: CLIENT_SECRET });
+  res = await get(dashOnly.env, OPS_SUMMARY_PATH, {
+    headers: { authorization: `Bearer ${SCRAPE_TOKEN}` },
+  });
+  assert.equal(res.status, 401);
+  await res.text();
+  assert.equal(dashOnly.calls.length, 0);
 });

@@ -365,11 +365,22 @@ as dynamic labels.
 
 Three JSON roll-ups on the same listener reuse the `/readyz`, gateway,
 job, pool and event-store sources above. Like `/metrics` they are served
-openly on the container port; the only off-container path is the Worker,
-gated by the same scrape bearer (`METRICS_SCRAPE_TOKEN`, 404 when unset or
-short, 401 on a wrong bearer, 429 per-caller attempt budget). The Worker
-exact-matches the three paths before the invite-redirect lookup, and the DO
-proxies them with the same 6 s deadline and 64 KiB body cap as the scrape.
+openly on the container port. The off-container path is the Worker, which
+exact-matches the three paths before the invite-redirect lookup:
+`/ops/gateway` and `/ops/backfill` stay gated by the scrape bearer
+(`METRICS_SCRAPE_TOKEN`, 404 when unset or short, 401 on a wrong bearer,
+429 per-caller attempt budget), while `/ops/summary` accepts either the
+scrape bearer or the dashboard service-token pair
+(`OPS_DASHBOARD_CLIENT_ID` / `OPS_DASHBOARD_CLIENT_SECRET`, same 404/401/429
+shape). The scrape gate runs first and its 429 is a hard fence; a
+non-throttled scrape refusal falls through to the dashboard gate.
+Doubly-unconfigured still 404s, otherwise a failed attempt is 401 with the
+Bearer challenge. The DO proxies the roll-ups with the same 6 s deadline and
+64 KiB body cap as the scrape, fetching the container's `/ops/summary`
+(never `/readyz`) and rewriting a 200 whose body has `ready: false` into the
+503 the dashboard renders (the roll-up itself always answers 200). Closing
+the summary requires removing both `METRICS_SCRAPE_TOKEN` and the dashboard
+pair; removing only one leaves the other credential open.
 
 - `GET /ops/summary`: readiness (`ready`, `components`), gateway state and
   failure, the informational `jobs` map, pool gauges (`size`/`idle`/`max`),
