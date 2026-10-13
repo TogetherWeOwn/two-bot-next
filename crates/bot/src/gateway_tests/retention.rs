@@ -65,7 +65,7 @@ impl Peer {
                         let packet: Value = serde_json::from_str(message.as_text().unwrap()).unwrap();
                         match packet["op"].as_u64() {
                             Some(1) => { if ws.send(Message::text("{\"op\":11,\"d\":null}".to_owned())).await.is_err() { break; } }
-                            Some(2 | 6) => { if auth_tx.send(packet).await.is_err() { break; } }
+                            Some(2 | 6) if auth_tx.send(packet).await.is_err() => break,
                             _ => {},
                         }
                     }

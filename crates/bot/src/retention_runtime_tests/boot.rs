@@ -49,7 +49,7 @@ fn boot_registers_safe_modes_and_parks_invalid_disabled_or_missing_database() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
-        assert!(String::from_utf8_lossy(&output.stdout).contains("retention boot probe completed"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("retention boot probe completed"));
     }
 }
 
@@ -162,5 +162,5 @@ async fn isolated_boot_probe() {
         );
     }
     db.close().await.unwrap();
-    println!("retention boot probe completed");
+    eprintln!("retention boot probe completed");
 }
