@@ -11,9 +11,9 @@
 //! - [`AppToken`]: the cached client-credentials app token with
 //!   refresh-before-expiry ([`TOKEN_REFRESH_SKEW_MS`]) and
 //!   [`parse_token_response`].
-//! - [`plan_boot_actions`]: GET-response JSON plus desired broadcasters in,
-//!   deletes-before-creates plan out. Pure: runs at boot and after a
-//!   `revocation`, never on a timer.
+//! - [`plan_boot_actions`]: the accumulated subscription list plus desired
+//!   broadcasters in, deletes-before-creates plan out. Pure: runs at boot and
+//!   after a `revocation`, never on a timer.
 //! - [`HelixClient`]: executes the plan over a [`HelixTransport`]. Tests
 //!   inject a scripted transport; production uses [`HyperHelixTransport`]
 //!   (hyper 1.x over rustls, one fresh client per request, fixed hosts only).
@@ -25,6 +25,7 @@
 //! solely at the header/body boundary. Error messages name environment
 //! variables and HTTP statuses, never secret values.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -54,9 +55,8 @@ pub const TOKEN_REFRESH_SKEW_MS: i64 = 60_000;
 pub const HELIX_TIMEOUT_MS: u64 = 15_000;
 /// Largest response body the client buffers; subscription listings are small.
 pub const HELIX_MAX_BODY_BYTES: usize = 64 * 1024;
-/// Subscriptions fetched per listing call (Twitch page cap; our callback's
-/// fleet stays far below it while `MAX_BROADCASTERS` is 100).
-pub const HELIX_SUBSCRIPTIONS_FIRST: u32 = 100;
+/// Maximum number of pages accepted before reconciliation fails closed.
+pub const HELIX_MAX_SUBSCRIPTION_PAGES: usize = 100;
 /// User-Agent for the token and Helix calls.
 pub const HELIX_USER_AGENT: &str = "two-bot-next/1.0 (+https://two.gg)";
 
@@ -95,6 +95,9 @@ pub enum HelixError {
     /// A 2xx body was not the shape the caller asked for.
     #[error("helix response was not usable: {0}")]
     BadResponse(&'static str),
+    /// The subscription listing exceeded its bounded page count.
+    #[error("helix subscription listing exceeded the page limit")]
+    SubscriptionPageLimit,
     /// TLS, TCP or HTTP-layer failure, or a body over the byte cap.
     #[error("helix request failed: {0}")]
     Transport(String),
@@ -226,16 +229,16 @@ pub fn system_millis() -> i64 {
         .unwrap_or(0)
 }
 
-/// Plan the boot (or post-revocation) reconcile: parse the `GET`
-/// subscriptions document, then diff the desired broadcasters against it.
-/// The returned plan is deletes-first via [`reconcile`].
+/// Plan the boot (or post-revocation) reconcile from all subscriptions returned
+/// by [`HelixClient::list_subscriptions`]. The returned plan is deletes-first
+/// via [`reconcile`].
 #[must_use = "a reconcile plan does nothing until executed"]
 pub fn plan_boot_actions(
     desired: &[String],
     callback: &CallbackUrl,
-    listing: &serde_json::Value,
+    existing: &[ExistingSubscription],
 ) -> Result<Vec<SubscriptionAction>, HelixError> {
-    Ok(reconcile(desired, callback, &parse_subscriptions(listing))?)
+    Ok(reconcile(desired, callback, existing)?)
 }
 
 /// One Helix/token HTTP exchange. Header values and bodies that carry secrets
@@ -359,12 +362,24 @@ pub enum ActionOutcome {
         /// Broadcaster the subscription was created for.
         broadcaster_user_id: String,
     },
-    /// Twitch answered 409: the subscription already exists, which is the
-    /// reconciled end state, so the plan step counts as done.
+    /// Twitch answered 409 and a follow-up listing confirmed a healthy
+    /// subscription for this broadcaster on our callback.
     AlreadyExists {
         /// Broadcaster the subscription already covers.
         broadcaster_user_id: String,
     },
+}
+
+fn subscriptions_url(broadcaster_user_id: Option<&str>, cursor: Option<&str>) -> String {
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    query.append_pair("type", "stream.online");
+    if let Some(broadcaster_user_id) = broadcaster_user_id {
+        query.append_pair("user_id", broadcaster_user_id);
+    }
+    if let Some(cursor) = cursor {
+        query.append_pair("after", cursor);
+    }
+    format!("{HELIX_SUBSCRIPTIONS_URL}?{}", query.finish())
 }
 
 /// The Helix client: cached app token plus plan execution. `T` is the
@@ -496,31 +511,81 @@ impl<T: HelixTransport> HelixClient<T> {
         Ok(response)
     }
 
-    /// List our subscriptions: one `GET` page, parsed to `stream.online` v1
-    /// webhooks via [`parse_subscriptions`].
+    /// List every `stream.online` subscription page, parsed to v1 webhooks via
+    /// [`parse_subscriptions`].
     pub async fn list_subscriptions(&mut self) -> Result<Vec<ExistingSubscription>, HelixError> {
-        let response = self
-            .send_authed(
-                "list subscriptions",
-                HelixRequest {
-                    method: Method::GET,
-                    url: format!("{HELIX_SUBSCRIPTIONS_URL}?first={HELIX_SUBSCRIPTIONS_FIRST}"),
-                    headers: vec![(
-                        "accept".to_owned(),
-                        Secret::new("application/json".to_owned()),
-                    )],
-                    body: None,
+        self.list_subscriptions_with_user_id(None).await
+    }
+
+    async fn list_subscriptions_for_broadcaster(
+        &mut self,
+        broadcaster_user_id: &str,
+    ) -> Result<Vec<ExistingSubscription>, HelixError> {
+        self.list_subscriptions_with_user_id(Some(broadcaster_user_id))
+            .await
+    }
+
+    async fn list_subscriptions_with_user_id(
+        &mut self,
+        broadcaster_user_id: Option<&str>,
+    ) -> Result<Vec<ExistingSubscription>, HelixError> {
+        let mut subscriptions = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+
+        for page in 0..HELIX_MAX_SUBSCRIPTION_PAGES {
+            let response = self
+                .send_authed(
+                    "list subscriptions",
+                    HelixRequest {
+                        method: Method::GET,
+                        url: subscriptions_url(broadcaster_user_id, cursor.as_deref()),
+                        headers: vec![(
+                            "accept".to_owned(),
+                            Secret::new("application/json".to_owned()),
+                        )],
+                        body: None,
+                    },
+                )
+                .await?;
+            let document: serde_json::Value = serde_json::from_slice(&response.body)
+                .map_err(|_| HelixError::BadResponse("subscription listing is not JSON"))?;
+            subscriptions.extend(parse_subscriptions(&document));
+
+            let next_cursor = match document.get("pagination") {
+                Some(pagination) => match pagination.get("cursor") {
+                    Some(serde_json::Value::String(value)) if !value.is_empty() => {
+                        Some(value.as_str())
+                    }
+                    Some(serde_json::Value::Null) | None => None,
+                    Some(_) => {
+                        return Err(HelixError::BadResponse(
+                            "subscription pagination cursor is not usable",
+                        ));
+                    }
                 },
-            )
-            .await?;
-        let document: serde_json::Value = serde_json::from_slice(&response.body)
-            .map_err(|_| HelixError::BadResponse("subscription listing is not JSON"))?;
-        Ok(parse_subscriptions(&document))
+                None => None,
+            };
+            let Some(next_cursor) = next_cursor else {
+                return Ok(subscriptions);
+            };
+            if !seen_cursors.insert(next_cursor.to_owned()) {
+                return Err(HelixError::BadResponse(
+                    "subscription pagination cursor repeated",
+                ));
+            }
+            if page + 1 == HELIX_MAX_SUBSCRIPTION_PAGES {
+                return Err(HelixError::SubscriptionPageLimit);
+            }
+            cursor = Some(next_cursor.to_owned());
+        }
+
+        Err(HelixError::SubscriptionPageLimit)
     }
 
     /// Execute a [`reconcile`] plan in order (deletes first). A create that
-    /// answers 409 already matches the reconciled end state and reports
-    /// [`ActionOutcome::AlreadyExists`] instead of failing.
+    /// answers 409 reports [`ActionOutcome::AlreadyExists`] only after a
+    /// follow-up listing confirms a healthy subscription on our callback.
     pub async fn execute_actions(
         &mut self,
         actions: &[SubscriptionAction],
@@ -574,9 +639,24 @@ impl<T: HelixTransport> HelixClient<T> {
                         Err(HelixError::HelixRejected { status, .. })
                             if status == StatusCode::CONFLICT =>
                         {
-                            outcomes.push(ActionOutcome::AlreadyExists {
-                                broadcaster_user_id: broadcaster_user_id.clone(),
-                            })
+                            let existing = self
+                                .list_subscriptions_for_broadcaster(broadcaster_user_id)
+                                .await?;
+                            if existing.iter().any(|subscription| {
+                                subscription.broadcaster_user_id.as_str()
+                                    == broadcaster_user_id.as_str()
+                                    && subscription.callback == callback.as_str()
+                                    && subscription.healthy()
+                            }) {
+                                outcomes.push(ActionOutcome::AlreadyExists {
+                                    broadcaster_user_id: broadcaster_user_id.clone(),
+                                });
+                            } else {
+                                return Err(HelixError::HelixRejected {
+                                    status: StatusCode::CONFLICT,
+                                    action: "create subscription (conflict not verified)",
+                                });
+                            }
                         }
                         Err(err) => return Err(err),
                     }
@@ -710,35 +790,50 @@ mod tests {
     }
 
     #[test]
-    fn boot_plan_is_deletes_first() {
-        let listing = serde_json::json!({
-            "data": [
-                {
+    fn boot_plan_uses_subscriptions_accumulated_from_all_pages() {
+        let pages = [
+            serde_json::json!({
+                "data": [{
                     "id": "stale-id",
                     "status": "enabled",
                     "type": "stream.online",
                     "version": "1",
                     "condition": {"broadcaster_user_id": "111"},
                     "transport": {"method": "webhook", "callback": "https://hooks.example.com/twitch"},
-                },
-                {
-                    "id": "other-callback-id",
-                    "status": "enabled",
-                    "type": "stream.online",
-                    "version": "1",
-                    "condition": {"broadcaster_user_id": "222"},
-                    "transport": {"method": "webhook", "callback": "https://other.example.com/hook"},
-                },
-            ]
-        });
-        let plan =
-            plan_boot_actions(&["222".to_owned()], &callback(), &listing).expect("plan must build");
-        // "stale-id" is on our callback for an undesired broadcaster: delete.
-        // "other-callback-id" is not ours: never touched. "222" is wanted but
-        // only exists elsewhere: create.
+                }]
+            }),
+            serde_json::json!({
+                "data": [
+                    {
+                        "id": "second-stale-id",
+                        "status": "enabled",
+                        "type": "stream.online",
+                        "version": "1",
+                        "condition": {"broadcaster_user_id": "333"},
+                        "transport": {"method": "webhook", "callback": "https://hooks.example.com/twitch"},
+                    },
+                    {
+                        "id": "other-callback-id",
+                        "status": "enabled",
+                        "type": "stream.online",
+                        "version": "1",
+                        "condition": {"broadcaster_user_id": "222"},
+                        "transport": {"method": "webhook", "callback": "https://other.example.com/hook"},
+                    },
+                ]
+            }),
+        ];
+        let existing: Vec<_> = pages.iter().flat_map(parse_subscriptions).collect();
+        let plan = plan_boot_actions(&["222".to_owned()], &callback(), &existing)
+            .expect("plan must build from accumulated pages");
+        // Both stale subscriptions are on our callback and must be deleted.
+        // The foreign subscription is not ours, so create the requested one.
         assert_eq!(
             plan,
             vec![
+                SubscriptionAction::Delete {
+                    id: "second-stale-id".to_owned()
+                },
                 SubscriptionAction::Delete {
                     id: "stale-id".to_owned()
                 },
@@ -851,7 +946,9 @@ mod tests {
             ScriptTransport::token_answer("listed-token", 3_600),
             Ok(HelixResponse {
                 status: StatusCode::OK,
-                body: serde_json::json!({"data": []}).to_string().into_bytes(),
+                body: serde_json::json!({"data": [], "pagination": {}})
+                    .to_string()
+                    .into_bytes(),
             }),
         ]);
         let mut client = HelixClient::new(transport, fixture_creds()).with_clock(|| 0);
@@ -864,11 +961,95 @@ mod tests {
         assert_eq!(transport.seen_urls().len(), 2);
         assert_eq!(
             transport.seen_urls()[1],
-            format!("{HELIX_SUBSCRIPTIONS_URL}?first={HELIX_SUBSCRIPTIONS_FIRST}")
+            format!("{HELIX_SUBSCRIPTIONS_URL}?type=stream.online")
         );
         let headers = transport.auth_headers(1);
         assert!(headers.contains(&("authorization".to_owned(), "Bearer listed-token".to_owned())));
         assert!(headers.contains(&("client-id".to_owned(), "fixture-client-id".to_owned())));
+    }
+
+    #[tokio::test]
+    async fn listing_follows_cursor_across_pages() {
+        let subscription = |id: &str, broadcaster: &str| {
+            serde_json::json!({
+                "id": id,
+                "status": "enabled",
+                "type": "stream.online",
+                "version": "1",
+                "condition": {"broadcaster_user_id": broadcaster},
+                "transport": {
+                    "method": "webhook",
+                    "callback": "https://hooks.example.com/twitch"
+                }
+            })
+        };
+        let transport = ScriptTransport::new(vec![
+            ScriptTransport::token_answer("listed-token", 3_600),
+            Ok(HelixResponse {
+                status: StatusCode::OK,
+                body: serde_json::json!({
+                    "data": [subscription("first", "111")],
+                    "pagination": {"cursor": "cursor+/="}
+                })
+                .to_string()
+                .into_bytes(),
+            }),
+            Ok(HelixResponse {
+                status: StatusCode::OK,
+                body: serde_json::json!({
+                    "data": [subscription("second", "222")],
+                    "pagination": {}
+                })
+                .to_string()
+                .into_bytes(),
+            }),
+        ]);
+        let mut client = HelixClient::new(transport, fixture_creds()).with_clock(|| 0);
+        let subscriptions = client
+            .list_subscriptions()
+            .await
+            .expect("all pages must be listed");
+        assert_eq!(
+            subscriptions
+                .iter()
+                .map(|sub| sub.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert_eq!(
+            client.transport.seen_urls(),
+            [
+                TOKEN_URL.to_owned(),
+                format!("{HELIX_SUBSCRIPTIONS_URL}?type=stream.online"),
+                format!("{HELIX_SUBSCRIPTIONS_URL}?type=stream.online&after=cursor%2B%2F%3D"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_fails_closed_when_page_limit_is_exceeded() {
+        let mut answers = vec![ScriptTransport::token_answer("listed-token", 3_600)];
+        for page in 0..HELIX_MAX_SUBSCRIPTION_PAGES {
+            answers.push(Ok(HelixResponse {
+                status: StatusCode::OK,
+                body: serde_json::json!({
+                    "data": [],
+                    "pagination": {"cursor": format!("cursor-{page}")}
+                })
+                .to_string()
+                .into_bytes(),
+            }));
+        }
+        let transport = ScriptTransport::new(answers);
+        let mut client = HelixClient::new(transport, fixture_creds()).with_clock(|| 0);
+        assert!(matches!(
+            client.list_subscriptions().await,
+            Err(HelixError::SubscriptionPageLimit)
+        ));
+        assert_eq!(
+            client.transport.seen_urls().len(),
+            HELIX_MAX_SUBSCRIPTION_PAGES + 1
+        );
     }
 
     #[tokio::test]
@@ -897,7 +1078,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_runs_deletes_before_creates_and_tolerates_409() {
+    async fn execute_runs_deletes_before_creates_and_verifies_409() {
+        let existing = serde_json::json!({
+            "data": [{
+                "id": "existing-id",
+                "status": "enabled",
+                "type": "stream.online",
+                "version": "1",
+                "condition": {"broadcaster_user_id": "222"},
+                "transport": {
+                    "method": "webhook",
+                    "callback": "https://hooks.example.com/twitch"
+                }
+            }],
+            "pagination": {}
+        });
         let transport = ScriptTransport::new(vec![
             ScriptTransport::token_answer("exec-token", 3_600),
             ok_empty(), // DELETE stale-id -> 204
@@ -905,6 +1100,10 @@ mod tests {
                 status: StatusCode::CONFLICT,
                 body: Vec::new(),
             }), // POST create -> 409
+            Ok(HelixResponse {
+                status: StatusCode::OK,
+                body: existing.to_string().into_bytes(),
+            }), // GET broadcaster subscriptions -> confirms healthy callback
         ]);
         let mut client = HelixClient::new(transport, fixture_creds()).with_clock(|| 0);
         let outcomes = client
@@ -921,7 +1120,7 @@ mod tests {
                 &webhook_secret(),
             )
             .await
-            .expect("execute must succeed");
+            .expect("verified 409 must be treated as already existing");
         assert_eq!(
             outcomes,
             vec![
@@ -935,9 +1134,13 @@ mod tests {
         );
         let transport = &client.transport;
         let urls = transport.seen_urls();
-        assert_eq!(urls.len(), 3);
+        assert_eq!(urls.len(), 4);
         assert_eq!(urls[1], format!("{HELIX_SUBSCRIPTIONS_URL}?id=stale-id"));
         assert_eq!(urls[2], HELIX_SUBSCRIPTIONS_URL);
+        assert_eq!(
+            urls[3],
+            format!("{HELIX_SUBSCRIPTIONS_URL}?type=stream.online&user_id=222")
+        );
         // The create body carries our callback and condition, never logged here.
         let created = &transport.seen.lock().unwrap()[2];
         let document: serde_json::Value =
@@ -948,6 +1151,58 @@ mod tests {
             document["transport"]["callback"],
             "https://hooks.example.com/twitch"
         );
+    }
+
+    #[tokio::test]
+    async fn create_conflict_is_not_success_for_foreign_or_failed_subscription() {
+        for (callback_url, status) in [
+            ("https://other.example.com/hook", "enabled"),
+            (
+                "https://hooks.example.com/twitch",
+                "notification_failures_exceeded",
+            ),
+        ] {
+            let existing = serde_json::json!({
+                "data": [{
+                    "id": "existing-id",
+                    "status": status,
+                    "type": "stream.online",
+                    "version": "1",
+                    "condition": {"broadcaster_user_id": "222"},
+                    "transport": {"method": "webhook", "callback": callback_url}
+                }],
+                "pagination": {}
+            });
+            let transport = ScriptTransport::new(vec![
+                ScriptTransport::token_answer("exec-token", 3_600),
+                Ok(HelixResponse {
+                    status: StatusCode::CONFLICT,
+                    body: Vec::new(),
+                }),
+                Ok(HelixResponse {
+                    status: StatusCode::OK,
+                    body: existing.to_string().into_bytes(),
+                }),
+            ]);
+            let mut client = HelixClient::new(transport, fixture_creds()).with_clock(|| 0);
+            let error = client
+                .execute_actions(
+                    &[SubscriptionAction::Create {
+                        broadcaster_user_id: "222".to_owned(),
+                    }],
+                    &callback(),
+                    &webhook_secret(),
+                )
+                .await
+                .expect_err("unverified create conflict must fail");
+            assert!(matches!(
+                error,
+                HelixError::HelixRejected {
+                    status: StatusCode::CONFLICT,
+                    ..
+                }
+            ));
+        }
     }
 
     #[tokio::test]
@@ -970,7 +1225,7 @@ mod tests {
     fn production_request_builder_sets_headers_without_tls() {
         let req = HelixRequest {
             method: Method::GET,
-            url: format!("{HELIX_SUBSCRIPTIONS_URL}?first=100"),
+            url: subscriptions_url(None, None),
             headers: vec![(
                 "authorization".to_owned(),
                 Secret::new("Bearer prove-no-tls".to_owned()),

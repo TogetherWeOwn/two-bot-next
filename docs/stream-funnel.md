@@ -114,6 +114,8 @@ post and the 2xx can post once more after restart.
 - The app token is cached and refreshed 60 s before its `expires_in`
   instant, plus once on a 401 with a single retry. No timers: reconcile
   runs at boot and after a `revocation` only.
-- `plan_boot_actions` parses one `GET` subscriptions page and returns the
-  deletes-first plan; `execute_actions` runs it in order. A create that
-  answers 409 already matches the reconciled end state and counts as done.
+- `list_subscriptions` follows every `stream.online` page (up to a bounded
+  limit); pass its complete result to `plan_boot_actions` for the deletes-first
+  plan, then `execute_actions` runs it in order. A create that answers 409
+  counts as done only after a follow-up listing confirms a healthy subscription
+  for that broadcaster on the configured callback.
