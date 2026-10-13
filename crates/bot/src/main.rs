@@ -67,6 +67,7 @@ mod onboarding;
 #[cfg(test)]
 mod onboarding_tests;
 mod ops_backfill;
+mod ops_http;
 mod preflight;
 mod raid_runtime;
 #[cfg(test)]

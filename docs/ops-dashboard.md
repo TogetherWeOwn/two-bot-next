@@ -1,9 +1,11 @@
 # Read-only ops dashboard (TOG-22861)
 
 A static Worker-served page (`GET /ops/dashboard`) polling a JSON summary
-(`GET /ops/summary`, a bounded proxy of the container's `/readyz`). Strictly
-read-only: the page issues only `GET` fetches and the summary only reports
-status. All mutations stay on their existing API routes.
+(`GET /ops/summary`, a bounded proxy of the container's `/ops/summary`
+roll-up, never `/readyz`). Strictly read-only: the page issues only `GET`
+fetches and the summary only reports status. All mutations stay on their
+existing API routes. The dashboard renders readiness from the HTTP status:
+the DO rewrites a 200 roll-up with `ready: false` into a 503.
 
 ## Access (Operator setup)
 
@@ -21,6 +23,10 @@ on the summary (`GET /ops/summary`), enforced twice:
    secrets on every summary request, so a direct `workers.dev` hit cannot
    bypass the gate. Unconfigured/short secrets → 404; missing/wrong → 401
    (never a login redirect). Attempts are per-caller throttled (10-burst, 1/sec).
+   The Worker also accepts the scrape bearer (`METRICS_SCRAPE_TOKEN`) on the
+   same path for operator automation: the scrape gate runs first and its 429
+   is a hard fence, while a non-throttled scrape refusal falls through to the
+   service-token gate.
 
 Open the page in any browser, then paste the service-token pair into its
 Connect form; the page sends the headers on its `GET /ops/summary` fetches.
@@ -32,8 +38,11 @@ wrangler secret put --env staging OPS_DASHBOARD_CLIENT_ID
 wrangler secret put --env staging OPS_DASHBOARD_CLIENT_SECRET  # >= 32 chars
 ```
 
-Same for `--env production`. Removing either secret closes the summary (404);
-the static page stays reachable (it holds no data).
+Same for `--env production`. Closing the summary requires removing both the
+dashboard pair and `METRICS_SCRAPE_TOKEN`: removing only the dashboard pair
+leaves scrape-bearer access open (and vice versa); doubly-unconfigured still
+404s, otherwise unauthenticated callers get 401. The static page stays
+reachable (it holds no data).
 
 ## Break-glass
 
@@ -58,15 +67,18 @@ the static page stays reachable (it holds no data).
 - The page contains no `POST`/`PUT`/`DELETE`/`PATCH` and stores credentials
   only in memory (never `localStorage`); disconnect clears them.
 - The summary rejects non-`GET` with 404 and proxies at most 64 KiB of the
-  container's readiness JSON with `cache-control: no-store`.
+  container's `/ops/summary` roll-up JSON with `cache-control: no-store`,
+  mapping `ready: false` to 503 so the page renders NOT READY.
 - `/ops/*` paths are reserved in `wrangler/src/redirect.ts` and never become
   invite campaigns.
 
 ## Rollback
 
 1. Delete the Worker secrets (`wrangler secret delete --env <name>
-   OPS_DASHBOARD_CLIENT_ID OPS_DASHBOARD_CLIENT_SECRET`) → the summary 404s
-   (the static page stays reachable).
+   OPS_DASHBOARD_CLIENT_ID OPS_DASHBOARD_CLIENT_SECRET` **and**
+   `METRICS_SCRAPE_TOKEN`) → the summary 404s (the static page stays
+   reachable). Deleting only the dashboard pair leaves scrape-bearer access
+   open.
 2. If the routes themselves must go, revert `wrangler/src/ops-dashboard.ts`
    and its wiring in `wrangler/src/index.ts`, then redeploy.
 3. `workers.dev` flips back by reverting the three `workers_dev` lines in
