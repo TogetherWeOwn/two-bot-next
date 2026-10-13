@@ -869,11 +869,11 @@ async fn concurrent_counter_write_during_opt_out_never_attributing() {
 /// opt-out; deleting its `LOCK TABLE` turns the final assertion red.
 const OPT_OUT_LOCK_SQL: &str = "LOCK TABLE community_facts, events, invite_snapshots, members, privacy_opt_outs, privacy_opt_out_audit IN SHARE ROW EXCLUSIVE MODE";
 
-async fn hold_opt_out_open(
-    pool: &sqlx::PgPool,
-    guild: &str,
-    member: &str,
-) -> sqlx::Transaction<'_, sqlx::Postgres> {
+async fn hold_opt_out_open<'a>(
+    pool: &'a sqlx::PgPool,
+    guild: &'a str,
+    member: &'a str,
+) -> sqlx::Transaction<'a, sqlx::Postgres> {
     let mut opt_tx = pool.begin().await.expect("opt-out tx");
     sqlx::query(OPT_OUT_LOCK_SQL)
         .execute(&mut *opt_tx)
