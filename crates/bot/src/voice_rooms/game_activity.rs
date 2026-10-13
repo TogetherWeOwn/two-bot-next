@@ -777,10 +777,12 @@ mod tests {
             flush_due(Some(T0), T0 + 2 * GAME_ACTIVITY_FLUSH_INTERVAL_MS),
             "overdue stays due"
         );
-        assert!(
-            GAME_ACTIVITY_FLUSH_INTERVAL_MS >= 4 * GAME_ACTIVITY_GAP_TIMEOUT_MS,
-            "cadence stays well past the session gap, so steady play sessionizes whole"
-        );
+        const {
+            assert!(
+                GAME_ACTIVITY_FLUSH_INTERVAL_MS >= 4 * GAME_ACTIVITY_GAP_TIMEOUT_MS,
+                "cadence stays well past the session gap, so steady play sessionizes whole"
+            )
+        };
     }
 
     #[test]
