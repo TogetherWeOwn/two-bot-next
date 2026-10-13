@@ -381,10 +381,7 @@ pub fn plan_live_post(
     recent: &mut RecentKeys,
     now_ms: i64,
 ) -> Result<NotificationPlan, StreamFunnelError> {
-    if !allowed_broadcasters
-        .iter()
-        .any(|id| *id == stream.broadcaster_user_id)
-    {
+    if !allowed_broadcasters.contains(&stream.broadcaster_user_id) {
         return Ok(NotificationPlan::Skip(SkipReason::BroadcasterNotAllowed));
     }
     // Render first so an invalid invite never burns the claim.
@@ -567,6 +564,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    // codeql[rust/hard-coded-cryptographic-value]: test-only HMAC fixture; production secret is Operator-managed env, never code.
     const SECRET: &str = "fixture-signing-secret";
     const NOW_MS: i64 = 1_760_000_000_000;
     const TS: &str = "2025-10-09T08:53:20.123456789Z";
@@ -636,6 +634,7 @@ mod tests {
             verify_delivery(&secret(), &h, &tampered, NOW_MS),
             Err(EventSubError::BadSignature)
         );
+        // codeql[rust/hard-coded-cryptographic-value]: test-only wrong-key fixture; production secret is Operator-managed env, never code.
         let other = sign("another-secret-value", ID, TS, &body);
         let h = headers(ID, TS, &other, "notification");
         assert_eq!(
@@ -748,7 +747,10 @@ mod tests {
         assert!(WebhookSecret::new("a".repeat(10)).is_ok());
         assert!(WebhookSecret::new("a".repeat(100)).is_ok());
         let shown = format!("{:?} {:#?}", secret(), Some(secret()));
-        assert!(!shown.contains(SECRET), "{shown}");
+        assert!(
+            !shown.contains(SECRET),
+            "WebhookSecret Debug must redact the signing secret"
+        );
         assert!(shown.contains("[REDACTED]"));
     }
 
