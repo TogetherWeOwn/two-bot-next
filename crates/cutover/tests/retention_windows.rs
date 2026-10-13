@@ -952,8 +952,8 @@ async fn guild_purge_covers_every_plan_table_and_preserves_receipts() {
             .await
             .unwrap();
     assert_eq!(
-        event_store_other, 2,
-        "the surviving guild's event_store rows must stay"
+        event_store_other, 8,
+        "the surviving guild's event_store rows must stay (2 members x 4 rows: 1 presence + 3 S8)"
     );
     assert_eq!(
         count(

@@ -335,7 +335,7 @@ pub async fn request_user_deletion(
 
 /// Fulfil one queued deletion request and return its receipt. Completion is
 /// immediate, so the under-72-hour SLA holds by construction. Shares
-/// `erase_member`'s locks and replay-guard refusal via [`complete_request`]:
+/// `erase_member`'s locks and replay-guard refusal via `complete_request`:
 /// a refused request returns an error with no receipt and stays pending.
 pub async fn fulfill_user_deletion(
     pool: &PgPool,
