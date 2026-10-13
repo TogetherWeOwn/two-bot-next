@@ -340,6 +340,10 @@
     "crates/cutover/migrations/0429_event_store_thread_capture.sql": {
       "sha256": "a24111554362c07b2dc188c86daa4c80ff8ddd5a5e60e2e8952bdd2997cde78d",
       "justification": "Event-store S6 thread capture, comment-only refresh: header now points at the ALLOWED_COLUMNS union plus json/jsonb type fence (review round 2), no DDL change; same order-independent table plus thread_id, parent_id and archived/locked/invitable with nullable user_id, UNIQUE dedup_key, no free-text columns."
+    },
+    "crates/cutover/migrations/0432_event_store_member_capture.sql": {
+      "sha256": "81e51abeda792b6e8dfa4ad714e744fcc09b96f9d857ca70bf4080ef8ce46faf",
+      "justification": "Event-store S2 member capture: order-independent event_store table plus premium_since, nick_changed flag and role-id columns for GUILD_MEMBER_ADD/REMOVE/UPDATE, idempotent on the shared UNIQUE dedup_key index, no free-text columns."
     }
   }
 }

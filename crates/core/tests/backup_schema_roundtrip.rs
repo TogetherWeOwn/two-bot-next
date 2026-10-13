@@ -623,7 +623,7 @@ async fn assert_default_inserts(
         ("internal_idempotency", "intent_id", "INSERT INTO internal_idempotency (caller_hash, key_hash, action, payload_hash, state) VALUES (repeat('4', 64), repeat('5', 64), 'event.read', repeat('6', 64), 'in_flight') RETURNING intent_id"),
         ("internal_action_log", "audit_id", "INSERT INTO internal_action_log (intent_id, phase, caller_hash, action, resolved_role_id) VALUES (83, 'intent', repeat('b', 64), 'role.assign', '100000000000000010') RETURNING audit_id"),
         ("moderation_member_bans", "generation", "INSERT INTO moderation_member_bans (request_id, guild_id, user_id, state, created_at) VALUES ('post-restore:ban', '100000000000000001', '100000000000000012', 'prepared', now()) RETURNING generation"),
-        ("event_store", "id", "INSERT INTO event_store (event_type, guild_id, thread_id, event_time, dedup_key) VALUES ('THREAD_CREATE', '100000000000000001', 'post-restore:thread', now(), 'post-restore:es') RETURNING id"),
+        ("event_store", "id", "INSERT INTO event_store (event_type, guild_id, thread_id, user_id, event_time, dedup_key) VALUES ('THREAD_MEMBER_UPDATE', '100000000000000001', 'post-restore:thread', '100000000000000002', now(), 'post-restore:es-thread-member') RETURNING id"),
     ];
     let cases: BTreeSet<(String, String)> = inserts
         .iter()

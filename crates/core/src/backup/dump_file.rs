@@ -139,9 +139,10 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_vote_kick_audit",
     // V5 adds accepted-create history; see [`V5_ADDED_TABLES`].
     "voice_create_reservations",
-    // V6 adds the event-store thread lifecycle + member-delta capture
-    // (0429 S6; shared table for S1-S8 slices); see [`V6_ADDED_TABLES`].
-    // Guild-keyed, no foreign keys, so order among the tail is free.
+    // V6 adds the shared event-store capture: S2 member deltas (0432) plus
+    // S6 thread lifecycle + member deltas (0429); one table for the S1-S8
+    // slices, see [`V6_ADDED_TABLES`]. Guild-keyed, no foreign keys, so order
+    // among the tail is free.
     "event_store",
 ];
 
@@ -151,9 +152,10 @@ pub const DUMP_TABLES: &[&str] = &[
 /// waiving arbitrary missing tables.
 pub const V5_ADDED_TABLES: &[&str] = &["voice_create_reservations"];
 
-/// Tables first covered by v6. A v5 archive predates them and need not declare
-/// them; v6 archives must cover the full inventory, so a pre-event-store
-/// recovery point stays readable without waiving arbitrary missing tables.
+/// Tables first covered by v6. A v4 or v5 archive predates them and need not
+/// declare them; v5 still requires every other covered table, so recovery
+/// points written before event-store capture (member deltas, thread
+/// lifecycle) stay readable without waiving arbitrary missing tables.
 pub const V6_ADDED_TABLES: &[&str] = &["event_store"];
 
 /// Covered tables not created by the current cutover migration set, if any.
@@ -1739,33 +1741,63 @@ mod tests {
     }
 
     #[test]
-    fn pre_event_store_v5_archives_stay_readable_but_v6_requires_event_store() {
-        // A v5 recovery point written before the event-store slice declares
-        // every covered table except event_store; v6 made that table mandatory.
-        let v5_tables: Vec<Value> = complete_tables(&BTreeMap::new())
-            .into_iter()
-            .filter(|table| table["name"] != "event_store")
-            .collect();
-        let mut v5 = manifest(v5_tables);
+    fn v5_archives_read_without_event_store_but_v6_requires_it() {
+        fn without(tables: Vec<Value>, name: &str) -> Vec<Value> {
+            tables
+                .into_iter()
+                .filter(|t| t.get("name").and_then(Value::as_str) != Some(name))
+                .collect()
+        }
+        // A v5 manifest (full v5 inventory, no event_store) stays readable:
+        // v5 predates event-store capture (member deltas, thread lifecycle).
+        let mut v5 = manifest(without(complete_tables(&BTreeMap::new()), "event_store"));
         v5["version"] = serde_json::json!(5);
         assert!(
             validate_manifest(&v5).is_ok(),
-            "v5 predates the event store and stays readable"
+            "v5 without event_store reads"
         );
-        // The inspect read path accepts the frozen v5 envelope too.
-        let bytes = gzip_lines(&[v5.clone(), serde_json::json!({"kind":"end","rows":0})]);
-        let contents = inspect_bytes(&bytes).expect("v5 without event_store inspects");
-        assert_eq!(contents.manifest.version, 5);
-        assert_eq!(contents.manifest.missing_tables(), ["event_store"]);
-        // The same inventory at the current version refuses: new archives must
-        // cover the event store.
-        assert_eq!(DUMP_VERSION, 6);
-        let mut v6 = v5;
-        v6["version"] = serde_json::json!(DUMP_VERSION);
-        assert!(validate_manifest(&v6)
+        // Dropping a v5-covered table from a v5 manifest still refuses.
+        let mut v5_gap = v5.clone();
+        v5_gap["tables"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|t| t.get("name").and_then(Value::as_str) != Some("voice_create_reservations"));
+        assert!(validate_manifest(&v5_gap)
+            .unwrap_err()
+            .to_string()
+            .contains("voice_create_reservations"));
+        // v6 without event_store refuses.
+        let v6_gap = manifest(without(complete_tables(&BTreeMap::new()), "event_store"));
+        assert_eq!(v6_gap["version"], serde_json::json!(DUMP_VERSION));
+        assert!(validate_manifest(&v6_gap)
             .unwrap_err()
             .to_string()
             .contains("event_store"));
+    }
+
+    #[test]
+    fn inspect_still_reads_v5_archives_and_refuses_unknown_versions() {
+        // The version gate in `inspect_reader` is a second half of the v6
+        // bump: `validate_manifest` waives event_store for v5, but the gate
+        // must also let a v5 archive reach it.
+        let mut v5 = good_dump();
+        v5[0]["version"] = serde_json::json!(5);
+        v5[0]["tables"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|t| t.get("name").and_then(Value::as_str) != Some("event_store"));
+        let contents = inspect_bytes(&gzip_lines(&v5)).expect("a v5 archive stays readable");
+        assert_eq!(contents.manifest.version, 5);
+        assert_eq!(contents.rows, 1);
+        assert_eq!(contents.manifest.missing_tables(), ["event_store"]);
+
+        let mut future = good_dump();
+        future[0]["version"] = serde_json::json!(DUMP_VERSION + 1);
+        let message = inspect_bytes(&gzip_lines(&future)).unwrap_err().to_string();
+        assert!(
+            message.contains(&format!("reads 3, 4, 5 and {DUMP_VERSION}")),
+            "unknown versions are refused with the readable list: {message}"
+        );
     }
 
     #[test]
