@@ -44,6 +44,10 @@ JOB_INVENTORY = {
     # SDLC separation gate (org test-guard reusable, warn mode): one
     # reusable call, least-privilege grant pinned below.
     "test-guard.yml": {"test-guard"},
+    # TOG-21027: manual, bounded vote_kick libFuzzer smoke on a GitHub-hosted
+    # runner. Read-only, no secrets, no deploy route: the generic
+    # deployment/probe scan already passes, so only the inventory pin is needed.
+    "vote-kick-fuzz-smoke.yml": {"vote-kick-smoke"},
 }
 # Reusable-workflow calls are allowed only to these non-deploy workflows.
 # TOG-10893 registers the read-only sbom.yml calls alongside the benchmark one.
