@@ -335,6 +335,33 @@ fn voice_event(member: u64, channel: Option<u64>) -> Event {
     })).unwrap()))
 }
 
+fn game_activity_delta(
+    member_id: u64,
+    game: Option<&str>,
+    observed_at_ms: i64,
+) -> two_bot_core::game_activity::PresenceDelta {
+    let activities = game
+        .into_iter()
+        .map(|name| two_bot_core::game_activity::ActivitySnapshot {
+            activity_type: two_bot_core::game_activity::ActivityType::Playing,
+            name: name.to_owned(),
+            application_id: None,
+            details: None,
+            state: None,
+            party_size: None,
+            assets: false,
+            button_labels: Vec::new(),
+            button_urls: Vec::new(),
+            stream_url: None,
+        })
+        .collect();
+    two_bot_core::game_activity::PresenceDelta {
+        user_key: member_id.to_string(),
+        observed_at_ms,
+        activities,
+    }
+}
+
 fn feed(runtime: &Runtime, pipeline: &MemPipeline, event: Event) {
     pipeline.handle(&event);
     runtime.handle(&event, pipeline.cache());
@@ -626,6 +653,86 @@ async fn actor_load_failure_bumps_counter_and_arms_warn_throttle() {
         super::super::VOICE_ACTOR_LOAD_WARN_LAST_SECS.load(std::sync::atomic::Ordering::Relaxed),
         0,
         "first failure arms the warn throttle"
+    );
+}
+
+#[tokio::test]
+async fn guild_create_closes_open_voice_span_for_absent_member() {
+    const MIN: i64 = 60_000;
+    let (store, http, _) = fixture();
+    let runtime = runtime(store, http);
+    let pipeline = MemPipeline::for_replay();
+    let collector = runtime.game_activity_collector();
+    let now = i64::try_from(wall_ms()).unwrap_or(i64::MAX);
+    let start = now - 10 * MIN;
+    collector.observe_presence(GUILD, game_activity_delta(MEMBER, Some("Apex"), start));
+    collector.observe_join(GUILD, MEMBER, start);
+
+    feed(&runtime, &pipeline, guild_event(&[], permissions()));
+
+    let stop = now + 10 * MIN;
+    collector.observe_presence(GUILD, game_activity_delta(MEMBER, None, stop));
+    collector.observe_leave(GUILD, MEMBER, stop);
+    let rows = collector.flush(GUILD, 15 * MIN, stop);
+    let apex = rows
+        .iter()
+        .find(|row| row.game.as_deref() == Some("Apex"))
+        .expect("Apex row");
+    assert!(
+        (9 * MIN..15 * MIN).contains(&apex.in_voice_ms),
+        "the guild snapshot closes at reconnect, not the later presence stop: {:?}",
+        apex
+    );
+}
+
+#[test]
+fn disconnect_closes_open_voice_spans() {
+    const MIN: i64 = 60_000;
+    let (store, http, _) = fixture();
+    let runtime = runtime(store, http);
+    let collector = runtime.game_activity_collector();
+    let now = i64::try_from(wall_ms()).unwrap_or(i64::MAX);
+    let start = now - 10 * MIN;
+    collector.observe_presence(GUILD, game_activity_delta(MEMBER, Some("Apex"), start));
+    collector.observe_join(GUILD, MEMBER, start);
+
+    runtime.disconnect();
+
+    let stop = now + 10 * MIN;
+    collector.observe_presence(GUILD, game_activity_delta(MEMBER, None, stop));
+    collector.observe_leave(GUILD, MEMBER, stop);
+    let rows = collector.flush(GUILD, 15 * MIN, stop);
+    let apex = rows
+        .iter()
+        .find(|row| row.game.as_deref() == Some("Apex"))
+        .expect("Apex row");
+    assert!(
+        (9 * MIN..15 * MIN).contains(&apex.in_voice_ms),
+        "voice time ends at disconnect rather than covering the reconnect gap: {:?}",
+        apex
+    );
+}
+
+#[test]
+fn guild_delete_drops_unflushed_game_activity_state() {
+    let (store, http, _) = fixture();
+    let runtime = runtime(store, http);
+    let pipeline = MemPipeline::for_replay();
+    let collector = runtime.game_activity_collector();
+    let now = i64::try_from(wall_ms()).unwrap_or(i64::MAX);
+    collector.observe_presence(GUILD, game_activity_delta(MEMBER, Some("Apex"), now));
+    collector.observe_join(GUILD, MEMBER, now);
+
+    let deleted = Event::GuildDelete(Box::new(
+        serde_json::from_value::<twilight_model::gateway::payload::incoming::GuildDelete>(json!({
+            "id": GUILD.to_string(), "unavailable": false
+        }))
+        .unwrap(),
+    ));
+    feed(&runtime, &pipeline, deleted);
+    assert!(
+        collector.guilds().is_empty(),
+        "guild removal must discard all buffered and open collector state"
     );
 }
 

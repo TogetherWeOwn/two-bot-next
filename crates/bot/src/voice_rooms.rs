@@ -7007,6 +7007,9 @@ where
         {
             actor.live.disconnect();
         }
+        // Game-activity wiring: nothing for the guild persists after removal,
+        // and a rejoin starts fresh.
+        self.game_activity.clear_guild(guild);
     }
 
     /// Feed one member's presence facts; a change for a member in voice asks
@@ -7179,6 +7182,10 @@ where
         for actor in self.actors.lock().expect("voice runtime lock").values() {
             actor.live.disconnect();
         }
+        // Game-activity wiring: transport loss invalidates live voice state,
+        // so open spans close here instead of covering the offline gap.
+        self.game_activity
+            .close_all_opens(i64::try_from(wall_ms()).unwrap_or(i64::MAX));
     }
 }
 
@@ -7246,23 +7253,28 @@ where
                             presence::facts(member),
                         );
                     }
+                    // Game-activity wiring: reconcile open spans against the
+                    // snapshot. Members in voice open idempotently (a later
+                    // join keeps the earlier join); members missing from the
+                    // snapshot close now, so a leave lost during a
+                    // non-resumed reconnect never inflates voice time.
+                    let snapshot_ms = i64::try_from(wall_ms()).unwrap_or(i64::MAX);
+                    let mut snapshot_present = Vec::new();
                     for state in &guild.voice_states {
                         self.stream_frame(
                             guild_id,
                             state.user_id.get(),
                             state.self_stream && state.channel_id.is_some(),
                         );
-                        // Game-activity wiring: members already in voice at
-                        // snapshot time open their span now (idempotent: a
-                        // later join for the same member keeps this join).
                         if state.channel_id.is_some() {
-                            self.game_activity.observe_join(
-                                guild_id,
-                                state.user_id.get(),
-                                i64::try_from(wall_ms()).unwrap_or(i64::MAX),
-                            );
+                            snapshot_present.push(state.user_id.get());
                         }
                     }
+                    self.game_activity.reconcile_voice_snapshot(
+                        guild_id,
+                        &snapshot_present,
+                        snapshot_ms,
+                    );
                 }
             }
             Event::PresenceUpdate(update) => {
