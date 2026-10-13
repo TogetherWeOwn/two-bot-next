@@ -133,7 +133,11 @@ impl SharedRing {
     }
 
     /// Production wiring: parse `TWO_INTERNAL_KEYS`, fail closed to an empty
-    /// ring (every read refuses) when it is missing or invalid.
+    /// ring (every read refuses) when it is missing or invalid. Silent at
+    /// INFO: `router_with_guard` runs under test dispatchers that capture
+    /// INFO+ events (the shutdown-correlation test pins exactly three
+    /// lifecycle lines), and the internal-action receiver likewise stays
+    /// quiet when dark. Per-read denials already log at debug with a reason.
     pub(crate) fn from_env() -> Self {
         match std::env::var("TWO_INTERNAL_KEYS")
             .ok()
@@ -141,7 +145,7 @@ impl SharedRing {
         {
             Some(keys) => Self::new(keys),
             None => {
-                tracing::warn!(
+                tracing::debug!(
                     msg = "ops_backfill_keys_invalid",
                     "TWO_INTERNAL_KEYS missing or invalid; backfill reads will refuse"
                 );
