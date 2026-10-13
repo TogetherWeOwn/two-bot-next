@@ -405,6 +405,10 @@
       "sha256": "ec8fa9475530ab759dafa3d2963e9465796daa7e05f8d500d001aa2a13721312",
       "justification": "Event-store S7 invite + scheduled-event capture: order-independent event_store invite columns (invite_code_hash as hex sha256, never the raw code, plus inviter_id) and scheduled-event columns (scheduled_event_id plus event_status/entity_type integer enums) with nullable convergence and the shared UNIQUE dedup index; ids+hash+timestamps+enums only, no description/name/location/username columns. Renumbered to 0439 because the merged retention migration owns 0438; the S7 migration has not merged."
 
+    },
+    "crates/cutover/migrations/0440_stream_live_claims.sql": {
+      "sha256": "c34223b642a8c626281eef8fecef96f165a9d96be4acf510bff550f5d5e50c72",
+      "justification": "Durable Twitch go-live dedup ledger keyed by live_dedup_key: claim-before-post insert, release-on-failed-send delete, delivered rows stamped and kept as the restart-proof fence. Renumbered 0435 to 0438 on the merge past main's 0435/0436 backfill and 0437 event-store S1 core, then to 0439 after main added 0438 retention queues, then to 0440 after main added 0439 event-store S7 invite/scheduled-event capture."
     }
   }
 }

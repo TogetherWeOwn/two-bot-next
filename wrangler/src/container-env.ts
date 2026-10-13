@@ -249,6 +249,7 @@ const REDIRECT = "go.two.gg redirect is served by the Worker (REDIRECT_*), not t
 
 /** Every other `TWO_*` name in crates/, with why it stays out of the Container. */
 export const NOT_FORWARDED: Readonly<Record<string, string>> = {
+  TWO_EVENTSUB: "Worker-only ingress gate; never read by the Container",
   TWO_DATABASE_URL: "cutover/operator CLI secret; the Container reads DATABASE_URL",
   TWO_STAGING_DATABASE_URL: SECRET,
   TWO_BOT_STAGING_MIGRATOR_DATABASE_URL: SECRET,

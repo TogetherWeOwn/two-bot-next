@@ -252,6 +252,9 @@ jobs:
           --skip rejected_lockdown_removes_only_new_seed_and_allows_same_key_retry
           --skip permission_actor_and_guild_refusals_never_mutate
           --skip feed_crud_audit_scope_and_timestamp_roundtrip
+          --skip claim_is_owned_once_then_duplicate
+          --skip failed_send_releases_the_claim_for_the_retry
+          --skip delivered_rows_are_never_released
           --skip concurrent_claims_lease_takeover_and_stale_owner_fencing
           --skip mock_delivery_crash_reconciliation_restart_and_overflow
           --skip parity_mismatch_cursor_and_read_only_acceptance
