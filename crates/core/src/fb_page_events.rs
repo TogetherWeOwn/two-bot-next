@@ -577,9 +577,11 @@ fn readback_matches(draft: &FbEventDraft, observed: &EventReadback) -> bool {
 ///    heals forward inside `execute` without a second fetch (control 6);
 /// 4. exactly one mutating driver call for create/update/delete; challenges
 ///    abort with zero retries + one CEO notification (control 2);
-/// 5. every mutating path captures a screenshot artifact, persisted on the
-///    audit row, plus a readback; a failed readback falls back to the
-///    link-post path and audits both (control 5);
+/// 5. create/update capture a screenshot artifact, persisted on the audit
+///    row, plus a readback; a failed readback falls back to the link-post
+///    path and audits both (control 5). Delete is screenshot-only: on
+///    driver `Ok` the mapping drops without a readback; on `Failed` the
+///    mapping is kept as [`RunOutcome::DeleteFailed`];
 /// 6. every automated action emits exactly one audit row on success
 ///    (control 8); the fallback path emits two (prior failure + link post).
 ///    Failures are never success-shaped: a failed delete keeps the mapping
@@ -856,6 +858,8 @@ mod tests {
         readback: Option<EventReadback>,
         rows: Vec<AuditRow>,
         notes: Vec<CeoNotification>,
+        full_creates: Vec<FbEventDraft>,
+        full_updates: Vec<(String, FbEventDraft)>,
     }
 
     impl Default for FakeInner {
@@ -872,6 +876,8 @@ mod tests {
                 }),
                 rows: Vec::new(),
                 notes: Vec::new(),
+                full_creates: Vec::new(),
+                full_updates: Vec::new(),
             }
         }
     }
@@ -892,6 +898,14 @@ mod tests {
 
         fn notes(&self) -> Vec<CeoNotification> {
             self.inner.lock().expect("fake lock").notes.clone()
+        }
+
+        fn full_creates(&self) -> Vec<FbEventDraft> {
+            self.inner.lock().expect("fake lock").full_creates.clone()
+        }
+
+        fn full_updates(&self) -> Vec<(String, FbEventDraft)> {
+            self.inner.lock().expect("fake lock").full_updates.clone()
         }
     }
 
@@ -927,6 +941,18 @@ mod tests {
 
         fn readback_event(&self, _fb_url: &str) -> Option<EventReadback> {
             self.inner.lock().expect("fake lock").readback.clone()
+        }
+
+        fn create_event_full(&self, draft: &FbEventDraft) -> Result<String, DriverError> {
+            let mut inner = self.inner.lock().expect("fake lock");
+            inner.full_creates.push(draft.clone());
+            inner.create.clone()
+        }
+
+        fn update_event_full(&self, fb_url: &str, draft: &FbEventDraft) -> Result<(), DriverError> {
+            let mut inner = self.inner.lock().expect("fake lock");
+            inner.full_updates.push((fb_url.to_owned(), draft.clone()));
+            inner.update.clone()
         }
     }
 
@@ -1145,7 +1171,37 @@ mod tests {
     fn full_draft_methods_default_to_narrowing_calls() {
         // The `_full` defaults narrow to the legacy calls so existing fakes
         // keep working; real drivers override them to sync content.
-        let fake = Fake::default();
+        struct NarrowOnly {
+            inner: Mutex<FakeInner>,
+        }
+        impl BrowserDriver for NarrowOnly {
+            fn create_event(&self, _id: &str, _name: &str) -> Result<String, DriverError> {
+                self.inner.lock().expect("fake lock").create.clone()
+            }
+            fn update_event(&self, _url: &str, _id: &str) -> Result<(), DriverError> {
+                self.inner.lock().expect("fake lock").update.clone()
+            }
+            fn delete_event(&self, _url: &str) -> Result<(), DriverError> {
+                self.inner.lock().expect("fake lock").delete.clone()
+            }
+            fn screenshot_png(&self) -> Vec<u8> {
+                vec![0x89, b'P', b'N', b'G']
+            }
+            fn readback_url(&self, _fb_url: &str) -> Option<String> {
+                self.inner
+                    .lock()
+                    .expect("fake lock")
+                    .readback
+                    .clone()
+                    .map(|observed| observed.url)
+            }
+            fn link_post_fallback(&self, _id: &str, _name: &str) -> Result<String, DriverError> {
+                self.inner.lock().expect("fake lock").link.clone()
+            }
+        }
+        let fake = NarrowOnly {
+            inner: Mutex::new(FakeInner::default()),
+        };
         let draft = FbEventDraft::from_scheduled(&scheduled("event-7"));
         assert_eq!(draft.starts_at, TEST_START);
         assert_eq!(
@@ -1159,5 +1215,358 @@ mod tests {
                 .map(|observed| observed.url),
             Some(TEST_PAGE_URL.to_owned())
         );
+    }
+
+    #[test]
+    fn create_full_draft_reaches_driver_with_start_and_description() {
+        let fake = Fake::default();
+        let secrets = FakeSecrets::default();
+        let mut pages = IdempotencyMap::new();
+
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Created).expect("create runs");
+        assert!(
+            matches!(outcome, RunOutcome::Created { .. }),
+            "create succeeds: {outcome:?}"
+        );
+        let creates = fake.full_creates();
+        assert_eq!(creates.len(), 1, "create must go through create_event_full");
+        assert_eq!(creates[0].starts_at, TEST_START);
+        assert_eq!(
+            creates[0].description.as_deref(),
+            Some("Join the weekly games night.")
+        );
+        assert_eq!(creates[0].channel_id.as_deref(), Some("voice-1"));
+        assert_eq!(creates[0].name, "Sunday Squad");
+    }
+
+    #[test]
+    fn update_full_draft_reaches_driver_with_start_and_description() {
+        let fake = Fake::default();
+        let secrets = FakeSecrets::default();
+        let mut pages = IdempotencyMap::new();
+        pages.record("event-1", TEST_PAGE_URL);
+
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Updated).expect("update runs");
+        assert!(
+            matches!(outcome, RunOutcome::Updated { .. }),
+            "update succeeds: {outcome:?}"
+        );
+        let updates = fake.full_updates();
+        assert_eq!(updates.len(), 1, "update must go through update_event_full");
+        assert_eq!(updates[0].0, TEST_PAGE_URL);
+        assert_eq!(updates[0].1.starts_at, TEST_START);
+        assert_eq!(
+            updates[0].1.description.as_deref(),
+            Some("Join the weekly games night.")
+        );
+    }
+
+    #[test]
+    fn starts_at_mismatch_fails_create_verification_into_fallback() {
+        let fake = Fake::default();
+        fake.edit(|inner| {
+            inner.readback = Some(EventReadback {
+                url: TEST_PAGE_URL.to_owned(),
+                name: Some("Sunday Squad".to_owned()),
+                starts_at: Some("2026-09-06T19:00:00.000Z".to_owned()),
+            });
+        });
+        let secrets = FakeSecrets::default();
+        let mut pages = IdempotencyMap::new();
+
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Created).expect("fallback runs");
+        assert!(
+            matches!(outcome, RunOutcome::LinkPostFallback { .. }),
+            "a starts_at mismatch must not verify: {outcome:?}"
+        );
+        assert_eq!(
+            pages.lookup("event-1").as_deref(),
+            Some(TEST_PAGE_URL),
+            "the unverified event stays mapped"
+        );
+    }
+
+    #[test]
+    fn name_mismatch_on_update_fails_verification_into_fallback() {
+        let fake = Fake::default();
+        fake.edit(|inner| {
+            inner.readback = Some(EventReadback {
+                url: TEST_PAGE_URL.to_owned(),
+                name: Some("Renamed Squad".to_owned()),
+                starts_at: None,
+            });
+        });
+        let secrets = FakeSecrets::default();
+        let mut pages = IdempotencyMap::new();
+        pages.record("event-1", TEST_PAGE_URL);
+
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Updated).expect("fallback runs");
+        assert!(
+            matches!(outcome, RunOutcome::LinkPostFallback { .. }),
+            "an observed name mismatch on update must not verify: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn create_mismatch_challenge_notifies_ceo_once() {
+        let fake = Fake::default();
+        fake.edit(|inner| {
+            inner.readback = None;
+            inner.link = Err(DriverError::Challenge(ChallengeSignal::Captcha));
+        });
+        let secrets = FakeSecrets::default();
+        let mut pages = IdempotencyMap::new();
+
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Created)
+            .expect("challenge abort is an outcome");
+        assert!(
+            matches!(
+                outcome,
+                RunOutcome::ChallengeAborted {
+                    ceo_notified: true,
+                    ..
+                }
+            ),
+            "create-mismatch challenge aborts: {outcome:?}"
+        );
+        assert_eq!(
+            fake.notes().len(),
+            1,
+            "the create-mismatch challenge notifies exactly once"
+        );
+    }
+
+    #[test]
+    fn update_failure_challenge_notifies_ceo_once() {
+        let fake = Fake::default();
+        fake.edit(|inner| {
+            inner.update = Err(DriverError::Failed("no update".to_owned()));
+            inner.link = Err(DriverError::Challenge(ChallengeSignal::Captcha));
+        });
+        let secrets = FakeSecrets::default();
+        let mut pages = IdempotencyMap::new();
+        pages.record("event-1", TEST_PAGE_URL);
+
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Updated)
+            .expect("challenge abort is an outcome");
+        assert!(
+            matches!(
+                outcome,
+                RunOutcome::ChallengeAborted {
+                    ceo_notified: true,
+                    ..
+                }
+            ),
+            "update-failure challenge aborts: {outcome:?}"
+        );
+        assert_eq!(
+            fake.notes().len(),
+            1,
+            "the update-failure challenge notifies exactly once"
+        );
+    }
+
+    #[test]
+    fn update_mismatch_challenge_notifies_ceo_once() {
+        let fake = Fake::default();
+        fake.edit(|inner| {
+            inner.readback = None;
+            inner.link = Err(DriverError::Challenge(ChallengeSignal::Captcha));
+        });
+        let secrets = FakeSecrets::default();
+        let mut pages = IdempotencyMap::new();
+        pages.record("event-1", TEST_PAGE_URL);
+
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Updated)
+            .expect("challenge abort is an outcome");
+        assert!(
+            matches!(
+                outcome,
+                RunOutcome::ChallengeAborted {
+                    ceo_notified: true,
+                    ..
+                }
+            ),
+            "update-mismatch challenge aborts: {outcome:?}"
+        );
+        assert_eq!(
+            fake.notes().len(),
+            1,
+            "the update-mismatch challenge notifies exactly once"
+        );
+    }
+
+    #[test]
+    fn success_and_failure_rows_carry_screenshot_evidence() {
+        // Created.
+        let fake = Fake::default();
+        let secrets = FakeSecrets::default();
+        let mut pages = IdempotencyMap::new();
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Created).expect("create runs");
+        assert!(matches!(outcome, RunOutcome::Created { .. }));
+        let rows = fake.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, "created");
+        assert!(
+            rows[0]
+                .screenshot_png
+                .as_ref()
+                .is_some_and(|png| !png.is_empty()),
+            "the created row carries screenshot evidence"
+        );
+
+        // Updated.
+        let fake = Fake::default();
+        let mut pages = IdempotencyMap::new();
+        pages.record("event-1", TEST_PAGE_URL);
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Updated).expect("update runs");
+        assert!(matches!(outcome, RunOutcome::Updated { .. }));
+        let rows = fake.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, "updated");
+        assert!(
+            rows[0]
+                .screenshot_png
+                .as_ref()
+                .is_some_and(|png| !png.is_empty()),
+            "the updated row carries screenshot evidence"
+        );
+
+        // Deleted.
+        let fake = Fake::default();
+        let mut pages = IdempotencyMap::new();
+        pages.record("event-1", TEST_PAGE_URL);
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Cancelled).expect("delete runs");
+        assert!(matches!(outcome, RunOutcome::Deleted));
+        let rows = fake.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, "deleted");
+        assert!(
+            rows[0]
+                .screenshot_png
+                .as_ref()
+                .is_some_and(|png| !png.is_empty()),
+            "the deleted row carries screenshot evidence"
+        );
+
+        // Delete-failed.
+        let fake = Fake::default();
+        fake.edit(|inner| {
+            inner.delete = Err(DriverError::Failed("boom".to_owned()));
+        });
+        let mut pages = IdempotencyMap::new();
+        pages.record("event-1", TEST_PAGE_URL);
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Cancelled)
+            .expect("delete failure is an outcome");
+        assert!(matches!(outcome, RunOutcome::DeleteFailed { .. }));
+        let rows = fake.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, "delete_failed_driver_error");
+        assert_eq!(rows[0].fb_url.as_deref(), Some(TEST_PAGE_URL));
+        assert!(
+            rows[0]
+                .screenshot_png
+                .as_ref()
+                .is_some_and(|png| !png.is_empty()),
+            "the delete-failed row carries screenshot evidence"
+        );
+    }
+
+    #[test]
+    fn link_post_rows_carry_screenshot_evidence() {
+        // Fallback success: prior row + link-post row.
+        let fake = Fake::default();
+        fake.edit(|inner| inner.readback = None);
+        let secrets = FakeSecrets::default();
+        let mut pages = IdempotencyMap::new();
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Created).expect("fallback runs");
+        assert!(matches!(outcome, RunOutcome::LinkPostFallback { .. }));
+        let rows = fake.rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].outcome, "link_post_created_via_pages_manage_posts");
+        assert!(
+            rows[1]
+                .screenshot_png
+                .as_ref()
+                .is_some_and(|png| !png.is_empty()),
+            "the link-post success row carries screenshot evidence"
+        );
+
+        // Fallback double failure: link-post failure row still carries it.
+        let fake = Fake::default();
+        fake.edit(|inner| {
+            inner.readback = None;
+            inner.link = Err(DriverError::Failed("no link".to_owned()));
+        });
+        let mut pages = IdempotencyMap::new();
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Created).expect("failure runs");
+        assert!(matches!(
+            outcome,
+            RunOutcome::FallbackFailed { stage: "create" }
+        ));
+        let rows = fake.rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].outcome, "link_post_failed_driver_error");
+        assert!(
+            rows[1]
+                .screenshot_png
+                .as_ref()
+                .is_some_and(|png| !png.is_empty()),
+            "the link-post failure row carries screenshot evidence"
+        );
+    }
+
+    #[test]
+    fn update_double_failure_reports_fallback_failed_update_stage() {
+        let fake = Fake::default();
+        fake.edit(|inner| {
+            inner.update = Err(DriverError::Failed("no update".to_owned()));
+            inner.link = Err(DriverError::Failed("no link".to_owned()));
+        });
+        let secrets = FakeSecrets::default();
+        let mut pages = IdempotencyMap::new();
+        pages.record("event-1", TEST_PAGE_URL);
+
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Updated)
+            .expect("double failure is an outcome");
+        assert!(
+            matches!(outcome, RunOutcome::FallbackFailed { stage: "update" }),
+            "nothing reached Facebook on update: {outcome:?}"
+        );
+        let rows = fake.rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].outcome, "update_failed_driver_error");
+        assert_eq!(rows[1].outcome, "link_post_failed_driver_error");
+    }
+
+    #[test]
+    fn audit_labels_distinguish_driver_failures_from_mismatch() {
+        let secrets = FakeSecrets::default();
+
+        // Create driver failure.
+        let fake = Fake::default();
+        fake.edit(|inner| {
+            inner.create = Err(DriverError::Failed("no event".to_owned()));
+        });
+        let mut pages = IdempotencyMap::new();
+        run(&fake, &secrets, &mut pages, ChangeKind::Created).expect("fallback runs");
+        assert_eq!(fake.rows()[0].outcome, "create_failed_driver_error");
+
+        // Update driver failure.
+        let fake = Fake::default();
+        fake.edit(|inner| {
+            inner.update = Err(DriverError::Failed("no update".to_owned()));
+        });
+        let mut pages = IdempotencyMap::new();
+        pages.record("event-1", TEST_PAGE_URL);
+        run(&fake, &secrets, &mut pages, ChangeKind::Updated).expect("fallback runs");
+        assert_eq!(fake.rows()[0].outcome, "update_failed_driver_error");
+
+        // Readback mismatch.
+        let fake = Fake::default();
+        fake.edit(|inner| inner.readback = None);
+        let mut pages = IdempotencyMap::new();
+        run(&fake, &secrets, &mut pages, ChangeKind::Created).expect("fallback runs");
+        assert_eq!(fake.rows()[0].outcome, "verify_failed_readback_mismatch");
     }
 }
