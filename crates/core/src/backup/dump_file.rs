@@ -109,6 +109,9 @@ pub const DUMP_TABLES: &[&str] = &[
     "internal_action_log",
     "internal_discord_events",
     "internal_event_keys",
+    // Stream go-live dedup ledger (0435): one row per go-live, no foreign
+    // keys, so order among the internal tables is free.
+    "stream_live_claims",
     "moderation_channel_executions",
     "moderation_member_bans",
     "invite_campaigns",
@@ -145,7 +148,7 @@ pub const DUMP_TABLES: &[&str] = &[
 /// them; every other covered table is still required, so a v4 recovery point
 /// written before create-reservation persistence stays readable without
 /// waiving arbitrary missing tables.
-pub const V5_ADDED_TABLES: &[&str] = &["voice_create_reservations"];
+pub const V5_ADDED_TABLES: &[&str] = &["voice_create_reservations", "stream_live_claims"];
 
 /// Covered tables not created by the current cutover migration set, if any.
 /// Keep legacy data when such tables exist, but do not require nonexistent
@@ -1701,7 +1704,7 @@ mod tests {
         assert_eq!(names, expected);
         assert_eq!(
             contents.manifest.missing_tables(),
-            ["voice_create_reservations"]
+            ["stream_live_claims", "voice_create_reservations"]
         );
         assert_eq!(contents.buffers["voice_rooms"][0]["channel_id"], "500");
         let mut manifest = serde_json::to_value(&contents.manifest).unwrap();

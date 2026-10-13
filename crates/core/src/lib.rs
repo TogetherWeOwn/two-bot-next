@@ -117,6 +117,9 @@ pub mod send_admission;
 pub mod settings;
 pub mod sticky;
 pub mod stream_funnel;
+pub mod stream_live;
+#[cfg(feature = "db")]
+pub mod stream_live_store;
 pub mod tickets;
 pub mod voice;
 pub mod voice_access;

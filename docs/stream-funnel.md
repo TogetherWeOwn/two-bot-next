@@ -37,3 +37,16 @@ post is planned. See `crates/core/src/stream_funnel.rs`.
 - VOD discovery reuses the existing no-quota Atom/RSS polling in `feeds`.
   No `youtube.search` loop (search calls are quota-expensive).
 - This slice adds no interval, job, or background task.
+
+## Durable go-live ledger
+
+- One `stream_live_claims` row per go-live, keyed by `live_dedup_key`.
+  `claim_live` inserts with `ON CONFLICT DO NOTHING`: the inserter owns
+  the post, a conflict is a retry/replay and is acknowledged with 2xx.
+- The LIVE post goes through `ActionExecutor::post_message`, whose body
+  always carries `allowed_mentions: { parse: [] }`, so it can never ping.
+- A send that provably never reached Discord deletes its unposted row
+  (`release_live`) and the receiver answers 5xx so Twitch retries; a
+  delivered row is stamped, never deleted, so a restart between post and
+  acknowledgement cannot double-post. The claim → send → settle table is
+  `stream_live::disposition`; the async glue lives with the receiver.
