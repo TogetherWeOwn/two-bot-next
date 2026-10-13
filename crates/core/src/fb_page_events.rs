@@ -185,7 +185,7 @@ pub trait BrowserDriver: Send + Sync {
     fn screenshot_png(&self) -> Vec<u8>;
     fn readback_url(&self, fb_url: &str) -> Option<String>;
     fn link_post_fallback(&self, discord_event_id: &str, name: &str)
-    -> Result<String, DriverError>;
+        -> Result<String, DriverError>;
 
     /// Create carrying the full [`FbEventDraft`] (start time, description,
     /// channel). Defaults to the narrowing [`BrowserDriver::create_event`]
@@ -362,19 +362,32 @@ pub enum Refused {
 /// Outcome of one [`run_once`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunOutcome {
-    Created { url: String },
-    Updated { url: String },
+    Created {
+        url: String,
+    },
+    Updated {
+        url: String,
+    },
     Deleted,
-    LinkPostFallback { url: String },
+    LinkPostFallback {
+        url: String,
+    },
     /// Delete failed: the FB event is still live, so the mapping is kept and
     /// a later cancel can retry. Never reported as [`RunOutcome::Deleted`]
     /// (control 4, never silent success).
-    DeleteFailed { fb_url: String },
+    DeleteFailed {
+        fb_url: String,
+    },
     /// Primary action and the link-post fallback both failed: nothing new
     /// reached Facebook. `stage` is `"create"` or `"update"`. Never shaped
     /// as [`RunOutcome::LinkPostFallback`] (never silent success).
-    FallbackFailed { stage: &'static str },
-    ChallengeAborted { retries: u32, ceo_notified: bool },
+    FallbackFailed {
+        stage: &'static str,
+    },
+    ChallengeAborted {
+        retries: u32,
+        ceo_notified: bool,
+    },
     Disabled,
 }
 
@@ -542,7 +555,10 @@ fn fallback_to_link_post<D: BrowserDriver, A: AuditSink>(
 /// every content field the driver observed (`Some`) must match too;
 /// unobserved (`None`) fields are skipped so URL-only drivers keep working.
 fn readback_matches(draft: &FbEventDraft, observed: &EventReadback) -> bool {
-    observed.name.as_deref().is_none_or(|name| name == draft.name)
+    observed
+        .name
+        .as_deref()
+        .is_none_or(|name| name == draft.name)
         && observed
             .starts_at
             .as_deref()
@@ -618,9 +634,7 @@ fn execute<D: BrowserDriver, A: AuditSink, N: NotifySink>(
             };
             let shot = driver.screenshot_png();
             match driver.readback_event(&fb_url) {
-                Some(observed)
-                    if observed.url == fb_url && readback_matches(&draft, &observed) =>
-                {
+                Some(observed) if observed.url == fb_url && readback_matches(&draft, &observed) => {
                     pages.record(&event_id, &fb_url);
                     audit.push(audit_create(
                         &fb_url,
@@ -687,9 +701,7 @@ fn execute<D: BrowserDriver, A: AuditSink, N: NotifySink>(
             }
             let shot = driver.screenshot_png();
             match driver.readback_event(&fb_url) {
-                Some(observed)
-                    if observed.url == fb_url && readback_matches(&draft, &observed) =>
-                {
+                Some(observed) if observed.url == fb_url && readback_matches(&draft, &observed) => {
                     audit.push(AuditRow {
                         action: "fb_page_event_update".to_owned(),
                         target_key: event_id.clone(),
@@ -709,9 +721,7 @@ fn execute<D: BrowserDriver, A: AuditSink, N: NotifySink>(
                     FallbackPrior::ReadbackMismatch,
                 ) {
                     Ok(outcome) => outcome,
-                    Err(signal) => {
-                        abort_on_challenge(driver, notify, audit, &event_id, &signal)
-                    }
+                    Err(signal) => abort_on_challenge(driver, notify, audit, &event_id, &signal),
                 },
             }
         }
@@ -777,13 +787,7 @@ fn fallback_after_create_failure<D: BrowserDriver, A: AuditSink, N: NotifySink>(
         FallbackPrior::CreateFailed,
     ) {
         Ok(outcome) => outcome,
-        Err(signal) => abort_on_challenge(
-            driver,
-            notify,
-            audit,
-            &draft.discord_event_id,
-            &signal,
-        ),
+        Err(signal) => abort_on_challenge(driver, notify, audit, &draft.discord_event_id, &signal),
     }
 }
 
@@ -791,8 +795,8 @@ fn fallback_after_create_failure<D: BrowserDriver, A: AuditSink, N: NotifySink>(
 mod tests {
     use super::*;
     use std::sync::{
-        Mutex,
         atomic::{AtomicUsize, Ordering},
+        Mutex,
     };
 
     #[test]
@@ -946,7 +950,11 @@ mod tests {
 
     impl NotifySink for Fake {
         fn notify(&self, notification: CeoNotification) {
-            self.inner.lock().expect("fake lock").notes.push(notification);
+            self.inner
+                .lock()
+                .expect("fake lock")
+                .notes
+                .push(notification);
         }
     }
 
@@ -993,8 +1001,7 @@ mod tests {
         );
 
         fake.edit(|inner| inner.delete = Ok(()));
-        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Cancelled)
-            .expect("retry runs");
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Cancelled).expect("retry runs");
         assert!(
             matches!(outcome, RunOutcome::Deleted),
             "retry after recovery deletes: {outcome:?}"
@@ -1060,8 +1067,8 @@ mod tests {
         let secrets = FakeSecrets::default();
         let mut pages = IdempotencyMap::new();
 
-        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Created)
-            .expect("fallback is an outcome");
+        let outcome =
+            run(&fake, &secrets, &mut pages, ChangeKind::Created).expect("fallback is an outcome");
         assert!(
             matches!(outcome, RunOutcome::LinkPostFallback { .. }),
             "unreadable create falls back: {outcome:?}"
@@ -1086,8 +1093,8 @@ mod tests {
         let secrets = FakeSecrets::default();
         let mut pages = IdempotencyMap::new();
 
-        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Created)
-            .expect("fallback is an outcome");
+        let outcome =
+            run(&fake, &secrets, &mut pages, ChangeKind::Created).expect("fallback is an outcome");
         assert!(
             matches!(outcome, RunOutcome::LinkPostFallback { .. }),
             "an observed content mismatch must not verify: {outcome:?}"
@@ -1121,8 +1128,8 @@ mod tests {
         let secrets = FakeSecrets::default();
         let mut pages = IdempotencyMap::new();
 
-        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Updated)
-            .expect("heal-forward runs");
+        let outcome =
+            run(&fake, &secrets, &mut pages, ChangeKind::Updated).expect("heal-forward runs");
         assert!(
             matches!(outcome, RunOutcome::Created { .. }),
             "an unmapped update heals forward into a create: {outcome:?}"
