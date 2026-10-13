@@ -1996,6 +1996,197 @@ async fn owner_leave_hands_room_to_earliest_joiner_and_persists() {
     assert_eq!(worker.queue.pending_counts(GUILD), queued);
 }
 
+#[test]
+fn join_reports_human_occupancy_at_join_before_insert() {
+    // Seeding TEST: occupancy-at-join counts the humans already present in
+    // the target channel, excluding the joiner.
+    let live = LiveGuild::new(GUILD);
+    live.publish(snapshot(
+        &[500],
+        vec![VoiceMember {
+            member_id: MEMBER,
+            channel_id: 500,
+            bot: Some(false),
+        }],
+    ));
+    let (_, occupancy) = live
+        .voice_update_at_with_occupancy(301, Some(500), Some(false), 1_000)
+        .expect("ticket");
+    assert_eq!(occupancy, Some(1));
+    let (_, occupancy) = live
+        .voice_update_at_with_occupancy(302, Some(500), Some(false), 2_000)
+        .expect("ticket");
+    assert_eq!(occupancy, Some(2));
+    // An empty creator sees zero.
+    let (_, occupancy) = live
+        .voice_update_at_with_occupancy(303, Some(CREATOR), Some(false), 3_000)
+        .expect("ticket");
+    assert_eq!(occupancy, Some(0));
+    // Leaves and same-channel updates are not join samples.
+    assert!(live
+        .voice_update_at_with_occupancy(MEMBER, None, Some(false), 4_000)
+        .is_none());
+    assert!(live
+        .voice_update_at_with_occupancy(301, Some(500), Some(false), 5_000)
+        .is_none());
+}
+
+#[test]
+fn mechanical_generator_and_move_echo_carry_no_occupancy_sample() {
+    // Review finding: one room creation emitted two occupancy-0 samples
+    // (the generator join and the bot's move echo into the new room),
+    // skewing the 0 bucket. Both keep their ticket so room creation is
+    // unaffected, but carry no sample.
+    const GENERATOR: u64 = 900;
+    let live = LiveGuild::new(GUILD);
+    live.publish(snapshot(
+        &[500],
+        vec![VoiceMember {
+            member_id: MEMBER,
+            channel_id: 500,
+            bot: Some(false),
+        }],
+    ));
+    live.protect_creators([GENERATOR]);
+    // Joining the creator-tracked generator keeps the ticket, samples nothing.
+    let (_, sample) = live
+        .voice_update_at_with_occupancy(301, Some(GENERATOR), Some(false), 1_000)
+        .expect("generator join keeps its ticket");
+    assert_eq!(sample, None);
+    // The move echo out of the generator into the new room also samples
+    // nothing, while an organic join into the same room still samples.
+    let (_, sample) = live
+        .voice_update_at_with_occupancy(301, Some(500), Some(false), 2_000)
+        .expect("move echo keeps its ticket");
+    assert_eq!(sample, None);
+    let (_, sample) = live
+        .voice_update_at_with_occupancy(302, Some(500), Some(false), 3_000)
+        .expect("organic join keeps its sample");
+    assert_eq!(sample, Some(2));
+}
+
+#[test]
+fn protected_lobby_and_lounge_joins_still_sample_occupancy() {
+    // Review finding: the mechanical filter tested the whole protected set,
+    // so organic joins into the session lobby and permanent protected
+    // channels (lounges) emitted no sample. Only creator/generator channels
+    // are mechanical; lobby and lounge joins are organic choices and sample.
+    const LOBBY: u64 = 600;
+    const LOUNGE: u64 = 700;
+    let live = LiveGuild::new(GUILD);
+    live.publish(snapshot(
+        &[500, LOBBY, LOUNGE],
+        vec![VoiceMember {
+            member_id: MEMBER,
+            channel_id: LOUNGE,
+            bot: Some(false),
+        }],
+    ));
+    live.protect_channels([LOBBY, LOUNGE]);
+    // Organic joins into protected-but-not-creator channels still sample.
+    let (_, sample) = live
+        .voice_update_at_with_occupancy(301, Some(LOUNGE), Some(false), 1_000)
+        .expect("lounge join keeps its ticket");
+    assert_eq!(sample, Some(1));
+    let (_, sample) = live
+        .voice_update_at_with_occupancy(302, Some(LOBBY), Some(false), 2_000)
+        .expect("lobby join keeps its ticket");
+    assert_eq!(sample, Some(0));
+    // A move out of the lounge into a plain channel is organic too.
+    let (_, sample) = live
+        .voice_update_at_with_occupancy(MEMBER, Some(500), Some(false), 3_000)
+        .expect("move out of lounge keeps its ticket");
+    assert_eq!(sample, Some(0));
+}
+
+#[tokio::test]
+async fn store_creators_reach_creator_channels_via_load() {
+    // Review finding: five store-creator sites feed `creator_channels`;
+    // reverting `GuildRoomWorker::load` to `protect_channels` reintroduced
+    // the two spurious occupancy-0 samples with no test failing. The
+    // fixture store holds CREATOR, so a join into it must carry no sample
+    // while an organic join still samples.
+    let (live, store, http, _) = fixture();
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let (_, sample) = worker
+        .live
+        .voice_update_with_occupancy(301, Some(CREATOR), Some(false))
+        .expect("store creator join keeps its ticket");
+    assert_eq!(
+        sample, None,
+        "store creator join carries no occupancy sample"
+    );
+    let (_, sample) = worker
+        .live
+        .voice_update_with_occupancy(302, Some(500), Some(false))
+        .expect("organic join keeps its sample");
+    assert_eq!(sample, Some(0));
+}
+
+#[tokio::test]
+async fn runtime_creator_added_and_updated_feed_creator_channels() {
+    // Review finding: `creator_added` and `creator_updated` are the live
+    // paths for newly saved creators; reverting either to
+    // `protect_channels` left all lib tests green. Both update the actor's
+    // `creator_channels` synchronously, so the seam check below is
+    // deterministic (no global counter, no background worker timing).
+    const ADDED: u64 = 901;
+    const UPDATED: u64 = 902;
+    let trace = Trace::default();
+    let runtime = test_runtime(trace);
+    assert!(runtime.publish_snapshot(GUILD, snapshot(&[], vec![])));
+    let added = CreatorChannel::new(GUILD, ADDED);
+    runtime.creator_added(&added, channel(ADDED, 2, Some(CATEGORY)));
+    let updated = CreatorChannel::new(GUILD, UPDATED);
+    runtime.creator_updated(&updated);
+    let actor = runtime.live_actor(GUILD).expect("live actor");
+    let (_, sample) = actor
+        .live
+        .voice_update_with_occupancy(301, Some(ADDED), Some(false))
+        .expect("added creator join keeps its ticket");
+    assert_eq!(
+        sample, None,
+        "added creator join carries no occupancy sample"
+    );
+    let (_, sample) = actor
+        .live
+        .voice_update_with_occupancy(302, Some(UPDATED), Some(false))
+        .expect("updated creator join keeps its ticket");
+    assert_eq!(
+        sample, None,
+        "updated creator join carries no occupancy sample"
+    );
+    let (_, sample) = actor
+        .live
+        .voice_update_with_occupancy(303, Some(500), Some(false))
+        .expect("organic join keeps its sample");
+    assert_eq!(sample, Some(0));
+    runtime.remove_guild(GUILD);
+}
+
+#[tokio::test]
+async fn actor_creator_added_command_feeds_creator_channels() {
+    // Review finding: the `ActorCommand::CreatorAdded` worker branch is the
+    // fourth store-creator path (the name-panel refresh shares this seam and
+    // needs no separate test). `apply_command` runs it synchronously.
+    const COMMANDED: u64 = 903;
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    apply_command(
+        &mut worker,
+        ActorCommand::CreatorAdded(CreatorChannel::new(GUILD, COMMANDED)),
+        0,
+    );
+    let (_, sample) = worker
+        .live
+        .voice_update_with_occupancy(301, Some(COMMANDED), Some(false))
+        .expect("commanded creator join keeps its ticket");
+    assert_eq!(
+        sample, None,
+        "commanded creator join carries no occupancy sample"
+    );
+}
+
 #[tokio::test]
 async fn succession_skips_present_owners_and_pending_moves() {
     let (live, store, http, trace) = fixture();
@@ -4375,6 +4566,68 @@ fn runtime_drops_voice_frames_before_first_snapshot() {
     let trace = Trace::default();
     let runtime = test_runtime(trace);
     assert!(!runtime.voice_frame(GUILD, MEMBER, Some(CREATOR), Some(false), "x".to_owned()));
+}
+
+#[tokio::test]
+async fn voice_frame_counts_occupancy_without_per_event_log() {
+    // Seeding TEST AC(1): organic VOICE_STATE_UPDATE joins increment the
+    // occupancy counter. VOICE_STATE_UPDATE is hot per
+    // docs/log-volume-guard.md, so no per-event log line is emitted.
+    // Joins still dispatch their ticket; leaves dispatch none. The counter
+    // reads below are the pin: replacing the `voice_join_occupancy` call in
+    // the frame handler with `let _ = occupancy` fails the growth assert.
+    const GENERATOR: u64 = 900;
+    let (bytes, _subscriber) = capture_join_logs();
+    let trace = Trace::default();
+    let runtime = VoiceRuntime::new(
+        move || (Store::new(trace.clone()), Http::new(trace.clone())),
+        Duration::from_millis(10),
+        true,
+    )
+    .with_creator_channels(HashSet::from([GENERATOR]));
+    assert!(runtime.publish_snapshot(
+        GUILD,
+        snapshot(
+            &[500],
+            vec![VoiceMember {
+                member_id: MEMBER,
+                channel_id: 500,
+                bot: Some(false),
+            }],
+        ),
+    ));
+    let series = "two_bot_voice_join_occupancy_total";
+    let before = global_series(series);
+    assert!(runtime.voice_frame(GUILD, 301, Some(500), Some(false), "x".to_owned()));
+    assert!(runtime.voice_frame(GUILD, 302, Some(500), Some(false), "x".to_owned()));
+    assert!(runtime.voice_frame(GUILD, MEMBER, None, Some(false), "x".to_owned()));
+    // Global counters are shared with parallel tests, so growth asserts a
+    // lower bound (see `global_series` convention); our own two organic joins
+    // guarantee it.
+    assert!(
+        global_series(series) >= before + 2,
+        "two organic joins increment the occupancy counter"
+    );
+    // The mechanical generator join keeps its ticket but emits no sample,
+    // pinned at the actor seam: the global counter is shared with parallel
+    // tests, so exact-equality reads flake (14/60 full-lib runs at 32
+    // threads). The seam check is per-actor and deterministic.
+    let actor = runtime.live_actor(GUILD).expect("live actor");
+    let (_, sample) = actor
+        .live
+        .voice_update_with_occupancy(401, Some(GENERATOR), Some(false))
+        .expect("generator join keeps its ticket");
+    assert_eq!(sample, None, "generator join carries no occupancy sample");
+    // The runtime path keeps the ticket too, so room creation is unaffected.
+    assert!(runtime.voice_frame(GUILD, 402, Some(GENERATOR), Some(false), "x".to_owned()));
+    let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+    let joins: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["fields"]["voice_event"] == "voice_join_occupancy")
+        .collect();
+    assert!(joins.is_empty(), "{text}");
+    runtime.remove_guild(GUILD);
 }
 
 #[tokio::test]
@@ -12049,6 +12302,21 @@ fn synthetic_humans_never_reach_the_live_guild() {
         .unwrap();
     assert!(synthetic_humans_for(live_guild, &ids).is_empty());
     assert_eq!(synthetic_humans_for(GUILD, &ids), ids);
+}
+
+#[test]
+fn generator_channel_config_takes_one_id_and_refuses_garbage() {
+    let channel = |value: &str| {
+        configured_generator_channel(|key| {
+            (key == "TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID").then(|| value.to_owned())
+        })
+    };
+    assert_eq!(channel("900"), Ok(Some(900)));
+    assert_eq!(channel(""), Ok(None));
+    assert_eq!(channel("   "), Ok(None));
+    for bad in ["900,901", "abc", "0", "-1", "0900", "9 00"] {
+        assert!(channel(bad).is_err(), "{bad}");
+    }
 }
 
 #[tokio::test(start_paused = true)]

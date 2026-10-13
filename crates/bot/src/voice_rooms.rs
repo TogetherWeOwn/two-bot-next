@@ -1271,6 +1271,12 @@ pub(crate) struct LiveState {
     member_roles: HashMap<Snowflake, Vec<Snowflake>>,
     bot: Option<BotAccess>,
     protected_channels: HashSet<Snowflake>,
+    /// Join-to-create creator channels plus the generator channel: joins into
+    /// (or moves out of) these are mechanical room-creation steps, never
+    /// occupancy samples. Narrower than `protected_channels`, which also holds
+    /// the session lobby, the category and permanent protected channels whose
+    /// joins are organic choices and still sample.
+    creator_channels: HashSet<Snowflake>,
     /// Continuous human-empty evidence in this authoritative gateway session.
     /// Reconnects restart the grace; human joins cancel it even between ticks.
     empty_since: HashMap<Snowflake, tokio::time::Instant>,
@@ -1328,6 +1334,31 @@ fn configured_protected_channels(
         }
     }
     Ok(protected)
+}
+
+/// Boot-only join-to-create generator channel. The occupancy curve treats
+/// joins into (or moves out of) the generator as mechanical, like store
+/// creator channels; the session lobby, the category and permanent protected
+/// channels stay organic samples.
+fn configured_generator_channel(
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<Option<Snowflake>, &'static str> {
+    let Some(raw) =
+        env("TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID").filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    if raw.contains(',') {
+        return Err("invalid generator channel id");
+    }
+    let value = raw.trim();
+    let id = value
+        .parse::<Snowflake>()
+        .map_err(|_| "invalid generator channel id")?;
+    if id == 0 || value != id.to_string() {
+        return Err("invalid generator channel id");
+    }
+    Ok(Some(id))
 }
 
 impl LiveState {
@@ -1565,6 +1596,17 @@ impl LiveGuild {
     /// Keep this in shared state so a write awaiting a rate limit sees updates.
     pub fn protect_channels(&self, channels: impl IntoIterator<Item = Snowflake>) {
         self.write_state().protected_channels.extend(channels);
+    }
+
+    /// Add creator-channel IDs: they join `protected_channels` (delete
+    /// protection) and `creator_channels` (the mechanical occupancy filter),
+    /// so room creation stays protected without silencing organic joins into
+    /// the session lobby or permanent protected channels.
+    pub fn protect_creators(&self, channels: impl IntoIterator<Item = Snowflake>) {
+        let channels: Vec<Snowflake> = channels.into_iter().collect();
+        let mut live = self.write_state();
+        live.protected_channels.extend(channels.iter().copied());
+        live.creator_channels.extend(channels.iter().copied());
     }
 
     /// Shorten the empty-room grace for offline fixtures that exercise
@@ -1887,6 +1929,24 @@ impl LiveGuild {
         self.voice_update_at(member, channel, bot, wall_ms())
     }
 
+    /// Ticket plus the seeding-TEST occupancy sample: the humans already
+    /// present in the target channel when the join arrived, excluding the
+    /// joiner. The sample is `None` for mechanical transitions (joining a
+    /// creator/generator channel, or moving out of one: the creator and
+    /// generator joins and the bot's own move echo), which are not organic
+    /// join decisions. Joins into the session lobby or permanent protected
+    /// channels still sample: those are places people choose to join.
+    /// The outer `None` still means leaves, same-channel updates and
+    /// pre-READY frames (no ticket at all).
+    pub fn voice_update_with_occupancy(
+        &self,
+        member: Snowflake,
+        channel: Option<Snowflake>,
+        bot: Option<bool>,
+    ) -> Option<(JoinTicket, Option<u64>)> {
+        self.voice_update_at_with_occupancy(member, channel, bot, wall_ms())
+    }
+
     /// Deterministic tenure seam: `voice_update` stamps the wall clock;
     /// tests pin `now_ms` to control caretaker ordering.
     fn voice_update_at(
@@ -1896,6 +1956,24 @@ impl LiveGuild {
         bot: Option<bool>,
         now_ms: u64,
     ) -> Option<JoinTicket> {
+        self.voice_update_at_with_occupancy(member, channel, bot, now_ms)
+            .map(|(ticket, _)| ticket)
+    }
+
+    /// Tenure seam with the occupancy sample. The count is taken before the
+    /// insert, inside the same write lock, so concurrent joins cannot skew
+    /// it; the joiner is never in the target yet, so no self-count.
+    /// Mechanical transitions (target or previous channel a creator/generator
+    /// channel: the creator and generator joins and the bot's move echo into
+    /// the new room) keep their ticket but carry no sample, so the 0 bucket
+    /// counts only organic joins into empty channels.
+    fn voice_update_at_with_occupancy(
+        &self,
+        member: Snowflake,
+        channel: Option<Snowflake>,
+        bot: Option<bool>,
+        now_ms: u64,
+    ) -> Option<(JoinTicket, Option<u64>)> {
         let mut live = self.write_state();
         let previous_channel = live
             .members
@@ -1910,6 +1988,13 @@ impl LiveGuild {
                 return None;
             }
         }
+        let mechanical = channel.is_some_and(|target| live.creator_channels.contains(&target))
+            || previous_channel.is_some_and(|previous| live.creator_channels.contains(&previous));
+        let occupancy_at_join = if mechanical {
+            None
+        } else {
+            channel.map(|target| live.humans(target) as u64)
+        };
         let bot = bot.or_else(|| live.members.get(&member).and_then(|previous| previous.bot));
         live.next_transition += 1;
         let transition = live.next_transition;
@@ -1928,11 +2013,16 @@ impl LiveGuild {
         if let Some(channel) = channel {
             live.refresh_empty_since(channel);
         }
-        channel.filter(|_| live.ready).map(|creator_id| JoinTicket {
-            member_id: member,
-            creator_id,
-            generation: live.generation,
-            transition,
+        channel.filter(|_| live.ready).map(|creator_id| {
+            (
+                JoinTicket {
+                    member_id: member,
+                    creator_id,
+                    generation: live.generation,
+                    transition,
+                },
+                occupancy_at_join,
+            )
         })
     }
 
@@ -2680,7 +2770,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .into_iter()
             .map(|c| (c.channel_id, c))
             .collect();
-        live.protect_channels(creators.keys().copied());
+        live.protect_creators(creators.keys().copied());
         let access = store.access_controls(live.guild_id).await?;
         let rooms = store
             .rooms(live.guild_id)
@@ -6479,6 +6569,9 @@ pub struct VoiceRuntime<S, H> {
     tick: Duration,
     enabled: bool,
     protected_channels: HashSet<Snowflake>,
+    /// Boot creator set (the generator channel): copied into each new actor's
+    /// `creator_channels` alongside the store creators loaded later.
+    creator_channels: HashSet<Snowflake>,
     empty_grace: Option<Duration>,
     synthetic_humans: HashSet<Snowflake>,
     seeds: AtomicU64,
@@ -6514,6 +6607,7 @@ where
             tick,
             enabled,
             protected_channels: HashSet::new(),
+            creator_channels: HashSet::new(),
             empty_grace: None,
             synthetic_humans: HashSet::new(),
             seeds: AtomicU64::new(initial_seed()),
@@ -6535,6 +6629,13 @@ where
     /// Install boot configuration before spawning any actors.
     pub fn with_protected_channels(mut self, channels: HashSet<Snowflake>) -> Self {
         self.protected_channels = channels;
+        self
+    }
+
+    /// Install the boot creator set (the generator channel) before spawning
+    /// any actors. Each new actor copies it into `creator_channels`.
+    pub fn with_creator_channels(mut self, channels: HashSet<Snowflake>) -> Self {
+        self.creator_channels = channels;
         self
     }
 
@@ -6638,6 +6739,9 @@ where
         actor
             .live
             .protect_channels(self.protected_channels.iter().copied());
+        actor
+            .live
+            .protect_creators(self.creator_channels.iter().copied());
         if let Some(grace) = self.empty_grace {
             actor.live.set_empty_grace(grace);
         }
@@ -6717,14 +6821,27 @@ where
         let Some(actor) = self.live_actor(guild) else {
             return false;
         };
-        let command = match actor.live.voice_update(member, channel, bot) {
-            Some(ticket) => ActorCommand::Join {
-                ticket,
-                display,
-                seed: self.seeds.fetch_add(1, Ordering::Relaxed),
-                created_at: now_iso(),
-                received,
-            },
+        let command = match actor.live.voice_update_with_occupancy(member, channel, bot) {
+            Some((ticket, occupancy_at_join)) => {
+                // Seeding TEST (occupancy-to-join curve): one label-free
+                // counter sample per organic ticketed join. No member,
+                // channel or guild IDs are recorded, and no per-event log
+                // line is emitted: VOICE_STATE_UPDATE is hot per
+                // docs/log-volume-guard.md. Mechanical transitions (the
+                // creator and generator joins and the bot's move echo)
+                // carry no sample but still dispatch their ticket so room
+                // creation is unaffected.
+                if let Some(occupancy) = occupancy_at_join {
+                    metrics::global().voice_join_occupancy(occupancy);
+                }
+                ActorCommand::Join {
+                    ticket,
+                    display,
+                    seed: self.seeds.fetch_add(1, Ordering::Relaxed),
+                    created_at: now_iso(),
+                    received,
+                }
+            }
             None => {
                 if channel.is_some() {
                     let _ = actor.tx.send(ActorCommand::Display {
@@ -6934,7 +7051,7 @@ where
     fn creator_added(&self, creator: &CreatorChannel, channel: Channel) {
         if let Some(actor) = self.live_actor(creator.guild_id) {
             actor.live.upsert_channel(channel);
-            actor.live.protect_channels([creator.channel_id]);
+            actor.live.protect_creators([creator.channel_id]);
             let _ = actor.tx.send(ActorCommand::CreatorAdded(creator.clone()));
         }
     }
@@ -7030,7 +7147,7 @@ where
 
     fn creator_updated(&self, creator: &CreatorChannel) {
         if let Some(actor) = self.live_actor(creator.guild_id) {
-            actor.live.protect_channels([creator.channel_id]);
+            actor.live.protect_creators([creator.channel_id]);
             let _ = actor.tx.send(ActorCommand::CreatorAdded(creator.clone()));
         }
     }
@@ -7638,7 +7755,7 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             worker.reconcile();
         }
         ActorCommand::CreatorAdded(creator) => {
-            worker.live.protect_channels([creator.channel_id]);
+            worker.live.protect_creators([creator.channel_id]);
             if worker.creators.get(&creator.channel_id) != Some(&creator) {
                 worker.creators.insert(creator.channel_id, creator);
                 worker.name_signatures.clear();
@@ -7728,6 +7845,8 @@ pub fn build_production_runtime(
     // through its cataloged `voice HTTP setup failed` event.
     let protected = configured_protected_channels(|key| std::env::var(key).ok())
         .map_err(|_| RoomHttpError::InvalidRequest)?;
+    let generator = configured_generator_channel(|key| std::env::var(key).ok())
+        .map_err(|_| RoomHttpError::InvalidRequest)?;
     let empty_grace = configured_empty_grace(
         std::env::var("TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS")
             .ok()
@@ -7751,6 +7870,7 @@ pub fn build_production_runtime(
                 true,
             )
             .with_protected_channels(protected)
+            .with_creator_channels(generator.into_iter().collect())
             .with_empty_grace(empty_grace)
             .with_synthetic_humans(synthetic_humans)
             .with_name_policy(name_policy),
