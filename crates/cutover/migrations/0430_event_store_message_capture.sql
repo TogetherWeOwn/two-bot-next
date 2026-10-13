@@ -1,5 +1,7 @@
--- 0429_event_store_message_capture: append-only message update/delete plus
+-- 0430_event_store_message_capture: append-only message update/delete plus
 -- reaction capture for event-store S5 (parent scope TOG-22849 slice 5).
+-- Numbered 0430 so it never collides with the S6 thread-capture slice's
+-- 0429: any merge order applies each file once under its own number.
 --
 -- Creates the append-only `event_store` table (if S1 has not created it yet)
 -- and adds the S5 message/reaction columns: identity + timestamps
@@ -7,7 +9,7 @@
 -- `event_time`, `received_at`, `dedup_key`) plus the emoji id/name reference
 -- (`emoji_id`, `emoji_name`). Ids, timestamps and enum/id references only:
 -- no content column, no embeds column, no attachments column, no username
--- column (see the FORBIDDEN_COLUMNS tripwire in
+-- column (see the ALLOWED_COLUMNS fence in
 -- crates/discord/tests/event_store_s5.rs). Unicode (non-custom) reactions
 -- persist as an enum/id reference (NULL custom id plus a codepoint reference
 -- such as `U+1F44D` in `emoji_name`), never as message text. Bulk delete
@@ -16,11 +18,14 @@
 -- runs `ON CONFLICT (dedup_key) DO NOTHING` against the shared UNIQUE index
 -- below, so a gateway resume redelivery inserts nothing.
 --
--- Ordering: S5 may land before S1, so every step is re-runnable
--- (`IF NOT EXISTS`): the CREATE covers a missing table and the ALTERs cover
--- a table S1 created first with a narrower column set. Later slices must add
--- their own columns with `ADD COLUMN IF NOT EXISTS` and must reuse the
--- shared dedup index name `idx_event_store_dedup_key` (via
+-- Ordering: S5 may land before or after any sibling slice, so every step is
+-- re-runnable. The CREATE covers a missing table and the ALTERs cover a
+-- table a sibling created first with a narrower column set; `ADD COLUMN IF
+-- NOT EXISTS` never changes an existing column, so the explicit
+-- `DROP NOT NULL` relaxations below converge the shared nullable columns no
+-- matter which slice created the table first. Later slices must add their
+-- own columns with `ADD COLUMN IF NOT EXISTS` and must reuse the shared
+-- dedup index name `idx_event_store_dedup_key` (via
 -- `CREATE UNIQUE INDEX IF NOT EXISTS`) rather than adding a second UNIQUE
 -- constraint, so the resume-safe key stays a single index.
 --
@@ -69,6 +74,17 @@ ALTER TABLE event_store
   ADD COLUMN IF NOT EXISTS event_time  timestamptz,
   ADD COLUMN IF NOT EXISTS received_at timestamptz,
   ADD COLUMN IF NOT EXISTS dedup_key   TEXT;
+
+-- Bulk-delete fan-out rows carry no reacting user or emoji, and non-message
+-- sibling rows carry no message or emoji references: relax these columns when
+-- an earlier slice (e.g. S2/S4) created the table first with one of them
+-- NOT NULL. Safe when already nullable (no-op) and ordered after the ADD
+-- COLUMN above so each column always exists here.
+ALTER TABLE event_store ALTER COLUMN channel_id DROP NOT NULL;
+ALTER TABLE event_store ALTER COLUMN message_id DROP NOT NULL;
+ALTER TABLE event_store ALTER COLUMN user_id DROP NOT NULL;
+ALTER TABLE event_store ALTER COLUMN emoji_id DROP NOT NULL;
+ALTER TABLE event_store ALTER COLUMN emoji_name DROP NOT NULL;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_event_store_dedup_key
   ON event_store (dedup_key);

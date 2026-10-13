@@ -1,9 +1,5 @@
-//! Event-store S5 acceptance tests (paired failing-tests card for the S5 build).
-//!
-//! Test files ONLY: this suite pins the S5 acceptance criteria before the
-//! builder starts, so every test here FAILS until the S5 build lands its
-//! message/reaction-capture migration on the append-only store. The builder
-//! makes these tests pass; nothing outside test code changes on this card.
+//! Event-store S5 acceptance tests for the message/reaction-capture slice
+//! (0430 migration on the shared append-only `event_store` table).
 //!
 //! Contract under test (event-store P1 slice 5: MESSAGE_UPDATE /
 //! MESSAGE_DELETE / MESSAGE_DELETE_BULK plus MESSAGE_REACTION_ADD /
@@ -20,14 +16,14 @@
 //!   resume redelivery inserts nothing.
 //! - Emoji unicode is stored as an enum/id reference only (custom emoji id or
 //!   a codepoint reference in `emoji_name`); raw message text never persists.
-//! - Privacy tripwire: a fixture carrying message-body sentinels persists its
-//!   ids only; the sentinels appear in no stored row.
+//! - Privacy fence: the table's columns must stay within the reviewed
+//!   [`ALLOWED_COLUMNS`] allowlist (the union of the slices' columns), so any
+//!   new free-form column fails the suite; the insert helpers bind ids only,
+//!   and a sentinel row-scan pins that binding.
 //!
-//! Pending-test routing (established pattern): every test is ignored and
-//! skipped in the nightly broad sweep, so this card's CI stays green while
-//! the S5 build is outstanding; run with `-- --ignored` to see the gap. The
-//! S5 build card un-ignores these tests once the migration lands. DB tests
-//! run only against the disposable test database (`TestDatabase` refuses
+//! Routing: these tests run in the `ignored db (stores)` CI lane and are
+//! skipped in the nightly broad sweep to avoid a double run. DB tests run
+//! only against the disposable test database (`TestDatabase` refuses
 //! anything but agent-testdb), never staging or production.
 #![cfg(feature = "db")]
 
@@ -274,16 +270,52 @@ const REQUIRED_COLUMNS: &[&str] = &[
     "dedup_key",
 ];
 
-const FORBIDDEN_COLUMNS: &[&str] = &[
-    "content",
-    "message_body",
-    "body",
-    "text",
-    "embeds",
-    "embed_title",
-    "attachments",
-    "attachment_url",
-    "username",
+/// The reviewed column allowlist for the shared `event_store` table: the union
+/// of the slices' columns (S2 member deltas, S4 voice, S5 message/reaction,
+/// S6 threads, S8 stage/interaction) plus the `id` primary key. Every actual
+/// column must be a member, so any new free-form column (a body-carrying
+/// `raw_payload`, `message_content`, or similar) fails the suite. A denylist
+/// cannot fail on a new name, so this asserts the closed set instead. Later
+/// slices extend this list when they add their own reviewed columns
+/// (`ADD COLUMN IF NOT EXISTS` per 0430).
+const ALLOWED_COLUMNS: &[&str] = &[
+    "action_type",
+    "actor_id",
+    "application_id",
+    "archived",
+    "audit_log_entry_id",
+    "channel_id",
+    "command_id",
+    "deaf",
+    "dedup_key",
+    "emoji_id",
+    "emoji_name",
+    "event_time",
+    "event_type",
+    "guild_id",
+    "id",
+    "interaction_id",
+    "interaction_type",
+    "invitable",
+    "locked",
+    "message_id",
+    "mute",
+    "nick",
+    "parent_id",
+    "premium_since",
+    "privacy_level",
+    "received_at",
+    "roles",
+    "self_deaf",
+    "self_mute",
+    "self_stream",
+    "self_video",
+    "session_id",
+    "stage_instance_id",
+    "suppress",
+    "target_id",
+    "thread_id",
+    "user_id",
 ];
 
 fn assert_message_schema(columns: &[String]) {
@@ -297,10 +329,11 @@ fn assert_message_schema(columns: &[String]) {
             "event_store keeps message column {required}; has {columns:?}"
         );
     }
-    for forbidden in FORBIDDEN_COLUMNS {
+    for column in columns {
         assert!(
-            !columns.iter().any(|column| column == forbidden),
-            "event_store must not gain a {forbidden} column; has {columns:?}"
+            ALLOWED_COLUMNS.contains(&column.as_str()),
+            "event_store holds only reviewed slice columns; unexpected {column}; \
+             has {columns:?} (extend ALLOWED_COLUMNS only with a reviewed slice column)"
         );
     }
 }
@@ -341,8 +374,7 @@ async fn stored_row(pool: &PgPool, key: &str) -> Vec<String> {
 /// author ids plus timestamps only — with NO message body, NO embeds and NO
 /// attachments.
 ///
-/// Pending: no message columns exist until the S5 migration lands, so run
-/// with `-- --ignored` against the disposable test database to see the gap.
+/// Runs in the `ignored db (stores)` CI lane against the disposable test database.
 #[tokio::test]
 async fn event_store_s5_message_update_persists_ids_without_body() {
     let db = TestDb::new().await;
@@ -394,8 +426,7 @@ async fn event_store_s5_message_update_persists_ids_without_body() {
 /// plus timestamps — the delete dispatch names ids only, so the capture holds
 /// no body by construction.
 ///
-/// Pending: no message columns exist until the S5 migration lands, so run
-/// with `-- --ignored` against the disposable test database to see the gap.
+/// Runs in the `ignored db (stores)` CI lane against the disposable test database.
 #[tokio::test]
 async fn event_store_s5_message_delete_persists_ids_only() {
     let db = TestDb::new().await;
@@ -441,8 +472,7 @@ async fn event_store_s5_message_delete_persists_ids_only() {
 /// guild and user ids plus the emoji id/name reference only — with NO message
 /// body.
 ///
-/// Pending: no message columns exist until the S5 migration lands, so run
-/// with `-- --ignored` against the disposable test database to see the gap.
+/// Runs in the `ignored db (stores)` CI lane against the disposable test database.
 #[tokio::test]
 async fn event_store_s5_reaction_add_remove_persist_emoji_refs_only() {
     let db = TestDb::new().await;
@@ -508,8 +538,7 @@ async fn event_store_s5_reaction_add_remove_persist_emoji_refs_only() {
 /// under a shared dedup prefix, and redelivery of the same bulk inserts
 /// nothing (`ON CONFLICT DO NOTHING` per id).
 ///
-/// Pending: no message columns exist until the S5 migration lands, so run
-/// with `-- --ignored` against the disposable test database to see the gap.
+/// Runs in the `ignored db (stores)` CI lane against the disposable test database.
 #[tokio::test]
 async fn event_store_s5_bulk_delete_fans_out_one_row_per_id() {
     let db = TestDb::new().await;
@@ -570,8 +599,7 @@ async fn event_store_s5_bulk_delete_fans_out_one_row_per_id() {
 /// reference only — NULL custom id plus the codepoint reference — never raw
 /// message text.
 ///
-/// Pending: no message columns exist until the S5 migration lands, so run
-/// with `-- --ignored` against the disposable test database to see the gap.
+/// Runs in the `ignored db (stores)` CI lane against the disposable test database.
 #[tokio::test]
 async fn event_store_s5_unicode_reaction_stores_enum_ref_only() {
     let db = TestDb::new().await;
@@ -622,28 +650,23 @@ async fn event_store_s5_unicode_reaction_stores_enum_ref_only() {
     db.cleanup().await;
 }
 
-/// S5 AC 4 (privacy tripwire): a fixture carrying message-body, embed and
-/// attachment payload is rejected or never persisted.
+/// S5 AC 4 (privacy fence): the table holds only reviewed slice columns, and a
+/// fixture carrying message-body, embed and attachment payload persists its
+/// ids only.
 ///
-/// Pending: no message columns exist until the S5 migration lands, so run
-/// with `-- --ignored` against the disposable test database to see the gap.
+/// Runs in the `ignored db (stores)` CI lane against the disposable test database.
 #[tokio::test]
 async fn event_store_s5_privacy_tripwire_rejects_message_bodies() {
     let db = TestDb::new().await;
-    // Tripwire part 1: no message-body column may exist to hold the payload.
-    let columns = table_columns(&db.pool).await;
-    assert!(
-        !columns.is_empty(),
-        "S5 creates the message columns on the append-only event_store table"
-    );
-    for forbidden in FORBIDDEN_COLUMNS {
-        assert!(
-            !columns.iter().any(|column| column == forbidden),
-            "privacy fence: no {forbidden} column; has {columns:?}"
-        );
-    }
-    // Tripwire part 2: a fixture carrying body + embed + attachment free text
-    // persists its ids only; the sentinels appear in no stored row.
+    // Fence part 1: the schema allowlist is the real fence. Any new free-form
+    // column (a body-carrying `raw_payload`, `message_content`, or similar)
+    // fails here, where a denylist would pass it.
+    assert_message_schema(&table_columns(&db.pool).await);
+    // Fence part 2: a fixture carrying body + embed + attachment free text
+    // persists its ids only; the sentinels appear in no stored row. This pins
+    // the insert helpers' bound column list (a future edit binding body text
+    // fails here); it cannot catch schema additions by construction, so part 1
+    // carries that half.
     let event = MessageEvent {
         event_type: "MESSAGE_UPDATE",
         message_id: MESSAGE,
