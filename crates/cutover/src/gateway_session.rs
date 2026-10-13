@@ -345,8 +345,9 @@ impl GatewaySessionStore {
             // join they did not perform: the prefetched suppressed set already
             // covers this, so no extra query is needed.
             if event.event_type == EventType::MemberJoin {
-                if let Some(inviter) =
-                    metadata.as_deref().and_then(|blob| inviter_in_metadata(Some(blob)))
+                if let Some(inviter) = metadata
+                    .as_deref()
+                    .and_then(|blob| inviter_in_metadata(Some(blob)))
                 {
                     if suppressed.contains(inviter.as_str()) {
                         metadata = scrubbed_member_join_metadata(metadata.as_deref(), &inviter);

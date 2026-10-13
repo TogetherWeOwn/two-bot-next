@@ -344,6 +344,10 @@
     "crates/store/migrations/0428_privacy_opt_out.sql": {
       "sha256": "7a73f12f891b30d35f07198f0ff7ec8ce2ddf3a5e3f4cf3434ef87675852867b",
       "justification": "Per-user opt-out suppression plus per-guild presence/activity/voice toggles plus one audit receipt row per purge; store chain copy, additive with IF NOT EXISTS."
+    },
+    "crates/cutover/migrations/0432_event_store_member_capture.sql": {
+      "sha256": "81e51abeda792b6e8dfa4ad714e744fcc09b96f9d857ca70bf4080ef8ce46faf",
+      "justification": "Event-store S2 member capture: order-independent event_store table plus premium_since, nick_changed flag and role-id columns for GUILD_MEMBER_ADD/REMOVE/UPDATE, idempotent on the shared UNIQUE dedup_key index, no free-text columns."
     }
   }
 }

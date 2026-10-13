@@ -20,6 +20,7 @@ pub mod command_registry;
 pub mod custom_commands;
 pub mod executor;
 mod executor_metrics;
+pub mod funnel_invites;
 
 #[cfg(feature = "db")]
 pub use channel_moderation::{

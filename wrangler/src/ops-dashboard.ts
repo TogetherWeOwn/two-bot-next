@@ -13,7 +13,8 @@
  *   semantics: both headers on every summary request, no cookies or
  *   sessions, and failures are 401 text (never a login redirect).
  * - Strictly read-only: the page issues only `GET /ops/summary` fetches and
- *   the summary proxies only the container's `GET /readyz` JSON. All mutations
+ *   the summary proxies only the container's `GET /ops/summary` roll-up JSON
+ *   (never `/readyz`; the DO maps `ready: false` to 503). All mutations
  *   stay on their existing API routes; nothing here accepts POST/PUT/DELETE.
  * - Break-glass: staging and production both keep their `workers.dev` routes
  *   (see wrangler.toml) until a custom domain and Access app exist; either
