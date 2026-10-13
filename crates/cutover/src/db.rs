@@ -319,6 +319,14 @@ pub async fn record_event(
 ) -> Result<(bool, Option<i64>), sqlx::Error> {
     let key = idempotency_key(e);
     let mut tx = db.pool.begin().await?;
+    // Serialize with concurrent opt-outs (which take SHARE ROW EXCLUSIVE
+    // over these tables): whoever locks first wins, so a write that passes
+    // the gate can never land after the purge. Lock order matches
+    // `opt_out_member`'s sorted order, and ROW EXCLUSIVE never blocks other
+    // writers.
+    sqlx::query("LOCK TABLE events, members, privacy_opt_outs IN ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
     if two_bot_core::privacy::ingestion_blocked_in(
         &mut tx,
         &e.guild_id,
@@ -330,6 +338,21 @@ pub async fn record_event(
         tx.rollback().await?;
         return Ok((false, None));
     }
+    // A suppressed inviter's attribution never re-enters through a join they
+    // did not perform: strip `inviterId` from `member_join` metadata when the
+    // inviter is suppressed, keeping the joiner's own row (and every other
+    // metadata key) intact.
+    let mut metadata = e.metadata.clone();
+    if e.event_type == "member_join" {
+        if let Some(inviter) = two_bot_core::privacy::inviter_in_metadata(metadata.as_deref()) {
+            if two_bot_core::privacy::suppressed_in(&mut tx, &e.guild_id, &inviter).await? {
+                metadata = two_bot_core::privacy::scrubbed_member_join_metadata(
+                    metadata.as_deref(),
+                    &inviter,
+                );
+            }
+        }
+    }
     let inserted: Option<(i64,)> = sqlx::query_as(
         "INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
          VALUES ($1, $2, $3, $4::timestamptz, $5, $6, $7)
@@ -340,7 +363,7 @@ pub async fn record_event(
     .bind(&e.guild_id)
     .bind(&e.occurred_at)
     .bind(&e.source)
-    .bind(&e.metadata)
+    .bind(&metadata)
     .bind(&key)
     .fetch_optional(&mut *tx)
     .await?;

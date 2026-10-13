@@ -28,9 +28,27 @@ pub async fn store_counters(
     captured_at: &str,
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
+    // Serialize with concurrent opt-outs so the suppressed set below is
+    // fresh. Lock order matches `opt_out_member`'s sorted order.
+    sqlx::query("LOCK TABLE invite_snapshots, privacy_opt_outs IN ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    // Suppressed inviters keep the aggregate `uses` count but lose the
+    // per-user attribution, like every other invite-snapshot seam.
+    let suppressed: HashSet<String> =
+        sqlx::query_scalar("SELECT member_id FROM privacy_opt_outs WHERE guild_id = $1")
+            .bind(guild_id)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .collect();
     let mut seen: HashSet<&str> = HashSet::new();
     for row in rows {
         seen.insert(row.code.as_str());
+        let inviter = row
+            .inviter_id
+            .as_deref()
+            .filter(|id| !suppressed.contains(*id));
         sqlx::query(
             "INSERT INTO invite_snapshots (guild_id, code, uses, inviter_id, channel_id, updated_at)
              VALUES ($1, $2, $3, $4, $5, $6::timestamptz)
@@ -41,7 +59,7 @@ pub async fn store_counters(
         .bind(guild_id)
         .bind(&row.code)
         .bind(row.uses)
-        .bind(&row.inviter_id)
+        .bind(inviter)
         .bind(&row.channel_id)
         .bind(captured_at)
         .execute(&mut *tx)

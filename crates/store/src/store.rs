@@ -117,8 +117,14 @@ async fn record_async(
     let key = new_row.idempotency_key.clone();
     let member_id = new_row.member_id.map(snowflake_text);
     let guild_id = snowflake_text(new_row.guild_id);
-    let metadata = new_row.metadata.as_ref().map(|v| v.to_string());
     let mut tx = pool.begin().await?;
+    // Serialize with concurrent opt-outs (which take SHARE ROW EXCLUSIVE
+    // over these tables): whoever locks first wins, so a write that passes
+    // the gate can never land after the purge. Lock order matches the
+    // opt-out's sorted order, and ROW EXCLUSIVE never blocks other writers.
+    sqlx::query("LOCK TABLE events, members, privacy_opt_outs IN ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
     // Privacy gate, inside the write transaction: a suppressed pair or a
     // guild-disabled analytics family drops the write (and any duplicate
     // reconfirmation below) with no event row and no members projection.
@@ -132,6 +138,20 @@ async fn record_async(
     {
         tx.rollback().await?;
         return Ok(RecordOutcome { inserted: false });
+    }
+    // A suppressed inviter's attribution never re-enters through a join they
+    // did not perform: strip `inviterId` from `member_join` metadata when the
+    // inviter is suppressed, keeping the joiner's own row intact.
+    let mut metadata = new_row.metadata.as_ref().map(|v| v.to_string());
+    if event.event_type.as_str() == "member_join" {
+        if let Some(inviter) = two_bot_core::privacy::inviter_in_metadata(metadata.as_deref()) {
+            if two_bot_core::privacy::suppressed_in(&mut tx, &guild_id, &inviter).await? {
+                metadata = two_bot_core::privacy::scrubbed_member_join_metadata(
+                    metadata.as_deref(),
+                    &inviter,
+                );
+            }
+        }
     }
     let inserted: Option<(i64,)> = sqlx::query_as(
         "INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)

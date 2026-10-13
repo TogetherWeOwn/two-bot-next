@@ -74,7 +74,10 @@ async fn service_opt_out_purges_suppresses_audits_then_reenables() {
     let counts = opt_out_member(&db, GUILD, MEMBER, "operator:privacy-review")
         .await
         .expect("service opt-out commits");
-    assert_eq!(counts.len(), 3);
+    // Four purge tables since review finding 1 extended the opt-out to
+    // `community_facts`; this fixture holds no community rows, so the new
+    // table contributes zero and the purged sum is unchanged.
+    assert_eq!(counts.len(), 4);
     let purged: i64 = counts.iter().map(|c| c.rows).sum();
     assert_eq!(purged, 2, "one events row plus one members row");
 

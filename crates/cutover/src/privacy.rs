@@ -4,8 +4,10 @@
 //! An opt-out deletes the member's event-store rows for the opting guild
 //! only — `events` (with the reviewed `member_erasure` predicate, so rows
 //! that merely mention the snowflake in serialized metadata go too),
-//! the `members` projection row, and `invite_snapshots` rows attributing
-//! invites to them — then installs the `(guild_id, member_id)` suppression
+//! the `members` projection row, `invite_snapshots` rows attributing
+//! invites to them, and `community_facts` rows (actor, metadata,
+//! source-event and idempotency matches from the same reviewed plan) —
+//! then installs the `(guild_id, member_id)` suppression
 //! row that makes every gated write seam drop future per-user persistence
 //! for that pair. The transaction also writes exactly one
 //! `privacy_opt_out_audit` receipt (scope plus operator actor plus database
@@ -33,7 +35,10 @@ use crate::db::CutoverDb;
 use crate::member_erasure::{plan, TableCount};
 
 /// The event-store tables an opt-out purges, in count/delete order.
-const PURGE_TABLES: [&str; 3] = ["events", "members", "invite_snapshots"];
+/// `community_facts` joins the set so an opted-out member's message, voice
+/// and join facts leave with the funnel rows; its predicate is the reviewed
+/// erasure-plan entry for that table.
+const PURGE_TABLES: [&str; 4] = ["events", "members", "invite_snapshots", "community_facts"];
 
 fn valid_identity(guild: &str, member: &str) -> bool {
     crate::is_snowflake(guild)

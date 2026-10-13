@@ -10,8 +10,10 @@ use two_bot_core::gateway_funnel::{FunnelBatch, SnapshotWrite};
 use two_bot_core::gateway_session::{
     dispatch_action, BootDirective, DispatchAction, GatewaySession,
 };
-use two_bot_core::privacy::{category_of_event, AnalyticsCategory};
-use two_bot_core::{format_iso_millis, idempotency_key, FunnelEvent};
+use two_bot_core::privacy::{
+    category_of_event, inviter_in_metadata, scrubbed_member_join_metadata, AnalyticsCategory,
+};
+use two_bot_core::{format_iso_millis, idempotency_key, EventType, FunnelEvent};
 
 use crate::db::{project_event, FunnelWrite};
 
@@ -192,6 +194,15 @@ impl GatewaySessionStore {
         let sequence =
             i64::try_from(session.sequence).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
         let mut tx = self.pool.begin().await?;
+        // Serialize with concurrent opt-outs (which take SHARE ROW EXCLUSIVE
+        // over these tables) so the suppressed set prefetched below is fresh:
+        // whoever locks first wins. Lock order matches `opt_out_member`'s
+        // sorted order, and ROW EXCLUSIVE never blocks other writers.
+        sqlx::query(
+            "LOCK TABLE events, invite_snapshots, members, privacy_opt_outs IN ROW EXCLUSIVE MODE",
+        )
+        .execute(&mut *tx)
+        .await?;
         // Serialize even the first checkpoint (there may be no row to lock).
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(format!("gateway:{}:{}", self.guild_id, self.shard_id))
@@ -329,7 +340,19 @@ impl GatewaySessionStore {
                     "gateway batch belongs to another guild".into(),
                 ));
             }
-            let metadata = event.metadata.as_ref().map(serde_json::Value::to_string);
+            let mut metadata = event.metadata.as_ref().map(serde_json::Value::to_string);
+            // A suppressed inviter's attribution never re-enters through a
+            // join they did not perform: the prefetched suppressed set already
+            // covers this, so no extra query is needed.
+            if event.event_type == EventType::MemberJoin {
+                if let Some(inviter) =
+                    metadata.as_deref().and_then(|blob| inviter_in_metadata(Some(blob)))
+                {
+                    if suppressed.contains(inviter.as_str()) {
+                        metadata = scrubbed_member_join_metadata(metadata.as_deref(), &inviter);
+                    }
+                }
+            }
             let write = FunnelWrite {
                 guild_id: event.guild_id.to_string(),
                 member_id: event.member_id.map(|id| id.to_string()),

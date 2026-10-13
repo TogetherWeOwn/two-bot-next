@@ -98,6 +98,18 @@ pub async fn category_disabled_in(
     let Some(category) = category_of_event(event_type) else {
         return Ok(false);
     };
+    category_off_in(connection, guild_id, category).await
+}
+
+/// True when an analytics family is disabled for the guild, addressed by
+/// family rather than by event-type string. Community-facts writers map
+/// their own fact types through [`community_category`] and gate here, since
+/// their wire names differ from the funnel vocabulary.
+pub async fn category_off_in(
+    connection: &mut PgConnection,
+    guild_id: &str,
+    category: AnalyticsCategory,
+) -> Result<bool, sqlx::Error> {
     let sql = format!(
         "SELECT {} FROM guild_analytics_settings WHERE guild_id = $1",
         toggle_column(category)
@@ -107,6 +119,58 @@ pub async fn category_disabled_in(
         .fetch_optional(&mut *connection)
         .await?;
     Ok(enabled.is_some_and(|(flag,)| !flag))
+}
+
+/// The analytics family a `community_facts` row belongs to, if any. Message
+/// facts follow the activity switch, voice facts the voice switch;
+/// join/rules facts are lifecycle-like and suppression-only (no toggle
+/// drops them), mirroring [`category_of_event`] leaving lifecycle types
+/// ungated.
+#[must_use]
+pub fn community_category(event_type: &str) -> Option<AnalyticsCategory> {
+    match event_type {
+        "message_created" => Some(AnalyticsCategory::Activity),
+        "voice_session_started" | "voice_session_ended" => Some(AnalyticsCategory::Voice),
+        _ => None,
+    }
+}
+
+/// Extract the `inviterId` attribution from a `member_join` metadata blob.
+/// String and numeric encodings both count (the funnel writes strings;
+/// hand-written rows may carry numbers). `None` when the blob is absent,
+/// unparsable, or carries no inviter.
+#[must_use]
+pub fn inviter_in_metadata(metadata: Option<&str>) -> Option<String> {
+    let text = metadata?;
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let inviter = value.get("inviterId")?;
+    if let Some(id) = inviter.as_str() {
+        return Some(id.to_owned());
+    }
+    inviter.as_u64().map(|id| id.to_string())
+}
+
+/// Remove a suppressed inviter's attribution from a `member_join` metadata
+/// blob, keeping every other key. A blob holding only the inviter becomes
+/// `None` (no attribution), matching the blanked `inviter_id` in
+/// invite snapshots. Blobs without that inviter return unchanged.
+#[must_use]
+pub fn scrubbed_member_join_metadata(metadata: Option<&str>, inviter: &str) -> Option<String> {
+    let text = metadata?;
+    let mut value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let hit = value.get("inviterId").is_some_and(|current| {
+        current.as_str() == Some(inviter)
+            || current.as_u64().is_some_and(|id| id.to_string() == inviter)
+    });
+    if !hit {
+        return Some(text.to_owned());
+    }
+    value.as_object_mut()?.remove("inviterId");
+    if value.as_object().is_some_and(|obj| obj.is_empty()) {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 /// [`category_disabled_in`] over a pool for call sites with no open transaction.
@@ -191,6 +255,56 @@ mod tests {
         ] {
             assert_eq!(category_of_event(event_type), None, "{event_type}");
         }
+    }
+
+    #[test]
+    fn community_facts_map_to_activity_and_voice_only() {
+        assert_eq!(
+            community_category("message_created"),
+            Some(AnalyticsCategory::Activity)
+        );
+        for event_type in ["voice_session_started", "voice_session_ended"] {
+            assert_eq!(
+                community_category(event_type),
+                Some(AnalyticsCategory::Voice),
+                "{event_type}"
+            );
+        }
+        for event_type in ["member_joined", "rules_accepted", "event_attended", ""] {
+            assert_eq!(community_category(event_type), None, "{event_type}");
+        }
+    }
+
+    #[test]
+    fn inviter_attribution_extracts_and_scrubs() {
+        assert_eq!(
+            inviter_in_metadata(Some(r#"{"inviterId":"123"}"#)),
+            Some("123".to_owned())
+        );
+        assert_eq!(
+            inviter_in_metadata(Some(r#"{"inviterId":123}"#)),
+            Some("123".to_owned())
+        );
+        assert_eq!(inviter_in_metadata(Some("{}")), None);
+        assert_eq!(inviter_in_metadata(None), None);
+        assert_eq!(inviter_in_metadata(Some("not json")), None);
+        // A blob holding only the suppressed inviter becomes unattributed.
+        assert_eq!(
+            scrubbed_member_join_metadata(Some(r#"{"inviterId":"123"}"#), "123"),
+            None
+        );
+        // Other keys survive the scrub.
+        let scrubbed =
+            scrubbed_member_join_metadata(Some(r#"{"inviterId":"123","source":"x"}"#), "123")
+                .expect("kept keys");
+        assert!(!scrubbed.contains("inviterId"), "{scrubbed}");
+        assert!(scrubbed.contains("\"source\":\"x\""), "{scrubbed}");
+        // A different inviter leaves the blob byte-identical.
+        let untouched = r#"{"inviterId":"999"}"#;
+        assert_eq!(
+            scrubbed_member_join_metadata(Some(untouched), "123"),
+            Some(untouched.to_owned())
+        );
     }
 
     #[test]

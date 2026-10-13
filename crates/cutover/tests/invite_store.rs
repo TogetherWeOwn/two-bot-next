@@ -119,3 +119,95 @@ async fn exercise(pool: &PgPool) -> TestResult {
     assert_eq!(foreign, foreign_after, "foreign guild untouched");
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires agent-testdb; run explicitly with --ignored"]
+async fn counter_checkpoint_blanks_suppressed_inviters() -> TestResult {
+    let options = PgConnectOptions::new()
+        .host("agent-testdb")
+        .port(5432)
+        .username("agent_test")
+        .password("")
+        .database("agent_test");
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone())
+        .await?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let schema = format!("invite_privacy_{}_{}", std::process::id(), nonce);
+    // Audited: identifier is a fixed prefix plus numeric PID and timestamp.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&admin)
+        .await?;
+    let search_path = schema.clone();
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(move |conn, _| {
+            let search_path = search_path.clone();
+            Box::pin(async move {
+                sqlx::query("SELECT set_config('search_path', $1, false)")
+                    .bind(search_path)
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(options)
+        .await?;
+    sqlx::raw_sql(
+        "CREATE TABLE invite_snapshots (
+           guild_id TEXT NOT NULL, code TEXT NOT NULL, uses INTEGER NOT NULL,
+           inviter_id TEXT, channel_id TEXT, updated_at timestamptz NOT NULL,
+           PRIMARY KEY (guild_id, code));
+         CREATE TABLE privacy_opt_outs (
+           guild_id TEXT NOT NULL, member_id TEXT NOT NULL,
+           opted_out_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+           PRIMARY KEY (guild_id, member_id));",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query("INSERT INTO privacy_opt_outs (guild_id, member_id) VALUES ('g1', 'suppressed')")
+        .execute(&pool)
+        .await?;
+    store_counters(
+        &pool,
+        "g1",
+        &[
+            CounterRow {
+                code: "a".to_owned(),
+                uses: 5,
+                inviter_id: Some("suppressed".to_owned()),
+                channel_id: None,
+            },
+            CounterRow {
+                code: "b".to_owned(),
+                uses: 7,
+                inviter_id: Some("other".to_owned()),
+                channel_id: None,
+            },
+        ],
+        NEW,
+    )
+    .await?;
+    let rows: Vec<(String, i32, Option<String>)> = sqlx::query_as(
+        "SELECT code, uses, inviter_id FROM invite_snapshots WHERE guild_id = 'g1' ORDER BY code",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        rows,
+        vec![
+            ("a".to_owned(), 5, None),
+            ("b".to_owned(), 7, Some("other".to_owned())),
+        ],
+        "suppressed inviters keep uses with a blanked inviter"
+    );
+    pool.close().await;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&admin)
+        .await?;
+    admin.close().await;
+    Ok(())
+}

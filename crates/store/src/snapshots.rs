@@ -91,6 +91,11 @@ impl InviteSnapshotStore for PgInviteSnapshots {
         let stamp = snapshot_stamp();
         self.block_on(async {
             let mut tx = self.pool.begin().await?;
+            // Serialize with concurrent opt-outs so the suppressed set below
+            // is fresh. Lock order matches the opt-out's sorted order.
+            sqlx::query("LOCK TABLE invite_snapshots, privacy_opt_outs IN ROW EXCLUSIVE MODE")
+                .execute(&mut *tx)
+                .await?;
             // Suppressed inviters keep the aggregate `uses` count but lose
             // the per-user attribution; the set is fetched once for the batch.
             let suppressed: std::collections::HashSet<String> = sqlx::query_scalar(

@@ -102,13 +102,19 @@ When your opt-out runs, the bot:
 1. Deletes your event-store rows for that guild: your `events` rows
    (including rows that merely mention your ID in serialized metadata, with
    the same guild+identity matching as member erasure), your `members`
-   projection row, and any invite-snapshot rows attributing invites to you.
+   projection row, any invite-snapshot rows attributing invites to you, and
+   your `community_facts` rows (message, voice and join facts, matched by
+   actor plus metadata/source-event/idempotency-key like member erasure).
 2. Installs a suppression entry for your (guild, member) pair. From then
    on, every gated write seam drops future per-user persistence for that
    pair: event writes, activity/bot-flag upserts, onboarding prompt and
    selection rows (an opted-out member is not sent welcome prompts, because
-   sending one would persist per-user state), and invite-attribution writes
-   (invite use counts keep counting, with the inviter field blanked).
+   sending one would persist per-user state), community-facts writes
+   (message facts follow the activity switch, voice facts the voice switch,
+   join/rules facts are suppression-only), invite-attribution writes
+   (invite use counts keep counting, with the inviter field blanked), and
+   the standalone capture's counter baseline. A join attributed to your
+   invite keeps the joiner's row but with your inviter field blanked.
    Anonymous aggregate counters keep counting throughout.
 3. Writes exactly one audit receipt: the guild/member scope plus the
    operator actor label and the database timestamp.
@@ -186,8 +192,8 @@ voice.
 | Family | Switch | Gated event types |
 | --- | --- | --- |
 | Presence | `presence_enabled` | `presence_update` |
-| Activity | `activity_enabled` | `first/second/third_message` |
-| Voice | `voice_enabled` | `voice_session_start/end`, `first_voice_session` |
+| Activity | `activity_enabled` | `first/second/third_message`, community `message_created` facts |
+| Voice | `voice_enabled` | `voice_session_start/end`, `first_voice_session`, community `voice_session_started/ended` facts |
 
 Every other event type still persists: joins, leaves, gate clears,
 onboarding prompts, invite clicks and routing rows serve
@@ -200,13 +206,18 @@ any `presence_update` row a backfill or replay would otherwise write.
 
 Gated seams: the cutover event writer (`record_event`, with `record_earliest`
 and the backfill/community replays that call them), the runtime funnel
-store, the gateway batch commit, invite snapshots (suppressed inviters keep
-the aggregate use count with a blanked inviter field), and the onboarding
-writers. `touch_activity` / `mark_bot` honor suppression; under a disabled
-toggle they may still refresh `last_active_at` for non-suppressed members,
-which is a known residual for a follow-up, not silent per-user analytics.
-Duplicate reconfirmations for suppressed pairs advance nothing: the gate
-runs before the observation-maximum path too.
+store, the gateway batch commit, the community-facts writer (`record_fact`,
+including the leveling-runtime flush), invite snapshots (suppressed inviters
+keep the aggregate use count with a blanked inviter field, including the
+standalone capture's counter baseline), and the onboarding writers. Every
+gated writer serializes with concurrent opt-outs (a shared table lock, so a
+write that passes the gate can never land after the purge), and `member_join`
+rows strip a suppressed inviter's `inviterId` from metadata while keeping the
+joiner's own row. `touch_activity` / `mark_bot` honor suppression; under a
+disabled toggle they may still refresh `last_active_at` for non-suppressed
+members, which is a known residual for a follow-up, not silent per-user
+analytics. Duplicate reconfirmations for suppressed pairs advance nothing:
+the gate runs before the observation-maximum path too.
 
 Backups follow the existing [backup runbook](backup.md): retention is measured
 in retained snapshots (default 14 newest), **not 14 days**. Historical snapshots
