@@ -475,7 +475,7 @@ fn is_guard_refusal(err: &sqlx::Error) -> bool {
 /// [`run_retention`] pending drain so both paths honor the same receipt and
 /// the same safety gates as `erase_member`.
 async fn complete_request(
-    mut tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     request_id: &str,
     guild_id: &str,
     user_id: &str,
@@ -484,15 +484,12 @@ async fn complete_request(
     // replay fences, leaving the request pending with no receipt. The caller
     // (single fulfilment or per-request savepoint) decides whether a refusal
     // is swallowed or fatal.
-    if !crate::member_erasure::schema_gaps(&mut tx)
-        .await?
-        .is_empty()
-    {
+    if !crate::member_erasure::schema_gaps(tx).await?.is_empty() {
         return Err(sqlx::Error::InvalidArgument(
             "erasure schema coverage incomplete".into(),
         ));
     }
-    if crate::member_erasure::has_unresolved_guards(&mut tx, guild_id, user_id).await? {
+    if crate::member_erasure::has_unresolved_guards(tx, guild_id, user_id).await? {
         return Err(sqlx::Error::InvalidArgument(
             "unresolved erasure replay guard".into(),
         ));
