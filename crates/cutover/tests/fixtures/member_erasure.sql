@@ -13,6 +13,9 @@ BEGIN
       INSERT INTO members (guild_id, member_id) VALUES (g, u);
       INSERT INTO events (event_type, member_id, guild_id, occurred_at, source, metadata, idempotency_key)
         VALUES ('member_join', u, g, now(), 'fixture', '{}', k);
+      -- event_store is shared by the S1/S2/S4 slices: exactly one seed row per
+      -- member, so the erasure suites' exactly-one-row-per-table invariant holds.
+      -- Later slices must extend this row's columns, never add a second row.
       INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key)
         VALUES ('GUILD_MEMBER_ADD', g, u, '2026-10-01T00:00:00Z',
                 'GUILD_MEMBER_ADD:' || g || ':' || u || ':2026-10-01T00:00:00Z');
@@ -145,8 +148,6 @@ BEGIN
       INSERT INTO voice_vote_kick_audit
         (guild_id, vote_id, event, room_id, initiator_id, target_id, outcome, occurred_at)
         VALUES (g, 'vk-' || k, 'vote_started', 'v-' || k, u, u, 'started', '2026-10-01T00:00:00Z');
-      INSERT INTO event_store (event_type, guild_id, user_id, channel_id, session_id, event_time, dedup_key)
-        VALUES ('voice_state_update', g, u, 'v-' || k, 's-' || k, '2026-10-01T00:00:00Z', 'd-' || k);
       -- Explicit exceptions are seeded too: erasure must not change safety policy.
       INSERT INTO guild_settings (guild_id, key, value, version, updated_by)
         VALUES (g, 'fixture_' || u, to_jsonb(u), 1, u);
