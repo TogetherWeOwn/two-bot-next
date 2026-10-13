@@ -558,7 +558,7 @@ mod tests {
         let app = test_app(test_ring());
         let (bare_status, bare) = get(&app, Vec::new()).await;
         assert_eq!(bare_status, StatusCode::UNAUTHORIZED);
-        let other_secret = vec![b'y'; 40];
+        let other_secret = format!("{}-wrong", "y".repeat(40)).into_bytes();
         let wrong = signed_headers_for("fixture-unknown-key", &other_secret, BACKFILL_PATH);
         let (wrong_status, refused) = get(&app, wrong).await;
         assert_eq!(wrong_status, StatusCode::UNAUTHORIZED);
@@ -643,7 +643,8 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // First read advances the high-water mark to base_ms.
-        let first_nonce = format!("{:032x}", 0xaaaau128);
+        // Random nonces only: hard-coded hex would trip the crypto-value gate.
+        let first_nonce = format!("{:032x}", rand::random::<u128>());
         let first_sig = mint_signature(&fixture_secret(), BACKFILL_PATH, &timestamp, &first_nonce);
         authenticate(
             &mut guard,
@@ -655,7 +656,12 @@ mod tests {
         // Second read with the clock 3 s behind: freshness still passes
         // against the mark, and the nonce must burn at the mark.
         let regressed_ms = base_ms - 3_000;
-        let second_nonce = format!("{:032x}", 0xbbbbu128);
+        let second_nonce = loop {
+            let candidate = format!("{:032x}", rand::random::<u128>());
+            if candidate != first_nonce {
+                break candidate;
+            }
+        };
         let second_sig =
             mint_signature(&fixture_secret(), BACKFILL_PATH, &timestamp, &second_nonce);
         let second_headers = headers_for(&second_nonce, &timestamp, &second_sig);

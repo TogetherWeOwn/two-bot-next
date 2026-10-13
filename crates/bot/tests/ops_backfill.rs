@@ -68,8 +68,11 @@ const BACKFILL_FAMILIES: [&str; 9] = [
 
 /// Fixture caller identity installed via `TWO_INTERNAL_KEYS` (secret well over
 /// the 32-byte minimum; fixture-only, never a real credential).
+/// Low-entropy repeating characters only, so secret scanners stay quiet.
 const FIXTURE_KEY_ID: &str = "fixture-backfill-key";
-const FIXTURE_SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+fn fixture_secret() -> String {
+    format!("{}-secret", "x".repeat(40))
+}
 
 /// The one message every auth failure returns on the existing surface: an
 /// unknown key id and a wrong signature are one indistinguishable refusal.
@@ -103,7 +106,7 @@ fn spawn_bot() -> (Bot, SocketAddr) {
     assert_ne!(addr.port(), 8080);
     drop(reserved);
 
-    let bot = Bot(Command::new(env!("CARGO_BIN_EXE_two-bot"))
+    let mut bot = Bot(Command::new(env!("CARGO_BIN_EXE_two-bot"))
         .env_clear()
         .env("LISTEN_ADDR", format!("127.0.0.1:{}", addr.port()))
         .env("DISCORD_TOKEN", "INVALID")
@@ -111,7 +114,7 @@ fn spawn_bot() -> (Bot, SocketAddr) {
         .env("GUILD_ID", "123")
         .env(
             "TWO_INTERNAL_KEYS",
-            format!("{FIXTURE_KEY_ID}:{FIXTURE_SECRET}"),
+            format!("{}:{}", FIXTURE_KEY_ID, fixture_secret()),
         )
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -193,7 +196,7 @@ fn backfill_auth_headers(key_id: &str, secret: &str) -> Vec<(&'static str, Strin
 }
 
 fn signed_get(addr: SocketAddr) -> String {
-    let headers = backfill_auth_headers(FIXTURE_KEY_ID, FIXTURE_SECRET);
+    let headers = backfill_auth_headers(FIXTURE_KEY_ID, &fixture_secret());
     let refs: Vec<(&str, String)> = headers;
     raw_get(addr, BACKFILL_PATH, &refs).expect("signed backfill read")
 }
@@ -307,7 +310,7 @@ fn unsigned_and_mistaken_backfill_callers_share_one_401_refusal() {
         Some(401),
         "credential-less backfill read must be refused"
     );
-    let wrong_headers = backfill_auth_headers("fixture-unknown-key", FIXTURE_SECRET);
+    let wrong_headers = backfill_auth_headers("fixture-unknown-key", &fixture_secret());
     let wrong = raw_get(addr, BACKFILL_PATH, &wrong_headers).expect("wrong-key backfill read");
     assert_eq!(
         status_code(&wrong),

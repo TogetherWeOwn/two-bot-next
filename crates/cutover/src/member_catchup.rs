@@ -1,7 +1,7 @@
 //! Member-list catch-up worker slice (TOG-22941, TOG-22852 slice).
 //!
 //! Slow, resumable catch-up of guild members the bot did not capture live.
-//! The wire half rides the shared [`RestClient`](crate::rest::RestClient)
+//! The wire half rides the shared [`RestClient`]
 //! as-is: one `GET /guilds/{id}/members` page per call, so every request
 //! passes through the rate-limit client and its `requests()` counter.
 //!
