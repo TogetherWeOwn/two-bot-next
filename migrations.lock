@@ -345,9 +345,9 @@
       "sha256": "5be88c0d2541613d571f30cdb1108c42e17532541f8bf6eb1f99181ad87b05ef",
       "justification": "Append-only event_store for presence capture: nullable user_id for sibling slices, best-effort dedup key, ids/enums only with no free-text columns."
     },
-    "crates/store/migrations/0429_privacy_opt_out.sql": {
-      "sha256": "88c96fff37a316fac51e3655171621e49b97d177c64e81122a560b471bd09e09",
-      "justification": "Per-user opt-out suppression plus per-guild presence/activity/voice toggles plus one audit receipt row per purge; store chain copy, additive with IF NOT EXISTS."
+    "crates/cutover/migrations/0429_event_store_thread_capture.sql": {
+      "sha256": "a24111554362c07b2dc188c86daa4c80ff8ddd5a5e60e2e8952bdd2997cde78d",
+      "justification": "Event-store S6 thread capture, comment-only refresh: header now points at the ALLOWED_COLUMNS union plus json/jsonb type fence (review round 2), no DDL change; same order-independent table plus thread_id, parent_id and archived/locked/invitable with nullable user_id, UNIQUE dedup_key, no free-text columns."
     },
     "crates/cutover/migrations/0432_event_store_member_capture.sql": {
       "sha256": "81e51abeda792b6e8dfa4ad714e744fcc09b96f9d857ca70bf4080ef8ce46faf",
@@ -356,6 +356,10 @@
     "crates/cutover/migrations/0433_privacy_opt_out.sql": {
       "sha256": "c60803ccfb20a7748d43dc2630653950c894953cf8010347b4ad6f681b3197d0",
       "justification": "Per-user opt-out suppression plus per-guild presence/activity/voice toggles plus one audit receipt row per purge; cutover chain copy, additive with IF NOT EXISTS."
+    },
+    "crates/store/migrations/0434_privacy_opt_out.sql": {
+      "sha256": "798f514afa6cc212a10aba9fb769ba56dd43a7dfcde31983a114421b81dabf7e",
+      "justification": "Per-user opt-out suppression plus per-guild presence/activity/voice toggles plus one audit receipt row per purge; store chain copy, additive with IF NOT EXISTS."
     }
   }
 }

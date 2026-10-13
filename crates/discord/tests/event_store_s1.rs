@@ -131,14 +131,15 @@ async fn table_columns(pool: &PgPool) -> Vec<String> {
     .expect("event_store columns readable")
 }
 
-const FORBIDDEN_COLUMNS: &[&str] = &[
-    "body",
-    "content",
-    "message_body",
-    "message_content",
-    "custom_status_text",
-    "status_text",
-];
+async fn table_column_types(pool: &PgPool) -> Vec<(String, String)> {
+    sqlx::query_as(
+        "SELECT column_name, data_type FROM information_schema.columns
+         WHERE table_name = 'event_store' ORDER BY column_name",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("event_store column types readable")
+}
 
 /// Required S1 columns: `id` plus the eight metadata columns. The table is
 /// shared with the other capture slices, so the check also requires every
@@ -157,6 +158,15 @@ const EXPECTED_COLUMNS: &[&str] = &[
     "dedup_key",
 ];
 
+const FORBIDDEN_COLUMNS: &[&str] = &[
+    "body",
+    "content",
+    "message_body",
+    "message_content",
+    "custom_status_text",
+    "status_text",
+];
+
 fn assert_minimal_schema(columns: &[String]) {
     assert!(
         !columns.is_empty(),
@@ -167,6 +177,22 @@ fn assert_minimal_schema(columns: &[String]) {
         assert!(
             !columns.iter().any(|column| column == forbidden),
             "event_store must not gain a {forbidden} column; has {columns:?}"
+        );
+    }
+}
+
+/// No `json`/`jsonb` column may exist except the reviewed `roles` role-id
+/// array (S2): free-text payloads (message bodies, raw payloads) have no
+/// schema home whatever the column name.
+async fn assert_no_json_columns(pool: &PgPool) {
+    for (column, data_type) in table_column_types(pool).await {
+        if column == "roles" {
+            continue;
+        }
+        assert!(
+            data_type != "json" && data_type != "jsonb",
+            "event_store column {column} has free-text type {data_type}; \
+             message capture persists ids+timestamps only"
         );
     }
 }
@@ -349,6 +375,7 @@ async fn event_store_s1_privacy_tripwire_rejects_body_text() {
         "S1 creates the append-only event_store table"
     );
     assert_minimal_schema(&columns);
+    assert_no_json_columns(&db.pool).await;
     // Tripwire part 2: a fixture carrying body + custom-status text persists
     // its ids only; the sentinels appear in no stored row.
     let fixture = message_create_fixture("trip-1", "2026-10-12T12:00:00.000Z");
