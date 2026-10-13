@@ -335,7 +335,7 @@ impl RateLimitGuard {
         let reset_wait = value("x-ratelimit-reset-after")
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|secs| secs.is_finite() && *secs >= 0.0)
-            .and_then(Duration::try_from_secs_f64)
+            .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
             .or_else(|| {
                 let epoch = value("x-ratelimit-reset")?
                     .parse::<f64>()
