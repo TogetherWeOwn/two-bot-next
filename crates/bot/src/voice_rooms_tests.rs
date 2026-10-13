@@ -2112,7 +2112,10 @@ async fn store_creators_reach_creator_channels_via_load() {
         .live
         .voice_update_with_occupancy(301, Some(CREATOR), Some(false))
         .expect("store creator join keeps its ticket");
-    assert_eq!(sample, None, "store creator join carries no occupancy sample");
+    assert_eq!(
+        sample, None,
+        "store creator join carries no occupancy sample"
+    );
     let (_, sample) = worker
         .live
         .voice_update_with_occupancy(302, Some(500), Some(false))
@@ -2141,12 +2144,18 @@ async fn runtime_creator_added_and_updated_feed_creator_channels() {
         .live
         .voice_update_with_occupancy(301, Some(ADDED), Some(false))
         .expect("added creator join keeps its ticket");
-    assert_eq!(sample, None, "added creator join carries no occupancy sample");
+    assert_eq!(
+        sample, None,
+        "added creator join carries no occupancy sample"
+    );
     let (_, sample) = actor
         .live
         .voice_update_with_occupancy(302, Some(UPDATED), Some(false))
         .expect("updated creator join keeps its ticket");
-    assert_eq!(sample, None, "updated creator join carries no occupancy sample");
+    assert_eq!(
+        sample, None,
+        "updated creator join carries no occupancy sample"
+    );
     let (_, sample) = actor
         .live
         .voice_update_with_occupancy(303, Some(500), Some(false))
