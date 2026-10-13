@@ -58,6 +58,20 @@ CONTAINER_BACKED = {"get_status", "get_gateway", "get_backfill_progress"}
 WRONG_BEARER = "wrong-bearer-probe-0000"
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects so the bearer never leaves STAGING_MCP_URL.
+
+    The default opener follows 301/302/303 by re-issuing a GET to the
+    Location URL with every non-content header copied, including
+    Authorization, without checking host or scheme. Returning None makes
+    the opener surface the 3xx as an HTTPError, which do_post records as
+    a probe failure instead of forwarding the bearer.
+    """
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
 def fail_refusal(message):
     print(f"REFUSED: {message}", flush=True)
     return 2
@@ -75,7 +89,9 @@ def do_post(url, payload, token_or_none, timeout=REQUEST_TIMEOUT_SECONDS):
     """POST one JSON-RPC payload. Returns (http_status, headers_dict, body_text).
 
     Network errors return (None, {}, "<error-class>") with no secret text.
-    The bearer is never included in any returned string.
+    The bearer is never included in any returned string. Redirects are
+    refused (NoRedirect) so the bearer never leaves the target origin;
+    a 3xx surfaces as its HTTP status and is recorded as a failure.
     """
     data = json.dumps(payload).encode("utf-8")
     headers = {
@@ -87,7 +103,8 @@ def do_post(url, payload, token_or_none, timeout=REQUEST_TIMEOUT_SECONDS):
         headers["Authorization"] = f"Bearer {token_or_none}"
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        opener = urllib.request.build_opener(NoRedirect)
+        with opener.open(req, timeout=timeout) as resp:
             status = resp.status
             resp_headers = {k.lower(): v for k, v in resp.headers.items()}
             body = resp.read().decode("utf-8", errors="replace")

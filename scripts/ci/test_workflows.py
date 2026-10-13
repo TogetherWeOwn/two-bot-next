@@ -820,11 +820,12 @@ def staging_mcp_proveout_errors(workflow):
     stored or uploaded; responses carry no credential). One job runs only
     from main through the `staging` environment, on the routed runner for
     job `proveout`, with its own non-cancelling concurrency group and a 10
-    minute timeout. Exactly three unconditional steps: pinned checkout
-    without persisted credentials, one Run step that calls the reviewed
-    stdlib script with the bearer via the environment only, and the 14 day
-    artifact upload of the sanitized prove-out file. No wrangler, no
-    production path, no staging Worker URL variable, no `set -x`.
+    minute timeout. Exactly three steps: pinned checkout without persisted
+    credentials, one Run step that calls the reviewed stdlib script with
+    the bearer via the environment only, and the 14 day artifact upload of
+    the sanitized prove-out file with `if: always()` so failures keep
+    their evidence. No wrangler, no production path, no staging Worker URL
+    variable, no `set -x`.
     """
     name = "staging-mcp-proveout.yml"
     errors = []
@@ -867,10 +868,16 @@ def staging_mcp_proveout_errors(workflow):
     if secrets != {"staging_mcp_token"}:
         errors.append(f"{name}:proveout: must read exactly the STAGING_MCP_TOKEN secret")
     steps = job.get("steps") or []
-    if len(steps) != 3 or any(key in step for step in steps for key in ("if", "continue-on-error")):
+    if len(steps) != 3 or any("continue-on-error" in step for step in steps):
         errors.append(f"{name}:proveout: must run exactly checkout, the prove-out and the upload, unconditionally")
         return errors
     checkout, run, upload = steps
+    if "if" in checkout or "if" in run:
+        errors.append(f"{name}:proveout: only the upload may carry a condition (always())")
+        return errors
+    if upload.get("if") != "always()":
+        errors.append(f"{name}:proveout: upload must run with if: always() so failures keep their artifact")
+        return errors
     if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
             or (checkout.get("with") or {}).get("persist-credentials") != "false" \
             or (checkout.get("with") or {}).get("fetch-depth") != "1":
