@@ -139,17 +139,23 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_vote_kick_audit",
     // V5 adds accepted-create history; see [`V5_ADDED_TABLES`].
     "voice_create_reservations",
-    // Event-store S3 presence capture (0428): append-only, guild-keyed, no
-    // foreign keys, so order after the vote-kick audit trail is free.
+    // V6 adds event-store presence capture (0428); see [`V6_ADDED_TABLES`].
+    // Append-only, guild-keyed, no foreign keys, so order after the vote-kick
+    // audit trail is free.
     "event_store",
 ];
 
 /// Tables first covered by v5. A v4 archive predates them and need not declare
 /// them; every other covered table is still required, so a v4 recovery point
-/// written before create-reservation persistence (0422) and event-store
-/// presence capture (0428) stays readable without waiving arbitrary missing
-/// tables.
-pub const V5_ADDED_TABLES: &[&str] = &["voice_create_reservations", "event_store"];
+/// written before create-reservation persistence (0422) stays readable without
+/// waiving arbitrary missing tables.
+pub const V5_ADDED_TABLES: &[&str] = &["voice_create_reservations"];
+
+/// Tables first covered by v6. A v4 archive predates them along with the v5
+/// tables, and a v5 archive predates them; neither need declare them. A v5
+/// recovery point written before event-store presence capture (0428) stays
+/// readable without waiving arbitrary missing tables.
+pub const V6_ADDED_TABLES: &[&str] = &["event_store"];
 
 /// Covered tables not created by the current cutover migration set, if any.
 /// Keep legacy data when such tables exist, but do not require nonexistent
@@ -209,8 +215,8 @@ pub fn is_destination_owned(table: &str, column: &str) -> bool {
         .any(|(owned_table, owned_column)| *owned_table == table && *owned_column == column)
 }
 
-/// Write complete v5 coverage; the reader also accepts frozen v3/v4 coverage.
-pub const DUMP_VERSION: u32 = 5;
+/// Write complete v6 coverage; the reader also accepts frozen v3/v4/v5 coverage.
+pub const DUMP_VERSION: u32 = 6;
 
 /// A table name in the dump, validated against [`DUMP_TABLES`].
 pub type DumpTable = String;
@@ -734,9 +740,13 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                     .get("version")
                     .and_then(Value::as_u64)
                     .ok_or_else(|| refuse("manifest has an invalid version"))?;
-                if version != 3 && version != 4 && version != u64::from(DUMP_VERSION) {
+                if version != 3
+                    && version != 4
+                    && version != 5
+                    && version != u64::from(DUMP_VERSION)
+                {
                     return Err(refuse(format!(
-                        "dump version {version}, this build reads 3, 4 and {DUMP_VERSION}"
+                        "dump version {version}, this build reads 3, 4, 5 and {DUMP_VERSION}"
                     )));
                 }
                 retain_within_cap(&mut retained, &obj, limits.retained)?;
@@ -938,8 +948,9 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             .ok_or_else(|| refuse(format!("manifest table {name} has an invalid row count")))?;
         let _ = count;
     }
-    // Historical inventories are pinned by fixtures. New v5 archives must cover
-    // reservations too; v4 recovery points remain readable without them.
+    // Historical inventories are pinned by fixtures. New v6 archives must cover
+    // reservations and the event store too; v4 recovery points remain readable
+    // without both, and v5 recovery points without the event store.
     let version = obj.get("version").and_then(Value::as_u64);
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
@@ -947,7 +958,12 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
         .enumerate()
         .filter(|(index, name)| match version {
             Some(3) => *index < 22,
-            Some(4) => !V5_ADDED_TABLES.contains(name) && !OPTIONAL_LEGACY_TABLES.contains(name),
+            Some(4) => {
+                !V5_ADDED_TABLES.contains(name)
+                    && !V6_ADDED_TABLES.contains(name)
+                    && !OPTIONAL_LEGACY_TABLES.contains(name)
+            }
+            Some(5) => !V6_ADDED_TABLES.contains(name) && !OPTIONAL_LEGACY_TABLES.contains(name),
             _ => !OPTIONAL_LEGACY_TABLES.contains(name),
         })
         .map(|(_, name)| name)
@@ -1700,7 +1716,7 @@ mod tests {
         let expected: Vec<&str> = DUMP_TABLES
             .iter()
             .copied()
-            .filter(|name| !V5_ADDED_TABLES.contains(name))
+            .filter(|name| !V5_ADDED_TABLES.contains(name) && !V6_ADDED_TABLES.contains(name))
             .collect();
         assert_eq!(names, expected);
         assert_eq!(
@@ -1721,6 +1737,42 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("missing tables: events"));
+    }
+
+    #[test]
+    fn inspects_frozen_v5_without_event_store_but_v6_requires_it() {
+        // A v5 recovery point written before event-store presence capture
+        // (0428) declares every covered table except the v6 addition and stays
+        // readable; promoting it to v6 without the event store is refused.
+        let tables: Vec<Value> = DUMP_TABLES
+            .iter()
+            .copied()
+            .filter(|name| !V6_ADDED_TABLES.contains(name))
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "columns": [],
+                    "column_types": [],
+                    "count": 0,
+                })
+            })
+            .collect();
+        let mut v5 = manifest(tables);
+        v5["version"] = serde_json::json!(5);
+        assert!(
+            validate_manifest(&v5).is_ok(),
+            "frozen v5 without event_store stays readable"
+        );
+        let bytes = gzip_lines(&[v5.clone(), serde_json::json!({"kind":"end","rows":0})]);
+        let contents = inspect_bytes(&bytes).expect("frozen v5 inspects");
+        assert_eq!(contents.manifest.version, 5);
+        let mut v6 = v5;
+        v6["version"] = serde_json::json!(DUMP_VERSION);
+        assert_eq!(DUMP_VERSION, 6, "frozen v5 test pins the v6 bump");
+        assert!(validate_manifest(&v6)
+            .unwrap_err()
+            .to_string()
+            .contains("event_store"));
     }
 
     #[test]

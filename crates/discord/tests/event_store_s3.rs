@@ -15,10 +15,12 @@
 //!   3 Watching, 4 Custom, 5 Competing) and the nullable `application_id`.
 //!   No free-text columns: no custom-status text, no activity name, details,
 //!   state, URL or emoji.
-//! - Resume-safe idempotent inserts: `dedup_key` carries a UNIQUE key such as
-//!   `PRESENCE_UPDATE:<guild>:<user>:<event_time>` and every insert runs
-//!   `ON CONFLICT (dedup_key) DO NOTHING`, so a gateway resume redelivery
-//!   inserts nothing.
+//! - Best-effort idempotent inserts: `dedup_key` carries a UNIQUE key such as
+//!   `PRESENCE_UPDATE:<guild>:<user>:<event_time>` (with `event_time` set at
+//!   receive time, since Discord's PRESENCE_UPDATE payload carries no event
+//!   timestamp) and every insert runs `ON CONFLICT (dedup_key) DO NOTHING`,
+//!   so a same-key retry inserts nothing. A resume redelivery received at a
+//!   different instant carries a different key and is NOT absorbed.
 //! - Privacy tripwire: a fixture carrying custom-status text or activity
 //!   details/URLs persists its ids and enums only; the sentinels appear in
 //!   no stored row.
@@ -133,9 +135,10 @@ fn dedup_key(event_time: &str) -> String {
 
 /// S3 append-only insert for a presence update: identity + timestamps + the
 /// presence status and activity TYPE enums, idempotent on `dedup_key`.
-/// Returns rows inserted (1) or deduplicated (0). The column list is the
-/// whole contract: anything the fixture carries beyond these columns
-/// (custom-status text, details, URLs) has no binding and can never persist.
+/// Returns rows inserted (1) or deduplicated (0). This helper binds
+/// ids/enums only, so on its own it cannot prove free text never persists
+/// (an extra column would simply stay NULL here); the schema allowlist plus
+/// the no-json fence in the privacy tripwire is what refuses that column.
 async fn insert_presence_event(
     pool: &PgPool,
     guild_id: &str,
@@ -176,6 +179,16 @@ async fn table_columns(pool: &PgPool) -> Vec<String> {
     .expect("event_store columns readable")
 }
 
+async fn table_column_types(pool: &PgPool) -> Vec<(String, String)> {
+    sqlx::query_as(
+        "SELECT column_name, data_type FROM information_schema.columns
+         WHERE table_name = 'event_store' ORDER BY column_name",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("event_store column types readable")
+}
+
 const REQUIRED_COLUMNS: &[&str] = &[
     "event_type",
     "guild_id",
@@ -188,15 +201,23 @@ const REQUIRED_COLUMNS: &[&str] = &[
     "application_id",
 ];
 
-const FORBIDDEN_COLUMNS: &[&str] = &[
-    "username",
-    "custom_status_text",
-    "status_text",
-    "activity_name",
-    "activity_details",
-    "activity_state",
-    "activity_url",
-    "activity_emoji",
+/// Strict allowlist for the shared `event_store` table as S3 leaves it: the
+/// surrogate key plus the S3 presence contract. Sibling slices add their own
+/// columns with `ADD COLUMN IF NOT EXISTS`; when they land they must extend
+/// this list explicitly, so a free-text column (e.g. `raw_payload`,
+/// `custom_status`) fails here instead of slipping past a name denylist. The
+/// companion type fence below rejects `json`/`jsonb` whatever the name.
+const ALLOWED_COLUMNS: &[&str] = &[
+    "id",
+    "event_type",
+    "guild_id",
+    "user_id",
+    "event_time",
+    "received_at",
+    "dedup_key",
+    "presence_status",
+    "activity_type",
+    "application_id",
 ];
 
 fn assert_presence_schema(columns: &[String]) {
@@ -210,10 +231,26 @@ fn assert_presence_schema(columns: &[String]) {
             "event_store keeps presence column {required}; has {columns:?}"
         );
     }
-    for forbidden in FORBIDDEN_COLUMNS {
+    for column in columns {
         assert!(
-            !columns.iter().any(|column| column == forbidden),
-            "event_store must not gain a {forbidden} column; has {columns:?}"
+            ALLOWED_COLUMNS.contains(&column.as_str()),
+            "event_store has unexpected column {column}; extend ALLOWED_COLUMNS \
+             explicitly when a sibling slice lands it, has {columns:?}"
+        );
+    }
+}
+
+/// No `json`/`jsonb` column may exist: free-text payloads (raw presence
+/// payloads, activity blobs) have no schema home whatever the column name.
+/// The writer below binds ids/enums only, so this type fence plus the name
+/// allowlist above is what makes the privacy tripwire fail on a scratch
+/// `raw_payload JSONB` migration.
+async fn assert_no_json_columns(pool: &PgPool) {
+    for (column, data_type) in table_column_types(pool).await {
+        assert!(
+            data_type != "json" && data_type != "jsonb",
+            "event_store column {column} has free-text type {data_type}; \
+             presence capture persists ids+enums only"
         );
     }
 }
@@ -228,7 +265,7 @@ async fn assert_dedup_key_is_unique(pool: &PgPool) {
     .fetch_one(pool)
     .await
     .expect("dedup_key index readable");
-    assert_eq!(unique.0, 1, "dedup_key carries the resume-safe UNIQUE key");
+    assert_eq!(unique.0, 1, "dedup_key carries the best-effort UNIQUE key");
 }
 
 fn assert_no_presence_free_text(row: &str) {
@@ -369,7 +406,10 @@ async fn event_store_s3_presence_update_without_activity_persists_null_activity(
 }
 
 /// S3 AC 3: duplicate delivery with the same `dedup_key` inserts once
-/// (resume-safe, `ON CONFLICT DO NOTHING`).
+/// (best-effort, `ON CONFLICT DO NOTHING`). Same-key retries insert nothing;
+/// a resume redelivery received at a different instant carries a different
+/// key (Discord's PRESENCE_UPDATE has no event timestamp) and is not
+/// absorbed.
 ///
 /// Pending: no presence columns exist until the S3 migration lands, so run
 /// with `-- --ignored` against the disposable test database to see the gap.
@@ -391,7 +431,7 @@ async fn event_store_s3_duplicate_delivery_inserts_once() {
     .await
     .expect("first delivery inserts");
     assert_eq!(first, 1, "first delivery inserts");
-    // Gateway resume redelivery of the same dispatch: same dedup_key.
+    // Same-key retry of the same dispatch: same dedup_key.
     let retry = insert_presence_event(
         &db.pool,
         GUILD,
@@ -402,14 +442,14 @@ async fn event_store_s3_duplicate_delivery_inserts_once() {
         Some(APP_ID),
     )
     .await
-    .expect("duplicate delivery is resume-safe");
-    assert_eq!(retry, 0, "same dedup_key must insert nothing on redelivery");
+    .expect("duplicate delivery inserts nothing");
+    assert_eq!(retry, 0, "same dedup_key must insert nothing on retry");
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM event_store WHERE dedup_key = $1")
         .bind(dedup_key(event_time))
         .fetch_one(&db.pool)
         .await
         .expect("row count readable");
-    assert_eq!(count.0, 1, "no double row after resume redelivery");
+    assert_eq!(count.0, 1, "no double row after same-key retry");
     db.cleanup().await;
 }
 
@@ -421,18 +461,13 @@ async fn event_store_s3_duplicate_delivery_inserts_once() {
 #[tokio::test]
 async fn event_store_s3_privacy_tripwire_rejects_custom_status_text() {
     let db = TestDb::new().await;
-    // Tripwire part 1: no free-text column may exist to hold the payload.
-    let columns = table_columns(&db.pool).await;
-    assert!(
-        !columns.is_empty(),
-        "S3 creates the presence columns on the append-only event_store table"
-    );
-    for forbidden in FORBIDDEN_COLUMNS {
-        assert!(
-            !columns.iter().any(|column| column == forbidden),
-            "privacy fence: no {forbidden} column; has {columns:?}"
-        );
-    }
+    // Tripwire part 1: the schema is exactly the allowlisted ids/enums (plus
+    // the surrogate key) with no json/jsonb home for a free-text payload. A
+    // scratch migration adding `raw_payload JSONB` or `custom_status TEXT`
+    // fails here even though the lean writer below would leave those columns
+    // NULL.
+    assert_presence_schema(&table_columns(&db.pool).await);
+    assert_no_json_columns(&db.pool).await;
     // Tripwire part 2: a fixture carrying custom-status text plus activity
     // details/URLs persists its ids and enums only; the sentinels appear in
     // no stored row.

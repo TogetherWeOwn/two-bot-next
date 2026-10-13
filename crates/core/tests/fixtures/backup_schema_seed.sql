@@ -494,7 +494,8 @@ VALUES ('100000000000000001', '100000000000000050', 'vote_started', '10000000000
         '100000000000000003', '100000000000000002', 'protected_target',
         NULL, NULL, NULL, '2026-08-03T10:05:00Z');
 -- Event-store S3 presence capture (0428): append-only presence rows with the
--- resume-safe dedup key PRESENCE_UPDATE:<guild_id>:<user_id>:<event_time>.
+-- best-effort dedup key PRESENCE_UPDATE:<guild_id>:<user_id>:<event_time>
+-- (receive time; same-key retries insert nothing).
 INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key,
   presence_status, activity_type, application_id)
 VALUES ('PRESENCE_UPDATE', '100000000000000001', '100000000000000002',

@@ -294,7 +294,7 @@ pub const DISPATCH_LANES: &[&str] = &[
 pub const CHECKPOINT_FAILURE_STAGES: &[&str] = &["pre_commit", "commit"];
 /// Presence-capture outcomes for `two_bot_presence_capture_total{outcome}`
 /// (event-store S3): `inserted` for a first delivery that stored a row,
-/// `duplicate` for a resume redelivery absorbed by the shared dedup key, and
+/// `duplicate` for a same-key retry absorbed by the shared dedup key, and
 /// `rejected` for a payload refused before the insert. Exactly these three
 /// series exist — presence is the highest-volume family, so the outcome label
 /// carries no user id, activity name, application id or any free text, and an
