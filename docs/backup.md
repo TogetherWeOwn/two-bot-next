@@ -82,15 +82,15 @@ A v4 archive must declare every covered table except the ones v5 added
 0427 voice, 0428 presence, 0429 thread lifecycle, 0430 message/reaction
 capture, 0431 stage/interaction-observe/audit-log capture and 0432 member
 deltas) and the ones v7 added (`V7_ADDED_TABLES`: seasonal XP projection
-0100 plus retention queues 0437), so recovery points written before
+0100 plus retention queues 0438), so recovery points written before
 create-reservation persistence, event-store capture, the seasonal XP
-projection (0100) and the retention queues (0437) remain inspectable and
+projection (0100) and the retention queues (0438) remain inspectable and
 restorable.
 A v4 archive written before any other table joined the inventory is refused at
 inspect ("manifest is missing tables"); take a fresh dump after upgrading. V5
 requires everything except `V6_ADDED_TABLES` and `V7_ADDED_TABLES`, so recovery
 points written before event-store capture and before the seasonal XP
-projection (0100) and retention queues (0437) stay readable; V6 requires
+projection (0100) and retention queues (0438) stay readable; V6 requires
 everything except `V7_ADDED_TABLES`, so recovery points written before the
 seasonal XP projection and the retention queues stay readable; V7 requires
 the full current inventory, and an incomplete new archive refuses at

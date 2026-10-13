@@ -160,7 +160,7 @@ answer, open the live page and quote what it says that day.
 
 ## Retention and explicit exceptions
 
-The retention module (`two-bot-cutover::retention`, migration `0437`)
+The retention module (`two-bot-cutover::retention`, migration `0438`)
 implements the rolling windows when invoked: raw presence/voice rows roll off
 at 30 days, the audit-log cache expires at 45 days, and user deletion requests
 complete in under 72 hours with a receipt unless a replay guard is unresolved,

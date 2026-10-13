@@ -155,7 +155,7 @@ pub const DUMP_TABLES: &[&str] = &[
     // voice capture plus 0428 S3 presence plus 0429 S6 thread lifecycle plus
     // 0430 S5 message/reaction capture plus 0431 S8
     // stage/interaction-observe/audit-log capture plus 0432 S2 member
-    // capture); see [`V6_ADDED_TABLES`]. V7 adds the retention queues (0437)
+    // capture); see [`V6_ADDED_TABLES`]. V7 adds the retention queues (0438)
     // alongside the seasonal XP projection; see [`V7_ADDED_TABLES`]. The
     // retention queues are guild-purge intent and user-deletion ledger with
     // receipts: both must survive restore (a lost purge resurrects departed
@@ -192,7 +192,7 @@ pub const V5_ADDED_TABLES: &[&str] = &[
 pub const V6_ADDED_TABLES: &[&str] = &["event_store"];
 
 /// Tables first covered by v7 (seasonal XP projection 0100 plus retention
-/// queues, migration 0437). A v4, v5 or v6 archive predates them and need
+/// queues, migration 0438). A v4, v5 or v6 archive predates them and need
 /// not declare them; v7 archives must cover the full inventory, so recovery
 /// points written before the seasonal projection or the retention queues stay
 /// readable without waiving arbitrary missing tables. v6 archives written on
@@ -1011,7 +1011,7 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
         let _ = count;
     }
     // Historical inventories are pinned by fixtures. New v7 archives must cover
-    // reservations, the retention queues (0437, v7), the seasonal XP
+    // reservations, the retention queues (0438, v7), the seasonal XP
     // projection (0100, v7) and the event store (0427 voice plus 0428
     // presence plus 0429 thread lifecycle plus 0430 message/reaction plus
     // 0431 stage/interaction/audit capture plus 0432 member capture, v6)
@@ -1864,7 +1864,7 @@ mod tests {
         // A v5 archive carries reservations but predates the v6 event-store
         // capture (0427-0432): it must validate at version 5 and fail at
         // version 6. The v6 set is the event store only; the retention queues
-        // (0437) and the seasonal projection are v7 and stay waived at v6
+        // (0438) and the seasonal projection are v7 and stay waived at v6
         // (see the frozen v6 pre-retention test below).
         let tables: Vec<Value> = DUMP_TABLES
             .iter()
@@ -2007,7 +2007,7 @@ mod tests {
                 .collect()
         }
         // A v6 recovery point written on main after the event-store bump but
-        // before the retention queues (0437) declares every covered table
+        // before the retention queues (0438) declares every covered table
         // except the two retention queues and the seasonal projection, and
         // stays readable; promoting it to v7 without the retention tables is
         // refused. This is the frozen-manifest guard for the v7 grouping:
