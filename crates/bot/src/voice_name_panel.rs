@@ -927,7 +927,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 return;
             };
             if self.creators != creators {
-                self.live.protect_channels(creators.keys().copied());
+                self.live.protect_creators(creators.keys().copied());
                 self.creators = creators;
                 self.name_signatures.clear();
                 self.name_inputs = None;

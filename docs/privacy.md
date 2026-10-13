@@ -45,6 +45,18 @@ are outside this implementation's scope.
   outcome codes and no names, text or interaction tokens) stores the initiator
   and target member IDs, so erasure removes every row where the member is
   either one. It records a room-scoped disconnect, never a guild kick.
+  The event-store voice shape (`event_store`) is provisioned by the S4 migration
+  for a future gateway writer (guild / member / channel / session IDs plus a
+  nullable `message_id` for S1 message-row coexistence, timestamps and enum
+  mute/deaf/video/stream flags, no audio, transcripts, tokens or endpoints);
+  erasure already removes every row for the member.
+- Thread lifecycle and membership history (`event_store`: one row per
+  THREAD_CREATE / UPDATE / DELETE, one row per listed thread per
+  THREAD_LIST_SYNC fan-out, one row per THREAD_MEMBER_UPDATE / REMOVE delta).
+  Rows hold guild, thread and parent IDs, the archived / locked / invitable
+  state enums and member IDs on member-delta rows (also embedded in
+  `dedup_key`), with no names, topics or message content. Member erasure
+  deletes the member's rows by guild ID plus user ID.
 - Event RSVPs and attendance/community facts, including attribution and compound
   voice-session/event keys (`event_rsvps`, `community_facts`). Scorecards normally
   store aggregates; the erasure plan also checks their serialized payloads.
@@ -52,7 +64,10 @@ are outside this implementation's scope.
   and delivery state. Sticky bodies and their creator/editor IDs are stored. Scheduled messages store creator/editor IDs and are erased with them.
 - Moderation, announcements, automation and operational audit rows, actor/target
   IDs, reasons and metadata. Some legacy-compatible payload columns are arbitrary
-  TEXT, not database-validated JSON.
+  TEXT, not database-validated JSON. The event-store capture (`event_store`:
+  stage-instance, interaction-observe and audit-log-entry rows with IDs and
+  enum fields only, no free text) stores actor/target member IDs, erased as
+  either one.
 - Automod violation counts and once-per-message ledgers store member and message
   IDs and filter names, never content (`automod_violations`,
   `automod_processed_messages`). Per-delivery replay claims may keep a matched
@@ -98,6 +113,17 @@ identity-bearing field require source review and an explicit manifest update.
 No new automatic age-based purger is installed by this change. Covered activity
 persists until an authorized erasure or a separate existing feature lifecycle
 removes it. Do not claim a 30/90-day TTL where no enforcing timer exists.
+
+The append-only event-store capture (`event_store`, when its slices land)
+follows the same rule: its rows persist until erasure, and its TTL policy is
+an explicit placeholder awaiting a reviewed migration, not an installed
+timer. The per-user purge path is this procedure plus one manifest entry per
+landing slice, deleting by guild plus user; rows without a user id purge per
+guild (and per message or thread where the columns exist) instead. The
+capture fence is ids, timestamps and enums only: no message bodies and no
+custom free text are ever stored. See the
+[event-store wiring note](event-store.md) for the per-slice fence table,
+the backfill-no-replay rule and the read-only staging verify steps.
 
 The manifest explicitly retains these control-plane records:
 

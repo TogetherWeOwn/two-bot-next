@@ -57,7 +57,7 @@ env:
 # exactly one pr-lint and one gitleaks run.
 concurrency:
   group: supply-chain-${{ github.event.pull_request.number || inputs.pr_number || github.sha }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   pr-lint:

@@ -54,6 +54,7 @@ pub mod e2e_matrix;
 pub mod events;
 pub mod evidence;
 pub mod expected_joins;
+pub mod fb_page_events;
 pub mod feature_commands;
 pub mod feeds;
 pub mod feeds_connector;
@@ -61,11 +62,13 @@ pub mod feeds_http;
 #[cfg(feature = "db")]
 pub mod feeds_store;
 pub mod funnel;
+pub mod game_activity;
 pub mod gateway_funnel;
 pub mod gateway_session;
 pub mod handlers;
 pub mod health;
 pub mod help;
+pub mod hotzone;
 pub mod inactivity;
 #[cfg(feature = "db")]
 pub mod inactivity_store;
@@ -101,9 +104,11 @@ pub mod presence;
 pub mod presence_store;
 pub mod raid;
 pub mod raid_removal;
+pub mod referral_rewards;
 pub mod rejection_telemetry;
 pub mod router;
 pub mod rsvp;
+pub mod rsvp_conversion;
 #[cfg(feature = "db")]
 pub mod rsvp_store;
 pub mod scheduled;
@@ -116,6 +121,7 @@ pub mod self_roles;
 pub mod send_admission;
 pub mod settings;
 pub mod sticky;
+pub mod stream_funnel;
 pub mod tickets;
 pub mod voice;
 pub mod voice_access;
@@ -365,6 +371,10 @@ pub use rsvp::{
     RsvpError, RsvpRecord, RsvpStatus, RsvpTotals, RsvpTransition, ATTENDANCE_EVENT_TYPE,
     AUDIT_RETENTION_DAYS, MAX_CHECKINS_PER_OCCURRENCE, MAX_RSVPS_PER_EVENT,
     MAX_RSVP_WRITES_PER_USER_PER_MINUTE, RSVP_AUDIT_ACTION, RSVP_RETENTION_DAYS,
+};
+pub use rsvp_conversion::{
+    assign_variant, compute_conversion, reminders_due, render_report_text, AnnouncementVariant,
+    ConversionReport, ReminderKind,
 };
 #[cfg(feature = "db")]
 pub use rsvp_store::{
