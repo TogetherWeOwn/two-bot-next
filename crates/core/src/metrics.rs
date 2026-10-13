@@ -320,6 +320,15 @@ pub const DISPATCH_LANES: &[&str] = &[
 /// single checkpoint failure stops the worker, so there is no
 /// benign-singleton case.
 pub const CHECKPOINT_FAILURE_STAGES: &[&str] = &["pre_commit", "commit"];
+/// Presence-capture outcomes for `two_bot_presence_capture_total{outcome}`
+/// (event-store S3): `inserted` for a first delivery that stored a row,
+/// `duplicate` for a same-key retry absorbed by the shared dedup key, and
+/// `rejected` for a payload refused before the insert. Exactly these three
+/// series exist — presence is the highest-volume family, so the outcome label
+/// carries no user id, activity name, application id or any free text, and an
+/// unrecognised outcome collapses to the last entry (`rejected`) rather than
+/// growing the series vocabulary.
+pub const PRESENCE_CAPTURE_OUTCOMES: &[&str] = &["inserted", "duplicate", "rejected"];
 /// Website-action receiver families for
 /// `two_bot_internal_actions_total{family,outcome}` (TOG-20119, roadmap
 /// M4.23). The signed receiver (`crates/bot/src/internal_action_http.rs`)
@@ -467,6 +476,7 @@ struct Values {
     prefix_trigger_refused: [u64; PREFIX_TRIGGER_REFUSED_REASONS.len()],
     dispatch_drops: [u64; DISPATCH_LANES.len()],
     checkpoint_failures: [u64; CHECKPOINT_FAILURE_STAGES.len()],
+    presence_capture: [u64; PRESENCE_CAPTURE_OUTCOMES.len()],
     last_ready_unix: Option<u64>,
     last_resume_unix: Option<u64>,
     internal_actions: [[u64; INTERNAL_ACTION_OUTCOMES.len()]; INTERNAL_ACTION_FAMILIES.len()],
@@ -530,6 +540,20 @@ impl Metrics {
             last_ready_unix: values.last_ready_unix,
             last_resume_unix: values.last_resume_unix,
         }
+    }
+
+    /// One presence-update capture decision on the hot path: `inserted`,
+    /// `duplicate` or `rejected` (see `PRESENCE_CAPTURE_OUTCOMES`). The
+    /// outcome is the whole label vocabulary — caller payloads never become
+    /// labels — and an unrecognised outcome collapses to `rejected`.
+    pub fn presence_capture(&self, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter =
+            &mut values.presence_capture[bounded_index(outcome, PRESENCE_CAPTURE_OUTCOMES)];
+        *counter = counter.saturating_add(1);
     }
 
     pub fn gateway_reconnect(&self) {
@@ -980,6 +1004,22 @@ impl Metrics {
             "counter",
             values.missed_events,
         );
+        header(
+            &mut out,
+            "two_bot_presence_capture_total",
+            "counter",
+            "Presence-update capture outcomes by bounded outcome; fixed three series.",
+        );
+        for (outcome, count) in PRESENCE_CAPTURE_OUTCOMES
+            .iter()
+            .zip(values.presence_capture)
+        {
+            writeln!(
+                out,
+                "two_bot_presence_capture_total{{outcome=\"{outcome}\"}} {count}"
+            )
+            .unwrap();
+        }
         header(
             &mut out,
             "two_bot_gateway_latency_seconds",
@@ -1594,6 +1634,7 @@ mod tests {
             metrics.dispatch_drop(&hostile);
             metrics.voice_vote_kick(&hostile);
             metrics.checkpoint_failure(&hostile);
+            metrics.presence_capture(&hostile);
             metrics.internal_action(&hostile, &hostile);
         }
         let text = metrics.render(None);

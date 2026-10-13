@@ -36,6 +36,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'counter_snapshots', 'table'),
     ('public', 'member_exclusions', 'table'),
     ('public', 'presence_probe', 'table'),
+    ('public', 'event_store', 'table'),
     ('public', 'community_stream_heartbeats', 'table'),
     ('public', 'community_scorecard_runs', 'table'),
     ('public', 'community_scorecard_attempts', 'table'),
