@@ -574,7 +574,7 @@ fn readback_matches(draft: &FbEventDraft, observed: &EventReadback) -> bool {
 ///    before the credential fetch and before any driver call;
 /// 3. credential fetch exactly once; rotation/failure -> [`Refused::SecretUnavailable`]
 ///    (fail closed, no secret in the error). The Updated-without-mapping case
-///    heals forward inside [`execute`] without a second fetch (control 6);
+///    heals forward inside `execute` without a second fetch (control 6);
 /// 4. exactly one mutating driver call for create/update/delete; challenges
 ///    abort with zero retries + one CEO notification (control 2);
 /// 5. every mutating path captures a screenshot artifact, persisted on the
