@@ -9,8 +9,7 @@ on:
     branches: [ci/vote-kick-fuzz-smoke]
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   vote-kick-smoke:
