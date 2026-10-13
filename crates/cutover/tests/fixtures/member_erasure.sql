@@ -154,6 +154,9 @@ BEGIN
       INSERT INTO voice_vote_kick_audit
         (guild_id, vote_id, event, room_id, initiator_id, target_id, outcome, occurred_at)
         VALUES (g, 'vk-' || k, 'vote_started', 'v-' || k, u, u, 'started', '2026-10-01T00:00:00Z');
+      -- event_store keeps its single shared row above (one row per member):
+      -- the THREAD_MEMBER_UPDATE shape is covered by the backup seed, and a
+      -- second row here would break the exactly-one-row-per-table invariant.
       -- Explicit exceptions are seeded too: erasure must not change safety policy.
       INSERT INTO guild_settings (guild_id, key, value, version, updated_by)
         VALUES (g, 'fixture_' || u, to_jsonb(u), 1, u);

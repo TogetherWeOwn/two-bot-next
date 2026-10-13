@@ -140,9 +140,9 @@ pub const DUMP_TABLES: &[&str] = &[
     // V5 adds accepted-create history; see [`V5_ADDED_TABLES`].
     "voice_create_reservations",
     // V6 adds the event-store capture (0427 voice plus 0428 presence plus
-    // 0430 S5 message/reaction plus 0432 S2 member deltas; shared table for
-    // S1-S8 slices); see [`V6_ADDED_TABLES`]. Append-only, guild-keyed, no
-    // foreign keys, so order among the tail is free.
+    // 0429 S6 thread lifecycle plus 0430 S5 message/reaction plus 0432 S2
+    // member deltas; shared table for S1-S8 slices); see [`V6_ADDED_TABLES`].
+    // Append-only, guild-keyed, no foreign keys, so order among the tail is free.
     "event_store",
 ];
 
@@ -155,8 +155,8 @@ pub const V5_ADDED_TABLES: &[&str] = &["voice_create_reservations"];
 /// Tables first covered by v6. A v4 or v5 archive predates them and need not
 /// declare them; v5 still requires every other covered table, so recovery
 /// points written before event-store persistence (0427 voice, 0428 presence,
-/// 0432 member deltas and 0430 message/reaction capture) stay readable
-/// without waiving arbitrary missing tables.
+/// 0429 thread lifecycle, 0430 message/reaction capture and 0432 member
+/// deltas) stay readable without waiving arbitrary missing tables.
 pub const V6_ADDED_TABLES: &[&str] = &["event_store"];
 
 /// Covered tables not created by the current cutover migration set, if any.
@@ -1816,8 +1816,9 @@ mod tests {
                 .filter(|t| t.get("name").and_then(Value::as_str) != Some(name))
                 .collect()
         }
-        // A main-shaped v5 manifest (full v5 inventory, no event_store) stays
-        // readable: v5 predates member/presence/voice-capture persistence.
+        // A v5 manifest (full v5 inventory, no event_store) stays readable:
+        // v5 predates event-store capture (voice, presence, member deltas,
+        // thread lifecycle).
         let mut v5 = manifest(without(complete_tables(&BTreeMap::new()), "event_store"));
         v5["version"] = serde_json::json!(5);
         assert!(

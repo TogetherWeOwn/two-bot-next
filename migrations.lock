@@ -345,6 +345,10 @@
       "sha256": "5be88c0d2541613d571f30cdb1108c42e17532541f8bf6eb1f99181ad87b05ef",
       "justification": "Append-only event_store for presence capture: nullable user_id for sibling slices, best-effort dedup key, ids/enums only with no free-text columns."
     },
+    "crates/cutover/migrations/0429_event_store_thread_capture.sql": {
+      "sha256": "a24111554362c07b2dc188c86daa4c80ff8ddd5a5e60e2e8952bdd2997cde78d",
+      "justification": "Event-store S6 thread capture, comment-only refresh: header now points at the ALLOWED_COLUMNS union plus json/jsonb type fence (review round 2), no DDL change; same order-independent table plus thread_id, parent_id and archived/locked/invitable with nullable user_id, UNIQUE dedup_key, no free-text columns."
+    },
     "crates/cutover/migrations/0430_event_store_message_capture.sql": {
       "sha256": "36a256cdb57fa5acaedfa1a0fa72a5442ef1c6fc91e23b9c64d25e99e9176ddc",
       "justification": "Event-store S5 message/reaction capture: order-independent event_store table plus emoji id/name reference columns for MESSAGE_UPDATE/DELETE/DELETE_BULK and MESSAGE_REACTION_ADD/REMOVE, idempotent on UNIQUE dedup_key, no message-body columns."
