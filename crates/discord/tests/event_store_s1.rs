@@ -1,5 +1,5 @@
 //! Event-store S1 acceptance tests for the append-only core slice
-//! (0433 migration on the shared append-only `event_store` table).
+//! (0435 migration on the shared append-only `event_store` table).
 //!
 //! Contract under test (event-store P1 slice 1: append-only core +
 //! message-create metadata + idempotent keys + lag metric):

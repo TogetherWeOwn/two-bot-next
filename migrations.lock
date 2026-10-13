@@ -361,8 +361,16 @@
       "sha256": "81e51abeda792b6e8dfa4ad714e744fcc09b96f9d857ca70bf4080ef8ce46faf",
       "justification": "Event-store S2 member capture: order-independent event_store table plus premium_since, nick_changed flag and role-id columns for GUILD_MEMBER_ADD/REMOVE/UPDATE, idempotent on the shared UNIQUE dedup_key index, no free-text columns."
     },
-    "crates/cutover/migrations/0433_event_store_s1_core.sql": {
-      "sha256": "7b6b730520b365640abdfae101351cb671e413e9c0d147c2cf7d4b618437bb1d",
+    "crates/cutover/migrations/0433_privacy_opt_out.sql": {
+      "sha256": "c60803ccfb20a7748d43dc2630653950c894953cf8010347b4ad6f681b3197d0",
+      "justification": "Per-user opt-out suppression plus per-guild presence/activity/voice toggles plus one audit receipt row per purge; cutover chain copy, additive with IF NOT EXISTS."
+    },
+    "crates/store/migrations/0434_privacy_opt_out.sql": {
+      "sha256": "798f514afa6cc212a10aba9fb769ba56dd43a7dfcde31983a114421b81dabf7e",
+      "justification": "Per-user opt-out suppression plus per-guild presence/activity/voice toggles plus one audit receipt row per purge; store chain copy, additive with IF NOT EXISTS."
+    },
+    "crates/cutover/migrations/0435_event_store_s1_core.sql": {
+      "sha256": "63008ba9997da496166d02aae68b25e1f5e46f3981175a1d72e14a86db1356b3",
       "justification": "Event-store S1 append-only core: order-independent event_store table with MESSAGE_CREATE metadata columns (event_type, guild_id, channel_id, message_id, user_id, event_time, received_at, dedup_key) plus nullable convergence and the shared UNIQUE dedup index; ids+timestamps only, no body columns."
     }
   }

@@ -245,8 +245,9 @@ pub struct CheckinWrite {
 }
 
 /// Record one verified-attendance fact. Returns `true` when the fact was
-/// inserted, `false` when the idempotency key already held it (retry dedupe)
-/// or the proof is `rsvp` (legacy writes nothing for it).
+/// inserted, `false` when the idempotency key already held it (retry dedupe),
+/// the proof is `rsvp` (legacy writes nothing for it), or the member opted
+/// out (suppressed pairs drop the fact like every other community writer).
 ///
 /// RA-03 admission (TOG-19773): inside one transaction the write is refused
 /// with [`RsvpStoreError::OccurrenceAtCapacity`] when a new fact would grow
@@ -255,6 +256,13 @@ pub struct CheckinWrite {
 /// full occurrence. The occurrence-scoped advisory lock keeps the
 /// existence check and the admission count stable across concurrent
 /// writers, so concurrent same-key writes still produce one logical effect.
+///
+/// Privacy gate, inside the write transaction: a suppressed `(guild, member)`
+/// pair drops the fact. Attendance facts are lifecycle-like (no analytics
+/// family), so suppression alone gates them, mirroring join/rules facts.
+/// The shared table lock serializes with concurrent opt-outs (which take
+/// SHARE ROW EXCLUSIVE over these tables): whoever locks first wins, so a
+/// write that passes the gate can never land after the purge.
 pub async fn record_checkin(
     pool: &Pool<Postgres>,
     checkin: &CheckinWrite,
@@ -265,6 +273,16 @@ pub async fn record_checkin(
     let key = checkin_idempotency_key(&checkin.event_occurrence_id, &checkin.member_id);
     let source = checkin_source(&checkin.event_occurrence_id);
     let mut tx = pool.begin().await?;
+    // Serialize with concurrent opt-outs: lock order matches
+    // `opt_out_member`'s sorted order, and ROW EXCLUSIVE never blocks other
+    // writers.
+    sqlx::query("LOCK TABLE community_facts, privacy_opt_outs IN ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    if crate::privacy::suppressed_in(&mut tx, &checkin.guild_id, &checkin.member_id).await? {
+        tx.rollback().await?;
+        return Ok(false);
+    }
     sqlx::query(
         "SELECT pg_advisory_xact_lock(hashtextextended(
             jsonb_build_array($1::text, $2::text)::text, 0))",
@@ -512,6 +530,17 @@ mod tests {
         sqlx::raw_sql(include_str!("../../cutover/migrations/0160_rsvp.sql"))
             .execute(&pool)
             .await?;
+        // `record_checkin` gates on the opt-out suppression table (same
+        // shape as 0433, suppression only): the privacy migration itself is
+        // not applied here so this fixture stays on the RSVP slice.
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS privacy_opt_outs (
+               guild_id TEXT NOT NULL, member_id TEXT NOT NULL,
+               opted_out_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+               PRIMARY KEY (guild_id, member_id))",
+        )
+        .execute(&pool)
+        .await?;
         Ok((pool, schema))
     }
 

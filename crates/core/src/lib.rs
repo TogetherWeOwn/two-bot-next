@@ -102,6 +102,8 @@ pub mod onboarding_store;
 pub mod presence;
 #[cfg(feature = "db")]
 pub mod presence_store;
+#[cfg(feature = "db")]
+pub mod privacy;
 pub mod raid;
 pub mod raid_removal;
 pub mod referral_rewards;
