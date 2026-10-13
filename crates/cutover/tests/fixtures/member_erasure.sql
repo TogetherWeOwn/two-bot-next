@@ -41,6 +41,11 @@ BEGIN
       INSERT INTO moderation_idempotency
         (guild_id, idempotency_key, action, request_hash, state, claimed_at, completed_at, result_json)
         VALUES (g, k, 'warn', 'fixture', 'done', '2026-10-01T00:00:00Z', '2026-10-01T00:00:01Z', '{}');
+      -- FK child of the idempotency row above: every self-role send writes an
+      -- exchange row and nothing deletes them, so erasure/purge must delete
+      -- the child first or the parent delete fails with 23503.
+      INSERT INTO moderation_channel_executions (channel_id, guild_id, idempotency_key, claim_token)
+        VALUES ('exec-' || k, g, k, 'tok-' || k);
       INSERT INTO moderation_warnings
         (id, guild_id, user_id, actor_id, reason, request_id, created_at)
         VALUES ('w-' || k, g, u, u, 'fixture', 'w-' || k, now());
@@ -132,6 +137,10 @@ BEGIN
          added_role_ids, removed_role_ids, created_at)
         VALUES (k, g, 'fixture-panel', u, 'fixture-source', 'button', 'assign', 'assigned',
           '[]', '[]', '2026-10-01T00:00:00Z');
+      -- FK child of the audit row above: insert_role_exchange writes one row
+      -- per send, so erasure/purge must delete exchanges before the audit row.
+      INSERT INTO self_role_exchanges (event_id, origin_generation, role_id, adding, compensating)
+        VALUES (k, 1, '101', TRUE, FALSE);
       INSERT INTO self_role_panel_claims
         (guild_id, member_id, panel_id, claim_token, claim_generation, processing_expires_at,
          latest_event_id, target_committed)
@@ -157,6 +166,8 @@ BEGIN
       INSERT INTO voice_vote_kick_audit
         (guild_id, vote_id, event, room_id, initiator_id, target_id, outcome, occurred_at)
         VALUES (g, 'vk-' || k, 'vote_started', 'v-' || k, u, u, 'started', '2026-10-01T00:00:00Z');
+      INSERT INTO retention_deletion_requests (request_id, guild_id, user_id)
+        VALUES (k, g, u);
       -- Three S8 event_store rows per member, each binding the member in exactly
       -- one of actor_id, target_id and user_id (the others NULL) with distinct
       -- dedup_keys, so each erasure predicate branch is exercised

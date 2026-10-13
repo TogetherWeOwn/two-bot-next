@@ -397,13 +397,17 @@
       "sha256": "9e1c4d2f46f3a36e1e155de83a41a2bcd1d5c4dd2f68ab47dbdd304082e8a1ef",
       "justification": "Event-store S1 append-only core: order-independent event_store table with MESSAGE_CREATE metadata columns (event_type, guild_id, channel_id, message_id, user_id, event_time, received_at, dedup_key) plus nullable convergence and the shared UNIQUE dedup index; ids+timestamps only, no body columns."
     },
-    "crates/cutover/migrations/0438_game_activity_guild_aggregates.sql": {
-      "sha256": "49ec620d59069f83906559c90f5b22fc93fb8a777b27636267ce359413b27ae0",
-      "justification": "Guild-level game-activity aggregates (no member columns): additive table with nonnegativity plus voice-within-total checks; cutover chain copy, IF NOT EXISTS. Renumbered 0435 to 0438 on the merge past main's 0435 backfill cursors, 0436 member catch-up and 0437 event-store S1 core."
+    "crates/cutover/migrations/0438_retention_queues.sql": {
+      "sha256": "7ab729b1c4340ab962ef0b8beba6aff3ecd1962e2fb0f002d5e1e75b5c351f56",
+      "justification": "Retention rolling-window queues: guild-purge queue and user-deletion request ledger backing 30-day raw and 45-day audit roll-off with under-72-hour deletion receipts; additive, backout drops both tables. Renumbered from 0427 to 0437 and then 0438 after main claimed 0427 for event-store voice capture, 0435/0436 for backfill cursors and member catch-up, and 0437 for event-store S1 core; the 0427/0437 files never merged so no database has applied them under either number."
     },
-    "crates/store/migrations/0439_game_activity_guild_aggregates.sql": {
+    "crates/cutover/migrations/0439_game_activity_guild_aggregates.sql": {
       "sha256": "bdcc1dee299bd59e5ebfb84bd7875e38f4f6c025cd524f377f2a6eff94028fce",
-      "justification": "Guild-level game-activity aggregates (no member columns): additive table with nonnegativity plus voice-within-total checks; store chain copy, IF NOT EXISTS. Renumbered 0436 to 0439 on the merge past main's 0436 member catch-up (global migration numbers are unique across chains)."
+      "justification": "Guild-level game-activity aggregates (no member columns): additive table with nonnegativity plus voice-within-total checks; cutover chain copy, IF NOT EXISTS. Renumbered 0438 to 0439 after main's cutover 0438 retention queues; global migration numbers remain unique across both chains."
+    },
+    "crates/store/migrations/0440_game_activity_guild_aggregates.sql": {
+      "sha256": "b208398e0ca388e197658a404664f4a0d9be6056375bf5ae7a396a6afec7e698",
+      "justification": "Guild-level game-activity aggregates (no member columns): additive table with nonnegativity plus voice-within-total checks; store chain copy, IF NOT EXISTS. Renumbered 0439 to 0440 after main's cutover 0438 retention queues; global migration numbers remain unique across both chains."
     }
   }
 }
