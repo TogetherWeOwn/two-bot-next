@@ -76,6 +76,10 @@ async fn exercise(pool: &PgPool) -> TestResult {
            guild_id TEXT NOT NULL, code TEXT NOT NULL, uses INTEGER NOT NULL,
            inviter_id TEXT, channel_id TEXT, updated_at timestamptz NOT NULL,
            PRIMARY KEY (guild_id, code));
+         CREATE TABLE privacy_opt_outs (
+           guild_id TEXT NOT NULL, member_id TEXT NOT NULL,
+           opted_out_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+           PRIMARY KEY (guild_id, member_id));
          INSERT INTO invite_snapshots (guild_id, code, uses, updated_at) VALUES
            ('g1','a',1,'2026-01-01T00:00:00Z'),
            ('g1','b',2,'2026-01-01T00:00:00Z'),

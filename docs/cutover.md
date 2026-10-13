@@ -527,7 +527,7 @@ the authorized migration procedure: no agent-run live test inserts, generic
 receipt is **NO-GO**. The same allocator gate applies to a rollback recovery target.
 
 Source example: [events BIGSERIAL](../crates/cutover/migrations/0001_funnel.sql#L14)
-is allocated by [gateway inserts](../crates/cutover/src/gateway_session.rs#L304)
+is allocated by [gateway inserts](../crates/cutover/src/gateway_session.rs#L374)
 that handle only idempotency-key conflicts, not primary-key collisions. The
 [restore's sequence restart](../crates/core/src/backup/dump.rs#L218)
 illustrates the hazard; it does not prove the planned copier covers every table.
