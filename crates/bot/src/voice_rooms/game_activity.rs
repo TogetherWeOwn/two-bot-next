@@ -472,7 +472,9 @@ impl GameActivityCollector {
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
-        inner.carry.retain(|(carry_guild, _)| *carry_guild != guild);
+        inner
+            .carry
+            .retain(|(carry_guild, _), _| *carry_guild != guild);
     }
 
     /// Forget the carried play states of opted-out members: their future
