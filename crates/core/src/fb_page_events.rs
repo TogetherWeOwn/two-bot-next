@@ -397,9 +397,11 @@ pub enum RunOutcome {
 /// - Two or more *distinct* Discord event ids are refused as [`Refused::Bulk`]
 ///   (no backfill sweep, no bulk fan-out).
 /// - Duplicate deliveries of the same event collapse to the latest request.
-/// - `Created` plans a create; `Updated` plans an update when the map already
-///   holds a URL (otherwise a create, so a lost map entry heals forward);
-///   `Cancelled` plans a delete.
+/// - `Created` plans a create, unless the map already holds a URL for the
+///   event — then it plans an update, so a stale or duplicate `Created` can
+///   never mint a second FB event (control 4, map authoritative);
+///   `Updated` plans an update when the map already holds a URL (otherwise a
+///   create, so a lost map entry heals forward); `Cancelled` plans a delete.
 pub fn plan_actions(
     requests: &[RunRequest],
     known: &IdempotencyMap,
@@ -417,8 +419,14 @@ pub fn plan_actions(
     let latest = requests.last().expect("non-empty checked above");
     let id = latest.discord_event.id.clone();
     let action = match latest.change {
-        ChangeKind::Created => PlannedAction::Create {
-            discord_event_id: id,
+        ChangeKind::Created => match known.lookup(&id) {
+            Some(fb_url) if !fb_url.is_empty() => PlannedAction::Update {
+                discord_event_id: id,
+                fb_url,
+            },
+            _ => PlannedAction::Create {
+                discord_event_id: id,
+            },
         },
         ChangeKind::Updated => match known.lookup(&id) {
             Some(fb_url) => PlannedAction::Update {
@@ -625,6 +633,20 @@ fn execute<D: BrowserDriver, A: AuditSink, N: NotifySink>(
 
     match request.change {
         ChangeKind::Created => {
+            // The map is authoritative in both directions: a stale queued
+            // `Created`, or two deliveries classified before the first ran,
+            // must not mint a second FB event and orphan the first
+            // (control 4). Mirror the `Updated`-without-mapping heal-forward
+            // below by re-dispatching as `Updated` when a URL is known.
+            if let Some(known_url) = pages.lookup(&event_id) {
+                if !known_url.is_empty() {
+                    let updated = RunRequest {
+                        discord_event: request.discord_event.clone(),
+                        change: ChangeKind::Updated,
+                    };
+                    return execute(driver, pages, audit, notify, &updated);
+                }
+            }
             let fb_url = match driver.create_event_full(&draft) {
                 Ok(url) => url,
                 Err(DriverError::Challenge(signal)) => {
@@ -1483,7 +1505,18 @@ mod tests {
         assert!(matches!(outcome, RunOutcome::LinkPostFallback { .. }));
         let rows = fake.rows();
         assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].outcome, "verify_failed_readback_mismatch");
+        assert_eq!(
+            rows[0].fb_url.as_deref(),
+            Some(TEST_PAGE_URL),
+            "the create-mismatch prior row records the unverified event URL"
+        );
         assert_eq!(rows[1].outcome, "link_post_created_via_pages_manage_posts");
+        assert_eq!(
+            rows[1].fb_url.as_deref(),
+            Some(TEST_LINK_URL),
+            "the link-post success row records the link URL"
+        );
         assert!(
             rows[1]
                 .screenshot_png
@@ -1517,6 +1550,106 @@ mod tests {
     }
 
     #[test]
+    fn link_post_fallback_rows_carry_evidence_on_update_and_create_failure_paths() {
+        let secrets = FakeSecrets::default();
+
+        // Update-failure fallback success: prior row carries the mapped URL,
+        // link-post row carries the screenshot.
+        let fake = Fake::default();
+        fake.edit(|inner| {
+            inner.update = Err(DriverError::Failed("no update".to_owned()));
+        });
+        let mut pages = IdempotencyMap::new();
+        pages.record("event-1", TEST_PAGE_URL);
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Updated).expect("fallback runs");
+        assert!(
+            matches!(outcome, RunOutcome::LinkPostFallback { .. }),
+            "update failure falls back: {outcome:?}"
+        );
+        let rows = fake.rows();
+        assert_eq!(rows.len(), 2, "prior row + link-post row: {rows:?}");
+        assert_eq!(rows[0].outcome, "update_failed_driver_error");
+        assert_eq!(
+            rows[0].fb_url.as_deref(),
+            Some(TEST_PAGE_URL),
+            "the update-failure prior row records the mapped URL"
+        );
+        assert_eq!(rows[1].outcome, "link_post_created_via_pages_manage_posts");
+        assert_eq!(
+            rows[1].fb_url.as_deref(),
+            Some(TEST_LINK_URL),
+            "the update-failure link-post row records the link URL"
+        );
+        assert!(
+            rows[1]
+                .screenshot_png
+                .as_ref()
+                .is_some_and(|png| !png.is_empty()),
+            "the update-failure link-post row carries screenshot evidence"
+        );
+
+        // Update-mismatch fallback success.
+        let fake = Fake::default();
+        fake.edit(|inner| inner.readback = None);
+        let mut pages = IdempotencyMap::new();
+        pages.record("event-1", TEST_PAGE_URL);
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Updated).expect("fallback runs");
+        assert!(
+            matches!(outcome, RunOutcome::LinkPostFallback { .. }),
+            "update mismatch falls back: {outcome:?}"
+        );
+        let rows = fake.rows();
+        assert_eq!(rows.len(), 2, "prior row + link-post row: {rows:?}");
+        assert_eq!(rows[0].outcome, "verify_failed_readback_mismatch");
+        assert_eq!(
+            rows[0].fb_url.as_deref(),
+            Some(TEST_PAGE_URL),
+            "the update-mismatch prior row records the mapped URL"
+        );
+        assert_eq!(rows[1].outcome, "link_post_created_via_pages_manage_posts");
+        assert!(
+            rows[1]
+                .screenshot_png
+                .as_ref()
+                .is_some_and(|png| !png.is_empty()),
+            "the update-mismatch link-post row carries screenshot evidence"
+        );
+
+        // Create-failure fallback success: no event URL exists yet, but the
+        // link-post row still carries the screenshot.
+        let fake = Fake::default();
+        fake.edit(|inner| {
+            inner.create = Err(DriverError::Failed("no event".to_owned()));
+        });
+        let mut pages = IdempotencyMap::new();
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Created).expect("fallback runs");
+        assert!(
+            matches!(outcome, RunOutcome::LinkPostFallback { .. }),
+            "create failure falls back: {outcome:?}"
+        );
+        let rows = fake.rows();
+        assert_eq!(rows.len(), 2, "prior row + link-post row: {rows:?}");
+        assert_eq!(rows[0].outcome, "create_failed_driver_error");
+        assert_eq!(
+            rows[0].fb_url, None,
+            "the create-failure prior row has no event URL yet"
+        );
+        assert_eq!(rows[1].outcome, "link_post_created_via_pages_manage_posts");
+        assert_eq!(
+            rows[1].fb_url.as_deref(),
+            Some(TEST_LINK_URL),
+            "the create-failure link-post row records the link URL"
+        );
+        assert!(
+            rows[1]
+                .screenshot_png
+                .as_ref()
+                .is_some_and(|png| !png.is_empty()),
+            "the create-failure link-post row carries screenshot evidence"
+        );
+    }
+
+    #[test]
     fn update_double_failure_reports_fallback_failed_update_stage() {
         let fake = Fake::default();
         fake.edit(|inner| {
@@ -1537,6 +1670,18 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].outcome, "update_failed_driver_error");
         assert_eq!(rows[1].outcome, "link_post_failed_driver_error");
+        assert_eq!(
+            rows[0].fb_url.as_deref(),
+            Some(TEST_PAGE_URL),
+            "the update-failure prior row records the mapped URL"
+        );
+        assert!(
+            rows[1]
+                .screenshot_png
+                .as_ref()
+                .is_some_and(|png| !png.is_empty()),
+            "the update-stage link-post failure row carries screenshot evidence"
+        );
     }
 
     #[test]
@@ -1568,5 +1713,236 @@ mod tests {
         let mut pages = IdempotencyMap::new();
         run(&fake, &secrets, &mut pages, ChangeKind::Created).expect("fallback runs");
         assert_eq!(fake.rows()[0].outcome, "verify_failed_readback_mismatch");
+    }
+
+    #[test]
+    fn created_with_mapping_redispatches_as_update_without_duplicate() {
+        let fake = Fake::default();
+        let secrets = FakeSecrets::default();
+        let mut pages = IdempotencyMap::new();
+        pages.record("event-1", TEST_PAGE_URL);
+
+        let outcome =
+            run(&fake, &secrets, &mut pages, ChangeKind::Created).expect("redispatch runs");
+        assert!(
+            matches!(outcome, RunOutcome::Updated { .. }),
+            "a Created for an already-mapped event must update, never a second create: {outcome:?}"
+        );
+        assert_eq!(
+            fake.full_creates().len(),
+            0,
+            "no second FB event may be minted for a mapped event"
+        );
+        assert_eq!(
+            fake.full_updates().len(),
+            1,
+            "the mapped event is updated in place"
+        );
+        assert_eq!(
+            pages.lookup("event-1").as_deref(),
+            Some(TEST_PAGE_URL),
+            "the mapping is unchanged, nothing orphaned"
+        );
+    }
+
+    #[test]
+    fn plan_created_with_known_url_plans_update() {
+        let mut known = IdempotencyMap::new();
+        known.record("event-1", TEST_PAGE_URL);
+        let planned = plan_actions(
+            &[RunRequest {
+                discord_event: scheduled("event-1"),
+                change: ChangeKind::Created,
+            }],
+            &known,
+        )
+        .expect("plannable");
+        assert_eq!(planned.len(), 1);
+        assert!(
+            matches!(planned[0], PlannedAction::Update { .. }),
+            "a Created with a known URL plans an update, never a second create: {:?}",
+            planned[0]
+        );
+
+        let empty = IdempotencyMap::new();
+        let planned = plan_actions(
+            &[RunRequest {
+                discord_event: scheduled("event-1"),
+                change: ChangeKind::Created,
+            }],
+            &empty,
+        )
+        .expect("plannable");
+        assert!(
+            matches!(planned[0], PlannedAction::Create { .. }),
+            "a Created with no mapping still plans a create: {:?}",
+            planned[0]
+        );
+    }
+
+    #[test]
+    fn update_challenge_aborts_with_ceo_notification_and_keeps_mapping() {
+        let fake = Fake::default();
+        fake.edit(|inner| {
+            inner.update = Err(DriverError::Challenge(ChallengeSignal::LoginWall));
+        });
+        let secrets = FakeSecrets::default();
+        let mut pages = IdempotencyMap::new();
+        pages.record("event-1", TEST_PAGE_URL);
+
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Updated).expect("abort runs");
+        assert!(
+            matches!(
+                outcome,
+                RunOutcome::ChallengeAborted {
+                    retries: 0,
+                    ceo_notified: true
+                }
+            ),
+            "an update challenge aborts with zero retries and CEO flagged: {outcome:?}"
+        );
+        assert_eq!(
+            fake.notes().len(),
+            1,
+            "the update challenge notifies the CEO exactly once"
+        );
+        let rows = fake.rows();
+        assert_eq!(rows.len(), 1, "abort audits exactly one row: {rows:?}");
+        assert!(
+            rows[0]
+                .screenshot_png
+                .as_ref()
+                .is_some_and(|png| !png.is_empty()),
+            "the update challenge abort records screenshot evidence"
+        );
+        assert_eq!(
+            pages.lookup("event-1").as_deref(),
+            Some(TEST_PAGE_URL),
+            "the mapping is unchanged by a challenge abort"
+        );
+        assert_eq!(
+            fake.full_updates().len(),
+            1,
+            "exactly the challenged update ran, no second driver call"
+        );
+        assert_eq!(
+            fake.full_creates().len(),
+            0,
+            "no create follows a challenge"
+        );
+    }
+
+    #[test]
+    fn delete_challenge_aborts_with_ceo_notification_and_keeps_mapping() {
+        let fake = Fake::default();
+        fake.edit(|inner| {
+            inner.delete = Err(DriverError::Challenge(ChallengeSignal::Checkpoint));
+        });
+        let secrets = FakeSecrets::default();
+        let mut pages = IdempotencyMap::new();
+        pages.record("event-1", TEST_PAGE_URL);
+
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Cancelled).expect("abort runs");
+        assert!(
+            matches!(
+                outcome,
+                RunOutcome::ChallengeAborted {
+                    retries: 0,
+                    ceo_notified: true
+                }
+            ),
+            "a delete challenge aborts with zero retries and CEO flagged: {outcome:?}"
+        );
+        assert_eq!(
+            fake.notes().len(),
+            1,
+            "the delete challenge notifies the CEO exactly once"
+        );
+        let rows = fake.rows();
+        assert_eq!(rows.len(), 1, "abort audits exactly one row: {rows:?}");
+        assert!(
+            rows[0]
+                .screenshot_png
+                .as_ref()
+                .is_some_and(|png| !png.is_empty()),
+            "the delete challenge abort records screenshot evidence"
+        );
+        assert_eq!(
+            pages.lookup("event-1").as_deref(),
+            Some(TEST_PAGE_URL),
+            "the mapping is unchanged by a challenge abort"
+        );
+        assert_eq!(
+            fake.full_creates().len(),
+            0,
+            "no create follows a challenge"
+        );
+        assert_eq!(
+            fake.full_updates().len(),
+            0,
+            "no update follows a challenge"
+        );
+    }
+
+    #[test]
+    fn create_readback_url_mismatch_falls_back_to_link_post() {
+        const OTHER_URL: &str = "https://www.facebook.com/events/9999999999";
+        let fake = Fake::default();
+        fake.edit(|inner| {
+            // URL-only readback pointing at a different page: only the URL
+            // equality guard can catch this (`readback_matches` skips the
+            // unobserved content fields).
+            inner.readback = Some(EventReadback {
+                url: OTHER_URL.to_owned(),
+                name: None,
+                starts_at: None,
+            });
+        });
+        let secrets = FakeSecrets::default();
+        let mut pages = IdempotencyMap::new();
+
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Created).expect("fallback runs");
+        assert!(
+            matches!(outcome, RunOutcome::LinkPostFallback { .. }),
+            "a readback URL mismatch must not verify: {outcome:?}"
+        );
+        let rows = fake.rows();
+        assert_eq!(rows.len(), 2, "prior row + link-post row: {rows:?}");
+        assert_eq!(rows[0].outcome, "verify_failed_readback_mismatch");
+        assert_eq!(
+            pages.lookup("event-1").as_deref(),
+            Some(TEST_PAGE_URL),
+            "the unverified event stays mapped"
+        );
+    }
+
+    #[test]
+    fn update_readback_url_mismatch_falls_back_to_link_post() {
+        const OTHER_URL: &str = "https://www.facebook.com/events/9999999999";
+        let fake = Fake::default();
+        fake.edit(|inner| {
+            inner.readback = Some(EventReadback {
+                url: OTHER_URL.to_owned(),
+                name: None,
+                starts_at: None,
+            });
+        });
+        let secrets = FakeSecrets::default();
+        let mut pages = IdempotencyMap::new();
+        pages.record("event-1", TEST_PAGE_URL);
+
+        let outcome = run(&fake, &secrets, &mut pages, ChangeKind::Updated).expect("fallback runs");
+        assert!(
+            matches!(outcome, RunOutcome::LinkPostFallback { .. }),
+            "a readback URL mismatch on update must not verify: {outcome:?}"
+        );
+        let rows = fake.rows();
+        assert_eq!(rows.len(), 2, "prior row + link-post row: {rows:?}");
+        assert_eq!(rows[0].outcome, "verify_failed_readback_mismatch");
+        assert_eq!(
+            pages.lookup("event-1").as_deref(),
+            Some(TEST_PAGE_URL),
+            "the mapping is unchanged by a verify failure"
+        );
     }
 }
