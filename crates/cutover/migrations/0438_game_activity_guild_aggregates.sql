@@ -1,4 +1,4 @@
--- 0435_game_activity_guild_aggregates: guild-level game-activity aggregates.
+-- 0438_game_activity_guild_aggregates: guild-level game-activity aggregates.
 --
 -- Durable half of the game-activity analytics pipeline (core
 -- `game_activity` sessionize/aggregate, fed by gateway presence deltas and

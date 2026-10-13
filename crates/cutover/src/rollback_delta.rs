@@ -65,6 +65,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "automod_delivery_claims", measure: TableMeasure::Columns(&["claimed_at", "completed_at"]) },
     TableSpec { table: "automod_processed_messages", measure: TableMeasure::Columns(&["processed_at"]) },
     TableSpec { table: "automod_violations", measure: TableMeasure::Columns(&["updated_at"]) },
+    TableSpec { table: "backfill_cursors", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "community_facts", measure: TableMeasure::Columns(&["recorded_at"]) },
     TableSpec { table: "community_scorecard_alerts", measure: TableMeasure::Columns(&["created_at"]) },
     // Retry reservation (TOG-11145): next_attempt_at is a BIGINT epoch-ms
@@ -145,10 +146,17 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         ),
     },
     TableSpec { table: "lfg_signups", measure: TableMeasure::Columns(&["joined_at"]) },
+    TableSpec { table: "member_catchup_cursors", measure: TableMeasure::Columns(&["updated_at"]) },
+    TableSpec { table: "member_catchup_members", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "member_erasure_audit", measure: TableMeasure::Columns(&["erased_at"]) },
     TableSpec { table: "member_exclusions", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "member_levels", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "member_ranks", measure: TableMeasure::Columns(&["updated_at"]) },
+    // Seasonal projection (migrations 0100/0101): award upserts move
+    // updated_at and reset the decayed_weeks watermark; decay rewrites
+    // seasonal_xp/decayed_weeks but leaves an occurred_at-stamped decay row
+    // in xp_awards, mirroring the member_levels lifetime path.
+    TableSpec { table: "member_season_xp", measure: TableMeasure::Columns(&["updated_at"]) },
     // Pure projection: any milestone/activity write must move the maximum.
     TableSpec {
         table: "members",

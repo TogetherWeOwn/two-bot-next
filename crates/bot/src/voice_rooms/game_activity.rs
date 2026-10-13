@@ -301,22 +301,32 @@ impl GameActivityCollector {
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
-        let buffer = inner.deltas.entry(guild).or_default();
-        deltas.extend(std::mem::take(buffer));
-        if deltas.len() > MAX_DELTAS_PER_GUILD {
-            let overflow = deltas.len() - MAX_DELTAS_PER_GUILD;
-            deltas.drain(..overflow);
+        let overflow = {
+            let buffer = inner.deltas.entry(guild).or_default();
+            deltas.extend(std::mem::take(buffer));
+            let overflow = deltas.len().saturating_sub(MAX_DELTAS_PER_GUILD);
+            if overflow > 0 {
+                deltas.drain(..overflow);
+            }
+            *buffer = std::mem::take(&mut deltas);
+            overflow
+        };
+        if overflow > 0 {
             inner.dropped_deltas += overflow as u64;
         }
-        *buffer = deltas;
-        let buffer = inner.spans.entry(guild).or_default();
-        spans.extend(std::mem::take(buffer));
-        if spans.len() > MAX_SPANS_PER_GUILD {
-            let overflow = spans.len() - MAX_SPANS_PER_GUILD;
-            spans.drain(..overflow);
+        let overflow = {
+            let buffer = inner.spans.entry(guild).or_default();
+            spans.extend(std::mem::take(buffer));
+            let overflow = spans.len().saturating_sub(MAX_SPANS_PER_GUILD);
+            if overflow > 0 {
+                spans.drain(..overflow);
+            }
+            *buffer = std::mem::take(&mut spans);
+            overflow
+        };
+        if overflow > 0 {
             inner.dropped_spans += overflow as u64;
         }
-        *buffer = spans;
     }
 
     /// Evicted-buffer counters `(deltas, spans)` for tests and operators.

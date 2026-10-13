@@ -169,7 +169,7 @@ class FixtureTests(unittest.TestCase):
 class RealTreeTests(unittest.TestCase):
     def test_real_tree_passes_with_the_documented_exemption(self):
         self.assertEqual(gate.check(ROOT), [])
-        self.assertEqual(set(gate.EXEMPT), {"reference_docs", "event_store_s1"})
+        self.assertEqual(set(gate.EXEMPT), {"reference_docs"})
 
 
 if __name__ == "__main__":

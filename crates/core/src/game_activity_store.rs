@@ -1,7 +1,7 @@
 //! Game-activity guild-aggregate sqlx store.
 //!
 //! Ports the durable half of the game-activity analytics pipeline onto the
-//! `0435`/`0436` table: [`upsert_guild_aggregates`] adds one flush of
+//! `0438`/`0439` table: [`upsert_guild_aggregates`] adds one flush of
 //! [`GuildGameAggregate`](crate::game_activity::GuildGameAggregate) rows into
 //! the per-(guild, game) counters, and
 //! [`read_guild_aggregates`](read_guild_aggregates) reads a guild's rows back
@@ -371,7 +371,7 @@ mod tests {
         .execute(&pool)
         .await?;
         sqlx::raw_sql(include_str!(
-            "../../cutover/migrations/0435_game_activity_guild_aggregates.sql"
+            "../../cutover/migrations/0438_game_activity_guild_aggregates.sql"
         ))
         .execute(&pool)
         .await?;

@@ -24,6 +24,13 @@ pub struct SharedState {
     pub database: Option<sqlx::PgPool>,
     /// Why the gateway task last stopped (TOG-13044); empty until it fails.
     pub failure: FailureSlot,
+    /// Verifier for the private backfill progress route: the same
+    /// `TWO_INTERNAL_KEYS` ring as the internal-action receiver. Empty by
+    /// default (every read refuses); production attaches `from_env()`, tests
+    /// attach an explicit spec. Lives in listener state — not an `Extension`
+    /// layer — so the handler stays a `State + Request` pair like the
+    /// receiver's `handle`.
+    pub backfill_ring: crate::ops_backfill::SharedRing,
 }
 
 impl SharedState {
@@ -32,7 +39,14 @@ impl SharedState {
             gateway,
             database,
             failure: FailureSlot::default(),
+            backfill_ring: crate::ops_backfill::SharedRing::empty(),
         }
+    }
+
+    /// Attach the backfill verifier without disturbing the other fields.
+    pub fn with_backfill_ring(mut self, ring: crate::ops_backfill::SharedRing) -> Self {
+        self.backfill_ring = ring;
+        self
     }
 }
 
@@ -55,10 +69,19 @@ pub(crate) fn router_with_guard(
     jobs: crate::jobs::SharedStatus,
     guard: Arc<two_bot_discord::ratelimit_guard::RateLimitGuard>,
 ) -> Router {
+    // Attach the backfill verifier before `with_state`: the handler reads
+    // both pool and ring from listener state (a `State + Request` pair like
+    // the internal-action receiver's `handle`), never an `Extension` layer.
+    let state = state.with_backfill_ring(crate::ops_backfill::SharedRing::from_env());
     Router::new()
         .route("/health", get(health))
         .route("/healthz", get(health))
         .route("/readyz", get(readyz))
+        // Backfill progress reads the same TWO_INTERNAL_KEYS ring as the
+        // internal-action receiver, over its own path-bound signature. Merged
+        // before `with_state` (unlike the stateless metrics route below): the
+        // handler reads pool and ring from listener state.
+        .merge(crate::ops_backfill::router())
         .with_state((state.clone(), jobs.clone()))
         .layer(axum::Extension(Arc::clone(&guard)))
         // Metrics and readiness sample the same guard as production executors.
@@ -104,8 +127,8 @@ pub(crate) fn router_with_guard(
 
 /// Routes the public listener serves; the only paths a span may record.
 /// Keep in sync with `router_with_guard`, `metrics_http::router_with_guard`
-/// and `ops_http::router_with_state`.
-const TRACED_PATHS: [&str; 7] = [
+/// `ops_backfill::router` and `ops_http::router_with_state`.
+const TRACED_PATHS: [&str; 8] = [
     "/health",
     "/healthz",
     "/readyz",
@@ -113,6 +136,7 @@ const TRACED_PATHS: [&str; 7] = [
     "/ops/summary",
     "/ops/gateway",
     "/ops/backfill",
+    "/ops/backfill/progress",
 ];
 
 /// Recorded for every path that is not an exact `TRACED_PATHS` entry.
@@ -466,6 +490,7 @@ mod tests {
             ("/ops/summary", "/ops/summary"),
             ("/ops/gateway", "/ops/gateway"),
             ("/ops/backfill", "/ops/backfill"),
+            ("/ops/backfill/progress", "/ops/backfill/progress"),
             ("/ops/summary?token=fixture-query-secret", "/ops/summary"),
             ("/readyz?token=fixture-query-secret", "/readyz"),
             ("/health?key=fixture-query-secret", "/health"),
@@ -506,7 +531,7 @@ mod tests {
             "fixture-header-secret",
             "fixture-encoded-token",
         ];
-        let cases: [(&str, StatusCode); 14] = [
+        let cases: [(&str, StatusCode); 15] = [
             (
                 "/readyz?token=fixture-query-secret",
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -541,6 +566,10 @@ mod tests {
             ),
             ("/Health", StatusCode::NOT_FOUND),
             ("/metrics?token=fixture-query-secret", StatusCode::OK),
+            // The backfill progress route is signed: a bare read refuses without
+            // leaking whether any key exists. The open `/ops/backfill`
+            // roll-up stays unauthenticated (see `ops_http`).
+            ("/ops/backfill/progress", StatusCode::UNAUTHORIZED),
             ("/ops/summary?token=fixture-query-secret", StatusCode::OK),
         ];
         let recorder = SpanRecorder::default();

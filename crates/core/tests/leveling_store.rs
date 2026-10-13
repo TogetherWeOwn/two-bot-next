@@ -320,9 +320,11 @@ async fn level_up_crosses_threshold_and_plans_grants(
     let fixture = database().await;
     let pool = fixture.pool().clone();
     // Bring A to 99 XP (message 15 × 6 = 90, then a 9-XP top-up), then one
-    // more award crosses the L1 floor at 100.
+    // more award crosses the L1 floor at 100. One award per UTC day so the
+    // AC2 daily ladder (15/5/0) and same-channel burst halving stay out of
+    // this level-up path; both have dedicated policy tests.
     for step in 0..6 {
-        store::award_message(&pool, GUILD, A, &at(step * 61), None).await?;
+        store::award_message(&pool, GUILD, A, &at(step * 86_400), None).await?;
     }
     store::award(
         &pool,
@@ -330,11 +332,11 @@ async fn level_up_crosses_threshold_and_plans_grants(
         A,
         two_bot_core::leveling::XpSource::Message,
         9,
-        &at(6 * 61 + 1),
+        &at(6 * 86_400),
         None,
     )
     .await?;
-    let award = store::award_message(&pool, GUILD, A, &at(7 * 61 + 2), None).await?;
+    let award = store::award_message(&pool, GUILD, A, &at(7 * 86_400), None).await?;
     assert!(award.leveled_up);
     assert_eq!((award.previous_level, award.level), (0, 1));
     assert_eq!(award.total_xp, 114);
@@ -393,8 +395,16 @@ async fn submillisecond_awards_keep_exact_sixty_second_boundary(
     let blocked =
         store::award_message(&pool, GUILD, A, "2026-09-30T14:01:59.000500+02:00", None).await?;
     assert_eq!(blocked.awarded, 0);
-    let third =
-        store::award_message(&pool, GUILD, A, "2026-09-30T14:02:00.000500+02:00", None).await?;
+    // Distinct channel so the AC2 same-channel burst halving (dedicated
+    // policy test) stays out of this millisecond-boundary path.
+    let third = store::award_message(
+        &pool,
+        GUILD,
+        A,
+        "2026-09-30T14:02:00.000500+02:00",
+        Some("200000000000000002"),
+    )
+    .await?;
     assert_eq!(third.awarded, 15);
     // Stored instants carry no sub-millisecond residue.
     let stored: String = sqlx::query_scalar(
