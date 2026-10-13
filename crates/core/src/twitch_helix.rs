@@ -370,12 +370,16 @@ pub enum ActionOutcome {
     },
 }
 
+/// Twitch rejects (400) a listing that carries more than one of the
+/// `status`/`type`/`user_id`/`subscription_id`/`conduit_id` filters, so the
+/// broadcaster lookup sends `user_id` alone; `parse_subscriptions` already
+/// keeps only `stream.online` v1 webhooks, so the type filter is redundant.
 fn subscriptions_url(broadcaster_user_id: Option<&str>, cursor: Option<&str>) -> String {
     let mut query = form_urlencoded::Serializer::new(String::new());
-    query.append_pair("type", "stream.online");
-    if let Some(broadcaster_user_id) = broadcaster_user_id {
-        query.append_pair("user_id", broadcaster_user_id);
-    }
+    match broadcaster_user_id {
+        Some(broadcaster_user_id) => query.append_pair("user_id", broadcaster_user_id),
+        None => query.append_pair("type", "stream.online"),
+    };
     if let Some(cursor) = cursor {
         query.append_pair("after", cursor);
     }
@@ -888,8 +892,52 @@ mod tests {
         }
     }
 
+    /// Twitch answers 400 when a subscription listing carries more than one
+    /// filter; the scripted transport fails the test instead of masking it.
+    fn assert_single_listing_filter(url: &str) {
+        let Some((_, query)) = url.split_once('?') else {
+            return;
+        };
+        let filters = form_urlencoded::parse(query.as_bytes())
+            .filter(|(key, _)| {
+                matches!(
+                    key.as_ref(),
+                    "status" | "type" | "user_id" | "subscription_id" | "conduit_id"
+                )
+            })
+            .count();
+        assert!(filters <= 1, "listing URL carries {filters} filters: {url}");
+    }
+
+    #[test]
+    fn listing_url_carries_exactly_one_filter() {
+        assert_eq!(
+            subscriptions_url(None, None),
+            format!("{HELIX_SUBSCRIPTIONS_URL}?type=stream.online")
+        );
+        assert_eq!(
+            subscriptions_url(Some("222"), Some("a+b")),
+            format!("{HELIX_SUBSCRIPTIONS_URL}?user_id=222&after=a%2Bb")
+        );
+        for url in [
+            subscriptions_url(None, Some("c")),
+            subscriptions_url(Some("222"), None),
+        ] {
+            assert_single_listing_filter(&url);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "filters")]
+    fn scripted_transport_rejects_two_filters() {
+        assert_single_listing_filter(&format!(
+            "{HELIX_SUBSCRIPTIONS_URL}?type=stream.online&user_id=1"
+        ));
+    }
+
     impl HelixTransport for ScriptTransport {
         async fn send(&self, request: HelixRequest) -> Result<HelixResponse, HelixError> {
+            assert_single_listing_filter(&request.url);
             self.seen.lock().unwrap().push(request);
             self.answers
                 .lock()
@@ -1137,10 +1185,7 @@ mod tests {
         assert_eq!(urls.len(), 4);
         assert_eq!(urls[1], format!("{HELIX_SUBSCRIPTIONS_URL}?id=stale-id"));
         assert_eq!(urls[2], HELIX_SUBSCRIPTIONS_URL);
-        assert_eq!(
-            urls[3],
-            format!("{HELIX_SUBSCRIPTIONS_URL}?type=stream.online&user_id=222")
-        );
+        assert_eq!(urls[3], format!("{HELIX_SUBSCRIPTIONS_URL}?user_id=222"));
         // The create body carries our callback and condition, never logged here.
         let created = &transport.seen.lock().unwrap()[2];
         let document: serde_json::Value =
