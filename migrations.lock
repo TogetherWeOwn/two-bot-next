@@ -400,6 +400,11 @@
     "crates/cutover/migrations/0438_retention_queues.sql": {
       "sha256": "7ab729b1c4340ab962ef0b8beba6aff3ecd1962e2fb0f002d5e1e75b5c351f56",
       "justification": "Retention rolling-window queues: guild-purge queue and user-deletion request ledger backing 30-day raw and 45-day audit roll-off with under-72-hour deletion receipts; additive, backout drops both tables. Renumbered from 0427 to 0437 and then 0438 after main claimed 0427 for event-store voice capture, 0435/0436 for backfill cursors and member catch-up, and 0437 for event-store S1 core; the 0427/0437 files never merged so no database has applied them under either number."
+    },
+    "crates/cutover/migrations/0439_event_store_invite_scheduled_event_capture.sql": {
+      "sha256": "ec8fa9475530ab759dafa3d2963e9465796daa7e05f8d500d001aa2a13721312",
+      "justification": "Event-store S7 invite + scheduled-event capture: order-independent event_store invite columns (invite_code_hash as hex sha256, never the raw code, plus inviter_id) and scheduled-event columns (scheduled_event_id plus event_status/entity_type integer enums) with nullable convergence and the shared UNIQUE dedup index; ids+hash+timestamps+enums only, no description/name/location/username columns. Renumbered to 0439 because the merged retention migration owns 0438; the S7 migration has not merged."
+
     }
   }
 }

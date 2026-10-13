@@ -94,10 +94,11 @@ async fn dry_run_execute_counts_scope_survivors_and_second_run_zero() {
         )))
         .bind(GUILD).bind(USER).fetch_all(db.pool()).await.unwrap();
         // The other member and both members in the other guild survive.
-        // event_store seeds four rows per member: one presence row binding
-        // user_id plus three S8 rows (actor-only, target-only, user-only),
-        // so each erasure predicate branch is exercised independently.
-        let expected_survivors = if entry.table == "event_store" { 12 } else { 3 };
+        // event_store seeds five rows per member: one presence row binding
+        // user_id plus three S8 rows (actor-only, target-only, user-only)
+        // plus one S7 invite row binding inviter_id only, so each erasure
+        // predicate branch is exercised independently.
+        let expected_survivors = if entry.table == "event_store" { 15 } else { 3 };
         assert_eq!(
             rows.len(),
             expected_survivors,
@@ -119,7 +120,7 @@ async fn dry_run_execute_counts_scope_survivors_and_second_run_zero() {
         .unwrap();
     assert_eq!(before.len(), plan.tables.len());
     for row in &before {
-        let expected = if row.table == "event_store" { 4 } else { 1 };
+        let expected = if row.table == "event_store" { 5 } else { 1 };
         assert_eq!(row.rows, expected, "{} dry-run count", row.table);
     }
     assert_eq!(audit_count(db.pool()).await, 0);
