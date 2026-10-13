@@ -31,11 +31,6 @@
       "predicate": "guild_id = $1 AND (member_id = $2 OR metadata ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)') OR idempotency_key ~ ('(^|[^0-9])' || $2 || '([^0-9]|$)'))"
     },
     {
-      "table": "event_store",
-      "columns": ["user_id"],
-      "predicate": "guild_id = $1 AND user_id = $2"
-    },
-    {
       "table": "invite_snapshots",
       "columns": ["inviter_id"],
       "predicate": "guild_id = $1 AND inviter_id = $2"
@@ -229,6 +224,11 @@
       "table": "voice_logging_mention_members",
       "columns": ["member_id"],
       "predicate": "guild_id = $1 AND member_id = $2"
+    },
+    {
+      "table": "event_store",
+      "columns": ["actor_id", "target_id", "user_id"],
+      "predicate": "guild_id = $1 AND (actor_id = $2 OR target_id = $2 OR user_id = $2)"
     },
     {
       "table": "members",

@@ -353,6 +353,10 @@
       "sha256": "36a256cdb57fa5acaedfa1a0fa72a5442ef1c6fc91e23b9c64d25e99e9176ddc",
       "justification": "Event-store S5 message/reaction capture: order-independent event_store table plus emoji id/name reference columns for MESSAGE_UPDATE/DELETE/DELETE_BULK and MESSAGE_REACTION_ADD/REMOVE, idempotent on UNIQUE dedup_key, no message-body columns."
     },
+    "crates/cutover/migrations/0431_event_store_stage_interaction_audit_capture.sql": {
+      "sha256": "2d3d4725f66f7bbccca06d34c5552227aebb977cedee1222ba2e3dd20ce2782d",
+      "justification": "Event-store S8 stage/interaction-observe/audit-log capture: order-independent event_store table plus stage_instance_id/privacy_level, interaction_id/interaction_type/application_id/command_id and audit_log_entry_id/action_type/actor_id/target_id columns with nullable user_id and DROP NOT NULL for S2/S4 order-independence, idempotent on UNIQUE dedup_key, no free-text columns."
+    },
     "crates/cutover/migrations/0432_event_store_member_capture.sql": {
       "sha256": "81e51abeda792b6e8dfa4ad714e744fcc09b96f9d857ca70bf4080ef8ce46faf",
       "justification": "Event-store S2 member capture: order-independent event_store table plus premium_since, nick_changed flag and role-id columns for GUILD_MEMBER_ADD/REMOVE/UPDATE, idempotent on the shared UNIQUE dedup_key index, no free-text columns."
