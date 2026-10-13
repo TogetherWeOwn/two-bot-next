@@ -338,8 +338,8 @@
       "justification": "RSVP check-in capacity count index: cover (guild_id, source) so record_checkin counts the occurrence without scanning the guild message history while holding the occurrence lock."
     },
     "crates/cutover/migrations/0427_event_store_voice_capture.sql": {
-      "sha256": "1965b2eb91ffa7c01573107ec6e9caafaa609eeb6934d2ef0ca1d32280653d3c",
-      "justification": "Event-store S4 voice capture: create the append-only event_store table (or add its voice columns) with ids, session, timestamps and enum mute/deaf/video/stream flags plus the shared UNIQUE dedup index; additive, backout drops the table."
+      "sha256": "7b96ea3478d398853a32690e248b3350944ef0267e90ca89a338ba9eb5c39397",
+      "justification": "Event-store S4 voice capture: create the append-only event_store table (or add its voice columns) with ids including nullable message_id for S1 coexistence, session, timestamps and enum mute/deaf/video/stream flags plus the shared UNIQUE dedup index; additive, backout drops the table."
     }
   }
 }
