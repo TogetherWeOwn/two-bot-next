@@ -80,7 +80,7 @@ the target first.
 A v4 archive must declare every covered table except the ones v5 added
 (`V5_ADDED_TABLES`), the ones v6 added (`V6_ADDED_TABLES`) and the ones v7
 added (`V7_ADDED_TABLES`), so recovery points written before
-create-reservation persistence, the retention queues (0435) and event-store
+create-reservation persistence, the retention queues (0437) and event-store
 capture (0427 voice, 0428 presence, 0429 thread lifecycle, 0430
 message/reaction capture, 0431 stage/interaction-observe/audit-log capture
 and 0432 member deltas), and the seasonal XP projection (0100) remain

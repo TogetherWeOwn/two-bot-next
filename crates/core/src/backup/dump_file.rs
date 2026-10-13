@@ -151,7 +151,7 @@ pub const DUMP_TABLES: &[&str] = &[
     // XP projection beside `member_levels` is a v7 addition; see
     // [`V7_ADDED_TABLES`].
     "voice_create_reservations",
-    // V6 adds retention queues (0435) and the shared event-store table for the
+    // V6 adds retention queues (0437) and the shared event-store table for the
     // S1-S8 slices (0427 S4 voice capture plus 0428 S3 presence plus 0429 S6
     // thread lifecycle plus 0430 S5 message/reaction capture plus 0431 S8
     // stage/interaction-observe/audit-log capture plus 0432 S2 member
@@ -180,7 +180,7 @@ pub const V5_ADDED_TABLES: &[&str] = &[
     "privacy_opt_out_audit",
 ];
 
-/// Tables first covered by v6 (retention queues, migration 0435, plus
+/// Tables first covered by v6 (retention queues, migration 0437, plus
 /// event-store capture: 0427 voice, 0428 presence, 0429 thread lifecycle,
 /// 0430 message/reaction capture, 0431 stage/interaction/audit capture,
 /// 0432 member deltas).
@@ -231,6 +231,20 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     // and silently break rollback coverage.
     "rollback_journal",
     "rollback_watermarks",
+    // Resumable Discord backfill progress (store 0408/0409, cutover 0433
+    // mirror, cutover 0434 member catch-up): per-family pagination cursors,
+    // channel-history metadata catch-up, per-guild member rows and resume
+    // cursors. Rows are re-capturable from the Discord API on the next worker
+    // run (the cutover ledger marks 0408/0433/0434 re-runnable: drop and
+    // re-checkpoint). Never replay a pre-restore cursor into a recovered
+    // process: a restored cursor could mark post-backup messages as already
+    // backfilled and silently skip them, the same watermark hazard as
+    // rollback_watermarks above.
+    "backfill_cursors",
+    "backfill_history_messages",
+    "backfill_history_counts",
+    "member_catchup_cursors",
+    "member_catchup_members",
     // Migration ledgers describe target DDL; replacing them would falsely mark
     // unapplied migrations as applied. Legacy schema_migrations is diagnostic
     // manifest metadata only, never restored application data. The store
@@ -1843,7 +1857,7 @@ mod tests {
     #[test]
     fn v5_archives_without_v6_tables_validate_but_v6_requires_them() {
         // A v5 archive carries reservations but predates the v6 tables
-        // (retention queues 0435 plus event-store capture 0427-0432): it must
+        // (retention queues 0437 plus event-store capture 0427-0432): it must
         // validate at version 5 and fail at version 6.
         let tables: Vec<Value> = DUMP_TABLES
             .iter()

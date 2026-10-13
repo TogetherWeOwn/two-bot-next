@@ -512,7 +512,7 @@ VALUES ('100000000000000001', '100000000000000050', 'vote_started', '10000000000
        ('100000000000000001', '100000000000000051', 'vote_refused', '100000000000000033',
         '100000000000000003', '100000000000000002', 'protected_target',
         NULL, NULL, NULL, '2026-08-03T10:05:00Z');
--- Retention queues (0435): one queued guild purge plus one pending and one
+-- Retention queues (0437): one queued guild purge plus one pending and one
 -- completed user-deletion request, so the dump/restore round trip covers both
 -- the pending-NULL and completed-receipt shapes.
 INSERT INTO retention_guild_purge_queue (guild_id, enqueued_at)

@@ -241,6 +241,11 @@
       "predicate": "guild_id = $1 AND member_id = $2"
     },
     {
+      "table": "member_catchup_members",
+      "columns": ["member_id"],
+      "predicate": "guild_id = $1 AND member_id = $2"
+    },
+    {
       "table": "event_store",
       "columns": ["actor_id", "target_id", "user_id"],
       "predicate": "guild_id = $1 AND (actor_id = $2 OR target_id = $2 OR user_id = $2)"
