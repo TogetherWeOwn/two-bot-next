@@ -724,7 +724,11 @@ async fn a_transient_guard_loss_requeues_instead_of_retiring() {
     assert_eq!(worker.queue.pending_counts(GUILD), (1, 0));
     assert!(worker.failures().is_empty());
     // The reconnect retries the same write to completion.
-    worker.http.before_limit = None;
+    // The writer handle is shared with the watchdog sibling, so clear the
+    // hook through the sole owner instead of a direct field write.
+    Arc::get_mut(&mut worker.http)
+        .expect("sole writer handle")
+        .before_limit = None;
     worker.live.publish(snapshot(&[500], room_members()));
     assert!(worker.dispatch_one(0).await);
     assert_eq!(limit_writes(&trace), ["limit:500:5"]);
