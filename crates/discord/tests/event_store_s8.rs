@@ -46,7 +46,7 @@
 
 use serde_json::{json, Value};
 use sqlx::PgPool;
-use two_bot_testsupport::TestDatabase;
+use two_bot_testsupport::{assert_event_store_columns, TestDatabase};
 
 const GUILD: &str = "99991";
 const CHANNEL: &str = "99992";
@@ -344,7 +344,11 @@ async fn table_columns(pool: &PgPool) -> Vec<String> {
 
 /// The S8 columns that must exist after the S8 migration: ids, timestamps,
 /// the resume-safe key, the member id relaxed for sibling order-independence,
-/// and the stage/interaction/audit enums only.
+/// and the stage/interaction/audit enums only. The table is shared with the
+/// other capture slices, so the schema check pairs this required set with the
+/// reviewed allowlist in `two_bot_testsupport::EVENT_STORE_ALLOWED_COLUMNS`:
+/// a sibling slice adding its columns stays green, while a raw-payload or
+/// free-text column outside every reviewed slice fails.
 const REQUIRED_COLUMNS: &[&str] = &[
     "action_type",
     "actor_id",
@@ -366,83 +370,21 @@ const REQUIRED_COLUMNS: &[&str] = &[
     "user_id",
 ];
 
-/// The reviewed column allowlist for the shared `event_store` table: the union
-/// of the slices' columns (S2 member deltas, S3 presence, S4 voice, S5
-/// message/reaction, S6 threads, S8 stage/interaction) plus the `id` primary
-/// key. Every actual column must be a member, so any new free-text column (a
-/// body-carrying `raw_payload`, `stage_topic`, or similar) fails the suite. A
-/// denylist cannot fail on a new name, so this asserts the closed set instead.
-/// Later slices extend this list when they add their own reviewed columns
-/// (`ADD COLUMN IF NOT EXISTS` per 0431).
-const ALLOWED_COLUMNS: &[&str] = &[
-    "action_type",
-    "activity_type",
-    "actor_id",
-    "application_id",
-    "archived",
-    "audit_log_entry_id",
-    "channel_id",
-    "command_id",
-    "deaf",
-    "dedup_key",
-    "emoji_id",
-    "emoji_name",
-    "event_time",
-    "event_type",
-    "guild_id",
-    "id",
-    "interaction_id",
-    "interaction_type",
-    "invitable",
-    "locked",
-    "message_id",
-    "mute",
-    "nick",
-    "nick_changed",
-    "parent_id",
-    "premium_since",
-    "presence_status",
-    "privacy_level",
-    "received_at",
-    "roles",
-    "self_deaf",
-    "self_mute",
-    "self_stream",
-    "self_video",
-    "session_id",
-    "stage_instance_id",
-    "suppress",
-    "target_id",
-    "thread_id",
-    "user_id",
-];
-
 fn assert_stage_schema(columns: &[String]) {
     assert!(
         !columns.is_empty(),
         "S8 creates the stage/interaction/audit columns on the append-only event_store table"
     );
-    for required in REQUIRED_COLUMNS {
-        assert!(
-            columns.iter().any(|column| column == required),
-            "event_store keeps S8 column {required}; has {columns:?}"
-        );
-    }
-    for column in columns {
-        assert!(
-            ALLOWED_COLUMNS.contains(&column.as_str()),
-            "event_store holds only reviewed slice columns; unexpected {column}; \
-             has {columns:?} (extend ALLOWED_COLUMNS only with a reviewed slice column)"
-        );
-    }
+    assert_event_store_columns(columns, REQUIRED_COLUMNS);
 }
 
 /// Only the reviewed S2 `roles` role-id array may use `jsonb`: free-text
 /// payloads (raw stage/interaction/audit blobs) have no other schema home
 /// whatever the column name. The writer below binds ids/enums only, so this
-/// type fence plus the shared allowlist above is what makes the privacy
-/// tripwire fail on a scratch `raw_payload JSONB` migration while the sibling
-/// S2 `roles` column passes.
+/// type fence plus the shared allowlist in
+/// `two_bot_testsupport::EVENT_STORE_ALLOWED_COLUMNS` is what makes the
+/// privacy tripwire fail on a scratch `raw_payload JSONB` migration while the
+/// sibling S2 `roles` column passes.
 async fn assert_no_free_form_types(pool: &PgPool) {
     let types: Vec<(String, String)> = sqlx::query_as(
         "SELECT column_name, data_type FROM information_schema.columns
