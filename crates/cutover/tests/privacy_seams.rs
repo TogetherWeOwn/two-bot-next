@@ -441,6 +441,8 @@ async fn gateway_batch_commit_gates_suppression_toggles_and_inviters() {
                 uses: 5,
                 inviter_id: Some(member_u64(MEMBER_A)),
                 channel_id: None,
+                max_uses: 0,
+                temporary: false,
             }],
             observed_at: at.clone(),
             replace_all: false,

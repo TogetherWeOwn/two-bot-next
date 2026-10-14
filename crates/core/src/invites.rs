@@ -426,6 +426,8 @@ impl<S: InviteSnapshotStore> InviteTracker<S> {
             uses: 0,
             inviter_id: old.inviter_id,
             channel_id: old.channel_id,
+            max_uses: old.max_uses,
+            temporary: old.temporary,
         };
         self.store
             .store_all(guild_id, std::slice::from_ref(&rotated));

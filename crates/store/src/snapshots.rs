@@ -257,6 +257,8 @@ mod privacy_lock_tests {
                         uses: i,
                         inviter_id: Some(member),
                         channel_id: None,
+                        max_uses: 0,
+                        temporary: false,
                     }],
                 );
             }
@@ -346,6 +348,8 @@ mod privacy_lock_tests {
                     uses: 7,
                     inviter_id: Some(member),
                     channel_id: None,
+                    max_uses: 0,
+                    temporary: false,
                 }],
             );
         });

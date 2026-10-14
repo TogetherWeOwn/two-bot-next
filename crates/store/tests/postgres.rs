@@ -604,6 +604,8 @@ async fn suppressed_pair_drops_funnel_writes_while_others_persist() {
             uses: 3,
             inviter_id: Some(456),
             channel_id: None,
+            max_uses: 0,
+            temporary: false,
         }],
     );
     let row: (i32, Option<String>) = sqlx::query_as(
