@@ -259,6 +259,9 @@ async fn runtime_surfaces_failed_guild_purge_and_retries_the_queued_work() {
 
 #[tokio::test]
 async fn runtime_database_error_preserves_s1_schema_guard_and_retries_after_repair() {
+    // S1 schema guard stays fail-closed per request (no receipt while gapped)
+    // but no longer aborts the run: time-window deletes commit and the
+    // gapped request defers as a partial Ok, retrying after repair.
     let _serial = RUNTIME_LOCK.lock().await;
     let Some(db) = database().await else { return };
     let pool = db.pool();
@@ -267,17 +270,27 @@ async fn runtime_database_error_preserves_s1_schema_guard_and_retries_after_repa
         .execute(pool)
         .await
         .unwrap();
-    let before = snapshot(pool).await;
-    let (result, _) = tick(pool, RetentionMode::Execute).await;
-    assert_eq!(
-        result,
-        Err(ErrorClass::Database),
-        "schema coverage refusal must reach the supervisor"
+    let (result, logs) = tick(pool, RetentionMode::Execute).await;
+    result.unwrap();
+    let report = report_line(&logs);
+    assert!(
+        report.starts_with("WARN "),
+        "schema-gap deferral must not be a silent success: {report}"
     );
+    field(report, "deletions_deferred", 1);
+    field(report, "deletions_completed", 0);
+    field(report, "presence_raw_deleted", 1);
+    field(report, "voice_raw_deleted", 1);
+    field(report, "audit_cache_deleted", 1);
+    let pending: bool = sqlx::query_scalar("SELECT status = 'pending' AND receipt_id IS NULL FROM retention_deletion_requests WHERE request_id = $1").bind(&id).fetch_one(pool).await.unwrap();
+    assert!(pending, "gapped request stays pending with no receipt");
+    let presence_left: i64 = sqlx::query_scalar("SELECT count(*) FROM presence_probe")
+        .fetch_one(pool)
+        .await
+        .unwrap();
     assert_eq!(
-        snapshot(pool).await,
-        before,
-        "whole transaction rolls back on schema refusal"
+        presence_left, 0,
+        "time-window deletes must commit despite the schema gap"
     );
     sqlx::query("DROP TABLE retention_uncovered_fixture")
         .execute(pool)
