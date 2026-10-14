@@ -97,11 +97,11 @@ pub struct RetentionReport {
     /// Queued guild purges deferred by an unresolved replay guard in this
     /// run, in both modes. Deferred guilds stay queued with rows untouched
     /// until the guards settle; unlike `guild_purges_failed` this needs no
-    /// incident response, only guard settlement (see [`purge_guild`] for
+    /// incident response, only guard settlement (see `purge_guild` for
     /// the per-guard operator path). The dry run probes the same guards,
     /// so it reports exactly what the live run will defer. Guards already
     /// tracked as deferred user-deletion requests for the same guild do not
-    /// defer it; their rows are consumed by the purge (see [`purge_guild`]).
+    /// defer it; their rows are consumed by the purge (see `purge_guild`).
     pub guild_purges_deferred: u64,
     /// Age of the longest-waiting deferred guild purge, in seconds since
     /// `retention_guild_purge_queue.enqueued_at`. Zero when nothing was
