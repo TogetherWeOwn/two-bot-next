@@ -76,7 +76,7 @@ const SHUTDOWN_RS_EVENTS: [&str; 2] = [
 const JOBS_RS_EVENTS: [&str; 1] = ["periodic job failed"];
 
 /// `crates/bot/src/voice_rooms.rs`: the cataloged voice messages.
-const VOICE_RS_CATALOG_MESSAGES: [&str; 11] = [
+const VOICE_RS_CATALOG_MESSAGES: [&str; 15] = [
     "voice join completed",
     "voice_operation succeeded",
     "voice_operation failed",
@@ -87,6 +87,10 @@ const VOICE_RS_CATALOG_MESSAGES: [&str; 11] = [
     "voice creator orphan needs manual deletion",
     "voice creator join accepted",
     "voice creator join refused before queueing",
+    "voice creator view revalidated from the store",
+    "voice creator view merged stored rows",
+    "voice creator revalidation failed; keeping the cached view",
+    "voice creator refresh failed; keeping the cached view",
     "voice halt re-probe skipped: Discord credential latch set",
 ];
 

@@ -210,6 +210,20 @@ out because only a token fix and a restart clear that halt.
 `voice halt re-probe: store still refusing` / `voice halt re-probe timed out`
 (debug): the latch stays set; the next probe runs after the re-probe interval.
 
+Creator-view refresh actor messages (all in `GuildRoomWorker::revalidate_creator`
+/ `reload_creators` in `crates/bot/src/voice_rooms.rs`, guild-only fields,
+no IDs):
+`voice creator view revalidated from the store` (info): a join arrived for an
+unknown channel id that turned out to be a `voice_creators` row; the row merged
+into the in-memory view instead of refusing the join.
+`voice creator view merged stored rows` (info, only when at least one new row
+merged): a channel create/update/delete (debounced) or the five-minute
+maintenance tick merged stored creator rows into the view; the merge only adds
+or updates, never deletes.
+`voice creator revalidation failed; keeping the cached view` /
+`voice creator refresh failed; keeping the cached view` (debug): the store read
+failed, so the old view is kept and the join is refused exactly as before.
+
 ## Unknowns (TBD)
 
 - Whether any additional `tracing` message on the session-commit path was
