@@ -21,7 +21,7 @@ JOB_INVENTORY = {
                   # Compile-only libFuzzer build, gated by ci-ok like the Rust lanes.
                   "fuzz-compile"},
     "deploy-production.yml": {"guard", "production", "release"},
-    "deploy-staging.yml": {"deploy", "voice-synthetic"},
+    "deploy-staging.yml": {"deploy", "schema-gate", "voice-synthetic"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
     "release.yml": {"tag", "sbom-target", "release-sbom", "attach-sbom"},
@@ -950,6 +950,71 @@ def staging_active_errors(workflow):
     return errors
 
 
+# Pinned build image shared with the staging-migrate plan job (same runner
+# binary, same toolchain). A digest bump must move both together.
+SCHEMA_GATE_IMAGE = ("rust:bookworm@sha256:"
+                     "93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e")
+
+
+def schema_gate_errors(workflow, name="deploy-staging.yml"):
+    """Pre-deploy schema-drift gate: read-only plan, fail closed, no new privilege.
+
+    One job runs on every deploy-staging run (no `if:`, no `needs:` of its own)
+    through the no-reviewer `staging-migrate-plan` environment, builds the
+    reviewed `staging-migrate` binary and fails the run with a `schema drift`
+    error when `pending_before` is non-empty. The deploy job must `needs` the
+    gate, so drift can never deploy silently. Plan-only: no migrator binding,
+    no `--apply`, no role/grant route, no wrangler, no secret indexing.
+    """
+    errors = []
+    jobs = workflow.get("jobs") or {}
+    gate = jobs.get("schema-gate", {})
+    if gate.get("environment") != "staging-migrate-plan":
+        errors.append(f"{name}:schema-gate: must read only the staging-migrate-plan Environment binding")
+    if gate.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:schema-gate: must keep contents:read only")
+    if "if" in gate:
+        errors.append(f"{name}:schema-gate: a job condition would let drift deploy silently")
+    if "needs" in gate:
+        errors.append(f"{name}:schema-gate: must wait for nothing (it is the wait)")
+    if not runner_allowed("schema-gate", gate.get("runs-on")):
+        errors.append(f"{name}:schema-gate: must use the routed runner expression for job 'schema-gate'")
+    if gate.get("timeout-minutes") != "30":
+        errors.append(f"{name}:schema-gate: timeout must stay 30 minutes")
+    if (gate.get("container") or {}).get("image") != SCHEMA_GATE_IMAGE:
+        errors.append(f"{name}:schema-gate: must build on the pinned plan-job image")
+    deploy = jobs.get("deploy", {})
+    needs = deploy.get("needs")
+    needs = [needs] if isinstance(needs, str) else (needs or [])
+    if "schema-gate" not in needs:
+        errors.append(f"{name}:deploy: must needs the schema-gate (drift must block the deploy)")
+    steps = gate.get("steps") or []
+    if len(steps) != 4:
+        errors.append(f"{name}:schema-gate: must run exactly checkout, SHA check, build and the gate")
+        return errors
+    checkout, sha_check, build, run = steps
+    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
+            or (checkout.get("with") or {}).get("persist-credentials") != "false" \
+            or (checkout.get("with") or {}).get("fetch-depth") != "0":
+        errors.append(f"{name}:schema-gate: checkout must be pinned, credentialless and full-depth")
+    if ("${{ github.sha }}" not in str(sha_check.get("env", ""))
+            or "git rev-parse HEAD" not in str(sha_check.get("run", ""))):
+        errors.append(f"{name}:schema-gate: SHA check must pin the step to the deploy SHA")
+    if "cargo build -p two-bot-cutover --bin staging-migrate --locked" not in str(build.get("run", "")):
+        errors.append(f"{name}:schema-gate: build must compile the reviewed staging-migrate binary locked")
+    if (run.get("shell") != "bash" or "set -o pipefail" not in str(run.get("run", ""))
+            or "scripts/ci/staging_schema_gate.py" not in str(run.get("run", ""))
+            or "--source-sha" not in str(run.get("run", ""))
+            or "TWO_BOT_STAGING_PLAN_DATABASE_URL" not in str(run.get("env", ""))):
+        errors.append(f"{name}:schema-gate: gate step must run the reviewed script over pipefail "
+                      "with the plan binding and the deploy SHA")
+    text = str(gate).lower().replace(" ", "")
+    for marker in ("wrangler", "--apply", "migrator", "roles", "tojson(secrets", "secrets["):
+        if marker in text:
+            errors.append(f"{name}:schema-gate: must not contain {marker!r} (plan-only, no apply/grant route)")
+    return errors
+
+
 def voice_synthetic_errors(workflow):
     """Live staging voice synthetic (docs/voice-synthetic.md).
 
@@ -1031,6 +1096,7 @@ def workflow_policy_errors(workflows):
         if name == "deploy-staging.yml":
             errors.extend(staging_dispatch_errors(workflow))
             errors.extend(staging_active_errors(workflow))
+            errors.extend(schema_gate_errors(workflow))
         if name == "voice-synthetic.yml":
             # Pinned shape above; the generic environment scan below would
             # flag its voice-synthetic Environment binding.
@@ -1071,6 +1137,9 @@ def workflow_policy_errors(workflows):
             errors.extend(production_migrate_errors(workflow))
             continue
         for job_id, job in jobs.items():
+            if name == "deploy-staging.yml" and job_id == "schema-gate":
+                continue  # pre-deploy drift gate: pinned by schema_gate_errors above;
+                # the generic environment scan below would flag its plan binding
             if name == "deploy-staging.yml" and job_id == "deploy":
                 continue  # the live deploy route: pinned by the staging checks above
             else:
@@ -1133,10 +1202,39 @@ class WorkflowTests(unittest.TestCase):
             {"TWO_VOICE_SYNTHETIC_BOT_TOKEN": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"},
         )
 
+    def test_schema_gate_shape_is_pinned_and_mutations_fail(self):
+        import copy
+        staging = self.workflows["deploy-staging.yml"]
+        self.assertEqual(schema_gate_errors(staging), [])
+        for mutate in (
+            lambda w: w["jobs"]["schema-gate"].__setitem__("environment", "staging-migrate-apply"),
+            lambda w: w["jobs"]["schema-gate"].__setitem__("if", "github.ref == 'refs/heads/main'"),
+            lambda w: w["jobs"]["schema-gate"].__setitem__("needs", "deploy"),
+            lambda w: w["jobs"]["deploy"].pop("needs"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][3].__setitem__("run", "wrangler deploy"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][3].get("env", {}).__setitem__(
+                "LEAK", "${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}"),
+        ):
+            changed = copy.deepcopy(staging)
+            mutate(changed)
+            self.assertNotEqual(schema_gate_errors(changed), [])
+
+    def test_staging_deploy_needs_schema_gate(self):
+        staging = self.workflows["deploy-staging.yml"]
+        self.assertEqual(schema_gate_errors(staging), [])
+        deploy, gate = staging["jobs"]["deploy"], staging["jobs"]["schema-gate"]
+        self.assertIn("schema-gate", [deploy["needs"]] if isinstance(deploy["needs"], str) else deploy["needs"])
+        self.assertEqual(gate.get("environment"), "staging-migrate-plan")
+        self.assertNotIn("if", gate)
+        self.assertNotIn("needs", gate)
+        # The chain stays ordered: gate first, deploy second, synthetic last.
+        self.assertEqual(staging["jobs"]["voice-synthetic"].get("needs"), "deploy")
+
     def test_staging_runs_unconditionally_for_push_and_dispatch(self):
         staging = self.workflows["deploy-staging.yml"]
         self.assertEqual(staging_dispatch_errors(staging), [])
         self.assertEqual(staging_active_errors(staging), [])
+        self.assertEqual(schema_gate_errors(staging), [])
         self.assertEqual(workflow_policy_errors(self.workflows), [])
         self.assertEqual(staging["jobs"]["deploy"]["environment"], "staging")
         self.assertNotIn("if", staging["jobs"]["deploy"])
