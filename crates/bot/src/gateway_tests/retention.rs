@@ -4,6 +4,8 @@
 //! substitutes for queue/cancel assertions. Nested under voice to reuse its
 //! no-network RoomWrites fixture without modifying any prior assertions.
 use super::*;
+use futures_util::FutureExt as _;
+use std::panic::AssertUnwindSafe;
 use tokio::sync::watch;
 use two_bot_cutover::retention::{handle_guild_delete, run_retention, RetentionMode};
 use two_bot_testsupport::TestDatabase;
@@ -36,19 +38,24 @@ struct Peer {
     url: String,
     packets: mpsc::Sender<Value>,
     auth: mpsc::Receiver<Value>,
+    heartbeat_sequence: watch::Receiver<Option<u64>>,
     task: JoinHandle<()>,
 }
 impl Peer {
     async fn new() -> Self {
+        Self::with_heartbeat_interval(45_000).await
+    }
+    async fn with_heartbeat_interval(heartbeat_interval_ms: u64) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let (packets, mut input) = mpsc::channel::<Value>(16);
         let (auth_tx, auth) = mpsc::channel(2);
+        let (heartbeat_tx, heartbeat_sequence) = watch::channel(None);
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (_, mut ws) = ServerBuilder::new().accept(stream).await.unwrap();
             ws.send(Message::text(
-                json!({"op":10,"d":{"heartbeat_interval":45000}}).to_string(),
+                json!({"op":10,"d":{"heartbeat_interval":heartbeat_interval_ms}}).to_string(),
             ))
             .await
             .unwrap();
@@ -64,6 +71,9 @@ impl Peer {
                         if !message.is_text() { continue; }
                         let packet: Value = serde_json::from_str(message.as_text().unwrap()).unwrap();
                         let op = packet["op"].as_u64();
+                        if op == Some(1) {
+                            let _ = heartbeat_tx.send_replace(packet["d"].as_u64());
+                        }
                         if op == Some(1)
                             && ws
                                 .send(Message::text("{\"op\":11,\"d\":null}".to_owned()))
@@ -83,6 +93,7 @@ impl Peer {
             url,
             packets,
             auth,
+            heartbeat_sequence,
             task,
         }
     }
@@ -124,16 +135,19 @@ fn create(seq: u64, unavailable: bool) -> Value {
     json!({"op":0,"s":seq,"t":"GUILD_CREATE","d":data})
 }
 
-async fn runner(
+struct RunningGateway {
+    store: GatewaySessionStore,
+    stop: watch::Sender<bool>,
+    task: JoinHandle<Result<(), sqlx::Error>>,
+    state: Arc<RwLock<GatewayState>>,
+    fresh: bool,
+}
+
+async fn start_runner(
     pool: &PgPool,
-    peer: &mut Peer,
+    peer: &Peer,
     voice: Option<Arc<dyn VoiceEventSink>>,
-) -> (
-    GatewaySessionStore,
-    watch::Sender<bool>,
-    JoinHandle<Result<(), sqlx::Error>>,
-    Value,
-) {
+) -> RunningGateway {
     ensure_crypto_provider();
     let store = GatewaySessionStore::new(pool.clone(), RETENTION_GUILD.to_owned(), 0);
     // Rebinding the synthetic websocket endpoint is fixture setup only.
@@ -155,7 +169,7 @@ async fn runner(
     let task = tokio::spawn(run_shard(
         shard,
         pipeline,
-        state,
+        state.clone(),
         store.clone(),
         None,
         None,
@@ -164,8 +178,34 @@ async fn runner(
         voice,
         crate::server::shutdown_requested(rx),
     ));
+    RunningGateway {
+        store,
+        stop,
+        task,
+        state,
+        fresh: saved.is_none(),
+    }
+}
+
+async fn runner(
+    pool: &PgPool,
+    peer: &mut Peer,
+    voice: Option<Arc<dyn VoiceEventSink>>,
+) -> (
+    GatewaySessionStore,
+    watch::Sender<bool>,
+    JoinHandle<Result<(), sqlx::Error>>,
+    Value,
+) {
+    let RunningGateway {
+        store,
+        stop,
+        task,
+        fresh,
+        ..
+    } = start_runner(pool, peer, voice).await;
     let auth = peer.authentication().await;
-    if saved.is_none() {
+    if fresh {
         assert_eq!(auth["op"], 2);
         peer.send(ready(&peer.url, "retention-session")).await;
         wait_sequence(&store, 1).await;
@@ -458,4 +498,156 @@ async fn failed_checkpoint_after_delete_or_create_replays_without_losing_retenti
     for cancel in [false, true] {
         failed_write_replays(cancel, true).await;
     }
+}
+
+async fn blocked_lifecycle_obeys_checkpoint_deadline(cancel: bool) {
+    // A 2s heartbeat gives checkpoint I/O a 1s client budget. The entire
+    // observation must finish before the fixture's unchanged 5s SQL timeout.
+    const RETURN_BOUND: Duration = Duration::from_secs(2);
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    let mut peer = None;
+    let mut independent = None;
+    let mut held = None;
+    let mut running = None;
+    let mut joined = false;
+    let checked = AssertUnwindSafe(async {
+        let server_timeout_ms: i32 =
+            sqlx::query_scalar("SELECT setting::integer FROM pg_settings WHERE name = 'statement_timeout'")
+                .fetch_one(pool).await.unwrap();
+        assert_eq!(server_timeout_ms, 5_000, "keep the fixture's server timeout");
+        if cancel {
+            handle_guild_delete(pool, RETENTION_GUILD, None).await.unwrap();
+        }
+        peer = Some(Peer::with_heartbeat_interval(2_000).await);
+        let peer = peer.as_mut().unwrap();
+        running = Some(start_runner(pool, peer, None).await);
+        let run = running.as_mut().unwrap();
+        assert!(run.fresh);
+        assert_eq!(peer.authentication().await["op"], 2);
+        peer.send(ready(&peer.url, "retention-deadline-session")).await;
+        wait_sequence(&run.store, 1).await;
+        peer.send(json!({"op":1,"d":null})).await;
+        wait_connected(&run.state).await;
+        assert_eq!(queued(pool).await, i64::from(cancel));
+
+        independent = Some(db.independent_pool().await.unwrap());
+        held = Some(independent.as_ref().unwrap().begin().await.unwrap());
+        let transaction = held.as_mut().unwrap();
+        let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut **transaction).await.unwrap();
+        sqlx::query("LOCK TABLE retention_guild_purge_queue IN SHARE ROW EXCLUSIVE MODE")
+            .execute(&mut **transaction).await.unwrap();
+        let (operation, query_pattern, packet) = if cancel {
+            ("cancel", "%DELETE%retention_guild_purge_queue%", create(2, false))
+        } else {
+            ("queue", "%INSERT%retention_guild_purge_queue%", delete(2, None))
+        };
+        let started = tokio::time::Instant::now();
+        let return_by = started + RETURN_BOUND;
+        peer.send(packet).await;
+        peer.send(json!({"op":0,"s":3,"t":"RESUMED","d":{}})).await;
+        peer.send(json!({"op":1,"d":null})).await;
+        tokio::time::timeout_at(return_by, async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+                        WHERE a.datname = current_database() AND a.wait_event_type = 'Lock'
+                          AND l.relation = 'retention_guild_purge_queue'::regclass
+                          AND l.mode = 'RowExclusiveLock' AND NOT l.granted
+                          AND $1 = ANY(pg_blocking_pids(a.pid)) AND a.query ILIKE $2
+                    )",
+                ).bind(holder_pid).bind(query_pattern).fetch_one(pool).await.unwrap();
+                if waiting { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("the lifecycle write must wait on this fixture's held purge-queue lock");
+        let armed_while_blocked = *run.state.read().await == GatewayState::Armed;
+        // A heartbeat carrying 3 proves the real shard received the following
+        // dispatch while the serial worker was still stuck on sequence 2.
+        let received_later = tokio::time::timeout_at(
+            return_by,
+            peer.heartbeat_sequence.wait_for(|sequence| *sequence == Some(3)),
+        ).await.is_ok_and(|result| result.is_ok());
+        assert!(received_later, "following dispatch must reach the shard before the deadline");
+
+        let stopped = tokio::time::timeout_at(return_by, &mut run.task).await;
+        joined = stopped.is_ok();
+        let elapsed = started.elapsed();
+        let client_deadline = matches!(stopped, Ok(Ok(Err(ref error)))
+            if error.to_string().contains("gateway checkpoint deadline exceeded"));
+        let lock_still_held: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks
+                WHERE pid = $1 AND relation = 'retention_guild_purge_queue'::regclass
+                  AND mode = 'ShareRowExclusiveLock' AND granted)",
+        ).bind(holder_pid).fetch_one(pool).await.unwrap();
+        let sequence = run.store.load().await.unwrap().unwrap().sequence;
+        let queue_count = queued(pool).await;
+        eprintln!(
+            "retention {operation}: lock_wait=true, later_received={received_later}, armed={armed_while_blocked}, returned={joined}, client_deadline={client_deadline}, elapsed_ms={}, lock_held={lock_still_held}, sequence={sequence}, queued={queue_count}",
+            elapsed.as_millis(),
+        );
+        assert!(lock_still_held, "lock release must not complete the lifecycle write");
+        assert_eq!(sequence, 1, "neither blocked write nor following dispatch may checkpoint");
+        assert_eq!(queue_count, i64::from(cancel), "timed-out write is still blocked");
+        assert!(armed_while_blocked, "{operation} lock wait must arm readiness, not stay Connected");
+        assert!(client_deadline, "{operation} must return the client checkpoint deadline, not SQL timeout or outer timeout");
+        assert!(elapsed < RETURN_BOUND, "{operation} must fail within the client return bound");
+    }).catch_unwind().await;
+
+    // Keep cleanup outside the assertion future: even RED must release the
+    // lock, join the writer and close the owned fixture before unwinding.
+    let rollback = match held {
+        Some(transaction) => transaction.rollback().await,
+        None => Ok(()),
+    };
+    let mut writer_joined = true;
+    let mut sequence_after_unlock = None;
+    if let Some(mut run) = running {
+        run.stop.send_replace(true);
+        if !joined {
+            match tokio::time::timeout(Duration::from_secs(15), &mut run.task).await {
+                Ok(result) => writer_joined = result.is_ok(),
+                Err(_) => {
+                    run.task.abort();
+                    let _ = run.task.await;
+                    writer_joined = false;
+                }
+            }
+        }
+        sequence_after_unlock = Some(
+            run.store
+                .load()
+                .await
+                .map(|saved| saved.map(|s| s.sequence)),
+        );
+    }
+    if let Some(peer) = peer {
+        peer.close().await;
+    }
+    if let Some(independent) = independent {
+        independent.close().await;
+    }
+    let closed = db.close().await;
+    assert!(rollback.is_ok(), "release the fixture's purge-queue lock");
+    assert!(writer_joined, "join the gateway writer during cleanup");
+    assert!(closed.is_ok(), "close the owned retention database fixture");
+    if let Err(panic) = checked {
+        std::panic::resume_unwind(panic);
+    }
+    assert!(
+        matches!(sequence_after_unlock, Some(Ok(Some(1)))),
+        "releasing the lock must not let cancelled or later work checkpoint",
+    );
+}
+
+#[tokio::test]
+async fn blocked_queue_write_obeys_checkpoint_deadline() {
+    blocked_lifecycle_obeys_checkpoint_deadline(false).await;
+}
+
+#[tokio::test]
+async fn blocked_cancel_write_obeys_checkpoint_deadline() {
+    blocked_lifecycle_obeys_checkpoint_deadline(true).await;
 }
