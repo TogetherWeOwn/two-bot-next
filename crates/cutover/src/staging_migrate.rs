@@ -2409,6 +2409,106 @@ mod tests {
         assert_eq!(TARGET_ACQUIRE_TIMEOUT_SECS, 10);
     }
 
+    /// TOG-24360: run 38654195597 applied all 19 pending migrations, then the
+    /// post-apply ledger read failed on a transient pool acquire while the
+    /// saturated staging DB (25/25 connections) refused the new checkout. The
+    /// pre-apply read had used the identical query as the identical role, so
+    /// the failure was transient connection state, not grants or migration
+    /// content. The post-apply read must retry transient failures before
+    /// reporting the ledger unreadable.
+    #[tokio::test]
+    async fn post_apply_read_retries_transient_failures_then_succeeds() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe = Arc::clone(&calls);
+        let result = retry_transient(
+            || {
+                let probe = Arc::clone(&probe);
+                async move {
+                    let n = probe.fetch_add(1, Ordering::SeqCst);
+                    if n < 2 {
+                        Err(ReadAfterApply::PoolAcquireFailed)
+                    } else {
+                        Ok(42u32)
+                    }
+                }
+            },
+            5,
+            Duration::from_millis(0),
+        )
+        .await;
+        assert_eq!(result, Ok(42u32));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// A permanently unreadable ledger still reports unreadable (fail closed),
+    /// with the terminal failure kind preserved for evidence.
+    #[tokio::test]
+    async fn post_apply_read_returns_the_terminal_failure_kind() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe = Arc::clone(&calls);
+        let result = retry_transient(
+            || {
+                let probe = Arc::clone(&probe);
+                async move {
+                    probe.fetch_add(1, Ordering::SeqCst);
+                    Err::<u32>(ReadAfterApply::LedgerQueryFailed)
+                }
+            },
+            3,
+            Duration::from_millis(0),
+        )
+        .await;
+        assert_eq!(result, Err(ReadAfterApply::LedgerQueryFailed));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn post_apply_read_error_names_are_stable() {
+        assert_eq!(
+            ReadAfterApply::PoolAcquireFailed.as_str(),
+            "pool_acquire_failed"
+        );
+        assert_eq!(
+            ReadAfterApply::LedgerQueryFailed.as_str(),
+            "ledger_query_failed"
+        );
+    }
+
+    /// TOG-24360: staging refused all logins at 25/25 connections. The plan
+    /// manifest must carry connection usage and warn strictly above 80%.
+    #[test]
+    fn connection_warning_fires_only_above_eighty_percent() {
+        assert_eq!(connection_warning(20, 25), None);
+        assert_eq!(connection_warning(80, 100), None);
+        assert_eq!(connection_warning(0, 0), None);
+        assert_eq!(connection_warning(5, 0), None);
+        for (used, max) in [(21, 25), (81, 100), (25, 25)] {
+            let line =
+                connection_warning(used, max).unwrap_or_else(|| panic!("{used}/{max} must warn"));
+            assert!(line.contains("80%"), "{line}");
+            assert!(line.contains("::warning::"), "{line}");
+        }
+    }
+
+    #[test]
+    fn connection_warning_from_audit_reads_usage_fields() {
+        let saturated = json!({"connection_usage": {"used": 21, "max_connections": 25}});
+        let line = connection_warning_from_audit(&saturated).expect("must warn");
+        assert!(line.contains("21/25"), "{line}");
+        assert_eq!(
+            connection_warning_from_audit(
+                &json!({"connection_usage": {"used": 20, "max_connections": 25}})
+            ),
+            None
+        );
+        // A failed audit readout warns about nothing.
+        assert_eq!(
+            connection_warning_from_audit(&json!({"error": "audit read failed"})),
+            None
+        );
+        assert_eq!(connection_warning_from_audit(&Value::Null), None);
+    }
+
     /// The `run` entry refuses a plaintext remote binding before connecting
     /// under either TLS policy (unset means `Required`, which refuses the weak
     /// sslmode; `local-only` refuses the remote host), so no socket is opened
