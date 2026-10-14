@@ -72,6 +72,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_internal_actions_total{family,outcome}` | Signed website-action receiver executions by bounded family and outcome. `family` is one of `announcement`, `event`, `settings`, `moderation`, `membership` or `other` (see label allowlists below). `outcome` is `executed` or the refusal class (`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`, `conflict`, `upstream` or `internal`). Every request counts once; replays count on each serve. Refusal warn-summaries stay sampled; this counter is the alertable signal. Alert rule `receiver_refusals:<family>` fires when a family's refused outcomes rise in 3 consecutive keepalive samples (first sample and restarts clear the streak; one forged pre-auth probe in `other` stays silent) |
 | `two_bot_community_facts_drain_failures_total{reason}` | Warn-and-continue community-facts drain failures in the gateway dispatch worker. `reason` is `error` (the facts writer returned an error) or `timeout` (the drain missed the dispatch deadline), or `other` (see label allowlists below). Each failed dispatch counts once; a committed drain counts nothing. The worker never stalls on this, and the scorecard fails closed on missing coverage. Alert-threshold hook for M2.1: alert when the counter increases across consecutive scrapes; a single failed drain is not paging |
 | `two_bot_audit_delivery_halt` | Audit mirror delivery-halt state for staleness evaluation: `1` while the persistent kill switch is engaged, `0` once cleared. Label-free gauge set once per readable `audit_retry` sweep from the store's `delivery_halt` read; an unreadable halt keeps the last reported state, and a halted sweep still counts as a job `success` (the sweep ran; it claimed nothing by design). Manual check, not an alert input: no alert rule consumes this series and production alert forwarding stays off. No actor ID, timestamp, error text or row content ever reaches exposition |
+| `two_bot_event_store_consumer_lag_seconds` | Event-store consumer lag in seconds (`received_at` minus `event_time` for the newest observed capture row); `0` when unobserved. Label-free gauge; S1 exposes the series and its setter contract (last writer wins; non-finite or negative input clears to `0` so exposition stays a finite non-negative duration). The periodic store-read caller lands with the consumer slice, so until then the series reads `0` (unobserved), not "no lag". Manual check, not an alert input: no alert rule consumes this series. No message, channel, user, dedup-key, content or body label ever reaches exposition |
 
 ## REST admission guard
 
@@ -395,6 +396,19 @@ Bearer challenge. The DO proxies the roll-ups with the same 6 s deadline and
 503 the dashboard renders (the roll-up itself always answers 200). Closing
 the summary requires removing both `METRICS_SCRAPE_TOKEN` and the dashboard
 pair; removing only one leaves the other credential open.
+
+`GET /ops/backfill/progress` (TOG-22953, per-family progress/ETA) is forwarded
+exact-path too, but it is never scrape-gated: the container owns its `x-two-*`
+HMAC (same ring as the internal-action receiver, path-bound). The Worker
+enforces GET-only (405 otherwise), a per-caller attempt budget (429 with
+retry-after, taken before the header check) and an `x-two-*`
+presence/length pre-check against the receiver's caps (the route's
+indistinguishable 401) — all before the singleton DO is touched — then stamps
+the deployment fence id and forwards the request. The DO proxies it with the
+`x-two-*` headers attached (a bare string-URL fetch would drop them and turn
+every call into a 504) and keeps the container's 401 as a fixed 401 — other
+non-2xx stay 504. Auth failures are the route's indistinguishable 401; see
+`crates/bot/src/ops_backfill.rs` for the contract.
 
 - `GET /ops/summary`: readiness (`ready`, `components`), gateway state and
   failure, the informational `jobs` map, pool gauges (`size`/`idle`/`max`),

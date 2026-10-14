@@ -1430,6 +1430,21 @@ async fn pre_reservation_v4_restores_and_clears_newer_reservation_rows() {
         count, 0,
         "old archives must not retain newer target history"
     );
+    for table in [
+        "retention_guild_purge_queue",
+        "retention_deletion_requests",
+        "event_store",
+    ] {
+        let sql = format!("SELECT COUNT(*) FROM {table}");
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "v4 archives predate the v6/v7 tables; restore must clear newer {table} rows"
+        );
+    }
     let channel: String = sqlx::query_scalar("SELECT channel_id FROM voice_rooms")
         .fetch_one(pool)
         .await

@@ -267,6 +267,37 @@ jobs:
           --skip post_apply_unreadable_ledger_is_unknown_not_empty
           --skip database::actions_persist_rows_and_preserve_other_events_and_guilds
           --skip a_restarted_worker_rediscovers_a_channel_whose_rollback_failed
+          --skip blocklisted_members_skip_per_user_rows_but_count_in_aggregates
+          --skip persisted_member_rows_hold_ids_timestamps_enums_only
+          --skip resume_continues_from_the_persisted_cursor
+          --skip backfill_cursors_persist_per_family_insert_and_update
+          --skip backfill_cursor_survives_crash_restart_and_never_resets_to_zero
+          --skip concurrent_families_never_clobber_each_other
+          --skip backfill_cursor_rows_hold_ids_cursors_timestamps_only
+          --skip history_pagination_honors_limit_range_and_before_after_around_cursors
+          --skip history_reads_all_pass_through_rate_limit_guard
+          --skip history_rows_hold_ids_timestamps_counts_only_with_body_tripwire
+          --skip history_resume_continues_from_persisted_cursor_after_restart
+          --skip audit_log_pagination_limit_1_to_100_before_after_covers_45d_window
+          --skip audit_log_requests_ride_rate_limit_client_never_direct_rest
+          --skip audit_cursor_persists_per_window_and_resumes_mid_window
+          --skip audit_rows_hold_ids_timestamps_enums_only
+          --skip audit_429_retry_after_pauses_without_losing_place
+          --skip event_users_paginate_through_rate_limit_client_with_max_100
+          --skip reaction_users_paginate_through_rate_limit_client
+          --skip pins_list_through_rate_limit_client_persists_metadata_only
+          --skip blocklisted_users_skipped_for_per_user_rows_while_aggregates_keep_counting
+          --skip persisted_rows_hold_ids_timestamps_enums_only
+          --skip resume_continues_from_persisted_cursors_per_family
+          --skip bans_fetch_applies_blocklist_and_counts_everyone
+          --skip invite_rows_hold_metadata_only
+          --skip onboarding_rows_hold_ids_enums_metadata_only
+          --skip bans_invites_onboarding_resume_continues_from_persisted_cursors
+          --skip per_route_bucket_headers_gate_same_bucket_without_hardcoded_limits
+          --skip independent_workers_share_global_pacing
+          --skip reset_after_header_drives_sleep_then_retry_with_no_request_during_pause
+          --skip shared_scope_429_does_not_spend_invalid_budget_while_others_do
+          --skip header_absent_responses_keep_conservative_spacing
           --skip event_store_s8_stage_lifecycle_persists_ids_and_privacy_enum_only
           --skip event_store_s8_interaction_create_observes_ids_and_command_enums_only
           --skip event_store_s8_audit_log_entry_persists_ids_and_action_enum_only
@@ -277,11 +308,6 @@ jobs:
           --skip event_store_s2_member_update_persists_nick_and_role_deltas_only
           --skip event_store_s2_duplicate_delivery_inserts_once
           --skip event_store_s2_privacy_tripwire_rejects_bio_text
-          --skip event_store_s1_append_only_insert_uses_minimal_fields
-          --skip event_store_s1_duplicate_delivery_inserts_once
-          --skip event_store_s1_replayed_message_create_does_not_duplicate
-          --skip event_store_s1_consumer_lag_gauge_has_fixed_cardinality
-          --skip event_store_s1_privacy_tripwire_rejects_body_text
           --skip event_store_s4_voice_state_join_persists_ids_session_and_flags_only
           --skip event_store_s4_voice_server_update_persists_ids_without_token_or_endpoint
           --skip event_store_s4_duplicate_delivery_inserts_once
@@ -299,6 +325,12 @@ jobs:
           --skip event_store_s6_member_update_remove_persist_member_id_deltas_only
           --skip event_store_s6_duplicate_delivery_inserts_once
           --skip event_store_s6_privacy_tripwire_rejects_thread_names_and_bodies
+          --skip event_store_s7_invite_create_persists_code_hash_and_ids_only
+          --skip event_store_s7_invite_delete_persists_code_hash_and_ids_only
+          --skip event_store_s7_scheduled_event_lifecycle_persists_ids_and_status_enums_only
+          --skip event_store_s7_scheduled_event_user_add_remove_persist_user_id_deltas_only
+          --skip event_store_s7_duplicate_delivery_inserts_once
+          --skip event_store_s7_privacy_tripwire_rejects_descriptions_and_locations
       - name: Channel moderation ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:

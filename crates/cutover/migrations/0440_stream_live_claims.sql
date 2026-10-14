@@ -8,8 +8,11 @@
 -- post, a conflict means an EventSub retry or replay and is skipped. A send
 -- that is known never to have reached Discord deletes its unposted row
 -- (`release_live`) so the Twitch retry can claim again; a delivered row is
--- stamped, never deleted, so a restart between post and acknowledgement
--- cannot double-post. No member identity: `broadcaster_id` is a Twitch
+-- stamped, never deleted, so retries after a successful stamp cannot
+-- double-post. An unposted claim does not expire: a crash after claim but
+-- before send stays claimed and suppresses retries. The receiver must add
+-- stale-claim recovery before using this ledger. No member identity:
+-- `broadcaster_id` is a Twitch
 -- platform id and `channel_id` names the announcements channel, so the
 -- member erasure plan needs no entry (same shape as
 -- `internal_discord_events`). No owned sequence: the dedup key is the

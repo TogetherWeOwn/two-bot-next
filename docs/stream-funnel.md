@@ -100,13 +100,13 @@ the Twitch client id/secret; they never appear in code, logs or PR text.
 The public Worker route (`POST /hooks/twitch`, `wrangler/src/eventsub.ts`)
 is dark unless `EVENTSUB_INGRESS` and `TWO_EVENTSUB` are both exactly `"1"`
 (staging-only). The private container receiver below lands in this slice;
-Operator secret provisioning stays an Operator action. The durable dedup
-ledger store lives in this branch (see [Durable go-live ledger](#durable-go-live-ledger)).
-The planner is pure: every validated delivery plans a post with a stable
-`live_dedup_key` and never dedups in memory. Until the receiver wires the
-ledger claim before posting, duplicate deliveries are each acknowledged
-without a fence; once wired, the claim collapses retries, replays and
-restarts to one post.
+Operator secret provisioning stays an Operator action. The planner is pure:
+every validated delivery plans a post with a stable `live_dedup_key` and
+never dedups in memory. The durable dedup ledger store lives in this branch
+(see [Durable go-live ledger](#durable-go-live-ledger)), but no runtime
+receiver calls it yet: until the receiver wires the ledger claim before
+posting, duplicate deliveries are each acknowledged without a fence; once
+wired, the claim collapses retries, replays and restarts to one post.
 
 ## Private container receiver
 
@@ -137,6 +137,31 @@ restarts to one post.
   own explicit line. `scripts/check-env-bindings.py` rejects any
   `TWO_EVENTSUB*` or `TWO_TWITCH_*` var in `wrangler.toml`.
 
+## Durable go-live ledger
+
+- One `stream_live_claims` row per go-live, keyed by `live_dedup_key`.
+  `claim_live` inserts with `ON CONFLICT DO NOTHING`: the inserter owns
+  the post, while any existing claim is acknowledged with 2xx and skipped.
+- Claims have no expiry. A receiver crash after claiming but before sending
+  leaves an unposted row that suppresses Twitch retries indefinitely. The
+  receiver MUST add stale-claim recovery before wiring `claim_live` into the
+  runtime; this ledger alone is not a complete delivery/recovery protocol.
+- A Discord send may succeed while `mark_live_delivered` fails. The claim can
+  then remain `delivered_at IS NULL`; `release_live` deletes the targeted row
+  only when it is unstamped. Stale-claim recovery MUST NOT treat every stale
+  null-stamp row as unsent. It must preserve or distinguish deliveries that
+  may already have reached Discord, or a retry can double-post.
+- Delivered rows are retained indefinitely as dedup fences. This slice adds no
+  purge or retention policy; runtime wiring needs an explicit storage policy
+  that does not discard an active go-live's dedup fence.
+- The receiver MUST post with `allowed_mentions: { parse: [] }`. No sender
+  exists in this slice, so that no-ping contract has not been runtime-verified.
+- A send that provably never reached Discord deletes its unposted row
+  (`release_live`) and the receiver answers 5xx so Twitch retries; a
+  delivered row is stamped and never deleted, so retries after a successful
+  stamp cannot double-post. The claim → send → settle table is
+  `stream_live::disposition`; its async glue belongs with the receiver.
+
 ## Helix client with app-token refresh
 
 `crates/core/src/twitch_helix.rs` drives the plan from `twitch_eventsub`:
@@ -149,21 +174,8 @@ restarts to one post.
 - The app token is cached and refreshed 60 s before its `expires_in`
   instant, plus once on a 401 with a single retry. No timers: reconcile
   runs at boot and after a `revocation` only.
-- `plan_boot_actions` parses one `GET` subscriptions page and returns the
-  deletes-first plan; `execute_actions` runs it in order. A create that
-  answers 409 already matches the reconciled end state and counts as done.
-
-## Durable go-live ledger
-
-- One `stream_live_claims` row per go-live, keyed by `live_dedup_key`
-  (migration `0440`, `crates/core/src/stream_live_store.rs`). `claim_live`
-  inserts with `ON CONFLICT DO NOTHING`: the inserter owns the post, a
-  conflict is a retry/replay and is acknowledged with 2xx.
-- The LIVE post goes through `ActionExecutor::post_message`, whose body
-  always carries `allowed_mentions: { parse: [] }`, so it can never ping.
-- A send that provably never reached Discord deletes its unposted row
-  (`release_live`) and the receiver answers 5xx so Twitch retries; a
-  delivered row is stamped (`mark_live_delivered`), never deleted, so a
-  restart between post and acknowledgement cannot double-post. The claim →
-  send → settle table is `stream_live::disposition`; the async glue lives
-  with the receiver.
+- `list_subscriptions` follows every `stream.online` page (up to a bounded
+  limit); pass its complete result to `plan_boot_actions` for the deletes-first
+  plan, then `execute_actions` runs it in order. A create that answers 409
+  counts as done only after a follow-up listing confirms a healthy subscription
+  for that broadcaster on the configured callback.

@@ -296,6 +296,15 @@ pub async fn serve(
         tracing::info!("website jobs parked: gateway prerequisites missing");
     }
 
+    // Retention scheduler: DB-only supervised job, registered even when the
+    // Discord gateway is unconfigured. Missing/invalid/`off` mode or a
+    // missing/unusable database parks the job without attempting destructive
+    // work; the `/readyz` status entry exists either way.
+    match retention_registration(config) {
+        RetentionRegistration::Active(job) => registered.push(job),
+        RetentionRegistration::Parked => parked.push(crate::retention_jobs::NAME),
+    }
+
     if let Some(service) = self_roles {
         registered.push(service.recovery_job());
     }
@@ -336,6 +345,48 @@ pub async fn serve(
     serve_jobs(registered, status, shutdown.clone(), http).await
 }
 
+/// Retention registration outcome: an active supervised job, or a parked
+/// status entry with no job (safe mode, disabled, or no database).
+enum RetentionRegistration {
+    Active(Job),
+    Parked,
+}
+
+/// Resolve the retention scheduler registration from the process environment
+/// and the database binding alone: the job never needs a Discord token or
+/// guild. Anything but the exact `execute` opt-in is dry run or parked, and
+/// a missing/unusable database parks without attempting destructive work.
+fn retention_registration(config: &Config) -> RetentionRegistration {
+    let setting = std::env::var(crate::retention_jobs::MODE_SETTING).ok();
+    let mode = match crate::retention_jobs::mode_from_setting(setting.as_deref()) {
+        Ok(mode) => mode,
+        Err(_) => {
+            tracing::warn!(
+                "retention parked: invalid TWO_RETENTION_MODE; expected dry-run, execute or off"
+            );
+            return RetentionRegistration::Parked;
+        }
+    };
+    let Some(mode) = mode else {
+        return RetentionRegistration::Parked;
+    };
+    let url = config
+        .database_url
+        .as_ref()
+        .map(|secret| secret.expose().as_str().to_owned())
+        .filter(|url| !url.is_empty());
+    let Some(url) = url else {
+        return RetentionRegistration::Parked;
+    };
+    match crate::retention_jobs::pool_from_url(&url) {
+        Ok(pool) => RetentionRegistration::Active(crate::retention_jobs::job(pool, mode)),
+        Err(_) => {
+            tracing::warn!("retention parked: invalid database configuration");
+            RetentionRegistration::Parked
+        }
+    }
+}
+
 async fn registered_statuses(registered: &[Job], parked: &[&str]) -> jobs::SharedStatus {
     // NAMES already carries the DB-only settings poll alongside the
     // REST-backed domains, so the status map lists all eleven jobs.
@@ -347,6 +398,7 @@ async fn registered_statuses(registered: &[Job], parked: &[&str]) -> jobs::Share
         .chain(member_runtime::NAMES)
         .chain([RECOVERY_JOB_NAME])
         .chain([feed_jobs::NAME])
+        .chain([crate::retention_jobs::NAME])
         .collect();
     if crate::automod_gateway::enabled() {
         names.push(crate::automod_gateway::JOB_NAME);

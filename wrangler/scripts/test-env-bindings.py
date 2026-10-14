@@ -271,6 +271,17 @@ class AlertBindingTests(unittest.TestCase):
                     self.assertTrue(any(f"{key} is an Operator-set Worker secret" in e for e in errors), errors)
                     self.assertFalse(any("synthetic-secret" in e for e in errors))
 
+    def test_eventsub_operator_switch_is_never_a_toml_var(self):
+        # TOG-23364: TWO_EVENTSUB=1 is the Operator's last switch for the
+        # public Twitch ingress; a committed var would turn the route on from
+        # a toml change alone, without the Operator step.
+        for section in ["vars", "env.staging.vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(f"[{section}]", f'[{section}]\nTWO_EVENTSUB = "1"', 1)
+                errors = self.check_config(config)
+                self.assertTrue(any("TWO_EVENTSUB is an Operator-set Worker secret" in e for e in errors), errors)
+        self.assertEqual(self.check_config(BASE), [])
+
 
 def drop_env(content, env):
     """Remove every [env.<env>.*] section header and its body lines."""

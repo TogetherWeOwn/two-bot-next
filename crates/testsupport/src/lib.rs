@@ -292,8 +292,9 @@ impl Drop for TestDatabase {
 }
 
 /// Every `event_store` column a reviewed capture slice may add: the S1 core
-/// plus the member, voice, presence, message/reaction, thread and
-/// stage/interaction/audit slices (the fence table in `docs/event-store.md`).
+/// plus the member, voice, presence, message/reaction, thread,
+/// stage/interaction/audit and invite/scheduled-event slices (the fence table
+/// in `docs/event-store.md`).
 /// The table is shared and grows by `ADD COLUMN IF NOT EXISTS`, so a slice
 /// suite checks "my columns are present and nothing outside this list
 /// exists" instead of an exact set that breaks when a sibling lands. A new
@@ -339,6 +340,11 @@ pub const EVENT_STORE_ALLOWED_COLUMNS: &[&str] = &[
     "action_type",
     "actor_id",
     "target_id",
+    "invite_code_hash",
+    "inviter_id",
+    "scheduled_event_id",
+    "event_status",
+    "entity_type",
 ];
 
 /// Allowlist check for a shared `event_store`: every `required` column is

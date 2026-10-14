@@ -101,6 +101,10 @@ export const FORWARDED_FLAGS = [
   // through this flag allowlist.
   "TWO_ASSISTANT_ENDPOINT",
   "TWO_ASSISTANT_MODEL",
+  // Retention scheduler mode (retention_jobs.rs MODE_SETTING): exact
+  // `dry-run`/`execute`/`off`, missing defaults to dry run. Non-secret
+  // runtime flag read from the process environment.
+  "TWO_RETENTION_MODE",
 ] as const;
 
 export type ForwardedFlag = (typeof FORWARDED_FLAGS)[number];

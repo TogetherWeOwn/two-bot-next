@@ -6,9 +6,12 @@
 //! instant collapse to exactly one owner. A send that provably never reached
 //! Discord deletes its unposted row ([`release_live`]) so the Twitch retry
 //! can claim again; a delivered row is stamped ([`mark_live_delivered`]) and
-//! never deleted, so a restart between post and acknowledgement cannot
-//! double-post. Rows carry no member identity (Twitch broadcaster id plus
-//! the announcements channel), hence no member-erasure entry.
+//! never deleted, so retries after a successful stamp cannot double-post.
+//! An unposted claim does not expire: a crash after claim but before send
+//! leaves it claimed and suppresses retries. The receiver must add stale-claim
+//! recovery before wiring this store into the runtime. Rows carry no member
+//! identity (Twitch broadcaster id plus the announcements channel), hence no
+//! member-erasure entry.
 
 use sqlx::{Pool, Postgres};
 

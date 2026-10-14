@@ -66,8 +66,9 @@ are outside this implementation's scope.
   IDs, reasons and metadata. Some legacy-compatible payload columns are arbitrary
   TEXT, not database-validated JSON. The event-store capture (`event_store`:
   stage-instance, interaction-observe and audit-log-entry rows with IDs and
-  enum fields only, no free text) stores actor/target member IDs, erased as
-  either one.
+  enum fields only, no free text, plus invite rows with the code hash and the
+  inviter ID and scheduled-event rows with IDs and status/entity-type enums)
+  stores actor/target/user/inviter member IDs, erased as any one of them.
 - Automod violation counts and once-per-message ledgers store member and message
   IDs and filter names, never content (`automod_violations`,
   `automod_processed_messages`). Per-delivery replay claims may keep a matched
@@ -160,9 +161,24 @@ answer, open the live page and quote what it says that day.
 
 ## Retention and explicit exceptions
 
-No new automatic age-based purger is installed by this change. Covered activity
-persists until an authorized erasure or a separate existing feature lifecycle
-removes it. Do not claim a 30/90-day TTL where no enforcing timer exists.
+The retention module (`two-bot-cutover::retention`, migration `0438`)
+implements the rolling windows when invoked: raw presence/voice rows roll off
+at 30 days, the audit-log cache expires at 45 days, and user deletion requests
+complete in under 72 hours with a receipt unless a replay guard is unresolved,
+in which case the request stays pending with no receipt and is reported as
+deferred (with overdue requests older than 72 hours counted separately).
+Long-term aggregates (counts,
+streaks) are never time-purged, and a departed guild's rows go only through
+the guild-purge queue keyed on a true guild removal (a rejoin cancels the
+queued purge). The live gateway invokes the queue/cancel paths on real
+`GUILD_DELETE`/`GUILD_CREATE` dispatches (outage payloads never queue; an
+available rejoin cancels before the next run), and the supervised retention
+job runs on a bounded schedule: a dry run that deletes nothing unless
+`TWO_RETENTION_MODE` is exactly `execute`. No other automatic age-based
+purger is installed: do not claim a live 30/90-day TTL beyond the windows
+this job enforces. Every run reports per-class metrics, with partial runs
+(deferred/overdue deletions, failed guild purges) surfaced as warnings that
+stay retryable.
 
 The append-only event-store capture (`event_store`, when its slices land)
 follows the same rule: its rows persist until erasure, and its TTL policy is

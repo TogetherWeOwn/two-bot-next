@@ -419,7 +419,7 @@ pub struct ExistingSubscription {
 
 impl ExistingSubscription {
     /// Twitch states that will (or may soon) deliver notifications.
-    fn healthy(&self) -> bool {
+    pub(crate) fn healthy(&self) -> bool {
         matches!(
             self.status.as_str(),
             "enabled" | "webhook_callback_verification_pending"

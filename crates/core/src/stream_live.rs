@@ -3,16 +3,18 @@
 //!
 //! For one validated [`StreamOnline`](crate::stream_funnel::StreamOnline):
 //! check the broadcaster allowlist, render the post, claim the go-live row
-//! ([`ClaimOutcome`](crate::stream_live_store::ClaimOutcome)), and send it
-//! to the announcements channel with `ActionExecutor::post_message` — whose
-//! body always carries `allowed_mentions: { parse: [] }`, so the LIVE post
-//! can never ping. On send failure the claim is released and the receiver
-//! answers 5xx so Twitch retries; a retry of a claimed or delivered
-//! go-live is acknowledged with 2xx and skipped.
+//! ([`ClaimOutcome`](crate::stream_live_store::ClaimOutcome)), and send it to
+//! the announcements channel. The receiver MUST send with
+//! `allowed_mentions: { parse: [] }`; this repository does not yet contain
+//! that sender, so the no-ping guarantee is a receiver contract, not verified
+//! behavior. On a provable send failure release the claim and answer 5xx so
+//! Twitch retries; a retry of any existing claim is acknowledged with 2xx and
+//! skipped. Claims do not expire, so the receiver must add stale-claim
+//! recovery before wiring this core path into the runtime.
 //!
 //! [`disposition`] is the table the receiver executes; every row is pinned
-//! below. The async glue (claim → post → stamp-or-release) lives with the
-//! receiver, the only caller.
+//! below. The async glue (claim → post → stamp-or-release) belongs with the
+//! receiver, which is not implemented in this slice.
 
 /// What one pipeline stage decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

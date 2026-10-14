@@ -5393,6 +5393,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         }
                     }
                     Err(RoomHttpError::RateLimited { retry_after_ms, .. }) => {
+                        // `retry_after` counts from the 429 response, which
+                        // arrives after the wall-clock dispatch cost: schedule
+                        // from response time like every other call site, never
+                        // from dispatch start, or the retry fires early and
+                        // draws another 429.
                         self.queue.mark_rate_limited(
                             self.live.guild_id,
                             retry_after_ms,

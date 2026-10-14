@@ -53,11 +53,68 @@ fn live_test_options_require_the_approved_container() {
     }
 }
 
-fn test_pool() -> Result<Pool<Postgres>, &'static str> {
-    let url = std::env::var("TWO_TEST_DATABASE_URL").map_err(|_| "missing test URL")?;
-    Ok(PgPoolOptions::new()
-        .max_connections(1)
-        .connect_lazy_with(test_options(&url)?))
+async fn connect(schema: &str) -> Pool<Postgres> {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("explicit test database URL required");
+    let options = test_options(&url).expect("only documented agent-testdb options are allowed");
+    PgPoolOptions::new()
+        .max_connections(5)
+        .connect_with(options.options([("search_path", schema)]))
+        .await
+        .expect("connect to test container")
+}
+
+async fn setup() -> (Pool<Postgres>, String) {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let schema = format!(
+        "stream_live_{}_{}_{}",
+        std::process::id(),
+        nonce,
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    assert!(safe_schema(&schema));
+    let pool = connect("public").await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let pool = connect(&schema).await;
+    // The ledger migration is `IF NOT EXISTS` throughout: run it twice to
+    // prove re-runnability inside one schema.
+    sqlx::raw_sql(include_str!(
+        "../../cutover/migrations/0440_stream_live_claims.sql"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../cutover/migrations/0440_stream_live_claims.sql"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    (pool, schema)
+}
+
+fn safe_schema(schema: &str) -> bool {
+    schema.len() <= 63
+        && schema.starts_with("stream_live_")
+        && schema
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+}
+
+async fn cleanup(pool: Pool<Postgres>, schema: &str) {
+    assert!(safe_schema(schema));
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
 }
 
 fn claim(key: &str) -> LiveClaim {
@@ -70,21 +127,10 @@ fn claim(key: &str) -> LiveClaim {
     }
 }
 
-async fn migrated_pool() -> Pool<Postgres> {
-    let pool = test_pool().expect("approved test container URL");
-    let key = format!("{:064x}", 0x9e17bfa9a053696fu64);
-    sqlx::query("DELETE FROM stream_live_claims WHERE dedup_key = $1")
-        .bind(&key)
-        .execute(&pool)
-        .await
-        .expect("ledger table is migrated");
-    pool
-}
-
 #[tokio::test]
 #[ignore = "needs the disposable agent-testdb container"]
 async fn claim_is_owned_once_then_duplicate() {
-    let pool = migrated_pool().await;
+    let (pool, schema) = setup().await;
     let key = format!("{:064x}", 0x9e17bfa9a053696fu64);
     assert_eq!(
         claim_live(&pool, &claim(&key)).await.expect("claim"),
@@ -102,18 +148,13 @@ async fn claim_is_owned_once_then_duplicate() {
         claim_live(&pool, &later).await.expect("new instant"),
         ClaimOutcome::Claimed
     );
-    sqlx::query("DELETE FROM stream_live_claims WHERE dedup_key IN ($1, $2)")
-        .bind(&key)
-        .bind(&later.dedup_key)
-        .execute(&pool)
-        .await
-        .expect("cleanup");
+    cleanup(pool, &schema).await;
 }
 
 #[tokio::test]
 #[ignore = "needs the disposable agent-testdb container"]
 async fn failed_send_releases_the_claim_for_the_retry() {
-    let pool = migrated_pool().await;
+    let (pool, schema) = setup().await;
     let key = format!("{:064x}", 0x9e17bfa9a053696fu64);
     assert_eq!(
         claim_live(&pool, &claim(&key)).await.expect("claim"),
@@ -130,17 +171,13 @@ async fn failed_send_releases_the_claim_for_the_retry() {
             .expect("release missing"),
         "releasing an unknown key must report false"
     );
-    sqlx::query("DELETE FROM stream_live_claims WHERE dedup_key = $1")
-        .bind(&key)
-        .execute(&pool)
-        .await
-        .expect("cleanup");
+    cleanup(pool, &schema).await;
 }
 
 #[tokio::test]
 #[ignore = "needs the disposable agent-testdb container"]
 async fn delivered_rows_are_never_released() {
-    let pool = migrated_pool().await;
+    let (pool, schema) = setup().await;
     let key = format!("{:064x}", 0x9e17bfa9a053696fu64);
     assert_eq!(
         claim_live(&pool, &claim(&key)).await.expect("claim"),
@@ -163,9 +200,5 @@ async fn delivered_rows_are_never_released() {
             .expect("restamp"),
         "a delivered row must not restamp"
     );
-    sqlx::query("DELETE FROM stream_live_claims WHERE dedup_key = $1")
-        .bind(&key)
-        .execute(&pool)
-        .await
-        .expect("cleanup");
+    cleanup(pool, &schema).await;
 }

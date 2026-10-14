@@ -517,6 +517,18 @@ VALUES ('100000000000000001', '100000000000000050', 'vote_started', '10000000000
        ('100000000000000001', '100000000000000051', 'vote_refused', '100000000000000033',
         '100000000000000003', '100000000000000002', 'protected_target',
         NULL, NULL, NULL, '2026-08-03T10:05:00Z');
+-- Retention queues (0438): one queued guild purge plus one pending and one
+-- completed user-deletion request, so the dump/restore round trip covers both
+-- the pending-NULL and completed-receipt shapes.
+INSERT INTO retention_guild_purge_queue (guild_id, enqueued_at)
+VALUES ('100000000000000001', '2026-08-03T10:06:00.123456Z');
+INSERT INTO retention_deletion_requests
+  (request_id, guild_id, user_id, requested_at, status, completed_at, receipt_id)
+VALUES ('backup-del-pending', '100000000000000001', '100000000000000002',
+        '2026-08-01T10:00:00.123456Z', 'pending', NULL, NULL),
+       ('backup-del-completed', '100000000000000001', '100000000000000003',
+        '2026-08-01T09:00:00Z', 'completed', '2026-08-01T10:00:00Z',
+        'rcpt-backup-del-completed');
 -- Privacy opt-out control plane (0433/0434): one suppressed pair plus one
 -- untouched pair, per-guild toggles with one category disabled, and one
 -- audit receipt per suppression. Every table carries rows so the roundtrip
@@ -591,3 +603,22 @@ VALUES ('THREAD_CREATE', '100000000000000001', '100000000000000060',
         NULL, '100000000000000002', '2026-08-03T10:01:00Z',
         'THREAD_MEMBER_UPDATE:100000000000000001:100000000000000060:2026-08-03T10:01:00Z:100000000000000002',
         NULL, NULL, NULL);
+-- Event-store S7 invite + scheduled-event capture (0439): one invite row
+-- with the code hash (never the raw code) plus the inviter id, and one
+-- scheduled-event lifecycle row with the status/entity-type enums. The hash
+-- below is hash-shaped seed data; the sha256 property itself is pinned by
+-- the S7 acceptance suite, not the backup roundtrip.
+INSERT INTO event_store (event_type, guild_id, channel_id, invite_code_hash,
+  inviter_id, event_time, received_at, dedup_key)
+VALUES ('INVITE_CREATE', '100000000000000001', '100000000000000033',
+        repeat(md5('backup:event-store:invite'), 2), '100000000000000002',
+        '2026-08-03T10:00:00Z', '2026-08-03T10:00:01Z',
+        'INVITE_CREATE:100000000000000001:100000000000000033:' ||
+          repeat(md5('backup:event-store:invite'), 2) ||
+          ':2026-08-03T10:00:00Z');
+INSERT INTO event_store (event_type, guild_id, channel_id, scheduled_event_id,
+  event_status, entity_type, event_time, received_at, dedup_key)
+VALUES ('GUILD_SCHEDULED_EVENT_CREATE', '100000000000000001',
+        '100000000000000033', '100000000000000065', 1, 2,
+        '2026-08-03T10:00:00Z', '2026-08-03T10:00:01Z',
+        'GUILD_SCHEDULED_EVENT_CREATE:100000000000000001:100000000000000065:2026-08-03T10:00:00Z');

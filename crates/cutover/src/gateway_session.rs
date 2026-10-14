@@ -61,6 +61,14 @@ impl GatewaySessionStore {
         }
     }
 
+    /// Borrow the store's pool for serial lifecycle writes that must commit
+    /// before the dispatch checkpoint (retention queue/cancel). A failed
+    /// lifecycle write holds the cursor exactly like any other pre-commit
+    /// failure, so the dispatch replays after restart.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     pub async fn load(&self) -> Result<Option<GatewaySession>, sqlx::Error> {
         self.read(&mut *self.pool.acquire().await?).await
     }
@@ -248,26 +256,35 @@ impl GatewaySessionStore {
         } else {
             None
         };
-        // Privacy gate, prefetched once for the whole batch: the suppressed
-        // member set plus the guild's analytics switches. A missing settings
-        // row means every category is enabled. Suppressed members drop every
-        // per-user write below; disabled families drop their events while
-        // other members' rows keep the aggregates counting.
-        let suppressed: HashSet<String> =
-            sqlx::query_scalar("SELECT member_id FROM privacy_opt_outs WHERE guild_id = $1")
-                .bind(&self.guild_id)
-                .fetch_all(&mut *tx)
-                .await?
-                .into_iter()
-                .collect();
-        let switches: Option<(bool, bool, bool)> = sqlx::query_as(
-            "SELECT presence_enabled, activity_enabled, voice_enabled
-             FROM guild_analytics_settings WHERE guild_id = $1",
+        // Privacy gate, prefetched once for the whole batch in a single
+        // round-trip (pipeline budget): the suppressed member set plus the
+        // guild's analytics switches. A missing settings row means every
+        // category is enabled. Suppressed members drop every per-user write
+        // below; disabled families drop their events while other members'
+        // rows keep the aggregates counting. One statement (not two) keeps
+        // the per-dispatch statement count inside the pipeline benchmark
+        // tolerance; the LOCK above still serializes with concurrent
+        // opt-outs, so the combined snapshot is at least as fresh.
+        let (suppressed_list, presence_opt, activity_opt, voice_opt): (
+            Vec<String>,
+            Option<bool>,
+            Option<bool>,
+            Option<bool>,
+        ) = sqlx::query_as(
+            "SELECT (SELECT COALESCE(array_agg(member_id), '{}'::text[]) \
+             FROM privacy_opt_outs WHERE guild_id = $1), \
+             s.presence_enabled, s.activity_enabled, s.voice_enabled \
+             FROM (SELECT 1) AS dummy \
+             LEFT JOIN guild_analytics_settings s ON s.guild_id = $1",
         )
         .bind(&self.guild_id)
-        .fetch_optional(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
-        let (presence_on, activity_on, voice_on) = switches.unwrap_or((true, true, true));
+        let suppressed: HashSet<String> = suppressed_list.into_iter().collect();
+        let (presence_on, activity_on, voice_on) = match (presence_opt, activity_opt, voice_opt) {
+            (Some(presence), Some(activity), Some(voice)) => (presence, activity, voice),
+            _ => (true, true, true),
+        };
         let family_off = |event_type: &str| match category_of_event(event_type) {
             Some(AnalyticsCategory::Presence) => !presence_on,
             Some(AnalyticsCategory::Activity) => !activity_on,

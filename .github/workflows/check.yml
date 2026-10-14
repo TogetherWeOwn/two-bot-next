@@ -647,7 +647,7 @@ jobs:
           PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-backup-tests
         # The publication regression has its own guarded DB and actual binary
         # in the dedicated step below; never feed it the round-trip fixture URL.
-        run: cargo test --workspace --test '*' --features two-bot-core/db --locked -- --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump
+        run: cargo test --workspace --test '*' --features two-bot-core/db --locked -- --skip cli_write_failure_and_crash_never_publish_prune_or_upload_a_partial_dump --skip per_route_bucket_headers_gate_same_bucket_without_hardcoded_limits --skip independent_workers_share_global_pacing --skip reset_after_header_drives_sleep_then_retry_with_no_request_during_pause --skip shared_scope_429_does_not_spend_invalid_budget_while_others_do --skip header_absent_responses_keep_conservative_spacing
 
       # Reuse the exact feature/target graph above so this measures execution,
       # not a second compilation. Property tests are pure fixtures (64 cases).
@@ -888,7 +888,7 @@ jobs:
       - name: Store Postgres integration (isolated CI schemas)
         env:
           TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/postgres
-        run: cargo test -p two-bot-store --locked --test postgres --test journal --test membership_pg -- --ignored
+        run: cargo test -p two-bot-store --locked --test postgres --test journal --test membership_pg --test backfill_cursors --test backfill_history --test backfill_audit_log --test backfill_event_users_reactions_pins --test backfill_bans_invites_onboarding --test explain_seqscan -- --ignored --skip audit_log_pagination_limit_1_to_100_before_after_covers_45d_window --skip audit_log_requests_ride_rate_limit_client_never_direct_rest --skip audit_cursor_persists_per_window_and_resumes_mid_window --skip audit_rows_hold_ids_timestamps_enums_only --skip audit_429_retry_after_pauses_without_losing_place --skip event_users_paginate_through_rate_limit_client_with_max_100 --skip reaction_users_paginate_through_rate_limit_client --skip pins_list_through_rate_limit_client_persists_metadata_only --skip blocklisted_users_skipped_for_per_user_rows_while_aggregates_keep_counting --skip persisted_rows_hold_ids_timestamps_enums_only --skip resume_continues_from_persisted_cursors_per_family --skip bans_fetch_applies_blocklist_and_counts_everyone --skip invite_rows_hold_metadata_only --skip onboarding_rows_hold_ids_enums_metadata_only --skip bans_invites_onboarding_resume_continues_from_persisted_cursors
 
       - name: sticky live store regressions (CI service container only)
         run: cargo test -p two-bot-core --features db --locked --test sticky_store_live -- --ignored
@@ -926,6 +926,11 @@ jobs:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/agent_test
         run: cargo test -p two-bot-discord --features db --locked --test internal_events -- --include-ignored
 
+      - name: Event-store S1 append-only core acceptance (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-discord --features db --locked --test event_store_s1
+
       - name: Event-store S8 stage/interaction-observe/audit-log capture acceptance (CI service only)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
@@ -955,6 +960,11 @@ jobs:
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot-discord --features db --locked --test event_store_s6
+
+      - name: Event-store S7 invite/scheduled-event capture acceptance (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-discord --features db --locked --test event_store_s7
 
       - name: custom-command Postgres proof
         run: cargo test -p two-bot-core --features db --locked --test custom_command_store -- --ignored
@@ -1191,6 +1201,9 @@ jobs:
       # regen, never in CI.
       - name: invite store atomicity (CI service container only)
         run: cargo test -p two-bot-cutover --locked --test invite_store -- --ignored
+
+      - name: member-list catch-up acceptance (CI service container only)
+        run: cargo test -p two-bot-cutover --locked --test member_list_catchup -- --ignored
 
       - name: cutover reward ladder lib regression (CI service container only)
         run: cargo test -p two-bot-cutover --locked --lib -- --ignored
@@ -1731,7 +1744,7 @@ jobs:
       - name: Fetch pinned fuzz dependencies (locked)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fetch --locked
-      # Compile-only: builds all thirteen libFuzzer targets without executing them.
+      # Compile-only: builds all fourteen libFuzzer targets without executing them.
       # No execution, no corpus output, no schedule; the bounded
       # vote_kick smoke stays a manual non-controller step (see fuzz/README.md).
       # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the

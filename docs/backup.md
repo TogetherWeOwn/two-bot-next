@@ -1,7 +1,7 @@
 # Backups, restore drills, and sealed guild-config snapshots (TOG-9881)
 
 Rust port of the legacy `two-bot` cutover-data surface (frozen source
-`two-bot` `main @ d5d11793`): v7 dump format with v3/v4/v5/v6 read compatibility,
+`two-bot` `main @ d5d11793`): v8 dump format with v3/v4/v5/v6/v7 read compatibility,
 SigV4 off-box upload, retention
 math, sealed guild-config snapshot + restore planner, and the three timer
 equivalents. Code: `crates/core/src/backup/`, CLI: `two-bot backup |
@@ -17,11 +17,13 @@ require `--force`. This confirmation is not authorization to target production.
 ## The format
 
 Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
-write **v7** (including durable voice-create reservations, the seasonal XP
-projection and the event store: voice capture plus presence capture plus
-member-capture deltas plus message/reaction capture plus thread lifecycle plus
-stage/interaction-observe/audit-log capture); the reader also accepts frozen
-**v3**, pre-reservation **v4**, pre-event-store **v5** and pre-seasonal **v6**.
+write **v8** (including durable voice-create reservations, the retention
+queues, the seasonal XP projection, the event store: voice capture plus
+presence capture plus member-capture deltas plus message/reaction capture
+plus thread lifecycle plus stage/interaction-observe/audit-log capture plus
+invite/scheduled-event capture, and the stream go-live ledger); the reader
+also accepts frozen **v3**, pre-reservation **v4**, pre-v6-tables **v5**,
+pre-seasonal **v6** and pre-ledger **v7**.
 Other versions refuse.
 The manifest carries per-table `{name, columns, column_types, count}` taken
 inside one `REPEATABLE READ` transaction, the `events` high-water mark, the
@@ -54,47 +56,61 @@ unsupported. A failed write or validation leaves existing published recovery
 points untouched; a crash may leave a temporary file, but retention and drill
 selectors ignore it.
 
-### Coverage and recovery semantics (v4, v5, v6 and v7)
+### Coverage and recovery semantics (v4, v5, v6, v7 and v8)
 
 `DUMP_TABLES` in `crates/core/src/backup/dump_file.rs` is the single ordered
-inventory for both dump and restore. It includes **84 durable tables from the
+inventory for both dump and restore. It includes **94 durable tables from the
 current cutover migrations**, including the bot-owned website-contract backing
 tables, the member-moderation ledger, the self-role send receipts
 (`self_role_exchanges`) plus their uncertainty baselines
 (`self_role_exchange_baselines`), the automod delivery claims, the gateway
 boot directives, the member-erasure audit, the internal clock high-water
 mark, the voice configuration tables, the accepted voice-room create history
-(`voice_create_reservations`), the seasonal XP projection (`member_season_xp`)
-and the event store (voice capture plus presence capture plus member-capture
-deltas plus message/reaction capture plus thread lifecycle plus
-stage/interaction-observe/audit-log capture)
+(`voice_create_reservations`), the retention queues
+(`retention_guild_purge_queue`, `retention_deletion_requests`), the seasonal
+XP projection (`member_season_xp`), the event store (voice capture plus
+presence capture plus member-capture deltas plus message/reaction capture
+plus thread lifecycle plus stage/interaction-observe/audit-log capture plus
+invite/scheduled-event capture)
 (`event_store`: 0427 voice, 0428 presence, 0429 thread lifecycle, 0430
 message/reaction capture, 0431 stage/interaction-observe/audit-log capture
-plus 0432 member-capture deltas).
+plus 0432 member-capture deltas plus 0439 invite/scheduled-event capture)
+and the stream go-live ledger (`stream_live_claims`: 0440).
 `OPTIONAL_LEGACY_TABLES` is empty: the coverage
 test fails if a covered table is not migrated. A dump from a fresh Rust schema
-has 84 table entries. A missing current table refuses a dump/restore: migrate
+has 94 table entries. A missing current table refuses a dump/restore: migrate
 the target first.
 A v4 archive must declare every covered table except the ones v5 added
-(`V5_ADDED_TABLES`), the ones v6 added (`V6_ADDED_TABLES`) and the ones v7
-added (`V7_ADDED_TABLES`), so recovery points written before
-create-reservation persistence, event-store capture and the seasonal XP
-projection remain inspectable and restorable.
+(`V5_ADDED_TABLES`), the one v6 added (`V6_ADDED_TABLES`: event-store capture
+0427 voice, 0428 presence, 0429 thread lifecycle, 0430 message/reaction
+capture, 0431 stage/interaction-observe/audit-log capture and 0432 member
+deltas), the ones v7 added (`V7_ADDED_TABLES`: seasonal XP projection
+0100 plus retention queues 0438) and the one v8 added (`V8_ADDED_TABLES`:
+stream go-live ledger 0440), so recovery points written before
+create-reservation persistence, event-store capture, the seasonal XP
+projection (0100), the retention queues (0438) and the stream ledger (0440)
+remain inspectable and restorable.
 A v4 archive written before any other table joined the inventory is refused at
 inspect ("manifest is missing tables"); take a fresh dump after upgrading. V5
-requires everything except `V6_ADDED_TABLES` and `V7_ADDED_TABLES`, so recovery
-points written before event-store capture (0427 voice, 0428 presence, 0429
-thread lifecycle, 0430 message/reaction capture, 0431
-stage/interaction-observe/audit-log capture and 0432 member deltas) and before
-the seasonal XP projection (0100) stay readable; V6 requires everything except
-`V7_ADDED_TABLES`, so recovery points written before the seasonal XP
-projection stay readable; V7 requires the full current inventory, and an
-incomplete new archive refuses at inspection. Restoring a pre-reservation
-archive clears the destination's reservation, seasonal and event-store tables,
-as with other tables absent from an older version; restoring a pre-event-store
-archive clears the destination's seasonal and event-store tables the same way;
-restoring a pre-seasonal v6 archive clears only the destination's seasonal
-table.
+requires everything except `V6_ADDED_TABLES`, `V7_ADDED_TABLES` and
+`V8_ADDED_TABLES`, so recovery points written before event-store capture
+(0427 voice, 0428 presence, 0429 thread lifecycle, 0430 message/reaction
+capture, 0431 stage/interaction-observe/audit-log capture, 0432 member deltas
+and 0439 invite/scheduled-event capture), before the seasonal XP projection
+(0100) and retention queues (0438) and before the stream ledger (0440) stay
+readable; V6 requires everything except `V7_ADDED_TABLES` and
+`V8_ADDED_TABLES`, so recovery points written before the seasonal XP
+projection, the retention queues and the stream ledger stay readable; V7
+requires everything except `V8_ADDED_TABLES`, so recovery points written
+before the stream ledger stay readable; V8 requires the full current
+inventory, and an incomplete new archive refuses at inspection. Restoring a
+pre-reservation archive clears the destination's reservation, retention,
+seasonal, event-store and stream-ledger tables, as with other tables absent
+from an older version; restoring a pre-event-store archive clears the
+destination's retention, seasonal, event-store and stream-ledger tables the
+same way; restoring a pre-retention v6 archive clears only the destination's
+seasonal, retention and stream-ledger tables; restoring a pre-ledger v7
+archive clears only the destination's stream-ledger table.
 An optional legacy table may be absent only when there are no archived rows for
 it. Nonempty legacy data without a matching target table refuses **before any
 truncate**, rather than silently discarding it.
