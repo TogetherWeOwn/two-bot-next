@@ -368,3 +368,93 @@ async fn failing_guild_purge_is_counted_and_stays_queued() {
     );
     db.close().await.unwrap();
 }
+
+/// A schema-coverage refusal defers the pending request instead of aborting
+/// the run: time-window deletes commit, the gapped request stays pending,
+/// and the request completes once the gap is gone.
+#[tokio::test]
+async fn schema_gap_defers_request_without_rolling_back_time_window() {
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    // One 31-day presence row: the time-window work that must commit.
+    sqlx::query(
+        "INSERT INTO presence_probe (guild_id, observed_at, approximate_presence_count, bot_floor)
+         VALUES ($1, to_char(now() - interval '31 days', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), 10, NULL)",
+    )
+    .bind(OTHER_GUILD)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO members (guild_id, member_id) VALUES ($1, $2)")
+        .bind(OTHER_GUILD)
+        .bind(MEMBER)
+        .execute(pool)
+        .await
+        .unwrap();
+    let request_id = request_user_deletion(pool, OTHER_GUILD, MEMBER)
+        .await
+        .unwrap();
+    // Uncovered identity column outside the erasure plan: `owner_id` trips
+    // the naming tripwire, so `schema_gaps` is nonempty for this run only.
+    sqlx::query(
+        "CREATE TABLE retention_schema_gap_probe (guild_id TEXT NOT NULL, owner_id TEXT NOT NULL)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let dry = run_retention(pool, RetentionMode::DryRun).await.unwrap();
+    assert_eq!(
+        dry.deletions_deferred, 1,
+        "dry run must report the schema-gapped request as deferred, got {dry:?}"
+    );
+    assert_eq!(
+        dry.deletions_completed, 0,
+        "dry run must not promise a completion while gapped, got {dry:?}"
+    );
+
+    let live = run_retention(pool, RetentionMode::Execute).await.unwrap();
+    assert_eq!(
+        live.presence_raw_deleted, 1,
+        "time-window deletes must commit despite the schema gap, got {live:?}"
+    );
+    assert_eq!(
+        live.deletions_completed, 0,
+        "the gapped request must not complete, got {live:?}"
+    );
+    assert_eq!(
+        live.deletions_deferred, 1,
+        "the gapped request must defer, not abort the run, got {live:?}"
+    );
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM presence_probe WHERE guild_id = $1")
+            .bind(OTHER_GUILD)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        remaining, 0,
+        "the 31-day presence row must be gone: the run committed"
+    );
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM retention_deletion_requests WHERE request_id = $1 AND status = 'pending'",
+    )
+    .bind(&request_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(pending, 1, "the gapped request must stay pending");
+
+    // Removing the gap unblocks the same request on the next run.
+    sqlx::query("DROP TABLE retention_schema_gap_probe")
+        .execute(pool)
+        .await
+        .unwrap();
+    let settled = run_retention(pool, RetentionMode::Execute).await.unwrap();
+    assert_eq!(
+        settled.deletions_completed, 1,
+        "the deferred request must complete once the gap is gone, got {settled:?}"
+    );
+    assert_eq!(settled.deletions_deferred, 0);
+    db.close().await.unwrap();
+}

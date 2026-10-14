@@ -89,9 +89,10 @@ pub struct RetentionReport {
     pub guild_purges_failed: u64,
     /// User-deletion requests completed by this run.
     pub deletions_completed: u64,
-    /// Pending deletion requests refused by a replay guard in this run,
-    /// staying pending with no receipt. A stuck fence can keep a request
-    /// here beyond the deletion SLA; see `deletions_overdue`.
+    /// Pending deletion requests refused by a replay guard or by schema
+    /// coverage in this run, staying pending with no receipt. A stuck fence
+    /// or an unplanned identity column can keep a request here beyond the
+    /// deletion SLA; see `deletions_overdue`.
     pub deletions_deferred: u64,
     /// Pending deletion requests older than [`DELETION_SLA_HOURS`], whether
     /// deferred or not. A nonzero value is the signal that the under-72-hour
@@ -153,15 +154,15 @@ fn next_request_id() -> String {
 /// completion, then guild-purge drain. Dry run reports counts and changes
 /// nothing. Deletion and queue writes happen in ONE transaction with the
 /// same lock/timeout discipline as `erase_member`; each pending deletion
-/// runs in its own savepoint so one guard refusal leaves that request
-/// pending without rolling back the time-window deletes, and each guild
-/// purge runs in its own savepoint so one bad guild stays queued without
-/// rolling back the rest of the run. Pending deletions drain before guild
-/// purges so a departed guild's pending receipts complete against pre-purge
-/// rows, and purges leave the deletion ledger to the receipt path.
-/// Guard-refused requests are counted in `deletions_deferred` (and logged at
-/// warn level) and SLA-breaching pendings in `deletions_overdue`, in both
-/// modes.
+/// runs in its own savepoint so one guard or schema-coverage refusal leaves
+/// that request pending without rolling back the time-window deletes, and
+/// each guild purge runs in its own savepoint so one bad guild stays queued
+/// without rolling back the rest of the run. Pending deletions drain before
+/// guild purges so a departed guild's pending receipts complete against
+/// pre-purge rows, and purges leave the deletion ledger to the receipt path.
+/// Guard- or schema-refused requests are counted in `deletions_deferred`
+/// (and logged at warn level) and SLA-breaching pendings in
+/// `deletions_overdue`, in both modes.
 pub async fn run_retention(
     pool: &PgPool,
     mode: RetentionMode,
@@ -188,9 +189,18 @@ pub async fn run_retention(
             )
             .fetch_all(&mut *tx)
             .await?;
+            // A schema-coverage refusal defers every pending request (the
+            // live drain rolls back only that request's savepoint), so the
+            // dry run mirrors it: with gaps, all pendings are deferred.
+            let schema_gap = !crate::member_erasure::schema_gaps(&mut tx)
+                .await?
+                .is_empty();
             let mut deferred = 0u64;
             for (guild_id, user_id) in &pendings {
-                if crate::member_erasure::has_unresolved_guards(&mut tx, guild_id, user_id).await? {
+                if schema_gap
+                    || crate::member_erasure::has_unresolved_guards(&mut tx, guild_id, user_id)
+                        .await?
+                {
                     deferred += 1;
                 }
             }
@@ -261,9 +271,9 @@ pub async fn run_retention(
             let overdue = count_overdue_deletions(&mut tx).await?;
             // Pending deletions drain BEFORE guild purges so a departed
             // guild's pending receipts complete against pre-purge rows.
-            // Each request runs in its own savepoint: a guard refusal rolls
-            // back only that request, leaving it pending, while other
-            // failures abort the run.
+            // Each request runs in its own savepoint: a guard or
+            // schema-coverage refusal rolls back only that request, leaving
+            // it pending, while other failures abort the run.
             let pendings: Vec<(String, String, String)> = sqlx::query_as(
                 "SELECT request_id, guild_id, user_id FROM retention_deletion_requests WHERE status = 'pending'",
             )
@@ -283,7 +293,7 @@ pub async fn run_retention(
                             .await?;
                         completed += 1;
                     }
-                    Err(err) if is_guard_refusal(&err) => {
+                    Err(err) if is_deferrable_refusal(&err) => {
                         sqlx::query("ROLLBACK TO SAVEPOINT retention_pending")
                             .execute(&mut *tx)
                             .await?;
@@ -301,7 +311,7 @@ pub async fn run_retention(
                     deferred = deferred,
                     overdue = overdue,
                     requests = ?deferred_ids,
-                    "retention user deletions deferred by unresolved replay guard"
+                    "retention user deletions deferred by unresolved replay guard or schema coverage"
                 );
             }
             let guilds: Vec<String> =
@@ -412,12 +422,12 @@ pub async fn request_user_deletion(
 }
 
 /// Fulfil one queued deletion request and return its receipt. Completion is
-/// immediate unless a replay guard is unresolved, in which case the request
-/// stays pending with no receipt and is reported as deferred by
-/// [`run_retention`]; the under-72-hour SLA holds for unguarded requests.
-/// Shares `erase_member`'s locks and replay-guard refusal via
-/// `complete_request`: a refused request returns an error with no receipt
-/// and stays pending.
+/// immediate unless a replay guard is unresolved or schema coverage is
+/// incomplete, in which case the request stays pending with no receipt and
+/// is reported as deferred by [`run_retention`]; the under-72-hour SLA holds
+/// for unguarded, covered requests. Shares `erase_member`'s locks and
+/// refusal gates via `complete_request`: a refused request returns an error
+/// with no receipt and stays pending.
 pub async fn fulfill_user_deletion(
     pool: &PgPool,
     request_id: &str,
@@ -475,12 +485,17 @@ pub async fn fulfill_user_deletion(
     })
 }
 
-/// True when the error is the shared replay-guard refusal (the request must
-/// stay pending, not fail the run). Matches on the message text so both the
+/// True when the error is a deferrable per-request refusal (the request must
+/// stay pending, not fail the run): the shared replay-guard refusal or the
+/// shared schema-coverage refusal. Matches on the message text so both the
 /// erasure and retention paths stay in sync without coupling to sqlx internals.
-fn is_guard_refusal(err: &sqlx::Error) -> bool {
-    format!("{err}").contains("unresolved erasure replay guard")
-        || format!("{err:?}").contains("unresolved erasure replay guard")
+fn is_deferrable_refusal(err: &sqlx::Error) -> bool {
+    let display = format!("{err}");
+    let debug = format!("{err:?}");
+    display.contains("unresolved erasure replay guard")
+        || debug.contains("unresolved erasure replay guard")
+        || display.contains("erasure schema coverage incomplete")
+        || debug.contains("erasure schema coverage incomplete")
 }
 
 /// Delete the requesting member's full footprint and settle the request,
