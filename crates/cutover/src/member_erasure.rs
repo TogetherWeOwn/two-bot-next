@@ -225,13 +225,12 @@ pub async fn has_unresolved_guild_guards_except(
         // above so only the member placeholder moves per exclusion. Any other
         // `$` in a predicate is a regex end anchor, never `$2`.
         let mut clauses: Vec<String> = Vec::new();
-        let mut next_placeholder = 2usize;
-        for _ in excluded {
+        for (offset, _) in excluded.iter().enumerate() {
+            let next_placeholder = offset + 2;
             let predicate = entry
                 .predicate
                 .replace("$2", &format!("${next_placeholder}"));
             clauses.push(format!("({predicate})"));
-            next_placeholder += 1;
         }
         let mut sql = format!(
             "SELECT EXISTS (SELECT 1 FROM {table} WHERE guild_id = $1 AND ({unresolved_predicate})"
