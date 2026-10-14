@@ -258,10 +258,11 @@ async fn runtime_surfaces_failed_guild_purge_and_retries_the_queued_work() {
 }
 
 #[tokio::test]
-async fn runtime_database_error_preserves_s1_schema_guard_and_retries_after_repair() {
+async fn runtime_schema_gap_defers_deletions_and_guild_purges_and_retries_after_repair() {
     // S1 schema guard stays fail-closed per request (no receipt while gapped)
-    // but no longer aborts the run: time-window deletes commit and the
-    // gapped request defers as a partial Ok, retrying after repair.
+    // but no longer aborts the run: time-window deletes commit, the gapped
+    // request defers as a partial Ok with a distinct schema-gap counter, and
+    // every queued guild stays queued until the plan is repaired.
     let _serial = RUNTIME_LOCK.lock().await;
     let Some(db) = database().await else { return };
     let pool = db.pool();
@@ -278,10 +279,13 @@ async fn runtime_database_error_preserves_s1_schema_guard_and_retries_after_repa
         "schema-gap deferral must not be a silent success: {report}"
     );
     field(report, "deletions_deferred", 1);
+    field(report, "schema_gap_deferrals", 1);
     field(report, "deletions_completed", 0);
     field(report, "presence_raw_deleted", 1);
     field(report, "voice_raw_deleted", 1);
     field(report, "audit_cache_deleted", 1);
+    field(report, "guild_rows_purged", 0);
+    field(report, "guild_purges_failed", 1);
     let pending: bool = sqlx::query_scalar("SELECT status = 'pending' AND receipt_id IS NULL FROM retention_deletion_requests WHERE request_id = $1").bind(&id).fetch_one(pool).await.unwrap();
     assert!(pending, "gapped request stays pending with no receipt");
     let presence_left: i64 = sqlx::query_scalar("SELECT count(*) FROM presence_probe")
@@ -292,14 +296,30 @@ async fn runtime_database_error_preserves_s1_schema_guard_and_retries_after_repa
         presence_left, 0,
         "time-window deletes must commit despite the schema gap"
     );
+    let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM retention_guild_purge_queue")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        queued, 1,
+        "queued guild must stay queued while the schema gap exists"
+    );
     sqlx::query("DROP TABLE retention_uncovered_fixture")
         .execute(pool)
         .await
         .unwrap();
     let (result, logs) = tick(pool, RetentionMode::Execute).await;
     result.unwrap();
-    field(report_line(&logs), "deletions_completed", 1);
+    let settled = report_line(&logs);
+    field(settled, "deletions_completed", 1);
+    field(settled, "schema_gap_deferrals", 0);
+    field(settled, "guild_purges_failed", 0);
     let complete: bool = sqlx::query_scalar("SELECT status = 'completed' AND receipt_id IS NOT NULL FROM retention_deletion_requests WHERE request_id = $1").bind(id).fetch_one(pool).await.unwrap();
     assert!(complete);
+    let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM retention_guild_purge_queue")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(queued, 0, "repaired run must purge the deferred guild");
     db.close().await.unwrap();
 }

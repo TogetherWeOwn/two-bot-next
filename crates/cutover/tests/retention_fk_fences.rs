@@ -371,7 +371,8 @@ async fn failing_guild_purge_is_counted_and_stays_queued() {
 
 /// A schema-coverage refusal defers the pending request instead of aborting
 /// the run: time-window deletes commit, the gapped request stays pending,
-/// and the request completes once the gap is gone.
+/// every queued guild stays queued, and the request completes once the gap
+/// is gone.
 #[tokio::test]
 async fn schema_gap_defers_request_without_rolling_back_time_window() {
     let Some(db) = database().await else { return };
@@ -394,6 +395,15 @@ async fn schema_gap_defers_request_without_rolling_back_time_window() {
     let request_id = request_user_deletion(pool, OTHER_GUILD, MEMBER)
         .await
         .unwrap();
+    // A queued departed guild: its purge must defer while the gap exists,
+    // or the queue row would dequeue work the incomplete plan never deleted.
+    sqlx::query("INSERT INTO members (guild_id, member_id) VALUES ($1, $2)")
+        .bind(GONE_GUILD)
+        .bind(MEMBER)
+        .execute(pool)
+        .await
+        .unwrap();
+    assert!(handle_guild_delete(pool, GONE_GUILD, None).await.unwrap());
     // Uncovered identity column outside the erasure plan: `owner_id` trips
     // the naming tripwire, so `schema_gaps` is nonempty for this run only.
     sqlx::query(
@@ -409,8 +419,20 @@ async fn schema_gap_defers_request_without_rolling_back_time_window() {
         "dry run must report the schema-gapped request as deferred, got {dry:?}"
     );
     assert_eq!(
+        dry.schema_gap_deferrals, 1,
+        "dry run must distinguish the gap deferral, got {dry:?}"
+    );
+    assert_eq!(
         dry.deletions_completed, 0,
         "dry run must not promise a completion while gapped, got {dry:?}"
+    );
+    assert_eq!(
+        dry.guild_rows_purged, 0,
+        "dry run must not promise a guild purge while gapped, got {dry:?}"
+    );
+    assert_eq!(
+        dry.guild_purges_failed, 1,
+        "dry run must report the gapped guild as failed, got {dry:?}"
     );
 
     let live = run_retention(pool, RetentionMode::Execute).await.unwrap();
@@ -425,6 +447,18 @@ async fn schema_gap_defers_request_without_rolling_back_time_window() {
     assert_eq!(
         live.deletions_deferred, 1,
         "the gapped request must defer, not abort the run, got {live:?}"
+    );
+    assert_eq!(
+        live.schema_gap_deferrals, 1,
+        "the gap deferral must be distinguishable from a guard, got {live:?}"
+    );
+    assert_eq!(
+        live.guild_rows_purged, 0,
+        "no guild rows may purge while the gap exists, got {live:?}"
+    );
+    assert_eq!(
+        live.guild_purges_failed, 1,
+        "the queued guild must defer while the gap exists, got {live:?}"
     );
     let remaining: i64 =
         sqlx::query_scalar("SELECT count(*) FROM presence_probe WHERE guild_id = $1")
@@ -444,8 +478,24 @@ async fn schema_gap_defers_request_without_rolling_back_time_window() {
     .await
     .unwrap();
     assert_eq!(pending, 1, "the gapped request must stay pending");
+    let queued: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM retention_guild_purge_queue WHERE guild_id = $1")
+            .bind(GONE_GUILD)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(queued, 1, "the queued guild must stay queued while gapped");
+    let guild_members: i64 = sqlx::query_scalar("SELECT count(*) FROM members WHERE guild_id = $1")
+        .bind(GONE_GUILD)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        guild_members, 1,
+        "the queued guild's rows must survive while gapped"
+    );
 
-    // Removing the gap unblocks the same request on the next run.
+    // Removing the gap unblocks the same request and guild on the next run.
     sqlx::query("DROP TABLE retention_schema_gap_probe")
         .execute(pool)
         .await
@@ -456,5 +506,14 @@ async fn schema_gap_defers_request_without_rolling_back_time_window() {
         "the deferred request must complete once the gap is gone, got {settled:?}"
     );
     assert_eq!(settled.deletions_deferred, 0);
+    assert_eq!(settled.schema_gap_deferrals, 0);
+    assert_eq!(
+        settled.guild_purges_failed, 0,
+        "the deferred guild must purge once the gap is gone, got {settled:?}"
+    );
+    assert!(
+        settled.guild_rows_purged > 0,
+        "the deferred guild's rows must purge once the gap is gone, got {settled:?}"
+    );
     db.close().await.unwrap();
 }
