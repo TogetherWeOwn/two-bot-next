@@ -975,11 +975,11 @@ pub fn render<E: ExtensionPolicy>(template: &Template, ctx: &RoomContext, ext: &
     let mut out = truncate_chars(&joined, MAX_NAME_LEN);
     out = out.trim_end().to_string();
     if out.is_empty() {
-        let fallback = ctx.fallback_name.trim();
-        if fallback.is_empty() {
+        let fallback = join_emoji_separator(ctx.fallback_name.trim());
+        if fallback.trim().is_empty() {
             out = DEFAULT_FALLBACK_NAME.to_string();
         } else {
-            out = truncate_chars(fallback, MAX_NAME_LEN);
+            out = truncate_chars(&fallback, MAX_NAME_LEN);
             out = out.trim_end().to_string();
             if out.is_empty() {
                 out = DEFAULT_FALLBACK_NAME.to_string();
@@ -1581,9 +1581,11 @@ pub fn resolve_room_name_with<E: ExtensionPolicy>(
     render(&parse(template), &ctx, extensions)
 }
 
-/// Trim → truncate → built-in default, mirroring the engine's pipeline tail.
+/// Trim → emoji separator → truncate → built-in default, mirroring the
+/// engine's pipeline tail so blank-template restores keep the guild style.
 fn finalize_raw(raw_name: &str) -> String {
-    let mut out = truncate_chars(raw_name.trim(), MAX_NAME_LEN);
+    let joined = join_emoji_separator(raw_name.trim());
+    let mut out = truncate_chars(&joined, MAX_NAME_LEN);
     out = out.trim_end().to_string();
     if out.is_empty() {
         DEFAULT_FALLBACK_NAME.to_string()
@@ -1776,6 +1778,24 @@ mod tests {
     fn default_template_render_uses_emoji_separator() {
         let name = render_str(DEFAULT_NAME_TEMPLATE, &ctx());
         assert!(name.contains("〢Ava's"), "unexpected {name:?}");
+    }
+
+    #[test]
+    fn fallback_names_use_emoji_separator() {
+        let c = ctx();
+        // Blank template (e.g. /name restore with no creator template) keeps
+        // the guild separator instead of reverting to the spaced V1 form.
+        assert_eq!(
+            resolve_room_name("", &c, "👾 Wardogs's room"),
+            "👾〢Wardogs's room"
+        );
+        // A template that renders empty falls back through the same joined path.
+        let mut empty_ctx = c.clone();
+        empty_ctx.fallback_name = "👾 Wardogs's room".to_string();
+        assert_eq!(
+            render(&parse("@@bogus@@"), &empty_ctx, &PassthroughExtensions),
+            "👾〢Wardogs's room"
+        );
     }
 
     #[test]
