@@ -596,15 +596,6 @@ fn count_community_facts_drain_failure<T, E>(
     metrics.community_facts_drain_failure(reason);
 }
 
-/// One blocking-worker dispatch step: run the funnel/leveling drain, await the
-/// interaction completion, serialize any onboarding job and commit the
-/// checkpoint — or record the first failure as a typed error and skip the
-/// commit so the cursor stays unchanged.
-///
-/// Extracted verbatim from the `dispatch_bounded` worker closure so tests can
-/// drive a failing dispatch through the real worker path: restoring a `panic!`
-/// at any failure site below fails the worker-level test instead of slipping
-/// through constructor-only coverage.
 /// Serial retention lifecycle for one gateway dispatch, ahead of the
 /// checkpoint commit. A real `GUILD_DELETE` queues a guild-data purge with
 /// the dispatch's `unavailable` flag preserved (`None`/available queues,
@@ -643,6 +634,15 @@ async fn retention_lifecycle(store: &GatewaySessionStore, event: &Event) -> Opti
     }
 }
 
+/// One blocking-worker dispatch step: run the funnel/leveling drain, await the
+/// interaction completion, serialize any onboarding job and commit the
+/// checkpoint — or record the first failure as a typed error and skip the
+/// commit so the cursor stays unchanged.
+///
+/// Extracted verbatim from the `dispatch_bounded` worker closure so tests can
+/// drive a failing dispatch through the real worker path: restoring a `panic!`
+/// at any failure site below fails the worker-level test instead of slipping
+/// through constructor-only coverage.
 #[allow(clippy::too_many_arguments)]
 fn apply_dispatch<I: InviteSource>(
     handle: &tokio::runtime::Handle,
@@ -759,9 +759,20 @@ fn apply_dispatch<I: InviteSource>(
         // Retention lifecycle before the checkpoint commits: a failed
         // queue/cancel write holds the cursor via `dispatch_error` so the
         // dispatch (and any later dispatch) is never acknowledged, and the
-        // next process replays it from the last committed sequence.
+        // next process replays it from the last committed sequence. The
+        // purge-queue write runs under the checkpoint client deadline with
+        // readiness armed, so lock contention fails bounded instead of
+        // waiting for the server statement timeout with the checkpoint
+        // uncommitted.
         if dispatch_error.is_none() {
-            if let Some(error) = handle.block_on(retention_lifecycle(store, &dispatch.event)) {
+            let retention_result =
+                handle.block_on(checkpoint_io(worker_state, generation, deadline, async {
+                    match retention_lifecycle(store, &dispatch.event).await {
+                        Some(error) => Err(error),
+                        None => Ok(()),
+                    }
+                }));
+            if let Err(error) = retention_result {
                 dispatch_error = Some(error);
             }
         }

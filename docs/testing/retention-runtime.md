@@ -1,10 +1,10 @@
 # Retention runtime acceptance contract
 
-This tests-first handoff extends the merged retention stores in [PR #923](https://github.com/TogetherWeOwn/two-bot-next/pull/923). It does **not** implement gateway hooks, a scheduler adapter, environment forwarding, or a public deletion endpoint. Do not merge the tests alone: the missing adapter is an intentional unresolved dependency until implementation lands.
+This acceptance contract began as a tests-first handoff extending the merged retention stores in [PR #923](https://github.com/TogetherWeOwn/two-bot-next/pull/923). The runtime implementation now includes the [gateway queue/cancel hooks](../../crates/bot/src/gateway.rs), the [`retention_jobs` scheduler adapter](../../crates/bot/src/retention_jobs.rs), and [`TWO_RETENTION_MODE` Worker forwarding](../../wrangler/src/container-env.ts); a public deletion endpoint and deployment changes remain out of scope.
 
-## Smallest implementation seam
+## Runtime adapter
 
-The binary needs a production `retention_jobs` module with two crate-visible functions and the configuration key used by boot:
+The production `retention_jobs` module provides two crate-visible functions and the configuration key used by boot:
 
 ```rust,ignore
 const MODE_SETTING: &str = "TWO_RETENTION_MODE";
@@ -19,7 +19,7 @@ fn job(
 ) -> jobs::Job;
 ```
 
-The test-author contract chooses `TWO_RETENTION_MODE` with the following exact, case-sensitive values. It is a proposed integration contract, not a claim that the baseline already supports this setting. The boot fixture uses the adapter's `MODE_SETTING` constant rather than duplicating a production configuration key in test code. When defining that constant, the implementer must classify and forward the non-secret runtime binding through the existing Worker allowlist and tests. Do not classify this future runtime flag as test-only to silence the environment-drift guard; this handoff changes neither the guard nor its classifications.
+The adapter parses `TWO_RETENTION_MODE` with the following exact, case-sensitive values. The boot fixture uses the adapter's `MODE_SETTING` constant rather than duplicating a production configuration key in test code. The non-secret runtime binding is classified in the existing Worker's `FORWARDED_FLAGS` allowlist, not as a test-only flag; the environment-drift guard remains in place.
 
 | Setting | Result |
 |---|---|
@@ -75,10 +75,10 @@ python3 scripts/cargo_cache.py run -- test -p two-bot --locked --bin two-bot gat
 
 Database tests explicitly skip locally when `TWO_TEST_DATABASE_URL` is absent and fail if it is absent in GitHub Actions. A configured invalid/unreachable database fails, never skips. An all-green test summary without a configured bootstrap is **not** database acceptance; check for SKIP messages. The child probe is a helper that returns immediately unless launched by its parent test.
 
-A refused Cargo cache lease is infrastructure refusal, not compiler RED and not a behavioral failure. Preserve the observed exit/log separately from the expected missing-adapter RED. Do not bypass the wrapper. After implementing, run the full relevant checks and same-head CI/review before merging.
+A refused Cargo cache lease is infrastructure refusal, not compiler RED and not a behavioral failure. Record that refusal separately from a test failure; do not bypass the wrapper. Run the relevant checks and same-head CI/review before merging.
 
 ## Handoff ownership and exclusions
 
-Owned additions: `crates/bot/src/retention_runtime_tests.rs`, its `database.rs` and `boot.rs` children, `crates/bot/src/gateway_tests/retention.rs`, and this document. Registration-only changes are in `main.rs` and `gateway_tests/voice.rs`. Previous S1 acceptance files and production behavior are unchanged.
+The tests-first handoff added `crates/bot/src/retention_runtime_tests.rs`, its `database.rs` and `boot.rs` children, `crates/bot/src/gateway_tests/retention.rs`, and this document, with test registration in `main.rs` and `gateway_tests/voice.rs`. The implementation incorporated the test-author commits and added the gateway lifecycle hook, `retention_jobs`, registration in `website_jobs::serve`, and Worker forwarding. Previous S1 acceptance files remain unchanged; production code now invokes the retention core through these runtime paths.
 
-The implementer incorporates the immutable test commit into their own assigned branch. Keep acceptance files immutable during implementation; report any demonstrated fixture defect to the test author instead of weakening an assertion. Event-store age TTL, a public user-deletion endpoint, production/staging rollout, and deployment configuration changes are outside this handoff.
+Keep acceptance files immutable during implementation; report any demonstrated fixture defect to the test author instead of weakening an assertion. Event-store age TTL, a public user-deletion endpoint, production/staging rollout, and deployment configuration changes remain outside this slice.
