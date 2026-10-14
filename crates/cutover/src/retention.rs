@@ -84,6 +84,8 @@ pub struct RetentionReport {
     /// Guild-scoped rows purged for departed guilds.
     pub guild_rows_purged: u64,
     /// Queued guild purges that failed in this run, leaving the guild queued.
+    /// Guard-deferred purges (an unresolved replay guard anywhere in the
+    /// guild) count here too: the guild stays queued with rows untouched.
     /// A nonzero value with an `Ok` return is the signal that a departed
     /// guild's rows survived the run (see the warn log for the guild id).
     pub guild_purges_failed: u64,
@@ -329,11 +331,18 @@ pub async fn run_retention(
                             .execute(&mut *tx)
                             .await?;
                         guild_failed += 1;
-                        tracing::warn!(
-                            guild_id = %guild,
-                            error = %format!("{err:?}"),
-                            "retention guild purge failed, kept queued"
-                        );
+                        if is_guard_refusal(&err) {
+                            tracing::warn!(
+                                guild_id = %guild,
+                                "retention guild purge deferred by unresolved replay guard, kept queued"
+                            );
+                        } else {
+                            tracing::warn!(
+                                guild_id = %guild,
+                                error = %format!("{err:?}"),
+                                "retention guild purge failed, kept queued"
+                            );
+                        }
                     }
                 }
             }
@@ -625,6 +634,10 @@ async fn count_overdue_deletions(
 /// for a departed guild still completes with a receipt instead of vanishing.
 /// Re-checks the queue row under the caller's lock: a guild whose purge was
 /// cancelled via [`cancel_guild_purge`] (rejoin before the run) keeps its rows.
+/// Refuses before deleting anything while any replay guard is unresolved
+/// anywhere in the guild (see [`crate::member_erasure::has_unresolved_guild_guards`]):
+/// the error keeps the guild queued with rows untouched until the guards
+/// settle, and the caller reports it via `guild_purges_failed`.
 async fn purge_guild(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     guild_id: &str,
@@ -636,6 +649,11 @@ async fn purge_guild(
             .await?;
     if still_queued.is_none() {
         return Ok(0);
+    }
+    if crate::member_erasure::has_unresolved_guild_guards(tx, guild_id).await? {
+        return Err(sqlx::Error::InvalidArgument(
+            "unresolved erasure replay guard".into(),
+        ));
     }
     let mut purged = 0u64;
     purged += sqlx::query("DELETE FROM presence_probe WHERE guild_id = $1")
