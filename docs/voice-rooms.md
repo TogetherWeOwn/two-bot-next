@@ -182,7 +182,12 @@ library code with no Discord dependency and can start immediately.
 - The name is recalculated on join or leave, activity changes, and limit or
   privacy changes.
 - Evaluation order: conditionals (innermost first) → token substitution →
-  styling → trim → truncate to 100 characters → fallback name if empty.
+  styling → trim → emoji separator → truncate to 100 characters → fallback
+  name if empty.
+- A rendered name that opens with an emoji joins it to the rest with `〢`
+  (U+3022) and no spaces (`👾 WARDOGS deep dive` → `👾〢WARDOGS deep dive`);
+  an already-separated name is left alone, never doubled. The legacy
+  `{username}` create path applies the same separator.
 
 **Numbering**
 
