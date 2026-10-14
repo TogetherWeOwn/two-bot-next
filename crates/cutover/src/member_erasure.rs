@@ -227,7 +227,9 @@ pub async fn has_unresolved_guild_guards_except(
         let mut clauses: Vec<String> = Vec::new();
         let mut next_placeholder = 2usize;
         for _ in excluded {
-            let predicate = entry.predicate.replace("$2", &format!("${next_placeholder}"));
+            let predicate = entry
+                .predicate
+                .replace("$2", &format!("${next_placeholder}"));
             clauses.push(format!("({predicate})"));
             next_placeholder += 1;
         }
@@ -238,8 +240,7 @@ pub async fn has_unresolved_guild_guards_except(
             sql.push_str(&format!(" AND NOT ({})", clauses.join(" OR ")));
         }
         sql.push(')');
-        let mut query =
-            sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(sql)).bind(guild);
+        let mut query = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(sql)).bind(guild);
         for member in excluded {
             query = query.bind(*member);
         }

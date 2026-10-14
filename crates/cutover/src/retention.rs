@@ -762,7 +762,9 @@ async fn purge_guild(
     if still_queued.is_none() {
         return Ok(0);
     }
-    if crate::member_erasure::has_unresolved_guild_guards_except(tx, guild_id, pending_members).await? {
+    if crate::member_erasure::has_unresolved_guild_guards_except(tx, guild_id, pending_members)
+        .await?
+    {
         return Err(sqlx::Error::InvalidArgument(
             "unresolved erasure replay guard".into(),
         ));
@@ -874,7 +876,9 @@ async fn count_queued_guild_rows(
             .filter(|(pending_guild, _)| pending_guild == guild)
             .map(|(_, user_id)| user_id.as_str())
             .collect();
-        if crate::member_erasure::has_unresolved_guild_guards_except(&mut *tx, guild, &pending_here).await? {
+        if crate::member_erasure::has_unresolved_guild_guards_except(&mut *tx, guild, &pending_here)
+            .await?
+        {
             deferred_guilds += 1;
             deferred_oldest = deferred_oldest.max((*waited_secs).max(0) as u64);
             continue;
@@ -962,7 +966,4 @@ async fn count_queued_guild_rows(
         }
     }
     Ok((total, deferred_guilds, deferred_oldest))
-}
-    }
-    Ok(total)
 }
