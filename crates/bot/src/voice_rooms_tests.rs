@@ -179,6 +179,10 @@ struct Store {
     /// that pin ordering against the Discord and persist calls.
     trace_claims: bool,
     creators_error: Option<StoreError>,
+    /// Acceptance probes for the creator-view refresh (#961): how many times
+    /// the worker re-read the creator table, in bulk and by single row.
+    creators_reads: Arc<AtomicU64>,
+    creator_for_reads: Arc<AtomicU64>,
     custom_names: Mutex<HashMap<u64, String>>,
     save_custom_name_errors: Mutex<VecDeque<StoreError>>,
     /// V4 audit rows appended so far, in append order.
@@ -230,6 +234,8 @@ impl Store {
             bind_errors: Mutex::new(VecDeque::new()),
             trace_claims: false,
             creators_error: None,
+            creators_reads: Arc::new(AtomicU64::new(0)),
+            creator_for_reads: Arc::new(AtomicU64::new(0)),
             custom_names: Mutex::new(HashMap::new()),
             save_custom_name_errors: Mutex::new(VecDeque::new()),
             kick_audit: Mutex::new(Vec::new()),
@@ -240,6 +246,8 @@ impl Store {
 
 impl RoomPersistence for Store {
     async fn creators(&self, _: u64) -> Result<Vec<CreatorChannel>, StoreError> {
+        self.creators_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match self.creators_error {
             Some(error) => Err(error),
             None => Ok(self.creators.lock().unwrap().clone()),
@@ -307,6 +315,8 @@ impl RoomPersistence for Store {
         _: u64,
         channel: u64,
     ) -> Result<Option<CreatorChannel>, StoreError> {
+        self.creator_for_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(self
             .creators
             .lock()
@@ -13572,4 +13582,231 @@ async fn global_429_requeues_and_resumes_without_losing_the_move() {
     dispatch(&mut worker, 2_000).await;
     assert_eq!(worker.queue.pending_counts(GUILD), (0, 0));
     assert_eq!(worker.queue.oldest_pending_age(GUILD), None);
+}
+
+// ---- creator-view refresh acceptance (PR #961, TOG-24332) ----
+//
+// Failing-first pins for `fix(voice): revalidate stale creator view from the
+// store`. The production stall: joins to the "Create a Lobby" creator refused
+// as `unknown_creator` while the `voice_creators` row existed, because the
+// worker's creator map loads once at startup and only grows through admin
+// pushes. The fix re-reads the single row on an unknown join (known creators
+// and known rooms skip the read) and merges the stored rows on channel
+// create/update/delete (debounced) plus every five minutes.
+//
+// Every test below compiles against the pre-fix tree and drives the worker
+// through the real actor (`run_actor_with_limits`), so each discriminating
+// test fails without the fix and passes with it. The `*_reads` counters on
+// the fake store are the mechanism pins; the worker-state asserts are the
+// behavior pins. Guard tests pass both before and after: they lock the
+// refusal side (unknown channels still refuse) and the no-regression side
+// (known creators and rooms cost no extra read). The builder implements
+// production code on this branch and never touches this file.
+
+/// Drive one actor lifetime: send every command, flush with a Status
+/// round-trip (the channel is FIFO, so the reply proves the earlier commands
+/// were handled), then shut down and hand the worker back for asserts.
+async fn acceptance_drive(
+    worker: GuildRoomWorker<Store, Http>,
+    commands: Vec<ActorCommand>,
+) -> GuildRoomWorker<Store, Http> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            ActorLimits::default(),
+        )
+        .await;
+        worker
+    });
+    for command in commands {
+        tx.send(command).expect("actor inbox stays open");
+    }
+    acceptance_flush(&tx).await;
+    drop(tx);
+    task.await.expect("actor task joins")
+}
+
+/// One Status round-trip: proves everything sent before it was handled.
+async fn acceptance_flush(tx: &mpsc::UnboundedSender<ActorCommand>) {
+    let (reply, reply_rx) = oneshot::channel();
+    tx.send(ActorCommand::Status(reply))
+        .expect("actor inbox stays open");
+    reply_rx.await.expect("actor answers Status");
+}
+
+#[tokio::test(start_paused = true)]
+async fn acceptance_stale_creator_join_revalidates_through_the_actor() {
+    // The #961 stall: the runtime creator view went stale while the
+    // `voice_creators` row existed, so joins refused as `unknown_creator`
+    // until restart. A stale view must re-read the single store row for the
+    // joined channel instead of refusing it.
+    let (live, store, http, _) = fixture();
+    let creator_for_reads = Arc::clone(&store.creator_for_reads);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // Stale view only: the store row stays, the worker map loses it.
+    worker.creators.clear();
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(CREATOR), Some(false))
+        .expect("ticket for a joined channel");
+    let worker = acceptance_drive(worker, vec![join_command(ticket)]).await;
+    assert!(
+        !worker.creations.is_empty(),
+        "a join for a stored creator row must be accepted, not refused as unknown_creator"
+    );
+    assert!(
+        worker.creators.contains_key(&CREATOR),
+        "the stale view must revalidate the row from the store"
+    );
+    assert_eq!(
+        creator_for_reads.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the unknown join must cost exactly one single-row store read"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn acceptance_join_without_a_store_row_still_refuses() {
+    // Revalidation only admits channels that are `voice_creators` rows: a
+    // join to a channel the store never heard of still refuses.
+    const STRANGER: u64 = 999;
+    let (live, store, http, _) = fixture();
+    live.publish(snapshot(&[STRANGER], vec![]));
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(STRANGER), Some(false))
+        .expect("ticket for a joined channel");
+    let worker = acceptance_drive(worker, vec![join_command(ticket)]).await;
+    assert!(
+        worker.creations.is_empty(),
+        "a channel with no creator row must still refuse"
+    );
+    assert!(
+        !worker.creators.contains_key(&STRANGER),
+        "revalidation must not invent creator rows"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn acceptance_known_creator_join_skips_the_extra_store_read() {
+    // Known creators never cost a store read: only a channel the worker has
+    // never seen triggers one.
+    let (live, store, http, _) = fixture();
+    let creator_for_reads = Arc::clone(&store.creator_for_reads);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(CREATOR), Some(false))
+        .expect("ticket for a joined channel");
+    let worker = acceptance_drive(worker, vec![join_command(ticket)]).await;
+    assert!(
+        !worker.creations.is_empty(),
+        "known creator joins keep working"
+    );
+    assert_eq!(
+        creator_for_reads.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "known creators must skip the extra store read"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn acceptance_known_room_join_skips_the_extra_store_read() {
+    // A tracked room is not a creator: the join refuses, and the refusal
+    // costs no store read either.
+    const ROOM: u64 = 500;
+    let (live, store, http, _) = fixture();
+    store.rooms.lock().unwrap().insert(ROOM, room(ROOM));
+    live.publish(snapshot(&[ROOM], vec![]));
+    let creator_for_reads = Arc::clone(&store.creator_for_reads);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(ROOM), Some(false))
+        .expect("ticket for a joined channel");
+    let worker = acceptance_drive(worker, vec![join_command(ticket)]).await;
+    assert!(
+        worker.creations.is_empty(),
+        "a tracked room is not a creator, so the join refuses"
+    );
+    assert_eq!(
+        creator_for_reads.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "known rooms must skip the extra store read"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn acceptance_periodic_merge_rereads_the_store() {
+    // The five-minute merge: a row written outside the worker (operator
+    // tooling, a missed CreatorAdded) converges on the maintenance tick even
+    // with no channel events. The first tick merges immediately, a minute
+    // later the fresh view reads nothing, and past five minutes the interval
+    // fires again.
+    let (live, store, http, _) = fixture();
+    let creators_reads = Arc::clone(&store.creators_reads);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    assert_eq!(
+        creators_reads.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "worker load reads the creator table once"
+    );
+    // Stale view only: the store row stays, the worker map loses it.
+    worker.creators.clear();
+    let (tx, rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            ActorLimits::default(),
+        )
+        .await;
+        worker
+    });
+    for _ in 0..50 {
+        if creators_reads.load(std::sync::atomic::Ordering::Relaxed) >= 2 {
+            break;
+        }
+        tokio::time::advance(Duration::from_millis(100)).await;
+        acceptance_flush(&tx).await;
+    }
+    assert_eq!(
+        creators_reads.load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "the first maintenance must merge the stored rows"
+    );
+    // A minute later the view is fresh: inside the five-minute interval with
+    // no channel event pending, so no second read.
+    tokio::time::advance(Duration::from_secs(60)).await;
+    acceptance_flush(&tx).await;
+    acceptance_flush(&tx).await;
+    assert_eq!(
+        creators_reads.load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "a fresh view must not re-read the creator table"
+    );
+    // Past five minutes the interval fires again.
+    for _ in 0..50 {
+        if creators_reads.load(std::sync::atomic::Ordering::Relaxed) >= 3 {
+            break;
+        }
+        tokio::time::advance(Duration::from_millis(500)).await;
+        acceptance_flush(&tx).await;
+    }
+    assert_eq!(
+        creators_reads.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "the five-minute interval must re-read the creator table"
+    );
+    drop(tx);
+    let worker = task.await.expect("actor task joins");
+    assert!(
+        worker.creators.contains_key(&CREATOR),
+        "the merge must converge the externally kept row without a restart"
+    );
 }
