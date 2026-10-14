@@ -302,18 +302,20 @@ async fn failing_guild_purge_is_counted_and_stays_queued() {
     // Wedge: a NO ACTION foreign key onto the departed guild's member row so
     // the purge's member delete fails with 23503. The wedge table is outside
     // the erasure plan, so the purge never deletes the blocking row itself.
+    // The column is not named `member_id`: an uncovered identity column is a
+    // schema gap, which would defer the purge before the FK can fail.
     sqlx::query(
         "CREATE TABLE retention_purge_wedge (
            id SERIAL PRIMARY KEY,
            guild_id TEXT NOT NULL,
-           member_id TEXT NOT NULL,
-           FOREIGN KEY (guild_id, member_id) REFERENCES members (guild_id, member_id)
+           held_ref TEXT NOT NULL,
+           FOREIGN KEY (guild_id, held_ref) REFERENCES members (guild_id, member_id)
          )",
     )
     .execute(pool)
     .await
     .unwrap();
-    sqlx::query("INSERT INTO retention_purge_wedge (guild_id, member_id) VALUES ($1, $2)")
+    sqlx::query("INSERT INTO retention_purge_wedge (guild_id, held_ref) VALUES ($1, $2)")
         .bind(GONE_GUILD)
         .bind(MEMBER)
         .execute(pool)
