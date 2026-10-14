@@ -769,11 +769,75 @@ fn ledger_json(rows: &[LedgerRow]) -> Value {
 /// empty list: `[]` reads as "nothing applied".
 const LEDGER_UNKNOWN: &str = "unknown: ledger unreadable";
 
-/// `None` when no connection or the read fails, so the caller records
-/// [`LEDGER_UNKNOWN`] instead of an empty ledger.
-async fn read_ledger_after_run(pool: &PgPool) -> Option<Vec<LedgerRow>> {
-    let mut conn = pool.acquire().await.ok()?;
-    read_ledger(&mut conn).await.ok()
+/// Post-apply ledger read attempts: the pre-apply read uses the identical
+/// query as the identical role, so a post-apply read failure is transient
+/// connection state (a pool checkout timing out against a saturated
+/// database), not grants or migration content. Retry briefly before reporting
+/// the ledger unreadable; a permanently unreadable ledger still fails closed.
+pub const POST_APPLY_READ_ATTEMPTS: u32 = 5;
+pub const POST_APPLY_READ_RETRY_DELAY_SECS: u64 = 2;
+
+/// Why the post-apply ledger read failed. Fixed strings only; never a URL,
+/// host, login or error body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadAfterApply {
+    PoolAcquireFailed,
+    LedgerQueryFailed,
+}
+
+impl ReadAfterApply {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PoolAcquireFailed => "pool_acquire_failed",
+            Self::LedgerQueryFailed => "ledger_query_failed",
+        }
+    }
+}
+
+/// Run a fallible post-apply read `attempts` times (at least once), sleeping
+/// `delay` between attempts. Returns the first success or the terminal
+/// failure kind.
+async fn retry_transient<F, Fut, T>(
+    mut op: F,
+    attempts: u32,
+    delay: Duration,
+) -> Result<T, ReadAfterApply>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, ReadAfterApply>>,
+{
+    let attempts = attempts.max(1);
+    for attempt in 0..attempts {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(kind) => {
+                if attempt + 1 == attempts {
+                    return Err(kind);
+                }
+                tokio::sleep(delay).await;
+            }
+        }
+    }
+    unreachable!("attempts is at least 1");
+}
+
+/// `Err` with the terminal failure kind when no attempt could read, so the
+/// caller records [`LEDGER_UNKNOWN`] instead of an empty ledger.
+async fn read_ledger_after_run(pool: &PgPool) -> Result<Vec<LedgerRow>, ReadAfterApply> {
+    retry_transient(
+        move || async move {
+            let mut conn = pool
+                .acquire()
+                .await
+                .map_err(|_| ReadAfterApply::PoolAcquireFailed)?;
+            read_ledger(&mut conn)
+                .await
+                .map_err(|_| ReadAfterApply::LedgerQueryFailed)
+        },
+        POST_APPLY_READ_ATTEMPTS,
+        Duration::from_secs(POST_APPLY_READ_RETRY_DELAY_SECS),
+    )
+    .await
 }
 
 fn ledger_or_unknown(rows: Option<&[LedgerRow]>) -> Value {
@@ -848,6 +912,18 @@ async fn audit_queries(pool: &PgPool) -> Result<Value, &'static str> {
         .fetch_all(&mut *tx)
         .await
         .map_err(|_| "audit verify read failed")?;
+    // Connection pressure: staging once refused all logins at 25/25
+    // connections with no prior signal. Both counters are readable by any
+    // login and live in pg_catalog, so they survive the search_path pin.
+    let connections_used: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| "audit connection count read failed")?;
+    let max_connections: i64 =
+        sqlx::query_scalar("SELECT current_setting('max_connections')::bigint")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| "audit max_connections read failed")?;
     tx.rollback().await.map_err(|_| "audit rollback failed")?;
     let mut membership_entries = Vec::with_capacity(memberships.len());
     for (login, exists, member_of, of_migrator, of_ro) in &memberships {
@@ -866,7 +942,45 @@ async fn audit_queries(pool: &PgPool) -> Result<Value, &'static str> {
         "verify_findings": findings,
         "matrix_sha256": hex::encode(Sha256::digest(AUDIT_MATRIX.as_bytes())),
         "verify_sha256": hex::encode(Sha256::digest(AUDIT_VERIFY.as_bytes())),
+        "connection_usage": {
+            "used": connections_used,
+            "max_connections": max_connections,
+            "pct_full": connections_used as f64 / max_connections.max(1) as f64 * 100.0,
+        },
     }))
+}
+
+/// Warn threshold for staging connection pressure: staging once refused all
+/// logins at 25/25 connections with no prior signal. Strictly above 80%
+/// warns; degenerate inputs never warn. The line is a GitHub workflow
+/// annotation, so the plan run surfaces it without failing the plan manifest
+/// the apply binds to.
+pub const CONNECTION_WARN_PCT: f64 = 80.0;
+
+/// `Some` annotation line when `used` exceeds [`CONNECTION_WARN_PCT`] of
+/// `max`, else `None`. Counts only; never a URL, host or login.
+pub fn connection_warning(used: i64, max: i64) -> Option<String> {
+    if max <= 0 || used < 0 {
+        return None;
+    }
+    let pct = used as f64 / max as f64 * 100.0;
+    if pct > CONNECTION_WARN_PCT {
+        Some(format!(
+            "::warning::staging database connections above 80% of max_connections: \
+             {used}/{max} ({pct:.1}%)"
+        ))
+    } else {
+        None
+    }
+}
+
+/// Read the plan audit's `connection_usage` back into [`connection_warning`].
+/// A failed or field-less readout warns about nothing.
+fn connection_warning_from_audit(audit: &Value) -> Option<String> {
+    let usage = audit.get("connection_usage")?;
+    let used = usage.get("used")?.as_i64()?;
+    let max = usage.get("max_connections")?.as_i64()?;
+    connection_warning(used, max)
 }
 
 async fn connect(
@@ -957,11 +1071,17 @@ async fn run_on_pool(
     check_plan_provenance(req, &computed_hash)?;
 
     // Plan-only readout inside one READ ONLY transaction. Apply skips it: that
-    // login is the migrator, not the read-only readout.
+    // login is the migrator, not the read-only readout. A saturated staging
+    // database warns on stderr (a workflow annotation) without failing the
+    // plan manifest the apply binds to.
     let audit = if req.apply {
         Value::Null
     } else {
-        read_audit(pool).await
+        let audit = read_audit(pool).await;
+        if let Some(line) = connection_warning_from_audit(&audit) {
+            eprintln!("{line}");
+        }
+        audit
     };
 
     let mut applied = 0usize;
@@ -970,18 +1090,23 @@ async fn run_on_pool(
         let outcome = MIGRATOR.run(pool).await;
         let read_back = read_ledger_after_run(pool).await;
         if let Err(e) = outcome {
-            let evidence = json!({"ledger_after_failure": ledger_or_unknown(read_back.as_deref()),
+            let evidence = json!({"ledger_after_failure":
+                                      ledger_or_unknown(read_back.as_ref().ok().map(Vec::as_slice)),
                                   "error": e.to_string()});
             return Err(RunError::Failed(
                 "migration execution failed".to_owned(),
                 evidence,
             ));
         }
-        let Some(rows) = read_back else {
-            return Err(RunError::Failed(
-                "ledger unreadable after apply".to_owned(),
-                json!({"ledger_after": LEDGER_UNKNOWN}),
-            ));
+        let rows = match read_back {
+            Ok(rows) => rows,
+            Err(kind) => {
+                return Err(RunError::Failed(
+                    "ledger unreadable after apply".to_owned(),
+                    json!({"ledger_after": LEDGER_UNKNOWN,
+                           "ledger_after_error": kind.as_str()}),
+                ));
+            }
         };
         after = rows;
         applied = after.len().saturating_sub(before.len());
