@@ -278,7 +278,19 @@ impl GameActivityCollector {
                             // old game already stopped (`stopped_at`), the run
                             // ended at the stop: bridging to the change clock
                             // would credit the idle gap as phantom play, so the
-                            // close-out ends at the stop instead.
+                            // close-out ends at the stop instead. When the stop
+                            // is already in this window's buffer, the flush's
+                            // own stop-bridge replays the run-up, so no
+                            // synthetic close-out is emitted at all: emitting
+                            // one would duplicate the stop-bridge points and
+                            // the stop between the duplicates would split the
+                            // run into a floored phantom singleton.
+                            let stopped_bounds_run = matches!(
+                                prev.stopped_at,
+                                Some(stopped_at)
+                                    if stopped_at >= prev.from_ms
+                                        && stopped_at <= observed_at_ms
+                            );
                             let close_at_ms = match prev.stopped_at {
                                 Some(stopped_at)
                                     if stopped_at >= prev.from_ms
@@ -288,7 +300,8 @@ impl GameActivityCollector {
                                 }
                                 _ => observed_at_ms,
                             };
-                            if observed_at_ms >= prev.from_ms
+                            if !stopped_bounds_run
+                                && observed_at_ms >= prev.from_ms
                                 && observed_at_ms.saturating_sub(prev.from_ms)
                                     <= GAME_ACTIVITY_CARRY_TTL_MS
                             {

@@ -713,8 +713,8 @@ fn disconnect_closes_open_voice_spans() {
     );
 }
 
-#[test]
-fn warm_resume_reopens_voice_span_for_cached_member() {
+#[tokio::test]
+async fn warm_resume_reopens_voice_span_for_cached_member() {
     const MIN: i64 = 60_000;
     let (store, http, _) = fixture();
     let runtime = runtime(store, http);
