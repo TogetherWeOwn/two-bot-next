@@ -106,7 +106,9 @@ impl RetentionReport {
     /// classes are disjoint in both modes: Execute deletes each row in the
     /// first stage that selects it, and the dry-run guild projection
     /// excludes rows the preceding time-window and eligible user-deletion
-    /// stages would remove. Completed user deletions are receipts, not row
+    /// stages would remove, including rows removed only by
+    /// `ON DELETE CASCADE` from a parent the user stage deletes.
+    /// Completed user deletions are receipts, not row
     /// counts, and are reported separately in `deletions_completed`;
     /// deferred and overdue requests are pending-work signals, not
     /// deletions, and are excluded, as are failed guild purges
@@ -613,6 +615,48 @@ fn guild_projection_time_exclusion(table: &str, placeholder: usize) -> Option<(S
     }
 }
 
+/// `ON DELETE CASCADE` parents of one erasure-plan table, as
+/// `(parent table, join condition)` pairs with fully qualified columns.
+/// Mirrors the CASCADE foreign keys in migrations 0170, 0180, 0210, 0413,
+/// 0416 and 0418: every CASCADE child the guild purge counts. The
+/// remaining CASCADE child, `self_role_exchange_baselines` (0206), is not
+/// a plan table and is never counted by the purge, so it needs no
+/// exclusion. A child row whose parent the user-deletion stage deletes is
+/// removed by the cascade in an Execute run even when the child's own
+/// plan predicate does not match the deleted member (another member's
+/// block or grant in the deleted member's room), so the dry-run guild
+/// projection excludes it via the parent's own plan predicate; several
+/// children (`lfg_signups`, `lfg_roles`, `feed_deliveries`) already fold
+/// that parent condition into their predicate, and the explicit exclusion
+/// keeps them correct if the predicate changes.
+fn guild_projection_cascade_parents(table: &str) -> &'static [(&'static str, &'static str)] {
+    match table {
+        "lfg_signups" => &[
+            ("lfg_posts", "lfg_posts.id = lfg_signups.lfg_id"),
+            (
+                "lfg_roles",
+                "lfg_roles.lfg_id = lfg_signups.lfg_id AND lfg_roles.role_key = lfg_signups.role_key",
+            ),
+        ],
+        "lfg_roles" => &[("lfg_posts", "lfg_posts.id = lfg_roles.lfg_id")],
+        "feed_deliveries" => &[("feed_relays", "feed_relays.id = feed_deliveries.feed_id")],
+        "ticket_transcripts" => &[("tickets", "tickets.id = ticket_transcripts.ticket_id")],
+        "voice_room_blocks" => &[(
+            "voice_rooms",
+            "voice_rooms.guild_id = voice_room_blocks.guild_id AND voice_rooms.channel_id = voice_room_blocks.room_channel_id",
+        )],
+        "voice_join_grants" => &[(
+            "voice_rooms",
+            "voice_rooms.guild_id = voice_join_grants.guild_id AND voice_rooms.channel_id = voice_join_grants.room_channel_id",
+        )],
+        "voice_owner_grants" => &[(
+            "voice_rooms",
+            "voice_rooms.guild_id = voice_owner_grants.guild_id AND voice_rooms.channel_id = voice_owner_grants.channel_id",
+        )],
+        _ => &[],
+    }
+}
+
 /// Pending deletion requests older than [`DELETION_SLA_HOURS`]: the overdue
 /// signal for both run modes. Uses the same clock as the request ledger.
 async fn count_overdue_deletions(
@@ -717,7 +761,8 @@ enum ProjectionBind<'a> {
 /// deletion ledger, plus the raw probe. Execute runs the purge LAST, so the
 /// projection excludes rows the preceding stages would already remove —
 /// expired time-window rows and the guild's eligible (not guard-deferred)
-/// pending user deletions — instead of counting those rows twice across
+/// pending user deletions, including `ON DELETE CASCADE` children of
+/// parents those deletions remove — instead of counting rows twice across
 /// per-class buckets. Exclusions use `IS NOT TRUE` so a NULL time or member
 /// column keeps the row, matching a DELETE whose WHERE is not true. Plan
 /// predicates are evaluated against this snapshot; the plan's
@@ -777,10 +822,32 @@ async fn count_queued_guild_rows(
                 // member bind to this query's next placeholder. The only
                 // other `$` occurrences in plan predicates are regex end
                 // anchors (`...|$)`), which never read `$2`.
+                let user_placeholder = next_placeholder;
                 let predicate = entry
                     .predicate
-                    .replace("$2", &format!("${next_placeholder}"));
+                    .replace("$2", &format!("${user_placeholder}"));
                 sql.push_str(&format!(" AND ({predicate}) IS NOT TRUE"));
+                // Cascade children: a row the user stage removes only
+                // because it deletes the row's CASCADE parent (matched by
+                // the parent's own plan predicate, evaluated inside the
+                // EXISTS so its unqualified columns bind to the parent)
+                // never reaches the guild stage. Shares this user's bind.
+                for (parent_table, join_condition) in guild_projection_cascade_parents(&entry.table)
+                {
+                    let Some(parent) = erasure
+                        .tables
+                        .iter()
+                        .find(|plan| plan.table == *parent_table)
+                    else {
+                        continue;
+                    };
+                    let parent_predicate = parent
+                        .predicate
+                        .replace("$2", &format!("${user_placeholder}"));
+                    sql.push_str(&format!(
+                        " AND NOT EXISTS (SELECT 1 FROM {parent_table} WHERE {join_condition} AND ({parent_predicate}))"
+                    ));
+                }
                 binds.push(ProjectionBind::Text(user_id));
                 next_placeholder += 1;
             }

@@ -6,7 +6,10 @@
 //! removes must not be counted again in `guild_rows_purged`, or the dry-run
 //! total overstates what Execute will delete. Guard-deferred users are the
 //! exception: their rows survive the user-deletion stage and are purged
-//! with the guild, so they stay in the guild projection.
+//! with the guild, so they stay in the guild projection. Rows another
+//! member owns that only disappear because the user stage deletes their
+//! `ON DELETE CASCADE` parent (the deletion user's voice room or ticket)
+//! are gone before the guild stage too, so they stay out of it.
 
 use two_bot_cutover::retention::{
     handle_guild_delete, request_user_deletion, run_retention, RetentionMode,
@@ -17,6 +20,9 @@ const GONE_GUILD: &str = "333333333333333333";
 const MEMBER: &str = "555555555555555555";
 const OTHER_MEMBER: &str = "666666666666666666";
 const GUARDED_MEMBER: &str = "777777777777777777";
+const ROOM_CHANNEL: &str = "888888888888888888";
+const CREATOR_CHANNEL: &str = "999999999999999999";
+const TICKET_CHANNEL: &str = "444444444444444444";
 
 async fn database() -> Option<TestDatabase> {
     let url = match std::env::var("TWO_TEST_DATABASE_URL") {
@@ -124,6 +130,61 @@ async fn dry_run_guild_projection_agrees_with_execute_when_stages_overlap() {
         .await
         .unwrap();
     }
+    // Cascade children of parents the user stage deletes: the deletion
+    // user's voice room carries another member's block and grants (FK
+    // ON DELETE CASCADE), and their ticket carries a transcript whose
+    // copied opener is the other member. None of those child rows match
+    // the deletion user directly, but all are gone before the guild
+    // stage, so none may be projected as guild rows.
+    sqlx::query(
+        "INSERT INTO voice_rooms
+           (guild_id, channel_id, creator_channel_id, owner_id, original_creator_id, name_seed, created_at)
+         VALUES ($1, $3, $4, $2, $2, '7', now())",
+    )
+    .bind(GONE_GUILD)
+    .bind(MEMBER)
+    .bind(ROOM_CHANNEL)
+    .bind(CREATOR_CHANNEL)
+    .execute(pool)
+    .await
+    .unwrap();
+    for sql in [
+        "INSERT INTO voice_room_blocks (guild_id, room_channel_id, blocked_member_id)
+         VALUES ($1, $3, $2)",
+        "INSERT INTO voice_join_grants (guild_id, room_channel_id, member_id)
+         VALUES ($1, $3, $2)",
+        "INSERT INTO voice_owner_grants (guild_id, channel_id, member_id, revision, pending)
+         VALUES ($1, $3, $2, 'proj-revision', TRUE)",
+    ] {
+        sqlx::query(sql)
+            .bind(GONE_GUILD)
+            .bind(OTHER_MEMBER)
+            .bind(ROOM_CHANNEL)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO tickets (id, guild_id, channel_id, opener_id, claimed_by, status, created_at)
+         VALUES ('proj-ticket', $1, $3, $2, NULL, 'closed', '2026-10-01T00:00:00Z')",
+    )
+    .bind(GONE_GUILD)
+    .bind(MEMBER)
+    .bind(TICKET_CHANNEL)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ticket_transcripts
+           (ticket_id, guild_id, channel_id, opener_id, claimed_by, content, message_count, created_at, purge_after)
+         VALUES ('proj-ticket', $1, $3, $2, NULL, 'fixture', 1, '2026-10-01T00:00:00Z', '2026-12-30T00:00:00Z')",
+    )
+    .bind(GONE_GUILD)
+    .bind(OTHER_MEMBER)
+    .bind(TICKET_CHANNEL)
+    .execute(pool)
+    .await
+    .unwrap();
     // In-flight fence: the guarded member's request defers, leaving their
     // rows (and the fence itself) to the guild stage.
     sqlx::query(
@@ -150,7 +211,9 @@ async fn dry_run_guild_projection_agrees_with_execute_when_stages_overlap() {
     // 1 expired audit row. The guild stage then sees only the fresh
     // presence row, the fresh non-voice event, the fresh other-member
     // audit row, the other + guarded members and levels, and the fence
-    // (8 rows); the deletion user's rows already went in earlier stages.
+    // (8 rows); the deletion user's rows already went in earlier stages,
+    // including the room and ticket whose CASCADE children (another
+    // member's block/grants/transcript) therefore never reach it either.
     assert_eq!(
         (
             live.presence_raw_deleted,
