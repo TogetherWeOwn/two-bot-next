@@ -897,14 +897,14 @@ fn plan_flush(
                 // carried game met by a different game was already over:
                 // skip the reopened point instead of flooring a phantom
                 // minute for it. A stop still bridges the run-up to it.
-                let bridge = match ordered
-                    .first()
-                    .and_then(|delta| game_activity::session_game(delta))
-                {
-                    Some((game, is_streaming)) => {
-                        game == stated.game && is_streaming == stated.is_streaming
-                    }
-                    None => true,
+                let bridge = match ordered.first() {
+                    Some(first) if stated.from_ms > first.observed_at_ms => false,
+                    first => match first.and_then(|delta| game_activity::session_game(delta)) {
+                        Some((game, is_streaming)) => {
+                            game == stated.game && is_streaming == stated.is_streaming
+                        }
+                        None => true,
+                    },
                 };
                 if bridge {
                     sequence.push(synthetic_delta(
@@ -1945,6 +1945,50 @@ mod tests {
             .find(|row| row.game.as_deref() == Some("Zelda"))
             .expect("Zelda row");
         assert_eq!(zelda.total_play_ms, 10 * MIN, "got {zelda:?}");
+        assert_eq!(zelda.session_count, 1, "got {zelda:?}");
+    }
+
+    #[test]
+    fn switch_back_to_first_game_in_one_window_keeps_both_sessions() {
+        // Apex 0-120, Zelda 120-180, Apex 180-240, stop at 240, one flush:
+        // the carry from the last switch postdates the window's first delta,
+        // so plan_flush must not prepend a duplicate reopen point that cuts
+        // Zelda's session and floors phantom singletons for both games.
+        let collector = GameActivityCollector::new();
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0),
+        );
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Zelda")])), T0 + 120 * MIN),
+        );
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0 + 180 * MIN),
+        );
+        collector.observe_presence(7, presence_delta(&update(json!([])), T0 + 240 * MIN));
+
+        let rows = collector.flush(7, 15 * MIN, T0 + 240 * MIN);
+        let apex = rows
+            .iter()
+            .find(|row| row.game.as_deref() == Some("Apex"))
+            .expect("Apex row");
+        assert_eq!(
+            apex.total_play_ms,
+            180 * MIN,
+            "two Apex legs with no phantom minute, got {apex:?}"
+        );
+        assert_eq!(apex.session_count, 2, "two Apex runs, got {apex:?}");
+        let zelda = rows
+            .iter()
+            .find(|row| row.game.as_deref() == Some("Zelda"))
+            .expect("Zelda row");
+        assert_eq!(
+            zelda.total_play_ms,
+            60 * MIN,
+            "one uncut Zelda run, got {zelda:?}"
+        );
         assert_eq!(zelda.session_count, 1, "got {zelda:?}");
     }
 
