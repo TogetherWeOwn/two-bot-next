@@ -125,7 +125,9 @@ WORKER_PREFIX = "wrangler/"
 # fixture validator, staging-e2e-command-matrix by the matrix coverage test,
 # soak/parity by the checklist and baseline guards, smoke-run-record and
 # smoke-expected-responses by the smoke surface inventory link test (and
-# smoke-surface-inventory for the same family of smoke content reads).
+# smoke-surface-inventory for the same family of smoke content reads),
+# privacy/database-roles/rollback-delta by the voice owner-grant journal
+# documentation regression (crates/core/tests/voice_owner_grants_docs.rs).
 # parity.md and the baseline also gate parity-docs. Existence-only docs
 # (staging-soak/backup/preflight: the preconditions binary checks is_file,
 # never content) and runbook/container-readiness (worker tests only) fall
@@ -144,6 +146,9 @@ RUST_DOCS = frozenset({
     "docs/smoke-expected-responses.md",
     "docs/smoke-run-record.md",
     "docs/smoke-surface-inventory.md",
+    "docs/privacy.md",
+    "docs/database-roles.md",
+    "docs/rollback-delta.md",
 })
 PARITY_DOCS = frozenset({
     "docs/parity.md",

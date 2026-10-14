@@ -201,7 +201,9 @@ class SelectionTests(unittest.TestCase):
         rust_docs = ["docs/cutover.md",
                      "docs/commands.md", "docs/configuration.md",
                      "docs/voice-rooms.md",
-                     "docs/soak-checklist.json", "docs/soak-checklist.md"]
+                     "docs/soak-checklist.json", "docs/soak-checklist.md",
+                     "docs/privacy.md", "docs/database-roles.md",
+                     "docs/rollback-delta.md"]
         for path in rust_docs:
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {RUST}, path)
@@ -244,10 +246,11 @@ class SelectionTests(unittest.TestCase):
     def test_unrelated_docs_select_worker_only(self):
         # No file reader in PR-run code, but runbook.test.ts asserts on the
         # docs/ listing itself (case-collision + readiness links).
+        # docs/database-roles.md left this list: the voice owner-grant
+        # journal regression reads its content, so it selects rust.
         for path in ["docs/gateway-recovery.md",
                      "docs/leveling-port.md", "docs/feeds-port.md",
                      "docs/distroless-evaluation.md", "docs/build-cache.md",
-                     "docs/database-roles.md",
                      "docs/member-journey-parity.md"]:
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {WORKER}, path)
