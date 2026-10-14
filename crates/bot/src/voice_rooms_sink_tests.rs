@@ -714,6 +714,44 @@ fn disconnect_closes_open_voice_spans() {
 }
 
 #[test]
+fn warm_resume_reopens_voice_span_for_cached_member() {
+    const MIN: i64 = 60_000;
+    let (store, http, _) = fixture();
+    let runtime = runtime(store, http);
+    let pipeline = MemPipeline::for_replay();
+    bootstrap(&runtime, &pipeline, &[]);
+    let collector = runtime.game_activity_collector();
+    let now = i64::try_from(wall_ms()).unwrap_or(i64::MAX);
+    let start = now - 10 * MIN;
+    collector.observe_presence(GUILD, game_activity_delta(MEMBER, Some("Apex"), start));
+    // The span opens at `start` for determinism; the voice frame populates
+    // the gateway cache (its idempotent join keeps the earlier join).
+    collector.observe_join(GUILD, MEMBER, start);
+    feed(&runtime, &pipeline, voice_event(MEMBER, Some(CREATOR)));
+
+    runtime.disconnect();
+    feed(&runtime, &pipeline, Event::Resumed);
+
+    let stop = now + 10 * MIN;
+    collector.observe_presence(GUILD, game_activity_delta(MEMBER, None, stop));
+    collector.observe_leave(GUILD, MEMBER, stop);
+    let rows = collector.flush(GUILD, 15 * MIN, stop);
+    let apex = rows
+        .iter()
+        .find(|row| row.game.as_deref() == Some("Apex"))
+        .expect("Apex row");
+    assert_eq!(
+        apex.total_play_ms,
+        20 * MIN,
+        "play spans the resume, got {apex:?}"
+    );
+    assert!(
+        (19 * MIN..21 * MIN).contains(&apex.in_voice_ms),
+        "voice resumes after RESUMED instead of staying shut: {apex:?}",
+    );
+}
+
+#[test]
 fn guild_delete_drops_unflushed_game_activity_state() {
     let (store, http, _) = fixture();
     let runtime = runtime(store, http);

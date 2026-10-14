@@ -7412,6 +7412,21 @@ where
                     if let Some(snapshot) = snapshot_from_cache(cache, guild_id) {
                         self.publish_snapshot(guild_id, snapshot);
                     }
+                    // Game-activity wiring: `disconnect` closed every open
+                    // voice span, but a warm RESUME sends no GUILD_CREATE and
+                    // no voice-state events for unchanged members, so spans
+                    // for members still in voice would stay shut while their
+                    // play time keeps counting. Reopen from the cache
+                    // (idempotent: still-open spans keep their join); the
+                    // offline gap itself stays excluded.
+                    let now_ms = i64::try_from(wall_ms()).unwrap_or(i64::MAX);
+                    let guild_key = Id::new(guild_id);
+                    if let Some(users) = cache.guild_voice_states(guild_key) {
+                        for user_id in users.iter() {
+                            self.game_activity
+                                .observe_join(guild_id, user_id.get(), now_ms);
+                        }
+                    }
                 }
             }
             Event::GuildDelete(deleted) => {

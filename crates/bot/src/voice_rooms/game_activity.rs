@@ -165,7 +165,10 @@ struct OpenSpan {
 /// assumed still playing it until a stop (or different game) arrives. The
 /// next flush reopens their interval from `from_ms` instead of starting
 /// over, and drops the carry past [`GAME_ACTIVITY_CARRY_TTL_MS`] with no
-/// fresh observation.
+/// fresh observation. A stop does not drop the carry (the run-up to it still
+/// bridges at flush time) but stamps `stopped_at`, so a later different game
+/// in the same window closes the old run at the stop instead of bridging
+/// straight across the idle gap.
 #[derive(Debug, Clone)]
 struct PlayCarry {
     game: String,
@@ -175,6 +178,10 @@ struct PlayCarry {
     from_ms: i64,
     /// The last real observation time, guarding against out-of-order frames.
     last_ms: i64,
+    /// The stop time when the member's last observation was an empty delta.
+    /// `None` while a game is asserted. A re-asserted game clears it; a game
+    /// change ends its close-out here instead of at the change clock.
+    stopped_at: Option<i64>,
 }
 
 #[derive(Default)]
@@ -257,16 +264,30 @@ impl GameActivityCollector {
                                 is_streaming,
                                 from_ms,
                                 last_ms: observed_at_ms,
+                                // A re-asserted game resumes play: the earlier
+                                // stop no longer bounds the run.
+                                stopped_at: None,
                             });
                         } else {
-                            // A game change closes the previous game at the change
-                            // clock: change-driven presence means the old game ran
-                            // until this update arrived, exactly as for a stop. The
-                            // carry below switches to the new game, so the old
+                            // A game change closes the previous game: the old
                             // run-up is materialized into the delta buffer now
                             // (reopen point, bridge ticks, closing point); the
-                            // flush would otherwise never replay it. TTL-stale
-                            // carries are dropped instead of credited.
+                            // flush would otherwise never replay it after the
+                            // carry below switches to the new game. TTL-stale
+                            // carries are dropped instead of credited. When the
+                            // old game already stopped (`stopped_at`), the run
+                            // ended at the stop: bridging to the change clock
+                            // would credit the idle gap as phantom play, so the
+                            // close-out ends at the stop instead.
+                            let close_at_ms = match prev.stopped_at {
+                                Some(stopped_at)
+                                    if stopped_at >= prev.from_ms
+                                        && stopped_at <= observed_at_ms =>
+                                {
+                                    stopped_at
+                                }
+                                _ => observed_at_ms,
+                            };
                             if observed_at_ms >= prev.from_ms
                                 && observed_at_ms.saturating_sub(prev.from_ms)
                                     <= GAME_ACTIVITY_CARRY_TTL_MS
@@ -283,14 +304,14 @@ impl GameActivityCollector {
                                     &prev.game,
                                     prev.is_streaming,
                                     prev.from_ms,
-                                    observed_at_ms,
+                                    close_at_ms,
                                     GAME_ACTIVITY_GAP_TIMEOUT_MS,
                                 );
                                 pending.push(synthetic_delta(
                                     &user_key,
                                     &prev.game,
                                     prev.is_streaming,
-                                    observed_at_ms,
+                                    close_at_ms,
                                 ));
                             }
                             stated.insert(PlayCarry {
@@ -298,16 +319,20 @@ impl GameActivityCollector {
                                 is_streaming,
                                 from_ms: observed_at_ms,
                                 last_ms: observed_at_ms,
+                                stopped_at: None,
                             });
                         }
                     }
                     None => {
                         // A stop closes the interval at flush time; the carry
                         // stays so the run-up to the stop still bridges there
-                        // (the flush drops it once closed).
+                        // (the flush drops it once closed). The stop clock is
+                        // stamped so a later different game in the same window
+                        // ends the old run here, not at the change clock.
                         let prev = stated.get().clone();
                         stated.insert(PlayCarry {
                             last_ms: observed_at_ms,
+                            stopped_at: Some(observed_at_ms),
                             ..prev
                         });
                     }
@@ -320,6 +345,7 @@ impl GameActivityCollector {
                         is_streaming,
                         from_ms: observed_at_ms,
                         last_ms: observed_at_ms,
+                        stopped_at: None,
                     });
                 }
             }
@@ -935,6 +961,7 @@ fn plan_flush(
                         is_streaming: open_streaming,
                         from_ms: now_ms,
                         last_ms: now_ms,
+                        stopped_at: None,
                     },
                 ));
             }
@@ -948,6 +975,7 @@ fn plan_flush(
                         is_streaming: open_streaming,
                         from_ms: started_ms,
                         last_ms: started_ms,
+                        stopped_at: None,
                     },
                 ));
             }
@@ -1766,6 +1794,73 @@ mod tests {
             .find(|row| row.game.as_deref() == Some("Zelda"))
             .expect("Zelda row");
         assert_eq!(zelda.total_play_ms, MIN);
+    }
+
+    #[test]
+    fn stop_then_different_game_in_one_window_credits_no_phantom_play() {
+        // Apex 0-10, idle, Zelda 50-60, then one flush: the stop bounds the
+        // old run, so the game-change close-out must end at the stop clock
+        // instead of bridging straight across the idle gap.
+        let collector = GameActivityCollector::new();
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0),
+        );
+        collector.observe_presence(7, presence_delta(&update(json!([])), T0 + 10 * MIN));
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Zelda")])), T0 + 50 * MIN),
+        );
+        collector.observe_presence(7, presence_delta(&update(json!([])), T0 + 60 * MIN));
+
+        let rows = collector.flush(7, 15 * MIN, T0 + 60 * MIN);
+        let apex = rows
+            .iter()
+            .find(|row| row.game.as_deref() == Some("Apex"))
+            .expect("Apex row");
+        assert_eq!(
+            apex.total_play_ms,
+            10 * MIN,
+            "the stop bounds the old run, got {apex:?}"
+        );
+        assert_eq!(apex.session_count, 1, "one stopped run, got {apex:?}");
+        let zelda = rows
+            .iter()
+            .find(|row| row.game.as_deref() == Some("Zelda"))
+            .expect("Zelda row");
+        assert_eq!(zelda.total_play_ms, 10 * MIN, "got {zelda:?}");
+        assert_eq!(zelda.session_count, 1, "got {zelda:?}");
+    }
+
+    #[test]
+    fn stop_then_same_game_in_one_window_bridges_without_phantom_gap() {
+        // Apex 0-10, stop, Apex 50-60, then one flush: both runs count while
+        // the idle gap stays uncredited.
+        let collector = GameActivityCollector::new();
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0),
+        );
+        collector.observe_presence(7, presence_delta(&update(json!([])), T0 + 10 * MIN));
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0 + 50 * MIN),
+        );
+        collector.observe_presence(7, presence_delta(&update(json!([])), T0 + 60 * MIN));
+
+        let rows = collector.flush(7, 15 * MIN, T0 + 60 * MIN);
+        assert_eq!(rows.len(), 1, "one game, got {rows:?}");
+        assert_eq!(
+            rows[0].total_play_ms,
+            20 * MIN,
+            "both runs with no idle gap, got {:?}",
+            rows[0]
+        );
+        assert_eq!(
+            rows[0].session_count, 2,
+            "the stop splits the sessions, got {:?}",
+            rows[0]
+        );
     }
 
     #[test]
