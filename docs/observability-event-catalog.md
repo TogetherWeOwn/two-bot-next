@@ -222,7 +222,13 @@ maintenance tick merged stored creator rows into the view; the merge only adds
 or updates, never deletes.
 `voice creator revalidation failed; keeping the cached view` /
 `voice creator refresh failed; keeping the cached view` (debug): the store read
-failed, so the old view is kept and the join is refused exactly as before.
+failed (or the single-row read-through timed out after 1 s, `timed_out=true`),
+so the old view is kept and the join is refused exactly as before.
+`voice naming settings refresh failed; keeping the cached view` (warn, in
+`GuildRoomWorker::reload_name_settings` in `crates/bot/src/voice_name_panel.rs`):
+the `config_snapshot` read failed, so the naming reload kept the cached
+settings and creators; the direct creator merge still converges the view while
+this fails.
 
 ## Unknowns (TBD)
 

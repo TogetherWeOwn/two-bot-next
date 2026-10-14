@@ -2505,6 +2505,11 @@ pub struct GuildRoomWorker<S, H> {
     creators_refresh_due: bool,
     /// Actor clock of the last creator-view merge (periodic refresh).
     creators_read_ms: Option<u64>,
+    /// Channel ids the join read-through already asked the store about with
+    /// no row found, cleared by each successful creator merge. Joins into
+    /// ordinary (non-creator, non-room) channels must not cost a store read
+    /// every time; a later creator row still converges via the next merge.
+    creator_misses: HashSet<Snowflake>,
     access: AccessControls,
     /// Caps and cooldown for the durable create admission; the rolling burst
     /// limits are fixed legacy constants.
@@ -2744,12 +2749,18 @@ const OWNER_REPAIR_COOLDOWN_MS: u64 = 60_000;
 
 /// Creator-view refresh bounds: channel events flag a re-read, debounced so a
 /// bulk reorder's CHANNEL_UPDATE echo storm costs one query; the interval
-/// mirrors the five-minute naming-settings reload so a row written outside the
-/// worker (operator tooling, a missed CreatorAdded) converges even with no
-/// channel events. The merge only adds or updates rows: nothing in-process
-/// deletes creators, so a failed read keeps the old map instead of dropping it.
+/// backs up the five-minute naming-settings reload, which already replaces
+/// the whole creator map from the same rows (deletions included) and now
+/// warns when its own read fails. The direct read still earns its place: it
+/// converges full-row fields the snapshot codec does not copy, and rows the
+/// naming reload never saw because its read failed. The merge only adds or
+/// updates rows: a row missing from one direct read is treated as transient,
+/// not a deletion, and a failed read keeps the old map instead of dropping it.
+/// Bound for the join-path single-row read-through: a saturated pool waits up
+/// to 10 s for a connection, but a lobby join must not wait that long.
 const CREATORS_REFRESH_DEBOUNCE_MS: u64 = 10_000;
 const CREATORS_REFRESH_INTERVAL_MS: u64 = 300_000;
+const REVALIDATE_TIMEOUT_MS: u64 = 1_000;
 
 /// Repeat bookkeeping for one tracked failure. `last_attempt_ms` is the
 /// actor's monotonic clock, so a restart begins a fresh budget.
@@ -2866,6 +2877,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             creators,
             creators_refresh_due: false,
             creators_read_ms: None,
+            creator_misses: HashSet::new(),
             access,
             admission: temp_voice_admission(),
             rooms,
@@ -3090,15 +3102,29 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// Re-read one creator row when the in-memory view lacks it, so a join is
     /// never refused for a channel id that is a `voice_creators` row. Returns
     /// whether the channel is a creator afterwards (the map now holds it).
-    /// Known creators and known rooms never cost a store read: only a channel
-    /// the worker has never seen triggers one. A failed read keeps the old
-    /// view and reports false, so the caller refuses exactly as before.
+    /// Known creators and known rooms never cost a store read, and neither do
+    /// halted workers (the join is refused as `halted` anyway) nor channels a
+    /// previous read-through already missed (cleared by each successful
+    /// merge). The read is bounded so a saturated pool cannot hold the inbox
+    /// ahead of the create-to-move dispatch. A failed or slow read keeps the
+    /// old view and reports false, so the caller refuses exactly as before.
     pub(super) async fn revalidate_creator(&mut self, channel_id: Snowflake) -> bool {
         if self.creators.contains_key(&channel_id) || self.rooms.contains_key(&channel_id) {
             return self.creators.contains_key(&channel_id);
         }
-        match self.store.creator_for(self.live.guild_id, channel_id).await {
-            Ok(Some(creator)) => {
+        if self.halted {
+            return false;
+        }
+        if self.creator_misses.contains(&channel_id) {
+            return false;
+        }
+        let read = tokio::time::timeout(
+            Duration::from_millis(REVALIDATE_TIMEOUT_MS),
+            self.store.creator_for(self.live.guild_id, channel_id),
+        )
+        .await;
+        match read {
+            Ok(Ok(Some(creator))) => {
                 self.live.protect_creators([creator.channel_id]);
                 self.creators.insert(creator.channel_id, creator);
                 self.name_signatures.clear();
@@ -3109,11 +3135,22 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 );
                 true
             }
-            Ok(None) => false,
-            Err(error) => {
+            Ok(Ok(None)) => {
+                self.creator_misses.insert(channel_id);
+                false
+            }
+            Ok(Err(error)) => {
                 debug!(
                     guild = self.live.guild_id.to_string(),
                     ?error,
+                    "voice creator revalidation failed; keeping the cached view"
+                );
+                false
+            }
+            Err(_) => {
+                debug!(
+                    guild = self.live.guild_id.to_string(),
+                    timed_out = true,
                     "voice creator revalidation failed; keeping the cached view"
                 );
                 false
@@ -3122,10 +3159,15 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     }
 
     /// Merge the stored creator rows into the in-memory view: insert rows the
-    /// view lacks and swap in changed ones, exactly like `CreatorAdded`, but
-    /// never delete. Nothing in-process deletes creators, so a row missing
-    /// from one read is a transient read, not a deletion: dropping it would
-    /// refuse joins until restart. A failed read keeps the old view.
+    /// view lacks and swap in changed ones, exactly like `CreatorAdded` (which
+    /// also clears the name caches on any change), but never delete.
+    /// `reload_name_settings` already replaces the whole map from the same
+    /// rows every five minutes, deletions included, so this merge is the
+    /// backstop for what that path cannot see: a failing config-snapshot read
+    /// and full-row fields the snapshot codec does not copy. A row missing
+    /// from one direct read is still treated as transient, not a deletion:
+    /// dropping it would refuse joins until restart. A failed read keeps the
+    /// old view. A successful merge clears the read-through miss cache.
     /// Runs when `creators_refresh_due` is set (channel events, debounced) or
     /// every [`CREATORS_REFRESH_INTERVAL_MS`], from the maintenance tick.
     pub(super) async fn reload_creators(&mut self, now_ms: u64) {
@@ -3142,7 +3184,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         self.creators_read_ms = Some(now_ms);
         match self.store.creators(self.live.guild_id).await {
             Ok(rows) => {
+                self.creator_misses.clear();
                 let mut added = 0u64;
+                let mut changed = false;
                 for creator in rows {
                     if self.creators.get(&creator.channel_id) != Some(&creator) {
                         let known = self.creators.contains_key(&creator.channel_id);
@@ -3151,9 +3195,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         if !known {
                             added += 1;
                         }
+                        changed = true;
                     }
                 }
-                if added > 0 {
+                if changed {
                     self.name_signatures.clear();
                     self.name_inputs = None;
                     info!(
@@ -7966,6 +8011,7 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
         }
         ActorCommand::CreatorAdded(creator) => {
             worker.live.protect_creators([creator.channel_id]);
+            let _ = worker.creator_misses.remove(&creator.channel_id);
             if worker.creators.get(&creator.channel_id) != Some(&creator) {
                 worker.creators.insert(creator.channel_id, creator);
                 worker.name_signatures.clear();

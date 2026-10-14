@@ -179,6 +179,9 @@ struct Store {
     /// that pin ordering against the Discord and persist calls.
     trace_claims: bool,
     creators_error: Option<StoreError>,
+    /// Single-row creator reads: the join-path read-through must skip known
+    /// creators, rooms, halted workers and already-missed channels.
+    creator_for_reads: Arc<AtomicU64>,
     custom_names: Mutex<HashMap<u64, String>>,
     save_custom_name_errors: Mutex<VecDeque<StoreError>>,
     /// V4 audit rows appended so far, in append order.
@@ -230,6 +233,7 @@ impl Store {
             bind_errors: Mutex::new(VecDeque::new()),
             trace_claims: false,
             creators_error: None,
+            creator_for_reads: Arc::new(AtomicU64::new(0)),
             custom_names: Mutex::new(HashMap::new()),
             save_custom_name_errors: Mutex::new(VecDeque::new()),
             kick_audit: Mutex::new(Vec::new()),
@@ -307,6 +311,7 @@ impl RoomPersistence for Store {
         _: u64,
         channel: u64,
     ) -> Result<Option<CreatorChannel>, StoreError> {
+        self.creator_for_reads.fetch_add(1, Ordering::Relaxed);
         Ok(self
             .creators
             .lock()
@@ -13039,6 +13044,211 @@ async fn revalidate_ignores_channels_with_no_creator_row() {
     const STRANGER: u64 = 999;
     assert!(!worker.revalidate_creator(STRANGER).await);
     assert!(!worker.creators.contains_key(&STRANGER));
+}
+
+#[tokio::test]
+async fn creator_template_edit_reaches_existing_rooms_through_the_refresh() {
+    // reload_creators runs just before reload_name_settings on the same
+    // maintenance tick. When it swaps a changed row it must clear the name
+    // caches like CreatorAdded does: NameSignature carries no template, so
+    // once the edited row is stored, reload_name_settings sees an unchanged
+    // map and skips its own clear, and the edit never re-renders.
+    let (live, store, http, _) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "old".to_owned();
+    slow_rename_room(&live, &store);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.wall_clock = || 0;
+    worker.name_directory.insert(MEMBER, "Alex".to_owned());
+    worker.reload_name_settings(0).await;
+    worker.refresh_template_names(0);
+    dispatch(&mut worker, 0).await;
+    assert_eq!(worker.desired_names[&700], "old");
+    worker.store.creators.lock().unwrap()[0].name_template = "new".to_owned();
+    worker.reload_creators(300_000).await;
+    worker.reload_name_settings(300_000).await;
+    worker.refresh_template_names(300_000);
+    assert_eq!(
+        worker.desired_names[&700], "new",
+        "a template-only row edit merged by reload_creators must re-render existing rooms"
+    );
+}
+
+#[tokio::test]
+async fn revalidate_skips_the_store_read_while_halted() {
+    // A halted worker refuses every join as `halted` anyway; the read-through
+    // must not spend store reads (or bypass the halt re-probe pacing) first.
+    let (live, store, http, _) = fixture();
+    let reads = Arc::clone(&store.creator_for_reads);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.halted = true;
+    const STRANGER: u64 = 555;
+    assert!(!worker.revalidate_creator(STRANGER).await);
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        0,
+        "halted joins must not cost a store read"
+    );
+}
+
+#[tokio::test]
+async fn revalidate_remembers_channels_with_no_creator_row() {
+    // Joins into ordinary voice channels (permanent, AFK, lobby) arrive as
+    // Join commands too. Without a miss cache each one costs a store read;
+    // the merge clears misses, so a later creator row still converges.
+    let (live, store, http, _) = fixture();
+    let reads = Arc::clone(&store.creator_for_reads);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    const STRANGER: u64 = 999;
+    assert!(!worker.revalidate_creator(STRANGER).await);
+    assert!(!worker.revalidate_creator(STRANGER).await);
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        1,
+        "repeat joins to a non-creator channel must reuse the miss cache"
+    );
+}
+
+#[tokio::test]
+async fn actor_join_revalidates_a_stale_creator_view() {
+    // The inbox read-through is the production path: a Join sent through the
+    // actor loop must merge a store row the in-memory view lost.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.creators.clear();
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(CREATOR), Some(false))
+        .expect("ticket for a joined channel");
+    let (tx, rx) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), ActorLimits::default())
+            .await;
+        worker
+    });
+    tx.send(ActorCommand::Join {
+        ticket,
+        display: "new room".to_owned(),
+        seed: 7,
+        created_at: NOW.to_owned(),
+        received: tokio::time::Instant::now(),
+    })
+    .unwrap();
+    // The Status round-trip proves the Join was handled: the inbox is FIFO.
+    let (reply, reply_rx) = oneshot::channel();
+    tx.send(ActorCommand::Status(reply)).unwrap();
+    reply_rx.await.unwrap();
+    drop(tx);
+    let worker = handle.await.unwrap();
+    assert!(
+        worker.creators.contains_key(&CREATOR),
+        "a Join through the actor must revalidate a stale creator view"
+    );
+}
+
+#[tokio::test]
+async fn refresh_creators_command_flags_a_debounced_merge() {
+    // Channel create/update/delete frames must reach the worker as a merge
+    // flag: without this arm the gateway wiring is dead.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    assert!(!worker.creators_refresh_due);
+    apply_command(&mut worker, ActorCommand::RefreshCreators, 0);
+    assert!(worker.creators_refresh_due);
+}
+
+#[tokio::test(start_paused = true)]
+async fn maintenance_tick_runs_the_creator_refresh() {
+    // The maintenance branch must call reload_creators: it stamps the read
+    // clock and clears the miss cache, which reload_name_settings never does.
+    let (live, store, http, _) = fixture();
+    let reads = Arc::clone(&store.creator_for_reads);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    const STRANGER: u64 = 999;
+    assert!(!worker.revalidate_creator(STRANGER).await);
+    assert_eq!(reads.load(Ordering::Relaxed), 1);
+    assert!(worker.creators_read_ms.is_none());
+    let (tx, rx) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), ActorLimits::default())
+            .await;
+        worker
+    });
+    for _ in 0..5 {
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+    }
+    let (reply, reply_rx) = oneshot::channel();
+    tx.send(ActorCommand::Status(reply)).unwrap();
+    reply_rx.await.unwrap();
+    drop(tx);
+    let mut worker = handle.await.unwrap();
+    assert!(
+        worker.creators_read_ms.is_some(),
+        "the maintenance tick must run reload_creators"
+    );
+    assert!(!worker.revalidate_creator(STRANGER).await);
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        2,
+        "the merge must clear the miss cache"
+    );
+}
+
+#[tokio::test]
+async fn reload_creators_debounces_channel_event_refreshes() {
+    // A bulk reorder's CHANNEL_UPDATE echo storm flags one re-read, not one
+    // per frame: refreshes inside the debounce window are skipped.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.reload_creators(0).await;
+    worker.store.creators.lock().unwrap().push(CreatorChannel::new(GUILD, 201));
+    worker.creators_refresh_due = true;
+    worker.reload_creators(5_000).await;
+    assert!(
+        !worker.creators.contains_key(&201),
+        "a flagged refresh inside the debounce window must wait"
+    );
+    worker.creators_refresh_due = true;
+    worker.reload_creators(10_000).await;
+    assert!(worker.creators.contains_key(&201));
+}
+
+#[tokio::test]
+async fn reload_creators_converges_rows_on_the_five_minute_interval() {
+    // With no channel events flagging a merge, the interval still converges
+    // rows written outside the worker.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.store.creators.lock().unwrap()[0].name_template = "old".to_owned();
+    worker.reload_creators(0).await;
+    assert_eq!(worker.creators[&CREATOR].name_template, "old");
+    worker.store.creators.lock().unwrap()[0].name_template = "new".to_owned();
+    worker.reload_creators(299_999).await;
+    assert_eq!(
+        worker.creators[&CREATOR].name_template, "old",
+        "the interval must gate the periodic merge"
+    );
+    worker.reload_creators(300_000).await;
+    assert_eq!(worker.creators[&CREATOR].name_template, "new");
+}
+
+#[tokio::test]
+async fn reload_creators_keeps_the_view_on_a_failed_read() {
+    // A transient store error is not a deletion: the old map stays so joins
+    // keep flowing until the next refresh.
+    let (live, mut store, http, _) = fixture();
+    store.creators_error = Some(StoreError::Unavailable);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.creators.clear();
+    worker.reload_creators(300_000).await;
+    assert!(
+        !worker.creators.contains_key(&CREATOR),
+        "a failed read must not invent rows"
+    );
+    worker.store.creators_error = None;
+    worker.reload_creators(600_000).await;
+    assert!(worker.creators.contains_key(&CREATOR));
 }
 
 #[test]

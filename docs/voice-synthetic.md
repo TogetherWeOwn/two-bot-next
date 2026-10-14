@@ -101,10 +101,15 @@ joins it, and restores the original name in a `finally` block, so a renamed
 creator that stops moving joins fails the gate. Renaming needs Manage
 Channels: grant the test bot's staging role Manage Channels once (staging
 guild only; the test bot lives nowhere else). Until then the check reports
-SKIP with that detail and every other check still runs. A name already
+SKIP with that detail and every other check still runs. A rename PATCH
+answered with HTTP 429 (Discord allows 2 channel renames per 10 minutes)
+also reports SKIP: the workflow retries after 30 seconds and dispatches can
+collide within 10 minutes, and neither must fail the run. A name already
 carrying ` (synthetic)` means a previous run did not restore: the rename is
 skipped and the check FAILs naming the residue, so it is restored manually
-instead of being renamed over.
+instead of being renamed over. Restore runs whenever a rename was attempted
+and the live name differs from the original, so a rename Discord applied but
+whose response was lost is still restored.
 
 ## Run it by hand
 

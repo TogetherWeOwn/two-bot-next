@@ -17,7 +17,8 @@ What it proves on the deployed staging bot (stdlib only, no third-party code):
   rename     the creator is renamed before the join and restored after: the
              post-rename join must still move the test bot into a new room
              (SKIP while the test bot may not rename: its staging role needs
-             Manage Channels once)
+             Manage Channels once; SKIP on HTTP 429, Discord's 2-renames-per-
+             10-minutes per-channel limit, so workflow retries do not fail)
   metrics    optional: /ops/metrics `two_bot_voice_names_total` counts the room
              as created_with_template (SKIP when no metrics token is configured)
 
@@ -171,6 +172,11 @@ def evaluate(obs):
         out.append(check("rename", False,
                          "test bot may not rename the staging creator (HTTP 403): grant its "
                          "staging role Manage Channels once, then the rename case gates",
+                         skip=True))
+    elif obs.get("rename_rate_limited"):
+        out.append(check("rename", False,
+                         "creator rename hit Discord's per-channel rename limit (HTTP 429): "
+                         "a retry or dispatch collided within 10 minutes; rename skipped",
                          skip=True))
     elif obs.get("rename_applied") and obs.get("rename_restored"):
         out.append(check("rename", True,
@@ -427,20 +433,32 @@ def run_live(args, token):
         # the rename but still runs the lifecycle checks.
         original_name = creator.get("name", "")
         obs["rename_original"] = original_name
-        obs["rename_applied"] = obs["rename_restored"] = obs["rename_forbidden"] = False
+        obs["rename_applied"] = obs["rename_restored"] = False
+        obs["rename_forbidden"] = obs["rename_rate_limited"] = False
+        # Set before the PATCH: a request Discord applies but whose response
+        # is lost (timeout, failed read-back) must still be restored.
+        obs["rename_attempted"] = False
         temp_name = (original_name + RENAME_MARKER)[:100] or "Create a Lobby" + RENAME_MARKER
         if RENAME_MARKER in original_name:
             obs["rename_note"] = ("creator already carries synthetic residue "
                                   f"({original_name!r}); rename skipped, restore it manually")
         else:
+            obs["rename_attempted"] = True
             status, _ = rest_patch(token, f"/channels/{args.creator}", {"name": temp_name})
             if status == 403:
                 obs["rename_forbidden"] = True
+            elif status == 429:
+                obs["rename_rate_limited"] = True
+                obs["rename_note"] = ("rename PATCH answered 429 (per-channel rename limit); "
+                                      "rename skipped")
             elif status is not None and 200 <= status < 300:
-                seen = rest(token, f"/channels/{args.creator}")
+                obs["rename_applied"] = True
+                obs["rename_name"] = temp_name
+                try:
+                    seen = rest(token, f"/channels/{args.creator}")
+                except Exception:
+                    seen = {}
                 if seen.get("name") == temp_name:
-                    obs["rename_applied"] = True
-                    obs["rename_name"] = temp_name
                     obs["creator"] = creator = seen
                 else:
                     obs["rename_note"] = (f"rename PATCH answered {status} but the name "
@@ -500,13 +518,18 @@ def run_live(args, token):
                 s.voice(args.guild, None)
             except OSError:
                 pass
-        if obs.get("rename_applied"):
+        # Restore whenever a rename was attempted and the live name differs
+        # from the original: the PATCH may have applied while its response
+        # was lost, which the old applied-only gate left as residue.
+        if obs.get("rename_attempted") and not obs.get("rename_forbidden"):
             try:
-                status, _ = rest_patch(token, f"/channels/{args.creator}",
-                                       {"name": obs.get("rename_original", "")})
-                seen = rest(token, f"/channels/{args.creator}")
-                obs["rename_restored"] = (isinstance(status, int) and 200 <= status < 300
-                                          and seen.get("name") == obs.get("rename_original"))
+                seen_now = rest(token, f"/channels/{args.creator}")
+                if seen_now.get("name") != obs.get("rename_original", ""):
+                    status, _ = rest_patch(token, f"/channels/{args.creator}",
+                                           {"name": obs.get("rename_original", "")})
+                    seen = rest(token, f"/channels/{args.creator}")
+                    obs["rename_restored"] = (isinstance(status, int) and 200 <= status < 300
+                                              and seen.get("name") == obs.get("rename_original"))
             except Exception:
                 obs["rename_restored"] = False
         s.close()

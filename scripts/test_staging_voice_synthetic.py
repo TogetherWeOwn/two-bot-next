@@ -136,6 +136,17 @@ class EvaluateTest(unittest.TestCase):
         result = verdicts(obs(rename_applied=False, rename_restored=False))
         self.assertEqual(result["rename"], "FAIL")
 
+    def test_rename_skips_on_the_per_channel_rename_limit(self):
+        result = verdicts(obs(rename_applied=False, rename_restored=False,
+                              rename_rate_limited=True,
+                              rename_note="rename PATCH answered 429 (per-channel rename limit); "
+                                          "rename skipped"))
+        self.assertEqual(result["rename"], "SKIP")
+        detail = next(c["detail"] for c in synth.evaluate(
+            obs(rename_applied=False, rename_restored=False, rename_rate_limited=True))
+            if c["check"] == "rename")
+        self.assertIn("429", detail)
+
     def test_rename_residue_fails_with_the_note(self):
         result = verdicts(obs(rename_applied=False, rename_restored=False,
                               rename_note="creator already carries synthetic residue"))
