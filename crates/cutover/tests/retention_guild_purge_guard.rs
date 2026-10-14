@@ -87,6 +87,34 @@ async fn guild_purge_with_unresolved_guard_keeps_rows_queued() {
         handle_guild_delete(pool, GONE_GUILD, None).await.unwrap(),
         "a real removal enqueues a purge"
     );
+    // Backdate the queue row so the deferred-age signal has a known floor.
+    sqlx::query(
+        "UPDATE retention_guild_purge_queue SET enqueued_at = clock_timestamp() - interval '2 hours' WHERE guild_id = $1",
+    )
+    .bind(GONE_GUILD)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // The dry run must preview exactly what the live run will do: no rows,
+    // no failure, one guard deferral with the queue age attached.
+    let dry: RetentionReport = run_retention(pool, RetentionMode::DryRun).await.unwrap();
+    assert_eq!(
+        dry.guild_rows_purged, 0,
+        "the dry run must not report a guarded guild's rows as purged, got {dry:?}"
+    );
+    assert_eq!(
+        dry.guild_purges_failed, 0,
+        "a guard deferral is not a failure, got {dry:?}"
+    );
+    assert_eq!(
+        dry.guild_purges_deferred, 1,
+        "the dry run must report the guarded guild as deferred, got {dry:?}"
+    );
+    assert!(
+        dry.guild_purges_deferred_oldest_secs >= 7200,
+        "the dry run must report the queue age, got {dry:?}"
+    );
 
     let report: RetentionReport = run_retention(pool, RetentionMode::Execute).await.unwrap();
     assert_eq!(
@@ -94,8 +122,17 @@ async fn guild_purge_with_unresolved_guard_keeps_rows_queued() {
         "a guarded purge must delete nothing, got {report:?}"
     );
     assert_eq!(
-        report.guild_purges_failed, 1,
-        "a guarded purge must stay queued, got {report:?}"
+        report.guild_purges_failed, 0,
+        "a guard deferral is not a failure, got {report:?}"
+    );
+    assert_eq!(
+        report.guild_purges_deferred, 1,
+        "a guarded purge must stay queued as deferred, got {report:?}"
+    );
+    assert_eq!(
+        (dry.guild_rows_purged, dry.guild_purges_deferred),
+        (report.guild_rows_purged, report.guild_purges_deferred),
+        "the live run must delete and defer exactly what the dry run reported, dry {dry:?} vs live {report:?}"
     );
     assert_eq!(
         count(
@@ -148,6 +185,11 @@ async fn guild_purge_with_unresolved_guard_keeps_rows_queued() {
     assert!(
         settled.guild_rows_purged > 0,
         "the settled purge must delete rows, got {settled:?}"
+    );
+    assert_eq!(
+        (settled.guild_purges_failed, settled.guild_purges_deferred),
+        (0, 0),
+        "the settled purge must report no failure and no deferral, got {settled:?}"
     );
     assert_eq!(
         count(
