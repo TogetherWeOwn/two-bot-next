@@ -102,11 +102,17 @@ pub struct RetentionReport {
 }
 
 impl RetentionReport {
-    /// Rows deleted across the time-window and guild-purge classes.
-    /// Completed user deletions are receipts, not row counts, and are
-    /// reported separately in `deletions_completed`; deferred and overdue
-    /// requests are pending-work signals, not deletions, and are excluded,
-    /// as are failed guild purges (`guild_purges_failed`).
+    /// Rows deleted across the time-window and guild-purge classes. The
+    /// classes are disjoint in both modes: Execute deletes each row in the
+    /// first stage that selects it, and the dry-run guild projection
+    /// excludes rows the preceding time-window and eligible user-deletion
+    /// stages would remove, including rows removed only by
+    /// `ON DELETE CASCADE` from a parent the user stage deletes.
+    /// Completed user deletions are receipts, not row
+    /// counts, and are reported separately in `deletions_completed`;
+    /// deferred and overdue requests are pending-work signals, not
+    /// deletions, and are excluded, as are failed guild purges
+    /// (`guild_purges_failed`).
     #[must_use]
     pub fn total_deleted(&self) -> u64 {
         self.presence_raw_deleted
@@ -176,7 +182,6 @@ pub async fn run_retention(
             let presence = count_presence_raw(&mut tx).await?;
             let voice = count_voice_raw(&mut tx).await?;
             let audit = count_audit_cache(&mut tx).await?;
-            let guild_rows = count_queued_guild_rows(&mut tx).await?;
             let pending: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM retention_deletion_requests WHERE status = 'pending'",
             )
@@ -188,12 +193,20 @@ pub async fn run_retention(
             )
             .fetch_all(&mut *tx)
             .await?;
+            // Split pendings before projecting guild rows: an Execute run
+            // deletes eligible users' rows in the user-deletion stage, ahead
+            // of the guild purge, so those rows must not be counted again as
+            // guild rows. Guard-deferred rows survive to the guild stage.
             let mut deferred = 0u64;
+            let mut eligible: Vec<(String, String)> = Vec::new();
             for (guild_id, user_id) in &pendings {
                 if crate::member_erasure::has_unresolved_guards(&mut tx, guild_id, user_id).await? {
                     deferred += 1;
+                } else {
+                    eligible.push((guild_id.clone(), user_id.clone()));
                 }
             }
+            let guild_rows = count_queued_guild_rows(&mut tx, &eligible).await?;
             tx.commit().await?;
             RetentionReport {
                 presence_raw_deleted: presence,
@@ -545,62 +558,102 @@ async fn complete_request(
     Ok((receipt_id, requested_at_unix, completed_at_unix))
 }
 
-/// Guild-scoped delete for one erasure-plan table: child tables without
+/// Guild-scope predicate for one erasure-plan table: child tables without
 /// their own `guild_id` purge via their parent's guild scope, and the
 /// operator-released replay fence is never selected. Table names come from
-/// the reviewed embedded plan, never caller input.
-fn guild_purge_sql(table: &str) -> String {
+/// the reviewed embedded plan, never caller input. Binds $1 = guild.
+fn guild_purge_predicate(table: &str) -> String {
     match table {
-        "lfg_signups" | "lfg_roles" => format!(
-            "DELETE FROM {table} WHERE lfg_id IN (SELECT id FROM lfg_posts WHERE guild_id = $1)"
-        ),
+        "lfg_signups" | "lfg_roles" => {
+            "lfg_id IN (SELECT id FROM lfg_posts WHERE guild_id = $1)".to_owned()
+        }
         "feed_deliveries" => {
-            "DELETE FROM feed_deliveries WHERE feed_id IN (SELECT id FROM feed_relays WHERE guild_id = $1)"
-                .to_owned()
+            "feed_id IN (SELECT id FROM feed_relays WHERE guild_id = $1)".to_owned()
         }
         "self_role_exchanges" => {
-            "DELETE FROM self_role_exchanges WHERE event_id IN (SELECT event_id FROM self_role_audit WHERE guild_id = $1)"
-                .to_owned()
+            "event_id IN (SELECT event_id FROM self_role_audit WHERE guild_id = $1)".to_owned()
         }
         // Keep the operator-released replay fence: only executions whose
         // parent idempotency row is itself purged go here.
         "moderation_channel_executions" => {
-            "DELETE FROM moderation_channel_executions WHERE guild_id = $1 AND idempotency_key IN (SELECT idempotency_key FROM moderation_idempotency WHERE guild_id = $1 AND (state IS DISTINCT FROM 'done' OR outcome IS DISTINCT FROM 'operator_released'))"
+            "guild_id = $1 AND idempotency_key IN (SELECT idempotency_key FROM moderation_idempotency WHERE guild_id = $1 AND (state IS DISTINCT FROM 'done' OR outcome IS DISTINCT FROM 'operator_released'))"
                 .to_owned()
         }
         // Mirrors the erasure-plan predicate: done/operator_released rows are
         // an indefinite replay fence and are never selected.
         "moderation_idempotency" => {
-            "DELETE FROM moderation_idempotency WHERE guild_id = $1 AND (state IS DISTINCT FROM 'done' OR outcome IS DISTINCT FROM 'operator_released')"
+            "guild_id = $1 AND (state IS DISTINCT FROM 'done' OR outcome IS DISTINCT FROM 'operator_released')"
                 .to_owned()
         }
-        _ => format!("DELETE FROM {table} WHERE guild_id = $1"),
+        _ => "guild_id = $1".to_owned(),
     }
 }
 
-/// Guild-scoped count for one erasure-plan table, mirroring [`guild_purge_sql`].
-fn guild_purge_count_sql(table: &str) -> String {
+/// Guild-scoped delete for one erasure-plan table.
+fn guild_purge_sql(table: &str) -> String {
+    format!("DELETE FROM {table} WHERE {}", guild_purge_predicate(table))
+}
+
+/// Time-window condition an Execute run applies to this table before the
+/// guild purge, as SQL over a caller-numbered day-interval placeholder, or
+/// `None` when the table has no time-window stage. Mirrors the Execute
+/// deletes in [`run_retention`] so the dry-run guild projection can exclude
+/// rows that stage would already have removed.
+fn guild_projection_time_exclusion(table: &str, placeholder: usize) -> Option<(String, i32)> {
     match table {
-        "lfg_signups" | "lfg_roles" => format!(
-            "SELECT count(*) FROM {table} WHERE lfg_id IN (SELECT id FROM lfg_posts WHERE guild_id = $1)"
-        ),
-        "feed_deliveries" => {
-            "SELECT count(*) FROM feed_deliveries WHERE feed_id IN (SELECT id FROM feed_relays WHERE guild_id = $1)"
-                .to_owned()
-        }
-        "self_role_exchanges" => {
-            "SELECT count(*) FROM self_role_exchanges WHERE event_id IN (SELECT event_id FROM self_role_audit WHERE guild_id = $1)"
-                .to_owned()
-        }
-        "moderation_channel_executions" => {
-            "SELECT count(*) FROM moderation_channel_executions WHERE guild_id = $1 AND idempotency_key IN (SELECT idempotency_key FROM moderation_idempotency WHERE guild_id = $1 AND (state IS DISTINCT FROM 'done' OR outcome IS DISTINCT FROM 'operator_released'))"
-                .to_owned()
-        }
-        "moderation_idempotency" => {
-            "SELECT count(*) FROM moderation_idempotency WHERE guild_id = $1 AND (state IS DISTINCT FROM 'done' OR outcome IS DISTINCT FROM 'operator_released')"
-                .to_owned()
-        }
-        _ => format!("SELECT count(*) FROM {table} WHERE guild_id = $1"),
+        "events" => Some((
+            format!(
+                "event_type IN ('voice_session_started', 'voice_session_ended') AND occurred_at < now() - make_interval(days => ${placeholder})"
+            ),
+            VOICE_RAW_RETENTION_DAYS,
+        )),
+        "operational_audit_log" => Some((
+            format!("occurred_at < now() - make_interval(days => ${placeholder})"),
+            AUDIT_CACHE_RETENTION_DAYS,
+        )),
+        _ => None,
+    }
+}
+
+/// `ON DELETE CASCADE` parents of one erasure-plan table, as
+/// `(parent table, join condition)` pairs with fully qualified columns.
+/// Mirrors the CASCADE foreign keys in migrations 0170, 0180, 0210, 0413,
+/// 0416 and 0418: every CASCADE child the guild purge counts. The
+/// remaining CASCADE child, `self_role_exchange_baselines` (0206), is not
+/// a plan table and is never counted by the purge, so it needs no
+/// exclusion. A child row whose parent the user-deletion stage deletes is
+/// removed by the cascade in an Execute run even when the child's own
+/// plan predicate does not match the deleted member (another member's
+/// block or grant in the deleted member's room), so the dry-run guild
+/// projection excludes it via the parent's own plan predicate; several
+/// children (`lfg_signups`, `lfg_roles`, `feed_deliveries`) already fold
+/// that parent condition into their predicate, and the explicit exclusion
+/// keeps them correct if the predicate changes.
+fn guild_projection_cascade_parents(table: &str) -> &'static [(&'static str, &'static str)] {
+    match table {
+        "lfg_signups" => &[
+            ("lfg_posts", "lfg_posts.id = lfg_signups.lfg_id"),
+            (
+                "lfg_roles",
+                "lfg_roles.lfg_id = lfg_signups.lfg_id AND lfg_roles.role_key = lfg_signups.role_key",
+            ),
+        ],
+        "lfg_roles" => &[("lfg_posts", "lfg_posts.id = lfg_roles.lfg_id")],
+        "feed_deliveries" => &[("feed_relays", "feed_relays.id = feed_deliveries.feed_id")],
+        "ticket_transcripts" => &[("tickets", "tickets.id = ticket_transcripts.ticket_id")],
+        "voice_room_blocks" => &[(
+            "voice_rooms",
+            "voice_rooms.guild_id = voice_room_blocks.guild_id AND voice_rooms.channel_id = voice_room_blocks.room_channel_id",
+        )],
+        "voice_join_grants" => &[(
+            "voice_rooms",
+            "voice_rooms.guild_id = voice_join_grants.guild_id AND voice_rooms.channel_id = voice_join_grants.room_channel_id",
+        )],
+        "voice_owner_grants" => &[(
+            "voice_rooms",
+            "voice_rooms.guild_id = voice_owner_grants.guild_id AND voice_rooms.channel_id = voice_owner_grants.channel_id",
+        )],
+        _ => &[],
     }
 }
 
@@ -697,11 +750,28 @@ async fn count_audit_cache(
     Ok(count as u64)
 }
 
-/// Rows the queued guild purges would delete, without deleting anything.
-/// Mirrors [`purge_guild`]: every plan table except the deletion ledger, plus
-/// the raw probe.
+/// One dynamically-numbered bind for a guild-projection count.
+enum ProjectionBind<'a> {
+    Text(&'a str),
+    Days(i32),
+}
+
+/// Rows the guild-purge stage of an Execute run would delete, without
+/// deleting anything. Mirrors [`purge_guild`]: every plan table except the
+/// deletion ledger, plus the raw probe. Execute runs the purge LAST, so the
+/// projection excludes rows the preceding stages would already remove —
+/// expired time-window rows and the guild's eligible (not guard-deferred)
+/// pending user deletions, including `ON DELETE CASCADE` children of
+/// parents those deletions remove — instead of counting rows twice across
+/// per-class buckets. Exclusions use `IS NOT TRUE` so a NULL time or member
+/// column keeps the row, matching a DELETE whose WHERE is not true. Plan
+/// predicates are evaluated against this snapshot; the plan's
+/// child-before-parent order keeps every referenced parent visible at the
+/// same point in an Execute run, so the snapshot and staged evaluations
+/// agree.
 async fn count_queued_guild_rows(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    eligible_deletions: &[(String, String)],
 ) -> Result<u64, sqlx::Error> {
     let guilds: Vec<String> =
         sqlx::query_scalar("SELECT guild_id FROM retention_guild_purge_queue")
@@ -710,22 +780,85 @@ async fn count_queued_guild_rows(
     let erasure = crate::member_erasure::plan();
     let mut total = 0u64;
     for guild in &guilds {
-        // Table names come from the reviewed embedded plan, never caller input.
-        let sql = "SELECT count(*) FROM presence_probe WHERE guild_id = $1".to_owned();
-        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
-            .bind(guild)
-            .fetch_one(&mut **tx)
-            .await?;
+        let mut eligible_users: Vec<&str> = eligible_deletions
+            .iter()
+            .filter(|(pending_guild, _)| pending_guild == guild)
+            .map(|(_, user_id)| user_id.as_str())
+            .collect();
+        eligible_users.sort_unstable();
+        eligible_users.dedup();
+        // Table names and predicates come from the reviewed embedded plan,
+        // never caller input. The probe is not a plan table, so the
+        // user-deletion stage never touches it; only its own time window
+        // runs ahead of the purge.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM presence_probe WHERE guild_id = $1 AND (observed_at < to_char(now() - make_interval(days => $2), 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')) IS NOT TRUE",
+        )
+        .bind(guild)
+        .bind(PRESENCE_RAW_RETENTION_DAYS)
+        .fetch_one(&mut **tx)
+        .await?;
         total += count as u64;
         for entry in &erasure.tables {
             if entry.table == "retention_deletion_requests" {
                 continue;
             }
-            let sql = guild_purge_count_sql(&entry.table);
-            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
-                .bind(guild)
-                .fetch_one(&mut **tx)
-                .await?;
+            let mut sql = format!(
+                "SELECT count(*) FROM {} WHERE {}",
+                entry.table,
+                guild_purge_predicate(&entry.table)
+            );
+            let mut binds: Vec<ProjectionBind<'_>> = vec![ProjectionBind::Text(guild)];
+            let mut next_placeholder = 2usize;
+            if let Some((condition, days)) =
+                guild_projection_time_exclusion(&entry.table, next_placeholder)
+            {
+                sql.push_str(&format!(" AND ({condition}) IS NOT TRUE"));
+                binds.push(ProjectionBind::Days(days));
+                next_placeholder += 1;
+            }
+            for user_id in &eligible_users {
+                // The plan predicate binds $1 = guild, $2 = member; move the
+                // member bind to this query's next placeholder. The only
+                // other `$` occurrences in plan predicates are regex end
+                // anchors (`...|$)`), which never read `$2`.
+                let user_placeholder = next_placeholder;
+                let predicate = entry
+                    .predicate
+                    .replace("$2", &format!("${user_placeholder}"));
+                sql.push_str(&format!(" AND ({predicate}) IS NOT TRUE"));
+                // Cascade children: a row the user stage removes only
+                // because it deletes the row's CASCADE parent (matched by
+                // the parent's own plan predicate, evaluated inside the
+                // EXISTS so its unqualified columns bind to the parent)
+                // never reaches the guild stage. Shares this user's bind.
+                for (parent_table, join_condition) in guild_projection_cascade_parents(&entry.table)
+                {
+                    let Some(parent) = erasure
+                        .tables
+                        .iter()
+                        .find(|plan| plan.table == *parent_table)
+                    else {
+                        continue;
+                    };
+                    let parent_predicate = parent
+                        .predicate
+                        .replace("$2", &format!("${user_placeholder}"));
+                    sql.push_str(&format!(
+                        " AND NOT EXISTS (SELECT 1 FROM {parent_table} WHERE {join_condition} AND ({parent_predicate}))"
+                    ));
+                }
+                binds.push(ProjectionBind::Text(user_id));
+                next_placeholder += 1;
+            }
+            let mut query = sqlx::query_scalar(sqlx::AssertSqlSafe(sql));
+            for bind in binds {
+                query = match bind {
+                    ProjectionBind::Text(value) => query.bind(value),
+                    ProjectionBind::Days(days) => query.bind(days),
+                };
+            }
+            let count: i64 = query.fetch_one(&mut **tx).await?;
             total += count as u64;
         }
     }
