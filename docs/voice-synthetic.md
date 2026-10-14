@@ -19,6 +19,7 @@ creator) and asserts:
 | status | a voice-channel status line is set on the room |
 | rejoin | the test bot hops from that room straight back into the creator, and a second new room appears and it is moved into that room (a member must never stay in the lobby) |
 | delete | after the test bot leaves, every room it was moved into (the first room and the rejoin room) is deleted within the empty grace |
+| rename | the creator is renamed before the join and restored after; the post-rename join must still move the test bot into a new room (SKIP while the test bot may not rename — see below) |
 | metrics | optional: `two_bot_voice_names_total{outcome="created_with_template"}` grows (SKIP without a metrics token) |
 
 The script refuses (exit 2, no request sent) unless the guild is TWO Staging
@@ -92,6 +93,23 @@ A missing token fails the run: the voice gate is required by default, so an
 unconfigured gate never reads as green. Set `VOICE_SYNTHETIC_REQUIRED=false`
 to restore the old "not configured" notice-and-pass while the test bot is
 being provisioned.
+
+## Rename case (one-time staging role grant)
+
+The `rename` check renames the staging creator to `<name> (synthetic)`,
+joins it, and restores the original name in a `finally` block, so a renamed
+creator that stops moving joins fails the gate. Renaming needs Manage
+Channels: grant the test bot's staging role Manage Channels once (staging
+guild only; the test bot lives nowhere else). Until then the check reports
+SKIP with that detail and every other check still runs. A rename PATCH
+answered with HTTP 429 (Discord allows 2 channel renames per 10 minutes)
+also reports SKIP: the workflow retries after 30 seconds and dispatches can
+collide within 10 minutes, and neither must fail the run. A name already
+carrying ` (synthetic)` means a previous run did not restore: the rename is
+skipped and the check FAILs naming the residue, so it is restored manually
+instead of being renamed over. Restore runs whenever a rename was attempted
+and the live name differs from the original, so a rename Discord applied but
+whose response was lost is still restored.
 
 ## Run it by hand
 
