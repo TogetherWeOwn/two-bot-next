@@ -96,7 +96,17 @@ are outside this implementation's scope.
   with hashed keys/nonces/event identities. Settings and immutable settings audit
   store operator attribution and JSON policy configuration.
 - Aggregate counters/probes, gateway checkpoints and shared role/event
-  configuration also exist, but are not member activity records.
+  configuration also exist, but are not member activity records. Game-activity
+  analytics (`game_activity_guild_aggregates`: per-guild per-game play/in-voice
+  millis plus session counts, flushed hourly from the voice runtime's
+  in-memory collector) belongs to this class: guild-keyed rows with no member
+  column, gated before every persist by the same per-user opt-out and the
+  presence toggle above, so opted-out members never persist and a disabled
+  guild drains and drops. The voice toggle is independent: with voice off but
+  presence on, play aggregates still persist while voice-derived `in_voice_ms`
+  stays 0 (voice spans drain and drop). The table is not a replay fence and
+  holds no fence rows; member erasure and opt-out purges have no row to delete
+  there.
 
 The authoritative, ordered deletion manifest is
 [`member_erasure_plan.json`](../crates/cutover/src/member_erasure_plan.json).

@@ -79,6 +79,10 @@ pub const DUMP_TABLES: &[&str] = &[
     "privacy_opt_outs",
     "guild_analytics_settings",
     "privacy_opt_out_audit",
+    // Game-activity guild aggregates (0441/0442): guild-keyed counters with
+    // no member column, archived like the other aggregate tables. No foreign
+    // keys, so order is free.
+    "game_activity_guild_aggregates",
     "member_levels",
     // Seasonal XP projection (0100): append-only mirror of lifetime XP per
     // quarter, guild-keyed with no foreign keys, so order beside

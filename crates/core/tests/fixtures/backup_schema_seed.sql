@@ -257,6 +257,14 @@ INSERT INTO presence_probe
     (guild_id, observed_at, approximate_presence_count, bot_floor, bot_floor_scan_truncated)
 VALUES ('100000000000000001', '2026-08-01T10:00:00.000Z', 31, 3, TRUE),
        ('100000000000000001', '2026-08-01T10:01:00.000Z', 30, NULL, FALSE);
+-- Game-activity guild aggregates (0441/0442): one titled row, one untitled
+-- row (`''` game key), and one row in another guild. Guild keys only, so the
+-- roundtrip asserts archive coverage, not an empty seed.
+INSERT INTO game_activity_guild_aggregates
+    (guild_id, game, total_play_ms, in_voice_ms, session_count, updated_at)
+VALUES ('100000000000000001', 'Apex', 1800000, 60000, 1, '2026-08-01T10:00:00.000Z'),
+       ('100000000000000001', '', 60000, 0, 1, '2026-08-01T10:00:00.000Z'),
+       ('100000000000000002', 'Apex', 5940000, 0, 9, '2026-08-01T11:00:00.000Z');
 
 INSERT INTO community_stream_heartbeats (guild_id, stream, covered_from, covered_through, updated_at)
 VALUES ('100000000000000001', 'event_attended', '2026-07-27T00:00:00.000Z',

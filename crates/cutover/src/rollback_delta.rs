@@ -92,6 +92,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "events", measure: TableMeasure::Columns(&["recorded_at"]) },
     TableSpec { table: "feed_deliveries", measure: TableMeasure::Columns(&["first_seen_at"]) },
     TableSpec { table: "feed_relays", measure: TableMeasure::Columns(&["updated_at"]) },
+    TableSpec { table: "game_activity_guild_aggregates", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "gateway_boot_directives", measure: TableMeasure::Columns(&["armed_at", "consumed_at"]) },
     TableSpec {
         table: "gateway_onboarding_jobs",

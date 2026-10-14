@@ -1605,6 +1605,7 @@ jobs:
         run: |
           cargo test -p two-bot-core --features db --locked --lib community_store
           cargo test -p two-bot-core --features db --locked --lib presence_store
+          cargo test -p two-bot-core --features db --locked --lib game_activity_store
           cargo test -p two-bot-core --features db --locked --lib inactivity_store
 
   feeds-db:
