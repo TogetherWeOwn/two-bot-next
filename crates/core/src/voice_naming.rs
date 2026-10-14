@@ -1491,10 +1491,7 @@ fn emoji_run_len(name: &str) -> Option<usize> {
         return None;
     }
     let mut end = first.len_utf8();
-    loop {
-        let Some((_, c)) = name[end..].char_indices().next() else {
-            break;
-        };
+    while let Some((_, c)) = name[end..].char_indices().next() {
         let take = match c {
             '\u{FE0E}' | '\u{FE0F}' => c.len_utf8(),
             '\u{1F3FB}'..='\u{1F3FF}' => c.len_utf8(),
