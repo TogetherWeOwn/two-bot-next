@@ -170,11 +170,15 @@ deferred (with overdue requests older than 72 hours counted separately).
 Long-term aggregates (counts,
 streaks) are never time-purged, and a departed guild's rows go only through
 the guild-purge queue keyed on a true guild removal (a rejoin cancels the
-queued purge). No scheduler, CLI, or gateway hook calls the job yet, and no
-automatic age-based purger is installed: do not claim a live 30/90-day TTL or
-live enforcement where no enforcing timer exists. Gateway wiring for
-`GUILD_DELETE`/`GUILD_CREATE` and a schedule are follow-up work. Every run
-reports per-class metrics and supports a dry run that deletes nothing.
+queued purge). The live gateway invokes the queue/cancel paths on real
+`GUILD_DELETE`/`GUILD_CREATE` dispatches (outage payloads never queue; an
+available rejoin cancels before the next run), and the supervised retention
+job runs on a bounded schedule: a dry run that deletes nothing unless
+`TWO_RETENTION_MODE` is exactly `execute`. No other automatic age-based
+purger is installed: do not claim a live 30/90-day TTL beyond the windows
+this job enforces. Every run reports per-class metrics, with partial runs
+(deferred/overdue deletions, failed guild purges) surfaced as warnings that
+stay retryable.
 
 The append-only event-store capture (`event_store`, when its slices land)
 follows the same rule: its rows persist until erasure, and its TTL policy is
