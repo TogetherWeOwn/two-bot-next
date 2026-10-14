@@ -772,8 +772,40 @@ const LEDGER_UNKNOWN: &str = "unknown: ledger unreadable";
 /// `None` when no connection or the read fails, so the caller records
 /// [`LEDGER_UNKNOWN`] instead of an empty ledger.
 async fn read_ledger_after_run(pool: &PgPool) -> Option<Vec<LedgerRow>> {
-    let mut conn = pool.acquire().await.ok()?;
-    read_ledger(&mut conn).await.ok()
+    // Post-apply follow-up (TOG-24361): run 38654195597 applied all 19
+    // pending migrations but reported `ledger unreadable after apply` on a
+    // single post-verify read while the ledger itself was fine (max 441).
+    // Staging was under `max_connections` pressure at the time, so one
+    // acquire/read can blip even after successful DDL. Retry a bounded
+    // number of times with backoff so a transient blip does not mark a
+    // successful apply as failed. A permanent revoke still returns `None`
+    // after the retries, preserving the fail-closed `LEDGER_UNKNOWN` path.
+    retry_on_transient(|| async {
+        let mut conn = pool.acquire().await.ok()?;
+        read_ledger(&mut conn).await.ok()
+    })
+    .await
+}
+
+/// Bounded retry for a transient post-run read: returns the first `Some`,
+/// else `None` after [`POST_READ_ATTEMPTS`] tries with linear backoff.
+/// Extracted so the retry itself is unit-testable without a database.
+const POST_READ_ATTEMPTS: usize = 5;
+
+async fn retry_on_transient<F, Fut>(mut op: F) -> Option<Vec<LedgerRow>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<Vec<LedgerRow>>>,
+{
+    for attempt in 0..POST_READ_ATTEMPTS {
+        if let Some(rows) = op().await {
+            return Some(rows);
+        }
+        if attempt + 1 < POST_READ_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(500 * (attempt as u64 + 1))).await;
+        }
+    }
+    None
 }
 
 fn ledger_or_unknown(rows: Option<&[LedgerRow]>) -> Value {
@@ -2449,6 +2481,64 @@ mod tests {
             !debug.contains("fixture"),
             "refusal echoed the URL: {debug}"
         );
+    }
+
+    /// TOG-24361: the post-apply ledger read must survive a transient blip
+    /// (apply run 38654195597 applied 19 migrations, then failed one read
+    /// while the ledger itself was fine at max 441). A read that fails twice
+    /// then succeeds must return the rows instead of `LEDGER_UNKNOWN`.
+    #[tokio::test]
+    async fn post_apply_read_retries_a_transient_blip() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe = calls.clone();
+        let rows = retry_on_transient(|| {
+            let probe = probe.clone();
+            async move {
+                let n = probe.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    None
+                } else {
+                    Some(vec![LedgerRow {
+                        version: 441,
+                        description: "transient probe".to_owned(),
+                        success: true,
+                        checksum_hex: "ab".to_owned(),
+                    }])
+                }
+            }
+        })
+        .await;
+        let rows = rows.expect("transient blip must be retried");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].version, 441);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// A permanent read failure must still give up after the bounded retries
+    /// and let the caller record `LEDGER_UNKNOWN`, preserving the existing
+    /// fail-closed path covered by `post_apply_unreadable_ledger_is_unknown`.
+    #[tokio::test]
+    async fn post_apply_read_gives_up_after_bounded_retries() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe = calls.clone();
+        let rows = retry_on_transient(|| {
+            let probe = probe.clone();
+            async move {
+                probe.fetch_add(1, Ordering::SeqCst);
+                None::<Vec<LedgerRow>>
+            }
+        })
+        .await;
+        assert!(rows.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), POST_READ_ATTEMPTS);
     }
 
     #[test]
