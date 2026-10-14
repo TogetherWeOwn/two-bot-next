@@ -277,31 +277,22 @@ impl GameActivityCollector {
                             // carries are dropped instead of credited. When the
                             // old game already stopped (`stopped_at`), the run
                             // ended at the stop: bridging to the change clock
-                            // would credit the idle gap as phantom play, so the
-                            // close-out ends at the stop instead. When the stop
-                            // is already in this window's buffer, the flush's
-                            // own stop-bridge replays the run-up, so no
-                            // synthetic close-out is emitted at all: emitting
-                            // one would duplicate the stop-bridge points and
-                            // the stop between the duplicates would split the
-                            // run into a floored phantom singleton.
+                            // would credit the idle gap as phantom play, so
+                            // only the reopen point is emitted and the flush's
+                            // own stop-bridge replays the run-up to the stop.
+                            // The stop delta is already in this window's buffer
+                            // when the stop and the change share a window; when
+                            // the old game was carried over from an earlier
+                            // flush, the reopen point still precedes the stop
+                            // so the run-up from the last flush is not lost.
                             let stopped_bounds_run = matches!(
                                 prev.stopped_at,
                                 Some(stopped_at)
                                     if stopped_at >= prev.from_ms
                                         && stopped_at <= observed_at_ms
                             );
-                            let close_at_ms = match prev.stopped_at {
-                                Some(stopped_at)
-                                    if stopped_at >= prev.from_ms
-                                        && stopped_at <= observed_at_ms =>
-                                {
-                                    stopped_at
-                                }
-                                _ => observed_at_ms,
-                            };
-                            if !stopped_bounds_run
-                                && observed_at_ms >= prev.from_ms
+                            let close_at_ms = observed_at_ms;
+                            if observed_at_ms >= prev.from_ms
                                 && observed_at_ms.saturating_sub(prev.from_ms)
                                     <= GAME_ACTIVITY_CARRY_TTL_MS
                             {
@@ -311,21 +302,23 @@ impl GameActivityCollector {
                                     prev.is_streaming,
                                     prev.from_ms,
                                 ));
-                                fill_ticks(
-                                    &mut pending,
-                                    &user_key,
-                                    &prev.game,
-                                    prev.is_streaming,
-                                    prev.from_ms,
-                                    close_at_ms,
-                                    GAME_ACTIVITY_GAP_TIMEOUT_MS,
-                                );
-                                pending.push(synthetic_delta(
-                                    &user_key,
-                                    &prev.game,
-                                    prev.is_streaming,
-                                    close_at_ms,
-                                ));
+                                if !stopped_bounds_run {
+                                    fill_ticks(
+                                        &mut pending,
+                                        &user_key,
+                                        &prev.game,
+                                        prev.is_streaming,
+                                        prev.from_ms,
+                                        close_at_ms,
+                                        GAME_ACTIVITY_GAP_TIMEOUT_MS,
+                                    );
+                                    pending.push(synthetic_delta(
+                                        &user_key,
+                                        &prev.game,
+                                        prev.is_streaming,
+                                        close_at_ms,
+                                    ));
+                                }
                             }
                             stated.insert(PlayCarry {
                                 game,
@@ -1835,6 +1828,48 @@ mod tests {
             apex.total_play_ms,
             10 * MIN,
             "the stop bounds the old run, got {apex:?}"
+        );
+        assert_eq!(apex.session_count, 1, "one stopped run, got {apex:?}");
+        let zelda = rows
+            .iter()
+            .find(|row| row.game.as_deref() == Some("Zelda"))
+            .expect("Zelda row");
+        assert_eq!(zelda.total_play_ms, 10 * MIN, "got {zelda:?}");
+        assert_eq!(zelda.session_count, 1, "got {zelda:?}");
+    }
+
+    #[test]
+    fn stop_then_different_game_across_flush_keeps_old_run_up() {
+        // Apex 0-40 with a flush at +30, idle, Zelda 80-90, then a flush at
+        // +90: the old game was carried over from the earlier flush, so no
+        // start delta precedes the stop in this window's buffer. The
+        // game-change close-out must still emit the reopen point so the
+        // flush's stop-bridge credits Apex 30-40 instead of dropping it.
+        let collector = GameActivityCollector::new();
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0),
+        );
+        let rows = collector.flush(7, 15 * MIN, T0 + 30 * MIN);
+        assert_eq!(rows.len(), 1, "first window stores Apex, got {rows:?}");
+        assert_eq!(rows[0].total_play_ms, 30 * MIN, "got {:?}", rows[0]);
+
+        collector.observe_presence(7, presence_delta(&update(json!([])), T0 + 40 * MIN));
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Zelda")])), T0 + 80 * MIN),
+        );
+        collector.observe_presence(7, presence_delta(&update(json!([])), T0 + 90 * MIN));
+
+        let rows = collector.flush(7, 15 * MIN, T0 + 90 * MIN);
+        let apex = rows
+            .iter()
+            .find(|row| row.game.as_deref() == Some("Apex"))
+            .expect("Apex run-up to the stop");
+        assert_eq!(
+            apex.total_play_ms,
+            10 * MIN,
+            "carried run-up 30-40 survives the game change, got {apex:?}"
         );
         assert_eq!(apex.session_count, 1, "one stopped run, got {apex:?}");
         let zelda = rows
