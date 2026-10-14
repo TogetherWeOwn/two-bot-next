@@ -14,6 +14,10 @@ What it proves on the deployed staging bot (stdlib only, no third-party code):
              Connect and Manage Channels (owner grants)
   status     a voice-channel status line is set on the room
   delete     after the test bot leaves, the room is deleted within the grace
+  rename     the creator is renamed before the join and restored after: the
+             post-rename join must still move the test bot into a new room
+             (SKIP while the test bot may not rename: its staging role needs
+             Manage Channels once)
   metrics    optional: /ops/metrics `two_bot_voice_names_total` counts the room
              as created_with_template (SKIP when no metrics token is configured)
 
@@ -60,6 +64,10 @@ VIEW, CONNECT, MANAGE = 1 << 10, 1 << 20, 1 << 4
 OWNER_BITS = VIEW | CONNECT | MANAGE
 VOICE_TYPES = (2, 13)
 FALLBACK = re.compile(r"^.+['’]s room$")
+# Marker appended to the staging creator's name for the rename case. The run
+# restores the original name in a finally block; a name already carrying the
+# marker means a previous run did not restore, and the rename is skipped.
+RENAME_MARKER = " (synthetic)"
 
 # Body-cap refusal contract (same shape as staging_probe.py MAX_BODY_BYTES and
 # the contract probe BODY_CAP): every response read takes at most
@@ -158,6 +166,24 @@ def evaluate(obs):
     out.append(check("metrics", delta is not None and delta >= 1,
                      "no metrics token configured" if delta is None else f"created_with_template +{delta}",
                      skip=delta is None))
+    note = obs.get("rename_note")
+    if obs.get("rename_forbidden"):
+        out.append(check("rename", False,
+                         "test bot may not rename the staging creator (HTTP 403): grant its "
+                         "staging role Manage Channels once, then the rename case gates",
+                         skip=True))
+    elif obs.get("rename_applied") and obs.get("rename_restored"):
+        out.append(check("rename", True,
+                         f"creator renamed to {obs.get('rename_name')!r} and restored; "
+                         f"the post-rename join landed in {obs.get('moved_to')}"))
+    elif note and not obs.get("rename_applied"):
+        out.append(check("rename", False, note))
+    elif obs.get("rename_applied") and not obs.get("rename_restored"):
+        out.append(check("rename", False,
+                         "creator was renamed but the original name was NOT restored; "
+                         "restore it manually"))
+    else:
+        out.append(check("rename", False, note or "creator rename was not applied"))
     return out
 
 
@@ -286,6 +312,31 @@ def rest(token, path, timeout=20):
     return json.loads(raw)
 
 
+def rest_patch(token, path, payload, timeout=20):
+    """PATCH a Discord resource with a JSON body under the same body cap.
+
+    Returns (status, parsed body or None). HTTP errors report their status
+    instead of raising (a 403 means the test bot may not rename); only an
+    over-cap body raises BodyTooLarge, like the GET path.
+    """
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(f"{API}{path}", data=data, headers={
+        "Authorization": f"Bot {token}", "User-Agent": "two-bot-voice-synthetic (staging)",
+        "Content-Type": "application/json"}, method="PATCH")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read(MAX_BODY_BYTES + 1)
+            status = resp.status
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(MAX_BODY_BYTES + 1)
+        if len(raw) > MAX_BODY_BYTES:
+            raise BodyTooLarge("Discord REST read answered over the body cap") from None
+        return exc.code, None
+    if len(raw) > MAX_BODY_BYTES:
+        raise BodyTooLarge("Discord REST read answered over the body cap")
+    return status, json.loads(raw)
+
+
 def metrics_value(staging_url, token):
     if not (staging_url and token):
         return None
@@ -370,6 +421,32 @@ def run_live(args, token):
         obs["me"] = s.me
         creator = rest(token, f"/channels/{args.creator}")
         obs["creator"] = creator
+        # Rename case: a renamed creator must still move joins into new rooms
+        # (a stale creator view refused them until restart). The original name
+        # is restored in the finally block; residue from a previous run skips
+        # the rename but still runs the lifecycle checks.
+        original_name = creator.get("name", "")
+        obs["rename_original"] = original_name
+        obs["rename_applied"] = obs["rename_restored"] = obs["rename_forbidden"] = False
+        temp_name = (original_name + RENAME_MARKER)[:100] or "Create a Lobby" + RENAME_MARKER
+        if RENAME_MARKER in original_name:
+            obs["rename_note"] = ("creator already carries synthetic residue "
+                                  f"({original_name!r}); rename skipped, restore it manually")
+        else:
+            status, _ = rest_patch(token, f"/channels/{args.creator}", {"name": temp_name})
+            if status == 403:
+                obs["rename_forbidden"] = True
+            elif status is not None and 200 <= status < 300:
+                seen = rest(token, f"/channels/{args.creator}")
+                if seen.get("name") == temp_name:
+                    obs["rename_applied"] = True
+                    obs["rename_name"] = temp_name
+                    obs["creator"] = creator = seen
+                else:
+                    obs["rename_note"] = (f"rename PATCH answered {status} but the name "
+                                          f"reads back {seen.get('name')!r}")
+            else:
+                obs["rename_note"] = f"rename PATCH answered {status}; rename skipped"
         obs["channels_before"] = rest(token, f"/guilds/{args.guild}/channels")
         s.voice(args.guild, args.creator)
         joined = True
@@ -423,6 +500,15 @@ def run_live(args, token):
                 s.voice(args.guild, None)
             except OSError:
                 pass
+        if obs.get("rename_applied"):
+            try:
+                status, _ = rest_patch(token, f"/channels/{args.creator}",
+                                       {"name": obs.get("rename_original", "")})
+                seen = rest(token, f"/channels/{args.creator}")
+                obs["rename_restored"] = (isinstance(status, int) and 200 <= status < 300
+                                          and seen.get("name") == obs.get("rename_original"))
+            except Exception:
+                obs["rename_restored"] = False
         s.close()
     after = metrics_value(args.staging_url, os.environ.get("TWO_STAGING_METRICS_TOKEN"))
     obs["metrics_delta"] = None if before is None or after is None else int(after - before)

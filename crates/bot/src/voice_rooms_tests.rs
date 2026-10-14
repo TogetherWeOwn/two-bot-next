@@ -12995,6 +12995,52 @@ async fn silent_join_refusals_carry_stable_reason_labels() {
     );
 }
 
+#[tokio::test]
+async fn stale_creator_view_revalidates_from_the_store_before_refusing() {
+    // The runtime creator view went stale while the voice_creators row
+    // existed, so joins refused as unknown_creator until restart. A stale
+    // view must re-read the store row for the joined channel instead of
+    // refusing it.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    // Stale view only: the store row stays, the worker map loses it.
+    worker.creators.clear();
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(CREATOR), Some(false))
+        .expect("ticket for a joined channel");
+    assert!(
+        !worker.creators.contains_key(&CREATOR),
+        "stale view under test"
+    );
+    assert!(
+        worker.revalidate_creator(CREATOR).await,
+        "a voice_creators row must revalidate the stale view"
+    );
+    assert!(worker.creators.contains_key(&CREATOR));
+    assert!(
+        worker.accept_join_received(
+            ticket,
+            "new room",
+            7,
+            NOW.to_owned(),
+            tokio::time::Instant::now()
+        ),
+        "the revalidated join is accepted, not refused as unknown_creator"
+    );
+}
+
+#[tokio::test]
+async fn revalidate_ignores_channels_with_no_creator_row() {
+    // A join to a channel the store never heard of still refuses: the
+    // revalidation only admits channels that are voice_creators rows.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    const STRANGER: u64 = 999;
+    assert!(!worker.revalidate_creator(STRANGER).await);
+    assert!(!worker.creators.contains_key(&STRANGER));
+}
+
 #[test]
 fn watchdog_due_needs_a_queue_and_an_expired_window() {
     let start = tokio::time::Instant::now();
