@@ -199,51 +199,26 @@ pub async fn has_unresolved_guild_guards(
     conn: &mut PgConnection,
     guild: &str,
 ) -> Result<bool, sqlx::Error> {
-    has_unresolved_guild_guards_except(conn, guild, &[]).await
-}
-
-/// Guild-wide probe as above, ignoring guards attributable to `excluded`
-/// members (member ids as bound to `$2` of each plan predicate). The
-/// retention guild purge passes the guild's pending-deletion members: their
-/// guards are already tracked as deferred user deletions whose rows the
-/// purge is the designated consumer of, so only untracked guards defer the
-/// guild. Table names and predicates come from reviewed code, never caller
-/// input; member values are bound, never interpolated.
-pub async fn has_unresolved_guild_guards_except(
-    conn: &mut PgConnection,
-    guild: &str,
-    excluded: &[&str],
-) -> Result<bool, sqlx::Error> {
     let plan = plan();
     for &(table, unresolved_predicate) in REPLAY_GUARDS {
-        let entry = plan
-            .tables
+        plan.tables
             .iter()
             .find(|entry| entry.table == table)
             .expect("replay guards must be in the erasure plan");
-        // The plan predicate binds $1 = guild, $2 = member; $1 is bound once
-        // above so only the member placeholder moves per exclusion. Any other
-        // `$` in a predicate is a regex end anchor, never `$2`.
-        let mut clauses: Vec<String> = Vec::new();
-        for (offset, _) in excluded.iter().enumerate() {
-            let next_placeholder = offset + 2;
-            let predicate = entry
-                .predicate
-                .replace("$2", &format!("${next_placeholder}"));
-            clauses.push(format!("({predicate})"));
-        }
-        let mut sql = format!(
-            "SELECT EXISTS (SELECT 1 FROM {table} WHERE guild_id = $1 AND ({unresolved_predicate})"
+        // Table names and predicates come from reviewed code, never caller input.
+        // No member exclusions: any unresolved guard anywhere in the guild
+        // defers the purge, including guards of members with a pending
+        // user-deletion request. Those rows are replay fences, not stale data,
+        // and the plan's per-member predicates go NULL on nullable columns, so
+        // an exclusion would hide other members' guards (NOT NULL is NULL).
+        let sql = format!(
+            "SELECT EXISTS (SELECT 1 FROM {table} WHERE guild_id = $1 AND ({unresolved_predicate}))"
         );
-        if !clauses.is_empty() {
-            sql.push_str(&format!(" AND NOT ({})", clauses.join(" OR ")));
-        }
-        sql.push(')');
-        let mut query = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(sql)).bind(guild);
-        for member in excluded {
-            query = query.bind(*member);
-        }
-        if query.fetch_one(&mut *conn).await? {
+        let unresolved = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(sql))
+            .bind(guild)
+            .fetch_one(&mut *conn)
+            .await?;
+        if unresolved {
             return Ok(true);
         }
     }
