@@ -36,7 +36,12 @@ are outside this implementation's scope.
   erased with its owner takes its whole list with it (the rows cascade). Its approved-grant
   witness (`voice_join_grants`) does the same: erasure removes the erased member's rows from
   every room's grant list, and a room erased with its owner takes its grants with it
-  (the rows cascade). Guild room-command controls
+  (the rows cascade). Its owner-grant journal (`voice_owner_grants`) records
+  prospective recipients, pending or completed: erasure removes the erased
+  member's rows by (`guild_id`, `member_id`), and deleting a parent room
+  removes its journal rows through the migration's `ON DELETE CASCADE`.
+  Erasure removes database tracking only, never the Discord channel.
+  Guild room-command controls
   (`voice_access_controls`: creation switch, required role ID, per-command role
   IDs) and room logging settings (`voice_logging_settings`: detail level, notice
   channel ID, mention role ID) hold channel and role IDs only and no member IDs.
