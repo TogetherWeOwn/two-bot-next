@@ -199,21 +199,51 @@ pub async fn has_unresolved_guild_guards(
     conn: &mut PgConnection,
     guild: &str,
 ) -> Result<bool, sqlx::Error> {
+    has_unresolved_guild_guards_except(conn, guild, &[]).await
+}
+
+/// Guild-wide probe as above, ignoring guards attributable to `excluded`
+/// members (member ids as bound to `$2` of each plan predicate). The
+/// retention guild purge passes the guild's pending-deletion members: their
+/// guards are already tracked as deferred user deletions whose rows the
+/// purge is the designated consumer of, so only untracked guards defer the
+/// guild. Table names and predicates come from reviewed code, never caller
+/// input; member values are bound, never interpolated.
+pub async fn has_unresolved_guild_guards_except(
+    conn: &mut PgConnection,
+    guild: &str,
+    excluded: &[&str],
+) -> Result<bool, sqlx::Error> {
     let plan = plan();
     for &(table, unresolved_predicate) in REPLAY_GUARDS {
-        plan.tables
+        let entry = plan
+            .tables
             .iter()
             .find(|entry| entry.table == table)
             .expect("replay guards must be in the erasure plan");
-        // Table names and predicates come from reviewed code, never caller input.
-        let sql = format!(
-            "SELECT EXISTS (SELECT 1 FROM {table} WHERE guild_id = $1 AND ({unresolved_predicate}))"
+        // The plan predicate binds $1 = guild, $2 = member; $1 is bound once
+        // above so only the member placeholder moves per exclusion. Any other
+        // `$` in a predicate is a regex end anchor, never `$2`.
+        let mut clauses: Vec<String> = Vec::new();
+        let mut next_placeholder = 2usize;
+        for _ in excluded {
+            let predicate = entry.predicate.replace("$2", &format!("${next_placeholder}"));
+            clauses.push(format!("({predicate})"));
+            next_placeholder += 1;
+        }
+        let mut sql = format!(
+            "SELECT EXISTS (SELECT 1 FROM {table} WHERE guild_id = $1 AND ({unresolved_predicate})"
         );
-        let unresolved = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(sql))
-            .bind(guild)
-            .fetch_one(&mut *conn)
-            .await?;
-        if unresolved {
+        if !clauses.is_empty() {
+            sql.push_str(&format!(" AND NOT ({})", clauses.join(" OR ")));
+        }
+        sql.push(')');
+        let mut query =
+            sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(sql)).bind(guild);
+        for member in excluded {
+            query = query.bind(*member);
+        }
+        if query.fetch_one(&mut *conn).await? {
             return Ok(true);
         }
     }
