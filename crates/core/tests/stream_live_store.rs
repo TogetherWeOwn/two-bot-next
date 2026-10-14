@@ -87,7 +87,7 @@ async fn setup() -> (Pool<Postgres>, String) {
     // to prove re-runnability inside one schema.
     for migration in [
         "../../cutover/migrations/0440_stream_live_claims.sql",
-        "../../cutover/migrations/0441_stream_live_send_started.sql",
+        "../../cutover/migrations/0443_stream_live_send_started.sql",
     ] {
         // `include_str!` needs a literal path, so match the two known files.
         if migration.ends_with("0440_stream_live_claims.sql") {
@@ -105,13 +105,13 @@ async fn setup() -> (Pool<Postgres>, String) {
             .unwrap();
         } else {
             sqlx::raw_sql(include_str!(
-                "../../cutover/migrations/0441_stream_live_send_started.sql"
+                "../../cutover/migrations/0443_stream_live_send_started.sql"
             ))
             .execute(&pool)
             .await
             .unwrap();
             sqlx::raw_sql(include_str!(
-                "../../cutover/migrations/0441_stream_live_send_started.sql"
+                "../../cutover/migrations/0443_stream_live_send_started.sql"
             ))
             .execute(&pool)
             .await

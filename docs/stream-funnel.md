@@ -108,7 +108,7 @@ receiver yet.
   `claim_live` inserts with `ON CONFLICT DO NOTHING`: the inserter owns
   the post, while any existing claim is acknowledged with 2xx and skipped.
 - Crash recovery is a bounded lease over never-started claims only
-  (migration 0441, `send_started_at`, `STALE_CLAIM_LEASE_SECS = 300 s`).
+  (migration 0443, `send_started_at`, `STALE_CLAIM_LEASE_SECS = 300 s`).
   The receiver MUST call `mark_live_send_started` before the first Discord
   POST; `reclaim_stale_live` atomically takes over one stale row with
   `delivered_at IS NULL AND send_started_at IS NULL` and restarts its

@@ -966,19 +966,20 @@ impl Dice {
 
 /// Render a parsed template against a room context.
 ///
-/// Pipeline tail: trim → truncate to [`MAX_NAME_LEN`] characters →
-/// fallback name when empty.
+/// Pipeline tail: trim → emoji separator ([`join_emoji_separator`]) →
+/// truncate to [`MAX_NAME_LEN`] characters → fallback name when empty.
 pub fn render<E: ExtensionPolicy>(template: &Template, ctx: &RoomContext, ext: &E) -> String {
     let rendered = Evaluation::new(ctx, ext).evaluate(template);
-    // Pipeline tail: trim → truncate → fallback.
-    let mut out = truncate_chars(rendered.trim(), MAX_NAME_LEN);
+    // Pipeline tail: trim → emoji separator → truncate → fallback.
+    let joined = join_emoji_separator(rendered.trim());
+    let mut out = truncate_chars(&joined, MAX_NAME_LEN);
     out = out.trim_end().to_string();
     if out.is_empty() {
-        let fallback = ctx.fallback_name.trim();
-        if fallback.is_empty() {
+        let fallback = join_emoji_separator(ctx.fallback_name.trim());
+        if fallback.trim().is_empty() {
             out = DEFAULT_FALLBACK_NAME.to_string();
         } else {
-            out = truncate_chars(fallback, MAX_NAME_LEN);
+            out = truncate_chars(&fallback, MAX_NAME_LEN);
             out = out.trim_end().to_string();
             if out.is_empty() {
                 out = DEFAULT_FALLBACK_NAME.to_string();
@@ -1454,6 +1455,91 @@ pub fn majority_games(
 pub const DEFAULT_NAME_TEMPLATE: &str =
     "@@random_emoji@@ @@owner@@'s [[den/crew/lair/hangout/base/club]]";
 
+/// Separator between a leading emoji and the rest of a minted room name:
+/// 〢 (hangzhou numeral two, U+3022). Narrow, never whitespace-folded, and
+/// untouched by NFKC, so the name sanitizer preserves it verbatim.
+pub const EMOJI_NAME_SEPARATOR: char = '\u{3022}';
+
+/// First-scalar ranges that may open an emoji-prefixed room name:
+/// pictographs and emoticons (👾 🎮), miscellaneous symbols and dingbats
+/// (☕ ⚔), and the single-width symbols Discord renders as emoji. Arrows,
+/// `©`/`®` and keycap leads (`#`, `*`, digits) are deliberately excluded:
+/// those open literal names where a space stays a space.
+const EMOJI_LEAD_RANGES: &[(u32, u32)] = &[
+    (0x231A, 0x231B),   // ⌚ ⌛
+    (0x23E9, 0x23F3),   // ⏩ through ⏳
+    (0x23F8, 0x23FA),   // ⏸ ⏹ ⏺
+    (0x24C2, 0x24C2),   // Ⓜ
+    (0x25B6, 0x25B6),   // ▶
+    (0x25C0, 0x25C0),   // ◀
+    (0x2600, 0x27BF),   // miscellaneous symbols and dingbats
+    (0x2B00, 0x2BFF),   // miscellaneous symbols and arrows
+    (0x1F000, 0x1FAFF), // pictographs, emoticons, transport, regional indicators
+];
+
+/// Byte length of the leading emoji run in `name`, or `None` when the name
+/// does not open with an emoji. The run covers one base pictograph plus its
+/// modifiers — variation selectors, skin tones, ZWJ-joined parts, the keycap
+/// combiner, regional-indicator pairs and tag runs — so the separator is
+/// never spliced inside a multi-scalar emoji such as `⚔️`.
+fn emoji_run_len(name: &str) -> Option<usize> {
+    let (_, first) = name.char_indices().next()?;
+    if !EMOJI_LEAD_RANGES
+        .iter()
+        .any(|(lo, hi)| (*lo..=*hi).contains(&(first as u32)))
+    {
+        return None;
+    }
+    let mut end = first.len_utf8();
+    while let Some((_, c)) = name[end..].char_indices().next() {
+        let take = match c {
+            '\u{FE0E}' | '\u{FE0F}' => c.len_utf8(),
+            '\u{1F3FB}'..='\u{1F3FF}' => c.len_utf8(),
+            '\u{20E3}' => c.len_utf8(),
+            '\u{E0020}'..='\u{E007F}' => c.len_utf8(),
+            '\u{1F1E6}'..='\u{1F1FF}' => c.len_utf8(),
+            '\u{200D}' => {
+                let mut taken = c.len_utf8();
+                if let Some((_, next)) = name[end + taken..].char_indices().next() {
+                    taken += next.len_utf8();
+                }
+                taken
+            }
+            _ => break,
+        };
+        end += take;
+    }
+    Some(end)
+}
+
+/// Normalize the separator after a leading emoji to [`EMOJI_NAME_SEPARATOR`]
+/// with no spaces: `👾 WARDOGS deep dive` becomes `👾〢WARDOGS deep dive`.
+/// Names without a leading emoji pass through unchanged, and an
+/// already-separated name is returned as-is (never doubled), so create and
+/// every rename re-render converge on one separator. Only the first
+/// separator is touched: emoji later in the name keep their spaces.
+#[must_use]
+pub fn join_emoji_separator(name: &str) -> String {
+    let Some(run) = emoji_run_len(name) else {
+        return name.to_string();
+    };
+    let after = &name[run..];
+    let spaceless = after.trim_start_matches(char::is_whitespace);
+    let had_space = spaceless.len() != after.len();
+    let (rest, had_separator) = match spaceless.strip_prefix(EMOJI_NAME_SEPARATOR) {
+        Some(tail) => (tail.trim_start_matches(char::is_whitespace), true),
+        None => (spaceless, false),
+    };
+    if rest.is_empty() || (!had_space && !had_separator) {
+        return name.to_string();
+    }
+    let mut out = String::with_capacity(name.len() + EMOJI_NAME_SEPARATOR.len_utf8());
+    out.push_str(&name[..run]);
+    out.push(EMOJI_NAME_SEPARATOR);
+    out.push_str(rest);
+    out
+}
+
 /// Resolve the channel name for a room create or rename.
 ///
 /// `template` is the creator channel's (or standalone channel's) configured
@@ -1495,9 +1581,11 @@ pub fn resolve_room_name_with<E: ExtensionPolicy>(
     render(&parse(template), &ctx, extensions)
 }
 
-/// Trim → truncate → built-in default, mirroring the engine's pipeline tail.
+/// Trim → emoji separator → truncate → built-in default, mirroring the
+/// engine's pipeline tail so blank-template restores keep the guild style.
 fn finalize_raw(raw_name: &str) -> String {
-    let mut out = truncate_chars(raw_name.trim(), MAX_NAME_LEN);
+    let joined = join_emoji_separator(raw_name.trim());
+    let mut out = truncate_chars(&joined, MAX_NAME_LEN);
     out = out.trim_end().to_string();
     if out.is_empty() {
         DEFAULT_FALLBACK_NAME.to_string()
@@ -1604,6 +1692,110 @@ mod tests {
         let mut renamed = c.clone();
         renamed.member_count = 7;
         assert_eq!(name, render_str(template, &renamed));
+    }
+
+    // -- emoji separator (〢 U+3022) ------------------------------------------
+
+    #[test]
+    fn emoji_separator_replaces_space_after_leading_emoji() {
+        assert_eq!(
+            join_emoji_separator("👾 WARDOGS deep dive"),
+            "👾〢WARDOGS deep dive"
+        );
+        assert_eq!(join_emoji_separator("🎮 Ava's den"), "🎮〢Ava's den");
+    }
+
+    #[test]
+    fn emoji_separator_does_not_double() {
+        assert_eq!(
+            join_emoji_separator("👾〢WARDOGS deep dive"),
+            "👾〢WARDOGS deep dive"
+        );
+        assert_eq!(join_emoji_separator("👾〢 WARDOGS"), "👾〢WARDOGS");
+        assert_eq!(join_emoji_separator("👾 〢  WARDOGS"), "👾〢WARDOGS");
+    }
+
+    #[test]
+    fn emoji_separator_collapses_space_runs() {
+        assert_eq!(join_emoji_separator("🎮  Ava"), "🎮〢Ava");
+    }
+
+    #[test]
+    fn emoji_separator_leaves_plain_names_alone() {
+        for name in [
+            "Ava's room",
+            "#3 Apex",
+            "1st room",
+            "日本語 room",
+            "plain name",
+        ] {
+            assert_eq!(join_emoji_separator(name), name, "name {name:?}");
+        }
+    }
+
+    #[test]
+    fn emoji_separator_keeps_variation_selector_attached() {
+        // Crossed swords plus VS16: the separator must follow the whole
+        // sequence, never split the selector from its base.
+        assert_eq!(
+            join_emoji_separator("⚔\u{FE0F} Ava's den"),
+            "⚔\u{FE0F}〢Ava's den"
+        );
+    }
+
+    #[test]
+    fn emoji_separator_keeps_modifiers_attached() {
+        // Waving hand plus skin tone: the separator follows the modifier.
+        assert_eq!(join_emoji_separator("👋\u{1F3FD} Hi"), "👋\u{1F3FD}〢Hi");
+        // ZWJ-joined family: the separator follows the whole sequence.
+        assert_eq!(
+            join_emoji_separator("👨\u{200D}👩\u{200D}👧 Room"),
+            "👨\u{200D}👩\u{200D}👧〢Room"
+        );
+        // Regional-indicator flag: the pair stays together.
+        assert_eq!(
+            join_emoji_separator("🇺\u{1F1F8} Party"),
+            "🇺\u{1F1F8}〢Party"
+        );
+    }
+
+    #[test]
+    fn emoji_separator_leaves_bare_or_joined_emoji_alone() {
+        assert_eq!(join_emoji_separator("👾"), "👾");
+        assert_eq!(join_emoji_separator("👾X"), "👾X");
+        assert_eq!(join_emoji_separator(""), "");
+    }
+
+    #[test]
+    fn rendered_template_names_use_emoji_separator() {
+        let c = ctx();
+        assert_eq!(render_str("👾 @@owner@@'s room", &c), "👾〢Ava's room");
+        // Rename re-renders from the template: already-separated stays single.
+        assert_eq!(render_str("👾〢 @@owner@@'s room", &c), "👾〢Ava's room");
+    }
+
+    #[test]
+    fn default_template_render_uses_emoji_separator() {
+        let name = render_str(DEFAULT_NAME_TEMPLATE, &ctx());
+        assert!(name.contains("〢Ava's"), "unexpected {name:?}");
+    }
+
+    #[test]
+    fn fallback_names_use_emoji_separator() {
+        let c = ctx();
+        // Blank template (e.g. /name restore with no creator template) keeps
+        // the guild separator instead of reverting to the spaced V1 form.
+        assert_eq!(
+            resolve_room_name("", &c, "👾 Wardogs's room"),
+            "👾〢Wardogs's room"
+        );
+        // A template that renders empty falls back through the same joined path.
+        let mut empty_ctx = c.clone();
+        empty_ctx.fallback_name = "👾 Wardogs's room".to_string();
+        assert_eq!(
+            render(&parse("@@bogus@@"), &empty_ctx, &PassthroughExtensions),
+            "👾〢Wardogs's room"
+        );
     }
 
     #[test]
@@ -2657,10 +2849,11 @@ mod tests {
         c.member_count = 4;
         let busy = resolve_room_name(template, &c, "old");
         assert!(busy.ends_with("4 people"), "unexpected {busy:?}");
-        // Same seed: the emoji pick never re-rolls across renames.
+        // Same seed: the emoji pick never re-rolls across renames. The pick
+        // now joins the count with 〢, so it is everything before it.
         assert_eq!(
-            solo.split(' ').next(),
-            busy.split(' ').next(),
+            solo.split('〢').next(),
+            busy.split('〢').next(),
             "random pick re-rolled"
         );
     }

@@ -111,3 +111,10 @@ path = "fuzz_targets/lfg_select.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "internal_action_validators"
+path = "fuzz_targets/internal_action_validators.rs"
+test = false
+doc = false
+bench = false

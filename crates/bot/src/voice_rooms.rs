@@ -6585,6 +6585,10 @@ pub struct VoiceRuntime<S, H> {
     pending_imports: Mutex<HashMap<(Snowflake, Snowflake, String), PendingImport>>,
     /// Automod policy every room-name and `/create` name is filtered under.
     name_policy: Arc<AutomodPolicy>,
+    /// Game-activity analytics feeds (presence deltas + voice spans). Fed on
+    /// every presence and voice frame alongside the room-name facts above;
+    /// in-memory and guild-aggregate-only, never a durable per-member row.
+    game_activity: Arc<game_activity::GameActivityCollector>,
     command_identities: RwLock<two_bot_discord::command_identity::CommandIdentities>,
 }
 
@@ -6615,6 +6619,7 @@ where
             access_lock: tokio::sync::Mutex::new(()),
             pending_imports: Mutex::new(HashMap::new()),
             name_policy: Arc::new(AutomodPolicy::default()),
+            game_activity: Arc::new(game_activity::GameActivityCollector::new()),
             command_identities: RwLock::new(
                 two_bot_discord::command_identity::CommandIdentities::default(),
             ),
@@ -6660,6 +6665,14 @@ where
     pub fn with_name_policy(mut self, policy: AutomodPolicy) -> Self {
         self.name_policy = Arc::new(policy);
         self
+    }
+
+    /// Game-activity analytics feeds for this runtime. The only consumer is
+    /// the follow-up durability slice's flush; the aggregates it returns are
+    /// guild-level only (never a per-member row, reader or view).
+    #[must_use]
+    pub fn game_activity_collector(&self) -> &Arc<game_activity::GameActivityCollector> {
+        &self.game_activity
     }
 
     fn live_actor(&self, guild: Snowflake) -> Option<GuildActor> {
@@ -6994,6 +7007,9 @@ where
         {
             actor.live.disconnect();
         }
+        // Game-activity wiring: nothing for the guild persists after removal,
+        // and a rejoin starts fresh.
+        self.game_activity.clear_guild(guild);
     }
 
     /// Feed one member's presence facts; a change for a member in voice asks
@@ -7013,6 +7029,16 @@ where
                 let _ = actor.tx.send(ActorCommand::RoomFactsChanged(room));
             }
         }
+        // Game-activity wiring: fold the flag into the member's voice span.
+        // Runs without an actor on purpose: the span tracker is
+        // actor-independent (bounded buffers), so pre-bootstrap frames still
+        // count. The flag never creates overlap on its own.
+        self.game_activity.observe_self_stream(
+            guild,
+            member,
+            streaming,
+            i64::try_from(wall_ms()).unwrap_or(i64::MAX),
+        );
     }
 
     fn update_live(&self, guild: Snowflake, update: impl FnOnce(&LiveGuild)) {
@@ -7156,6 +7182,10 @@ where
         for actor in self.actors.lock().expect("voice runtime lock").values() {
             actor.live.disconnect();
         }
+        // Game-activity wiring: transport loss invalidates live voice state,
+        // so open spans close here instead of covering the offline gap.
+        self.game_activity
+            .close_all_opens(i64::try_from(wall_ms()).unwrap_or(i64::MAX));
     }
 }
 
@@ -7182,6 +7212,14 @@ where
             update.0.guild_id.get(),
             presence::member_id(&update.0),
             presence::facts(&update.0),
+        );
+        // Game-activity wiring: the same update feeds the analytics delta
+        // buffer (in-memory, guild-aggregate-only). No funnel, audit or
+        // durable effect here, same as the room-name facts above.
+        let observed_at_ms = i64::try_from(wall_ms()).unwrap_or(i64::MAX);
+        self.game_activity.observe_presence(
+            update.0.guild_id.get(),
+            game_activity::presence_delta(update, observed_at_ms),
         );
     }
 
@@ -7215,13 +7253,28 @@ where
                             presence::facts(member),
                         );
                     }
+                    // Game-activity wiring: reconcile open spans against the
+                    // snapshot. Members in voice open idempotently (a later
+                    // join keeps the earlier join); members missing from the
+                    // snapshot close now, so a leave lost during a
+                    // non-resumed reconnect never inflates voice time.
+                    let snapshot_ms = i64::try_from(wall_ms()).unwrap_or(i64::MAX);
+                    let mut snapshot_present = Vec::new();
                     for state in &guild.voice_states {
                         self.stream_frame(
                             guild_id,
                             state.user_id.get(),
                             state.self_stream && state.channel_id.is_some(),
                         );
+                        if state.channel_id.is_some() {
+                            snapshot_present.push(state.user_id.get());
+                        }
                     }
+                    self.game_activity.reconcile_voice_snapshot(
+                        guild_id,
+                        &snapshot_present,
+                        snapshot_ms,
+                    );
                 }
             }
             Event::PresenceUpdate(update) => {
@@ -7229,6 +7282,14 @@ where
                     update.0.guild_id.get(),
                     presence::member_id(&update.0),
                     presence::facts(&update.0),
+                );
+                // Game-activity wiring, same delta as `presence()` above. An
+                // update routed through both paths records twice; duplicates
+                // merge harmlessly (same member, game and timestamp).
+                let observed_at_ms = i64::try_from(wall_ms()).unwrap_or(i64::MAX);
+                self.game_activity.observe_presence(
+                    update.0.guild_id.get(),
+                    game_activity::presence_delta(update, observed_at_ms),
                 );
             }
             Event::VoiceStateUpdate(update) => {
@@ -7267,6 +7328,15 @@ where
                     member_id,
                     update.self_stream && update.channel_id.is_some(),
                 );
+                // Game-activity wiring: channel transitions open/close the
+                // member's voice span (moves keep it open; idempotent).
+                let now_ms = i64::try_from(wall_ms()).unwrap_or(i64::MAX);
+                if update.channel_id.is_some() {
+                    self.game_activity.observe_join(guild_id, member_id, now_ms);
+                } else {
+                    self.game_activity
+                        .observe_leave(guild_id, member_id, now_ms);
+                }
             }
             Event::ChannelCreate(created) => {
                 if let Some(guild_id) = created.guild_id.map(|id| id.get()) {
@@ -7341,6 +7411,21 @@ where
                 for guild_id in self.known_guilds() {
                     if let Some(snapshot) = snapshot_from_cache(cache, guild_id) {
                         self.publish_snapshot(guild_id, snapshot);
+                    }
+                    // Game-activity wiring: `disconnect` closed every open
+                    // voice span, but a warm RESUME sends no GUILD_CREATE and
+                    // no voice-state events for unchanged members, so spans
+                    // for members still in voice would stay shut while their
+                    // play time keeps counting. Reopen from the cache
+                    // (idempotent: still-open spans keep their join); the
+                    // offline gap itself stays excluded.
+                    let now_ms = i64::try_from(wall_ms()).unwrap_or(i64::MAX);
+                    let guild_key = Id::new(guild_id);
+                    if let Some(users) = cache.guild_voice_states(guild_key) {
+                        for user_id in users.iter() {
+                            self.game_activity
+                                .observe_join(guild_id, user_id.get(), now_ms);
+                        }
                     }
                 }
             }
@@ -11349,6 +11434,13 @@ where
         Self { runtime, replies }
     }
 
+    /// The wrapped lifecycle runtime, for boot-owned background work (the
+    /// game-activity flush loop) that needs the same handles as dispatch.
+    #[must_use]
+    pub fn runtime(&self) -> &Arc<VoiceRuntime<S, H>> {
+        &self.runtime
+    }
+
     /// [`Self::respond_named`] with no display-name directory: every member
     /// renders as "member" in a `/name` template.
     #[cfg(test)]
@@ -11603,6 +11695,10 @@ where
     }
 }
 
+/// Game-activity analytics feeds and the hourly guild-aggregate persist loop.
+/// Public so the binary's voice boot can spawn [`flush_loop`](game_activity::flush_loop);
+/// the aggregates stay guild-level-only (never a per-member row, reader or view).
+pub mod game_activity;
 #[path = "voice_rooms_limit.rs"]
 mod limit;
 mod presence;

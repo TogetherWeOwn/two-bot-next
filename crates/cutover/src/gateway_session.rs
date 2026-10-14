@@ -61,6 +61,14 @@ impl GatewaySessionStore {
         }
     }
 
+    /// Borrow the store's pool for serial lifecycle writes that must commit
+    /// before the dispatch checkpoint (retention queue/cancel). A failed
+    /// lifecycle write holds the cursor exactly like any other pre-commit
+    /// failure, so the dispatch replays after restart.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     pub async fn load(&self) -> Result<Option<GatewaySession>, sqlx::Error> {
         self.read(&mut *self.pool.acquire().await?).await
     }

@@ -409,9 +409,17 @@
       "sha256": "c34223b642a8c626281eef8fecef96f165a9d96be4acf510bff550f5d5e50c72",
       "justification": "Durable Twitch go-live dedup ledger keyed by live_dedup_key: claim-before-post insert, release-on-failed-send delete, delivered rows stamped and kept as the restart-proof fence. Renumbered 0435 to 0438 on the merge past main's 0435/0436 backfill and 0437 event-store S1 core, then to 0439 after main added 0438 retention queues, then to 0440 after main added 0439 event-store S7 invite/scheduled-event capture."
     },
-    "crates/cutover/migrations/0441_stream_live_send_started.sql": {
-      "sha256": "d47901a83e379f448ce1db50f22a5a4c152e4565c2047a76a99e8b23f78f4b34",
-      "justification": "Stale-claim recovery fence for the Twitch go-live ledger: send_started_at marker committed before the first Discord POST so atomic takeover reclaims only never-sent stale claims and ambiguous started/delivered rows stay fenced."
+    "crates/cutover/migrations/0441_game_activity_guild_aggregates.sql": {
+      "sha256": "fb64d28a044ed67813fc4056aa964df52a15c3010405c2394c8da01feebb25db",
+      "justification": "Guild-level game-activity aggregates (no member columns): additive table with nonnegativity plus voice-within-total checks; cutover chain copy, IF NOT EXISTS. Renumbered 0440 to 0441 after main's cutover 0440 stream-live claims; global migration numbers remain unique across both chains."
+    },
+    "crates/cutover/migrations/0443_stream_live_send_started.sql": {
+      "sha256": "70b95ddd45efa31967a7bb3811ce63073eedd4555cbd4ea0d89fd12562da8be2",
+      "justification": "Stale-claim recovery fence for the Twitch go-live ledger: send_started_at marker committed before the first Discord POST so atomic takeover reclaims only never-sent stale claims and ambiguous started/delivered rows stay fenced. Renumbered 0441 to 0443 after main claimed 0441/0442 for game-activity aggregates; never merged under 0441."
+    },
+    "crates/store/migrations/0442_game_activity_guild_aggregates.sql": {
+      "sha256": "1fccfea2ca41d6047c4ac2af17b955c3f76b2fa108bfe648f6e22dc8845a6f60",
+      "justification": "Guild-level game-activity aggregates (no member columns): additive table with nonnegativity plus voice-within-total checks; store chain copy, IF NOT EXISTS. Renumbered 0441 to 0442 after main's cutover 0440 stream-live claims; global migration numbers remain unique across both chains."
     }
   }
 }

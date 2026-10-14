@@ -221,7 +221,14 @@ struct OpenSession {
     ended_at_ms: i64,
 }
 
-fn session_game(delta: &PresenceDelta) -> Option<(String, bool)> {
+/// The game (and streaming flag) one delta asserts, if any.
+///
+/// Playing wins over Streaming; blank titles assert nothing. The gateway only
+/// sends presence on change, so the collector treats the result as the
+/// member's current state until the next delta (see its carry map), rather
+/// than as one poller tick.
+#[must_use]
+pub fn session_game(delta: &PresenceDelta) -> Option<(String, bool)> {
     for activity in &delta.activities {
         if activity.activity_type == ActivityType::Playing {
             if let Some(game) = bounded(&activity.name) {

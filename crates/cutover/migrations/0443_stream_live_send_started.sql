@@ -1,4 +1,4 @@
--- 0441_stream_live_send_started: fence ambiguous Discord sends for stale-claim recovery.
+-- 0443_stream_live_send_started: fence ambiguous Discord sends for stale-claim recovery.
 --
 -- `stream_live_claims` (0440) never expires, so a crash after `claim_live`
 -- but before the Discord POST suppresses EventSub retries forever. Recovery

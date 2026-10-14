@@ -92,6 +92,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "events", measure: TableMeasure::Columns(&["recorded_at"]) },
     TableSpec { table: "feed_deliveries", measure: TableMeasure::Columns(&["first_seen_at"]) },
     TableSpec { table: "feed_relays", measure: TableMeasure::Columns(&["updated_at"]) },
+    TableSpec { table: "game_activity_guild_aggregates", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "gateway_boot_directives", measure: TableMeasure::Columns(&["armed_at", "consumed_at"]) },
     TableSpec {
         table: "gateway_onboarding_jobs",
@@ -221,7 +222,7 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // Claim/start/stamp/takeover transitions rewrite claimed_at,
     // send_started_at and delivered_at without touching the others, so the
     // maximum across all three is the row's last write (same shape as
-    // tickets). Migrations 0440-0441.
+    // tickets). Migrations 0440/0443.
     TableSpec { table: "stream_live_claims", measure: TableMeasure::Columns(&["claimed_at", "send_started_at", "delivered_at"]) },
     TableSpec { table: "ticket_transcripts", measure: TableMeasure::Columns(&["created_at"]) },
     // Status/close transitions rewrite these columns without touching
