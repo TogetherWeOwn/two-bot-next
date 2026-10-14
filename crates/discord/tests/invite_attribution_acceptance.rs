@@ -263,7 +263,7 @@ fn capture_logs(run: impl FnOnce()) -> Vec<String> {
         .with_writer(writer)
         .with_max_level(tracing::Level::INFO)
         .finish();
-    tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber), run);
+    tracing::subscriber::with_default(subscriber, run);
     let bytes = sink.0.lock().expect("log lock").clone();
     String::from_utf8_lossy(&bytes)
         .lines()
@@ -273,7 +273,7 @@ fn capture_logs(run: impl FnOnce()) -> Vec<String> {
 
 /// The single attribution log line for one join: names the filed source and
 /// the joining member.
-fn attribution_line(logs: &[String], source: &str, member_id: u64) -> &String {
+fn attribution_line<'a>(logs: &'a [String], source: &str, member_id: u64) -> &'a String {
     let member = member_id.to_string();
     let hits: Vec<&String> = logs
         .iter()
@@ -378,13 +378,13 @@ fn single_growth_join_credits_inviter_end_to_end() {
 /// `unknown` for the same silence.
 #[test]
 fn no_movement_join_files_vanity_or_unknown_never_an_invite() {
-    let (pipeline, buffer) = pipeline();
-    pipeline.set_guild_vanity(GUILD, true);
-    pipeline.invite_source().push(GUILD, vec![]);
+    let (vanity_pipeline, buffer) = pipeline();
+    vanity_pipeline.set_guild_vanity(GUILD, true);
+    vanity_pipeline.invite_source().push(GUILD, vec![]);
     let logs = capture_logs(|| {
-        pipeline.handle_at(&join_event(A, "12:00:00"), &stamp("12:00:00"));
+        vanity_pipeline.handle_at(&join_event(A, "12:00:00"), &stamp("12:00:00"));
     });
-    let row = join_row(&pipeline, A);
+    let row = join_row(&vanity_pipeline, A);
     assert_eq!(row.source, "vanity");
     assert_eq!(row.metadata, None, "vanity credits no inviter");
     assert_eq!(buffer.take_joins()[0].inviter_id, None);
