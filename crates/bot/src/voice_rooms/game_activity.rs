@@ -168,7 +168,9 @@ struct OpenSpan {
 /// fresh observation. A stop does not drop the carry (the run-up to it still
 /// bridges at flush time) but stamps `stopped_at`, so a later different game
 /// in the same window closes the old run at the stop instead of bridging
-/// straight across the idle gap.
+/// straight across the idle gap. A re-assert after a stop stamps
+/// `resumed_at`, so a later game change bridges only the post-resume leg
+/// instead of crediting the idle gap as play.
 #[derive(Debug, Clone)]
 struct PlayCarry {
     game: String,
@@ -182,6 +184,11 @@ struct PlayCarry {
     /// `None` while a game is asserted. A re-asserted game clears it; a game
     /// change ends its close-out here instead of at the change clock.
     stopped_at: Option<i64>,
+    /// When the current game resumed after a stop (re-assert time).
+    /// `None` for a freshly asserted game. A game change starts its bridge
+    /// here instead of at `from_ms`, so the idle gap stays uncredited while
+    /// the pre-stop run-up still bridges via the reopen point.
+    resumed_at: Option<i64>,
 }
 
 #[derive(Default)]
@@ -259,6 +266,15 @@ impl GameActivityCollector {
                         // bridges at flush time. A changed game restarts it.
                         if prev.game == game && prev.is_streaming == is_streaming {
                             let from_ms = prev.from_ms.min(observed_at_ms);
+                            // A re-assert after a stop resumes play there: the
+                            // earlier stop no longer bounds the run, but the
+                            // idle gap must stay uncredited when a later game
+                            // change closes this run.
+                            let resumed_at = if prev.stopped_at.is_some() {
+                                Some(observed_at_ms)
+                            } else {
+                                prev.resumed_at
+                            };
                             stated.insert(PlayCarry {
                                 game,
                                 is_streaming,
@@ -267,6 +283,7 @@ impl GameActivityCollector {
                                 // A re-asserted game resumes play: the earlier
                                 // stop no longer bounds the run.
                                 stopped_at: None,
+                                resumed_at,
                             });
                         } else {
                             // A game change closes the previous game: the old
@@ -291,7 +308,6 @@ impl GameActivityCollector {
                                     if stopped_at >= prev.from_ms
                                         && stopped_at <= observed_at_ms
                             );
-                            let close_at_ms = observed_at_ms;
                             if observed_at_ms >= prev.from_ms
                                 && observed_at_ms.saturating_sub(prev.from_ms)
                                     <= GAME_ACTIVITY_CARRY_TTL_MS
@@ -303,20 +319,25 @@ impl GameActivityCollector {
                                     prev.from_ms,
                                 ));
                                 if !stopped_bounds_run {
+                                    // A resume inside the bridged range restarts
+                                    // the bridge there: the pre-stop leg still
+                                    // bridges via the reopen point above, while
+                                    // the idle gap stays uncredited.
+                                    let bridge_from_ms = prev.resumed_at.unwrap_or(prev.from_ms);
                                     fill_ticks(
                                         &mut pending,
                                         &user_key,
                                         &prev.game,
                                         prev.is_streaming,
-                                        prev.from_ms,
-                                        close_at_ms,
+                                        bridge_from_ms,
+                                        observed_at_ms,
                                         GAME_ACTIVITY_GAP_TIMEOUT_MS,
                                     );
                                     pending.push(synthetic_delta(
                                         &user_key,
                                         &prev.game,
                                         prev.is_streaming,
-                                        close_at_ms,
+                                        observed_at_ms,
                                     ));
                                 }
                             }
@@ -326,6 +347,7 @@ impl GameActivityCollector {
                                 from_ms: observed_at_ms,
                                 last_ms: observed_at_ms,
                                 stopped_at: None,
+                                resumed_at: None,
                             });
                         }
                     }
@@ -352,6 +374,7 @@ impl GameActivityCollector {
                         from_ms: observed_at_ms,
                         last_ms: observed_at_ms,
                         stopped_at: None,
+                        resumed_at: None,
                     });
                 }
             }
@@ -968,6 +991,7 @@ fn plan_flush(
                         from_ms: now_ms,
                         last_ms: now_ms,
                         stopped_at: None,
+                        resumed_at: None,
                     },
                 ));
             }
@@ -982,6 +1006,7 @@ fn plan_flush(
                         from_ms: started_ms,
                         last_ms: started_ms,
                         stopped_at: None,
+                        resumed_at: None,
                     },
                 ));
             }
@@ -1872,6 +1897,96 @@ mod tests {
             "carried run-up 30-40 survives the game change, got {apex:?}"
         );
         assert_eq!(apex.session_count, 1, "one stopped run, got {apex:?}");
+        let zelda = rows
+            .iter()
+            .find(|row| row.game.as_deref() == Some("Zelda"))
+            .expect("Zelda row");
+        assert_eq!(zelda.total_play_ms, 10 * MIN, "got {zelda:?}");
+        assert_eq!(zelda.session_count, 1, "got {zelda:?}");
+    }
+
+    #[test]
+    fn stop_restart_then_switch_in_one_window_skips_idle_gap() {
+        // Apex 0-10, idle, Apex 50-60, Zelda 60-70, then one flush: the
+        // game-change close-out must bridge only the post-resume leg
+        // (50-60), not the idle gap back to the earliest reopen point.
+        let collector = GameActivityCollector::new();
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0),
+        );
+        collector.observe_presence(7, presence_delta(&update(json!([])), T0 + 10 * MIN));
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0 + 50 * MIN),
+        );
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Zelda")])), T0 + 60 * MIN),
+        );
+        collector.observe_presence(7, presence_delta(&update(json!([])), T0 + 70 * MIN));
+
+        let rows = collector.flush(7, 15 * MIN, T0 + 70 * MIN);
+        let apex = rows
+            .iter()
+            .find(|row| row.game.as_deref() == Some("Apex"))
+            .expect("Apex row");
+        assert_eq!(
+            apex.total_play_ms,
+            20 * MIN,
+            "two runs with no idle gap, got {apex:?}"
+        );
+        assert_eq!(
+            apex.session_count, 2,
+            "the stop splits the runs, got {apex:?}"
+        );
+        let zelda = rows
+            .iter()
+            .find(|row| row.game.as_deref() == Some("Zelda"))
+            .expect("Zelda row");
+        assert_eq!(zelda.total_play_ms, 10 * MIN, "got {zelda:?}");
+        assert_eq!(zelda.session_count, 1, "got {zelda:?}");
+    }
+
+    #[test]
+    fn stop_restart_then_switch_across_flush_skips_idle_gap() {
+        // Apex 0-40 with a flush at +30, idle, Apex 70-80, Zelda 80-90, then
+        // a flush at +90: the carried run-up (30-40) and the post-resume leg
+        // (70-80) count while the idle gap stays uncredited.
+        let collector = GameActivityCollector::new();
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0),
+        );
+        let rows = collector.flush(7, 15 * MIN, T0 + 30 * MIN);
+        assert_eq!(rows.len(), 1, "first window stores Apex, got {rows:?}");
+        assert_eq!(rows[0].total_play_ms, 30 * MIN, "got {:?}", rows[0]);
+
+        collector.observe_presence(7, presence_delta(&update(json!([])), T0 + 40 * MIN));
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0 + 70 * MIN),
+        );
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Zelda")])), T0 + 80 * MIN),
+        );
+        collector.observe_presence(7, presence_delta(&update(json!([])), T0 + 90 * MIN));
+
+        let rows = collector.flush(7, 15 * MIN, T0 + 90 * MIN);
+        let apex = rows
+            .iter()
+            .find(|row| row.game.as_deref() == Some("Apex"))
+            .expect("Apex row");
+        assert_eq!(
+            apex.total_play_ms,
+            20 * MIN,
+            "carried run-up plus post-resume leg, got {apex:?}"
+        );
+        assert_eq!(
+            apex.session_count, 2,
+            "the stop splits the runs, got {apex:?}"
+        );
         let zelda = rows
             .iter()
             .find(|row| row.game.as_deref() == Some("Zelda"))
