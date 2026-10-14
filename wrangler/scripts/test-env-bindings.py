@@ -106,6 +106,26 @@ class AlertBindingTests(unittest.TestCase):
                 config = BASE.replace('INTERNAL_ACTIONS_INGRESS = "1"', f"INTERNAL_ACTIONS_INGRESS = {value}")
                 self.assertTrue(any('must be exactly "1"' in e for e in self.check_config(config)))
 
+    def test_eventsub_ingress_is_staging_only_and_deployed_dark(self):
+        staging = BASE.split("[env.staging.vars]", 1)[1].split("\n[", 1)[0]
+        self.assertIn('EVENTSUB_INGRESS = "1"', staging)
+        self.assertEqual(self.check_config(BASE), [])
+        for section in ["vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(f"[{section}]", f'[{section}]\nEVENTSUB_INGRESS = "1"', 1)
+                errors = self.check_config(config)
+                self.assertTrue(any("EVENTSUB_INGRESS is staging-only" in e for e in errors), errors)
+        # Absent from staging is also fine: the route is simply dark.
+        self.assertEqual(
+            self.check_config(BASE.replace('EVENTSUB_INGRESS = "1"\n', "")), []
+        )
+
+    def test_eventsub_ingress_value_must_be_exactly_one(self):
+        for value in ['"0"', '"true"', '""', '"1 "', "1"]:
+            with self.subTest(value=value):
+                config = BASE.replace('EVENTSUB_INGRESS = "1"', f"EVENTSUB_INGRESS = {value}")
+                self.assertTrue(any('must be exactly "1"' in e for e in self.check_config(config)))
+
     def test_boot_publish_is_staging_only(self):
         staging = BASE.split("[env.staging.vars]", 1)[1].split("\n[", 1)[0]
         self.assertIn('TWO_COMMANDS_PUBLISH_ON_BOOT = "1"', staging)
@@ -160,6 +180,88 @@ class AlertBindingTests(unittest.TestCase):
                 config = BASE.replace('TWO_VOICE_PRESENCE = "1"', f"TWO_VOICE_PRESENCE = {value}")
                 self.assertTrue(any('must be exactly "1"' in e for e in self.check_config(config)))
 
+    def test_dashboard_secrets_are_never_toml_vars(self):
+        # TOG-22861: the dashboard service-token pair gates human access; a
+        # committed value would hand out that access. Both keys must stay
+        # Worker secrets, like the metrics scrape token.
+        for section in ["vars", "env.staging.vars", "env.production.vars"]:
+            for key in ["OPS_DASHBOARD_CLIENT_ID", "OPS_DASHBOARD_CLIENT_SECRET"]:
+                with self.subTest(section=section, key=key):
+                    config = BASE.replace(f"[{section}]", f'[{section}]\n{key} = "synthetic-secret"', 1)
+                    errors = self.check_config(config)
+                    self.assertTrue(any("must be an optional Worker secret" in e for e in errors), errors)
+                    self.assertFalse(any("synthetic-secret" in e for e in errors))
+        self.assertEqual(self.check_config(BASE), [])
+
+    def test_ops_config_writes_is_staging_only(self):
+        enabled = BASE.replace(
+            "[env.staging.vars]", '[env.staging.vars]\nOPS_CONFIG_WRITES_ENABLED = "1"', 1
+        )
+        self.assertEqual(self.check_config(enabled), [])
+        for section in ["vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(
+                    f"[{section}]", f'[{section}]\nOPS_CONFIG_WRITES_ENABLED = "1"', 1
+                )
+                errors = self.check_config(config)
+                self.assertTrue(
+                    any("OPS_CONFIG_WRITES_ENABLED is staging-only" in e for e in errors), errors
+                )
+        # Absent from staging is also fine: config writes stay dark.
+        self.assertEqual(self.check_config(BASE), [])
+
+    def test_ops_config_writes_value_must_be_exactly_one(self):
+        enabled = BASE.replace(
+            "[env.staging.vars]", '[env.staging.vars]\nOPS_CONFIG_WRITES_ENABLED = "1"', 1
+        )
+        for value in ['"0"', '"true"', '""', '"1 "', "1"]:
+            with self.subTest(value=value):
+                config = enabled.replace(
+                    'OPS_CONFIG_WRITES_ENABLED = "1"', f"OPS_CONFIG_WRITES_ENABLED = {value}"
+                )
+                self.assertTrue(any('must be exactly "1"' in e for e in self.check_config(config)))
+
+    def test_ops_killswitch_is_staging_only(self):
+        enabled = BASE.replace(
+            "[env.staging.vars]", '[env.staging.vars]\nOPS_KILLSWITCH_ENABLED = "1"', 1
+        )
+        self.assertEqual(self.check_config(enabled), [])
+        for section in ["vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(
+                    f"[{section}]", f'[{section}]\nOPS_KILLSWITCH_ENABLED = "1"', 1
+                )
+                errors = self.check_config(config)
+                self.assertTrue(
+                    any("OPS_KILLSWITCH_ENABLED is staging-only" in e for e in errors), errors
+                )
+        # Absent from staging is also fine: the kill-switch stays dark.
+        self.assertEqual(self.check_config(BASE), [])
+
+    def test_ops_killswitch_value_must_be_exactly_one(self):
+        enabled = BASE.replace(
+            "[env.staging.vars]", '[env.staging.vars]\nOPS_KILLSWITCH_ENABLED = "1"', 1
+        )
+        for value in ['"0"', '"true"', '""', '"1 "', "1"]:
+            with self.subTest(value=value):
+                config = enabled.replace(
+                    'OPS_KILLSWITCH_ENABLED = "1"', f"OPS_KILLSWITCH_ENABLED = {value}"
+                )
+                self.assertTrue(any('must be exactly "1"' in e for e in self.check_config(config)))
+
+    def test_ops_control_token_is_never_a_toml_var(self):
+        for section in ["vars", "env.staging.vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(
+                    f"[{section}]", f'[{section}]\nOPS_CONTROL_TOKEN = "synthetic-secret"', 1
+                )
+                errors = self.check_config(config)
+                self.assertTrue(
+                    any("OPS_CONTROL_TOKEN must be an optional Worker secret" in e for e in errors),
+                    errors,
+                )
+                self.assertFalse(any("synthetic-secret" in e for e in errors))
+
     def test_receiver_config_is_never_a_toml_var(self):
         for section in ["vars", "env.staging.vars", "env.production.vars"]:
             for key in ["TWO_INTERNAL_KEYS", "TWO_INTERNAL_ACTIONS", "TWO_INTERNAL_BIND", "TWO_INTERNAL_CONTAINER"]:
@@ -168,6 +270,17 @@ class AlertBindingTests(unittest.TestCase):
                     errors = self.check_config(config)
                     self.assertTrue(any(f"{key} is an Operator-set Worker secret" in e for e in errors), errors)
                     self.assertFalse(any("synthetic-secret" in e for e in errors))
+
+    def test_eventsub_operator_switch_is_never_a_toml_var(self):
+        # TOG-23364: TWO_EVENTSUB=1 is the Operator's last switch for the
+        # public Twitch ingress; a committed var would turn the route on from
+        # a toml change alone, without the Operator step.
+        for section in ["vars", "env.staging.vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(f"[{section}]", f'[{section}]\nTWO_EVENTSUB = "1"', 1)
+                errors = self.check_config(config)
+                self.assertTrue(any("TWO_EVENTSUB is an Operator-set Worker secret" in e for e in errors), errors)
+        self.assertEqual(self.check_config(BASE), [])
 
 
 def drop_env(content, env):
@@ -282,6 +395,54 @@ class RequiredEnvironmentTests(unittest.TestCase):
         config = top_level_prefix(BASE) + "[env]\nstaging = 1\nproduction = 2\n"
         errors = self.check_config(config)
         self.assertEqual(errors, [checker.INVALID_TOML_ERROR])
+
+
+class WorkersDevBreakGlassTests(unittest.TestCase):
+    """TOG-22861: staging + production are the workers.dev break-glass
+    origins until a custom domain exists; every other route (including bare
+    deploys) must not serve the public suffix."""
+
+    def check_config(self, content):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "wrangler.toml"
+            path.write_text(content)
+            return checker.check(path)
+
+    def test_base_declares_staging_and_production_break_glass(self):
+        self.assertEqual(self.check_config(BASE), [])
+        self.assertIn("workers_dev = true", BASE.split("[env.staging]", 1)[1].split("[env.staging.", 1)[0])
+        self.assertIn("workers_dev = true", BASE.split("[env.production]", 1)[1].split("[env.production.", 1)[0])
+
+    def test_top_level_workers_dev_must_be_explicitly_false(self):
+        for variant in ['workers_dev = true', '']:
+            with self.subTest(variant=variant or "absent"):
+                config = BASE.replace("workers_dev = false\n", f"{variant}\n" if variant else "")
+                errors = self.check_config(config)
+                self.assertTrue(any("top-level workers_dev must be explicitly false" in e for e in errors), errors)
+
+    def test_staging_workers_dev_must_be_explicitly_true(self):
+        for variant in ['workers_dev = false', '']:
+            with self.subTest(variant=variant or "absent"):
+                staging = BASE.split("[env.staging]\n", 1)
+                config = staging[0] + "[env.staging]\n" + staging[1].replace("workers_dev = true\n", f"{variant}\n" if variant else "", 1)
+                errors = self.check_config(config)
+                self.assertTrue(any("[env.staging]: workers_dev must be explicitly true" in e for e in errors), errors)
+
+    def test_production_workers_dev_must_be_explicitly_true(self):
+        for variant in ['workers_dev = false', '']:
+            with self.subTest(variant=variant or "absent"):
+                production = BASE.split("[env.production]\n", 1)
+                config = production[0] + "[env.production]\n" + production[1].replace("workers_dev = true\n", f"{variant}\n" if variant else "", 1)
+                errors = self.check_config(config)
+                self.assertTrue(any("[env.production]: workers_dev must be explicitly true" in e for e in errors), errors)
+
+    def test_additional_env_must_declare_workers_dev_false(self):
+        config = BASE + '\n[env.preview.vars]\nTWO_GUILD_NAME = "Preview"\n'
+        errors = self.check_config(config)
+        self.assertTrue(any("[env.preview]: workers_dev must be explicitly false" in e for e in errors), errors)
+        config = BASE + '\n[env.preview]\nworkers_dev = false\n[env.preview.vars]\nTWO_GUILD_NAME = "Preview"\n'
+        errors = self.check_config(config)
+        self.assertFalse(any("workers_dev" in e for e in errors), errors)
 
 
 if __name__ == "__main__":

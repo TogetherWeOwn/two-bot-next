@@ -24,6 +24,13 @@ pub struct SharedState {
     pub database: Option<sqlx::PgPool>,
     /// Why the gateway task last stopped (TOG-13044); empty until it fails.
     pub failure: FailureSlot,
+    /// Verifier for the private backfill progress route: the same
+    /// `TWO_INTERNAL_KEYS` ring as the internal-action receiver. Empty by
+    /// default (every read refuses); production attaches `from_env()`, tests
+    /// attach an explicit spec. Lives in listener state — not an `Extension`
+    /// layer — so the handler stays a `State + Request` pair like the
+    /// receiver's `handle`.
+    pub backfill_ring: crate::ops_backfill::SharedRing,
 }
 
 impl SharedState {
@@ -32,7 +39,14 @@ impl SharedState {
             gateway,
             database,
             failure: FailureSlot::default(),
+            backfill_ring: crate::ops_backfill::SharedRing::empty(),
         }
+    }
+
+    /// Attach the backfill verifier without disturbing the other fields.
+    pub fn with_backfill_ring(mut self, ring: crate::ops_backfill::SharedRing) -> Self {
+        self.backfill_ring = ring;
+        self
     }
 }
 
@@ -55,14 +69,26 @@ pub(crate) fn router_with_guard(
     jobs: crate::jobs::SharedStatus,
     guard: Arc<two_bot_discord::ratelimit_guard::RateLimitGuard>,
 ) -> Router {
+    // Attach the backfill verifier before `with_state`: the handler reads
+    // both pool and ring from listener state (a `State + Request` pair like
+    // the internal-action receiver's `handle`), never an `Extension` layer.
+    let state = state.with_backfill_ring(crate::ops_backfill::SharedRing::from_env());
     Router::new()
         .route("/health", get(health))
         .route("/healthz", get(health))
         .route("/readyz", get(readyz))
-        .with_state((state, jobs))
+        // Backfill progress reads the same TWO_INTERNAL_KEYS ring as the
+        // internal-action receiver, over its own path-bound signature. Merged
+        // before `with_state` (unlike the stateless metrics route below): the
+        // handler reads pool and ring from listener state.
+        .merge(crate::ops_backfill::router())
+        .with_state((state.clone(), jobs.clone()))
         .layer(axum::Extension(Arc::clone(&guard)))
         // Metrics and readiness sample the same guard as production executors.
-        .merge(crate::metrics_http::router_with_guard(guard))
+        .merge(crate::metrics_http::router_with_guard(Arc::clone(&guard)))
+        // Read-only operator roll-ups; the Worker gates off-container reads
+        // behind the scrape bearer, as with `/metrics`.
+        .merge(crate::ops_http::router_with_state(state, jobs, guard))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(RedactedHttpMakeSpan)
@@ -100,8 +126,18 @@ pub(crate) fn router_with_guard(
 }
 
 /// Routes the public listener serves; the only paths a span may record.
-/// Keep in sync with `router_with_guard` and `metrics_http::router_with_guard`.
-const TRACED_PATHS: [&str; 4] = ["/health", "/healthz", "/readyz", "/metrics"];
+/// Keep in sync with `router_with_guard`, `metrics_http::router_with_guard`
+/// `ops_backfill::router` and `ops_http::router_with_state`.
+const TRACED_PATHS: [&str; 8] = [
+    "/health",
+    "/healthz",
+    "/readyz",
+    "/metrics",
+    "/ops/summary",
+    "/ops/gateway",
+    "/ops/backfill",
+    "/ops/backfill/progress",
+];
 
 /// Recorded for every path that is not an exact `TRACED_PATHS` entry.
 const REDACTED_PATH: &str = "[REDACTED]";
@@ -144,26 +180,26 @@ async fn health() -> Json<serde_json::Value> {
 }
 
 #[derive(serde::Serialize)]
-struct ReadinessReport {
+pub(crate) struct ReadinessReport {
     #[serde(flatten)]
-    health: HealthReport,
+    pub(crate) health: HealthReport,
     // Informational component: not included in HealthReport::ready().
-    jobs: std::collections::BTreeMap<String, crate::jobs::JobStatus>,
+    pub(crate) jobs: std::collections::BTreeMap<String, crate::jobs::JobStatus>,
     /// Fixed-vocabulary phase/class of the last gateway task failure; absent
     /// while none has happened. Never carries error text.
     #[serde(skip_serializing_if = "Option::is_none")]
-    gateway_failure: Option<GatewayFailure>,
-    build_revision: &'static str,
-    build_id: &'static str,
+    pub(crate) gateway_failure: Option<GatewayFailure>,
+    pub(crate) build_revision: &'static str,
+    pub(crate) build_id: &'static str,
 }
 
-async fn readyz(
-    axum::extract::State((state, jobs)): axum::extract::State<(
-        SharedState,
-        crate::jobs::SharedStatus,
-    )>,
-    axum::Extension(guard): axum::Extension<Arc<two_bot_discord::ratelimit_guard::RateLimitGuard>>,
-) -> (StatusCode, Json<ReadinessReport>) {
+/// Shared readiness computation for `/readyz` and the read-only `/ops`
+/// roll-ups: same ping budget, same component breakdown, same jobs sample.
+pub(crate) async fn readiness(
+    state: &SharedState,
+    jobs: &crate::jobs::SharedStatus,
+    token_invalid: bool,
+) -> (StatusCode, ReadinessReport) {
     // Sample informational jobs before the ping/gateway fence too: awaiting
     // their lock afterward could publish a readiness snapshot from before stop.
     let jobs = jobs.read().await.clone();
@@ -178,17 +214,28 @@ async fn readyz(
         }
     })
     .await;
-    let (code, health) = with_token_state(code, health, guard.snapshot().token_invalid);
+    let (code, health) = with_token_state(code, health, token_invalid);
     (
         code,
-        Json(ReadinessReport {
+        ReadinessReport {
             health,
             jobs,
             gateway_failure: state.failure.get(),
             build_revision: option_env!("BOT_BUILD_REVISION").unwrap_or("unknown"),
             build_id: option_env!("BOT_BUILD_ID").unwrap_or("unknown"),
-        }),
+        },
     )
+}
+
+async fn readyz(
+    axum::extract::State((state, jobs)): axum::extract::State<(
+        SharedState,
+        crate::jobs::SharedStatus,
+    )>,
+    axum::Extension(guard): axum::Extension<Arc<two_bot_discord::ratelimit_guard::RateLimitGuard>>,
+) -> (StatusCode, Json<ReadinessReport>) {
+    let (code, report) = readiness(&state, &jobs, guard.snapshot().token_invalid).await;
+    (code, Json(report))
 }
 
 /// A rejected bot token is fatal: surface it as its own readiness component.
@@ -440,6 +487,11 @@ mod tests {
             ("/healthz", "/healthz"),
             ("/readyz", "/readyz"),
             ("/metrics", "/metrics"),
+            ("/ops/summary", "/ops/summary"),
+            ("/ops/gateway", "/ops/gateway"),
+            ("/ops/backfill", "/ops/backfill"),
+            ("/ops/backfill/progress", "/ops/backfill/progress"),
+            ("/ops/summary?token=fixture-query-secret", "/ops/summary"),
             ("/readyz?token=fixture-query-secret", "/readyz"),
             ("/health?key=fixture-query-secret", "/health"),
             ("/api/webhooks/1/fixture-webhook-token", "[REDACTED]"),
@@ -479,7 +531,7 @@ mod tests {
             "fixture-header-secret",
             "fixture-encoded-token",
         ];
-        let cases: [(&str, StatusCode); 13] = [
+        let cases: [(&str, StatusCode); 15] = [
             (
                 "/readyz?token=fixture-query-secret",
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -514,6 +566,11 @@ mod tests {
             ),
             ("/Health", StatusCode::NOT_FOUND),
             ("/metrics?token=fixture-query-secret", StatusCode::OK),
+            // The backfill progress route is signed: a bare read refuses without
+            // leaking whether any key exists. The open `/ops/backfill`
+            // roll-up stays unauthenticated (see `ops_http`).
+            ("/ops/backfill/progress", StatusCode::UNAUTHORIZED),
+            ("/ops/summary?token=fixture-query-secret", StatusCode::OK),
         ];
         let recorder = SpanRecorder::default();
         tracing::subscriber::with_default(recorder.clone(), || {
@@ -551,7 +608,7 @@ mod tests {
         );
         assert!(text.contains("span request"), "http trace span missing");
         assert!(text.contains("http.request.method=GET"), "method missing");
-        for known in ["/health", "/healthz", "/readyz", "/metrics"] {
+        for known in ["/health", "/healthz", "/readyz", "/metrics", "/ops/summary"] {
             assert!(
                 text.lines()
                     .any(|l| l.ends_with(&format!("http.request.path={known}"))),

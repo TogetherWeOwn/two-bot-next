@@ -15,7 +15,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, RwLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -25,7 +25,7 @@ use crate::voice_room_plan::{
     category_room_ids, plan_room_diagnosed, RoomPlanError, RoomPlanInput, BOT_ROOM_ACCESS,
 };
 use tokio::sync::{mpsc, oneshot};
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 use twilight_cache_inmemory::DefaultInMemoryCache;
 use twilight_gateway::Event;
 use twilight_model::{
@@ -811,6 +811,14 @@ pub trait RoomWrites: Send + Sync {
         let _ = (guild, positions);
         async { Ok(()) }
     }
+    /// Whether the writer latched a Discord 401. Writers without a
+    /// credential latch never refuse on auth, so the default is false.
+    fn is_unauthorized(&self) -> bool {
+        false
+    }
+    /// Recompute the in-flight REST age gauge from live attempts. Writers
+    /// without in-flight tracking publish at begin/drop only.
+    fn republish_rest_age(&self) {}
     /// V4 vote-kick enforcement: disconnect the member from voice
     /// (`channel_id: null`); 404 (already left) is success.
     fn disconnect(
@@ -1043,6 +1051,14 @@ impl RoomWrites for RoomHttp {
         RoomHttp::reorder_channels(self, guild, positions).await
     }
 
+    fn is_unauthorized(&self) -> bool {
+        RoomHttp::is_unauthorized(self)
+    }
+
+    fn republish_rest_age(&self) {
+        RoomHttp::republish_rest_age(self)
+    }
+
     fn detached_rename(&self, channel: Snowflake, name: &str) -> Option<DetachedRename> {
         let http = self.clone();
         let name = name.to_owned();
@@ -1255,6 +1271,12 @@ pub(crate) struct LiveState {
     member_roles: HashMap<Snowflake, Vec<Snowflake>>,
     bot: Option<BotAccess>,
     protected_channels: HashSet<Snowflake>,
+    /// Join-to-create creator channels plus the generator channel: joins into
+    /// (or moves out of) these are mechanical room-creation steps, never
+    /// occupancy samples. Narrower than `protected_channels`, which also holds
+    /// the session lobby, the category and permanent protected channels whose
+    /// joins are organic choices and still sample.
+    creator_channels: HashSet<Snowflake>,
     /// Continuous human-empty evidence in this authoritative gateway session.
     /// Reconnects restart the grace; human joins cancel it even between ticks.
     empty_since: HashMap<Snowflake, tokio::time::Instant>,
@@ -1312,6 +1334,31 @@ fn configured_protected_channels(
         }
     }
     Ok(protected)
+}
+
+/// Boot-only join-to-create generator channel. The occupancy curve treats
+/// joins into (or moves out of) the generator as mechanical, like store
+/// creator channels; the session lobby, the category and permanent protected
+/// channels stay organic samples.
+fn configured_generator_channel(
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<Option<Snowflake>, &'static str> {
+    let Some(raw) =
+        env("TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID").filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    if raw.contains(',') {
+        return Err("invalid generator channel id");
+    }
+    let value = raw.trim();
+    let id = value
+        .parse::<Snowflake>()
+        .map_err(|_| "invalid generator channel id")?;
+    if id == 0 || value != id.to_string() {
+        return Err("invalid generator channel id");
+    }
+    Ok(Some(id))
 }
 
 impl LiveState {
@@ -1549,6 +1596,17 @@ impl LiveGuild {
     /// Keep this in shared state so a write awaiting a rate limit sees updates.
     pub fn protect_channels(&self, channels: impl IntoIterator<Item = Snowflake>) {
         self.write_state().protected_channels.extend(channels);
+    }
+
+    /// Add creator-channel IDs: they join `protected_channels` (delete
+    /// protection) and `creator_channels` (the mechanical occupancy filter),
+    /// so room creation stays protected without silencing organic joins into
+    /// the session lobby or permanent protected channels.
+    pub fn protect_creators(&self, channels: impl IntoIterator<Item = Snowflake>) {
+        let channels: Vec<Snowflake> = channels.into_iter().collect();
+        let mut live = self.write_state();
+        live.protected_channels.extend(channels.iter().copied());
+        live.creator_channels.extend(channels.iter().copied());
     }
 
     /// Shorten the empty-room grace for offline fixtures that exercise
@@ -1871,6 +1929,24 @@ impl LiveGuild {
         self.voice_update_at(member, channel, bot, wall_ms())
     }
 
+    /// Ticket plus the seeding-TEST occupancy sample: the humans already
+    /// present in the target channel when the join arrived, excluding the
+    /// joiner. The sample is `None` for mechanical transitions (joining a
+    /// creator/generator channel, or moving out of one: the creator and
+    /// generator joins and the bot's own move echo), which are not organic
+    /// join decisions. Joins into the session lobby or permanent protected
+    /// channels still sample: those are places people choose to join.
+    /// The outer `None` still means leaves, same-channel updates and
+    /// pre-READY frames (no ticket at all).
+    pub fn voice_update_with_occupancy(
+        &self,
+        member: Snowflake,
+        channel: Option<Snowflake>,
+        bot: Option<bool>,
+    ) -> Option<(JoinTicket, Option<u64>)> {
+        self.voice_update_at_with_occupancy(member, channel, bot, wall_ms())
+    }
+
     /// Deterministic tenure seam: `voice_update` stamps the wall clock;
     /// tests pin `now_ms` to control caretaker ordering.
     fn voice_update_at(
@@ -1880,6 +1956,24 @@ impl LiveGuild {
         bot: Option<bool>,
         now_ms: u64,
     ) -> Option<JoinTicket> {
+        self.voice_update_at_with_occupancy(member, channel, bot, now_ms)
+            .map(|(ticket, _)| ticket)
+    }
+
+    /// Tenure seam with the occupancy sample. The count is taken before the
+    /// insert, inside the same write lock, so concurrent joins cannot skew
+    /// it; the joiner is never in the target yet, so no self-count.
+    /// Mechanical transitions (target or previous channel a creator/generator
+    /// channel: the creator and generator joins and the bot's move echo into
+    /// the new room) keep their ticket but carry no sample, so the 0 bucket
+    /// counts only organic joins into empty channels.
+    fn voice_update_at_with_occupancy(
+        &self,
+        member: Snowflake,
+        channel: Option<Snowflake>,
+        bot: Option<bool>,
+        now_ms: u64,
+    ) -> Option<(JoinTicket, Option<u64>)> {
         let mut live = self.write_state();
         let previous_channel = live
             .members
@@ -1894,6 +1988,13 @@ impl LiveGuild {
                 return None;
             }
         }
+        let mechanical = channel.is_some_and(|target| live.creator_channels.contains(&target))
+            || previous_channel.is_some_and(|previous| live.creator_channels.contains(&previous));
+        let occupancy_at_join = if mechanical {
+            None
+        } else {
+            channel.map(|target| live.humans(target) as u64)
+        };
         let bot = bot.or_else(|| live.members.get(&member).and_then(|previous| previous.bot));
         live.next_transition += 1;
         let transition = live.next_transition;
@@ -1912,11 +2013,16 @@ impl LiveGuild {
         if let Some(channel) = channel {
             live.refresh_empty_since(channel);
         }
-        channel.filter(|_| live.ready).map(|creator_id| JoinTicket {
-            member_id: member,
-            creator_id,
-            generation: live.generation,
-            transition,
+        channel.filter(|_| live.ready).map(|creator_id| {
+            (
+                JoinTicket {
+                    member_id: member,
+                    creator_id,
+                    generation: live.generation,
+                    transition,
+                },
+                occupancy_at_join,
+            )
         })
     }
 
@@ -2387,7 +2493,11 @@ struct Creation {
 pub struct GuildRoomWorker<S, H> {
     live: LiveGuild,
     store: S,
-    http: H,
+    /// Shared writer handle: the actor loop's watchdog sibling holds a clone
+    /// so it can republish the in-flight REST age while a dispatch is hung
+    /// inside the main task. Method calls resolve through the `Arc` deref;
+    /// only whole-handle replacement needs `Arc::get_mut`.
+    http: Arc<H>,
     creators: HashMap<Snowflake, CreatorChannel>,
     access: AccessControls,
     /// Caps and cooldown for the durable create admission; the rolling burst
@@ -2508,6 +2618,10 @@ pub struct GuildRoomWorker<S, H> {
     rename_timeouts: HashMap<Snowflake, u32>,
     notices: Vec<NoticeState>,
     halted: bool,
+    /// Why the latch tripped: a Discord 401 needs a token fix and a restart
+    /// (the writer's auth latch never clears in-process), so a healthy store
+    /// re-probe must not clear it.
+    halted_by_discord: bool,
     votes: VoteKickCore,
     /// Every vote started this session, by its initiating interaction ID. A
     /// button carries only that ID; guild, room and target come from here, never
@@ -2656,7 +2770,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .into_iter()
             .map(|c| (c.channel_id, c))
             .collect();
-        live.protect_channels(creators.keys().copied());
+        live.protect_creators(creators.keys().copied());
         let access = store.access_controls(live.guild_id).await?;
         let rooms = store
             .rooms(live.guild_id)
@@ -2733,7 +2847,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         let worker = Self {
             live,
             store,
-            http,
+            http: Arc::new(http),
             creators,
             access,
             admission: temp_voice_admission(),
@@ -2788,6 +2902,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             rename_timeouts: HashMap::new(),
             notices: Vec::new(),
             halted: false,
+            halted_by_discord: false,
             votes: VoteKickCore::new(),
             vote_refs: HashMap::new(),
             active_votes: Vec::new(),
@@ -2846,17 +2961,51 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         created_at: String,
         received: tokio::time::Instant,
     ) -> bool {
-        if self.halted
-            || !may_create_room(&self.access)
-            || !self.creators.contains_key(&ticket.creator_id)
-            || !self.live.read_state().ticket_valid(ticket)
-            || self
-                .accepted
-                .get(&ticket.member_id)
-                .is_some_and(|seen| *seen >= (ticket.generation, ticket.transition))
+        // Every refusal path is a metric plus a log line: silent drops
+        // caused the 2026-10-12 lobby stall to need guessing. No member,
+        // channel or name content is logged.
+        let refusal = if self.halted {
+            Some("halted")
+        } else if !may_create_room(&self.access) {
+            Some("access")
+        } else if !self.creators.contains_key(&ticket.creator_id) {
+            Some("unknown_creator")
+        } else if !self.live.read_state().ticket_valid(ticket) {
+            Some("stale_ticket")
+        } else if self
+            .accepted
+            .get(&ticket.member_id)
+            .is_some_and(|seen| *seen >= (ticket.generation, ticket.transition))
         {
+            Some("duplicate")
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            metrics::global().voice_join_refused(reason);
+            if reason == "halted" {
+                warn!(
+                    guild = self.live.guild_id.to_string(),
+                    reason, "voice creator join refused before queueing"
+                );
+            } else if reason == "duplicate" {
+                debug!(
+                    guild = self.live.guild_id.to_string(),
+                    reason, "voice creator join refused before queueing"
+                );
+            } else {
+                info!(
+                    guild = self.live.guild_id.to_string(),
+                    reason, "voice creator join refused before queueing"
+                );
+            }
             return false;
         }
+        info!(
+            voice_event = "voice_join_received",
+            guild = self.live.guild_id.to_string(),
+            "voice creator join accepted"
+        );
         let timing = JoinTiming::new(received);
         self.accepted
             .insert(ticket.member_id, (ticket.generation, ticket.transition));
@@ -2874,6 +3023,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     creator_id: ticket.creator_id,
                     error: blocked.error,
                 });
+                metrics::global().voice_join_refused("name_blocked");
+                info!(
+                    guild = self.live.guild_id.to_string(),
+                    reason = "name_blocked",
+                    "voice creator join refused before queueing"
+                );
                 timing.finish("name_blocked");
                 return false;
             }
@@ -3550,7 +3705,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             return Ok(());
         }
         match write_owner_overwrite_delta(
-            &self.http,
+            // The writer handle is shared with the watchdog sibling: pass
+            // the inner writer, not the `Arc`, to the `RoomWrites` bound.
+            &*self.http,
             &self.live,
             channel_id,
             generation,
@@ -3579,7 +3736,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     return Err(RoomHttpError::AccessDenied);
                 };
                 match write_owner_overwrite_delta(
-                    &self.http,
+                    // The writer handle is shared with the watchdog sibling:
+                    // pass the inner writer, not the `Arc`, to the bound.
+                    &*self.http,
                     &self.live,
                     channel_id,
                     generation,
@@ -4141,6 +4300,27 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     pub fn halted(&self) -> bool {
         self.halted
     }
+    /// Whether a Discord 401 tripped the latch. Store-credential re-probes
+    /// never clear these halts: they need a token fix and a restart.
+    pub fn halted_by_discord(&self) -> bool {
+        self.halted_by_discord
+    }
+    /// Clear the store-credential latch after a successful re-probe. Only
+    /// the actor loop calls this, and only for non-Discord halts; every
+    /// other halted write path sets the latch.
+    ///
+    /// Recovery also drops the delete and ownership dedup markers. Halted
+    /// branches `mark_succeeded` their action while leaving the marker, so
+    /// without this the next reconcile dedups against the leftover marker
+    /// and strands the work until a restart. Re-derivation is safe: a
+    /// duplicate `DeleteRoom` returns early when the room is gone, and an
+    /// ownership handoff reconverges on the latest worker owner.
+    pub fn clear_halt(&mut self) {
+        self.halted = false;
+        self.halted_by_discord = false;
+        self.deletes.clear();
+        self.ownership_queued.clear();
+    }
     pub fn tracked(&self) -> &HashMap<Snowflake, VoiceRoom> {
         &self.rooms
     }
@@ -4256,6 +4436,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             creator_channel_id: self.creators.keys().min().copied(),
             setup_user_id: None,
         };
+        // Bounded by construction (TOG stall follow-up, verified): each
+        // iteration clears exactly one candidate facet and
+        // `resolve_log_target` returns `None` once all three are gone, so
+        // this runs at most three sends plus the configured-channel attempt
+        // above. Every send carries the RoomHttp wire timeout plus the
+        // global-backoff cap, so no unbounded await chain can park the actor
+        // here.
         while let Some(target) = resolve_log_target(candidates) {
             let (notice_target, role) = match target {
                 LogTarget::SystemChannel { channel_id, .. } => {
@@ -5134,6 +5321,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         {
                             if !self.settle_reservation(&held, Some(channel_id)).await {
                                 if self.halted {
+                                    // Keep the hold but drop the delete marker:
+                                    // the next post-recovery reconcile re-queues
+                                    // the delete (queue_delete dedups on
+                                    // `deletes`), retrying the unsettled hold
+                                    // instead of counting it against admission
+                                    // caps until a restart.
+                                    self.deletes.remove(&channel_id);
                                     self.queue.mark_succeeded(&action);
                                 } else {
                                     // The channel is known gone; retry only SQL,
@@ -5199,6 +5393,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         }
                     }
                     Err(RoomHttpError::RateLimited { retry_after_ms, .. }) => {
+                        // `retry_after` counts from the 429 response, which
+                        // arrives after the wall-clock dispatch cost: schedule
+                        // from response time like every other call site, never
+                        // from dispatch start, or the retry fires early and
+                        // draws another 429.
                         self.queue.mark_rate_limited(
                             self.live.guild_id,
                             retry_after_ms,
@@ -5446,7 +5645,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                             );
                         }
                         RoomHttpError::Unauthorized => {
+                            // Discord-credential halt: the writer's auth latch
+                            // never clears in-process, so the store re-probe
+                            // must not clear this either.
                             self.halted = true;
+                            self.halted_by_discord = true;
                             self.record(LifecycleFailure::Discord { channel_id, error });
                             self.queue.mark_succeeded(&action);
                         }
@@ -6136,7 +6339,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         write: Option<RefusedWrite>,
     ) {
         if error == RoomHttpError::Unauthorized {
+            // A 401 needs a token fix and a restart: record the cause so the
+            // store re-probe never clears this latch.
             self.halted = true;
+            self.halted_by_discord = true;
         }
         if error == RoomHttpError::Cancelled {
             return;
@@ -6363,6 +6569,9 @@ pub struct VoiceRuntime<S, H> {
     tick: Duration,
     enabled: bool,
     protected_channels: HashSet<Snowflake>,
+    /// Boot creator set (the generator channel): copied into each new actor's
+    /// `creator_channels` alongside the store creators loaded later.
+    creator_channels: HashSet<Snowflake>,
     empty_grace: Option<Duration>,
     synthetic_humans: HashSet<Snowflake>,
     seeds: AtomicU64,
@@ -6398,6 +6607,7 @@ where
             tick,
             enabled,
             protected_channels: HashSet::new(),
+            creator_channels: HashSet::new(),
             empty_grace: None,
             synthetic_humans: HashSet::new(),
             seeds: AtomicU64::new(initial_seed()),
@@ -6419,6 +6629,13 @@ where
     /// Install boot configuration before spawning any actors.
     pub fn with_protected_channels(mut self, channels: HashSet<Snowflake>) -> Self {
         self.protected_channels = channels;
+        self
+    }
+
+    /// Install the boot creator set (the generator channel) before spawning
+    /// any actors. Each new actor copies it into `creator_channels`.
+    pub fn with_creator_channels(mut self, channels: HashSet<Snowflake>) -> Self {
+        self.creator_channels = channels;
         self
     }
 
@@ -6522,6 +6739,9 @@ where
         actor
             .live
             .protect_channels(self.protected_channels.iter().copied());
+        actor
+            .live
+            .protect_creators(self.creator_channels.iter().copied());
         if let Some(grace) = self.empty_grace {
             actor.live.set_empty_grace(grace);
         }
@@ -6601,14 +6821,27 @@ where
         let Some(actor) = self.live_actor(guild) else {
             return false;
         };
-        let command = match actor.live.voice_update(member, channel, bot) {
-            Some(ticket) => ActorCommand::Join {
-                ticket,
-                display,
-                seed: self.seeds.fetch_add(1, Ordering::Relaxed),
-                created_at: now_iso(),
-                received,
-            },
+        let command = match actor.live.voice_update_with_occupancy(member, channel, bot) {
+            Some((ticket, occupancy_at_join)) => {
+                // Seeding TEST (occupancy-to-join curve): one label-free
+                // counter sample per organic ticketed join. No member,
+                // channel or guild IDs are recorded, and no per-event log
+                // line is emitted: VOICE_STATE_UPDATE is hot per
+                // docs/log-volume-guard.md. Mechanical transitions (the
+                // creator and generator joins and the bot's move echo)
+                // carry no sample but still dispatch their ticket so room
+                // creation is unaffected.
+                if let Some(occupancy) = occupancy_at_join {
+                    metrics::global().voice_join_occupancy(occupancy);
+                }
+                ActorCommand::Join {
+                    ticket,
+                    display,
+                    seed: self.seeds.fetch_add(1, Ordering::Relaxed),
+                    created_at: now_iso(),
+                    received,
+                }
+            }
             None => {
                 if channel.is_some() {
                     let _ = actor.tx.send(ActorCommand::Display {
@@ -6818,7 +7051,7 @@ where
     fn creator_added(&self, creator: &CreatorChannel, channel: Channel) {
         if let Some(actor) = self.live_actor(creator.guild_id) {
             actor.live.upsert_channel(channel);
-            actor.live.protect_channels([creator.channel_id]);
+            actor.live.protect_creators([creator.channel_id]);
             let _ = actor.tx.send(ActorCommand::CreatorAdded(creator.clone()));
         }
     }
@@ -6914,7 +7147,7 @@ where
 
     fn creator_updated(&self, creator: &CreatorChannel) {
         if let Some(actor) = self.live_actor(creator.guild_id) {
-            actor.live.protect_channels([creator.channel_id]);
+            actor.live.protect_creators([creator.channel_id]);
             let _ = actor.tx.send(ActorCommand::CreatorAdded(creator.clone()));
         }
     }
@@ -7127,10 +7360,170 @@ where
     }
 }
 
-async fn run_actor<S: RoomPersistence, H: RoomWrites>(
+async fn run_actor<S: RoomPersistence, H: RoomWrites + 'static>(
+    worker: &mut GuildRoomWorker<S, H>,
+    inbox: mpsc::UnboundedReceiver<ActorCommand>,
+    tick: Duration,
+) {
+    run_actor_with_limits(worker, inbox, tick, ActorLimits::default()).await;
+}
+
+/// Bounds for the per-guild actor loop (TOG stall follow-up). All bounds are
+/// observe-and-recover, never future-dropping: abandoning a `dispatch_one`
+/// future mid-flight would leak its creation record and wedge the guild, so
+/// an over-budget dispatch is logged + counted and retried next turn.
+#[derive(Debug, Clone, Copy)]
+struct ActorLimits {
+    /// Dispatch turns slower than this count a `dispatch_timeout` (stuck
+    /// constituent await) but run to completion.
+    dispatch_observe_after: Duration,
+    /// Queue non-empty with no progress for this long fires the watchdog
+    /// (log + `watchdog_stucks_total`), at most once per interval.
+    watchdog_stuck_after: Duration,
+    /// While halted, re-probe store credentials this often.
+    halt_reprobe_interval: Duration,
+    /// Timeout for one halt re-probe.
+    halt_probe_timeout: Duration,
+}
+
+impl Default for ActorLimits {
+    fn default() -> Self {
+        Self {
+            dispatch_observe_after: Duration::from_secs(60),
+            watchdog_stuck_after: Duration::from_secs(120),
+            halt_reprobe_interval: Duration::from_secs(60),
+            halt_probe_timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+/// Pure watchdog predicate, unit-tested: the worker is stuck when actions are
+/// queued but nothing has completed since `stuck_after` ago. Tokio instants:
+/// the actor loop already runs on the Tokio clock (interval, timeouts), so
+/// paused-time tests can advance it deterministically.
+fn watchdog_due(
+    last_progress: tokio::time::Instant,
+    now: tokio::time::Instant,
+    queue_nonempty: bool,
+    stuck_after: Duration,
+) -> bool {
+    queue_nonempty && now.saturating_duration_since(last_progress) >= stuck_after
+}
+
+/// Publish the per-tick stall gauges: halt latch plus per-lane queue depth
+/// and oldest-pending age. Cheap atomics; called every actor tick so
+/// `/ops/metrics` always shows the worker's stall posture.
+fn publish_voice_gauges<S: RoomPersistence, H: RoomWrites>(worker: &GuildRoomWorker<S, H>) {
+    let guild = worker.live.guild_id;
+    let (urgent, deferred) = worker.queue.pending_counts(guild);
+    let oldest_age_secs = worker
+        .queue
+        .oldest_pending_age(guild)
+        .map_or(0, |age| age.as_secs());
+    let gauges = metrics::global();
+    gauges.set_voice_halted(worker.halted());
+    // Recompute the in-flight REST age from attempts still live, so the
+    // gauge shows a currently-stalled request instead of the begin/drop
+    // snapshots (0 at begin, already removed at drop).
+    worker.http.republish_rest_age();
+    gauges.set_voice_queue(
+        u64::try_from(urgent).unwrap_or(u64::MAX),
+        u64::try_from(deferred).unwrap_or(u64::MAX),
+        oldest_age_secs,
+    );
+}
+
+/// Stall posture shared between the guild actor loop and its watchdog
+/// sibling. The main task owns `&mut worker` and refreshes the snapshot; the
+/// sibling only reads it, so the watchdog and the gauge publish keep running
+/// while a dispatch is hung inside an unbounded await. A hung dispatch still
+/// cannot answer inbox commands (the inbox consumer is the hung task) and
+/// still cannot recover the halt latch mid-hang: the sibling detects, the
+/// main task recovers once the write returns.
+struct StallShared<H> {
+    guild: Snowflake,
+    http: Arc<H>,
+    state: Mutex<StallState>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StallState {
+    last_progress: tokio::time::Instant,
+    urgent: usize,
+    deferred: usize,
+    oldest_age_secs: u64,
+    halted: bool,
+}
+
+impl<H: RoomWrites> StallShared<H> {
+    fn snapshot<S: RoomPersistence>(
+        &self,
+        worker: &GuildRoomWorker<S, H>,
+        last_progress: tokio::time::Instant,
+    ) {
+        let guild = worker.live.guild_id;
+        let (urgent, deferred) = worker.queue.pending_counts(guild);
+        let oldest_age_secs = worker
+            .queue
+            .oldest_pending_age(guild)
+            .map_or(0, |age| age.as_secs());
+        *self.state.lock().expect("stall snapshot lock") = StallState {
+            last_progress,
+            urgent,
+            deferred,
+            oldest_age_secs,
+            halted: worker.halted(),
+        };
+    }
+
+    /// Watchdog + gauge publish from the shared snapshot. Reads only: safe
+    /// to run on the sibling task while the main task is hung in dispatch.
+    fn observe(&self, stuck_after: Duration, last_fire: &mut Option<tokio::time::Instant>) {
+        let snap = *self.state.lock().expect("stall snapshot lock");
+        // Recompute the in-flight REST age from attempts still live, so the
+        // gauge shows a currently-stalled request instead of the begin/drop
+        // snapshots (0 at begin, already removed at drop).
+        self.http.republish_rest_age();
+        let gauges = metrics::global();
+        gauges.set_voice_halted(snap.halted);
+        gauges.set_voice_queue(
+            u64::try_from(snap.urgent).unwrap_or(u64::MAX),
+            u64::try_from(snap.deferred).unwrap_or(u64::MAX),
+            snap.oldest_age_secs,
+        );
+        // Stuck-worker watchdog: queued work with no completed turn for the
+        // full window. Log + metric only; the queue keeps its retries so a
+        // transient outage still drains on recovery.
+        let now = tokio::time::Instant::now();
+        let fire_cooled =
+            last_fire.is_none_or(|fired| now.saturating_duration_since(fired) >= stuck_after);
+        if fire_cooled
+            && watchdog_due(
+                snap.last_progress,
+                now,
+                snap.urgent + snap.deferred > 0,
+                stuck_after,
+            )
+        {
+            *last_fire = Some(now);
+            metrics::global().voice_watchdog_stuck();
+            error!(
+                guild = self.guild.to_string(),
+                urgent = snap.urgent,
+                deferred = snap.deferred,
+                oldest_pending_age_secs = snap.oldest_age_secs,
+                halted = snap.halted,
+                "voice worker stuck: queued actions with no progress"
+            );
+        }
+    }
+}
+
+async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
     worker: &mut GuildRoomWorker<S, H>,
     mut inbox: mpsc::UnboundedReceiver<ActorCommand>,
     tick: Duration,
+    limits: ActorLimits,
 ) {
     let start = tokio::time::Instant::now();
     let mut timer = tokio::time::interval(tick);
@@ -7139,6 +7532,46 @@ async fn run_actor<S: RoomPersistence, H: RoomWrites>(
     let mut maintenance_ready = false;
     let mut dispatch_budget = 8u8;
     let mut complete_join_pair = false;
+    let mut last_progress = tokio::time::Instant::now();
+    let mut last_halt_probe = tokio::time::Instant::now();
+    // Watchdog sibling: observes the shared snapshot on its own timer, so a
+    // dispatch hung in an unbounded await still counts stucks and publishes
+    // gauges. The sibling never touches `worker`.
+    let stall = Arc::new(StallShared {
+        guild: worker.live.guild_id,
+        http: Arc::clone(&worker.http),
+        state: Mutex::new(StallState {
+            last_progress,
+            urgent: 0,
+            deferred: 0,
+            oldest_age_secs: 0,
+            halted: false,
+        }),
+    });
+    stall.snapshot(worker, last_progress);
+    let stop_watchdog = Arc::new(AtomicBool::new(false));
+    let watchdog = {
+        // Weak, not a clone: the actor task owns the only strong ref. If a
+        // dispatch panics, the task unwinds past the stop code below, so the
+        // sibling must exit on the dead weak instead of alarming forever
+        // from the stale snapshot of a worker that no longer exists.
+        let weak = Arc::downgrade(&stall);
+        let stop = Arc::clone(&stop_watchdog);
+        let stuck_after = limits.watchdog_stuck_after;
+        tokio::spawn(async move {
+            let mut watch_timer = tokio::time::interval(tick);
+            watch_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last_fire = None;
+            loop {
+                watch_timer.tick().await;
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Some(stall) = weak.upgrade() else { break };
+                stall.observe(stuck_after, &mut last_fire);
+            }
+        })
+    };
     loop {
         tokio::select! {
             biased;
@@ -7148,7 +7581,12 @@ async fn run_actor<S: RoomPersistence, H: RoomWrites>(
                     .elapsed()
                     .as_millis()
                     .min(u128::from(u64::MAX)) as u64;
-                dispatch_ready |= apply_command(worker, command, now_ms);
+                let accepted = apply_command(worker, command, now_ms);
+                if accepted {
+                    last_progress = tokio::time::Instant::now();
+                }
+                stall.snapshot(worker, last_progress);
+                dispatch_ready |= accepted;
             }
             // Inbox first between writes, but no timer between a persisted
             // create and its priority move. A backed-off/idle queue returns
@@ -7156,11 +7594,83 @@ async fn run_actor<S: RoomPersistence, H: RoomWrites>(
             _ = std::future::ready(()), if dispatch_ready && (dispatch_budget > 0 || complete_join_pair) => {
                 let now_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                 let pending_moves = worker.moves.len();
-                dispatch_ready = worker.dispatch_one(now_ms).await;
+                let dispatch_started = tokio::time::Instant::now();
+                let progressed = worker.dispatch_one(now_ms).await;
+                // Observe-only bound: the future runs to completion (dropping
+                // it would leak the creation record), but an over-budget turn
+                // means a constituent await has no cap — count it loudly.
+                // While the turn is still in flight, the watchdog sibling is
+                // the stuck signal: this counter only fires after a return.
+                if dispatch_started.elapsed() >= limits.dispatch_observe_after {
+                    metrics::global().voice_dispatch_timeout();
+                    warn!(
+                        guild = worker.live.guild_id.to_string(),
+                        elapsed_secs = dispatch_started.elapsed().as_secs(),
+                        "voice dispatch turn exceeded observe bound"
+                    );
+                }
+                if progressed {
+                    last_progress = tokio::time::Instant::now();
+                }
+                stall.snapshot(worker, last_progress);
+                dispatch_ready = progressed;
                 complete_join_pair = worker.moves.len() > pending_moves;
                 dispatch_budget = dispatch_budget.saturating_sub(1);
             }
             _ = timer.tick() => {
+                publish_voice_gauges(worker);
+                // The stuck-worker watchdog lives on the sibling task now, so
+                // it fires while a dispatch is hung: see `StallShared`. The
+                // tick arm keeps the fresh gauge publish plus recovery below.
+                let now = tokio::time::Instant::now();
+                // Halted-latch recovery: a CredentialRefused parks the worker
+                // silently. Re-probe credentials under a timeout; a healthy
+                // read clears the latch so the next join flows.
+                if worker.halted()
+                    && now.saturating_duration_since(last_halt_probe) >= limits.halt_reprobe_interval
+                {
+                    last_halt_probe = now;
+                    let guild = worker.live.guild_id;
+                    // A Discord-401 halt needs a token fix and a restart: the
+                    // writer's auth latch never clears in-process, so a store
+                    // re-probe must not report recovery here.
+                    if worker.halted_by_discord() || worker.http.is_unauthorized() {
+                        debug!(
+                            guild = guild.to_string(),
+                            "voice halt re-probe skipped: Discord credential latch set"
+                        );
+                    } else {
+                        match tokio::time::timeout(
+                        limits.halt_probe_timeout,
+                        worker.store.creators(guild),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {
+                            worker.clear_halt();
+                            metrics::global().voice_halt_recovered();
+                            info!(
+                                guild = guild.to_string(),
+                                "voice worker halt cleared: store credentials healthy"
+                            );
+                            last_progress = tokio::time::Instant::now();
+                        }
+                        Ok(Err(error)) => {
+                            debug!(
+                                guild = guild.to_string(),
+                                ?error,
+                                "voice halt re-probe: store still refusing"
+                            );
+                        }
+                        Err(_) => {
+                            debug!(
+                                guild = guild.to_string(),
+                                "voice halt re-probe timed out"
+                            );
+                        }
+                        }
+                    }
+                }
                 worker.reconcile();
                 let now_ms = start
                     .elapsed()
@@ -7172,6 +7682,7 @@ async fn run_actor<S: RoomPersistence, H: RoomWrites>(
                 // V5: re-render template names whose facts changed (create,
                 // join/leave, owner handoff); the rename lane paces them.
                 worker.refresh_template_names(now_ms);
+                stall.snapshot(worker, last_progress);
                 dispatch_ready = true;
                 maintenance_ready = true;
             }
@@ -7191,6 +7702,11 @@ async fn run_actor<S: RoomPersistence, H: RoomWrites>(
             }
         }
     }
+    // Inbox closed: stop the sibling first so no watchdog publish outlives
+    // the actor (and its tests).
+    stop_watchdog.store(true, Ordering::Relaxed);
+    watchdog.abort();
+    let _ = watchdog.await;
     worker.finish_pending_joins();
     // Inbox closed: append what is left (one failed batch ends it) so a clean
     // shutdown keeps the trail.
@@ -7229,12 +7745,17 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             created_at,
             received,
         } => {
+            // Received-vs-handled accounting (TOG stall follow-up): every
+            // creator-channel join the sink delivers bumps `received`, whether
+            // or not the worker accepts it. `handled` is the create/move
+            // success counters; received > handled for >2min means a stall.
+            metrics::global().voice_join_received();
             accepted_join =
                 worker.accept_join_received(ticket, &display, seed, created_at, received);
             worker.reconcile();
         }
         ActorCommand::CreatorAdded(creator) => {
-            worker.live.protect_channels([creator.channel_id]);
+            worker.live.protect_creators([creator.channel_id]);
             if worker.creators.get(&creator.channel_id) != Some(&creator) {
                 worker.creators.insert(creator.channel_id, creator);
                 worker.name_signatures.clear();
@@ -7324,6 +7845,8 @@ pub fn build_production_runtime(
     // through its cataloged `voice HTTP setup failed` event.
     let protected = configured_protected_channels(|key| std::env::var(key).ok())
         .map_err(|_| RoomHttpError::InvalidRequest)?;
+    let generator = configured_generator_channel(|key| std::env::var(key).ok())
+        .map_err(|_| RoomHttpError::InvalidRequest)?;
     let empty_grace = configured_empty_grace(
         std::env::var("TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS")
             .ok()
@@ -7347,6 +7870,7 @@ pub fn build_production_runtime(
                 true,
             )
             .with_protected_channels(protected)
+            .with_creator_channels(generator.into_iter().collect())
             .with_empty_grace(empty_grace)
             .with_synthetic_humans(synthetic_humans)
             .with_name_policy(name_policy),

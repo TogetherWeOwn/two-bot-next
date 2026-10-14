@@ -36,8 +36,10 @@ Fail-closed rules, each pinned by scripts/test_staging_container_drill.py:
   leg is skipped, never retried with another credential.
 - Readiness requires every `/readyz` component `ready` (process AND gateway
   plus database) on the exact Worker version, revision and build id, with a
-  converged full_auto rollout and the application listing pointing at the
-  intended image. A converged rollout alone is not readiness.
+  converged or steady-state active_lag full_auto rollout (mirroring
+  `staging_rollout.verify`) and the application listing pointing at the
+  intended image. An accepted rollout alone is not readiness, and a wait
+  failure keeps its timeline plus the last observation in the leg evidence.
 - Exactly one gateway session per leg is witnessed, never assumed: the
   drill records a temporally complete probe timeline (baseline ready,
   teardown gap, first ready on the target, confirmation probes) and folds in
@@ -309,6 +311,13 @@ class Drill:
         self.auth_failed = False
         self.evidence = {"worker": WORKER, "application": APPLICATION,
                          "budget_seconds": READY_BUDGET_SECONDS}
+        # Last wait_ready snapshot, kept so a ready_timeout (or any other
+        # wait failure) can leave the timeline plus the last observation in
+        # the leg evidence instead of discarding them. Secret-safe by
+        # construction: ISO times, integers and booleans plus a fixed
+        # vocabulary observation string only.
+        self._last_wait_timeline = []
+        self._last_wait_observation = ""
 
     # -- primitives ---------------------------------------------------------
     def owner(self, state):
@@ -339,6 +348,29 @@ class Drill:
                 f"elapsed={elapsed} code={returncode}")
         return self.stamp(f"{label}: deployed"), elapsed
 
+    def _snapshot_wait(self, pinned, probes, status, accepted, timeline):
+        """Remember the wait timeline plus the last observation for evidence.
+
+        Only ISO times, integer statuses and booleans reach the snapshot;
+        the observation names the probe counts, the last `/readyz` status,
+        whether a new rollout was pinned (allowlisted id or none) and
+        whether its shape was accepted, so probes=0 separates a missing
+        rollout from an unconverged one.
+        """
+        pinned_label = "none"
+        if pinned is not None:
+            try:
+                pinned_label = rollout.identifier(pinned.get("id"))
+            except GateError:
+                pinned_label = "unrecognized"
+        self._last_wait_timeline = [[iso(moment), poll_status, gateway,
+                                     version, shape]
+                                    for (moment, poll_status, gateway,
+                                         version, shape) in timeline]
+        self._last_wait_observation = (
+            f"probes={probes} last_readyz={status} pinned={pinned_label} "
+            f"rollout_accepted={accepted}")
+
     def wait_ready(self, worker, revision, build_id, image, deployed,
                    expect_rollout=True):
         """Poll rollout convergence plus exact runtime identity until ready.
@@ -346,12 +378,21 @@ class Drill:
         Returns (first ready time, probe counts, timeline). The timeline is
         the temporally complete in-band half of the session witness: every
         poll records its UTC time, `/readyz` status, gateway state, version
-        agreement and rollout convergence with no bodies or identifiers.
+        agreement and rollout acceptance with no bodies or identifiers.
+
+        Mirrors `staging_rollout.verify`: a `completed` rollout in either the
+        strict converged shape or the steady-state active_lag shape is
+        accepted for exact-version probing (the post-ready confirmation
+        still requires consecutive agreeing probes). Every poll updates the
+        wait snapshot so a failure preserves the timeline plus the last
+        observation in the leg evidence.
         """
         deadline = deployed + READY_TIMEOUT_SECONDS
         pinned, stale = None, 0
         probes = non_200 = 0
         timeline = []
+        self._last_wait_timeline = []
+        self._last_wait_observation = ""
         while True:
             app = rollout.application(self.client)
             if pinned is None and expect_rollout:
@@ -360,6 +401,7 @@ class Drill:
                 candidates = [rollout.mapping(row) for row in rows
                               if row.get("id") not in baseline_ids
                               and rollout_image(rollout.mapping(row)) == image]
+                self._snapshot_wait(pinned, probes, 0, False, timeline)
                 require(len(candidates) <= 1, "ambiguous_new_rollout")
                 pinned = candidates[0] if candidates else None
             if pinned is None and not expect_rollout:
@@ -384,12 +426,14 @@ class Drill:
                     moment = self.stamp("ready")
                     return (moment, {"probes": probes, "non_200_readyz": non_200},
                             timeline)
+                self._snapshot_wait(pinned, probes, status, False, timeline)
                 require(self.now() < deadline, "ready_timeout",
                         f"probes={probes} last_readyz={status}")
                 self.sleep(POLL_SECONDS)
                 continue
             status = health = 0
-            gateway_ready = version_ok = converged_now = False
+            gateway_ready = version_ok = False
+            accepted_now = False
             if pinned is not None:
                 row = rollout.mapping(self.client.api(
                     f"/containers/applications/{app['id']}/rollouts/"
@@ -397,11 +441,16 @@ class Drill:
                 require(row.get("id") == pinned["id"], "rollout_identity_drift")
                 target = rollout.number(row.get("target_version"))
                 converged_now = rollout.converged(row, image, target)
+                lag_now = (False if converged_now
+                           else rollout.active_lag(row, image, target))
+                accepted_now = converged_now or lag_now
                 listing = rollout.mapping(app.get("configuration")).get("image")
-                if converged_now and listing != image:
+                if accepted_now and listing != image:
                     stale += 1
+                    self._snapshot_wait(pinned, probes, status, accepted_now,
+                                        timeline)
                     require(stale <= STALE_IMAGE_POLLS, "application_image_drift")
-                elif converged_now:
+                elif accepted_now:
                     stale = 0
                     rollout.active_worker(self.client, worker)
                     status, health, headers, report = probe_report(self.client, self.url)
@@ -427,7 +476,8 @@ class Drill:
                                      "non_200_readyz": non_200},
                                     timeline)
                         version_ok = False  # confirmation disagreed: keep polling
-            timeline.append((self.now(), status, gateway_ready, version_ok, converged_now))
+            timeline.append((self.now(), status, gateway_ready, version_ok, accepted_now))
+            self._snapshot_wait(pinned, probes, status, accepted_now, timeline)
             require(self.now() < deadline, "ready_timeout",
                     f"probes={probes} last_readyz={status}")
             self.sleep(POLL_SECONDS)
@@ -554,9 +604,19 @@ class Drill:
         taken = self.stamp(f"{name}: ownership taken")
         leg["takeover"] = iso(taken)
         target_worker = serving_version(self.client)
-        first_ready, counts, timeline = self.wait_ready(
-            target_worker, pin["source_sha"], pin["build_id"], pin["image"], deployed,
-            expect_rollout)
+        try:
+            first_ready, counts, timeline = self.wait_ready(
+                target_worker, pin["source_sha"], pin["build_id"], pin["image"],
+                deployed, expect_rollout)
+        except GateError:
+            # Keep the wait timeline plus the last observation in the leg
+            # evidence so a timeout distinguishes a missing rollout
+            # (pinned=none) from an unconverged one (probes=0 with a pinned
+            # rollout). Secret-safe: the snapshot holds ISO times, integers
+            # and booleans plus fixed-vocabulary text only.
+            leg["wait_timeline"] = list(self._last_wait_timeline)
+            leg["last_observation"] = self._last_wait_observation
+            raise
         leg.update({"serving_worker_version": target_worker,
                     "first_ready": iso(first_ready),
                     "time_to_ready_seconds": round(first_ready - deployed, 1),

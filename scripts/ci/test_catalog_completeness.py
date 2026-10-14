@@ -95,6 +95,7 @@ EXEMPT_SERIES = {
     "two_bot_voice_compensation_pending": _VOICE_SERIES_REASON,
     "two_bot_voice_names_total": _VOICE_SERIES_REASON,
     "two_bot_voice_vote_kick_total": _VOICE_SERIES_REASON,
+    "two_bot_voice_join_occupancy_total": _VOICE_SERIES_REASON,
     "two_bot_dispatch_drops_total": _ALERT_INPUT_REASON + " (dispatch_drops)",
     "two_bot_gateway_checkpoint_failures_total": (
         _ALERT_INPUT_REASON + " (gateway_checkpoint_failures)"
@@ -107,6 +108,24 @@ EXEMPT_SERIES = {
     "two_bot_audit_delivery_halt": (
         "manual check documented in docs/metrics.md, consumed by no alert "
         "rule; catalog row lands with the halt-gauge change"
+    ),
+    # Voice stall-observability families (lobby-stall follow-up): refusal
+    # labels, backoff cap, halt gauge, and the per-tick stall gauges. All rows
+    # live in docs/metrics.md; the catalog covers voice_event log fields.
+    # (joins_received, dispatch_timeouts, watchdog_stucks, halt_recoveries are
+    # cataloged, so they carry no exemption.)
+    "two_bot_voice_join_refused_total": _VOICE_SERIES_REASON,
+    "two_bot_voice_global_backoff_capped_total": _VOICE_SERIES_REASON,
+    "two_bot_voice_worker_halted": _VOICE_SERIES_REASON,
+    "two_bot_voice_queue_pending": _VOICE_SERIES_REASON,
+    "two_bot_voice_queue_oldest_age_seconds": _VOICE_SERIES_REASON,
+    "two_bot_voice_rest_in_flight_age_seconds": _VOICE_SERIES_REASON,
+    # Event-store S1 consumer-lag gauge: label-free manual check, not an
+    # alert input. Documented in docs/metrics.md; the catalog tracks event
+    # names, not this operational gauge.
+    "two_bot_event_store_consumer_lag_seconds": (
+        "manual check documented in docs/metrics.md, consumed by no alert "
+        "rule; label-free S1 consumer-lag gauge"
     ),
 }
 

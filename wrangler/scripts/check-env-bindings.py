@@ -42,7 +42,20 @@ def missing_env_error(missing: list[str]) -> str:
 EXTRA_REQUIRED_VARS = {"TWO_GUILD_NAME"}
 # Worker secrets live outside wrangler.toml and are optional per environment.
 # Never require this binding (absence is log-only), or accept a plaintext URL.
-OPTIONAL_SECRET_BINDINGS = {"OPS_ALERT_WEBHOOK_URL", "METRICS_SCRAPE_TOKEN"}
+OPTIONAL_SECRET_BINDINGS = {
+    "OPS_ALERT_WEBHOOK_URL",
+    "METRICS_SCRAPE_TOKEN",
+    "OPS_CONTROL_TOKEN",
+    # TOG-22861: the read-only ops dashboard service-token pair. Worker
+    # secrets only; a committed value would hand out dashboard access.
+    "OPS_DASHBOARD_CLIENT_ID",
+    "OPS_DASHBOARD_CLIENT_SECRET",
+}
+# TOG-22861 workers.dev break-glass: staging and production serve the public
+# suffix until a custom domain and Access app exist. Every named environment
+# must declare workers_dev explicitly; exactly the break-glass envs enable
+# it. The top level must disable it so bare deploys never serve it.
+WORKERS_DEV_ENVS = {"staging", "production"}
 # Absent tuning uses the code default; a named env may opt in independently.
 OPTIONAL_VARS = {"UNREADY_ALERT_FAILURES"}
 # TOG-12980 (CISO TOG-12979 C1/C10): the default-dark POST /internal/actions
@@ -50,8 +63,18 @@ OPTIONAL_VARS = {"UNREADY_ALERT_FAILURES"}
 # environment, so it is denied there too; production must never carry it.
 INGRESS_VAR = "INTERNAL_ACTIONS_INGRESS"
 INGRESS_ENVS = {"staging"}
+# TOG-23364: the default-dark POST /hooks/twitch EventSub ingress exists in
+# staging only, under the same rule as the internal-actions ingress above.
+EVENTSUB_INGRESS_VAR = "EVENTSUB_INGRESS"
+EVENTSUB_INGRESS_ENVS = {"staging"}
 # Private-receiver config is Operator-set Worker secrets, never wrangler.toml.
 RECEIVER_CONFIG_PREFIX = "TWO_INTERNAL_"
+# TOG-23364: the EventSub Operator switch is the last enable step for the
+# public Twitch ingress (wrangler/src/eventsub.ts): the route stays dark until
+# the Operator sets the Worker secret TWO_EVENTSUB=1. A committed var would
+# turn the route on from a toml change alone, so it is rejected in every vars
+# table, like the TWO_INTERNAL_* receiver config above.
+OPERATOR_SECRET_VARS = {"TWO_EVENTSUB"}
 # Boot publication of the guild command registry is a full replacement of the
 # guild's commands. wrangler.toml may opt in for staging only; production
 # publication stays an Operator-approved Worker binding, never a committed var.
@@ -70,6 +93,14 @@ VOICE_GATE_ENVS = {"staging"}
 # Operator-set Worker binding after the app's Presence Intent is on.
 VOICE_PRESENCE_VAR = "TWO_VOICE_PRESENCE"
 VOICE_PRESENCE_ENVS = {"staging"}
+# TOG-22862 (CISO AC4): the mutating admin controls (PUT /ops/config,
+# POST /ops/kill-switch) stay dark unless the environment opts in with these
+# exact-"1" switches. A top-level var would be required in every environment,
+# so it is denied there too; production stays dark until the CISO review.
+OPS_CONFIG_WRITES_VAR = "OPS_CONFIG_WRITES_ENABLED"
+OPS_CONFIG_WRITES_ENVS = {"staging"}
+OPS_KILLSWITCH_VAR = "OPS_KILLSWITCH_ENABLED"
+OPS_KILLSWITCH_ENVS = {"staging"}
 
 
 def check(path: Path) -> list[str]:
@@ -103,6 +134,29 @@ def _collect_errors(cfg: dict) -> list[str]:
     if missing:
         return [missing_env_error(missing)]
 
+    # TOG-22861: workers.dev break-glass is staging + production until a
+    # custom domain and Access app exist. Every named environment declares it
+    # explicitly so a new env cannot inherit the public suffix by accident;
+    # diagnostics name the section, never values.
+    if cfg.get("workers_dev") is not False:
+        errors.append(
+            "top-level workers_dev must be explicitly false "
+            "(only break-glass envs serve workers.dev)"
+        )
+    for env_name, env in envs.items():
+        workers_dev = env.get("workers_dev")
+        if env_name in WORKERS_DEV_ENVS:
+            if workers_dev is not True:
+                errors.append(
+                    f"[env.{env_name}]: workers_dev must be explicitly true "
+                    f"({env_name} is a dashboard break-glass origin)"
+                )
+        elif workers_dev is not False:
+            errors.append(
+                f"[env.{env_name}]: workers_dev must be explicitly false "
+                "(only break-glass envs serve workers.dev)"
+            )
+
     for prefix, section in [("[vars]", cfg), *[(f"[env.{name}.vars]", env) for name, env in envs.items()]]:
         variables = section.get("vars", {})
         for key in sorted(OPTIONAL_SECRET_BINDINGS & set(variables)):
@@ -115,6 +169,13 @@ def _collect_errors(cfg: dict) -> list[str]:
             )
         if variables.get(INGRESS_VAR, "1") != "1":
             errors.append(f'{prefix}: {INGRESS_VAR} must be exactly "1" or absent')
+        if EVENTSUB_INGRESS_VAR in variables and env_name not in EVENTSUB_INGRESS_ENVS:
+            errors.append(
+                f"{prefix}: {EVENTSUB_INGRESS_VAR} is staging-only "
+                "(top-level vars are required in every env; production must never set it)"
+            )
+        if variables.get(EVENTSUB_INGRESS_VAR, "1") != "1":
+            errors.append(f'{prefix}: {EVENTSUB_INGRESS_VAR} must be exactly "1" or absent')
         if BOOT_PUBLISH_VAR in variables and env_name not in BOOT_PUBLISH_ENVS:
             errors.append(
                 f"{prefix}: {BOOT_PUBLISH_VAR} is staging-only "
@@ -136,7 +197,23 @@ def _collect_errors(cfg: dict) -> list[str]:
             )
         if variables.get(VOICE_PRESENCE_VAR, "1") != "1":
             errors.append(f'{prefix}: {VOICE_PRESENCE_VAR} must be exactly "1" or absent')
+        if OPS_CONFIG_WRITES_VAR in variables and env_name not in OPS_CONFIG_WRITES_ENVS:
+            errors.append(
+                f"{prefix}: {OPS_CONFIG_WRITES_VAR} is staging-only "
+                "(top-level vars are required in every env; production writes need the CISO review)"
+            )
+        if variables.get(OPS_CONFIG_WRITES_VAR, "1") != "1":
+            errors.append(f'{prefix}: {OPS_CONFIG_WRITES_VAR} must be exactly "1" or absent')
+        if OPS_KILLSWITCH_VAR in variables and env_name not in OPS_KILLSWITCH_ENVS:
+            errors.append(
+                f"{prefix}: {OPS_KILLSWITCH_VAR} is staging-only "
+                "(top-level vars are required in every env; production kill-switch needs the CISO review)"
+            )
+        if variables.get(OPS_KILLSWITCH_VAR, "1") != "1":
+            errors.append(f'{prefix}: {OPS_KILLSWITCH_VAR} must be exactly "1" or absent')
         for key in sorted(k for k in variables if k.startswith(RECEIVER_CONFIG_PREFIX)):
+            errors.append(f"{prefix}: {key} is an Operator-set Worker secret, never a wrangler.toml var")
+        for key in sorted(OPERATOR_SECRET_VARS & set(variables)):
             errors.append(f"{prefix}: {key} is an Operator-set Worker secret, never a wrangler.toml var")
         threshold = variables.get("UNREADY_ALERT_FAILURES")
         if threshold is not None and (

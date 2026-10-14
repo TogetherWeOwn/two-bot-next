@@ -48,6 +48,13 @@ tables to the migrator and grants the migrator ALL with no runtime or reader
 grant; the verifier requires migrator ownership/privileges and rejects any
 runtime/reader access, including TOAST-storage ownership drift.
 
+The three opt-out tables (`privacy_opt_outs`, `guild_analytics_settings`,
+`privacy_opt_out_audit`, plus the audit `id` sequence) are ordinary `table`
+kind instead: the always-on runtime reads suppression and switches on its
+hot write paths, and operator opt-outs execute through the app pool, so the
+runtime needs SELECT/INSERT/UPDATE/DELETE there. See `docs/privacy.md` for
+what those rows mean.
+
 The reader cannot read bot base tables, including through inherited/public or
 column-level grants. Normal PostgreSQL views deliberately run with their owner's
 base-table privileges: only the reviewed `web_v1` projection is exposed. Do not
@@ -137,7 +144,7 @@ never returns PASS. Verification checks missing groups/objects, group attributes
 and memberships, database/schema privileges, ownership/object kinds, effective
 table/column/sequence/function privileges (including PUBLIC), grant options, parsed
 boolean view invoker settings and unsafe future grants. Explicit grants cover the
-current migrations' 86 ordinary bot tables plus two restricted admission lanes,
+current migrations' 89 ordinary bot tables plus two restricted admission lanes,
 SQLx ledger, two migrator-only tables, twelve sequences,
 nine web views and six functions (three trigger helpers plus three `web_v1`
 helpers). The read-only migrator group additionally reads the ordinary tables,

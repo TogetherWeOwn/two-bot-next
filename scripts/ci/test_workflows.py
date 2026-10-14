@@ -33,6 +33,8 @@ JOB_INVENTORY = {
     "staging-container-drill.yml": {"container-drill"},
     # Manual read-only staging events read for the B2 soak; pinned shape below.
     "staging-events-read.yml": {"read"},
+    # Manual read-only authenticated MCP prove-out (TOG-23456); pinned shape below.
+    "staging-mcp-proveout.yml": {"proveout"},
     "supply-chain.yml": {"pr-lint", "gitleaks"},
     # TOG-10893: read-only SBOM inventory/gates shared by the PR dry-run and releases.
     # `image` builds/scans the untrusted ref with pinned actions only; `verify`
@@ -41,6 +43,13 @@ JOB_INVENTORY = {
     "sbom.yml": {"image", "verify"},
     # Live staging voice synthetic (docs/voice-synthetic.md); pinned shape below.
     "voice-synthetic.yml": {"synthetic"},
+    # SDLC separation gate (org test-guard reusable, warn mode): one
+    # reusable call, least-privilege grant pinned below.
+    "test-guard.yml": {"test-guard"},
+    # TOG-21027: manual, bounded vote_kick libFuzzer smoke on a GitHub-hosted
+    # runner. Read-only, no secrets, no deploy route: the generic
+    # deployment/probe scan already passes, so only the inventory pin is needed.
+    "vote-kick-fuzz-smoke.yml": {"vote-kick-smoke"},
 }
 # Reusable-workflow calls are allowed only to these non-deploy workflows.
 # TOG-10893 registers the read-only sbom.yml calls alongside the benchmark one.
@@ -48,7 +57,9 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
                    ("check.yml", "supply-chain"): "./.github/workflows/sbom.yml",
                    ("release.yml", "release-sbom"): "./.github/workflows/sbom.yml",
                    # After every staging deploy; its failure fails deploy-staging (promotion gate).
-                   ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml"}
+                   ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml",
+                   # SDLC separation gate: org reusable, warn mode, pinned SHA.
+                   ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95"}
 # Main's runner routing (#265, 2026-10-02): the repo is public and the org's
 # self-hosted runner group refuses public repos, so every job routes through
 # one expression — public repo -> GitHub-hosted, private -> CI_OVERFLOW_* switch
@@ -792,6 +803,97 @@ def staging_events_read_errors(workflow):
     return errors
 
 
+MCP_PROVEOUT_ENV = {
+    "STAGING_MCP_TOKEN": "${{ secrets.STAGING_MCP_TOKEN }}",
+    "STAGING_MCP_URL": "https://two-bot-next-staging.5150.workers.dev/mcp",
+    "RUN_ID": "${{ github.run_id }}",
+}
+MCP_PROVEOUT_COMMAND = ('python3 scripts/staging_mcp_proveout.py '
+                        '--output "staging-mcp-proveout-$RUN_ID.json"')
+
+
+def staging_mcp_proveout_errors(workflow):
+    """Manual staging-only read-only authenticated MCP prove-out (TOG-23456).
+
+    Dispatch-only with no inputs. The bearer arrives only as the `staging`
+    environment secret STAGING_MCP_TOKEN into one Run step (never echoed,
+    stored or uploaded; responses carry no credential). One job runs only
+    from main through the `staging` environment, on the routed runner for
+    job `proveout`, with its own non-cancelling concurrency group and a 10
+    minute timeout. Exactly three steps: pinned checkout without persisted
+    credentials, one Run step that calls the reviewed stdlib script with
+    the bearer via the environment only, and the 14 day artifact upload of
+    the sanitized prove-out file with `if: always()` so failures keep
+    their evidence. No wrangler, no production path, no staging Worker URL
+    variable, no `set -x`.
+    """
+    name = "staging-mcp-proveout.yml"
+    errors = []
+    if "env" in workflow:
+        errors.append(f"{name}: workflow-level env must stay absent; secrets belong only on the Run step")
+    on = workflow.get("on") or {}
+    if set(on) != {"workflow_dispatch"}:
+        errors.append(f"{name}: must be dispatch-only (no push/pull_request/schedule)")
+    elif on.get("workflow_dispatch") not in (None, {}, ""):
+        errors.append(f"{name}: workflow_dispatch must take no inputs")
+    if workflow.get("permissions") != {}:
+        errors.append(f"{name}: top-level permissions must stay empty")
+    if workflow.get("concurrency") != {"group": "staging-mcp-proveout", "cancel-in-progress": "false"}:
+        errors.append(f"{name}: must use its own staging-mcp-proveout group without cancelling")
+    jobs = workflow.get("jobs") or {}
+    if set(jobs) != {"proveout"}:
+        errors.append(f"{name}: jobs must be exactly proveout")
+        return errors
+    job = jobs["proveout"]
+    if job.get("environment") != "staging":
+        errors.append(f"{name}:proveout: must read the staging Environment binding for STAGING_MCP_TOKEN")
+    if job.get("if") != "github.ref == 'refs/heads/main'":
+        errors.append(f"{name}:proveout: must run only from main")
+    if job.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:proveout: must keep contents:read only")
+    if job.get("timeout-minutes") != "10":
+        errors.append(f"{name}:proveout: timeout must stay 10 minutes")
+    if not runner_allowed("proveout", job.get("runs-on")):
+        errors.append(f"{name}:proveout: must use the routed runner expression for job 'proveout'")
+    for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+        if key in job:
+            errors.append(f"{name}:proveout: must not set {key} (bindings stay on the single Run step)")
+    text = str(job).lower().replace(" ", "")
+    for marker in ("wrangler", "production", "tojson(secrets", "secrets[", "set-x", "setx", "xtrace",
+                   "cloudflare_api_token", "ownership_control", "staging_worker_url",
+                   "production_worker_url", "/health", "/readyz", "vars.staging", "inputs."):
+        if marker in text:
+            errors.append(f"{name}:proveout: must not contain {marker!r}")
+    secrets = set(re.findall(r"secrets\.([a-z0-9_]+)", text))
+    if secrets != {"staging_mcp_token"}:
+        errors.append(f"{name}:proveout: must read exactly the STAGING_MCP_TOKEN secret")
+    steps = job.get("steps") or []
+    if len(steps) != 3 or any("continue-on-error" in step for step in steps):
+        errors.append(f"{name}:proveout: must run exactly checkout, the prove-out and the upload, unconditionally")
+        return errors
+    checkout, run, upload = steps
+    if "if" in checkout or "if" in run:
+        errors.append(f"{name}:proveout: only the upload may carry a condition (always())")
+        return errors
+    if upload.get("if") != "always()":
+        errors.append(f"{name}:proveout: upload must run with if: always() so failures keep their artifact")
+        return errors
+    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
+            or (checkout.get("with") or {}).get("persist-credentials") != "false" \
+            or (checkout.get("with") or {}).get("fetch-depth") != "1":
+        errors.append(f"{name}:proveout: checkout must be pinned, shallow and must not persist credentials")
+    if run.get("env") != MCP_PROVEOUT_ENV:
+        errors.append(f"{name}:proveout: Run step must bind exactly the bearer, the staging URL and the run id")
+    if run.get("run") != MCP_PROVEOUT_COMMAND or "uses" in run or "shell" in run:
+        errors.append(f"{name}:proveout: Run step must call the reviewed script with the run id via the environment only")
+    if not str(upload.get("uses", "")).startswith("actions/upload-artifact@") or upload.get("with") != {
+            "name": "staging-mcp-proveout-${{ github.run_id }}",
+            "path": "staging-mcp-proveout-${{ github.run_id }}.json",
+            "if-no-files-found": "error", "retention-days": "14"}:
+        errors.append(f"{name}:proveout: must upload only the run's json for 14 days and fail if absent")
+    return errors
+
+
 def production_errors(workflow):
     """deploy-production is the one live route: dispatch-only, human-gated, chained to staging."""
     name = "deploy-production.yml"
@@ -949,6 +1051,12 @@ def workflow_policy_errors(workflows):
             # Manual read-only events read: pinned shape above; the generic
             # environment scan below would flag its Environment binding.
             errors.extend(staging_events_read_errors(workflow))
+            continue
+        if name == "staging-mcp-proveout.yml":
+            # Manual read-only authenticated MCP prove-out: pinned shape
+            # above; the generic environment scan below would flag its
+            # staging Environment binding.
+            errors.extend(staging_mcp_proveout_errors(workflow))
             continue
         if name == "staging-migrate.yml":
             # Manual runner: pinned shape above, not the
@@ -1713,6 +1821,45 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(set(installers["check"][0]["with"]["components"].replace(" ", "").split(",")),
                          {"rustfmt", "clippy"})
 
+    def test_rust_tests_toolchain_install_is_retry_guarded(self):
+        # `rustup toolchain install` inside the installer failed once on main
+        # with `Network is unreachable` syncing the channel manifest, failing
+        # the job before any test ran (green on re-run). The upstream
+        # installer retries only checksum-rotation failures, so the installer
+        # continues on error and the next step retries the same pin and fails
+        # closed. The retry must request the repository pin and every
+        # component the installer requests, or a green retry can mask a drift.
+        channel = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
+        steps = self.workflows["check.yml"]["jobs"]["rust-tests"]["steps"]
+        installers = [index for index, step in enumerate(steps)
+                      if str(step.get("uses", "")).startswith("dtolnay/rust-toolchain@")]
+        self.assertEqual(len(installers), 1)
+        index = installers[0]
+        installer = steps[index]
+        self.assertTrue(installer.get("continue-on-error"),
+                        "toolchain installer must continue so the retry step can run")
+        self.assertIn("id", installer)
+        retry = steps[index + 1]
+        self.assertNotIn("uses", retry)
+        self.assertIn("run", retry)
+        self.assertEqual(retry.get("if"), f"steps.{installer['id']}.outcome == 'failure'")
+        self.assertNotEqual(retry.get("continue-on-error"), True,
+                            "the retry must fail the job when the toolchain stays missing")
+        self.assertIn(channel, retry["run"])
+        for component in installer["with"]["components"].replace(" ", "").split(","):
+            with self.subTest(component=component):
+                self.assertIn(component, retry["run"])
+        with self.subTest(change="retry step removed"):
+            workflows = deepcopy(self.workflows)
+            del workflows["check.yml"]["jobs"]["rust-tests"]["steps"][index + 1]
+            retry_steps = workflows["check.yml"]["jobs"]["rust-tests"]["steps"]
+            still_guarded = (
+                len(retry_steps) > index + 1
+                and "run" in retry_steps[index + 1]
+                and retry_steps[index + 1].get("if") == f"steps.{installer['id']}.outcome == 'failure'"
+            )
+            self.assertFalse(still_guarded, "removing the retry step must fail this guard")
+
     def test_overflow_runner_must_name_its_own_job(self):
         self.assertTrue(runner_allowed("worker", self.workflows["check.yml"]["jobs"]["worker"]["runs-on"]))
         for runs_on in (ROUTED_RUNNER.format(job="check"), "ubuntu-latest", ["self-hosted"],
@@ -1747,6 +1894,9 @@ class WorkflowTests(unittest.TestCase):
                 with self.subTest(workflow=name, job=job_id):
                     expected = {"contents": "read"}
                     if (name, job_id) == ("supply-chain.yml", "pr-lint"):
+                        expected["pull-requests"] = "read"
+                    elif (name, job_id) == ("test-guard.yml", "test-guard"):
+                        # Marker-label actor audit via the issue-events API.
                         expected["pull-requests"] = "read"
                     elif (name, job_id) in (("staging-migrate.yml", "apply"),
                                                  ("production-migrate.yml", "apply")):

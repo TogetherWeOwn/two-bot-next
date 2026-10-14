@@ -1118,6 +1118,295 @@ test("Worker and DO private scrape preserve the bounded REST guard fixture", asy
   assert.equal(upstream.mock.callCount(), 1);
 });
 
+for (const path of ["/ops/summary", "/ops/gateway", "/ops/backfill", "/ops/backfill/progress"]) {
+  test(`DO ${path}: small JSON body proxies with the JSON content type`, async (t) => {
+    const h = await harness(t);
+    t.mock.method(h.bot, "containerFetch", async () => new Response('{"ready":true}\n', { status: 200 }));
+    const response = await h.bot.fetch(probeRequest(`https://worker.invalid${path}`));
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), "application/json");
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    assert.equal(await response.text(), '{"ready":true}\n');
+  });
+
+  test(`DO ${path}: unknown paths are not served by the container`, async (t) => {
+    const h = await harness(t);
+    const response = await h.bot.fetch(probeRequest(`https://worker.invalid${path}/extra`));
+    assert.equal(response.status, 404);
+  });
+}
+
+test("DO /ops/backfill/progress: forwards x-two-* signing headers to the container", async (t) => {
+  // Regression for the 504-every-call review finding: the SDK builds a bare
+  // request from a string URL, so the DO must attach the signing headers
+  // explicitly — the container 401s without them and the proxy maps that to
+  // 504. The mock asserts on the request the DO hands to containerFetch.
+  const h = await harness(t);
+  const seen: unknown[] = [];
+  t.mock.method(h.bot, "containerFetch", async (input: unknown) => {
+    seen.push(input);
+    return new Response('{"ok":true}\n', { status: 200 });
+  });
+  const response = await h.bot.fetch(new Request("https://worker.invalid/ops/backfill/progress", {
+    headers: {
+      "x-two-key-id": "synthetic-progress-key",
+      "x-two-timestamp": "1700000000",
+      "x-two-nonce": "synthetic-nonce-0123456789abcdef",
+      "x-two-signature": "synthetic-progress-signature",
+      [DEPLOYMENT_HEADER]: ID,
+    },
+  }));
+  assert.equal(response.status, 200);
+  assert.equal(seen.length, 1);
+  const forwarded = seen[0] as Request;
+  assert.ok(forwarded instanceof Request);
+  assert.equal(forwarded.headers.get("x-two-key-id"), "synthetic-progress-key");
+  assert.equal(forwarded.headers.get("x-two-timestamp"), "1700000000");
+  assert.equal(forwarded.headers.get("x-two-nonce"), "synthetic-nonce-0123456789abcdef");
+  assert.equal(forwarded.headers.get("x-two-signature"), "synthetic-progress-signature");
+});
+
+test("DO /ops/backfill/progress: container 401 stays 401 with a generic body", async (t) => {
+  // A bad signature, skew, replay or unknown key is the route's own 401, not
+  // an outage: the DO must not map it to 504 "ops unavailable".
+  const h = await harness(t);
+  t.mock.method(h.bot, "containerFetch", async () => new Response('{"error":"unauthorized"}\n', { status: 401 }));
+  const response = await h.bot.fetch(new Request("https://worker.invalid/ops/backfill/progress", {
+    headers: {
+      "x-two-key-id": "synthetic-progress-key",
+      "x-two-timestamp": "1700000000",
+      "x-two-nonce": "synthetic-nonce-0123456789abcdef",
+      "x-two-signature": "synthetic-progress-signature",
+      [DEPLOYMENT_HEADER]: ID,
+    },
+  }));
+  assert.equal(response.status, 401);
+  assert.equal(await response.text(), "unauthorized");
+});
+
+test("DO /ops/gateway: oversized body returns 502 with a generic body", async (t) => {
+  const h = await harness(t);
+  t.mock.method(h.bot, "containerFetch", async () => new Response('{"k":"v"}\n'.repeat(20000)));
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/ops/gateway"));
+  assert.equal(response.status, 502);
+  assert.equal(await response.text(), "ops unavailable\n");
+});
+
+test("DO /ops/backfill: rejected container fetch returns 504 with a generic body", async (t) => {
+  const h = await harness(t);
+  t.mock.method(h.bot, "containerFetch", async () => { throw new Error("fixture transport failure"); });
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/ops/backfill"));
+  assert.equal(response.status, 504);
+  assert.equal(await response.text(), "ops unavailable\n");
+});
+
+test("Worker gates the ops JSON roll-ups behind the scrape bearer, before the redirect lookup", async (t) => {
+  const token = "synthetic-ops-json-scrape-token-0123456789";
+  const body = '{"ready":true,"tables":[]}\n';
+  // A campaign row can never shadow the reserved roll-ups: the exact-path
+  // gate runs before the invite-redirect lookup.
+  const env = {
+    ...WORKER_ENV,
+    METRICS_SCRAPE_TOKEN: token,
+    CF_VERSION_METADATA: { id: ID },
+    REDIRECT_FALLBACK_CODE: "synthetic0",
+    REDIRECT_MAPPINGS_JSON: "[]",
+    TWO_BOT: { getByName: () => { throw new Error("unauthenticated calls must not reach the DO"); } },
+  } as unknown as Env;
+  const ctx = { waitUntil: () => {} } as ExecutionContext;
+  // Attempt buckets are per caller and module-level, so every sub-request
+  // below carries its own caller IP: earlier tests in this isolate share the
+  // default "unknown" budget and must not throttle these assertions.
+  let caller = 0;
+  const gated = (path: string, init?: RequestInit) => {
+    caller += 1;
+    return worker.fetch(new Request(`https://worker.invalid${path}`, {
+      ...init,
+      headers: { "cf-connecting-ip": `10.99.0.${caller}`, ...(init?.headers ?? {}) },
+    }), env, ctx);
+  };
+  for (const path of ["/ops/summary", "/ops/gateway", "/ops/backfill"]) {
+    assert.equal((await gated(path)).status, 401);
+    const wrong = await gated(path, {
+      headers: { authorization: "Bearer wrong-bearer-not-a-secret-0123456789" },
+    });
+    assert.equal(wrong.status, 401);
+    assert.equal(wrong.headers.get("www-authenticate"), "Bearer");
+    const post = await gated(path, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    assert.equal(post.status, 404);
+  }
+  // No token configured: the routes do not exist.
+  const unconfigured = { ...env, METRICS_SCRAPE_TOKEN: undefined } as unknown as Env;
+  for (const path of ["/ops/summary", "/ops/gateway", "/ops/backfill"]) {
+    caller += 1;
+    const response = await worker.fetch(new Request(`https://worker.invalid${path}`, {
+      headers: { authorization: `Bearer ${token}`, "cf-connecting-ip": `10.99.0.${caller}` },
+    }), unconfigured, ctx);
+    assert.equal(response.status, 404);
+  }
+  // Authorized reads proxy the container JSON untouched.
+  const h = await harness(t, { METRICS_SCRAPE_TOKEN: token });
+  const upstream = t.mock.method(h.bot, "containerFetch", async () => new Response(body));
+  const authed = {
+    ...WORKER_ENV,
+    METRICS_SCRAPE_TOKEN: token,
+    CF_VERSION_METADATA: { id: ID },
+    TWO_BOT: { getByName: () => ({ fetch: (request: Request) => h.bot.fetch(request) }) },
+  } as unknown as Env;
+  for (const path of ["/ops/summary", "/ops/gateway", "/ops/backfill"]) {
+    caller += 1;
+    const response = await worker.fetch(new Request(`https://worker.invalid${path}`, {
+      headers: { authorization: `Bearer ${token}`, "cf-connecting-ip": `10.99.0.${caller}` },
+    }), authed, ctx);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), "application/json");
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    assert.equal(await response.text(), body);
+  }
+  assert.equal(upstream.mock.callCount(), 3);
+  // Unknown /ops subpaths never reach the container: the slug allowlist
+  // rejects them in the redirect lookup, with no Location header.
+  const before = upstream.mock.callCount();
+  caller += 1;
+  const unknown = await worker.fetch(new Request("https://worker.invalid/ops/unknown", {
+    headers: { authorization: `Bearer ${token}`, "cf-connecting-ip": `10.99.0.${caller}` },
+  }), authed, ctx);
+  assert.equal(unknown.status, 404);
+  assert.equal(unknown.headers.get("location"), null);
+  assert.equal(upstream.mock.callCount(), before);
+});
+
+test("Worker forwards /ops/backfill/progress with x-two-* headers and no scrape bearer", async () => {
+  // The signed progress read is container-authenticated (x-two-* HMAC), so
+  // unlike the scrape-gated roll-ups it forwards with no bearer and no
+  // configured token — and the signing headers must arrive unchanged.
+  const seen: Request[] = [];
+  const env = {
+    ...WORKER_ENV,
+    CF_VERSION_METADATA: { id: ID },
+    REDIRECT_FALLBACK_CODE: "synthetic0",
+    REDIRECT_MAPPINGS_JSON: "[]",
+    TWO_BOT: {
+      getByName: () => ({
+        fetch: async (r: Request) => {
+          seen.push(r);
+          return new Response('{"ok":true}\n', {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        },
+      }),
+    },
+  } as unknown as Env;
+  const ctx = { waitUntil: () => {} } as ExecutionContext;
+  const response = await worker.fetch(new Request("https://worker.invalid/ops/backfill/progress", {
+    headers: {
+      "cf-connecting-ip": "10.99.7.1",
+      "x-two-key-id": "synthetic-progress-key",
+      "x-two-timestamp": "1700000000",
+      "x-two-nonce": "synthetic-nonce-0123456789abcdef",
+      "x-two-signature": "sha256=synthetic-progress-signature",
+    },
+  }), env, ctx);
+  assert.equal(response.status, 200);
+  assert.equal(seen.length, 1);
+  const forwarded = seen[0]!;
+  assert.equal(new URL(forwarded.url).pathname, "/ops/backfill/progress");
+  assert.equal(forwarded.headers.get("x-two-key-id"), "synthetic-progress-key");
+  assert.equal(forwarded.headers.get("x-two-timestamp"), "1700000000");
+  assert.equal(forwarded.headers.get("x-two-nonce"), "synthetic-nonce-0123456789abcdef");
+  assert.equal(forwarded.headers.get("x-two-signature"), "sha256=synthetic-progress-signature");
+  assert.equal(forwarded.headers.get(DEPLOYMENT_HEADER), ID);
+});
+
+test("Worker /ops/backfill/progress: non-GET is 405 without reaching the DO", async () => {
+  const env = {
+    ...WORKER_ENV,
+    CF_VERSION_METADATA: { id: ID },
+    REDIRECT_FALLBACK_CODE: "synthetic0",
+    REDIRECT_MAPPINGS_JSON: "[]",
+    TWO_BOT: { getByName: () => { throw new Error("method-gated calls must not reach the DO"); } },
+  } as unknown as Env;
+  const ctx = { waitUntil: () => {} } as ExecutionContext;
+  const response = await worker.fetch(new Request("https://worker.invalid/ops/backfill/progress", {
+    method: "POST",
+    headers: {
+      "cf-connecting-ip": "10.99.7.2",
+      "x-two-key-id": "synthetic-progress-key",
+      "x-two-timestamp": "1700000000",
+      "x-two-nonce": "synthetic-nonce-0123456789abcdef",
+      "x-two-signature": "synthetic-progress-signature",
+    },
+  }), env, ctx);
+  assert.equal(response.status, 405);
+  assert.equal(response.headers.get("allow"), "GET");
+});
+
+test("Worker /ops/backfill/progress: missing or overlong x-two-* headers are 401 without reaching the DO", async () => {
+  const env = {
+    ...WORKER_ENV,
+    CF_VERSION_METADATA: { id: ID },
+    REDIRECT_FALLBACK_CODE: "synthetic0",
+    REDIRECT_MAPPINGS_JSON: "[]",
+    TWO_BOT: { getByName: () => { throw new Error("unsigned calls must not reach the DO"); } },
+  } as unknown as Env;
+  const ctx = { waitUntil: () => {} } as ExecutionContext;
+  const unsigned = await worker.fetch(new Request("https://worker.invalid/ops/backfill/progress", {
+    headers: { "cf-connecting-ip": "10.99.7.3" },
+  }), env, ctx);
+  assert.equal(unsigned.status, 401);
+  const overlong = await worker.fetch(new Request("https://worker.invalid/ops/backfill/progress", {
+    headers: {
+      "cf-connecting-ip": "10.99.7.4",
+      "x-two-key-id": "k".repeat(129),
+      "x-two-timestamp": "1700000000",
+      "x-two-nonce": "synthetic-nonce-0123456789abcdef",
+      "x-two-signature": "synthetic-progress-signature",
+    },
+  }), env, ctx);
+  assert.equal(overlong.status, 401);
+});
+
+test("Worker /ops/backfill/progress: over-budget caller is 429 without reaching the DO", async () => {
+  let reached = 0;
+  const env = {
+    ...WORKER_ENV,
+    CF_VERSION_METADATA: { id: ID },
+    REDIRECT_FALLBACK_CODE: "synthetic0",
+    REDIRECT_MAPPINGS_JSON: "[]",
+    TWO_BOT: {
+      getByName: () => ({
+        fetch: async () => {
+          reached += 1;
+          return new Response('{"ok":true}\n', {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        },
+      }),
+    },
+  } as unknown as Env;
+  const ctx = { waitUntil: () => {} } as ExecutionContext;
+  // Attempt buckets are module-level: one caller IP burns one 10-token budget.
+  const headers = {
+    "cf-connecting-ip": "10.99.7.5",
+    "x-two-key-id": "synthetic-progress-key",
+    "x-two-timestamp": "1700000000",
+    "x-two-nonce": "synthetic-nonce-0123456789abcdef",
+    "x-two-signature": "synthetic-progress-signature",
+  };
+  let last: Response | undefined;
+  for (let i = 0; i < 11; i++) {
+    last = await worker.fetch(new Request("https://worker.invalid/ops/backfill/progress", { headers }), env, ctx);
+  }
+  assert.equal(last!.status, 429);
+  assert.ok(last!.headers.get("retry-after"));
+  assert.equal(reached, 10);
+});
+
 // Readiness monitoring uses synthetic responses only. Global fetch is stubbed
 // in every alert test: no configured webhook, Worker or database is contacted.
 async function alertHarness(t: TestContext, env: Partial<Env> = {}, values?: Map<string, unknown>) {

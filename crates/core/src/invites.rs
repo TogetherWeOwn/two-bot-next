@@ -399,6 +399,46 @@ impl<S: InviteSnapshotStore> InviteTracker<S> {
         self.store.store_all(guild_id, &[state]);
     }
 
+    /// Rotate one permanent invite code without dropping its funnel row.
+    ///
+    /// Drops the `old_code` snapshot row and stores the `new_code` row
+    /// carrying the old row's inviter and channel with `uses` reset to zero:
+    /// a rotated permanent invite is fresh in Discord but keeps its funnel
+    /// attribution. Returns the stored row, or `None` (storing nothing) when
+    /// `old_code` is unknown.
+    pub fn rotate_code(
+        &self,
+        guild_id: Snowflake,
+        old_code: &str,
+        new_code: &str,
+    ) -> Option<InviteState> {
+        let current = self.store.load(guild_id);
+        // A rotation that hands back the same code (Discord reusing an invite
+        // when `unique` is false) must not zero the live row: the next full
+        // diff would count the whole history as growth and misattribute a
+        // join. Returning the stored row unchanged keeps attribution.
+        if old_code == new_code {
+            return current.into_iter().find(|state| state.code == old_code);
+        }
+        let old = current.iter().find(|state| state.code == old_code)?.clone();
+        let rotated = InviteState {
+            code: new_code.to_owned(),
+            uses: 0,
+            inviter_id: old.inviter_id,
+            channel_id: old.channel_id,
+        };
+        self.store
+            .store_all(guild_id, std::slice::from_ref(&rotated));
+        let live: HashSet<String> = current
+            .iter()
+            .map(|state| state.code.clone())
+            .filter(|code| code != old_code)
+            .chain(std::iter::once(new_code.to_owned()))
+            .collect();
+        self.store.delete_missing(guild_id, &live);
+        Some(rotated)
+    }
+
     /// Attribution string for a join, given the codes that grew.
     ///
     /// Multi-code growth files `ambiguous:a+b` with the codes SORTED, so the
@@ -516,6 +556,17 @@ mod tests {
         assert!(grew.is_empty());
         let grew = t.diff_and_store(1, &[state("a", 6), state("new", 9)]);
         assert!(grew.is_empty());
+    }
+
+    #[test]
+    fn rotate_same_code_keeps_row_and_uses() {
+        let t = InviteTracker::new(MemSnapshots::new());
+        t.diff_and_store(1, &[state("a", 5)]);
+        // Same-code rotation stores nothing and keeps the live uses: the next
+        // full diff credits only real growth instead of the whole history.
+        assert_eq!(t.rotate_code(1, "a", "a"), Some(state("a", 5)));
+        assert!(t.diff_and_store(1, &[state("a", 5)]).is_empty());
+        assert_eq!(t.rotate_code(1, "missing", "missing"), None);
     }
 
     #[test]

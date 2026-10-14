@@ -101,6 +101,10 @@ export const FORWARDED_FLAGS = [
   // through this flag allowlist.
   "TWO_ASSISTANT_ENDPOINT",
   "TWO_ASSISTANT_MODEL",
+  // Retention scheduler mode (retention_jobs.rs MODE_SETTING): exact
+  // `dry-run`/`execute`/`off`, missing defaults to dry run. Non-secret
+  // runtime flag read from the process environment.
+  "TWO_RETENTION_MODE",
 ] as const;
 
 export type ForwardedFlag = (typeof FORWARDED_FLAGS)[number];
@@ -249,6 +253,7 @@ const REDIRECT = "go.two.gg redirect is served by the Worker (REDIRECT_*), not t
 
 /** Every other `TWO_*` name in crates/, with why it stays out of the Container. */
 export const NOT_FORWARDED: Readonly<Record<string, string>> = {
+  TWO_EVENTSUB: "Worker-only ingress gate; never read by the Container",
   TWO_DATABASE_URL: "cutover/operator CLI secret; the Container reads DATABASE_URL",
   TWO_STAGING_DATABASE_URL: SECRET,
   TWO_BOT_STAGING_MIGRATOR_DATABASE_URL: SECRET,
@@ -260,6 +265,9 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_ONBOARDING_ROTA_PSEUDONYM_KEY: SECRET,
   TWO_BACKUP_S3_ACCESS_KEY_ID: SECRET,
   TWO_BACKUP_S3_SECRET_ACCESS_KEY: SECRET,
+  TWO_TWITCH_CLIENT_ID: SECRET,
+  TWO_TWITCH_CLIENT_SECRET: SECRET,
+  TWO_TWITCH_WEBHOOK_SECRET: SECRET,
   TWO_DB_POOL_MAX: "cutover CLI pool size, not read by the Container runtime",
   TWO_DATABASE_TLS: "cutover/operator CLI TLS policy for database_tls::enforce (default required); not read by the Container runtime",
   TWO_ERASURE_ACTOR: "erase-member operator CLI audit actor, set per invocation; not read by the Container runtime",
