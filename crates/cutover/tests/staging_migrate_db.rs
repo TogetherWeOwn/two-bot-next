@@ -69,6 +69,39 @@ fn fixture_tag() -> String {
     format!("{}_{}_{}", std::process::id(), nonce, seq)
 }
 
+/// The reviewed expectations a runner invocation binds: the pending lists
+/// for both chains and, for apply, the producing plan's binding. Grouped so
+/// the `Fixture::run*` helpers stay within the argument limit without a
+/// clippy waiver.
+#[derive(Default)]
+struct RunExpect<'a> {
+    expected_pending: Option<&'a str>,
+    expected_store_pending: Option<&'a str>,
+    plan_binding: Option<(&'a str, &'a str, &'a str, &'a str)>,
+}
+
+impl<'a> RunExpect<'a> {
+    fn pending(expected_pending: Option<&'a str>, expected_store_pending: Option<&'a str>) -> Self {
+        Self {
+            expected_pending,
+            expected_store_pending,
+            plan_binding: None,
+        }
+    }
+
+    fn bound(
+        expected_pending: Option<&'a str>,
+        expected_store_pending: Option<&'a str>,
+        plan_binding: (&'a str, &'a str, &'a str, &'a str),
+    ) -> Self {
+        Self {
+            expected_pending,
+            expected_store_pending,
+            plan_binding: Some(plan_binding),
+        }
+    }
+}
+
 struct Fixture {
     admin: PgConnection,
     host: String,
@@ -201,33 +234,19 @@ impl Fixture {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn run(
         &self,
         mode: &str,
         url: Option<String>,
         host: &str,
         db: &str,
-        expected_pending: Option<&str>,
-        expected_store_pending: Option<&str>,
-        plan_binding: Option<(&str, &str, &str, &str)>,
+        expect: RunExpect<'_>,
     ) -> (i32, String, String) {
-        self.run_with_stray(
-            mode,
-            url,
-            None,
-            host,
-            db,
-            expected_pending,
-            expected_store_pending,
-            plan_binding,
-        )
-        .await
+        self.run_with_stray(mode, url, None, host, db, expect).await
     }
 
     /// Like [`Self::run`], but also sets `stray` as the OTHER mode's binding:
     /// proves a mode never borrows the credential reserved for the other one.
-    #[allow(clippy::too_many_arguments)]
     async fn run_with_stray(
         &self,
         mode: &str,
@@ -235,9 +254,7 @@ impl Fixture {
         stray: Option<String>,
         host: &str,
         db: &str,
-        expected_pending: Option<&str>,
-        expected_store_pending: Option<&str>,
-        plan_binding: Option<(&str, &str, &str, &str)>,
+        expect: RunExpect<'_>,
     ) -> (i32, String, String) {
         let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_staging-migrate"));
         cmd.args([
@@ -255,13 +272,13 @@ impl Fixture {
             "--acl-plan-ref",
             "TOG-fixture#acl",
         ]);
-        if let Some(list) = expected_pending {
+        if let Some(list) = expect.expected_pending {
             cmd.args(["--expected-pending", list]);
         }
-        if let Some(list) = expected_store_pending {
+        if let Some(list) = expect.expected_store_pending {
             cmd.args(["--expected-store-pending", list]);
         }
-        if let Some((hash, store_hash, run_id, manifest_path)) = plan_binding {
+        if let Some((hash, store_hash, run_id, manifest_path)) = expect.plan_binding {
             cmd.args([
                 "--plan-manifest-sha256",
                 hash,
@@ -465,7 +482,13 @@ async fn real_sqlx_runner_cases() -> TestResult {
 
     // Missing binding and wrong target refuse before any DDL.
     let (code, _, err) = fx
-        .run("--apply", None, &host, &db, Some(""), Some(""), None)
+        .run(
+            "--apply",
+            None,
+            &host,
+            &db,
+            RunExpect::pending(Some(""), Some("")),
+        )
         .await;
     assert_eq!(code, 2, "{err}");
     let (code, _, _) = fx
@@ -474,9 +497,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             Some(migrator.clone()),
             &host,
             "two_bot_staging_other",
-            Some(""),
-            Some(""),
-            None,
+            RunExpect::pending(Some(""), Some("")),
         )
         .await;
     assert_eq!(code, 2);
@@ -486,9 +507,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             Some(migrator.clone()),
             "other-host",
             &db,
-            Some(""),
-            Some(""),
-            None,
+            RunExpect::pending(Some(""), Some("")),
         )
         .await;
     assert_eq!(code, 2);
@@ -499,9 +518,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             Some(migrator.clone()),
             "ep-prod-fixture.us-east-2.aws.neon.tech",
             &db,
-            Some(""),
-            Some(""),
-            None,
+            RunExpect::pending(Some(""), Some("")),
         )
         .await;
     assert_eq!(code, 2, "{err}");
@@ -512,9 +529,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             Some(migrator.clone()),
             "ep-test-pooler.us-east-2.aws.neon.tech",
             &db,
-            Some(""),
-            Some(""),
-            None,
+            RunExpect::pending(Some(""), Some("")),
         )
         .await;
     assert_eq!(code, 2, "{err}");
@@ -524,9 +539,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             Some(migrator.clone()),
             "",
             &db,
-            Some(""),
-            Some(""),
-            None,
+            RunExpect::pending(Some(""), Some("")),
         )
         .await;
     assert_eq!(code, 2);
@@ -536,9 +549,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             Some(migrator.clone()),
             &host,
             "",
-            Some(""),
-            Some(""),
-            None,
+            RunExpect::pending(Some(""), Some("")),
         )
         .await;
     assert_eq!(code, 2);
@@ -549,9 +560,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             Some(migrator.clone()),
             &host,
             &db,
-            None,
-            None,
-            None,
+            RunExpect::default(),
         )
         .await;
     assert_eq!(code, 2, "{err}");
@@ -563,9 +572,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             Some(migrator.clone()),
             &host,
             &db,
-            Some(""),
-            Some(""),
-            None,
+            RunExpect::pending(Some(""), Some("")),
         )
         .await;
     assert_eq!(code, 2, "{err}");
@@ -578,9 +585,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             Some(outsider),
             &host,
             &db,
-            Some(""),
-            Some(""),
-            None,
+            RunExpect::pending(Some(""), Some("")),
         )
         .await;
     assert_eq!(code, 2, "{err}");
@@ -593,7 +598,13 @@ async fn real_sqlx_runner_cases() -> TestResult {
         ("superuser", migrator.clone(), "agent_test".to_owned()),
     ] {
         let (code, out, err) = fx
-            .run("--plan", Some(url.clone()), &host, &db, None, None, None)
+            .run(
+                "--plan",
+                Some(url.clone()),
+                &host,
+                &db,
+                RunExpect::default(),
+            )
             .await;
         assert_eq!(code, 2, "{label}: {err}");
         assert!(err.contains("two_bot_migrator group"), "{label}: {err}");
@@ -673,9 +684,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             Some(migrator.clone()),
             &host,
             &db,
-            None,
-            None,
-            None,
+            RunExpect::default(),
         )
         .await;
     assert_eq!(code, 2, "{err}");
@@ -684,7 +693,13 @@ async fn real_sqlx_runner_cases() -> TestResult {
     // The migrator-group login cannot be used as the plan credential either:
     // it does not hold the RO group, so SET ROLE two_bot_migrator_ro refuses.
     let (code, _, err) = fx
-        .run("--plan", Some(member.clone()), &host, &db, None, None, None)
+        .run(
+            "--plan",
+            Some(member.clone()),
+            &host,
+            &db,
+            RunExpect::default(),
+        )
         .await;
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("SET ROLE two_bot_migrator_ro"), "{err}");
@@ -696,14 +711,16 @@ async fn real_sqlx_runner_cases() -> TestResult {
             Some(ro.clone()),
             &host,
             &db,
-            Some(""),
-            Some(""),
-            Some((
-                &"a".repeat(64),
-                &"a".repeat(64),
-                "424240",
-                "producing-plan/staging-migrate-manifest.json",
-            )),
+            RunExpect::bound(
+                Some(""),
+                Some(""),
+                (
+                    &"a".repeat(64),
+                    &"a".repeat(64),
+                    "424240",
+                    "producing-plan/staging-migrate-manifest.json",
+                ),
+            ),
         )
         .await;
     assert_eq!(code, 2, "{err}");
@@ -718,7 +735,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
 
     // Plan is read-only and prints the computed pending list with its hash.
     let (code, out, err) = fx
-        .run("--plan", Some(ro.clone()), &host, &db, None, None, None)
+        .run("--plan", Some(ro.clone()), &host, &db, RunExpect::default())
         .await;
     assert_eq!(code, 0, "{err}");
     let m = manifest(&out);
@@ -856,9 +873,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             Some(member.clone()),
             &host,
             &db,
-            Some("201"),
-            None,
-            None,
+            RunExpect::pending(Some("201"), None),
         )
         .await;
     assert_eq!(code, 2, "{err}");
@@ -876,9 +891,11 @@ async fn real_sqlx_runner_cases() -> TestResult {
             Some(member.clone()),
             &host,
             &db,
-            Some(&expected_csv),
-            Some(&store_csv),
-            Some((&bad_hash, &store_hash, "424242", &plan_artifact)),
+            RunExpect::bound(
+                Some(&expected_csv),
+                Some(&store_csv),
+                (&bad_hash, &store_hash, "424242", &plan_artifact),
+            ),
         )
         .await;
     assert_eq!(code, 2, "{err}");
@@ -897,14 +914,16 @@ async fn real_sqlx_runner_cases() -> TestResult {
             Some(member.clone()),
             &host,
             &db,
-            Some(&expected_csv),
-            Some(&store_csv),
-            Some((
-                &plan_hash,
-                &store_hash,
-                "424242",
-                "/tmp/staging-migrate-db-no-such-manifest.json",
-            )),
+            RunExpect::bound(
+                Some(&expected_csv),
+                Some(&store_csv),
+                (
+                    &plan_hash,
+                    &store_hash,
+                    "424242",
+                    "/tmp/staging-migrate-db-no-such-manifest.json",
+                ),
+            ),
         )
         .await;
     assert_eq!(code, 2, "{err}");
@@ -923,9 +942,11 @@ async fn real_sqlx_runner_cases() -> TestResult {
             Some(member.clone()),
             &host,
             &db,
-            Some(&expected_csv),
-            Some(&store_csv),
-            Some((&plan_hash, &store_hash, "424242", &plan_artifact)),
+            RunExpect::bound(
+                Some(&expected_csv),
+                Some(&store_csv),
+                (&plan_hash, &store_hash, "424242", &plan_artifact),
+            ),
         )
         .await;
     assert_eq!(code, 0, "{err}");
@@ -1029,14 +1050,16 @@ async fn real_sqlx_runner_cases() -> TestResult {
             Some(member.clone()),
             &host,
             &db,
-            Some(&expected_csv),
-            Some(&store_csv),
-            Some((&plan_hash, &store_hash, "424242", &plan_artifact)),
+            RunExpect::bound(
+                Some(&expected_csv),
+                Some(&store_csv),
+                (&plan_hash, &store_hash, "424242", &plan_artifact),
+            ),
         )
         .await;
     assert_eq!(code, 2);
     let (code, out, err) = fx
-        .run("--plan", Some(ro.clone()), &host, &db, None, None, None)
+        .run("--plan", Some(ro.clone()), &host, &db, RunExpect::default())
         .await;
     assert_eq!(code, 0, "{err}");
     let empty_hash = manifest(&out)["plan_manifest_sha256"]
@@ -1061,9 +1084,11 @@ async fn real_sqlx_runner_cases() -> TestResult {
             Some(member.clone()),
             &host,
             &db,
-            Some(""),
-            Some(""),
-            Some((&empty_hash, &empty_store_hash, "424243", &empty_artifact)),
+            RunExpect::bound(
+                Some(""),
+                Some(""),
+                (&empty_hash, &empty_store_hash, "424243", &empty_artifact),
+            ),
         )
         .await;
     assert_eq!(code, 0, "{err}");
@@ -1083,16 +1108,18 @@ async fn real_sqlx_runner_cases() -> TestResult {
             Some(member.clone()),
             &host,
             &db,
-            Some(""),
-            Some(""),
-            Some((&empty_hash, &empty_store_hash, "424244", &empty_artifact)),
+            RunExpect::bound(
+                Some(""),
+                Some(""),
+                (&empty_hash, &empty_store_hash, "424244", &empty_artifact),
+            ),
         )
         .await;
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("drift"));
     // Restore the checksum from the source, then an incomplete row refuses.
     let (code, _, _) = fx
-        .run("--plan", Some(ro.clone()), &host, &db, None, None, None)
+        .run("--plan", Some(ro.clone()), &host, &db, RunExpect::default())
         .await;
     assert_eq!(code, 2);
     sqlx::query("DELETE FROM public._sqlx_migrations WHERE version = (SELECT max(version) FROM public._sqlx_migrations)")
@@ -1118,9 +1145,11 @@ async fn real_sqlx_runner_cases() -> TestResult {
             Some(member),
             &host,
             &db,
-            Some(""),
-            Some(""),
-            Some((&empty_hash, &empty_store_hash, "424245", &empty_artifact)),
+            RunExpect::bound(
+                Some(""),
+                Some(""),
+                (&empty_hash, &empty_store_hash, "424245", &empty_artifact),
+            ),
         )
         .await;
     assert_eq!(code, 2, "{err}");
@@ -1164,7 +1193,7 @@ async fn apply_with_post_run_read_fault(
     let ro = fx.url(&fx.rologin, &fx.database);
 
     let (code, out, err) = fx
-        .run("--plan", Some(ro), &host, &db, None, None, None)
+        .run("--plan", Some(ro), &host, &db, RunExpect::default())
         .await;
     assert_eq!(code, 0, "{err}");
     let plan = manifest(&out);
@@ -1208,9 +1237,11 @@ async fn apply_with_post_run_read_fault(
             Some(member),
             &host,
             &db,
-            Some(&expected_csv),
-            Some(&store_csv),
-            Some((&plan_hash, &store_hash, "424242", &plan_artifact)),
+            RunExpect::bound(
+                Some(&expected_csv),
+                Some(&store_csv),
+                (&plan_hash, &store_hash, "424242", &plan_artifact),
+            ),
         )
         .await;
     let mut c = fx.scratch().await?;
