@@ -14,10 +14,13 @@ aggregate, so no branch-protection change was needed.
 
 Red-group ejection without a revert: the reusable lane takes a
 `quarantine` input (whitespace-separated nextest filters, empty by
-default). Each filter becomes one `--skip`, so the rest of the suite
-still gates while the red group is out. Drilled on a throwaway draft PR
-(synthetic failing test went red, then green under quarantine, PR closed
-unmerged) before the promotion merged.
+default). Each filter becomes one `--skip` after the `--` separator
+(pinned cargo-nextest 0.9.99 only accepts `--skip` there), so the rest
+of the suite still gates while the red group is out. Drilled on a
+throwaway draft PR (synthetic failing test went red, then green under
+quarantine, PR closed unmerged) before the promotion merged; the first
+quarantine run caught a `--skip`-before-`--` usage error, which the fix
+and the re-run receipts on the promotion PR close out.
 
 ## What shipped in the pilot (advisory, this repo)
 
@@ -26,12 +29,13 @@ unmerged) before the promotion merged.
   existing `job-inputs` selector; the required `ci-ok` aggregator is
   untouched, so no required context can strand.
 - `Swatinem/rust-cache` (restore-only from the warm `check` entry) plus
-  `sccache` in `.github/workflows/reusable-rust-nextest.yml`: off-PR runs
-  (push to main, workflow_dispatch) use the R2 backend when
+  `sccache` in `.github/workflows/reusable-rust-nextest.yml`: push-to-main
+  and workflow_dispatch runs use the R2 backend when
   `SCCACHE_BUCKET`/`SCCACHE_ENDPOINT` secrets exist and degrade to the
-  GitHub-cache backend otherwise. Pull-request runs use sccache on local
-  disk only: no R2 write credential ever reaches PR-built code (the lane
-  compiles and executes code at the PR head, and a shared R2 bucket has no
+  GitHub-cache backend otherwise. Every other event (pull_request,
+  merge_group, ...) uses sccache on local disk only: no R2 write credential
+  ever reaches code that is not on `main` yet (the lane compiles and
+  executes code at an unmerged head, and a shared R2 bucket has no
   per-PR scope), and the lane writes no shared Actions-cache entry that
   could crowd out the warm `check` entry. No new paid SaaS, no new Actions
   minutes beyond the advisory job itself.

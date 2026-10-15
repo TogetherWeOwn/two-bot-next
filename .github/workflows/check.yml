@@ -695,19 +695,22 @@ jobs:
       # Drill ejection only (throwaway PR, closed unmerged): skip the
       # synthetic red group so the rest of the suite still gates.
       quarantine: 'drill_synthetic_red_group_fails_until_ejected'
-    # R2 write credentials stay off pull_request events: the lane compiles
-    # and executes code at the PR head, and the reusable lane independently
-    # refuses shared backends on PRs (defense in depth; see its backend
-    # step). Empty on PRs, so the lane falls back to local-disk sccache.
-    # NOTE: the gate must read `!= 'pull_request' && secrets.X || ''`. The
-    # seemingly equivalent `== 'pull_request' && '' || secrets.X` forwards
-    # the secret anyway, because '' is falsy in GitHub expressions.
+    # R2 write credentials flow only on push to main and workflow_dispatch:
+    # the lane compiles and executes code, and any other event (pull_request,
+    # merge_group, ...) runs a head that is not on `main` yet. The reusable
+    # lane independently refuses shared backends off those two events
+    # (defense in depth; see its backend step). Empty elsewhere, so the lane
+    # falls back to local-disk sccache.
+    # NOTE: the gate must read `(== 'push' || == 'workflow_dispatch') &&
+    # secrets.X || ''`. A `!= 'pull_request' && secrets.X` form forwards the
+    # secret on merge_group, and `== 'pull_request' && '' || secrets.X`
+    # forwards it everywhere, because '' is falsy in GitHub expressions.
     secrets:
-      SCCACHE_BUCKET: ${{ github.event_name != 'pull_request' && secrets.SCCACHE_BUCKET || '' }}
-      SCCACHE_ENDPOINT: ${{ github.event_name != 'pull_request' && secrets.SCCACHE_ENDPOINT || '' }}
-      SCCACHE_REGION: ${{ github.event_name != 'pull_request' && secrets.SCCACHE_REGION || '' }}
-      AWS_ACCESS_KEY_ID: ${{ github.event_name != 'pull_request' && secrets.AWS_ACCESS_KEY_ID || '' }}
-      AWS_SECRET_ACCESS_KEY: ${{ github.event_name != 'pull_request' && secrets.AWS_SECRET_ACCESS_KEY || '' }}
+      SCCACHE_BUCKET: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.SCCACHE_BUCKET || '' }}
+      SCCACHE_ENDPOINT: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.SCCACHE_ENDPOINT || '' }}
+      SCCACHE_REGION: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.SCCACHE_REGION || '' }}
+      AWS_ACCESS_KEY_ID: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.AWS_ACCESS_KEY_ID || '' }}
+      AWS_SECRET_ACCESS_KEY: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.AWS_SECRET_ACCESS_KEY || '' }}
 
   ignored-db-stores:
     name: ignored db (stores)
