@@ -1476,6 +1476,62 @@ async fn duplicate_voice_frames_and_duplicate_tickets_do_not_create_twice() {
 }
 
 #[tokio::test]
+async fn refused_creator_joins_log_channel_and_creator_map_state() {
+    // Stall triage needs the refusing channel and the creator-map state on
+    // every refusal line: the channel id, the ticket's map generation versus
+    // the live one, whether the channel is a known creator, and the map size.
+    let (bytes, _subscriber) = capture_join_logs();
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let ticket = join(&mut worker, MEMBER);
+    // Same ticket twice: the repeat is refused as a benign duplicate while
+    // the channel stays a known creator.
+    assert!(!worker.accept_join(ticket.clone(), "duplicate", 8, NOW.to_owned()));
+    // A join into a channel the creator map never held.
+    let unknown = JoinTicket {
+        creator_id: 999,
+        ..ticket.clone()
+    };
+    assert!(!worker.accept_join(unknown, "new room", 9, NOW.to_owned()));
+    // A name the automod filter blocks: refused as name_blocked with the
+    // same channel and map-state fields.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http)
+        .await
+        .unwrap()
+        .with_name_policy(Arc::new(fixture_policy(&["room"])));
+    assert!(!join_as(&mut worker, MEMBER, "Ava"));
+    let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+    let refusals: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["fields"]["message"] == "voice creator join refused before queueing")
+        .collect();
+    assert_eq!(refusals.len(), 3, "{text}");
+    let fields = &refusals[0]["fields"];
+    assert_eq!(fields["reason"], "duplicate");
+    assert_eq!(fields["channel"], CREATOR.to_string());
+    assert_eq!(fields["ticket_generation"], ticket.generation);
+    assert_eq!(fields["live_generation"], ticket.generation);
+    assert_eq!(fields["known"], true);
+    assert_eq!(fields["creators_len"], 1);
+    assert_eq!(fields["halted"], false);
+    assert_eq!(fields["ready"], true);
+    let fields = &refusals[1]["fields"];
+    assert_eq!(fields["reason"], "unknown_creator");
+    assert_eq!(fields["channel"], "999");
+    assert_eq!(fields["ticket_generation"], ticket.generation);
+    assert_eq!(fields["live_generation"], ticket.generation);
+    assert_eq!(fields["known"], false);
+    assert_eq!(fields["creators_len"], 1);
+    let fields = &refusals[2]["fields"];
+    assert_eq!(fields["reason"], "name_blocked");
+    assert_eq!(fields["channel"], CREATOR.to_string());
+    assert_eq!(fields["known"], true);
+    assert_eq!(fields["creators_len"], 1);
+}
+
+#[tokio::test]
 async fn two_simultaneous_members_get_distinct_persisted_rooms() {
     let (live, store, http, trace) = fixture();
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();

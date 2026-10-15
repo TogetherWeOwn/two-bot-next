@@ -3023,20 +3023,51 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         };
         if let Some(reason) = refusal {
             metrics::global().voice_join_refused(reason);
+            // Name the refusal reason, the refusing channel, and the
+            // creator-map state at join time: the next restart-cured stall
+            // must not need guessing. No member, name or token content is
+            // logged: counts, booleans, clocks and ids only.
+            let live_state = self.live.read_state();
+            let creators_len = self.creators.len() as u64;
+            let known = self.creators.contains_key(&ticket.creator_id);
             if reason == "halted" {
                 warn!(
                     guild = self.live.guild_id.to_string(),
-                    reason, "voice creator join refused before queueing"
+                    channel = ticket.creator_id.to_string(),
+                    reason,
+                    creators_len,
+                    known,
+                    halted = self.halted,
+                    ready = live_state.ready,
+                    live_generation = live_state.generation,
+                    ticket_generation = ticket.generation,
+                    "voice creator join refused before queueing"
                 );
             } else if reason == "duplicate" {
                 debug!(
                     guild = self.live.guild_id.to_string(),
-                    reason, "voice creator join refused before queueing"
+                    channel = ticket.creator_id.to_string(),
+                    reason,
+                    creators_len,
+                    known,
+                    halted = self.halted,
+                    ready = live_state.ready,
+                    live_generation = live_state.generation,
+                    ticket_generation = ticket.generation,
+                    "voice creator join refused before queueing"
                 );
             } else {
                 info!(
                     guild = self.live.guild_id.to_string(),
-                    reason, "voice creator join refused before queueing"
+                    channel = ticket.creator_id.to_string(),
+                    reason,
+                    creators_len,
+                    known,
+                    halted = self.halted,
+                    ready = live_state.ready,
+                    live_generation = live_state.generation,
+                    ticket_generation = ticket.generation,
+                    "voice creator join refused before queueing"
                 );
             }
             return false;
@@ -3064,9 +3095,17 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     error: blocked.error,
                 });
                 metrics::global().voice_join_refused("name_blocked");
+                let live_state = self.live.read_state();
                 info!(
                     guild = self.live.guild_id.to_string(),
+                    channel = ticket.creator_id.to_string(),
                     reason = "name_blocked",
+                    creators_len = self.creators.len() as u64,
+                    known = self.creators.contains_key(&ticket.creator_id),
+                    halted = self.halted,
+                    ready = live_state.ready,
+                    live_generation = live_state.generation,
+                    ticket_generation = ticket.generation,
                     "voice creator join refused before queueing"
                 );
                 timing.finish("name_blocked");
