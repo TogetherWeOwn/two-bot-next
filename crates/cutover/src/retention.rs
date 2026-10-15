@@ -1082,20 +1082,9 @@ mod ledger_tests {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn report(
-        presence: u64,
-        voice: u64,
-        audit: u64,
-        guild_rows: u64,
-        failed: u64,
-        deferred_guilds: u64,
-        oldest_secs: u64,
-        completed: u64,
-        deferred: u64,
-        gap: u64,
-        overdue: u64,
-    ) -> RetentionReport {
+    fn report(values: [u64; 11]) -> RetentionReport {
+        let [presence, voice, audit, guild_rows, failed, deferred_guilds, oldest_secs, completed, deferred, gap, overdue] =
+            values;
         RetentionReport {
             presence_raw_deleted: presence,
             voice_raw_deleted: voice,
@@ -1114,7 +1103,7 @@ mod ledger_tests {
 
     #[test]
     fn empty_run_deletes_nothing() {
-        let idle = report(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        let idle = report([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(idle.total_deleted(), 0);
     }
 
@@ -1130,7 +1119,7 @@ mod ledger_tests {
                 rng.below(1_000_000),
                 rng.below(1_000_000),
             );
-            let raffle = report(
+            let raffle = report([
                 presence,
                 voice,
                 audit,
@@ -1142,7 +1131,7 @@ mod ledger_tests {
                 rng.next(),
                 rng.next(),
                 rng.next(),
-            );
+            ]);
             assert_eq!(
                 raffle.total_deleted(),
                 presence + voice + audit + guild_rows,
@@ -1164,7 +1153,7 @@ mod ledger_tests {
                 rng.below(1_000_000),
                 rng.below(1_000_000),
             );
-            let dry = report(
+            let dry = report([
                 presence,
                 voice,
                 audit,
@@ -1176,8 +1165,8 @@ mod ledger_tests {
                 rng.next(),
                 rng.next(),
                 rng.next(),
-            );
-            let live = report(
+            ]);
+            let live = report([
                 presence,
                 voice,
                 audit,
@@ -1189,7 +1178,7 @@ mod ledger_tests {
                 rng.next(),
                 rng.next(),
                 rng.next(),
-            );
+            ]);
             assert_eq!(
                 dry.total_deleted(),
                 live.total_deleted(),
