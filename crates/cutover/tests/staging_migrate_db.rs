@@ -1121,3 +1121,45 @@ async fn post_apply_unreadable_ledger_is_unknown_not_empty() -> TestResult {
     assert_eq!(run.present.len(), total, "every pending migration applied");
     Ok(())
 }
+
+/// The connection count must be visible to the unprivileged plan login:
+/// `backend_type` is NULL for other roles' sessions without
+/// `pg_read_all_stats`, so a filtered `pg_stat_activity` count sees only the
+/// reader's own session. Open sessions as another role and read through the
+/// plan-style RO login; the count must include them.
+#[tokio::test]
+#[ignore = "requires agent-testdb or the CI service"]
+async fn connection_count_sees_other_roles_from_plan_login() -> TestResult {
+    use two_bot_cutover::staging_migrate::CONNECTION_COUNT_SQL;
+
+    let fx = Fixture::new().await?;
+    let result = async {
+        let outsider_options = PgConnectOptions::new_without_pgpass()
+            .host(&fx.host)
+            .port(5432)
+            .username(&fx.outsider)
+            .password("")
+            .database(&fx.database)
+            .ssl_mode(PgSslMode::Disable);
+        let mut others = Vec::new();
+        for _ in 0..3 {
+            others.push(PgConnection::connect_with(&outsider_options).await?);
+        }
+        let mut reader = fx.ro_session().await?;
+        let used: i64 = sqlx::query_scalar(CONNECTION_COUNT_SQL)
+            .fetch_one(&mut reader)
+            .await?;
+        assert!(
+            used >= 3,
+            "plan login must see the 3 other-role sessions, counted {used}"
+        );
+        for mut conn in others {
+            conn.close().await?;
+        }
+        reader.close().await?;
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    }
+    .await;
+    fx.finish().await?;
+    result
+}

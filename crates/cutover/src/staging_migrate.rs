@@ -915,9 +915,12 @@ async fn audit_queries(pool: &PgPool) -> Result<Value, &'static str> {
     // Connection pressure: staging once refused all logins at 25/25
     // connections with no prior signal. Both counters are readable by any
     // login and live in pg_catalog, so they survive the search_path pin.
-    // Count only real client backends: pg_stat_activity also lists aux
-    // processes (walwriter, checkpointer, background writer, autovacuum and
-    // replication launchers) that do not count against max_connections.
+    // Count real client backends from pg_stat_database: every login can
+    // read numbackends in full, while pg_stat_activity.backend_type is NULL
+    // for other roles' sessions unless the reader holds pg_read_all_stats
+    // (the plan login does not), which would hide exactly the sessions that
+    // saturate the database. Aux processes are not backends and never
+    // appear in numbackends.
     let connections_used: i64 = sqlx::query_scalar(CONNECTION_COUNT_SQL)
         .fetch_one(&mut *tx)
         .await
@@ -960,13 +963,15 @@ async fn audit_queries(pool: &PgPool) -> Result<Value, &'static str> {
     }))
 }
 
-/// Client-backend count: `pg_stat_activity` lists one row per server process,
-/// including aux processes (walwriter, checkpointer, background writer,
-/// autovacuum and replication launchers) that do not count against
-/// `max_connections`. Filter to real client connections so the 80% warning
-/// does not fire ~20 points early on the 25-connection staging database.
+/// Client-backend count from `pg_stat_database`: aux processes (walwriter,
+/// checkpointer, background writer, autovacuum and replication launchers)
+/// are not backends, so `numbackends` excludes them without the
+/// `backend_type` filter — whose value is NULL for other roles' sessions
+/// unless the reader holds `pg_read_all_stats`, which the plan login does
+/// not. Every login reads this in full, so the 80% warning can fire when
+/// the runtime role's sessions saturate the database.
 pub const CONNECTION_COUNT_SQL: &str =
-    "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend'";
+    "SELECT coalesce(sum(numbackends), 0)::bigint FROM pg_stat_database";
 
 /// Non-superuser login ceiling: `max_connections` minus
 /// `superuser_reserved_connections`. Degenerate inputs floor at 1 so the
@@ -2666,13 +2671,20 @@ mod tests {
     }
 
     #[test]
-    fn connection_count_excludes_aux_processes() {
+    fn connection_count_uses_fully_readable_source() {
+        // `backend_type` is NULL for other roles' sessions unless the reader
+        // holds pg_read_all_stats, which the plan login does not; the count
+        // must come from pg_stat_database, readable in full by every login.
         assert!(
-            CONNECTION_COUNT_SQL.contains("backend_type"),
+            CONNECTION_COUNT_SQL.contains("pg_stat_database"),
             "{CONNECTION_COUNT_SQL}"
         );
         assert!(
-            CONNECTION_COUNT_SQL.contains("client backend"),
+            CONNECTION_COUNT_SQL.contains("numbackends"),
+            "{CONNECTION_COUNT_SQL}"
+        );
+        assert!(
+            !CONNECTION_COUNT_SQL.contains("backend_type"),
             "{CONNECTION_COUNT_SQL}"
         );
     }

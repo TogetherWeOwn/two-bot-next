@@ -30,7 +30,8 @@ EXPECTED_BRANCH_ENV = "TWO_BOT_STAGING_BRANCH_ID"
 # the evidence: a read-only plan needs no human review reference.
 GATE_REF = "deploy-staging-schema-gate"
 # Mirror the staging-migrate plan warning (CONNECTION_WARN_PCT there):
-# strictly above 80% of max_connections warns, never fails.
+# strictly above 80% of the effective (non-superuser) ceiling warns,
+# never fails.
 CONNECTION_WARN_PCT = 80.0
 I64_MAX = 2**63 - 1
 
@@ -153,8 +154,11 @@ def connection_warning(manifest):
 
     Reads the real plan-manifest shape the binary emits:
     ``manifest["audit"]["connection_usage"]`` with ``used`` and
-    ``max_connections`` counts. Degenerate or absent usage never warns,
-    mirroring the binary's own warning boundary (strictly above 80%).
+    ``max_connections`` counts. The ratio uses the non-superuser ceiling
+    the binary warns on: ``effective_max_connections`` when present, else
+    ``max_connections - reserved_connections``, else raw ``max_connections``
+    (older manifests). Degenerate or absent usage never warns, mirroring
+    the binary's own warning boundary (strictly above 80%).
     """
     if not isinstance(manifest, dict):
         return None
@@ -168,10 +172,19 @@ def connection_warning(manifest):
         return None
     if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0:
         return None
-    if used / maximum * 100.0 > CONNECTION_WARN_PCT:
+    ceiling = usage.get("effective_max_connections")
+    ceiling_label = "the non-superuser connection ceiling"
+    if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling <= 0:
+        reserved = usage.get("reserved_connections")
+        if isinstance(reserved, bool) or not isinstance(reserved, int):
+            ceiling = maximum
+            ceiling_label = "max_connections"
+        else:
+            ceiling = max(maximum - max(reserved, 0), 1)
+    if used / ceiling * 100.0 > CONNECTION_WARN_PCT:
         return (
-            f"staging database connection usage is {used}/{maximum} "
-            f"({used / maximum:.0%} of max_connections); "
+            f"staging database connection usage is {used}/{ceiling} "
+            f"({used / ceiling:.0%} of {ceiling_label}); "
             "logins may refuse under saturation."
         )
     return None

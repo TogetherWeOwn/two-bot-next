@@ -153,6 +153,30 @@ class ConnectionWarningTests(unittest.TestCase):
         self.assertIsNone(connection_warning(manifest(80, 100)))
         self.assertIsNotNone(connection_warning(manifest(81, 100)))
 
+    def test_effective_ceiling_from_reserved_warns(self):
+        # 18/25 is 72% of raw max but 82% of the 22-login ceiling.
+        manifest = {"audit": {"connection_usage": {
+            "used": 18, "max_connections": 25, "reserved_connections": 3}}}
+        warning = connection_warning(manifest)
+        self.assertIsNotNone(warning)
+        self.assertIn("18/22", warning)
+
+    def test_effective_max_field_warns_without_reserved(self):
+        manifest = {"audit": {"connection_usage": {
+            "used": 18, "max_connections": 25, "effective_max_connections": 22}}}
+        warning = connection_warning(manifest)
+        self.assertIsNotNone(warning)
+        self.assertIn("18/22", warning)
+
+    def test_older_manifest_without_ceiling_uses_raw_max(self):
+        def manifest(used):
+            return {"audit": {"connection_usage": {"used": used, "max_connections": 25}}}
+
+        self.assertIsNone(connection_warning(manifest(20)))
+        warning = connection_warning(manifest(21))
+        self.assertIsNotNone(warning)
+        self.assertIn("21/25", warning)
+
     def test_degenerate_or_misplaced_usage_never_warns(self):
         for bad in (
             {"audit": None},
