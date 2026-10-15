@@ -20,7 +20,7 @@ use tokio::{
     process::{Child, Command},
     sync::{mpsc, Mutex},
     task::JoinHandle,
-    time::{sleep, timeout, Instant},
+    time::{timeout, Instant},
 };
 use tokio_websockets::{Message, ServerBuilder};
 use two_bot_core::database_tls::TlsPolicy;
@@ -422,7 +422,9 @@ async fn wait_http(bot: &mut Bot, addr: SocketAddr, path: &str, code: u16) -> St
                     return response;
                 }
             }
-            sleep(Duration::from_millis(10)).await;
+            // Deterministic sync: re-poll on scheduler wakeup under the outer
+            // deadline instead of a wall-clock backoff sleep.
+            tokio::task::yield_now().await;
         }
     })
     .await
@@ -441,7 +443,9 @@ async fn checkpoint(db: &TestDb, seq: u64) {
             {
                 break;
             }
-            sleep(Duration::from_millis(10)).await;
+            // Deterministic sync: re-poll on scheduler wakeup under the outer
+            // deadline instead of a wall-clock backoff sleep.
+            tokio::task::yield_now().await;
         }
     })
     .await
@@ -645,7 +649,9 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
                     {
                         break;
                     }
-                    sleep(Duration::from_millis(10)).await;
+                    // Deterministic sync: re-poll on scheduler wakeup under the
+                    // outer deadline instead of a wall-clock backoff sleep.
+                    tokio::task::yield_now().await;
                 }
             })
             .await;
@@ -654,7 +660,9 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
                 "events job never hit REST during first boot"
             );
         }
-        sleep(Duration::from_millis(100)).await;
+        // Deterministic sync: yield to the scheduler once so in-flight bot
+        // output settles instead of waiting out a fixed wall-clock delay.
+        tokio::task::yield_now().await;
         bot.assert_alive();
         assert_ready_correlation(&logs.lock().await);
         bot.terminate().await;

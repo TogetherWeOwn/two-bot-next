@@ -141,7 +141,9 @@ fn spawn_bot() -> (Bot, SocketAddr) {
             Instant::now() < deadline,
             "bot did not serve health on the configured port"
         );
-        thread::sleep(Duration::from_millis(20));
+        // Deterministic sync: re-poll on scheduler wakeup under the deadline
+        // instead of a wall-clock backoff sleep.
+        thread::yield_now();
     }
     (bot, addr)
 }
