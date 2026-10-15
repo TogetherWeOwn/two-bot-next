@@ -190,6 +190,22 @@ fn refuse<T>(message: impl Into<String>) -> Result<T, RunError> {
     Err(RunError::Refused(message.into()))
 }
 
+fn with_cutover_evidence(
+    error: RunError,
+    cutover_after: &[LedgerRow],
+    cutover_applied: usize,
+) -> RunError {
+    match error {
+        RunError::Failed(message, evidence) => {
+            let mut evidence = evidence.as_object().cloned().unwrap_or_default();
+            evidence.insert("ledger_after".to_owned(), ledger_json(cutover_after));
+            evidence.insert("applied_count".to_owned(), json!(cutover_applied));
+            RunError::Failed(message, Value::Object(evidence))
+        }
+        RunError::Refused(message) => RunError::Refused(message),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Request {
     pub url: Option<String>,
@@ -1265,7 +1281,7 @@ async fn apply_chain(
     // literals (one per chain) so no table name is interpolated from input.
     let ledger_key = match chain {
         Chain::Cutover => "ledger_after",
-        Chain::Store => "store_ledger_after",
+        Chain::Store => "ledger_store_after",
     };
     let outcome = migrator.run(pool).await;
     let read_back = read_ledger_after_run(pool, chain).await;
@@ -1403,7 +1419,9 @@ async fn run_on_pool(
             applied = count;
         }
         if !store_pending.is_empty() {
-            let (rows, count) = apply_chain(pool, Chain::Store, &store, &store_before).await?;
+            let (rows, count) = apply_chain(pool, Chain::Store, &store, &store_before)
+                .await
+                .map_err(|error| with_cutover_evidence(error, &after, applied))?;
             store_after = rows;
             store_applied = count;
         }
@@ -1461,6 +1479,23 @@ mod tests {
                 checksum_hex: hex::encode(&m.checksum),
             })
             .collect()
+    }
+
+    #[test]
+    fn store_failure_retains_committed_cutover_evidence() {
+        let cutover = rows();
+        let failure = RunError::Failed(
+            "store migration failed".to_owned(),
+            json!({"error": "store failure", "ledger_store_after_failure": LEDGER_UNKNOWN}),
+        );
+
+        let RunError::Failed(_, evidence) = with_cutover_evidence(failure, &cutover, cutover.len())
+        else {
+            panic!("failure should stay a failure");
+        };
+        assert_eq!(evidence["ledger_after"], ledger_json(&cutover));
+        assert_eq!(evidence["applied_count"], cutover.len());
+        assert_eq!(evidence["ledger_store_after_failure"], LEDGER_UNKNOWN);
     }
 
     #[test]

@@ -147,13 +147,17 @@ def drift_message(pending, source_sha, store_pending=()):
         f"schema drift: staging database is behind source {source_sha}: "
         f"pending versions [{versions}]. Run the manual staging-migrate apply "
         f"dispatch for that source with expected_pending \"{versions}\" "
-        "(reviewed plan required), then re-run deploy-staging."
+        "(reviewed plan required)."
     )
+    if not store_pending:
+        message += " Then re-run deploy-staging."
     if store_pending:
         store_versions = ",".join(str(v) for v in store_pending)
         message += (
             f" Store chain also behind: pending store versions [{store_versions}] "
-            f"(expected_store_pending \"{store_versions}\")."
+            f"(expected_store_pending \"{store_versions}\"). After apply, reapply "
+            "the full role-plan (`two-bot db roles plan`), verify it reports "
+            "0 findings, then redeploy."
         )
     return message
 

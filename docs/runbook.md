@@ -893,8 +893,13 @@ Outcomes: `pending_before` and `pending_store_before` both empty prints
 `schema drift: staging database is behind source <sha>: pending versions [...]`
 — fix it with the manual `staging-migrate` apply dispatch for that source
 (reviewed plan, exact `expected_pending` plus `expected_store_pending` when
-the store chain is behind), then re-run `deploy-staging`. The gate never fixes drift
-itself. The plan manifest is written to `staging-schema-gate-manifest.json`
+the store chain is behind). When applying the store chain, the apply creates a
+new ledger whose default privileges do not automatically grant the plan login
+read access: reapply the full reviewed role plan (`two-bot db roles plan`), run
+`verify` and require 0 findings, then re-run `deploy-staging`. The drift output
+prints this sequence. For cutover-only apply, re-run `deploy-staging` after
+apply. The gate never fixes drift itself. The plan manifest is written to
+`staging-schema-gate-manifest.json`
 in the job workspace; its `audit.connection_usage` (sessions summed from
 `pg_stat_database.numbackends`, readable in full by the plan login) warns —
 never fails — when usage is strictly above 80% of the non-superuser ceiling

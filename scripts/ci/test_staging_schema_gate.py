@@ -145,11 +145,15 @@ class DriftMessageTests(unittest.TestCase):
         self.assertIn("apply", message)
         self.assertNotIn("Store chain", message)
 
-    def test_store_drift_names_the_store_fix(self):
+    def test_store_drift_names_the_store_fix_and_role_restore_sequence(self):
         message = drift_message([], "a" * 40, [400, 401])
         self.assertIn("schema drift", message)
         self.assertIn("400", message)
         self.assertIn("expected_store_pending", message)
+        self.assertIn("reapply the full role-plan", message)
+        self.assertIn("two-bot db roles plan", message)
+        self.assertIn("verify", message)
+        self.assertIn("redeploy", message)
 
 
 class ConnectionWarningTests(unittest.TestCase):
