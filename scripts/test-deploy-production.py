@@ -1289,6 +1289,20 @@ class ShellStepTests(unittest.TestCase):
                 self.assertEqual(code, exit_code, summary)
                 self.assertIn(expected, summary)
 
+    def test_rollback_pre_stamp_still_needs_gateway_ready(self):
+        # The workflow gate polls this script: 18 parked pre-stamp answers
+        # must never count as a stable pass on a pre-stamping rollback.
+        parked_pre_stamp = json.dumps({"components": [["process", "ready"], ["gateway", "down"],
+                                                       ["database", "ready"], ["token_invalid", "ready"]],
+                                       "jobs": {}, "build_revision": "unknown", "build_id": "unknown"})
+        pre_stamp = report(revision="unknown", build_id="unknown")
+        for status, body in (("503", pre_stamp), ("200", parked_pre_stamp), ("503", parked_pre_stamp)):
+            with self.subTest(status=status):
+                code, summary, _ = self.gate({"/health": [(200, "{}")], "/readyz": [(status, body)]},
+                                             mode="rollback")
+                self.assertEqual(code, 1, summary)
+                self.assertIn("roll back", summary)
+
     def test_production_url_must_be_https_and_not_staging(self):
         staging = "https://staging.example.workers.dev"
         for url, ok in (("", False), ("http://prod.example.workers.dev", False), (staging, False),
@@ -1419,9 +1433,21 @@ class ReadyzVerdictTests(unittest.TestCase):
 
     def test_rollback_passes_the_supplied_revision_or_a_pre_stamp_target(self):
         self.assertEqual(self.judge("200", report(), mode="rollback")[0], 0)
-        code, message = self.judge("503", report(revision="unknown", build_id="unknown"), mode="rollback")
+        # A pre-stamp rollback still needs a live 200 with gateway ready:
+        # parked answers never certify a build from before stamping.
+        code, message = self.judge("200", report(revision="unknown", build_id="unknown"), mode="rollback")
         self.assertEqual(code, 0)
         self.assertIn("pre-stamp version", message)
+        parked_pre_stamp = json.dumps({"components": [["process", "ready"], ["gateway", "down"],
+                                                       ["database", "ready"], ["token_invalid", "ready"]],
+                                       "jobs": {}, "build_revision": "unknown", "build_id": "unknown"})
+        for status, body in (("503", report(revision="unknown", build_id="unknown")),
+                             ("200", parked_pre_stamp),
+                             ("503", parked_pre_stamp)):
+            with self.subTest(status=status):
+                code, message = self.judge(status, body, mode="rollback")
+                self.assertEqual(code, 1, message)
+                self.assertIn("gateway not ready", message)
         self.assertEqual(self.judge("200", report(revision="f" * 40), mode="rollback")[0], 1)
         self.assertEqual(self.judge("200", report(revision="unknown", build_id=BUILD_ID), mode="rollback")[0], 1)
         # The rolled-back version was built by an older run: its build id is

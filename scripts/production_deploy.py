@@ -172,6 +172,11 @@ def readyz(args):
         print(f"gateway ready, revision matches the SHA, build {build_id}")
         return 0
     if args.mode == "rollback" and revision == build_id == UNSTAMPED:
+        # Pre-stamp identity is recorded, not verified: it still needs a live
+        # 200 with gateway ready, so parked 503s never count as a stable pass
+        # on a rollback to a build from before stamping.
+        if args.status != "200" or not _gateway_ready(report):
+            return reject("gateway not ready: /readyz is not 200 with gateway ready; roll back")
         print("pre-stamp version: build identity unknown, revision not verifiable (recorded; rollback not failed)")
         return 0
     if revision == UNSTAMPED:

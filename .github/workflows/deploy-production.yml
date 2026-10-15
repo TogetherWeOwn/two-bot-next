@@ -283,7 +283,8 @@ jobs:
               # latest green deploy-staging run on this SHA. A rollback or a
               # live-SHA redeploy waives that history, so it still needs the
               # human Environment reviewers even with auto-approve on.
-              refuse("the production Environment has no required reviewers for a staging-history waiver")
+              refuse("the production Environment has no required reviewers for a staging-history waiver "
+                     "(add a required reviewer; auto-approve does not cover rollback/live-SHA cure)")
           policy = env.get("deployment_branch_policy") or {}
           if not policy.get("custom_branch_policies"):
               refuse("the production Environment must restrict deployments to main")
