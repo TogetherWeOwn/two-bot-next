@@ -1967,15 +1967,101 @@ class WorkflowTests(unittest.TestCase):
         lines = run_text.splitlines()
         gate = next(i for i, line in enumerate(lines)
                     if "NEXTEST_EVENT" in line and "pull_request" in line)
-        self.assertTrue(lines[gate].strip().startswith("if "),
-                        f"pull_request guard must be the first branch, got: {lines[gate]!r}")
+        # Exact pin: an inverted (!=), dead (&& false), or reordered guard
+        # all keep the `if ` prefix, so pin the full first line.
+        self.assertEqual(
+            lines[gate].strip(),
+            'if [ "$NEXTEST_EVENT" = "pull_request" ]; then',
+            f"pull_request guard must be the exact first branch, got: {lines[gate]!r}",
+        )
         before = "\n".join(lines[:gate])
         self.assertNotIn("GITHUB_ENV", before)
         self.assertNotIn("R2_", before)
         self.assertNotIn("SCCACHE_", before)
+        # The pull_request body must write nothing shared: an extra
+        # SCCACHE_/R2_/GITHUB_ENV write inside the PR branch keeps every
+        # substring above while leaking credentials on PR runs.
+        end = next(
+            i
+            for i in range(gate + 1, len(lines))
+            if lines[i].strip().startswith("elif ")
+            or lines[i].strip() == "else"
+            or lines[i].strip().startswith("fi")
+        )
+        pr_body = "\n".join(lines[gate + 1 : end])
+        self.assertNotIn("GITHUB_ENV", pr_body)
+        self.assertNotIn("R2_", pr_body)
+        self.assertNotIn("SCCACHE_", pr_body)
+        self.assertNotIn("AWS_", pr_body)
         # The shared backends are still configured off-PR: this guards
         # against gutting the step instead of guarding it.
-        self.assertIn("GITHUB_ENV", "\n".join(lines[gate:]))
+        self.assertIn("GITHUB_ENV", "\n".join(lines[end:]))
+        # Behavioral pin: run the extracted step under bash. On PRs the
+        # env file stays empty even with all R2 vars set; off-PR the R2
+        # lines appear. Catches inverted/dead guards and PR-branch writes
+        # that structural pins miss.
+        import os
+        import subprocess
+        import tempfile
+
+        r2_env = {
+            "R2_BUCKET": "test-bucket",
+            "R2_ENDPOINT": "https://test.example.com",
+            "R2_REGION": "auto",
+            "R2_KEY": "test-key",
+            "R2_SECRET": "test-secret",
+        }
+        with tempfile.NamedTemporaryFile(mode="r", delete=False) as tmp:
+            backend_env_path = tmp.name
+        try:
+            base = dict(os.environ)
+            pr_env = dict(base)
+            pr_env.update(
+                {
+                    "NEXTEST_EVENT": "pull_request",
+                    **r2_env,
+                    "GITHUB_ENV": backend_env_path,
+                }
+            )
+            Path(backend_env_path).write_text("", encoding="utf-8")
+            proc = subprocess.run(
+                ["bash", "-c", run_text],
+                env=pr_env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(proc.returncode, 0, f"PR backend step failed: {proc.stderr}")
+            self.assertEqual(
+                Path(backend_env_path).read_text(encoding="utf-8"),
+                "",
+                "PR run must not write shared-backend credentials",
+            )
+            push_env = dict(base)
+            push_env.update(
+                {
+                    "NEXTEST_EVENT": "push",
+                    **r2_env,
+                    "GITHUB_ENV": backend_env_path,
+                }
+            )
+            Path(backend_env_path).write_text("", encoding="utf-8")
+            proc = subprocess.run(
+                ["bash", "-c", run_text],
+                env=push_env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(proc.returncode, 0, f"push backend step failed: {proc.stderr}")
+            written = Path(backend_env_path).read_text(encoding="utf-8")
+            self.assertIn("SCCACHE_BUCKET=test-bucket", written)
+            self.assertIn("AWS_ACCESS_KEY_ID=test-key", written)
+        finally:
+            try:
+                os.unlink(backend_env_path)
+            except FileNotFoundError:
+                pass
         raw = (ROOT / ".github/workflows/reusable-rust-nextest.yml").read_text(encoding="utf-8")
         self.assertNotIn("adds no cache footprint", raw)
 
