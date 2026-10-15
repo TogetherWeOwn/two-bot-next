@@ -1,0 +1,144 @@
+name: ci-speed
+
+# Advisory CI speed pilot (SDLC 2.3): paths-filter affected-only selection,
+# the shared nextest lane, and the minutes-per-merged-PR report. Never a
+# required check and never part of ci-ok: a red pilot run is a signal, not a
+# merge gate. No `paths:` filter on the trigger: that would skip the whole
+# workflow including the report job.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Repo policy (scripts/ci/test_workflows.py): top-level permissions stay
+# empty; the least-privilege grant lives on each job instead.
+permissions: {}
+
+concurrency:
+  group: ci-speed-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    name: affected paths
+    permissions:
+      contents: read
+    # Runner routing (TOG-12339): public repo -> GitHub-hosted, private ->
+    # CI_OVERFLOW_* switch for this named job, then the self-hosted pool.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'changes') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      worker: ${{ steps.filter.outputs.worker }}
+      docs: ${{ steps.filter.outputs.docs }}
+      ci: ${{ steps.filter.outputs.ci }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # Affected-only pre-filter for the advisory lane. Required lanes keep
+      # the authoritative `job-inputs` selector; this output only decides
+      # whether the advisory nextest run below is worth its minutes.
+      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3.0.4
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'crates/**'
+              - 'src/**'
+              - 'tests/**'
+              - 'fuzz/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'deny.toml'
+              - 'migrations.lock'
+              - 'Dockerfile'
+              - 'Dockerfile.distroless'
+              - '.dockerignore'
+              - 'sql/**'
+              - '.config/nextest.toml'
+              - 'scripts/ci/flake_ledger.py'
+              - 'scripts/ci/test_flake_ledger.py'
+              - '.github/workflows/reusable-rust-nextest.yml'
+              - '.github/workflows/ci-speed.yml'
+            worker:
+              - 'wrangler/**'
+            docs:
+              - 'docs/**'
+              - '*.md'
+            ci:
+              - '.github/**'
+              - 'scripts/**'
+
+      - name: Selection note (advisory only)
+        env:
+          SEL_RUST: ${{ steps.filter.outputs.rust }}
+          SEL_WORKER: ${{ steps.filter.outputs.worker }}
+          SEL_DOCS: ${{ steps.filter.outputs.docs }}
+          SEL_CI: ${{ steps.filter.outputs.ci }}
+        run: |
+          printf 'paths-filter: rust=%s worker=%s docs=%s ci=%s\n' \
+            "$SEL_RUST" "$SEL_WORKER" "$SEL_DOCS" "$SEL_CI"
+
+  nextest:
+    name: rust nextest (advisory)
+    permissions:
+      contents: read
+    needs: [changes]
+    # Affected-only: Rust-untouched PRs skip the lane instead of burning a
+    # compile. The required matrix is unaffected; this is pilot signal only.
+    if: needs.changes.outputs.rust == 'true'
+    uses: ./.github/workflows/reusable-rust-nextest.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
+    with:
+      ref: ${{ github.event.pull_request.head.sha || github.sha }}
+    # R2 write credentials stay off pull_request events: the lane compiles
+    # and executes code at the PR head, and the reusable lane independently
+    # refuses shared backends on PRs (defense in depth; see its backend
+    # step). Empty on PRs, so the lane falls back to local-disk sccache.
+    # NOTE: the gate must read `!= 'pull_request' && secrets.X || ''`. The
+    # seemingly equivalent `== 'pull_request' && '' || secrets.X` forwards
+    # the secret anyway, because '' is falsy in GitHub expressions.
+    secrets:
+      SCCACHE_BUCKET: ${{ github.event_name != 'pull_request' && secrets.SCCACHE_BUCKET || '' }}
+      SCCACHE_ENDPOINT: ${{ github.event_name != 'pull_request' && secrets.SCCACHE_ENDPOINT || '' }}
+      SCCACHE_REGION: ${{ github.event_name != 'pull_request' && secrets.SCCACHE_REGION || '' }}
+      AWS_ACCESS_KEY_ID: ${{ github.event_name != 'pull_request' && secrets.AWS_ACCESS_KEY_ID || '' }}
+      AWS_SECRET_ACCESS_KEY: ${{ github.event_name != 'pull_request' && secrets.AWS_SECRET_ACCESS_KEY || '' }}
+
+  report:
+    name: ci minutes report
+    permissions:
+      contents: read
+    needs: [changes, nextest]
+    # Always runs: the minutes skeleton is evidence even when the lane
+    # skipped (Rust-untouched) or failed.
+    if: always()
+    # Runner routing: see the note on `changes`.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'report') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Write minutes comparison skeleton
+        env:
+          RUN_ID: ${{ github.run_id }}
+          SHA: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+        run: python3 scripts/ci/ci_minutes.py report --baseline docs/ci-speed-baseline.json --run-id "$RUN_ID" --sha "$SHA" --event "$EVENT" --output ci-minutes.json
+
+      - name: Upload minutes skeleton
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-minutes-${{ github.run_id }}
+          path: ci-minutes.json
+          if-no-files-found: error
+          retention-days: 14

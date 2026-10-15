@@ -50,6 +50,13 @@ JOB_INVENTORY = {
     # runner. Read-only, no secrets, no deploy route: the generic
     # deployment/probe scan already passes, so only the inventory pin is needed.
     "vote-kick-fuzz-smoke.yml": {"vote-kick-smoke"},
+    # SDLC 2.3 CI speed pilot (advisory only, never required, never in
+    # ci-ok): dorny/paths-filter affected-only selection, the shared
+    # nextest lane, and the minutes-per-merged-PR report.
+    "ci-speed.yml": {"changes", "nextest", "report"},
+    # Shared nextest lane, called by ci-speed.yml; org-level home is
+    # TogetherWeOwn/.github with a pinned SHA like test-guard.
+    "reusable-rust-nextest.yml": {"nextest"},
 }
 # Reusable-workflow calls are allowed only to these non-deploy workflows.
 # TOG-10893 registers the read-only sbom.yml calls alongside the benchmark one.
@@ -59,7 +66,10 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
                    # After every staging deploy; its failure fails deploy-staging (promotion gate).
                    ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml",
                    # SDLC separation gate: org reusable, warn mode, pinned SHA.
-                   ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95"}
+                   ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95",
+                   # SDLC 2.3 CI speed pilot: advisory caller to the shared
+                   # nextest lane (local path until the central move).
+                   ("ci-speed.yml", "nextest"): "./.github/workflows/reusable-rust-nextest.yml"}
 # Main's runner routing (#265, 2026-10-02): the repo is public and the org's
 # self-hosted runner group refuses public repos, so every job routes through
 # one expression — public repo -> GitHub-hosted, private -> CI_OVERFLOW_* switch
@@ -2015,6 +2025,202 @@ class WorkflowTests(unittest.TestCase):
                         self.assertIn("container", job)
                         for service in job["services"].values():
                             self.assertNotIn("ports", service)
+
+    def test_nextest_lane_declares_bash_and_keeps_strict_artifacts(self):
+        # SDLC 2.3 CI speed pilot: the reusable lane runs in a job container
+        # whose default shell is sh, so a pipefail script without an explicit
+        # shell exits 2, no tests run, and the downstream parse/upload steps
+        # fail on the missing files and mask the root cause. Every run step
+        # declares bash, the parse names its upstream on a missing JUnit, and
+        # the artifact uploads keep failing when their files are absent.
+        job = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
+        run_steps = [step for step in job.get("steps", []) if "run" in step]
+        self.assertGreater(len(run_steps), 0)
+        for step in run_steps:
+            with self.subTest(step=step.get("name")):
+                self.assertEqual(step.get("shell"), "bash")
+        select = next(step for step in run_steps
+                      if str(step.get("name", "")).startswith("Select sccache backend"))
+        self.assertIn("pipefail", str(select.get("run", "")))
+        run_nextest = next(step for step in run_steps
+                           if str(step.get("name", "")).startswith("cargo nextest"))
+        run_text = str(run_nextest.get("run", ""))
+        # The JUnit path in .config/nextest.toml is profile-store relative
+        # (target/nextest/ci/junit.xml), not workspace-root: the step must
+        # resolve it and copy to the workspace root, keep failing when truly
+        # absent, and preserve a failing nextest status with its evidence.
+        self.assertIn("target/nextest/ci/junit.xml", run_text)
+        self.assertIn("cp ", run_text)
+        self.assertIn("test -f junit.xml", run_text)
+        self.assertIn("exit $status", run_text)
+        parse = next(step for step in run_steps
+                     if str(step.get("name", "")).startswith("Parse JUnit"))
+        self.assertIn("-f junit.xml", str(parse.get("run", "")))
+        uploads = [step for step in job.get("steps", [])
+                   if str(step.get("uses", "")).startswith("actions/upload-artifact@")]
+        self.assertGreater(len(uploads), 0)
+        for step in uploads:
+            with self.subTest(upload=step.get("name")):
+                self.assertEqual(step["with"]["if-no-files-found"], "error")
+
+    def test_nextest_ci_profile_disables_fail_fast(self):
+        # Fail-fast cancels not-yet-started tests after the first exhausted
+        # failure, so junit.xml omits them and per-run ledger rows stop
+        # being comparable. The evidence lane must run everything.
+        import tomllib
+        config = tomllib.loads((ROOT / ".config/nextest.toml").read_text(encoding="utf-8"))
+        profile = config["profile"]["ci"]
+        self.assertEqual(profile.get("retries"), 1)
+        self.assertIs(profile.get("fail-fast"), False)
+
+    def test_nextest_shared_backends_stay_off_pull_requests(self):
+        # R2 write credentials must never reach PR-built code (build scripts
+        # and tests execute at the PR head, and a shared R2 bucket has no
+        # per-PR scope: a PR could poison objects main later links). The
+        # GitHub-cache backend has the same quota shape: the lane's entries
+        # share the repo Actions cache with the warm `check` entry. PR runs
+        # therefore use sccache on local disk only; shared backends are
+        # main/push-only.
+        lane = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
+        select = next(step for step in lane.get("steps", [])
+                      if str(step.get("name", "")).startswith("Select sccache backend"))
+        run_text = str(select.get("run", ""))
+        self.assertIn("pull_request", run_text)
+        self.assertIn("github.event_name", str(select.get("env", "")))
+        self.assertIn("local disk", run_text)
+        # The pull_request branch must come FIRST: reordering the R2 branch
+        # ahead of it (even with the guard kept as a later elif) would let
+        # shared-backend credentials reach PR runs as soon as any secret is
+        # set, while every substring above stays present. Nothing
+        # credential-shaped may precede the guard.
+        lines = run_text.splitlines()
+        gate = next(i for i, line in enumerate(lines)
+                    if "NEXTEST_EVENT" in line and "pull_request" in line)
+        # Exact pin: an inverted (!=), dead (&& false), or reordered guard
+        # all keep the `if ` prefix, so pin the full first line.
+        self.assertEqual(
+            lines[gate].strip(),
+            'if [ "$NEXTEST_EVENT" = "pull_request" ]; then',
+            f"pull_request guard must be the exact first branch, got: {lines[gate]!r}",
+        )
+        before = "\n".join(lines[:gate])
+        self.assertNotIn("GITHUB_ENV", before)
+        self.assertNotIn("R2_", before)
+        self.assertNotIn("SCCACHE_", before)
+        # The pull_request body must write nothing shared: an extra
+        # SCCACHE_/R2_/GITHUB_ENV write inside the PR branch keeps every
+        # substring above while leaking credentials on PR runs.
+        end = next(
+            i
+            for i in range(gate + 1, len(lines))
+            if lines[i].strip().startswith("elif ")
+            or lines[i].strip() == "else"
+            or lines[i].strip().startswith("fi")
+        )
+        pr_body = "\n".join(lines[gate + 1 : end])
+        self.assertNotIn("GITHUB_ENV", pr_body)
+        self.assertNotIn("R2_", pr_body)
+        self.assertNotIn("SCCACHE_", pr_body)
+        self.assertNotIn("AWS_", pr_body)
+        # The shared backends are still configured off-PR: this guards
+        # against gutting the step instead of guarding it.
+        self.assertIn("GITHUB_ENV", "\n".join(lines[end:]))
+        # Behavioral pin: run the extracted step under bash. On PRs the
+        # env file stays empty even with all R2 vars set; off-PR the R2
+        # lines appear. Catches inverted/dead guards and PR-branch writes
+        # that structural pins miss.
+        import os
+        import subprocess
+        import tempfile
+
+        r2_env = {
+            "R2_BUCKET": "test-bucket",
+            "R2_ENDPOINT": "https://test.example.com",
+            "R2_REGION": "auto",
+            "R2_KEY": "test-key",
+            "R2_SECRET": "test-secret",
+        }
+        with tempfile.NamedTemporaryFile(mode="r", delete=False) as tmp:
+            backend_env_path = tmp.name
+        try:
+            base = dict(os.environ)
+            pr_env = dict(base)
+            pr_env.update(
+                {
+                    "NEXTEST_EVENT": "pull_request",
+                    **r2_env,
+                    "GITHUB_ENV": backend_env_path,
+                }
+            )
+            Path(backend_env_path).write_text("", encoding="utf-8")
+            proc = subprocess.run(
+                ["bash", "-c", run_text],
+                env=pr_env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(proc.returncode, 0, f"PR backend step failed: {proc.stderr}")
+            self.assertEqual(
+                Path(backend_env_path).read_text(encoding="utf-8"),
+                "",
+                "PR run must not write shared-backend credentials",
+            )
+            push_env = dict(base)
+            push_env.update(
+                {
+                    "NEXTEST_EVENT": "push",
+                    **r2_env,
+                    "GITHUB_ENV": backend_env_path,
+                }
+            )
+            Path(backend_env_path).write_text("", encoding="utf-8")
+            proc = subprocess.run(
+                ["bash", "-c", run_text],
+                env=push_env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(proc.returncode, 0, f"push backend step failed: {proc.stderr}")
+            written = Path(backend_env_path).read_text(encoding="utf-8")
+            self.assertIn("SCCACHE_BUCKET=test-bucket", written)
+            self.assertIn("AWS_ACCESS_KEY_ID=test-key", written)
+        finally:
+            try:
+                os.unlink(backend_env_path)
+            except FileNotFoundError:
+                pass
+        raw = (ROOT / ".github/workflows/reusable-rust-nextest.yml").read_text(encoding="utf-8")
+        self.assertNotIn("adds no cache footprint", raw)
+
+    def test_ci_speed_withholds_r2_secrets_on_pull_request(self):
+        # Even with the callee-side guard, the caller must not forward R2
+        # write secrets on pull_request events. The gate must read
+        # `!= 'pull_request' && secrets.X || ''`: the seemingly equivalent
+        # `== 'pull_request' && '' || secrets.X` forwards the secret anyway,
+        # because '' is falsy in GitHub expressions.
+        job = self.workflows["ci-speed.yml"]["jobs"]["nextest"]
+        r2_keys = ("SCCACHE_BUCKET", "SCCACHE_ENDPOINT", "SCCACHE_REGION",
+                   "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
+        for key in r2_keys:
+            with self.subTest(secret=key):
+                # Exact pin: only `!= 'pull_request' && secrets.X || ''`
+                # withholds the secret on pull_request. Flipping && to ||
+                # (or leading with `== 'pull_request' && ''`) forwards it
+                # while keeping every substring present, so substrings
+                # cannot pin this gate.
+                self.assertEqual(
+                    str(job["secrets"][key]),
+                    "${{ github.event_name != 'pull_request' && secrets." + key + " || '' }}",
+                )
+
+    def test_ci_speed_rollout_documents_pr_local_cache(self):
+        rollout = (ROOT / "docs/ci-speed-rollout.md").read_text(encoding="utf-8")
+        # Markdown wraps mid-phrase, so match on whitespace-normalized text.
+        flat = " ".join(rollout.split())
+        self.assertIn("local disk", flat)
+        self.assertNotIn("adds no cache footprint", flat)
 
     def test_minimal_grants_and_no_persisted_checkout_credentials(self):
         for name, workflow in self.workflows.items():
