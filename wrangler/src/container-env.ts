@@ -265,6 +265,8 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_ONBOARDING_ROTA_PSEUDONYM_KEY: SECRET,
   TWO_BACKUP_S3_ACCESS_KEY_ID: SECRET,
   TWO_BACKUP_S3_SECRET_ACCESS_KEY: SECRET,
+  TWO_TWITCH_BROADCASTERS: "reconcile broadcaster allowlist; the Container reads its own Operator-provisioned value, never a Worker-forwarded flag",
+  TWO_TWITCH_CALLBACK_URL: "reconcile callback URL; the Container reads its own Operator-provisioned value, never a Worker-forwarded flag",
   TWO_TWITCH_CLIENT_ID: SECRET,
   TWO_TWITCH_CLIENT_SECRET: SECRET,
   TWO_TWITCH_WEBHOOK_SECRET: SECRET,

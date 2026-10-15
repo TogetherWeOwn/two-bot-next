@@ -86,10 +86,14 @@ What the core does, in order, for every delivery:
    retries. Classification or planning errors alone must not trigger a retry.
 
 Subscription management is pure request building plus a diff
-(`create_subscription_body`, `parse_subscriptions`, `reconcile`). It runs at
-boot and after a `revocation`, never on a timer, and it only touches
-subscriptions on the bot's own callback. Deletes precede creates because
-Twitch answers 409 to a duplicate create.
+(`create_subscription_body`, `parse_subscriptions`, `reconcile`). The runtime
+wiring (`crates/bot/src/eventsub_reconcile.rs`) runs it once at startup and on
+a bounded hourly interval while `TWO_EVENTSUB` is exactly `1`, and it only
+touches subscriptions on the bot's own callback (`TWO_TWITCH_CALLBACK_URL`).
+Deletes precede creates because Twitch answers 409 to a duplicate create. A
+`revocation` delivery is acknowledged by the receiver and healed by the next
+pass; the desired set comes from `TWO_TWITCH_BROADCASTERS` (empty parks the
+pass without mutations).
 
 Secret handling: the signing secret is a `WebhookSecret` (10-100 ASCII, as
 Twitch requires) wrapping `Secret<String>`; its `Debug` is `[REDACTED]`. It is
@@ -172,10 +176,14 @@ below is present but is not called by a runtime receiver yet.
   Every value travels inside `Secret`, so even a `Debug` dump renders
   `[REDACTED]`.
 - The app token is cached and refreshed 60 s before its `expires_in`
-  instant, plus once on a 401 with a single retry. No timers: reconcile
-  runs at boot and after a `revocation` only.
+  instant, plus once on a 401 with a single retry. The Helix calls have no
+  timers of their own; the bot runtime (`crates/bot/src/eventsub_reconcile.rs`)
+  invokes them once at startup and on a bounded hourly interval.
 - `list_subscriptions` follows every `stream.online` page (up to a bounded
   limit); pass its complete result to `plan_boot_actions` for the deletes-first
   plan, then `execute_actions` runs it in order. A create that answers 409
   counts as done only after a follow-up listing confirms a healthy subscription
-  for that broadcaster on the configured callback.
+  for that broadcaster on the configured callback. After the plan executes, a
+  final listing confirms every desired broadcaster holds a healthy subscription
+  on the bot callback; anything missing or unhealthy logs with an `error_class`
+  and fails the pass, never silently.

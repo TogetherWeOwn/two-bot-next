@@ -1,0 +1,563 @@
+//! EventSub subscription reconcile at startup plus a bounded interval (M3.3).
+//!
+//! The receiver (`eventsub_http`) is served when `TWO_EVENTSUB` is exactly
+//! `1`, but without subscriptions Twitch never delivers. This module drives
+//! the pure-core plan (`plan_boot_actions` over `list_subscriptions`) through
+//! the verifying executor (`execute_actions`, whose 409 path confirms via a
+//! follow-up broadcaster listing) against the bot's own callback, then runs a
+//! final listing that confirms every desired broadcaster holds a healthy
+//! subscription. Anything unhealthy is logged with an `error_class`, never
+//! silent.
+//!
+//! The task runs once at startup and on a bounded interval afterwards. The
+//! signing secret travels only inside `WebhookSecret` (HMAC plus the
+//! create-subscription body, both inside core) and no log line carries a
+//! secret value, header, challenge or body byte: only scalar counts, statuses
+//! and error classes.
+
+use std::{collections::HashMap, time::Duration};
+
+use two_bot_core::twitch_eventsub::{CallbackUrl, ExistingSubscription, WebhookSecret};
+use two_bot_core::twitch_helix::{
+    plan_boot_actions, webhook_secret_from_env, ActionOutcome, HelixClient, HelixCredentials,
+    HelixError, HelixTransport, HyperHelixTransport,
+};
+
+/// Environment variable carrying the bot's own public callback. Reconcile only
+/// ever touches subscriptions on this URL, never a foreign one.
+pub const CALLBACK_ENV: &str = "TWO_TWITCH_CALLBACK_URL";
+/// Environment variable carrying the comma-separated broadcaster allowlist
+/// (`broadcaster_user_id` values) to subscribe to on the bot callback.
+pub const BROADCASTERS_ENV: &str = "TWO_TWITCH_BROADCASTERS";
+/// Reconcile cadence after the startup run. Hourly is cheap (a few Helix calls
+/// per pass) and bounds how long a dropped subscription stays dark.
+pub const RECONCILE_INTERVAL_SECS: u64 = 3_600;
+
+/// What one reconcile pass did, for scalar receiver logs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReconcileSummary {
+    /// Stale/failed subscriptions deleted (plus already-gone deletes).
+    pub deleted: usize,
+    /// Subscriptions created with a 2xx answer.
+    pub created: usize,
+    /// 409 creates confirmed healthy by the follow-up listing.
+    pub already_exists: usize,
+}
+
+/// True when the EventSub slice is enabled in `vars`.
+fn gate_open(vars: &HashMap<String, String>) -> bool {
+    vars.get("TWO_EVENTSUB")
+        .is_some_and(|flag| flag.as_str() == "1")
+}
+
+/// True when the process environment enables the reconcile task.
+fn enabled() -> bool {
+    gate_open(&std::env::vars().collect())
+}
+
+/// Split the broadcaster allowlist: comma-separated, trimmed, sorted and
+/// deduplicated so the plan is deterministic.
+fn parse_broadcasters(raw: &str) -> Vec<String> {
+    let mut ids: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// Load the callback plus desired broadcasters. An empty allowlist parks the
+/// pass without mutations (the caller logs it); a missing or invalid callback
+/// fails loudly so the operator notices.
+fn load_from_map(vars: &HashMap<String, String>) -> Result<(CallbackUrl, Vec<String>), HelixError> {
+    let raw = vars.get(CALLBACK_ENV).map(String::as_str).unwrap_or("");
+    if raw.trim().is_empty() {
+        return Err(HelixError::Missing(CALLBACK_ENV));
+    }
+    let callback = CallbackUrl::new(raw.trim()).map_err(|_| HelixError::InvalidCredential {
+        name: CALLBACK_ENV,
+        reason: "value must be an https callback without port, query or fragment",
+    })?;
+    let desired = vars
+        .get(BROADCASTERS_ENV)
+        .map_or_else(Vec::new, |raw| parse_broadcasters(raw));
+    Ok((callback, desired))
+}
+
+/// Mirrors the healthy set in core (the authoritative check lives next to the
+/// listing parser in `twitch_eventsub`): only these statuses deliver.
+fn is_healthy_status(status: &str) -> bool {
+    matches!(status, "enabled" | "webhook_callback_verification_pending")
+}
+
+/// Desired broadcasters without a healthy subscription on our callback in the
+/// follow-up listing.
+fn unconfirmed_broadcasters(
+    desired: &[String],
+    callback: &CallbackUrl,
+    listed: &[ExistingSubscription],
+) -> Vec<String> {
+    desired
+        .iter()
+        .filter(|id| {
+            !listed.iter().any(|sub| {
+                &sub.broadcaster_user_id == *id
+                    && sub.callback == callback.as_str()
+                    && is_healthy_status(&sub.status)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Count one executed plan by outcome, for the scalar run log.
+fn summarize(outcomes: &[ActionOutcome]) -> ReconcileSummary {
+    let mut summary = ReconcileSummary::default();
+    for outcome in outcomes {
+        match outcome {
+            ActionOutcome::Deleted { .. } => summary.deleted += 1,
+            ActionOutcome::Created { .. } => summary.created += 1,
+            ActionOutcome::AlreadyExists { .. } => summary.already_exists += 1,
+        }
+    }
+    summary
+}
+
+/// List, diff with `plan_boot_actions` (deletes before creates, our callback
+/// only), execute with `execute_actions`, then confirm with a follow-up
+/// `list_subscriptions`: every desired broadcaster must hold a healthy
+/// subscription afterwards, else the pass fails loudly.
+pub async fn reconcile_all<T: HelixTransport>(
+    client: &mut HelixClient<T>,
+    callback: &CallbackUrl,
+    desired: &[String],
+    secret: &WebhookSecret,
+) -> Result<ReconcileSummary, HelixError> {
+    let existing = client.list_subscriptions().await?;
+    let plan = plan_boot_actions(desired, callback, &existing)?;
+    let outcomes = client.execute_actions(&plan, callback, secret).await?;
+    let confirmed = client.list_subscriptions().await?;
+    let missing = unconfirmed_broadcasters(desired, callback, &confirmed);
+    if !missing.is_empty() {
+        tracing::error!(
+            event = "eventsub_reconcile",
+            error_class = "reconcile_unhealthy",
+            broadcasters = desired.len(),
+            missing = missing.len(),
+            "eventsub reconcile follow-up listing is missing a healthy subscription"
+        );
+        return Err(HelixError::BadResponse(
+            "reconcile follow-up listing is missing a healthy subscription",
+        ));
+    }
+    let summary = summarize(&outcomes);
+    tracing::info!(
+        event = "eventsub_reconcile",
+        status = "healthy",
+        broadcasters = desired.len(),
+        deleted = summary.deleted,
+        created = summary.created,
+        already_exists = summary.already_exists,
+        "eventsub subscriptions reconciled"
+    );
+    Ok(summary)
+}
+
+/// One reconcile pass from the process environment: gate, Operator
+/// credentials, callback plus allowlist, then `reconcile_all`. Every refusal
+/// and failure is logged with an `error_class`; callers need no extra log.
+pub async fn startup_reconcile() -> Result<ReconcileSummary, HelixError> {
+    let vars: HashMap<String, String> = std::env::vars().collect();
+    if !gate_open(&vars) {
+        tracing::info!(
+            event = "eventsub_reconcile",
+            status = "parked",
+            reason = "flag_dark",
+            "eventsub reconcile parked: TWO_EVENTSUB is not exactly 1"
+        );
+        return Ok(ReconcileSummary::default());
+    }
+    let (callback, desired) = match load_from_map(&vars) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            tracing::error!(
+                event = "eventsub_reconcile",
+                error_class = "reconcile_config_invalid",
+                error = %error,
+                "eventsub reconcile refused: callback configuration is invalid"
+            );
+            return Err(error);
+        }
+    };
+    if desired.is_empty() {
+        tracing::warn!(
+            event = "eventsub_reconcile",
+            error_class = "reconcile_no_broadcasters",
+            "eventsub reconcile parked: broadcaster allowlist is empty, no subscriptions mutated"
+        );
+        return Ok(ReconcileSummary::default());
+    }
+    let creds = match HelixCredentials::from_env() {
+        Ok(creds) => creds,
+        Err(error) => {
+            tracing::error!(
+                event = "eventsub_reconcile",
+                error_class = "reconcile_config_invalid",
+                error = %error,
+                "eventsub reconcile refused: Twitch credentials are missing or invalid"
+            );
+            return Err(error);
+        }
+    };
+    let secret = match webhook_secret_from_env() {
+        Ok(secret) => secret,
+        Err(error) => {
+            tracing::error!(
+                event = "eventsub_reconcile",
+                error_class = "reconcile_config_invalid",
+                error = %error,
+                "eventsub reconcile refused: webhook secret is missing or invalid"
+            );
+            return Err(error);
+        }
+    };
+    let mut client = HelixClient::new(HyperHelixTransport, creds);
+    match reconcile_all(&mut client, &callback, &desired, &secret).await {
+        Ok(summary) => Ok(summary),
+        Err(error) => {
+            tracing::error!(
+                event = "eventsub_reconcile",
+                error_class = "reconcile_failed",
+                error = %error,
+                "eventsub reconcile failed"
+            );
+            Err(error)
+        }
+    }
+}
+
+/// One pass; the outcome is already logged inside `startup_reconcile`.
+async fn run_once() {
+    let _ = startup_reconcile().await;
+}
+
+/// Shutdown latch for the interval loop.
+fn stopped(shutdown: &tokio::sync::watch::Receiver<bool>) -> bool {
+    *shutdown.borrow() || shutdown.has_changed().is_err()
+}
+
+/// Startup run, then the bounded interval, until shutdown. Failures are
+/// logged per pass and never stop the loop: the next tick retries.
+async fn run_loop(mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    run_once().await;
+    loop {
+        tokio::select! {
+            biased;
+            result = shutdown.changed() => {
+                let _ = result;
+                return;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(RECONCILE_INTERVAL_SECS)) => {}
+        }
+        if stopped(&shutdown) {
+            return;
+        }
+        run_once().await;
+    }
+}
+
+/// Spawn the reconcile task when `TWO_EVENTSUB` is exactly `1`. Dark is a
+/// parked info log, never a silent downgrade of an enabled receiver.
+pub fn spawn_if_enabled(shutdown: tokio::sync::watch::Receiver<bool>) {
+    if !enabled() {
+        tracing::info!(
+            event = "eventsub_reconcile",
+            status = "parked",
+            reason = "flag_dark",
+            "eventsub reconcile parked: TWO_EVENTSUB is not exactly 1"
+        );
+        return;
+    }
+    tokio::spawn(run_loop(shutdown));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use axum::http::{Method, StatusCode};
+    use serde_json::{json, Value};
+    use two_bot_core::twitch_helix::{HelixRequest, HelixResponse};
+
+    fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    fn subscription_entry(id: &str, status: &str, broadcaster: &str, callback: &str) -> Value {
+        json!({
+            "id": id,
+            "status": status,
+            "type": "stream.online",
+            "version": "1",
+            "condition": {"broadcaster_user_id": broadcaster},
+            "transport": {"method": "webhook", "callback": callback},
+        })
+    }
+
+    struct ScriptTransport {
+        answers: Mutex<VecDeque<Result<HelixResponse, HelixError>>>,
+        log: CallLog,
+    }
+
+    impl ScriptTransport {
+        fn new(answers: Vec<Result<HelixResponse, HelixError>>, log: CallLog) -> Self {
+            Self {
+                answers: Mutex::new(answers.into()),
+                log,
+            }
+        }
+
+        fn token_answer() -> Result<HelixResponse, HelixError> {
+            Ok(HelixResponse {
+                status: StatusCode::OK,
+                body: json!({"access_token": "synthetic-token", "expires_in": 3_600})
+                    .to_string()
+                    .into_bytes(),
+            })
+        }
+
+        fn listing_answer(document: &Value) -> Result<HelixResponse, HelixError> {
+            Ok(HelixResponse {
+                status: StatusCode::OK,
+                body: document.to_string().into_bytes(),
+            })
+        }
+
+        fn no_content() -> Result<HelixResponse, HelixError> {
+            Ok(HelixResponse {
+                status: StatusCode::NO_CONTENT,
+                body: Vec::new(),
+            })
+        }
+    }
+
+    impl HelixTransport for ScriptTransport {
+        async fn send(&self, request: HelixRequest) -> Result<HelixResponse, HelixError> {
+            self.log
+                .inner
+                .lock()
+                .expect("call log must unlock")
+                .push(request);
+            self.answers
+                .lock()
+                .expect("script must unlock")
+                .pop_front()
+                .expect("script must answer every call")
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CallLog {
+        inner: std::sync::Arc<Mutex<Vec<HelixRequest>>>,
+    }
+
+    impl CallLog {
+        fn requests(&self) -> Vec<HelixRequest> {
+            self.inner.lock().expect("call log must unlock").clone()
+        }
+    }
+
+    fn test_secret() -> WebhookSecret {
+        WebhookSecret::new("synthetic-webhook-secret-01".to_owned())
+            .expect("fixture secret must parse")
+    }
+
+    fn callback() -> CallbackUrl {
+        CallbackUrl::new("https://hooks.example.com/twitch").expect("fixture callback must parse")
+    }
+
+    fn creds() -> HelixCredentials {
+        HelixCredentials {
+            client_id: two_bot_core::Secret::new("fixture-client-id".to_owned()),
+            client_secret: two_bot_core::Secret::new("fixture-client-secret".to_owned()),
+        }
+    }
+
+    #[test]
+    fn gate_opens_only_on_exact_one() {
+        assert!(!gate_open(&vars(&[])));
+        assert!(!gate_open(&vars(&[("TWO_EVENTSUB", "0")])));
+        assert!(!gate_open(&vars(&[("TWO_EVENTSUB", "true")])));
+        assert!(gate_open(&vars(&[("TWO_EVENTSUB", "1")])));
+    }
+
+    #[test]
+    fn broadcasters_split_trim_and_dedupe() {
+        assert_eq!(
+            parse_broadcasters("222, 444,,222,  ,111"),
+            vec!["111".to_owned(), "222".to_owned(), "444".to_owned()]
+        );
+        assert!(parse_broadcasters(" , ,").is_empty());
+    }
+
+    #[test]
+    fn config_requires_a_valid_callback() {
+        let err = load_from_map(&vars(&[])).expect_err("missing callback must fail");
+        assert!(matches!(err, HelixError::Missing(CALLBACK_ENV)));
+        let err = load_from_map(&vars(&[(CALLBACK_ENV, "http://plain.example.com/hook")]))
+            .expect_err("non-https callback must fail");
+        assert!(matches!(err, HelixError::InvalidCredential { .. }));
+    }
+
+    #[test]
+    fn config_loads_callback_and_allowlist() {
+        let (callback, desired) = load_from_map(&vars(&[
+            (CALLBACK_ENV, "https://hooks.example.com/twitch"),
+            (BROADCASTERS_ENV, "444,222,444"),
+        ]))
+        .expect("valid config must load");
+        assert_eq!(callback.as_str(), "https://hooks.example.com/twitch");
+        assert_eq!(desired, vec!["222".to_owned(), "444".to_owned()]);
+        let (_, desired) =
+            load_from_map(&vars(&[(CALLBACK_ENV, "https://hooks.example.com/twitch")]))
+                .expect("missing allowlist parks with an empty list");
+        assert!(desired.is_empty());
+    }
+
+    #[test]
+    fn healthy_set_covers_enabled_and_pending() {
+        assert!(is_healthy_status("enabled"));
+        assert!(is_healthy_status("webhook_callback_verification_pending"));
+        for status in [
+            "webhook_callback_verification_failed",
+            "notification_failures_exceeded",
+            "authorization_revoked",
+            "",
+        ] {
+            assert!(!is_healthy_status(status), "{status}");
+        }
+    }
+
+    #[test]
+    fn interval_is_bounded_and_nonzero() {
+        assert!(RECONCILE_INTERVAL_SECS > 0);
+        assert!(RECONCILE_INTERVAL_SECS <= 24 * 3_600);
+    }
+
+    #[test]
+    fn summary_counts_by_outcome() {
+        let summary = summarize(&[
+            ActionOutcome::Deleted {
+                id: "gone".to_owned(),
+            },
+            ActionOutcome::Created {
+                broadcaster_user_id: "444".to_owned(),
+            },
+            ActionOutcome::AlreadyExists {
+                broadcaster_user_id: "222".to_owned(),
+            },
+        ]);
+        assert_eq!(
+            summary,
+            ReconcileSummary {
+                deleted: 1,
+                created: 1,
+                already_exists: 1,
+            }
+        );
+        assert_eq!(
+            summarize(&[]),
+            ReconcileSummary::default(),
+            "an empty plan reconciles to nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_runs_deletes_before_creates_then_confirms_healthy() {
+        let listing = json!({
+            "data": [
+                subscription_entry("stale-id", "enabled", "111", "https://hooks.example.com/twitch"),
+                subscription_entry("keep-id", "enabled", "222", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let confirmed = json!({
+            "data": [
+                subscription_entry("keep-id", "enabled", "222", "https://hooks.example.com/twitch"),
+                subscription_entry("fresh-id", "enabled", "444", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let log = CallLog::default();
+        let transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                ScriptTransport::listing_answer(&listing),
+                ScriptTransport::no_content(),
+                ScriptTransport::no_content(),
+                ScriptTransport::listing_answer(&confirmed),
+            ],
+            log.clone(),
+        );
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let summary = reconcile_all(
+            &mut client,
+            &callback(),
+            &["222".to_owned(), "444".to_owned()],
+            &test_secret(),
+        )
+        .await
+        .expect("healthy follow-up must succeed");
+        assert_eq!(
+            summary,
+            ReconcileSummary {
+                deleted: 1,
+                created: 1,
+                already_exists: 0,
+            }
+        );
+        let seen = log.requests();
+        assert_eq!(
+            seen.len(),
+            5,
+            "token, listing, delete, create, follow-up listing"
+        );
+        assert_eq!(seen[2].method, Method::DELETE);
+        assert_eq!(seen[3].method, Method::POST);
+    }
+
+    #[tokio::test]
+    async fn reconcile_fails_loudly_when_followup_listing_is_unhealthy() {
+        let listing = json!({"data": [], "pagination": {}});
+        let transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                ScriptTransport::listing_answer(&listing),
+                ScriptTransport::no_content(),
+                ScriptTransport::listing_answer(&listing),
+            ],
+            CallLog::default(),
+        );
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let error = reconcile_all(
+            &mut client,
+            &callback(),
+            &["444".to_owned()],
+            &test_secret(),
+        )
+        .await
+        .expect_err("missing follow-up subscription must fail");
+        assert!(
+            matches!(error, HelixError::BadResponse(_)),
+            "unhealthy state must surface, not count as done: {error}"
+        );
+    }
+}

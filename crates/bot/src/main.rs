@@ -35,6 +35,7 @@ mod dispatch;
 mod erasure_cli;
 mod event_cli;
 mod eventsub_http;
+mod eventsub_reconcile;
 mod feed_jobs;
 mod gateway;
 mod gateway_commands;
@@ -346,6 +347,12 @@ async fn run(cli_args: &[String]) {
         )),
         None => None,
     };
+
+    // M3.3 reconcile: once at startup plus a bounded interval while
+    // `TWO_EVENTSUB` is exactly `1`. Dark parks with an info log;
+    // enabled-but-invalid configuration logs with an error class and never
+    // mutates.
+    eventsub_reconcile::spawn_if_enabled(shutdown.subscribe());
 
     // ONE optional self-role service: gateway dispatch and the supervised
     // recovery job share this Arc. Empty/invalid catalogues, non-staging guilds
