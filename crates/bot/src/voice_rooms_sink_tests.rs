@@ -1,6 +1,8 @@
 use super::*;
 use tokio::sync::Notify;
-use twilight_model::gateway::payload::incoming::{GuildCreate, Ready, VoiceStateUpdate};
+use twilight_model::gateway::payload::incoming::{
+    ChannelCreate, ChannelDelete, ChannelUpdate, GuildCreate, Ready, VoiceStateUpdate,
+};
 use two_bot_discord::MemPipeline;
 
 impl RoomPersistence for Arc<Store> {
@@ -806,4 +808,86 @@ async fn guild_create_seeds_display_names_for_restarted_rooms() {
         .expect("probe deadline")
         .expect("actor exists");
     assert!(directory.knows(MEMBER));
+}
+
+async fn creator_ids(runtime: &Runtime) -> Vec<u64> {
+    tokio::time::timeout(Duration::from_secs(5), runtime.creators_probe(GUILD))
+        .await
+        .expect("probe deadline")
+        .expect("actor exists")
+}
+
+async fn settle_first_merge(runtime: &Runtime) {
+    // Let the spawned actor load and run its first (interval) merge, so a
+    // row pushed afterwards can only converge via a flagged refresh.
+    for _ in 0..50 {
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        if creator_ids(runtime).await.contains(&CREATOR) {
+            return;
+        }
+    }
+    panic!("the actor must load its creator view before the test row lands");
+}
+
+/// Drive one channel event through the gateway sink and prove the worker
+/// merges a store row its view was missing: without the event hook (or its
+/// caller) the row stays absent past the debounce. The probe reads the
+/// worker view directly, never a join, so the join read-through cannot
+/// mask a dead event hook.
+async fn channel_event_merges_a_missing_creator_row(make_event: impl FnOnce(Channel) -> Event) {
+    const ADDED: u64 = 201;
+    let (store, http, _) = fixture();
+    let runtime = runtime(store.clone(), http);
+    let pipeline = MemPipeline::for_replay();
+    bootstrap(&runtime, &pipeline, &[]);
+    settle_first_merge(&runtime).await;
+    store
+        .creators
+        .lock()
+        .unwrap()
+        .push(CreatorChannel::new(GUILD, ADDED));
+    assert!(
+        !creator_ids(&runtime).await.contains(&ADDED),
+        "the pushed row must start outside the worker view"
+    );
+    feed(
+        &runtime,
+        &pipeline,
+        make_event(channel(ADDED, 2, Some(CATEGORY))),
+    );
+    for _ in 0..120 {
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        creator_ids(&runtime).await.contains(&ADDED),
+        "a channel event must merge a missing creator row past the debounce"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn sink_channel_create_merges_a_missing_creator_row() {
+    channel_event_merges_a_missing_creator_row(|channel| {
+        Event::ChannelCreate(Box::new(ChannelCreate(channel)))
+    })
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn sink_channel_update_merges_a_missing_creator_row() {
+    channel_event_merges_a_missing_creator_row(|channel| {
+        Event::ChannelUpdate(Box::new(ChannelUpdate(channel)))
+    })
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn sink_channel_delete_merges_a_missing_creator_row() {
+    channel_event_merges_a_missing_creator_row(|channel| {
+        Event::ChannelDelete(Box::new(ChannelDelete(channel)))
+    })
+    .await;
 }

@@ -876,7 +876,19 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             return;
         }
         self.name_settings_read_ms = Some(now_ms);
-        if let Ok(config) = self.store.config_snapshot(self.live.guild_id).await {
+        let snapshot = self.store.config_snapshot(self.live.guild_id).await;
+        if let Err(error) = &snapshot {
+            // A persistently failing snapshot is how a creator view stays
+            // stale for longer than the reload interval: surface it instead
+            // of swallowing it. The direct creator merge still converges the
+            // view while this fails.
+            tracing::warn!(
+                guild = self.live.guild_id.to_string(),
+                ?error,
+                "voice naming settings refresh failed; keeping the cached view"
+            );
+        }
+        if let Ok(config) = snapshot {
             // Use the same snapshot for creator templates and naming settings.
             // The export codec omits per-creator companion overrides and folds
             // an inherited limit into zero; preserve those just as config_apply
