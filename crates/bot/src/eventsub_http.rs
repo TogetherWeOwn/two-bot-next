@@ -381,8 +381,7 @@ mod tests {
     }
 
     fn sign(message_id: &str, timestamp: &str, body: &[u8]) -> String {
-        let mut mac =
-            <Hmac<Sha256>>::new_from_slice(test_secret().as_bytes()).unwrap();
+        let mut mac = <Hmac<Sha256>>::new_from_slice(test_secret().as_bytes()).unwrap();
         mac.update(message_id.as_bytes());
         mac.update(timestamp.as_bytes());
         mac.update(body);

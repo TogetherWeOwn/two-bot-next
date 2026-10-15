@@ -164,7 +164,7 @@ mod tests {
         let mut vars = vars();
         vars.remove("TWO_EVENTSUB_BIND");
         assert!(load(&vars).is_err());
-        let mut vars_no_secret = vars();
+        let mut vars_no_secret = vars.clone();
         vars_no_secret.remove("TWO_TWITCH_WEBHOOK_SECRET");
         assert!(load(&vars_no_secret).is_err());
     }
@@ -174,7 +174,7 @@ mod tests {
         let mut vars = vars();
         vars.insert("TWO_TWITCH_WEBHOOK_SECRET".to_owned(), "short".to_owned());
         assert!(load(&vars).is_err());
-        let mut vars_bad_bind = vars();
+        let mut vars_bad_bind = vars.clone();
         vars_bad_bind.insert("TWO_EVENTSUB_BIND".to_owned(), "127.0.0.1:0".to_owned());
         assert!(load(&vars_bad_bind).is_err());
     }
