@@ -37,6 +37,9 @@ mod event_cli;
 mod eventsub_http;
 mod feed_jobs;
 mod gateway;
+// Bounded reconnect schedule and runner: no runtime caller yet, the offline
+// acceptance tests are the consumer until the gateway loop adopts it.
+#[allow(dead_code)]
 mod gateway_backoff;
 mod gateway_commands;
 mod gateway_failure;

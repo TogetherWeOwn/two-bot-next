@@ -1,4 +1,4 @@
-//! Bounded gateway reconnect backoff: the retry contract for TOG-25284.
+//! Bounded gateway reconnect backoff: the gateway retry contract.
 //!
 //! A dead gateway process exits and the container supervisor restarts it, but
 //! a restart hot loop is unbounded work (the October crash-loop week). The
@@ -7,23 +7,19 @@
 //! retry is pending, and the runner gives up after [`ReconnectPolicy`]
 //! attempts instead of spinning forever.
 //!
-//! This module is the frozen contract the acceptance tests
-//! (`gateway_tests::supervised_reconnect`) pin: the build card keeps every
-//! signature here and replaces only the body of [`run_supervised`]. The
-//! schedule below is real and fully pinned; the runner body is a scaffold that
-//! performs one attempt with today's fatal semantics (fail fast) so the
-//! acceptance suite compiles and fails red until the loop lands. Nothing in
-//! the running binary calls this module yet, so shipping it changes no
-//! runtime behavior.
+//! The acceptance tests (`gateway_tests::supervised_reconnect`) pin this
+//! module's contract: the schedule and [`run_supervised`]'s retry loop.
+//! Nothing in the running binary calls this module yet, so shipping it
+//! changes no runtime behavior.
 //!
-//! Builder loop algorithm (keep the polling exact so paused-time tests observe
-//! it):
+//! The loop (keep the polling exact so paused-time tests observe it):
 //!
 //! ```text
 //! for attempt in 0..policy.max_attempts:
 //!     match connect(attempt).await:
 //!         Connected => publish Connected, return Reconnected
 //!         Retryable => publish Armed, sleep reconnect_delay(policy, attempt)
+//!                      (skipped after the final budgeted attempt)
 //! publish Draining, return BudgetExhausted
 //! ```
 //!
@@ -140,38 +136,53 @@ pub fn reconnect_delay(policy: &ReconnectPolicy, attempt: u32) -> Option<Duratio
 /// record what readyz served) but the runner never holds the state lock
 /// across `connect` or a backoff sleep.
 ///
-/// SCAFFOLD (TOG-25284 replaces this body, keeping the signature): probes a
-/// single attempt with today's fatal semantics — success publishes
-/// `Connected`, a retryable failure publishes `Draining` and reports
-/// exhaustion. The acceptance tests fail red against this body and pass
-/// unmodified once the retry loop above lands.
-pub async fn run_supervised<C, Attempt, S>(
+/// The connector returns a boxed attempt future; the runner pins it before
+/// polling, so callers never have to name the exact future type. Retryable
+/// outcomes publish [`GatewayState::Armed`] (readyz serves `starting`) and
+/// wait exactly [`reconnect_delay`] before the next attempt, except after the
+/// final budgeted attempt, where there is no next attempt to wait for.
+/// Exhausting the budget publishes [`GatewayState::Draining`] so readyz fails
+/// closed. A shutdown that is already pending wins before any attempt, and
+/// one arriving during an attempt or a backoff sleep ends the episode.
+pub async fn run_supervised<C, S>(
     state: Arc<RwLock<GatewayState>>,
     policy: ReconnectPolicy,
     mut connect: C,
     shutdown: S,
 ) -> SupervisedExit
 where
-    C: FnMut(u32) -> Attempt,
-    Attempt: Future<Output = AttemptOutcome>,
+    C: FnMut(u32) -> Box<dyn Future<Output = AttemptOutcome> + Send>,
     S: Future<Output = ()>,
 {
-    // The loop below consumes the full budget; this scaffold probes one
-    // attempt, so the policy is intentionally unread here.
-    let _ = &policy;
-    tokio::select! {
-        biased;
-        () = shutdown => return SupervisedExit::ShutdownRequested,
-        () = std::future::ready(()) => {}
-    }
-    match connect(0).await {
-        AttemptOutcome::Connected => {
-            *state.write().await = GatewayState::Connected;
-            SupervisedExit::Reconnected
+    tokio::pin!(shutdown);
+    for attempt in 0..policy.max_attempts {
+        let outcome = tokio::select! {
+            biased;
+            () = &mut shutdown => return SupervisedExit::ShutdownRequested,
+            outcome = Box::pin(connect(attempt)) => outcome,
+        };
+        match outcome {
+            AttemptOutcome::Connected => {
+                *state.write().await = GatewayState::Connected;
+                return SupervisedExit::Reconnected;
+            }
+            AttemptOutcome::Retryable => {
+                if attempt + 1 >= policy.max_attempts {
+                    break;
+                }
+                *state.write().await = GatewayState::Armed;
+                // `attempt` is within budget (checked above), so the delay
+                // exists; fall back to no wait rather than panic if a future
+                // policy rule ever disagrees.
+                let delay = reconnect_delay(&policy, attempt).unwrap_or(Duration::ZERO);
+                tokio::select! {
+                    biased;
+                    () = &mut shutdown => return SupervisedExit::ShutdownRequested,
+                    () = tokio::time::sleep(delay) => {}
+                }
+            }
         }
-        AttemptOutcome::Retryable => {
-            *state.write().await = GatewayState::Draining;
-            SupervisedExit::BudgetExhausted
-        }
     }
+    *state.write().await = GatewayState::Draining;
+    SupervisedExit::BudgetExhausted
 }
