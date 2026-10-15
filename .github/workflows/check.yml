@@ -692,6 +692,9 @@ jobs:
     uses: ./.github/workflows/reusable-rust-nextest.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
     with:
       ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      # Drill ejection only (throwaway PR, closed unmerged): skip the
+      # synthetic red group so the rest of the suite still gates.
+      quarantine: 'drill_synthetic_red_group_fails_until_ejected'
     # R2 write credentials stay off pull_request events: the lane compiles
     # and executes code at the PR head, and the reusable lane independently
     # refuses shared backends on PRs (defense in depth; see its backend
