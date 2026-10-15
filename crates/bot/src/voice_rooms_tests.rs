@@ -6076,11 +6076,15 @@ fn parse_logging_subcommands() {
 #[tokio::test]
 async fn logging_command_needs_an_admin() {
     let runtime = logging_runtime(Arc::default(), None, None);
-    assert!(runtime.publish_snapshot(GUILD, logging_snapshot()));
+    // Ready guild-role facts, not cold ones: command_snapshot's @everyone
+    // carries no permissions and the member holds no roles, so authority
+    // resolves to a known non-admin and the denial is permanent.
+    // (logging_snapshot's @everyone carries MANAGE_CHANNELS, and a held
+    // role missing from the snapshot is the cold warming-up case covered
+    // by the cold-authority tests.)
+    assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
     let mut member = logging_interaction(sub_option("show", vec![]), false);
-    // logging_snapshot() grants MANAGE_CHANNELS to role 10; use the
-    // non-privileged role 9 so ready guild-role facts still deny.
-    member.member.as_mut().unwrap().roles = vec![Id::new(9)];
+    member.member.as_mut().unwrap().roles.clear();
     let (owned, response) = handle_capture(&runtime, &member).await;
     assert!(owned);
     assert_eq!(
