@@ -414,7 +414,7 @@
       "justification": "Guild-level game-activity aggregates (no member columns): additive table with nonnegativity plus voice-within-total checks; cutover chain copy, IF NOT EXISTS. Renumbered 0440 to 0441 after main's cutover 0440 stream-live claims; global migration numbers remain unique across both chains."
     },
     "crates/cutover/migrations/0443_stream_live_send_started.sql": {
-      "sha256": "70b95ddd45efa31967a7bb3811ce63073eedd4555cbd4ea0d89fd12562da8be2",
+      "sha256": "9b007eede519dd029ef91ce3ff1e6561e056cd6a578a8be51811ff6bfc0b4912",
       "justification": "Stale-claim recovery fence for the Twitch go-live ledger: send_started_at marker committed before the first Discord POST so atomic takeover reclaims only never-sent stale claims and ambiguous started/delivered rows stay fenced. Renumbered 0441 to 0443 after main claimed 0441/0442 for game-activity aggregates; never merged under 0441."
     },
     "crates/store/migrations/0442_game_activity_guild_aggregates.sql": {

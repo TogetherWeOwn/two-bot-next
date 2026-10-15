@@ -15,7 +15,7 @@
 -- claimed (`send_started_at IS NULL`, `delivered_at IS NULL`) -> sending
 -- (`send_started_at NOT NULL`) -> delivered (`delivered_at NOT NULL`).
 -- Stale takeover (`reclaim_stale_live`) only rewrites claimed rows whose
--- `claimed_at` is older than the bounded lease (300 s, see
+-- `claimed_at` is older than the bounded lease (see
 -- `STALE_CLAIM_LEASE_SECS`): atomic single-statement UPDATE with
 -- `delivered_at IS NULL AND send_started_at IS NULL`, so concurrent retries
 -- cannot both win and delivered/ambiguous rows are never reclaimed.
