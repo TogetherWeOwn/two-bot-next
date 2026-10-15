@@ -11,10 +11,12 @@ as proven before then.
 
 | Time | Event (receipt) |
 |---|---|
+| 15:48:47Z | `deploy-production` run [38763610825](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/38763610825) dispatched in deploy mode for `7302cc3eded75085f71e53e8bb4d79d4e776d19a`; the `sha guard` refused it: `Refusing production deploy: deploy-staging has no successful run on 7302cc3eded75085f71e53e8bb4d79d4e776d19a`. Deploy and release jobs skipped. |
 | 15:50:02Z | `deploy-production` run [38763788270](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/38763788270) dispatched for commit `6baab871d31c076f89b45db644e6bddef8d447cd`, with ownership takeover. |
 | ~15:57Z | New container serving. It crash-looped about every 90 s: READY + GUILD_CREATE, then `durable gateway failed; checkpoint unchanged, readiness unavailable` (`gateway_runtime_failed`, `durable_gateway` phase), then shard close 1000 and shutdown. |
 | 15:58:51Z | The deploy's `/readyz` gate polled once, read 503 with gateway `starting`, and **passed the deploy as healthy** (detection gap below). Job `wrangler deploy + readyz gate` completed success 15:58:57Z; run concluded success 15:59:03Z. |
 | 16:00–16:12Z | Container logs show the repeated READY → `gateway_runtime_failed` → shutdown cycle. The same commit stayed green on staging (deploy + voice synthetic 14:18/14:20Z). |
+| 16:05:30Z | Workflow rollback run [38766033550](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/38766033550) refused in the `sha guard`: `Refusing production rollback: sha must be a full 40-character hex commit SHA` (malformed `sha` input). Deploy and release jobs skipped. |
 | 16:09:45Z | Workflow rollback dispatched as run [38766633962](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/38766633962): `sha` = `7302cc3eded75085f71e53e8bb4d79d4e776d19a`, `rollback` = `952618ab-771f-427d-b957-9037d6f7bb73`, `takeover: true`. The `sha guard` job **refused it in 14 s** (recovery gap below); deploy and release jobs skipped. |
 | ~16:1xZ | Host rolled back directly via the Cloudflare API (outside the workflow): Worker version `952618ab` plus container image `sha256:bfe1038e` (built from `33e653d2c43e91a89842549d8fbdffcb13092b45`), takeover epoch 19. |
 | 16:19Z | `/readyz` 200 on the rolled-back version. |
@@ -28,13 +30,16 @@ rewards antigaming), `0101` (seasonal decay watermark), and `0424`–`0433`
 plus `0435`–`0441` (internal-action outcome/audit, community facts, event-store
 capture slices, privacy opt-out, backfill cursors, member catch-up, event-store
 S1 core, retention queues, stream live claims, game activity aggregates).
-There is no `0434` in the tree, so the gap is exactly these 19.
+There is no `0434` in `crates/cutover/migrations` (counted there), so the
+gap is exactly these 19. (`crates/store/migrations/0434_privacy_opt_out.sql`
+exists outside the cutover set, as does `0442_game_activity_guild_aggregates.sql`.)
 
-Fitted mechanism (code-verified, log proof pending #978): on the first
+Fitted mechanism (code-verified at `6baab871`, log proof pending #978): on the first
 `GUILD_CREATE` after boot, `retention_lifecycle`
-(`crates/bot/src/gateway.rs:611`, call at `:626`) calls
-`cancel_guild_purge`, which deletes from `retention_guild_purge_queue`
-(`crates/cutover/src/retention.rs:515`) — created by migration `0438`,
+(`crates/bot/src/gateway.rs:611`, inner call at `:626`) calls
+`cancel_guild_purge` (`crates/cutover/src/retention.rs:527`, DELETE at
+`:529`), which deletes from `retention_guild_purge_queue`
+— created by migration `0438`,
 missing in production. The build predates the schema-gap skip, so the
 missing-table error holds the dispatch cursor, the worker stops, and the
 gateway task returns `Err` → `gateway_runtime_failed`. The next boot replays
@@ -81,18 +86,33 @@ died in the `sha guard` with this exact refusal:
 ```
 
 Why: the guard requires a successful `deploy-staging` run on the exact rollback
-SHA. The only staging run on `7302cc3ed` (run
+SHA, and `7302cc3ed` was not the commit the working version was built from.
+The only staging run on `7302cc3ed` (run
 [38644156611](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/38644156611),
-2026-10-14) concluded `failure` — the prior good commit's staging run had
-failed and later merges superseded it, so no green staging receipt existed.
-The guard worked as coded, but its admission rule assumes the rollback target
-was recently staged, which is exactly what is false during an incident: the
-last known-good commit is usually several merges old. The host therefore
-rolled back outside the workflow via the Cloudflare API. That path worked,
-but it bypassed the guard, the environment approval, and the run-summary
-receipt chain — the drill record for the deploy-mode prior-good-SHA path
-remains empty (see [production-deploy.md](production-deploy.md): "The
-deploy-mode path with a prior good SHA has no production drill record").
+2026-10-14) concluded `failure`, so no green staging receipt existed — and
+`7302cc3ed` was never known-good: it carries the same suspect
+`retention_lifecycle` wiring (`crates/bot/src/gateway.rs:611` at both
+commits, absent at `33e653d2`), so under this postmortem's own hypothesis a
+build from it crash-loops on the behind production schema too. The version
+that worked was built from `33e653d2` (tagged `v1.3.0`, green staging run
+38316885340 and production deploy 38319357528 on 10-12). A rollback
+dispatched with `sha` = `33e653d2` would have passed the staging check. The
+16:09Z refusal therefore looks like a wrong-SHA input the guard correctly
+caught — the dispatch did not follow the contract below (`sha` set to the
+commit the previous version was built from) — not an admission-rule gap.
+The 15:48Z deploy-mode refusal of the same SHA and the 16:05Z malformed-SHA
+refusal (timeline) reinforce that the recovery story on 10-15 is input
+derivation, not guard design. The host therefore rolled back outside the
+workflow via the Cloudflare API. That path worked, but it bypassed the guard,
+the environment approval, and the run-summary receipt chain — the drill
+record for the deploy-mode prior-good-SHA path remains empty (see
+[production-deploy.md](production-deploy.md): "The deploy-mode path with a
+prior good SHA has no production drill record").
+
+Pre-dispatch step: before any rollback dispatch, derive `sha` from the
+target Worker version's recorded build SHA (the version Summary/metadata,
+not the incident commit), and confirm a successful `deploy-staging` run
+exists on it. Do not re-dispatch with a guessed or incident-commit SHA.
 
 ## Rollback receipts (quoted, not re-executed)
 
@@ -108,7 +128,8 @@ TAKEOVER: true
 ```
 
 That dispatch is the single sanctioned production rollback method
-([production-deploy.md](production-deploy.md)): dispatch
+([production-deploy.md](production-deploy.md)): derive `sha` from the target
+version's recorded build SHA first (pre-dispatch step above), then dispatch
 `deploy-production` with `sha` set to the commit the previous version was
 built from, `rollback` set to the previous Worker version ID from the failed
 run's summary, and `takeover: true`. Inside the workflow that becomes
@@ -183,11 +204,15 @@ ownership record and can restart an unauthorized gateway), and never silently
 accept data loss to restore availability — reconcile per the
 [cutover rollback runbook](cutover-rollback-runbook.md) ordered steps.
 
-If the workflow guard refuses the rollback (as on 10-15: no successful
-staging run on the prior good SHA), do not retry the dispatch with different
-inputs to slip past the guard. Escalate to the host path with the recorded
-version ID, and file the guard refusal as its own finding — the refusal is
-evidence, not an override prompt.
+If the workflow guard refuses the rollback, stop and re-derive the inputs
+before anything else: on 10-15 the record shows three refusals in sequence —
+a deploy-mode refusal of `7302cc3ed` (15:48Z), a malformed-`sha` rollback
+(16:05Z), then the wrong-SHA rollback (16:09Z). Do not retry with changed
+inputs to slip past the guard. Derive `sha` from the target version's
+recorded build SHA, confirm its staging receipt, then dispatch once.
+Otherwise escalate to the host path with the recorded version ID, and file
+each guard refusal as its own finding — refusals are evidence, not override
+prompts.
 
 ### Who runs it
 
@@ -210,16 +235,22 @@ evidence, not an override prompt.
 - Strict ready gate: a 503-`starting` answer must not pass a deploy on a
   single early poll; require a 200 (or a bounded parked-with-evidence rule)
   before green.
-- Rollback admission: the guard needs a path that admits a prior good SHA
-  with no green staging run (e.g. admit on green `ci-ok` + `worker check`
-  for that SHA, or a pinned known-good record) — otherwise every rollback
-  to an older commit repeats the 16:09Z refusal.
+- Rollback inputs: record a pinned known-good Worker version + Git SHA +
+  image after every production deploy (version discovery above), and make the
+  rollback dispatch derive `sha` from that record. Do not widen the guard to
+  admit any CI-green SHA: CI-green does not mean schema-compatible (a
+  CI-green build carrying this defect would be admitted), and the 16:09Z
+  refusal was a wrong-SHA input, not a rule gap.
 - The fix itself and any live deploy or rollback are out of scope here.
 
 ## Sources
 
 - Deploy run 38763788270 (breaking `6baab871` deploy + gate pass) and rollback
   run 38766633962 (guard refusal), linked in the timeline; job logs quoted above.
-- Staging run 38644156611 (only staging run on the rollback SHA, concluded `failure`).
+- Staging run 38644156611 (only staging run on `7302cc3ed`, concluded
+  `failure`); deploy-mode refusal run 38763610825 (15:48Z) and
+  malformed-`sha` rollback run 38766033550 (16:05Z), both refused in the
+  `sha guard` with the strings quoted in the timeline.
+- Working version provenance: `33e653d2` = tag `v1.3.0`, green staging run 38316885340 and production deploy 38319357528 (10-12).
 - Host read-only schema receipt, 2026-10-15 17:41Z: production 73 applied / max 423 vs staging 92 / max 441.
 - [production-deploy.md](production-deploy.md) (dispatch, guard, build-identity gate), [runbook.md](runbook.md#redeploy-and-rollback) (version discovery), [cutover-rollback-runbook.md](cutover-rollback-runbook.md) (ordered rollback steps), [gateway-recovery.md](gateway-recovery.md) (checkpoint contract).
