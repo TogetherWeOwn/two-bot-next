@@ -182,6 +182,13 @@ struct Store {
     /// Single-row creator reads: the join-path read-through must skip known
     /// creators, rooms, halted workers and already-missed channels.
     creator_for_reads: Arc<AtomicU64>,
+    /// Scripted single-row creator read failure: while set, every
+    /// `creator_for` read fails, so tests can prove the join path backs off
+    /// instead of paying a read per join.
+    creator_for_error: Option<StoreError>,
+    /// Hanging single-row reads sleep this long before the row lookup, so a
+    /// test can prove the join path bounds a slow pool at the timeout.
+    creator_for_delay: Option<Duration>,
     custom_names: Mutex<HashMap<u64, String>>,
     save_custom_name_errors: Mutex<VecDeque<StoreError>>,
     /// V4 audit rows appended so far, in append order.
@@ -234,6 +241,8 @@ impl Store {
             trace_claims: false,
             creators_error: None,
             creator_for_reads: Arc::new(AtomicU64::new(0)),
+            creator_for_error: None,
+            creator_for_delay: None,
             custom_names: Mutex::new(HashMap::new()),
             save_custom_name_errors: Mutex::new(VecDeque::new()),
             kick_audit: Mutex::new(Vec::new()),
@@ -312,6 +321,12 @@ impl RoomPersistence for Store {
         channel: u64,
     ) -> Result<Option<CreatorChannel>, StoreError> {
         self.creator_for_reads.fetch_add(1, Ordering::Relaxed);
+        if let Some(error) = self.creator_for_error {
+            return Err(error);
+        }
+        if let Some(delay) = self.creator_for_delay {
+            tokio::time::sleep(delay).await;
+        }
         Ok(self
             .creators
             .lock()
@@ -13105,6 +13120,69 @@ async fn revalidate_remembers_channels_with_no_creator_row() {
         reads.load(Ordering::Relaxed),
         1,
         "repeat joins to a non-creator channel must reuse the miss cache"
+    );
+}
+
+#[tokio::test]
+async fn revalidate_backs_off_while_the_store_is_degraded() {
+    // One failed read must not cost a read per later join: while the store
+    // is degraded every join skips the read, and the next successful merge
+    // clears the backoff so joins read again.
+    let (live, store, http, _) = fixture();
+    let reads = Arc::clone(&store.creator_for_reads);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.store.creator_for_error = Some(StoreError::Unavailable);
+    const FIRST: u64 = 901;
+    const SECOND: u64 = 902;
+    assert!(!worker.revalidate_creator(FIRST).await);
+    assert!(!worker.revalidate_creator(SECOND).await);
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        1,
+        "joins into other channels must skip the read while the store is degraded"
+    );
+    // Recovery: the store is healthy again and a merge ran, so the next
+    // join into an unseen channel reads once more.
+    worker.store.creator_for_error = None;
+    worker
+        .store
+        .creators
+        .lock()
+        .unwrap()
+        .push(CreatorChannel::new(GUILD, FIRST));
+    worker.creators_refresh_due = true;
+    worker.reload_creators(0).await;
+    assert!(worker.creators.contains_key(&FIRST));
+    assert!(!worker.revalidate_creator(SECOND).await);
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        2,
+        "a successful merge must clear the backoff"
+    );
+}
+
+#[tokio::test]
+async fn revalidate_bounds_a_hanging_store_read() {
+    // A saturated pool must not hold the join inbox: the read resolves at
+    // the timeout, and the repeat join pays no second read.
+    let (live, store, http, _) = fixture();
+    let reads = Arc::clone(&store.creator_for_reads);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.store.creator_for_delay = Some(Duration::from_secs(30));
+    const STRANGER: u64 = 903;
+    const OTHER: u64 = 904;
+    let started = tokio::time::Instant::now();
+    assert!(!worker.revalidate_creator(STRANGER).await);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "a hanging read must resolve at the 1 s bound, took {:?}",
+        started.elapsed()
+    );
+    assert!(!worker.revalidate_creator(OTHER).await);
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        1,
+        "a timed-out read must back further joins off"
     );
 }
 

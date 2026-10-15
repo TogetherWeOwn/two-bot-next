@@ -2510,6 +2510,12 @@ pub struct GuildRoomWorker<S, H> {
     /// ordinary (non-creator, non-room) channels must not cost a store read
     /// every time; a later creator row still converges via the next merge.
     creator_misses: HashSet<Snowflake>,
+    /// Join read-through backoff: set when a single-row creator read fails
+    /// or times out (or the bulk merge fails), cleared by the next
+    /// successful store read. While set, joins skip the store read instead
+    /// of each holding the inbox for up to the timeout ahead of the
+    /// create-to-move dispatch.
+    creator_revalidate_cooldown_until: Option<tokio::time::Instant>,
     access: AccessControls,
     /// Caps and cooldown for the durable create admission; the rolling burst
     /// limits are fixed legacy constants.
@@ -2761,6 +2767,10 @@ const OWNER_REPAIR_COOLDOWN_MS: u64 = 60_000;
 const CREATORS_REFRESH_DEBOUNCE_MS: u64 = 10_000;
 const CREATORS_REFRESH_INTERVAL_MS: u64 = 300_000;
 const REVALIDATE_TIMEOUT_MS: u64 = 1_000;
+/// How long join-path creator re-reads back off after a failed, timed-out or
+/// refused bulk store read: one slow pool must not serialize every later
+/// join behind another long wait. A successful store read clears it early.
+const REVALIDATE_COOLDOWN_MS: u64 = 30_000;
 
 /// Repeat bookkeeping for one tracked failure. `last_attempt_ms` is the
 /// actor's monotonic clock, so a restart begins a fresh budget.
@@ -2878,6 +2888,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             creators_refresh_due: false,
             creators_read_ms: None,
             creator_misses: HashSet::new(),
+            creator_revalidate_cooldown_until: None,
             access,
             admission: temp_voice_admission(),
             rooms,
@@ -3103,17 +3114,26 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// never refused for a channel id that is a `voice_creators` row. Returns
     /// whether the channel is a creator afterwards (the map now holds it).
     /// Known creators and known rooms never cost a store read, and neither do
-    /// halted workers (the join is refused as `halted` anyway) nor channels a
+    /// halted workers (the join is refused as `halted` anyway), channels a
     /// previous read-through already missed (cleared by each successful
-    /// merge). The read is bounded so a saturated pool cannot hold the inbox
-    /// ahead of the create-to-move dispatch. A failed or slow read keeps the
-    /// old view and reports false, so the caller refuses exactly as before.
+    /// merge), nor joins while a recent read failed or timed out (backing
+    /// off for [`REVALIDATE_COOLDOWN_MS`], cleared early by the next
+    /// successful store read). The read is bounded so a saturated pool cannot
+    /// hold the inbox ahead of the create-to-move dispatch. A failed or slow
+    /// read keeps the old view and reports false, so the caller refuses
+    /// exactly as before.
     pub(super) async fn revalidate_creator(&mut self, channel_id: Snowflake) -> bool {
         if self.creators.contains_key(&channel_id) || self.rooms.contains_key(&channel_id) {
             return self.creators.contains_key(&channel_id);
         }
         if self.halted {
             return false;
+        }
+        if let Some(until) = self.creator_revalidate_cooldown_until {
+            if tokio::time::Instant::now() < until {
+                return false;
+            }
+            self.creator_revalidate_cooldown_until = None;
         }
         if self.creator_misses.contains(&channel_id) {
             return false;
@@ -3125,6 +3145,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         .await;
         match read {
             Ok(Ok(Some(creator))) => {
+                self.creator_revalidate_cooldown_until = None;
                 self.live.protect_creators([creator.channel_id]);
                 self.creators.insert(creator.channel_id, creator);
                 self.name_signatures.clear();
@@ -3136,10 +3157,14 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 true
             }
             Ok(Ok(None)) => {
+                self.creator_revalidate_cooldown_until = None;
                 self.creator_misses.insert(channel_id);
                 false
             }
             Ok(Err(error)) => {
+                self.creator_revalidate_cooldown_until = Some(
+                    tokio::time::Instant::now() + Duration::from_millis(REVALIDATE_COOLDOWN_MS),
+                );
                 debug!(
                     guild = self.live.guild_id.to_string(),
                     ?error,
@@ -3148,6 +3173,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 false
             }
             Err(_) => {
+                self.creator_revalidate_cooldown_until = Some(
+                    tokio::time::Instant::now() + Duration::from_millis(REVALIDATE_COOLDOWN_MS),
+                );
                 debug!(
                     guild = self.live.guild_id.to_string(),
                     timed_out = true,
@@ -3167,7 +3195,8 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// and full-row fields the snapshot codec does not copy. A row missing
     /// from one direct read is still treated as transient, not a deletion:
     /// dropping it would refuse joins until restart. A failed read keeps the
-    /// old view. A successful merge clears the read-through miss cache.
+    /// old view and backs the join read-through off. A successful merge
+    /// clears the read-through miss cache and that backoff.
     /// Runs when `creators_refresh_due` is set (channel events, debounced) or
     /// every [`CREATORS_REFRESH_INTERVAL_MS`], from the maintenance tick.
     pub(super) async fn reload_creators(&mut self, now_ms: u64) {
@@ -3185,6 +3214,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         match self.store.creators(self.live.guild_id).await {
             Ok(rows) => {
                 self.creator_misses.clear();
+                self.creator_revalidate_cooldown_until = None;
                 let mut added = 0u64;
                 let mut changed = false;
                 for creator in rows {
@@ -3208,6 +3238,9 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 }
             }
             Err(error) => {
+                self.creator_revalidate_cooldown_until = Some(
+                    tokio::time::Instant::now() + Duration::from_millis(REVALIDATE_COOLDOWN_MS),
+                );
                 debug!(
                     guild = self.live.guild_id.to_string(),
                     ?error,
@@ -6596,6 +6629,11 @@ enum ActorCommand {
     /// Test probe: the worker's naming settings and known display names.
     #[cfg(test)]
     NamingProbe(oneshot::Sender<(NameSettings, NameDirectory)>),
+    /// Test probe: the worker's current creator-channel ids, so sink tests
+    /// can pin the channel-event merge without driving a join (which would
+    /// also merge via the read-through and hide a dead event hook).
+    #[cfg(test)]
+    CreatorsProbe(oneshot::Sender<Vec<Snowflake>>),
     /// An occupant's game or stream changed: the room's name inputs moved.
     RoomFactsChanged(Snowflake),
     Join {
@@ -7322,6 +7360,15 @@ where
         inbox.await.ok()
     }
 
+    /// Test probe: the worker's current creator-channel ids.
+    #[cfg(test)]
+    async fn creators_probe(&self, guild_id: Snowflake) -> Option<Vec<Snowflake>> {
+        let actor = self.live_actor(guild_id)?;
+        let (reply, inbox) = oneshot::channel();
+        actor.tx.send(ActorCommand::CreatorsProbe(reply)).ok()?;
+        inbox.await.ok()
+    }
+
     /// Hand freshly written voice settings to the guild worker.
     fn name_settings_updated(&self, guild_id: Snowflake, config: &VoiceConfiguration) {
         if let Some(actor) = self.live_actor(guild_id) {
@@ -7991,6 +8038,12 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
         #[cfg(test)]
         ActorCommand::NamingProbe(reply) => {
             let _ = reply.send((worker.name_settings.clone(), worker.name_directory.clone()));
+        }
+        #[cfg(test)]
+        ActorCommand::CreatorsProbe(reply) => {
+            let mut ids: Vec<Snowflake> = worker.creators.keys().copied().collect();
+            ids.sort_unstable();
+            let _ = reply.send(ids);
         }
         ActorCommand::RoomFactsChanged(room) => worker.room_facts_changed(room, now_ms),
         ActorCommand::Join {
