@@ -20,10 +20,10 @@ Flake rule (nextest-first, document-order based):
   status fail/error; otherwise pass (a skips-only group stays skipped).
   Retry children never decide the outcome: flakyFailure means the final
   attempt passed.
-- flaky = any flakyFailure/flakyError child (fail-then-pass), or
-  rerunFailure/rerunError children on a final failure (exhausted retries),
-  or, for merged non-nextest JUnit only, repeated elements whose outcomes
-  disagree.
+- flaky = any flakyFailure/flakyError child (fail-then-pass), or, for
+  merged non-nextest JUnit only, repeated elements whose outcomes
+  disagree. Exhausted retries on a final failure stay flaky=false: the
+  test failed on every attempt, and attempts already records the retries.
 
 Ledger row keys (stable order): suite, classname, name, status, flaky,
 attempts, time_ms (summed across attempts, truncated to int milliseconds).
@@ -54,7 +54,6 @@ def parse_time_ms(raw):
 # exhausted retry on a test whose terminal failure/error is also present.
 RETRY_TAGS = frozenset({"flakyFailure", "flakyError", "rerunFailure", "rerunError"})
 FLAKY_TAGS = frozenset({"flakyFailure", "flakyError"})
-RERUN_TAGS = frozenset({"rerunFailure", "rerunError"})
 
 
 def case_outcome(case):
@@ -121,10 +120,10 @@ def parse_junit(path):
             status = "pass"
         flaky = (
             any(child.tag in FLAKY_TAGS for child in retries)
-            or (any(child.tag in RERUN_TAGS for child in retries) and status in ("fail", "error"))
             # Merged non-nextest JUnit only: repeated elements whose outcomes
-            # disagree mean a retry changed the result.
-            or (len(cases) > 1 and (len(set(outcomes)) > 1 or last in ("fail", "error")))
+            # disagree mean a retry changed the result. Repeated identical
+            # failures are deterministic, not flakes.
+            or (len(cases) > 1 and len(set(outcomes)) > 1)
         )
         time_ms = sum(
             parse_time_ms(case.get("time"))

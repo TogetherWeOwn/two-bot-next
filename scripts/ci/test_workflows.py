@@ -1959,6 +1959,23 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("pull_request", run_text)
         self.assertIn("github.event_name", str(select.get("env", "")))
         self.assertIn("local disk", run_text)
+        # The pull_request branch must come FIRST: reordering the R2 branch
+        # ahead of it (even with the guard kept as a later elif) would let
+        # shared-backend credentials reach PR runs as soon as any secret is
+        # set, while every substring above stays present. Nothing
+        # credential-shaped may precede the guard.
+        lines = run_text.splitlines()
+        gate = next(i for i, line in enumerate(lines)
+                    if "NEXTEST_EVENT" in line and "pull_request" in line)
+        self.assertTrue(lines[gate].strip().startswith("if "),
+                        f"pull_request guard must be the first branch, got: {lines[gate]!r}")
+        before = "\n".join(lines[:gate])
+        self.assertNotIn("GITHUB_ENV", before)
+        self.assertNotIn("R2_", before)
+        self.assertNotIn("SCCACHE_", before)
+        # The shared backends are still configured off-PR: this guards
+        # against gutting the step instead of guarding it.
+        self.assertIn("GITHUB_ENV", "\n".join(lines[gate:]))
         raw = (ROOT / ".github/workflows/reusable-rust-nextest.yml").read_text(encoding="utf-8")
         self.assertNotIn("adds no cache footprint", raw)
 
@@ -1973,10 +1990,15 @@ class WorkflowTests(unittest.TestCase):
                    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
         for key in r2_keys:
             with self.subTest(secret=key):
-                val = str(job["secrets"][key])
-                self.assertIn("pull_request", val)
-                self.assertIn("github.event_name != 'pull_request'", val)
-                self.assertIn(f"secrets.{key}", val)
+                # Exact pin: only `!= 'pull_request' && secrets.X || ''`
+                # withholds the secret on pull_request. Flipping && to ||
+                # (or leading with `== 'pull_request' && ''`) forwards it
+                # while keeping every substring present, so substrings
+                # cannot pin this gate.
+                self.assertEqual(
+                    str(job["secrets"][key]),
+                    "${{ github.event_name != 'pull_request' && secrets." + key + " || '' }}",
+                )
 
     def test_ci_speed_rollout_documents_pr_local_cache(self):
         rollout = (ROOT / "docs/ci-speed-rollout.md").read_text(encoding="utf-8")

@@ -48,7 +48,9 @@ FLAKY_SUITE = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 # nextest 0.9.99 shape: the terminal failure plus one rerunFailure child per
-# exhausted retry. flaky = rerun evidence on a final failure.
+# exhausted retry. This is a deterministic failure, not a flake: the test
+# failed on every attempt, so flaky stays false while attempts records the
+# spent retries.
 STUCK_FAIL_SUITE = """<?xml version="1.0" encoding="UTF-8"?>
 <testsuite name="integration" tests="1" failures="1" errors="0" skipped="0">
   <testcase classname="db" name="still_red" time="0.110">
@@ -129,12 +131,12 @@ class FlakeLedgerTests(unittest.TestCase):
         # Deterministic order: sorted by (suite, classname, name).
         self.assertEqual([row["name"] for row in rows], ["flaky_retry", "skipped_case"])
 
-    def test_fail_on_every_retry_stays_failed_and_flaky(self):
+    def test_fail_on_every_retry_stays_failed_not_flaky(self):
         code, rows = run_ledger(STUCK_FAIL_SUITE)
         self.assertEqual(code, 0)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "fail")
-        self.assertTrue(rows[0]["flaky"])
+        self.assertFalse(rows[0]["flaky"])
         self.assertEqual(rows[0]["attempts"], 2)
         # Retry time lives on the rerunFailure child; dropping it would
         # undercount the test's cost (0.110 final + 0.100 retry).
