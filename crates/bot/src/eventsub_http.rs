@@ -793,10 +793,17 @@ mod tests {
                 .is_none(),
             "receiver must wait for the slow body"
         );
-        tokio::time::advance(BODY_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert!(
+            futures_util::future::poll_immediate(&mut pending_response)
+                .await
+                .is_none(),
+            "receiver must still wait before the 5 s body budget"
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
         let response = futures_util::future::poll_immediate(pending_response)
             .await
-            .expect("slow body must time out within BODY_TIMEOUT + 1 s")
+            .expect("slow body must time out within 6 s")
             .unwrap();
         assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
         let bytes = axum::body::to_bytes(response.into_body(), 4096)
@@ -823,10 +830,17 @@ mod tests {
                 .is_none(),
             "receiver must wait for the stalled request"
         );
-        tokio::time::advance(REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::time::advance(Duration::from_secs(19)).await;
+        assert!(
+            futures_util::future::poll_immediate(&mut pending_response)
+                .await
+                .is_none(),
+            "receiver must still wait before the 20 s request budget"
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
         let response = futures_util::future::poll_immediate(pending_response)
             .await
-            .expect("stalled request must time out within REQUEST_TIMEOUT + 1 s");
+            .expect("stalled request must time out within 21 s");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let bytes = axum::body::to_bytes(response.into_body(), 4096)
             .await
