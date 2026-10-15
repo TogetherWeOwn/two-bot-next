@@ -2409,6 +2409,16 @@ pub struct GuildRoomWorker<S, H> {
     /// only whole-handle replacement needs `Arc::get_mut`.
     http: Arc<H>,
     creators: HashMap<Snowflake, CreatorChannel>,
+    /// Live generation the creator view was last merged at. A gateway
+    /// reconnect (GuildCreate/Resumed) bumps the generation but sends no
+    /// channel event, so a creator row written while down stays invisible
+    /// until restart. The maintenance tick merges on a generation change
+    /// (debounced), so the row converges within about 10 s. Updated only by
+    /// a successful merge, so a failed read retries on the next debounced
+    /// tick instead of parking on the five-minute naming refresh.
+    creators_generation: u64,
+    /// Actor clock of the last creator-view merge attempt (reconnect path).
+    creators_read_ms: Option<u64>,
     access: AccessControls,
     /// Caps and cooldown for the durable create admission; the rolling burst
     /// limits are fixed legacy constants.
@@ -2646,6 +2656,11 @@ const KICK_AUDIT_RETRY_MS: u64 = 5_000;
 
 const OWNER_REPAIR_COOLDOWN_MS: u64 = 60_000;
 
+/// Debounce for a gateway-reconnect creator merge: a generation change
+/// inside this window since the last attempt waits instead of re-reading
+/// the store about 4 times a second per guild on the 250 ms tick.
+const CREATORS_RECONNECT_DEBOUNCE_MS: u64 = 10_000;
+
 /// Repeat bookkeeping for one tracked failure. `last_attempt_ms` is the
 /// actor's monotonic clock, so a restart begins a fresh budget.
 #[derive(Debug, Clone)]
@@ -2754,11 +2769,17 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             Err(_) => (NameSettings::default(), false),
         };
         let guild_id = live.guild_id;
+        let creators_generation = live.read_state().generation;
         let worker = Self {
             live,
             store,
             http: Arc::new(http),
             creators,
+            creators_generation,
+            // `load` just read the creators at actor-clock ~0 (the loop
+            // starts right after), so the first reconnect merge is
+            // debounced against startup instead of re-reading instantly.
+            creators_read_ms: Some(0),
             access,
             admission: temp_voice_admission(),
             rooms,
@@ -2893,20 +2914,47 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         };
         if let Some(reason) = refusal {
             metrics::global().voice_join_refused(reason);
+            // Name the refusal reason and the creator-map state at join time:
+            // the next restart-cured stall must not need guessing. No member,
+            // channel or name content is logged: counts, booleans and clocks.
+            let live_state = self.live.read_state();
+            let creators_len = self.creators.len() as u64;
+            let known = self.creators.contains_key(&ticket.creator_id);
             if reason == "halted" {
                 warn!(
                     guild = self.live.guild_id.to_string(),
-                    reason, "voice creator join refused before queueing"
+                    reason,
+                    creators_len,
+                    known,
+                    halted = self.halted,
+                    ready = live_state.ready,
+                    live_generation = live_state.generation,
+                    ticket_generation = ticket.generation,
+                    "voice creator join refused before queueing"
                 );
             } else if reason == "duplicate" {
                 debug!(
                     guild = self.live.guild_id.to_string(),
-                    reason, "voice creator join refused before queueing"
+                    reason,
+                    creators_len,
+                    known,
+                    halted = self.halted,
+                    ready = live_state.ready,
+                    live_generation = live_state.generation,
+                    ticket_generation = ticket.generation,
+                    "voice creator join refused before queueing"
                 );
             } else {
                 info!(
                     guild = self.live.guild_id.to_string(),
-                    reason, "voice creator join refused before queueing"
+                    reason,
+                    creators_len,
+                    known,
+                    halted = self.halted,
+                    ready = live_state.ready,
+                    live_generation = live_state.generation,
+                    ticket_generation = ticket.generation,
+                    "voice creator join refused before queueing"
                 );
             }
             return false;
@@ -3111,6 +3159,66 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 plan,
             },
         );
+    }
+
+    /// Merge the stored creator rows into the in-memory view after a gateway
+    /// reconnect: insert rows the view lacks and swap in changed ones,
+    /// exactly like `CreatorAdded` (which also clears the name caches on any
+    /// change), but never delete. `reload_name_settings` already replaces
+    /// the whole map from the same rows every five minutes, deletions
+    /// included, so this merge is the backstop for what that path cannot
+    /// see: a failing config-snapshot read and full-row fields the snapshot
+    /// codec does not copy. A row missing from one direct read is still
+    /// treated as transient, not a deletion: dropping it would refuse joins
+    /// until restart. A failed read keeps the old view; the stored
+    /// generation is stamped only by a successful merge, so the next
+    /// debounced tick retries instead of parking on the five-minute naming
+    /// refresh. Runs from the maintenance tick when the live generation
+    /// changed since the last successful merge (a gateway reconnect
+    /// republished the snapshot but sent no channel event).
+    pub(super) async fn reload_creators(&mut self, now_ms: u64) {
+        let debounced = self
+            .creators_read_ms
+            .is_none_or(|last| now_ms.saturating_sub(last) >= CREATORS_RECONNECT_DEBOUNCE_MS);
+        let generation_changed = self.live.read_state().generation != self.creators_generation;
+        if !(generation_changed && debounced) {
+            return;
+        }
+        self.creators_read_ms = Some(now_ms);
+        let generation = self.live.read_state().generation;
+        match self.store.creators(self.live.guild_id).await {
+            Ok(rows) => {
+                self.creators_generation = generation;
+                let mut added = 0u64;
+                let mut changed = false;
+                for creator in rows {
+                    if self.creators.get(&creator.channel_id) != Some(&creator) {
+                        let known = self.creators.contains_key(&creator.channel_id);
+                        self.live.protect_channels([creator.channel_id]);
+                        self.creators.insert(creator.channel_id, creator);
+                        if !known {
+                            added += 1;
+                        }
+                        changed = true;
+                    }
+                }
+                if changed {
+                    self.name_signatures.clear();
+                    self.name_inputs = None;
+                    info!(
+                        guild = self.live.guild_id.to_string(),
+                        added, "voice creator view merged stored rows after a gateway reconnect"
+                    );
+                }
+            }
+            Err(error) => {
+                debug!(
+                    guild = self.live.guild_id.to_string(),
+                    ?error,
+                    "voice creator reconnect merge failed; keeping the cached view"
+                );
+            }
+        }
     }
 
     pub fn reconcile(&mut self) {
@@ -7568,6 +7676,7 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
             _ = std::future::ready(()), if maintenance_ready => {
                 maintenance_ready = false;
                 let now_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                worker.reload_creators(now_ms).await;
                 worker.reload_name_settings(now_ms).await;
                 worker.send_notices(now_ms).await;
                 worker.flush_kick_audit(now_ms).await;
