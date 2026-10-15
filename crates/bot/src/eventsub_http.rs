@@ -432,7 +432,7 @@ mod tests {
     use sha2::Sha256;
     use std::sync::{
         atomic::{AtomicU64, Ordering},
-        OnceLock,
+        Mutex, OnceLock,
     };
     use tower::ServiceExt as _;
 
@@ -484,6 +484,31 @@ mod tests {
             .unwrap()
             .as_millis() as i64;
         two_bot_core::format_iso_millis(now)
+    }
+
+    #[derive(Clone)]
+    struct EventSubLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for EventSubLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_eventsub_logs() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::clone(&bytes);
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || EventSubLogWriter(Arc::clone(&output)))
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (bytes, guard)
     }
 
     struct TestHeaders<'a> {
@@ -790,10 +815,26 @@ mod tests {
         assert_eq!(value["error"]["retryable"], false);
     }
 
+    #[test]
+    fn bounded_message_type_accepts_only_known_eventsub_types() {
+        for (input, expected) in [
+            (
+                "webhook_callback_verification",
+                "webhook_callback_verification",
+            ),
+            ("notification", "notification"),
+            ("revocation", "revocation"),
+            ("untrusted-header-value", "unknown"),
+        ] {
+            assert_eq!(bounded_message_type(input), expected);
+        }
+    }
+
     #[tokio::test]
     async fn malformed_challenge_is_refused() {
         // Empty and non-graphic challenges are `InvalidChallenge`: 400, never
         // an ack. Each body is signed exactly as sent.
+        let (logs, _subscriber) = capture_eventsub_logs();
         for challenge in ["", "has space"] {
             let body = format!(
                 r#"{{"challenge":{challenge:?},"subscription":{{"id":"synthetic-sub-0014","status":"webhook_callback_verification_pending","type":"stream.online","version":"1","condition":{{"broadcaster_user_id":"123456"}},"transport":{{"method":"webhook","callback":"https://example.com/hooks/twitch"}},"created_at":"2026-10-13T00:00:00Z"}}}}"#
@@ -823,6 +864,18 @@ mod tests {
             assert_eq!(value["error"]["code"], "malformed");
             assert_eq!(value["error"]["retryable"], false);
         }
+
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert_eq!(logs.matches("\"event\":\"eventsub_receiver\"").count(), 2);
+        assert_eq!(
+            logs.matches("\"message_type\":\"webhook_callback_verification\"")
+                .count(),
+            2
+        );
+        assert_eq!(logs.matches("\"error_class\":\"malformed\"").count(), 2);
+        assert!(!logs.contains("has space"));
+        assert!(!logs.contains("synthetic-delivery-0014"));
+        assert!(!logs.contains("https://example.com/hooks/twitch"));
     }
 
     #[tokio::test]
