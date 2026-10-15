@@ -12,23 +12,23 @@
 
 use std::{
     future::IntoFuture,
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
+    Json, Router,
     body::to_bytes,
     extract::{Request, State},
-    http::{header, HeaderValue, Method, StatusCode},
+    http::{HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::any,
-    Json, Router,
 };
 use serde_json::json;
 use tokio::{net::TcpListener, sync::Semaphore};
 use two_bot_core::{
     eventsub_receiver_config::EventsubReceiverConfig,
-    twitch_eventsub::{classify, verify_delivery, Delivery, DeliveryHeaders, EventSubError},
+    twitch_eventsub::{Delivery, DeliveryHeaders, EventSubError, classify, verify_delivery},
 };
 
 /// Exact callback path; mirrors `wrangler/src/eventsub.ts` (`EVENTSUB_PATH`).
@@ -39,18 +39,23 @@ const BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 struct ReceiverState {
-    secret: two_bot_core::twitch_eventsub::WebhookSecret,
+    secret: RwLock<two_bot_core::twitch_eventsub::WebhookSecret>,
     capacity: Arc<Semaphore>,
 }
 
 impl ReceiverState {
     fn new(config: &EventsubReceiverConfig) -> Self {
         Self {
-            // `WebhookSecret` is `Clone` (wraps `Secret<String>`); keep the
-            // value inside the state so the handler never re-reads the env.
-            secret: config.secret().clone(),
+            // Keep one atomic secret snapshot in the state; handlers never
+            // re-read the environment or observe partially replaced material.
+            secret: RwLock::new(config.secret().clone()),
             capacity: Arc::new(Semaphore::new(MAX_REQUESTS)),
         }
+    }
+
+    #[cfg(test)]
+    fn reload_secret(&self, config: &EventsubReceiverConfig) {
+        *self.secret.write().expect("EventSub secret lock poisoned") = config.secret().clone();
     }
 }
 
@@ -252,7 +257,12 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
         return refuse(state, StatusCode::BAD_REQUEST, "malformed", false, id);
     }
 
-    if let Err(error) = verify_delivery(&state.secret, &headers, &raw, now_ms_i64()) {
+    let secret = state
+        .secret
+        .read()
+        .expect("EventSub secret lock poisoned")
+        .clone();
+    if let Err(error) = verify_delivery(&secret, &headers, &raw, now_ms_i64()) {
         // `BodyTooLarge` cannot arrive here (`to_bytes` caps first), but map
         // it explicitly rather than collapsing every variant into one arm.
         if error == EventSubError::BodyTooLarge {
@@ -349,8 +359,8 @@ mod tests {
     use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     use std::sync::{
-        atomic::{AtomicU64, Ordering},
         OnceLock,
+        atomic::{AtomicU64, Ordering},
     };
     use tower::ServiceExt as _;
 
@@ -850,19 +860,13 @@ mod tests {
         assert_eq!(value["error"]["retryable"], true);
     }
 
-    // Webhook-secret reload acceptance: the no-restart rotation contract.
+    // Webhook-secret reload coverage: the no-restart rotation contract.
     //
-    // The rotation primitive is `EventsubReceiverConfig::from_map` (the same
-    // process re-reads the Operator-provided map; nothing restarts) combined
-    // with `verify_delivery` against the reloaded secret. These tests pin the
-    // reload properties end to end through the bound router: the reloaded
-    // secret verifies new deliveries, the pre-reload secret is rejected
-    // afterwards (no dual-accept window), an in-flight delivery sees exactly
-    // one verifier (deterministic verify or refusal, never 500, never a
-    // mixed-secret accept), and no secret material reaches logs or `Debug`
-    // output on the reload path. Secrets are runtime-generated per test, so
-    // no key material appears in source and parallel tests never share a
-    // secret with the module's shared signing fixture.
+    // Tests rotate one bound ReceiverState through its test-visible reload
+    // seam, then verify deliveries through the same router. Production binds
+    // the initial secret at startup; runtime configuration wiring remains a
+    // separate follow-up. Secrets are runtime-generated per test, so no key
+    // material appears in source or overlaps the module's signing fixture.
 
     /// Runtime-generated reload secret: never a literal, so the hardcoded-key
     /// rule stays silent. The embedded counter makes every call distinct,
@@ -921,51 +925,20 @@ mod tests {
             .unwrap()
     }
 
-    fn reload_headers<'a>(
-        message_id: &'a str,
-        timestamp: &'a str,
-        signature: &'a str,
-    ) -> DeliveryHeaders<'a> {
-        DeliveryHeaders::from_lookup(|name| match name {
-            "twitch-eventsub-message-id" => Some(message_id),
-            "twitch-eventsub-message-timestamp" => Some(timestamp),
-            "twitch-eventsub-message-signature" => Some(signature),
-            "twitch-eventsub-message-type" => Some("webhook_callback_verification"),
-            _ => None,
-        })
-        .unwrap()
-    }
-
     #[tokio::test]
     async fn reloaded_secret_verifies_new_deliveries() {
         let old_secret = fresh_reload_secret();
         let new_secret = fresh_reload_secret();
         assert_ne!(old_secret, new_secret, "rotation must change the secret");
-        // The same process loads the initial map, then re-reads it after the
-        // Operator rotation: no restart happens between the two loads.
-        let _initial = reload_config_for(&old_secret);
-        let reloaded = reload_config_for(&new_secret);
+        let state = Arc::new(ReceiverState::new(&reload_config_for(&old_secret)));
+        let bound = router(Arc::clone(&state));
+        state.reload_secret(&reload_config_for(&new_secret));
+
         let body = challenge_body();
         let timestamp = fresh_timestamp();
         let message_id = "synthetic-reload-0001";
         let signature = sign_with(&new_secret, message_id, &timestamp, body.as_bytes());
-        // Pure verification first: the reloaded secret authenticates the new
-        // delivery at the current clock.
-        let headers = reload_headers(message_id, &timestamp, &signature);
-        assert_eq!(
-            verify_delivery(reloaded.secret(), &headers, body.as_bytes(), now_ms_i64()),
-            Ok(())
-        );
-        // Then end to end: a router bound to the reloaded secret answers the
-        // Twitch challenge instead of refusing it.
-        let response = reload_response(
-            router_for_secret(&new_secret),
-            message_id,
-            &timestamp,
-            &signature,
-            body,
-        )
-        .await;
+        let response = reload_response(bound, message_id, &timestamp, &signature, body).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get("content-type").unwrap(),
@@ -981,150 +954,98 @@ mod tests {
     async fn pre_reload_secret_is_rejected_after_reload() {
         let old_secret = fresh_reload_secret();
         let new_secret = fresh_reload_secret();
-        let _initial = reload_config_for(&old_secret);
-        let reloaded = reload_config_for(&new_secret);
+        let state = Arc::new(ReceiverState::new(&reload_config_for(&old_secret)));
+        let bound = router(Arc::clone(&state));
         let body = challenge_body();
-        // A delivery signed before the rotation ...
         let timestamp = fresh_timestamp();
-        let message_id = "synthetic-reload-0002";
-        let old_signature = sign_with(&old_secret, message_id, &timestamp, body.as_bytes());
-        // ... is rejected by the reloaded secret: no dual-accept window.
-        let headers = reload_headers(message_id, &timestamp, &old_signature);
-        assert_eq!(
-            verify_delivery(reloaded.secret(), &headers, body.as_bytes(), now_ms_i64()),
-            Err(EventSubError::BadSignature)
-        );
-        let response = reload_response(
-            router_for_secret(&new_secret),
-            message_id,
+
+        let before_id = "synthetic-reload-0002";
+        let before_signature = sign_with(&old_secret, before_id, &timestamp, body.as_bytes());
+        let before = reload_response(
+            bound.clone(),
+            before_id,
             &timestamp,
-            &old_signature,
+            &before_signature,
             body,
         )
         .await;
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(before.status(), StatusCode::OK);
+
+        state.reload_secret(&reload_config_for(&new_secret));
+        let old_id = "synthetic-reload-0003";
+        let old_signature = sign_with(&old_secret, old_id, &timestamp, body.as_bytes());
+        let stale = reload_response(bound.clone(), old_id, &timestamp, &old_signature, body).await;
+        assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
         assert_ne!(
-            response.status(),
+            stale.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
             "a stale secret is a deterministic refusal, never a 500"
         );
-        let bytes = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
+        let bytes = axum::body::to_bytes(stale.into_body(), 4096).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["ok"], false);
         assert_eq!(value["error"]["code"], "unauthorized");
         assert_eq!(value["error"]["retryable"], false);
         assert!(!String::from_utf8_lossy(&bytes).contains("synthetic-challenge-0001"));
-        // And symmetrically: the new secret never verifies against the old
-        // one, so the cutover is atomic in both directions.
-        let reverse_timestamp = fresh_timestamp();
-        let reverse_id = "synthetic-reload-0003";
-        let new_signature = sign_with(&new_secret, reverse_id, &reverse_timestamp, body.as_bytes());
-        let reverse = reload_headers(reverse_id, &reverse_timestamp, &new_signature);
-        let initial = reload_config_for(&old_secret);
-        assert_eq!(
-            verify_delivery(initial.secret(), &reverse, body.as_bytes(), now_ms_i64()),
-            Err(EventSubError::BadSignature)
-        );
+
+        let new_id = "synthetic-reload-0004";
+        let new_signature = sign_with(&new_secret, new_id, &timestamp, body.as_bytes());
+        let fresh = reload_response(bound, new_id, &timestamp, &new_signature, body).await;
+        assert_eq!(fresh.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn in_flight_delivery_during_reload_is_deterministic() {
-        // An in-flight delivery is signed once, before the cutover, and lands
-        // on either side of it. The atomic cutover means exactly one verifier
-        // accepts each delivery: 200 on the matching side, a deterministic
-        // refusal on the other, never 500 and never a cross-secret accept.
         let old_secret = fresh_reload_secret();
         let new_secret = fresh_reload_secret();
+        let state = Arc::new(ReceiverState::new(&reload_config_for(&old_secret)));
+        let bound = router(Arc::clone(&state));
         let body = challenge_body();
         let timestamp = fresh_timestamp();
-        let old_id = "synthetic-reload-0004";
-        let new_id = "synthetic-reload-0005";
+        let old_id = "synthetic-reload-0005";
         let old_signature = sign_with(&old_secret, old_id, &timestamp, body.as_bytes());
-        let new_signature = sign_with(&new_secret, new_id, &timestamp, body.as_bytes());
-        // Pure layer: each signature verifies under exactly one secret.
-        for (secret, message_id, signature) in [
-            (old_secret.as_str(), old_id, old_signature.as_str()),
-            (new_secret.as_str(), new_id, new_signature.as_str()),
-        ] {
-            for verifier in [old_secret.as_str(), new_secret.as_str()] {
-                let headers = reload_headers(message_id, &timestamp, signature);
-                let config = reload_config_for(verifier);
-                let outcome =
-                    verify_delivery(config.secret(), &headers, body.as_bytes(), now_ms_i64());
-                if verifier == secret {
-                    assert_eq!(outcome, Ok(()), "matching secret must verify");
-                } else {
-                    assert_eq!(
-                        outcome,
-                        Err(EventSubError::BadSignature),
-                        "a cross-secret verify would be a mixed-secret accept"
-                    );
-                }
-            }
-        }
-        // Router layer: the same four combinations answer 200 on the matching
-        // side and a deterministic non-500 refusal on the other.
-        for (secret, message_id, signature) in [
-            (old_secret.as_str(), old_id, old_signature.as_str()),
-            (new_secret.as_str(), new_id, new_signature.as_str()),
-        ] {
-            for verifier in [old_secret.as_str(), new_secret.as_str()] {
-                let response = reload_response(
-                    router_for_secret(verifier),
-                    message_id,
-                    &timestamp,
-                    signature,
-                    body,
-                )
-                .await;
-                assert_ne!(
-                    response.status(),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "in-flight must never see 500"
-                );
-                if verifier == secret {
-                    assert_eq!(response.status(), StatusCode::OK);
-                    let bytes = axum::body::to_bytes(response.into_body(), 4096)
-                        .await
-                        .unwrap();
-                    assert_eq!(&bytes[..], b"synthetic-challenge-0001");
-                } else {
-                    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-                    let bytes = axum::body::to_bytes(response.into_body(), 4096)
-                        .await
-                        .unwrap();
-                    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                    assert_eq!(value["ok"], false);
-                    assert_eq!(value["error"]["code"], "unauthorized");
-                    assert_eq!(value["error"]["retryable"], false);
-                }
-            }
-        }
-        // The retryable refusal is deterministic too: with every permit held,
-        // an in-flight delivery gets 503 `busy`, still never 500.
-        let loaded = reload_config_for(&new_secret);
-        let state = Arc::new(ReceiverState::new(&loaded));
-        let _permits = (0..MAX_REQUESTS)
-            .map(|_| state.capacity.clone().try_acquire_owned().expect("permit"))
-            .collect::<Vec<_>>();
-        let response = router(Arc::clone(&state))
-            .oneshot(request("POST", EVENTSUB_PATH, None, None, None, None, ""))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_ne!(
-            response.status(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "overload is a retryable refusal, never a 500"
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let held_body = Body::from_stream(futures_util::stream::once(async move {
+            started_tx.send(()).expect("test is waiting for body read");
+            release_rx.await.expect("test releases the request body")
+        }));
+        let request = request_with_content_type(
+            EVENTSUB_PATH,
+            "application/json",
+            "POST",
+            TestHeaders {
+                message_id: Some(old_id),
+                timestamp: Some(&timestamp),
+                signature: Some(&old_signature),
+                message_type: Some("webhook_callback_verification"),
+            },
+            held_body,
         );
-        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+        let pending = tokio::spawn(bound.clone().oneshot(request));
+
+        // The request is waiting for its body while the shared secret changes.
+        started_rx
             .await
-            .unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["error"]["code"], "busy");
-        assert_eq!(value["error"]["retryable"], true);
+            .expect("receiver began reading request body");
+        state.reload_secret(&reload_config_for(&new_secret));
+        release_tx
+            .send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                body.as_bytes().to_vec(),
+            )))
+            .expect("receiver is waiting for request body");
+        let in_flight = pending.await.unwrap().unwrap();
+        assert_eq!(in_flight.status(), StatusCode::UNAUTHORIZED);
+        assert_ne!(
+            in_flight.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "one atomic secret snapshot yields a deterministic refusal, never a 500"
+        );
+
+        let new_id = "synthetic-reload-0006";
+        let new_signature = sign_with(&new_secret, new_id, &timestamp, body.as_bytes());
+        let reloaded = reload_response(bound, new_id, &timestamp, &new_signature, body).await;
+        assert_eq!(reloaded.status(), StatusCode::OK);
     }
 
     #[derive(Clone)]
@@ -1260,34 +1181,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bound_receiver_serves_initial_secret_until_runtime_reload_lands() {
+    async fn bound_receiver_does_not_observe_config_rotation() {
         // Gap pin: `ReceiverState` clones the secret at bind time and never
-        // re-reads it, so a rotation without restart is invisible to an
-        // already-bound router. The runtime-reload build replaces this test's
-        // second expectation with post-reload verification on the same bound
-        // router (no restart, no new bind); until then this documents the
-        // missing holder. Fail-without-holder evidence: expecting 200 for the
-        // new-signed delivery below fails on this head with 401.
+        // re-reads it. The old secret works before the config is re-read.
         let old_secret = fresh_reload_secret();
         let new_secret = fresh_reload_secret();
         let bound = router_for_secret(&old_secret);
-        // Simulate the Operator rotation: the map now yields the new secret.
-        let _reloaded = reload_config_for(&new_secret);
         let body = challenge_body();
         let timestamp = fresh_timestamp();
-        // The bound router still serves the initial secret ...
         let old_id = "synthetic-reload-0008";
         let old_signature = sign_with(&old_secret, old_id, &timestamp, body.as_bytes());
-        let served = reload_response(bound.clone(), old_id, &timestamp, &old_signature, body).await;
-        assert_eq!(served.status(), StatusCode::OK);
-        // ... and the same bound router does not pick up the rotation.
+        let before_rotation =
+            reload_response(bound.clone(), old_id, &timestamp, &old_signature, body).await;
+        assert_eq!(before_rotation.status(), StatusCode::OK);
+
+        // Simulate the Operator map changing without restarting or rebinding.
+        let _reloaded = reload_config_for(&new_secret);
+        // Today's bound receiver still accepts the old secret here (200).
+        // When the reload holder lands, this post-rotation expectation must
+        // flip to 401, and the new-secret expectation below must flip 401 ->
+        // 200 on this same router. Never keep both secrets accepted.
+        let after_rotation =
+            reload_response(bound.clone(), old_id, &timestamp, &old_signature, body).await;
+        assert_eq!(after_rotation.status(), StatusCode::OK);
         let new_id = "synthetic-reload-0009";
         let new_signature = sign_with(&new_secret, new_id, &timestamp, body.as_bytes());
         let missed = reload_response(bound, new_id, &timestamp, &new_signature, body).await;
-        assert_eq!(
-            missed.status(),
-            StatusCode::UNAUTHORIZED,
-            "the bound router cannot see the rotation until the reload holder lands"
-        );
+        assert_eq!(missed.status(), StatusCode::UNAUTHORIZED);
     }
 }
