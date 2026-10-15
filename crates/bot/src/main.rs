@@ -34,6 +34,7 @@ mod discord_test_common;
 mod dispatch;
 mod erasure_cli;
 mod event_cli;
+mod eventsub_http;
 mod feed_jobs;
 mod gateway;
 mod gateway_commands;
@@ -156,6 +157,15 @@ async fn run(cli_args: &[String]) {
             );
             std::process::exit(1);
         });
+    let eventsub_config = two_bot_core::eventsub_receiver_config::EventsubReceiverConfig::from_env(
+    )
+    .unwrap_or_else(|_| {
+        tracing::error!(
+            error_class = "receiver_config_invalid",
+            "eventsub startup refused"
+        );
+        std::process::exit(1);
+    });
     let config = Config::from_env().unwrap_or_else(|err| {
         if receiver_config.is_some() {
             tracing::error!(
@@ -318,6 +328,22 @@ async fn run(cli_args: &[String]) {
                     }),
             )
         }
+        None => None,
+    };
+
+    // Private EventSub listener (TOG-23387): verified deliveries only, no
+    // database and no Discord send in this slice. Enabled failures never fall
+    // back; a bound listener that later fails stops the container.
+    let eventsub_receiver = match eventsub_config {
+        Some(eventsub_config) => Some(eventsub_http::bind(eventsub_config).await.unwrap_or_else(
+            |_| {
+                tracing::error!(
+                    error_class = "receiver_bind_failed",
+                    "eventsub startup refused"
+                );
+                std::process::exit(1);
+            },
+        )),
         None => None,
     };
 
@@ -659,6 +685,7 @@ async fn run(cli_args: &[String]) {
         self_roles,
         automod_slot,
         receiver,
+        eventsub_receiver,
         member,
     );
     let result = match gateway_task {
