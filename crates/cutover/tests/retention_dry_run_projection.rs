@@ -4,9 +4,9 @@
 //! Execute run deletes in stages: time-window rows first, then eligible
 //! pending user deletions, then the guild purge. Rows an earlier stage
 //! removes must not be counted again in `guild_rows_purged`, or the dry-run
-//! total overstates what Execute will delete. Guard-deferred users are the
-//! exception: their rows survive the user-deletion stage and are purged
-//! with the guild, so they stay in the guild projection. Rows another
+//! total overstates what Execute will delete. Guard-deferred requests stay
+//! pending, and any unresolved guard in a queued guild defers its purge
+//! with rows untouched, so a guarded guild contributes no guild rows. Rows another
 //! member owns that only disappear because the user stage deletes their
 //! `ON DELETE CASCADE` parent (the deletion user's voice room or ticket)
 //! are gone before the guild stage too, so they stay out of it.
@@ -185,8 +185,9 @@ async fn dry_run_guild_projection_agrees_with_execute_when_stages_overlap() {
     .execute(pool)
     .await
     .unwrap();
-    // In-flight fence: the guarded member's request defers, leaving their
-    // rows (and the fence itself) to the guild stage.
+    // In-flight fence: the guarded member's request defers, and the same
+    // fence defers the queued guild purge too, so their rows (and the fence
+    // itself) survive both stages with the guild kept queued.
     sqlx::query(
         "INSERT INTO internal_idempotency
            (caller_hash, key_hash, action, payload_hash, state, guild_id, actor_id, target_id)
@@ -208,12 +209,12 @@ async fn dry_run_guild_projection_agrees_with_execute_when_stages_overlap() {
     let dry = run_retention(pool, RetentionMode::DryRun).await.unwrap();
     let live = run_retention(pool, RetentionMode::Execute).await.unwrap();
     // Execute ground truth: 1 expired presence row, 2 expired voice rows,
-    // 1 expired audit row. The guild stage then sees only the fresh
-    // presence row, the fresh non-voice event, the fresh other-member
-    // audit row, the other + guarded members and levels, and the fence
-    // (8 rows); the deletion user's rows already went in earlier stages,
-    // including the room and ticket whose CASCADE children (another
-    // member's block/grants/transcript) therefore never reach it either.
+    // 1 expired audit row. The guarded member's in-flight fence defers the
+    // queued guild purge, so the guild stage deletes nothing (0 rows) and
+    // reports one deferral; the deletion user's rows already went in
+    // earlier stages, including the room and ticket whose CASCADE children
+    // (another member's block/grants/transcript) therefore never reach the
+    // guild stage either.
     assert_eq!(
         (
             live.presence_raw_deleted,
@@ -223,8 +224,13 @@ async fn dry_run_guild_projection_agrees_with_execute_when_stages_overlap() {
             live.deletions_completed,
             live.deletions_deferred,
         ),
-        (1, 2, 1, 8, 1, 1),
+        (1, 2, 1, 0, 1, 1),
         "execute must delete each row once across stages, got {live:?}"
+    );
+    assert_eq!(
+        (live.guild_purges_failed, live.guild_purges_deferred),
+        (0, 1),
+        "the guarded guild must stay queued as deferred, got {live:?}"
     );
     assert_eq!(
         (
@@ -244,6 +250,11 @@ async fn dry_run_guild_projection_agrees_with_execute_when_stages_overlap() {
             live.deletions_deferred,
         ),
         "dry run must project execute per class, got dry {dry:?} live {live:?}"
+    );
+    assert_eq!(
+        (dry.guild_purges_failed, dry.guild_purges_deferred),
+        (live.guild_purges_failed, live.guild_purges_deferred),
+        "dry run must project the guarded guild's deferral, got dry {dry:?} live {live:?}"
     );
     assert_eq!(
         dry.total_deleted(),

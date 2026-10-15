@@ -88,10 +88,27 @@ pub struct RetentionReport {
     pub audit_cache_deleted: u64,
     /// Guild-scoped rows purged for departed guilds.
     pub guild_rows_purged: u64,
-    /// Queued guild purges that failed in this run, leaving the guild queued.
-    /// A nonzero value with an `Ok` return is the signal that a departed
-    /// guild's rows survived the run (see the warn log for the guild id).
+    /// Queued guild purges that failed with a real error in this run,
+    /// leaving the guild queued. Guard-deferred purges are NOT counted
+    /// here; see `guild_purges_deferred`. A nonzero value with an `Ok`
+    /// return means a departed guild's rows survived a storage or
+    /// constraint error (see the warn log for the guild id).
     pub guild_purges_failed: u64,
+    /// Queued guild purges deferred by an unresolved replay guard in this
+    /// run, in both modes. Deferred guilds stay queued with rows untouched
+    /// until the guards settle; unlike `guild_purges_failed` this needs no
+    /// incident response, only guard settlement (see `purge_guild` for
+    /// the per-guard settlement path). The dry run probes the same guards,
+    /// so it reports exactly what the live run will defer, including guards
+    /// of members with a pending user-deletion request: those rows are
+    /// replay fences, not stale data, so they defer the guild too.
+    pub guild_purges_deferred: u64,
+    /// Age of the longest-waiting deferred guild purge, in seconds since
+    /// `retention_guild_purge_queue.enqueued_at`. Zero when nothing was
+    /// deferred this run. Operators watch this alongside
+    /// `guild_purges_deferred`: a growing age means a departed guild's rows
+    /// wait on a guard that may never settle on its own.
+    pub guild_purges_deferred_oldest_secs: u64,
     /// User-deletion requests completed by this run.
     pub deletions_completed: u64,
     /// Pending deletion requests refused by a replay guard or by schema
@@ -123,8 +140,8 @@ impl RetentionReport {
     /// Completed user deletions are receipts, not row
     /// counts, and are reported separately in `deletions_completed`;
     /// deferred and overdue requests are pending-work signals, not
-    /// deletions, and are excluded, as are failed guild purges
-    /// (`guild_purges_failed`).
+    /// deletions, and are excluded, as are failed and guard-deferred guild
+    /// purges (`guild_purges_failed`, `guild_purges_deferred`).
     #[must_use]
     pub fn total_deleted(&self) -> u64 {
         self.presence_raw_deleted
@@ -179,8 +196,11 @@ fn next_request_id() -> String {
 /// pre-purge rows, and purges leave the deletion ledger to the receipt path.
 /// Guard- or schema-refused requests are counted in `deletions_deferred`
 /// (and logged at warn level) and SLA-breaching pendings in
-/// `deletions_overdue`, in both modes. Schema gaps are computed once per
-/// run: gap-deferred deletions are counted separately in
+/// `deletions_overdue`, in both modes. Guard-deferred guild purges are
+/// counted in `guild_purges_deferred` with the longest wait in
+/// `guild_purges_deferred_oldest_secs`, in both modes, so the dry run
+/// previews exactly what the live run will defer. Schema gaps are computed
+/// once per run: gap-deferred deletions are counted separately in
 /// `schema_gap_deferrals` with the gap list in the warn log, and every queued
 /// guild stays queued (counted in `guild_purges_failed`) while gaps exist.
 pub async fn run_retention(
@@ -216,7 +236,8 @@ pub async fn run_retention(
             // Split pendings before projecting guild rows: an Execute run
             // deletes eligible users' rows in the user-deletion stage, ahead
             // of the guild purge, so those rows must not be counted again as
-            // guild rows. Guard-deferred rows survive to the guild stage.
+            // guild rows. Guard-deferred requests stay pending, and any
+            // unresolved guard in the guild defers its purge too.
             let gaps = crate::member_erasure::schema_gaps(&mut tx).await?;
             let schema_gap = !gaps.is_empty();
             let mut deferred = 0u64;
@@ -231,14 +252,25 @@ pub async fn run_retention(
                     eligible.push((guild_id.clone(), user_id.clone()));
                 }
             }
-            let (guild_rows, guild_failed) = if schema_gap {
+            // With schema gaps a purge built from an incomplete plan would
+            // dequeue work it did not fully delete, so every queued guild
+            // stays queued (failed, not purged) and guard probing is
+            // skipped. Without gaps the guild projection probes the same
+            // guild-wide replay guards as the live run (see
+            // count_queued_guild_rows): guarded guilds contribute no rows
+            // and count as deferred, never as purged. Unpredictable storage
+            // errors stay unreported here (the dry run deletes nothing to
+            // fail on).
+            let (guild_rows, guild_failed, guild_deferred, guild_deferred_oldest) = if schema_gap {
                 let queued: i64 =
                     sqlx::query_scalar("SELECT count(*) FROM retention_guild_purge_queue")
                         .fetch_one(&mut *tx)
                         .await?;
-                (0, queued as u64)
+                (0, queued as u64, 0, 0)
             } else {
-                (count_queued_guild_rows(&mut tx, &eligible).await?, 0)
+                let (rows, deferred_guilds, deferred_oldest) =
+                    count_queued_guild_rows(&mut tx, &eligible).await?;
+                (rows, 0, deferred_guilds, deferred_oldest)
             };
             tx.commit().await?;
             RetentionReport {
@@ -247,9 +279,12 @@ pub async fn run_retention(
                 audit_cache_deleted: audit,
                 guild_rows_purged: guild_rows,
                 // The dry run reports what the live run will delete: guarded
-                // requests stay pending, so they are deferred, not completed,
-                // and gapped guilds stay queued, so they are failed, not purged.
+                // requests stay pending, so they are deferred, not completed;
+                // guarded guild purges are deferred, never failed; and gapped
+                // guilds stay queued, so they are failed, not purged.
                 guild_purges_failed: guild_failed,
+                guild_purges_deferred: guild_deferred,
+                guild_purges_deferred_oldest_secs: guild_deferred_oldest,
                 deletions_completed: (pending as u64).saturating_sub(deferred),
                 deletions_deferred: deferred,
                 schema_gap_deferrals: if schema_gap { pending as u64 } else { 0 },
@@ -376,12 +411,20 @@ pub async fn run_retention(
                     "retention user deletions deferred by unresolved replay guard or schema coverage"
                 );
             }
-            let guilds: Vec<String> =
-                sqlx::query_scalar("SELECT guild_id FROM retention_guild_purge_queue")
-                    .fetch_all(&mut *tx)
-                    .await?;
+            let guilds: Vec<(String, i64)> = sqlx::query_as(
+                "SELECT guild_id, (EXTRACT(EPOCH FROM (clock_timestamp() - enqueued_at)))::BIGINT FROM retention_guild_purge_queue",
+            )
+            .fetch_all(&mut *tx)
+            .await?;
             let mut guild_rows = 0u64;
             let mut guild_failed = 0u64;
+            let mut guild_deferred = 0u64;
+            let mut guild_deferred_oldest = 0u64;
+            // Schema gaps are gated once up front: a purge built from an
+            // incomplete plan would dequeue work it did not fully delete, so
+            // every queued guild stays queued while gaps exist. Otherwise
+            // each guild drains in its own savepoint with the same guard
+            // settlement the dry-run projection reports.
             if schema_gapped {
                 guild_failed = guilds.len() as u64;
                 if !guilds.is_empty() {
@@ -392,7 +435,7 @@ pub async fn run_retention(
                     );
                 }
             } else {
-                for guild in &guilds {
+                for (guild, waited_secs) in &guilds {
                     sqlx::query("SAVEPOINT retention_guild")
                         .execute(&mut *tx)
                         .await?;
@@ -410,12 +453,26 @@ pub async fn run_retention(
                             sqlx::query("RELEASE SAVEPOINT retention_guild")
                                 .execute(&mut *tx)
                                 .await?;
-                            guild_failed += 1;
-                            tracing::warn!(
-                                guild_id = %guild,
-                                error = %format!("{err:?}"),
-                                "retention guild purge failed, kept queued"
-                            );
+                            // Gaps are pre-gated above, so a deferrable
+                            // refusal here is an unresolved replay guard:
+                            // keep the guild queued as deferred, not failed.
+                            if is_deferrable_refusal(&err) {
+                                guild_deferred += 1;
+                                guild_deferred_oldest =
+                                    guild_deferred_oldest.max((*waited_secs).max(0) as u64);
+                                tracing::warn!(
+                                    guild_id = %guild,
+                                    waited_secs = (*waited_secs).max(0),
+                                    "retention guild purge deferred by unresolved replay guard, kept queued"
+                                );
+                            } else {
+                                guild_failed += 1;
+                                tracing::warn!(
+                                    guild_id = %guild,
+                                    error = %format!("{err:?}"),
+                                    "retention guild purge failed, kept queued"
+                                );
+                            }
                         }
                     }
                 }
@@ -427,6 +484,8 @@ pub async fn run_retention(
                 audit_cache_deleted: audit,
                 guild_rows_purged: guild_rows,
                 guild_purges_failed: guild_failed,
+                guild_purges_deferred: guild_deferred,
+                guild_purges_deferred_oldest_secs: guild_deferred_oldest,
                 deletions_completed: completed,
                 deletions_deferred: deferred,
                 schema_gap_deferrals: gap_deferred,
@@ -763,6 +822,29 @@ async fn count_overdue_deletions(
 /// for a departed guild still completes with a receipt instead of vanishing.
 /// Re-checks the queue row under the caller's lock: a guild whose purge was
 /// cancelled via [`cancel_guild_purge`] (rejoin before the run) keeps its rows.
+/// Refuses before deleting anything while any replay guard is unresolved
+/// anywhere in the guild (see `has_unresolved_guild_guards` in
+/// `crate::member_erasure`, which takes no member exclusions): the error
+/// keeps the guild queued with rows untouched until the guards settle, and
+/// the caller reports it via `guild_purges_deferred` (with the wait in
+/// `guild_purges_deferred_oldest_secs`), never `guild_purges_failed`.
+/// `not_sent` internal intents deliberately block too: a `not_sent` row is a
+/// live same-key retry permit (the owning caller may still re-claim it), and
+/// purging the row would destroy the dedup record so a later retry executes
+/// as a brand-new intent. Settling a deferred guild is always through the
+/// guard's own path, never by deleting the guard row: `not_sent` intents
+/// settle when the owning caller retries the same key, and self-role,
+/// automod-claim, and containment guards settle through their own runtime
+/// lifecycles. For `unknown` and stale `in_flight` internal intents,
+/// `InternalActionStore::reconcile` is NOT an operator path (it needs the
+/// caller's exact raw payload bytes); the shipped operator exit is
+/// `two-bot reconcile-event`, which only lists and resolves
+/// `event.upsert` / `event.cancel` intents by id with independently-proven
+/// evidence, and only for the staging allowlisted guild. Any other action
+/// or guild has no shipped operator settlement today, so the guild stays
+/// queued and the deferred counters are the visibility. There is no
+/// auto-expiry; a growing `guild_purges_deferred_oldest_secs` is the
+/// escalation signal.
 async fn purge_guild(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     guild_id: &str,
@@ -774,6 +856,11 @@ async fn purge_guild(
             .await?;
     if still_queued.is_none() {
         return Ok(0);
+    }
+    if crate::member_erasure::has_unresolved_guild_guards(tx, guild_id).await? {
+        return Err(sqlx::Error::InvalidArgument(
+            "unresolved erasure replay guard".into(),
+        ));
     }
     let mut purged = 0u64;
     purged += sqlx::query("DELETE FROM presence_probe WHERE guild_id = $1")
@@ -854,17 +941,29 @@ enum ProjectionBind<'a> {
 /// child-before-parent order keeps every referenced parent visible at the
 /// same point in an Execute run, so the snapshot and staged evaluations
 /// agree.
+///
+/// Guilds with any unresolved replay guard contribute no rows: they are
+/// reported as deferred (with the longest queue wait) so the dry run
+/// previews exactly what the live run will defer.
 async fn count_queued_guild_rows(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     eligible_deletions: &[(String, String)],
-) -> Result<u64, sqlx::Error> {
-    let guilds: Vec<String> =
-        sqlx::query_scalar("SELECT guild_id FROM retention_guild_purge_queue")
-            .fetch_all(&mut **tx)
-            .await?;
+) -> Result<(u64, u64, u64), sqlx::Error> {
+    let queued: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT guild_id, (EXTRACT(EPOCH FROM (clock_timestamp() - enqueued_at)))::BIGINT FROM retention_guild_purge_queue",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
     let erasure = crate::member_erasure::plan();
     let mut total = 0u64;
-    for guild in &guilds {
+    let mut deferred_guilds = 0u64;
+    let mut deferred_oldest = 0u64;
+    for (guild, waited_secs) in &queued {
+        if crate::member_erasure::has_unresolved_guild_guards(&mut *tx, guild).await? {
+            deferred_guilds += 1;
+            deferred_oldest = deferred_oldest.max((*waited_secs).max(0) as u64);
+            continue;
+        }
         let mut eligible_users: Vec<&str> = eligible_deletions
             .iter()
             .filter(|(pending_guild, _)| pending_guild == guild)
@@ -947,5 +1046,5 @@ async fn count_queued_guild_rows(
             total += count as u64;
         }
     }
-    Ok(total)
+    Ok((total, deferred_guilds, deferred_oldest))
 }
