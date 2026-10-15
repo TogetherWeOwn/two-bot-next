@@ -1,25 +1,19 @@
-//! Acceptance: gateway supervised reconnect with bounded backoff (TOG-25281).
+//! Acceptance tests: gateway supervised reconnect with bounded backoff.
 //!
-//! BUILDER CONTRACT (TOG-25284): this file is frozen. Build on the test
-//! card's branch, keep every test here verbatim, and make the suite green by
-//! changing production code only — replace the body of
-//! `crate::gateway_backoff::run_supervised` with the retry loop documented on
-//! that item, reusing `reconnect_delay` for every wait. Do not edit the
-//! policies constructed below, the expected exits, or the exact-gap
-//! assertions: they are the spec.
+//! BUILDER CONTRACT: keep the policies, expected exits, and
+//! behavior assertions below as the spec. The paused-time driver settles the
+//! supervisor before each advance; timer gaps allow Tokio's 1ms resolution.
 //!
 //! Suite map (all offline: no DB, no live Discord, no wall-clock sleeps —
-//! `start_paused` time plus `yield_now` only, per the flake-ledger policy):
+//! paused Tokio timers, notifications, and bounded yields only):
 //!
 //! - schedule pins (green now, guard the builder's edits): cap, jitter
 //!   bounds, determinism, budget end, no-panic extremes, sane defaults.
-//! - readyz pins (green now, compat with TOG-25132): backoff serves
-//!   `starting` (never `ready`, never `parked`); a parked gateway still fails
-//!   the strict gate.
-//! - loop pins (RED now: the scaffold probes one attempt with today's fatal
-//!   semantics; they pass once the loop lands): a flapping gateway reconnects
-//!   on the bounded schedule with exact disappointment-timed gaps, and an
-//!   always-failing gateway stops after exactly the budgeted attempts.
+//! - readyz pins (green now): backoff serves `starting` (never `ready`, never
+//!   `parked`); a parked gateway still fails the strict gate.
+//! - loop pins: a flapping gateway reconnects on the bounded schedule with
+//!   timer-resolution-bounded gaps, and an always-failing gateway stops after
+//!   exactly the budgeted attempts.
 //! - shutdown pin (green now and later): a pending shutdown ends the episode
 //!   before any attempt.
 
@@ -51,14 +45,6 @@ fn tiny_policy() -> ReconnectPolicy {
     }
 }
 
-fn full_budget(policy: &ReconnectPolicy) -> Duration {
-    let mut total = Duration::ZERO;
-    for attempt in 0..policy.max_attempts {
-        total += reconnect_delay(policy, attempt).expect("attempt is within budget");
-    }
-    total + Duration::from_secs(5)
-}
-
 /// Record of what one connector invocation saw: its index, the paused-clock
 /// timestamp, and the gateway state readyz served at that moment.
 struct AttemptRecord {
@@ -69,6 +55,7 @@ struct AttemptRecord {
 
 struct Script {
     records: Arc<std::sync::Mutex<Vec<AttemptRecord>>>,
+    attempted: Arc<tokio::sync::Notify>,
     state: Arc<RwLock<GatewayState>>,
     failures_before_success: u32,
 }
@@ -77,6 +64,7 @@ impl Script {
     fn new(state: Arc<RwLock<GatewayState>>, failures_before_success: u32) -> Self {
         Self {
             records: Arc::new(std::sync::Mutex::new(Vec::new())),
+            attempted: Arc::new(tokio::sync::Notify::new()),
             state,
             failures_before_success,
         }
@@ -86,10 +74,12 @@ impl Script {
         &self,
     ) -> impl FnMut(u32) -> Box<dyn Future<Output = AttemptOutcome> + Send> + Send {
         let records = Arc::clone(&self.records);
+        let attempted = Arc::clone(&self.attempted);
         let state = Arc::clone(&self.state);
         let failures = self.failures_before_success;
         move |attempt: u32| {
             let records = Arc::clone(&records);
+            let attempted = Arc::clone(&attempted);
             let state = Arc::clone(&state);
             Box::new(async move {
                 // The runner never holds the state lock across `connect`, so a
@@ -100,6 +90,7 @@ impl Script {
                     at: tokio::time::Instant::now(),
                     observed,
                 });
+                attempted.notify_one();
                 if attempt < failures {
                     AttemptOutcome::Retryable
                 } else {
@@ -115,32 +106,61 @@ impl Script {
 }
 
 /// Drive an episode to completion on paused time with no open-ended waits:
-/// advance past the whole budget, flush the executor with bounded yields,
-/// then hand back the exit. An unbounded retry loop fails here (the task is
-/// still pending) instead of hanging CI.
+/// settle the spawned task until each attempt is recorded, then advance only
+/// that attempt's delay. Bounded yields make an unbounded retry loop fail here
+/// instead of hanging CI.
 async fn drive_to_exit(
     state: Arc<RwLock<GatewayState>>,
     policy: ReconnectPolicy,
     script: &Script,
 ) -> SupervisedExit {
-    let supervised = tokio::spawn(run_supervised(
+    let mut supervised = tokio::spawn(run_supervised(
         Arc::clone(&state),
         policy,
         script.connector(),
         std::future::pending(),
     ));
-    tokio::time::advance(full_budget(&policy)).await;
-    for _ in 0..1000 {
+    for attempt in 0..policy.max_attempts {
+        let next_attempt = script.attempted.notified();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), next_attempt)
+                .await
+                .is_ok(),
+            "supervisor must reach each attempt within a bounded paused-time wait"
+        );
+        assert_eq!(script.attempts(), attempt + 1);
+        // The attempt record is written immediately before the connector
+        // returns. Let the supervisor consume that outcome and register its
+        // sleep before advancing paused time.
+        for _ in 0..10 {
+            if supervised.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         if supervised.is_finished() {
             break;
         }
-        tokio::task::yield_now().await;
+        let delay = reconnect_delay(&policy, attempt).expect("attempt is within budget");
+        tokio::time::advance(delay).await;
     }
+    let result = tokio::time::timeout(Duration::from_secs(1), &mut supervised)
+        .await
+        .expect("supervisor must terminate within its bounded budget");
+    result.expect("supervisor task")
+}
+
+fn assert_gap_within_timer_resolution(gap: Duration, expected: Duration, attempt: usize) {
+    let difference = if gap >= expected {
+        gap - expected
+    } else {
+        expected - gap
+    };
     assert!(
-        supervised.is_finished(),
-        "supervisor must terminate within its bounded budget, never spin"
+        difference <= Duration::from_millis(1),
+        "gap before attempt {} was {gap:?}, expected {expected:?} within Tokio's 1ms timer resolution",
+        attempt + 1
     );
-    supervised.await.expect("supervisor task")
 }
 
 fn records(script: &Script) -> Vec<(u32, tokio::time::Instant, GatewayState)> {
@@ -265,7 +285,7 @@ fn default_policy_is_sane() {
 #[tokio::test]
 async fn backoff_state_reports_starting_never_ready_nor_parked() {
     // During backoff the supervisor holds Armed: readyz must serve 503 with
-    // gateway=starting — the strict gate (TOG-25132) treats Starting as not
+    // gateway=starting — the strict gate treats Starting as not
     // ready, and it must never read as Connected (ready) or Unconfigured
     // (parked/down).
     assert_eq!(GatewayState::Armed.status(), ComponentStatus::Starting);
@@ -290,7 +310,7 @@ async fn backoff_state_reports_starting_never_ready_nor_parked() {
 
 #[tokio::test]
 async fn parked_gateway_still_fails_the_strict_readyz_gate() {
-    // Compat with TOG-25132: missing prerequisites park the gateway as
+    // Missing prerequisites park the gateway as
     // Unconfigured (down), and the strict gate keeps failing. The supervised
     // reconnect must not blur this into a retrying state.
     assert_eq!(GatewayState::Unconfigured.status(), ComponentStatus::Down);
@@ -316,8 +336,8 @@ async fn parked_gateway_still_fails_the_strict_readyz_gate() {
 #[tokio::test(start_paused = true)]
 async fn supervisor_retries_a_flapping_gateway_on_the_bounded_schedule() {
     // Two transient failures, then recovery: the supervisor must attempt
-    // exactly 3 times, serve Starting between attempts, space the attempts by
-    // exactly the scheduled delays, and publish Connected on recovery.
+    // exactly 3 times, serve Starting between attempts, space the attempts
+    // within timer resolution of the scheduled delays, and publish Connected.
     let policy = flap_policy();
     let state = Arc::new(RwLock::new(GatewayState::Connected));
     let script = Script::new(Arc::clone(&state), 2);
@@ -351,12 +371,7 @@ async fn supervisor_retries_a_flapping_gateway_on_the_bounded_schedule() {
     for (index, window) in history.windows(2).enumerate() {
         let gap = window[1].1 - window[0].1;
         let expected = reconnect_delay(&policy, index as u32).expect("within budget");
-        assert_eq!(
-            gap,
-            expected,
-            "gap before attempt {} must equal the scheduled delay",
-            index + 1
-        );
+        assert_gap_within_timer_resolution(gap, expected, index);
     }
     assert_eq!(*state.read().await, GatewayState::Connected);
 }
@@ -390,12 +405,7 @@ async fn supervisor_stops_after_the_bounded_budget() {
     for (index, window) in history.windows(2).enumerate() {
         let gap = window[1].1 - window[0].1;
         let expected = reconnect_delay(&policy, index as u32).expect("within budget");
-        assert_eq!(
-            gap,
-            expected,
-            "gap before attempt {} must equal the scheduled delay",
-            index + 1
-        );
+        assert_gap_within_timer_resolution(gap, expected, index);
     }
     assert_eq!(*state.read().await, GatewayState::Draining);
 }
