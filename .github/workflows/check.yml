@@ -369,7 +369,7 @@ jobs:
           FLOOR_HEAD: ${{ github.sha }}
         run: python3 scripts/ci/check-floor-guard.py --base-ref "$FLOOR_BASE" --head-ref "$FLOOR_HEAD"
 
-      - name: Patch coverage (WARN, 80% of added lines)
+      - name: Patch coverage (HARD, 80% of added lines)
         if: needs.job-inputs.outputs.rust != 'false'
         # The check job runs in a container whose default shell is sh (no pipefail).
         shell: bash
@@ -388,8 +388,10 @@ jobs:
           done
           echo "b3f68e625481fed9b16444174f3fa5ebcdbde4a1878803a35eabe2dcefcdc41a  $archive" | sha256sum --check -
           tar -xzf "$archive" -C "$RUNNER_TEMP" cargo-llvm-cov
-          # WARN measurement only: unit-test failures are owned HARD by the
-          # rust-tests lane, so a failed measurement run warns here instead of
+          # HARD gate with one warn-only escape hatch: shortfalls and blind
+          # gate runs fail via check-patch-coverage.py, but unit-test
+          # failures during measurement are owned HARD by the rust-tests
+          # lane, so a failed measurement run warns here instead of
           # failing this lane (for example DB-backed lib tests behave
           # differently without the lane's database service).
           if "$RUNNER_TEMP/cargo-llvm-cov" llvm-cov --workspace --lib --locked --lcov \

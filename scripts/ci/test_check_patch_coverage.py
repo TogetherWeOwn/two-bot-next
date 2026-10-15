@@ -1,7 +1,7 @@
-"""Offline tests for the patch-coverage WARN gate.
+"""Offline tests for the patch-coverage HARD gate.
 
-The gate must warn (never fail) below the threshold, stay silent at or above
-it, pass when there is nothing coverable to measure, and stay green-but-loud
+The gate must fail below the threshold, stay silent at or above
+it, pass when there is nothing coverable to measure, and fail closed
 when it is blind. lcov parsing and the covered/coverable math run against
 fixtures; diff parsing runs against a throwaway git repo.
 """
@@ -89,31 +89,32 @@ class EndToEndTests(unittest.TestCase):
             Path(lcov).unlink()
         return code, out.getvalue()
 
-    def test_below_threshold_warns_but_passes(self):
+    def test_below_threshold_fails_hard(self):
         code, output = self.run_gate(LCOV, {("crates/bot/src/gateway_commands.rs", 1),
                                             ("crates/bot/src/gateway_commands.rs", 2)})
-        self.assertEqual(code, 0)
-        self.assertIn("::warning::", output)
+        self.assertEqual(code, 1)
+        self.assertIn("::error::", output)
         self.assertIn("50.0%", output)
 
     def test_at_threshold_is_silent(self):
         code, output = self.run_gate(LCOV, {("crates/bot/src/gateway_commands.rs", 1),
                                             ("crates/bot/src/gateway_commands.rs", 3)})
         self.assertEqual(code, 0)
+        self.assertNotIn("::error::", output)
         self.assertNotIn("::warning::", output)
 
     def test_no_coverable_lines_passes_with_a_note(self):
         code, output = self.run_gate(LCOV, {("other.rs", 1)})
         self.assertEqual(code, 0)
-        self.assertNotIn("::warning::", output)
+        self.assertNotIn("::error::", output)
         self.assertIn("no coverable changed lines", output)
 
-    def test_missing_lcov_warns_and_passes(self):
+    def test_missing_lcov_fails_closed(self):
         out = io.StringIO()
         with redirect_stdout(out):
             code = gate.main(["--lcov", "/nonexistent/lcov.info"])
-        self.assertEqual(code, 0)
-        self.assertIn("::warning::", out.getvalue())
+        self.assertEqual(code, 1)
+        self.assertIn("::error::", out.getvalue())
         self.assertIn("blind", out.getvalue())
 
 

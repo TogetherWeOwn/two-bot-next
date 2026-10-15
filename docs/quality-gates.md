@@ -5,9 +5,11 @@ HARD fails the PR. All Rust gates run as steps of the `check` lane in
 `check.yml` on the existing routed runner, so no new runner minutes beyond
 the step itself.
 
-- Patch coverage (WARN): `cargo llvm-cov --workspace --lib` plus
+- Patch coverage (HARD): `cargo llvm-cov --workspace --lib` plus
   `scripts/ci/check-patch-coverage.py` requires 80% line coverage over the
-  lines the PR adds. Shortfalls annotate the PR and pass.
+  lines the PR adds. Shortfalls fail the PR. A blind gate run fails closed;
+  only a failed `cargo llvm-cov` measurement itself warns (unit-test
+  failures are owned HARD by the rust-tests lane).
 - Dependency advisories (HARD): the `cargo-deny` step (`check all`, which
   includes advisories) runs on every PR, not only Rust-selected ones.
 - Rust ast-grep advisories (WARN): the local `sgconfig.yml` runs the request-path

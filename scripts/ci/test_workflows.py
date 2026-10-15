@@ -1212,7 +1212,7 @@ class WorkflowTests(unittest.TestCase):
         expected_head = "${{ github.sha }}"
         for name in (
             "Floor guard (HARD, CONSTRAINTS.md floor)",
-            "Patch coverage (WARN, 80% of added lines)",
+            "Patch coverage (HARD, 80% of added lines)",
             "Unwrap in request paths (WARN)",
             "Semgrep Rust rules (WARN)",
         ):

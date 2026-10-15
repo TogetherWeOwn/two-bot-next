@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""WARN gate: changed-lines coverage must stay at or above the threshold.
+"""HARD gate: changed-lines coverage must stay at or above the threshold.
 
 Inputs are a ``cargo llvm-cov --lcov`` report and a zero-context
 ``git diff base head`` over Rust files. A changed line counts when lcov lists
 it as executable (a ``DA`` record); it is covered when its execution count is
-positive. The gate reports covered/coverable over the intersection and warns
+positive. The gate reports covered/coverable over the intersection and fails
 below ``--threshold`` percent (default 80). A patch with no coverable changed
 lines passes with a note.
 
-WARN mode: a shortfall prints ``::warning::`` annotations and the script
-exits 0. A blind gate (missing lcov, unreadable diff) also warns instead of
-failing; it must never turn a PR red. Only malformed arguments exit non-zero.
+HARD mode: a shortfall prints ``::error::`` annotations and exits 1. A blind
+gate (missing lcov, unreadable diff) also errors and exits 1; it must never
+turn a blind PR green. Only the check.yml measurement wrapper stays
+warn-only: when ``cargo llvm-cov`` itself fails to run, unit-test failures
+are owned HARD by the rust-tests lane, so that path warns instead of failing
+this lane. Malformed arguments exit non-zero.
 """
 
 import argparse
@@ -107,8 +110,8 @@ def evaluate(hits, added):
     return covered, covered + len(uncovered), uncovered
 
 
-def warn(message):
-    print(f"::warning::{message}", flush=True)
+def error(message):
+    print(f"::error::{message}", flush=True)
 
 
 def main(argv=None):
@@ -121,15 +124,15 @@ def main(argv=None):
     if not 0 < args.threshold <= 100:
         parser.error("--threshold must be in (0, 100]")
 
-    hits, error = read_lcov(args.lcov)
+    hits, read_error = read_lcov(args.lcov)
     if hits is None:
-        warn(f"patch coverage gate is blind ({error}); treating as pass")
-        return 0
+        error(f"patch coverage gate is blind ({read_error}); failing closed")
+        return 1
 
-    added, error = added_lines(args.base_ref, args.head_ref)
+    added, diff_error = added_lines(args.base_ref, args.head_ref)
     if added is None:
-        warn(f"patch coverage gate could not read the diff ({error}); treating as pass")
-        return 0
+        error(f"patch coverage gate could not read the diff ({diff_error}); failing closed")
+        return 1
 
     covered, coverable, uncovered = evaluate(hits, added)
     if not coverable:
@@ -140,11 +143,11 @@ def main(argv=None):
     if pct >= args.threshold:
         return 0
     for path, line in uncovered[:MAX_ANNOTATIONS]:
-        warn(f"{path}:{line} changed but not covered by tests")
+        error(f"{path}:{line} changed but not covered by tests")
     if len(uncovered) > MAX_ANNOTATIONS:
-        warn(f"... and {len(uncovered) - MAX_ANNOTATIONS} more uncovered changed line(s)")
-    warn(f"patch coverage gate: {pct:.1f}% below the {args.threshold:g}% WARN threshold")
-    return 0
+        error(f"... and {len(uncovered) - MAX_ANNOTATIONS} more uncovered changed line(s)")
+    error(f"patch coverage gate: {pct:.1f}% below the {args.threshold:g}% HARD threshold")
+    return 1
 
 
 if __name__ == "__main__":
