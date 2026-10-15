@@ -448,8 +448,10 @@ mod tests {
 
     #[test]
     fn interval_is_bounded_and_nonzero() {
-        assert!(RECONCILE_INTERVAL_SECS > 0);
-        assert!(RECONCILE_INTERVAL_SECS <= 24 * 3_600);
+        const {
+            assert!(RECONCILE_INTERVAL_SECS > 0);
+            assert!(RECONCILE_INTERVAL_SECS <= 24 * 3_600);
+        }
     }
 
     #[test]
