@@ -1,16 +1,26 @@
 # Distroless runtime evaluation ([TOG-12144](/TOG/issues/TOG-12144), follow-up of [TOG-10893](/TOG/issues/TOG-10893))
 
-Trial only. The default image is unchanged (`Dockerfile` still builds
-`debian:bookworm-slim`); switching it is a separate CEO-gated decision.
-The trial variant is `Dockerfile.distroless`: identical to the CI-proven
-runtime from commit `5957e929` ([TOG-10893](/TOG/issues/TOG-10893) SBOM branch)
-except for its header comment. No `wrangler/` or workflow files were touched.
+Cutover complete. The default `Dockerfile` builds digest-pinned
+`gcr.io/distroless/cc-debian13:nonroot` since PR #84 (CEO scope decision for
+the supply-chain slice). `Dockerfile.distroless` is kept as a documented
+fallback mirroring the default; it is not built by CI. No `wrangler/` or
+workflow files were touched by the switch.
+
+Staging TLS-handshake receipt: deploy-staging run `38773972225` verified the
+distroless head `46a30b19e` with `/health` 200 and `/readyz` 200 (all
+components ready, gateway included) plus a green voice-synthetic pass — the
+`rustls-platform-verifier` system-bundle path completes live Discord TLS.
+Rollback is one commit: restore the bookworm `Dockerfile` from the parent of
+the distroless switch (`3a571ab`). SBOMs regenerate per head through the
+supply-chain lane.
 
 ## Verdict
 
-Recommend adopting `gcr.io/distroless/cc-debian13:nonroot` (digest-pinned,
-trixie builder) as the default runtime through a separate CEO-gated cutover
-card — not this one — after the preconditions below. Do not use the `static`
+Adopted `gcr.io/distroless/cc-debian13:nonroot` (digest-pinned,
+trixie builder) as the default runtime in PR #84 under the CEO scope
+decision; the preconditions below are met per the cutover note above.
+Original recommendation (kept for provenance): adopt through a separate
+CEO-gated cutover card after the preconditions below. Do not use the `static`
 variant; do not deploy a `debug-nonroot` variant.
 
 ## Compatibility
@@ -18,11 +28,11 @@ variant; do not deploy a `debug-nonroot` variant.
 - **CA certs:** the base ships Debian trust data (`ca-certificates`) at
   `/etc/ssl/certs/ca-certificates.crt`; nothing is installed or copied in
   except the release binary. Smoke verified the bundle is present and
-  PEM-readable (docker-cp archive inspection of the built image). Caveat:
-  smoke checks readability only, not a live TLS handshake — the
-  `rustls-platform-verifier` path (`crates/discord/src/executor.rs`,
-  `try_with_platform_verifier`) relies on the system bundle, so run a live
-  Discord TLS handshake on staging before cutover.
+  PEM-readable (docker-cp archive inspection of the built image). The live
+  TLS handshake closed the remaining caveat: the `rustls-platform-verifier`
+  path (`crates/discord/src/executor.rs`, `try_with_platform_verifier`)
+  relies on the system bundle, and the staging receipt in the cutover note
+  above proves it handshakes live Discord TLS on this base.
 - **User:** base `nonroot` uid/gid 65532, workdir `/home/nonroot`,
   `COPY --chown=65532:65532`. CI verified PID 1 runs with non-zero
   real/effective/saved/filesystem uids (`docker top`).
