@@ -133,13 +133,16 @@ def evaluate(obs):
     after the move), statuses (room status
     strings seen), deleted (bool), delete_seconds, grace_seconds, metrics_delta
     (int or None when unavailable), channels_before (guild channels before the
-    join; the creator's existing rooms move the expected slot to their end).
+    join; the creator's existing rooms move the expected slot to their end),
+    received_delta (joins-received delta or None when metrics are unavailable),
+    refused_delta (per-reason refused deltas, {} when unavailable).
     """
     out = []
     creator, room_id = obs["creator"], obs.get("room_id")
     created = obs.get("room_created") or {}
     out.append(check("create", bool(room_id) and created.get("parent_id") == creator.get("parent_id"),
-                     f"room={room_id} parent={created.get('parent_id')} creator_parent={creator.get('parent_id')}"))
+                     f"room={room_id} parent={created.get('parent_id')} creator_parent={creator.get('parent_id')}"
+                     f"{refusal_suffix(obs)}"))
     out.append(check("moved", bool(room_id) and obs.get("moved_to") == room_id,
                      f"joiner landed in {obs.get('moved_to')} (room {room_id})"))
     rejoin = obs.get("rejoin_room_id")
@@ -193,6 +196,28 @@ def evaluate(obs):
     return out
 
 
+def refusal_suffix(obs):
+    """Name the refusal reason on a failed create: joins-received plus per-reason
+    refused deltas when metrics are available, or a metrics-unavailable note.
+    The next restart-cured stall must name its reason, not just room=None."""
+    refused = obs.get("refused_delta") or {}
+    total = sum(refused.values())
+    received = obs.get("received_delta")
+    if received is None and not refused:
+        return ""
+    parts = []
+    if received is not None:
+        parts.append(f"received={received:g}")
+    for reason in sorted(refused):
+        if refused[reason]:
+            parts.append(f"{reason}={refused[reason]:g}")
+    if not parts:
+        if received is not None:
+            return f"; joins received={received:g}, no refusals"
+        return ""
+    return "; joins " + ", ".join(parts)
+
+
 def fence(guild_id, creator_id, staging_url):
     if guild_id == LIVE_GUILD_ID or guild_id != STAGING_GUILD_ID:
         raise Refusal(f"guild {guild_id!r} is not TWO Staging; refusing before any request")
@@ -214,6 +239,63 @@ def counter(text, outcome):
             except ValueError:
                 pass
     return total
+
+
+def parse_received(text):
+    """Value of two_bot_voice_joins_received_total in a Prometheus body (0.0 when absent)."""
+    for line in text.splitlines():
+        if line.startswith("two_bot_voice_joins_received_total "):
+            try:
+                return float(line.rsplit(" ", 1)[1])
+            except ValueError:
+                pass
+    return 0.0
+
+
+def parse_refusals(text):
+    """Per-reason two_bot_voice_join_refused_total{reason=...} counts in a Prometheus body."""
+    out = {}
+    for line in text.splitlines():
+        if not line.startswith("two_bot_voice_join_refused_total{"):
+            continue
+        try:
+            value = float(line.rsplit(" ", 1)[1])
+        except ValueError:
+            continue
+        for part in line.split("{", 1)[1].split("}", 1)[0].split(","):
+            key, _, val = part.partition("=")
+            if key.strip() == "reason":
+                out[val.strip().strip('"')] = out.get(val.strip().strip('"'), 0.0) + value
+    return out
+
+
+def metrics_snapshot(staging_url, token):
+    """One /ops/metrics fetch returning (received, refusals) or (None, None).
+
+    `received` is the joins-received counter, `refusals` maps each refusal
+    reason to its count. Unavailable metrics (no URL/token, HTTP error,
+    network failure) report (None, None) so the caller SKIPs the refusal
+    naming instead of guessing; an over-cap body raises BodyTooLarge like the
+    other readers.
+    """
+    if not (staging_url and token):
+        return None, None
+    req = urllib.request.Request(f"{staging_url.rstrip('/')}/ops/metrics", headers={
+        "Authorization": f"Bearer {token}", "User-Agent": "two-bot-voice-synthetic (staging)"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read(MAX_BODY_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(MAX_BODY_BYTES + 1)
+        if len(raw) > MAX_BODY_BYTES:
+            raise BodyTooLarge("metrics read answered over the body cap") from None
+        return None, None
+    except (urllib.error.URLError, OSError):
+        return None, None
+    if len(raw) > MAX_BODY_BYTES:
+        raise BodyTooLarge("metrics read answered over the body cap")
+    text = raw.decode()
+    return parse_received(text), parse_refusals(text)
 
 
 # --------------------------------------------------------------------------
@@ -417,8 +499,10 @@ class Session:
 
 
 def run_live(args, token):
-    obs = {"grace_seconds": args.grace, "statuses": [], "deleted": False}
+    obs = {"grace_seconds": args.grace, "statuses": [], "deleted": False,
+           "received_delta": None, "refused_delta": {}}
     before = metrics_value(args.staging_url, os.environ.get("TWO_STAGING_METRICS_TOKEN"))
+    snap_before = metrics_snapshot(args.staging_url, os.environ.get("TWO_STAGING_METRICS_TOKEN"))
     s = Session(token)
     joined = False
     try:
@@ -535,6 +619,18 @@ def run_live(args, token):
         s.close()
     after = metrics_value(args.staging_url, os.environ.get("TWO_STAGING_METRICS_TOKEN"))
     obs["metrics_delta"] = None if before is None or after is None else int(after - before)
+    received_before, refused_before = snap_before
+    received_after, refused_after = metrics_snapshot(
+        args.staging_url, os.environ.get("TWO_STAGING_METRICS_TOKEN"))
+    if received_before is not None and received_after is not None:
+        obs["received_delta"] = received_after - received_before
+    if refused_before is not None and refused_after is not None:
+        delta = {}
+        for reason in set(refused_before) | set(refused_after):
+            moved = refused_after.get(reason, 0.0) - refused_before.get(reason, 0.0)
+            if moved:
+                delta[reason] = moved
+        obs["refused_delta"] = delta
     obs.setdefault("creator", {"id": args.creator})
     obs.setdefault("channels", [])
     return obs

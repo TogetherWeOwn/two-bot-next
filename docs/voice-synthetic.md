@@ -22,6 +22,13 @@ creator) and asserts:
 | rename | the creator is renamed before the join and restored after; the post-rename join must still move the test bot into a new room (SKIP while the test bot may not rename — see below) |
 | metrics | optional: `two_bot_voice_names_total{outcome="created_with_template"}` grows (SKIP without a metrics token) |
 
+A failed `create` names the refusal reason: the run snapshots
+`two_bot_voice_joins_received_total` and per-reason
+`two_bot_voice_join_refused_total` before and after the join, and the create
+detail reports the deltas (for example `joins received=2,
+unknown_creator=2`), so the next restart-cured stall names its reason instead
+of just `room=None`. Without a metrics token there is no suffix.
+
 The script refuses (exit 2, no request sent) unless the guild is TWO Staging
 and the creator is the staging Create a Lobby channel.
 

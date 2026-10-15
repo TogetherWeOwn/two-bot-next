@@ -156,6 +156,59 @@ class EvaluateTest(unittest.TestCase):
             if c["check"] == "rename")
         self.assertIn("x", detail)
 
+    def test_failed_create_names_the_refusal_reason(self):
+        # RED first: a create stall must name its refusal reason and the
+        # creator-map state, not just room=None. The next restart-cured stall
+        # diagnoses itself from the create line.
+        failing = obs(room_id=None, room_created=None, moved_to=None,
+                      received_delta=2.0, refused_delta={"unknown_creator": 2.0})
+        detail = next(c["detail"] for c in synth.evaluate(failing)
+                      if c["check"] == "create")
+        self.assertIn("unknown_creator=2", detail)
+        self.assertIn("received=2", detail)
+
+    def test_failed_create_without_metrics_carries_no_suffix(self):
+        failing = obs(room_id=None, room_created=None, moved_to=None)
+        detail = next(c["detail"] for c in synth.evaluate(failing)
+                      if c["check"] == "create")
+        self.assertNotIn("received=", detail)
+        self.assertNotIn("unknown_creator", detail)
+
+
+class MetricsSnapshotTest(unittest.TestCase):
+    def test_parses_received_and_per_reason_refusals(self):
+        body = ("two_bot_voice_joins_received_total 7\n"
+                'two_bot_voice_join_refused_total{reason="unknown_creator"} 2\n'
+                'two_bot_voice_join_refused_total{reason="halted"} 1\n'
+                'two_bot_voice_names_total{outcome="created_with_template"} 3\n')
+        seen = []
+
+        def fake_open(req, timeout=None):
+            class _Resp:
+                def read(self, n):
+                    seen.append(n)
+                    return body.encode()
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+            return _Resp()
+
+        with mock.patch.object(synth.urllib.request, "urlopen", side_effect=fake_open):
+            received, refused = synth.metrics_snapshot("https://two-bot-next-staging.x", "tok")
+        self.assertEqual(received, 7)
+        self.assertEqual(refused, {"unknown_creator": 2.0, "halted": 1.0})
+        self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
+
+    def test_unavailable_metrics_report_none(self):
+        with mock.patch.object(synth.urllib.request, "urlopen",
+                               side_effect=OSError("down")):
+            self.assertEqual(synth.metrics_snapshot("https://two-bot-next-staging.x", "tok"),
+                             (None, None))
+        self.assertEqual(synth.metrics_snapshot(None, None), (None, None))
+
 
 class FenceTest(unittest.TestCase):
     def test_only_the_staging_guild_and_creator_pass(self):
