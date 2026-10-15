@@ -122,7 +122,7 @@ RUNTIME_PATHS = (
     "crates/bot/src/main.rs", "crates/core/Cargo.toml", "crates/core/README.md",
     "crates/core/tests/fixtures/reference_settings.json", "src/main.rs",
     "sql/web_v1.sql", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "deny.toml",
-    "migrations.lock", "Dockerfile", "Dockerfile.distroless", ".dockerignore",
+    "migrations.lock", "Dockerfile", ".dockerignore",
     "wrangler/wrangler.toml", "wrangler/src/index.ts", "wrangler/package.json",
     "wrangler/package-lock.json", "wrangler/scripts/ownership-control.mjs",
     "wrangler/README.md", "scripts/staging_rollout.py", "scripts/container-smoke.py",
