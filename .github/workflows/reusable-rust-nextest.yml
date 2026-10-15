@@ -113,17 +113,18 @@ jobs:
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
 
-      # PR isolation first: on pull_request events sccache stays on local disk
+      # PR and merge-queue isolation first: sccache stays on local disk
       # only and no shared-backend credential is written anywhere. R2 write
-      # credentials must never reach PR-built code (this lane compiles and
-      # executes build scripts and tests at the PR head, and a shared R2
-      # bucket has no per-PR scope, so a PR could poison objects a later
-      # main build links). The GitHub-cache backend stays off PRs too: its
-      # entries share the repo Actions cache quota with the warm `check`
-      # entry the required lanes restore, so an advisory lane must not grow
-      # it. Off-PR runs (push to main, workflow_dispatch) use R2 when the
-      # caller passed all the pins, else the GitHub-cache backend. Values
-      # travel via the environment file, never the log: secrets stay masked.
+      # credentials must never reach PR- or merge-queue-built code (this lane
+      # compiles and executes build scripts and tests at a head that is not
+      # on `main` yet, and a shared R2 bucket has no per-PR scope, so a PR
+      # could poison objects a later main build links). The GitHub-cache
+      # backend stays off PRs and the merge queue too: its entries share the
+      # repo Actions cache quota with the warm `check` entry the required
+      # lanes restore, so a non-main lane must not grow it. Push-to-main and
+      # workflow_dispatch runs use R2 when the caller passed all the pins,
+      # else the GitHub-cache backend. Values travel via the environment
+      # file, never the log: secrets stay masked.
       - name: Select sccache backend (R2 when pinned, GitHub cache otherwise)
         env:
           R2_BUCKET: ${{ secrets.SCCACHE_BUCKET }}
@@ -135,20 +136,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ "$NEXTEST_EVENT" = "pull_request" ]; then
-            echo "sccache backend: local disk only (no shared writes on PRs)"
-          elif [ -n "$R2_BUCKET" ] && [ -n "$R2_ENDPOINT" ] && [ -n "$R2_KEY" ] && [ -n "$R2_SECRET" ]; then
-            {
-              echo "SCCACHE_BUCKET=$R2_BUCKET"
-              echo "SCCACHE_ENDPOINT=$R2_ENDPOINT"
-              echo "SCCACHE_REGION=${R2_REGION:-auto}"
-              echo "AWS_ACCESS_KEY_ID=$R2_KEY"
-              echo "AWS_SECRET_ACCESS_KEY=$R2_SECRET"
-            } >> "$GITHUB_ENV"
-            echo "sccache backend: R2"
+          if [ "$NEXTEST_EVENT" = "push" ] || [ "$NEXTEST_EVENT" = "workflow_dispatch" ]; then
+            if [ -n "$R2_BUCKET" ] && [ -n "$R2_ENDPOINT" ] && [ -n "$R2_KEY" ] && [ -n "$R2_SECRET" ]; then
+              {
+                echo "SCCACHE_BUCKET=$R2_BUCKET"
+                echo "SCCACHE_ENDPOINT=$R2_ENDPOINT"
+                echo "SCCACHE_REGION=${R2_REGION:-auto}"
+                echo "AWS_ACCESS_KEY_ID=$R2_KEY"
+                echo "AWS_SECRET_ACCESS_KEY=$R2_SECRET"
+              } >> "$GITHUB_ENV"
+              echo "sccache backend: R2"
+            else
+              echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+              echo "sccache backend: GitHub cache"
+            fi
           else
-            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-            echo "sccache backend: GitHub cache"
+            echo "sccache backend: local disk only (no shared writes on PRs, the merge queue, or other events)"
           fi
 
       - name: Start sccache
@@ -156,8 +159,8 @@ jobs:
 
       # Restore-only: the warm `check` entry in check.yml owns the registry
       # write, so this step never saves. sccache is the only shared-cache
-      # writer left, and only off-PR (R2 or GitHub cache on push to main;
-      # local disk on pull_request per the backend step above).
+      # writer left, and only on push to main or workflow_dispatch (R2 or
+      # GitHub cache; local disk everywhere else per the backend step above).
       - name: Restore cargo registry cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -182,7 +185,10 @@ jobs:
       # retry is reported flaky, not red; the ledger step still runs.
       # `inputs.quarantine` ejects a red group without a revert: each
       # whitespace-separated filter becomes one `--skip` (test-name
-      # substrings, no spaces), so the rest of the suite still gates.
+      # substrings, no spaces), so the rest of the suite still gates. The
+      # skips travel AFTER the `--` separator: pinned cargo-nextest 0.9.99
+      # only accepts `--skip` as an emulated libtest argument there, and a
+      # `--skip` before `--` fails the whole lane with a usage error.
       # JUnit `path = "junit.xml"` in .config/nextest.toml is profile-store
       # relative (target/nextest/ci/junit.xml), not workspace-root. Resolve it
       # and copy to the workspace root so the parse/upload steps below see one
@@ -195,13 +201,17 @@ jobs:
         shell: bash
         run: |
           status=0
-          skip_args=""
+          skip_args=()
           # Word splitting is the mechanism: filters are test-name
           # substrings and never contain spaces.
           for filter in $QUARANTINE; do
-            skip_args="$skip_args --skip $filter"
+            skip_args+=(--skip "$filter")
           done
-          cargo nextest run --workspace --lib --bins --features two-bot-core/db --locked --profile ci $skip_args || status=$?
+          if [ "${#skip_args[@]}" -gt 0 ]; then
+            cargo nextest run --workspace --lib --bins --features two-bot-core/db --locked --profile ci -- "${skip_args[@]}" || status=$?
+          else
+            cargo nextest run --workspace --lib --bins --features two-bot-core/db --locked --profile ci || status=$?
+          fi
           for candidate in target/nextest/ci/junit.xml junit.xml; do
             if [ -f "$candidate" ]; then
               cp "$candidate" junit.xml
