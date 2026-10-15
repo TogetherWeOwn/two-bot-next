@@ -6753,6 +6753,42 @@ struct PendingImport {
     expires_at: Instant,
 }
 
+/// Reply for a command whose required guild-role facts have not loaded
+/// yet: retryable, never a permanent permission denial.
+const WARMING_UP_REPLY: &str =
+    "Voice commands are warming up while I load this server's permissions. Please try again shortly.";
+
+/// Whether guild-role authority could be established for an interaction.
+/// `WarmingUp` covers absent, unready, disconnected or incomplete
+/// guild-role facts; `MissingMember` covers an interaction without the
+/// member/user facts needed to evaluate authority at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuildAuthority {
+    Ready(Permissions),
+    WarmingUp,
+    MissingMember,
+}
+
+/// Commands gated on guild-role authority (`may_create`, the admin flag,
+/// or `may_manage_server`). Only these get the warming-up reply when cold;
+/// commands that do not depend on that authority keep their behaviour.
+fn requires_guild_authority(command: &VoiceCommand) -> bool {
+    matches!(
+        command,
+        VoiceCommand::Create { .. }
+            | VoiceCommand::TextChannels { .. }
+            | VoiceCommand::Position { .. }
+            | VoiceCommand::Group { .. }
+            | VoiceCommand::InheritPermissions { .. }
+            | VoiceCommand::DefaultLimit { .. }
+            | VoiceCommand::AlwaysPrivate { .. }
+            | VoiceCommand::Access(_)
+            | VoiceCommand::Logging(_)
+            | VoiceCommand::Export
+            | VoiceCommand::Import { .. }
+    )
+}
+
 pub struct VoiceRuntime<S, H> {
     make: Arc<dyn Fn() -> (S, H) + Send + Sync>,
     tick: Duration,
@@ -6890,23 +6926,53 @@ where
         interaction: &Interaction,
         now_micros: i128,
     ) -> Option<Permissions> {
-        let guild = interaction_guild(interaction)?;
-        let member = interaction.member.as_ref()?;
-        let member_id = member.user.as_ref()?.id.get();
-        let actor = self.live_actor(guild)?;
+        match self.guild_authority_at(interaction, now_micros) {
+            GuildAuthority::Ready(permissions) => Some(permissions),
+            GuildAuthority::WarmingUp | GuildAuthority::MissingMember => None,
+        }
+    }
+
+    fn guild_authority(&self, interaction: &Interaction) -> GuildAuthority {
+        self.guild_authority_at(
+            interaction,
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000,
+        )
+    }
+
+    /// Tri-state behind [`Self::guild_permissions_at`]: a generic `None`
+    /// cannot tell a cold snapshot (retryable) from a missing member
+    /// (malformed, never relabelled as warm-up). Missing/disconnected or
+    /// incomplete guild-role facts are `WarmingUp` and stay fail-closed.
+    fn guild_authority_at(&self, interaction: &Interaction, now_micros: i128) -> GuildAuthority {
+        let Some(guild) = interaction_guild(interaction) else {
+            return GuildAuthority::MissingMember;
+        };
+        let Some(member) = interaction.member.as_ref() else {
+            return GuildAuthority::MissingMember;
+        };
+        let Some(member_id) = member.user.as_ref().map(|user| user.id.get()) else {
+            return GuildAuthority::MissingMember;
+        };
+        let Some(actor) = self.live_actor(guild) else {
+            return GuildAuthority::WarmingUp;
+        };
         let live = actor.live.read_state();
         if !live.ready {
-            return None;
+            return GuildAuthority::WarmingUp;
         }
-        let bot = live.bot.as_ref()?;
-        let mut permissions = effective_permissions(
+        let Some(bot) = live.bot.as_ref() else {
+            return GuildAuthority::WarmingUp;
+        };
+        let Some(mut permissions) = effective_permissions(
             guild,
             bot.guild_owner_id,
             member_id,
             &member.roles,
             &bot.roles,
             &[],
-        )?;
+        ) else {
+            return GuildAuthority::WarmingUp;
+        };
         // Discord exempts the guild owner and Administrator, both of which
         // effective_permissions resolves to all bits. Other timed-out members
         // retain only their existing View Channel and Read Message History bits.
@@ -6918,7 +6984,7 @@ where
         {
             permissions &= Permissions::VIEW_CHANNEL | Permissions::READ_MESSAGE_HISTORY;
         }
-        Some(permissions)
+        GuildAuthority::Ready(permissions)
     }
 
     fn ensure_actor(&self, guild: Snowflake) -> Option<GuildActor> {
@@ -10674,6 +10740,15 @@ where
     let Some(command) = runtime.parse_voice_command(interaction) else {
         return false;
     };
+    // Cold guild-role facts are not a permanent denial: a command that
+    // needs that authority gets the retryable warming-up reply and fails
+    // closed before any gate read or protected effect. Missing-member
+    // interactions keep their existing handling.
+    let authority = runtime.guild_authority(interaction);
+    if matches!(authority, GuildAuthority::WarmingUp) && requires_guild_authority(&command) {
+        reply(ephemeral_response(WARMING_UP_REPLY)).await;
+        return true;
+    }
     // Guild-level role gate first. Settings that cannot be read fail closed for
     // members: only an admin proceeds without them.
     let member = access_member(interaction, runtime.guild_permissions(interaction));
@@ -11401,6 +11476,13 @@ where
     }
     let permissions = runtime.guild_permissions(interaction);
     if !may_manage_server(permissions) {
+        if matches!(
+            runtime.guild_authority(interaction),
+            GuildAuthority::WarmingUp
+        ) {
+            reply(ephemeral_response(WARMING_UP_REPLY)).await;
+            return true;
+        }
         reply(ephemeral_response(
             "You need Manage Server to confirm an import.",
         ))
