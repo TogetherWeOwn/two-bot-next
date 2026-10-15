@@ -52,9 +52,10 @@ jobs:
   # Pre-deploy schema-drift gate: a drifted staging database fails this job
   # (and, through `needs`, the deploy below) instead of staying red silently.
   # Read-only `staging-migrate plan` through the no-reviewer
-  # `staging-migrate-plan` environment binding; the host/database pins are
-  # derived from that same binding URL, so the gate needs no new secret,
-  # input or reviewer. Drift is fixed by the manual staging-migrate apply
+  # `staging-migrate-plan` environment binding; the expected host/database/
+  # branch pins are non-secret `vars.*` compared against that binding (never
+  # derived from it), so a wrong-target binding refuses instead of reading
+  # the wrong database. Drift is fixed by the manual staging-migrate apply
   # dispatch named in the failure, never by this workflow (plan-only; the
   # `db roles` CLI is plan/verify only by design, and the reviewed-apply
   # fence is untouched).
@@ -90,6 +91,11 @@ jobs:
           # Must already exist as a staging-migrate-plan environment secret; absent means refusal.
           # Read-only login: the gate never applies and never reads the migrator binding.
           TWO_BOT_STAGING_PLAN_DATABASE_URL: ${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}
+          # Non-secret expected staging identity (repo/org vars, Operator-owned):
+          # the gate refuses unless the secret binding matches these pins.
+          TWO_BOT_STAGING_HOST: ${{ vars.TWO_BOT_STAGING_HOST }}
+          TWO_BOT_STAGING_DATABASE: ${{ vars.TWO_BOT_STAGING_DATABASE }}
+          TWO_BOT_STAGING_BRANCH_ID: ${{ vars.TWO_BOT_STAGING_BRANCH_ID }}
           SOURCE_SHA: ${{ github.sha }}
         # `shell: bash` runs with `-eo pipefail`. The container's default `sh`
         # has no pipefail, so a gate refusal piped anywhere would read green.

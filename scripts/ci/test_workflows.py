@@ -1008,6 +1008,15 @@ def schema_gate_errors(workflow, name="deploy-staging.yml"):
             or "TWO_BOT_STAGING_PLAN_DATABASE_URL" not in str(run.get("env", ""))):
         errors.append(f"{name}:schema-gate: gate step must run the reviewed script over pipefail "
                       "with the plan binding and the deploy SHA")
+    # The expected staging identity is pinned independently of the secret
+    # binding (vars, never derived from the URL): a wrong-target binding must
+    # refuse instead of reading the wrong database.
+    env_text = str(run.get("env", ""))
+    for pin, var in (("TWO_BOT_STAGING_HOST", "vars.TWO_BOT_STAGING_HOST"),
+                     ("TWO_BOT_STAGING_DATABASE", "vars.TWO_BOT_STAGING_DATABASE"),
+                     ("TWO_BOT_STAGING_BRANCH_ID", "vars.TWO_BOT_STAGING_BRANCH_ID")):
+        if pin not in env_text or var not in env_text:
+            errors.append(f"{name}:schema-gate: gate step must pin {pin} from {var}")
     text = str(gate).lower().replace(" ", "")
     for marker in ("wrangler", "--apply", "migrator", "roles", "tojson(secrets", "secrets["):
         if marker in text:

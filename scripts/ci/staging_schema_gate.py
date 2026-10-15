@@ -3,12 +3,13 @@
 
 Runs the reviewed `staging-migrate --plan` binary against the staging
 database through the no-reviewer `staging-migrate-plan` environment binding
-and refuses the deploy when `pending_before` is non-empty. The host,
-database and branch pins are derived from that same binding URL (parsed, not
-printed), so the gate needs no new secret, input or reviewer; a pooled,
-unparseable or mismatched binding refuses before any plan runs. DDL never
-runs here: drift is fixed by the manual `staging-migrate` apply dispatch,
-exactly as the drift message says.
+and refuses the deploy when `pending_before` is non-empty. The expected
+host, database and branch pins are non-secret workflow vars
+(`vars.TWO_BOT_STAGING_HOST/DATABASE/BRANCH_ID`), read here from the
+environment independently of the secret binding; a pooled, unparseable or
+mismatched binding refuses before any plan runs, exactly as the manual plan
+does. DDL never runs here: drift is fixed by the manual `staging-migrate`
+apply dispatch, exactly as the drift message says.
 """
 import argparse
 import json
@@ -18,6 +19,13 @@ import sys
 from urllib.parse import urlparse
 
 PLAN_URL_ENV = "TWO_BOT_STAGING_PLAN_DATABASE_URL"
+# Non-secret expected staging identity, wired in deploy-staging.yml from
+# `vars.*` (never from the secret binding: a binding compared with itself
+# cannot mismatch). Names match the binary's --staging-host/database/branch-id
+# flags; the binary re-checks the same comparison in verify_target.
+EXPECTED_HOST_ENV = "TWO_BOT_STAGING_HOST"
+EXPECTED_DATABASE_ENV = "TWO_BOT_STAGING_DATABASE"
+EXPECTED_BRANCH_ENV = "TWO_BOT_STAGING_BRANCH_ID"
 # Bare, non-secret provenance refs recorded in the plan manifest. The gate is
 # the evidence: a read-only plan needs no human review reference.
 GATE_REF = "deploy-staging-schema-gate"
@@ -64,6 +72,58 @@ def pins_from_url(url):
         require(len(suffix) == 2 and suffix[1], "binding branch does not pin a staging branch")
         branch = suffix[1]
     return host, database, branch
+
+
+def branch_id_valid(value):
+    """Mirror the binary's bare branch-id shape (alphanumerics, dash, underscore, <=63)."""
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 63
+        and all(ch.isascii() and (ch.isalnum() or ch in "-_") for ch in value)
+    )
+
+
+def verify_binding(url, expected_host, expected_database, expected_branch):
+    """Refuse unless the secret binding matches the independently pinned identity.
+
+    Mirrors `validate_request` + `verify_target` in staging_migrate.rs for the
+    staging target: the expected pins are staging-fenced (non-empty, never
+    production-like, never a pooler host; a PlanetScale pin requires a bare
+    branch id), the binding shape is parsed by `pins_from_url`, and the
+    binding host/database must equal the pins (host case-insensitively,
+    database exactly). A non-empty expected branch must equal the binding
+    username's `{role}.{branch_id}` suffix case-insensitively; an empty
+    expected branch refuses a PlanetScale binding, so an unpinned dispatch
+    cannot reach an unpinned branch. Every refusal is a fixed string: nothing
+    echoes the URL or the pins.
+    """
+    host_pin = (expected_host or "").strip()
+    db_pin = (expected_database or "").strip()
+    branch_pin = (expected_branch or "").strip()
+    for label, pin in (("expected host", host_pin), ("expected database", db_pin)):
+        lowered = pin.lower()
+        require(
+            pin and "prod" not in lowered and "@" not in pin and "/" not in pin,
+            f"{label} is empty, production-like or not a bare name",
+        )
+    require("-pooler" not in host_pin.lower(), "expected host is a pooler endpoint")
+    if branch_pin:
+        require(branch_id_valid(branch_pin), "expected branch id is not a bare branch pin")
+    elif host_pin.lower().endswith(".psdb.cloud"):
+        raise Refused("PlanetScale hosts require TWO_BOT_STAGING_BRANCH_ID")
+    host, database, branch = pins_from_url(url)
+    require(
+        host == host_pin.lower() and database == db_pin,
+        "plan database binding does not match the verified staging identity",
+    )
+    if branch_pin:
+        require(
+            branch and branch.lower() == branch_pin.lower(),
+            "plan database binding does not match the verified staging branch",
+        )
+    elif host.endswith(".psdb.cloud"):
+        raise Refused("plan database binding is an unpinned PlanetScale branch")
+    return host_pin, db_pin, branch_pin
 
 
 def pending_versions(manifest):
@@ -117,9 +177,15 @@ def connection_warning(manifest):
     return None
 
 
-def run_gate(binary, source_sha, url):
-    """Run the plan binary and return its manifest dict (raises on refusal)."""
-    host, database, branch = pins_from_url(url)
+def run_gate(binary, source_sha, url, expected_host, expected_database, expected_branch):
+    """Run the plan binary and return its manifest dict (raises on refusal).
+
+    The independently pinned identity is verified against the binding first,
+    then passed to the binary (never derived from the binding), so the
+    binary's own `verify_target` compares the secret with the pins, as the
+    manual plan does.
+    """
+    host, database, branch = verify_binding(url, expected_host, expected_database, expected_branch)
     proc = subprocess.run(
         [binary, "--target", "staging", "--plan", "--source-sha", source_sha,
          "--staging-host", host, "--staging-database", database,
@@ -148,7 +214,14 @@ def main(argv=None, env=None, run=None):
     env = os.environ if env is None else env
     run = run_gate if run is None else run
     require(len(args.source_sha) == 40, "source SHA must be a full 40-char commit")
-    manifest = run(args.binary, args.source_sha, env.get(PLAN_URL_ENV, ""))
+    manifest = run(
+        args.binary,
+        args.source_sha,
+        env.get(PLAN_URL_ENV, ""),
+        env.get(EXPECTED_HOST_ENV, ""),
+        env.get(EXPECTED_DATABASE_ENV, ""),
+        env.get(EXPECTED_BRANCH_ENV, ""),
+    )
     with open(args.manifest_out, "w", encoding="utf-8") as handle:
         json.dump(manifest, handle, sort_keys=True)
         handle.write("\n")

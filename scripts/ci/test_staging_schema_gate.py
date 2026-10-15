@@ -5,10 +5,12 @@ import unittest
 
 from staging_schema_gate import (
     Refused,
+    branch_id_valid,
     connection_warning,
     drift_message,
     pending_versions,
     pins_from_url,
+    verify_binding,
 )
 
 
@@ -38,6 +40,71 @@ class PinsFromUrlTests(unittest.TestCase):
             with self.subTest(bad=bad):
                 with self.assertRaises(Refused):
                     pins_from_url(bad)
+
+
+class VerifyBindingTests(unittest.TestCase):
+    """The binding is compared with independently pinned vars, never itself."""
+
+    STAGING_HOST = "ep-staging-123.us-east-2.aws.neon.tech"
+    STAGING_DB = "two_bot"
+    STAGING_URL = f"postgresql://two_bot_migrator_ro:pw@{STAGING_HOST}/{STAGING_DB}"
+    PSDB_HOST = "myapp.pg.psdb.cloud"
+    PSDB_BRANCH = "cnlmx96ec5kw"
+    PSDB_URL = f"postgresql://two-bot-migrator.{PSDB_BRANCH}:pw@{PSDB_HOST}:5432/postgres"
+
+    def test_matching_neon_binding_passes_and_returns_pins(self):
+        pins = verify_binding(self.STAGING_URL, self.STAGING_HOST, self.STAGING_DB, "")
+        self.assertEqual(pins, (self.STAGING_HOST, self.STAGING_DB, ""))
+
+    def test_wrong_target_binding_is_refused(self):
+        # A production-class binding aimed at the gate refuses even though its
+        # own shape parses: the pins come from vars, not from the URL.
+        prod_url = "postgresql://two_bot_migrator_ro:pw@ep-prod-999.us-east-2.aws.neon.tech/two_bot"
+        with self.assertRaises(Refused):
+            verify_binding(prod_url, self.STAGING_HOST, self.STAGING_DB, "")
+        wrong_db = f"postgresql://two_bot_migrator_ro:pw@{self.STAGING_HOST}/other_db"
+        with self.assertRaises(Refused):
+            verify_binding(wrong_db, self.STAGING_HOST, self.STAGING_DB, "")
+
+    def test_matching_planetscale_branch_passes(self):
+        pins = verify_binding(self.PSDB_URL, self.PSDB_HOST, "postgres", self.PSDB_BRANCH)
+        self.assertEqual(pins, (self.PSDB_HOST, "postgres", self.PSDB_BRANCH))
+
+    def test_planetscale_branch_mismatch_is_refused(self):
+        with self.assertRaises(Refused):
+            verify_binding(self.PSDB_URL, self.PSDB_HOST, "postgres", "otherbranch1")
+        # Unpinned dispatch against a PlanetScale binding refuses.
+        with self.assertRaises(Refused):
+            verify_binding(self.PSDB_URL, self.PSDB_HOST, "postgres", "")
+
+    def test_missing_expected_branch_pin_is_refused(self):
+        with self.assertRaises(Refused):
+            verify_binding(self.STAGING_URL, self.PSDB_HOST, "postgres", "")
+
+    def test_production_like_or_pooler_expected_pins_are_refused(self):
+        for host, database in (
+            ("ep-prod-1.aws.neon.tech", self.STAGING_DB),
+            (self.STAGING_HOST, "two_bot_prod"),
+            ("ep-pooler-staging.aws.neon.tech", self.STAGING_DB),
+            ("", self.STAGING_DB),
+            (self.STAGING_HOST, ""),
+        ):
+            with self.subTest(host=host, database=database):
+                with self.assertRaises(Refused):
+                    verify_binding(self.STAGING_URL, host, database, "")
+
+    def test_malformed_expected_branch_is_refused(self):
+        for bad in ("not a branch!", "x" * 64, ""):
+            if not bad:
+                continue
+            with self.subTest(bad=bad):
+                with self.assertRaises(Refused):
+                    verify_binding(self.PSDB_URL, self.PSDB_HOST, "postgres", bad)
+
+    def test_branch_id_shape(self):
+        self.assertTrue(branch_id_valid("cnlmx96ec5kw"))
+        self.assertFalse(branch_id_valid(""))
+        self.assertFalse(branch_id_valid("not a branch!"))
 
 
 class PendingVersionsTests(unittest.TestCase):
