@@ -79,6 +79,21 @@ can cause component-install conflicts before fmt runs. The offline workflow
 policy suite pins all nine installers to the repository version; bump them and
 the toolchain and builder-image pins together.
 
+### Pull-request size labels (advisory)
+
+`.github/workflows/pr-size.yml` labels every pull request `size/S` (up to 100
+counted lines), `size/M` (up to 400), `size/L` (up to 1000) or `size/XL`, and
+keeps one advisory comment on pull requests over the 400-line threshold.
+Counted lines are additions + deletions excluding lockfiles, generated files
+and fixtures (plus `migrations.lock`, the generated migration inventory; the
+hand-written migration SQL stays counted). The labeller lives once in the org
+[TogetherWeOwn/.github](https://github.com/TogetherWeOwn/.github) repository
+(CI-STANDARD.md, "Advisory PR-size labels"); the workflow here is a thin
+caller pinned to a central SHA and passes only this repo's generated paths.
+This is advisory only: it is not a required check and never blocks a merge.
+A Monday run of the same workflow prints the weekly tally of merged pull
+requests per size; the labels are the durable record behind it.
+
 ### Issues
 
 Use an issue form: bug report, feature request, enhancement or documentation
