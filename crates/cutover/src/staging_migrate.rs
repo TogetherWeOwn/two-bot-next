@@ -769,11 +769,75 @@ fn ledger_json(rows: &[LedgerRow]) -> Value {
 /// empty list: `[]` reads as "nothing applied".
 const LEDGER_UNKNOWN: &str = "unknown: ledger unreadable";
 
-/// `None` when no connection or the read fails, so the caller records
-/// [`LEDGER_UNKNOWN`] instead of an empty ledger.
-async fn read_ledger_after_run(pool: &PgPool) -> Option<Vec<LedgerRow>> {
-    let mut conn = pool.acquire().await.ok()?;
-    read_ledger(&mut conn).await.ok()
+/// Post-apply ledger read attempts: the pre-apply read uses the identical
+/// query as the identical role, so a post-apply read failure is transient
+/// connection state (a pool checkout timing out against a saturated
+/// database), not grants or migration content. Retry briefly before reporting
+/// the ledger unreadable; a permanently unreadable ledger still fails closed.
+pub const POST_APPLY_READ_ATTEMPTS: u32 = 5;
+pub const POST_APPLY_READ_RETRY_DELAY_SECS: u64 = 2;
+
+/// Why the post-apply ledger read failed. Fixed strings only; never a URL,
+/// host, login or error body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadAfterApply {
+    PoolAcquireFailed,
+    LedgerQueryFailed,
+}
+
+impl ReadAfterApply {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PoolAcquireFailed => "pool_acquire_failed",
+            Self::LedgerQueryFailed => "ledger_query_failed",
+        }
+    }
+}
+
+/// Run a fallible post-apply read `attempts` times (at least once), sleeping
+/// `delay` between attempts. Returns the first success or the terminal
+/// failure kind.
+async fn retry_transient<F, Fut, T>(
+    mut op: F,
+    attempts: u32,
+    delay: Duration,
+) -> Result<T, ReadAfterApply>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, ReadAfterApply>>,
+{
+    let attempts = attempts.max(1);
+    for attempt in 0..attempts {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(kind) => {
+                if attempt + 1 == attempts {
+                    return Err(kind);
+                }
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+    unreachable!("attempts is at least 1");
+}
+
+/// `Err` with the terminal failure kind when no attempt could read, so the
+/// caller records [`LEDGER_UNKNOWN`] instead of an empty ledger.
+async fn read_ledger_after_run(pool: &PgPool) -> Result<Vec<LedgerRow>, ReadAfterApply> {
+    retry_transient(
+        move || async move {
+            let mut conn = pool
+                .acquire()
+                .await
+                .map_err(|_| ReadAfterApply::PoolAcquireFailed)?;
+            read_ledger(&mut conn)
+                .await
+                .map_err(|_| ReadAfterApply::LedgerQueryFailed)
+        },
+        POST_APPLY_READ_ATTEMPTS,
+        Duration::from_secs(POST_APPLY_READ_RETRY_DELAY_SECS),
+    )
+    .await
 }
 
 fn ledger_or_unknown(rows: Option<&[LedgerRow]>) -> Value {
@@ -848,6 +912,29 @@ async fn audit_queries(pool: &PgPool) -> Result<Value, &'static str> {
         .fetch_all(&mut *tx)
         .await
         .map_err(|_| "audit verify read failed")?;
+    // Connection pressure: staging once refused all logins at 25/25
+    // connections with no prior signal. Both counters are readable by any
+    // login and live in pg_catalog, so they survive the search_path pin.
+    // Count real client backends from pg_stat_database: every login can
+    // read numbackends in full, while pg_stat_activity.backend_type is NULL
+    // for other roles' sessions unless the reader holds pg_read_all_stats
+    // (the plan login does not), which would hide exactly the sessions that
+    // saturate the database. Aux processes are not backends and never
+    // appear in numbackends.
+    let connections_used: i64 = sqlx::query_scalar(CONNECTION_COUNT_SQL)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| "audit connection count read failed")?;
+    let max_connections: i64 =
+        sqlx::query_scalar("SELECT current_setting('max_connections')::bigint")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| "audit max_connections read failed")?;
+    let reserved_connections: i64 =
+        sqlx::query_scalar("SELECT current_setting('superuser_reserved_connections')::bigint")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| "audit reserved_connections read failed")?;
     tx.rollback().await.map_err(|_| "audit rollback failed")?;
     let mut membership_entries = Vec::with_capacity(memberships.len());
     for (login, exists, member_of, of_migrator, of_ro) in &memberships {
@@ -866,7 +953,70 @@ async fn audit_queries(pool: &PgPool) -> Result<Value, &'static str> {
         "verify_findings": findings,
         "matrix_sha256": hex::encode(Sha256::digest(AUDIT_MATRIX.as_bytes())),
         "verify_sha256": hex::encode(Sha256::digest(AUDIT_VERIFY.as_bytes())),
+        "connection_usage": {
+            "used": connections_used,
+            "max_connections": max_connections,
+            "reserved_connections": reserved_connections,
+            "effective_max_connections": effective_max_connections(max_connections, reserved_connections),
+            "pct_full": connections_used as f64 / effective_max_connections(max_connections, reserved_connections).max(1) as f64 * 100.0,
+        },
     }))
+}
+
+/// Client-backend count from `pg_stat_database`: aux processes (walwriter,
+/// checkpointer, background writer, autovacuum and replication launchers)
+/// are not backends, so `numbackends` excludes them without the
+/// `backend_type` filter — whose value is NULL for other roles' sessions
+/// unless the reader holds `pg_read_all_stats`, which the plan login does
+/// not. Every login reads this in full, so the 80% warning can fire when
+/// the runtime role's sessions saturate the database.
+pub const CONNECTION_COUNT_SQL: &str =
+    "SELECT coalesce(sum(numbackends), 0)::bigint FROM pg_stat_database";
+
+/// Non-superuser login ceiling: `max_connections` minus
+/// `superuser_reserved_connections`. Degenerate inputs floor at 1 so the
+/// warning ratio never divides by zero.
+pub fn effective_max_connections(max_connections: i64, reserved_connections: i64) -> i64 {
+    (max_connections.saturating_sub(reserved_connections.max(0))).max(1)
+}
+
+/// Warn threshold for staging connection pressure: staging once refused all
+/// logins at 25/25 connections with no prior signal. Strictly above 80%
+/// warns; degenerate inputs never warn. The line is a GitHub workflow
+/// annotation, so the plan run surfaces it without failing the plan manifest
+/// the apply binds to.
+pub const CONNECTION_WARN_PCT: f64 = 80.0;
+
+/// `Some` annotation line when `used` exceeds [`CONNECTION_WARN_PCT`] of
+/// `max`, else `None`. Counts only; never a URL, host or login.
+pub fn connection_warning(used: i64, max: i64) -> Option<String> {
+    if max <= 0 || used < 0 {
+        return None;
+    }
+    let pct = used as f64 / max as f64 * 100.0;
+    if pct > CONNECTION_WARN_PCT {
+        Some(format!(
+            "::warning::staging database connections above 80% of max_connections: \
+             {used}/{max} ({pct:.1}%)"
+        ))
+    } else {
+        None
+    }
+}
+
+/// Read the plan audit's `connection_usage` back into [`connection_warning`].
+/// Prefers the non-superuser `effective_max_connections` ceiling when present
+/// (older manifests carry only `max_connections`). A failed or field-less
+/// readout warns about nothing.
+fn connection_warning_from_audit(audit: &Value) -> Option<String> {
+    let usage = audit.get("connection_usage")?;
+    let used = usage.get("used")?.as_i64()?;
+    let max = usage.get("max_connections")?.as_i64()?;
+    let reserved = usage.get("reserved_connections").and_then(Value::as_i64);
+    let ceiling = reserved
+        .map(|r| effective_max_connections(max, r))
+        .unwrap_or(max);
+    connection_warning(used, ceiling)
 }
 
 async fn connect(
@@ -957,11 +1107,17 @@ async fn run_on_pool(
     check_plan_provenance(req, &computed_hash)?;
 
     // Plan-only readout inside one READ ONLY transaction. Apply skips it: that
-    // login is the migrator, not the read-only readout.
+    // login is the migrator, not the read-only readout. A saturated staging
+    // database warns on stderr (a workflow annotation) without failing the
+    // plan manifest the apply binds to.
     let audit = if req.apply {
         Value::Null
     } else {
-        read_audit(pool).await
+        let audit = read_audit(pool).await;
+        if let Some(line) = connection_warning_from_audit(&audit) {
+            eprintln!("{line}");
+        }
+        audit
     };
 
     let mut applied = 0usize;
@@ -970,18 +1126,23 @@ async fn run_on_pool(
         let outcome = MIGRATOR.run(pool).await;
         let read_back = read_ledger_after_run(pool).await;
         if let Err(e) = outcome {
-            let evidence = json!({"ledger_after_failure": ledger_or_unknown(read_back.as_deref()),
+            let evidence = json!({"ledger_after_failure":
+                                      ledger_or_unknown(read_back.as_ref().ok().map(Vec::as_slice)),
                                   "error": e.to_string()});
             return Err(RunError::Failed(
                 "migration execution failed".to_owned(),
                 evidence,
             ));
         }
-        let Some(rows) = read_back else {
-            return Err(RunError::Failed(
-                "ledger unreadable after apply".to_owned(),
-                json!({"ledger_after": LEDGER_UNKNOWN}),
-            ));
+        let rows = match read_back {
+            Ok(rows) => rows,
+            Err(kind) => {
+                return Err(RunError::Failed(
+                    "ledger unreadable after apply".to_owned(),
+                    json!({"ledger_after": LEDGER_UNKNOWN,
+                           "ledger_after_error": kind.as_str()}),
+                ));
+            }
         };
         after = rows;
         applied = after.len().saturating_sub(before.len());
@@ -2407,6 +2568,145 @@ mod tests {
     fn target_pool_shape_pins_acquire_timeout() {
         assert_eq!(TARGET_POOL_MAX, 2);
         assert_eq!(TARGET_ACQUIRE_TIMEOUT_SECS, 10);
+    }
+
+    /// Staging drift witness: run 38654195597 applied all 19 pending migrations, then the
+    /// post-apply ledger read failed on a transient pool acquire while the
+    /// saturated staging DB (25/25 connections) refused the new checkout. The
+    /// pre-apply read had used the identical query as the identical role, so
+    /// the failure was transient connection state, not grants or migration
+    /// content. The post-apply read must retry transient failures before
+    /// reporting the ledger unreadable.
+    #[tokio::test]
+    async fn post_apply_read_retries_transient_failures_then_succeeds() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe = Arc::clone(&calls);
+        let result = retry_transient(
+            || {
+                let probe = Arc::clone(&probe);
+                async move {
+                    let n = probe.fetch_add(1, Ordering::SeqCst);
+                    if n < 2 {
+                        Err(ReadAfterApply::PoolAcquireFailed)
+                    } else {
+                        Ok(42u32)
+                    }
+                }
+            },
+            5,
+            Duration::from_millis(0),
+        )
+        .await;
+        assert_eq!(result, Ok(42u32));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// A permanently unreadable ledger still reports unreadable (fail closed),
+    /// with the terminal failure kind preserved for evidence.
+    #[tokio::test]
+    async fn post_apply_read_returns_the_terminal_failure_kind() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe = Arc::clone(&calls);
+        let result = retry_transient(
+            || {
+                let probe = Arc::clone(&probe);
+                async move {
+                    probe.fetch_add(1, Ordering::SeqCst);
+                    Err::<u32, ReadAfterApply>(ReadAfterApply::LedgerQueryFailed)
+                }
+            },
+            3,
+            Duration::from_millis(0),
+        )
+        .await;
+        assert_eq!(result, Err(ReadAfterApply::LedgerQueryFailed));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn post_apply_read_error_names_are_stable() {
+        assert_eq!(
+            ReadAfterApply::PoolAcquireFailed.as_str(),
+            "pool_acquire_failed"
+        );
+        assert_eq!(
+            ReadAfterApply::LedgerQueryFailed.as_str(),
+            "ledger_query_failed"
+        );
+    }
+
+    /// Staging drift witness: staging refused all logins at 25/25 connections. The plan
+    /// manifest must carry connection usage and warn strictly above 80%.
+    #[test]
+    fn connection_warning_fires_only_above_eighty_percent() {
+        assert_eq!(connection_warning(20, 25), None);
+        assert_eq!(connection_warning(80, 100), None);
+        assert_eq!(connection_warning(0, 0), None);
+        assert_eq!(connection_warning(5, 0), None);
+        for (used, max) in [(21, 25), (81, 100), (25, 25)] {
+            let line =
+                connection_warning(used, max).unwrap_or_else(|| panic!("{used}/{max} must warn"));
+            assert!(line.contains("80%"), "{line}");
+            assert!(line.contains("::warning::"), "{line}");
+        }
+    }
+
+    #[test]
+    fn connection_warning_from_audit_reads_usage_fields() {
+        let saturated = json!({"connection_usage": {"used": 21, "max_connections": 25}});
+        let line = connection_warning_from_audit(&saturated).expect("must warn");
+        assert!(line.contains("21/25"), "{line}");
+        assert_eq!(
+            connection_warning_from_audit(
+                &json!({"connection_usage": {"used": 20, "max_connections": 25}})
+            ),
+            None
+        );
+        // A failed audit readout warns about nothing.
+        assert_eq!(
+            connection_warning_from_audit(&json!({"error": "audit read failed"})),
+            None
+        );
+        assert_eq!(connection_warning_from_audit(&Value::Null), None);
+    }
+
+    #[test]
+    fn connection_count_uses_fully_readable_source() {
+        // `backend_type` is NULL for other roles' sessions unless the reader
+        // holds pg_read_all_stats, which the plan login does not; the count
+        // must come from pg_stat_database, readable in full by every login.
+        assert!(
+            CONNECTION_COUNT_SQL.contains("pg_stat_database"),
+            "{CONNECTION_COUNT_SQL}"
+        );
+        assert!(
+            CONNECTION_COUNT_SQL.contains("numbackends"),
+            "{CONNECTION_COUNT_SQL}"
+        );
+        assert!(
+            !CONNECTION_COUNT_SQL.contains("backend_type"),
+            "{CONNECTION_COUNT_SQL}"
+        );
+    }
+
+    #[test]
+    fn effective_ceiling_subtracts_reserved() {
+        assert_eq!(effective_max_connections(25, 3), 22);
+        assert_eq!(effective_max_connections(25, 0), 25);
+        assert_eq!(effective_max_connections(1, 5), 1);
+        // Backwards-compatible: manifests without the reserved field warn on raw max.
+        assert_eq!(
+            connection_warning_from_audit(
+                &json!({"connection_usage": {"used": 20, "max_connections": 25}})
+            ),
+            None
+        );
+        // Same reading against the login ceiling (25 - 3 = 22) warns: 20/22 > 80%.
+        let line = connection_warning_from_audit(
+            &json!({"connection_usage": {"used": 20, "max_connections": 25, "reserved_connections": 3}}),
+        )
+        .expect("must warn on effective ceiling");
+        assert!(line.contains("20/22"), "{line}");
     }
 
     /// The `run` entry refuses a plaintext remote binding before connecting

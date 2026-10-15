@@ -67,6 +67,41 @@ environment-scoped with no unintended fallback:
 - The existing deployment/approval principal can still deploy and the
   `STAGING_WORKER_URL` variable resolves in that environment.
 
+## Staging schema-drift gate (automatic, plan-only)
+
+Every `deploy-staging` run starts with the `schema-gate` job, and `deploy`
+needs it, so a staging database behind the source fails the run before any
+deploy step instead of staying red silently. The gate job runs only in the
+`staging-migrate-plan` environment with `contents: read`, builds the reviewed
+`staging-migrate` binary at the exact deploy SHA, and runs
+`scripts/ci/staging_schema_gate.py`, which invokes the binary's read-only
+`--plan` through the plan environment's existing
+`TWO_BOT_STAGING_PLAN_DATABASE_URL` binding (a login holding only
+`two_bot_migrator_ro`). It never applies migrations, never reads the migrator
+binding, and never creates or grants roles: non-empty `pending_before` exits
+non-zero naming the pending versions and the manual `staging-migrate` apply
+dispatch that fixes them, and the reviewed-apply fence is unchanged.
+
+The expected staging identity is pinned independently of that secret: the
+non-secret variables `TWO_BOT_STAGING_HOST`, `TWO_BOT_STAGING_DATABASE` and
+`TWO_BOT_STAGING_BRANCH_ID`, scoped to the `staging-migrate-plan` environment
+and Operator-owned. The gate (and then the binary's own `verify_target`)
+refuses before any plan when the binding's host, database or PlanetScale
+branch suffix does not match those pins, when a pin is empty, production-like
+or a pooler endpoint, or when a PlanetScale pin carries no branch id; refusal
+messages are fixed strings that echo neither the URL nor the pins. PlanetScale
+hosts remain supported through the explicit branch pin — there is no blanket
+host-suffix rejection. Until the three variables are set, the gate fails
+closed on every deploy.
+
+The plan manifest's `audit.connection_usage` (sessions summed from
+`pg_stat_database.numbackends`, which the unprivileged plan login can read in
+full, against `effective_max_connections`, or `max_connections` minus
+`superuser_reserved_connections` when the effective field is absent) also
+drives a warning, never a failure, when usage is strictly above 80% of that
+non-superuser ceiling; older manifests without the effective/reserved fields
+fall back to raw `max_connections` and label the ceiling as such.
+
 ## Staging rollback drill (manual)
 
 `staging-rollback-drill.yml` is a manual, staging-only workflow that runs the
