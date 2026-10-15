@@ -262,6 +262,20 @@ class GatePassTests(unittest.TestCase):
         self.assertTrue(passed)
         self.assertTrue(rb.evidence.get("pre_stamp_recorded"))
 
+    def test_snapshot_rollback_ignores_the_failed_build_revision(self):
+        # Auto-rollback restores the previous build, whose /readyz reports
+        # the previous revision instead of the failed SHA. Without
+        # --expected-sha the gate trusts the version header plus gateway
+        # readiness; with it, the same answer must still fail.
+        routes = self.routes(version=BAD_VERSION, revision="f" * 40)
+        rb, _, _ = make_rollback(routes, expected_sha=None)
+        passed, observation = rb.gate_pass(BAD_VERSION)
+        self.assertTrue(passed, observation)
+        self.assertIn("gateway=ready", observation)
+        rb, _, _ = make_rollback(routes, expected_sha=SHA)
+        passed, _ = rb.gate_pass(BAD_VERSION)
+        self.assertFalse(passed)
+
     def test_hostile_body_never_reaches_observation(self):
         marker = "sg%s%s%d" % ("ni", "p", id(object()))
         body = json.dumps({"components": [["gateway", "ready\nextra " + marker]],
@@ -367,6 +381,25 @@ class RollbackRunTests(unittest.TestCase):
         rb.run(GOOD_VERSION, good_image())
         posts = [call for call in client.calls if call[0] == "POST"]
         self.assertFalse(any("deployments" in path for _, path, _ in posts))
+        self.assertTrue(any("rollouts" in path for _, path, _ in posts))
+
+    def test_image_restore_accepts_the_steady_state_lag_shape(self):
+        # Under durable_object scheduling the completed rollout can read
+        # active:1/healthy:0 while the exact build serves ready; staging
+        # verify accepts that shape, so the restore must not time out on it.
+        routes, _ = self.routes()
+        lag = rollout_row("r-new", good_image(), created="2026-10-15T01:00:00Z",
+                          status="completed", target_version=9)
+        lag["health"]["instances"] = {"active": 1, "healthy": 0, "failed": 0,
+                                      "starting": 0, "scheduling": 0}
+        self.assertTrue(base.active_lag(lag, good_image(), 9))
+        routes[(f"GET", f"/containers/applications/{APP_ID}/rollouts/r-new")] = \
+            lambda: {"success": True, "result": lag}
+        control, _ = control_stub()
+        rb, client, _ = make_rollback(routes, control=control)
+        evidence = rb.run(GOOD_VERSION, good_image())
+        self.assertEqual(evidence["restored_rollout_id"], "r-new")
+        posts = [call for call in client.calls if call[0] == "POST"]
         self.assertTrue(any("rollouts" in path for _, path, _ in posts))
 
     def test_production_variant_fences_then_takes_over_with_epoch(self):

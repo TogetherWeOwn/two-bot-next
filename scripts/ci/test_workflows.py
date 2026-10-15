@@ -1081,15 +1081,20 @@ def production_schema_gate_errors(workflow, name="deploy-production.yml"):
     if "schema-gate" not in needs or "guard" not in needs:
         errors.append(f"{name}:production: must needs the guard and the schema-gate (drift must block the deploy)")
     steps = gate.get("steps") or []
-    if len(steps) != 4:
-        errors.append(f"{name}:schema-gate: must run exactly checkout, SHA check, build and the gate")
+    if len(steps) != 5:
+        errors.append(f"{name}:schema-gate: must run exactly checkout, tooling checkout, SHA check, build and the gate")
         return errors
-    checkout, sha_check, build, run = steps
+    checkout, tooling, sha_check, build, run = steps
     if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
             or (checkout.get("with") or {}).get("persist-credentials") != "false" \
             or (checkout.get("with") or {}).get("fetch-depth") != "0" \
             or "needs.guard.outputs.sha" not in str((checkout.get("with") or {}).get("ref", "")):
         errors.append(f"{name}:schema-gate: checkout must be pinned, credentialless, full-depth and on the guarded SHA")
+    if not str(tooling.get("uses", "")).startswith("actions/checkout@") \
+            or (tooling.get("with") or {}).get("persist-credentials") != "false" \
+            or (tooling.get("with") or {}).get("path") != "tooling" \
+            or "github.sha" not in str((tooling.get("with") or {}).get("ref", "")):
+        errors.append(f"{name}:schema-gate: tooling checkout must be pinned, credentialless and on the workflow commit")
     if ("needs.guard.outputs.sha" not in str(sha_check.get("env", ""))
             or "git rev-parse HEAD" not in str(sha_check.get("run", ""))):
         errors.append(f"{name}:schema-gate: SHA check must pin the step to the guarded SHA")
@@ -1518,8 +1523,8 @@ class WorkflowTests(unittest.TestCase):
             lambda w: w["jobs"]["schema-gate"].__setitem__("needs", "production"),
             lambda w: w["jobs"]["production"].__setitem__("needs", "guard"),
             lambda w: w["jobs"]["production"].__setitem__("needs", ["schema-gate"]),
-            lambda w: w["jobs"]["schema-gate"]["steps"][3].__setitem__("run", "wrangler deploy"),
-            lambda w: w["jobs"]["schema-gate"]["steps"][3].get("env", {}).__setitem__(
+            lambda w: w["jobs"]["schema-gate"]["steps"][4].__setitem__("run", "wrangler deploy"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4].get("env", {}).__setitem__(
                 "LEAK", "${{ secrets.TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL }}"),
         ):
             changed = copy.deepcopy(production)

@@ -346,8 +346,13 @@ class Rollback:
                     target_version = base.number(row.get("target_version"))
                 except GateError:
                     target_version = None
+            # The lag shape is the same steady state staging verify accepts
+            # (a completed rollout whose counters read active:1/healthy:0
+            # under durable_object scheduling); the stable gate after takeover
+            # still proves the exact version serves.
             if (target_version is not None
-                    and base.converged(row, image, target_version)
+                    and (base.converged(row, image, target_version)
+                         or base.active_lag(row, image, target_version))
                     and base.mapping(application_by_name(
                         self.client, self.application).get("configuration")).get("image")
                     == image):
@@ -394,7 +399,10 @@ class Rollback:
             # Pre-stamp version: the restored build predates build identity.
             # Recorded as a pass like the release gate, never a failure.
             self.evidence["pre_stamp_recorded"] = True
-        elif revision != self.expected_sha:
+        elif self.expected_sha is not None and revision != self.expected_sha:
+            # Snapshot rollbacks (auto-rollback) carry no --expected-sha: the
+            # restored build reports the previous revision, so identity rests
+            # on the x-two-worker-version header checked above.
             return False, f"readyz={status} identity=mismatch"
         if gateway_state(report) != "ready":
             return False, f"readyz={status} gateway=not-ready"

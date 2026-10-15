@@ -116,7 +116,10 @@ jobs:
     # TOG-11143: STAGING_OWNERSHIP_CONTROL_TOKEN is a `staging` environment
     # secret (TOG-12030); the job must declare the environment to read it.
     environment: staging
-    timeout-minutes: 30
+    # Sized for the worst case: the deploy, a failing verify and the
+    # auto-rollback budget (600 s image + 900 s gate). A 30 min cap can
+    # cancel the run mid-rollback and leave staging fenced.
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: wrangler
@@ -242,10 +245,12 @@ jobs:
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
         run: |
           set -euo pipefail
+          # No --expected-sha: the snapshot restores the previous serving
+          # build, whose /readyz reports the previous revision, not the
+          # failed SHA. Identity rests on the restored Worker version header.
           python3 ../scripts/worker_container_rollback.py rollback \
             --variant staging \
             --worker-url "$STAGING_WORKER_URL" \
-            --expected-sha "$GITHUB_SHA" \
             --snapshot "$ROLLOUT_DIR/staging-rollback-snapshot.json" \
             --actor "$ROLLBACK_ACTOR" \
             --evidence "$ROLLOUT_DIR/auto-rollback-evidence.json"

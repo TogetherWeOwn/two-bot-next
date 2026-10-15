@@ -312,6 +312,13 @@ class StaticGuardTests(unittest.TestCase):
         self.assertIn("worker_container_rollback.py rollback", auto)
         self.assertIn("--snapshot", auto)
         self.assertIn("--variant production", auto)
+        # The snapshot restores the previous build, whose /readyz reports
+        # the previous revision: gating it against the failed SHA could
+        # never pass, so the snapshot rollback carries no --expected-sha.
+        self.assertNotIn("--expected-sha", auto)
+        # A manual rollback names the restored version's commit as the SHA,
+        # so its gate still checks the revision.
+        self.assertIn('--expected-sha "$SHA"', inline_script(ROLLBACK_STEP))
         conditions = {
             step[0]: [line.strip() for line in step if line.strip().startswith("if:")]
             for step in steps(JOBS["production"])
@@ -345,7 +352,11 @@ class StaticGuardTests(unittest.TestCase):
     def test_build_identity_comes_from_the_guarded_sha_and_run(self):
         production = "\n".join(JOBS["production"])
         self.assertNotIn("GITHUB_SHA", production)
-        self.assertNotIn("github.sha", production)
+        # The only github.sha references are the tooling checkout refs: build
+        # identity (deploy message, config, gate) still uses the guarded SHA.
+        for line in production.splitlines():
+            if "github.sha" in line:
+                self.assertIn("ref:", line)
         self.assertIn('--sha "$SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"', RENDER)
         self.assertIn('echo "PRODUCTION_DEPLOY_CONFIG=$config" >> "$GITHUB_ENV"', RENDER)
         names = [step[0].strip() for step in steps(JOBS["production"])]
@@ -392,9 +403,9 @@ class StaticGuardTests(unittest.TestCase):
         self.assertIn("PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}", text)
         self.assertIn("STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}", text)
         self.assertNotIn("STAGING_OWNERSHIP_CONTROL_TOKEN", text)
-        self.assertIn("node scripts/production-ownership-control.mjs preflight", text)
-        self.assertIn("node scripts/production-ownership-control.mjs status", text)
-        self.assertIn('node scripts/production-ownership-control.mjs takeover "$epoch"', text)
+        self.assertIn("node ../tooling/wrangler/scripts/production-ownership-control.mjs preflight", text)
+        self.assertIn("node ../tooling/wrangler/scripts/production-ownership-control.mjs status", text)
+        self.assertIn('node ../tooling/wrangler/scripts/production-ownership-control.mjs takeover "$epoch"', text)
         # The takeover posts exactly the P2 epoch with an explicit release and
         # a run-derived audit actor naming the guarded SHA, never GITHUB_SHA.
         self.assertIn('OWNERSHIP_RELEASE_FENCE: "true"', text)
@@ -896,6 +907,29 @@ class GuardBehaviourTests(unittest.TestCase):
         for flag in ("", "false", "TRUE", "1", " true"):
             with self.subTest(flag=flag):
                 self.assertRefused(self.guard(auto=flag, environment=environment), "no required reviewers")
+
+    def test_staging_waivers_still_need_human_reviewers_with_auto_approve(self):
+        # Automated approval vouches through staging history; a rollback or
+        # a live-SHA redeploy waives that history, so auto-approve cannot
+        # replace the human Environment reviewers there.
+        environment = {**green()["environment"], "protection_rules": []}
+        result = self.guard(auto="true", environment=environment, rollback=VERSION, takeover="true")
+        self.assertRefused(result, "no required reviewers")
+        result = self.guard(auto="true", environment=environment, takeover="true", allow_unstaged="true")
+        self.assertRefused(result, "no required reviewers")
+
+    def test_reviewed_tooling_runs_from_the_workflow_commit(self):
+        # A rollback targets an older SHA that predates these scripts, so
+        # the guarded checkout may not contain them; reviewed tooling runs
+        # from a second checkout of the workflow's own commit.
+        production = "\n".join(JOBS["production"])
+        self.assertIn("path: tooling", production)
+        self.assertIn("ref: ${{ github.sha }}", production)
+        self.assertIn("../tooling/scripts/worker_container_rollback.py", production)
+        self.assertIn("../tooling/scripts/production_deploy.py", production)
+        self.assertIn("../tooling/wrangler/scripts/production-ownership-control.mjs", production)
+        self.assertIn("tooling/scripts/ci/production_schema_gate.py",
+                      "\n".join(JOBS["schema-gate"]))
 
     def test_api_failures_fail_closed(self):
         for key in ("compare", "ci-runs", "ci-run", "ci-jobs", "ci-ok", "worker check", "staging", "branches"):

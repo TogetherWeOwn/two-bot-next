@@ -278,6 +278,12 @@ jobs:
           )
           if not reviewers and not auto_approve:
               refuse("the production Environment has no required reviewers")
+          if not reviewers and not needs_staging:
+              # Automated approval vouches through staging history: the
+              # latest green deploy-staging run on this SHA. A rollback or a
+              # live-SHA redeploy waives that history, so it still needs the
+              # human Environment reviewers even with auto-approve on.
+              refuse("the production Environment has no required reviewers for a staging-history waiver")
           policy = env.get("deployment_branch_policy") or {}
           if not policy.get("custom_branch_policies"):
               refuse("the production Environment must restrict deployments to main")
@@ -348,6 +354,15 @@ jobs:
           ref: ${{ needs.guard.outputs.sha }}
           persist-credentials: false
           fetch-depth: 0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Reviewed tooling runs from the workflow's own commit: a rollback
+          # (or live-SHA redeploy) targets an older SHA that predates these
+          # scripts, so the guarded checkout above may not contain them.
+          ref: ${{ github.sha }}
+          path: tooling
+          persist-credentials: false
+          fetch-depth: 1
       - name: Deploy SHA must be exact
         env:
           SOURCE_SHA: ${{ needs.guard.outputs.sha }}
@@ -377,7 +392,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          python3 scripts/ci/production_schema_gate.py \
+          python3 tooling/scripts/ci/production_schema_gate.py \
             --binary ./target/debug/staging-migrate --source-sha "$SOURCE_SHA" \
             --mode "$MODE" --allow-unstaged "$ALLOW_UNSTAGED"
 
@@ -386,7 +401,10 @@ jobs:
     needs: [guard, schema-gate]
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'production') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
-    timeout-minutes: 30
+    # Sized for the worst case: a ~442 s deploy, a failing gate (~15 min of
+    # polls) and the auto-rollback budget (600 s image + 900 s gate). A 30 min
+    # cap can cancel the run mid-rollback and leave production fenced.
+    timeout-minutes: 60
     # The human gate: this job waits for the Environment's required
     # reviewers. The guard job refused to get here without them, unless
     # vars.PRODUCTION_AUTO_APPROVE is true and the latest staging deploy of
@@ -411,6 +429,15 @@ jobs:
           ref: ${{ needs.guard.outputs.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Reviewed tooling runs from the workflow's own commit: a rollback
+          # targets an older SHA that predates these scripts, so the guarded
+          # checkout above may not contain them.
+          ref: ${{ github.sha }}
+          path: tooling
+          persist-credentials: false
+          fetch-depth: 1
       - name: Recheck the SHA is on origin/main after approval
         run: |
           set -euo pipefail
@@ -446,7 +473,7 @@ jobs:
           PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.PRODUCTION_OWNERSHIP_CONTROL_TOKEN }}
-        run: node scripts/production-ownership-control.mjs preflight
+        run: node ../tooling/wrangler/scripts/production-ownership-control.mjs preflight
       # The version serving before the change is the rollback target. The
       # first production deploy has none, so this step may fail.
       - name: Read the active production version
@@ -471,7 +498,7 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
-          python3 ../scripts/worker_container_rollback.py snapshot \
+          python3 ../tooling/scripts/worker_container_rollback.py snapshot \
             --variant production \
             --out "$RUNNER_TEMP/production-rollback-snapshot.json"
           python3 -c 'import json; print(json.dumps(json.load(open("'$RUNNER_TEMP'/production-rollback-snapshot.json")), sort_keys=True))'
@@ -494,7 +521,7 @@ jobs:
         run: |
           set -euo pipefail
           config="$RUNNER_TEMP/production-deploy.json"
-          python3 ../scripts/production_deploy.py render \
+          python3 ../tooling/scripts/production_deploy.py render \
             --config wrangler.toml --out "$config" \
             --sha "$SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
           echo "PRODUCTION_DEPLOY_CONFIG=$config" >> "$GITHUB_ENV"
@@ -530,7 +557,7 @@ jobs:
           set -euo pipefail
           test -n "${TARGET_VERSION:?rollback needs the guarded Worker version}"
           test -n "${TARGET_IMAGE:?rollback needs the guarded container image}"
-          python3 ../scripts/worker_container_rollback.py rollback \
+          python3 ../tooling/scripts/worker_container_rollback.py rollback \
             --variant production \
             --worker-url "$PRODUCTION_WORKER_URL" \
             --staging-url "$STAGING_WORKER_URL" \
@@ -629,7 +656,7 @@ jobs:
         run: |
           set -euo pipefail
           test -n "${OWNERSHIP_EXPECTED_DEPLOYMENT:?takeover needs the recorded new Worker version}"
-          node scripts/production-ownership-control.mjs status | tee "$RUNNER_TEMP/production-ownership-status.json"
+          node ../tooling/wrangler/scripts/production-ownership-control.mjs status | tee "$RUNNER_TEMP/production-ownership-status.json"
       # Deploy mode only: the rollback step above already fenced, restored
       # and handed ownership to the target version through the same client.
       - name: Take over production ownership at the read epoch
@@ -649,7 +676,7 @@ jobs:
           case "$epoch" in
             ''|*[!0-9]*) echo "::error::takeover needs the numeric epoch read in the previous step"; exit 1 ;;
           esac
-          node scripts/production-ownership-control.mjs takeover "$epoch"
+          node ../tooling/wrangler/scripts/production-ownership-control.mjs takeover "$epoch"
       # Same contract as staging, plus the build identity and stability:
       # /health must be 200, which proves the Container/DO bindings are wired.
       # /readyz must answer 200 with gateway=ready and this run's build
@@ -685,7 +712,7 @@ jobs:
             code=$(curl -s --max-time 10 -H "User-Agent: $agent" -o "$readyz" -w '%{http_code}' "$url/readyz" || true)
             # The verdict follows the script's exit code; `state` carries its
             # fixed-vocabulary reason either way.
-            if state=$(python3 ../scripts/production_deploy.py readyz --status "$code" --body "$readyz" --sha "$SHA" --mode "$MODE" --build-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" 2>&1); then
+            if state=$(python3 ../tooling/scripts/production_deploy.py readyz --status "$code" --body "$readyz" --sha "$SHA" --mode "$MODE" --build-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" 2>&1); then
               return 0
             else
               return 1
@@ -698,12 +725,12 @@ jobs:
             if poll; then
               first_state="$state"
               echo "first pass after ~$((i * 10))s: $state"
-              python3 ../scripts/production_deploy.py excerpt --body "$readyz"
+              python3 ../tooling/scripts/production_deploy.py excerpt --body "$readyz"
               break
             fi
             echo "attempt $i: $state; waiting 10s"
             if [ "$i" = "30" ]; then
-              python3 ../scripts/production_deploy.py excerpt --body "$readyz"
+              python3 ../tooling/scripts/production_deploy.py excerpt --body "$readyz"
               echo "- Gate failed: no fully-passing answer in ~5 min ($state); roll back" >> "$GITHUB_STEP_SUMMARY"
               exit 1
             fi
@@ -724,7 +751,7 @@ jobs:
               streak=0
             fi
             if [ "$i" = "60" ]; then
-              python3 ../scripts/production_deploy.py excerpt --body "$readyz"
+              python3 ../tooling/scripts/production_deploy.py excerpt --body "$readyz"
               echo "- Gate failed: no 3 min stable gateway-ready window ($state); roll back" >> "$GITHUB_STEP_SUMMARY"
               exit 1
             fi
@@ -748,11 +775,13 @@ jobs:
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.PRODUCTION_OWNERSHIP_CONTROL_TOKEN }}
         run: |
           set -euo pipefail
-          python3 ../scripts/worker_container_rollback.py rollback \
+          # No --expected-sha: the snapshot restores the previous serving
+          # build, whose /readyz reports the previous revision, not the
+          # failed SHA. Identity rests on the restored Worker version header.
+          python3 ../tooling/scripts/worker_container_rollback.py rollback \
             --variant production \
             --worker-url "$PRODUCTION_WORKER_URL" \
             --staging-url "$STAGING_WORKER_URL" \
-            --expected-sha "$SHA" \
             --snapshot "$RUNNER_TEMP/production-rollback-snapshot.json" \
             --actor "$ROLLBACK_ACTOR" \
             --evidence "$RUNNER_TEMP/production-auto-rollback-evidence.json"
