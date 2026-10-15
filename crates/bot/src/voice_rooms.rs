@@ -2505,6 +2505,15 @@ pub struct GuildRoomWorker<S, H> {
     creators_refresh_due: bool,
     /// Actor clock of the last creator-view merge (periodic refresh).
     creators_read_ms: Option<u64>,
+    /// Live generation the creator view was last merged at. A gateway
+    /// reconnect (GuildCreate/Resumed) bumps the generation but sends no
+    /// channel event, so with no RefreshCreators flag the merge would wait
+    /// up to the five-minute interval. The next maintenance tick merges on
+    /// a generation change (debounced), so rows written while down converge
+    /// within about 10 s instead of up to 5 minutes. Updated only by a
+    /// successful merge, so a failed read retries on the next debounced
+    /// tick.
+    creators_generation: u64,
     /// Channel ids the join read-through already asked the store about with
     /// no row found, cleared by each successful creator merge. Joins into
     /// ordinary (non-creator, non-room) channels must not cost a store read
@@ -2880,6 +2889,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             Err(_) => (NameSettings::default(), false),
         };
         let guild_id = live.guild_id;
+        let creators_generation = live.read_state().generation;
         let worker = Self {
             live,
             store,
@@ -2887,6 +2897,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             creators,
             creators_refresh_due: false,
             creators_read_ms: None,
+            creators_generation,
             creator_misses: HashSet::new(),
             creator_revalidate_cooldown_until: None,
             access,
@@ -3023,20 +3034,47 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         };
         if let Some(reason) = refusal {
             metrics::global().voice_join_refused(reason);
+            // Name the refusal reason and the creator-map state at join time:
+            // the next restart-cured stall must not need guessing. No member,
+            // channel or name content is logged: counts, booleans and clocks.
+            let live_state = self.live.read_state();
+            let creators_len = self.creators.len() as u64;
+            let known = self.creators.contains_key(&ticket.creator_id);
             if reason == "halted" {
                 warn!(
                     guild = self.live.guild_id.to_string(),
-                    reason, "voice creator join refused before queueing"
+                    reason,
+                    creators_len,
+                    known,
+                    halted = self.halted,
+                    ready = live_state.ready,
+                    live_generation = live_state.generation,
+                    ticket_generation = ticket.generation,
+                    "voice creator join refused before queueing"
                 );
             } else if reason == "duplicate" {
                 debug!(
                     guild = self.live.guild_id.to_string(),
-                    reason, "voice creator join refused before queueing"
+                    reason,
+                    creators_len,
+                    known,
+                    halted = self.halted,
+                    ready = live_state.ready,
+                    live_generation = live_state.generation,
+                    ticket_generation = ticket.generation,
+                    "voice creator join refused before queueing"
                 );
             } else {
                 info!(
                     guild = self.live.guild_id.to_string(),
-                    reason, "voice creator join refused before queueing"
+                    reason,
+                    creators_len,
+                    known,
+                    halted = self.halted,
+                    ready = live_state.ready,
+                    live_generation = live_state.generation,
+                    ticket_generation = ticket.generation,
+                    "voice creator join refused before queueing"
                 );
             }
             return false;
@@ -3197,8 +3235,13 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// dropping it would refuse joins until restart. A failed read keeps the
     /// old view and backs the join read-through off. A successful merge
     /// clears the read-through miss cache and that backoff.
-    /// Runs when `creators_refresh_due` is set (channel events, debounced) or
-    /// every [`CREATORS_REFRESH_INTERVAL_MS`], from the maintenance tick.
+    /// Runs when `creators_refresh_due` is set (channel events, debounced),
+    /// every [`CREATORS_REFRESH_INTERVAL_MS`], or when the live generation
+    /// changed since the last successful merge (a gateway reconnect
+    /// republished the snapshot but sent no channel event), from the
+    /// maintenance tick. The generation path is debounced like a channel
+    /// event, so a failed read retries on the next debounced tick instead of
+    /// every tick.
     pub(super) async fn reload_creators(&mut self, now_ms: u64) {
         let interval_elapsed = self
             .creators_read_ms
@@ -3206,13 +3249,19 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         let debounced = self
             .creators_read_ms
             .is_none_or(|last| now_ms.saturating_sub(last) >= CREATORS_REFRESH_DEBOUNCE_MS);
-        if !(interval_elapsed || (self.creators_refresh_due && debounced)) {
+        let generation_changed = self.live.read_state().generation != self.creators_generation;
+        if !(interval_elapsed
+            || (self.creators_refresh_due && debounced)
+            || (generation_changed && debounced))
+        {
             return;
         }
         self.creators_refresh_due = false;
         self.creators_read_ms = Some(now_ms);
+        let generation = self.live.read_state().generation;
         match self.store.creators(self.live.guild_id).await {
             Ok(rows) => {
+                self.creators_generation = generation;
                 self.creator_misses.clear();
                 self.creator_revalidate_cooldown_until = None;
                 let mut added = 0u64;
