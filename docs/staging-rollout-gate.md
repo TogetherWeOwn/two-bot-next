@@ -15,7 +15,7 @@ not production authorization or a migration tool.
 
 ## Step order and why
 
-1. `preflight` -> `prepare` -> `wrangler deploy` -> `receipt` ->
+0. `schema-gate` -> `preflight` -> `prepare` -> `wrangler deploy` -> `receipt` ->
    `deployment-takeover` -> `verify`.
 2. Once `wrangler deploy` succeeds the new Worker version is already at 100%
    traffic. Ownership transfer does not choose what serves; it lets that version's
@@ -34,6 +34,25 @@ not production authorization or a migration tool.
    park every later push deploy until a manual `release_fence` dispatch. Re-run the
    deploy (or dispatch it) after fixing the cause; production deploys are separate,
    manual and cutover-owned.
+
+## Schema gate (migrate + grants readout)
+
+Before `preflight`, the `schema-gate` job runs the reviewed
+`staging-migrate --target staging --plan` runner at the exact deploy SHA
+through the read-only `staging-migrate-plan` environment (login holds only
+`two_bot_migrator_ro`) and evaluates the manifest with
+`scripts/ci/staging_schema_gate.py`. It fails the run before any rollout when
+the SHA still has pending migrations or the role verifier reports findings, so
+staging can no longer deploy silently past drifted schema or grants (the
+post-#939 gateway outage stayed red until manual host work). The gate never
+applies DDL and never grants: pending migrations need a manual
+`staging-migrate` plan then apply for the SHA, role findings a host role-plan
+re-apply per `docs/database-roles.md`, then a re-run of `deploy-staging`. A
+red gate skips `deploy`, so the production guard keeps refusing the SHA until
+the drift is cleared. The gate's host/database/branch pins live as
+`staging-migrate-plan` environment secrets
+(`STAGING_SCHEMA_GATE_EXPECTED_HOST/DATABASE/BRANCH_ID`); absent pins refuse
+before any connection, so provision them before the first gated deploy.
 
 ## Provenance chain
 

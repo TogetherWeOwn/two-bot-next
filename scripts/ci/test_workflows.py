@@ -21,7 +21,7 @@ JOB_INVENTORY = {
                   # Compile-only libFuzzer build, gated by ci-ok like the Rust lanes.
                   "fuzz-compile"},
     "deploy-production.yml": {"guard", "production", "release"},
-    "deploy-staging.yml": {"deploy", "voice-synthetic"},
+    "deploy-staging.yml": {"deploy", "voice-synthetic", "schema-gate"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
     "release.yml": {"tag", "sbom-target", "release-sbom", "attach-sbom"},
@@ -950,6 +950,118 @@ def staging_active_errors(workflow):
     return errors
 
 
+SCHEMA_GATE_ENV = {
+    "TWO_BOT_STAGING_PLAN_DATABASE_URL": "${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}",
+    "STAGING_SCHEMA_GATE_EXPECTED_HOST": "${{ secrets.STAGING_SCHEMA_GATE_EXPECTED_HOST }}",
+    "STAGING_SCHEMA_GATE_EXPECTED_DATABASE": "${{ secrets.STAGING_SCHEMA_GATE_EXPECTED_DATABASE }}",
+    "STAGING_SCHEMA_GATE_EXPECTED_BRANCH_ID": "${{ secrets.STAGING_SCHEMA_GATE_EXPECTED_BRANCH_ID }}",
+    "EXPECTED_SHA": "${{ github.sha }}",
+}
+SCHEMA_GATE_SECRETS = {"two_bot_staging_plan_database_url", "staging_schema_gate_expected_host",
+                       "staging_schema_gate_expected_database", "staging_schema_gate_expected_branch_id"}
+SCHEMA_GATE_CONTAINER = "rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e"
+
+
+def staging_schema_gate_errors(workflow):
+    """Read-only staging schema gate (TOG-24362): pending migrations and role
+    grants fail the deploy before any rollout.
+
+    One job runs only from main through the read-only `staging-migrate-plan`
+    environment (no reviewer: the runner holds only two_bot_migrator_ro), on
+    the routed runner for job `schema-gate`, in the pinned Rust container, with
+    a 30 minute timeout. Exactly four unconditional steps: pinned checkout
+    without persisted credentials, the locked runner build (no secrets), one
+    Run step that plans at the exact deploy SHA through a pipefail shell and
+    evaluates the manifest with the reviewed script, and the 14 day manifest
+    upload with stored ZIP entries. The deploy job waits for a green gate. The
+    gate reads only the plan binding plus its three host/database/branch pins
+    and the deploy SHA (all via the Run step's environment, never an inline
+    expression): no dispatch inputs, no migrator or production binding, no
+    wrangler/probe markers, no `--apply`. The four pins/secrets must already
+    exist in the environment; absent means refusal before any connection.
+    """
+    name = "deploy-staging.yml"
+    errors = []
+    if "env" in workflow:
+        errors.append(f"{name}: workflow-level env must stay absent; secrets belong only on the Run step")
+    if workflow.get("permissions") != {}:
+        errors.append(f"{name}: top-level permissions must stay empty")
+    if workflow.get("concurrency") != {"group": "deploy-staging", "cancel-in-progress": "false"}:
+        errors.append(f"{name}: must share the deploy-staging group without cancelling")
+    jobs = workflow.get("jobs") or {}
+    if set(jobs) != {"deploy", "voice-synthetic", "schema-gate"}:
+        errors.append(f"{name}: jobs must be exactly deploy, voice-synthetic and schema-gate")
+        return errors
+    if jobs.get("deploy", {}).get("needs") != "schema-gate":
+        errors.append(f"{name}:deploy: must wait for a green schema-gate before any rollout")
+    gate = jobs["schema-gate"]
+    if gate.get("environment") != "staging-migrate-plan":
+        errors.append(f"{name}:schema-gate: must read only the staging-migrate-plan Environment binding")
+    if gate.get("if") != "github.ref == 'refs/heads/main'":
+        errors.append(f"{name}:schema-gate: must run only from main")
+    if gate.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:schema-gate: must keep contents:read only")
+    if gate.get("timeout-minutes") != "30":
+        errors.append(f"{name}:schema-gate: timeout must stay 30 minutes")
+    if not runner_allowed("schema-gate", gate.get("runs-on")):
+        errors.append(f"{name}:schema-gate: must use the routed runner expression for job 'schema-gate'")
+    if (gate.get("container") or {}).get("image") != SCHEMA_GATE_CONTAINER:
+        errors.append(f"{name}:schema-gate: must build the runner in the pinned Rust container")
+    for key in ("env", "needs", "uses", "services", "continue-on-error", "strategy"):
+        if key in gate:
+            errors.append(f"{name}:schema-gate: must not set {key} (bindings stay on the single Run step)")
+    text = str(gate).lower().replace(" ", "")
+    for marker in DEPLOY_MARKERS + ("tojson(secrets", "secrets[", "set-x", "setx", "xtrace",
+                                    "two_bot_staging_migrator_database_url",
+                                    "two_bot_production_plan_database_url",
+                                    "two_bot_production_migrator_database_url"):
+        if marker in text:
+            errors.append(f"{name}:schema-gate: must not contain {marker!r} "
+                          "(read-only plan binding only, no deploy route)")
+    if set(re.findall(r"secrets\.([a-z0-9_]+)", text)) != SCHEMA_GATE_SECRETS:
+        errors.append(f"{name}:schema-gate: must read exactly the plan binding plus the three gate pins")
+    if re.findall(r"inputs\.([a-z0-9_]+)", text):
+        errors.append(f"{name}:schema-gate: must not reference dispatch inputs (pins are environment secrets)")
+    steps = gate.get("steps") or []
+    if len(steps) != 4 or any(key in step for step in steps for key in ("if", "continue-on-error")):
+        errors.append(f"{name}:schema-gate: must run exactly checkout, build, gate and upload, unconditionally")
+        return errors
+    checkout, build, run, upload = steps
+    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
+            or (checkout.get("with") or {}).get("persist-credentials") != "false":
+        errors.append(f"{name}:schema-gate: checkout must be pinned and must not persist credentials")
+    if build.get("run") != "cargo build -p two-bot-cutover --bin staging-migrate --locked" \
+            or "env" in build or "uses" in build:
+        errors.append(f"{name}:schema-gate: build must be only the locked runner build, holding no secrets")
+    if run.get("env") != SCHEMA_GATE_ENV:
+        errors.append(f"{name}:schema-gate: Run step must bind exactly the plan binding, "
+                      "the three gate pins and the deploy SHA")
+    command = str(run.get("run", ""))
+    if run.get("shell") != "bash" or "set -o pipefail" not in command:
+        errors.append(f"{name}:schema-gate: Run step must use a pipefail shell so a "
+                      "migrator refusal/failure fails the job instead of reporting green")
+    for required in ("--target staging", "--staging-host", "--staging-database", "--staging-branch-id",
+                     "--recovery-evidence-ref", "--acl-plan-ref", "| tee staging-schema-gate-manifest.json",
+                     "scripts/ci/staging_schema_gate.py", "--manifest staging-schema-gate-manifest.json",
+                     "--expected-sha", "$EXPECTED_SHA"):
+        if required not in command:
+            errors.append(f"{name}:schema-gate: Run step must contain {required!r}")
+    if "--apply" in command or "--plan-manifest-sha256" in command or "--plan-run-id" in command \
+            or "--production-host" in command or "--production-database" in command:
+        errors.append(f"{name}:schema-gate: Run step must plan only (no apply, provenance or production flags)")
+    if "${{" in command:
+        errors.append(f"{name}:schema-gate: Run step must take pins via the environment, never an inline expression")
+    if "uses" in run:
+        errors.append(f"{name}:schema-gate: Run step must be a script call, not an action")
+    if not str(upload.get("uses", "")).startswith("actions/upload-artifact@") or upload.get("with") != {
+            "name": "staging-schema-gate-manifest",
+            "path": "staging-schema-gate-manifest.json",
+            "if-no-files-found": "error", "retention-days": "14", "compression-level": "0"}:
+        errors.append(f"{name}:schema-gate: must upload only the gate manifest for 14 days "
+                      "with stored ZIP entries and fail if absent")
+    return errors
+
+
 def voice_synthetic_errors(workflow):
     """Live staging voice synthetic (docs/voice-synthetic.md).
 
@@ -1031,6 +1143,7 @@ def workflow_policy_errors(workflows):
         if name == "deploy-staging.yml":
             errors.extend(staging_dispatch_errors(workflow))
             errors.extend(staging_active_errors(workflow))
+            errors.extend(staging_schema_gate_errors(workflow))
         if name == "voice-synthetic.yml":
             # Pinned shape above; the generic environment scan below would
             # flag its voice-synthetic Environment binding.
@@ -1071,8 +1184,8 @@ def workflow_policy_errors(workflows):
             errors.extend(production_migrate_errors(workflow))
             continue
         for job_id, job in jobs.items():
-            if name == "deploy-staging.yml" and job_id == "deploy":
-                continue  # the live deploy route: pinned by the staging checks above
+            if name == "deploy-staging.yml" and job_id in ("deploy", "schema-gate"):
+                continue  # the live deploy route and its gate: pinned by the staging checks above
             else:
                 # Retargeting a known CI job must not create an unapproved
                 # deploy/probe route outside the deploy workflows.
@@ -1132,6 +1245,46 @@ class WorkflowTests(unittest.TestCase):
             job.get("secrets"),
             {"TWO_VOICE_SYNTHETIC_BOT_TOKEN": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"},
         )
+
+    def test_staging_schema_gate_shape_is_pinned(self):
+        staging = self.workflows["deploy-staging.yml"]
+        self.assertEqual(staging_schema_gate_errors(staging), [])
+        self.assertEqual(staging["jobs"]["deploy"].get("needs"), "schema-gate")
+
+    def test_staging_schema_gate_mutations_fail(self):
+        def mutate(path):
+            workflows = deepcopy(self.workflows)
+            gate = workflows["deploy-staging.yml"]["jobs"]["schema-gate"]
+            run = next(step for step in gate["steps"]
+                         if "staging_schema_gate.py" in str(step.get("run", "")))
+            if path == "drop-if":
+                gate.pop("if")
+            elif path == "staging-env":
+                gate["environment"] = "staging"
+            elif path == "deploy-without-gate":
+                workflows["deploy-staging.yml"]["jobs"]["deploy"].pop("needs")
+            elif path == "migrator-secret":
+                run["env"]["TWO_BOT_STAGING_MIGRATOR_DATABASE_URL"] = "${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}"
+            elif path == "apply-flag":
+                run["run"] = run["run"].replace("--plan", "--apply")
+            elif path == "drop-pipefail":
+                run["run"] = run["run"].replace("set -o pipefail\n", "")
+            elif path == "inline-expression":
+                run["run"] = run["run"] + '\necho "${{ github.sha }}"'
+            elif path == "timeout":
+                gate["timeout-minutes"] = "5"
+            elif path == "container":
+                gate["container"] = {"image": "rust:latest"}
+            elif path == "upload-deflate":
+                gate["steps"][-1]["with"]["compression-level"] = "6"
+            return workflows["deploy-staging.yml"]
+        for path in ("drop-if", "staging-env", "deploy-without-gate", "migrator-secret",
+                     "apply-flag", "drop-pipefail", "inline-expression", "timeout",
+                     "container", "upload-deflate"):
+            with self.subTest(path=path):
+                changed = mutate(path)
+                self.assertTrue(staging_schema_gate_errors(changed))
+                self.assertTrue(workflow_policy_errors({**self.workflows, "deploy-staging.yml": changed}))
 
     def test_staging_runs_unconditionally_for_push_and_dispatch(self):
         staging = self.workflows["deploy-staging.yml"]
