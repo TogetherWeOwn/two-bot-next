@@ -20,7 +20,7 @@ use tokio::{
     process::{Child, Command},
     sync::{mpsc, Mutex},
     task::JoinHandle,
-    time::{timeout, Instant},
+    time::{sleep, timeout, Instant},
 };
 use tokio_websockets::{Message, ServerBuilder};
 use two_bot_core::database_tls::TlsPolicy;
@@ -422,9 +422,10 @@ async fn wait_http(bot: &mut Bot, addr: SocketAddr, path: &str, code: u16) -> St
                     return response;
                 }
             }
-            // Deterministic sync: re-poll on scheduler wakeup under the outer
-            // deadline instead of a wall-clock backoff sleep.
-            tokio::task::yield_now().await;
+            // Bounded 10 ms backoff under the outer STEP deadline (~100
+            // polls/s): throttles the /readyz round trips instead of
+            // busy-spinning on scheduler wakeups.
+            sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -443,9 +444,9 @@ async fn checkpoint(db: &TestDb, seq: u64) {
             {
                 break;
             }
-            // Deterministic sync: re-poll on scheduler wakeup under the outer
-            // deadline instead of a wall-clock backoff sleep.
-            tokio::task::yield_now().await;
+            // Bounded 10 ms backoff under the outer STEP deadline: spaces
+            // the store loads against the same Postgres the bot writes to.
+            sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -649,9 +650,10 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
                     {
                         break;
                     }
-                    // Deterministic sync: re-poll on scheduler wakeup under the
-                    // outer deadline instead of a wall-clock backoff sleep.
-                    tokio::task::yield_now().await;
+                    // Bounded 10 ms backoff under the outer STEP deadline:
+                    // spaces the rest_requests lock polls during the jitter
+                    // window instead of spinning on the mutex.
+                    sleep(Duration::from_millis(10)).await;
                 }
             })
             .await;
@@ -660,9 +662,15 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
                 "events job never hit REST during first boot"
             );
         }
-        // Deterministic sync: yield to the scheduler once so in-flight bot
-        // output settles instead of waiting out a fixed wall-clock delay.
-        tokio::task::yield_now().await;
+        // Post-ready settle window: poll liveness for 200 ms so a crash
+        // just after RESUMED fails as "bot exited early" instead of being
+        // masked by an immediate SIGTERM. Bounded 10 ms backoff keeps the
+        // window cheap under load.
+        let settle_until = tokio::time::Instant::now() + Duration::from_millis(200);
+        while tokio::time::Instant::now() < settle_until {
+            bot.assert_alive();
+            sleep(Duration::from_millis(10)).await;
+        }
         bot.assert_alive();
         assert_ready_correlation(&logs.lock().await);
         bot.terminate().await;

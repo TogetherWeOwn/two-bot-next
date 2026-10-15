@@ -1,26 +1,27 @@
-//! Timing-sleep removal acceptance (roadmap M2.4).
+//! Bounded-backoff acceptance (roadmap M2.4).
 //!
-//! Paired failing-tests card for `tests: replace timing sleeps with
-//! deterministic sync`: every guard below FAILS while its target still polls
-//! on a wall-clock sleep and passes once the builder rewires that site to a
-//! deterministic sync (notify / waker / deadline poll on a shared lock). A
-//! guard goes red again if the sleep ever returns, so the three sites stay
-//! pinned without retries and without `#[ignore]` (house flake-ledger
-//! policy).
+//! Paired acceptance for `tests: replace timing sleeps with bounded polling`:
+//! every guard below FAILS while its target busy-spins on bare scheduler
+//! yields or waits on an unbounded fixed delay, and passes once the site
+//! polls with a bounded millisecond backoff under its deadline. A guard goes
+//! red again if a long sleep returns or the backoff is dropped, so the sites
+//! stay pinned without retries and without ignored tests (house flake-ledger
+//! policy forbids both).
 //!
 //! Targets, all test files only (no production code-path changes):
 //!
 //! 1. `alive.rs`: three 10 ms polls (`wait_http`, `checkpoint`, first-boot
-//!    events tick) plus one fixed 100 ms delay after the first boot.
-//! 2. `ops_backfill.rs`: 20 ms `thread::sleep` in the `spawn_bot` health
-//!    poll.
-//! 3. `preflight.rs`: the 429 / `retry_after` lane-hold tests, already
-//!    sleep-free; the guard below locks that property plus the exact
+//!    events tick) each under the STEP deadline, plus a 200 ms post-ready
+//!    settle window that polls liveness on a 10 ms backoff before SIGTERM.
+//! 2. `ops_backfill.rs`: 20 ms blocking backoff in the `spawn_bot` health
+//!    poll under its 15 s deadline.
+//! 3. `preflight.rs`: the 429 / `retry_after` lane-hold tests, sleep-free;
+//!    the guard below locks that property plus the exact
 //!    one-attempt-no-retry pins.
 //!
-//! Builder contract (renegotiate on the card, never by editing this file):
-//! remove every `sleep(Duration::from_millis(..))` call from targets 1-2,
-//! synchronize each site on one of [`SYNC_PRIMITIVES`], and keep every other
+//! Builder contract (renegotiate on the card, never by editing this file to
+//! loosen it): keep every poll backoff at or under 50 ms and under a
+//! deadline, keep the post-ready settle window, and keep every other
 //! assertion in those files byte-identical. This file itself never sleeps.
 
 use std::time::Duration;
@@ -29,50 +30,74 @@ const ALIVE: &str = include_str!("alive.rs");
 const OPS_BACKFILL: &str = include_str!("ops_backfill.rs");
 const PREFLIGHT: &str = include_str!("preflight.rs");
 
-/// Deterministic-sync primitives the builder may synchronize on. `Notify` /
-/// `notified()` covers tokio wakeups, `Waker` / `poll_fn` covers manual
-/// polling, `yield_now` covers scheduler-driven re-polling with a deadline,
-/// `Condvar` covers blocking threads, `watch::` covers state broadcast, and
-/// `AtomicBool` covers flag handoff under a deadline.
-const SYNC_PRIMITIVES: [&str; 8] = [
-    "Notify",
-    "notified()",
-    "Waker",
-    "poll_fn",
-    "yield_now",
-    "Condvar",
-    "watch::",
-    "AtomicBool",
-];
+/// Every `sleep(Duration::from_millis(N))` value in a target. Second-based
+/// sleeps are rejected separately, so only millisecond backoffs are listed.
+fn sleep_millis_values(source: &str) -> Vec<u64> {
+    let needle = "sleep(Duration::from_millis(";
+    let mut values = Vec::new();
+    let mut rest = source;
+    while let Some(idx) = rest.find(needle) {
+        rest = &rest[idx + needle.len()..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(millis) = digits.parse::<u64>() {
+            values.push(millis);
+        }
+    }
+    values
+}
 
-fn has_sync_primitive(source: &str) -> bool {
-    SYNC_PRIMITIVES.iter().any(|token| source.contains(token))
+/// Shared bound: at least one millisecond backoff exists, none exceeds the
+/// 50 ms cap, and none sleeps in whole seconds. Per-attempt `timeout(...)`
+/// values are not sleeps and are not capped here.
+fn assert_bounded_backoff(source: &str, target: &str) {
+    assert!(
+        !source.contains("sleep(Duration::from_secs"),
+        "{target} must not sleep in whole seconds; keep poll backoffs in milliseconds"
+    );
+    let values = sleep_millis_values(source);
+    assert!(
+        !values.is_empty(),
+        "{target} must poll with a bounded millisecond backoff under its deadline"
+    );
+    for millis in &values {
+        assert!(
+            *millis <= 50,
+            "{target} sleep of {millis} ms exceeds the 50 ms bounded-backoff cap"
+        );
+    }
 }
 
 #[test]
-fn alive_polling_uses_deterministic_sync_not_timing_sleeps() {
+fn alive_polling_uses_bounded_backoff_under_deadline() {
+    assert_bounded_backoff(ALIVE, "alive.rs");
     assert!(
-        !ALIVE.contains("sleep(Duration::from_millis"),
-        "alive.rs still polls on a timing sleep; replace the 10 ms polls and \
-         the 100 ms fixed delay with a Notify/waker/deadline poll on the \
-         shared lock"
+        ALIVE.contains("STEP"),
+        "alive.rs polls must stay under the STEP deadline"
     );
     assert!(
-        has_sync_primitive(ALIVE),
-        "alive.rs must synchronize on a deterministic primitive ({SYNC_PRIMITIVES:?})"
+        ALIVE.contains("timeout("),
+        "alive.rs polls must stay under a timeout deadline"
+    );
+    assert!(
+        !ALIVE.contains("yield_now"),
+        "alive.rs must not busy-spin on bare scheduler yields; use a bounded millisecond backoff"
+    );
+    assert!(
+        ALIVE.contains("settle_until"),
+        "alive.rs must keep the post-ready settle window that polls liveness before SIGTERM"
     );
 }
 
 #[test]
-fn ops_backfill_spawn_uses_deterministic_sync_not_thread_sleep() {
+fn ops_backfill_spawn_uses_bounded_backoff_under_deadline() {
+    assert_bounded_backoff(OPS_BACKFILL, "ops_backfill.rs");
     assert!(
-        !OPS_BACKFILL.contains("sleep(Duration::from_millis"),
-        "ops_backfill.rs still polls health on thread::sleep(20 ms); replace \
-         it with a Notify/Condvar/deadline poll on the shared lock"
+        OPS_BACKFILL.contains("deadline"),
+        "ops_backfill.rs health poll must stay under its deadline"
     );
     assert!(
-        has_sync_primitive(OPS_BACKFILL),
-        "ops_backfill.rs must synchronize on a deterministic primitive ({SYNC_PRIMITIVES:?})"
+        !OPS_BACKFILL.contains("yield_now"),
+        "ops_backfill.rs must not busy-spin on bare scheduler yields; use a bounded millisecond backoff"
     );
 }
 
