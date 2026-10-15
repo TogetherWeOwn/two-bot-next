@@ -4,8 +4,8 @@
 #
 # On `pull_request` the checkout is the PR merge ref, and on `merge_group` it
 # is the unmerged queue commit, so the root `.gitleaks.toml`, the root
-# `.gitleaksignore` and any `gitleaks:allow` comment are whatever the PR
-# author wrote. Left alone, a PR could silence the required `gitleaks` check
+# `.gitleaksignore` and any inline allow comment are whatever the PR author
+# wrote. Left alone, a PR could silence the required `gitleaks` check
 # for its own leak by adding an allowlist. This wrapper makes a PR or queue
 # run honour only the policy that has already merged:
 #   * `--config` points at the base branch's `.gitleaks.toml` (or the stock
