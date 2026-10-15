@@ -8,8 +8,10 @@
 //! `allowed_mentions: { parse: [] }`; this repository does not yet contain
 //! that sender, so the no-ping guarantee is a receiver contract, not verified
 //! behavior. On a provable send failure release the claim and answer 5xx so
-//! Twitch retries; a retry of any existing claim is acknowledged with 2xx and
-//! skipped. Never-started claims expire on a bounded lease
+//! Twitch retries; a retry of a started or delivered claim is acknowledged
+//! with 2xx and skipped, while a retry of a fresh never-started claim is
+//! answered 5xx (`InFlight`) so Twitch keeps retrying instead of treating
+//! the go-live as delivered. Never-started claims expire on a bounded lease
 //! (`STALE_CLAIM_LEASE_SECS`, 300 s) via atomic stale takeover; started and
 //! delivered rows never expire and are never reclaimed.
 //!
@@ -32,6 +34,10 @@ pub enum Stage {
     ClaimFailed,
     /// The go-live row already exists (retry, replay, or restart).
     Duplicate,
+    /// A never-started claim exists but its lease is still fresh: answer
+    /// 5xx so Twitch retries again after the lease can expire or the owner
+    /// settles the row.
+    InFlight,
     /// This delivery owns the post but the Discord send failed.
     SendFailed,
     /// Sent and stamped with the Discord message receipt.
@@ -60,10 +66,12 @@ pub fn disposition(stage: Stage) -> Disposition {
             status: 200,
             release: false,
         },
-        Stage::InvalidInvite | Stage::ClaimFailed | Stage::StampFailed => Disposition {
-            status: 500,
-            release: false,
-        },
+        Stage::InvalidInvite | Stage::ClaimFailed | Stage::StampFailed | Stage::InFlight => {
+            Disposition {
+                status: 500,
+                release: false,
+            }
+        }
         Stage::SendFailed => Disposition {
             status: 500,
             release: true,
@@ -93,6 +101,7 @@ mod tests {
             (Stage::InvalidInvite, 500, false),
             (Stage::ClaimFailed, 500, false),
             (Stage::StampFailed, 500, false),
+            (Stage::InFlight, 500, false),
             (Stage::SendFailed, 500, true),
         ] {
             assert_eq!(
@@ -110,6 +119,7 @@ mod tests {
             Stage::InvalidInvite,
             Stage::ClaimFailed,
             Stage::Duplicate,
+            Stage::InFlight,
             Stage::Sent,
             Stage::StampFailed,
         ] {
@@ -125,6 +135,7 @@ mod tests {
             Stage::ClaimFailed,
             Stage::SendFailed,
             Stage::StampFailed,
+            Stage::InFlight,
         ] {
             assert_eq!(
                 disposition(stage).status,

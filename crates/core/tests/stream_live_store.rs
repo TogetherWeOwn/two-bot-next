@@ -215,15 +215,26 @@ async fn fresh_claim_cannot_be_reclaimed() {
         claim_live(&pool, &claim(&key)).await.expect("claim"),
         ClaimOutcome::Claimed
     );
-    // Fresh (unexpired) unposted claim: concurrent retry stays Duplicate.
+    // Fresh (unexpired) unposted claim: the retry is InFlight, so the
+    // receiver answers 5xx and Twitch keeps retrying instead of treating
+    // the go-live as delivered.
     assert_eq!(
         reclaim_stale_live(&pool, &claim(&key), STALE_CLAIM_LEASE_SECS)
             .await
             .expect("reclaim fresh"),
-        ClaimOutcome::Duplicate
+        ClaimOutcome::InFlight
     );
     assert_eq!(
         claim_live(&pool, &claim(&key)).await.expect("retry"),
+        ClaimOutcome::Duplicate
+    );
+    // Once the owner starts sending, the same row is permanently fenced:
+    // retries are Duplicate (200), never InFlight.
+    assert!(mark_live_send_started(&pool, &key).await.expect("start"));
+    assert_eq!(
+        reclaim_stale_live(&pool, &claim(&key), STALE_CLAIM_LEASE_SECS)
+            .await
+            .expect("reclaim started"),
         ClaimOutcome::Duplicate
     );
     cleanup(pool, &schema).await;
@@ -246,12 +257,13 @@ async fn stale_unposted_claim_is_taken_over_atomically() {
             .expect("takeover"),
         ClaimOutcome::Claimed
     );
-    // Takeover refreshes the lease: an immediate second retry loses.
+    // Takeover refreshes the lease: an immediate second retry loses and is
+    // InFlight (fresh, never started), so it is answered 5xx, not 200.
     assert_eq!(
         reclaim_stale_live(&pool, &claim(&key), STALE_CLAIM_LEASE_SECS)
             .await
             .expect("second reclaim"),
-        ClaimOutcome::Duplicate
+        ClaimOutcome::InFlight
     );
     assert_eq!(
         claim_live(&pool, &claim(&key)).await.expect("retry"),

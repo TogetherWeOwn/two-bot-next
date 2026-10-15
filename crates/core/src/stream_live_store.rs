@@ -30,8 +30,10 @@ use sqlx::{Pool, Postgres};
 
 /// Bounded lease for a never-started claim, in seconds. A normal
 /// claim → start → send → stamp cycle completes in seconds; 300 s gives the
-/// live owner ample headroom while ensuring a crash-before-send recovers
-/// inside the EventSub retry horizon. Matches the existing 300 s delivery
+/// live owner ample headroom. A retry that finds the lease still fresh gets
+/// [`ClaimOutcome::InFlight`] (answered 5xx), so Twitch keeps retrying
+/// instead of treating the go-live as delivered; once the lease expires a
+/// retry can take the claim over. Matches the existing 300 s delivery
 /// lease (`audit_store::DELIVERY_LEASE_SECONDS`).
 pub const STALE_CLAIM_LEASE_SECS: i64 = 300;
 
@@ -55,7 +57,14 @@ pub struct LiveClaim {
 pub enum ClaimOutcome {
     /// This delivery owns the post; send it, then stamp or release.
     Claimed,
-    /// The go-live is already claimed or delivered; acknowledge and skip.
+    /// A never-started claim exists but its lease is still fresh: its owner
+    /// may still be sending, or may have crashed before starting. Answer
+    /// 5xx so Twitch keeps retrying; a retry after the lease expires can
+    /// take over via [`reclaim_stale_live`], and a retry after the owner
+    /// starts or delivers sees `Duplicate` instead.
+    InFlight,
+    /// The go-live is started or delivered; acknowledge and skip. Also the
+    /// answer when no row exists to reclaim.
     Duplicate,
 }
 
@@ -146,14 +155,18 @@ pub async fn mark_live_send_started(
 
 /// Atomically take over one stale never-sent claim. Returns `Claimed` when
 /// this retry now owns the post (its `claimed_at` lease restarts and its
-/// channel/content refresh to this retry's values); `Duplicate` otherwise.
+/// channel/content refresh to this retry's values); `InFlight` when a
+/// never-started row exists but its lease is still fresh, so the caller
+/// must answer 5xx and let Twitch retry again later; `Duplicate` when the
+/// row is started or delivered (or does not exist).
 ///
 /// Only rows with `delivered_at IS NULL AND send_started_at IS NULL AND
 /// claimed_at` older than `stale_secs` are eligible, in a single `UPDATE`.
 /// Concurrent retries cannot both win: the first refreshes `claimed_at` and
-/// the second sees a fresh lease. Delivered rows and ambiguous started rows
-/// (a Discord send may have succeeded while [`mark_live_delivered`] failed)
-/// are never reclaimed, so a retry can never double-post them.
+/// the second sees a fresh lease (`InFlight`). Delivered rows and ambiguous
+/// started rows (a Discord send may have succeeded while
+/// [`mark_live_delivered`] failed) are never reclaimed, so a retry can
+/// never double-post them.
 pub async fn reclaim_stale_live(
     pool: &Pool<Postgres>,
     claim: &LiveClaim,
@@ -175,8 +188,23 @@ pub async fn reclaim_stale_live(
     .execute(pool)
     .await?
     .rows_affected();
-    Ok(if updated == 1 {
-        ClaimOutcome::Claimed
+    if updated == 1 {
+        return Ok(ClaimOutcome::Claimed);
+    }
+    // The takeover lost: distinguish a fresh never-started claim (retry
+    // later, answer 5xx) from a permanently fenced started/delivered row
+    // (acknowledge, 200). A row that turns stale between the UPDATE and
+    // this read still reports `InFlight`, which is safe: the next retry
+    // takes it over.
+    let in_flight: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM stream_live_claims
+         WHERE dedup_key = $1 AND delivered_at IS NULL AND send_started_at IS NULL)",
+    )
+    .bind(&claim.dedup_key)
+    .fetch_one(pool)
+    .await?;
+    Ok(if in_flight {
+        ClaimOutcome::InFlight
     } else {
         ClaimOutcome::Duplicate
     })
