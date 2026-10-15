@@ -51,12 +51,24 @@ const GET_SQL: &str = "SELECT cursor FROM backfill_cursors WHERE family = $1";
 /// Cursor-store failure: a database error, or a cursor that fails
 /// validation. Validation runs before any SQL, so an invalid write never
 /// touches the database.
+///
+/// Fail closed: the `Db` variant carries no `sqlx::Error` payload. Its
+/// `Display`, `Debug` and `source()` are all fixed, so no SQLSTATE, message,
+/// connection URL or statement detail can surface through error formatting.
+/// Structured callers that need a failure token use their own fixed
+/// `db_class`/`db_cause` values, never this error's text.
 #[derive(Debug, Error)]
 pub enum BackfillCursorError {
-    #[error("backfill cursor database error: {0}")]
-    Db(#[from] sqlx::Error),
+    #[error("backfill cursor database error: database error")]
+    Db,
     #[error("invalid backfill cursor: {0}")]
     Invalid(&'static str),
+}
+
+impl From<sqlx::Error> for BackfillCursorError {
+    fn from(_: sqlx::Error) -> Self {
+        Self::Db
+    }
 }
 
 /// Checkpoint `family`'s cursor. Overwrites any previous cursor for the
@@ -129,6 +141,36 @@ mod tests {
         assert!(!is_backfill_family("messages"));
         assert!(!is_backfill_family(""));
         assert!(!is_backfill_family("Audit"));
+    }
+
+    #[test]
+    fn db_error_display_and_debug_hide_sqlx_text() {
+        // Fail-closed regression: ordinary non-pattern text such as
+        // `invalid member display name` matches no token redactor, so the
+        // fixed Display/Debug/source must drop it structurally. The
+        // `InvalidArgument` case is the strongest one: its message is
+        // verbatim caller text, the exact shape a pattern redactor keeps.
+        for raw in [
+            sqlx::Error::InvalidArgument("invalid member display name".into()),
+            sqlx::Error::RowNotFound,
+        ] {
+            let err: BackfillCursorError = raw.into();
+            let display = err.to_string();
+            assert_eq!(display, "backfill cursor database error: database error");
+            assert!(
+                !display.contains("invalid member display name"),
+                "Display leaked sqlx text: {display}"
+            );
+            let debug = format!("{err:?}");
+            assert!(
+                !debug.contains("invalid member display name"),
+                "Debug leaked sqlx text: {debug}"
+            );
+            assert!(
+                std::error::Error::source(&err).is_none(),
+                "source chain re-exposed the sqlx error"
+            );
+        }
     }
 
     #[test]

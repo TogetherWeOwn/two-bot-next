@@ -46,12 +46,24 @@ const RECORD_COUNT_SQL: &str = "INSERT INTO backfill_history_counts
 
 /// History-store failure: a database error, or ids/count that fail validation.
 /// Validation runs before any SQL, so an invalid write never touches the database.
+///
+/// Fail closed: the `Db` variant carries no `sqlx::Error` payload. Its
+/// `Display`, `Debug` and `source()` are all fixed, so no SQLSTATE, message,
+/// connection URL or statement detail can surface through error formatting.
+/// Structured callers that need a failure token use their own fixed
+/// `db_class`/`db_cause` values, never this error's text.
 #[derive(Debug, Error)]
 pub enum BackfillHistoryError {
-    #[error("backfill history database error: {0}")]
-    Db(#[from] sqlx::Error),
+    #[error("backfill history database error: database error")]
+    Db,
     #[error("invalid backfill history row: {0}")]
     Invalid(&'static str),
+}
+
+impl From<sqlx::Error> for BackfillHistoryError {
+    fn from(_: sqlx::Error) -> Self {
+        Self::Db
+    }
 }
 
 /// Build the paged history path for `GET /channels/{channel}/messages`.
@@ -139,6 +151,36 @@ pub async fn record_backfill_history_count(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn db_error_display_and_debug_hide_sqlx_text() {
+        // Fail-closed regression: ordinary non-pattern text such as
+        // `invalid member display name` matches no token redactor, so the
+        // fixed Display/Debug/source must drop it structurally. The
+        // `InvalidArgument` case is the strongest one: its message is
+        // verbatim caller text, the exact shape a pattern redactor keeps.
+        for raw in [
+            sqlx::Error::InvalidArgument("invalid member display name".into()),
+            sqlx::Error::RowNotFound,
+        ] {
+            let err: BackfillHistoryError = raw.into();
+            let display = err.to_string();
+            assert_eq!(display, "backfill history database error: database error");
+            assert!(
+                !display.contains("invalid member display name"),
+                "Display leaked sqlx text: {display}"
+            );
+            let debug = format!("{err:?}");
+            assert!(
+                !debug.contains("invalid member display name"),
+                "Debug leaked sqlx text: {debug}"
+            );
+            assert!(
+                std::error::Error::source(&err).is_none(),
+                "source chain re-exposed the sqlx error"
+            );
+        }
+    }
 
     #[test]
     fn wrapper_sql_matches_the_acceptance_target_byte_for_byte() {
