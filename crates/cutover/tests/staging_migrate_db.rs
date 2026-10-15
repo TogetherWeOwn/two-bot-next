@@ -1153,7 +1153,7 @@ async fn connection_count_sees_other_roles_from_plan_login() -> TestResult {
             used >= 3,
             "plan login must see the 3 other-role sessions, counted {used}"
         );
-        for mut conn in others {
+        for conn in others {
             conn.close().await?;
         }
         reader.close().await?;
