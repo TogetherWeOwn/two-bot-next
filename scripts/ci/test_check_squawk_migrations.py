@@ -232,6 +232,83 @@ class RuleTests(unittest.TestCase):
             ["adding-check-constraint"],
         )
 
+    def test_index_on_same_file_table_is_clean(self):
+        # Empty tables need no CONCURRENTLY: the index follows the CREATE
+        # TABLE in the same migration file.
+        self.assertEqual(
+            self.rules(
+                "CREATE TABLE guilds (id bigint PRIMARY KEY, name text);\n"
+                "CREATE INDEX guilds_name_idx ON guilds (name);\n"
+            ),
+            [],
+        )
+        self.assertEqual(
+            self.rules(
+                "CREATE TABLE IF NOT EXISTS guilds (id bigint PRIMARY KEY);\n"
+                "CREATE UNIQUE INDEX guilds_uidx ON guilds (id);\n"
+            ),
+            [],
+        )
+
+    def test_index_on_other_table_still_flags(self):
+        self.assertEqual(
+            self.rules(
+                "CREATE TABLE guilds (id bigint PRIMARY KEY);\n"
+                "CREATE INDEX members_name_idx ON members (name);\n"
+            ),
+            ["creating-index"],
+        )
+
+    def test_index_before_create_table_still_flags(self):
+        # Only tables created EARLIER in the same file are empty and safe.
+        self.assertEqual(
+            self.rules(
+                "CREATE INDEX guilds_name_idx ON guilds (name);\n"
+                "CREATE TABLE guilds (id bigint PRIMARY KEY, name text);\n"
+            ),
+            ["creating-index"],
+        )
+
+    def test_e_string_escaped_quote_does_not_hide_index(self):
+        # E'it\\'s' must not end the literal early and swallow the index.
+        self.assertEqual(
+            self.rules(
+                "SELECT E'it\\'s';\n"
+                "CREATE INDEX bad_idx ON t (a);\n"
+            ),
+            ["creating-index"],
+        )
+        self.assertEqual(
+            self.rules(
+                "SELECT e'xy\\'z';\n"
+                "CREATE INDEX bad_idx ON t (a);\n"
+            ),
+            ["creating-index"],
+        )
+
+    def test_ordinary_string_backslash_keeps_behavior(self):
+        # Ordinary strings have no backslash escapes: 'a\\' ends at the
+        # quote, so the following index stays visible.
+        self.assertEqual(
+            self.rules(
+                "SELECT 'a\\';\n"
+                "CREATE INDEX bad_idx ON t (a);\n"
+            ),
+            ["creating-index"],
+        )
+        # '' doubling still escapes in both string kinds.
+        self.assertEqual(
+            self.rules(
+                "SELECT 'it''s';\n"
+                "CREATE INDEX bad_idx ON t (a);\n"
+            ),
+            ["creating-index"],
+        )
+        self.assertEqual(
+            self.rules("SELECT E'it''s';\n"),
+            [],
+        )
+
     def test_several_rules_in_one_file_report_each_line(self):
         self.assertEqual(
             squawk.lint_text(

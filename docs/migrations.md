@@ -53,8 +53,11 @@ Write migrations that stay silent:
 - New required column: `ADD COLUMN x bigint DEFAULT 0`, backfill existing
   rows, then `ALTER TABLE ... ALTER COLUMN x SET NOT NULL` in a later
   migration.
-- New index: `CREATE INDEX CONCURRENTLY` (outside the migration
-  transaction when the runner wraps one; see the staging-migrate contract).
+- New index on an existing table: `CREATE INDEX CONCURRENTLY` in a
+  separate migration run outside a transaction (sqlx no-transaction;
+  `CONCURRENTLY` cannot run inside a transaction block). An index on a
+  table created earlier in the same migration file targets an empty table
+  and is not flagged.
 - New check: `ADD CONSTRAINT ... CHECK (...) NOT VALID`, then
   `VALIDATE CONSTRAINT` separately.
 - Type change or drop: prefer an additive migration (new column, backfill,

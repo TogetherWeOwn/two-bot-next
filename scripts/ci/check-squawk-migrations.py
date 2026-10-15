@@ -44,8 +44,10 @@ ADVICE = {
         "then SET NOT NULL in a later migration"
     ),
     "creating-index": (
-        "CREATE INDEX without CONCURRENTLY blocks writes; "
-        "use CREATE INDEX CONCURRENTLY"
+        "CREATE INDEX without CONCURRENTLY blocks writes on existing tables; "
+        "use CREATE INDEX CONCURRENTLY in a separate migration run outside "
+        "a transaction (sqlx no-transaction). Indexes on a table created "
+        "earlier in the same file target an empty table and are not flagged"
     ),
     "adding-check-constraint": (
         "CHECK constraint without NOT VALID scans and locks the table; "
@@ -80,7 +82,29 @@ ALTER_TYPE = re.compile(
     re.IGNORECASE,
 )
 DROP_OBJECT = re.compile(r"\bDROP\s+(?:TABLE|COLUMN)\b", re.IGNORECASE)
+CREATE_TABLE = re.compile(
+    r"\bCREATE\s+(?:(?:GLOBAL|LOCAL)\s+)?(?:TEMP(?:ORARY)?\s+|UNLOGGED\s+)?"
+    r"TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:ONLY\s+)?"
+    r'(?P<name>"[^"]+"|[A-Za-z_][A-Za-z0-9_\.]*)',
+    re.IGNORECASE,
+)
+INDEX_TARGET = re.compile(
+    r"\bCREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?"
+    r"(?:IF\s+NOT\s+EXISTS\s+)?"
+    r'(?:(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_\.]*)\s+)?'
+    r"ON\s+(?:ONLY\s+)?"
+    r'(?P<name>"[^"]+"|[A-Za-z_][A-Za-z0-9_\.]*)',
+    re.IGNORECASE,
+)
 DOLLAR_OPEN = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$")
+
+
+def normalize_table(raw):
+    """Lowercase unqualified table name for same-file empty-table checks."""
+    last = raw.strip().split(".")[-1].strip()
+    if len(last) >= 2 and last.startswith('"') and last.endswith('"'):
+        last = last[1:-1]
+    return last.lower()
 
 
 class SquawkError(ValueError):
@@ -112,9 +136,21 @@ def blanked(text):
             blank(i, end)
             i = end
         elif text[i] == "'":
-            begin = i
+            # Postgres E'...' strings use backslash escapes (\' does not end
+            # the literal); ordinary '...' strings do not. A bare E prefix
+            # that is itself part of an identifier (e.g. someE'...') is not
+            # an escape prefix.
+            is_escape = (
+                i > 0
+                and text[i - 1] in "Ee"
+                and (i - 1 == 0 or not (text[i - 2].isalnum() or text[i - 2] == "_"))
+            )
+            begin = i - 1 if is_escape else i
             i += 1
             while i < n:
+                if is_escape and text[i] == "\\" and i + 1 < n:
+                    i += 2
+                    continue
                 if text[i] == "'":
                     if text[i + 1 : i + 2] == "'":
                         i += 2
@@ -224,12 +260,23 @@ def has_check_constraint(sql):
     return False
 
 
-def lint_statement(sql):
+def index_on_existing_table(sql, created_tables):
+    """True when a non-concurrent index targets a table outside the file's
+    earlier CREATE TABLEs (empty same-file tables are safe to index)."""
+    if not CREATE_INDEX.search(sql) or CONCURRENTLY.search(sql):
+        return False
+    match = INDEX_TARGET.search(sql)
+    if not match:
+        return True
+    return normalize_table(match.group("name")) not in created_tables
+
+
+def lint_statement(sql, created_tables=frozenset()):
     """Return the list of rule IDs violated by one cleaned statement."""
     found = []
     if has_required_field(sql):
         found.append("adding-required-field")
-    if CREATE_INDEX.search(sql) and not CONCURRENTLY.search(sql):
+    if index_on_existing_table(sql, created_tables):
         found.append("creating-index")
     if has_check_constraint(sql):
         found.append("adding-check-constraint")
@@ -241,11 +288,19 @@ def lint_statement(sql):
 
 
 def lint_text(text):
-    """Return [(line, rule)] findings for one migration file's contents."""
+    """Return [(line, rule)] findings for one migration file's contents.
+
+    CREATE TABLE names accumulate in statement order so an index on a table
+    created earlier in the same file (still empty) is not flagged, while an
+    index on any other table still is.
+    """
     findings = []
+    created = set()
     for line, sql in statements(text):
-        for rule in lint_statement(sql):
+        for rule in lint_statement(sql, created):
             findings.append((line, rule))
+        for match in CREATE_TABLE.finditer(sql):
+            created.add(normalize_table(match.group("name")))
     return findings
 
 
