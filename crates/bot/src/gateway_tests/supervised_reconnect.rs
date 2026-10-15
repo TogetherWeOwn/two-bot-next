@@ -151,11 +151,7 @@ async fn drive_to_exit(
 }
 
 fn assert_gap_within_timer_resolution(gap: Duration, expected: Duration, attempt: usize) {
-    let difference = if gap >= expected {
-        gap - expected
-    } else {
-        expected - gap
-    };
+    let difference = gap.abs_diff(expected);
     assert!(
         difference <= Duration::from_millis(1),
         "gap before attempt {} was {gap:?}, expected {expected:?} within Tokio's 1ms timer resolution",
