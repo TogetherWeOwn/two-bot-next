@@ -417,6 +417,7 @@ mod tests {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn request_with_content_type(
         uri: &str,
         content_type: &str,
