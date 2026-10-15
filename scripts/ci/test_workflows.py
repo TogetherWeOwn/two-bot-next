@@ -1089,9 +1089,31 @@ class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.workflows = load_workflows()
 
+    def test_merge_queue_reports_required_checks_without_pr_metadata(self):
+        for name in ("check.yml", "supply-chain.yml"):
+            workflow = self.workflows[name]
+            self.assertEqual(workflow["on"]["merge_group"], {"types": ["checks_requested"]})
+            self.assertEqual(workflow["concurrency"]["cancel-in-progress"],
+                             "${{ github.event_name == 'pull_request' }}")
+        gates = self.workflows["supply-chain.yml"]["jobs"]
+        self.assertEqual(gates["pr-lint"]["name"], "pr-lint")
+        self.assertEqual(gates["gitleaks"]["name"], "gitleaks")
+        self.assertEqual(gates["gitleaks"]["if"], "${{ !cancelled() }}")
+        steps = gates["pr-lint"]["steps"]
+        for name in ("Resolve PR title/body", "Check title, body, branch and commits"):
+            step = next(s for s in steps if s.get("name") == name)
+            self.assertEqual(step["if"], "github.event_name != 'merge_group'")
+        receipt = next(s for s in steps if s.get("name") == "Accept metadata already linted on the PR")
+        self.assertEqual(receipt["if"], "github.event_name == 'merge_group'")
+        self.assertIn("echo ", receipt["run"])
+        self.assertEqual(self.workflows["check.yml"]["jobs"]["ci-ok"]["name"], "ci-ok")
+        # Queue validation never becomes a deployment entry point.
+        for name in ("deploy-staging.yml", "deploy-production.yml"):
+            self.assertNotIn("merge_group", self.workflows[name]["on"])
+
     def test_quality_gates_diff_merge_checkout_against_its_first_parent(self):
         steps = self.workflows["check.yml"]["jobs"]["check"]["steps"]
-        expected_base = "${{ github.event.pull_request && format('{0}^1', github.sha) || github.event.before || 'origin/main' }}"
+        expected_base = "${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before || 'origin/main' }}"
         expected_head = "${{ github.sha }}"
         for name in (
             "Floor guard (HARD, CONSTRAINTS.md floor)",

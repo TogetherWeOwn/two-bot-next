@@ -16,6 +16,8 @@ on:
     # opened or synchronize, so the gate always reports. Title re-lint on
     # `edited` lives in supply-chain.yml, where it belongs.
     types: [opened, synchronize, reopened]
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main]
   # Weekly full run (CI standard rule 6, TOG-14881): the supply-chain
@@ -148,7 +150,7 @@ jobs:
 
       - name: Check migration numbering and immutability
         env:
-          MIGRATION_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
+          MIGRATION_BASE: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-check-migrations.py
           python3 scripts/check-migrations.py --base-ref "$MIGRATION_BASE"
@@ -353,7 +355,7 @@ jobs:
       # docs-only PR can still weaken CONSTRAINTS.md, so this must see it.
       - name: Floor guard (HARD, CONSTRAINTS.md floor)
         env:
-          FLOOR_BASE: ${{ github.event.pull_request && format('{0}^1', github.sha) || github.event.before || 'origin/main' }}
+          FLOOR_BASE: ${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before || 'origin/main' }}
           FLOOR_HEAD: ${{ github.sha }}
         run: python3 scripts/ci/check-floor-guard.py --base-ref "$FLOOR_BASE" --head-ref "$FLOOR_HEAD"
 
@@ -362,7 +364,7 @@ jobs:
         # The check job runs in a container whose default shell is sh (no pipefail).
         shell: bash
         env:
-          QUALITY_BASE: ${{ github.event.pull_request && format('{0}^1', github.sha) || github.event.before || 'origin/main' }}
+          QUALITY_BASE: ${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before || 'origin/main' }}
           QUALITY_HEAD: ${{ github.sha }}
         run: |
           set -euo pipefail
@@ -392,7 +394,7 @@ jobs:
         if: needs.job-inputs.outputs.rust != 'false'
         shell: bash
         env:
-          QUALITY_BASE: ${{ github.event.pull_request && format('{0}^1', github.sha) || github.event.before || 'origin/main' }}
+          QUALITY_BASE: ${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before || 'origin/main' }}
           QUALITY_HEAD: ${{ github.sha }}
         run: |
           set -euo pipefail
@@ -417,7 +419,7 @@ jobs:
         if: needs.job-inputs.outputs.rust != 'false'
         shell: bash
         env:
-          QUALITY_BASE: ${{ github.event.pull_request && format('{0}^1', github.sha) || github.event.before || 'origin/main' }}
+          QUALITY_BASE: ${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before || 'origin/main' }}
           QUALITY_HEAD: ${{ github.sha }}
         run: |
           set -euo pipefail
