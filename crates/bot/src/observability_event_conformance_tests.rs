@@ -504,6 +504,17 @@ const EVENTSUB_RS_EVENTS: [&str; 5] = [
     "delivery ignored",
 ];
 
+/// Test-only emissions inside the receiver file's `#[cfg(test)]` module,
+/// mirroring `TEST_ONLY_EMISSIONS` for the scoped sources: they never run
+/// in production and carry no `event` field, but the disk read sees the
+/// whole file, so they join the known set explicitly instead of failing
+/// the scan.
+const EVENTSUB_TEST_ONLY_EMISSIONS: [&str; 1] = [
+    // Secret-reload log-capture self-check: proves the test recorder
+    // observes events; asserts on the text, ships no behavior.
+    "reload log capture live",
+];
+
 /// The receiver's startup diagnostic in `main.rs` (also in
 /// `MAIN_RS_ADJACENT` for the scanned-source pin above).
 const EVENTSUB_STARTUP_EVENT: &str = "eventsub startup refused";
@@ -540,21 +551,29 @@ fn observability_catalog_doc() -> String {
 #[test]
 fn eventsub_receiver_emissions_match_the_catalog() {
     let source = eventsub_receiver_source();
+    let traced = traced_messages(&source);
+    let mut known = EVENTSUB_RS_EVENTS.to_vec();
+    known.extend(EVENTSUB_TEST_ONLY_EMISSIONS);
     assert_eq!(
-        sorted_unique(traced_messages(&source)),
-        sorted_unique(EVENTSUB_RS_EVENTS.to_vec()),
+        sorted_unique(traced.clone()),
+        sorted_unique(known),
         "eventsub receiver emitted an uncataloged message or dropped a cataloged one: \
          record it in docs/observability-event-catalog.md and EVENTSUB_RS_EVENTS together"
     );
-    // Every log callsite must carry the bounded field, and it must be the
-    // only `event` value in the file. Count the field literals against the
-    // traced callsites so a callsite that drops the field fails.
-    let traced = traced_messages(&source).len();
+    // Every receiver log callsite must carry the bounded field, and it must
+    // be the only `event` value in the file. Count the field literals
+    // against the receiver callsites (test-only emissions carry no field)
+    // so a callsite that drops the field fails.
+    let receiver_callsites = traced
+        .iter()
+        .copied()
+        .filter(|message| !EVENTSUB_TEST_ONLY_EMISSIONS.contains(message))
+        .count();
     let fielded = source.matches("event = \"eventsub_receiver\"").count();
     assert_eq!(
-        fielded, traced,
+        fielded, receiver_callsites,
         "every eventsub receiver log callsite carries event = \"eventsub_receiver\" \
-         ({fielded} fielded of {traced} callsites)"
+         ({fielded} fielded of {receiver_callsites} receiver callsites)"
     );
 }
 
