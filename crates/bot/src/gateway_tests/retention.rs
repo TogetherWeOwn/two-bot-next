@@ -6,9 +6,7 @@
 use super::*;
 use futures_util::FutureExt as _;
 use std::panic::AssertUnwindSafe;
-use std::sync::Mutex as StdMutex;
 use tokio::sync::watch;
-use tracing_subscriber::layer::SubscriberExt as _;
 use two_bot_cutover::retention::{handle_guild_delete, run_retention, RetentionMode};
 use two_bot_testsupport::TestDatabase;
 
@@ -413,50 +411,13 @@ async fn missing_retention_tables_do_not_stop_the_gateway() {
     db.close().await.unwrap();
 }
 
-/// Thread-scoped tracing capture for the schema-gap skip lines.
-/// `#[tokio::test]` runs current-thread, so the spawned writer task's gateway
-/// events land in this buffer while the guard lives. No target filter: the
-/// assertions below match exact lines, and only this thread's events are
-/// captured.
-#[derive(Clone, Default)]
-struct LogCapture(Arc<StdMutex<String>>);
-
-impl LogCapture {
-    fn contents(&self) -> String {
-        self.0.lock().expect("capture lock").clone()
-    }
-}
-
-impl std::io::Write for LogCapture {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0
-            .lock()
-            .expect("capture lock")
-            .push_str(&String::from_utf8_lossy(buf));
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
-    type Writer = LogCapture;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
-fn captured_logs() -> (LogCapture, tracing::subscriber::DefaultGuard) {
-    let capture = LogCapture::default();
-    let subscriber = tracing_subscriber::registry().with(
-        tracing_subscriber::fmt::layer()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .without_time(),
-    );
-    (capture, tracing::subscriber::set_default(subscriber))
+/// Process-wide tracing capture for the schema-gap skip lines, shared with
+/// every log-hygiene test in this binary (`crate::tracing_capture::global`).
+/// A thread-local `set_default` capture drops events from the spawned gateway
+/// worker on another thread once a sibling test caches callsite interest, so
+/// this test reads only the text appended after its own start offset.
+fn schema_gap_capture() -> &'static crate::tracing_capture::Capture {
+    crate::tracing_capture::global()
 }
 
 #[tokio::test]
@@ -474,7 +435,8 @@ async fn schema_gapped_real_delete_survives_and_operator_replay_restores_purge()
         .execute(pool)
         .await
         .unwrap();
-    let (capture, _guard) = captured_logs();
+    let capture = schema_gap_capture();
+    let start = capture.text().len();
     let mut peer = Peer::new().await;
     let (store, stop, task, _) = runner(pool, &mut peer, None).await;
     peer.send(delete(2, None)).await;
@@ -485,7 +447,7 @@ async fn schema_gapped_real_delete_survives_and_operator_replay_restores_purge()
         !task.is_finished(),
         "schema-gapped real delete must not stop the gateway"
     );
-    let logs = capture.contents();
+    let logs = capture.text().split_off(start);
     assert!(
         logs.lines().any(|line| line.contains("ERROR")
             && line.contains("retention purge skipped; schema gap, operator replay required")
