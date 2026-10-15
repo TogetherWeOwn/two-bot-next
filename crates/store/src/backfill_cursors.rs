@@ -18,7 +18,7 @@
 //! wrapper and the tests can never drift apart.
 
 use sqlx::{Pool, Postgres};
-use two_bot_core::error_chain::sanitize_chain;
+use thiserror::Error;
 
 /// The nine backfill families from the TOG-22852 plan.
 pub const BACKFILL_FAMILIES: &[&str] = &[
@@ -52,40 +52,22 @@ const GET_SQL: &str = "SELECT cursor FROM backfill_cursors WHERE family = $1";
 /// validation. Validation runs before any SQL, so an invalid write never
 /// touches the database.
 ///
-/// The `Db` Display is sanitized, never the raw sqlx text: a database error
-/// can carry a connection URL, so it renders through the shared chain
-/// sanitizer before reaching any failure line.
-#[derive(Debug)]
+/// Fail closed: the `Db` variant carries no `sqlx::Error` payload. Its
+/// `Display`, `Debug` and `source()` are all fixed, so no SQLSTATE, message,
+/// connection URL or statement detail can surface through error formatting.
+/// Structured callers that need a failure token use their own fixed
+/// `db_class`/`db_cause` values, never this error's text.
+#[derive(Debug, Error)]
 pub enum BackfillCursorError {
-    Db(sqlx::Error),
+    #[error("backfill cursor database error: database error")]
+    Db,
+    #[error("invalid backfill cursor: {0}")]
     Invalid(&'static str),
 }
 
-impl std::fmt::Display for BackfillCursorError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Db(inner) => write!(
-                f,
-                "backfill cursor database error: {}",
-                sanitize_chain(&inner.to_string())
-            ),
-            Self::Invalid(message) => write!(f, "invalid backfill cursor: {message}"),
-        }
-    }
-}
-
-impl std::error::Error for BackfillCursorError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Db(inner) => Some(inner),
-            Self::Invalid(_) => None,
-        }
-    }
-}
-
 impl From<sqlx::Error> for BackfillCursorError {
-    fn from(error: sqlx::Error) -> Self {
-        Self::Db(error)
+    fn from(_: sqlx::Error) -> Self {
+        Self::Db
     }
 }
 
@@ -159,6 +141,36 @@ mod tests {
         assert!(!is_backfill_family("messages"));
         assert!(!is_backfill_family(""));
         assert!(!is_backfill_family("Audit"));
+    }
+
+    #[test]
+    fn db_error_display_and_debug_hide_sqlx_text() {
+        // Fail-closed regression: ordinary non-pattern text such as
+        // `invalid member display name` matches no token redactor, so the
+        // fixed Display/Debug/source must drop it structurally. The
+        // `InvalidArgument` case is the strongest one: its message is
+        // verbatim caller text, the exact shape a pattern redactor keeps.
+        for raw in [
+            sqlx::Error::InvalidArgument("invalid member display name".into()),
+            sqlx::Error::RowNotFound,
+        ] {
+            let err: BackfillCursorError = raw.into();
+            let display = err.to_string();
+            assert_eq!(display, "backfill cursor database error: database error");
+            assert!(
+                !display.contains("invalid member display name"),
+                "Display leaked sqlx text: {display}"
+            );
+            let debug = format!("{err:?}");
+            assert!(
+                !debug.contains("invalid member display name"),
+                "Debug leaked sqlx text: {debug}"
+            );
+            assert!(
+                std::error::Error::source(&err).is_none(),
+                "source chain re-exposed the sqlx error"
+            );
+        }
     }
 
     #[test]
