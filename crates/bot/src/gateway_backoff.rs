@@ -9,8 +9,8 @@
 //!
 //! The acceptance tests (`gateway_tests::supervised_reconnect`) pin this
 //! module's contract: the schedule and [`run_supervised`]'s retry loop.
-//! Nothing in the running binary calls this module yet, so shipping it
-//! changes no runtime behavior.
+//! Test-only until the gateway loop adopts it: no runtime caller yet, so the
+//! module is gated to test builds and ships no code to the container.
 //!
 //! The loop (keep the polling exact so paused-time tests observe it):
 //!
