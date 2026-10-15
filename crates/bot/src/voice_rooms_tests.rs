@@ -13121,8 +13121,13 @@ async fn actor_join_revalidates_a_stale_creator_view() {
         .expect("ticket for a joined channel");
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = tokio::spawn(async move {
-        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), ActorLimits::default())
-            .await;
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            ActorLimits::default(),
+        )
+        .await;
         worker
     });
     tx.send(ActorCommand::Join {
@@ -13169,8 +13174,13 @@ async fn maintenance_tick_runs_the_creator_refresh() {
     assert!(worker.creators_read_ms.is_none());
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = tokio::spawn(async move {
-        run_actor_with_limits(&mut worker, rx, Duration::from_millis(100), ActorLimits::default())
-            .await;
+        run_actor_with_limits(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            ActorLimits::default(),
+        )
+        .await;
         worker
     });
     for _ in 0..5 {
@@ -13202,7 +13212,12 @@ async fn reload_creators_debounces_channel_event_refreshes() {
     let (live, store, http, _) = fixture();
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     worker.reload_creators(0).await;
-    worker.store.creators.lock().unwrap().push(CreatorChannel::new(GUILD, 201));
+    worker
+        .store
+        .creators
+        .lock()
+        .unwrap()
+        .push(CreatorChannel::new(GUILD, 201));
     worker.creators_refresh_due = true;
     worker.reload_creators(5_000).await;
     assert!(
@@ -13237,10 +13252,10 @@ async fn reload_creators_converges_rows_on_the_five_minute_interval() {
 async fn reload_creators_keeps_the_view_on_a_failed_read() {
     // A transient store error is not a deletion: the old map stays so joins
     // keep flowing until the next refresh.
-    let (live, mut store, http, _) = fixture();
-    store.creators_error = Some(StoreError::Unavailable);
+    let (live, store, http, _) = fixture();
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     worker.creators.clear();
+    worker.store.creators_error = Some(StoreError::Unavailable);
     worker.reload_creators(300_000).await;
     assert!(
         !worker.creators.contains_key(&CREATOR),
