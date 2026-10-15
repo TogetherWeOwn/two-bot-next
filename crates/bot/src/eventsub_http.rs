@@ -5,7 +5,8 @@
 //! Only transient failures (none in this slice: no send, no ledger) would be
 //! 5xx. No Helix client and no durable ledger here (separate slices).
 //!
-//! Logging carries only scalar `event`/`status`/`error_class`: no header
+//! Logging carries only scalar `event`/`status`/`error_class` plus the bounded
+//! `message_type` (refusals) and `reason` (revocation ack) scalars: no header
 //! values, challenge, body bytes or query. The callback path never reaches a
 //! trace span (`server::TRACED_PATHS` must not list it; unknown paths render
 //! as `[REDACTED]`).
@@ -114,18 +115,33 @@ fn envelope(status: StatusCode, code: &str, retryable: bool, id: &str) -> Respon
     (status, body).into_response()
 }
 
+/// Bounded `message_type` scalar for refuse lines: the three Twitch types the
+/// receiver handles, else `unknown`. Raw header values never reach a log
+/// line, so a failed challenge separates from a malformed notification or
+/// an edge probe in logs alone.
+fn bounded_message_type(value: &str) -> &'static str {
+    match value {
+        "webhook_callback_verification" => "webhook_callback_verification",
+        "notification" => "notification",
+        "revocation" => "revocation",
+        _ => "unknown",
+    }
+}
+
 fn refuse(
     state: &ReceiverState,
     status: StatusCode,
     code: &str,
     retryable: bool,
     id: &str,
+    message_type: &'static str,
 ) -> Response {
     let _ = state;
     tracing::warn!(
         event = "eventsub_receiver",
         status = status.as_u16(),
         error_class = code,
+        message_type = message_type,
         "eventsub delivery refused"
     );
     envelope(status, code, retryable, id)
@@ -136,19 +152,28 @@ fn ack(id: &str) -> Response {
 }
 
 async fn not_found(State(state): State<Arc<ReceiverState>>) -> Response {
+    // Fallback for any non-callback path or method: no header is trusted.
     refuse(
         &state,
         StatusCode::NOT_FOUND,
         "not_found",
         false,
         &request_id(),
+        "unknown",
     )
 }
 
 async fn handle(State(state): State<Arc<ReceiverState>>, request: Request) -> Response {
     let id = request_id();
     let Ok(_permit) = Arc::clone(&state.capacity).try_acquire_owned() else {
-        return refuse(&state, StatusCode::SERVICE_UNAVAILABLE, "busy", true, &id);
+        return refuse(
+            &state,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            true,
+            &id,
+            "unknown",
+        );
     };
     receive_with_timeout(&state, &id, receive(&state, request, &id)).await
 }
@@ -160,12 +185,15 @@ async fn receive_with_timeout(
 ) -> Response {
     match tokio::time::timeout(REQUEST_TIMEOUT, receive).await {
         Ok(response) => response,
+        // The stalled future is opaque on timeout: the message type may never
+        // have been established, so `unknown` is the honest scalar.
         Err(_) => refuse(
             state,
             StatusCode::SERVICE_UNAVAILABLE,
             "upstream_timeout",
             true,
             id,
+            "unknown",
         ),
     }
 }
@@ -175,10 +203,24 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
     // a direct `containerFetch` must not reach verification with extras.
     let path = request.uri().path();
     if path != EVENTSUB_PATH {
-        return refuse(state, StatusCode::NOT_FOUND, "not_found", false, id);
+        return refuse(
+            state,
+            StatusCode::NOT_FOUND,
+            "not_found",
+            false,
+            id,
+            "unknown",
+        );
     }
     if request.uri().query().is_some() {
-        return refuse(state, StatusCode::BAD_REQUEST, "malformed", false, id);
+        return refuse(
+            state,
+            StatusCode::BAD_REQUEST,
+            "malformed",
+            false,
+            id,
+            "unknown",
+        );
     }
     if request.method() != Method::POST {
         let mut response = refuse(
@@ -187,6 +229,7 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             "method_not_allowed",
             false,
             id,
+            "unknown",
         );
         response
             .headers_mut()
@@ -210,6 +253,7 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             "unsupported_media_type",
             false,
             id,
+            "unknown",
         );
     }
 
@@ -222,7 +266,15 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
     }) {
         Ok(headers) => headers,
         Err(_) => {
-            return refuse(state, StatusCode::UNAUTHORIZED, "unauthorized", false, id);
+            // Headers missing or malformed: the message type is untrusted.
+            return refuse(
+                state,
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                false,
+                id,
+                "unknown",
+            );
         }
     };
     let message_type = headers.message_type().to_owned();
@@ -236,6 +288,7 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
                 "payload_too_large",
                 false,
                 id,
+                bounded_message_type(&message_type),
             );
         }
         Err(_) => {
@@ -245,11 +298,19 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
                 "request_timeout",
                 true,
                 id,
+                bounded_message_type(&message_type),
             );
         }
     };
     if raw.is_empty() {
-        return refuse(state, StatusCode::BAD_REQUEST, "malformed", false, id);
+        return refuse(
+            state,
+            StatusCode::BAD_REQUEST,
+            "malformed",
+            false,
+            id,
+            bounded_message_type(&message_type),
+        );
     }
 
     if let Err(error) = verify_delivery(&state.secret, &headers, &raw, now_ms_i64()) {
@@ -262,9 +323,17 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
                 "payload_too_large",
                 false,
                 id,
+                bounded_message_type(&message_type),
             );
         }
-        return refuse(state, StatusCode::UNAUTHORIZED, "unauthorized", false, id);
+        return refuse(
+            state,
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            false,
+            id,
+            bounded_message_type(&message_type),
+        );
     }
 
     match classify(&message_type, &raw) {
@@ -294,12 +363,15 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             );
             ack(id)
         }
-        Ok(Delivery::Revocation { .. }) => {
+        Ok(Delivery::Revocation { reason, .. }) => {
             // Reconcile runs at boot and after revocation in the Helix slice;
-            // here only acknowledge so Twitch does not retry.
+            // here only acknowledge so Twitch does not retry. The bounded
+            // `reason` scalar (never the subscription id) answers
+            // revocation counts by reason from logs alone.
             tracing::info!(
                 event = "eventsub_receiver",
                 status = 200,
+                reason = reason.as_str(),
                 "revocation acknowledged"
             );
             ack(id)
@@ -324,7 +396,17 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             ack(id)
         }
         Err(EventSubError::InvalidChallenge) => {
-            refuse(state, StatusCode::BAD_REQUEST, "malformed", false, id)
+            // Same `malformed` error class as a bad notification body, but
+            // `message_type = "webhook_callback_verification"` separates
+            // failed challenges in logs alone.
+            refuse(
+                state,
+                StatusCode::BAD_REQUEST,
+                "malformed",
+                false,
+                id,
+                bounded_message_type(&message_type),
+            )
         }
         Err(e) => {
             // Unreachable today: post-verification `classify` only yields

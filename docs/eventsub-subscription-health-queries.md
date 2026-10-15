@@ -140,13 +140,15 @@ one `healthy` line per hour per container boot plus one per startup; a gap
 with `TWO_EVENTSUB=1` set means the task is not running and is itself the
 finding.
 
-## Q3 — revocation count (total today; by reason needs a logging slice)
+## Q3 — revocation count (total; by reason from the `reason` scalar)
 
 Each verified revocation logs one `revocation acknowledged` info line
-(`crates/bot/src/eventsub_http.rs`, `event = "eventsub_receiver"`). Count
-them for the total:
-
-Sample (staging container, 30 min, 2026-10-15):
+(`crates/bot/src/eventsub_http.rs`, `event = "eventsub_receiver"`) with a
+bounded `reason` scalar: `user_removed`, `authorization_revoked`,
+`notification_failures_exceeded`, `version_removed`, or `other` (unmapped
+Twitch statuses collapse to `other`; no subscription id, header, body or
+secret is logged). Count the lines for the total; group by `reason` for
+the breakdown:
 
 ```bash
 python3 scripts/container_stdout_read.py \
@@ -154,24 +156,34 @@ python3 scripts/container_stdout_read.py \
   --minutes 30 --contains "revocation acknowledged"
 ```
 
+```bash
+# Same output, grouped by reason (needs this slice deployed; re-check the
+# container id with `containers list` first — ids change on re-provision).
+python3 scripts/container_stdout_read.py \
+  --service a038b0ad-a1f9-4966-bfb7-f992c602d938 \
+  --minutes 30 --contains "revocation acknowledged" \
+  | jq '[.events[].reason] | group_by(.) | map({reason: .[0], count: length})'
+```
+
+Sample (staging container, 30 min, 2026-10-15 — pre-dates the `reason`
+scalar, so only the total is shown):
+
 ```json
 {"event_count": 0, "window": {"start": "2026-10-15T19:43:51.000Z", "end": "2026-10-15T20:13:52.000Z"}}
 ```
 
-By reason is not answerable from logs today: the ack line drops
-Twitch's `status` (`user_removed`, `authorization_revoked`,
-`notification_failures_exceeded`, `version_removed`, other), and the
-reconcile only runs at boot/hourly, so a reason breakdown needs a
-receiver-logging slice that records the reason as one bounded scalar (no
-header, body or secret ever leaves the process). Until that lands, get the
-current-state reasons from the Q1 Helix listing (`status` per entry), which
-is a snapshot, not a count.
+The Q1 Helix listing (`status` per entry) remains the cross-check for
+current-state reasons; it is a snapshot, not a count.
 
-## Q4 — challenge-failure count (approximate today)
+## Q4 — challenge-failure count (exact, from the `message_type` scalar)
 
 A good challenge logs `challenge answered` (echoed as `200 text/plain`;
 Twitch then enables the subscription). A bad one is refused before any
-announcement path:
+announcement path with `error_class = "malformed"` and
+`message_type = "webhook_callback_verification"` — the bounded
+`message_type` scalar (`webhook_callback_verification` / `notification` /
+`revocation` / `unknown`, `unknown` before headers are established) separates
+failed challenges from malformed notifications and edge probes in logs alone:
 
 Sample (staging container, 30 min, 2026-10-15):
 
@@ -190,23 +202,28 @@ Failure side: `eventsub delivery refused` warn lines carry `error_class`
 bad query, empty body, or an invalid challenge; `unsupported_media_type`,
 `payload_too_large`, `request_timeout`, `method_not_allowed`, `not_found`,
 `busy` / `request_timeout` / `upstream_timeout` for the three retryable
-stalls). The Worker edge
+stalls) plus the `message_type` scalar on every line. The Worker edge
 adds its own `eventsub_ingress` refusals with the same vocabulary plus
 `rate_limited` (429) and `unavailable` (503: DO/binding/relay failures)
 (`wrangler/src/eventsub.ts`):
 
 Sample (staging Worker, 30 min, 2026-10-15): `eventsub_ingress` count 0.
 
-The count is approximate: refusal lines carry no message-type field, so a
-failed challenge (`InvalidChallenge` → `malformed`) cannot be separated from
-a malformed notification or a garbage probe. Treat `malformed` + `401
-unauthorized` refusals during a subscription setup as suspected
-challenge failures, and confirm against the subscription's Helix status
-(`webhook_callback_verification_pending` stuck, or
-`webhook_callback_verification_failed` after a reconcile). Exact
-per-type attribution needs the same logging slice as Q3 (one bounded
-message-type scalar on the refuse paths, or a challenge-specific
-error class).
+Exact challenge-failure query (needs this slice deployed):
+
+```bash
+python3 scripts/container_stdout_read.py \
+  --service a038b0ad-a1f9-4966-bfb7-f992c602d938 \
+  --minutes 30 --contains "delivery refused" \
+  | jq '[.events[] | select(.message_type == "webhook_callback_verification")] | length'
+```
+
+Sample (staging container, 30 min, 2026-10-15 — pre-dates the
+`message_type` scalar): `eventsub_ingress` count 0, `delivery refused`
+count 0. A stuck `webhook_callback_verification_pending` (or
+`webhook_callback_verification_failed` after a reconcile) in the Q1 Helix
+listing remains the cross-check for a subscription whose challenges never
+succeed.
 
 Remaining receiver lines for completeness: `notification acknowledged`
 (verified go-live acked; same `--contains "acknowledged"` query covers it —

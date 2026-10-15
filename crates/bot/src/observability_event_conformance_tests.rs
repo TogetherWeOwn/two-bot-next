@@ -511,6 +511,28 @@ const EVENTSUB_STARTUP_EVENT: &str = "eventsub startup refused";
 /// Bounded `event` field value every receiver emission carries.
 const EVENTSUB_EVENT_FIELD: &str = "eventsub_receiver";
 
+/// Bounded `message_type` scalars the receiver's refuse paths log: the three
+/// Twitch types the receiver handles, else `unknown`. Raw header values never
+/// reach a log line, so a failed challenge (`webhook_callback_verification`)
+/// separates from a malformed notification or an edge probe in logs alone.
+const EVENTSUB_MESSAGE_TYPES: [&str; 4] = [
+    "webhook_callback_verification",
+    "notification",
+    "revocation",
+    "unknown",
+];
+
+/// Bounded `reason` scalars the revocation ack logs: Twitch's revocation
+/// `status` vocabulary, unmapped values collapsing to `other`. Revocation
+/// counts by reason are answerable from logs alone.
+const EVENTSUB_REVOCATION_REASONS: [&str; 5] = [
+    "user_removed",
+    "authorization_revoked",
+    "notification_failures_exceeded",
+    "version_removed",
+    "other",
+];
+
 fn eventsub_receiver_source() -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/eventsub_http.rs");
     std::fs::read_to_string(&path).unwrap_or_else(|err| {
@@ -573,4 +595,88 @@ fn eventsub_events_are_recorded_in_the_catalog_doc() {
             "eventsub event missing from docs/observability-event-catalog.md: {event}"
         );
     }
+    // The attribution scalars are cataloged as backticked values so the
+    // check is precise: bare `notification` or `unknown` would match prose.
+    for scalar in EVENTSUB_MESSAGE_TYPES
+        .into_iter()
+        .chain(EVENTSUB_REVOCATION_REASONS)
+    {
+        let backticked = format!("`{scalar}`");
+        assert!(
+            catalog.contains(&backticked),
+            "eventsub scalar missing from docs/observability-event-catalog.md: {backticked}"
+        );
+    }
+}
+
+/// Every `refuse` callsite passes one bounded `message_type` scalar and the
+/// `refuse` definition logs it: a new refuse path without attribution fails
+/// here, and a raw header value smuggled into a callsite fails the bounded
+/// vocabulary check above. The single `fn refuse` definition declares the
+/// scalar; everything else matching `refuse(` is a callsite.
+#[test]
+fn eventsub_refuse_callsites_pass_a_bounded_message_type() {
+    let source = eventsub_receiver_source();
+    let bytes = source.as_bytes();
+    let mut search_from = 0;
+    let mut definitions = 0;
+    let mut callsites = 0;
+    while let Some(rel) = source[search_from..].find("refuse(") {
+        let open = search_from + rel + "refuse".len();
+        let Some(close) = closing_paren(bytes, open) else {
+            panic!("unbalanced refuse( call fails closed");
+        };
+        let body = &source[open + 1..close];
+        if body.contains("&'static str") {
+            assert!(
+                body.contains("message_type"),
+                "fn refuse must declare the bounded message_type scalar"
+            );
+            assert!(
+                source[close..].starts_with(") -> Response"),
+                "refuse definition shape changed; re-check this pin"
+            );
+            definitions += 1;
+        } else {
+            assert!(
+                body.contains("bounded_message_type(") || body.contains("\"unknown\""),
+                "refuse callsite without a bounded message_type fails closed; \
+                 pass bounded_message_type(&message_type) or \"unknown\"; \
+                 body starts: {}",
+                body.chars().take(80).collect::<String>()
+            );
+            callsites += 1;
+        }
+        search_from = close + 1;
+    }
+    assert_eq!(
+        definitions, 1,
+        "exactly one fn refuse definition carries the message_type scalar"
+    );
+    assert!(
+        callsites > 0,
+        "no refuse callsites found; the receiver lost its refusal paths"
+    );
+    for bounded in EVENTSUB_MESSAGE_TYPES {
+        assert!(
+            source.contains(&format!("\"{bounded}\"")),
+            "bounded message_type value missing from eventsub_http.rs: {bounded}"
+        );
+    }
+}
+
+/// The revocation ack logs exactly one bounded `reason` scalar and nothing
+/// else identifying the subscription: no id, header, body or secret.
+#[test]
+fn eventsub_revocation_ack_carries_a_bounded_reason() {
+    let source = eventsub_receiver_source();
+    assert!(
+        source.contains("reason = reason.as_str()"),
+        "revocation acknowledged must log reason = reason.as_str()"
+    );
+    assert_eq!(
+        source.matches("reason = ").count(),
+        1,
+        "exactly one reason field on the receiver: the revocation ack"
+    );
 }
