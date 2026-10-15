@@ -1165,6 +1165,31 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized reply text or screenshots and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 - **Owner:** [TOG-13123](/TOG/issues/TOG-13123)
 
+### s12-30: Private Twitch EventSub receiver inside the container network (#973)
+
+- **Method:** `manual` (not an execution verdict).
+- **Action:** On staging with the Operator-provisioned webhook secret, enable the receiver dark-flag exactly as configured, deliver a signed Twitch challenge and one signed notification through the Worker ingress, then repeat with a bad signature and with the flag unset.
+- **Expected:** The challenge is echoed only after verification, signed notifications are accepted with scalar-only logs, bad signatures are refused before parsing, the receiver is not served while the flag is unset, and enabled-but-invalid configuration stops startup instead of downgrading.
+- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Owner:** [TOG-13123](/TOG/issues/TOG-13123)
+
+### s12-31: Voice creator-view merge on gateway reconnect plus join-time creator-map refusal naming (#976)
+
+- **Method:** `manual` (not an execution verdict).
+- **Action:** On the disposable staging guild, register a creator channel, force a gateway reconnect, then join the creator channel; also join once against a deliberately stale creator map.
+- **Expected:** The creator view merges stored rows after the reconnect generation change (debounced, failed reads keep the old generation), the join succeeds without a restart, and any refusal names its reason with the join-time map state in the log.
+- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Owner:** [TOG-10119](/TOG/issues/TOG-10119), [TOG-13123](/TOG/issues/TOG-13123)
+- **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
+
+### s12-32: EventSub subscription reconcile at startup plus a bounded hourly interval (#989, open)
+
+- **Method:** `manual` (not an execution verdict).
+- **Action:** After the open reconcile slice merges, first re-verify the flag names and cited file:line at its merge head and refresh the parity row; then on staging with the receiver enabled, restart the container and observe one bounded reconcile interval tick with an empty and a populated broadcaster allowlist.
+- **Expected:** Reconcile runs at startup and on the hourly interval only while the receiver flag is exactly on, an empty allowlist parks without subscriptions, and no reconcile runs while the flag is off; until the slice lands, HEAD behavior stays boot-plus-revocation only.
+- **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
+- **Owner:** [TOG-13123](/TOG/issues/TOG-13123)
+
 ## 13. Post-freeze ledger obligations (non-dropped rows)
 
 ### s13-f114c44: f114c44 — TOG-3052: temp-voice generator (join-to-create), staging only
