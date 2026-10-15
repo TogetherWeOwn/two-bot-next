@@ -13436,6 +13436,34 @@ async fn reload_creators_retries_a_failed_generation_merge_on_the_next_tick() {
     );
 }
 
+#[tokio::test]
+async fn reload_creators_settles_generation_after_a_successful_merge() {
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.reload_creators(0).await;
+    worker
+        .store
+        .creators
+        .lock()
+        .unwrap()
+        .push(CreatorChannel::new(GUILD, 201));
+    assert!(worker.live.publish(snapshot(&[201], vec![])));
+    worker.reload_creators(10_000).await;
+    assert!(worker.creators.contains_key(&201));
+
+    worker
+        .store
+        .creators
+        .lock()
+        .unwrap()
+        .push(CreatorChannel::new(GUILD, 202));
+    worker.reload_creators(20_000).await;
+    assert!(
+        !worker.creators.contains_key(&202),
+        "a successful generation merge must settle the generation until the next interval"
+    );
+}
+
 #[test]
 fn watchdog_due_needs_a_queue_and_an_expired_window() {
     let start = tokio::time::Instant::now();
