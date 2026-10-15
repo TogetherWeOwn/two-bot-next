@@ -11,15 +11,18 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 STATIC_FALSE = "${{ false }}"
 JOB_INVENTORY = {
-    # Branch keeps the moderation-db job; main #84 added the supply-chain job.
-    # The pin must be the union of both sides.
+    # The nextest branch adds its required lane; main adds the production schema gate.
+    # The inventory pin must retain both changes.
     "check.yml": {"check", "moderation-db", "parity-docs", "self-role-store", "job-inputs", "container-inputs", "container",
                   "community-db", "feeds-db", "tickets-postgres", "worker", "supply-chain", "ci-ok",
                   # `check` is now the lint lane; the test steps it used to
                   # carry run in these three parallel lanes, all gated by ci-ok.
                   "rust-tests", "ignored-db-stores", "ignored-db-runtime",
                   # Compile-only libFuzzer build, gated by ci-ok like the Rust lanes.
-                  "fuzz-compile"},
+                  "fuzz-compile",
+                  # Promoted nextest lane (shared reusable), gated by ci-ok
+                  # like the Rust lanes.
+                  "nextest"},
     "deploy-production.yml": {"guard", "schema-gate", "production", "release"},
     "deploy-staging.yml": {"deploy", "schema-gate", "voice-synthetic"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
@@ -50,10 +53,10 @@ JOB_INVENTORY = {
     # runner. Read-only, no secrets, no deploy route: the generic
     # deployment/probe scan already passes, so only the inventory pin is needed.
     "vote-kick-fuzz-smoke.yml": {"vote-kick-smoke"},
-    # SDLC 2.3 CI speed pilot (advisory only, never required, never in
-    # ci-ok): dorny/paths-filter affected-only selection, the shared
-    # nextest lane, and the minutes-per-merged-PR report.
-    "ci-speed.yml": {"changes", "nextest", "report"},
+    # SDLC 2.3 CI speed evidence (the shared nextest lane graduated to a
+    # required check.yml job): dorny/paths-filter affected-only selection
+    # and the minutes-per-merged-PR report.
+    "ci-speed.yml": {"changes", "report"},
     # Shared nextest lane, called by ci-speed.yml; org-level home is
     # TogetherWeOwn/.github with a pinned SHA like test-guard.
     "reusable-rust-nextest.yml": {"nextest"},
@@ -70,9 +73,10 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
                    ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml",
                    # SDLC separation gate: org reusable, warn mode, pinned SHA.
                    ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95",
-                   # SDLC 2.3 CI speed pilot: advisory caller to the shared
-                   # nextest lane (local path until the central move).
-                   ("ci-speed.yml", "nextest"): "./.github/workflows/reusable-rust-nextest.yml",
+                   # SDLC 2.3 CI speed pilot, promoted: required check.yml
+                   # caller to the shared nextest lane (local path until
+                   # the central move).
+                   ("check.yml", "nextest"): "./.github/workflows/reusable-rust-nextest.yml",
                    # Advisory PR-size labels: thin caller to the central
                    # reusable, pinned SHA (repin both refs together).
                    ("pr-size.yml", "pr-size"): "TogetherWeOwn/.github/.github/workflows/pr-size.yml@82c5b367c6e3e8032666029dc22d206fff39c3f2",
@@ -2203,61 +2207,70 @@ class WorkflowTests(unittest.TestCase):
         self.assertIs(profile.get("fail-fast"), False)
 
     def test_nextest_shared_backends_stay_off_pull_requests(self):
-        # R2 write credentials must never reach PR-built code (build scripts
-        # and tests execute at the PR head, and a shared R2 bucket has no
-        # per-PR scope: a PR could poison objects main later links). The
-        # GitHub-cache backend has the same quota shape: the lane's entries
-        # share the repo Actions cache with the warm `check` entry. PR runs
-        # therefore use sccache on local disk only; shared backends are
-        # main/push-only.
+        # R2 write credentials must never reach PR- or merge-queue-built code
+        # (build scripts and tests execute at a head that is not on `main`
+        # yet, and a shared R2 bucket has no per-PR scope: a PR could poison
+        # objects main later links). check.yml runs on merge_group, so a
+        # pull_request-only denylist is not enough. Only push-to-main and
+        # workflow_dispatch runs may use shared backends; every other event
+        # uses sccache on local disk only. The GitHub-cache backend has the
+        # same quota shape: the lane's entries share the repo Actions cache
+        # with the warm `check` entry, so non-main runs must not grow it.
         lane = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
         select = next(step for step in lane.get("steps", [])
                       if str(step.get("name", "")).startswith("Select sccache backend"))
         run_text = str(select.get("run", ""))
-        self.assertIn("pull_request", run_text)
+        self.assertIn("workflow_dispatch", run_text)
         self.assertIn("github.event_name", str(select.get("env", "")))
         self.assertIn("local disk", run_text)
-        # The pull_request branch must come FIRST: reordering the R2 branch
-        # ahead of it (even with the guard kept as a later elif) would let
-        # shared-backend credentials reach PR runs as soon as any secret is
-        # set, while every substring above stays present. Nothing
+        # The allowlist branch must come FIRST: a denylist (`!=`) or a
+        # reordered R2 branch ahead of it would let shared-backend
+        # credentials reach merge_group runs as soon as any secret is set,
+        # while every substring above stays present. Nothing
         # credential-shaped may precede the guard.
         lines = run_text.splitlines()
         gate = next(i for i, line in enumerate(lines)
-                    if "NEXTEST_EVENT" in line and "pull_request" in line)
-        # Exact pin: an inverted (!=), dead (&& false), or reordered guard
-        # all keep the `if ` prefix, so pin the full first line.
+                    if "NEXTEST_EVENT" in line)
+        # Exact pin: a denylist, dead (&& false), or reordered guard all keep
+        # the `if ` prefix, so pin the full first line.
         self.assertEqual(
             lines[gate].strip(),
-            'if [ "$NEXTEST_EVENT" = "pull_request" ]; then',
-            f"pull_request guard must be the exact first branch, got: {lines[gate]!r}",
+            'if [ "$NEXTEST_EVENT" = "push" ] || [ "$NEXTEST_EVENT" = "workflow_dispatch" ]; then',
+            f"push/workflow_dispatch allowlist must be the exact first branch, got: {lines[gate]!r}",
         )
         before = "\n".join(lines[:gate])
         self.assertNotIn("GITHUB_ENV", before)
         self.assertNotIn("R2_", before)
         self.assertNotIn("SCCACHE_", before)
-        # The pull_request body must write nothing shared: an extra
-        # SCCACHE_/R2_/GITHUB_ENV write inside the PR branch keeps every
-        # substring above while leaking credentials on PR runs.
-        end = next(
-            i
-            for i in range(gate + 1, len(lines))
-            if lines[i].strip().startswith("elif ")
-            or lines[i].strip() == "else"
-            or lines[i].strip().startswith("fi")
-        )
-        pr_body = "\n".join(lines[gate + 1 : end])
-        self.assertNotIn("GITHUB_ENV", pr_body)
-        self.assertNotIn("R2_", pr_body)
-        self.assertNotIn("SCCACHE_", pr_body)
-        self.assertNotIn("AWS_", pr_body)
-        # The shared backends are still configured off-PR: this guards
+        indent = lines[gate][: len(lines[gate]) - len(lines[gate].lstrip())]
+
+        def outer_boundary(start, word):
+            return next(
+                i
+                for i in range(start, len(lines))
+                if lines[i].strip() == word
+                and lines[i][: len(lines[i]) - len(lines[i].lstrip())] == indent
+            )
+
+        outer_else = outer_boundary(gate + 1, "else")
+        outer_fi = outer_boundary(outer_else + 1, "fi")
+        # The local-disk body must write nothing shared: an extra
+        # SCCACHE_/R2_/GITHUB_ENV write inside it keeps every substring above
+        # while leaking credentials on PR and merge-queue runs.
+        disk_body = "\n".join(lines[outer_else + 1 : outer_fi])
+        self.assertIn("local disk", disk_body)
+        self.assertNotIn("GITHUB_ENV", disk_body)
+        self.assertNotIn("R2_", disk_body)
+        self.assertNotIn("SCCACHE_", disk_body)
+        self.assertNotIn("AWS_", disk_body)
+        # The shared backends are still configured on main: this guards
         # against gutting the step instead of guarding it.
-        self.assertIn("GITHUB_ENV", "\n".join(lines[end:]))
-        # Behavioral pin: run the extracted step under bash. On PRs the
-        # env file stays empty even with all R2 vars set; off-PR the R2
-        # lines appear. Catches inverted/dead guards and PR-branch writes
-        # that structural pins miss.
+        self.assertIn("GITHUB_ENV", "\n".join(lines[gate + 1 : outer_else]))
+        # Behavioral pin: run the extracted step under bash. On
+        # pull_request, merge_group, and other events the env file stays
+        # empty even with all R2 vars set; on push and workflow_dispatch
+        # the R2 lines appear. Catches inverted/dead guards and disk-branch
+        # writes that structural pins miss.
         import os
         import subprocess
         import tempfile
@@ -2273,48 +2286,52 @@ class WorkflowTests(unittest.TestCase):
             backend_env_path = tmp.name
         try:
             base = dict(os.environ)
-            pr_env = dict(base)
-            pr_env.update(
-                {
-                    "NEXTEST_EVENT": "pull_request",
-                    **r2_env,
-                    "GITHUB_ENV": backend_env_path,
-                }
-            )
-            Path(backend_env_path).write_text("", encoding="utf-8")
-            proc = subprocess.run(
-                ["bash", "-c", run_text],
-                env=pr_env,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            self.assertEqual(proc.returncode, 0, f"PR backend step failed: {proc.stderr}")
-            self.assertEqual(
-                Path(backend_env_path).read_text(encoding="utf-8"),
-                "",
-                "PR run must not write shared-backend credentials",
-            )
-            push_env = dict(base)
-            push_env.update(
-                {
-                    "NEXTEST_EVENT": "push",
-                    **r2_env,
-                    "GITHUB_ENV": backend_env_path,
-                }
-            )
-            Path(backend_env_path).write_text("", encoding="utf-8")
-            proc = subprocess.run(
-                ["bash", "-c", run_text],
-                env=push_env,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            self.assertEqual(proc.returncode, 0, f"push backend step failed: {proc.stderr}")
-            written = Path(backend_env_path).read_text(encoding="utf-8")
-            self.assertIn("SCCACHE_BUCKET=test-bucket", written)
-            self.assertIn("AWS_ACCESS_KEY_ID=test-key", written)
+            for event in ("pull_request", "merge_group", "schedule"):
+                with self.subTest(event=event):
+                    run_env = dict(base)
+                    run_env.update(
+                        {
+                            "NEXTEST_EVENT": event,
+                            **r2_env,
+                            "GITHUB_ENV": backend_env_path,
+                        }
+                    )
+                    Path(backend_env_path).write_text("", encoding="utf-8")
+                    proc = subprocess.run(
+                        ["bash", "-c", run_text],
+                        env=run_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(proc.returncode, 0, f"{event} backend step failed: {proc.stderr}")
+                    self.assertEqual(
+                        Path(backend_env_path).read_text(encoding="utf-8"),
+                        "",
+                        f"{event} run must not write shared-backend credentials",
+                    )
+            for event in ("push", "workflow_dispatch"):
+                with self.subTest(event=event):
+                    run_env = dict(base)
+                    run_env.update(
+                        {
+                            "NEXTEST_EVENT": event,
+                            **r2_env,
+                            "GITHUB_ENV": backend_env_path,
+                        }
+                    )
+                    Path(backend_env_path).write_text("", encoding="utf-8")
+                    proc = subprocess.run(
+                        ["bash", "-c", run_text],
+                        env=run_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(proc.returncode, 0, f"{event} backend step failed: {proc.stderr}")
+                    written = Path(backend_env_path).read_text(encoding="utf-8")
+                    self.assertIn("SCCACHE_BUCKET=test-bucket", written)
+                    self.assertIn("AWS_ACCESS_KEY_ID=test-key", written)
         finally:
             try:
                 os.unlink(backend_env_path)
@@ -2323,26 +2340,142 @@ class WorkflowTests(unittest.TestCase):
         raw = (ROOT / ".github/workflows/reusable-rust-nextest.yml").read_text(encoding="utf-8")
         self.assertNotIn("adds no cache footprint", raw)
 
-    def test_ci_speed_withholds_r2_secrets_on_pull_request(self):
-        # Even with the callee-side guard, the caller must not forward R2
-        # write secrets on pull_request events. The gate must read
-        # `!= 'pull_request' && secrets.X || ''`: the seemingly equivalent
-        # `== 'pull_request' && '' || secrets.X` forwards the secret anyway,
-        # because '' is falsy in GitHub expressions.
-        job = self.workflows["ci-speed.yml"]["jobs"]["nextest"]
+    def test_required_nextest_withholds_r2_secrets_on_pull_request(self):
+        # Even with the callee-side guard, the caller must forward R2 write
+        # secrets only on push to main and workflow_dispatch. check.yml runs
+        # on merge_group too, so a `!= 'pull_request'` gate would forward the
+        # secrets to queued code that is not on `main` yet. The gate must
+        # read `(== 'push' || == 'workflow_dispatch') && secrets.X || ''`:
+        # the seemingly equivalent `== 'pull_request' && '' || secrets.X`
+        # forwards the secret anyway, because '' is falsy in GitHub
+        # expressions.
+        job = self.workflows["check.yml"]["jobs"]["nextest"]
         r2_keys = ("SCCACHE_BUCKET", "SCCACHE_ENDPOINT", "SCCACHE_REGION",
                    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
         for key in r2_keys:
             with self.subTest(secret=key):
-                # Exact pin: only `!= 'pull_request' && secrets.X || ''`
-                # withholds the secret on pull_request. Flipping && to ||
-                # (or leading with `== 'pull_request' && ''`) forwards it
+                # Exact pin: the allowlist form withholds the secret on
+                # pull_request AND merge_group. A `!= 'pull_request'` form or
+                # a leading `== ... && ''` form forwards it on some event
                 # while keeping every substring present, so substrings
                 # cannot pin this gate.
                 self.assertEqual(
                     str(job["secrets"][key]),
-                    "${{ github.event_name != 'pull_request' && secrets." + key + " || '' }}",
+                    "${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets." + key + " || '' }}",
                 )
+
+    def test_required_nextest_caller_shape_is_pinned(self):
+        # The promoted lane is a required check.yml job: least-privilege
+        # grant, rust-selector gate like the other Rust test lanes, exact
+        # head SHA into the reusable lane, and R2 secrets only off-PR
+        # (pinned by the withholding test above).
+        job = self.workflows["check.yml"]["jobs"]["nextest"]
+        self.assertEqual(job.get("name"), "rust nextest")
+        self.assertEqual(job.get("permissions"), {"contents": "read"})
+        self.assertIn("job-inputs", job.get("needs", []))
+        self.assertIn("needs.job-inputs.outputs.rust != 'false'", job.get("if", ""))
+        self.assertEqual(job.get("uses"), "./.github/workflows/reusable-rust-nextest.yml")
+        self.assertEqual(job["with"]["ref"], "${{ github.event.pull_request.head.sha || github.sha }}")
+        self.assertNotIn("runs-on", job)
+        agg = self.workflows["check.yml"]["jobs"]["ci-ok"]
+        self.assertIn("nextest", agg["needs"])
+        self.assertIn("NEXTEST_RESULT", "\n".join(step.get("run", "") for step in agg["steps"]))
+
+    def test_required_nextest_timeout_ceiling_is_pinned(self):
+        # Gate ceiling: the required lane must keep its 45-minute ceiling.
+        # Raising it hides a wedged runner; the pin forces a reviewed change.
+        job = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
+        # BaseLoader keeps scalars as strings; "45" is the 45-minute ceiling.
+        self.assertEqual(job.get("timeout-minutes"), "45")
+
+    def test_required_nextest_quarantine_ejects_without_revert(self):
+        # Red-group ejection path: the `quarantine` input must exist with an
+        # empty default, and the nextest step must turn each filter into a
+        # `--skip` so the rest of the suite still gates. Pinned
+        # cargo-nextest 0.9.99 only accepts `--skip` AFTER the `--`
+        # separator, so the pin asserts the exact argv order: a `--skip`
+        # before `--` fails the whole lane with a usage error.
+        workflow = self.workflows["reusable-rust-nextest.yml"]
+        quarantine = workflow["on"]["workflow_call"]["inputs"]["quarantine"]
+        self.assertEqual(quarantine.get("default"), "")
+        job = workflow["jobs"]["nextest"]
+        run_nextest = next(step for step in job.get("steps", [])
+                           if str(step.get("name", "")).startswith("cargo nextest"))
+        self.assertEqual(run_nextest["env"]["QUARANTINE"], "${{ inputs.quarantine }}")
+        run_text = str(run_nextest.get("run", ""))
+        self.assertIn("--skip", run_text)
+        self.assertIn("$QUARANTINE", run_text)
+        self.assertIn('-- "${skip_args[@]}"', run_text)
+        self.assertNotIn("--profile ci $skip_args", run_text)
+        # Behavioral pin: substrings alone cannot pin branch selection (an
+        # inverted empty/non-empty guard, or a flag dropped from one branch,
+        # keeps every substring above while silently disabling ejection).
+        # Run the extracted step under bash with a function-shimmed fake
+        # `cargo` that records its argv and emits the JUnit file the rest of
+        # the step copies, then pin the exact argv for both quarantine
+        # states. (A function shim, not a PATH shim, so the pin also runs
+        # in harnesses that sanitize PATH on exec.)
+        import os
+        import subprocess
+        import tempfile
+
+        base_argv = [
+            "nextest", "run", "--workspace", "--lib", "--bins",
+            "--features", "two-bot-core/db", "--locked", "--profile", "ci",
+        ]
+        cases = (
+            ("empty-quarantine", "", base_argv, 0, 0),
+            (
+                "two-quarantine-filters",
+                "red_group other_red",
+                base_argv + ["--", "--skip", "red_group", "--skip", "other_red"],
+                0,
+                0,
+            ),
+            # A real nextest failure must remain the step result after the
+            # JUnit report is copied for the always-run ledger/upload steps.
+            ("nextest-failure", "", base_argv, 37, 37),
+        )
+        fake_cargo = (
+            "cargo() {\n"
+            "  printf '%s\\n' \"$@\" > \"$FAKE_CARGO_ARGV\"\n"
+            "  mkdir -p target/nextest/ci\n"
+            "  printf '<testsuites/>\\n' > target/nextest/ci/junit.xml\n"
+            "  return \"${FAKE_CARGO_STATUS:-0}\"\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            argv_path = tmp_path / "cargo-argv.txt"
+            for case_name, quarantine_value, expected_argv, cargo_status, expected_status in cases:
+                with self.subTest(case=case_name):
+                    work_dir = tmp_path / ("work-" + case_name)
+                    work_dir.mkdir()
+                    run_env = dict(os.environ)
+                    run_env.update(
+                        {
+                            "QUARANTINE": quarantine_value,
+                            "FAKE_CARGO_ARGV": str(argv_path),
+                            "FAKE_CARGO_STATUS": str(cargo_status),
+                        }
+                    )
+                    proc = subprocess.run(
+                        ["bash", "-eo", "pipefail", "-c", fake_cargo + run_text],
+                        cwd=work_dir,
+                        env=run_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(
+                        proc.returncode, expected_status,
+                        f"unexpected step status for {case_name}: {proc.stderr}",
+                    )
+                    recorded = argv_path.read_text(encoding="utf-8").splitlines()
+                    self.assertEqual(recorded, expected_argv)
+                    report = work_dir / "junit.xml"
+                    self.assertTrue(report.is_file(), f"nextest report was not copied for {case_name}")
+                    self.assertEqual(report.read_text(encoding="utf-8"), "<testsuites/>\n")
 
     def test_ci_speed_rollout_documents_pr_local_cache(self):
         rollout = (ROOT / "docs/ci-speed-rollout.md").read_text(encoding="utf-8")

@@ -1,9 +1,10 @@
 name: ci-speed
 
-# Advisory CI speed pilot (SDLC 2.3): paths-filter affected-only selection,
-# the shared nextest lane, and the minutes-per-merged-PR report. Never a
-# required check and never part of ci-ok: a red pilot run is a signal, not a
-# merge gate. No `paths:` filter on the trigger: that would skip the whole
+# CI speed evidence (SDLC 2.3): paths-filter affected-only selection and the
+# minutes-per-merged-PR report. The shared nextest lane graduated to required
+# (check.yml `nextest` job, aggregated by `ci-ok`); this workflow keeps the
+# per-run comparison skeleton. Never a required check and never part of
+# ci-ok. No `paths:` filter on the trigger: that would skip the whole
 # workflow including the report job.
 
 on:
@@ -86,38 +87,13 @@ jobs:
           printf 'paths-filter: rust=%s worker=%s docs=%s ci=%s\n' \
             "$SEL_RUST" "$SEL_WORKER" "$SEL_DOCS" "$SEL_CI"
 
-  nextest:
-    name: rust nextest (advisory)
-    permissions:
-      contents: read
-    needs: [changes]
-    # Affected-only: Rust-untouched PRs skip the lane instead of burning a
-    # compile. The required matrix is unaffected; this is pilot signal only.
-    if: needs.changes.outputs.rust == 'true'
-    uses: ./.github/workflows/reusable-rust-nextest.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
-    with:
-      ref: ${{ github.event.pull_request.head.sha || github.sha }}
-    # R2 write credentials stay off pull_request events: the lane compiles
-    # and executes code at the PR head, and the reusable lane independently
-    # refuses shared backends on PRs (defense in depth; see its backend
-    # step). Empty on PRs, so the lane falls back to local-disk sccache.
-    # NOTE: the gate must read `!= 'pull_request' && secrets.X || ''`. The
-    # seemingly equivalent `== 'pull_request' && '' || secrets.X` forwards
-    # the secret anyway, because '' is falsy in GitHub expressions.
-    secrets:
-      SCCACHE_BUCKET: ${{ github.event_name != 'pull_request' && secrets.SCCACHE_BUCKET || '' }}
-      SCCACHE_ENDPOINT: ${{ github.event_name != 'pull_request' && secrets.SCCACHE_ENDPOINT || '' }}
-      SCCACHE_REGION: ${{ github.event_name != 'pull_request' && secrets.SCCACHE_REGION || '' }}
-      AWS_ACCESS_KEY_ID: ${{ github.event_name != 'pull_request' && secrets.AWS_ACCESS_KEY_ID || '' }}
-      AWS_SECRET_ACCESS_KEY: ${{ github.event_name != 'pull_request' && secrets.AWS_SECRET_ACCESS_KEY || '' }}
-
   report:
     name: ci minutes report
     permissions:
       contents: read
-    needs: [changes, nextest]
-    # Always runs: the minutes skeleton is evidence even when the lane
-    # skipped (Rust-untouched) or failed.
+    needs: [changes]
+    # Always runs: the minutes skeleton is evidence even on Rust-untouched
+    # PRs. The required nextest lane now reports through check.yml.
     if: always()
     # Runner routing: see the note on `changes`.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'report') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
