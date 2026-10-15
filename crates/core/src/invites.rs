@@ -171,9 +171,17 @@ pub fn summarize_attribution_split(rows: &[(&str, u64)]) -> AttributionSplit {
 /// when `inviter_id` is `Some`), so `vanity`/`unknown`/`ambiguous` rows and
 /// non-join rows contribute nothing. An unparseable inviter id is ignored,
 /// never attributed.
+///
+/// Raw evidence, not credit decisions: each member counts at most once
+/// (first credited join wins, mirroring `referral_rewards` `DuplicateJoin`),
+/// and self-referrals (`member_id == inviter`) are skipped (mirroring
+/// `SelfReferral`). Consumers that award credit must evaluate through
+/// `referral_rewards::evaluate_referrals`; this seam never applies tenure or
+/// engagement rules.
 #[must_use]
 pub fn referral_counts(events: &[FunnelEvent]) -> HashMap<Snowflake, u64> {
     let mut out: HashMap<Snowflake, u64> = HashMap::new();
+    let mut seen_members: HashSet<Snowflake> = HashSet::new();
     for event in events {
         if event.event_type != EventType::MemberJoin {
             continue;
@@ -192,6 +200,15 @@ pub fn referral_counts(events: &[FunnelEvent]) -> HashMap<Snowflake, u64> {
         else {
             continue;
         };
+        let Some(member) = event.member_id else {
+            continue;
+        };
+        if member == inviter {
+            continue;
+        }
+        if !seen_members.insert(member) {
+            continue;
+        }
         *out.entry(inviter).or_default() += 1;
     }
     out
@@ -715,5 +732,35 @@ mod tests {
         ];
         let c = count_downtime_unknown_joins(&w, &joins);
         assert_eq!(c[0].downtime_unknown, 1);
+    }
+
+    #[test]
+    fn referral_counts_dedupes_rejoins_and_skips_self_referrals() {
+        fn credited_join(member_id: u64, inviter_id: u64) -> FunnelEvent {
+            FunnelEvent {
+                guild_id: 1,
+                member_id: Some(member_id),
+                event_type: EventType::MemberJoin,
+                occurred_at: "2026-09-20T12:00:00.000Z".to_owned(),
+                source: "invite:a".to_owned(),
+                metadata: Some(serde_json::json!({ "inviterId": inviter_id.to_string() })),
+                dedupe_token: None,
+            }
+        }
+        // Review probe: three joins by member 5 plus a self-join by inviter 7
+        // must not read back as `{7: 4}`.
+        let events = vec![
+            credited_join(5, 7),
+            credited_join(5, 7),
+            credited_join(5, 7),
+            credited_join(7, 7),
+        ];
+        let counts = referral_counts(&events);
+        assert_eq!(
+            counts.get(&7),
+            Some(&1),
+            "first credited join wins; rejoins and self-referrals add nothing"
+        );
+        assert_eq!(counts.len(), 1);
     }
 }
