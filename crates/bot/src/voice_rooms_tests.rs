@@ -1498,6 +1498,12 @@ async fn refused_creator_joins_log_channel_and_creator_map_state() {
         ..ticket
     };
     assert!(!worker.accept_join(unknown, "new room", 9, NOW.to_owned()));
+    // A stale ticket on a gateway that has not re-readied: flip ready on the
+    // same worker and re-offer the queued ticket. The stale_ticket check runs
+    // before the duplicate check, so the reason is stale_ticket with
+    // ready=false, proving the field varies instead of being a constant.
+    worker.live.write_state().ready = false;
+    assert!(!worker.accept_join(ticket, "new room", 10, NOW.to_owned()));
     // A halted worker refuses joins until restart: seed a credential refusal
     // so the first dispatch halts it, then join again and check the halted
     // line carries the same channel and map-state fields.
@@ -1530,7 +1536,7 @@ async fn refused_creator_joins_log_channel_and_creator_map_state() {
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .filter(|event| event["fields"]["message"] == "voice creator join refused before queueing")
         .collect();
-    assert_eq!(refusals.len(), 4, "{text}");
+    assert_eq!(refusals.len(), 5, "{text}");
     let fields = &refusals[0]["fields"];
     assert_eq!(fields["voice_event"], "voice_join_received");
     assert_eq!(fields["reason"], "duplicate");
@@ -1549,7 +1555,19 @@ async fn refused_creator_joins_log_channel_and_creator_map_state() {
     assert_eq!(fields["live_generation"], ticket.generation);
     assert_eq!(fields["known"], false);
     assert_eq!(fields["creators_len"], 1);
+    assert_eq!(fields["halted"], false);
+    assert_eq!(fields["ready"], true);
     let fields = &refusals[2]["fields"];
+    assert_eq!(fields["voice_event"], "voice_join_received");
+    assert_eq!(fields["reason"], "stale_ticket");
+    assert_eq!(fields["channel"], CREATOR.to_string());
+    assert_eq!(fields["ticket_generation"], ticket.generation);
+    assert_eq!(fields["live_generation"], ticket.generation);
+    assert_eq!(fields["known"], true);
+    assert_eq!(fields["creators_len"], 1);
+    assert_eq!(fields["halted"], false);
+    assert_eq!(fields["ready"], false);
+    let fields = &refusals[3]["fields"];
     assert_eq!(fields["voice_event"], "voice_join_received");
     assert_eq!(fields["reason"], "halted");
     assert_eq!(fields["channel"], CREATOR.to_string());
@@ -1559,7 +1577,7 @@ async fn refused_creator_joins_log_channel_and_creator_map_state() {
     assert_eq!(fields["creators_len"], 1);
     assert_eq!(fields["halted"], true);
     assert_eq!(fields["ready"], true);
-    let fields = &refusals[3]["fields"];
+    let fields = &refusals[4]["fields"];
     assert_eq!(fields["voice_event"], "voice_join_received");
     assert_eq!(fields["reason"], "name_blocked");
     assert_eq!(fields["channel"], CREATOR.to_string());
