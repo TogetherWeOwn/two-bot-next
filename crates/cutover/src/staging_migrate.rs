@@ -1,7 +1,12 @@
 //! SQLx migration runner with an explicit staging/production target.
 //!
-//! Applies this crate's embedded migrations through the same SQLx migrator the
-//! gateway used before it went DML-only, with ledger `public._sqlx_migrations`.
+//! Applies two independent chains, each with its own ledger: this crate's
+//! embedded migrations (ledger `public._sqlx_migrations`) and the store
+//! migrations from [`two_bot_store`] (ledger `public._two_bot_migrations`,
+//! the chain the DML-only gateway needs at boot but nothing applied). Each
+//! chain is planned, applied and verified separately with its own pending
+//! list and plan-binding hash, so a drifted store ledger refuses exactly
+//! like a drifted cutover ledger.
 //! Every pooled connection runs `SET ROLE` in `after_connect` and verifies
 //! `current_user`: plan connections assume the read-only [`READ_ONLY_ROLE`]
 //! group (physically incapable of DDL), while apply connections assume the
@@ -27,7 +32,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256, Sha384};
 use sqlx::{
     migrate::Migrator,
-    postgres::{PgConnectOptions, PgConnection, PgPoolOptions},
+    postgres::{PgConnectOptions, PgConnection, PgPoolOptions, PgRow},
     Executor, PgPool, Row,
 };
 use two_bot_core::database_tls::{self, TlsPolicy};
@@ -82,6 +87,50 @@ const AUDIT_MEMBERSHIP_SQL: &str = "SELECT e.login, (r.oid IS NOT NULL) AS login
      GROUP BY e.login, r.oid ORDER BY e.login";
 
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+
+/// Which migration chain a ledger operation targets. Each chain has its own
+/// embedded source and its own bookkeeping table; the two never share rows,
+/// so a same-version number in the other chain can never trip a mismatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chain {
+    Cutover,
+    Store,
+}
+
+impl Chain {
+    /// Bookkeeping table for this chain. The store table name is the store
+    /// crate's own constant, so the runner can never drift from the runtime.
+    pub fn table(self) -> &'static str {
+        match self {
+            Self::Cutover => "_sqlx_migrations",
+            Self::Store => two_bot_store::TABLE_NAME,
+        }
+    }
+
+    /// Embedded migrations for this chain. The store set is cloned out of the
+    /// store crate (the single source of truth) and pointed at its own
+    /// ledger; the bot-range guard mirrors `two_bot_store::migrate` so an
+    /// out-of-range store version refuses here too, before any DDL.
+    pub fn migrator(self) -> Result<Migrator, String> {
+        match self {
+            Self::Cutover => Ok(Migrator::with_migrations(
+                MIGRATOR.iter().cloned().collect(),
+            )),
+            Self::Store => {
+                if two_bot_store::MIGRATOR
+                    .iter()
+                    .any(|m| !(1..=999).contains(&m.version))
+                {
+                    return Err("store migrations must use versions 0001-0999".to_owned());
+                }
+                let mut migrator =
+                    Migrator::with_migrations(two_bot_store::MIGRATOR.iter().cloned().collect());
+                migrator.dangerous_set_table_name(two_bot_store::TABLE_NAME);
+                Ok(migrator)
+            }
+        }
+    }
+}
 
 /// Explicit migration target. The CLI requires `--target staging|production`;
 /// there is no default. Staging keeps its bindings and production-substring
@@ -160,10 +209,18 @@ pub struct Request {
     /// Raw `expected_pending` workflow input (ascending, comma-separated
     /// versions). Required for apply; ignored for plan.
     pub expected_pending: Option<String>,
+    /// Raw `expected_store_pending` workflow input for the store chain
+    /// (own ledger, own pending list). Required for apply; ignored for plan.
+    pub expected_store_pending: Option<String>,
     /// Plan-bound apply identity: the SHA-256 of the plan job's uploaded
     /// `staging-migrate-manifest.json` and the run that produced it. Both are
     /// required for apply; both are ignored for plan.
     pub plan_manifest_sha256: Option<String>,
+    /// The store chain's own binding hash, computed over the same source SHA
+    /// plus the store pending list and store migration table. Required for
+    /// apply; ignored for plan. The cutover hash above is unchanged, so
+    /// existing claim-script projections keep matching byte-for-byte.
+    pub store_plan_manifest_sha256: Option<String>,
     pub plan_run_id: Option<String>,
     /// Provenance anchor (TOG-15157): path to the producing plan run's
     /// downloaded `staging-migrate-manifest.json` (the workflow fetches it
@@ -320,6 +377,33 @@ pub fn check_plan_binding(
     Ok(computed)
 }
 
+/// Store chain plan binding, checked before any DDL.
+///
+/// Mirrors [`check_plan_binding`] over the store pending list and store
+/// migration table, bound to `store_plan_manifest_sha256`. The cutover hash
+/// is untouched, so existing claim-script projections keep matching.
+pub fn check_store_binding(
+    req: &Request,
+    pending: &[i64],
+    migrator: &Migrator,
+) -> Result<String, RunError> {
+    let computed = manifest_hash(&req.source_sha, pending, migrator);
+    if req.apply {
+        let want = req
+            .store_plan_manifest_sha256
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if computed != want {
+            return refuse(
+                "store_plan_manifest_sha256 does not match the computed store plan manifest",
+            );
+        }
+    }
+    Ok(computed)
+}
+
 /// Provenance of the bound hash, checked after manifest computation but
 /// before any DDL (TOG-15157 gap 2).
 ///
@@ -334,7 +418,27 @@ pub fn check_plan_binding(
 /// refuse: verification that is impossible is verification that failed.
 /// For plan the check is a no-op (plan produces the manifest; it binds
 /// nothing).
-pub fn check_plan_provenance(req: &Request, computed_hash: &str) -> Result<(), RunError> {
+fn produced_hash(artifact: &Value, run_id: &str, field: &str) -> Result<String, RunError> {
+    let produced = artifact
+        .get(field)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if produced.is_empty() {
+        return refuse(format!(
+            "the manifest fetched from producing plan_run_id {run_id} carries no \
+             {field}; the bound hash is unproven, refusing"
+        ));
+    }
+    Ok(produced)
+}
+
+pub fn check_plan_provenance(
+    req: &Request,
+    computed_hash: &str,
+    computed_store_hash: &str,
+) -> Result<(), RunError> {
     if !req.apply {
         return Ok(());
     }
@@ -358,22 +462,21 @@ pub fn check_plan_provenance(req: &Request, computed_hash: &str) -> Result<(), R
              JSON; plan_manifest_sha256 provenance is unprovable, refusing"
         ))
     })?;
-    let produced = artifact
-        .get("plan_manifest_sha256")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    if produced.is_empty() {
-        return refuse(format!(
-            "the manifest fetched from producing plan_run_id {run_id} carries no \
-             plan_manifest_sha256; the bound hash is unproven, refusing"
-        ));
-    }
+    let produced = produced_hash(&artifact, run_id, "plan_manifest_sha256")?;
     if produced != computed_hash.trim().to_ascii_lowercase() {
         return refuse(format!(
             "the manifest fetched from producing plan_run_id {run_id} does not match \
              plan_manifest_sha256; apply is not bound to that plan run, refusing"
+        ));
+    }
+    // The store chain binds through the same producing manifest: its embedded
+    // store hash must equal the recomputed store projection, or the apply is
+    // not bound to that plan run's store chain.
+    let produced_store = produced_hash(&artifact, run_id, "store_plan_manifest_sha256")?;
+    if produced_store != computed_store_hash.trim().to_ascii_lowercase() {
+        return refuse(format!(
+            "the manifest fetched from producing plan_run_id {run_id} does not match \
+             store_plan_manifest_sha256; apply is not bound to that plan run, refusing"
         ));
     }
     Ok(())
@@ -469,6 +572,15 @@ pub fn validate_request(req: &Request) -> Result<(), RunError> {
         }
         None => {}
     }
+    match &req.expected_store_pending {
+        Some(raw) => {
+            parse_expected_pending(raw).map_err(RunError::Refused)?;
+        }
+        None if req.apply => {
+            return refuse("apply requires expected_store_pending from the reviewed plan");
+        }
+        None => {}
+    }
     // Plan-bound apply identity: apply runs only the exact manifest the
     // reviewed plan produced. Both the hash and the producing run id are
     // required for apply; the hash check itself happens in `run_on_pool`,
@@ -491,6 +603,20 @@ pub fn validate_request(req: &Request) -> Result<(), RunError> {
             );
         }
         _ => {}
+    }
+    // The store chain binds separately: its hash covers the same source SHA
+    // plus the store pending list and store migration table.
+    match &req.store_plan_manifest_sha256 {
+        Some(hash) => {
+            let hash = hash.trim().to_ascii_lowercase();
+            if hash.len() != 64 || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                return refuse("store_plan_manifest_sha256 must be a 64-char lowercase hex digest");
+            }
+        }
+        None if req.apply => {
+            return refuse("apply requires store_plan_manifest_sha256 from the reviewed plan");
+        }
+        None => {}
     }
     // Provenance anchor: apply must also name the producing run's downloaded
     // manifest so `run_on_pool` can prove the bound hash came from that run.
@@ -729,6 +855,17 @@ async fn refuse_migrator_member_plan_login(conn: &mut PgConnection) -> Result<()
     Ok(())
 }
 
+fn ledger_rows(rows: &[PgRow]) -> Vec<LedgerRow> {
+    rows.iter()
+        .map(|r| LedgerRow {
+            version: r.get("version"),
+            description: r.get("description"),
+            success: r.get("success"),
+            checksum_hex: r.get("checksum"),
+        })
+        .collect()
+}
+
 async fn read_ledger(conn: &mut PgConnection) -> Result<Vec<LedgerRow>, sqlx::Error> {
     let exists: bool =
         sqlx::query_scalar("SELECT to_regclass('public._sqlx_migrations') IS NOT NULL")
@@ -743,15 +880,52 @@ async fn read_ledger(conn: &mut PgConnection) -> Result<Vec<LedgerRow>, sqlx::Er
     )
     .fetch_all(&mut *conn)
     .await?;
-    Ok(rows
-        .iter()
-        .map(|r| LedgerRow {
-            version: r.get("version"),
-            description: r.get("description"),
-            success: r.get("success"),
-            checksum_hex: r.get("checksum"),
-        })
-        .collect())
+    Ok(ledger_rows(&rows))
+}
+
+/// Read the store chain's own ledger. Mirrors [`read_ledger`] with the store
+/// table literal; the two queries stay separate fixed strings so no table
+/// name is ever interpolated from input.
+async fn read_store_ledger(conn: &mut PgConnection) -> Result<Vec<LedgerRow>, sqlx::Error> {
+    let exists: bool =
+        sqlx::query_scalar("SELECT to_regclass('public._two_bot_migrations') IS NOT NULL")
+            .fetch_one(&mut *conn)
+            .await?;
+    if !exists {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        "SELECT version, description, success, encode(checksum, 'hex') AS checksum \
+         FROM public._two_bot_migrations ORDER BY version",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(ledger_rows(&rows))
+}
+
+/// `Err` with the terminal failure kind when no attempt could read, so the
+/// caller records [`LEDGER_UNKNOWN`] instead of an empty ledger. Reads one
+/// chain's ledger; the chain selects which fixed query runs.
+async fn read_ledger_after_run(
+    pool: &PgPool,
+    chain: Chain,
+) -> Result<Vec<LedgerRow>, ReadAfterApply> {
+    retry_transient(
+        move || async move {
+            let mut conn = pool
+                .acquire()
+                .await
+                .map_err(|_| ReadAfterApply::PoolAcquireFailed)?;
+            match chain {
+                Chain::Cutover => read_ledger(&mut conn).await,
+                Chain::Store => read_store_ledger(&mut conn).await,
+            }
+            .map_err(|_| ReadAfterApply::LedgerQueryFailed)
+        },
+        POST_APPLY_READ_ATTEMPTS,
+        Duration::from_secs(POST_APPLY_READ_RETRY_DELAY_SECS),
+    )
+    .await
 }
 
 fn ledger_json(rows: &[LedgerRow]) -> Value {
@@ -821,25 +995,6 @@ where
     unreachable!("attempts is at least 1");
 }
 
-/// `Err` with the terminal failure kind when no attempt could read, so the
-/// caller records [`LEDGER_UNKNOWN`] instead of an empty ledger.
-async fn read_ledger_after_run(pool: &PgPool) -> Result<Vec<LedgerRow>, ReadAfterApply> {
-    retry_transient(
-        move || async move {
-            let mut conn = pool
-                .acquire()
-                .await
-                .map_err(|_| ReadAfterApply::PoolAcquireFailed)?;
-            read_ledger(&mut conn)
-                .await
-                .map_err(|_| ReadAfterApply::LedgerQueryFailed)
-        },
-        POST_APPLY_READ_ATTEMPTS,
-        Duration::from_secs(POST_APPLY_READ_RETRY_DELAY_SECS),
-    )
-    .await
-}
-
 fn ledger_or_unknown(rows: Option<&[LedgerRow]>) -> Value {
     rows.map_or_else(|| json!(LEDGER_UNKNOWN), ledger_json)
 }
@@ -902,6 +1057,27 @@ async fn audit_queries(pool: &PgPool) -> Result<Value, &'static str> {
     } else {
         json!({"successful_rows": 0, "max_version": Value::Null, "failed_rows": 0})
     };
+    // The store chain's own ledger, same readout: a missing table reports
+    // null/zero so a pre-bootstrap plan still prints.
+    let store_owner: Option<String> = sqlx::query_scalar(
+        "SELECT r.rolname::text FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner \
+         WHERE c.relnamespace = 'public'::regnamespace AND c.relname = '_two_bot_migrations'",
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| "audit store ledger owner read failed")?;
+    let store_counts = if store_owner.is_some() {
+        let row: (i64, Option<i64>, i64) = sqlx::query_as(
+            "SELECT count(*) FILTER (WHERE success), max(version) FILTER (WHERE success), \
+             count(*) FILTER (WHERE NOT success) FROM public._two_bot_migrations",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| "audit store ledger counts read failed")?;
+        json!({"successful_rows": row.0, "max_version": row.1, "failed_rows": row.2})
+    } else {
+        json!({"successful_rows": 0, "max_version": Value::Null, "failed_rows": 0})
+    };
     let memberships: Vec<(String, bool, Vec<String>, bool, bool)> =
         sqlx::query_as(AUDIT_MEMBERSHIP_SQL)
             .fetch_all(&mut *tx)
@@ -949,6 +1125,8 @@ async fn audit_queries(pool: &PgPool) -> Result<Value, &'static str> {
     Ok(json!({
         "ledger_owner": owner,
         "ledger_counts": counts,
+        "store_ledger_owner": store_owner,
+        "store_ledger_counts": store_counts,
         "memberships": membership_entries,
         "verify_findings": findings,
         "matrix_sha256": hex::encode(Sha256::digest(AUDIT_MATRIX.as_bytes())),
@@ -1072,28 +1250,114 @@ pub async fn run(req: &Request) -> Result<Value, RunError> {
     result
 }
 
+/// Apply one chain's pending migrations and verify its ledger. Runs only
+/// when `pending` is non-empty; returns the post-apply ledger and the
+/// applied count. Every failure carries that chain's ledger evidence under
+/// that chain's keys, so cutover and store evidence never mix.
+async fn apply_chain(
+    pool: &PgPool,
+    chain: Chain,
+    migrator: &Migrator,
+    before: &[LedgerRow],
+) -> Result<(Vec<LedgerRow>, usize), RunError> {
+    let failed = |m: &str| RunError::Failed(m.to_owned(), Value::Null);
+    // Evidence key per chain; the owner queries below stay separate fixed
+    // literals (one per chain) so no table name is interpolated from input.
+    let ledger_key = match chain {
+        Chain::Cutover => "ledger_after",
+        Chain::Store => "store_ledger_after",
+    };
+    let outcome = migrator.run(pool).await;
+    let read_back = read_ledger_after_run(pool, chain).await;
+    if let Err(e) = outcome {
+        let mut evidence = serde_json::Map::with_capacity(2);
+        evidence.insert("error".to_owned(), json!(e.to_string()));
+        evidence.insert(
+            format!("{ledger_key}_failure"),
+            ledger_or_unknown(read_back.as_ref().ok().map(Vec::as_slice)),
+        );
+        return Err(RunError::Failed(
+            "migration execution failed".to_owned(),
+            Value::Object(evidence),
+        ));
+    }
+    let rows = match read_back {
+        Ok(rows) => rows,
+        Err(kind) => {
+            let mut evidence = serde_json::Map::with_capacity(2);
+            evidence.insert(ledger_key.to_owned(), json!(LEDGER_UNKNOWN));
+            evidence.insert(format!("{ledger_key}_error"), json!(kind.as_str()));
+            return Err(RunError::Failed(
+                "ledger unreadable after apply".to_owned(),
+                Value::Object(evidence),
+            ));
+        }
+    };
+    let applied = rows.len().saturating_sub(before.len());
+    let mut leftover_evidence = serde_json::Map::with_capacity(1);
+    leftover_evidence.insert(ledger_key.to_owned(), ledger_json(&rows));
+    let leftover = reconcile(&rows, migrator)
+        .map_err(|m| RunError::Failed(m, Value::Object(leftover_evidence.clone())))?;
+    if !leftover.is_empty() {
+        return Err(RunError::Failed(
+            "ledger incomplete after apply".to_owned(),
+            Value::Object(leftover_evidence),
+        ));
+    }
+    let owner: String = match chain {
+        Chain::Cutover => {
+            sqlx::query_scalar(
+                "SELECT pg_get_userbyid(relowner)::text FROM pg_class \
+                 WHERE oid = to_regclass('public._sqlx_migrations')",
+            )
+            .fetch_one(pool)
+            .await
+        }
+        Chain::Store => {
+            sqlx::query_scalar(
+                "SELECT pg_get_userbyid(relowner)::text FROM pg_class \
+                 WHERE oid = to_regclass('public._two_bot_migrations')",
+            )
+            .fetch_one(pool)
+            .await
+        }
+    }
+    .map_err(|_| failed("ledger owner check failed"))?;
+    if owner != MIGRATOR_ROLE {
+        return Err(failed("ledger is not owned by two_bot_migrator"));
+    }
+    Ok((rows, applied))
+}
+
 async fn run_on_pool(
     req: &Request,
     pool: &PgPool,
     verified: &AtomicUsize,
 ) -> Result<Value, RunError> {
     let failed = |m: &str| RunError::Failed(m.to_owned(), Value::Null);
+    let cutover = Chain::Cutover.migrator().map_err(RunError::Refused)?;
+    let store = Chain::Store.migrator().map_err(RunError::Refused)?;
     let mut conn = pool
         .acquire()
         .await
         .map_err(|_| failed("pool acquire failed"))?;
     // "RO only" is enforced, not just documented: a plan login that also holds
-    // the migrator group is refused before the ledger is read.
+    // the migrator group is refused before either ledger is read.
     if !req.apply {
         refuse_migrator_member_plan_login(&mut conn).await?;
     }
     let before = read_ledger(&mut conn)
         .await
         .map_err(|_| failed("ledger read failed"))?;
+    let store_before = read_store_ledger(&mut conn)
+        .await
+        .map_err(|_| failed("store ledger read failed"))?;
     drop(conn);
-    let pending = reconcile(&before, &MIGRATOR).map_err(RunError::Refused)?;
-    // Plan binding: apply runs only the exact pending list the reviewed plan
-    // showed. Validated in `validate_request`; compared here, before any DDL.
+    let pending = reconcile(&before, &cutover).map_err(RunError::Refused)?;
+    let store_pending = reconcile(&store_before, &store).map_err(RunError::Refused)?;
+    // Plan binding: apply runs only the exact pending lists the reviewed plan
+    // showed, one per chain. Validated in `validate_request`; compared here,
+    // before any DDL.
     let expected = match &req.expected_pending {
         Some(raw) => parse_expected_pending(raw).map_err(RunError::Refused)?,
         None => Vec::new(),
@@ -1101,10 +1365,18 @@ async fn run_on_pool(
     if req.apply && expected != pending {
         return refuse("expected_pending does not match the computed pending list");
     }
-    let computed_hash = check_plan_binding(req, &pending, &MIGRATOR)?;
-    // Provenance follows exactness: the bound hash must additionally be the
-    // hash the named producing plan run uploaded. Both refuse before any DDL.
-    check_plan_provenance(req, &computed_hash)?;
+    let expected_store = match &req.expected_store_pending {
+        Some(raw) => parse_expected_pending(raw).map_err(RunError::Refused)?,
+        None => Vec::new(),
+    };
+    if req.apply && expected_store != store_pending {
+        return refuse("expected_store_pending does not match the computed store pending list");
+    }
+    let computed_hash = check_plan_binding(req, &pending, &cutover)?;
+    let computed_store_hash = check_store_binding(req, &store_pending, &store)?;
+    // Provenance follows exactness: each bound hash must additionally be the
+    // hash the named producing plan run uploaded. All refuse before any DDL.
+    check_plan_provenance(req, &computed_hash, &computed_store_hash)?;
 
     // Plan-only readout inside one READ ONLY transaction. Apply skips it: that
     // login is the migrator, not the read-only readout. A saturated staging
@@ -1122,47 +1394,18 @@ async fn run_on_pool(
 
     let mut applied = 0usize;
     let mut after = before.clone();
-    if req.apply && !pending.is_empty() {
-        let outcome = MIGRATOR.run(pool).await;
-        let read_back = read_ledger_after_run(pool).await;
-        if let Err(e) = outcome {
-            let evidence = json!({"ledger_after_failure":
-                                      ledger_or_unknown(read_back.as_ref().ok().map(Vec::as_slice)),
-                                  "error": e.to_string()});
-            return Err(RunError::Failed(
-                "migration execution failed".to_owned(),
-                evidence,
-            ));
+    let mut store_applied = 0usize;
+    let mut store_after = store_before.clone();
+    if req.apply {
+        if !pending.is_empty() {
+            let (rows, count) = apply_chain(pool, Chain::Cutover, &cutover, &before).await?;
+            after = rows;
+            applied = count;
         }
-        let rows = match read_back {
-            Ok(rows) => rows,
-            Err(kind) => {
-                return Err(RunError::Failed(
-                    "ledger unreadable after apply".to_owned(),
-                    json!({"ledger_after": LEDGER_UNKNOWN,
-                           "ledger_after_error": kind.as_str()}),
-                ));
-            }
-        };
-        after = rows;
-        applied = after.len().saturating_sub(before.len());
-        let leftover = reconcile(&after, &MIGRATOR)
-            .map_err(|m| RunError::Failed(m, json!({"ledger_after": ledger_json(&after)})))?;
-        if !leftover.is_empty() {
-            return Err(RunError::Failed(
-                "ledger incomplete after apply".to_owned(),
-                json!({"ledger_after": ledger_json(&after)}),
-            ));
-        }
-        let owner: String = sqlx::query_scalar(
-            "SELECT pg_get_userbyid(relowner)::text FROM pg_class \
-             WHERE oid = to_regclass('public._sqlx_migrations')",
-        )
-        .fetch_one(pool)
-        .await
-        .map_err(|_| failed("ledger owner check failed"))?;
-        if owner != MIGRATOR_ROLE {
-            return Err(failed("ledger is not owned by two_bot_migrator"));
+        if !store_pending.is_empty() {
+            let (rows, count) = apply_chain(pool, Chain::Store, &store, &store_before).await?;
+            store_after = rows;
+            store_applied = count;
         }
     }
     Ok(json!({
@@ -1178,21 +1421,28 @@ async fn run_on_pool(
         "acl_plan_ref": req.acl_plan_ref,
         "role": expected_role(req),
         "role_verified_connections": verified.load(Ordering::SeqCst),
-        "source_migrations": source_manifest(&MIGRATOR),
+        "source_migrations": source_manifest(&cutover),
         "ledger_before": ledger_json(&before),
         "ledger_after": ledger_json(&after),
         "pending_before": pending,
         "expected_pending": expected,
         "plan_manifest_sha256": computed_hash,
+        "source_store_migrations": source_manifest(&store),
+        "ledger_store_before": ledger_json(&store_before),
+        "ledger_store_after": ledger_json(&store_after),
+        "pending_store_before": store_pending,
+        "expected_store_pending": expected_store,
+        "store_plan_manifest_sha256": computed_store_hash,
         "plan_run_id": req.plan_run_id.clone().unwrap_or_default(),
         // True only for apply, and only because `check_plan_provenance`
-        // passed above: reaching this manifest means the bound hash was
+        // passed above: reaching this manifest means both bound hashes were
         // proven to come from the named producing plan run.
         "plan_provenance_verified": req.apply,
         "applied_count": applied,
-        // Plan-only readout (null for apply): ledger owner and counts,
+        "applied_store_count": store_applied,
+        // Plan-only readout (null for apply): ledger owners and counts,
         // four-login memberships and verifier findings from one READ ONLY
-        // transaction. Not part of `plan_manifest_sha256`.
+        // transaction. Not part of either plan hash.
         "audit": audit,
     }))
 }
@@ -1246,6 +1496,36 @@ mod tests {
         assert_eq!(
             fixture["plan_manifest_sha256"],
             manifest_hash(&"a".repeat(40), &pending, &migrator)
+        );
+        // The store half of the same fixture, pinned the same way: the
+        // Python claim projection must match this Rust projection byte for
+        // byte, so a drift in either breaks the test here, not in review.
+        let store_fixture = Migrator::with_migrations(vec![
+            Migration::new(
+                400,
+                "store first fixture".into(),
+                MigrationType::Simple,
+                "SELECT 3;".into_sql_str(),
+                false,
+            ),
+            Migration::new(
+                9_007_199_254_740_992,
+                "store fixture résumé".into(),
+                MigrationType::Simple,
+                "SELECT 4;".into_sql_str(),
+                false,
+            ),
+        ]);
+        let store_pending = [400, 9_007_199_254_740_992];
+        assert_eq!(
+            fixture["source_store_migrations"],
+            source_manifest(&store_fixture)
+        );
+        assert_eq!(fixture["pending_store_before"], json!(store_pending));
+        assert_eq!(fixture["expected_store_pending"], json!(store_pending));
+        assert_eq!(
+            fixture["store_plan_manifest_sha256"],
+            manifest_hash(&"a".repeat(40), &store_pending, &store_fixture)
         );
     }
 
@@ -1374,6 +1654,116 @@ mod tests {
     }
 
     #[test]
+    fn chains_have_distinct_ledgers_matching_the_runtimes() {
+        assert_eq!(Chain::Cutover.table(), "_sqlx_migrations");
+        assert_eq!(Chain::Store.table(), two_bot_store::TABLE_NAME);
+        assert_eq!(two_bot_store::TABLE_NAME, "_two_bot_migrations");
+        assert_ne!(Chain::Cutover.table(), Chain::Store.table());
+    }
+
+    #[test]
+    fn store_migrator_covers_the_foundation_without_leaving_bot_range() {
+        let store = Chain::Store.migrator().expect("store chain builds");
+        let versions: Vec<i64> = store.iter().map(|m| m.version).collect();
+        assert!(!versions.is_empty(), "store chain must not be empty");
+        for version in 400..=405 {
+            assert!(
+                versions.contains(&version),
+                "store foundation {version} must be present"
+            );
+        }
+        assert!(
+            store.iter().all(|m| (1..=999).contains(&m.version)),
+            "every store version stays in bot range"
+        );
+        assert_eq!(
+            versions.len(),
+            two_bot_store::embedded_versions().len(),
+            "runner embeds the whole store chain"
+        );
+    }
+
+    #[test]
+    fn store_reconcile_mirrors_cutover_semantics() {
+        let store = Chain::Store.migrator().expect("store chain builds");
+        let all: Vec<LedgerRow> = store
+            .iter()
+            .map(|m| LedgerRow {
+                version: m.version,
+                description: m.description.to_string(),
+                success: true,
+                checksum_hex: hex::encode(&m.checksum),
+            })
+            .collect();
+        assert_eq!(reconcile(&[], &store).unwrap().len(), all.len());
+        assert!(reconcile(&all, &store).unwrap().is_empty());
+        // A same-version number in the other chain's ledger is unknown here:
+        // ledgers never share rows.
+        let mut foreign = all.clone();
+        foreign.push(LedgerRow {
+            version: 1,
+            ..all[0].clone()
+        });
+        assert!(reconcile(&foreign, &store).unwrap_err().contains("unknown"));
+        let mut drift = all.clone();
+        drift[0].checksum_hex = "00".repeat(48);
+        assert!(reconcile(&drift, &store).unwrap_err().contains("drift"));
+        let mut failed = all.clone();
+        failed[0].success = false;
+        assert!(reconcile(&failed, &store)
+            .unwrap_err()
+            .contains("incomplete"));
+    }
+
+    #[test]
+    fn store_binding_accepts_its_own_hash_and_refuses_the_cutover_one() {
+        let sha = "a".repeat(40);
+        let store = Chain::Store.migrator().expect("store chain builds");
+        let store_pending = reconcile(&[], &store).expect("empty store ledger");
+        let req = bound_apply(&pending_versions(), &sha);
+        // The fixture binds both chains, so the store binding accepts.
+        assert!(validate_request(&req).is_ok());
+        assert_eq!(
+            check_store_binding(&req, &store_pending, &store).unwrap(),
+            req.store_plan_manifest_sha256.clone().unwrap()
+        );
+        // A cutover hash presented as the store hash refuses: the chains
+        // bind separately.
+        let mut swapped = req.clone();
+        swapped.store_plan_manifest_sha256 = swapped.plan_manifest_sha256.clone();
+        assert!(validate_request(&swapped).is_ok());
+        assert!(matches!(
+            check_store_binding(&swapped, &store_pending, &store),
+            Err(RunError::Refused(_))
+        ));
+        // A store pending list from another source SHA refuses as well.
+        let mut replay = req.clone();
+        replay.source_sha = "b".repeat(40);
+        assert!(validate_request(&replay).is_ok());
+        assert!(matches!(
+            check_store_binding(&replay, &store_pending, &store),
+            Err(RunError::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn apply_refuses_without_the_store_binding() {
+        let sha = "a".repeat(40);
+        let good = bound_apply(&pending_versions(), &sha);
+        for mutate in [
+            |r: &mut Request| r.expected_store_pending = None,
+            |r: &mut Request| r.store_plan_manifest_sha256 = None,
+            |r: &mut Request| {
+                r.store_plan_manifest_sha256 = Some("not-a-digest".to_owned());
+            },
+        ] {
+            let mut req = good.clone();
+            mutate(&mut req);
+            assert!(matches!(validate_request(&req), Err(RunError::Refused(_))));
+        }
+    }
+
+    #[test]
     fn expected_pending_parses_ascending() {
         assert_eq!(parse_expected_pending("").unwrap(), Vec::<i64>::new());
         assert_eq!(parse_expected_pending("  ").unwrap(), Vec::<i64>::new());
@@ -1398,10 +1788,15 @@ mod tests {
         reconcile(&[], &MIGRATOR).expect("empty ledger leaves every version pending")
     }
 
-    /// An apply request carrying the exact hash `check_plan_binding`
-    /// computes for its own source SHA, pending list and migration table.
+    /// An apply request carrying the exact hashes `check_plan_binding` and
+    /// `check_store_binding` compute for their own source SHA, pending lists
+    /// and migration tables.
     fn bound_apply(pending: &[i64], source_sha: &str) -> Request {
         let hash = manifest_hash(source_sha, pending, &MIGRATOR);
+        let store = Chain::Store.migrator().expect("store chain builds");
+        let store_pending =
+            reconcile(&[], &store).expect("empty ledger leaves every store version pending");
+        let store_hash = manifest_hash(source_sha, &store_pending, &store);
         Request {
             url: Some("postgres://u@agent-testdb:5432/two_staging".to_owned()),
             target: Target::Staging,
@@ -1419,7 +1814,15 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join(","),
             ),
+            expected_store_pending: Some(
+                store_pending
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
             plan_manifest_sha256: Some(hash),
+            store_plan_manifest_sha256: Some(store_hash),
             plan_run_id: Some("123456789".to_owned()),
             // Shape-valid only: `validate_request` checks presence, while
             // `check_plan_provenance` reads the file. Provenance tests below
@@ -1433,6 +1836,10 @@ mod tests {
     /// binding-host fence is covered separately.
     fn bound_production_apply(pending: &[i64], source_sha: &str) -> Request {
         let hash = manifest_hash(source_sha, pending, &MIGRATOR);
+        let store = Chain::Store.migrator().expect("store chain builds");
+        let store_pending =
+            reconcile(&[], &store).expect("empty ledger leaves every store version pending");
+        let store_hash = manifest_hash(source_sha, &store_pending, &store);
         Request {
             url: Some("postgres://u@prod-host.invalid:5432/two_bot".to_owned()),
             target: Target::Production,
@@ -1450,7 +1857,15 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join(","),
             ),
+            expected_store_pending: Some(
+                store_pending
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
             plan_manifest_sha256: Some(hash),
+            store_plan_manifest_sha256: Some(store_hash),
             plan_run_id: Some("123456789".to_owned()),
             plan_manifest_path: Some("producing-plan/production-migrate-manifest.json".to_owned()),
         }
@@ -1468,7 +1883,9 @@ mod tests {
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
             expected_pending: None,
+            expected_store_pending: None,
             plan_manifest_sha256: None,
+            store_plan_manifest_sha256: None,
             plan_run_id: None,
             plan_manifest_path: None,
         }
@@ -1486,7 +1903,9 @@ mod tests {
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
             expected_pending: None,
+            expected_store_pending: None,
             plan_manifest_sha256: None,
+            store_plan_manifest_sha256: None,
             plan_run_id: None,
             plan_manifest_path: None,
         }
@@ -1565,7 +1984,9 @@ mod tests {
         let plan = Request {
             apply: false,
             expected_pending: None,
+            expected_store_pending: None,
             plan_manifest_sha256: None,
+            store_plan_manifest_sha256: None,
             plan_run_id: None,
             plan_manifest_path: None,
             ..good
@@ -1588,17 +2009,28 @@ mod tests {
         path
     }
 
-    /// A producing-run manifest artifact carrying `hash` in its embedded
-    /// `plan_manifest_sha256` field, as the plan job's `tee` would upload it.
-    fn producing_manifest(hash: &str) -> String {
+    /// A producing-run manifest artifact carrying `hash` and `store_hash` in
+    /// its embedded hash fields, as the plan job's `tee` would upload it.
+    fn producing_manifest(hash: &str, store_hash: &str) -> String {
         json!({
             "runner_version": RUNNER_VERSION,
             "mode": "plan",
             "source_sha": "a".repeat(40),
             "plan_manifest_sha256": hash,
+            "store_plan_manifest_sha256": store_hash,
             "plan_run_id": "",
         })
         .to_string()
+    }
+
+    /// The store projection hash for `sha` over an empty ledger, matching
+    /// what `bound_apply` binds.
+    fn store_hash_for(source_sha: &str) -> (Vec<i64>, Migrator, String) {
+        let store = Chain::Store.migrator().expect("store chain builds");
+        let pending =
+            reconcile(&[], &store).expect("empty ledger leaves every store version pending");
+        let hash = manifest_hash(source_sha, &pending, &store);
+        (pending, store, hash)
     }
 
     #[test]
@@ -1606,14 +2038,15 @@ mod tests {
         let sha = "a".repeat(40);
         let pending = pending_versions();
         let hash = manifest_hash(&sha, &pending, &MIGRATOR);
-        let path = temp_manifest(&producing_manifest(&hash));
+        let (_, _, store_hash) = store_hash_for(&sha);
+        let path = temp_manifest(&producing_manifest(&hash, &store_hash));
         let req = Request {
             plan_manifest_path: Some(path.to_string_lossy().into_owned()),
             ..bound_apply(&pending, &sha)
         };
         assert!(validate_request(&req).is_ok());
         assert_eq!(check_plan_binding(&req, &pending, &MIGRATOR).unwrap(), hash);
-        assert!(check_plan_provenance(&req, &hash).is_ok());
+        assert!(check_plan_provenance(&req, &hash, &store_hash).is_ok());
         std::fs::remove_file(&path).ok();
     }
 
@@ -1622,17 +2055,18 @@ mod tests {
         let sha = "a".repeat(40);
         let pending = pending_versions();
         let hash = manifest_hash(&sha, &pending, &MIGRATOR);
+        let (_, _, store_hash) = store_hash_for(&sha);
         // Same shape, different producing run: its manifest carries another
         // hash, so binding apply to this run id must refuse.
         let other = manifest_hash(&"b".repeat(40), &pending, &MIGRATOR);
         assert_ne!(other, hash);
-        let path = temp_manifest(&producing_manifest(&other));
+        let path = temp_manifest(&producing_manifest(&other, &store_hash));
         let req = Request {
             plan_manifest_path: Some(path.to_string_lossy().into_owned()),
             ..bound_apply(&pending, &sha)
         };
         assert!(validate_request(&req).is_ok());
-        let err = check_plan_provenance(&req, &hash).unwrap_err();
+        let err = check_plan_provenance(&req, &hash, &store_hash).unwrap_err();
         assert!(matches!(err, RunError::Refused(_)));
         let message = err.to_string();
         assert!(message.contains("plan_run_id"), "{message}");
@@ -1641,10 +2075,34 @@ mod tests {
     }
 
     #[test]
+    fn plan_provenance_refuses_a_store_hash_from_another_run() {
+        let sha = "a".repeat(40);
+        let pending = pending_versions();
+        let hash = manifest_hash(&sha, &pending, &MIGRATOR);
+        let (_, _, store_hash) = store_hash_for(&sha);
+        // Cutover hash matches the producing run but the store hash is from
+        // another source SHA: the apply is not bound to that run's store
+        // chain and must refuse.
+        let (_, _, other_store) = store_hash_for(&"b".repeat(40));
+        assert_ne!(other_store, store_hash);
+        let path = temp_manifest(&producing_manifest(&hash, &other_store));
+        let req = Request {
+            plan_manifest_path: Some(path.to_string_lossy().into_owned()),
+            ..bound_apply(&pending, &sha)
+        };
+        assert!(validate_request(&req).is_ok());
+        let err = check_plan_provenance(&req, &hash, &store_hash).unwrap_err();
+        assert!(matches!(err, RunError::Refused(_)));
+        assert!(err.to_string().contains("store_plan_manifest_sha256"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn plan_provenance_refuses_when_verification_is_impossible() {
         let sha = "a".repeat(40);
         let pending = pending_versions();
         let hash = manifest_hash(&sha, &pending, &MIGRATOR);
+        let (_, _, store_hash) = store_hash_for(&sha);
         let good = bound_apply(&pending, &sha);
         // A wrong run id (or an expired artifact) leaves no manifest file:
         // the download step fails and, if the runner is ever reached without
@@ -1660,7 +2118,7 @@ mod tests {
         };
         assert!(validate_request(&missing).is_ok());
         assert!(matches!(
-            check_plan_provenance(&missing, &hash),
+            check_plan_provenance(&missing, &hash, &store_hash),
             Err(RunError::Refused(_))
         ));
         // Corrupt or field-less artifacts are equally unprovable.
@@ -1676,7 +2134,7 @@ mod tests {
                 ..good.clone()
             };
             assert!(matches!(
-                check_plan_provenance(&req, &hash),
+                check_plan_provenance(&req, &hash, &store_hash),
                 Err(RunError::Refused(_))
             ));
             std::fs::remove_file(&path).ok();
@@ -1685,12 +2143,14 @@ mod tests {
         let plan = Request {
             apply: false,
             expected_pending: None,
+            expected_store_pending: None,
             plan_manifest_sha256: None,
+            store_plan_manifest_sha256: None,
             plan_run_id: None,
             plan_manifest_path: None,
             ..good
         };
-        assert!(check_plan_provenance(&plan, &hash).is_ok());
+        assert!(check_plan_provenance(&plan, &hash, &store_hash).is_ok());
     }
 
     #[test]
@@ -1706,7 +2166,9 @@ mod tests {
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
             expected_pending: None,
+            expected_store_pending: None,
             plan_manifest_sha256: None,
+            store_plan_manifest_sha256: None,
             plan_run_id: None,
             plan_manifest_path: None,
         };
@@ -1885,7 +2347,9 @@ mod tests {
         assert!(validate_request(&Request {
             apply: true,
             expected_pending: Some(String::new()),
+            expected_store_pending: Some(String::new()),
             plan_manifest_sha256: Some("ab".repeat(32)),
+            store_plan_manifest_sha256: Some("ab".repeat(32)),
             plan_run_id: Some("123456789".to_owned()),
             plan_manifest_path: Some("producing-plan/staging-migrate-manifest.json".to_owned()),
             ..ok.clone()
@@ -1920,7 +2384,9 @@ mod tests {
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
             expected_pending: None,
+            expected_store_pending: None,
             plan_manifest_sha256: None,
+            store_plan_manifest_sha256: None,
             plan_run_id: None,
             plan_manifest_path: None,
         };
@@ -1947,7 +2413,9 @@ mod tests {
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
             expected_pending: None,
+            expected_store_pending: None,
             plan_manifest_sha256: None,
+            store_plan_manifest_sha256: None,
             plan_run_id: None,
             plan_manifest_path: None,
         };
@@ -1995,7 +2463,9 @@ mod tests {
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
             expected_pending: None,
+            expected_store_pending: None,
             plan_manifest_sha256: None,
+            store_plan_manifest_sha256: None,
             plan_run_id: None,
             plan_manifest_path: None,
         };
@@ -2508,7 +2978,9 @@ mod tests {
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
             expected_pending: None,
+            expected_store_pending: None,
             plan_manifest_sha256: None,
+            store_plan_manifest_sha256: None,
             plan_run_id: None,
             plan_manifest_path: None,
         };
@@ -2729,7 +3201,9 @@ mod tests {
             acl_plan_ref: "TOG-2#doc".to_owned(),
             apply: false,
             expected_pending: None,
+            expected_store_pending: None,
             plan_manifest_sha256: None,
+            store_plan_manifest_sha256: None,
             plan_run_id: None,
             plan_manifest_path: None,
         };

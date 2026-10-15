@@ -208,10 +208,20 @@ impl Fixture {
         host: &str,
         db: &str,
         expected_pending: Option<&str>,
-        plan_binding: Option<(&str, &str, &str)>,
+        expected_store_pending: Option<&str>,
+        plan_binding: Option<(&str, &str, &str, &str)>,
     ) -> (i32, String, String) {
-        self.run_with_stray(mode, url, None, host, db, expected_pending, plan_binding)
-            .await
+        self.run_with_stray(
+            mode,
+            url,
+            None,
+            host,
+            db,
+            expected_pending,
+            expected_store_pending,
+            plan_binding,
+        )
+        .await
     }
 
     /// Like [`Self::run`], but also sets `stray` as the OTHER mode's binding:
@@ -225,7 +235,8 @@ impl Fixture {
         host: &str,
         db: &str,
         expected_pending: Option<&str>,
-        plan_binding: Option<(&str, &str, &str)>,
+        expected_store_pending: Option<&str>,
+        plan_binding: Option<(&str, &str, &str, &str)>,
     ) -> (i32, String, String) {
         let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_staging-migrate"));
         cmd.args([
@@ -246,10 +257,15 @@ impl Fixture {
         if let Some(list) = expected_pending {
             cmd.args(["--expected-pending", list]);
         }
-        if let Some((hash, run_id, manifest_path)) = plan_binding {
+        if let Some(list) = expected_store_pending {
+            cmd.args(["--expected-store-pending", list]);
+        }
+        if let Some((hash, store_hash, run_id, manifest_path)) = plan_binding {
             cmd.args([
                 "--plan-manifest-sha256",
                 hash,
+                "--store-plan-manifest-sha256",
+                store_hash,
                 "--plan-run-id",
                 run_id,
                 "--plan-manifest-path",
@@ -447,7 +463,9 @@ async fn real_sqlx_runner_cases() -> TestResult {
     assert!(is_member, "member login must hold the migrator group");
 
     // Missing binding and wrong target refuse before any DDL.
-    let (code, _, err) = fx.run("--apply", None, &host, &db, Some(""), None).await;
+    let (code, _, err) = fx
+        .run("--apply", None, &host, &db, Some(""), Some(""), None)
+        .await;
     assert_eq!(code, 2, "{err}");
     let (code, _, _) = fx
         .run(
@@ -455,6 +473,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             Some(migrator.clone()),
             &host,
             "two_bot_staging_other",
+            Some(""),
             Some(""),
             None,
         )
@@ -466,6 +485,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             Some(migrator.clone()),
             "other-host",
             &db,
+            Some(""),
             Some(""),
             None,
         )
@@ -479,6 +499,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             "ep-prod-fixture.us-east-2.aws.neon.tech",
             &db,
             Some(""),
+            Some(""),
             None,
         )
         .await;
@@ -491,21 +512,46 @@ async fn real_sqlx_runner_cases() -> TestResult {
             "ep-test-pooler.us-east-2.aws.neon.tech",
             &db,
             Some(""),
+            Some(""),
             None,
         )
         .await;
     assert_eq!(code, 2, "{err}");
     let (code, _, _) = fx
-        .run("--apply", Some(migrator.clone()), "", &db, Some(""), None)
+        .run(
+            "--apply",
+            Some(migrator.clone()),
+            "",
+            &db,
+            Some(""),
+            Some(""),
+            None,
+        )
         .await;
     assert_eq!(code, 2);
     let (code, _, _) = fx
-        .run("--apply", Some(migrator.clone()), &host, "", Some(""), None)
+        .run(
+            "--apply",
+            Some(migrator.clone()),
+            &host,
+            "",
+            Some(""),
+            Some(""),
+            None,
+        )
         .await;
     assert_eq!(code, 2);
     // Apply without the reviewed pending list refuses before any DDL.
     let (code, _, err) = fx
-        .run("--apply", Some(migrator.clone()), &host, &db, None, None)
+        .run(
+            "--apply",
+            Some(migrator.clone()),
+            &host,
+            &db,
+            None,
+            None,
+            None,
+        )
         .await;
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("expected_pending"));
@@ -517,6 +563,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             &db,
             Some(""),
+            Some(""),
             None,
         )
         .await;
@@ -525,7 +572,15 @@ async fn real_sqlx_runner_cases() -> TestResult {
     // A login that cannot SET ROLE two_bot_migrator is refused.
     let outsider = fx.url(&fx.outsider, &fx.database);
     let (code, _, err) = fx
-        .run("--apply", Some(outsider), &host, &db, Some(""), None)
+        .run(
+            "--apply",
+            Some(outsider),
+            &host,
+            &db,
+            Some(""),
+            Some(""),
+            None,
+        )
         .await;
     assert_eq!(code, 2, "{err}");
     // "RO only" is enforced: a plan login that holds the migrator group is
@@ -537,7 +592,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
         ("superuser", migrator.clone(), "agent_test".to_owned()),
     ] {
         let (code, out, err) = fx
-            .run("--plan", Some(url.clone()), &host, &db, None, None)
+            .run("--plan", Some(url.clone()), &host, &db, None, None, None)
             .await;
         assert_eq!(code, 2, "{label}: {err}");
         assert!(err.contains("two_bot_migrator group"), "{label}: {err}");
@@ -627,7 +682,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
     // The migrator-group login cannot be used as the plan credential either:
     // it does not hold the RO group, so SET ROLE two_bot_migrator_ro refuses.
     let (code, _, err) = fx
-        .run("--plan", Some(member.clone()), &host, &db, None, None)
+        .run("--plan", Some(member.clone()), &host, &db, None, None, None)
         .await;
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("SET ROLE two_bot_migrator_ro"), "{err}");
@@ -640,7 +695,9 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             &db,
             Some(""),
+            Some(""),
             Some((
+                &"a".repeat(64),
                 &"a".repeat(64),
                 "424240",
                 "producing-plan/staging-migrate-manifest.json",
@@ -659,7 +716,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
 
     // Plan is read-only and prints the computed pending list with its hash.
     let (code, out, err) = fx
-        .run("--plan", Some(ro.clone()), &host, &db, None, None)
+        .run("--plan", Some(ro.clone()), &host, &db, None, None, None)
         .await;
     assert_eq!(code, 0, "{err}");
     let m = manifest(&out);
@@ -674,6 +731,28 @@ async fn real_sqlx_runner_cases() -> TestResult {
         plan_hash.len(),
         64,
         "plan hash must be a SHA-256 hex digest"
+    );
+    // The store chain plans alongside with its own ledger, pending list and
+    // binding hash; the fixture never applied it, so every store version is
+    // pending and nothing is applied by a read-only plan.
+    let store_hash = m["store_plan_manifest_sha256"]
+        .as_str()
+        .expect("store plan hash")
+        .to_owned();
+    assert_eq!(
+        store_hash.len(),
+        64,
+        "store plan hash must be a SHA-256 hex digest"
+    );
+    assert_ne!(store_hash, plan_hash, "each chain binds its own hash");
+    assert_eq!(m["applied_store_count"], 0);
+    assert_eq!(
+        m["ledger_store_before"], m["ledger_store_after"],
+        "plan must not change the store ledger"
+    );
+    assert!(
+        m["ledger_store_before"].as_array().unwrap().is_empty(),
+        "fixture never applied the store chain"
     );
     // Snapshot the plan stdout as the producing run's artifact: every apply
     // below proves its bound hash against this manifest.
@@ -751,6 +830,18 @@ async fn real_sqlx_runner_cases() -> TestResult {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(",");
+    // The store pending list comes from the same reviewed plan manifest, so
+    // the apply below binds both chains to one producing run.
+    let store_expected = pending_list(&m["pending_store_before"]);
+    assert!(
+        !store_expected.is_empty(),
+        "store chain must be pending on a fresh fixture"
+    );
+    let store_csv = store_expected
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     let ledger: i64 = sqlx::query_scalar("SELECT count(*) FROM public._sqlx_migrations")
         .fetch_one(&mut c)
         .await?;
@@ -783,7 +874,8 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             &db,
             Some(&expected_csv),
-            Some((&bad_hash, "424242", &plan_artifact)),
+            Some(&store_csv),
+            Some((&bad_hash, &store_hash, "424242", &plan_artifact)),
         )
         .await;
     assert_eq!(code, 2, "{err}");
@@ -803,8 +895,10 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             &db,
             Some(&expected_csv),
+            Some(&store_csv),
             Some((
                 &plan_hash,
+                &store_hash,
                 "424242",
                 "/tmp/staging-migrate-db-no-such-manifest.json",
             )),
@@ -818,6 +912,8 @@ async fn real_sqlx_runner_cases() -> TestResult {
     assert_eq!(ledger, 29, "provenance refusal must not change the ledger");
 
     // Apply the reviewed list as the member login, bound to the plan hash.
+    // Both chains apply: the cutover list plus the full store chain, each
+    // under its own ledger.
     let (code, out, err) = fx
         .run(
             "--apply",
@@ -825,12 +921,27 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             &db,
             Some(&expected_csv),
-            Some((&plan_hash, "424242", &plan_artifact)),
+            Some(&store_csv),
+            Some((&plan_hash, &store_hash, "424242", &plan_artifact)),
         )
         .await;
     assert_eq!(code, 0, "{err}");
     let m = manifest(&out);
     assert_eq!(m["applied_count"], expected.len() as u64);
+    assert_eq!(
+        m["applied_store_count"],
+        store_expected.len() as u64,
+        "apply must run the store chain too"
+    );
+    assert_eq!(
+        m["ledger_store_after"].as_array().unwrap().len(),
+        store_expected.len()
+    );
+    assert_eq!(
+        m["pending_store_before"],
+        serde_json::json!(store_expected),
+        "store pending must be the reviewed list"
+    );
     assert_eq!(m["role"], "two_bot_migrator", "apply path is unchanged");
     assert_eq!(m["plan_provenance_verified"], true);
     assert!(m["audit"].is_null(), "apply emits no plan readout");
@@ -862,6 +973,41 @@ async fn real_sqlx_runner_cases() -> TestResult {
     .fetch_one(&mut c)
     .await?;
     assert_eq!(owner, "two_bot_migrator");
+    // The store chain landed in its own ledger, owned by the migrator, with
+    // every version successful.
+    let (store_rows, store_failed): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE NOT success) \
+         FROM public._two_bot_migrations",
+    )
+    .fetch_one(&mut c)
+    .await?;
+    assert_eq!(
+        (store_rows, store_failed),
+        (store_expected.len() as i64, 0),
+        "store ledger must hold every store version"
+    );
+    let store_owner: String = sqlx::query_scalar(
+        "SELECT pg_get_userbyid(relowner)::text FROM pg_class \
+         WHERE oid = to_regclass('public._two_bot_migrations')",
+    )
+    .fetch_one(&mut c)
+    .await?;
+    assert_eq!(store_owner, "two_bot_migrator");
+    // Later re-plans read the store ledger as the RO login, so the fixture
+    // grants exactly that read (production grants it from the role matrix).
+    sqlx::query("GRANT SELECT ON public._two_bot_migrations TO two_bot_migrator_ro")
+        .execute(&mut c)
+        .await?;
+    let mut ro_conn = fx.ro_session().await?;
+    let store_readable: i64 = sqlx::query_scalar("SELECT count(*) FROM public._two_bot_migrations")
+        .fetch_one(&mut ro_conn)
+        .await?;
+    assert_eq!(
+        store_readable,
+        store_expected.len() as i64,
+        "RO group must read the store ledger"
+    );
+    ro_conn.close().await?;
     let foreign: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
          WHERE n.nspname = 'public' AND c.relkind IN ('r','S') \
@@ -881,18 +1027,30 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             &db,
             Some(&expected_csv),
-            Some((&plan_hash, "424242", &plan_artifact)),
+            Some(&store_csv),
+            Some((&plan_hash, &store_hash, "424242", &plan_artifact)),
         )
         .await;
     assert_eq!(code, 2);
     let (code, out, err) = fx
-        .run("--plan", Some(ro.clone()), &host, &db, None, None)
+        .run("--plan", Some(ro.clone()), &host, &db, None, None, None)
         .await;
     assert_eq!(code, 0, "{err}");
     let empty_hash = manifest(&out)["plan_manifest_sha256"]
         .as_str()
         .expect("empty plan hash")
         .to_owned();
+    let empty_store_hash = manifest(&out)["store_plan_manifest_sha256"]
+        .as_str()
+        .expect("empty store plan hash")
+        .to_owned();
+    assert!(
+        manifest(&out)["pending_store_before"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "store chain must be fully applied"
+    );
     let empty_artifact = snapshot_plan_manifest(&out);
     let (code, out, err) = fx
         .run(
@@ -901,11 +1059,13 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             &db,
             Some(""),
-            Some((&empty_hash, "424243", &empty_artifact)),
+            Some(""),
+            Some((&empty_hash, &empty_store_hash, "424243", &empty_artifact)),
         )
         .await;
     assert_eq!(code, 0, "{err}");
     assert_eq!(manifest(&out)["applied_count"], 0);
+    assert_eq!(manifest(&out)["applied_store_count"], 0);
 
     // SHA-384 drift refuses. The binding inputs must be valid-format so the
     // run reaches reconcile (which fails on drift) instead of refusing on the
@@ -921,14 +1081,15 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             &db,
             Some(""),
-            Some((&empty_hash, "424244", &empty_artifact)),
+            Some(""),
+            Some((&empty_hash, &empty_store_hash, "424244", &empty_artifact)),
         )
         .await;
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("drift"));
     // Restore the checksum from the source, then an incomplete row refuses.
     let (code, _, _) = fx
-        .run("--plan", Some(ro.clone()), &host, &db, None, None)
+        .run("--plan", Some(ro.clone()), &host, &db, None, None, None)
         .await;
     assert_eq!(code, 2);
     sqlx::query("DELETE FROM public._sqlx_migrations WHERE version = (SELECT max(version) FROM public._sqlx_migrations)")
@@ -955,7 +1116,8 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             &db,
             Some(""),
-            Some((&empty_hash, "424245", &empty_artifact)),
+            Some(""),
+            Some((&empty_hash, &empty_store_hash, "424245", &empty_artifact)),
         )
         .await;
     assert_eq!(code, 2, "{err}");
@@ -998,17 +1160,36 @@ async fn apply_with_post_run_read_fault(
     let member = fx.url(&fx.mlogin, &fx.database);
     let ro = fx.url(&fx.rologin, &fx.database);
 
-    let (code, out, err) = fx.run("--plan", Some(ro), &host, &db, None, None).await;
+    let (code, out, err) = fx
+        .run("--plan", Some(ro), &host, &db, None, None, None)
+        .await;
     assert_eq!(code, 0, "{err}");
     let plan = manifest(&out);
     let plan_hash = plan["plan_manifest_sha256"]
         .as_str()
         .expect("plan hash")
         .to_owned();
+    let store_hash = plan["store_plan_manifest_sha256"]
+        .as_str()
+        .expect("store plan hash")
+        .to_owned();
     let plan_artifact = snapshot_plan_manifest(&out);
     let pending = pending_list(&plan["pending_before"]);
     assert!(pending.len() >= 2, "need two pending migrations to fault");
     let expected_csv = pending
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    // The store chain is fully pending on this fresh fixture; bind it too so
+    // the apply reaches the cutover fault instead of refusing on the store
+    // binding first.
+    let store_pending = pending_list(&plan["pending_store_before"]);
+    assert!(
+        !store_pending.is_empty(),
+        "store chain must be pending on a fresh fixture"
+    );
+    let store_csv = store_pending
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>()
@@ -1025,7 +1206,8 @@ async fn apply_with_post_run_read_fault(
             &host,
             &db,
             Some(&expected_csv),
-            Some((&plan_hash, "424242", &plan_artifact)),
+            Some(&store_csv),
+            Some((&plan_hash, &store_hash, "424242", &plan_artifact)),
         )
         .await;
     let mut c = fx.scratch().await?;

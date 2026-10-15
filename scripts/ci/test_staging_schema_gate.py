@@ -114,12 +114,24 @@ class PendingVersionsTests(unittest.TestCase):
     def test_nonempty_pending_is_returned_in_order(self):
         self.assertEqual(pending_versions({"pending_before": [12, 13]}), [12, 13])
 
+    def test_store_pending_reads_its_own_field(self):
+        manifest = {"pending_before": [], "pending_store_before": [400, 401]}
+        self.assertEqual(pending_versions(manifest, "pending_store_before"), [400, 401])
+        self.assertEqual(pending_versions(manifest), [])
+
     def test_malformed_manifest_fails_closed(self):
         for bad in ({}, {"pending_before": None}, {"pending_before": ["12"]},
                     {"pending_before": [12, 11]}, {"pending_before": True}):
             with self.subTest(bad=bad):
                 with self.assertRaises(Refused):
                     pending_versions(bad)
+        # A manifest without the store field fails closed too: the gate must
+        # see both chains before calling a deploy clean.
+        for bad in ({}, {"pending_store_before": None}, {"pending_store_before": ["400"]},
+                    {"pending_store_before": [401, 400]}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(Refused):
+                    pending_versions(bad, "pending_store_before")
 
 
 class DriftMessageTests(unittest.TestCase):
@@ -131,6 +143,13 @@ class DriftMessageTests(unittest.TestCase):
         self.assertIn("a" * 40, message)
         self.assertIn("staging-migrate", message)
         self.assertIn("apply", message)
+        self.assertNotIn("Store chain", message)
+
+    def test_store_drift_names_the_store_fix(self):
+        message = drift_message([], "a" * 40, [400, 401])
+        self.assertIn("schema drift", message)
+        self.assertIn("400", message)
+        self.assertIn("expected_store_pending", message)
 
 
 class ConnectionWarningTests(unittest.TestCase):

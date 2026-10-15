@@ -7,21 +7,28 @@
 //!   --production-host <host> --production-database <db> (production only)
 //!   --recovery-evidence-ref <ref> --acl-plan-ref <ref>
 //!   [--expected-pending <ascending,comma-separated versions>]
-//!   [--plan-manifest-sha256 <64hex> --plan-run-id <run id>
+//!   [--expected-store-pending <ascending,comma-separated store versions>]
+//!   [--plan-manifest-sha256 <64hex> --store-plan-manifest-sha256 <64hex>
+//!    --plan-run-id <run id>
 //!    --plan-manifest-path <producing run's downloaded manifest>]
 //! ```
 //!
-//! The database URL comes only from the target and mode's fixed binding:
-//! staging plan reads TWO_BOT_STAGING_PLAN_DATABASE_URL (a login holding only
+//! The runner plans, applies and verifies two chains with separate ledgers:
+//! this crate's cutover migrations (`public._sqlx_migrations`) and the store
+//! migrations (`public._two_bot_migrations`). The database URL comes only
+//! from the target and mode's fixed binding: staging plan reads
+//! TWO_BOT_STAGING_PLAN_DATABASE_URL (a login holding only
 //! two_bot_migrator_ro), staging apply reads TWO_BOT_STAGING_MIGRATOR_DATABASE_URL,
 //! production plan reads TWO_BOT_PRODUCTION_PLAN_DATABASE_URL, production apply
 //! reads TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL. --apply refuses before any DDL
-//! unless --expected-pending equals the computed pending list exactly,
+//! unless --expected-pending equals the computed cutover pending list exactly,
+//! --expected-store-pending equals the computed store pending list exactly,
 //! --plan-manifest-sha256 equals the SHA-256 of the plan job's uploaded manifest
-//! for the same source SHA, and the downloaded manifest at --plan-manifest-path
-//! (fetched by the workflow from the --plan-run-id run) carries that same hash,
-//! proving the bound hash came from the named producing run; --plan prints that
-//! manifest (including its own hash) and ignores the plan-binding flags.
+//! for the same source SHA, --store-plan-manifest-sha256 equals the same
+//! manifest's store projection, and the downloaded manifest at --plan-manifest-path
+//! (fetched by the workflow from the --plan-run-id run) carries both hashes,
+//! proving the bound hashes came from the named producing run; --plan prints that
+//! manifest (including both hashes) and ignores the plan-binding flags.
 //!
 //! `--staging-branch-id` pins the PlanetScale branch id (non-secret, staging
 //! target only): it is required for `*.psdb.cloud` hosts and must match the
@@ -61,7 +68,9 @@ fn real_main() -> i32 {
             | "--recovery-evidence-ref"
             | "--acl-plan-ref"
             | "--expected-pending"
+            | "--expected-store-pending"
             | "--plan-manifest-sha256"
+            | "--store-plan-manifest-sha256"
             | "--plan-run-id"
             | "--plan-manifest-path" => match it.next() {
                 Some(v) => {
@@ -134,7 +143,9 @@ fn real_main() -> i32 {
         acl_plan_ref: get("--acl-plan-ref"),
         apply,
         expected_pending: values.get("--expected-pending").cloned(),
+        expected_store_pending: values.get("--expected-store-pending").cloned(),
         plan_manifest_sha256: values.get("--plan-manifest-sha256").cloned(),
+        store_plan_manifest_sha256: values.get("--store-plan-manifest-sha256").cloned(),
         plan_run_id: values.get("--plan-run-id").cloned(),
         plan_manifest_path: values.get("--plan-manifest-path").cloned(),
     };

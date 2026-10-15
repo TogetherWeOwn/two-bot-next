@@ -3,7 +3,9 @@
 
 Runs the reviewed `staging-migrate --plan` binary against the staging
 database through the no-reviewer `staging-migrate-plan` environment binding
-and refuses the deploy when `pending_before` is non-empty. The expected
+and refuses the deploy when `pending_before` or `pending_store_before` is
+non-empty: either chain behind source means the DML-only container would
+boot against a schema it cannot migrate. The expected
 host, database and branch pins are non-secret workflow vars
 (`vars.TWO_BOT_STAGING_HOST/DATABASE/BRANCH_ID`), read here from the
 environment independently of the secret binding; a pooled, unparseable or
@@ -127,10 +129,10 @@ def verify_binding(url, expected_host, expected_database, expected_branch):
     return host_pin, db_pin, branch_pin
 
 
-def pending_versions(manifest):
+def pending_versions(manifest, key="pending_before"):
     """Return the strictly-ascending pending list; refuse malformed manifests."""
     require(isinstance(manifest, dict), "plan manifest is not an object")
-    pending = manifest.get("pending_before")
+    pending = manifest.get(key)
     require(isinstance(pending, list), "pending versions are invalid")
     require(all(type(v) is int and 0 < v <= I64_MAX for v in pending),
             "pending version is outside the positive i64 range")
@@ -138,15 +140,22 @@ def pending_versions(manifest):
     return pending
 
 
-def drift_message(pending, source_sha):
+def drift_message(pending, source_sha, store_pending=()):
     """Fail-closed deploy refusal naming the drift and its manual fix."""
     versions = ",".join(str(v) for v in pending)
-    return (
+    message = (
         f"schema drift: staging database is behind source {source_sha}: "
         f"pending versions [{versions}]. Run the manual staging-migrate apply "
         f"dispatch for that source with expected_pending \"{versions}\" "
         "(reviewed plan required), then re-run deploy-staging."
     )
+    if store_pending:
+        store_versions = ",".join(str(v) for v in store_pending)
+        message += (
+            f" Store chain also behind: pending store versions [{store_versions}] "
+            f"(expected_store_pending \"{store_versions}\")."
+        )
+    return message
 
 
 def connection_warning(manifest):
@@ -239,11 +248,12 @@ def main(argv=None, env=None, run=None):
         json.dump(manifest, handle, sort_keys=True)
         handle.write("\n")
     pending = pending_versions(manifest)
+    store_pending = pending_versions(manifest, "pending_store_before")
     warning = connection_warning(manifest)
     if warning is not None:
         print(warning)
-    if pending:
-        print(drift_message(pending, args.source_sha), file=sys.stderr)
+    if pending or store_pending:
+        print(drift_message(pending, args.source_sha, store_pending), file=sys.stderr)
         return 1
     print(f"schema gate clean: no pending migrations on {args.source_sha}")
     return 0
