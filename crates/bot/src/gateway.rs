@@ -608,14 +608,24 @@ fn count_community_facts_drain_failure<T, E>(
 /// dispatch replays after restart; reception already skips duplicate
 /// sequences, and the write itself is idempotent, so a checkpoint failure
 /// after it still repairs on replay.
+///
+/// Deployment-state schema gaps (missing table `42P01`, missing grant
+/// `42501` — an unapplied migration or ACL plan) never hold the cursor:
+/// retrying them on every boot is futile. A skipped rejoin-cancel is safe (a
+/// missing queue table holds nothing to cancel), but a skipped real removal
+/// drops the guild's only purge-queue write — the removed guild is never seen
+/// again — so it logs at error level with the guild and SQLSTATE for the
+/// Operator replay documented in `docs/privacy.md` instead of warning
+/// (TOG-25067). The replay is conditional: a later rejoin means the guild is
+/// live and the insert must be skipped, per the privacy.md ordering check.
 async fn retention_lifecycle(store: &GatewaySessionStore, event: &Event) -> Option<sqlx::Error> {
     let pool = store.pool();
-    match event {
+    let write = match event {
         Event::GuildDelete(deleted) => {
             let guild_id = deleted.id.get().to_string();
             two_bot_cutover::retention::handle_guild_delete(pool, &guild_id, deleted.unavailable)
                 .await
-                .err()
+                .map(|_| ())
         }
         Event::GuildCreate(created) => {
             if matches!(
@@ -625,12 +635,53 @@ async fn retention_lifecycle(store: &GatewaySessionStore, event: &Event) -> Opti
                 let guild_id = created.id().get().to_string();
                 two_bot_cutover::retention::cancel_guild_purge(pool, &guild_id)
                     .await
-                    .err()
+                    .map(|_| ())
             } else {
-                None
+                Ok(())
             }
         }
-        _ => None,
+        _ => Ok(()),
+    };
+    match write {
+        Ok(()) => None,
+        Err(error) => {
+            if crate::gateway_failure::is_schema_gap(&error) {
+                let code = crate::db_log::error_code(&error);
+                let code = code.as_deref().unwrap_or("unknown");
+                if is_real_guild_removal(event) {
+                    tracing::error!(
+                        guild = event_guild_id(event),
+                        error_code = code,
+                        "retention purge skipped; schema gap, operator replay required"
+                    );
+                } else {
+                    tracing::warn!(
+                        guild = event_guild_id(event),
+                        error_code = code,
+                        "retention lifecycle skipped; schema gap, nothing to cancel"
+                    );
+                }
+                None
+            } else {
+                Some(error)
+            }
+        }
+    }
+}
+
+/// True for a real guild removal (`unavailable != Some(true)`): the only
+/// dispatch that writes the purge queue, so the only skip that needs the
+/// Operator replay. Rejoin-cancels and outage payloads write nothing durable.
+fn is_real_guild_removal(event: &Event) -> bool {
+    matches!(event, Event::GuildDelete(deleted) if deleted.unavailable != Some(true))
+}
+
+/// Guild id for lifecycle log lines, empty for non-guild dispatches.
+fn event_guild_id(event: &Event) -> String {
+    match event {
+        Event::GuildDelete(deleted) => deleted.id.get().to_string(),
+        Event::GuildCreate(created) => created.id().get().to_string(),
+        _ => String::new(),
     }
 }
 
@@ -759,7 +810,8 @@ fn apply_dispatch<I: InviteSource>(
         // Retention lifecycle before the checkpoint commits: a failed
         // queue/cancel write holds the cursor via `dispatch_error` so the
         // dispatch (and any later dispatch) is never acknowledged, and the
-        // next process replays it from the last committed sequence. The
+        // next process replays it from the last committed sequence, except
+        // deployment-state schema gaps, which skip per `retention_lifecycle`. The
         // purge-queue write runs under the checkpoint client deadline with
         // readiness armed, so lock contention fails bounded instead of
         // waiting for the server statement timeout with the checkpoint
