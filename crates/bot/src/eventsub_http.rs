@@ -396,6 +396,13 @@ mod tests {
         two_bot_core::format_iso_millis(now)
     }
 
+    struct TestHeaders<'a> {
+        message_id: Option<&'a str>,
+        timestamp: Option<&'a str>,
+        signature: Option<&'a str>,
+        message_type: Option<&'a str>,
+    }
+
     fn request(
         method: &str,
         uri: &str,
@@ -409,37 +416,35 @@ mod tests {
             uri,
             "application/json",
             method,
-            message_id,
-            timestamp,
-            signature,
-            message_type,
+            TestHeaders {
+                message_id,
+                timestamp,
+                signature,
+                message_type,
+            },
             Body::from(body),
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn request_with_content_type(
         uri: &str,
         content_type: &str,
         method: &str,
-        message_id: Option<&str>,
-        timestamp: Option<&str>,
-        signature: Option<&str>,
-        message_type: Option<&str>,
+        headers: TestHeaders<'_>,
         body: Body,
     ) -> Request<Body> {
         let mut builder = Request::builder().method(method).uri(uri);
         builder = builder.header("content-type", content_type);
-        if let Some(value) = message_id {
+        if let Some(value) = headers.message_id {
             builder = builder.header("twitch-eventsub-message-id", value);
         }
-        if let Some(value) = timestamp {
+        if let Some(value) = headers.timestamp {
             builder = builder.header("twitch-eventsub-message-timestamp", value);
         }
-        if let Some(value) = signature {
+        if let Some(value) = headers.signature {
             builder = builder.header("twitch-eventsub-message-signature", value);
         }
-        if let Some(value) = message_type {
+        if let Some(value) = headers.message_type {
             builder = builder.header("twitch-eventsub-message-type", value);
         }
         builder.body(body).unwrap()
@@ -623,10 +628,12 @@ mod tests {
                     EVENTSUB_PATH,
                     content_type,
                     "POST",
-                    Some(message_id),
-                    Some(&timestamp),
-                    Some(&signature),
-                    Some("webhook_callback_verification"),
+                    TestHeaders {
+                        message_id: Some(message_id),
+                        timestamp: Some(&timestamp),
+                        signature: Some(&signature),
+                        message_type: Some("webhook_callback_verification"),
+                    },
                     Body::from(body),
                 ))
                 .await
@@ -650,10 +657,12 @@ mod tests {
                 EVENTSUB_PATH,
                 "application/json; charset=utf-8",
                 "POST",
-                Some(message_id),
-                Some(&timestamp),
-                Some(&signature),
-                Some("webhook_callback_verification"),
+                TestHeaders {
+                    message_id: Some(message_id),
+                    timestamp: Some(&timestamp),
+                    signature: Some(&signature),
+                    message_type: Some("webhook_callback_verification"),
+                },
                 Body::from(body),
             ))
             .await
@@ -672,10 +681,12 @@ mod tests {
                 EVENTSUB_PATH,
                 "application/json",
                 "POST",
-                Some("synthetic-delivery-0013"),
-                Some(&timestamp),
-                Some(&signature),
-                Some("notification"),
+                TestHeaders {
+                    message_id: Some("synthetic-delivery-0013"),
+                    timestamp: Some(&timestamp),
+                    signature: Some(&signature),
+                    message_type: Some("notification"),
+                },
                 Body::from(big),
             ))
             .await
@@ -704,10 +715,12 @@ mod tests {
                     EVENTSUB_PATH,
                     "application/json",
                     "POST",
-                    Some("synthetic-delivery-0014"),
-                    Some(&timestamp),
-                    Some(&signature),
-                    Some("webhook_callback_verification"),
+                    TestHeaders {
+                        message_id: Some("synthetic-delivery-0014"),
+                        timestamp: Some(&timestamp),
+                        signature: Some(&signature),
+                        message_type: Some("webhook_callback_verification"),
+                    },
                     Body::from(body),
                 ))
                 .await
