@@ -57,6 +57,9 @@ JOB_INVENTORY = {
     # Shared nextest lane, called by ci-speed.yml; org-level home is
     # TogetherWeOwn/.github with a pinned SHA like test-guard.
     "reusable-rust-nextest.yml": {"nextest"},
+    # Advisory PR-size labels (org reusable, advisory only, never required):
+    # thin caller to the central labeller + weekly tally.
+    "pr-size.yml": {"pr-size", "pr-size-weekly"},
 }
 # Reusable-workflow calls are allowed only to these non-deploy workflows.
 # TOG-10893 registers the read-only sbom.yml calls alongside the benchmark one.
@@ -69,7 +72,11 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
                    ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95",
                    # SDLC 2.3 CI speed pilot: advisory caller to the shared
                    # nextest lane (local path until the central move).
-                   ("ci-speed.yml", "nextest"): "./.github/workflows/reusable-rust-nextest.yml"}
+                   ("ci-speed.yml", "nextest"): "./.github/workflows/reusable-rust-nextest.yml",
+                   # Advisory PR-size labels: thin caller to the central
+                   # reusable, pinned SHA (repin both refs together).
+                   ("pr-size.yml", "pr-size"): "TogetherWeOwn/.github/.github/workflows/pr-size.yml@82c5b367c6e3e8032666029dc22d206fff39c3f2",
+                   ("pr-size.yml", "pr-size-weekly"): "TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@82c5b367c6e3e8032666029dc22d206fff39c3f2"}
 # Main's runner routing (#265, 2026-10-02): the repo is public and the org's
 # self-hosted runner group refuses public repos, so every job routes through
 # one expression — public repo -> GitHub-hosted, private -> CI_OVERFLOW_* switch
@@ -2249,6 +2256,16 @@ class WorkflowTests(unittest.TestCase):
                     elif (name, job_id) == ("release.yml", "attach-sbom"):
                         # TOG-10893: uploads verified SBOMs to the published tag.
                         expected = {"contents": "write"}
+                    elif (name, job_id) == ("pr-size.yml", "pr-size"):
+                        # Advisory labeller: writes the size/* label and keeps
+                        # the one advisory comment on the caller's PR.
+                        expected = {"contents": "read", "issues": "write",
+                                    "pull-requests": "write"}
+                    elif (name, job_id) == ("pr-size.yml", "pr-size-weekly"):
+                        # Advisory weekly tally: read-only count of merged PRs
+                        # by size label.
+                        expected = {"contents": "read", "issues": "read",
+                                    "pull-requests": "read"}
                     self.assertEqual(job["permissions"], expected)
                     for step in job.get("steps", []):
                         if step.get("uses", "").startswith("actions/checkout@"):
