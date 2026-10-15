@@ -20,7 +20,7 @@ JOB_INVENTORY = {
                   "rust-tests", "ignored-db-stores", "ignored-db-runtime",
                   # Compile-only libFuzzer build, gated by ci-ok like the Rust lanes.
                   "fuzz-compile"},
-    "deploy-production.yml": {"guard", "production", "release"},
+    "deploy-production.yml": {"guard", "schema-gate", "production", "release"},
     "deploy-staging.yml": {"deploy", "schema-gate", "voice-synthetic"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
@@ -922,8 +922,10 @@ def production_errors(workflow):
         errors.append(f"{name}: production must be dispatch-only")
     jobs = workflow.get("jobs", {})
     production, guard = jobs.get("production", {}), jobs.get("guard", {})
-    if production.get("environment") != "production" or production.get("needs") != "guard":
-        errors.append(f"{name}:production: must wait for the guard and the protected Environment")
+    needs = production.get("needs")
+    needs = [needs] if isinstance(needs, str) else (needs or [])
+    if production.get("environment") != "production" or set(needs) != {"guard", "schema-gate"}:
+        errors.append(f"{name}:production: must wait for the guard, the schema gate and the protected Environment")
     if "if" in production:
         errors.append(f"{name}:production: a job condition could bypass the guard outputs")
     if ("environment" in guard or "uses" in guard
@@ -1044,6 +1046,89 @@ def schema_gate_errors(workflow, name="deploy-staging.yml"):
     return errors
 
 
+def production_schema_gate_errors(workflow, name="deploy-production.yml"):
+    """Pre-deploy production schema-drift gate: read-only plan, fail closed.
+
+    One job runs on every deploy-production dispatch after the guard (it
+    needs the guarded SHA: a dispatch SHA is an input, not github.sha),
+    through the no-reviewer `production-migrate-plan` environment, builds the
+    reviewed `staging-migrate` binary and fails the run with a `schema drift`
+    error when the guarded source is ahead of the production ledger. The
+    production job must `needs` both the guard and the gate, so drift can
+    never deploy silently. Plan-only: no migrator binding, no `--apply`, no
+    role/grant route, no wrangler, no secret indexing. Rollback and live-SHA
+    takeover redeploys serve no new schema and waive the ledger check inside
+    the reviewed script (recorded, never a job-level skip: the job carries
+    no `if:`).
+    """
+    errors = []
+    jobs = workflow.get("jobs") or {}
+    gate = jobs.get("schema-gate", {})
+    if gate.get("environment") != "production-migrate-plan":
+        errors.append(f"{name}:schema-gate: must read only the production-migrate-plan Environment binding")
+    if gate.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:schema-gate: must keep contents:read only")
+    if "if" in gate:
+        errors.append(f"{name}:schema-gate: a job condition would let drift deploy silently")
+    if gate.get("needs") != "guard":
+        errors.append(f"{name}:schema-gate: must wait for the guard (it gates the guarded SHA)")
+    if not runner_allowed("schema-gate", gate.get("runs-on")):
+        errors.append(f"{name}:schema-gate: must use the routed runner expression for job 'schema-gate'")
+    if gate.get("timeout-minutes") != "30":
+        errors.append(f"{name}:schema-gate: timeout must stay 30 minutes")
+    if (gate.get("container") or {}).get("image") != SCHEMA_GATE_IMAGE:
+        errors.append(f"{name}:schema-gate: must build on the pinned plan-job image")
+    production = jobs.get("production", {})
+    needs = production.get("needs")
+    needs = [needs] if isinstance(needs, str) else (needs or [])
+    if "schema-gate" not in needs or "guard" not in needs:
+        errors.append(f"{name}:production: must needs the guard and the schema-gate (drift must block the deploy)")
+    steps = gate.get("steps") or []
+    if len(steps) != 5:
+        errors.append(f"{name}:schema-gate: must run exactly checkout, tooling checkout, SHA check, build and the gate")
+        return errors
+    checkout, tooling, sha_check, build, run = steps
+    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
+            or (checkout.get("with") or {}).get("persist-credentials") != "false" \
+            or (checkout.get("with") or {}).get("fetch-depth") != "0" \
+            or "needs.guard.outputs.sha" not in str((checkout.get("with") or {}).get("ref", "")):
+        errors.append(f"{name}:schema-gate: checkout must be pinned, credentialless, full-depth and on the guarded SHA")
+    if not str(tooling.get("uses", "")).startswith("actions/checkout@") \
+            or (tooling.get("with") or {}).get("persist-credentials") != "false" \
+            or (tooling.get("with") or {}).get("path") != "tooling" \
+            or "github.sha" not in str((tooling.get("with") or {}).get("ref", "")):
+        errors.append(f"{name}:schema-gate: tooling checkout must be pinned, credentialless and on the workflow commit")
+    if ("needs.guard.outputs.sha" not in str(sha_check.get("env", ""))
+            or "git rev-parse HEAD" not in str(sha_check.get("run", ""))):
+        errors.append(f"{name}:schema-gate: SHA check must pin the step to the guarded SHA")
+    if "cargo build -p two-bot-cutover --bin staging-migrate --locked" not in str(build.get("run", "")):
+        errors.append(f"{name}:schema-gate: build must compile the reviewed staging-migrate binary locked")
+    if (run.get("shell") != "bash" or "set -o pipefail" not in str(run.get("run", ""))
+            or "scripts/ci/production_schema_gate.py" not in str(run.get("run", ""))
+            or "--source-sha" not in str(run.get("run", ""))
+            or "--mode" not in str(run.get("run", ""))
+            or "--allow-unstaged" not in str(run.get("run", ""))
+            or "TWO_BOT_PRODUCTION_PLAN_DATABASE_URL" not in str(run.get("env", ""))):
+        errors.append(f"{name}:schema-gate: gate step must run the reviewed script over pipefail "
+                      "with the plan binding, the guarded SHA and the guard-verified waive flags")
+    # The expected production identity is pinned independently of the secret
+    # binding (vars, never derived from the URL): a wrong-target binding must
+    # refuse instead of reading the wrong database. Production takes no
+    # branch pin.
+    env_text = str(run.get("env", ""))
+    for pin, var in (("TWO_BOT_PRODUCTION_HOST", "vars.TWO_BOT_PRODUCTION_HOST"),
+                     ("TWO_BOT_PRODUCTION_DATABASE", "vars.TWO_BOT_PRODUCTION_DATABASE")):
+        if pin not in env_text or var not in env_text:
+            errors.append(f"{name}:schema-gate: gate step must pin {pin} from {var}")
+    if "inputs." in str(gate):
+        errors.append(f"{name}:schema-gate: must read only guard-verified outputs, never raw inputs")
+    text = str(gate).lower().replace(" ", "")
+    for marker in ("wrangler", "--apply", "migrator", "roles", "tojson(secrets", "secrets["):
+        if marker in text:
+            errors.append(f"{name}:schema-gate: must not contain {marker!r} (plan-only, no apply/grant route)")
+    return errors
+
+
 def voice_synthetic_errors(workflow):
     """Live staging voice synthetic (docs/voice-synthetic.md).
 
@@ -1121,6 +1206,7 @@ def workflow_policy_errors(workflows):
             errors.append(f"{name}: job inventory changed")
         if name == "deploy-production.yml":
             errors.extend(production_errors(workflow))
+            errors.extend(production_schema_gate_errors(workflow))
             continue
         if name == "deploy-staging.yml":
             errors.extend(staging_dispatch_errors(workflow))
@@ -1428,6 +1514,37 @@ class WorkflowTests(unittest.TestCase):
                         if "run" in step:
                             step["run"] = step["run"].replace(pin, "")
                 self.assertTrue(mutated(drop))
+
+    def test_production_schema_gate_shape_is_pinned_and_mutations_fail(self):
+        import copy
+        production = self.workflows["deploy-production.yml"]
+        self.assertEqual(production_schema_gate_errors(production), [])
+        self.assertEqual(production_errors(production), [])
+        for mutate in (
+            lambda w: w["jobs"]["schema-gate"].__setitem__("environment", "production-migrate-apply"),
+            lambda w: w["jobs"]["schema-gate"].__setitem__("if", "github.ref == 'refs/heads/main'"),
+            lambda w: w["jobs"]["schema-gate"].__setitem__("needs", "production"),
+            lambda w: w["jobs"]["production"].__setitem__("needs", "guard"),
+            lambda w: w["jobs"]["production"].__setitem__("needs", ["schema-gate"]),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4].__setitem__("run", "wrangler deploy"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4].get("env", {}).__setitem__(
+                "LEAK", "${{ secrets.TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL }}"),
+        ):
+            changed = copy.deepcopy(production)
+            mutate(changed)
+            self.assertNotEqual(production_schema_gate_errors(changed), [])
+
+    def test_production_deploy_needs_prod_schema_gate(self):
+        production = self.workflows["deploy-production.yml"]
+        self.assertEqual(production_schema_gate_errors(production), [])
+        needs = production["jobs"]["production"]["needs"]
+        needs = [needs] if isinstance(needs, str) else needs
+        self.assertIn("guard", needs)
+        self.assertIn("schema-gate", needs)
+        self.assertEqual(production["jobs"]["schema-gate"].get("needs"), "guard")
+        self.assertEqual(production["jobs"]["schema-gate"].get("environment"),
+                         "production-migrate-plan")
+        self.assertNotIn("if", production["jobs"]["schema-gate"])
 
     def test_staging_migrate_runner_shape_is_pinned(self):
         # TOG-11572: the slice's own workflow must satisfy its carve-out, and

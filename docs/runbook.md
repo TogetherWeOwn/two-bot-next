@@ -1324,7 +1324,7 @@ or existing operator handoff; see [backup.md](backup.md) for unit contracts.
 | `POST /internal/actions` 503 `unavailable` | The container is not running (public ingress never starts it; wait for the probe or keepalive), the ownership fence refused this deployment, or the receiver answered something other than its JSON envelope. Check `/readyz` and ownership status; do not retry-loop a signed request with a new nonce. |
 | `POST /hooks/twitch` refusal or 404 on staging | The EventSub receiver is staging-only and dark unless the Worker route gate and the container listener are both enabled. Read the [EventSub operator runbook](eventsub-runbook.md) for the enable order, secret agreement, challenge echo, and the full refusal matrix before changing anything. |
 | Ready but feature inactive | Gateway readiness says nothing about library-only commands/jobs/kill switches. Check [runtime boundaries](#containment-kill-switches-and-feature-flags), not extra environment guesses. |
-| Worker restored but Rust regression remains | Worker-version rollback did not prove image rollback. Inspect the active image and use a schema-compatible full redeploy of the known-good pair. |
+| Worker restored but Rust regression remains | A bare `wrangler rollback` does not prove image rollback; the `deploy-production` rollback dispatch restores Worker version and container image together with a stable gate. Inspect the active image and use the workflow rollback (or a schema-compatible full redeploy of the known-good pair). |
 | Backup/drill red | Preserve valid archives; inspect exit status, verifier line, table counts and off-box receipt. Rehearse only on a prepared test database. No automatic promotion to a production restore. |
 
 ## Incident playbooks
