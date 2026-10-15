@@ -71,24 +71,37 @@ and a redeploy of a prior good commit, must always set `sha` explicitly: an empt
 `sha` promotes the latest staged commit, which during an incident is usually the
 build that just broke production (the guard refuses a rollback without `sha`).
 Dispatch again with `rollback` set to the previous version ID
-from the failed run's summary and `takeover: true`. Set `sha` to the commit that version was built
+from the failed run's summary, `image` set to the previous container image
+digest from the same summary's rollback-snapshot line, and `takeover: true`.
+Set `sha` to the commit that version was built
 from. It is recorded as the rollback message, and the `/readyz` gate after the
 rollback must report that revision, or a pre-stamp version (see below). The
-rollback passes the same guard and the same Environment approval. It then runs
-`wrangler rollback <version-id> --message <sha> --yes` and fails unless that
-version serves 100% of traffic. Without the takeover the fence stays held,
+rollback passes the same guard and the same Environment approval, except the
+guard never needs deploy-staging history for a rollback: aged-out staging
+runs must not block recovery. The step restores BOTH the named Worker version
+and the named container image (a Worker-only rollback leaves the new image
+serving), hands ownership to the restored version, and requires the same
+stable gateway-ready gate. Without the takeover the fence stays held,
 fenced answers carry no build fields, and the gate fails without being a
-rollback signal. When the Rust image itself is the fault,
-dispatch in deploy mode with `takeover: true` and the prior good SHA instead; a standalone full
-redeploy outside this workflow is superseded as a production rollback path.
+rollback signal. A standalone `wrangler rollback` outside this workflow is
+superseded as a production rollback path: it restores the Worker version but
+not the container image.
+
+**Stale bot, live SHA.** When the bot is stale but the live build is good
+(the owner's first-response cure), re-serve it without staging history:
+dispatch in deploy mode with `sha` set to the currently live commit,
+`takeover: true`, and `allow_unstaged: true`. The guard still requires the
+SHA on main with green `ci-ok`/`worker check` and the operator's confirmation
+that the SHA is live; it waives only the staging-history check. Anything else
+(a new build) always needs its staging run.
 Coverage: the rehearsal log in
 [cutover-rollback-runbook.md](cutover-rollback-runbook.md#7-staging-rehearsal-log)
 is a dry-walk that checked this route without executing a rollback or deploy;
 the staging rollback drill
 ([ci-security.md](ci-security.md#staging-rollback-drill-manual)) rehearses
 fence, unforced deployment with immediate Durable Object update, takeover and
-restore, which differs from this dispatch's `rollback --yes` with deferred
-Durable Object default. The deploy-mode path with a prior good SHA has no
+restore, which matches this dispatch's rollback immediate Durable Object
+update. The deploy-mode path with a prior good SHA has no
 production drill record.
 
 ## Build identity and the `/readyz` gate
@@ -123,8 +136,9 @@ only, because the serving version was built by an older run.
 
 | `/readyz` answer | Result |
 |---|---|
-| 200, revision is the SHA, `build_id` is this run's (deploy) or any stamped id (rollback) | Pass: gateway ready |
-| 503 with the SHA and a passing build id (same rule) | Pass: gateway parked (truthful 503 as a state, identity still matches) |
+| 200 with gateway `ready`, revision is the SHA, `build_id` is this run's (deploy) or any stamped id (rollback), held for 18 consecutive polls (~3 min) | Pass: gateway ready and stable |
+| 503 with the SHA and a passing build id (same rule) | Keep polling, then fail and auto-roll back: a parked gateway never certifies a build |
+| 200 with gateway `starting` or `down` | Keep polling, then fail and auto-roll back |
 | 503 `{"error":"ownership_fenced"}` with no build fields | Keep polling; fail at the end. The fence releases at cutover step 3.5, so the identity match is established only after the takeover |
 | Revision is the SHA but `build_id` is another run's (deploy mode) | Keep polling; fail at the end: the previous container still serves this SHA |
 | `build_revision` is another SHA | Keep polling; fail at the end |
@@ -133,6 +147,14 @@ only, because the serving version was built by an older run.
 | `build_revision` or `build_id` is missing or not a string, or the body is not a JSON object | Keep polling; fail at the end |
 | JSON repeats an object key, nests past the depth bound, or `build_revision`/`build_id` has an unexpected shape | Keep polling; fail at the end with a fixed single-line reason that echoes no remote value |
 | Any other status, including `000` (no answer) | Keep polling; fail at the end |
+
+A failed gate after a takeover rolls back automatically
+(`scripts/worker_container_rollback.py`): the job restores the pre-deploy
+snapshot's Worker version AND container image with takeover, requires the
+same stable gate on the restored build, uploads the evidence artifact, and
+still fails the run red. The rollback restores service; it never certifies
+the build. Without a takeover nothing moved, so there is nothing to restore;
+without a deploy or a snapshot the run just fails for the operator.
 
 Remote identity shapes are validated before any value enters diagnostics:
 only `unknown`, a 40-character hex revision, or a bounded digits-digits

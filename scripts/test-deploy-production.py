@@ -36,7 +36,11 @@ VERSION = "0b6e5e3c-1f2a-4b3c-8d4e-5f6a7b8c9d0e"
 OLD_VERSION = "9f8e7d6c-5b4a-4c3d-9e2f-1a0b9c8d7e6f"
 GUARD_STEP = "Refuse unverified SHA or unprotected Environment"
 RENDER_STEP = "Render the production deploy config with build identity"
-GATE_STEP = "Gate on /health + /readyz revision"
+GATE_STEP = "Gate on stable /health + /readyz gateway-ready"
+ROLLBACK_STEP = "Roll back production Worker version and container image"
+AUTO_ROLLBACK_STEP = "Auto-roll back Worker version and container image"
+SNAPSHOT_STEP = "Snapshot the pre-deploy rollback state"
+IMAGE = "registry.cloudflare.com/acct/two-bot-next-twobotcontainer-production@sha256:" + "c" * 64
 WRANGLER_ACTION = "cloudflare/wrangler-action@"
 
 
@@ -175,11 +179,18 @@ class StaticGuardTests(unittest.TestCase):
         self.assertEqual(value(sha_input["required"]), "false")
         self.assertEqual(value(sha_input["default"]), '""')
         self.assertEqual(value(children(inputs["rollback"][1:], 8)["required"]), "false")
+        self.assertEqual(value(children(inputs["image"][1:], 8)["required"]), "false")
+        self.assertEqual(value(children(inputs["image"][1:], 8)["default"]), '""')
         # The takeover flag is opt-in: a routine deploy leaves the fence held.
         takeover = children(inputs["takeover"][1:], 8)
         self.assertEqual(value(takeover["required"]), "false")
         self.assertEqual(value(takeover["type"]), "boolean")
         self.assertEqual(value(takeover["default"]), "false")
+        # allow_unstaged re-serves the live SHA when staging history aged out.
+        unstaged = children(inputs["allow_unstaged"][1:], 8)
+        self.assertEqual(value(unstaged["required"]), "false")
+        self.assertEqual(value(unstaged["type"]), "boolean")
+        self.assertEqual(value(unstaged["default"]), "false")
         text = "\n".join(TOP["on"])
         for trigger in ("push", "pull_request", "pull_request_target", "schedule", "workflow_run", "workflow_call"):
             self.assertNotRegex(text, rf"(?m)^\s*{trigger}:", trigger)
@@ -192,8 +203,10 @@ class StaticGuardTests(unittest.TestCase):
         self.assertNotIn("environment", guard)
         self.assertNotIn("secrets.", "\n".join(JOBS["guard"]))
         wrangler = [s for s in steps(JOBS["production"]) if WRANGLER_ACTION in "\n".join(s)]
-        # Deploy/rollback, the before/after version reads, and the post-takeover re-read.
-        self.assertEqual(len(wrangler), 5)
+        # Deploy, the before/after version reads, and the post-takeover
+        # re-read. Rollback mode restores Worker + image through the reviewed
+        # script, not `wrangler rollback`, so the image rolls back too.
+        self.assertEqual(len(wrangler), 4)
         for step in wrangler:
             self.assertIn("          environment: production", step)
 
@@ -263,6 +276,8 @@ class StaticGuardTests(unittest.TestCase):
         # reads the guard's validated outputs.
         input_lines = [line.strip() for line in LINES if "inputs." in line]
         self.assertEqual(input_lines, ["SHA: ${{ inputs.sha }}", "ROLLBACK: ${{ inputs.rollback }}",
+                                       "IMAGE: ${{ inputs.image }}",
+                                       "ALLOW_UNSTAGED: ${{ inputs.allow_unstaged }}",
                                        "TAKEOVER: ${{ inputs.takeover }}"])
         production = "\n".join(JOBS["production"])
         self.assertNotIn("inputs.", production)
@@ -270,16 +285,44 @@ class StaticGuardTests(unittest.TestCase):
         self.assertIn("persist-credentials: false", production)
         self.assertIn('git merge-base --is-ancestor "$SHA" origin/main', production)
         self.assertIn("command: deploy --config ${{ env.PRODUCTION_DEPLOY_CONFIG }} --env production --message ${{ needs.guard.outputs.sha }}", production)
-        self.assertIn(
-            "command: rollback ${{ needs.guard.outputs.version }} --message ${{ needs.guard.outputs.sha }} --yes",
-            production,
-        )
+        # No `wrangler rollback`: a Worker-only rollback leaves the new image
+        # serving. Rollback mode restores both through the reviewed script.
+        self.assertNotIn("wrangler rollback", production)
+        self.assertNotIn("command: rollback", production)
+        rollback = inline_script(ROLLBACK_STEP)
+        self.assertIn("worker_container_rollback.py rollback", rollback)
+        self.assertIn('--target-version "$TARGET_VERSION"', rollback)
+        self.assertIn('--target-image "$TARGET_IMAGE"', rollback)
+        self.assertIn("--variant production", rollback)
         conditions = {
             step[0]: [line.strip() for line in step if line.strip().startswith("if:")]
             for step in steps(JOBS["production"])
         }
         self.assertEqual(conditions["      - name: Deploy to production"], ["if: env.MODE == 'deploy'"])
-        self.assertEqual(conditions["      - name: Roll back production"], ["if: env.MODE == 'rollback'"])
+        self.assertEqual(conditions[f"      - name: {ROLLBACK_STEP}"], ["if: env.MODE == 'rollback'"])
+
+    def test_snapshot_and_auto_rollback_share_the_reviewed_script(self):
+        snapshot = inline_script(SNAPSHOT_STEP)
+        self.assertIn("worker_container_rollback.py snapshot", snapshot)
+        self.assertIn("--variant production", snapshot)
+        auto = inline_script(AUTO_ROLLBACK_STEP)
+        self.assertIn("worker_container_rollback.py rollback", auto)
+        self.assertIn("--snapshot", auto)
+        self.assertIn("--variant production", auto)
+        conditions = {
+            step[0]: [line.strip() for line in step if line.strip().startswith("if:")]
+            for step in steps(JOBS["production"])
+        }
+        # Auto-rollback only after a takeover deploy actually replaced
+        # something: the run still fails red, but service is restored first.
+        self.assertEqual(
+            conditions[f"      - name: {AUTO_ROLLBACK_STEP}"],
+            ["if: failure() && env.MODE == 'deploy' && env.TAKEOVER == 'true' "
+             "&& steps.deploy.outcome == 'success' && steps.snapshot.outcome == 'success'"],
+        )
+        production = "\n".join(JOBS["production"])
+        self.assertIn("production-rollback-snapshot.json", production)
+        self.assertIn("production-auto-rollback-evidence.json", production)
 
     def test_pre_freeze_candidate_requires_the_full_latest_ci_verdict(self):
         row = next(line for line in (ROOT / "docs/cutover-sequence.md").read_text().splitlines()
@@ -316,7 +359,10 @@ class StaticGuardTests(unittest.TestCase):
     def test_gate_prints_remote_bodies_only_as_escaped_excerpts(self):
         for name in ("health", "readyz"):
             self.assertNotIn(f'cat "${name}"', GATE)
-            self.assertIn(f'production_deploy.py excerpt --body "${name}"', GATE)
+        # /readyz bodies reach the log only through the bounded escaped
+        # excerpt; /health bodies never reach it at all (status code only).
+        self.assertIn('production_deploy.py excerpt --body "$readyz"', GATE)
+        self.assertNotIn('excerpt --body "$health"', GATE)
 
     def test_takeover_steps_run_only_when_requested_with_production_bindings(self):
         names = [step[0].strip() for step in steps(JOBS["production"])]
@@ -328,9 +374,14 @@ class StaticGuardTests(unittest.TestCase):
         for name in (preflight, status, takeover, reread, confirm):
             self.assertIn(name, names)
         by_name = {step[0].strip(): step for step in steps(JOBS["production"])}
-        for name in (preflight, status, takeover, reread, confirm):
+        for name in (preflight, status, reread, confirm):
             conditions = [line.strip() for line in by_name[name] if line.strip().startswith("if:")]
             self.assertEqual(conditions, ["if: env.TAKEOVER == 'true'"], name)
+        # The mutating takeover POST runs in deploy mode only: rollback mode
+        # already fenced, restored and handed ownership over in its own step.
+        conditions = [line.strip() for line in by_name[takeover]
+                      if line.strip().startswith("if:")]
+        self.assertEqual(conditions, ["if: env.TAKEOVER == 'true' && env.MODE == 'deploy'"], takeover)
         text = "\n".join(sum((by_name[name] for name in (preflight, status, takeover)), []))
         # Production bindings only: the control token comes from the
         # production Environment secret, the URL from its variable.
@@ -352,7 +403,10 @@ class StaticGuardTests(unittest.TestCase):
 
 
 class GuardBehaviourTests(unittest.TestCase):
-    def guard(self, sha=SHA, rollback="", takeover="false", ref="refs/heads/main", auto="", **responses):
+    def guard(self, sha=SHA, rollback="", image=None, takeover="false", allow_unstaged="false",
+              ref="refs/heads/main", auto="", **responses):
+        if image is None:
+            image = IMAGE if rollback else ""
         api = {**green(), "staging-latest": {"total_count": 1, "workflow_runs": [staging_run()]}, **responses}
         calls = []
         resolved = sha.strip().lower() or (SHA if not rollback else "")
@@ -422,7 +476,8 @@ class GuardBehaviourTests(unittest.TestCase):
             output, summary = Path(tmp) / "output", Path(tmp) / "summary"
             env = {
                 "GITHUB_REPOSITORY": REPO, "GITHUB_REF": ref, "SHA": sha, "ROLLBACK": rollback,
-                "TAKEOVER": takeover, "AUTO_APPROVE": auto,
+                "IMAGE": image, "TAKEOVER": takeover, "ALLOW_UNSTAGED": allow_unstaged,
+                "AUTO_APPROVE": auto,
                 "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary),
             }
             stdout, code = io.StringIO(), 0
@@ -448,7 +503,8 @@ class GuardBehaviourTests(unittest.TestCase):
     def test_green_main_sha_passes_and_reports(self):
         code, outputs, summary, calls, _ = self.guard()
         self.assertEqual(code, 0)
-        self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "takeover": "false"})
+        self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "image": "",
+                                   "takeover": "false", "allow_unstaged": "false"})
         self.assertIn("Takeover: not requested", summary)
         self.assertIn(SHA, summary)
         self.assertIn("full `ci-ok` verdict", summary)
@@ -509,8 +565,58 @@ class GuardBehaviourTests(unittest.TestCase):
                 self.assertEqual(result[3], [])
         code, outputs, summary, _, _ = self.guard(rollback=VERSION.upper())
         self.assertEqual(code, 0)
-        self.assertEqual(outputs, {"sha": SHA, "mode": "rollback", "version": VERSION, "takeover": "false"})
+        self.assertEqual(outputs, {"sha": SHA, "mode": "rollback", "version": VERSION,
+                                   "image": IMAGE, "takeover": "false",
+                                   "allow_unstaged": "false"})
         self.assertIn(VERSION, summary)
+
+    def test_rollback_needs_the_previous_container_image(self):
+        # The digest is a content hash, safe as an input; without it the
+        # rollback would repeat the incident (Worker back, image still bad).
+        for image in ("", "latest", IMAGE[:-1], IMAGE + "0", IMAGE.replace("@sha256:", ":x@sha256:")):
+            with self.subTest(image=image[:40]):
+                result = self.guard(rollback=VERSION, image=image)
+                self.assertRefused(result, "previous container image")
+                self.assertEqual(result[3], [])
+        result = self.guard(image=IMAGE)
+        self.assertRefused(result, "rollback-only input")
+        self.assertEqual(result[3], [])
+
+    def test_rollback_never_depends_on_staging_history(self):
+        # Aged-out staging history blocked the 10-15 rollback. A rollback
+        # needs the version that ran in prod plus takeover, never staging.
+        code, outputs, summary, calls, _ = self.guard(
+            rollback=VERSION, takeover="true",
+            staging={"total_count": 0, "workflow_runs": []})
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs["mode"], "rollback")
+        self.assertIn("never blocks recovery", summary)
+        self.assertFalse(any("deploy-staging" in path for path, _ in calls))
+
+    def test_live_sha_takeover_redeploy_waives_staging_history(self):
+        # The owner's first-response cure for a stale bot: re-serve the live
+        # SHA with takeover when staging history aged out.
+        code, outputs, summary, calls, _ = self.guard(
+            takeover="true", allow_unstaged="true",
+            staging={"total_count": 0, "workflow_runs": []})
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "image": "",
+                                   "takeover": "true", "allow_unstaged": "true"})
+        self.assertIn("operator confirms the SHA is live", summary)
+        self.assertFalse(any("deploy-staging" in path for path, _ in calls))
+
+    def test_allow_unstaged_needs_takeover_and_deploy_mode(self):
+        result = self.guard(allow_unstaged="true")
+        self.assertRefused(result, "needs takeover true")
+        self.assertEqual(result[3], [])
+        result = self.guard(rollback=VERSION, allow_unstaged="true")
+        self.assertRefused(result, "never a rollback")
+        self.assertEqual(result[3], [])
+        for flag in ("", "yes", "True", "1"):
+            with self.subTest(flag=flag):
+                result = self.guard(allow_unstaged=flag)
+                self.assertRefused(result, "allow_unstaged must be true or false")
+                self.assertEqual(result[3], [])
 
     def test_takeover_flag_is_validated_before_any_api_call(self):
         for flag in ("", "yes", "True", "1", " true", "takeover"):
@@ -748,7 +854,8 @@ class GuardBehaviourTests(unittest.TestCase):
         environment = {**green()["environment"], "protection_rules": [{"type": "branch_policy"}]}
         code, outputs, summary, calls, _ = self.guard(auto="true", environment=environment)
         self.assertEqual(code, 0)
-        self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "takeover": "false"})
+        self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "image": "",
+                                   "takeover": "false", "allow_unstaged": "false"})
         self.assertIn("Approval: automated", summary)
         self.assertIn("deploy-staging run `501`", summary)
         self.assertTrue(any(path.endswith("deploy-staging.yml/runs") and "status" not in q for path, q in calls))
@@ -1000,21 +1107,45 @@ class ShellStepTests(unittest.TestCase):
                                          GITHUB_RUN_ID=run_id, GITHUB_RUN_ATTEMPT=attempt)
         return code, summary, worker
 
-    def test_matching_revision_passes_ready_or_truthfully_parked(self):
-        for status, state in ((200, "gateway ready"), (503, "gateway parked")):
+    def test_matching_revision_passes_only_when_gateway_ready_and_stable(self):
+        code, summary, worker = self.gate(
+            {"/health": [(200, "{}")], "/readyz": [(200, report())]})
+        self.assertEqual(code, 0, summary)
+        self.assertIn("stable 18/18 polls", summary)
+        # One first pass plus 18 consecutive stability polls on each path.
+        self.assertEqual(worker.count("/readyz"), 1 + 18)
+        self.assertEqual(worker.count("/health"), 1 + 18)
+        self.assertEqual({agent for _, agent in worker.hits}, {AGENT})
+
+    def test_parked_gateway_never_passes(self):
+        # The 10-15 incident: a crash-looping build answered 503 parked and
+        # the gate certified it. Parked is now a failure that rolls back.
+        parked = json.dumps({"components": [["process", "ready"], ["gateway", "down"],
+                                             ["database", "ready"], ["token_invalid", "ready"]],
+                             "jobs": {}, "build_revision": SHA, "build_id": BUILD_ID})
+        for status in (200, 503):
             with self.subTest(status=status):
                 code, summary, worker = self.gate(
-                    {"/health": [(200, "{}")], "/readyz": [(status, report())]})
-                self.assertEqual(code, 0, summary)
-                self.assertIn(f"/readyz {status} ({state}", summary)
-                self.assertEqual(worker.count("/readyz"), 1)
-                self.assertEqual({agent for _, agent in worker.hits}, {AGENT})
+                    {"/health": [(200, "{}")], "/readyz": [(status, parked)]})
+                self.assertEqual(code, 1)
+                self.assertIn("roll back", summary)
+                # Phase 1 only: no stability window without a first pass.
+                self.assertEqual(worker.count("/readyz"), 30)
+
+    def test_stability_window_resets_on_a_miss(self):
+        missing = [(200, report())] * 2 + [(503, report())] + [(200, report())] * 30
+        code, summary, worker = self.gate(
+            {"/health": [(200, "{}")], "/readyz": missing})
+        self.assertEqual(code, 0, summary)
+        self.assertIn("stable 18/18 polls", summary)
+        # 2 passes, a miss resetting the streak, then 18 consecutive.
+        self.assertEqual(worker.count("/readyz"), 2 + 1 + 18)
 
     def test_health_is_polled_through_a_cold_start(self):
         code, summary, worker = self.gate(
             {"/health": [(502, ""), (503, ""), (200, "{}")], "/readyz": [(200, report())]})
         self.assertEqual(code, 0, summary)
-        self.assertEqual(worker.count("/health"), 3)
+        self.assertEqual(worker.count("/health"), 3 + 18)
 
     def test_readyz_must_serve_this_revision(self):
         cases = {
@@ -1059,7 +1190,8 @@ class ShellStepTests(unittest.TestCase):
             "/readyz": [(503, report(revision="a" * 40)), (200, report())],
         })
         self.assertEqual(code, 0, summary)
-        self.assertEqual(worker.count("/readyz"), 2)
+        # A miss, a first pass, then the 18-poll stability window.
+        self.assertEqual(worker.count("/readyz"), 2 + 18)
 
     def test_readyz_without_an_answer_fails(self):
         for status in (0, 404, 500):
@@ -1073,7 +1205,7 @@ class ShellStepTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(worker.count("/health"), 30)
         self.assertEqual(worker.count("/readyz"), 0)
-        self.assertIn("never 200", summary)
+        self.assertIn("no fully-passing answer", summary)
 
     def test_hostile_readyz_body_cannot_forge_workflow_commands_in_the_log(self):
         # A non-JSON 200 whose lines look like runner commands: the step log is
@@ -1184,11 +1316,20 @@ class ReadyzVerdictTests(unittest.TestCase):
             )
             return result.returncode, result.stdout.strip()
 
-    def test_matching_revision_passes_ready_and_truthfully_parked(self):
+    def test_matching_revision_passes_only_when_gateway_ready(self):
         code, message = self.judge("200", report())
         self.assertEqual((code, message.split(",")[0]), (0, "gateway ready"))
+        # A parked gateway is never a pass: the gate fails and rolls back.
+        parked = json.dumps({"components": [["process", "ready"], ["gateway", "down"],
+                                             ["database", "ready"], ["token_invalid", "ready"]],
+                             "jobs": {}, "build_revision": SHA, "build_id": BUILD_ID})
+        for status in ("200", "503"):
+            code, message = self.judge(status, parked)
+            self.assertEqual(code, 1)
+            self.assertIn("gateway not ready", message)
         code, message = self.judge("503", report())
-        self.assertEqual((code, message.split(",")[0]), (0, "gateway parked; deploy is healthy"))
+        self.assertEqual(code, 1)
+        self.assertIn("gateway not ready", message)
 
     def test_deploy_rejects_a_stale_build_of_the_same_sha(self):
         # The previous container still serves the SHA after a same-SHA
