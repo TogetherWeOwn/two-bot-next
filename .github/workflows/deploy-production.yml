@@ -67,7 +67,7 @@ jobs:
       sha: ${{ steps.guard.outputs.sha }}
       mode: ${{ steps.guard.outputs.mode }}
       version: ${{ steps.guard.outputs.version }}
-      image: ${{ steps.guard.outputs.image }}
+      restore_image: ${{ steps.guard.outputs.restore_image }}
       takeover: ${{ steps.guard.outputs.takeover }}
       allow_unstaged: ${{ steps.guard.outputs.allow_unstaged }}
     steps:
@@ -294,7 +294,7 @@ jobs:
               refuse("check.yml latest run/attempt changed during validation; retry after CI completes")
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-              out.write(f"sha={sha}\nmode={mode}\nversion={version}\nimage={image}\n"
+              out.write(f"sha={sha}\nmode={mode}\nversion={version}\nrestore_image={image}\n"
                         f"takeover={takeover}\nallow_unstaged={allow_unstaged}\n")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write(
@@ -398,7 +398,7 @@ jobs:
       SHA: ${{ needs.guard.outputs.sha }}
       MODE: ${{ needs.guard.outputs.mode }}
       TARGET_VERSION: ${{ needs.guard.outputs.version }}
-      TARGET_IMAGE: ${{ needs.guard.outputs.image }}
+      TARGET_IMAGE: ${{ needs.guard.outputs.restore_image }}
       TAKEOVER: ${{ needs.guard.outputs.takeover }}
       ALLOW_UNSTAGED: ${{ needs.guard.outputs.allow_unstaged }}
     defaults:
