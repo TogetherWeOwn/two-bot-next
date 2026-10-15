@@ -82,6 +82,11 @@ ALTER_TYPE = re.compile(
     re.IGNORECASE,
 )
 DROP_OBJECT = re.compile(r"\bDROP\s+(?:TABLE|COLUMN)\b", re.IGNORECASE)
+ALTER_TABLE_PREFIX = re.compile(
+    r"^\s*ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?\S+(?:\s*\*)?\s+",
+    re.IGNORECASE,
+)
+BARE_DROP = re.compile(r"^\s*DROP\s+(?!CONSTRAINT\b)", re.IGNORECASE)
 CREATE_TABLE = re.compile(
     r"\bCREATE\s+(?:(?:GLOBAL|LOCAL)\s+)?(?:TEMP(?:ORARY)?\s+|UNLOGGED\s+)?"
     r"TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:ONLY\s+)?"
@@ -102,13 +107,12 @@ DOLLAR_OPEN = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$")
 def normalize_table(raw):
     """Lowercase unqualified table name for same-file empty-table checks.
 
-    Unquoted names fold to lowercase; quoted identifiers are
-    case-sensitive, so their case is preserved.
+    Inputs arrive via blanked(), which already folds simple lowercase
+    quoted identifiers (``"guilds"``) to their bare name and maps every
+    other quoted identifier to a case-sensitive placeholder, so a plain
+    lowercase comparison is sufficient here.
     """
-    last = raw.strip().split(".")[-1].strip()
-    if len(last) >= 2 and last.startswith('"') and last.endswith('"'):
-        return last[1:-1].replace('""', '"')
-    return last.lower()
+    return raw.strip().split(".")[-1].strip().lower()
 
 
 class SquawkError(ValueError):
@@ -120,7 +124,10 @@ def blanked(text):
     spans replaced by spaces (newlines preserved), so keyword matching and
     statement splitting never fire inside literals or comments.
 
-    Quoted identifiers map to a unique placeholder per distinct name
+    Quoted identifiers that are already simple lowercase names (``"guilds"``)
+    emit their bare name so they compare equal to the unquoted form, as
+    Postgres folds unquoted names to lowercase. Every other quoted
+    identifier maps to a unique placeholder per distinct name
     (``_qq_<n>_``), so two different quoted table names never collapse to
     one token while the same quoted name stays equal to itself.
     """
@@ -182,10 +189,14 @@ def blanked(text):
                     break
                 j += 1
             raw = text[begin:j]
-            if raw not in quoted_ids:
-                quoted_ids[raw] = f"_qq_{len(quoted_ids)}_"
-            out.append(quoted_ids[raw])
-            out.append("\n" * raw.count("\n"))
+            inner = raw[1:-1] if len(raw) >= 2 else ""
+            if re.fullmatch(r"[a-z_][a-z0-9_$]*", inner or ""):
+                out.append(inner)
+            else:
+                if raw not in quoted_ids:
+                    quoted_ids[raw] = f"_qq_{len(quoted_ids)}_"
+                out.append(quoted_ids[raw])
+                out.append("\n" * raw.count("\n"))
             i = j
         elif text[i] == "$":
             match = DOLLAR_OPEN.match(text, i)
@@ -284,6 +295,31 @@ def index_on_existing_table(sql, created_tables):
     return normalize_table(match.group("name")) not in created_tables
 
 
+def has_dropping_object(sql):
+    """True when a DROP TABLE/COLUMN action drops a column or table.
+
+    The COLUMN keyword is optional in Postgres (``DROP [COLUMN]``), so a
+    per-action check covers the bare spelling as well as the explicit
+    ``DROP TABLE`` / ``DROP COLUMN`` forms. Only ALTER TABLE statements
+    take the bare path, so standalone ``DROP INDEX`` / ``DROP TRIGGER``
+    stay clean. ``DROP CONSTRAINT`` and ``ALTER COLUMN ... DROP NOT
+    NULL/DEFAULT/IDENTITY`` never start an action with DROP, so they stay
+    clean.
+    """
+    if DROP_OBJECT.search(sql):
+        return True
+    if not re.match(r"^\s*ALTER\s+TABLE\b", sql, re.IGNORECASE):
+        return False
+    actions = split_actions(sql)
+    for index, action in enumerate(actions):
+        candidate = action
+        if index == 0:
+            candidate = ALTER_TABLE_PREFIX.sub("", candidate, count=1)
+        if BARE_DROP.match(candidate):
+            return True
+    return False
+
+
 def lint_statement(sql, created_tables=frozenset()):
     """Return the list of rule IDs violated by one cleaned statement."""
     found = []
@@ -295,7 +331,7 @@ def lint_statement(sql, created_tables=frozenset()):
         found.append("adding-check-constraint")
     if ALTER_TYPE.search(sql):
         found.append("changing-column-type")
-    if DROP_OBJECT.search(sql):
+    if has_dropping_object(sql):
         found.append("dropping-object")
     return found
 

@@ -108,6 +108,27 @@ class RuleTests(unittest.TestCase):
             ["dropping-object"],
         )
 
+    def test_bare_drop_column_without_keyword_is_flagged(self):
+        # Postgres lets ALTER TABLE omit COLUMN: DROP [COLUMN] [IF EXISTS].
+        for sql in (
+            "ALTER TABLE t DROP c;\n",
+            "ALTER TABLE t DROP IF EXISTS c;\n",
+            'ALTER TABLE t DROP "c" CASCADE;\n',
+            "ALTER TABLE t ADD COLUMN a int, DROP b;\n",
+        ):
+            self.assertEqual(self.rules(sql), ["dropping-object"], sql)
+
+    def test_drop_constraint_and_alter_column_drops_stay_clean(self):
+        for sql in (
+            "ALTER TABLE t DROP CONSTRAINT k;\n",
+            "ALTER TABLE t ALTER COLUMN c DROP NOT NULL;\n",
+            "ALTER TABLE t ALTER COLUMN c DROP DEFAULT;\n",
+            "ALTER TABLE t ALTER c DROP IDENTITY;\n",
+            "DROP INDEX IF EXISTS idx_tickets_one_open;\n",
+            "DROP TRIGGER IF EXISTS trg ON guild_settings;\n",
+        ):
+            self.assertEqual(self.rules(sql), [], sql)
+
     def test_multiline_and_lowercase_statements(self):
         findings = squawk.lint_text(
             "alter table guilds\n"
@@ -366,13 +387,45 @@ class RuleTests(unittest.TestCase):
             [],
         )
 
-    def test_normalize_table_quoting_and_schema(self):
-        self.assertEqual(squawk.normalize_table("Guilds"), "guilds")
-        self.assertEqual(squawk.normalize_table("public.t"), "t")
-        self.assertEqual(squawk.normalize_table('"Alpha"'), "Alpha")
-        self.assertNotEqual(
-            squawk.normalize_table('"Alpha"'), squawk.normalize_table('"alpha"')
+    def test_quoted_lowercase_matches_unquoted(self):
+        # Postgres folds unquoted names to lowercase, so "guilds" == guilds.
+        self.assertEqual(
+            self.rules(
+                'CREATE TABLE "guilds" (id bigint PRIMARY KEY);\n'
+                "CREATE INDEX x ON guilds (id);\n"
+            ),
+            [],
         )
+        self.assertEqual(
+            self.rules(
+                "CREATE TABLE guilds (id bigint PRIMARY KEY);\n"
+                'CREATE INDEX x ON "guilds" (id);\n'
+            ),
+            [],
+        )
+
+    def test_quoted_mixed_case_does_not_match_unquoted(self):
+        # Quoted identifiers stay case-sensitive: "Guilds" != guilds.
+        self.assertEqual(
+            self.rules(
+                'CREATE TABLE "Guilds" (id bigint PRIMARY KEY);\n'
+                "CREATE INDEX x ON guilds (id);\n"
+            ),
+            ["creating-index"],
+        )
+        self.assertEqual(
+            self.rules(
+                "CREATE TABLE guilds (id bigint PRIMARY KEY);\n"
+                'CREATE INDEX x ON "Guilds" (id);\n'
+            ),
+            ["creating-index"],
+        )
+
+    def test_multiline_quoted_identifier_preserves_line_numbers(self):
+        findings = squawk.lint_text(
+            'SELECT "a\nb";\nCREATE INDEX bad ON t (a);\n'
+        )
+        self.assertEqual(findings, [(3, "creating-index")])
 
     def test_several_rules_in_one_file_report_each_line(self):
         self.assertEqual(
