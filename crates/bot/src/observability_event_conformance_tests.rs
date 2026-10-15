@@ -170,8 +170,9 @@ const STARTUP_ERROR_CLASSES: [&str; 8] = [
 
 // `crates/bot/src/main.rs`: boot/startup diagnostics owned by
 // `docs/startup-diagnostics.md`.
-const MAIN_RS_ADJACENT: [&str; 13] = [
+const MAIN_RS_ADJACENT: [&str; 14] = [
     "internal-action startup refused",
+    "eventsub startup refused",
     "config invalid; continuing with safe defaults",
     "container listener failed",
     "DISCORD_GATEWAY_URL must be valid UTF-8",
