@@ -206,6 +206,11 @@ pub async fn has_unresolved_guild_guards(
             .find(|entry| entry.table == table)
             .expect("replay guards must be in the erasure plan");
         // Table names and predicates come from reviewed code, never caller input.
+        // No member exclusions: any unresolved guard anywhere in the guild
+        // defers the purge, including guards of members with a pending
+        // user-deletion request. Those rows are replay fences, not stale data,
+        // and the plan's per-member predicates go NULL on nullable columns, so
+        // an exclusion would hide other members' guards (NOT NULL is NULL).
         let sql = format!(
             "SELECT EXISTS (SELECT 1 FROM {table} WHERE guild_id = $1 AND ({unresolved_predicate}))"
         );
