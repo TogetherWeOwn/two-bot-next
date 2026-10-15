@@ -82,8 +82,8 @@ What the core does, in order, for every delivery:
 4. For a go-live: check the broadcaster allowlist, render the post from the
    validated invite, then claim the go-live key. A retry or replay of the same
    `broadcaster + started_at` whose row is started or delivered is skipped
-   with 2XX; a fresh never-started row is answered 5XX (`InFlight`) so Twitch
-   keeps retrying until the lease expires or the row settles. If the send or
+   with 2XX; a fresh never-started row is answered 5XX (`InFlight`), which
+   asks Twitch to retry. If the send or
    durable-ledger operation fails transiently, the caller releases the claim
    and answers 5XX so Twitch retries. Classification or planning errors alone
    must not trigger a retry.
@@ -108,18 +108,24 @@ receiver yet.
 ## Durable go-live ledger
 
 - One `stream_live_claims` row per go-live, keyed by `live_dedup_key`.
-  `claim_live` inserts with `ON CONFLICT DO NOTHING`: the inserter owns
-  the post. An existing started or delivered claim is acknowledged with
-  2xx and skipped; an existing fresh never-started claim is answered 5xx
-  (`InFlight`, see `stream_live::disposition`) so Twitch keeps retrying.
+  `claim_live` inserts with `ON CONFLICT DO NOTHING` and classifies a
+  conflicting row in the same call, so its outcome is final: the inserter
+  (or the taker-over of a stale never-started claim) owns the post. An
+  existing started or delivered claim is acknowledged with 2xx and
+  skipped; an existing fresh never-started claim is answered 5xx
+  (`InFlight`, see `stream_live::disposition`), which asks Twitch to retry.
 - Crash recovery is a bounded lease over never-started claims only
-  (migration 0443, `send_started_at`, `STALE_CLAIM_LEASE_SECS = 300 s`).
+  (migration 0443, `send_started_at`, `STALE_CLAIM_LEASE_SECS = 30 s`).
   The receiver MUST call `mark_live_send_started` before the first Discord
-  POST; `reclaim_stale_live` atomically takes over one stale row with
+  POST; the takeover inside `claim_live` (also exposed as
+  `reclaim_stale_live`) atomically takes over one stale row with
   `delivered_at IS NULL AND send_started_at IS NULL` and restarts its
-  `claimed_at` lease, so concurrent retries cannot both win. A crash before
-  send is answered 5xx while the lease is fresh, so Twitch keeps retrying,
-  and recovers by takeover on the first retry after the lease expires; the
+  `claimed_at` lease, so concurrent retries cannot both win. Lease length
+  does not affect safety: the `send_started_at` fence alone decides who
+  may post. A crash before send is answered 5xx while the lease is fresh
+  and recovers by takeover only if a retry arrives after the lease
+  expires. Twitch documents no retry schedule and this slice has no
+  sweeper, so a go-live that is never retried is not recovered here; the
   route stays dark until a receiver wires this flow.
 - A Discord send may succeed while `mark_live_delivered` fails. The claim can
   then remain `delivered_at IS NULL` with `send_started_at NOT NULL`;

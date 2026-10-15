@@ -10,15 +10,19 @@
 //! behavior. On a provable send failure release the claim and answer 5xx so
 //! Twitch retries; a retry of a started or delivered claim is acknowledged
 //! with 2xx and skipped, while a retry of a fresh never-started claim is
-//! answered 5xx (`InFlight`) so Twitch keeps retrying instead of treating
-//! the go-live as delivered. Never-started claims expire on a bounded lease
-//! (`STALE_CLAIM_LEASE_SECS`, 300 s) via atomic stale takeover; started and
-//! delivered rows never expire and are never reclaimed.
+//! answered 5xx (`InFlight`), which asks Twitch to retry instead of
+//! treating the go-live as delivered. `claim_live` classifies a
+//! conflicting row itself, so that answer needs no follow-up call.
+//! Never-started claims expire on a bounded lease
+//! (`STALE_CLAIM_LEASE_SECS`, 30 s) via atomic stale takeover; started and
+//! delivered rows never expire and are never reclaimed. Twitch documents
+//! no retry schedule, so recovery depends on a retry arriving after the
+//! lease; there is no sweeper in this slice.
 //!
 //! [`disposition`] is the table the receiver executes; every row is pinned
 //! below. The async glue (claim → start → post → stamp-or-release, with
-//! stale takeover of never-started claims via
-//! [`crate::stream_live_store::reclaim_stale_live`]) belongs with the
+//! stale takeover of never-started claims inside
+//! [`crate::stream_live_store::claim_live`]) belongs with the
 //! receiver, which is not implemented in this slice. The receiver MUST call
 //! `mark_live_send_started` before the first Discord POST so an ambiguous
 //! send (posted but unstamped) stays fenced as `Duplicate` forever.
@@ -35,7 +39,7 @@ pub enum Stage {
     /// The go-live row already exists (retry, replay, or restart).
     Duplicate,
     /// A never-started claim exists but its lease is still fresh: answer
-    /// 5xx so Twitch retries again after the lease can expire or the owner
+    /// 5xx, asking Twitch to retry after the lease can expire or the owner
     /// settles the row.
     InFlight,
     /// This delivery owns the post but the Discord send failed.

@@ -13,7 +13,9 @@
 //! stamp cannot double-post.
 //!
 //! Crash recovery is a bounded lease over never-started claims only:
-//! [`reclaim_stale_live`] atomically takes over one stale unposted row whose
+//! [`claim_live`] itself classifies a conflicting row (and
+//! [`reclaim_stale_live`] exposes the same takeover directly): it atomically
+//! takes over one stale unposted row whose
 //! `claimed_at` is older than [`STALE_CLAIM_LEASE_SECS`] and whose
 //! `send_started_at IS NULL`. Started (`send_started_at NOT NULL`) and
 //! delivered (`delivered_at NOT NULL`) rows are never reclaimed, even when
@@ -28,14 +30,19 @@
 
 use sqlx::{Pool, Postgres};
 
-/// Bounded lease for a never-started claim, in seconds. A normal
-/// claim → start → send → stamp cycle completes in seconds; 300 s gives the
-/// live owner ample headroom. A retry that finds the lease still fresh gets
-/// [`ClaimOutcome::InFlight`] (answered 5xx), so Twitch keeps retrying
-/// instead of treating the go-live as delivered; once the lease expires a
-/// retry can take the claim over. Matches the existing 300 s delivery
-/// lease (`audit_store::DELIVERY_LEASE_SECONDS`).
-pub const STALE_CLAIM_LEASE_SECS: i64 = 300;
+/// Bounded lease for a never-started claim, in seconds. The window between
+/// claiming and [`mark_live_send_started`] is a few in-process database
+/// statements, so 30 s is ample headroom for a live owner while keeping a
+/// takeover reachable soon after a crash. Lease length does not affect
+/// safety: only the `send_started_at IS NULL` start fence decides who may
+/// post, so at most one Discord POST happens however short the lease is.
+/// A retry that finds the lease still fresh gets
+/// [`ClaimOutcome::InFlight`] (answered 5xx, which asks Twitch to retry
+/// instead of treating the go-live as delivered). Twitch does not document
+/// its retry schedule, so no horizon is promised: recovery happens only if
+/// a retry arrives after the lease expires, and this slice has no sweeper
+/// to recover a go-live that is never retried.
+pub const STALE_CLAIM_LEASE_SECS: i64 = 30;
 
 /// One go-live claim: the `live_dedup_key` plus the rendered post it owns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,17 +66,24 @@ pub enum ClaimOutcome {
     Claimed,
     /// A never-started claim exists but its lease is still fresh: its owner
     /// may still be sending, or may have crashed before starting. Answer
-    /// 5xx so Twitch keeps retrying; a retry after the lease expires can
-    /// take over via [`reclaim_stale_live`], and a retry after the owner
-    /// starts or delivers sees `Duplicate` instead.
+    /// 5xx, which asks Twitch to retry; a retry after the lease expires can
+    /// take the claim over, and a retry after the owner starts or delivers
+    /// sees `Duplicate` instead.
     InFlight,
     /// The go-live is started or delivered; acknowledge and skip. Also the
     /// answer when no row exists to reclaim.
     Duplicate,
 }
 
-/// Insert the go-live row. `Claimed` means this delivery owns the post;
-/// `Duplicate` means a retry, replay, or restart raced us to it.
+/// Insert the go-live row, classifying any conflicting row in the same
+/// call so the outcome is final and cannot be misread: `Claimed` means
+/// this delivery owns the post (a fresh insert, or an atomic takeover of a
+/// stale never-started claim); `InFlight` means a fresh never-started
+/// claim exists (answer 5xx); `Duplicate` means the row is started or
+/// delivered (acknowledge and skip). Callers must NOT map a conflicting
+/// insert straight to `Duplicate` — that two-step trap is exactly what
+/// this classification removes; [`reclaim_stale_live`] remains available
+/// for callers that already hold a claim attempt.
 pub async fn claim_live(
     pool: &Pool<Postgres>,
     claim: &LiveClaim,
@@ -87,11 +101,14 @@ pub async fn claim_live(
     .execute(pool)
     .await?
     .rows_affected();
-    Ok(if inserted == 1 {
-        ClaimOutcome::Claimed
+    if inserted == 1 {
+        Ok(ClaimOutcome::Claimed)
     } else {
-        ClaimOutcome::Duplicate
-    })
+        // Classify the conflict (and take it over if it is a stale
+        // never-started claim) so `claim_live` alone is the receiver's
+        // entry point and its outcome needs no follow-up call.
+        reclaim_stale_live(pool, claim, STALE_CLAIM_LEASE_SECS).await
+    }
 }
 
 /// Delete an unposted claim whose send provably never reached Discord, so a

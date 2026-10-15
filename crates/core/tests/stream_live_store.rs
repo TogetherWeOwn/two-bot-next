@@ -150,16 +150,18 @@ fn claim(key: &str) -> LiveClaim {
 
 #[tokio::test]
 #[ignore = "needs the disposable agent-testdb container"]
-async fn claim_is_owned_once_then_duplicate() {
+async fn claim_is_owned_once_then_in_flight() {
     let (pool, schema) = setup().await;
     let key = format!("{:064x}", 0x9e17bfa9a053696fu64);
     assert_eq!(
         claim_live(&pool, &claim(&key)).await.expect("claim"),
         ClaimOutcome::Claimed
     );
+    // The composed receiver entry point: a second delivery of the same
+    // fresh never-started claim is InFlight (5xx), not Duplicate (200).
     assert_eq!(
-        claim_live(&pool, &claim(&key)).await.expect("reclaim"),
-        ClaimOutcome::Duplicate
+        claim_live(&pool, &claim(&key)).await.expect("retry"),
+        ClaimOutcome::InFlight
     );
     // A new instant is a new go-live.
     let mut later = claim(&key);
@@ -216,8 +218,9 @@ async fn fresh_claim_cannot_be_reclaimed() {
         ClaimOutcome::Claimed
     );
     // Fresh (unexpired) unposted claim: the retry is InFlight, so the
-    // receiver answers 5xx and Twitch keeps retrying instead of treating
-    // the go-live as delivered.
+    // receiver answers 5xx, asking Twitch to retry instead of treating
+    // the go-live as delivered. Both the direct reclaim and the composed
+    // `claim_live` entry point must give that same answer.
     assert_eq!(
         reclaim_stale_live(&pool, &claim(&key), STALE_CLAIM_LEASE_SECS)
             .await
@@ -226,15 +229,21 @@ async fn fresh_claim_cannot_be_reclaimed() {
     );
     assert_eq!(
         claim_live(&pool, &claim(&key)).await.expect("retry"),
-        ClaimOutcome::Duplicate
+        ClaimOutcome::InFlight
     );
     // Once the owner starts sending, the same row is permanently fenced:
-    // retries are Duplicate (200), never InFlight.
+    // retries are Duplicate (200), never InFlight, through both calls.
     assert!(mark_live_send_started(&pool, &key).await.expect("start"));
     assert_eq!(
         reclaim_stale_live(&pool, &claim(&key), STALE_CLAIM_LEASE_SECS)
             .await
             .expect("reclaim started"),
+        ClaimOutcome::Duplicate
+    );
+    assert_eq!(
+        claim_live(&pool, &claim(&key))
+            .await
+            .expect("retry started"),
         ClaimOutcome::Duplicate
     );
     cleanup(pool, &schema).await;
@@ -250,11 +259,10 @@ async fn stale_unposted_claim_is_taken_over_atomically() {
         ClaimOutcome::Claimed
     );
     age_claim(&pool, &key, STALE_CLAIM_LEASE_SECS + 60).await;
-    // Crash-before-send: never started, lease expired, so the retry owns it.
+    // Crash-before-send: never started, lease expired, so the retry owns
+    // it — through the composed `claim_live` entry point alone.
     assert_eq!(
-        reclaim_stale_live(&pool, &claim(&key), STALE_CLAIM_LEASE_SECS)
-            .await
-            .expect("takeover"),
+        claim_live(&pool, &claim(&key)).await.expect("takeover"),
         ClaimOutcome::Claimed
     );
     // Takeover refreshes the lease: an immediate second retry loses and is
@@ -267,7 +275,7 @@ async fn stale_unposted_claim_is_taken_over_atomically() {
     );
     assert_eq!(
         claim_live(&pool, &claim(&key)).await.expect("retry"),
-        ClaimOutcome::Duplicate
+        ClaimOutcome::InFlight
     );
     // The new owner completes the normal path: start, then stamp.
     assert!(mark_live_send_started(&pool, &key).await.expect("start"));

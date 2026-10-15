@@ -252,7 +252,7 @@ jobs:
           --skip rejected_lockdown_removes_only_new_seed_and_allows_same_key_retry
           --skip permission_actor_and_guild_refusals_never_mutate
           --skip feed_crud_audit_scope_and_timestamp_roundtrip
-          --skip claim_is_owned_once_then_duplicate
+          --skip claim_is_owned_once_then_in_flight
           --skip failed_send_releases_the_claim_for_the_retry
           --skip delivered_rows_are_never_reclaimed
           --skip fresh_claim_cannot_be_reclaimed
