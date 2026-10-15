@@ -17,18 +17,18 @@ use std::{
 };
 
 use axum::{
-    Json, Router,
     body::to_bytes,
     extract::{Request, State},
-    http::{HeaderValue, Method, StatusCode, header},
+    http::{header, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::any,
+    Json, Router,
 };
 use serde_json::json;
 use tokio::{net::TcpListener, sync::Semaphore};
 use two_bot_core::{
     eventsub_receiver_config::EventsubReceiverConfig,
-    twitch_eventsub::{Delivery, DeliveryHeaders, EventSubError, classify, verify_delivery},
+    twitch_eventsub::{classify, verify_delivery, Delivery, DeliveryHeaders, EventSubError},
 };
 
 /// Exact callback path; mirrors `wrangler/src/eventsub.ts` (`EVENTSUB_PATH`).
@@ -359,8 +359,8 @@ mod tests {
     use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     use std::sync::{
-        OnceLock,
         atomic::{AtomicU64, Ordering},
+        OnceLock,
     };
     use tower::ServiceExt as _;
 
