@@ -25,8 +25,10 @@ Job map (each a pure function of the changed paths):
 
 Coupling notes (verified 2026-10-02, enforced by test_job_inputs.py):
 - Rust tests read a pinned doc set by content (parity/cutover/commands/
-  configuration/voice-rooms plus the soak/parity JSON): those docs select
-  ``rust``. staging-soak/backup/preflight/runbook are existence-only inputs
+  configuration/voice-rooms plus the soak/parity JSON, plus
+  privacy/database-roles/rollback-delta/backup by the voice owner-grant
+  journal regression): those docs select
+  ``rust``. staging-soak/preflight/runbook are existence-only inputs
   to the preconditions binary (is_file, never content), so a content edit
   cannot break Rust and they fall through to the worker rule below; any
   deletion forces all jobs via the deletion rule. Every other doc has no
@@ -126,10 +128,11 @@ WORKER_PREFIX = "wrangler/"
 # soak/parity by the checklist and baseline guards, smoke-run-record and
 # smoke-expected-responses by the smoke surface inventory link test (and
 # smoke-surface-inventory for the same family of smoke content reads),
-# privacy/database-roles/rollback-delta by the voice owner-grant journal
-# documentation regression (crates/core/tests/voice_owner_grants_docs.rs).
+# privacy/database-roles/rollback-delta/backup by the voice owner-grant
+# journal documentation regression
+# (crates/core/tests/voice_owner_grants_docs.rs).
 # parity.md and the baseline also gate parity-docs. Existence-only docs
-# (staging-soak/backup/preflight: the preconditions binary checks is_file,
+# (staging-soak/preflight: the preconditions binary checks is_file,
 # never content) and runbook/container-readiness (worker tests only) fall
 # through to the worker-only docs rule below; their absence is covered by
 # the deletion rule in selection().
@@ -149,6 +152,7 @@ RUST_DOCS = frozenset({
     "docs/privacy.md",
     "docs/database-roles.md",
     "docs/rollback-delta.md",
+    "docs/backup.md",
 })
 PARITY_DOCS = frozenset({
     "docs/parity.md",
