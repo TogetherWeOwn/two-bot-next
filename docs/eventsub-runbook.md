@@ -108,8 +108,10 @@ printing either value. Never use a test fixture as a runtime credential. No
 runtime reconciler is wired yet: nothing calls `reconcile()` /
 `plan_boot_actions()` at boot or after a revocation, so the
 delete-and-recreate step is manual.
-Source: `crates/core/src/twitch_eventsub.rs:59-60,74-78,466-471`,
-`wrangler/src/index.ts:535-537,594`, `crates/core/src/twitch_helix.rs`,
+Source: `crates/core/src/twitch_eventsub.rs:526-529` (duplicate create answers
+`409`), `:543-547` (healthy subscriptions on our callback are kept without
+comparing secrets), `:467-472` (`ExistingSubscription` carries no secret),
+`wrangler/src/index.ts:535-537,594`, `crates/core/src/twitch_helix.rs:365,591`,
 `crates/bot/src/main.rs` (wires only `eventsub_http`).
 
 ## Challenge verification
@@ -173,11 +175,11 @@ public URL):
 | Status | Code | Retryable | Meaning / first action |
 |---|---|---|---|
 | 404 | plain-text `not found` | false | Non-POST, wrong path, or any query (`isEventsubRequest`). Via the public URL a GET answers 404 here and never reaches the container 405 row; `?x=1` answers 404 here and never reaches the container 400 row. Source: `wrangler/src/eventsub.ts:101-103,133-137,241`. |
-| 400 | `malformed` | false | Present-but-badly-shaped delivery header, signature without the `sha256=` prefix, or malformed `content-length` / body framing. Check the request shape, not the secret. Source: `wrangler/src/eventsub.ts:158-169`. |
+| 400 | `malformed` | false | Present-but-badly-shaped delivery header, signature without the `sha256=` prefix, or malformed `content-length` / body framing. Check the request shape, not the secret. Source: `wrangler/src/eventsub.ts:158-169` (header/signature shape), `:181,184,208,212` (content-length and body framing). |
 | 401 | `unauthorized` | false | Missing delivery header or signature. Check that the sender forwarded every header. Source: `wrangler/src/eventsub.ts:158-169`. |
 | 429 | `rate_limited` | true | Per-isolate burst budget or in-flight cap hit. The sender backs off and redelivers. Source: `wrangler/src/eventsub.ts:243-248`. |
 | 504 | `upstream_timeout` | true | The fenced DO did not answer within the Worker deadline. Source: `wrangler/src/eventsub.ts:264`. |
-| 503 | `unavailable` | true | DO construction / binding failure, cold container, ownership-fence refusal, or relay failure (see the 503 triage below). Source: `wrangler/src/eventsub.ts:268`, `wrangler/src/index.ts:908-918,926`. |
+| 503 | `unavailable` | true | DO construction / binding failure, cold container, ownership-fence refusal, or relay failure (see the 503 triage below). Source: `wrangler/src/eventsub.ts:268,299-308,328,338,343` (ingress and relay failures), `wrangler/src/index.ts:905-915` (cold container at `:905`, `containerFetch` failure at `:906-910`, fence refusal at `:912-915`). |
 
 Container layer (`crates/bot/src/eventsub_http.rs`; the 400 / 404 / 405 rows
 are reachable via the public URL only when the Worker is bypassed by a
@@ -251,8 +253,9 @@ Dark is the normal state, not an outage:
   cold container (`!this.ctx.container?.running`), ownership-fence refusal,
   `containerFetch` failure, or the Worker running with `EVENTSUB_INGRESS=1`
   but without `TWO_TWITCH_WEBHOOK_SECRET` so no listener was forwarded.
-  Source: `wrangler/src/index.ts:908-918,926`,
-  `wrangler/src/eventsub.ts:21-25,268`.
+  Source: `wrangler/src/index.ts:905-915` (cold container at `:905`,
+  `containerFetch` failure at `:906-910`, fence refusal at `:912-915`),
+  `wrangler/src/eventsub.ts:21-25,268,299-308,328,338,343`.
 
 ## Operator do-not list
 
