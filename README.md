@@ -74,6 +74,23 @@ claim. Staging deploys from `main`; production deploys through the manual
 - [Command registry drift](docs/command-publish.md): dry-run-first
   `two-bot commands diff|publish` and opt-in boot publication for cutover.
 
+### Stream delivery (Twitch EventSub)
+
+Twitch `stream.online` deliveries arrive at the staging-only public Worker
+route (`POST /hooks/twitch`, `wrangler/src/eventsub.ts:30`), which forwards
+them inward (`wrangler/src/eventsub.ts:223`) to the private container
+receiver (`crates/bot/src/eventsub_http.rs:1`). The receiver stays dark
+unless `TWO_EVENTSUB` is exactly `1` with a valid bind
+(`crates/core/src/eventsub_receiver_config.rs:5`). Every delivery is
+verified (`twitch_eventsub::verify_delivery`,
+`crates/core/src/twitch_eventsub.rs:169`) before anything is parsed, then
+classified (`classify`, `crates/core/src/twitch_eventsub.rs:245`); only
+`stream.online` version 1 can produce an announcement plan. Planning rules
+live in the [stream funnel](docs/stream-funnel.md); the operator runbook is
+the [EventSub runbook](docs/eventsub-runbook.md). The keys (`TWO_EVENTSUB`,
+`TWO_EVENTSUB_BIND`, `TWO_TWITCH_WEBHOOK_SECRET`) are catalogued in
+[Configuration](docs/configuration.md) (`docs/configuration.md:194`).
+
 ### Regenerate the references
 
 The database-free integration test `crates/core/tests/reference_docs.rs` renders
