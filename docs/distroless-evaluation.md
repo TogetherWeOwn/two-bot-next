@@ -18,7 +18,12 @@ supply-chain lane.
 
 Adopted `gcr.io/distroless/cc-debian13:nonroot` (digest-pinned,
 trixie builder) as the default runtime in PR #84 under the CEO scope
-decision; the preconditions below are met per the cutover note above.
+decision. Per-precondition status at closeout: TLS handshake met per the
+cutover note above (deploy-staging run `38773972225`); backup/guild-config
+upload-hook path still open (needs sidecar/static upload binaries or
+host-side upload per `docs/backup.md`; not proven on the distroless image);
+CISO acknowledgement of the 14-package inventory and pin-refresh runbook
+still open (no receipt linked).
 Original recommendation (kept for provenance): adopt through a separate
 CEO-gated cutover card after the preconditions below. Do not use the `static`
 variant; do not deploy a `debug-nonroot` variant.
@@ -82,20 +87,24 @@ hyper/tokio). The `static` variant ships no libc — it would require retargetin
 to musl, out of scope. `cc` provides exactly the needed userspace and nothing
 else (14 packages, no shell or package manager).
 
-## Cutover preconditions (for the separate CEO-gated card)
+## Cutover preconditions — status at closeout
 
-1. Staging E2E: live Discord TLS handshake plus backup/guild-config upload-hook
-   path on the distroless image.
-2. CISO acknowledgement of the 14-package inventory and pin-refresh runbook.
-3. Keep the shell-free smoke probes (`docker cp`, `docker top`, binary
+1. [MET] Staging E2E TLS handshake on the distroless image (deploy-staging run
+   `38773972225` in the cutover note above).
+   [OPEN] Backup/guild-config upload-hook path on the distroless image —
+   needs sidecar/static upload binaries or host-side upload (see
+   `docs/backup.md`); not proven here.
+2. [OPEN] CISO acknowledgement of the 14-package inventory and pin-refresh
+   runbook — no receipt linked.
+3. [KEPT] Keep the shell-free smoke probes (`docker cp`, `docker top`, binary
    `--healthcheck`); never ship `debug-nonroot`.
 
 ## Runtime profile: cold start, RSS and readiness timings
 
-Trial-image profiling for the cutover guard. The default `Dockerfile` now builds
-the same pinned `cc-debian13:nonroot` base digest as this trial variant — only
-build-provenance labels differ, and labels do not execute — so this profile
-covers both images. No guard logic changes here; thresholds stay where the
+Trial-image profiling for the cutover guard. The default `Dockerfile` body and
+`Dockerfile.distroless` body are now identical apart from the fallback header
+(guarded by `dockerfile_mirror_errors` in `scripts/ci/test_toolchain_parity.py`),
+so this profile covers both images. No guard logic changes here; thresholds stay where the
 cutover guard reads them in the
 [production signal thresholds](production-deploy.md#signal-thresholds-budgets-and-rollback-triggers).
 
@@ -155,5 +164,6 @@ against the B1 floor for separate placement review (not B2 pass/fail), and the
 image/binary size ceilings. The cutover guard keeps reading those values; this
 section is the distroless evidence behind them.
 
-Not claimed here: a live Discord TLS handshake, backup/guild-config upload-hook
-paths, or loaded-guild RSS — those stay on the cutover preconditions above.
+Not claimed here: backup/guild-config upload-hook paths or loaded-guild RSS —
+those stay on the cutover preconditions above. The live Discord TLS handshake
+is claimed in the cutover note above (deploy-staging run `38773972225`).

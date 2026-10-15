@@ -8,7 +8,9 @@
 # variant.
 #
 # Provenance: body matches the default `Dockerfile` except for this header,
-# so both stages stay digest-pinned together. Local build only (self-hosted
+# so both stages stay digest-pinned together (guarded by
+# `dockerfile_mirror_errors` in `scripts/ci/test_toolchain_parity.py`).
+# Local build only (self-hosted
 # runner or a machine with Docker):
 #   docker build -f Dockerfile.distroless -t two-bot:distroless-fallback .
 #   python3 scripts/container-smoke.py two-bot:distroless-fallback

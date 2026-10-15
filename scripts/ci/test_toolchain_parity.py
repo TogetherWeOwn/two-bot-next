@@ -102,8 +102,46 @@ def dockerfile_parity_errors(root):
     return errors
 
 
+FALLBACK_BODY_MARKER = "# two-bot-next: single always-on"
+
+
+def fallback_body(text, default_text):
+    """Strip the fallback header: body is the trailing default text."""
+    if text == default_text:
+        return text
+    idx = text.find(default_text)
+    if idx != -1 and text[idx:] == default_text:
+        return text[idx:]
+    marker_idx = text.find(FALLBACK_BODY_MARKER)
+    if marker_idx != -1:
+        return text[marker_idx:]
+    return text
+
+
+def dockerfile_mirror_errors(root):
+    """Dockerfile.distroless body (header stripped) equals Dockerfile."""
+    try:
+        default_text = (root / "Dockerfile").read_text()
+    except Exception as exc:
+        return [f"Dockerfile unreadable: {exc}"]
+    try:
+        fallback_text = (root / "Dockerfile.distroless").read_text()
+    except Exception as exc:
+        return [f"Dockerfile.distroless unreadable: {exc}"]
+    if fallback_body(fallback_text, default_text) != default_text:
+        return [
+            "Dockerfile.distroless body drifted from Dockerfile "
+            "(strip leading header and diff)"
+        ]
+    return []
+
+
 def toolchain_parity_errors(root):
-    return workflow_toolchain_errors(root) + dockerfile_parity_errors(root)
+    return (
+        workflow_toolchain_errors(root)
+        + dockerfile_parity_errors(root)
+        + dockerfile_mirror_errors(root)
+    )
 
 
 PINNED_WORKFLOW = """\
@@ -180,6 +218,43 @@ class ToolchainParityTests(unittest.TestCase):
                     errors = dockerfile_parity_errors(root)
                     self.assertEqual(len(errors), 1, errors)
                     self.assertIn(drifted, errors[0])
+
+    def test_mirror_pinned_tree_passes(self):
+        self.assertEqual(dockerfile_mirror_errors(ROOT), [])
+
+    def test_mirror_header_stripped_passes(self):
+        with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
+            root = make_fixture_root(scratch)
+            body = (root / "Dockerfile").read_text()
+            header = (
+                "# fallback header\n"
+                "# mirrors the default except for this header\n\n"
+            )
+            (root / "Dockerfile.distroless").write_text(header + body)
+            self.assertEqual(dockerfile_mirror_errors(root), [])
+
+    def test_mirror_body_drift_fails(self):
+        with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
+            root = make_fixture_root(scratch)
+            body = (root / "Dockerfile").read_text()
+            header = (
+                "# fallback header\n"
+                "# mirrors the default except for this header\n\n"
+            )
+            (root / "Dockerfile.distroless").write_text(header + body)
+            (root / "Dockerfile").write_text(body + "# drift\n")
+            errors = dockerfile_mirror_errors(root)
+            self.assertEqual(len(errors), 1, errors)
+            self.assertIn("Dockerfile.distroless body drifted", errors[0])
+
+    def test_mirror_header_only_edit_passes(self):
+        with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
+            root = make_fixture_root(scratch)
+            body = (root / "Dockerfile").read_text()
+            (root / "Dockerfile.distroless").write_text(
+                "# a different header, same body\n# still a comment\n\n" + body
+            )
+            self.assertEqual(dockerfile_mirror_errors(root), [])
 
     def test_loose_channel_fails(self):
         with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
