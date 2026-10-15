@@ -18,7 +18,7 @@
 //! wrapper and the tests can never drift apart.
 
 use sqlx::{Pool, Postgres};
-use thiserror::Error;
+use two_bot_core::error_chain::sanitize_chain;
 
 /// The nine backfill families from the TOG-22852 plan.
 pub const BACKFILL_FAMILIES: &[&str] = &[
@@ -51,12 +51,42 @@ const GET_SQL: &str = "SELECT cursor FROM backfill_cursors WHERE family = $1";
 /// Cursor-store failure: a database error, or a cursor that fails
 /// validation. Validation runs before any SQL, so an invalid write never
 /// touches the database.
-#[derive(Debug, Error)]
+///
+/// The `Db` Display is sanitized, never the raw sqlx text: a database error
+/// can carry a connection URL, so it renders through the shared chain
+/// sanitizer before reaching any failure line.
+#[derive(Debug)]
 pub enum BackfillCursorError {
-    #[error("backfill cursor database error: {0}")]
-    Db(#[from] sqlx::Error),
-    #[error("invalid backfill cursor: {0}")]
+    Db(sqlx::Error),
     Invalid(&'static str),
+}
+
+impl std::fmt::Display for BackfillCursorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Db(inner) => write!(
+                f,
+                "backfill cursor database error: {}",
+                sanitize_chain(&inner.to_string())
+            ),
+            Self::Invalid(message) => write!(f, "invalid backfill cursor: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for BackfillCursorError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Db(inner) => Some(inner),
+            Self::Invalid(_) => None,
+        }
+    }
+}
+
+impl From<sqlx::Error> for BackfillCursorError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Db(error)
+    }
 }
 
 /// Checkpoint `family`'s cursor. Overwrites any previous cursor for the

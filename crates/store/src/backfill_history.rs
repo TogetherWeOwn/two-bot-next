@@ -29,7 +29,7 @@
 //! (<https://docs.discord.com/developers/topics/rate-limits>).
 
 use sqlx::{Pool, Postgres};
-use thiserror::Error;
+use two_bot_core::error_chain::sanitize_chain;
 
 /// Upsert SQL, byte-for-byte the acceptance target's `PUT_HISTORY_MESSAGE_SQL`.
 const PUT_MESSAGE_SQL: &str = "INSERT INTO backfill_history_messages
@@ -46,12 +46,42 @@ const RECORD_COUNT_SQL: &str = "INSERT INTO backfill_history_counts
 
 /// History-store failure: a database error, or ids/count that fail validation.
 /// Validation runs before any SQL, so an invalid write never touches the database.
-#[derive(Debug, Error)]
+///
+/// The `Db` Display is sanitized, never the raw sqlx text: a database error
+/// can carry a connection URL, so it renders through the shared chain
+/// sanitizer before reaching any failure line.
+#[derive(Debug)]
 pub enum BackfillHistoryError {
-    #[error("backfill history database error: {0}")]
-    Db(#[from] sqlx::Error),
-    #[error("invalid backfill history row: {0}")]
+    Db(sqlx::Error),
     Invalid(&'static str),
+}
+
+impl std::fmt::Display for BackfillHistoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Db(inner) => write!(
+                f,
+                "backfill history database error: {}",
+                sanitize_chain(&inner.to_string())
+            ),
+            Self::Invalid(message) => write!(f, "invalid backfill history row: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for BackfillHistoryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Db(inner) => Some(inner),
+            Self::Invalid(_) => None,
+        }
+    }
+}
+
+impl From<sqlx::Error> for BackfillHistoryError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Db(error)
+    }
 }
 
 /// Build the paged history path for `GET /channels/{channel}/messages`.

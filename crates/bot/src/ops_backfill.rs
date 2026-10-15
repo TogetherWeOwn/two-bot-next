@@ -67,6 +67,9 @@ use two_bot_core::{
     internal_actions::{self, AUTH_FAILURE_MESSAGE, NONCE_TTL_SECONDS, SKEW_SECONDS},
 };
 
+use crate::backfill_retention_chains::{render_backfill_failure, BackfillStep};
+use crate::gateway_failure::FailureClass;
+
 /// Route under test. Keep in sync with `crate::server::TRACED_PATHS`.
 pub const BACKFILL_PATH: &str = "/ops/backfill/progress";
 
@@ -395,9 +398,17 @@ async fn handler(
                 })),
             )
                 .into_response(),
-            Err(_) => {
+            Err(err) => {
+                let failure = render_backfill_failure(
+                    FailureClass::StoreUnavailable,
+                    BackfillStep::SnapshotRead,
+                    crate::db_log::db_class(&err),
+                );
                 tracing::warn!(
                     msg = "ops_backfill_snapshot_failed",
+                    class = FailureClass::StoreUnavailable.as_str(),
+                    step = BackfillStep::SnapshotRead.as_str(),
+                    failure = %failure,
                     "backfill snapshot unreadable"
                 );
                 unavailable(&id)

@@ -13,7 +13,6 @@ mod audit_runtime;
 mod automod_gateway;
 #[cfg(test)]
 mod backfill_error_chain_acceptance_tests;
-#[cfg(test)]
 mod backfill_retention_chains;
 mod backup_cli;
 // Pure burn math: no runtime caller yet, the offline pin test is the consumer.

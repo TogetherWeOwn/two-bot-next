@@ -58,6 +58,13 @@
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use two_bot_core::error_chain::{db_cause, render_retention_failure, RetentionStep};
+
+/// Store class token for retention failure lines. This mirrors the bot
+/// crate's `gateway_failure::FailureClass::StoreUnavailable` token: that enum
+/// lives in the bot crate, which depends on this one, so the token is
+/// repeated here as a literal and pinned by the bot acceptance suite.
+const STORE_UNAVAILABLE_CLASS: &str = "store_unavailable";
 
 /// Raw presence/voice rows older than this roll off.
 pub const PRESENCE_RAW_RETENTION_DAYS: i32 = 30;
@@ -402,12 +409,20 @@ pub async fn run_retention(
                 }
             }
             if !deferred_ids.is_empty() {
+                let failure = render_retention_failure(
+                    STORE_UNAVAILABLE_CLASS,
+                    RetentionStep::DeletionIntake,
+                    "replay guard or schema gap deferred the request",
+                );
                 tracing::warn!(
                     deferred = deferred,
                     schema_gap_deferrals = gap_deferred,
                     overdue = overdue,
                     requests = ?deferred_ids,
                     schema_gaps = ?schema_gaps,
+                    class = STORE_UNAVAILABLE_CLASS,
+                    step = RetentionStep::DeletionIntake.as_str(),
+                    failure = %failure,
                     "retention user deletions deferred by unresolved replay guard or schema coverage"
                 );
             }
@@ -428,9 +443,17 @@ pub async fn run_retention(
             if schema_gapped {
                 guild_failed = guilds.len() as u64;
                 if !guilds.is_empty() {
+                    let failure = render_retention_failure(
+                        STORE_UNAVAILABLE_CLASS,
+                        RetentionStep::DeletionIntake,
+                        "schema gap deferred the purge",
+                    );
                     tracing::warn!(
                         guilds = ?guilds,
                         schema_gaps = ?schema_gaps,
+                        class = STORE_UNAVAILABLE_CLASS,
+                        step = RetentionStep::DeletionIntake.as_str(),
+                        failure = %failure,
                         "retention guild purges deferred by schema coverage, kept queued"
                     );
                 }
@@ -460,16 +483,31 @@ pub async fn run_retention(
                                 guild_deferred += 1;
                                 guild_deferred_oldest =
                                     guild_deferred_oldest.max((*waited_secs).max(0) as u64);
+                                let failure = render_retention_failure(
+                                    STORE_UNAVAILABLE_CLASS,
+                                    RetentionStep::DeletionIntake,
+                                    "replay guard deferred the purge",
+                                );
                                 tracing::warn!(
                                     guild_id = %guild,
                                     waited_secs = (*waited_secs).max(0),
+                                    class = STORE_UNAVAILABLE_CLASS,
+                                    step = RetentionStep::DeletionIntake.as_str(),
+                                    failure = %failure,
                                     "retention guild purge deferred by unresolved replay guard, kept queued"
                                 );
                             } else {
                                 guild_failed += 1;
+                                let failure = render_retention_failure(
+                                    STORE_UNAVAILABLE_CLASS,
+                                    RetentionStep::DeletionIntake,
+                                    db_cause(&err),
+                                );
                                 tracing::warn!(
                                     guild_id = %guild,
-                                    error = %format!("{err:?}"),
+                                    class = STORE_UNAVAILABLE_CLASS,
+                                    step = RetentionStep::DeletionIntake.as_str(),
+                                    failure = %failure,
                                     "retention guild purge failed, kept queued"
                                 );
                             }
