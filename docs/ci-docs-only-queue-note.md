@@ -87,8 +87,9 @@ workflow: #129 (head `4f264ecc`, run 37186025663). `PR SBOM dry-run`
 skipped and the whole run took 2.1 min (07:31:06Z to 07:33:15Z).
 
 Its critical path is the `check` job at 106 s. Of that, 41 s is
-"Initialize containers" (the `rust:bookworm` job container and the
-Postgres service) and 22 s is the docker action image build in job
+"Initialize containers" (the Rust job container, then `rust:bookworm` and now
+`rust:1.98-trixie`, plus the Postgres service) and 22 s is the docker action
+image build in job
 set-up; the offline guard steps take about 40 s. A docs-only PR does
 not need the container or the database for those guards.
 

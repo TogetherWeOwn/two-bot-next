@@ -103,7 +103,7 @@ jobs:
     timeout-minutes: 45
     # Match required CI isolation on the shared Docker host.
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.98-trixie@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: '0'

@@ -3,9 +3,9 @@
 `rust-toolchain.toml` is the single source of truth (currently 1.98.1).
 Every `dtolnay/rust-toolchain` step in `check.yml`, `nightly.yml` and
 `pipeline-benchmark.yml` must request that exact channel (the fuzz-compile
-job alone uses pinned nightly), and both Dockerfiles must build
-`FROM rust:<major>.<minor>-trixie` on the same channel, since the toolchain
-header demands bump-both-together. Runs offline via the existing
+job alone uses pinned nightly), both Dockerfiles must build
+`FROM rust:<major>.<minor>-trixie`, and the selected workflow job containers
+must use the matching pinned Rust trixie image. Runs offline via the existing
 `Source-level CI gate regressions` discover step in check.yml.
 
 Hermetic fixtures: drifted synthetic roots fail, the pinned tree passes.
@@ -21,6 +21,13 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ("check.yml", "nightly.yml", "pipeline-benchmark.yml")
+CONTAINER_WORKFLOWS = {
+    "deploy-staging.yml": ("schema-gate",),
+    "staging-migrate.yml": ("plan", "apply"),
+    "deploy-production.yml": ("schema-gate",),
+    "production-migrate.yml": ("plan", "apply"),
+    "nightly.yml": ("sweep",),
+}
 DOCKERFILES = ("Dockerfile", "Dockerfile.distroless")
 # libFuzzer needs nightly; pinned date, not floating stable.
 FUZZ_TOOLCHAIN = "nightly-2026-10-01"
@@ -102,8 +109,34 @@ def dockerfile_parity_errors(root):
     return errors
 
 
+def container_image_errors(root):
+    """Selected job containers use the pinned Rust trixie image tag."""
+    errors = []
+    try:
+        expected = expected_image_tag(read_channel(root))
+    except Exception as exc:
+        return [f"rust-toolchain.toml unreadable: {exc}"]
+    for name, job_ids in CONTAINER_WORKFLOWS.items():
+        path = root / ".github/workflows" / name
+        try:
+            workflow = yaml.load(path.read_text(), Loader=UniqueKeyLoader)
+        except Exception as exc:
+            errors.append(f"{name} unreadable: {exc}")
+            continue
+        jobs = workflow.get("jobs") or {}
+        for job_id in job_ids:
+            container = (jobs.get(job_id) or {}).get("container") or {}
+            image = container.get("image") if isinstance(container, dict) else container
+            match = re.fullmatch(r"rust:([^@\s]+)@sha256:([0-9a-f]{64})", str(image or ""))
+            if not match:
+                errors.append(f"{name}#{job_id}: expected pinned rust:{expected}@sha256 image, got {image!r}")
+            elif match.group(1) != expected:
+                errors.append(f"{name}#{job_id}: expected rust:{expected}, got rust:{match.group(1)}")
+    return errors
+
+
 def toolchain_parity_errors(root):
-    return workflow_toolchain_errors(root) + dockerfile_parity_errors(root)
+    return workflow_toolchain_errors(root) + dockerfile_parity_errors(root) + container_image_errors(root)
 
 
 PINNED_WORKFLOW = """\
@@ -120,9 +153,10 @@ jobs:
 """
 
 PINNED_DOCKERFILE = "FROM rust:{tag}@sha256:abc AS builder\n"
+PINNED_CONTAINER_IMAGE = "rust:{tag}@sha256:" + "a" * 64
 
 
-def make_fixture_root(parent, channel="1.98.1", workflow_toolchain="1.98.1", docker_tag="1.98-trixie"):
+def make_fixture_root(parent, channel="1.98.1", workflow_toolchain="1.98.1", docker_tag="1.98-trixie", container_tag="1.98-trixie"):
     root = Path(parent) / "root"
     (root / ".github/workflows").mkdir(parents=True)
     (root / "rust-toolchain.toml").write_text(
@@ -132,6 +166,16 @@ def make_fixture_root(parent, channel="1.98.1", workflow_toolchain="1.98.1", doc
         (root / ".github/workflows" / name).write_text(
             PINNED_WORKFLOW.format(toolchain=workflow_toolchain)
         )
+    for name, job_ids in CONTAINER_WORKFLOWS.items():
+        path = root / ".github/workflows" / name
+        if not path.exists():
+            path.write_text("name: fixture\njobs:\n")
+        job_text = "\n".join(
+            f"  {job_id}:\n    container:\n      image: {PINNED_CONTAINER_IMAGE.format(tag=container_tag)}"
+            for job_id in job_ids
+        )
+        with path.open("a") as fixture:
+            fixture.write(job_text + "\n")
     for name in DOCKERFILES:
         (root / name).write_text(PINNED_DOCKERFILE.format(tag=docker_tag))
     return root
@@ -170,6 +214,19 @@ class ToolchainParityTests(unittest.TestCase):
             errors = dockerfile_parity_errors(root)
             self.assertEqual(len(errors), len(DOCKERFILES))
             self.assertTrue(all("1.99-trixie" in error for error in errors))
+
+    def test_drifted_container_image_fails(self):
+        with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
+            root = make_fixture_root(scratch, container_tag="1.98-bookworm")
+            errors = container_image_errors(root)
+            self.assertEqual(len(errors), sum(map(len, CONTAINER_WORKFLOWS.values())))
+            self.assertTrue(all("1.98-bookworm" in error for error in errors))
+
+    def test_each_container_image_is_covered(self):
+        for name, job_ids in CONTAINER_WORKFLOWS.items():
+            with self.subTest(workflow=name):
+                self.assertTrue(job_ids, name)
+                self.assertTrue((ROOT / ".github/workflows" / name).is_file(), name)
 
     def test_each_dockerfile_drift_fails_independently(self):
         for drifted in DOCKERFILES:
