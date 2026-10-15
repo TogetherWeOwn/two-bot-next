@@ -195,10 +195,15 @@ this job enforces. Every run reports per-class metrics, with partial runs
 (deferred/overdue deletions, failed guild purges) surfaced as warnings that
 stay retryable.
 
-The append-only event-store capture (`event_store`, when its slices land)
-follows the same rule: its rows persist until erasure, and its TTL policy is
-an explicit placeholder awaiting a reviewed migration, not an installed
-timer. The per-user purge path is this procedure plus one manifest entry per
+The append-only event-store capture (`event_store`) carries one narrow,
+documented retention exception: the same retention job expires its raw
+presence and voice captures (`PRESENCE_UPDATE`, `VOICE_STATE_UPDATE`,
+`VOICE_SERVER_UPDATE`) at 30 days and its cached Discord audit entries
+(`GUILD_AUDIT_LOG_ENTRY_CREATE`) at 45 days, selected by `event_time`
+(never the insertion time, so a backfill or replay cannot extend old
+data's lifetime) and only in `execute` mode. Capture writers stay
+insert-only and no other `event_store` family has an age TTL; those rows
+persist until erasure. The per-user purge path is this procedure plus one manifest entry per
 landing slice, deleting by guild plus user; rows without a user id purge per
 guild (and per message or thread where the columns exist) instead. The
 capture fence is ids, timestamps and enums only: no message bodies and no
