@@ -39,6 +39,36 @@ locked without changing their contents; this is a source-control baseline, **not
 an attestation that a database has applied them**. CI never queries migration
 history in staging or production.
 
+## Risky-statement lint (advisory)
+
+`python3 scripts/ci/check-squawk-migrations.py --base-ref <sha>` lints the
+migration files changed since the baseline (CI passes the PR base SHA, the
+push-before SHA, or `origin/main`; without `--base-ref` it lints every
+file). It is a deterministic squawk subset: standard library only, no
+database, no network. Findings warn without failing the PR; `--strict`
+turns them into errors for the later required phase.
+
+Write migrations that stay silent:
+
+- New required column: `ADD COLUMN x bigint DEFAULT 0`, backfill existing
+  rows, then `ALTER TABLE ... ALTER COLUMN x SET NOT NULL` in a later
+  migration.
+- New index on an existing table: `CREATE INDEX CONCURRENTLY` in a
+  separate migration run outside a transaction (sqlx no-transaction;
+  `CONCURRENTLY` cannot run inside a transaction block). An index on a
+  table created earlier in the same migration file targets an empty table
+  and is not flagged.
+- New check: `ADD CONSTRAINT ... CHECK (...) NOT VALID`, then
+  `VALIDATE CONSTRAINT` separately.
+- Type change or drop: prefer an additive migration (new column, backfill,
+  swap) and coordinate removal across deploys.
+
+The checker discovers `crates/*/migrations/*.sql` dynamically with
+`--migration-glob` and `--exclude` overrides and no hardcoded crate list,
+so the same script ports 1:1 into a central reusable workflow called from
+every repo (org rollout follow-up: central repo plus org ruleset required
+workflow, then `--strict` here).
+
 ## Existing migration changes
 
 Prefer an **additive new migration**, especially after a migration has shipped.
