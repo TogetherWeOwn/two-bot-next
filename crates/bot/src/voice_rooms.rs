@@ -2507,11 +2507,12 @@ pub struct GuildRoomWorker<S, H> {
     creators_read_ms: Option<u64>,
     /// Live generation the creator view was last merged at. A gateway
     /// reconnect (GuildCreate/Resumed) bumps the generation but sends no
-    /// channel event, so no RefreshCreators flag and the five-minute interval
-    /// has not elapsed. The next maintenance tick merges on a generation
-    /// change (debounced), so rows written while down converge without a
-    /// restart. Updated only by a successful merge, so a failed read retries
-    /// on the next debounced tick.
+    /// channel event, so with no RefreshCreators flag the merge would wait
+    /// up to the five-minute interval. The next maintenance tick merges on
+    /// a generation change (debounced), so rows written while down converge
+    /// within about 10 s instead of up to 5 minutes. Updated only by a
+    /// successful merge, so a failed read retries on the next debounced
+    /// tick.
     creators_generation: u64,
     /// Channel ids the join read-through already asked the store about with
     /// no row found, cleared by each successful creator merge. Joins into

@@ -13348,9 +13348,9 @@ async fn reload_creators_keeps_the_view_on_a_failed_read() {
 async fn reload_creators_converges_after_a_gateway_reconnect() {
     // A gateway reconnect (GuildCreate/Resumed) bumps the live generation but
     // sends no channel event, so no RefreshCreators flag is set and the
-    // five-minute interval has not elapsed. The creator map built at boot
-    // stays stale until restart. A generation change must trigger a debounced
-    // merge so the reconnected view converges without a restart.
+    // five-minute interval has not elapsed. A generation change must trigger
+    // a debounced merge so rows written while down converge within about
+    // 10 s instead of waiting up to 5 minutes.
     let (live, store, http, _) = fixture();
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     worker.reload_creators(0).await;
@@ -13370,6 +13370,69 @@ async fn reload_creators_converges_after_a_gateway_reconnect() {
     assert!(
         worker.creators.contains_key(&201),
         "a gateway reconnect must merge rows written while down"
+    );
+}
+
+#[tokio::test]
+async fn reload_creators_debounces_a_generation_merge_after_a_reconnect() {
+    // A generation change inside the debounce window must not read the
+    // store: without the debounce a reconnect during a store outage would
+    // re-read about 4 times a second per guild on the 250 ms tick.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.reload_creators(0).await;
+    worker
+        .store
+        .creators
+        .lock()
+        .unwrap()
+        .push(CreatorChannel::new(GUILD, 201));
+    // The reconnect republishes the snapshot (new generation, new channel).
+    assert!(worker.live.publish(snapshot(&[201], vec![])));
+    worker.reload_creators(5_000).await;
+    assert!(
+        !worker.creators.contains_key(&201),
+        "a generation change inside the debounce window must wait"
+    );
+    worker.reload_creators(10_000).await;
+    assert!(
+        worker.creators.contains_key(&201),
+        "the debounced tick must merge the row after a reconnect"
+    );
+}
+
+#[tokio::test]
+async fn reload_creators_retries_a_failed_generation_merge_on_the_next_tick() {
+    // A reconnect whose first merge read fails must leave the stored
+    // generation alone: stamping it before the read would park the retry on
+    // the five-minute interval, exactly the outage case the trigger targets.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.reload_creators(0).await;
+    worker
+        .store
+        .creators
+        .lock()
+        .unwrap()
+        .push(CreatorChannel::new(GUILD, 201));
+    // The reconnect republishes the snapshot (new generation, new channel).
+    assert!(worker.live.publish(snapshot(&[201], vec![])));
+    let generation_before = worker.creators_generation;
+    worker.store.creators_error = Some(StoreError::Unavailable);
+    worker.reload_creators(10_000).await;
+    assert!(
+        !worker.creators.contains_key(&201),
+        "a failed generation merge must not invent rows"
+    );
+    assert_eq!(
+        worker.creators_generation, generation_before,
+        "a failed read must leave the generation alone so the next tick retries"
+    );
+    worker.store.creators_error = None;
+    worker.reload_creators(20_000).await;
+    assert!(
+        worker.creators.contains_key(&201),
+        "the next debounced tick must retry the generation merge"
     );
 }
 
