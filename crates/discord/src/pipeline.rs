@@ -580,12 +580,33 @@ impl<
                     .lock()
                     .expect("vanity lock")
                     .contains(&guild_id);
+                let expected_won = expected.is_some();
                 let source = expected.unwrap_or_else(|| self.invites.attribute(&grew, has_vanity));
-                let inviter_id = if grew.len() == 1 {
+                // The web path's expected join has no inviter: a concurrently
+                // growing code belongs to some other join, never this one.
+                let inviter_id = if !expected_won && grew.len() == 1 {
                     self.invites.inviter_for(guild_id, &grew[0])
                 } else {
                     None
                 };
+                // Per-edge attribution log (snapshot-diff contract): exactly one
+                // INFO event per handled join, carrying the filed source and the
+                // joining member; the credited inviter rides along if and only
+                // if a single code grew for this (non-expected) join.
+                if let Some(inviter) = inviter_id {
+                    tracing::info!(
+                        source = %source,
+                        member_id = member_id,
+                        inviter_id = inviter,
+                        "invite attribution"
+                    );
+                } else {
+                    tracing::info!(
+                        source = %source,
+                        member_id = member_id,
+                        "invite attribution"
+                    );
+                }
                 let joined_at_ms = add.member.joined_at.map_or_else(
                     || two_bot_core::parse_iso_millis(observed_at),
                     |at| Some(at.as_micros().div_euclid(1000)),
@@ -759,6 +780,8 @@ impl<
                         uses: u64::from(invite.uses),
                         inviter_id: invite.inviter.as_ref().map(|user| user.id.get()),
                         channel_id: Some(invite.channel_id.get()),
+                        max_uses: invite.max_uses,
+                        temporary: invite.temporary,
                     },
                     observed_at,
                 );

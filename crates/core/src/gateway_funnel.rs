@@ -196,6 +196,8 @@ mod tests {
             uses: 1,
             inviter_id: Some(9),
             channel_id: Some(8),
+            max_uses: 0,
+            temporary: false,
         };
         // A direct write for a different code is not part of the tracker tail.
         buffer.store_all(1, &[invite("direct")]);
@@ -259,6 +261,8 @@ mod tests {
             uses: 1,
             inviter_id: None,
             channel_id: None,
+            max_uses: 0,
+            temporary: false,
         };
         buffer.seed_snapshots(1, vec![invite("old")]);
         assert!(buffer.take_batch().snapshots.is_empty());
