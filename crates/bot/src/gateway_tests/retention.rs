@@ -381,6 +381,36 @@ async fn queued_delete_then_create_is_ordered_before_durable_checkpoint() {
     db.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn missing_retention_tables_do_not_stop_the_gateway() {
+    // TOG-25067 staging reproduction: the 0438 retention queues are absent
+    // (an unapplied migration), so every queue/cancel write fails with 42P01.
+    // The gateway must skip the auxiliary write and commit the dispatch
+    // instead of holding the cursor and crash-looping on replay.
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    sqlx::query("DROP TABLE retention_guild_purge_queue")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE retention_deletion_requests")
+        .execute(pool)
+        .await
+        .unwrap();
+    let mut peer = Peer::new().await;
+    let (store, stop, task, _) = runner(pool, &mut peer, None).await;
+    peer.send(delete(2, None)).await;
+    peer.send(create(3, false)).await;
+    wait_sequence(&store, 3).await;
+    assert!(
+        !task.is_finished(),
+        "schema-gapped retention writes must not stop the gateway"
+    );
+    stop_runner(stop, task).await;
+    peer.close().await;
+    db.close().await.unwrap();
+}
+
 async fn failed_write_replays(cancel: bool, fail_checkpoint: bool) {
     let Some(db) = database().await else { return };
     let pool = db.pool();

@@ -608,14 +608,22 @@ fn count_community_facts_drain_failure<T, E>(
 /// dispatch replays after restart; reception already skips duplicate
 /// sequences, and the write itself is idempotent, so a checkpoint failure
 /// after it still repairs on replay.
+///
+/// Deployment-state schema gaps (missing table `42P01`, missing grant
+/// `42501` — an unapplied migration or ACL plan) never hold the cursor:
+/// retrying them on every boot is futile, and a missing queue table means no
+/// purge can be queued or executed anyway, while the retention job defers
+/// schema-gapped work instead of deleting. They warn with the guild and the
+/// SQLSTATE (never the raw error) and skip, so the gateway survives a schema
+/// behind the binary (TOG-25067).
 async fn retention_lifecycle(store: &GatewaySessionStore, event: &Event) -> Option<sqlx::Error> {
     let pool = store.pool();
-    match event {
+    let write = match event {
         Event::GuildDelete(deleted) => {
             let guild_id = deleted.id.get().to_string();
             two_bot_cutover::retention::handle_guild_delete(pool, &guild_id, deleted.unavailable)
                 .await
-                .err()
+                .map(|_| ())
         }
         Event::GuildCreate(created) => {
             if matches!(
@@ -625,12 +633,37 @@ async fn retention_lifecycle(store: &GatewaySessionStore, event: &Event) -> Opti
                 let guild_id = created.id().get().to_string();
                 two_bot_cutover::retention::cancel_guild_purge(pool, &guild_id)
                     .await
-                    .err()
+                    .map(|_| ())
             } else {
-                None
+                Ok(())
             }
         }
-        _ => None,
+        _ => Ok(()),
+    };
+    match write {
+        Ok(()) => None,
+        Err(error) => {
+            if crate::gateway_failure::is_schema_gap(&error) {
+                let code = crate::db_log::error_code(&error);
+                tracing::warn!(
+                    guild = event_guild_id(event),
+                    error_code = code.as_deref().unwrap_or("unknown"),
+                    "retention lifecycle skipped; schema gap, retention job defers"
+                );
+                None
+            } else {
+                Some(error)
+            }
+        }
+    }
+}
+
+/// Guild id for lifecycle warn lines, empty for non-guild dispatches.
+fn event_guild_id(event: &Event) -> String {
+    match event {
+        Event::GuildDelete(deleted) => deleted.id.get().to_string(),
+        Event::GuildCreate(created) => created.id().get().to_string(),
+        _ => String::new(),
     }
 }
 
