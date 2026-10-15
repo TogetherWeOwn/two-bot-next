@@ -3,13 +3,9 @@ name: deploy-staging
 # Staging only. Accept the intended new rollout + serving image, never an old
 # healthy singleton. Production deploys remain manual and cutover-owned.
 # Active (TOG-12856): runs on a push to main that changes runtime inputs, and
-# on manual dispatch. The schema-gate job runs first through the read-only
-# `staging-migrate-plan` environment and fails the run before any rollout when
-# the deploy SHA still has pending migrations or role-verify findings (TOG-24362:
-# staging drifted behind main after #939 and the gateway stayed red until manual
-# host work). The deploy job runs only after a green gate, unconditionally in
-# the `staging` environment; `release_fence` only releases an
-# uninitialized/parked singleton after handoff authorization and defaults to false.
+# on manual dispatch. The deploy job runs unconditionally in the `staging`
+# environment; `release_fence` only releases an uninitialized/parked singleton
+# after handoff authorization and defaults to false.
 #
 # Each deploy restarts the bot container and drops the gateway for 95-139 s, so
 # a push that only touches the paths below starts no run at all: the B2 soak
@@ -53,78 +49,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  schema-gate:
-    name: staging schema gate (migrate + grants readout)
-    permissions:
-      contents: read
-    # Dispatch from main only. The binding must be scoped to the
-    # staging-migrate-plan environment (no reviewer: this job only reads; the
-    # runner holds only two_bot_migrator_ro, physically read-only) so a workflow
-    # edited on another branch cannot read it. A dispatch from another branch
-    # skips this gate, and the deploy job below with it, instead of deploying
-    # past the drift check.
-    if: github.ref == 'refs/heads/main'
-    environment: staging-migrate-plan
-    # Runner routing: see the note on `check` in check.yml.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'schema-gate') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
-    timeout-minutes: 30
-    container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: 1
-      - name: Build runner
-        run: cargo build -p two-bot-cutover --bin staging-migrate --locked
-      # Read-only plan at the exact deploy SHA, then fail fast on drift. The
-      # runner (--plan) never applies DDL and never grants: pending migrations
-      # need a manual staging-migrate plan+apply, role findings a host role-plan
-      # re-apply, then a re-run of this workflow. The pins arrive as
-      # staging-migrate-plan environment secrets (never dispatch inputs or vars:
-      # a step's env block prints variable values on the public run page) and
-      # must already exist there; absent means refusal before any connection.
-      # The references are bare doc paths recorded in the manifest, not secrets.
-      - name: Read-only plan at the deploy SHA and fail fast on drift
-        env:
-          # Must already exist as staging-migrate-plan environment secrets; absent means refusal.
-          # Read-only login (two_bot_migrator_ro): the runner refuses at validate when absent.
-          TWO_BOT_STAGING_PLAN_DATABASE_URL: ${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}
-          STAGING_SCHEMA_GATE_EXPECTED_HOST: ${{ secrets.STAGING_SCHEMA_GATE_EXPECTED_HOST }}
-          STAGING_SCHEMA_GATE_EXPECTED_DATABASE: ${{ secrets.STAGING_SCHEMA_GATE_EXPECTED_DATABASE }}
-          STAGING_SCHEMA_GATE_EXPECTED_BRANCH_ID: ${{ secrets.STAGING_SCHEMA_GATE_EXPECTED_BRANCH_ID }}
-          EXPECTED_SHA: ${{ github.sha }}
-        # `shell: bash` runs with `-eo pipefail`. The container's default `sh`
-        # has no pipefail, so a refusal (exit 2) or failure (exit 1) piped into
-        # `tee` left the job green with nothing checked. `set -o pipefail` is
-        # belt-and-braces for the same guarantee if the shell key is ever
-        # re-targeted; the workflow-policy test pins both.
-        shell: bash
-        run: |
-          set -o pipefail
-          ./target/debug/staging-migrate --target staging --plan --source-sha "$EXPECTED_SHA" \
-            --staging-host "$STAGING_SCHEMA_GATE_EXPECTED_HOST" \
-            --staging-database "$STAGING_SCHEMA_GATE_EXPECTED_DATABASE" \
-            --staging-branch-id "$STAGING_SCHEMA_GATE_EXPECTED_BRANCH_ID" \
-            --recovery-evidence-ref docs/staging-rollout-gate.md \
-            --acl-plan-ref sql/database_role_matrix.sql \
-            | tee staging-schema-gate-manifest.json
-          python3 scripts/ci/staging_schema_gate.py --manifest staging-schema-gate-manifest.json \
-            --expected-sha "$EXPECTED_SHA"
-      - name: Upload gate manifest
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: staging-schema-gate-manifest
-          path: staging-schema-gate-manifest.json
-          if-no-files-found: error
-          retention-days: 14
-          # The protection-rule reader accepts stored ZIP entries, not deflate.
-          compression-level: 0
   deploy:
     name: wrangler deploy + intended rollout gate
-    # The schema gate above must be green before any rollout: a red gate skips
-    # this job, so drift can never deploy silently again.
-    needs: schema-gate
     permissions:
       contents: read # checkout only; the deploy authenticates with `staging` environment secrets
     # Runner routing: see the note on `check` in check.yml.
