@@ -788,13 +788,13 @@ mod tests {
         );
         let mut pending_response = Box::pin(app().oneshot(stalled));
         assert!(
-            futures_util::future::now_or_never(&mut pending_response)
+            futures_util::future::poll_immediate(&mut pending_response)
                 .await
                 .is_none(),
             "receiver must wait for the slow body"
         );
         tokio::time::advance(BODY_TIMEOUT + Duration::from_secs(1)).await;
-        let response = futures_util::future::now_or_never(pending_response)
+        let response = futures_util::future::poll_immediate(pending_response)
             .await
             .expect("slow body must time out within BODY_TIMEOUT + 1 s")
             .unwrap();
@@ -818,13 +818,13 @@ mod tests {
             std::future::pending::<Response>(),
         ));
         assert!(
-            futures_util::future::now_or_never(&mut pending_response)
+            futures_util::future::poll_immediate(&mut pending_response)
                 .await
                 .is_none(),
             "receiver must wait for the stalled request"
         );
         tokio::time::advance(REQUEST_TIMEOUT + Duration::from_secs(1)).await;
-        let response = futures_util::future::now_or_never(pending_response)
+        let response = futures_util::future::poll_immediate(pending_response)
             .await
             .expect("stalled request must time out within REQUEST_TIMEOUT + 1 s");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
