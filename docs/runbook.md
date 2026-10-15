@@ -1352,6 +1352,9 @@ staging container. [Tabletop evidence](incident-tabletop-2026-10-01.md) separate
 local source rehearsal, actual staging observations and unfinished acceptance.
 The [October-6 staging record](incident-tabletop-2026-10-06.md) is the Discord and
 Neon dry run against the live staging baseline, with its open evidence gaps.
+The [October-15 production postmortem](production-incident-2026-10-15-postmortem.md)
+records the production gateway crash-loop, its provisional schema-gap cause, and
+the rollback receipts; read it before any production gateway recovery.
 A denied observation or successful offline test is not a completed staging drill.
 
 ### Discord gateway or API outage
