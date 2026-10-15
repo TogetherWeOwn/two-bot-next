@@ -372,3 +372,245 @@ async fn ready_owner_and_timeout_protections_unchanged() {
         trace2.lock().unwrap()
     );
 }
+
+#[tokio::test]
+async fn cold_import_confirm_replies_warming_up_and_retains_preview() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let hash = "0123456789abcdef";
+    runtime.remember_pending_import(GUILD, super::UPLOADER, hash, super::full_config());
+    let custom_id = two_bot_core::voice_custom_id::import_confirm_custom_id(super::UPLOADER, hash);
+    let interaction = super::component_interaction(&custom_id, super::manager(), super::UPLOADER);
+    let (owned, response) = cold_handle(&runtime, &interaction).await;
+    assert!(owned, "cold Import Confirm must be answered");
+    let response = response.expect("cold Import Confirm must reply");
+    assert_eq!(
+        response.data.as_ref().and_then(|data| data.flags),
+        Some(twilight_model::channel::message::MessageFlags::EPHEMERAL),
+        "cold Import Confirm must reply privately"
+    );
+    let text = response_text(&response);
+    assert_eq!(
+        text,
+        super::super::WARMING_UP_REPLY,
+        "cold Import Confirm must send the shared warming-up reply"
+    );
+    assert_warming_up(&text, "cold Import Confirm");
+    assert!(
+        trace.lock().unwrap().is_empty(),
+        "cold Import Confirm must not write, trace: {:?}",
+        trace.lock().unwrap()
+    );
+    assert!(
+        runtime
+            .pending_imports
+            .lock()
+            .expect("voice runtime lock")
+            .contains_key(&(GUILD, super::UPLOADER, hash.to_owned())),
+        "cold Import Confirm must retain the preview for retry"
+    );
+}
+
+#[tokio::test]
+async fn cold_import_cancel_replies_warming_up_and_retains_preview() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let hash = "0123456789abcdef";
+    runtime.remember_pending_import(GUILD, super::UPLOADER, hash, super::full_config());
+    let custom_id = two_bot_core::voice_custom_id::import_cancel_custom_id(super::UPLOADER, hash);
+    let interaction = super::component_interaction(&custom_id, super::manager(), super::UPLOADER);
+    let (owned, response) = cold_handle(&runtime, &interaction).await;
+    assert!(owned, "cold Import Cancel must be answered");
+    let response = response.expect("cold Import Cancel must reply");
+    assert_eq!(
+        response.data.as_ref().and_then(|data| data.flags),
+        Some(twilight_model::channel::message::MessageFlags::EPHEMERAL),
+        "cold Import Cancel must reply privately"
+    );
+    let text = response_text(&response);
+    assert_eq!(
+        text,
+        super::super::WARMING_UP_REPLY,
+        "cold Import Cancel must send the shared warming-up reply"
+    );
+    assert_warming_up(&text, "cold Import Cancel");
+    assert!(
+        trace.lock().unwrap().is_empty(),
+        "cold Import Cancel must not write, trace: {:?}",
+        trace.lock().unwrap()
+    );
+    assert!(
+        runtime
+            .pending_imports
+            .lock()
+            .expect("voice runtime lock")
+            .contains_key(&(GUILD, super::UPLOADER, hash.to_owned())),
+        "cold Import Cancel must retain the preview for retry"
+    );
+}
+
+#[tokio::test]
+async fn cold_position_replies_warming_up_without_side_effects() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = super::v8_interaction(
+        "position",
+        vec![super::typed_option(
+            "channel",
+            twilight_model::application::interaction::application_command::CommandOptionValue::Channel(
+                twilight_model::id::Id::new(super::CREATOR),
+            ),
+        )],
+    );
+    let (owned, response) = cold_handle(&runtime, &interaction).await;
+    assert!(owned);
+    let text = response_text(&response.expect("cold /position must reply"));
+    assert_warming_up(&text, "cold /position");
+    assert!(
+        trace.lock().unwrap().is_empty(),
+        "cold /position must not read/write effects, trace: {:?}",
+        trace.lock().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn cold_group_replies_warming_up_without_side_effects() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = super::v8_interaction(
+        "group",
+        vec![
+            super::typed_option(
+                "channel",
+                twilight_model::application::interaction::application_command::CommandOptionValue::Channel(
+                    twilight_model::id::Id::new(super::CREATOR),
+                ),
+            ),
+            super::typed_option(
+                "enabled",
+                twilight_model::application::interaction::application_command::CommandOptionValue::Boolean(
+                    false,
+                ),
+            ),
+        ],
+    );
+    let (owned, response) = cold_handle(&runtime, &interaction).await;
+    assert!(owned);
+    let text = response_text(&response.expect("cold /group must reply"));
+    assert_warming_up(&text, "cold /group");
+    assert!(
+        trace.lock().unwrap().is_empty(),
+        "cold /group must not read/write effects, trace: {:?}",
+        trace.lock().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn cold_inheritpermissions_replies_warming_up_without_side_effects() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = super::v8_interaction(
+        "inheritpermissions",
+        vec![
+            super::typed_option(
+                "channel",
+                twilight_model::application::interaction::application_command::CommandOptionValue::Channel(
+                    twilight_model::id::Id::new(super::CREATOR),
+                ),
+            ),
+            super::typed_option(
+                "source",
+                twilight_model::application::interaction::application_command::CommandOptionValue::String(
+                    "channel".to_owned(),
+                ),
+            ),
+            super::typed_option(
+                "source-channel",
+                twilight_model::application::interaction::application_command::CommandOptionValue::Channel(
+                    twilight_model::id::Id::new(super::CATEGORY),
+                ),
+            ),
+        ],
+    );
+    let (owned, response) = cold_handle(&runtime, &interaction).await;
+    assert!(owned);
+    let text = response_text(&response.expect("cold /inheritpermissions must reply"));
+    assert_warming_up(&text, "cold /inheritpermissions");
+    assert!(
+        trace.lock().unwrap().is_empty(),
+        "cold /inheritpermissions must not read/write effects, trace: {:?}",
+        trace.lock().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn cold_defaultlimit_replies_warming_up_without_side_effects() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = super::v8_interaction(
+        "defaultlimit",
+        vec![
+            super::typed_option(
+                "channel",
+                twilight_model::application::interaction::application_command::CommandOptionValue::Channel(
+                    twilight_model::id::Id::new(super::CREATOR),
+                ),
+            ),
+            super::typed_option(
+                "limit",
+                twilight_model::application::interaction::application_command::CommandOptionValue::Integer(
+                    4,
+                ),
+            ),
+        ],
+    );
+    let (owned, response) = cold_handle(&runtime, &interaction).await;
+    assert!(owned);
+    let text = response_text(&response.expect("cold /defaultlimit must reply"));
+    assert_warming_up(&text, "cold /defaultlimit");
+    assert!(
+        trace.lock().unwrap().is_empty(),
+        "cold /defaultlimit must not read/write effects, trace: {:?}",
+        trace.lock().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn cold_alwaysprivate_replies_warming_up_without_side_effects() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = super::v8_interaction(
+        "alwaysprivate",
+        vec![super::typed_option(
+            "channel",
+            twilight_model::application::interaction::application_command::CommandOptionValue::Channel(
+                twilight_model::id::Id::new(super::CREATOR),
+            ),
+        )],
+    );
+    let (owned, response) = cold_handle(&runtime, &interaction).await;
+    assert!(owned);
+    let text = response_text(&response.expect("cold /alwaysprivate must reply"));
+    assert_warming_up(&text, "cold /alwaysprivate");
+    assert!(
+        trace.lock().unwrap().is_empty(),
+        "cold /alwaysprivate must not read/write effects, trace: {:?}",
+        trace.lock().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn cold_import_upload_replies_warming_up_without_side_effects() {
+    let trace = Trace::default();
+    let runtime = test_runtime(trace.clone());
+    let interaction = super::import_interaction(10, super::manager(), super::UPLOADER);
+    let (owned, response) = cold_handle(&runtime, &interaction).await;
+    assert!(owned);
+    let text = response_text(&response.expect("cold /import must reply"));
+    assert_warming_up(&text, "cold /import");
+    assert!(
+        trace.lock().unwrap().is_empty(),
+        "cold /import must not send or persist, trace: {:?}",
+        trace.lock().unwrap()
+    );
+}
