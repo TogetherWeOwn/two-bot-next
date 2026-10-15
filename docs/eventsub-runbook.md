@@ -92,14 +92,25 @@ Rules for the signing secret:
   `crates/bot/src/eventsub_http.rs:117-132`.
 
 Rotation procedure (needs its own authorization; this runbook does not grant
-it): generate a fresh value meeting the constraint above, update the Twitch
-subscription secret (the reconciler embeds the secret in the Helix
-create-subscription body) **and** the container's
-`TWO_TWITCH_WEBHOOK_SECRET` together, then restart. The two sides must agree:
+it): Twitch fixes the transport secret at subscription creation and offers
+no update, and `reconcile()` keeps any healthy subscription on our callback
+without comparing secrets, so a new secret alone orphans the old
+subscription. Generate a fresh value meeting the constraint above, set the
+Worker secret `TWO_TWITCH_WEBHOOK_SECRET`, redeploy that Worker version and
+transfer ownership per the enable order above, then restart the container.
+Then delete each `stream.online` v1 subscription on our callback (Helix
+DELETE, `delete_subscription_url`) and recreate it with the new secret
+(delete first: a duplicate create answers `409`). The two sides must agree:
 while they differ, every delivery fails closed with `401 unauthorized` (see
 the matrix below). Confirm agreement by watching for `notification
-acknowledged` or `challenge answered` lines after the restart, not by
-printing either value. Never use a test fixture as a runtime credential.
+acknowledged` or `challenge answered` lines after the recreate, not by
+printing either value. Never use a test fixture as a runtime credential. No
+runtime reconciler is wired yet: nothing calls `reconcile()` /
+`plan_boot_actions()` at boot or after a revocation, so the
+delete-and-recreate step is manual.
+Source: `crates/core/src/twitch_eventsub.rs:59-60,74-78,466-471`,
+`wrangler/src/index.ts:535-537,594`, `crates/core/src/twitch_helix.rs`,
+`crates/bot/src/main.rs` (wires only `eventsub_http`).
 
 ## Challenge verification
 
@@ -135,26 +146,49 @@ Classification after verification:
 
 If the challenge echo never arrives at Twitch, check in order: the Worker
 route gate (both flags `1`?), the container bind (did startup refuse?), the
-secret agreement (401s in the logs?), and only then the callback URL shape
+secret agreement (401s in the logs?), a `200 delivery ignored` right after
+the subscription creation (the challenge was not echoed — delete and
+recreate the subscription, see below), and only then the callback URL shape
 (plain `https`, no port, query, fragment, or userinfo; canonical form).
-Source: `crates/core/src/twitch_eventsub.rs:400-431`.
+Source: `crates/core/src/twitch_eventsub.rs:400-431`,
+`crates/bot/src/eventsub_http.rs:318-325`.
 
 ## Refusal matrix
 
-Every refusal uses the same JSON envelope
+Container refusals use the same JSON envelope
 (`{"ok": false, "request_id", "error": {"code", "message": "request refused", "retryable"}}`)
-and logs one scalar warn line (`event="eventsub_receiver"`, `status`,
-`error_class`). Only the two timeout/busy rows are `retryable: true`; this
-slice has no send and no durable ledger, so a verified delivery retries only
-on a pathological scheduling stall, and the retry re-acks with no side
-effects. Non-POST answers also carry an `Allow: POST` header.
+and log one scalar warn line (`event="eventsub_receiver"`, `status`,
+`error_class`). Worker-ingress refusals use the same envelope except the
+404 below, which is plain-text `not found`, and log
+`event="eventsub_ingress"`. Retryable refusals are the container
+timeout/busy rows plus the Worker 429 / 504 / 503 rows; this slice has no
+send and no durable ledger, so a verified delivery retries only on a
+pathological scheduling stall, and the retry re-acks with no side effects.
+Container non-POST answers also carry an `Allow: POST` header.
+Source: `wrangler/src/eventsub.ts:101-125`, `crates/bot/src/eventsub_http.rs`.
+
+Worker-ingress layer (`wrangler/src/eventsub.ts`, reached first via the
+public URL):
 
 | Status | Code | Retryable | Meaning / first action |
 |---|---|---|---|
-| 400 | `malformed` | false | Query string present, empty body, or invalid challenge. The query gate runs before verification, so even a correctly signed delivery with `?x=1` answers 400. Check the forwarded request shape, not the secret. Source: `crates/bot/src/eventsub_http.rs:180-182,251-253,326-328`. |
-| 401 | `unauthorized` | false | Missing/malformed delivery headers, or signature, freshness, or timestamp failure. First action: confirm secret agreement and clock skew (10-minute window), not the request shape. Source: `crates/bot/src/eventsub_http.rs:223-227,255-268`. |
-| 404 | `not_found` | false | Wrong path (exact path is `/hooks/twitch`) or any non-callback route via the fallback. Wrong method on the right path is 405, not 404. Source: `crates/bot/src/eventsub_http.rs:35,138-146,176-179`. |
-| 405 | `method_not_allowed` | false | Anything but POST on the callback path. Check the sender's method; the Worker already drops non-POSTs before the container. Source: `crates/bot/src/eventsub_http.rs:183-195`. |
+| 404 | plain-text `not found` | false | Non-POST, wrong path, or any query (`isEventsubRequest`). Via the public URL a GET answers 404 here and never reaches the container 405 row; `?x=1` answers 404 here and never reaches the container 400 row. Source: `wrangler/src/eventsub.ts:101-103,133-137,241`. |
+| 400 | `malformed` | false | Present-but-badly-shaped delivery header, signature without the `sha256=` prefix, or malformed `content-length` / body framing. Check the request shape, not the secret. Source: `wrangler/src/eventsub.ts:158-169`. |
+| 401 | `unauthorized` | false | Missing delivery header or signature. Check that the sender forwarded every header. Source: `wrangler/src/eventsub.ts:158-169`. |
+| 429 | `rate_limited` | true | Per-isolate burst budget or in-flight cap hit. The sender backs off and redelivers. Source: `wrangler/src/eventsub.ts:243-248`. |
+| 504 | `upstream_timeout` | true | The fenced DO did not answer within the Worker deadline. Source: `wrangler/src/eventsub.ts:264`. |
+| 503 | `unavailable` | true | DO construction / binding failure, cold container, ownership-fence refusal, or relay failure (see the 503 triage below). Source: `wrangler/src/eventsub.ts:268`, `wrangler/src/index.ts:908-918,926`. |
+
+Container layer (`crates/bot/src/eventsub_http.rs`; the 400 / 404 / 405 rows
+are reachable via the public URL only when the Worker is bypassed by a
+direct `containerFetch`, because the Worker answers those shapes first):
+
+| Status | Code | Retryable | Meaning / first action |
+|---|---|---|---|
+| 400 | `malformed` | false | Query string present, empty body, or invalid challenge on a direct fetch. The query gate runs before verification. Check the forwarded request shape, not the secret. Source: `crates/bot/src/eventsub_http.rs:180-182,251-253,326-328`. |
+| 401 | `unauthorized` | false | Signature, freshness, or timestamp failure, or (on a direct fetch) missing/malformed delivery headers. Via the Worker, a malformed header shape is 400 at ingress (row above); first action is still secret agreement and clock skew (10-minute window). Source: `crates/bot/src/eventsub_http.rs:223-227,255-268`. |
+| 404 | `not_found` | false | Wrong path (exact path is `/hooks/twitch`) or any non-callback route via the fallback on a direct fetch. Via the public URL the Worker already answered non-POSTs and bad shapes with its own 404. Source: `crates/bot/src/eventsub_http.rs:35,138-146,176-179`. |
+| 405 | `method_not_allowed` | false | Anything but POST on the callback path on a direct fetch. Via the public URL the Worker drops non-POSTs with its own 404 before the container. Source: `crates/bot/src/eventsub_http.rs:183-195`. |
 | 408 | `request_timeout` | true | Body slower than the 5 s read budget while holding one of the 32 permits. Retriable: the sender (Twitch) backs off and redelivers. Source: `crates/bot/src/eventsub_http.rs:38,241-250`. |
 | 413 | `payload_too_large` | false | Body over the 64 KiB cap, checked before verification. Genuine `stream.online` bodies are well under 2 KiB; treat 413 as a malformed or abusive sender. Source: `crates/bot/src/eventsub_http.rs:36,230-240,258-265`, `crates/core/src/twitch_eventsub.rs:49-51`. |
 | 415 | `unsupported_media_type` | false | Content type is not exactly `application/json` or `application/json; charset=utf-8` (case-insensitive); anything else, including another encoding, is refused. Source: `crates/bot/src/eventsub_http.rs:198-214`. |
@@ -163,11 +197,19 @@ effects. Non-POST answers also carry an `Allow: POST` header.
 Verified deliveries that need no operator action answer `200`:
 
 - `notification` and `revocation`: acknowledged as `200 {"ok": true}`. This
-  slice has no send and no ledger, so the receiver only acks; reconcile runs
-  at boot and after a revocation in the Helix slice.
-- Unknown message types, and deterministic classification errors
-  (`WrongSubscription`, `InvalidBody`): acknowledged with 2xx so Twitch does
-  not retry what will never succeed.
+  slice has no send and no ledger, so the receiver only acks; the Helix
+  slice plans the reconcile list but nothing calls it at runtime yet, so any
+  re-subscription after a revocation is manual.
+- Unknown message types, and deterministic classification errors on
+  non-verification messages (`WrongSubscription`, `InvalidBody`):
+  acknowledged with 2xx so Twitch does not retry what will never succeed.
+  This carve-out excludes `webhook_callback_verification`: `classify()`
+  returns `WrongSubscription` / `InvalidBody` for a challenge with the wrong
+  type or version, or an unparsable signed body, and the handler still acks
+  `200 {"ok": true}` with only an info `delivery ignored` line without
+  echoing the challenge — so the subscription is never enabled. A `200
+  delivery ignored` immediately after a subscription creation means the
+  challenge was not echoed: delete and recreate the subscription.
 
 Source: `crates/bot/src/eventsub_http.rs:287-325`.
 
@@ -190,15 +232,27 @@ Dark is the normal state, not an outage:
 - Worker route without both flags: the path keeps today's behavior (404) and
   the container is never contacted.
   Source: `wrangler/src/eventsub.ts:63-69`.
-- Enabled-but-invalid (bad flag value, bad bind, missing or short secret):
-  the process exits at startup with `eventsub startup refused`. Fix the
-  configuration and restart; do not work around it by enabling anything else.
-  Source: `crates/bot/src/main.rs:160-168`.
+- Enabled-but-invalid on a direct container start (bad flag value, bad bind,
+  missing or short secret): the process exits at startup with `eventsub
+  startup refused`. Through the Worker the shape differs: a missing
+  `TWO_TWITCH_WEBHOOK_SECRET` forwards nothing while the route stays live
+  (the ingress gate never checks the secret), so the result is 503
+  `unavailable` below with no startup refusal; only a present-but-short
+  secret crash-loops the container. Fix the configuration and restart; do
+  not work around it by enabling anything else.
+  Source: `crates/bot/src/main.rs:160-168`,
+  `wrangler/src/index.ts:535-537,583-585`, `wrangler/src/eventsub.ts:63-69`.
 - `POST /hooks/twitch` 404 on staging therefore means one of: the Worker
-  route is dark (check both flags), the container is cold (public ingress
-  never starts it), or the path/method/query shape is wrong (see the matrix).
+  route is dark (check both flags), or the path/method/query shape is wrong
+  (see the matrix). A cold container never answers 404.
   It never means "retry with another credential": an authentication failure
   is a stop — report it, do not substitute credentials.
+- `503 unavailable` triage (the matrix `busy` row covers saturation only):
+  cold container (`!this.ctx.container?.running`), ownership-fence refusal,
+  `containerFetch` failure, or the Worker running with `EVENTSUB_INGRESS=1`
+  but without `TWO_TWITCH_WEBHOOK_SECRET` so no listener was forwarded.
+  Source: `wrangler/src/index.ts:908-918,926`,
+  `wrangler/src/eventsub.ts:21-25,268`.
 
 ## Operator do-not list
 
