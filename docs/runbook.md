@@ -854,6 +854,42 @@ pre-split runner, which looks for `TWO_BOT_STAGING_MIGRATOR_DATABASE_URL`; the
 connection (fail closed). Dispatch plan and apply with a `source_sha` at or
 after the split.
 
+### Automatic pre-deploy drift gate in deploy-staging
+
+`deploy-staging` runs the read-only plan above before every deploy: its
+`schema-gate` job (in the `staging-migrate-plan` environment, `contents: read`
+only) builds `staging-migrate` at the deploy SHA and runs
+`scripts/ci/staging_schema_gate.py --binary ./target/debug/staging-migrate
+--source-sha <deploy SHA>`. The `deploy` job needs `schema-gate`, so a failed
+or skipped gate means no deploy. The gate reads only the plan binding
+(`TWO_BOT_STAGING_PLAN_DATABASE_URL`); it has no apply path, no migrator
+binding and no role/grant step.
+
+Before connecting, the gate compares the secret binding against the
+non-secret expected staging identity in the `staging-migrate-plan`
+environment variables `TWO_BOT_STAGING_HOST`, `TWO_BOT_STAGING_DATABASE` and
+`TWO_BOT_STAGING_BRANCH_ID` (Operator-owned; never derived from the binding
+itself). Host and database must match exactly (host case-insensitively); on
+PlanetScale hosts the binding username's `{role}.{branch_id}` suffix must
+match the branch pin, and a PlanetScale pin without a branch id refuses.
+Pooler hosts/ports and production-like or empty pins refuse with fixed,
+secret-free messages. When the three variables are unset the gate fails
+closed, so set and verify them in the environment before relying on deploys.
+
+Outcomes: `pending_before` empty prints `schema gate clean` and the deploy
+proceeds; non-empty pending exits 1 with `schema drift: staging database is
+behind source <sha>: pending versions [...]` — fix it with the manual
+`staging-migrate` apply dispatch for that source (reviewed plan, exact
+`expected_pending`), then re-run `deploy-staging`. The gate never fixes drift
+itself. The plan manifest is written to `staging-schema-gate-manifest.json`
+in the job workspace; its `audit.connection_usage` (sessions summed from
+`pg_stat_database.numbackends`, readable in full by the plan login) warns —
+never fails — when usage is strictly above 80% of the non-superuser ceiling
+(`effective_max_connections`, else `max_connections` minus
+`superuser_reserved_connections`, else raw `max_connections` for older
+manifests, labelled as such). A saturated staging database (logins refused)
+therefore shows in the gate log before the deploy hits it.
+
 ### Production migration runner
 
 `.github/workflows/production-migrate.yml` (manual, production-only) is the
