@@ -179,6 +179,10 @@ struct Store {
     /// that pin ordering against the Discord and persist calls.
     trace_claims: bool,
     creators_error: Option<StoreError>,
+    /// Bulk creator-view reads: the reconnect generation trigger must be
+    /// debounced, so tests can prove a generation change within the window
+    /// costs no store read.
+    creators_reads: Arc<AtomicU64>,
     /// Single-row creator reads: the join-path read-through must skip known
     /// creators, rooms, halted workers and already-missed channels.
     creator_for_reads: Arc<AtomicU64>,
@@ -240,6 +244,7 @@ impl Store {
             bind_errors: Mutex::new(VecDeque::new()),
             trace_claims: false,
             creators_error: None,
+            creators_reads: Arc::new(AtomicU64::new(0)),
             creator_for_reads: Arc::new(AtomicU64::new(0)),
             creator_for_error: None,
             creator_for_delay: None,
@@ -253,6 +258,7 @@ impl Store {
 
 impl RoomPersistence for Store {
     async fn creators(&self, _: u64) -> Result<Vec<CreatorChannel>, StoreError> {
+        self.creators_reads.fetch_add(1, Ordering::Relaxed);
         match self.creators_error {
             Some(error) => Err(error),
             None => Ok(self.creators.lock().unwrap().clone()),
@@ -13342,6 +13348,72 @@ async fn reload_creators_keeps_the_view_on_a_failed_read() {
     worker.store.creators_error = None;
     worker.reload_creators(600_000).await;
     assert!(worker.creators.contains_key(&CREATOR));
+}
+
+#[tokio::test]
+async fn reload_creators_retries_a_failed_reconnect_read_on_the_next_debounced_tick() {
+    // The generation trigger must retry: a failed first read after a
+    // reconnect leaves the generation unmerged, so the next debounced tick
+    // reads again instead of waiting for the five-minute interval. Mutant:
+    // stamping the generation before the read.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.reload_creators(0).await;
+    worker
+        .store
+        .creators
+        .lock()
+        .unwrap()
+        .push(CreatorChannel::new(GUILD, 201));
+    assert!(worker.live.publish(snapshot(&[201], vec![])));
+    worker.store.creators_error = Some(StoreError::Unavailable);
+    worker.reload_creators(10_000).await;
+    assert!(
+        !worker.creators.contains_key(&201),
+        "a failed reconnect read must not invent rows"
+    );
+    worker.store.creators_error = None;
+    worker.reload_creators(20_000).await;
+    assert!(
+        worker.creators.contains_key(&201),
+        "a failed reconnect read must retry on the next debounced tick"
+    );
+}
+
+#[tokio::test]
+async fn reload_creators_debounces_a_reconnect_generation_change() {
+    // The generation trigger is debounced like a channel event: a generation
+    // change within 10 s of the last read costs no store read, then merges
+    // once the window elapses. Mutant: triggering on every generation change
+    // without the debounce (about 4 reads per second per guild at the 250 ms
+    // tick during an outage).
+    let (live, store, http, _) = fixture();
+    let reads = Arc::clone(&store.creators_reads);
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.reload_creators(0).await;
+    let baseline = reads.load(Ordering::Relaxed);
+    worker
+        .store
+        .creators
+        .lock()
+        .unwrap()
+        .push(CreatorChannel::new(GUILD, 201));
+    assert!(worker.live.publish(snapshot(&[201], vec![])));
+    worker.reload_creators(5_000).await;
+    assert!(
+        !worker.creators.contains_key(&201),
+        "a reconnect inside the debounce window must wait"
+    );
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        baseline,
+        "a reconnect inside the debounce window must not read the store"
+    );
+    worker.reload_creators(10_000).await;
+    assert!(
+        worker.creators.contains_key(&201),
+        "a debounced reconnect must merge once the window elapses"
+    );
 }
 
 #[test]
