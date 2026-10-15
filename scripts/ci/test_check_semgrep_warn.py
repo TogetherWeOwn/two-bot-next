@@ -1,8 +1,8 @@
-"""Offline tests for the Semgrep WARN gate.
+"""Offline tests for the Semgrep HARD gate.
 
-The gate must warn (never fail) on new findings, stay silent when the diff
-adds none, and stay green-but-loud when it is blind. The vendored rule set
-is pinned: four rules, local config only, no registry access.
+The gate must fail on new findings, stay silent when the diff adds none,
+and fail closed when it is blind. The vendored rule set is pinned: four
+rules, local config only, no registry access.
 """
 
 import io
@@ -88,18 +88,19 @@ class GateTests(unittest.TestCase):
             tmp.cleanup()
         return code, out.getvalue()
 
-    def test_new_finding_warns_but_passes(self):
+    def test_new_finding_fails(self):
         code, output = self.run_gate(REPORT, {("crates/core/src/x.rs", 4)})
-        self.assertEqual(code, 0)
-        self.assertIn("::warning::", output)
+        self.assertEqual(code, 1)
+        self.assertIn("::error::", output)
         self.assertIn("rust-panic-in-prod", output)
 
     def test_old_finding_is_silent(self):
         code, output = self.run_gate(REPORT, {("crates/core/src/x.rs", 100)})
         self.assertEqual(code, 0)
+        self.assertNotIn("::error::", output)
         self.assertNotIn("::warning::", output)
 
-    def test_blind_gate_warns_and_passes(self):
+    def test_blind_gate_fails_closed(self):
         out = io.StringIO()
         real_added = gate.added_lines
         gate.added_lines = lambda _base, _head: (set(), "")
@@ -108,8 +109,8 @@ class GateTests(unittest.TestCase):
                 code = gate.main(["--semgrep", "/nonexistent/semgrep"])
         finally:
             gate.added_lines = real_added
-        self.assertEqual(code, 0)
-        self.assertIn("::warning::", out.getvalue())
+        self.assertEqual(code, 1)
+        self.assertIn("::error::", out.getvalue())
         self.assertIn("blind", out.getvalue())
 
 

@@ -1,7 +1,7 @@
 # `.unwrap()` backlog in non-test request paths
 
-Rule: `ast-grep-rules/no-unwrap-request-paths.yml` (WARN: new hits warn, never
-fail). The gate warns on any line the diff adds.
+Rule: `ast-grep-rules/no-unwrap-request-paths.yml` (HARD: newly added hits
+fail the PR). The gate fails on any line the diff adds.
 
 Scope: production source (`crates/*/src`, `src`) whose path contains
 `route`, `handler`, `interaction`, `command` or `webhook`, excluding test
@@ -10,7 +10,10 @@ The ast-grep rule itself only ignores test files/dirs, so its raw output
 still flags `.unwrap()` calls inside inline test modules; those flags are out
 of production scope. `unwrap` in tests is idiomatic.
 
-## Status: zero production hits (2026-10-12, `20de46b2`)
+## Status: zero production hits (2026-10-15, `f6d1ad2f7`; re-verified on the HARD promotion)
+
+Grandfathered production set is empty until 2027-01-15: there is nothing to
+work down, and the gate fails on any newly added hit.
 
 Every `.unwrap()` in a rule-scope file sits inside an inline `#[cfg(test)]`
 module: 50 hit lines across 9 files, none before its file's test-module

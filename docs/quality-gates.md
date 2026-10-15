@@ -10,21 +10,23 @@ the step itself.
   lines the PR adds. Shortfalls annotate the PR and pass.
 - Dependency advisories (HARD): the `cargo-deny` step (`check all`, which
   includes advisories) runs on every PR, not only Rust-selected ones.
-- Rust ast-grep advisories (WARN): the local `sgconfig.yml` runs the request-path
-  `.unwrap()` rule plus the six Rust detectors and positive/negative fixtures
-  adapted from TogetherWeOwn/paperclip-ops-tooling `quality/meta-only/` at
-  source commit `a10103b5f8c9846b8d12cc2d19c7bc2246d12349`. The additional rules
-  flag byte-based UTF-8 splitting, dropped `wait_for` futures, erased `map_err`
+- Request-path unwrap (HARD): the local `sgconfig.yml` runs the request-path
+  `.unwrap()` rule, and `scripts/ci/check-unwrap-request-paths.py` fails the
+  PR when the diff adds a hit. The six shared Rust detectors from
+  TogetherWeOwn/paperclip-ops-tooling `quality/meta-only/` at source commit
+  `a10103b5f8c9846b8d12cc2d19c7bc2246d12349` stay advisory (WARN): they flag
+  byte-based UTF-8 splitting, dropped `wait_for` futures, erased `map_err`
   causes, wildcard errors collapsed to `AccessDenied`, and process-global env or
-  metrics access in tests. Only findings on added lines warn; the unwrap backlog
-  remains in `docs/unwrap-backlog.md`. Thanks to the shared tooling contributors.
+  metrics access in tests. Only findings on added lines fail or warn; the
+  unwrap backlog remains in `docs/unwrap-backlog.md`. Thanks to the shared
+  tooling contributors.
   The corresponding Rust review checklist is available at the same source commit
   ([`rust-bot.yaml`](https://github.com/TogetherWeOwn/paperclip-ops-tooling/blob/a10103b5f8c9846b8d12cc2d19c7bc2246d12349/quality/meta-only/checklists/rust-bot.yaml));
   it is review guidance with fail-unknown evidence rules, not an automated CI gate.
-- Semgrep Rust rules (WARN): vendored `.semgrep/rust-warn.yml` (local rules
-  only, no registry) flags new `todo!`/`unimplemented!`, empty `.expect("")`,
-  `panic!` in non-test code and `process::exit` in library code; current
-  backlog is 41 `panic!` hits below.
+- Semgrep Rust rules (HARD): vendored `.semgrep/rust-warn.yml` (local rules
+  only, no registry) fails the PR on newly added `todo!`/`unimplemented!`,
+  empty `.expect("")`, `panic!` in non-test code or `process::exit` in
+  library code. Pre-existing hits are grandfathered below, not deleted.
 - Squawk migration lint (WARN): `scripts/ci/check-squawk-migrations.py`
   flags risky statements (`adding-required-field`, `creating-index`,
   `adding-check-constraint`, `changing-column-type`, `dropping-object`) in
@@ -46,7 +48,13 @@ the step itself.
   `cfg_attr(..., allow/expect/ignore)` count as waivers. The
   guard reads that table from the base branch, so a PR cannot exempt itself.
 
-## Semgrep backlog (41 `panic!` hits, WARN)
+## Semgrep backlog (41 `panic!` hits, grandfathered until 2027-01-15)
+
+Grandfathered on the HARD promotion: these pre-existing hits stay silent
+(the gate only fails on lines the diff adds) until 2027-01-15. Work them
+down or renew the date with a reason; never silently delete the list to get
+green. Counts below are the pinned snapshot; re-pin with real semgrep
+output if they drift.
 
 - `crates/bot/src/gateway.rs`: 12
 - `crates/core/src/onboarding.rs`: 7

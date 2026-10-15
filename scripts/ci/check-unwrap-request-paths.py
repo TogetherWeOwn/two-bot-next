@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""WARN gate: no new `.unwrap()` in non-test request paths.
+"""HARD gate: no new `.unwrap()` in non-test request paths.
 
 The request-path rule is defined by
 ``ast-grep-rules/no-unwrap-request-paths.yml`` (request-path file globs with
@@ -7,11 +7,14 @@ test files/dirs ignored). Six additional Rust advisories and their fixtures
 come from the shared meta-only assets. The script runs ``ast-grep scan --json``
 and intersects all reported hits with
 the lines the PR adds (``git diff -U0 base head``), so only newly added
-findings warn. Existing unwrap hits are listed in ``docs/unwrap-backlog.md``.
+findings fail. Existing unwrap hits are listed in ``docs/unwrap-backlog.md``.
 
-WARN mode: findings print ``::warning::`` annotations and the script exits 0.
-A blind gate (missing binary, unreadable diff) also warns instead of failing;
-it must never turn a PR red. Only malformed arguments exit non-zero.
+HARD mode: a newly added `.unwrap()` in scope prints ``::error::``
+annotations and the script exits 1. Findings from the six shared advisory
+rules stay WARN-only (``::warning::``, exit still 0 when they are the only
+fresh hits). A blind gate (missing binary, unreadable diff) fails closed
+instead of passing; only malformed arguments exit non-zero for another
+reason.
 """
 
 import argparse
@@ -99,6 +102,10 @@ def warn(message):
     print(f"::warning::{message}", flush=True)
 
 
+def error(message):
+    print(f"::error::{message}", flush=True)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-ref", default="origin/main")
@@ -106,35 +113,37 @@ def main(argv=None):
     parser.add_argument("--ast-grep", default="ast-grep")
     args = parser.parse_args(argv)
 
-    hits, error = run_scan(args.ast_grep, all_rules=True)
+    hits, scan_error = run_scan(args.ast_grep, all_rules=True)
     if hits is None:
-        warn(f"ast-grep WARN gate is blind ({error}); treating as pass")
-        return 0
+        error(f"ast-grep HARD gate is blind ({scan_error}); failing closed")
+        return 1
     unwrap_hits = [hit for hit in hits if hit[0] == RULE_ID]
     print(f"unwrap request-path gate: {len(unwrap_hits)} enforced-scope hit(s)")
     print(f"ast-grep advisory gate: {len(hits) - len(unwrap_hits)} other rule hit(s)")
 
-    added, error = added_lines(args.base_ref, args.head_ref)
+    added, diff_error = added_lines(args.base_ref, args.head_ref)
     if added is None:
-        warn(f"ast-grep WARN gate could not read the diff ({error}); totals only")
-        return 0
+        error(f"ast-grep HARD gate could not read the diff ({diff_error}); failing closed")
+        return 1
 
     fresh = sorted(set(hit for hit in hits if (hit[1], hit[2]) in added))
     if not fresh:
-        print("ast-grep WARN gate: no added findings in scope")
+        print("ast-grep HARD gate: no added findings in scope")
         return 0
+    unwrap_fresh = [hit for hit in fresh if hit[0] == RULE_ID]
     for rule_id, path, line in fresh[:MAX_ANNOTATIONS]:
         if rule_id == RULE_ID:
-            warn(f"{path}:{line} adds .unwrap() in a non-test request path")
+            error(f"{path}:{line} adds .unwrap() in a non-test request path")
         else:
             warn(f"{path}:{line} matches ast-grep rule {rule_id}")
     if len(fresh) > MAX_ANNOTATIONS:
-        warn(f"... and {len(fresh) - MAX_ANNOTATIONS} more new finding(s)")
-    unwrap_fresh = [hit for hit in fresh if hit[0] == RULE_ID]
+        (error if unwrap_fresh else warn)(
+            f"... and {len(fresh) - MAX_ANNOTATIONS} more new finding(s)")
     if unwrap_fresh:
-        warn(f"unwrap request-path gate: {len(unwrap_fresh)} added .unwrap() call(s) in scope "
-             f"(WARN only; existing backlog in {BACKLOG_NAME})")
-    warn(f"ast-grep WARN gate: {len(fresh)} new finding(s) (WARN only)")
+        error(f"unwrap request-path gate: {len(unwrap_fresh)} added .unwrap() call(s) in scope "
+              f"(existing backlog in {BACKLOG_NAME})")
+        return 1
+    warn(f"ast-grep advisory gate: {len(fresh)} new finding(s) (WARN only)")
     return 0
 
 

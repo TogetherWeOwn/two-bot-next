@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""WARN gate: Semgrep Rust rules report, never fail.
+"""HARD gate: Semgrep Rust rules fail on new findings.
 
 Runs the vendored rule set ``.semgrep/rust-warn.yml`` (local file only, so
 the gate is deterministic and needs no registry access) and intersects the
 findings with the lines the PR adds (``git diff -U0 base head``). New
-findings print ``::warning::`` annotations; pre-existing ones are listed in
-``docs/quality-gates.md`` and stay quiet.
+findings print ``::error::`` annotations and the script exits 1;
+pre-existing ones are grandfathered in ``docs/quality-gates.md`` and stay
+quiet.
 
-WARN mode: findings print warnings and the script exits 0. A blind gate
-(missing binary, unreadable config or diff) also warns instead of failing;
-it must never turn a PR red. Only malformed arguments exit non-zero.
+HARD mode: a blind gate (missing binary, unreadable config or diff) fails
+closed instead of passing. Only malformed arguments exit non-zero for
+another reason.
 """
 
 import argparse
@@ -86,8 +87,8 @@ def added_lines(base_ref, head_ref):
     return added, ""
 
 
-def warn(message):
-    print(f"::warning::{message}", flush=True)
+def error(message):
+    print(f"::error::{message}", flush=True)
 
 
 def main(argv=None):
@@ -98,30 +99,30 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if not CONFIG.is_file():
-        warn(f"semgrep WARN gate is blind (missing {CONFIG.relative_to(ROOT)}); treating as pass")
-        return 0
+        error(f"semgrep HARD gate is blind (missing {CONFIG.relative_to(ROOT)}); failing closed")
+        return 1
 
-    findings, error = run_semgrep(args.semgrep)
+    findings, scan_error = run_semgrep(args.semgrep)
     if findings is None:
-        warn(f"semgrep WARN gate is blind ({error}); treating as pass")
-        return 0
-    print(f"semgrep WARN gate: {len(findings)} finding(s)")
+        error(f"semgrep HARD gate is blind ({scan_error}); failing closed")
+        return 1
+    print(f"semgrep HARD gate: {len(findings)} finding(s)")
 
-    added, error = added_lines(args.base_ref, args.head_ref)
+    added, diff_error = added_lines(args.base_ref, args.head_ref)
     if added is None:
-        warn(f"semgrep WARN gate could not read the diff ({error}); totals only")
-        return 0
+        error(f"semgrep HARD gate could not read the diff ({diff_error}); failing closed")
+        return 1
 
     fresh = sorted(f for f in findings if (f[1], f[2]) in added)
     if not fresh:
-        print("semgrep WARN gate: no added lines match a rule")
+        print("semgrep HARD gate: no added lines match a rule")
         return 0
     for rule, path, line in fresh[:MAX_ANNOTATIONS]:
-        warn(f"{path}:{line} matches semgrep rule {rule}")
+        error(f"{path}:{line} matches semgrep rule {rule}")
     if len(fresh) > MAX_ANNOTATIONS:
-        warn(f"... and {len(fresh) - MAX_ANNOTATIONS} more new finding(s)")
-    warn(f"semgrep WARN gate: {len(fresh)} new finding(s) (WARN only)")
-    return 0
+        error(f"... and {len(fresh) - MAX_ANNOTATIONS} more new finding(s)")
+    error(f"semgrep HARD gate: {len(fresh)} new finding(s)")
+    return 1
 
 
 if __name__ == "__main__":

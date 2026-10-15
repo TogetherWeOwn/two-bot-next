@@ -1,9 +1,10 @@
-"""Offline tests for the unwrap request-path WARN gate.
+"""Offline tests for the unwrap request-path HARD gate.
 
-The gate must warn (never fail) on new `.unwrap()` in scope, stay silent when
-the diff adds none, and stay green-but-loud when it is blind. Fixtures use a
-throwaway git repo and a fake ast-grep binary; the real rule file shape is
-pinned so the gate cannot drift off the committed rule.
+The gate must fail on new `.unwrap()` in scope, stay silent when the diff
+adds none, warn (never fail) on new shared-advisory findings only, and fail
+closed when it is blind. Fixtures use a throwaway git repo and a fake
+ast-grep binary; the real rule file shape is pinned so the gate cannot
+drift off the committed rule.
 """
 
 import io
@@ -157,7 +158,7 @@ class GateTests(unittest.TestCase):
             tmp.cleanup()
         return code, out.getvalue()
 
-    def test_fresh_unwrap_warns_but_passes(self):
+    def test_fresh_unwrap_fails(self):
         tmp, root = make_repo()
         try:
             base = commit(root, {"crates/bot/src/gateway_commands.rs": "a\n"})
@@ -177,13 +178,14 @@ class GateTests(unittest.TestCase):
                 gate.ROOT = real_root
         finally:
             tmp.cleanup()
-        self.assertEqual(code, 0)
-        self.assertIn("::warning::", out.getvalue())
+        self.assertEqual(code, 1)
+        self.assertIn("::error::", out.getvalue())
         self.assertIn("gateway_commands.rs:2", out.getvalue())
 
     def test_preexisting_hit_is_silent(self):
         code, output = self.run_gate(SCAN_FIXTURE, "HEAD", "HEAD")
         self.assertEqual(code, 0)
+        self.assertNotIn("::error::", output)
         self.assertNotIn("::warning::", output)
 
     def test_new_shared_advisory_warns_but_passes(self):
@@ -201,14 +203,28 @@ class GateTests(unittest.TestCase):
         self.assertIn("rust-erased-map-err", out.getvalue())
         self.assertIn("::warning::", out.getvalue())
 
-    def test_blind_gate_warns_and_passes(self):
+    def test_blind_gate_fails_closed(self):
         out = io.StringIO()
         with redirect_stdout(out):
             code = gate.main(["--base-ref", "HEAD", "--head-ref", "HEAD",
                               "--ast-grep", "/nonexistent/ast-grep-binary"])
-        self.assertEqual(code, 0)
-        self.assertIn("::warning::", out.getvalue())
+        self.assertEqual(code, 1)
+        self.assertIn("::error::", out.getvalue())
         self.assertIn("blind", out.getvalue())
+
+    def test_unreadable_diff_fails_closed(self):
+        real_root, gate.ROOT = gate.ROOT, Path(tempfile.mkdtemp())
+        tmp, binary = fake_ast_grep(json.dumps(SCAN_FIXTURE))
+        out = io.StringIO()
+        try:
+            with redirect_stdout(out):
+                code = gate.main(["--base-ref", "nope", "--head-ref", "nada",
+                                  "--ast-grep", binary])
+        finally:
+            gate.ROOT = real_root
+            tmp.cleanup()
+        self.assertEqual(code, 1)
+        self.assertIn("::error::", out.getvalue())
 
 
 class RuleShapeTests(unittest.TestCase):

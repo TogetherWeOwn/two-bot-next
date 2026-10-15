@@ -1213,8 +1213,8 @@ class WorkflowTests(unittest.TestCase):
         for name in (
             "Floor guard (HARD, CONSTRAINTS.md floor)",
             "Patch coverage (WARN, 80% of added lines)",
-            "Unwrap in request paths (WARN)",
-            "Semgrep Rust rules (WARN)",
+            "Unwrap in request paths (HARD)",
+            "Semgrep Rust rules (HARD)",
         ):
             with self.subTest(name=name):
                 step = next(step for step in steps if step.get("name") == name)
