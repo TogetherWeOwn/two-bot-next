@@ -193,7 +193,14 @@ job runs on a bounded schedule: a dry run that deletes nothing unless
 purger is installed: do not claim a live 30/90-day TTL beyond the windows
 this job enforces. Every run reports per-class metrics, with partial runs
 (deferred/overdue deletions, failed guild purges) surfaced as warnings that
-stay retryable.
+stay retryable. When the database is behind the binary (an unapplied
+migration or grant), the gateway acks dispatches whose queue write hits the
+schema gap instead of crash-looping: a skipped rejoin-cancel is a no-op, but
+a skipped true guild removal is logged at error level with the guild id
+(`retention purge skipped; schema gap, operator replay required`) and must be
+replayed by the Operator once the migration lands, running the same insert
+the live path runs: `INSERT INTO retention_guild_purge_queue (guild_id)
+VALUES ('<guild id>') ON CONFLICT (guild_id) DO NOTHING;`
 
 The append-only event-store capture (`event_store`, when its slices land)
 follows the same rule: its rows persist until erasure, and its TTL policy is

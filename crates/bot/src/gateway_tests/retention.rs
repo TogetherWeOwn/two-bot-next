@@ -411,6 +411,54 @@ async fn missing_retention_tables_do_not_stop_the_gateway() {
     db.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn schema_gapped_real_delete_survives_and_operator_replay_restores_purge() {
+    // Paperclip Review on #978: acking a schema-gapped real GUILD_DELETE must
+    // not silently drop the purge obligation. The gateway survives (the
+    // sequence advances), and the privacy.md Operator replay — the same insert
+    // the live path runs — restores the purge once the queue table exists.
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    sqlx::query("DROP TABLE retention_guild_purge_queue")
+        .execute(pool)
+        .await
+        .unwrap();
+    let mut peer = Peer::new().await;
+    let (store, stop, task, _) = runner(pool, &mut peer, None).await;
+    peer.send(delete(2, None)).await;
+    wait_sequence(&store, 2).await;
+    assert!(
+        !task.is_finished(),
+        "schema-gapped real delete must not stop the gateway"
+    );
+    // The migration lands: recreate exactly the 0438 queue table, still empty
+    // because the skip dropped the obligation.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS retention_guild_purge_queue (guild_id TEXT PRIMARY KEY, enqueued_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp())",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        queued(pool).await,
+        0,
+        "the skipped delete queues nothing by itself"
+    );
+    // The documented Operator replay: the live queue insert for the removed
+    // guild from the error line.
+    handle_guild_delete(pool, RETENTION_GUILD, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        queued(pool).await,
+        1,
+        "operator replay must restore the skipped purge"
+    );
+    stop_runner(stop, task).await;
+    peer.close().await;
+    db.close().await.unwrap();
+}
+
 async fn failed_write_replays(cancel: bool, fail_checkpoint: bool) {
     let Some(db) = database().await else { return };
     let pool = db.pool();

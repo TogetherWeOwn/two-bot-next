@@ -611,11 +611,11 @@ fn count_community_facts_drain_failure<T, E>(
 ///
 /// Deployment-state schema gaps (missing table `42P01`, missing grant
 /// `42501` — an unapplied migration or ACL plan) never hold the cursor:
-/// retrying them on every boot is futile, and a missing queue table means no
-/// purge can be queued or executed anyway, while the retention job defers
-/// schema-gapped work instead of deleting. They warn with the guild and the
-/// SQLSTATE (never the raw error) and skip, so the gateway survives a schema
-/// behind the binary (TOG-25067).
+/// retrying them on every boot is futile. A skipped rejoin-cancel is safe (a
+/// missing queue table holds nothing to cancel), but a skipped real removal
+/// drops the guild's only purge-queue write — the removed guild is never seen
+/// again — so it logs at error level with the guild for the Operator replay
+/// documented in `docs/privacy.md` instead of warning (TOG-25067).
 async fn retention_lifecycle(store: &GatewaySessionStore, event: &Event) -> Option<sqlx::Error> {
     let pool = store.pool();
     let write = match event {
@@ -645,11 +645,20 @@ async fn retention_lifecycle(store: &GatewaySessionStore, event: &Event) -> Opti
         Err(error) => {
             if crate::gateway_failure::is_schema_gap(&error) {
                 let code = crate::db_log::error_code(&error);
-                tracing::warn!(
-                    guild = event_guild_id(event),
-                    error_code = code.as_deref().unwrap_or("unknown"),
-                    "retention lifecycle skipped; schema gap, retention job defers"
-                );
+                let code = code.as_deref().unwrap_or("unknown");
+                if is_real_guild_removal(event) {
+                    tracing::error!(
+                        guild = event_guild_id(event),
+                        error_code = code,
+                        "retention purge skipped; schema gap, operator replay required"
+                    );
+                } else {
+                    tracing::warn!(
+                        guild = event_guild_id(event),
+                        error_code = code,
+                        "retention lifecycle skipped; schema gap, nothing to cancel"
+                    );
+                }
                 None
             } else {
                 Some(error)
@@ -658,7 +667,14 @@ async fn retention_lifecycle(store: &GatewaySessionStore, event: &Event) -> Opti
     }
 }
 
-/// Guild id for lifecycle warn lines, empty for non-guild dispatches.
+/// True for a real guild removal (`unavailable != Some(true)`): the only
+/// dispatch that writes the purge queue, so the only skip that needs the
+/// Operator replay. Rejoin-cancels and outage payloads write nothing durable.
+fn is_real_guild_removal(event: &Event) -> bool {
+    matches!(event, Event::GuildDelete(deleted) if deleted.unavailable != Some(true))
+}
+
+/// Guild id for lifecycle log lines, empty for non-guild dispatches.
 fn event_guild_id(event: &Event) -> String {
     match event {
         Event::GuildDelete(deleted) => deleted.id.get().to_string(),
@@ -792,7 +808,8 @@ fn apply_dispatch<I: InviteSource>(
         // Retention lifecycle before the checkpoint commits: a failed
         // queue/cancel write holds the cursor via `dispatch_error` so the
         // dispatch (and any later dispatch) is never acknowledged, and the
-        // next process replays it from the last committed sequence. The
+        // next process replays it from the last committed sequence, except
+        // deployment-state schema gaps, which skip per `retention_lifecycle`. The
         // purge-queue write runs under the checkpoint client deadline with
         // readiness armed, so lock contention fails bounded instead of
         // waiting for the server statement timeout with the checkpoint
