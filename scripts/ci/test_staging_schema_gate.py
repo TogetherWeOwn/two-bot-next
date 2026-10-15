@@ -160,6 +160,7 @@ class ConnectionWarningTests(unittest.TestCase):
         warning = connection_warning(manifest)
         self.assertIsNotNone(warning)
         self.assertIn("18/22", warning)
+        self.assertIn("non-superuser", warning)
 
     def test_effective_max_field_warns_without_reserved(self):
         manifest = {"audit": {"connection_usage": {
@@ -167,6 +168,7 @@ class ConnectionWarningTests(unittest.TestCase):
         warning = connection_warning(manifest)
         self.assertIsNotNone(warning)
         self.assertIn("18/22", warning)
+        self.assertIn("non-superuser", warning)
 
     def test_older_manifest_without_ceiling_uses_raw_max(self):
         def manifest(used):
@@ -176,6 +178,7 @@ class ConnectionWarningTests(unittest.TestCase):
         warning = connection_warning(manifest(21))
         self.assertIsNotNone(warning)
         self.assertIn("21/25", warning)
+        self.assertIn("of max_connections", warning)
 
     def test_degenerate_or_misplaced_usage_never_warns(self):
         for bad in (

@@ -718,6 +718,30 @@ async fn real_sqlx_runner_cases() -> TestResult {
     assert!(audit["verify_findings"].is_array());
     assert_eq!(audit["matrix_sha256"].as_str().map(str::len), Some(64));
     assert_eq!(audit["verify_sha256"].as_str().map(str::len), Some(64));
+    // The plan manifest carries connection usage for the 80% warning: the
+    // login ceiling is max minus reserved, and the ratio is against it.
+    let usage = &audit["connection_usage"];
+    let used = usage["used"].as_i64().expect("connection used");
+    let max = usage["max_connections"].as_i64().expect("max connections");
+    let reserved = usage["reserved_connections"]
+        .as_i64()
+        .expect("reserved connections");
+    let effective = usage["effective_max_connections"]
+        .as_i64()
+        .expect("effective ceiling");
+    assert!(used >= 0, "connection usage must be present");
+    assert!(max > 0, "max_connections must be positive");
+    assert_eq!(
+        effective,
+        max - reserved,
+        "login ceiling is max minus reserved"
+    );
+    let pct = usage["pct_full"].as_f64().expect("pct_full");
+    let expected_pct = used as f64 / effective.max(1) as f64 * 100.0;
+    assert!(
+        (pct - expected_pct).abs() < 1e-9,
+        "pct_full is against the login ceiling"
+    );
     // Pending spans both sides of the ledger max: versions below 390 were
     // never applied, yet SQLx must still pick them up.
     assert!(expected.contains(&201), "below-max gap must be pending");
