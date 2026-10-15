@@ -309,6 +309,71 @@ class RuleTests(unittest.TestCase):
             [],
         )
 
+    def test_quoted_create_then_other_quoted_table_still_flags(self):
+        self.assertEqual(
+            self.rules(
+                'CREATE TABLE "Alpha" (a int);\n'
+                'CREATE INDEX ix ON "Beta" (a);\n'
+            ),
+            ["creating-index"],
+        )
+
+    def test_quoted_create_then_same_quoted_table_is_clean(self):
+        self.assertEqual(
+            self.rules(
+                'CREATE TABLE "Alpha" (a int);\n'
+                'CREATE INDEX ix ON "Alpha" (a);\n'
+            ),
+            [],
+        )
+
+    def test_quoted_names_differing_only_by_case_still_flag(self):
+        # Quoted identifiers are case-sensitive.
+        self.assertEqual(
+            self.rules(
+                'CREATE TABLE "Alpha" (a int);\n'
+                'CREATE INDEX ix ON "alpha" (a);\n'
+            ),
+            ["creating-index"],
+        )
+
+    def test_identifier_ending_in_e_does_not_start_escape_string(self):
+        # The E in ELSE is part of an identifier, not an E'...' prefix:
+        # the ordinary string ends at \' so the index stays visible.
+        self.assertEqual(
+            self.rules(
+                "SELECT CASE WHEN x THEN 1 ELSE'a\\' END;\n"
+                "CREATE INDEX bad ON t (a);\n"
+            ),
+            ["creating-index"],
+        )
+
+    def test_unquoted_names_fold_case(self):
+        self.assertEqual(
+            self.rules(
+                "CREATE TABLE Guilds (id bigint PRIMARY KEY);\n"
+                "CREATE INDEX x ON guilds (id);\n"
+            ),
+            [],
+        )
+
+    def test_schema_qualified_create_matches_bare_index(self):
+        self.assertEqual(
+            self.rules(
+                "CREATE TABLE public.t (id bigint PRIMARY KEY);\n"
+                "CREATE INDEX x ON t (id);\n"
+            ),
+            [],
+        )
+
+    def test_normalize_table_quoting_and_schema(self):
+        self.assertEqual(squawk.normalize_table("Guilds"), "guilds")
+        self.assertEqual(squawk.normalize_table("public.t"), "t")
+        self.assertEqual(squawk.normalize_table('"Alpha"'), "Alpha")
+        self.assertNotEqual(
+            squawk.normalize_table('"Alpha"'), squawk.normalize_table('"alpha"')
+        )
+
     def test_several_rules_in_one_file_report_each_line(self):
         self.assertEqual(
             squawk.lint_text(

@@ -100,10 +100,14 @@ DOLLAR_OPEN = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$")
 
 
 def normalize_table(raw):
-    """Lowercase unqualified table name for same-file empty-table checks."""
+    """Lowercase unqualified table name for same-file empty-table checks.
+
+    Unquoted names fold to lowercase; quoted identifiers are
+    case-sensitive, so their case is preserved.
+    """
     last = raw.strip().split(".")[-1].strip()
     if len(last) >= 2 and last.startswith('"') and last.endswith('"'):
-        last = last[1:-1]
+        return last[1:-1].replace('""', '"')
     return last.lower()
 
 
@@ -114,82 +118,91 @@ class SquawkError(ValueError):
 def blanked(text):
     """Return text with string, quoted-identifier, dollar-quoted and comment
     spans replaced by spaces (newlines preserved), so keyword matching and
-    statement splitting never fire inside literals or comments."""
-    chars = list(text)
+    statement splitting never fire inside literals or comments.
+
+    Quoted identifiers map to a unique placeholder per distinct name
+    (``_qq_<n>_``), so two different quoted table names never collapse to
+    one token while the same quoted name stays equal to itself.
+    """
+    out = []
     n = len(text)
-
-    def blank(start, end):
-        for i in range(start, end):
-            if chars[i] != "\n":
-                chars[i] = " "
-
+    quoted_ids = {}
     i = 0
     while i < n:
         two = text[i : i + 2]
         if two == "--":
             end = text.find("\n", i)
-            blank(i, n if end < 0 else end)
-            i = n if end < 0 else end
+            end = n if end < 0 else end
+            for char in text[i:end]:
+                out.append("\n" if char == "\n" else " ")
+            i = end
         elif two == "/*":
             end = text.find("*/", i + 2)
             end = n if end < 0 else end + 2
-            blank(i, end)
+            for char in text[i:end]:
+                out.append("\n" if char == "\n" else " ")
             i = end
         elif text[i] == "'":
             # Postgres E'...' strings use backslash escapes (\' does not end
             # the literal); ordinary '...' strings do not. A bare E prefix
-            # that is itself part of an identifier (e.g. someE'...') is not
-            # an escape prefix.
+            # that is itself part of an identifier (e.g. ELSE'...') is not
+            # an escape prefix: the E must stand alone.
             is_escape = (
                 i > 0
                 and text[i - 1] in "Ee"
                 and (i - 1 == 0 or not (text[i - 2].isalnum() or text[i - 2] == "_"))
             )
             begin = i - 1 if is_escape else i
-            i += 1
-            while i < n:
-                if is_escape and text[i] == "\\" and i + 1 < n:
-                    i += 2
+            if is_escape:
+                out.pop()
+            j = i + 1
+            while j < n:
+                if is_escape and text[j] == "\\" and j + 1 < n:
+                    j += 2
                     continue
-                if text[i] == "'":
-                    if text[i + 1 : i + 2] == "'":
-                        i += 2
+                if text[j] == "'":
+                    if text[j + 1 : j + 2] == "'":
+                        j += 2
                         continue
-                    i += 1
+                    j += 1
                     break
-                i += 1
-            blank(begin, i)
+                j += 1
+            for char in text[begin:j]:
+                out.append("\n" if char == "\n" else " ")
+            i = j
         elif text[i] == '"':
             begin = i
-            i += 1
-            while i < n:
-                if text[i] == '"':
-                    if text[i + 1 : i + 2] == '"':
-                        i += 2
+            j = i + 1
+            while j < n:
+                if text[j] == '"':
+                    if text[j + 1 : j + 2] == '"':
+                        j += 2
                         continue
-                    i += 1
+                    j += 1
                     break
-                i += 1
-            blank(begin, i)
-            # Leave a placeholder identifier so rules that expect a name
-            # (e.g. ADD CONSTRAINT <name> CHECK) still parse quoted names.
-            token = "_q_"[: max(1, min(3, i - begin))]
-            for j, char in enumerate(token):
-                if chars[begin + j] != "\n":
-                    chars[begin + j] = char
+                j += 1
+            raw = text[begin:j]
+            if raw not in quoted_ids:
+                quoted_ids[raw] = f"_qq_{len(quoted_ids)}_"
+            out.append(quoted_ids[raw])
+            out.append("\n" * raw.count("\n"))
+            i = j
         elif text[i] == "$":
             match = DOLLAR_OPEN.match(text, i)
             if match:
                 tag = match.group()
                 close = text.find(tag, match.end())
                 end = n if close < 0 else close + len(tag)
-                blank(i, end)
+                for char in text[i:end]:
+                    out.append("\n" if char == "\n" else " ")
                 i = end
             else:
+                out.append(text[i])
                 i += 1
         else:
+            out.append(text[i])
             i += 1
-    return "".join(chars)
+    return "".join(out)
 
 
 def statements(text):
