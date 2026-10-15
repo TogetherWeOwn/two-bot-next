@@ -32,6 +32,8 @@ def read_lcov(path):
         text = Path(path).read_text()
     except OSError as exc:
         return None, f"lcov report unreadable: {exc}"
+    if not text.strip():
+        return None, "lcov report is empty"
     hits = {}
     current = None
     for raw in text.splitlines():

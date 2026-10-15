@@ -66,7 +66,7 @@ in `scripts/ci/test_required_checks.py`. Only advisory `container smoke` is
 exempt: it can take up to 30 minutes, and image security stays gated through
 the SBOM job. The legacy `required-checks` aggregate is removed.
 
-Deterministic quality gates (patch coverage WARN, per-PR advisories HARD,
+Deterministic quality gates (patch coverage HARD, per-PR advisories HARD,
 ast-grep and Semgrep WARN, required voice synthetic, test-target inventory
 HARD) run as steps of the `check` lane on the existing routed runner; see
 [`docs/quality-gates.md`](docs/quality-gates.md). New checks start in WARN

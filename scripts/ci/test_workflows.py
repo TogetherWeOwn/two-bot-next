@@ -1223,6 +1223,15 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(step["env"][base_key], expected_base)
                 self.assertEqual(step["env"][head_key], expected_head)
 
+    def test_patch_coverage_measurement_writes_report_despite_test_failures(self):
+        step = next(
+            step for step in self.workflows["check.yml"]["jobs"]["check"]["steps"]
+            if step.get("name") == "Patch coverage (HARD, 80% of added lines)"
+        )
+        self.assertIn("--ignore-run-fail", step["run"])
+        self.assertIn('[ ! -s "$RUNNER_TEMP/lcov.info" ]', step["run"])
+        self.assertNotIn("measurement did not complete", step["run"])
+
     def test_voice_synthetic_shape_is_pinned_and_mutations_fail(self):
         import copy
         synthetic = self.workflows["voice-synthetic.yml"]

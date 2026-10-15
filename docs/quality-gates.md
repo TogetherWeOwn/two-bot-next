@@ -7,9 +7,10 @@ the step itself.
 
 - Patch coverage (HARD): `cargo llvm-cov --workspace --lib` plus
   `scripts/ci/check-patch-coverage.py` requires 80% line coverage over the
-  lines the PR adds. Shortfalls fail the PR. A blind gate run fails closed;
-  only a failed `cargo llvm-cov` measurement itself warns (unit-test
-  failures are owned HARD by the rust-tests lane).
+  lines the PR adds. Shortfalls and missing or empty reports fail the PR.
+  Measurement uses `--ignore-run-fail` so unit-test failures do not suppress
+  coverage output; the rust-tests lane remains responsible for reporting those
+  failures. A build or report-generation failure fails this gate.
 - Dependency advisories (HARD): the `cargo-deny` step (`check all`, which
   includes advisories) runs on every PR, not only Rust-selected ones.
 - Rust ast-grep advisories (WARN): the local `sgconfig.yml` runs the request-path

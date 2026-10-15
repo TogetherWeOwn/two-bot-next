@@ -117,6 +117,18 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("::error::", out.getvalue())
         self.assertIn("blind", out.getvalue())
 
+    def test_empty_lcov_fails_closed(self):
+        lcov = write_lcov("")
+        out = io.StringIO()
+        try:
+            with redirect_stdout(out):
+                code = gate.main(["--lcov", lcov])
+        finally:
+            Path(lcov).unlink()
+        self.assertEqual(code, 1)
+        self.assertIn("::error::", out.getvalue())
+        self.assertIn("blind", out.getvalue())
+
 
 class DiffTests(unittest.TestCase):
     def test_added_lines_tracks_new_file_lines(self):
