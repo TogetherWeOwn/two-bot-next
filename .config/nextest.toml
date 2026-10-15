@@ -9,4 +9,6 @@
 retries = 1
 
 [profile.ci.junit]
+# Store-relative: nextest writes target/nextest/ci/junit.xml, not the
+# workspace root. The reusable lane copies it to ./junit.xml for parse/upload.
 path = "junit.xml"

@@ -1913,6 +1913,17 @@ class WorkflowTests(unittest.TestCase):
         select = next(step for step in run_steps
                       if str(step.get("name", "")).startswith("Select sccache backend"))
         self.assertIn("pipefail", str(select.get("run", "")))
+        run_nextest = next(step for step in run_steps
+                           if str(step.get("name", "")).startswith("cargo nextest"))
+        run_text = str(run_nextest.get("run", ""))
+        # The JUnit path in .config/nextest.toml is profile-store relative
+        # (target/nextest/ci/junit.xml), not workspace-root: the step must
+        # resolve it and copy to the workspace root, keep failing when truly
+        # absent, and preserve a failing nextest status with its evidence.
+        self.assertIn("target/nextest/ci/junit.xml", run_text)
+        self.assertIn("cp ", run_text)
+        self.assertIn("test -f junit.xml", run_text)
+        self.assertIn("exit $status", run_text)
         parse = next(step for step in run_steps
                      if str(step.get("name", "")).startswith("Parse JUnit"))
         self.assertIn("-f junit.xml", str(parse.get("run", "")))

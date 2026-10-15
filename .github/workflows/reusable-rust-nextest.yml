@@ -161,13 +161,32 @@ jobs:
       # Advisory pilot scope: workspace lib/bins via nextest (retries=1 and
       # JUnit come from .config/nextest.toml profile `ci`). A fail-then-pass
       # retry is reported flaky, not red; the ledger step still runs.
+      # JUnit `path = "junit.xml"` in .config/nextest.toml is profile-store
+      # relative (target/nextest/ci/junit.xml), not workspace-root. Resolve it
+      # and copy to the workspace root so the parse/upload steps below see one
+      # stable path. The nextest exit status is preserved: a failing test run
+      # still fails this step, but its JUnit evidence is retained for upload.
       - name: cargo nextest (unit and binary, retries=1, JUnit)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         shell: bash
         run: |
-          cargo nextest run --workspace --lib --bins --features two-bot-core/db --locked --profile ci
+          status=0
+          cargo nextest run --workspace --lib --bins --features two-bot-core/db --locked --profile ci || status=$?
+          for candidate in target/nextest/ci/junit.xml junit.xml; do
+            if [ -f "$candidate" ]; then
+              cp "$candidate" junit.xml
+              break
+            fi
+          done
+          if [ ! -f junit.xml ]; then
+            found=$(find target/nextest -name junit.xml -print -quit 2>/dev/null || true)
+            if [ -n "$found" ]; then
+              cp "$found" junit.xml
+            fi
+          fi
           test -f junit.xml
+          exit $status
 
       - name: sccache stats (advisory speed evidence)
         shell: bash
