@@ -23,9 +23,10 @@ executor merged.
   `DiscordCall` describes the plain-data mutation. Each call must abort after
   **5 seconds**, without automatic retries. Preserve legacy success handling:
   ban 200/204, kick and unban 200/204/404, timeout 200.
-- Map definite Discord refusals to `Rejected`; timeouts, transport/5xx failures
-  and rate limits remain uncertain. Only a definite refusal permits releasing
-  a destructive claim or retrying an unban.
+- Map definite Discord refusals to `Rejected`; timeouts and transport/5xx
+  failures remain uncertain. A definite refusal or a rate limit (Discord did
+  not process the request, `DiscordError::proves_no_effect`) permits releasing
+  only the failed attempt's destructive claim or requeueing an unban.
 - Keep `TWO_MODERATION` off by default and restrict enabling it to staging.
   No production guild or token was used to verify this slice. The service is
   deliberately gate-independent: the shared router owns runtime gating.
@@ -79,8 +80,9 @@ serialize through one set of local queues.
 (`crates/discord/src/member_moderation.rs`): one attempt per verb, the legacy
 5 s abort, no automatic retry. Kick and unban treat 404 as complete; definite
 refusals (including local guard refusals, which never reach the wire) map to
-`Rejected`, while timeouts, transport/5xx failures and rate limits stay
-uncertain and keep the claim fenced. The audit-log reason stays within the
+`Rejected`, while timeouts and transport/5xx failures stay
+uncertain and keep the claim fenced; a rate limit proves no effect and
+releases only the failed attempt. The audit-log reason stays within the
 512-unit bound, enforced before any I/O.
 
 Interaction-to-`MemberExecution` mapping resolves live role facts (guild

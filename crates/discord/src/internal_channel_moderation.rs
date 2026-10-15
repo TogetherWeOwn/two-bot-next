@@ -462,7 +462,7 @@ impl InternalChannelExecutor {
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(failure) => {
-                if failure.is_safe_pre_mutation() {
+                if failure.proves_no_effect() {
                     self.abort(&ticket, &audit, clear_on_rejection.as_deref())
                         .await?;
                 } else {

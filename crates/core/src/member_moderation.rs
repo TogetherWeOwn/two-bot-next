@@ -159,8 +159,9 @@ pub enum DiscordCall {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DiscordError {
     /// Discord refused the request (4xx): provably no mutation happened, so
-    /// the claim is safe to release and the staged unban safe to cancel.
-    /// This is the ONLY retry-safe failure (legacy `discord_rejected`).
+    /// the claim is safe to release and the staged unban safe to cancel
+    /// (legacy `discord_rejected`). A 429 is equally retry-safe for the
+    /// failed attempt only; see [`DiscordError::proves_no_effect`].
     #[error("discord refused the request: {0}")]
     Rejected(String),
     /// Discord did not answer in time (legacy `upstream_timeout`): the
@@ -172,8 +173,9 @@ pub enum DiscordError {
     /// treatment as [`DiscordError::Timeout`].
     #[error("discord was unreachable: {0}")]
     Unavailable(String),
-    /// Rate limited (legacy `rate_limited`): uncertain, same treatment as
-    /// [`DiscordError::Timeout`]; the executor paces per legacy §6.
+    /// Rate limited (legacy `rate_limited`): Discord did not process the
+    /// request, so it proves no effect ([`DiscordError::proves_no_effect`])
+    /// and only the failed attempt is released; the executor paces per §6.
     #[error("discord rate-limited this request")]
     RateLimited,
 }
@@ -184,6 +186,16 @@ impl DiscordError {
     #[must_use]
     pub fn is_safe_pre_mutation(&self) -> bool {
         matches!(self, Self::Rejected(_))
+    }
+
+    /// True when the failure proves the request had no effect: everything
+    /// [`Self::is_safe_pre_mutation`] covers, plus a 429. Discord documents a
+    /// rate-limited request as not processed. Callers that fence a single
+    /// attempt may release only that attempt and retry; timeouts, transport
+    /// failures and unexpected statuses stay fenced.
+    #[must_use]
+    pub fn proves_no_effect(&self) -> bool {
+        self.is_safe_pre_mutation() || matches!(self, Self::RateLimited)
     }
 }
 
@@ -1036,9 +1048,11 @@ where
             Ok(outcome) => outcome,
             Err(err) => {
                 let release_cause = match &err {
-                    // Discord refused before mutating: provably nothing
-                    // happened, so the key is safe to give back.
-                    MemberError::Discord(d) if d.is_safe_pre_mutation() => Some("discord_rejected"),
+                    // Discord refused before mutating, or rate-limited the
+                    // request without processing it: provably nothing
+                    // happened, so only this attempt's key is given back.
+                    MemberError::Discord(DiscordError::RateLimited) => Some("discord_rate_limited"),
+                    MemberError::Discord(d) if d.proves_no_effect() => Some("discord_rejected"),
                     // Storage rolled back before any durable write for this
                     // request (or wrote nothing): equally safe to retry.
                     MemberError::Store(s) if s.is_safe_pre_mutation() => Some("store_rolled_back"),
@@ -1199,7 +1213,7 @@ where
             .ban(&exec.guild_id, target, &validated.reason)
             .await
         {
-            if err.is_safe_pre_mutation() {
+            if err.proves_no_effect() {
                 self.store
                     .reject_ban_attempt(
                         &exec.guild_id,
@@ -1298,7 +1312,7 @@ where
                     .unban(&job.guild_id, &job.user_id, &job.reason)
                     .await
                 {
-                    if err.is_safe_pre_mutation() {
+                    if err.proves_no_effect() {
                         self.store
                             .requeue_unban(&job.request_id, &job.claim_token)
                             .await?;
@@ -2276,6 +2290,17 @@ mod tests {
     const TARGET_ID: &str = "333333333333333333";
     const STAFF_ROLE: &str = "444444444444444444";
     const BOT_ID: &str = "555555555555555555";
+
+    #[test]
+    fn proves_no_effect_adds_only_rate_limits_to_safe_pre_mutation() {
+        assert!(DiscordError::RateLimited.proves_no_effect());
+        assert!(DiscordError::Rejected("refused".to_owned()).proves_no_effect());
+        assert!(!DiscordError::Timeout.proves_no_effect());
+        assert!(!DiscordError::Unavailable("503".to_owned()).proves_no_effect());
+        // The narrower legacy predicate is unchanged: a 429 is not a
+        // pre-mutation refusal, only a proven no-effect response.
+        assert!(!DiscordError::RateLimited.is_safe_pre_mutation());
+    }
 
     #[test]
     fn unban_debug_redacts_claim_tokens() {
