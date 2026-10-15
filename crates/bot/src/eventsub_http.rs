@@ -727,13 +727,7 @@ mod tests {
         // content-type and verification, so even a bare request gets 503.
         let state = Arc::new(ReceiverState::new(&config()));
         let _permits = (0..MAX_REQUESTS)
-            .map(|_| {
-                state
-                    .capacity
-                    .clone()
-                    .try_acquire_owned()
-                    .expect("permit")
-            })
+            .map(|_| state.capacity.clone().try_acquire_owned().expect("permit"))
             .collect::<Vec<_>>();
         let response = router(Arc::clone(&state))
             .oneshot(request("POST", EVENTSUB_PATH, None, None, None, None, ""))
