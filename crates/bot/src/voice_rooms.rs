@@ -3043,6 +3043,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             let known = self.creators.contains_key(&ticket.creator_id);
             if reason == "halted" {
                 warn!(
+                    voice_event = "voice_join_received",
                     guild = self.live.guild_id.to_string(),
                     channel = ticket.creator_id.to_string(),
                     reason,
@@ -3056,6 +3057,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 );
             } else if reason == "duplicate" {
                 debug!(
+                    voice_event = "voice_join_received",
                     guild = self.live.guild_id.to_string(),
                     channel = ticket.creator_id.to_string(),
                     reason,
@@ -3069,6 +3071,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 );
             } else {
                 info!(
+                    voice_event = "voice_join_received",
                     guild = self.live.guild_id.to_string(),
                     channel = ticket.creator_id.to_string(),
                     reason,
@@ -3108,6 +3111,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 metrics::global().voice_join_refused("name_blocked");
                 let live_state = self.live.read_state();
                 info!(
+                    voice_event = "voice_join_received",
                     guild = self.live.guild_id.to_string(),
                     channel = ticket.creator_id.to_string(),
                     reason = "name_blocked",

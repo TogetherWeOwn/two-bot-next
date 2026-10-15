@@ -1498,6 +1498,24 @@ async fn refused_creator_joins_log_channel_and_creator_map_state() {
         ..ticket
     };
     assert!(!worker.accept_join(unknown, "new room", 9, NOW.to_owned()));
+    // A halted worker refuses joins until restart: seed a credential refusal
+    // so the first dispatch halts it, then join again and check the halted
+    // line carries the same channel and map-state fields.
+    let (live, store, http, _) = fixture();
+    store
+        .claim_script
+        .lock()
+        .unwrap()
+        .push_back(Err(StoreError::CredentialRefused));
+    let mut halted_worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut halted_worker, MEMBER);
+    dispatch(&mut halted_worker, 0).await;
+    assert!(halted_worker.halted());
+    let halted_ticket = halted_worker
+        .live
+        .voice_update(MEMBER + 1, Some(CREATOR), Some(false))
+        .unwrap();
+    assert!(!halted_worker.accept_join(halted_ticket, "new room", 10, NOW.to_owned()));
     // A name the automod filter blocks: refused as name_blocked with the
     // same channel and map-state fields.
     let (live, store, http, _) = fixture();
@@ -1512,8 +1530,9 @@ async fn refused_creator_joins_log_channel_and_creator_map_state() {
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .filter(|event| event["fields"]["message"] == "voice creator join refused before queueing")
         .collect();
-    assert_eq!(refusals.len(), 3, "{text}");
+    assert_eq!(refusals.len(), 4, "{text}");
     let fields = &refusals[0]["fields"];
+    assert_eq!(fields["voice_event"], "voice_join_received");
     assert_eq!(fields["reason"], "duplicate");
     assert_eq!(fields["channel"], CREATOR.to_string());
     assert_eq!(fields["ticket_generation"], ticket.generation);
@@ -1523,6 +1542,7 @@ async fn refused_creator_joins_log_channel_and_creator_map_state() {
     assert_eq!(fields["halted"], false);
     assert_eq!(fields["ready"], true);
     let fields = &refusals[1]["fields"];
+    assert_eq!(fields["voice_event"], "voice_join_received");
     assert_eq!(fields["reason"], "unknown_creator");
     assert_eq!(fields["channel"], "999");
     assert_eq!(fields["ticket_generation"], ticket.generation);
@@ -1530,10 +1550,25 @@ async fn refused_creator_joins_log_channel_and_creator_map_state() {
     assert_eq!(fields["known"], false);
     assert_eq!(fields["creators_len"], 1);
     let fields = &refusals[2]["fields"];
-    assert_eq!(fields["reason"], "name_blocked");
+    assert_eq!(fields["voice_event"], "voice_join_received");
+    assert_eq!(fields["reason"], "halted");
     assert_eq!(fields["channel"], CREATOR.to_string());
+    assert_eq!(fields["ticket_generation"], halted_ticket.generation);
+    assert_eq!(fields["live_generation"], halted_ticket.generation);
     assert_eq!(fields["known"], true);
     assert_eq!(fields["creators_len"], 1);
+    assert_eq!(fields["halted"], true);
+    assert_eq!(fields["ready"], true);
+    let fields = &refusals[3]["fields"];
+    assert_eq!(fields["voice_event"], "voice_join_received");
+    assert_eq!(fields["reason"], "name_blocked");
+    assert_eq!(fields["channel"], CREATOR.to_string());
+    assert_eq!(fields["ticket_generation"], ticket.generation);
+    assert_eq!(fields["live_generation"], ticket.generation);
+    assert_eq!(fields["known"], true);
+    assert_eq!(fields["creators_len"], 1);
+    assert_eq!(fields["halted"], false);
+    assert_eq!(fields["ready"], true);
 }
 
 #[tokio::test]
