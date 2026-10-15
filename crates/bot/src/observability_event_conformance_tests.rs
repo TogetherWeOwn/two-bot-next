@@ -252,7 +252,8 @@ fn macro_name_before(source: &str, bang: usize) -> Option<&'static str> {
 
 /// Byte index of the `)` closing the paren opened at `open`, skipping
 /// over string literals, character literals and `//` line comments so
-/// parens inside them do not affect the depth.
+/// parens inside them do not affect the depth. A `'` that opens a lifetime
+/// (`'static`, `'a`) is not a character literal and never swallows the scan.
 fn closing_paren(source: &[u8], open: usize) -> Option<usize> {
     let mut depth = 0usize;
     let mut i = open;
@@ -270,7 +271,15 @@ fn closing_paren(source: &[u8], open: usize) -> Option<usize> {
                     }
                 }
             }
-            b'\'' => {
+            // Only `'\..'` (escape) or `'x'` (one byte, then the closing
+            // quote) opens a character literal; any other `'` is a lifetime
+            // and falls through as an ordinary byte. A multi-byte character
+            // literal holds no paren byte, so it is safe to count through.
+            b'\''
+                if i + 1 < source.len()
+                    && (source[i + 1] == b'\\'
+                        || (i + 2 < source.len() && source[i + 2] == b'\'')) =>
+            {
                 i += 1;
                 while i < source.len() {
                     if source[i] == b'\\' {
