@@ -814,7 +814,7 @@ where
                 if attempt + 1 == attempts {
                     return Err(kind);
                 }
-                tokio::sleep(delay).await;
+                tokio::time::sleep(delay).await;
             }
         }
     }
@@ -2576,7 +2576,7 @@ mod tests {
                 let probe = Arc::clone(&probe);
                 async move {
                     probe.fetch_add(1, Ordering::SeqCst);
-                    Err::<u32>(ReadAfterApply::LedgerQueryFailed)
+                    Err::<u32, ReadAfterApply>(ReadAfterApply::LedgerQueryFailed)
                 }
             },
             3,
