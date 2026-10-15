@@ -207,11 +207,11 @@ jobs:
           for filter in $QUARANTINE; do
             skip_args+=(--skip "$filter")
           done
-          if [ "${#skip_args[@]}" -gt 0 ]; then
-            cargo nextest run --workspace --lib --bins --features two-bot-core/db --locked --profile ci -- "${skip_args[@]}" || status=$?
-          else
-            cargo nextest run --workspace --lib --bins --features two-bot-core/db --locked --profile ci || status=$?
-          fi
+          # One command line for both quarantine states so a flag cannot
+          # drift in only one branch: the expansion appends `--` plus the
+          # skips when the array is non-empty and nothing when it is empty
+          # (behaviorally pinned in scripts/ci/test_workflows.py).
+          cargo nextest run --workspace --lib --bins --features two-bot-core/db --locked --profile ci ${skip_args[@]:+-- "${skip_args[@]}"} || status=$?
           for candidate in target/nextest/ci/junit.xml junit.xml; do
             if [ -f "$candidate" ]; then
               cp "$candidate" junit.xml

@@ -2285,6 +2285,64 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("$QUARANTINE", run_text)
         self.assertIn('-- "${skip_args[@]}"', run_text)
         self.assertNotIn("--profile ci $skip_args", run_text)
+        # Behavioral pin: substrings alone cannot pin branch selection (an
+        # inverted empty/non-empty guard, or a flag dropped from one branch,
+        # keeps every substring above while silently disabling ejection).
+        # Run the extracted step under bash with a function-shimmed fake
+        # `cargo` that records its argv and emits the JUnit file the rest of
+        # the step copies, then pin the exact argv for both quarantine
+        # states. (A function shim, not a PATH shim, so the pin also runs
+        # in harnesses that sanitize PATH on exec.)
+        import os
+        import subprocess
+        import tempfile
+
+        base_argv = [
+            "nextest", "run", "--workspace", "--lib", "--bins",
+            "--features", "two-bot-core/db", "--locked", "--profile", "ci",
+        ]
+        cases = (
+            ("", base_argv),
+            (
+                "red_group other_red",
+                base_argv + ["--", "--skip", "red_group", "--skip", "other_red"],
+            ),
+        )
+        fake_cargo = (
+            "cargo() {\n"
+            "  printf '%s\\n' \"$@\" > \"$FAKE_CARGO_ARGV\"\n"
+            "  mkdir -p target/nextest/ci\n"
+            "  printf '<testsuites/>\\n' > target/nextest/ci/junit.xml\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            argv_path = tmp_path / "cargo-argv.txt"
+            for quarantine_value, expected_argv in cases:
+                with self.subTest(quarantine=quarantine_value):
+                    work_dir = tmp_path / ("work-" + (quarantine_value.split(" ")[0] or "empty"))
+                    work_dir.mkdir()
+                    run_env = dict(os.environ)
+                    run_env.update(
+                        {
+                            "QUARANTINE": quarantine_value,
+                            "FAKE_CARGO_ARGV": str(argv_path),
+                        }
+                    )
+                    proc = subprocess.run(
+                        ["bash", "-eo", "pipefail", "-c", fake_cargo + run_text],
+                        cwd=work_dir,
+                        env=run_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(
+                        proc.returncode, 0,
+                        f"nextest step failed for QUARANTINE={quarantine_value!r}: {proc.stderr}",
+                    )
+                    recorded = argv_path.read_text(encoding="utf-8").splitlines()
+                    self.assertEqual(recorded, expected_argv)
 
     def test_ci_speed_rollout_documents_pr_local_cache(self):
         rollout = (ROOT / "docs/ci-speed-rollout.md").read_text(encoding="utf-8")
