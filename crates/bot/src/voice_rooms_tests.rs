@@ -13344,6 +13344,35 @@ async fn reload_creators_keeps_the_view_on_a_failed_read() {
     assert!(worker.creators.contains_key(&CREATOR));
 }
 
+#[tokio::test]
+async fn reload_creators_converges_after_a_gateway_reconnect() {
+    // A gateway reconnect (GuildCreate/Resumed) bumps the live generation but
+    // sends no channel event, so no RefreshCreators flag is set and the
+    // five-minute interval has not elapsed. The creator map built at boot
+    // stays stale until restart. A generation change must trigger a debounced
+    // merge so the reconnected view converges without a restart.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.reload_creators(0).await;
+    assert!(worker.creators.contains_key(&CREATOR));
+    // A creator row written outside the worker while the gateway was down.
+    worker
+        .store
+        .creators
+        .lock()
+        .unwrap()
+        .push(CreatorChannel::new(GUILD, 201));
+    // The reconnect republishes the snapshot (new generation, new channel).
+    assert!(worker.live.publish(snapshot(&[201], vec![])));
+    // Debounced (10 s since the last read) but no flag and no interval: the
+    // reconnect alone must converge the new row.
+    worker.reload_creators(10_000).await;
+    assert!(
+        worker.creators.contains_key(&201),
+        "a gateway reconnect must merge rows written while down"
+    );
+}
+
 #[test]
 fn watchdog_due_needs_a_queue_and_an_expired_window() {
     let start = tokio::time::Instant::now();
