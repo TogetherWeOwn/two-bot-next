@@ -150,14 +150,22 @@ async fn handle(State(state): State<Arc<ReceiverState>>, request: Request) -> Re
     let Ok(_permit) = Arc::clone(&state.capacity).try_acquire_owned() else {
         return refuse(&state, StatusCode::SERVICE_UNAVAILABLE, "busy", true, &id);
     };
-    match tokio::time::timeout(REQUEST_TIMEOUT, receive(&state, request, &id)).await {
+    receive_with_timeout(&state, &id, receive(&state, request, &id)).await
+}
+
+async fn receive_with_timeout(
+    state: &ReceiverState,
+    id: &str,
+    receive: impl std::future::Future<Output = Response>,
+) -> Response {
+    match tokio::time::timeout(REQUEST_TIMEOUT, receive).await {
         Ok(response) => response,
         Err(_) => refuse(
-            &state,
+            state,
             StatusCode::SERVICE_UNAVAILABLE,
             "upstream_timeout",
             true,
-            &id,
+            id,
         ),
     }
 }
@@ -753,6 +761,78 @@ mod tests {
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["error"]["code"], "busy");
+        assert_eq!(value["error"]["retryable"], true);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_body_times_out_with_408_and_retryable() {
+        // A body that never ends must hit the 5 s read budget instead of
+        // holding one of the 32 permits: 408 `request_timeout`, retriable.
+        let timestamp = fresh_timestamp();
+        let pending = Body::from_stream(futures_util::stream::pending::<
+            Result<axum::body::Bytes, std::io::Error>,
+        >());
+        let stalled = request_with_content_type(
+            EVENTSUB_PATH,
+            "application/json",
+            "POST",
+            TestHeaders {
+                message_id: Some("synthetic-delivery-0015"),
+                timestamp: Some(&timestamp),
+                signature: Some(
+                    "sha256=0000000000000000000000000000000000000000000000000000000000000000",
+                ),
+                message_type: Some("notification"),
+            },
+            pending,
+        );
+        let mut pending_response = Box::pin(app().oneshot(stalled));
+        assert!(
+            futures_util::future::now_or_never(&mut pending_response)
+                .await
+                .is_none(),
+            "receiver must wait for the slow body"
+        );
+        tokio::time::advance(BODY_TIMEOUT + Duration::from_secs(1)).await;
+        let response = futures_util::future::now_or_never(pending_response)
+            .await
+            .expect("slow body must time out within BODY_TIMEOUT + 1 s")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["code"], "request_timeout");
+        assert_eq!(value["error"]["retryable"], true);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_request_times_out_with_503_and_retryable() {
+        // The 20 s outer budget maps a stalled receive to 503
+        // `upstream_timeout`, retriable.
+        let state = ReceiverState::new(&config());
+        let mut pending_response = Box::pin(receive_with_timeout(
+            &state,
+            "synthetic-request-0016",
+            std::future::pending::<Response>(),
+        ));
+        assert!(
+            futures_util::future::now_or_never(&mut pending_response)
+                .await
+                .is_none(),
+            "receiver must wait for the stalled request"
+        );
+        tokio::time::advance(REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+        let response = futures_util::future::now_or_never(pending_response)
+            .await
+            .expect("stalled request must time out within REQUEST_TIMEOUT + 1 s");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["code"], "upstream_timeout");
         assert_eq!(value["error"]["retryable"], true);
     }
 }
