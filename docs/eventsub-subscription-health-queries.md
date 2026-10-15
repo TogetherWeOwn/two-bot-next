@@ -50,10 +50,13 @@ lines per call; `--minutes` caps at 30, page older windows with `--end
 allowlist (`error_class`, `missing`, `job`, …) and drops `status` and the
 reconcile count fields (`broadcasters`, `deleted`, `created`,
 `already_exists`): for those, use the dashboard Query Builder over the same
-dataset and filters. The `cloudflare-workers` queries use the dashboard or
-the same telemetry endpoint with `datasets: ["cloudflare-workers"]`; the
-Worker logs only scalar `event`/`status`/`error_class`, so its lines are safe
-to paste.
+dataset and filters. The `cloudflare-workers` signal is dashboard-only in
+this pack: the container reader is fixed to `containers` and cannot query the
+Worker dataset. In Workers Observability Query Builder, select dataset
+`cloudflare-workers`, service `two-bot-next-staging`, and filter the scalar
+`event` field to include `eventsub_ingress`; inspect `status` and
+`error_class`. The Worker logs only scalar `event`/`status`/`error_class`, so
+its lines are safe to paste.
 
 ## Q1 — are subscriptions healthy?
 
@@ -71,12 +74,17 @@ Shape contract (pinned by the `listing_url_carries_exactly_one_filter` unit
 test in `crates/core/src/twitch_helix.rs`): exactly one filter — Twitch
 answers 400 to more — and follow `pagination.cursor` until it is empty. For
 every desired broadcaster there must be an entry with `type:
-"stream.online"`, `version: "1"`, `transport.method: "webhook"`,
-`transport.callback` equal to the bot's callback, and `status` either
-`enabled` or `webhook_callback_verification_pending`. Any other status, or a
-missing entry, is the unhealthy set. This command was not executed while
-writing this pack (no Twitch credentials on the writing run); its URL shape
-is the tested one above.
+"stream.online"`, `version: "1"`, `transport.method: "webhook"`, and
+`transport.callback` equal to the bot's callback. In steady state, only
+`status: "enabled"` is healthy. A newly created subscription may be
+`webhook_callback_verification_pending` for up to five minutes only while its
+challenge is actively in flight; use `created_at` to measure that age. A
+pending entry at or beyond five minutes is unhealthy and needs the Q4
+challenge-failure investigation. The five-minute cutoff is an operational
+triage threshold, not a Twitch guarantee. Any other status, or a missing
+entry, is unhealthy. This command was not executed while writing this pack
+(no Twitch credentials on the writing run); its URL shape is the tested one
+above.
 
 The log proxy (executed below) covers the negative direction: in a healthy
 window there are no `revocation acknowledged` lines (Q3), no
@@ -123,18 +131,28 @@ The newest `eventsub_reconcile` line in the window is the last outcome; a
 staging there is no scheduled reconcile at all, so this query is the canary
 for the rollout itself.
 
-Sample (staging container, 30 min, 2026-10-15):
+The container reader's `--contains` option checks message text; it does not
+filter the flattened `event` field, and the script omits that field from its
+output. For the complete event-level view, use Workers Observability Query
+Builder on dataset `containers`, select this service id, filter
+`event = "eventsub_reconcile"`, and display `message`, `status`, and
+`error_class`. The CLI's message filters are two separate read-only queries:
 
 ```bash
 python3 scripts/container_stdout_read.py \
   --service a038b0ad-a1f9-4966-bfb7-f992c602d938 \
-  --minutes 30 --contains "eventsub_reconcile"
+  --minutes 30 --contains "eventsub reconcile"
+python3 scripts/container_stdout_read.py \
+  --service a038b0ad-a1f9-4966-bfb7-f992c602d938 \
+  --minutes 30 --contains "eventsub subscriptions reconciled"
 ```
 
-```json
-{"event_count": 0, "window": {"start": "2026-10-15T19:43:53.000Z", "end": "2026-10-15T20:13:53.000Z"}}
-```
-
+The first matches failure and refusal messages; the second matches the
+successful `eventsub subscriptions reconciled` message. For example, the
+literal `eventsub subscriptions reconciled` matches the second filter; this
+is an illustrative match from the reconcile log contract, not an observed
+staging event. The live staging read for 2026-10-15 21:41–22:11Z returned
+zero lines for both filters, so it cannot provide a truthful positive sample.
 Expected while the reconcile slice is undeployed. After it deploys, expect
 one `healthy` line per hour per container boot plus one per startup; a gap
 with `TWO_EVENTSUB=1` set means the task is not running and is itself the
@@ -195,7 +213,11 @@ adds its own `eventsub_ingress` refusals with the same vocabulary plus
 `rate_limited` (429) and `unavailable` (503: DO/binding/relay failures)
 (`wrangler/src/eventsub.ts`):
 
-Sample (staging Worker, 30 min, 2026-10-15): `eventsub_ingress` count 0.
+Dashboard-only sample (not a copy-paste command): in Workers Observability,
+select dataset `cloudflare-workers`, service `two-bot-next-staging`, and the
+`event` filter `includes "eventsub_ingress"`; the recorded 30-minute sample
+on 2026-10-15 had count 0. The `containers` reader cannot reproduce this
+Worker-dataset query.
 
 The count is approximate: refusal lines carry no message-type field, so a
 failed challenge (`InvalidChallenge` → `malformed`) cannot be separated from
