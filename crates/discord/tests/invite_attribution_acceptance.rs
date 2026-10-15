@@ -27,8 +27,9 @@
 //! event today): every handled `MemberAdd` MUST emit exactly one INFO tracing
 //! event carrying the filed `source` string, the joining member id, and the
 //! credited inviter id when (and only when) a single code grew. Capture is a
-//! thread-scoped subscriber, so parallel tests cannot cross-talk and no global
-//! subscriber or wall clock is involved. Deterministic stamps only.
+//! single global subscriber whose writer fans out to a per-thread buffer, so
+//! parallel tests cannot cross-talk (callsite interest is process-global) and
+//! no wall clock is involved. Deterministic stamps only.
 //!
 //! Builder maintenance note: `snap()` below is the ONLY `InviteState` literal
 //! in this file. When `max_uses`/`temporary` land on `InviteState`, extend
@@ -235,36 +236,58 @@ fn pipeline() -> (AttrPipeline, DeferredCommunityFacts) {
     (pipeline, buffer)
 }
 
-/// Run `run` under a thread-scoped INFO subscriber and return the captured
-/// log lines. No global state: parallel tests cannot cross-talk.
-fn capture_logs(run: impl FnOnce()) -> Vec<String> {
-    #[derive(Clone, Default)]
-    struct Sink(std::sync::Arc<Mutex<Vec<u8>>>);
+thread_local! {
+    static CAPTURE_BUF: std::cell::RefCell<Option<Vec<u8>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
-    impl std::io::Write for Sink {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("log lock").extend_from_slice(buf);
-            Ok(buf.len())
-        }
+/// `io::Write` that appends to the calling thread's capture buffer, when one
+/// is armed by `capture_logs`. Events on threads without a buffer are dropped.
+struct ThreadLocalSink;
 
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
+impl std::io::Write for ThreadLocalSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        CAPTURE_BUF.with(|cell| {
+            if let Some(vec) = cell.borrow_mut().as_mut() {
+                vec.extend_from_slice(buf);
+            }
+        });
+        Ok(buf.len())
     }
 
-    let sink = Sink::default();
-    let writer = {
-        let sink = sink.clone();
-        move || sink.clone()
-    };
-    let subscriber = tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_writer(writer)
-        .with_max_level(tracing::Level::INFO)
-        .finish();
-    tracing::subscriber::with_default(subscriber, run);
-    let bytes = sink.0.lock().expect("log lock").clone();
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Install the single process-global INFO subscriber once. Callsite interest
+/// and max-level hints are process-global, so a per-test scoped subscriber
+/// intermittently misses events under parallel runs; one global subscriber
+/// keeps interest enabled while the thread-local writer keeps tests isolated.
+fn ensure_global_subscriber() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(|| ThreadLocalSink)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    });
+}
+
+/// Run `run` under the shared global INFO subscriber and return the lines
+/// logged on this thread. `Pipeline::handle` is synchronous, so the
+/// attribution event is written on the test's own thread.
+fn capture_logs(run: impl FnOnce()) -> Vec<String> {
+    ensure_global_subscriber();
+    CAPTURE_BUF.with(|cell| *cell.borrow_mut() = Some(Vec::new()));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+    let bytes = CAPTURE_BUF.with(|cell| cell.borrow_mut().take().unwrap_or_default());
+    if let Err(payload) = outcome {
+        std::panic::resume_unwind(payload);
+    }
     String::from_utf8_lossy(&bytes)
         .lines()
         .map(str::to_owned)
