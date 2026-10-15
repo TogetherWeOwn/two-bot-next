@@ -32,8 +32,10 @@ use two_bot_core::twitch_eventsub::{
     MAX_TIMESTAMP_SKEW_MS,
 };
 
-/// Public synthetic test material, never an environment credential.
-const SECRET_STR: &str = "fuzz-synthetic-secret-0123456789abcdef";
+/// Deterministic synthetic key bytes for signing fuzz fixtures.
+fn synthetic_key() -> [u8; 32] {
+    std::array::from_fn(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
+}
 /// Fixed `now` for freshness checks; timestamps are derived from it.
 const NOW_MS: i64 = 1_760_000_000_000;
 /// Valid message-id base; the fuzzer varies only the hex suffix.
@@ -44,16 +46,15 @@ const MAX_RAW_BODY: usize = 8192;
 const MAX_TYPE_CHARS: usize = 64;
 
 fn test_secret() -> WebhookSecret {
-    WebhookSecret::new(SECRET_STR.to_owned()).expect("fuzz secret is valid")
+    WebhookSecret::new(hex::encode(synthetic_key())).expect("fuzz key is valid")
 }
 
 /// Recompute the delivery signature over `message-id + timestamp + body`
-/// with the synthetic secret. The secret literal never leaves the HMAC here
-/// and is never logged; [`WebhookSecret`]'s `Debug` stays redacted (pinned
-/// once in [`check_fixed_matrix`]).
+/// with generated synthetic key bytes; [`WebhookSecret`]'s `Debug` stays
+/// redacted (pinned once in [`check_fixed_matrix`]).
 fn sign(id: &str, ts: &str, body: &[u8]) -> String {
-    let mut mac =
-        <Hmac<Sha256>>::new_from_slice(SECRET_STR.as_bytes()).expect("HMAC takes any key");
+    let key = synthetic_key();
+    let mut mac = <Hmac<Sha256>>::new_from_slice(&key).expect("HMAC takes any key");
     mac.update(id.as_bytes());
     mac.update(ts.as_bytes());
     mac.update(body);
