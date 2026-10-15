@@ -10,11 +10,17 @@ than one repo lives ONCE at org level; per-repo files only call it.
   existing `job-inputs` selector; the required `ci-ok` aggregator is
   untouched, so no required context can strand.
 - `Swatinem/rust-cache` (restore-only from the warm `check` entry) plus
-  `sccache` in `.github/workflows/reusable-rust-nextest.yml`: sccache uses
-  the R2 backend when `SCCACHE_BUCKET`/`SCCACHE_ENDPOINT` secrets exist and
-  degrades to the GitHub-cache backend otherwise. No new paid SaaS, no new
-  Actions minutes beyond the advisory job itself.
+  `sccache` in `.github/workflows/reusable-rust-nextest.yml`: off-PR runs
+  (push to main, workflow_dispatch) use the R2 backend when
+  `SCCACHE_BUCKET`/`SCCACHE_ENDPOINT` secrets exist and degrade to the
+  GitHub-cache backend otherwise. Pull-request runs use sccache on local
+  disk only: no R2 write credential ever reaches PR-built code (the lane
+  compiles and executes code at the PR head, and a shared R2 bucket has no
+  per-PR scope), and the lane writes no shared Actions-cache entry that
+  could crowd out the warm `check` entry. No new paid SaaS, no new Actions
+  minutes beyond the advisory job itself.
 - `cargo-nextest --profile ci` (`.config/nextest.toml`: `retries = 1`,
+  `fail-fast = false` so every test runs and ledger rows stay comparable,
   JUnit to `junit.xml`) with `scripts/ci/flake_ledger.py` parsing JUnit
   into a JSONL flake ledger, uploaded as an artifact with the JUnit.
 - `scripts/ci/ci_minutes.py` + `docs/ci-speed-baseline.json`: the

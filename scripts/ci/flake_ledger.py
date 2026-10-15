@@ -7,13 +7,23 @@ distinct test to a JSONL flake ledger. Pure stdlib, no network, no clock:
 identical input bytes always produce identical output bytes, so the check
 lane can backtest it against fixtures instead of trusting a CI run.
 
-Flake rule (tool-agnostic, document-order based):
-- Group <testcase> elements by (classname, name) in document order.
-- attempts = number of elements in the group.
+Flake rule (nextest-first, document-order based):
+- Group <testcase> elements by (suite, classname, name) in document order.
+- cargo-nextest writes ONE <testcase> per test and records failed attempts
+  as child elements: a fail-then-pass test carries flakyFailure/flakyError
+  children, and a test that fails every retry carries its terminal
+  failure/error plus rerunFailure/rerunError children per exhausted retry.
+- attempts = number of elements in the group PLUS the number of retry
+  children across those elements (1 testcase + 1 flakyFailure = 2 attempts;
+  2 repeated testcases from merged JUnit = 2 attempts).
 - The LAST element decides the outcome: a trailing failure/error means
   status fail/error; otherwise pass (a skips-only group stays skipped).
-- flaky = attempts > 1 and the group is not uniformly one outcome, i.e. a
-  retry changed the result (fail-then-pass) or results disagree.
+  Retry children never decide the outcome: flakyFailure means the final
+  attempt passed.
+- flaky = any flakyFailure/flakyError child (fail-then-pass), or
+  rerunFailure/rerunError children on a final failure (exhausted retries),
+  or, for merged non-nextest JUnit only, repeated elements whose outcomes
+  disagree.
 
 Ledger row keys (stable order): suite, classname, name, status, flaky,
 attempts, time_ms (summed across attempts, truncated to int milliseconds).
@@ -39,8 +49,20 @@ def parse_time_ms(raw):
         return 0
 
 
+# Child tags cargo-nextest 0.9.99 uses for failed attempts. flaky* means a
+# failed attempt on a test that eventually passed; rerun* means an
+# exhausted retry on a test whose terminal failure/error is also present.
+RETRY_TAGS = frozenset({"flakyFailure", "flakyError", "rerunFailure", "rerunError"})
+FLAKY_TAGS = frozenset({"flakyFailure", "flakyError"})
+RERUN_TAGS = frozenset({"rerunFailure", "rerunError"})
+
+
 def case_outcome(case):
-    """Map one <testcase> element to pass/fail/error/skipped."""
+    """Map one <testcase> element to pass/fail/error/skipped.
+
+    Retry children (flaky*/rerun*) never decide the outcome: a testcase
+    carrying only flakyFailure children passed its final attempt.
+    """
     for child in case:
         if child.tag == "failure":
             return "fail"
@@ -50,6 +72,11 @@ def case_outcome(case):
         if child.tag == "skipped":
             return "skipped"
     return "pass"
+
+
+def retry_children(case):
+    """Failed-attempt children: one per exhausted retry (nextest shape)."""
+    return [child for child in case if child.tag in RETRY_TAGS]
 
 
 def parse_junit(path):
@@ -83,7 +110,8 @@ def parse_junit(path):
     for suite_name, classname, name in sorted(order):
         cases = groups[(suite_name, classname, name)]
         outcomes = [case_outcome(case) for case in cases]
-        attempts = len(cases)
+        retries = [child for case in cases for child in retry_children(case)]
+        attempts = len(cases) + len(retries)
         last = outcomes[-1]
         if last in ("fail", "error"):
             status = last
@@ -91,8 +119,18 @@ def parse_junit(path):
             status = "skipped"
         else:
             status = "pass"
-        flaky = attempts > 1 and (len(set(outcomes)) > 1 or last in ("fail", "error"))
-        time_ms = sum(parse_time_ms(case.get("time")) for case in cases)
+        flaky = (
+            any(child.tag in FLAKY_TAGS for child in retries)
+            or (any(child.tag in RERUN_TAGS for child in retries) and status in ("fail", "error"))
+            # Merged non-nextest JUnit only: repeated elements whose outcomes
+            # disagree mean a retry changed the result.
+            or (len(cases) > 1 and (len(set(outcomes)) > 1 or last in ("fail", "error")))
+        )
+        time_ms = sum(
+            parse_time_ms(case.get("time"))
+            + sum(parse_time_ms(child.get("time")) for child in retry_children(case))
+            for case in cases
+        )
         rows.append(
             {
                 "suite": suite_name,

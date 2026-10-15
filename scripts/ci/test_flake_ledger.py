@@ -4,6 +4,13 @@ Hermetic fixtures only: no cargo, no nextest, no network, no clock. Each
 case writes a small JUnit document to a temp dir and asserts the exact
 ledger rows, so a schema or rule change fails here before it can turn an
 advisory CI ledger into silent greens.
+
+Fixtures mirror what cargo-nextest 0.9.99 actually emits with
+`--profile ci` (retries = 1): ONE <testcase> per test, with failed attempts
+as child elements. A fail-then-pass test carries a flakyFailure child; a
+test that fails every retry carries its terminal failure plus a
+rerunFailure child. Repeated <testcase> elements (which nextest never
+emits) are covered only by the merged-input test below.
 """
 
 import json
@@ -24,13 +31,15 @@ PASS_SUITE = """<?xml version="1.0" encoding="UTF-8"?>
 </testsuites>
 """
 
+# nextest 0.9.99 shape: one <testcase> per test; the failed first attempt is a
+# flakyFailure child carrying its own time. The testcase time is the final
+# (passing) attempt, so the ledger must sum both.
 FLAKY_SUITE = """<?xml version="1.0" encoding="UTF-8"?>
 <testsuites>
-  <testsuite name="unit" tests="2" failures="1" errors="0" skipped="1">
-    <testcase classname="ledger" name="flaky_retry" time="0.020">
-      <failure message="first attempt">boom</failure>
+  <testsuite name="unit" tests="2" failures="0" errors="0" skipped="1">
+    <testcase classname="ledger" name="flaky_retry" time="0.005">
+      <flakyFailure message="first attempt failed" type="assert" time="0.020">boom</flakyFailure>
     </testcase>
-    <testcase classname="ledger" name="flaky_retry" time="0.005"/>
     <testcase classname="ledger" name="skipped_case" time="0">
       <skipped/>
     </testcase>
@@ -38,15 +47,29 @@ FLAKY_SUITE = """<?xml version="1.0" encoding="UTF-8"?>
 </testsuites>
 """
 
+# nextest 0.9.99 shape: the terminal failure plus one rerunFailure child per
+# exhausted retry. flaky = rerun evidence on a final failure.
 STUCK_FAIL_SUITE = """<?xml version="1.0" encoding="UTF-8"?>
 <testsuite name="integration" tests="1" failures="1" errors="0" skipped="0">
-  <testcase classname="db" name="still_red" time="0.100">
-    <failure message="attempt 1">boom</failure>
-  </testcase>
   <testcase classname="db" name="still_red" time="0.110">
-    <failure message="attempt 2">boom</failure>
+    <failure message="final attempt">boom</failure>
+    <rerunFailure message="attempt 1" type="assert" time="0.100">boom</rerunFailure>
   </testcase>
 </testsuite>
+"""
+
+# Non-nextest fallback: merged JUnit may repeat a <testcase> for one test.
+# Grouping still counts each element as an attempt; disagreeing outcomes
+# mean the retry changed the result, so the test is flaky.
+MERGED_SUITE = """<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="unit" tests="2" failures="1" errors="0" skipped="0">
+    <testcase classname="ledger" name="merged_retry" time="0.020">
+      <failure message="first attempt">boom</failure>
+    </testcase>
+    <testcase classname="ledger" name="merged_retry" time="0.005"/>
+  </testsuite>
+</testsuites>
 """
 
 
@@ -113,6 +136,18 @@ class FlakeLedgerTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "fail")
         self.assertTrue(rows[0]["flaky"])
         self.assertEqual(rows[0]["attempts"], 2)
+        # Retry time lives on the rerunFailure child; dropping it would
+        # undercount the test's cost (0.110 final + 0.100 retry).
+        self.assertEqual(rows[0]["time_ms"], 210)
+
+    def test_merged_repeated_testcases_stay_supported(self):
+        code, rows = run_ledger(MERGED_SUITE)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "pass")
+        self.assertTrue(rows[0]["flaky"])
+        self.assertEqual(rows[0]["attempts"], 2)
+        self.assertEqual(rows[0]["time_ms"], 25)
 
     def test_identical_input_bytes_give_identical_output_bytes(self):
         first = run_ledger(FLAKY_SUITE)

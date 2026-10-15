@@ -1934,6 +1934,57 @@ class WorkflowTests(unittest.TestCase):
             with self.subTest(upload=step.get("name")):
                 self.assertEqual(step["with"]["if-no-files-found"], "error")
 
+    def test_nextest_ci_profile_disables_fail_fast(self):
+        # Fail-fast cancels not-yet-started tests after the first exhausted
+        # failure, so junit.xml omits them and per-run ledger rows stop
+        # being comparable. The evidence lane must run everything.
+        import tomllib
+        config = tomllib.loads((ROOT / ".config/nextest.toml").read_text(encoding="utf-8"))
+        profile = config["profile"]["ci"]
+        self.assertEqual(profile.get("retries"), 1)
+        self.assertIs(profile.get("fail-fast"), False)
+
+    def test_nextest_shared_backends_stay_off_pull_requests(self):
+        # R2 write credentials must never reach PR-built code (build scripts
+        # and tests execute at the PR head, and a shared R2 bucket has no
+        # per-PR scope: a PR could poison objects main later links). The
+        # GitHub-cache backend has the same quota shape: the lane's entries
+        # share the repo Actions cache with the warm `check` entry. PR runs
+        # therefore use sccache on local disk only; shared backends are
+        # main/push-only.
+        lane = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
+        select = next(step for step in lane.get("steps", [])
+                      if str(step.get("name", "")).startswith("Select sccache backend"))
+        run_text = str(select.get("run", ""))
+        self.assertIn("pull_request", run_text)
+        self.assertIn("github.event_name", str(select.get("env", "")))
+        self.assertIn("local disk", run_text)
+        raw = (ROOT / ".github/workflows/reusable-rust-nextest.yml").read_text(encoding="utf-8")
+        self.assertNotIn("adds no cache footprint", raw)
+
+    def test_ci_speed_withholds_r2_secrets_on_pull_request(self):
+        # Even with the callee-side guard, the caller must not forward R2
+        # write secrets on pull_request events. The gate must read
+        # `!= 'pull_request' && secrets.X || ''`: the seemingly equivalent
+        # `== 'pull_request' && '' || secrets.X` forwards the secret anyway,
+        # because '' is falsy in GitHub expressions.
+        job = self.workflows["ci-speed.yml"]["jobs"]["nextest"]
+        r2_keys = ("SCCACHE_BUCKET", "SCCACHE_ENDPOINT", "SCCACHE_REGION",
+                   "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
+        for key in r2_keys:
+            with self.subTest(secret=key):
+                val = str(job["secrets"][key])
+                self.assertIn("pull_request", val)
+                self.assertIn("github.event_name != 'pull_request'", val)
+                self.assertIn(f"secrets.{key}", val)
+
+    def test_ci_speed_rollout_documents_pr_local_cache(self):
+        rollout = (ROOT / "docs/ci-speed-rollout.md").read_text(encoding="utf-8")
+        # Markdown wraps mid-phrase, so match on whitespace-normalized text.
+        flat = " ".join(rollout.split())
+        self.assertIn("local disk", flat)
+        self.assertNotIn("adds no cache footprint", flat)
+
     def test_minimal_grants_and_no_persisted_checkout_credentials(self):
         for name, workflow in self.workflows.items():
             self.assertEqual(workflow["permissions"], {})

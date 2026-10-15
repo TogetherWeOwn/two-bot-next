@@ -107,9 +107,17 @@ jobs:
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
 
-      # R2 backend only when the caller passed all three pins; otherwise the
-      # sccache server below uses the GitHub-cache backend. Values travel via
-      # the environment file, never the log: secrets stay masked.
+      # PR isolation first: on pull_request events sccache stays on local disk
+      # only and no shared-backend credential is written anywhere. R2 write
+      # credentials must never reach PR-built code (this lane compiles and
+      # executes build scripts and tests at the PR head, and a shared R2
+      # bucket has no per-PR scope, so a PR could poison objects a later
+      # main build links). The GitHub-cache backend stays off PRs too: its
+      # entries share the repo Actions cache quota with the warm `check`
+      # entry the required lanes restore, so an advisory lane must not grow
+      # it. Off-PR runs (push to main, workflow_dispatch) use R2 when the
+      # caller passed all the pins, else the GitHub-cache backend. Values
+      # travel via the environment file, never the log: secrets stay masked.
       - name: Select sccache backend (R2 when pinned, GitHub cache otherwise)
         env:
           R2_BUCKET: ${{ secrets.SCCACHE_BUCKET }}
@@ -117,10 +125,13 @@ jobs:
           R2_REGION: ${{ secrets.SCCACHE_REGION }}
           R2_KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
           R2_SECRET: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          NEXTEST_EVENT: ${{ github.event_name }}
         shell: bash
         run: |
           set -euo pipefail
-          if [ -n "$R2_BUCKET" ] && [ -n "$R2_ENDPOINT" ] && [ -n "$R2_KEY" ] && [ -n "$R2_SECRET" ]; then
+          if [ "$NEXTEST_EVENT" = "pull_request" ]; then
+            echo "sccache backend: local disk only (no shared writes on PRs)"
+          elif [ -n "$R2_BUCKET" ] && [ -n "$R2_ENDPOINT" ] && [ -n "$R2_KEY" ] && [ -n "$R2_SECRET" ]; then
             {
               echo "SCCACHE_BUCKET=$R2_BUCKET"
               echo "SCCACHE_ENDPOINT=$R2_ENDPOINT"
@@ -137,8 +148,10 @@ jobs:
       - name: Start sccache
         uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
-      # Restore-only: the warm `check` entry in check.yml owns the write, so
-      # this advisory lane adds no cache footprint of its own.
+      # Restore-only: the warm `check` entry in check.yml owns the registry
+      # write, so this step never saves. sccache is the only shared-cache
+      # writer left, and only off-PR (R2 or GitHub cache on push to main;
+      # local disk on pull_request per the backend step above).
       - name: Restore cargo registry cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
