@@ -625,8 +625,8 @@ pub async fn fulfill_user_deletion(
 fn is_deferrable_refusal(err: &sqlx::Error) -> bool {
     let display = format!("{err}");
     let debug = format!("{err:?}");
-    display.contains("unresolved erasure replay guard")
-        || debug.contains("unresolved erasure replay guard")
+    display.contains(crate::member_erasure::REPLAY_GUARD_REFUSAL)
+        || debug.contains(crate::member_erasure::REPLAY_GUARD_REFUSAL)
         || is_schema_gap_refusal(err)
 }
 
@@ -636,8 +636,8 @@ fn is_deferrable_refusal(err: &sqlx::Error) -> bool {
 fn is_schema_gap_refusal(err: &sqlx::Error) -> bool {
     let display = format!("{err}");
     let debug = format!("{err:?}");
-    display.contains("erasure schema coverage incomplete")
-        || debug.contains("erasure schema coverage incomplete")
+    display.contains(crate::member_erasure::SCHEMA_GAP_REFUSAL)
+        || debug.contains(crate::member_erasure::SCHEMA_GAP_REFUSAL)
 }
 
 /// Delete the requesting member's full footprint and settle the request,
@@ -656,12 +656,12 @@ async fn complete_request(
     // is swallowed or fatal.
     if !crate::member_erasure::schema_gaps(tx).await?.is_empty() {
         return Err(sqlx::Error::InvalidArgument(
-            "erasure schema coverage incomplete".into(),
+            crate::member_erasure::SCHEMA_GAP_REFUSAL.into(),
         ));
     }
     if crate::member_erasure::has_unresolved_guards(tx, guild_id, user_id).await? {
         return Err(sqlx::Error::InvalidArgument(
-            "unresolved erasure replay guard".into(),
+            crate::member_erasure::REPLAY_GUARD_REFUSAL.into(),
         ));
     }
     // Full erasure-plan footprint in the same transaction: every plan table's
@@ -859,7 +859,7 @@ async fn purge_guild(
     }
     if crate::member_erasure::has_unresolved_guild_guards(tx, guild_id).await? {
         return Err(sqlx::Error::InvalidArgument(
-            "unresolved erasure replay guard".into(),
+            crate::member_erasure::REPLAY_GUARD_REFUSAL.into(),
         ));
     }
     let mut purged = 0u64;
@@ -1054,13 +1054,11 @@ mod ledger_tests {
     //! Offline ledger laws for retention deferral and dry-run counting.
     //!
     //! The DB-backed acceptance suites prove the behavior against a live
-    //! schema; these tests pin the ledger semantics that make those runs
-    //! meaningful, with no database. They lock the #958 regression (a
-    //! schema-gap or replay-guard refusal defers through a per-request
-    //! savepoint instead of aborting the run and rolling back the
-    //! time-window deletes) and the #960 regression (the dry-run guild
-    //! projection excludes every row an earlier Execute stage removes, so
-    //! per-class counts and the total agree instead of double-counting).
+    //! schema. These offline tests pin refusal classification, purge predicate
+    //! shape, and report aggregation without a database. The #958 savepoint
+    //! behavior and #960 projection's agreement with Execute are exercised by
+    //! the acceptance suites; the offline total test only checks that equal
+    //! row-class inputs produce equal aggregate totals.
 
     use super::*;
 
@@ -1142,9 +1140,9 @@ mod ledger_tests {
 
     #[test]
     fn dry_and_execute_totals_agree_on_shared_classes() {
-        // The #960 total-agreement shape: mode-specific pending and purge
-        // signals differ between the projection and the live run, but equal
-        // row classes always produce equal totals, never a double count.
+        // Report aggregation is mode-independent: when callers provide the
+        // same row-class counts, mode-specific signals do not change totals.
+        // The DB acceptance suite exercises the actual #960 projection logic.
         let mut rng = Ladder(0x0bad_f00d_dead_beef);
         for _ in 0..256 {
             let (presence, voice, audit, guild_rows) = (
@@ -1191,11 +1189,12 @@ mod ledger_tests {
     fn deferral_decision_table_keeps_known_refusals_and_aborts_the_rest() {
         // The #958 law: these two refusals roll back only their request's
         // savepoint and stay pending; anything else aborts the run.
-        let gap = sqlx::Error::InvalidArgument("erasure schema coverage incomplete".into());
+        let gap = sqlx::Error::InvalidArgument(crate::member_erasure::SCHEMA_GAP_REFUSAL.into());
         assert!(is_deferrable_refusal(&gap));
         assert!(is_schema_gap_refusal(&gap));
 
-        let guard = sqlx::Error::InvalidArgument("unresolved erasure replay guard".into());
+        let guard =
+            sqlx::Error::InvalidArgument(crate::member_erasure::REPLAY_GUARD_REFUSAL.into());
         assert!(is_deferrable_refusal(&guard));
         assert!(!is_schema_gap_refusal(&guard));
 
@@ -1218,11 +1217,12 @@ mod ledger_tests {
         // Gap-deferred requests are always a subset of deferred requests, and
         // the guard refusal proves the subset is strict: deferrable without
         // being a gap.
-        let guard = sqlx::Error::InvalidArgument("unresolved erasure replay guard".into());
+        let guard =
+            sqlx::Error::InvalidArgument(crate::member_erasure::REPLAY_GUARD_REFUSAL.into());
         assert!(is_deferrable_refusal(&guard) && !is_schema_gap_refusal(&guard));
 
         for err in [
-            sqlx::Error::InvalidArgument("erasure schema coverage incomplete".into()),
+            sqlx::Error::InvalidArgument(crate::member_erasure::SCHEMA_GAP_REFUSAL.into()),
             sqlx::Error::InvalidArgument(
                 "erase_member: erasure schema coverage incomplete: retention_deferral_acceptance_probe.owner_id"
                     .into(),
@@ -1242,8 +1242,9 @@ mod ledger_tests {
 
     #[test]
     fn refusal_matching_is_exact_not_fuzzy() {
-        // A reworded producer must fail loudly here, never silently flip a
-        // deferral into a run abort (or a fatal error into a deferral).
+        // Producers and classifiers share these constants, preventing their
+        // refusal wording from drifting independently. Near-misses must not
+        // silently flip a deferral into a run abort (or a fatal error into one).
         for near_miss in [
             "erasure schema coverage",
             "schema coverage incomplete",
@@ -1262,9 +1263,10 @@ mod ledger_tests {
         }
         // Context-wrapped producer strings still defer: callers may add the
         // path that raised the refusal.
-        let wrapped = sqlx::Error::InvalidArgument(
-            "purge_guild: unresolved erasure replay guard for guild 123".into(),
-        );
+        let wrapped = sqlx::Error::InvalidArgument(format!(
+            "purge_guild: {} for guild 123",
+            crate::member_erasure::REPLAY_GUARD_REFUSAL
+        ));
         assert!(is_deferrable_refusal(&wrapped));
         assert!(!is_schema_gap_refusal(&wrapped));
     }
@@ -1349,8 +1351,10 @@ mod ledger_tests {
         for table in ["moderation_idempotency", "moderation_channel_executions"] {
             let predicate = guild_purge_predicate(table);
             assert!(
-                predicate.contains("operator_released"),
-                "{table} must keep the released fence: {predicate}"
+                predicate.contains(
+                    "(state IS DISTINCT FROM 'done' OR outcome IS DISTINCT FROM 'operator_released')"
+                ),
+                "{table} must exclude the released fence rows: {predicate}"
             );
         }
     }
