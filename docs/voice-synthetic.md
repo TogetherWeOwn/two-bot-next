@@ -140,8 +140,9 @@ the registry smoke.
 Grants and SKIP conditions, mirroring the rename case:
 
 - `limit` needs the owner Manage Channels grant the room already carries. A
-  403 SKIPs (the `owner` check above names the grant regression); a 429
-  SKIPs.
+  403 FAILs: the test bot owns its room, so the grant was lost or ineffective
+  after creation (the `owner` check reads creation-time grants and cannot see
+  this loss). A 429 SKIPs.
 - `privacy` needs Manage Roles to rewrite overwrites: grant the test bot's
   staging role Manage Roles once (staging guild only). Until then the check
   reports SKIP with that detail and every other check still runs. A 429

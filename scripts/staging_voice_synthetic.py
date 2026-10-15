@@ -22,7 +22,8 @@ What it proves on the deployed staging bot (stdlib only, no third-party code):
   metrics    optional: /ops/metrics `two_bot_voice_names_total` counts the room
              as created_with_template (SKIP when no metrics token is configured)
   limit      the room's `user_limit` PATCHes to a probed value and back with a
-             read-back after each write (SKIP on HTTP 403/429; the same Discord
+             read-back after each write (FAIL on HTTP 403: the owner grant was
+             lost after creation; SKIP on HTTP 429; the same Discord
              field `/limit` and `/unlimit` manage)
   privacy    the room's @everyone Connect overwrite toggles and restores with a
              read-back after each write (SKIP while the test bot may not edit
@@ -153,8 +154,9 @@ def evaluate(obs):
     received_delta (joins-received delta or None when metrics are unavailable),
     refused_delta (per-reason refused deltas, {} when unavailable),
     limit_initial/limit_probed (user_limit before/probed), limit_set_ok and
-    limit_restored (each write verified by read-back), limit_forbidden and
-    limit_rate_limited (SKIP reasons), limit_note, privacy_initial_denies
+    limit_restored (each write verified by read-back), limit_forbidden (FAIL
+    reason: the owner Manage Channels grant was lost after creation) and
+    limit_rate_limited (SKIP reason), limit_note, privacy_initial_denies
     (@everyone Connect deny before the toggle), privacy_toggled and
     privacy_restored (each write verified by read-back), privacy_forbidden
     and privacy_rate_limited (SKIP reasons), privacy_note, panel_name (the
@@ -219,10 +221,11 @@ def evaluate(obs):
     limit_note = obs.get("limit_note")
     if obs.get("limit_forbidden"):
         out.append(check("limit", False,
-                         "test bot may not PATCH the room's user_limit (HTTP 403): "
-                         "its owner grant should allow Manage Channels; "
-                         "the owner check above names a grant regression",
-                         skip=True))
+                         "room user_limit PATCH answered HTTP 403: the test bot owns "
+                         "its room, so its owner Manage Channels grant was lost or "
+                         "ineffective after creation; restore the member overwrite "
+                         "(the owner check reads creation-time grants and cannot "
+                         "see this loss)"))
     elif obs.get("limit_rate_limited"):
         out.append(check("limit", False,
                          "room user_limit PATCH hit Discord's rate limit (HTTP 429): "

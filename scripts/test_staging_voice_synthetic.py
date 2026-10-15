@@ -167,9 +167,15 @@ class EvaluateTest(unittest.TestCase):
     def test_limit_passes_on_verified_set_and_restore(self):
         self.assertEqual(verdicts(obs())["limit"], "PASS")
 
-    def test_limit_skips_when_the_test_bot_may_not_patch(self):
+    def test_limit_fails_when_owner_passes_but_patch_is_forbidden(self):
         result = verdicts(obs(limit_set_ok=False, limit_restored=False, limit_forbidden=True))
-        self.assertEqual(result["limit"], "SKIP")
+        self.assertEqual(result["owner"], "PASS")
+        self.assertEqual(result["limit"], "FAIL")
+        detail = next(c["detail"] for c in synth.evaluate(
+            obs(limit_set_ok=False, limit_restored=False, limit_forbidden=True))
+            if c["check"] == "limit")
+        self.assertIn("403", detail)
+        self.assertIn("Manage Channels", detail)
 
     def test_limit_skips_on_rate_limit(self):
         result = verdicts(obs(limit_set_ok=False, limit_restored=False,
