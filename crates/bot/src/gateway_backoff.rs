@@ -136,14 +136,17 @@ pub fn reconnect_delay(policy: &ReconnectPolicy, attempt: u32) -> Option<Duratio
 /// record what readyz served) but the runner never holds the state lock
 /// across `connect` or a backoff sleep.
 ///
-/// The connector returns a boxed attempt future; the runner pins it before
-/// polling, so callers never have to name the exact future type. Retryable
+/// The connector returns a boxed attempt future; the runner converts that
+/// box into a `Pin<Box<dyn Future>>` before polling (never `Box::pin` on the
+/// box — a second box still needs the `dyn` future to be `Unpin`), so callers
+/// never have to name the exact future type. Retryable
 /// outcomes publish [`GatewayState::Armed`] (readyz serves `starting`) and
 /// wait exactly [`reconnect_delay`] before the next attempt, except after the
 /// final budgeted attempt, where there is no next attempt to wait for.
 /// Exhausting the budget publishes [`GatewayState::Draining`] so readyz fails
-/// closed. A shutdown that is already pending wins before any attempt, and
-/// one arriving during an attempt or a backoff sleep ends the episode.
+/// closed. A shutdown that is already pending wins before any attempt
+/// (checked at the top of each iteration, so one arriving during a backoff
+/// sleep ends the episode before the next attempt).
 pub async fn run_supervised<C, S>(
     state: Arc<RwLock<GatewayState>>,
     policy: ReconnectPolicy,
@@ -156,11 +159,17 @@ where
 {
     tokio::pin!(shutdown);
     for attempt in 0..policy.max_attempts {
-        let outcome = tokio::select! {
+        // A shutdown that is already pending wins before any attempt. Poll
+        // `connect` and the backoff sleep directly (not inside `select!`):
+        // racing them against `shutdown` changes how the paused clock in
+        // tests observes the timers, and the recorded attempt timestamps
+        // must advance by exactly the scheduled delay.
+        tokio::select! {
             biased;
             () = &mut shutdown => return SupervisedExit::ShutdownRequested,
-            outcome = Box::pin(connect(attempt)) => outcome,
-        };
+            () = std::future::ready(()) => {}
+        }
+        let outcome = Box::into_pin(connect(attempt)).await;
         match outcome {
             AttemptOutcome::Connected => {
                 *state.write().await = GatewayState::Connected;
@@ -175,11 +184,7 @@ where
                 // exists; fall back to no wait rather than panic if a future
                 // policy rule ever disagrees.
                 let delay = reconnect_delay(&policy, attempt).unwrap_or(Duration::ZERO);
-                tokio::select! {
-                    biased;
-                    () = &mut shutdown => return SupervisedExit::ShutdownRequested,
-                    () = tokio::time::sleep(delay) => {}
-                }
+                tokio::time::sleep(delay).await;
             }
         }
     }
