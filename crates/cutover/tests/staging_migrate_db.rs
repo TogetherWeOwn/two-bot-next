@@ -674,6 +674,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &db,
             None,
             None,
+            None,
         )
         .await;
     assert_eq!(code, 2, "{err}");
@@ -855,6 +856,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             &db,
             Some("201"),
+            None,
             None,
         )
         .await;

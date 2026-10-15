@@ -1678,7 +1678,7 @@ mod tests {
         );
         assert_eq!(
             versions.len(),
-            two_bot_store::embedded_versions().len(),
+            two_bot_store::MIGRATOR.iter().count(),
             "runner embeds the whole store chain"
         );
     }
@@ -2943,7 +2943,9 @@ mod tests {
                 acl_plan_ref: "TOG-2#doc".to_owned(),
                 apply: false,
                 expected_pending: None,
+                expected_store_pending: None,
                 plan_manifest_sha256: None,
+                store_plan_manifest_sha256: None,
                 plan_run_id: None,
                 plan_manifest_path: None,
             };
