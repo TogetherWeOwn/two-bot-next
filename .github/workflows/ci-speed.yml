@@ -67,6 +67,10 @@ jobs:
               - 'scripts/ci/test_flake_ledger.py'
               - '.github/workflows/reusable-rust-nextest.yml'
               - '.github/workflows/ci-speed.yml'
+              # The required lane is called from check.yml (promotion
+              # TOG-25165): an edit there can change what it runs, so the
+              # affected-paths signal must select rust (job-inputs rule 4).
+              - '.github/workflows/check.yml'
             worker:
               - 'wrangler/**'
             docs:
