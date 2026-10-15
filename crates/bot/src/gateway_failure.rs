@@ -271,6 +271,13 @@ mod tests {
         );
     }
 
+    // Synthetic red group for the nextest ejection drill (throwaway draft
+    // PR, closed unmerged): fails until the `quarantine` input ejects it.
+    #[test]
+    fn drill_synthetic_red_group_fails_until_ejected() {
+        panic!("drill: synthetic red group, eject via quarantine");
+    }
+
     #[test]
     fn step_failure_keeps_the_error_out_of_the_class() {
         let secret = "postgres://user:hunter2@db.internal/app";
