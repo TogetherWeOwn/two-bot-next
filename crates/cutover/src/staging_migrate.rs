@@ -915,7 +915,10 @@ async fn audit_queries(pool: &PgPool) -> Result<Value, &'static str> {
     // Connection pressure: staging once refused all logins at 25/25
     // connections with no prior signal. Both counters are readable by any
     // login and live in pg_catalog, so they survive the search_path pin.
-    let connections_used: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity")
+    // Count only real client backends: pg_stat_activity also lists aux
+    // processes (walwriter, checkpointer, background writer, autovacuum and
+    // replication launchers) that do not count against max_connections.
+    let connections_used: i64 = sqlx::query_scalar(CONNECTION_COUNT_SQL)
         .fetch_one(&mut *tx)
         .await
         .map_err(|_| "audit connection count read failed")?;
@@ -924,6 +927,11 @@ async fn audit_queries(pool: &PgPool) -> Result<Value, &'static str> {
             .fetch_one(&mut *tx)
             .await
             .map_err(|_| "audit max_connections read failed")?;
+    let reserved_connections: i64 =
+        sqlx::query_scalar("SELECT current_setting('superuser_reserved_connections')::bigint")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| "audit reserved_connections read failed")?;
     tx.rollback().await.map_err(|_| "audit rollback failed")?;
     let mut membership_entries = Vec::with_capacity(memberships.len());
     for (login, exists, member_of, of_migrator, of_ro) in &memberships {
@@ -945,9 +953,26 @@ async fn audit_queries(pool: &PgPool) -> Result<Value, &'static str> {
         "connection_usage": {
             "used": connections_used,
             "max_connections": max_connections,
-            "pct_full": connections_used as f64 / max_connections.max(1) as f64 * 100.0,
+            "reserved_connections": reserved_connections,
+            "effective_max_connections": effective_max_connections(max_connections, reserved_connections),
+            "pct_full": connections_used as f64 / effective_max_connections(max_connections, reserved_connections).max(1) as f64 * 100.0,
         },
     }))
+}
+
+/// Client-backend count: `pg_stat_activity` lists one row per server process,
+/// including aux processes (walwriter, checkpointer, background writer,
+/// autovacuum and replication launchers) that do not count against
+/// `max_connections`. Filter to real client connections so the 80% warning
+/// does not fire ~20 points early on the 25-connection staging database.
+pub const CONNECTION_COUNT_SQL: &str =
+    "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend'";
+
+/// Non-superuser login ceiling: `max_connections` minus
+/// `superuser_reserved_connections`. Degenerate inputs floor at 1 so the
+/// warning ratio never divides by zero.
+pub fn effective_max_connections(max_connections: i64, reserved_connections: i64) -> i64 {
+    (max_connections.saturating_sub(reserved_connections.max(0))).max(1)
 }
 
 /// Warn threshold for staging connection pressure: staging once refused all
@@ -975,12 +1000,18 @@ pub fn connection_warning(used: i64, max: i64) -> Option<String> {
 }
 
 /// Read the plan audit's `connection_usage` back into [`connection_warning`].
-/// A failed or field-less readout warns about nothing.
+/// Prefers the non-superuser `effective_max_connections` ceiling when present
+/// (older manifests carry only `max_connections`). A failed or field-less
+/// readout warns about nothing.
 fn connection_warning_from_audit(audit: &Value) -> Option<String> {
     let usage = audit.get("connection_usage")?;
     let used = usage.get("used")?.as_i64()?;
     let max = usage.get("max_connections")?.as_i64()?;
-    connection_warning(used, max)
+    let reserved = usage.get("reserved_connections").and_then(Value::as_i64);
+    let ceiling = reserved
+        .map(|r| effective_max_connections(max, r))
+        .unwrap_or(max);
+    connection_warning(used, ceiling)
 }
 
 async fn connect(
@@ -2632,6 +2663,38 @@ mod tests {
             None
         );
         assert_eq!(connection_warning_from_audit(&Value::Null), None);
+    }
+
+    #[test]
+    fn connection_count_excludes_aux_processes() {
+        assert!(
+            CONNECTION_COUNT_SQL.contains("backend_type"),
+            "{CONNECTION_COUNT_SQL}"
+        );
+        assert!(
+            CONNECTION_COUNT_SQL.contains("client backend"),
+            "{CONNECTION_COUNT_SQL}"
+        );
+    }
+
+    #[test]
+    fn effective_ceiling_subtracts_reserved() {
+        assert_eq!(effective_max_connections(25, 3), 22);
+        assert_eq!(effective_max_connections(25, 0), 25);
+        assert_eq!(effective_max_connections(1, 5), 1);
+        // Backwards-compatible: manifests without the reserved field warn on raw max.
+        assert_eq!(
+            connection_warning_from_audit(
+                &json!({"connection_usage": {"used": 20, "max_connections": 25}})
+            ),
+            None
+        );
+        // Same reading against the login ceiling (25 - 3 = 22) warns: 20/22 > 80%.
+        let line = connection_warning_from_audit(
+            &json!({"connection_usage": {"used": 20, "max_connections": 25, "reserved_connections": 3}}),
+        )
+        .expect("must warn on effective ceiling");
+        assert!(line.contains("20/22"), "{line}");
     }
 
     /// The `run` entry refuses a plaintext remote binding before connecting
