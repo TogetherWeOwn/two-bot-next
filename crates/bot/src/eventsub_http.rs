@@ -252,7 +252,9 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
         return refuse(state, StatusCode::BAD_REQUEST, "malformed", false, id);
     }
 
+    two_bot_core::metrics::global().eventsub_received();
     if let Err(error) = verify_delivery(&state.secret, &headers, &raw, now_ms_i64()) {
+        two_bot_core::metrics::global().eventsub_classified("tampered");
         // `BodyTooLarge` cannot arrive here (`to_bytes` caps first), but map
         // it explicitly rather than collapsing every variant into one arm.
         if error == EventSubError::BodyTooLarge {
@@ -269,6 +271,7 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
 
     match classify(&message_type, &raw) {
         Ok(Delivery::Challenge(challenge)) => {
+            two_bot_core::metrics::global().eventsub_classified("challenge");
             tracing::info!(
                 event = "eventsub_receiver",
                 status = 200,
@@ -285,6 +288,7 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             response
         }
         Ok(Delivery::Notification(_)) => {
+            two_bot_core::metrics::global().eventsub_classified("notification");
             // No send and no ledger in this slice: acknowledge so Twitch does
             // not retry; the follow-up wires the durable claim plus post.
             tracing::info!(
@@ -295,6 +299,7 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             ack(id)
         }
         Ok(Delivery::Revocation { .. }) => {
+            two_bot_core::metrics::global().eventsub_classified("revocation");
             // Reconcile runs at boot and after revocation in the Helix slice;
             // here only acknowledge so Twitch does not retry.
             tracing::info!(
@@ -305,6 +310,7 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             ack(id)
         }
         Ok(Delivery::Ignored) => {
+            two_bot_core::metrics::global().eventsub_classified("ignored");
             tracing::info!(
                 event = "eventsub_receiver",
                 status = 200,
@@ -316,6 +322,7 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
         // not retry what will never succeed. Only transient send/ledger
         // failures (not in this slice) are 5xx.
         Err(EventSubError::WrongSubscription) | Err(EventSubError::InvalidBody) => {
+            two_bot_core::metrics::global().eventsub_classified("ignored");
             tracing::info!(
                 event = "eventsub_receiver",
                 status = 200,
@@ -324,9 +331,11 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             ack(id)
         }
         Err(EventSubError::InvalidChallenge) => {
+            two_bot_core::metrics::global().eventsub_classified("ignored");
             refuse(state, StatusCode::BAD_REQUEST, "malformed", false, id)
         }
         Err(e) => {
+            two_bot_core::metrics::global().eventsub_classified("ignored");
             // Unreachable today: post-verification `classify` only yields
             // WrongSubscription, InvalidBody or InvalidChallenge (all handled
             // above). Warn loudly so a future classify variant shows up in
