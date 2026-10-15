@@ -148,7 +148,7 @@ below is present but is not called by a runtime receiver yet.
   non-POST, `408` for a body slower than the read budget, `413` for an
   oversize body, `415` for a wrong content type, `404` for a wrong path, and
   `503` (`retryable: true`) while the receiver is busy or past the overall
-  20 s budget. Only the `503` paths are retriable; this slice has no send or
+  20 s budget. Only the `408` and `503` paths are retriable; this slice has no send or
   durable ledger, so a verified delivery retries only on a pathological
   scheduling stall, and the retry re-acks with no side effects. No header
   value, challenge, body byte or query is ever logged; only scalar

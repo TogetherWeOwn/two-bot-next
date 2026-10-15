@@ -405,8 +405,30 @@ mod tests {
         message_type: Option<&str>,
         body: &'static str,
     ) -> Request<Body> {
+        request_with_content_type(
+            uri,
+            "application/json",
+            method,
+            message_id,
+            timestamp,
+            signature,
+            message_type,
+            Body::from(body),
+        )
+    }
+
+    fn request_with_content_type(
+        uri: &str,
+        content_type: &str,
+        method: &str,
+        message_id: Option<&str>,
+        timestamp: Option<&str>,
+        signature: Option<&str>,
+        message_type: Option<&str>,
+        body: Body,
+    ) -> Request<Body> {
         let mut builder = Request::builder().method(method).uri(uri);
-        builder = builder.header("content-type", "application/json");
+        builder = builder.header("content-type", content_type);
         if let Some(value) = message_id {
             builder = builder.header("twitch-eventsub-message-id", value);
         }
@@ -419,7 +441,7 @@ mod tests {
         if let Some(value) = message_type {
             builder = builder.header("twitch-eventsub-message-type", value);
         }
-        builder.body(Body::from(body)).unwrap()
+        builder.body(body).unwrap()
     }
 
     fn challenge_body() -> &'static str {
@@ -557,5 +579,172 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn query_string_is_refused_before_verification() {
+        // Signed exactly like the happy path: the query gate runs first, so a
+        // valid signature must still answer 400, never reach the receiver.
+        let body = challenge_body();
+        let timestamp = fresh_timestamp();
+        let signature = sign("synthetic-delivery-0011", &timestamp, body.as_bytes());
+        let response = app()
+            .oneshot(request(
+                "POST",
+                "/hooks/twitch?x=1",
+                Some("synthetic-delivery-0011"),
+                Some(&timestamp),
+                Some(&signature),
+                Some("webhook_callback_verification"),
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["code"], "malformed");
+        assert_eq!(value["error"]["retryable"], false);
+    }
+
+    #[tokio::test]
+    async fn wrong_content_type_is_refused() {
+        let body = challenge_body();
+        let timestamp = fresh_timestamp();
+        let message_id = "synthetic-delivery-0012";
+        let signature = sign(message_id, &timestamp, body.as_bytes());
+        for content_type in ["text/plain", "application/json; charset=iso-8859-1"] {
+            let response = app()
+                .oneshot(request_with_content_type(
+                    EVENTSUB_PATH,
+                    content_type,
+                    "POST",
+                    Some(message_id),
+                    Some(&timestamp),
+                    Some(&signature),
+                    Some("webhook_callback_verification"),
+                    Body::from(body),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "{content_type}"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["error"]["code"], "unsupported_media_type");
+            assert_eq!(value["error"]["retryable"], false);
+        }
+        // The allowlisted utf-8 spelling passes the gate: same signed bytes
+        // answer the challenge instead of refusing.
+        let allowed = app()
+            .oneshot(request_with_content_type(
+                EVENTSUB_PATH,
+                "application/json; charset=utf-8",
+                "POST",
+                Some(message_id),
+                Some(&timestamp),
+                Some(&signature),
+                Some("webhook_callback_verification"),
+                Body::from(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn oversize_body_is_refused() {
+        // Headers pass `from_lookup`; the 64 KiB cap triggers before verify.
+        let timestamp = fresh_timestamp();
+        let big = vec![b'a'; MAX_BODY_BYTES + 1];
+        let signature = sign("synthetic-delivery-0013", &timestamp, &big);
+        let response = app()
+            .oneshot(request_with_content_type(
+                EVENTSUB_PATH,
+                "application/json",
+                "POST",
+                Some("synthetic-delivery-0013"),
+                Some(&timestamp),
+                Some(&signature),
+                Some("notification"),
+                Body::from(big),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["code"], "payload_too_large");
+        assert_eq!(value["error"]["retryable"], false);
+    }
+
+    #[tokio::test]
+    async fn malformed_challenge_is_refused() {
+        // Empty and non-graphic challenges are `InvalidChallenge`: 400, never
+        // an ack. Each body is signed exactly as sent.
+        for challenge in ["", "has space"] {
+            let body = format!(
+                r#"{{"challenge":{challenge:?},"subscription":{{"id":"synthetic-sub-0014","status":"webhook_callback_verification_pending","type":"stream.online","version":"1","condition":{{"broadcaster_user_id":"123456"}},"transport":{{"method":"webhook","callback":"https://example.com/hooks/twitch"}},"created_at":"2026-10-13T00:00:00Z"}}}}"#
+            );
+            let timestamp = fresh_timestamp();
+            let signature = sign("synthetic-delivery-0014", &timestamp, body.as_bytes());
+            let response = app()
+                .oneshot(request_with_content_type(
+                    EVENTSUB_PATH,
+                    "application/json",
+                    "POST",
+                    Some("synthetic-delivery-0014"),
+                    Some(&timestamp),
+                    Some(&signature),
+                    Some("webhook_callback_verification"),
+                    Body::from(body),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{challenge:?}");
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["error"]["code"], "malformed");
+            assert_eq!(value["error"]["retryable"], false);
+        }
+    }
+
+    #[tokio::test]
+    async fn busy_returns_503_with_retryable() {
+        // Hold every permit: the semaphore gate runs before path, method,
+        // content-type and verification, so even a bare request gets 503.
+        let state = Arc::new(ReceiverState::new(&config()));
+        let _permits = (0..MAX_REQUESTS)
+            .map(|_| {
+                state
+                    .capacity
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("permit")
+            })
+            .collect::<Vec<_>>();
+        let response = router(Arc::clone(&state))
+            .oneshot(request("POST", EVENTSUB_PATH, None, None, None, None, ""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["code"], "busy");
+        assert_eq!(value["error"]["retryable"], true);
     }
 }

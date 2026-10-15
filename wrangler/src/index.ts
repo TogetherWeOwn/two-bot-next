@@ -882,9 +882,10 @@ export class TwoBotContainer extends Container<Env> {
    * Staging-only EventSub ingress behind the ownership fence. Re-checks the
    * Worker's gate, then forwards the exact bytes to the EventSub receiver
    * port. Public ingress never starts the Container: probes and keepalive own
-   * that, so an unauthenticated flood cannot cause a cold start. Until the
-   * receiver slice lands nothing listens on that port and every forward fails
-   * closed to the 503 envelope below.
+   * that, so an unauthenticated flood cannot cause a cold start. The private
+   * receiver binds 8092 while TWO_EVENTSUB is "1" with the signing secret
+   * present; when dark or cold the forward fails closed to the 503 envelope
+   * below.
    */
   private async internalEventsub(request: Request): Promise<Response> {
     if (!eventsubIngressEnabled(this.env) || !isEventsubRequest(request)) return notFound();

@@ -13,12 +13,18 @@ import worker, { TwoBotContainer, type Env } from "../src/index.ts";
 import { DEPLOYMENT_HEADER, OWNER_KEY } from "../src/ownership.ts";
 import {
   EVENTSUB_PATH,
+  EVENTSUB_RECEIVER_BIND,
   EVENTSUB_RECEIVER_PORT,
   MAX_BODY_BYTES,
   MAX_IN_FLIGHT,
   relayEventsubResponse,
   resetEventsubIngressLimits,
 } from "../src/eventsub.ts";
+import {
+  CONTAINER_MARKER,
+  CONTAINER_MARKER_VALUE,
+  RECEIVER_PORT,
+} from "../src/internal-actions.ts";
 
 const ID = "deployment-A";
 const OWNER = {
@@ -247,6 +253,57 @@ test("enabled flag without the signing secret stays dark: nothing forwarded, no 
   // has no receiver: the forward fails closed to the 503 envelope.
   const response = await h.call(post());
   assert.equal(response.status, 503);
+});
+
+test("enabled env forwards flag, bind, marker and secret and pins 8092 in requiredPorts", async (t) => {
+  const h = await harness(t, ENABLED_ENV);
+  await h.warm();
+  assert.equal(h.starts.length, 1);
+  const forwarded = h.starts[0]?.env ?? {};
+  assert.equal(forwarded["TWO_EVENTSUB"], "1", "flag forwarded only with the secret");
+  assert.equal(forwarded["TWO_EVENTSUB_BIND"], EVENTSUB_RECEIVER_BIND, "bind is the Worker's constant");
+  assert.equal(forwarded[CONTAINER_MARKER], CONTAINER_MARKER_VALUE, "container marker forwarded");
+  assert.equal(
+    forwarded["TWO_TWITCH_WEBHOOK_SECRET"],
+    ENABLED_ENV.TWO_TWITCH_WEBHOOK_SECRET,
+    "signing secret forwarded only with the flag",
+  );
+  assert.deepEqual(h.bot.requiredPorts, [8080, EVENTSUB_RECEIVER_PORT]);
+  // Combined with the internal-actions receiver: both sidecars are checked.
+  const both = await harness(t, { ...ENABLED_ENV, TWO_INTERNAL_ACTIONS: "1" });
+  await both.warm();
+  assert.deepEqual(both.bot.requiredPorts, [8080, RECEIVER_PORT, EVENTSUB_RECEIVER_PORT]);
+});
+
+test("a silent eventsub receiver fails startup instead of reporting ready", async (t) => {
+  const h = await harness(t, ENABLED_ENV);
+  t.mock.method(h.runtime, "start", (config: { env?: Record<string, string> }) => {
+    h.starts.push(structuredClone(config));
+    h.runtime.running = true;
+    // Only the health port ever listens; the sidecar cannot reach the receiver.
+  });
+  t.mock.method(h.runtime, "getTcpPort", (port: number) => ({
+    fetch: async () => {
+      if (port === 8080) return Object.assign(Response.json({ ready: true }), { webSocket: null });
+      throw new Error("connection refused");
+    },
+  }));
+  await assert.rejects(
+    h.bot.startAndWaitForPorts(8080, { portReadyTimeoutMS: 400, waitInterval: 100 }),
+    /connection refused|port 8092|Failed to verify port/i,
+  );
+});
+
+test("health and eventsub ports listening together pass startup while enabled", async (t) => {
+  const h = await harness(t, ENABLED_ENV);
+  await h.bot.startAndWaitForPorts(8080, { portReadyTimeoutMS: 2000, waitInterval: 50 });
+  assert.equal(h.runtime.running, true);
+  assert.equal(h.starts.length, 1);
+  const env = h.starts[0]?.env ?? {};
+  assert.equal(env["TWO_EVENTSUB"], "1");
+  assert.equal(env["TWO_EVENTSUB_BIND"], EVENTSUB_RECEIVER_BIND);
+  assert.equal(env[CONTAINER_MARKER], CONTAINER_MARKER_VALUE);
+  assert.deepEqual(h.bot.requiredPorts, [8080, EVENTSUB_RECEIVER_PORT]);
 });
 
 // ---------------------------------------------------------------- enabled: refusals before the container
