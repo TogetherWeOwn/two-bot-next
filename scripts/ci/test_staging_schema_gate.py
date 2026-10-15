@@ -71,9 +71,36 @@ class ConnectionWarningTests(unittest.TestCase):
         self.assertIsNone(connection_warning({}))
 
     def test_hot_pool_warns_without_failing(self):
-        warning = connection_warning({"connection_usage": {"ratio": 0.96}})
+        manifest = {
+            "pending_before": [],
+            "audit": {"connection_usage": {"used": 25, "max_connections": 25}},
+        }
+        warning = connection_warning(manifest)
         self.assertIsNotNone(warning)
-        self.assertIn("connection", warning)
+        self.assertIn("25/25", warning)
+
+    def test_warning_boundary_is_strictly_above_eighty_percent(self):
+        def manifest(used, maximum):
+            return {"audit": {"connection_usage": {"used": used, "max_connections": maximum}}}
+
+        self.assertIsNone(connection_warning(manifest(80, 100)))
+        self.assertIsNotNone(connection_warning(manifest(81, 100)))
+
+    def test_degenerate_or_misplaced_usage_never_warns(self):
+        for bad in (
+            {"audit": None},
+            {"audit": {}},
+            {"audit": {"connection_usage": None}},
+            {"audit": {"connection_usage": {"used": 25}}},
+            {"audit": {"connection_usage": {"max_connections": 25}}},
+            {"audit": {"connection_usage": {"used": -1, "max_connections": 25}}},
+            {"audit": {"connection_usage": {"used": 25, "max_connections": 0}}},
+            {"audit": {"connection_usage": {"used": True, "max_connections": 25}}},
+            # Top-level usage is not the emitted shape; it must not warn.
+            {"connection_usage": {"used": 25, "max_connections": 25}},
+        ):
+            with self.subTest(bad=bad):
+                self.assertIsNone(connection_warning(bad))
 
 
 if __name__ == "__main__":

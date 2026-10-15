@@ -21,8 +21,9 @@ PLAN_URL_ENV = "TWO_BOT_STAGING_PLAN_DATABASE_URL"
 # Bare, non-secret provenance refs recorded in the plan manifest. The gate is
 # the evidence: a read-only plan needs no human review reference.
 GATE_REF = "deploy-staging-schema-gate"
-# Mirror the staging-migrate plan warning: hot pools warn, never fail.
-CONNECTION_WARN_RATIO = 0.8
+# Mirror the staging-migrate plan warning (CONNECTION_WARN_PCT there):
+# strictly above 80% of max_connections warns, never fails.
+CONNECTION_WARN_PCT = 80.0
 I64_MAX = 2**63 - 1
 
 
@@ -88,15 +89,30 @@ def drift_message(pending, source_sha):
 
 
 def connection_warning(manifest):
-    """Surface a hot staging pool in logs; never a gate failure."""
-    usage = manifest.get("connection_usage")
-    ratio = usage.get("ratio") if isinstance(usage, dict) else usage
-    if isinstance(ratio, bool) or not isinstance(ratio, (int, float)):
+    """Surface a hot staging pool in logs; never a gate failure.
+
+    Reads the real plan-manifest shape the binary emits:
+    ``manifest["audit"]["connection_usage"]`` with ``used`` and
+    ``max_connections`` counts. Degenerate or absent usage never warns,
+    mirroring the binary's own warning boundary (strictly above 80%).
+    """
+    if not isinstance(manifest, dict):
         return None
-    if ratio >= CONNECTION_WARN_RATIO:
+    audit = manifest.get("audit")
+    usage = audit.get("connection_usage") if isinstance(audit, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    used = usage.get("used")
+    maximum = usage.get("max_connections")
+    if isinstance(used, bool) or not isinstance(used, int) or used < 0:
+        return None
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0:
+        return None
+    if used / maximum * 100.0 > CONNECTION_WARN_PCT:
         return (
-            f"staging database connection usage is {ratio:.0%} "
-            "(above 80% of max_connections); logins may refuse under saturation."
+            f"staging database connection usage is {used}/{maximum} "
+            f"({used / maximum:.0%} of max_connections); "
+            "logins may refuse under saturation."
         )
     return None
 

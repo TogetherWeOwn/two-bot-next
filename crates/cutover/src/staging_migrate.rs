@@ -2534,7 +2534,7 @@ mod tests {
         assert_eq!(TARGET_ACQUIRE_TIMEOUT_SECS, 10);
     }
 
-    /// TOG-24360: run 38654195597 applied all 19 pending migrations, then the
+    /// Staging drift witness: run 38654195597 applied all 19 pending migrations, then the
     /// post-apply ledger read failed on a transient pool acquire while the
     /// saturated staging DB (25/25 connections) refused the new checkout. The
     /// pre-apply read had used the identical query as the identical role, so
@@ -2599,7 +2599,7 @@ mod tests {
         );
     }
 
-    /// TOG-24360: staging refused all logins at 25/25 connections. The plan
+    /// Staging drift witness: staging refused all logins at 25/25 connections. The plan
     /// manifest must carry connection usage and warn strictly above 80%.
     #[test]
     fn connection_warning_fires_only_above_eighty_percent() {
