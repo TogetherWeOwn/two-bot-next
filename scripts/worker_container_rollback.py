@@ -44,7 +44,7 @@ import time
 from urllib.request import Request
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import staging_rollout as base  # noqa: E402
+import staging_rollout as base
 
 GateError = base.GateError
 require = base.require
@@ -58,6 +58,8 @@ POLL_SECONDS = 10
 ROLLOUT_TIMEOUT_SECONDS = 600
 GATE_TIMEOUT_SECONDS = 900
 CONTROL_TIMEOUT_SECONDS = 420
+# HTTP statuses that stop the run without retry (see the module docstring).
+AUTH_STATUSES = ("401", "403")
 # Above the control client's takeover window plus one attempt of two 15 s
 # requests, so a fence/takeover POST is never killed mid-flight.
 ACTOR = re.compile(r"[a-zA-Z0-9_.:@/-]{1,128}")

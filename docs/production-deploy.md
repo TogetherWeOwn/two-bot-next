@@ -66,6 +66,21 @@ After the reviewer approves (or the automated approval passes), the job:
 4. gates on `/health` 200 and on `/readyz` reporting this SHA (see
    [Build identity and the `/readyz` gate](#build-identity-and-the-readyz-gate)).
 
+Before step 2, a schema gate runs the read-only `production-migrate plan` on
+the guarded SHA through the no-reviewer `production-migrate-plan` environment
+and refuses a new build whose migrations are ahead of the production ledger.
+Apply the named pending versions through the manual `production-migrate`
+apply dispatch (reviewed plan required), then re-dispatch. A rollback and a
+live-SHA takeover redeploy serve no new schema and waive the ledger check
+(recorded in the run, never a silent skip), so recovery never waits on it.
+
+Operator setup (once): create the non-secret repo vars
+`TWO_BOT_PRODUCTION_HOST` and `TWO_BOT_PRODUCTION_DATABASE` with the pinned
+production endpoint host and database name, and confirm the
+`production-migrate-plan` environment exposes the read-only
+`TWO_BOT_PRODUCTION_PLAN_DATABASE_URL` secret. Until the pins exist the gate
+fails closed on new builds (rollback and live-SHA redeploy still run).
+
 **Roll back.** This dispatch is the single production rollback method. A rollback,
 and a redeploy of a prior good commit, must always set `sha` explicitly: an empty
 `sha` promotes the latest staged commit, which during an incident is usually the

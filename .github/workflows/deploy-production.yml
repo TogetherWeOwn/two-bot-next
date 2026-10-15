@@ -9,7 +9,10 @@ name: deploy-production
 # attempt, plus a successful deploy-staging run, except that a rollback
 # (Worker version + container image) never needs staging history, and a
 # live-SHA takeover redeploy (`allow_unstaged` with `takeover`) waives it when
-# the operator confirms the SHA is live. The guard also refuses
+# the operator confirms the SHA is live. A pre-deploy schema gate then runs
+# the read-only production-migrate plan on the guarded SHA and refuses a new
+# build whose migrations are ahead of the production ledger (rollback and
+# live-SHA redeploy waive it: they serve no new schema). The guard also refuses
 # when the `production` Environment is missing or unprotected: a job that
 # names a missing Environment makes GitHub create it with no reviewers, which
 # would remove the human gate. A failed gate after a takeover auto-rolls back
@@ -316,9 +319,71 @@ jobs:
               )
           print(f"guard passed: {mode} {sha}")
 
+  # Pre-deploy schema-drift gate: a drifted production database fails this job
+  # (and, through `needs`, the deploy below) instead of crash-looping the new
+  # build at gateway startup. Read-only `production-migrate plan` through the
+  # no-reviewer `production-migrate-plan` environment binding; the expected
+  # host/database pins are non-secret `vars.*` compared against that binding
+  # (never derived from it), so a wrong-target binding refuses instead of
+  # reading the wrong database. Drift is fixed by the manual
+  # production-migrate apply dispatch named in the failure, never by this
+  # workflow. A rollback and a live-SHA takeover redeploy serve no new schema
+  # and waive the ledger check inside the reviewed script (recorded, never a
+  # silent skip), so recovery never waits on this gate.
+  schema-gate:
+    name: prod schema drift gate (production-migrate plan)
+    needs: guard
+    permissions:
+      contents: read
+    environment: production-migrate-plan
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'schema-gate') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 30
+    container:
+      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Gate exactly the guarded SHA, not a newer main head.
+          ref: ${{ needs.guard.outputs.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Deploy SHA must be exact
+        env:
+          SOURCE_SHA: ${{ needs.guard.outputs.sha }}
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Build runner
+        run: cargo build -p two-bot-cutover --bin staging-migrate --locked
+      - name: Fail closed on schema drift
+        env:
+          # Must already exist as a production-migrate-plan environment secret; absent means refusal.
+          # Read-only login: the gate never applies and never reads the migrator binding.
+          TWO_BOT_PRODUCTION_PLAN_DATABASE_URL: ${{ secrets.TWO_BOT_PRODUCTION_PLAN_DATABASE_URL }}
+          # Non-secret expected production identity (repo vars, Operator-owned;
+          # unset pins refuse): the gate refuses unless the secret binding
+          # matches these pins. New vars: TWO_BOT_PRODUCTION_HOST and
+          # TWO_BOT_PRODUCTION_DATABASE (see docs/production-deploy.md).
+          TWO_BOT_PRODUCTION_HOST: ${{ vars.TWO_BOT_PRODUCTION_HOST }}
+          TWO_BOT_PRODUCTION_DATABASE: ${{ vars.TWO_BOT_PRODUCTION_DATABASE }}
+          SOURCE_SHA: ${{ needs.guard.outputs.sha }}
+          MODE: ${{ needs.guard.outputs.mode }}
+          ALLOW_UNSTAGED: ${{ needs.guard.outputs.allow_unstaged }}
+        # `shell: bash` runs with `-eo pipefail`. The container's default `sh`
+        # has no pipefail, so a gate refusal piped anywhere would read green.
+        # `set -o pipefail` is belt-and-braces for the same guarantee if the
+        # shell key is ever re-targeted; the workflow-policy test pins both.
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 scripts/ci/production_schema_gate.py \
+            --binary ./target/debug/staging-migrate --source-sha "$SOURCE_SHA" \
+            --mode "$MODE" --allow-unstaged "$ALLOW_UNSTAGED"
+
   production:
     name: wrangler ${{ needs.guard.outputs.mode }} + readyz gate
-    needs: guard
+    needs: [guard, schema-gate]
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'production') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 30

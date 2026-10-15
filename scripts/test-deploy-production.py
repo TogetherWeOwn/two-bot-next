@@ -198,7 +198,10 @@ class StaticGuardTests(unittest.TestCase):
     def test_wrangler_and_secrets_only_run_in_the_production_environment(self):
         production = children(JOBS["production"][1:], 4)
         self.assertEqual(value(production["environment"]), "production")
-        self.assertEqual(value(production["needs"]), "guard")
+        # Drift must block the deploy: the production job waits for the guard
+        # and the prod schema gate. A rollback serves no new schema and waives
+        # the ledger check inside the reviewed gate script, never here.
+        self.assertEqual(value(production["needs"]), "[guard, schema-gate]")
         guard = children(JOBS["guard"][1:], 4)
         self.assertNotIn("environment", guard)
         self.assertNotIn("secrets.", "\n".join(JOBS["guard"]))
@@ -217,7 +220,7 @@ class StaticGuardTests(unittest.TestCase):
 
     def test_every_job_uses_the_shared_runner_routing(self):
         # scripts/test-runner-routing.py pins the full expression (TOG-12339).
-        self.assertEqual(list(JOBS), ["guard", "production", "release"])
+        self.assertEqual(list(JOBS), ["guard", "schema-gate", "production", "release"])
         for name, job in JOBS.items():
             runs_on = value(children(job[1:], 4)["runs-on"])
             self.assertTrue(runs_on.startswith("${{ fromJSON((!github.event.repository.private && "), name)
