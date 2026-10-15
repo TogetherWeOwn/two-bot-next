@@ -61,14 +61,22 @@ ADVICE = {
     ),
 }
 
-ADD_COLUMN = re.compile(r"\bADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?", re.IGNORECASE)
+ADD_KEYWORD = re.compile(r"\bADD\s+", re.IGNORECASE)
+ADD_NON_COLUMN_REST = re.compile(
+    r"(?:CONSTRAINT|PRIMARY|UNIQUE|FOREIGN|CHECK)\b", re.IGNORECASE
+)
+COLUMN_PREFIX = re.compile(
+    r"(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?", re.IGNORECASE
+)
 NOT_NULL = re.compile(r"\bNOT\s+NULL\b", re.IGNORECASE)
 DEFAULT = re.compile(r"\bDEFAULT\b", re.IGNORECASE)
 CREATE_INDEX = re.compile(r"\bCREATE\s+(?:UNIQUE\s+)?INDEX\b", re.IGNORECASE)
 CONCURRENTLY = re.compile(r"\bCONCURRENTLY\b", re.IGNORECASE)
 ADD_CHECK = re.compile(r"\bADD\s+(?:CONSTRAINT\s+\S+\s+)?CHECK\b", re.IGNORECASE)
 NOT_VALID = re.compile(r"\bNOT\s+VALID\b", re.IGNORECASE)
-ALTER_TYPE = re.compile(r"\bALTER\s+TABLE\b.*\bTYPE\s+[A-Za-z]", re.IGNORECASE | re.DOTALL)
+ALTER_TYPE = re.compile(
+    r"\bALTER\s+(?:COLUMN\s+)?\S+\s+(?:SET\s+DATA\s+)?TYPE\b", re.IGNORECASE
+)
 DROP_OBJECT = re.compile(r"\bDROP\s+(?:TABLE|COLUMN)\b", re.IGNORECASE)
 DOLLAR_OPEN = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$")
 
@@ -125,6 +133,12 @@ def blanked(text):
                     break
                 i += 1
             blank(begin, i)
+            # Leave a placeholder identifier so rules that expect a name
+            # (e.g. ADD CONSTRAINT <name> CHECK) still parse quoted names.
+            token = "_q_"[: max(1, min(3, i - begin))]
+            for j, char in enumerate(token):
+                if chars[begin + j] != "\n":
+                    chars[begin + j] = char
         elif text[i] == "$":
             match = DOLLAR_OPEN.match(text, i)
             if match:
@@ -157,10 +171,48 @@ def statements(text):
         yield cleaned.count("\n", 0, start) + 1, tail
 
 
+def split_actions(sql):
+    """Split one statement on top-level commas (paren depth 0).
+
+    Lets per-action rules scope NOT NULL / DEFAULT to the ADD that owns
+    them instead of the whole statement.
+    """
+    parts, depth, current = [], 0, []
+    for char in sql:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        if char == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    parts.append("".join(current))
+    return parts
+
+
+def has_required_field(sql):
+    """True when an ADD [COLUMN] action adds NOT NULL without a DEFAULT."""
+    for action in split_actions(sql):
+        match = ADD_KEYWORD.search(action)
+        if not match:
+            continue
+        rest = action[match.end() :]
+        if ADD_NON_COLUMN_REST.match(rest):
+            continue
+        rest = COLUMN_PREFIX.sub("", rest, count=1)
+        if not rest.strip():
+            continue
+        if NOT_NULL.search(rest) and not DEFAULT.search(rest):
+            return True
+    return False
+
+
 def lint_statement(sql):
     """Return the list of rule IDs violated by one cleaned statement."""
     found = []
-    if ADD_COLUMN.search(sql) and NOT_NULL.search(sql) and not DEFAULT.search(sql):
+    if has_required_field(sql):
         found.append("adding-required-field")
     if CREATE_INDEX.search(sql) and not CONCURRENTLY.search(sql):
         found.append("creating-index")
@@ -224,7 +276,7 @@ def select_files(root, globs, excludes, base_ref):
     selected = []
     for path in changed_paths(root, base_ref):
         parts = PurePosixPath(path).parts
-        if len(parts) < 4 or parts[0] == ".." or ".." in parts:
+        if not parts or parts[0] == ".." or ".." in parts:
             continue
         if matches_any(path, globs) and not matches_any(path, excludes):
             selected.append(path)
@@ -249,8 +301,11 @@ def main(argv=None):
     parser.add_argument(
         "--migration-glob",
         action="append",
-        default=[DEFAULT_GLOB],
-        help="repeatable glob for migration files (default: %(default)s)",
+        default=None,
+        help=(
+            "repeatable glob for migration files "
+            f"(default: {DEFAULT_GLOB}); passing it replaces the default"
+        ),
     )
     parser.add_argument(
         "--exclude",
@@ -261,8 +316,9 @@ def main(argv=None):
     parser.add_argument("--base-ref", default=None, help="Git baseline; lint files changed since it (default: lint all files)")
     parser.add_argument("--strict", action="store_true", help="exit 1 on findings (required-check mode)")
     args = parser.parse_args(argv)
+    globs = args.migration_glob if args.migration_glob else [DEFAULT_GLOB]
     try:
-        findings = check(args.root, args.migration_glob, args.exclude, args.base_ref)
+        findings = check(args.root, globs, args.exclude, args.base_ref)
     except (SquawkError, OSError) as error:
         print(f"squawk gate: {error}", file=sys.stderr)
         return 1

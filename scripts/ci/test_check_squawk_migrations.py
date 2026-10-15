@@ -148,6 +148,54 @@ class RuleTests(unittest.TestCase):
             ["adding-required-field"],
         )
 
+    def test_add_constraint_check_is_not_a_required_field(self):
+        # 0423: the only backtest hit for this rule was ADD CONSTRAINT with
+        # IS NOT NULL inside the CHECK expression, not a new NOT NULL column.
+        self.assertEqual(
+            self.rules(
+                "ALTER TABLE internal_actions ADD CONSTRAINT "
+                "internal_idempotency_check CHECK (response_code IS NOT NULL);\n"
+            ),
+            ["adding-check-constraint"],
+        )
+
+    def test_default_elsewhere_does_not_silence_required_field(self):
+        self.assertEqual(
+            self.rules(
+                "ALTER TABLE guilds ADD COLUMN b bigint NOT NULL, "
+                "ALTER COLUMN c SET DEFAULT 0;\n"
+            ),
+            ["adding-required-field"],
+        )
+
+    def test_column_named_type_is_not_a_type_change(self):
+        self.assertEqual(
+            self.rules("ALTER TABLE t ADD COLUMN type text;\n"),
+            [],
+        )
+        self.assertEqual(
+            self.rules(
+                "ALTER TABLE t ADD CONSTRAINT c CHECK (type IN ('a')) NOT VALID;\n"
+            ),
+            [],
+        )
+
+    def test_set_data_type_change_is_flagged(self):
+        self.assertEqual(
+            self.rules(
+                "ALTER TABLE guilds ALTER COLUMN flags SET DATA TYPE text;\n"
+            ),
+            ["changing-column-type"],
+        )
+
+    def test_quoted_constraint_name_still_flags_check(self):
+        self.assertEqual(
+            self.rules(
+                'ALTER TABLE t ADD CONSTRAINT "c" CHECK (x > 0);\n'
+            ),
+            ["adding-check-constraint"],
+        )
+
     def test_several_rules_in_one_file_report_each_line(self):
         self.assertEqual(
             squawk.lint_text(
@@ -226,6 +274,51 @@ class SelectionTests(unittest.TestCase):
         self.write(FIRST, "DROP TABLE first;\n")
         findings = squawk.check(self.root, [squawk.DEFAULT_GLOB], [], None)
         self.assertEqual(findings, [(FIRST, 1, "dropping-object")])
+
+    def test_diff_mode_lints_shallow_custom_glob(self):
+        self.git("init", "--initial-branch=main")
+        self.write("README.md", "base\n")
+        self.commit_all("baseline")
+        base = self.git("rev-parse", "HEAD")
+        self.write(
+            "migrations/0001_x.sql", "CREATE INDEX bad_idx ON t (a);\n"
+        )
+        self.commit_all("risky")
+        findings = squawk.check(
+            self.root, ["migrations/*.sql"], [], base
+        )
+        self.assertEqual(
+            findings, [("migrations/0001_x.sql", 1, "creating-index")]
+        )
+
+    def test_custom_glob_replaces_default(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = squawk.main(
+                [
+                    "--root",
+                    str(self.root),
+                    "--migration-glob",
+                    "migrations/*.sql",
+                ]
+            )
+        self.assertEqual(code, 0)
+        self.write(
+            "crates/a/migrations/0001_y.sql",
+            "CREATE INDEX bad_idx ON t (a);\n",
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = squawk.main(
+                [
+                    "--root",
+                    str(self.root),
+                    "--migration-glob",
+                    "migrations/*.sql",
+                ]
+            )
+        self.assertEqual(code, 0)
+        self.assertIn("no risky migration statements", out.getvalue())
 
 
 class ExitCodeTests(unittest.TestCase):
