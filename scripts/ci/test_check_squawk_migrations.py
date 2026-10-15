@@ -188,6 +188,42 @@ class RuleTests(unittest.TestCase):
             ["changing-column-type"],
         )
 
+    def test_column_named_type_actions_are_not_type_changes(self):
+        # The COLUMN keyword must not be consumed as the column name: a
+        # column literally named `type` with SET/DROP actions is lock-free.
+        for sql in (
+            "ALTER TABLE t ALTER COLUMN type SET NOT NULL;\n",
+            "ALTER TABLE t ALTER COLUMN type SET DEFAULT 'a';\n",
+            "ALTER TABLE t ALTER COLUMN type DROP DEFAULT;\n",
+            "ALTER TABLE type ADD COLUMN x int;\n",
+        ):
+            self.assertEqual(self.rules(sql), [], sql)
+        # True positives still flag, with and without the COLUMN keyword.
+        self.assertEqual(
+            self.rules("ALTER TABLE t ALTER COLUMN c TYPE text;\n"),
+            ["changing-column-type"],
+        )
+        self.assertEqual(
+            self.rules("ALTER TABLE t ALTER c TYPE text;\n"),
+            ["changing-column-type"],
+        )
+
+    def test_not_valid_on_sibling_action_does_not_silence_check(self):
+        self.assertEqual(
+            self.rules(
+                "ALTER TABLE t ADD CONSTRAINT a CHECK (x > 0), "
+                "ADD CONSTRAINT b CHECK (y > 0) NOT VALID;\n"
+            ),
+            ["adding-check-constraint"],
+        )
+        self.assertEqual(
+            self.rules(
+                "ALTER TABLE t ADD CONSTRAINT a CHECK (x > 0), "
+                "ADD CONSTRAINT b FOREIGN KEY (y) REFERENCES u (id) NOT VALID;\n"
+            ),
+            ["adding-check-constraint"],
+        )
+
     def test_quoted_constraint_name_still_flags_check(self):
         self.assertEqual(
             self.rules(
@@ -290,6 +326,21 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(
             findings, [("migrations/0001_x.sql", 1, "creating-index")]
         )
+
+    def test_diff_mode_star_star_glob_matches_full_mode(self):
+        # `**/migrations/*.sql` must lint a root-level migrations/ file in
+        # both full mode (Path.glob) and diff mode (changed paths).
+        self.git("init", "--initial-branch=main")
+        self.write("README.md", "base\n")
+        self.commit_all("baseline")
+        base = self.git("rev-parse", "HEAD")
+        self.write("migrations/0001_x.sql", "CREATE INDEX bad_idx ON t (a);\n")
+        self.commit_all("risky")
+        globs = ["**/migrations/*.sql"]
+        full = squawk.check(self.root, globs, [], None)
+        self.assertEqual(full, [("migrations/0001_x.sql", 1, "creating-index")])
+        diff = squawk.check(self.root, globs, [], base)
+        self.assertEqual(diff, full)
 
     def test_custom_glob_replaces_default(self):
         out = io.StringIO()

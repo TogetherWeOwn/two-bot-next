@@ -75,7 +75,9 @@ CONCURRENTLY = re.compile(r"\bCONCURRENTLY\b", re.IGNORECASE)
 ADD_CHECK = re.compile(r"\bADD\s+(?:CONSTRAINT\s+\S+\s+)?CHECK\b", re.IGNORECASE)
 NOT_VALID = re.compile(r"\bNOT\s+VALID\b", re.IGNORECASE)
 ALTER_TYPE = re.compile(
-    r"\bALTER\s+(?:COLUMN\s+)?\S+\s+(?:SET\s+DATA\s+)?TYPE\b", re.IGNORECASE
+    r"\bALTER\s+COLUMN\s+\S+\s+(?:SET\s+DATA\s+)?TYPE\b"
+    r"|\bALTER\s+(?!COLUMN\b|TABLE\b)\S+\s+(?:SET\s+DATA\s+)?TYPE\b",
+    re.IGNORECASE,
 )
 DROP_OBJECT = re.compile(r"\bDROP\s+(?:TABLE|COLUMN)\b", re.IGNORECASE)
 DOLLAR_OPEN = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$")
@@ -209,6 +211,19 @@ def has_required_field(sql):
     return False
 
 
+def has_check_constraint(sql):
+    """True when an ADD CONSTRAINT CHECK action lacks NOT VALID of its own.
+
+    NOT VALID is scoped per comma-separated action so a NOT VALID on one
+    action never silences a validated CHECK on another action in the same
+    ALTER TABLE statement.
+    """
+    for action in split_actions(sql):
+        if ADD_CHECK.search(action) and not NOT_VALID.search(action):
+            return True
+    return False
+
+
 def lint_statement(sql):
     """Return the list of rule IDs violated by one cleaned statement."""
     found = []
@@ -216,7 +231,7 @@ def lint_statement(sql):
         found.append("adding-required-field")
     if CREATE_INDEX.search(sql) and not CONCURRENTLY.search(sql):
         found.append("creating-index")
-    if ADD_CHECK.search(sql) and not NOT_VALID.search(sql):
+    if has_check_constraint(sql):
         found.append("adding-check-constraint")
     if ALTER_TYPE.search(sql):
         found.append("changing-column-type")
@@ -273,14 +288,13 @@ def changed_paths(root, base_ref):
 def select_files(root, globs, excludes, base_ref):
     if base_ref is None:
         return discover_all(root, globs, excludes)
-    selected = []
-    for path in changed_paths(root, base_ref):
-        parts = PurePosixPath(path).parts
-        if not parts or parts[0] == ".." or ".." in parts:
-            continue
-        if matches_any(path, globs) and not matches_any(path, excludes):
-            selected.append(path)
-    return sorted(selected)
+    # Intersect full-mode glob expansion with the changed paths so diff mode
+    # and full mode agree on `**` semantics (Path.glob matches a root-level
+    # `migrations/` for `**/migrations/*.sql` while fnmatch needs a leading
+    # segment, and fnmatch `*` crosses `/` while glob does not).
+    candidates = set(discover_all(root, globs, excludes))
+    changed = set(changed_paths(root, base_ref))
+    return sorted(candidates & changed)
 
 
 def check(root, globs, excludes, base_ref):
