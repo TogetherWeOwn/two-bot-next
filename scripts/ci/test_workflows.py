@@ -1897,6 +1897,32 @@ class WorkflowTests(unittest.TestCase):
                         for service in job["services"].values():
                             self.assertNotIn("ports", service)
 
+    def test_nextest_lane_declares_bash_and_keeps_strict_artifacts(self):
+        # SDLC 2.3 CI speed pilot: the reusable lane runs in a job container
+        # whose default shell is sh, so a pipefail script without an explicit
+        # shell exits 2, no tests run, and the downstream parse/upload steps
+        # fail on the missing files and mask the root cause. Every run step
+        # declares bash, the parse names its upstream on a missing JUnit, and
+        # the artifact uploads keep failing when their files are absent.
+        job = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
+        run_steps = [step for step in job.get("steps", []) if "run" in step]
+        self.assertGreater(len(run_steps), 0)
+        for step in run_steps:
+            with self.subTest(step=step.get("name")):
+                self.assertEqual(step.get("shell"), "bash")
+        select = next(step for step in run_steps
+                      if str(step.get("name", "")).startswith("Select sccache backend"))
+        self.assertIn("pipefail", str(select.get("run", "")))
+        parse = next(step for step in run_steps
+                     if str(step.get("name", "")).startswith("Parse JUnit"))
+        self.assertIn("-f junit.xml", str(parse.get("run", "")))
+        uploads = [step for step in job.get("steps", [])
+                   if str(step.get("uses", "")).startswith("actions/upload-artifact@")]
+        self.assertGreater(len(uploads), 0)
+        for step in uploads:
+            with self.subTest(upload=step.get("name")):
+                self.assertEqual(step["with"]["if-no-files-found"], "error")
+
     def test_minimal_grants_and_no_persisted_checkout_credentials(self):
         for name, workflow in self.workflows.items():
             self.assertEqual(workflow["permissions"], {})

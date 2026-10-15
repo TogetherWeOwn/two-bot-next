@@ -49,6 +49,8 @@ jobs:
     # port collides on the shared self-hosted Docker host.
     container:
       image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+    # NOTE: job-container steps default to sh (no pipefail), so every run
+    # step below declares bash explicitly.
     env:
       CARGO_TERM_COLOR: always
       # Disk hygiene (same pins as the check lanes): smaller binaries, no
@@ -90,6 +92,7 @@ jobs:
           fetch-depth: 1
 
       - name: Job-container prerequisites (loopback forward to agent-testdb)
+        shell: bash
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           apt-get update -qq
@@ -114,6 +117,7 @@ jobs:
           R2_REGION: ${{ secrets.SCCACHE_REGION }}
           R2_KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
           R2_SECRET: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        shell: bash
         run: |
           set -euo pipefail
           if [ -n "$R2_BUCKET" ] && [ -n "$R2_ENDPOINT" ] && [ -n "$R2_KEY" ] && [ -n "$R2_SECRET" ]; then
@@ -143,9 +147,11 @@ jobs:
           save-if: false
 
       - name: Install pinned cargo-nextest
+        shell: bash
         run: cargo install cargo-nextest --version 0.9.99 --locked
 
       - name: Prepare isolated test databases
+        shell: bash
         run: |
           createdb -h agent-testdb -U agent_test two_bot_test_ci
           createdb -h agent-testdb -U agent_test two_next_backup_ci
@@ -158,16 +164,28 @@ jobs:
       - name: cargo nextest (unit and binary, retries=1, JUnit)
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        shell: bash
         run: |
           cargo nextest run --workspace --lib --bins --features two-bot-core/db --locked --profile ci
           test -f junit.xml
 
       - name: sccache stats (advisory speed evidence)
+        shell: bash
         run: sccache --show-stats
 
       - name: Parse JUnit into the flake ledger
         if: always()
-        run: python3 scripts/ci/flake_ledger.py --junit junit.xml --output flake-ledger.jsonl
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Consequence, not root: when nextest never ran there is no JUnit
+          # to parse. Fail with a pointer upstream instead of a raw
+          # traceback so triage lands on the originating step.
+          if [ ! -f junit.xml ]; then
+            echo "junit.xml not found: nextest produced no output; see the upstream step for the root failure." >&2
+            exit 1
+          fi
+          python3 scripts/ci/flake_ledger.py --junit junit.xml --output flake-ledger.jsonl
 
       - name: Upload JUnit evidence
         if: always()
