@@ -44,7 +44,8 @@ import time
 from urllib.request import Request
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import staging_rollout as base  # noqa: E402
+# Same E402-safe convention as the other scripts/ tools (see test header).
+import staging_rollout as base
 
 GateError = base.GateError
 require = base.require

@@ -503,7 +503,7 @@ class GuardBehaviourTests(unittest.TestCase):
     def test_green_main_sha_passes_and_reports(self):
         code, outputs, summary, calls, _ = self.guard()
         self.assertEqual(code, 0)
-        self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "image": "",
+        self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "restore_image": "",
                                    "takeover": "false", "allow_unstaged": "false"})
         self.assertIn("Takeover: not requested", summary)
         self.assertIn(SHA, summary)
@@ -566,7 +566,7 @@ class GuardBehaviourTests(unittest.TestCase):
         code, outputs, summary, _, _ = self.guard(rollback=VERSION.upper())
         self.assertEqual(code, 0)
         self.assertEqual(outputs, {"sha": SHA, "mode": "rollback", "version": VERSION,
-                                   "image": IMAGE, "takeover": "false",
+                                   "restore_image": IMAGE, "takeover": "false",
                                    "allow_unstaged": "false"})
         self.assertIn(VERSION, summary)
 
@@ -600,7 +600,7 @@ class GuardBehaviourTests(unittest.TestCase):
             takeover="true", allow_unstaged="true",
             staging={"total_count": 0, "workflow_runs": []})
         self.assertEqual(code, 0)
-        self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "image": "",
+        self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "restore_image": "",
                                    "takeover": "true", "allow_unstaged": "true"})
         self.assertIn("operator confirms the SHA is live", summary)
         self.assertFalse(any("deploy-staging" in path for path, _ in calls))
@@ -854,7 +854,7 @@ class GuardBehaviourTests(unittest.TestCase):
         environment = {**green()["environment"], "protection_rules": [{"type": "branch_policy"}]}
         code, outputs, summary, calls, _ = self.guard(auto="true", environment=environment)
         self.assertEqual(code, 0)
-        self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "image": "",
+        self.assertEqual(outputs, {"sha": SHA, "mode": "deploy", "version": "", "restore_image": "",
                                    "takeover": "false", "allow_unstaged": "false"})
         self.assertIn("Approval: automated", summary)
         self.assertIn("deploy-staging run `501`", summary)

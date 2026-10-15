@@ -13,8 +13,10 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import staging_rollout as base  # noqa: E402
-import worker_container_rollback as rollback  # noqa: E402
+# E402-safe by convention: every scripts/ test adds its own directory first,
+# then imports the sibling module under test (no linter runs on scripts/).
+import staging_rollout as base
+import worker_container_rollback as rollback
 
 ACCOUNT = "a" * 32
 WORKER = "two-bot-next-staging"
@@ -83,7 +85,9 @@ def ready_probe(version, revision=SHA, gateway="ready", health=200, status=200):
         body = json.dumps({"components": components(gateway), "jobs": {},
                            "build_revision": revision, "build_id": "1-1"}).encode()
         return status, {"x-two-worker-version": version}, body
-    health_handler = lambda: (health, {}, b"{}")  # noqa: E731
+    def health_handler():
+        return health, {}, b"{}"
+
     return handler, health_handler
 
 
