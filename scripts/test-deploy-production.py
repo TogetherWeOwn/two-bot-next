@@ -1130,10 +1130,29 @@ class ShellStepTests(unittest.TestCase):
                 "PATH": f"{bin_dir}:{os.environ['PATH']}", "RUNNER_TEMP": tmp,
                 "GITHUB_STEP_SUMMARY": str(summary), **env,
             }
-            result = subprocess.run(
-                ["bash", "--noprofile", "--norc", "-eo", "pipefail", str(step)],
-                cwd=cwd, env=run_env, capture_output=True, text=True, timeout=120,
-            )
+            # The workflow runs reviewed tooling from a second checkout at
+            # <workspace>/tooling (ref github.sha) while steps run in
+            # <workspace>/wrangler, so inline scripts address ../tooling/....
+            # Offline there is a single checkout; link it as ./tooling for the
+            # run so the same relative paths resolve to the reviewed scripts.
+            # (A staged link must live in the real checkout: kernels resolve
+            # `..` physically, so a linked cwd would escape a temp layout.)
+            tooling = ROOT / "tooling"
+            staged = False
+            if cwd == WRANGLER_DIR:
+                if tooling.is_symlink() and os.readlink(tooling) == str(ROOT):
+                    pass
+                elif not tooling.exists():
+                    tooling.symlink_to(ROOT, target_is_directory=True)
+                    staged = True
+            try:
+                result = subprocess.run(
+                    ["bash", "--noprofile", "--norc", "-eo", "pipefail", str(step)],
+                    cwd=cwd, env=run_env, capture_output=True, text=True, timeout=120,
+                )
+            finally:
+                if staged:
+                    tooling.unlink()
             return (result.returncode, summary.read_text() if summary.exists() else "",
                     result.stdout + result.stderr)
 

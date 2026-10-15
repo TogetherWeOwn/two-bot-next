@@ -775,9 +775,9 @@ jobs:
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.PRODUCTION_OWNERSHIP_CONTROL_TOKEN }}
         run: |
           set -euo pipefail
-          # No --expected-sha: the snapshot restores the previous serving
-          # build, whose /readyz reports the previous revision, not the
-          # failed SHA. Identity rests on the restored Worker version header.
+          # No pinned-revision flag here: the snapshot restores the previous
+          # serving build, whose /readyz reports the previous revision, not
+          # the failed SHA. Identity rests on the restored Worker version header.
           python3 ../tooling/scripts/worker_container_rollback.py rollback \
             --variant production \
             --worker-url "$PRODUCTION_WORKER_URL" \
