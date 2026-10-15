@@ -25,7 +25,7 @@ pub mod snapshots;
 pub mod store;
 pub mod web;
 
-pub use migrations::{migrate, MigrationError, MIGRATOR, TABLE_NAME};
+pub use migrations::{embedded_versions, migrate, MigrationError, MIGRATOR, TABLE_NAME};
 pub use pool::{
     connect_pool, connect_pool_with_tls, ping, ConnectError, Store, DB_POOL_MAX,
     STATEMENT_TIMEOUT_MS,

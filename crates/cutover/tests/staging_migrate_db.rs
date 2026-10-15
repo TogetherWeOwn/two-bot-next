@@ -261,16 +261,12 @@ impl Fixture {
             cmd.args(["--expected-store-pending", list]);
         }
         if let Some((hash, store_hash, run_id, manifest_path)) = plan_binding {
-            cmd.args([
-                "--plan-manifest-sha256",
-                hash,
-                "--store-plan-manifest-sha256",
-                store_hash,
-                "--plan-run-id",
-                run_id,
-                "--plan-manifest-path",
-                manifest_path,
-            ]);
+            let binding = format!(
+                "{{\"plan_run_id\": \"{run_id}\", \"plan_manifest_sha256\": \"{hash}\", \
+                 \"store_plan_manifest_sha256\": \"{store_hash}\"}}"
+            );
+            cmd.args(["--plan-binding", binding.as_str()]);
+            cmd.args(["--plan-manifest-path", manifest_path]);
         }
         // Each mode reads only its own binding: the runner refuses when the
         // mode's binding is absent, even when the other mode's URL is set.
@@ -674,6 +670,7 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &db,
             None,
             None,
+            None,
         )
         .await;
     assert_eq!(code, 2, "{err}");
@@ -847,7 +844,9 @@ async fn real_sqlx_runner_cases() -> TestResult {
         .await?;
     assert_eq!(ledger, 29, "plan must not change the ledger");
 
-    // A wrong pending list refuses before any DDL.
+    // A wrong pending list refuses before any DDL. The plan binding is the
+    // reviewed one, so the refusal proves the pending-list fence (not the
+    // binding fence) fired.
     let (code, _, err) = fx
         .run(
             "--apply",
@@ -855,7 +854,8 @@ async fn real_sqlx_runner_cases() -> TestResult {
             &host,
             &db,
             Some("201"),
-            None,
+            Some(&store_csv),
+            Some((&plan_hash, &store_hash, "424242", &plan_artifact)),
         )
         .await;
     assert_eq!(code, 2, "{err}");

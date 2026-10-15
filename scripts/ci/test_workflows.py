@@ -252,9 +252,7 @@ def staging_claim_errors(claim, name="staging-migrate.yml",
     pairs.extend([("RECOVERY_REF", "recovery_evidence_ref"),
                   ("ACL_REF", "acl_plan_ref"), ("EXPECTED_PENDING", "expected_pending"),
                   ("EXPECTED_STORE_PENDING", "expected_store_pending"),
-                  ("PLAN_MANIFEST_SHA256", "plan_manifest_sha256"),
-                  ("STORE_PLAN_MANIFEST_SHA256", "store_plan_manifest_sha256"),
-                  ("PLAN_RUN_ID", "plan_run_id")])
+                  ("PLAN_BINDING", "plan_binding")])
     expected_env = {key: "${{ inputs." + value + " }}" for key, value in pairs}
     if publish.get("env") != expected_env or publish.get("shell") != "bash":
         errors.append(f"{prefix} must pass exactly the dispatch fields via env, in bash")
@@ -322,12 +320,13 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
     if set(on) != {"workflow_dispatch"}:
         errors.append(f"{name}: must be dispatch-only (no push/pull_request/schedule)")
     inputs = ((on.get("workflow_dispatch") or {}).get("inputs") or {})
-    optional = {"mode", "expected_pending", "expected_store_pending",
-                "plan_manifest_sha256", "store_plan_manifest_sha256", "plan_run_id"}
+    # The three opaque provenance values (plan run id plus both projection
+    # hashes) travel as one JSON `plan_binding` object: `workflow_dispatch`
+    # allows at most ten inputs, and the human-read pending lists stay plain.
+    optional = {"mode", "expected_pending", "expected_store_pending", "plan_binding"}
     expected = {"mode", "source_sha", host_input, db_input,
                 "recovery_evidence_ref", "acl_plan_ref", "expected_pending",
-                "expected_store_pending", "plan_manifest_sha256",
-                "store_plan_manifest_sha256", "plan_run_id"}
+                "expected_store_pending", "plan_binding"}
     if branch_input is not None:
         expected.add(branch_input)
         optional.add(branch_input)
@@ -362,19 +361,18 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
                 or "ascending" not in str(store_pending.get("description")).lower()):
             errors.append(f"{name}: expected_store_pending must stay optional, default empty, "
                           "and documented as the ascending reviewed store plan list")
-        for key in ("plan_manifest_sha256", "store_plan_manifest_sha256", "plan_run_id"):
-            field = inputs.get(key) or {}
-            if str(field.get("required")).lower() != "false" or field.get("default") != "":
-                errors.append(f"{name}: {key} must stay optional and default empty "
-                              "(the runner requires it for apply, not the dispatch)")
-        digest = inputs.get("plan_manifest_sha256") or {}
-        if "sha" not in str(digest.get("description")).lower():
-            errors.append(f"{name}: plan_manifest_sha256 must document the manifest-hash contract "
-                          "(apply refuses unless it matches on the same source_sha)")
-        store_digest = inputs.get("store_plan_manifest_sha256") or {}
-        if "sha" not in str(store_digest.get("description")).lower():
-            errors.append(f"{name}: store_plan_manifest_sha256 must document the store "
-                          "manifest-hash contract (apply refuses unless it matches)")
+        binding = inputs.get("plan_binding") or {}
+        if str(binding.get("required")).lower() != "false" or binding.get("default") != "":
+            errors.append(f"{name}: plan_binding must stay optional and default empty "
+                          "(the runner requires it for apply, not the dispatch)")
+        description = str(binding.get("description")).lower()
+        for token in ("plan_run_id", "plan_manifest_sha256", "store_plan_manifest_sha256"):
+            if token not in description:
+                errors.append(f"{name}: plan_binding must document the {token} member "
+                              "of the reviewed-plan binding object")
+        if "ten inputs" not in description:
+            errors.append(f"{name}: plan_binding must document why the provenance "
+                          "values share one input (the dispatch input cap)")
         acl = inputs.get("acl_plan_ref") or {}
         if "bare" not in str(acl.get("description")).lower():
             errors.append(f"{name}: acl_plan_ref must document the bare reference contract "
@@ -460,14 +458,16 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
         errors.append(f"{name}:plan: must run the migrator with --plan only")
     if "--apply " not in apply_runs or "--plan " in apply_runs:
         errors.append(f"{name}:apply: must run the migrator with --apply only")
-    if "--plan-manifest-sha256" not in apply_runs or "--plan-run-id" not in apply_runs:
-        errors.append(f"{name}:apply: must pass the plan-bound manifest hash and run id to the runner")
-    if "--store-plan-manifest-sha256" not in apply_runs or "--expected-store-pending" not in apply_runs:
-        errors.append(f"{name}:apply: must pass the store plan-bound manifest hash and pending list to the runner")
-    if "--plan-manifest-sha256" in plan_runs or "--plan-run-id" in plan_runs:
+    if "--plan-binding" not in apply_runs:
+        errors.append(f"{name}:apply: must pass the plan_binding envelope to the runner")
+    if "--expected-store-pending" not in apply_runs:
+        errors.append(f"{name}:apply: must pass the store pending list to the runner")
+    if "--plan-manifest-sha256" in apply_runs or "--plan-run-id" in apply_runs \
+            or "--store-plan-manifest-sha256" in apply_runs:
+        errors.append(f"{name}:apply: must take the provenance values only through "
+                      "--plan-binding (one dispatch input, not three flags)")
+    if "--plan-binding" in plan_runs:
         errors.append(f"{name}:plan: must not take plan-bound inputs (it produces the manifest)")
-    if "--store-plan-manifest-sha256" in plan_runs:
-        errors.append(f"{name}:plan: must not take the store plan-bound hash (it produces the manifest)")
     if "--plan-manifest-path" not in apply_runs:
         errors.append(f"{name}:apply: must pass the producing run's downloaded manifest to the runner")
     if "--plan-manifest-path" in plan_runs:
@@ -490,8 +490,10 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
         fetch_with = fetch.get("with", {})
         if fetch_with.get("name") != manifest:
             errors.append(f"{name}:apply: must fetch the {manifest} artifact")
-        if "plan_run_id" not in str(fetch_with.get("run-id", "")):
-            errors.append(f"{name}:apply: must fetch the artifact from the plan_run_id run")
+        run_id = str(fetch_with.get("run-id", ""))
+        if "plan_binding" not in run_id or "plan_run_id" not in run_id:
+            errors.append(f"{name}:apply: must fetch the artifact from the bound plan run "
+                          "(the run id member of the plan_binding envelope)")
         if fetch.get("continue-on-error") is True:
             errors.append(f"{name}:apply: the provenance fetch must fail the job, never continue-on-error")
     plan_uses = [step.get("uses", "") for step in plan.get("steps", [])]
@@ -1460,14 +1462,14 @@ class WorkflowTests(unittest.TestCase):
         for trigger in ("push", "pull_request", "schedule", "workflow_call"):
             with self.subTest(trigger=trigger):
                 self.assertTrue(mutated(lambda w, t=trigger: w["on"].update({t: ""})))
-        for missing in ("acl_plan_ref", "plan_manifest_sha256", "plan_run_id"):
+        for missing in ("acl_plan_ref", "plan_binding", "expected_store_pending"):
             with self.subTest(missing=missing):
                 def drop(w, missing=missing):
                     del w["on"]["workflow_dispatch"]["inputs"][missing]
                 self.assertTrue(mutated(drop))
         with self.subTest(widened="plan-required"):
             def require(w):
-                w["on"]["workflow_dispatch"]["inputs"]["plan_manifest_sha256"]["required"] = True
+                w["on"]["workflow_dispatch"]["inputs"]["plan_binding"]["required"] = True
             self.assertTrue(mutated(require))
         with self.subTest(mode="apply-default"):
             def widen(w):
@@ -1555,27 +1557,29 @@ class WorkflowTests(unittest.TestCase):
                 w["jobs"]["plan"]["environment"] = "staging-migrate-apply"
                 w["jobs"]["apply"]["environment"] = "staging-migrate-plan"
             self.assertTrue(mutated(swap))
-        # The plan hash binds apply to the reviewed plan: dropping either
-        # runner flag from apply, or the plan manifest upload, must fail.
-        with self.subTest(apply="no-plan-hash-flag"):
-            def drop_hash(w):
+        # The plan binding envelope carries apply's bond to the reviewed plan:
+        # dropping the runner flag from apply, or pointing the provenance
+        # fetch at a literal run instead of the bound one, must fail.
+        with self.subTest(apply="no-plan-binding-flag"):
+            def drop_binding(w):
                 for step in w["jobs"]["apply"]["steps"]:
-                    if "--plan-manifest-sha256" in str(step.get("run", "")):
-                        step["run"] = step["run"].replace("--plan-manifest-sha256 \"$PLAN_MANIFEST_SHA256\" ", "")
-            self.assertTrue(mutated(drop_hash))
-        with self.subTest(apply="no-plan-run-flag"):
-            def drop_run(w):
+                    if "--plan-binding" in str(step.get("run", "")):
+                        step["run"] = step["run"].replace("--plan-binding \"$PLAN_BINDING\" \\\n", "")
+            self.assertTrue(mutated(drop_binding))
+        with self.subTest(apply="provenance-run-id-literal"):
+            def hardcode_run(w):
                 for step in w["jobs"]["apply"]["steps"]:
-                    if "--plan-run-id" in str(step.get("run", "")):
-                        step["run"] = step["run"].replace("--plan-run-id \"$PLAN_RUN_ID\" ", "")
-            self.assertTrue(mutated(drop_run))
+                    with_ = step.get("with", {})
+                    if "download-artifact" in str(step.get("uses", "")) and "run-id" in with_:
+                        with_["run-id"] = "37110947190"
+            self.assertTrue(mutated(hardcode_run))
         with self.subTest(plan="hash-flags"):
             def widen(w):
                 for step in w["jobs"]["plan"]["steps"]:
                     if "--expected-pending" in str(step.get("run", "")):
                         step["run"] = step["run"].replace(
                             "--expected-pending \"$EXPECTED_PENDING\"",
-                            "--expected-pending \"$EXPECTED_PENDING\" --plan-manifest-sha256 \"$PLAN_MANIFEST_SHA256\"")
+                            "--expected-pending \"$EXPECTED_PENDING\" --plan-binding \"$PLAN_BINDING\"")
             self.assertTrue(mutated(widen))
         with self.subTest(plan="no-manifest-upload"):
             def drop_upload(w):
@@ -1662,7 +1666,7 @@ class WorkflowTests(unittest.TestCase):
         for trigger in ("push", "pull_request", "schedule", "workflow_call"):
             with self.subTest(trigger=trigger):
                 self.assertTrue(mutated(lambda w, t=trigger: w["on"].update({t: ""})))
-        for missing in ("acl_plan_ref", "plan_manifest_sha256", "plan_run_id",
+        for missing in ("acl_plan_ref", "plan_binding", "expected_store_pending",
                         "production_host", "production_database"):
             with self.subTest(missing=missing):
                 def drop(w, missing=missing):
@@ -1741,12 +1745,12 @@ class WorkflowTests(unittest.TestCase):
                 w["jobs"]["plan"]["environment"] = "production-migrate-apply"
                 w["jobs"]["apply"]["environment"] = "production-migrate-plan"
             self.assertTrue(mutated(swap))
-        with self.subTest(apply="no-plan-hash-flag"):
-            def drop_hash(w):
+        with self.subTest(apply="no-plan-binding-flag"):
+            def drop_binding(w):
                 for step in w["jobs"]["apply"]["steps"]:
-                    if "--plan-manifest-sha256" in str(step.get("run", "")):
-                        step["run"] = step["run"].replace("--plan-manifest-sha256 \"$PLAN_MANIFEST_SHA256\" ", "")
-            self.assertTrue(mutated(drop_hash))
+                    if "--plan-binding" in str(step.get("run", "")):
+                        step["run"] = step["run"].replace("--plan-binding \"$PLAN_BINDING\" \\\n", "")
+            self.assertTrue(mutated(drop_binding))
         with self.subTest(apply="no-provenance-fetch"):
             def drop_fetch(w):
                 w["jobs"]["apply"]["steps"] = [

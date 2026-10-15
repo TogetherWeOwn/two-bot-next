@@ -740,8 +740,8 @@ staging-migrate --target staging --plan --source-sha <40hex> --staging-host <hos
   [--expected-pending <ascending,comma-separated versions>]
 staging-migrate --target staging --apply <same flags> --expected-pending <list> \
   --expected-store-pending <store list> \
-  --plan-manifest-sha256 <64hex> --store-plan-manifest-sha256 <64hex> \
-  --plan-run-id <run id> \
+  --plan-binding '{"plan_run_id": "<run id>", "plan_manifest_sha256": "<64hex>", \
+    "store_plan_manifest_sha256": "<64hex>"}' \
   --plan-manifest-path <producing run's downloaded manifest>
 ```
 
@@ -760,11 +760,15 @@ prints that list in the manifest (`pending_before`) and changes nothing.
 `--apply` requires `--expected-pending` (the workflow input of the same name)
 and refuses before any DDL unless it equals the computed pending list exactly,
 so apply can only run the pending set a reviewed plan already showed. `--apply`
-additionally requires `--plan-manifest-sha256` and `--plan-run-id`: the SHA-256
-of the reviewed plan run's uploaded `staging-migrate-manifest.json` and the run
-that produced it, plus `--plan-manifest-path`: the producing run's
+additionally requires `--plan-binding`: one JSON object carrying the SHA-256
+of the reviewed plan run's uploaded `staging-migrate-manifest.json`
+(`plan_manifest_sha256`), the same manifest's store projection
+(`store_plan_manifest_sha256`) and the run that produced it (`plan_run_id`),
+plus `--plan-manifest-path`: the producing run's
 downloaded `staging-migrate-manifest.json`, which the workflow fetches back
-from the `plan_run_id` run before the runner starts. The runner recomputes
+from the bound run id before the runner starts. The three provenance values
+share one dispatch input because `workflow_dispatch` allows at most ten inputs.
+The runner recomputes
 the hash over its own source SHA, pending list and full source migration
 table (so same-pending-different-SQL replays refuse) and refuses on any
 mismatch, binding apply to the exact manifest the reviewed plan produced on
@@ -804,8 +808,8 @@ binding username's branch suffix does not match the pinned branch, the login
 cannot assume `two_bot_migrator` (apply) or `two_bot_migrator_ro` (plan), the
 plan login also holds `two_bot_migrator`, a reference is missing, `--apply` has no
 `--expected-pending` / `--expected-store-pending` or either mismatches,
-`--apply` has no `plan_manifest_sha256` / `store_plan_manifest_sha256` /
-`plan_run_id` or either hash does not match the recomputed manifest, `--apply`
+`--apply` has no well-formed `--plan-binding` or either hash does not match
+the recomputed manifest, `--apply`
 has no producing-run manifest or that manifest does not carry the bound hashes,
 or either ledger has a failed/incomplete
 row, a SHA-384 mismatch or a version unknown to the source. The database name needs no `staging`
@@ -821,7 +825,8 @@ The `plan` job always runs and reads the binding from the `staging-migrate-plan`
 GitHub environment, which carries no reviewer because planning changes nothing;
 it uploads `staging-migrate-manifest.json` as the `staging-migrate-manifest`
 run artifact (14-day retention), which is where the reviewer reads
-`plan_manifest_sha256`/`plan_run_id` for the apply dispatch. The digest is the
+the `plan_binding` members (`plan_run_id` plus both projection hashes) for the
+apply dispatch. The digest is the
 embedded source/pending/migration projection, **not** SHA-256 of the JSON or ZIP.
 For `mode: apply`, the unprotected `claim` job validates this dispatch's read-only
 plan against the request and uploads `staging-migrate-apply-claim.json` as the
@@ -921,8 +926,8 @@ staging-migrate --target production --plan --source-sha <40hex> \
   [--expected-pending <ascending,comma-separated versions>]
 staging-migrate --target production --apply <same flags> --expected-pending <list> \
   --expected-store-pending <store list> \
-  --plan-manifest-sha256 <64hex> --store-plan-manifest-sha256 <64hex> \
-  --plan-run-id <run id> \
+  --plan-binding '{"plan_run_id": "<run id>", "plan_manifest_sha256": "<64hex>", \
+    "store_plan_manifest_sha256": "<64hex>"}' \
   --plan-manifest-path <producing run's downloaded manifest>
 ```
 

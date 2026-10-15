@@ -19,7 +19,6 @@ ENV = {
     "GITHUB_RUN_ID": "37110947191",
     "GITHUB_RUN_ATTEMPT": "2",
     "MODE": "apply",
-    "PLAN_RUN_ID": "37110947190",
     "SOURCE_SHA": "a" * 40,
     "PRODUCTION_HOST": "prod-host.invalid",
     "PRODUCTION_DATABASE": "two_bot",
@@ -27,6 +26,15 @@ ENV = {
     "ACL_REF": "acl-review#decision",
     "EXPECTED_PENDING": "1,9007199254740993",
 }
+
+
+def _binding(plan, **overrides):
+    """The `PLAN_BINDING` dispatch envelope for a plan manifest."""
+    base = {"plan_run_id": "37110947190",
+            "plan_manifest_sha256": plan["plan_manifest_sha256"],
+            "store_plan_manifest_sha256": plan["store_plan_manifest_sha256"]}
+    base.update(overrides)
+    return json.dumps(base)
 
 
 def production_plan():
@@ -42,9 +50,8 @@ def production_plan():
 class ProductionClaimTests(unittest.TestCase):
     def setUp(self):
         self.plan = production_plan()
-        self.env = {**ENV, "PLAN_MANIFEST_SHA256": self.plan["plan_manifest_sha256"],
-                    "STORE_PLAN_MANIFEST_SHA256": self.plan["store_plan_manifest_sha256"],
-                    "EXPECTED_STORE_PENDING": "400,9007199254740992"}
+        self.env = {**ENV, "EXPECTED_STORE_PENDING": "400,9007199254740992",
+                    "PLAN_BINDING": _binding(self.plan)}
 
     def test_builds_production_claim(self):
         claim = build_claim(self.plan, self.env)
@@ -61,7 +68,8 @@ class ProductionClaimTests(unittest.TestCase):
         with self.assertRaises(Refused):
             build_claim(self.plan, {**self.env, "EXPECTED_STORE_PENDING": "400"})
         with self.assertRaises(Refused):
-            build_claim(self.plan, {**self.env, "STORE_PLAN_MANIFEST_SHA256": "c" * 64})
+            build_claim(self.plan, {**self.env, "PLAN_BINDING":
+                _binding(self.plan, store_plan_manifest_sha256="c" * 64)})
 
     def test_refuses_staging_manifest(self):
         staging = json.loads(PLAN.read_text())
@@ -69,8 +77,7 @@ class ProductionClaimTests(unittest.TestCase):
             {**staging, "migration_target": "staging"})
         staging["migration_target"] = "staging"
         with self.assertRaises(Refused):
-            build_claim(staging, {**self.env,
-                                  "PLAN_MANIFEST_SHA256": staging["plan_manifest_sha256"]})
+            build_claim(staging, {**self.env, "PLAN_BINDING": _binding(staging)})
         # A manifest with no target marker at all is not a production plan.
         unmarked = json.loads(PLAN.read_text())
         with self.assertRaises(Refused):
@@ -85,7 +92,7 @@ class ProductionClaimTests(unittest.TestCase):
                 plan["target"]["host"] = host
                 plan["plan_manifest_sha256"] = projection_hash(plan)
                 env = {**self.env, "PRODUCTION_HOST": host,
-                       "PLAN_MANIFEST_SHA256": plan["plan_manifest_sha256"]}
+                       "PLAN_BINDING": _binding(plan)}
                 with self.assertRaises(Refused):
                     build_claim(plan, env)
 
@@ -98,8 +105,7 @@ class ProductionClaimTests(unittest.TestCase):
                 plan["target"]["branch_id"] = branch_id
                 plan["plan_manifest_sha256"] = projection_hash(plan)
                 with self.assertRaises(Refused):
-                    build_claim(plan, {**self.env,
-                                       "PLAN_MANIFEST_SHA256": plan["plan_manifest_sha256"]})
+                    build_claim(plan, {**self.env, "PLAN_BINDING": _binding(plan)})
 
     def test_refuses_wrong_workflow_identity(self):
         with self.assertRaises(Refused):

@@ -8,8 +8,8 @@
 //!   --recovery-evidence-ref <ref> --acl-plan-ref <ref>
 //!   [--expected-pending <ascending,comma-separated versions>]
 //!   [--expected-store-pending <ascending,comma-separated store versions>]
-//!   [--plan-manifest-sha256 <64hex> --store-plan-manifest-sha256 <64hex>
-//!    --plan-run-id <run id>
+//!   [--plan-binding <JSON: {"plan_run_id","plan_manifest_sha256",
+//!    "store_plan_manifest_sha256"}>
 //!    --plan-manifest-path <producing run's downloaded manifest>]
 //! ```
 //!
@@ -23,12 +23,15 @@
 //! reads TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL. --apply refuses before any DDL
 //! unless --expected-pending equals the computed cutover pending list exactly,
 //! --expected-store-pending equals the computed store pending list exactly,
-//! --plan-manifest-sha256 equals the SHA-256 of the plan job's uploaded manifest
-//! for the same source SHA, --store-plan-manifest-sha256 equals the same
-//! manifest's store projection, and the downloaded manifest at --plan-manifest-path
-//! (fetched by the workflow from the --plan-run-id run) carries both hashes,
-//! proving the bound hashes came from the named producing run; --plan prints that
-//! manifest (including both hashes) and ignores the plan-binding flags.
+//! and --plan-binding carries the SHA-256 of the plan job's uploaded manifest
+//! for the same source SHA (`plan_manifest_sha256`), the same manifest's store
+//! projection (`store_plan_manifest_sha256`) and the run that produced it
+//! (`plan_run_id`). The downloaded manifest at --plan-manifest-path (fetched
+//! by the workflow from the bound run id before the runner starts) must carry
+//! both hashes, proving the bound hashes came from the named producing run;
+//! --plan prints that manifest (including both hashes) and ignores the
+//! plan-binding flags. The three provenance values travel as one JSON object
+//! because GitHub caps `workflow_dispatch` at ten inputs.
 //!
 //! `--staging-branch-id` pins the PlanetScale branch id (non-secret, staging
 //! target only): it is required for `*.psdb.cloud` hosts and must match the
@@ -42,7 +45,8 @@
 #![allow(clippy::print_stdout)]
 
 use two_bot_cutover::staging_migrate::{
-    run, Request, RunError, Target, PLAN_URL_ENV, PROD_PLAN_URL_ENV, PROD_URL_ENV, URL_ENV,
+    parse_plan_binding, run, Request, RunError, Target, PLAN_URL_ENV, PROD_PLAN_URL_ENV,
+    PROD_URL_ENV, URL_ENV,
 };
 
 fn main() {
@@ -69,9 +73,7 @@ fn real_main() -> i32 {
             | "--acl-plan-ref"
             | "--expected-pending"
             | "--expected-store-pending"
-            | "--plan-manifest-sha256"
-            | "--store-plan-manifest-sha256"
-            | "--plan-run-id"
+            | "--plan-binding"
             | "--plan-manifest-path" => match it.next() {
                 Some(v) => {
                     values.insert(arg.clone(), v.clone());
@@ -132,6 +134,17 @@ fn real_main() -> i32 {
         (Target::Production, true) => PROD_URL_ENV,
         (Target::Production, false) => PROD_PLAN_URL_ENV,
     };
+    // The three provenance values travel as one JSON dispatch input (GitHub
+    // caps `workflow_dispatch` at ten inputs). A malformed binding refuses here,
+    // before any connection; value formats are re-checked by the runner.
+    let plan_binding = match values.get("--plan-binding") {
+        None => None,
+        Some(raw) => match parse_plan_binding(raw) {
+            Ok(binding) => Some(binding),
+            Err(RunError::Refused(message)) => return refused(&message),
+            Err(other) => return refused(&other.to_string()),
+        },
+    };
     let req = Request {
         url: std::env::var(binding).ok(),
         target,
@@ -144,9 +157,13 @@ fn real_main() -> i32 {
         apply,
         expected_pending: values.get("--expected-pending").cloned(),
         expected_store_pending: values.get("--expected-store-pending").cloned(),
-        plan_manifest_sha256: values.get("--plan-manifest-sha256").cloned(),
-        store_plan_manifest_sha256: values.get("--store-plan-manifest-sha256").cloned(),
-        plan_run_id: values.get("--plan-run-id").cloned(),
+        plan_manifest_sha256: plan_binding
+            .as_ref()
+            .map(|binding| binding.plan_manifest_sha256.clone()),
+        store_plan_manifest_sha256: plan_binding
+            .as_ref()
+            .map(|binding| binding.store_plan_manifest_sha256.clone()),
+        plan_run_id: plan_binding.map(|binding| binding.plan_run_id),
         plan_manifest_path: values.get("--plan-manifest-path").cloned(),
     };
     let runtime = match tokio::runtime::Builder::new_current_thread()

@@ -104,6 +104,28 @@ def store_projection_hash(manifest):
     return hashlib.sha256("".join(rows).encode()).hexdigest()
 
 
+def plan_binding(env):
+    """Parse the `PLAN_BINDING` dispatch envelope into its three provenance values.
+
+    GitHub caps `workflow_dispatch` at ten inputs, so the reviewed plan run id
+    and both projection hashes travel as one JSON object instead of three
+    inputs. Shape errors refuse with a fixed message that never echoes the
+    rejected input; value formats are checked by the caller, exactly as when
+    the three values arrived as separate inputs.
+    """
+    try:
+        binding = json.loads(env.get("PLAN_BINDING", ""))
+    except (json.JSONDecodeError, UnicodeError, TypeError):
+        raise Refused("plan binding is invalid") from None
+    require(isinstance(binding, dict), "plan binding is invalid")
+    values = {}
+    for key in ("plan_run_id", "plan_manifest_sha256", "store_plan_manifest_sha256"):
+        value = binding.get(key)
+        require(isinstance(value, str), "plan binding is invalid")
+        values[key] = value
+    return values
+
+
 def build_claim(manifest, env):
     require(isinstance(manifest, dict), "plan manifest is invalid")
     require(env.get("GITHUB_REPOSITORY") == REPOSITORY, "repository is outside scope")
@@ -114,9 +136,11 @@ def build_claim(manifest, env):
     require(env.get("GITHUB_WORKFLOW_REF") == f"{REPOSITORY}/{WORKFLOW_PATH}@refs/heads/main",
             "workflow identity is invalid")
     require(env.get("MODE") == "apply", "claim is apply-only")
-    for key in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "PLAN_RUN_ID"):
+    for key in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"):
         require(DECIMAL.fullmatch(env.get(key, "")), "run identity is invalid")
-    require(env["PLAN_RUN_ID"] != env["GITHUB_RUN_ID"], "plan producer must be a different run")
+    binding = plan_binding(env)
+    require(DECIMAL.fullmatch(binding["plan_run_id"]), "run identity is invalid")
+    require(binding["plan_run_id"] != env["GITHUB_RUN_ID"], "plan producer must be a different run")
     require(manifest.get("mode") == "plan", "manifest must be read-only plan mode")
     require(type(manifest.get("runner_version")) is int and manifest["runner_version"] == 1,
             "manifest runner version is unsupported")
@@ -135,11 +159,11 @@ def build_claim(manifest, env):
             and isinstance(manifest.get("ledger_store_before"), list)
             and manifest["ledger_store_before"] == manifest.get("ledger_store_after"),
             "manifest is not an unchanged read-only plan")
-    digest = env.get("PLAN_MANIFEST_SHA256", "")
+    digest = binding["plan_manifest_sha256"]
     require(SHA256.fullmatch(digest), "claimed projection hash is invalid")
     require(projection_hash(manifest) == manifest.get("plan_manifest_sha256") == digest,
             "plan projection hash does not match the request")
-    store_digest = env.get("STORE_PLAN_MANIFEST_SHA256", "")
+    store_digest = binding["store_plan_manifest_sha256"]
     require(SHA256.fullmatch(store_digest), "claimed store projection hash is invalid")
     require(store_projection_hash(manifest)
             == manifest.get("store_plan_manifest_sha256") == store_digest,
@@ -202,7 +226,7 @@ def build_claim(manifest, env):
         "apply_run_id": env["GITHUB_RUN_ID"],
         "apply_run_attempt": env["GITHUB_RUN_ATTEMPT"],
         "workflow_head_sha": head,
-        "plan_run_id": env["PLAN_RUN_ID"],
+        "plan_run_id": binding["plan_run_id"],
         "plan_manifest_sha256": digest,
         "store_plan_manifest_sha256": store_digest,
         "source_sha": env["SOURCE_SHA"],

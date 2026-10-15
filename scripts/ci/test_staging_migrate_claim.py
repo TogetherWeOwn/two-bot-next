@@ -17,6 +17,22 @@ ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "crates/cutover/tests/fixtures"
 PLAN = FIXTURES / "staging-migrate-plan.json"
 CLAIM = FIXTURES / "staging-migrate-apply-claim.json"
+# The three provenance values travel as one JSON dispatch object (GitHub caps
+# `workflow_dispatch` at ten inputs); the claim output keeps them as separate
+# fields, so the fixture claim is unchanged.
+BINDING = {
+    "plan_run_id": "37110947190",
+    "plan_manifest_sha256": "e4a3136346ca546df4f1f4f654322c278ff7df1d5902ec5685cd43036b41beea",
+    "store_plan_manifest_sha256": "37b4068df78c6e975a6fca576f109260be97c4aa5defa316380be3c0f5c4f593",
+}
+
+
+def _binding(**overrides):
+    base = dict(BINDING)
+    base.update(overrides)
+    return json.dumps(base)
+
+
 ENV = {
     "GITHUB_REPOSITORY": "TogetherWeOwn/two-bot-next",
     "GITHUB_EVENT_NAME": "workflow_dispatch",
@@ -26,9 +42,7 @@ ENV = {
     "GITHUB_RUN_ID": "37110947191",
     "GITHUB_RUN_ATTEMPT": "2",
     "MODE": "apply",
-    "PLAN_RUN_ID": "37110947190",
-    "PLAN_MANIFEST_SHA256": "e4a3136346ca546df4f1f4f654322c278ff7df1d5902ec5685cd43036b41beea",
-    "STORE_PLAN_MANIFEST_SHA256": "37b4068df78c6e975a6fca576f109260be97c4aa5defa316380be3c0f5c4f593",
+    "PLAN_BINDING": json.dumps(BINDING),
     "SOURCE_SHA": "a" * 40,
     "STAGING_HOST": "staging.invalid",
     "STAGING_DATABASE": "two_bot",
@@ -58,12 +72,12 @@ class ClaimTests(unittest.TestCase):
         self.assertEqual(expected["plan_run_id"], "37110947190")
         self.assertEqual(expected["expected_pending"], ["1", "9007199254740993"])
         self.assertEqual(expected["expected_store_pending"], ["400", "9007199254740992"])
-        self.assertEqual(expected["store_plan_manifest_sha256"], ENV["STORE_PLAN_MANIFEST_SHA256"])
+        self.assertEqual(expected["store_plan_manifest_sha256"], BINDING["store_plan_manifest_sha256"])
         self.assertNotEqual(expected["workflow_head_sha"], expected["source_sha"])
 
     def test_digest_is_exact_rust_projection_not_document_or_zip_bytes(self):
         digest = projection_hash(self.plan)
-        self.assertEqual(digest, ENV["PLAN_MANIFEST_SHA256"])
+        self.assertEqual(digest, BINDING["plan_manifest_sha256"])
         self.assertNotEqual(digest, hashlib.sha256(PLAN.read_bytes()).hexdigest())
         reformatted = json.loads(json.dumps(self.plan, separators=(",", ":")))
         self.assertEqual(projection_hash(reformatted), digest)
@@ -83,8 +97,8 @@ class ClaimTests(unittest.TestCase):
 
     def test_store_digest_is_its_own_exact_projection(self):
         digest = store_projection_hash(self.plan)
-        self.assertEqual(digest, ENV["STORE_PLAN_MANIFEST_SHA256"])
-        self.assertNotEqual(digest, ENV["PLAN_MANIFEST_SHA256"])
+        self.assertEqual(digest, BINDING["store_plan_manifest_sha256"])
+        self.assertNotEqual(digest, BINDING["plan_manifest_sha256"])
         reformatted = json.loads(json.dumps(self.plan, separators=(",", ":")))
         self.assertEqual(store_projection_hash(reformatted), digest)
         for mutation in (lambda p: p["source_store_migrations"][0].update(description="changed"),
@@ -98,16 +112,26 @@ class ClaimTests(unittest.TestCase):
         plan = deepcopy(self.plan)
         plan["source_migrations"][0]["description"] = "cutover changed"
         self.assertEqual(store_projection_hash(plan), digest)
-        self.assertNotEqual(projection_hash(plan), ENV["PLAN_MANIFEST_SHA256"])
+        self.assertNotEqual(projection_hash(plan), BINDING["plan_manifest_sha256"])
 
     def test_wrong_producer_context_or_binding_refuses(self):
         for key, bad in (("GITHUB_REPOSITORY", "other/repo"), ("GITHUB_EVENT_NAME", "pull_request"),
                          ("GITHUB_REF", "refs/heads/topic"), ("GITHUB_WORKFLOW_REF", "other/workflow"),
                          ("GITHUB_SHA", "short"), ("MODE", "plan"), ("GITHUB_RUN_ID", ""),
-                         ("GITHUB_RUN_ATTEMPT", "0"), ("PLAN_RUN_ID", "37110947190x"),
-                         ("PLAN_RUN_ID", "0"), ("PLAN_RUN_ID", "1" * 21),
-                         ("PLAN_RUN_ID", ENV["GITHUB_RUN_ID"]),
-                         ("PLAN_MANIFEST_SHA256", "c" * 64), ("SOURCE_SHA", "c" * 40),
+                         ("GITHUB_RUN_ATTEMPT", "0"),
+                         ("PLAN_BINDING", "not json"), ("PLAN_BINDING", ""),
+                         ("PLAN_BINDING", "[]"), ("PLAN_BINDING", "{}"),
+                         ("PLAN_BINDING", json.dumps({"plan_manifest_sha256": BINDING["plan_manifest_sha256"],
+                                                     "store_plan_manifest_sha256": BINDING["store_plan_manifest_sha256"]})),
+                         ("PLAN_BINDING", _binding(plan_run_id=37110947190)),
+                         ("PLAN_BINDING", _binding(plan_run_id=None)),
+                         ("PLAN_BINDING", _binding(plan_run_id="37110947190x")),
+                         ("PLAN_BINDING", _binding(plan_run_id="0")),
+                         ("PLAN_BINDING", _binding(plan_run_id="1" * 21)),
+                         ("PLAN_BINDING", _binding(plan_run_id=ENV["GITHUB_RUN_ID"])),
+                         ("PLAN_BINDING", _binding(plan_manifest_sha256="c" * 64)),
+                         ("PLAN_BINDING", _binding(store_plan_manifest_sha256="c" * 64)),
+                         ("SOURCE_SHA", "c" * 40),
                          ("STAGING_HOST", "elsewhere.invalid"), ("STAGING_DATABASE", "other_db"),
                          ("STAGING_BRANCH_ID", "otherbranch"),
                          ("RECOVERY_REF", "other-review"), ("ACL_REF", "other-review"),
@@ -117,7 +141,6 @@ class ClaimTests(unittest.TestCase):
                          ("EXPECTED_PENDING", "0,9007199254740993"), ("EXPECTED_PENDING", "-1,9007199254740993"),
                          ("EXPECTED_PENDING", "1,9223372036854775808"),
                          ("EXPECTED_PENDING", "1,9_007_199_254_740_993"),
-                         ("STORE_PLAN_MANIFEST_SHA256", "c" * 64),
                          ("EXPECTED_STORE_PENDING", "400"),
                          ("EXPECTED_STORE_PENDING", "400,401"),
                          ("EXPECTED_STORE_PENDING", "400,9007199254740992,400"),
@@ -253,13 +276,13 @@ class ClaimTests(unittest.TestCase):
         plan = deepcopy(self.plan)
         plan["pending_before"] = []
         plan["plan_manifest_sha256"] = projection_hash(plan)
-        env = {**ENV, "PLAN_MANIFEST_SHA256": plan["plan_manifest_sha256"],
-               "PLAN_RUN_ID": "18446744073709551615"}
+        env = {**ENV, "PLAN_BINDING": _binding(plan_manifest_sha256=plan["plan_manifest_sha256"],
+                                               plan_run_id="18446744073709551615")}
         for raw in ("", "  ", "\t\n"):
             with self.subTest(raw=raw):
                 claim = build_claim(plan, {**env, "EXPECTED_PENDING": raw})
                 self.assertEqual(claim["expected_pending"], [])
-                self.assertEqual(claim["plan_run_id"], env["PLAN_RUN_ID"])
+                self.assertEqual(claim["plan_run_id"], "18446744073709551615")
 
     def test_producer_files_roundtrip_as_stored_zip_entries(self):
         for path in (PLAN, CLAIM):
@@ -270,7 +293,8 @@ class ClaimTests(unittest.TestCase):
                 self.assertEqual(reader.getinfo(path.name).compress_type, zipfile.ZIP_STORED)
                 self.assertEqual(reader.read(path.name), path.read_bytes())
             # ZIP digest is not the request's embedded projection digest either.
-            self.assertNotEqual(hashlib.sha256(archive.getvalue()).hexdigest(), ENV["PLAN_MANIFEST_SHA256"])
+            self.assertNotEqual(hashlib.sha256(archive.getvalue()).hexdigest(),
+                                BINDING["plan_manifest_sha256"])
 
 
 class ClaimWorkflowTests(unittest.TestCase):
@@ -294,7 +318,7 @@ class ClaimWorkflowTests(unittest.TestCase):
             lambda w: w["jobs"]["claim"]["steps"][0]["with"].update(ref="${{ inputs.source_sha }}"),
             lambda w: w["jobs"]["claim"]["steps"][1]["with"].update({"run-id": "arbitrary"}),
             lambda w: w["jobs"]["claim"]["steps"][2]["env"].update(SECRET="${{ secrets.DATABASE_URL }}"),
-            lambda w: w["jobs"]["claim"]["steps"][2]["env"].update(PLAN_RUN_ID="0"),
+            lambda w: w["jobs"]["claim"]["steps"][2]["env"].update(PLAN_BINDING=_binding(plan_run_id="0")),
             lambda w: w["jobs"]["claim"]["steps"][2].update({"continue-on-error": "true"}),
             lambda w: w["jobs"]["claim"]["steps"][3].update({"if": "always()"}),
             lambda w: w["jobs"]["claim"]["steps"][3]["with"].update({"compression-level": "6"}),

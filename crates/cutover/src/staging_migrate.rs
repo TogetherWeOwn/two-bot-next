@@ -350,6 +350,46 @@ pub fn manifest_hash(source_sha: &str, pending: &[i64], migrator: &Migrator) -> 
     hex::encode(Sha256::digest(projection.as_bytes()))
 }
 
+/// Parsed `plan_binding` dispatch input: apply's binding to the reviewed plan
+/// run. GitHub caps `workflow_dispatch` at ten inputs, so the three opaque
+/// provenance values travel as one JSON object instead of three inputs; the
+/// human-read pending lists stay plain inputs. Shape errors refuse with a
+/// fixed message that never echoes the rejected input; value formats (decimal
+/// run id, 64-hex digests) are checked later by `validate_request`, exactly as
+/// when the three values arrived as separate inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanBinding {
+    /// Decimal id of the reviewed plan dispatch whose manifest apply binds to.
+    pub plan_run_id: String,
+    /// Cutover projection digest the producing run embedded in its manifest.
+    pub plan_manifest_sha256: String,
+    /// Store-chain projection digest from that same manifest.
+    pub store_plan_manifest_sha256: String,
+}
+
+/// Parse the `plan_binding` dispatch envelope into its three provenance values.
+///
+/// Shape errors refuse; value formats are checked later by `validate_request`.
+pub fn parse_plan_binding(raw: &str) -> Result<PlanBinding, RunError> {
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|_| RunError::Refused("plan binding is invalid".into()))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| RunError::Refused("plan binding is invalid".into()))?;
+    let string_field = |name: &str| {
+        object
+            .get(name)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| RunError::Refused("plan binding is invalid".into()))
+    };
+    Ok(PlanBinding {
+        plan_run_id: string_field("plan_run_id")?,
+        plan_manifest_sha256: string_field("plan_manifest_sha256")?,
+        store_plan_manifest_sha256: string_field("store_plan_manifest_sha256")?,
+    })
+}
+
 /// Plan-bound apply identity, checked before any DDL.
 ///
 /// Returns the computed manifest hash. For apply, the request's
@@ -1924,6 +1964,42 @@ mod tests {
     }
 
     #[test]
+    fn plan_binding_json_parses_the_three_provenance_values() {
+        let binding = parse_plan_binding(
+            r#"{"plan_run_id": "424242", "plan_manifest_sha256": "a", "store_plan_manifest_sha256": "b"}"#,
+        )
+        .expect("valid plan binding parses");
+        assert_eq!(
+            binding,
+            PlanBinding {
+                plan_run_id: "424242".to_owned(),
+                plan_manifest_sha256: "a".to_owned(),
+                store_plan_manifest_sha256: "b".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn plan_binding_json_refuses_without_echoing_the_input() {
+        for raw in [
+            "",
+            "not json",
+            "[]",
+            "{}",
+            r#"{"plan_run_id": "424242"}"#,
+            r#"{"plan_run_id": 424242, "plan_manifest_sha256": "a", "store_plan_manifest_sha256": "b"}"#,
+            r#"{"plan_run_id": null, "plan_manifest_sha256": "a", "store_plan_manifest_sha256": "b"}"#,
+        ] {
+            let error = parse_plan_binding(raw).unwrap_err().to_string();
+            assert_eq!(error, "refused: plan binding is invalid", "{raw}");
+            assert!(
+                !error.contains(raw) || raw.is_empty(),
+                "refusal echoes the input"
+            );
+        }
+    }
+
+    #[test]
     fn plan_binding_refuses_a_mismatched_hash() {
         let sha = "a".repeat(40);
         let pending = pending_versions();
@@ -2943,7 +3019,9 @@ mod tests {
                 acl_plan_ref: "TOG-2#doc".to_owned(),
                 apply: false,
                 expected_pending: None,
+                expected_store_pending: None,
                 plan_manifest_sha256: None,
+                store_plan_manifest_sha256: None,
                 plan_run_id: None,
                 plan_manifest_path: None,
             };
