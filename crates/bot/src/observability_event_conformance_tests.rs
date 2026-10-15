@@ -170,8 +170,9 @@ const STARTUP_ERROR_CLASSES: [&str; 8] = [
 
 // `crates/bot/src/main.rs`: boot/startup diagnostics owned by
 // `docs/startup-diagnostics.md`.
-const MAIN_RS_ADJACENT: [&str; 13] = [
+const MAIN_RS_ADJACENT: [&str; 14] = [
     "internal-action startup refused",
+    "eventsub startup refused",
     "config invalid; continuing with safe defaults",
     "container listener failed",
     "DISCORD_GATEWAY_URL must be valid UTF-8",
@@ -487,4 +488,89 @@ fn voice_event_values_are_bounded_by_the_catalog() {
         sorted_unique(VOICE_EVENT_VALUES.to_vec()),
         "new voice_event value fails closed: record it in docs/observability-event-catalog.md and VOICE_EVENT_VALUES"
     );
+}
+
+/// `crates/bot/src/eventsub_http.rs`: the Twitch EventSub receiver messages,
+/// in file order. The receiver file is not one of the six `SCOPED_SOURCES`
+/// (it lands with the receiver slice, after this pin), so it is read from
+/// disk at test time instead of via `include_str!`: a missing file must fail
+/// this one test, not break compilation of the whole suite. Once the file
+/// is permanent, fold it into `SCOPED_SOURCES` and drop the disk read.
+const EVENTSUB_RS_EVENTS: [&str; 5] = [
+    "eventsub delivery refused",
+    "challenge answered",
+    "notification acknowledged",
+    "revocation acknowledged",
+    "delivery ignored",
+];
+
+/// The receiver's startup diagnostic in `main.rs` (also in
+/// `MAIN_RS_ADJACENT` for the scanned-source pin above).
+const EVENTSUB_STARTUP_EVENT: &str = "eventsub startup refused";
+
+/// Bounded `event` field value every receiver emission carries.
+const EVENTSUB_EVENT_FIELD: &str = "eventsub_receiver";
+
+fn eventsub_receiver_source() -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/eventsub_http.rs");
+    std::fs::read_to_string(&path).unwrap_or_else(|err| {
+        panic!(
+            "eventsub receiver source unreadable at {} ({err}); \
+             the receiver slice must land crates/bot/src/eventsub_http.rs",
+            path.display()
+        )
+    })
+}
+
+fn observability_catalog_doc() -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/observability-event-catalog.md");
+    std::fs::read_to_string(&path).unwrap_or_else(|err| {
+        panic!(
+            "observability catalog unreadable at {} ({err})",
+            path.display()
+        )
+    })
+}
+
+/// The receiver emits exactly the cataloged message set, each callsite
+/// carrying the bounded `event = "eventsub_receiver"` field and no other
+/// `event` value: a renamed, added or unfielded emission fails closed here
+/// even though `eventsub_http.rs` is outside the six scanned sources.
+#[test]
+fn eventsub_receiver_emissions_match_the_catalog() {
+    let source = eventsub_receiver_source();
+    assert_eq!(
+        sorted_unique(traced_messages(&source)),
+        sorted_unique(EVENTSUB_RS_EVENTS.to_vec()),
+        "eventsub receiver emitted an uncataloged message or dropped a cataloged one: \
+         record it in docs/observability-event-catalog.md and EVENTSUB_RS_EVENTS together"
+    );
+    // Every log callsite must carry the bounded field, and it must be the
+    // only `event` value in the file. Count the field literals against the
+    // traced callsites so a callsite that drops the field fails.
+    let traced = traced_messages(&source).len();
+    let fielded = source.matches("event = \"eventsub_receiver\"").count();
+    assert_eq!(
+        fielded, traced,
+        "every eventsub receiver log callsite carries event = \"eventsub_receiver\" \
+         ({fielded} fielded of {traced} callsites)"
+    );
+}
+
+/// Every receiver message, its startup diagnostic and the bounded `event`
+/// field value are recorded in the catalog doc, so the const pin above
+/// cannot go green while the operator-facing catalog still lacks the rows.
+#[test]
+fn eventsub_events_are_recorded_in_the_catalog_doc() {
+    let catalog = observability_catalog_doc();
+    for event in EVENTSUB_RS_EVENTS
+        .into_iter()
+        .chain([EVENTSUB_STARTUP_EVENT, EVENTSUB_EVENT_FIELD])
+    {
+        assert!(
+            catalog.contains(event),
+            "eventsub event missing from docs/observability-event-catalog.md: {event}"
+        );
+    }
 }

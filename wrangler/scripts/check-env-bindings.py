@@ -69,12 +69,15 @@ EVENTSUB_INGRESS_VAR = "EVENTSUB_INGRESS"
 EVENTSUB_INGRESS_ENVS = {"staging"}
 # Private-receiver config is Operator-set Worker secrets, never wrangler.toml.
 RECEIVER_CONFIG_PREFIX = "TWO_INTERNAL_"
-# TOG-23364: the EventSub Operator switch is the last enable step for the
-# public Twitch ingress (wrangler/src/eventsub.ts): the route stays dark until
-# the Operator sets the Worker secret TWO_EVENTSUB=1. A committed var would
-# turn the route on from a toml change alone, so it is rejected in every vars
-# table, like the TWO_INTERNAL_* receiver config above.
-OPERATOR_SECRET_VARS = {"TWO_EVENTSUB"}
+# The EventSub Operator switch is the last enable step for the public Twitch
+# ingress (wrangler/src/eventsub.ts): the route stays dark until the Operator
+# sets the Worker secret TWO_EVENTSUB=1. A committed var would turn the route
+# on from a toml change alone, so it is rejected in every vars table, like
+# the TWO_INTERNAL_* receiver config above. The prefix also covers the
+# private receiver enable, bind and signing secret (TWO_EVENTSUB_BIND,
+# TWO_TWITCH_*), which are Operator-set Worker secrets for the same reason.
+EVENTSUB_RECEIVER_PREFIX = "TWO_EVENTSUB"
+TWITCH_SECRET_PREFIX = "TWO_TWITCH_"
 # Boot publication of the guild command registry is a full replacement of the
 # guild's commands. wrangler.toml may opt in for staging only; production
 # publication stays an Operator-approved Worker binding, never a committed var.
@@ -213,7 +216,11 @@ def _collect_errors(cfg: dict) -> list[str]:
             errors.append(f'{prefix}: {OPS_KILLSWITCH_VAR} must be exactly "1" or absent')
         for key in sorted(k for k in variables if k.startswith(RECEIVER_CONFIG_PREFIX)):
             errors.append(f"{prefix}: {key} is an Operator-set Worker secret, never a wrangler.toml var")
-        for key in sorted(OPERATOR_SECRET_VARS & set(variables)):
+        for key in sorted(
+            k
+            for k in variables
+            if k.startswith(EVENTSUB_RECEIVER_PREFIX) or k.startswith(TWITCH_SECRET_PREFIX)
+        ):
             errors.append(f"{prefix}: {key} is an Operator-set Worker secret, never a wrangler.toml var")
         threshold = variables.get("UNREADY_ALERT_FAILURES")
         if threshold is not None and (

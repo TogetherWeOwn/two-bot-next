@@ -63,6 +63,8 @@
   "TWO_COMMUNITY_WELCOME_CHANNEL_IDS": "Welcome-channel classification for community analytics.",
   "TWO_DATABASE_URL": "Administrative/shared admission database credential required for live preflight, cutover and guild-config; must reach the same database as Container DATABASE_URL for the same token.",
   "TWO_DB_POOL_MAX": "Legacy database pool maximum read before the settings store exists.",
+  "TWO_EVENTSUB": "Master gate for the private EventSub receiver; exactly 1 enables the container listener, any other state stays dark.",
+  "TWO_EVENTSUB_BIND": "Canonical combined IP and port for the private EventSub receiver; a wildcard bind requires the Worker-set container marker, otherwise a specific private IP.",
   "TWO_FEED_POLL_SECONDS": "Feed polling interval (validated from 60 to 86400 seconds).",
   "TWO_HEALTH_BIND_HOST": "Legacy health listener interface; environment-only network bind.",
   "TWO_HEALTH_PORT": "Legacy health listener port; Container uses LISTEN_ADDR instead.",
@@ -121,5 +123,8 @@
   "TWO_TEMP_VOICE_SWEEP_SECONDS": "Temporary-room cleanup sweep interval.",
   "TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS": "Staging synthetic voice-test bots counted as human occupants; ignored for the live guild.",
   "TWO_TEXT_COMMANDS": "Enable optional text triggers only while automations are enabled.",
-  "TWO_TICKET_COOLDOWN_SECONDS": "Cooldown between ticket openings."
+  "TWO_TICKET_COOLDOWN_SECONDS": "Cooldown between ticket openings.",
+  "TWO_TWITCH_CLIENT_ID": "Twitch application client id for Helix calls; Operator-provisioned and never dashboard-stored.",
+  "TWO_TWITCH_CLIENT_SECRET": "Twitch application client secret for app-token refresh; Operator-provisioned and never rendered.",
+  "TWO_TWITCH_WEBHOOK_SECRET": "Signing secret for Twitch EventSub deliveries; Operator-provisioned and never rendered."
 }

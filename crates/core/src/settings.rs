@@ -124,6 +124,14 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_INTERNAL_CONTAINER", SettingClass::EnvOnly),
     ("TWO_INTERNAL_PORT", SettingClass::EnvOnly),
     ("TWO_INTERNAL_ROLE_KEYS", SettingClass::EnvOnly),
+    // --- private EventSub receiver (TOG-23387): enable/bind plus the Twitch
+    // --- signing secret. Env-only like the internal-actions receiver above:
+    // --- a web form must never enable the ingress or see the secret. ---
+    ("TWO_EVENTSUB", SettingClass::EnvOnly),
+    ("TWO_EVENTSUB_BIND", SettingClass::EnvOnly),
+    ("TWO_TWITCH_CLIENT_ID", SettingClass::EnvOnly),
+    ("TWO_TWITCH_CLIENT_SECRET", SettingClass::EnvOnly),
+    ("TWO_TWITCH_WEBHOOK_SECRET", SettingClass::EnvOnly),
     // --- capability gates outside the namespace (TOG-3183 finding) ---
     ("TWO_MODERATION", SettingClass::EnvOnly),
     ("TWO_ONBOARDING_MODE", SettingClass::EnvOnly),
@@ -930,6 +938,8 @@ mod tests {
         "TWO_BACKUP_S3_SECRET_ACCESS_KEY",
         "TWO_DATABASE_URL",
         "TWO_DB_POOL_MAX",
+        "TWO_EVENTSUB",
+        "TWO_EVENTSUB_BIND",
         "TWO_HEALTH_BIND_HOST",
         "TWO_HEALTH_PORT",
         "TWO_INTERNAL_ACTIONS",
@@ -964,6 +974,9 @@ mod tests {
         "TWO_STAGING_RESTART_CONTAINMENT",
         "TWO_STAGING_RESTART_SYNTHETIC_ACTORS",
         "TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS",
+        "TWO_TWITCH_CLIENT_ID",
+        "TWO_TWITCH_CLIENT_SECRET",
+        "TWO_TWITCH_WEBHOOK_SECRET",
     ];
 
     #[test]
@@ -978,7 +991,7 @@ mod tests {
             assert_eq!(classify_key(key), Some(SettingClass::EnvOnly), "{key}");
         }
         let expected_total = EXPECTED_HOT.len() + EXPECTED_COLD.len() + EXPECTED_ENV_ONLY.len();
-        assert_eq!(expected_total, 123, "tripwire lists must stay complete");
+        assert_eq!(expected_total, 128, "tripwire lists must stay complete");
         assert_eq!(
             SETTING_CLASSES.len(),
             expected_total,

@@ -123,7 +123,7 @@ gates (`feature_commands.rs`), moderation (`moderation.rs`), onboarding
 (`onboarding.rs`), automod (`automod.rs`), scorecard and classifier
 (`community.rs`). An empty ID list never contains a live ID.
 
-Catalog entries: 123.
+Catalog entries: 128.
 
 | Key | Class | Parsed default | Application | Description |
 | --- | --- | --- | --- | --- |
@@ -191,6 +191,8 @@ Catalog entries: 123.
 | `TWO_COMMUNITY_WELCOME_CHANNEL_IDS` | hot | Not specified in Next | stored unwired | Welcome-channel classification for community analytics. |
 | `TWO_DATABASE_URL` | env_only | Not rendered (secret) | environment only | Administrative/shared admission database credential required for live preflight, cutover and guild-config; must reach the same database as Container DATABASE_URL for the same token. |
 | `TWO_DB_POOL_MAX` | env_only | Not specified in Next | environment only | Legacy database pool maximum read before the settings store exists. |
+| `TWO_EVENTSUB` | env_only | Not specified in Next | environment only | Master gate for the private EventSub receiver; exactly 1 enables the container listener, any other state stays dark. |
+| `TWO_EVENTSUB_BIND` | env_only | Not specified in Next | environment only | Canonical combined IP and port for the private EventSub receiver; a wildcard bind requires the Worker-set container marker, otherwise a specific private IP. |
 | `TWO_FEED_POLL_SECONDS` | hot | `300` | stored, applied live by runtime refresh (reload-report hot) | Feed polling interval (validated from 60 to 86400 seconds). |
 | `TWO_HEALTH_BIND_HOST` | env_only | Not specified in Next | environment only | Legacy health listener interface; environment-only network bind. |
 | `TWO_HEALTH_PORT` | env_only | Not specified in Next | environment only | Legacy health listener port; Container uses LISTEN_ADDR instead. |
@@ -250,3 +252,6 @@ Catalog entries: 123.
 | `TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS` | env_only | Not specified in Next | environment only | Staging synthetic voice-test bots counted as human occupants; ignored for the live guild. |
 | `TWO_TEXT_COMMANDS` | cold | `false` | env at boot; stored unwired | Enable optional text triggers only while automations are enabled. |
 | `TWO_TICKET_COOLDOWN_SECONDS` | cold | Not specified in Next | stored unwired | Cooldown between ticket openings. |
+| `TWO_TWITCH_CLIENT_ID` | env_only | Not specified in Next | environment only | Twitch application client id for Helix calls; Operator-provisioned and never dashboard-stored. |
+| `TWO_TWITCH_CLIENT_SECRET` | env_only | Not rendered (secret) | environment only | Twitch application client secret for app-token refresh; Operator-provisioned and never rendered. |
+| `TWO_TWITCH_WEBHOOK_SECRET` | env_only | Not rendered (secret) | environment only | Signing secret for Twitch EventSub deliveries; Operator-provisioned and never rendered. |

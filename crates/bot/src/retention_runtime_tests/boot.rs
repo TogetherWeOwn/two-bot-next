@@ -104,6 +104,7 @@ async fn isolated_boot_probe() {
             Arc::new(std::sync::OnceLock::new()),
             None,
             None,
+            None,
         )
         .await
     });

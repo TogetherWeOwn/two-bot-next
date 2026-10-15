@@ -52,6 +52,7 @@ pub mod database_url;
 pub mod disable_preflight;
 pub mod e2e_matrix;
 pub mod events;
+pub mod eventsub_receiver_config;
 pub mod evidence;
 pub mod expected_joins;
 pub mod fb_page_events;
