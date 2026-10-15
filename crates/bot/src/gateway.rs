@@ -614,8 +614,10 @@ fn count_community_facts_drain_failure<T, E>(
 /// retrying them on every boot is futile. A skipped rejoin-cancel is safe (a
 /// missing queue table holds nothing to cancel), but a skipped real removal
 /// drops the guild's only purge-queue write — the removed guild is never seen
-/// again — so it logs at error level with the guild for the Operator replay
-/// documented in `docs/privacy.md` instead of warning (TOG-25067).
+/// again — so it logs at error level with the guild and SQLSTATE for the
+/// Operator replay documented in `docs/privacy.md` instead of warning
+/// (TOG-25067). The replay is conditional: a later rejoin means the guild is
+/// live and the insert must be skipped, per the privacy.md ordering check.
 async fn retention_lifecycle(store: &GatewaySessionStore, event: &Event) -> Option<sqlx::Error> {
     let pool = store.pool();
     let write = match event {

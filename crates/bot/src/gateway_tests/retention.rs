@@ -6,7 +6,9 @@
 use super::*;
 use futures_util::FutureExt as _;
 use std::panic::AssertUnwindSafe;
+use std::sync::Mutex as StdMutex;
 use tokio::sync::watch;
+use tracing_subscriber::layer::SubscriberExt as _;
 use two_bot_cutover::retention::{handle_guild_delete, run_retention, RetentionMode};
 use two_bot_testsupport::TestDatabase;
 
@@ -411,25 +413,90 @@ async fn missing_retention_tables_do_not_stop_the_gateway() {
     db.close().await.unwrap();
 }
 
+/// Thread-scoped tracing capture for the schema-gap skip lines.
+/// `#[tokio::test]` runs current-thread, so the spawned writer task's gateway
+/// events land in this buffer while the guard lives. No target filter: the
+/// assertions below match exact lines, and only this thread's events are
+/// captured.
+#[derive(Clone, Default)]
+struct LogCapture(Arc<StdMutex<String>>);
+
+impl LogCapture {
+    fn contents(&self) -> String {
+        self.0.lock().expect("capture lock").clone()
+    }
+}
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("capture lock")
+            .push_str(&String::from_utf8_lossy(buf));
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+    type Writer = LogCapture;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+fn captured_logs() -> (LogCapture, tracing::subscriber::DefaultGuard) {
+    let capture = LogCapture::default();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .without_time(),
+    );
+    (capture, tracing::subscriber::set_default(subscriber))
+}
+
 #[tokio::test]
 async fn schema_gapped_real_delete_survives_and_operator_replay_restores_purge() {
     // Paperclip Review on #978: acking a schema-gapped real GUILD_DELETE must
     // not silently drop the purge obligation. The gateway survives (the
-    // sequence advances), and the privacy.md Operator replay — the same insert
-    // the live path runs — restores the purge once the queue table exists.
+    // sequence advances), the skip is pinned at error level with the guild and
+    // SQLSTATE — forcing `is_real_guild_removal` false, downgrading `error!`
+    // to `warn!`, or dropping the `guild`/`error_code` fields fails this test —
+    // and the privacy.md Operator replay — the same insert the live path runs —
+    // restores the purge once the queue table exists.
     let Some(db) = database().await else { return };
     let pool = db.pool();
     sqlx::query("DROP TABLE retention_guild_purge_queue")
         .execute(pool)
         .await
         .unwrap();
+    let (capture, _guard) = captured_logs();
     let mut peer = Peer::new().await;
     let (store, stop, task, _) = runner(pool, &mut peer, None).await;
     peer.send(delete(2, None)).await;
     wait_sequence(&store, 2).await;
+    peer.send(create(3, false)).await;
+    wait_sequence(&store, 3).await;
     assert!(
         !task.is_finished(),
         "schema-gapped real delete must not stop the gateway"
+    );
+    let logs = capture.contents();
+    assert!(
+        logs.lines().any(|line| line.contains("ERROR")
+            && line.contains("retention purge skipped; schema gap, operator replay required")
+            && line.contains(RETENTION_GUILD)
+            && line.contains("42P01")),
+        "real removal skip must log at error with guild + SQLSTATE, got:\n{logs}"
+    );
+    assert!(
+        logs.lines().any(|line| line.contains("WARN")
+            && line.contains("retention lifecycle skipped; schema gap, nothing to cancel")),
+        "rejoin-cancel skip must warn instead of erroring, got:\n{logs}"
     );
     // The migration lands: recreate exactly the 0438 queue table, still empty
     // because the skip dropped the obligation.
@@ -453,6 +520,15 @@ async fn schema_gapped_real_delete_survives_and_operator_replay_restores_purge()
         queued(pool).await,
         1,
         "operator replay must restore the skipped purge"
+    );
+    // The queue is live again, so a later available rejoin cancels the
+    // replayed purge before any retention run can erase the guild's rows.
+    peer.send(create(4, false)).await;
+    wait_sequence(&store, 4).await;
+    assert_eq!(
+        queued(pool).await,
+        0,
+        "a rejoin after the replay must cancel the queued purge"
     );
     stop_runner(stop, task).await;
     peer.close().await;

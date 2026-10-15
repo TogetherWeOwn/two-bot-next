@@ -201,6 +201,12 @@ a skipped true guild removal is logged at error level with the guild id
 replayed by the Operator once the migration lands, running the same insert
 the live path runs: `INSERT INTO retention_guild_purge_queue (guild_id)
 VALUES ('<guild id>') ON CONFLICT (guild_id) DO NOTHING;`
+Conditional: replay only if no `GUILD_CREATE` for that guild was acked after
+the `operator replay required` line — a later `retention lifecycle skipped;
+schema gap, nothing to cancel` warn for the same guild means it rejoined, so
+skip the insert while the guild is live (replaying it would queue a live
+guild for the next `execute` run). Run the default dry run first and confirm
+the guild is still gone before executing.
 
 The append-only event-store capture (`event_store`, when its slices land)
 follows the same rule: its rows persist until erasure, and its TTL policy is
