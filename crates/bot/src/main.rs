@@ -37,6 +37,7 @@ mod event_cli;
 mod eventsub_http;
 mod feed_jobs;
 mod gateway;
+mod gateway_backoff;
 mod gateway_commands;
 mod gateway_failure;
 mod gateway_metrics;

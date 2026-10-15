@@ -1,0 +1,428 @@
+//! Acceptance: gateway supervised reconnect with bounded backoff (TOG-25281).
+//!
+//! BUILDER CONTRACT (TOG-25284): this file is frozen. Build on the test
+//! card's branch, keep every test here verbatim, and make the suite green by
+//! changing production code only — replace the body of
+//! `crate::gateway_backoff::run_supervised` with the retry loop documented on
+//! that item, reusing `reconnect_delay` for every wait. Do not edit the
+//! policies constructed below, the expected exits, or the exact-gap
+//! assertions: they are the spec.
+//!
+//! Suite map (all offline: no DB, no live Discord, no wall-clock sleeps —
+//! `start_paused` time plus `yield_now` only, per the flake-ledger policy):
+//!
+//! - schedule pins (green now, guard the builder's edits): cap, jitter
+//!   bounds, determinism, budget end, no-panic extremes, sane defaults.
+//! - readyz pins (green now, compat with TOG-25132): backoff serves
+//!   `starting` (never `ready`, never `parked`); a parked gateway still fails
+//!   the strict gate.
+//! - loop pins (RED now: the scaffold probes one attempt with today's fatal
+//!   semantics; they pass once the loop lands): a flapping gateway reconnects
+//!   on the bounded schedule with exact disappointment-timed gaps, and an
+//!   always-failing gateway stops after exactly the budgeted attempts.
+//! - shutdown pin (green now and later): a pending shutdown ends the episode
+//!   before any attempt.
+
+use super::*;
+use crate::gateway_backoff::{
+    reconnect_delay, run_supervised, AttemptOutcome, ReconnectPolicy, SupervisedExit,
+};
+use std::future::Future;
+use two_bot_core::ComponentStatus;
+
+const FLAP_SEED: u64 = 0xC0FFEE123456789;
+const BUDGET_SEED: u64 = 0x5EED5EED5EED5EED;
+
+fn flap_policy() -> ReconnectPolicy {
+    ReconnectPolicy {
+        base_delay: Duration::from_secs(1),
+        max_delay: Duration::from_secs(8),
+        max_attempts: 5,
+        seed: FLAP_SEED,
+    }
+}
+
+fn tiny_policy() -> ReconnectPolicy {
+    ReconnectPolicy {
+        base_delay: Duration::from_secs(1),
+        max_delay: Duration::from_secs(8),
+        max_attempts: 3,
+        seed: BUDGET_SEED,
+    }
+}
+
+fn full_budget(policy: &ReconnectPolicy) -> Duration {
+    let mut total = Duration::ZERO;
+    for attempt in 0..policy.max_attempts {
+        total += reconnect_delay(policy, attempt).expect("attempt is within budget");
+    }
+    total + Duration::from_secs(5)
+}
+
+/// Record of what one connector invocation saw: its index, the paused-clock
+/// timestamp, and the gateway state readyz served at that moment.
+struct AttemptRecord {
+    attempt: u32,
+    at: tokio::time::Instant,
+    observed: GatewayState,
+}
+
+struct Script {
+    records: Arc<std::sync::Mutex<Vec<AttemptRecord>>>,
+    state: Arc<RwLock<GatewayState>>,
+    failures_before_success: u32,
+}
+
+impl Script {
+    fn new(state: Arc<RwLock<GatewayState>>, failures_before_success: u32) -> Self {
+        Self {
+            records: Arc::new(std::sync::Mutex::new(Vec::new())),
+            state,
+            failures_before_success,
+        }
+    }
+
+    fn connector(
+        &self,
+    ) -> impl FnMut(u32) -> Box<dyn Future<Output = AttemptOutcome> + Send> + Send {
+        let records = Arc::clone(&self.records);
+        let state = Arc::clone(&self.state);
+        let failures = self.failures_before_success;
+        move |attempt: u32| {
+            let records = Arc::clone(&records);
+            let state = Arc::clone(&state);
+            Box::new(async move {
+                // The runner never holds the state lock across `connect`, so a
+                // plain read here observes exactly what readyz served.
+                let observed = *state.read().await;
+                records.lock().expect("attempt log").push(AttemptRecord {
+                    attempt,
+                    at: tokio::time::Instant::now(),
+                    observed,
+                });
+                if attempt < failures {
+                    AttemptOutcome::Retryable
+                } else {
+                    AttemptOutcome::Connected
+                }
+            }) as Box<dyn Future<Output = AttemptOutcome> + Send>
+        }
+    }
+
+    fn attempts(&self) -> u32 {
+        self.records.lock().expect("attempt log").len() as u32
+    }
+}
+
+/// Drive an episode to completion on paused time with no open-ended waits:
+/// advance past the whole budget, flush the executor with bounded yields,
+/// then hand back the exit. An unbounded retry loop fails here (the task is
+/// still pending) instead of hanging CI.
+async fn drive_to_exit(
+    state: Arc<RwLock<GatewayState>>,
+    policy: ReconnectPolicy,
+    script: &Script,
+) -> SupervisedExit {
+    let supervised = tokio::spawn(run_supervised(
+        Arc::clone(&state),
+        policy,
+        script.connector(),
+        std::future::pending(),
+    ));
+    tokio::time::advance(full_budget(&policy)).await;
+    for _ in 0..1000 {
+        if supervised.is_finished() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        supervised.is_finished(),
+        "supervisor must terminate within its bounded budget, never spin"
+    );
+    supervised.await.expect("supervisor task")
+}
+
+fn records(script: &Script) -> Vec<(u32, tokio::time::Instant, GatewayState)> {
+    script
+        .records
+        .lock()
+        .expect("attempt log")
+        .iter()
+        .map(|record| (record.attempt, record.at, record.observed))
+        .collect()
+}
+
+#[test]
+fn reconnect_schedule_never_exceeds_the_cap() {
+    let policy = ReconnectPolicy {
+        max_attempts: 100,
+        seed: 7,
+        ..ReconnectPolicy::default()
+    };
+    for attempt in 0..policy.max_attempts {
+        let delay = reconnect_delay(&policy, attempt).expect("within budget");
+        assert!(
+            delay <= policy.max_delay,
+            "attempt {attempt}: {delay:?} exceeds cap {:?}",
+            policy.max_delay
+        );
+    }
+}
+
+#[test]
+fn reconnect_schedule_carries_bounded_jitter() {
+    // base 4s: grown is exactly 4s at attempt 0, so equal jitter pins [2s, 4s].
+    let policy = ReconnectPolicy {
+        base_delay: Duration::from_secs(4),
+        max_delay: Duration::from_secs(3600),
+        max_attempts: 4,
+        seed: 11,
+    };
+    let delay = reconnect_delay(&policy, 0).expect("within budget");
+    assert!(
+        delay >= Duration::from_secs(2) && delay <= Duration::from_secs(4),
+        "attempt 0 must lie in [grown/2, grown], got {delay:?}"
+    );
+    // Past the cap the window pins to [cap/2, cap], never above the cap.
+    let policy = ReconnectPolicy {
+        base_delay: Duration::from_secs(64),
+        max_delay: Duration::from_secs(30),
+        max_attempts: 4,
+        seed: 11,
+    };
+    let delay = reconnect_delay(&policy, 0).expect("within budget");
+    assert!(
+        delay >= Duration::from_secs(15) && delay <= Duration::from_secs(30),
+        "capped delay must lie in [cap/2, cap], got {delay:?}"
+    );
+}
+
+#[test]
+fn reconnect_schedule_is_deterministic_for_a_seed() {
+    let policy = flap_policy();
+    for attempt in 0..policy.max_attempts {
+        assert_eq!(
+            reconnect_delay(&policy, attempt),
+            reconnect_delay(&policy, attempt),
+            "same seed must replay the same delay"
+        );
+    }
+}
+
+#[test]
+fn reconnect_delays_vary_with_seed() {
+    // Decorrelation is the point of jitter: two seeds must not march in lockstep.
+    let left = ReconnectPolicy {
+        seed: 1,
+        ..flap_policy()
+    };
+    let right = ReconnectPolicy {
+        seed: 2,
+        ..flap_policy()
+    };
+    let differing = (0..24u32)
+        .filter(|attempt| reconnect_delay(&left, *attempt) != reconnect_delay(&right, *attempt))
+        .count();
+    assert!(
+        differing > 0,
+        "different seeds must decorrelate at least one delay"
+    );
+}
+
+#[test]
+fn reconnect_budget_ends_retry() {
+    let policy = tiny_policy();
+    assert!(reconnect_delay(&policy, policy.max_attempts - 1).is_some());
+    assert_eq!(reconnect_delay(&policy, policy.max_attempts), None);
+    assert_eq!(reconnect_delay(&policy, u32::MAX), None);
+}
+
+#[test]
+fn reconnect_delay_never_panics_on_extreme_attempts() {
+    let unbounded = ReconnectPolicy {
+        max_attempts: u32::MAX,
+        ..ReconnectPolicy::default()
+    };
+    for attempt in [0, 1, 30, 31, 32, 100, u32::MAX - 1] {
+        let delay = reconnect_delay(&unbounded, attempt).expect("within budget");
+        assert!(
+            delay <= unbounded.max_delay,
+            "attempt {attempt}: {delay:?} exceeds cap"
+        );
+    }
+}
+
+#[test]
+fn default_policy_is_sane() {
+    let policy = ReconnectPolicy::default();
+    assert!(policy.base_delay > Duration::ZERO);
+    assert!(policy.base_delay <= policy.max_delay);
+    assert!(policy.max_attempts > 0);
+    assert!(reconnect_delay(&policy, 0).is_some());
+}
+
+#[tokio::test]
+async fn backoff_state_reports_starting_never_ready_nor_parked() {
+    // During backoff the supervisor holds Armed: readyz must serve 503 with
+    // gateway=starting — the strict gate (TOG-25132) treats Starting as not
+    // ready, and it must never read as Connected (ready) or Unconfigured
+    // (parked/down).
+    assert_eq!(GatewayState::Armed.status(), ComponentStatus::Starting);
+    let gateway = Arc::new(RwLock::new(GatewayState::Armed));
+    let shared = crate::server::SharedState::new(Arc::clone(&gateway), None);
+    let jobs = crate::jobs::statuses(&[], true);
+    let (code, report) = crate::server::readiness(&shared, &jobs, false).await;
+    assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    let gateway_status = report
+        .health
+        .components
+        .iter()
+        .find(|(name, _)| name == "gateway")
+        .expect("readyz names the gateway component")
+        .1;
+    assert_eq!(gateway_status, ComponentStatus::Starting);
+    assert!(
+        !report.health.ready(),
+        "starting must fail the strict readyz gate"
+    );
+}
+
+#[tokio::test]
+async fn parked_gateway_still_fails_the_strict_readyz_gate() {
+    // Compat with TOG-25132: missing prerequisites park the gateway as
+    // Unconfigured (down), and the strict gate keeps failing. The supervised
+    // reconnect must not blur this into a retrying state.
+    assert_eq!(GatewayState::Unconfigured.status(), ComponentStatus::Down);
+    let gateway = Arc::new(RwLock::new(GatewayState::Unconfigured));
+    let shared = crate::server::SharedState::new(gateway, None);
+    let jobs = crate::jobs::statuses(&[], true);
+    let (code, report) = crate::server::readiness(&shared, &jobs, false).await;
+    assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    let gateway_status = report
+        .health
+        .components
+        .iter()
+        .find(|(name, _)| name == "gateway")
+        .expect("readyz names the gateway component")
+        .1;
+    assert_eq!(gateway_status, ComponentStatus::Down);
+    assert!(
+        !report.health.ready(),
+        "parked must fail the strict readyz gate"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn supervisor_retries_a_flapping_gateway_on_the_bounded_schedule() {
+    // Two transient failures, then recovery: the supervisor must attempt
+    // exactly 3 times, serve Starting between attempts, space the attempts by
+    // exactly the scheduled delays, and publish Connected on recovery.
+    let policy = flap_policy();
+    let state = Arc::new(RwLock::new(GatewayState::Connected));
+    let script = Script::new(Arc::clone(&state), 2);
+    let exit = drive_to_exit(Arc::clone(&state), policy, &script).await;
+    assert_eq!(exit, SupervisedExit::Reconnected);
+    assert_eq!(
+        script.attempts(),
+        3,
+        "two failures then recovery is 3 attempts"
+    );
+    let history = records(&script);
+    assert_eq!(
+        history
+            .iter()
+            .map(|(attempt, _, _)| *attempt)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert_eq!(
+        history
+            .iter()
+            .map(|(_, _, observed)| *observed)
+            .collect::<Vec<_>>(),
+        vec![
+            GatewayState::Connected,
+            GatewayState::Armed,
+            GatewayState::Armed
+        ],
+        "backoff attempts must observe starting, never ready or parked"
+    );
+    for (index, window) in history.windows(2).enumerate() {
+        let gap = window[1].1 - window[0].1;
+        let expected = reconnect_delay(&policy, index as u32).expect("within budget");
+        assert_eq!(
+            gap,
+            expected,
+            "gap before attempt {} must equal the scheduled delay",
+            index + 1
+        );
+    }
+    assert_eq!(*state.read().await, GatewayState::Connected);
+}
+
+#[tokio::test(start_paused = true)]
+async fn supervisor_stops_after_the_bounded_budget() {
+    // An always-failing gateway must stop after exactly max_attempts attempts
+    // and fail readyz closed — bounded retries, never a hot loop.
+    let policy = tiny_policy();
+    let state = Arc::new(RwLock::new(GatewayState::Connected));
+    let script = Script::new(Arc::clone(&state), u32::MAX);
+    let exit = drive_to_exit(Arc::clone(&state), policy, &script).await;
+    assert_eq!(exit, SupervisedExit::BudgetExhausted);
+    assert_eq!(
+        script.attempts(),
+        policy.max_attempts,
+        "an always-failing gateway stops after exactly the budgeted attempts"
+    );
+    let history = records(&script);
+    assert_eq!(
+        history
+            .iter()
+            .map(|(_, _, observed)| *observed)
+            .collect::<Vec<_>>(),
+        vec![
+            GatewayState::Connected,
+            GatewayState::Armed,
+            GatewayState::Armed
+        ]
+    );
+    for (index, window) in history.windows(2).enumerate() {
+        let gap = window[1].1 - window[0].1;
+        let expected = reconnect_delay(&policy, index as u32).expect("within budget");
+        assert_eq!(
+            gap,
+            expected,
+            "gap before attempt {} must equal the scheduled delay",
+            index + 1
+        );
+    }
+    assert_eq!(*state.read().await, GatewayState::Draining);
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_wins_before_any_attempt() {
+    let state = Arc::new(RwLock::new(GatewayState::Connected));
+    let script = Script::new(Arc::clone(&state), 0);
+    let supervised = tokio::spawn(run_supervised(
+        Arc::clone(&state),
+        tiny_policy(),
+        script.connector(),
+        std::future::ready(()),
+    ));
+    for _ in 0..100 {
+        if supervised.is_finished() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        supervised.is_finished(),
+        "shutdown must end the episode promptly"
+    );
+    assert_eq!(
+        supervised.await.expect("supervisor task"),
+        SupervisedExit::ShutdownRequested
+    );
+    assert_eq!(script.attempts(), 0, "no attempt after shutdown");
+}
