@@ -1335,11 +1335,16 @@ impl std::io::Write for JoinLogWriter {
 fn capture_join_logs() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
     // Share the reconcile tests' global subscriber to keep callsite interest
     // stable; the local JSON writer captures only this runtime's events.
+    // Admit DEBUG: benign duplicate refusals log at debug, and the default
+    // fmt max is INFO, so without this the duplicate refusal line is dropped.
+    // No other capture user filters on a field a debug line sets, so their
+    // exact counts are unaffected.
     let _global = tracing_capture::global();
     let bytes = Arc::new(Mutex::new(Vec::new()));
     let output = Arc::clone(&bytes);
     let subscriber = tracing_subscriber::fmt()
         .json()
+        .with_max_level(tracing::Level::DEBUG)
         .with_writer(move || JoinLogWriter(Arc::clone(&output)))
         .finish();
     let guard = tracing::subscriber::set_default(subscriber);
@@ -1486,11 +1491,11 @@ async fn refused_creator_joins_log_channel_and_creator_map_state() {
     let ticket = join(&mut worker, MEMBER);
     // Same ticket twice: the repeat is refused as a benign duplicate while
     // the channel stays a known creator.
-    assert!(!worker.accept_join(ticket.clone(), "duplicate", 8, NOW.to_owned()));
+    assert!(!worker.accept_join(ticket, "duplicate", 8, NOW.to_owned()));
     // A join into a channel the creator map never held.
     let unknown = JoinTicket {
         creator_id: 999,
-        ..ticket.clone()
+        ..ticket
     };
     assert!(!worker.accept_join(unknown, "new room", 9, NOW.to_owned()));
     // A name the automod filter blocks: refused as name_blocked with the
