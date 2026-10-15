@@ -278,7 +278,8 @@ mod tests {
             "leveling gateway dispatch failed; checkpoint unchanged"
         );
         // Every other variant collapses to the fixed token, never the text.
-        let reason = failure_reason(&database("42P01"));
+        let gap = database("42P01");
+        let reason = failure_reason(&gap);
         assert_eq!(reason, "database");
         assert!(!reason.contains("secret"), "reason leaked error text");
         // The SQLSTATE rides along separately for database errors only.
