@@ -19,7 +19,10 @@ JOB_INVENTORY = {
                   # carry run in these three parallel lanes, all gated by ci-ok.
                   "rust-tests", "ignored-db-stores", "ignored-db-runtime",
                   # Compile-only libFuzzer build, gated by ci-ok like the Rust lanes.
-                  "fuzz-compile"},
+                  "fuzz-compile",
+                  # Promoted nextest lane (shared reusable), gated by ci-ok
+                  # like the Rust lanes.
+                  "nextest"},
     "deploy-production.yml": {"guard", "production", "release"},
     "deploy-staging.yml": {"deploy", "schema-gate", "voice-synthetic"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
@@ -50,10 +53,10 @@ JOB_INVENTORY = {
     # runner. Read-only, no secrets, no deploy route: the generic
     # deployment/probe scan already passes, so only the inventory pin is needed.
     "vote-kick-fuzz-smoke.yml": {"vote-kick-smoke"},
-    # SDLC 2.3 CI speed pilot (advisory only, never required, never in
-    # ci-ok): dorny/paths-filter affected-only selection, the shared
-    # nextest lane, and the minutes-per-merged-PR report.
-    "ci-speed.yml": {"changes", "nextest", "report"},
+    # SDLC 2.3 CI speed evidence (the shared nextest lane graduated to a
+    # required check.yml job): dorny/paths-filter affected-only selection
+    # and the minutes-per-merged-PR report.
+    "ci-speed.yml": {"changes", "report"},
     # Shared nextest lane, called by ci-speed.yml; org-level home is
     # TogetherWeOwn/.github with a pinned SHA like test-guard.
     "reusable-rust-nextest.yml": {"nextest"},
@@ -70,9 +73,10 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
                    ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml",
                    # SDLC separation gate: org reusable, warn mode, pinned SHA.
                    ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95",
-                   # SDLC 2.3 CI speed pilot: advisory caller to the shared
-                   # nextest lane (local path until the central move).
-                   ("ci-speed.yml", "nextest"): "./.github/workflows/reusable-rust-nextest.yml",
+                   # SDLC 2.3 CI speed pilot, promoted: required check.yml
+                   # caller to the shared nextest lane (local path until
+                   # the central move).
+                   ("check.yml", "nextest"): "./.github/workflows/reusable-rust-nextest.yml",
                    # Advisory PR-size labels: thin caller to the central
                    # reusable, pinned SHA (repin both refs together).
                    ("pr-size.yml", "pr-size"): "TogetherWeOwn/.github/.github/workflows/pr-size.yml@82c5b367c6e3e8032666029dc22d206fff39c3f2",
@@ -2201,13 +2205,13 @@ class WorkflowTests(unittest.TestCase):
         raw = (ROOT / ".github/workflows/reusable-rust-nextest.yml").read_text(encoding="utf-8")
         self.assertNotIn("adds no cache footprint", raw)
 
-    def test_ci_speed_withholds_r2_secrets_on_pull_request(self):
+    def test_required_nextest_withholds_r2_secrets_on_pull_request(self):
         # Even with the callee-side guard, the caller must not forward R2
         # write secrets on pull_request events. The gate must read
         # `!= 'pull_request' && secrets.X || ''`: the seemingly equivalent
         # `== 'pull_request' && '' || secrets.X` forwards the secret anyway,
         # because '' is falsy in GitHub expressions.
-        job = self.workflows["ci-speed.yml"]["jobs"]["nextest"]
+        job = self.workflows["check.yml"]["jobs"]["nextest"]
         r2_keys = ("SCCACHE_BUCKET", "SCCACHE_ENDPOINT", "SCCACHE_REGION",
                    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
         for key in r2_keys:
@@ -2221,6 +2225,45 @@ class WorkflowTests(unittest.TestCase):
                     str(job["secrets"][key]),
                     "${{ github.event_name != 'pull_request' && secrets." + key + " || '' }}",
                 )
+
+    def test_required_nextest_caller_shape_is_pinned(self):
+        # The promoted lane is a required check.yml job: least-privilege
+        # grant, rust-selector gate like the other Rust test lanes, exact
+        # head SHA into the reusable lane, and R2 secrets only off-PR
+        # (pinned by the withholding test above).
+        job = self.workflows["check.yml"]["jobs"]["nextest"]
+        self.assertEqual(job.get("name"), "rust nextest")
+        self.assertEqual(job.get("permissions"), {"contents": "read"})
+        self.assertIn("job-inputs", job.get("needs", []))
+        self.assertIn("needs.job-inputs.outputs.rust != 'false'", job.get("if", ""))
+        self.assertEqual(job.get("uses"), "./.github/workflows/reusable-rust-nextest.yml")
+        self.assertEqual(job["with"]["ref"], "${{ github.event.pull_request.head.sha || github.sha }}")
+        self.assertNotIn("runs-on", job)
+        agg = self.workflows["check.yml"]["jobs"]["ci-ok"]
+        self.assertIn("nextest", agg["needs"])
+        self.assertIn("NEXTEST_RESULT", "\n".join(step.get("run", "") for step in agg["steps"]))
+
+    def test_required_nextest_timeout_ceiling_is_pinned(self):
+        # Gate ceiling: the required lane must keep its 45-minute ceiling.
+        # Raising it hides a wedged runner; the pin forces a reviewed change.
+        job = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
+        # BaseLoader keeps scalars as strings; "45" is the 45-minute ceiling.
+        self.assertEqual(job.get("timeout-minutes"), "45")
+
+    def test_required_nextest_quarantine_ejects_without_revert(self):
+        # Red-group ejection path: the `quarantine` input must exist with an
+        # empty default, and the nextest step must turn each filter into a
+        # `--skip` so the rest of the suite still gates.
+        workflow = self.workflows["reusable-rust-nextest.yml"]
+        quarantine = workflow["on"]["workflow_call"]["inputs"]["quarantine"]
+        self.assertEqual(quarantine.get("default"), "")
+        job = workflow["jobs"]["nextest"]
+        run_nextest = next(step for step in job.get("steps", [])
+                           if str(step.get("name", "")).startswith("cargo nextest"))
+        self.assertEqual(run_nextest["env"]["QUARANTINE"], "${{ inputs.quarantine }}")
+        run_text = str(run_nextest.get("run", ""))
+        self.assertIn("--skip", run_text)
+        self.assertIn("$QUARANTINE", run_text)
 
     def test_ci_speed_rollout_documents_pr_local_cache(self):
         rollout = (ROOT / "docs/ci-speed-rollout.md").read_text(encoding="utf-8")

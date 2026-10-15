@@ -55,8 +55,9 @@ exact head commit. Never bypass or weaken a check.
 
 `check.yml` runs its Rust work as parallel lanes that all start once `job-inputs`
 finishes: `check` (lint: offline guards, cargo-deny, fmt, clippy), `rust tests`
-(unit, integration and doc tests) and two database lanes, `ignored db (stores)`
-and `ignored db (runtime)`. The single `ci-ok` aggregate waits on both selectors
+(unit, integration and doc tests), `rust nextest` (workspace lib/bins under
+cargo-nextest with one retry, JUnit and a flake ledger) and two database lanes,
+`ignored db (stores)` and `ignored db (runtime)`. The single `ci-ok` aggregate waits on both selectors
 (`job-inputs` and `container-inputs`), every selected lane, `worker check`, the
 SBOM dry-run and standalone database jobs. Both selectors and lint must always
 succeed; a heavy lane may skip only when selection explicitly deselects it.

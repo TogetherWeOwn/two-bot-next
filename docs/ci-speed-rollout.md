@@ -3,7 +3,23 @@
 One definition, inherited everywhere. Anything on this page used by more
 than one repo lives ONCE at org level; per-repo files only call it.
 
-## What ships in this pilot (advisory, this repo)
+## Promotion (2026-10-15): nextest is required
+
+The advisory pilot graduated. `check.yml` calls the shared lane as the
+`nextest` job (rust-selector gated, aggregated by `ci-ok`, 45-minute
+ceiling pinned in `scripts/ci/test_workflows.py`); `ci-speed.yml` keeps
+the affected-paths selection and the minutes-per-merged-PR report.
+No new required-check context was created: `ci-ok` stays the single
+aggregate, so no branch-protection change was needed.
+
+Red-group ejection without a revert: the reusable lane takes a
+`quarantine` input (whitespace-separated nextest filters, empty by
+default). Each filter becomes one `--skip`, so the rest of the suite
+still gates while the red group is out. Drilled on a throwaway draft PR
+(synthetic failing test went red, then green under quarantine, PR closed
+unmerged) before the promotion merged.
+
+## What shipped in the pilot (advisory, this repo)
 
 - `dorny/paths-filter` in `.github/workflows/ci-speed.yml` (`changes` job):
   affected-only pre-filter for the advisory lane. Required lanes keep the
@@ -61,9 +77,9 @@ than one repo lives ONCE at org level; per-repo files only call it.
   file I/O with offline fixtures (`test_flake_ledger.py`,
   `test_ci_minutes.py`) that run in the `check` lane's `scripts/ci`
   discover step. Identical input bytes give identical output bytes.
-- The pilot workflow is staging/advisory: it never gates merge, never
-  touches `ci-ok`, and follows the routed-runner, minimal-grant and
-  inventory pins in `scripts/ci/test_workflows.py`.
+- The lane graduated from advisory to required (see Promotion above):
+  it gates merge through `ci-ok` and follows the routed-runner,
+  minimal-grant and inventory pins in `scripts/ci/test_workflows.py`.
 - The phase0/blocker ledger was not present in this repo, so there was no
   local ledger to backtest against; the parser fixtures above are the
   backtest, and the first advisory runs attach real JUnit evidence.
