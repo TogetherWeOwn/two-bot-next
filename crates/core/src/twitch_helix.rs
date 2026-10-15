@@ -40,10 +40,10 @@ use hyper_util::rt::TokioExecutor;
 use thiserror::Error;
 use url::form_urlencoded;
 
+pub use crate::twitch_eventsub::HELIX_SUBSCRIPTIONS_URL;
 use crate::twitch_eventsub::{
     create_subscription_body, delete_subscription_url, parse_subscriptions, reconcile, CallbackUrl,
     EventSubError, ExistingSubscription, SubscriptionAction, WebhookSecret,
-    HELIX_SUBSCRIPTIONS_URL,
 };
 use crate::Secret;
 

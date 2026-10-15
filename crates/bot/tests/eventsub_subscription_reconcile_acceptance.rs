@@ -232,7 +232,7 @@ fn assert_startup_reconcile_wired(sources: &str, criterion: &str) {
 }
 
 fn hmac_sign(message_id: &str, timestamp: &str, body: &[u8]) -> String {
-    use hmac::{Hmac, Mac as _};
+    use hmac::{Hmac, KeyInit, Mac as _};
     use sha2::Sha256;
 
     let mut mac = <Hmac<Sha256>>::new_from_slice(test_secret_value().as_bytes())
