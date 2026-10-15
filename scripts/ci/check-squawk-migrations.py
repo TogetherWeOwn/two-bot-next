@@ -107,12 +107,17 @@ DOLLAR_OPEN = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$")
 def normalize_table(raw):
     """Lowercase unqualified table name for same-file empty-table checks.
 
-    Inputs arrive via blanked(), which already folds simple lowercase
-    quoted identifiers (``"guilds"``) to their bare name and maps every
-    other quoted identifier to a case-sensitive placeholder, so a plain
-    lowercase comparison is sufficient here.
+    Inputs arrive via blanked(), which maps every quoted identifier to a
+    placeholder: simple lowercase names (``"guilds"``) become ``_qq_guilds_``
+    (the same placeholder for the same name) while every other quoted name
+    becomes a case-sensitive ``_qq_<n>_`` token. Placeholders never match
+    keyword regexes (``\\b`` cannot fire inside ``_..._``), so quoted
+    keyword names such as ``"default"`` stay inert. Stripping the wrapper
+    restores equality: ``_qq_guilds_`` compares equal to unquoted ``guilds``.
     """
-    return raw.strip().split(".")[-1].strip().lower()
+    base = raw.strip().split(".")[-1].strip().lower()
+    match = re.fullmatch(r"_qq_(.+)_", base)
+    return match.group(1) if match else base
 
 
 class SquawkError(ValueError):
@@ -124,12 +129,15 @@ def blanked(text):
     spans replaced by spaces (newlines preserved), so keyword matching and
     statement splitting never fire inside literals or comments.
 
-    Quoted identifiers that are already simple lowercase names (``"guilds"``)
-    emit their bare name so they compare equal to the unquoted form, as
-    Postgres folds unquoted names to lowercase. Every other quoted
-    identifier maps to a unique placeholder per distinct name
-    (``_qq_<n>_``), so two different quoted table names never collapse to
-    one token while the same quoted name stays equal to itself.
+    Every quoted identifier maps to a placeholder so a quoted keyword name
+    such as ``"default"`` never reads as a live keyword. Simple lowercase
+    names (``"guilds"``) emit ``_qq_guilds_`` (the same placeholder for the
+    same name) so they compare equal to the unquoted form once
+    normalize_table() strips the wrapper, as Postgres folds unquoted names
+    to lowercase. Every other quoted identifier maps to a unique
+    placeholder per distinct name (``_qq_<n>_``), so two different quoted
+    table names never collapse to one token while the same quoted name
+    stays equal to itself.
     """
     out = []
     n = len(text)
@@ -190,8 +198,8 @@ def blanked(text):
                 j += 1
             raw = text[begin:j]
             inner = raw[1:-1] if len(raw) >= 2 else ""
-            if re.fullmatch(r"[a-z_][a-z0-9_$]*", inner or ""):
-                out.append(inner)
+            if re.fullmatch(r"[a-z_][a-z0-9_]*", inner or ""):
+                out.append(f"_qq_{inner}_")
             else:
                 if raw not in quoted_ids:
                     quoted_ids[raw] = f"_qq_{len(quoted_ids)}_"
@@ -254,6 +262,34 @@ def split_actions(sql):
     return parts
 
 
+def top_level(text):
+    """Return text with parenthesised spans blanked (newlines preserved).
+
+    Shares split_actions()' depth counter so NOT NULL / DEFAULT inside
+    CHECK (...) or type modifiers such as numeric(10,2) never read as
+    column-level clauses. DEFAULT (expr) keeps its DEFAULT keyword at
+    depth 0, so real expression defaults still count.
+    """
+    out, depth = [], 0
+    for char in text:
+        if char == "(":
+            depth += 1
+            out.append(" ")
+        elif char == ")":
+            depth = max(0, depth - 1)
+            out.append(" ")
+        elif depth > 0:
+            out.append("\n" if char == "\n" else " ")
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+REFERENTIAL_SET = re.compile(
+    r"\bON\s+(?:DELETE|UPDATE)\s+SET\s+(?:NULL|DEFAULT)\b", re.IGNORECASE
+)
+
+
 def has_required_field(sql):
     """True when an ADD [COLUMN] action adds NOT NULL without a DEFAULT."""
     for action in split_actions(sql):
@@ -266,7 +302,8 @@ def has_required_field(sql):
         rest = COLUMN_PREFIX.sub("", rest, count=1)
         if not rest.strip():
             continue
-        if NOT_NULL.search(rest) and not DEFAULT.search(rest):
+        scoped = REFERENTIAL_SET.sub(" ", top_level(rest))
+        if NOT_NULL.search(scoped) and not DEFAULT.search(scoped):
             return True
     return False
 

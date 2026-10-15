@@ -115,6 +115,10 @@ class RuleTests(unittest.TestCase):
             "ALTER TABLE t DROP IF EXISTS c;\n",
             'ALTER TABLE t DROP "c" CASCADE;\n',
             "ALTER TABLE t ADD COLUMN a int, DROP b;\n",
+            "ALTER TABLE IF EXISTS t DROP c;\n",
+            "ALTER TABLE ONLY t DROP c;\n",
+            "ALTER TABLE ONLY public.t DROP c;\n",
+            "ALTER TABLE t * DROP c;\n",
         ):
             self.assertEqual(self.rules(sql), ["dropping-object"], sql)
 
@@ -426,6 +430,64 @@ class RuleTests(unittest.TestCase):
             'SELECT "a\nb";\nCREATE INDEX bad ON t (a);\n'
         )
         self.assertEqual(findings, [(3, "creating-index")])
+
+    def test_quoted_keyword_names_do_not_hide_rules(self):
+        # A quoted name that is itself a keyword must never read as that
+        # keyword: "default" is a column name, not a DEFAULT clause.
+        self.assertEqual(
+            self.rules('ALTER TABLE t ADD COLUMN "default" int NOT NULL;\n'),
+            ["adding-required-field"],
+        )
+        self.assertEqual(
+            self.rules('ALTER TABLE t ADD "unique" int NOT NULL;\n'),
+            ["adding-required-field"],
+        )
+        self.assertEqual(
+            self.rules('ALTER TABLE t ADD "check" int NOT NULL;\n'),
+            ["adding-required-field"],
+        )
+        self.assertEqual(
+            self.rules('CREATE INDEX i ON "concurrently" (a);\n'),
+            ["creating-index"],
+        )
+
+    def test_required_field_ignores_parens_and_referential_actions(self):
+        # NOT NULL inside parenthesised expressions is not a column-level
+        # NOT NULL; ON DELETE/UPDATE SET DEFAULT is not a column DEFAULT.
+        self.assertEqual(
+            self.rules("ALTER TABLE t ADD COLUMN a int CHECK (a IS NOT NULL);\n"),
+            [],
+        )
+        self.assertEqual(
+            self.rules(
+                "ALTER TABLE t ADD COLUMN a int NOT NULL "
+                "REFERENCES u(id) ON DELETE SET DEFAULT;\n"
+            ),
+            ["adding-required-field"],
+        )
+        self.assertEqual(
+            self.rules(
+                "ALTER TABLE t ADD COLUMN a int NOT NULL "
+                "REFERENCES u(id) ON UPDATE SET DEFAULT;\n"
+            ),
+            ["adding-required-field"],
+        )
+        self.assertEqual(
+            self.rules(
+                "ALTER TABLE t ADD COLUMN a int NOT NULL DEFAULT (1+1);\n"
+            ),
+            [],
+        )
+        self.assertEqual(
+            self.rules("ALTER TABLE t ADD COLUMN a int DEFAULT 0 NOT NULL;\n"),
+            [],
+        )
+        self.assertEqual(
+            self.rules(
+                "ALTER TABLE t ADD COLUMN a numeric(10,2) NOT NULL;\n"
+            ),
+            ["adding-required-field"],
+        )
 
     def test_several_rules_in_one_file_report_each_line(self):
         self.assertEqual(
