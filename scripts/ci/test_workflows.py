@@ -50,6 +50,13 @@ JOB_INVENTORY = {
     # runner. Read-only, no secrets, no deploy route: the generic
     # deployment/probe scan already passes, so only the inventory pin is needed.
     "vote-kick-fuzz-smoke.yml": {"vote-kick-smoke"},
+    # SDLC 2.3 CI speed pilot (advisory only, never required, never in
+    # ci-ok): dorny/paths-filter affected-only selection, the shared
+    # nextest lane, and the minutes-per-merged-PR report.
+    "ci-speed.yml": {"changes", "nextest", "report"},
+    # Shared nextest lane, called by ci-speed.yml; org-level home is
+    # TogetherWeOwn/.github with a pinned SHA like test-guard.
+    "reusable-rust-nextest.yml": {"nextest"},
 }
 # Reusable-workflow calls are allowed only to these non-deploy workflows.
 # TOG-10893 registers the read-only sbom.yml calls alongside the benchmark one.
@@ -59,7 +66,10 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
                    # After every staging deploy; its failure fails deploy-staging (promotion gate).
                    ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml",
                    # SDLC separation gate: org reusable, warn mode, pinned SHA.
-                   ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95"}
+                   ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95",
+                   # SDLC 2.3 CI speed pilot: advisory caller to the shared
+                   # nextest lane (local path until the central move).
+                   ("ci-speed.yml", "nextest"): "./.github/workflows/reusable-rust-nextest.yml"}
 # Main's runner routing (#265, 2026-10-02): the repo is public and the org's
 # self-hosted runner group refuses public repos, so every job routes through
 # one expression — public repo -> GitHub-hosted, private -> CI_OVERFLOW_* switch
