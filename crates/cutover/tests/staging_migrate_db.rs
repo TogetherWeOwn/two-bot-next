@@ -201,6 +201,7 @@ impl Fixture {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run(
         &self,
         mode: &str,
