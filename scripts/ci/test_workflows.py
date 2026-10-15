@@ -220,7 +220,7 @@ def staging_claim_errors(claim, name="staging-migrate.yml",
 
     Parametrized by workflow name, job identity, artifact names, publisher
     script and host/database/branch env/input names so the production mirror
-    pins the same shape with its own names (production passes no branch pin).
+    pins the same shape with its own names.
     """
     errors = []
     prefix = f"{name}:claim:"
@@ -284,8 +284,8 @@ def production_claim_errors(claim):
         host_input="production_host",
         db_env="PRODUCTION_DATABASE",
         db_input="production_database",
-        branch_env=None,
-        branch_input=None,
+        branch_env="PRODUCTION_BRANCH_ID",
+        branch_input="production_branch_id",
     )
 
 
@@ -300,11 +300,11 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
                      target_flag, host_flag, db_flag, other_host_flag,
                      other_db_flag, other_plan_secret, other_migrator_secret,
                      branch_input="staging_branch_id", branch_flag="--staging-branch-id",
-                     other_branch_flag=None):
+                     branch_label="staging", other_branch_flag=None):
     """Parametrized migration-runner shape (staging and production mirrors).
 
-    Dispatch-only with exactly the reviewed inputs (staging carries the
-    PlanetScale branch pin, production does not yet), three jobs
+    Dispatch-only with exactly the reviewed inputs (each target carries its
+    own PlanetScale branch pin), three jobs
     (plan always runs through the no-reviewer plan environment, unprotected
     claim transports the apply request, apply runs only for mode=apply after a
     green plan and claim through the reviewed apply environment), each job with
@@ -460,9 +460,9 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
     # and branch mismatches before any DDL.
     if branch_flag is not None:
         if branch_flag not in plan_runs:
-            errors.append(f"{name}:plan: must pass the staging branch pin to the runner")
+            errors.append(f"{name}:plan: must pass the {branch_label} branch pin to the runner")
         if branch_flag not in apply_runs:
-            errors.append(f"{name}:apply: must pass the staging branch pin to the runner")
+            errors.append(f"{name}:apply: must pass the {branch_label} branch pin to the runner")
     apply_fetch = [step for step in apply.get("steps", [])
                    if str(step.get("uses", "")).startswith("actions/download-artifact@")]
     if len(apply_fetch) != 1:
@@ -512,15 +512,16 @@ def staging_migrate_errors(workflow, name="staging-migrate.yml",
                           target_flag=target_flag, host_flag=host_flag, db_flag=db_flag,
                           other_host_flag=other_host_flag, other_db_flag=other_db_flag,
                           other_plan_secret=other_plan_secret,
-                          other_migrator_secret=other_migrator_secret)
+                          other_migrator_secret=other_migrator_secret,
+                          other_branch_flag="--production-branch-id")
 
 
 def production_migrate_errors(workflow):
     """Production mirror of the migration-runner shape.
 
-    Production declares no branch pin yet (the runner fails closed on
-    `*.psdb.cloud` hosts until a production branch pin lands), so the
-    branch assertions are skipped for this target.
+    Production carries its own PlanetScale branch pin
+    (`production_branch_id` / `--production-branch-id`), mirroring staging
+    with production names; the staging pin must never appear.
     """
     return migrate_errors(workflow, name="production-migrate.yml",
                           plan_env="production-migrate-plan", apply_env="production-migrate-apply",
@@ -533,7 +534,9 @@ def production_migrate_errors(workflow):
                           other_db_flag="--staging-database",
                           other_plan_secret="TWO_BOT_STAGING_PLAN_DATABASE_URL",
                           other_migrator_secret="TWO_BOT_STAGING_MIGRATOR_DATABASE_URL",
-                          branch_input=None, branch_flag=None,
+                          branch_input="production_branch_id",
+                          branch_flag="--production-branch-id",
+                          branch_label="production",
                           other_branch_flag="--staging-branch-id")
 
 
@@ -1645,7 +1648,8 @@ class WorkflowTests(unittest.TestCase):
             with self.subTest(trigger=trigger):
                 self.assertTrue(mutated(lambda w, t=trigger: w["on"].update({t: ""})))
         for missing in ("acl_plan_ref", "plan_manifest_sha256", "plan_run_id",
-                        "production_host", "production_database"):
+                        "production_host", "production_database",
+                        "production_branch_id"):
             with self.subTest(missing=missing):
                 def drop(w, missing=missing):
                     del w["on"]["workflow_dispatch"]["inputs"][missing]
@@ -1687,7 +1691,8 @@ class WorkflowTests(unittest.TestCase):
                         if "--target production" in str(step.get("run", "")):
                             step["run"] = step["run"].replace("--target production", "")
             self.assertTrue(mutated(drop_target))
-        for wrong in ("--target staging", "--staging-host", "--staging-database"):
+        for wrong in ("--target staging", "--staging-host", "--staging-database",
+                      "--staging-branch-id"):
             with self.subTest(wrong=wrong):
                 def widen(w, wrong=wrong):
                     for step in w["jobs"]["plan"]["steps"]:
