@@ -196,12 +196,17 @@ class SelectionTests(unittest.TestCase):
                 self.assertEqual(inputs.classify(path), {WORKER}, path)
 
     def test_rust_docs_select_rust_only(self):
-        # Content reads only; existence-only docs (staging-soak/backup/
+        # Content reads only; existence-only docs (staging-soak/
         # preflight) fall through to the worker-only docs rule.
+        # docs/backup.md reads content in the voice owner-grant journal
+        # regression, so it selects rust despite the preconditions
+        # existence check.
         rust_docs = ["docs/cutover.md",
                      "docs/commands.md", "docs/configuration.md",
                      "docs/voice-rooms.md",
-                     "docs/soak-checklist.json", "docs/soak-checklist.md"]
+                     "docs/soak-checklist.json", "docs/soak-checklist.md",
+                     "docs/privacy.md", "docs/database-roles.md",
+                     "docs/rollback-delta.md", "docs/backup.md"]
         for path in rust_docs:
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {RUST}, path)
@@ -244,10 +249,11 @@ class SelectionTests(unittest.TestCase):
     def test_unrelated_docs_select_worker_only(self):
         # No file reader in PR-run code, but runbook.test.ts asserts on the
         # docs/ listing itself (case-collision + readiness links).
+        # docs/database-roles.md left this list: the voice owner-grant
+        # journal regression reads its content, so it selects rust.
         for path in ["docs/gateway-recovery.md",
                      "docs/leveling-port.md", "docs/feeds-port.md",
                      "docs/distroless-evaluation.md", "docs/build-cache.md",
-                     "docs/database-roles.md",
                      "docs/member-journey-parity.md"]:
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {WORKER}, path)
@@ -392,10 +398,12 @@ class ReaderCoverageTests(unittest.TestCase):
     # Docs the preconditions binary checks by existence only (is_file, never
     # content): a content edit cannot break Rust, and a deletion forces all
     # jobs via the deletion rule. Every other docs/ literal in Rust is a
-    # content read and must select the rust job.
+    # content read and must select the rust job. docs/backup.md left this
+    # set: the voice owner-grant journal regression reads its content, so a
+    # content edit must select rust (the preconditions is_file check still
+    # holds alongside the content read).
     EXISTENCE_ONLY_DOCS = frozenset({
         "docs/staging-soak.md",
-        "docs/backup.md",
         "docs/preflight.md",
         "docs/runbook.md",
     })

@@ -88,9 +88,14 @@ as the trigger document states. The measured voice tables (`voice_rooms`
 via `created_at`/`owner_touched_at`/`name_touched_at`/`privacy_touched_at`,
 `voice_create_reservations` via `created_at`/`settled_at`,
 `voice_room_blocks` via `created_at`, `voice_join_grants` via `created_at`,
+the owner-grant journal (`voice_owner_grants`) via `touched_at`,
 `voice_text_companions` via
 `created_at`, and the append-only `voice_vote_kick_audit` via `occurred_at`) need no
-disposition: their counts are the evidence. A reservation accepted before the baseline
+disposition: their counts are the evidence. The journal is not append-only
+deletion history: completion deletes non-current recipients and marks the
+retained row completed (`pending = FALSE`, `touched_at` refreshed), so the
+report counts surviving rows touched after the baseline, not every grant ever
+prepared. A reservation accepted before the baseline
 but bound or rolled back after it is included in both count and export. A block removed
 after the freeze deletes its row, so `voice_room_blocks` measures additions only; a grant
 revoked or refused after the freeze deletes its row, so `voice_join_grants` measures
