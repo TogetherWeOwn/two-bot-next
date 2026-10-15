@@ -310,7 +310,11 @@ jobs:
         env:
           GITLEAKS_BIN: ${{ runner.temp }}/gitleaks
           EVENT_NAME: ${{ github.event_name }}
-          BASE_REF: ${{ github.base_ref }}
-        # On pull_request the base branch's .gitleaks.toml / .gitleaksignore
-        # apply, so an allowlist is honoured only after it has merged.
+          # base_ref is empty on merge_group; the queue commit's target
+          # branch arrives as merge_group.base_ref (refs/heads/main), which
+          # gitleaks-scan.sh strips to the branch name.
+          BASE_REF: ${{ github.base_ref || github.event.merge_group.base_ref }}
+        # On pull_request and merge_group the base branch's .gitleaks.toml /
+        # .gitleaksignore apply, so an allowlist is honoured only after it
+        # has merged.
         run: bash .github/scripts/gitleaks-scan.sh
