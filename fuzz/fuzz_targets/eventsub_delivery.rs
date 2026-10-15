@@ -1,0 +1,418 @@
+#![no_main]
+
+//! Fuzz the Twitch EventSub delivery front door: [`verify_delivery`] (HMAC-SHA256
+//! + 10-minute freshness) and [`classify`] (challenge / notification /
+//! revocation / unknown) over structured inputs.
+//!
+//! Input structure: the raw fuzzer bytes are read as lossy text. Control
+//! keywords (`challenge`, `notification`, `revocation`, `unknown`, `tamper`, `stale`,
+//! `not-a-time`, `bad-id`, `bad-prefix`) select the delivery shape; when no
+//! keyword matches, selector bytes pick the template so unguided mutations
+//! still explore. The HMAC is always computed with public synthetic test
+//! material, so MAC failure cannot starve the JSON parser: tampered inputs
+//! assert `BadSignature`, stale inputs assert `StaleTimestamp`, and fresh
+//! correctly-signed inputs assert `Ok` before `classify` runs. A second
+//! `classify`-only pass on the raw truncated input stresses the JSON parser
+//! without needing a valid signature.
+//!
+//! Bounds: message ids are capped well under `MESSAGE_ID_MAX`, message types
+//! under 64 chars, and raw bodies under 8 KiB; the only `MAX_BODY_BYTES + 1`
+//! allocation lives in the once-per-campaign fixed matrix. No network,
+//! database, Discord client, clock, or environment secret is used.
+
+use std::sync::Once;
+
+use hmac::{Hmac, KeyInit, Mac};
+use libfuzzer_sys::fuzz_target;
+use sha2::Sha256;
+use two_bot_core::funnel::{format_iso_millis, parse_iso_millis};
+use two_bot_core::twitch_eventsub::{
+    classify, verify_delivery, Delivery, DeliveryHeaders, EventSubError, WebhookSecret,
+    HEADER_MESSAGE_ID, HEADER_MESSAGE_TYPE, HEADER_SIGNATURE, HEADER_TIMESTAMP, MAX_BODY_BYTES,
+    MAX_TIMESTAMP_SKEW_MS,
+};
+
+/// Public synthetic test material, never an environment credential.
+const SECRET_STR: &str = "fuzz-synthetic-secret-0123456789abcdef";
+/// Fixed `now` for freshness checks; timestamps are derived from it.
+const NOW_MS: i64 = 1_760_000_000_000;
+/// Valid message-id base; the fuzzer varies only the hex suffix.
+const ID_BASE: &str = "fuzz-id";
+/// Cap for raw-body bytes reaching `classify` per iteration.
+const MAX_RAW_BODY: usize = 8192;
+/// Cap for fuzz-derived message-type strings.
+const MAX_TYPE_CHARS: usize = 64;
+
+fn test_secret() -> WebhookSecret {
+    WebhookSecret::new(SECRET_STR.to_owned()).expect("fuzz secret is valid")
+}
+
+/// Recompute the delivery signature over `message-id + timestamp + body`
+/// with the synthetic secret. The secret literal never leaves the HMAC here
+/// and is never logged; [`WebhookSecret`]'s `Debug` stays redacted (pinned
+/// once in [`check_fixed_matrix`]).
+fn sign(id: &str, ts: &str, body: &[u8]) -> String {
+    let mut mac =
+        <Hmac<Sha256>>::new_from_slice(SECRET_STR.as_bytes()).expect("HMAC takes any key");
+    mac.update(id.as_bytes());
+    mac.update(ts.as_bytes());
+    mac.update(body);
+    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+}
+
+fn headers<'a>(
+    id: &'a str,
+    ts: &'a str,
+    sig: &'a str,
+    kind: &'a str,
+) -> Result<DeliveryHeaders<'a>, EventSubError> {
+    DeliveryHeaders::from_lookup(|name| match name {
+        HEADER_MESSAGE_ID => Some(id),
+        HEADER_TIMESTAMP => Some(ts),
+        HEADER_SIGNATURE => Some(sig),
+        HEADER_MESSAGE_TYPE => Some(kind),
+        _ => None,
+    })
+}
+
+fn challenge_body() -> Vec<u8> {
+    serde_json::json!({
+        "challenge": "pogchamp-kappa-360noscope-vohiyo",
+        "subscription": {
+            "id": "sub-1", "type": "stream.online", "version": "1",
+            "status": "webhook_callback_verification_pending",
+            "condition": {"broadcaster_user_id": "1337"},
+        },
+    })
+    .to_string()
+    .into_bytes()
+}
+
+fn notification_body() -> Vec<u8> {
+    serde_json::json!({
+        "subscription": {
+            "id": "sub-1", "type": "stream.online", "version": "1",
+            "status": "enabled",
+            "condition": {"broadcaster_user_id": "1337"},
+        },
+        "event": {
+            "id": "9001", "broadcaster_user_id": "1337",
+            "broadcaster_user_login": "cool_user",
+            "broadcaster_user_name": "Cool_User",
+            "type": "live", "started_at": "2025-10-09T08:50:00Z",
+        },
+    })
+    .to_string()
+    .into_bytes()
+}
+
+fn revocation_body() -> Vec<u8> {
+    serde_json::json!({
+        "subscription": {
+            "id": "sub-1", "type": "stream.online", "version": "1",
+            "status": "authorization_revoked",
+            "condition": {"broadcaster_user_id": "1337"},
+        },
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// Input-independent pins: every happy shape verifies and classifies, every
+/// hostile shape refuses with its documented error. Any verification-logic
+/// change must update this target on its own card; silent drift fails the
+/// fuzzer instead. Runs once per campaign; the oversize allocation stays here
+/// so per-iteration inputs stay small and fast.
+fn check_fixed_matrix() {
+    let secret = test_secret();
+    assert_eq!(format!("{secret:?}"), "[REDACTED]");
+    let fresh = format_iso_millis(NOW_MS);
+    let id = "e76c6bd4-55c9-4987-8304-da1588d8988b";
+
+    // Challenge.
+    let body = challenge_body();
+    let sig = sign(id, &fresh, &body);
+    let h = headers(id, &fresh, &sig, "webhook_callback_verification").unwrap();
+    assert_eq!(verify_delivery(&secret, &h, &body, NOW_MS), Ok(()));
+    assert_eq!(
+        classify("webhook_callback_verification", &body),
+        Ok(Delivery::Challenge(
+            "pogchamp-kappa-360noscope-vohiyo".to_owned()
+        ))
+    );
+
+    // Notification.
+    let body = notification_body();
+    let sig = sign(id, &fresh, &body);
+    let h = headers(id, &fresh, &sig, "notification").unwrap();
+    assert_eq!(verify_delivery(&secret, &h, &body, NOW_MS), Ok(()));
+    assert!(matches!(
+        classify("notification", &body),
+        Ok(Delivery::Notification(ref s)) if s.broadcaster_user_id == "1337"
+    ));
+
+    // Revocation.
+    let body = revocation_body();
+    let sig = sign(id, &fresh, &body);
+    let h = headers(id, &fresh, &sig, "revocation").unwrap();
+    assert_eq!(verify_delivery(&secret, &h, &body, NOW_MS), Ok(()));
+    assert_eq!(
+        classify("revocation", &body),
+        Ok(Delivery::Revocation {
+            subscription_id: "sub-1".to_owned(),
+            reason: two_bot_core::twitch_eventsub::RevocationReason::AuthorizationRevoked,
+        })
+    );
+
+    // Tampered signature: flip the final hex digit, keeping the shape valid.
+    let body = notification_body();
+    let mut sig = sign(id, &fresh, &body);
+    let last = sig.pop().unwrap();
+    sig.push(if last == '0' { '1' } else { '0' });
+    let h = headers(id, &fresh, &sig, "notification").unwrap();
+    assert_eq!(
+        verify_delivery(&secret, &h, &body, NOW_MS),
+        Err(EventSubError::BadSignature)
+    );
+
+    // Stale timestamp: sent is just outside the freshness window.
+    let body = notification_body();
+    let sent = parse_iso_millis(&fresh).expect("fresh timestamp parses");
+    let stale_now = sent + MAX_TIMESTAMP_SKEW_MS + 1;
+    let sig = sign(id, &fresh, &body);
+    let h = headers(id, &fresh, &sig, "notification").unwrap();
+    assert_eq!(
+        verify_delivery(&secret, &h, &body, stale_now),
+        Err(EventSubError::StaleTimestamp)
+    );
+
+    // Unknown message type: signature still verifies, body classifies Ignored.
+    let body = b"{}".to_vec();
+    let sig = sign(id, &fresh, &body);
+    let h = headers(id, &fresh, &sig, "something_new").unwrap();
+    assert_eq!(verify_delivery(&secret, &h, &body, NOW_MS), Ok(()));
+    assert_eq!(classify("something_new", &body), Ok(Delivery::Ignored));
+
+    // Oversize body is refused before hashing.
+    let big = vec![b'x'; MAX_BODY_BYTES + 1];
+    let sig = sign(id, &fresh, &big);
+    let h = headers(id, &fresh, &sig, "notification").unwrap();
+    assert_eq!(
+        verify_delivery(&secret, &h, &big, NOW_MS),
+        Err(EventSubError::BodyTooLarge)
+    );
+
+    // Header gate: an unsafe id never reaches verification.
+    assert_eq!(
+        DeliveryHeaders::from_lookup(|name| match name {
+            HEADER_MESSAGE_ID => Some("has space"),
+            HEADER_TIMESTAMP => Some(fresh.as_str()),
+            HEADER_SIGNATURE => Some("sha256=00"),
+            HEADER_MESSAGE_TYPE => Some("notification"),
+            _ => None,
+        })
+        .unwrap_err(),
+        EventSubError::InvalidHeader
+    );
+}
+
+fn sanitize_type(raw: &str) -> String {
+    raw.chars().take(MAX_TYPE_CHARS).collect()
+}
+
+fuzz_target!(|data: &[u8]| {
+    static MATRIX: Once = Once::new();
+    MATRIX.call_once(check_fixed_matrix);
+
+    let secret = test_secret();
+    let text = String::from_utf8_lossy(data);
+    let lower = text.to_lowercase();
+    let b0 = data.first().copied().unwrap_or(0);
+    let b1 = data.get(1).copied().unwrap_or(0);
+    let b2 = data.get(2).copied().unwrap_or(0);
+    let b3 = data.get(3).copied().unwrap_or(0);
+
+    // --- Body template + message type. Keywords win so the seed corpus
+    // deterministically covers each shape; otherwise the first selector byte
+    // explores. Raw JSON bodies (starting with `{`) fuzz the parser directly.
+    let trimmed = text.trim_start();
+    let raw_json = trimmed.starts_with('{');
+    let want_unknown = lower.contains("unknown") || lower.contains("something_new");
+    let want_challenge = lower.contains("challenge") || lower.contains("verification");
+    let want_revocation = lower.contains("revocation");
+    let want_notification = lower.contains("notification");
+    let (mut body, message_type): (Vec<u8>, String) = if raw_json {
+        let mut raw: Vec<u8> = data.to_vec();
+        if raw.len() > MAX_RAW_BODY {
+            raw.truncate(MAX_RAW_BODY);
+        }
+        let kind = match b3 % 4 {
+            0 => "notification".to_owned(),
+            1 => "webhook_callback_verification".to_owned(),
+            2 => "revocation".to_owned(),
+            _ => "something_new".to_owned(),
+        };
+        (raw, kind)
+    } else if want_unknown {
+        (b"{}".to_vec(), "something_new".to_owned())
+    } else if want_challenge {
+        (challenge_body(), "webhook_callback_verification".to_owned())
+    } else if want_revocation {
+        (revocation_body(), "revocation".to_owned())
+    } else if want_notification {
+        (notification_body(), "notification".to_owned())
+    } else {
+        match b0 % 5 {
+            0 => (challenge_body(), "webhook_callback_verification".to_owned()),
+            1 => (notification_body(), "notification".to_owned()),
+            2 => (revocation_body(), "revocation".to_owned()),
+            3 => (b"{}".to_vec(), "something_new".to_owned()),
+            _ => {
+                let mut raw: Vec<u8> = data.to_vec();
+                if raw.len() > MAX_RAW_BODY {
+                    raw.truncate(MAX_RAW_BODY);
+                }
+                (raw, "notification".to_owned())
+            }
+        }
+    };
+    if body.len() > MAX_RAW_BODY && !raw_json {
+        body.truncate(MAX_RAW_BODY);
+    }
+    let message_type = sanitize_type(&message_type);
+
+    // --- Message id: usually valid with a fuzzer-varying suffix, invalid only
+    // on the explicit keyword so the header gate stays reachable but rare.
+    let bad_id = lower.contains("bad-id");
+    let message_id = if bad_id {
+        "has space".to_owned()
+    } else {
+        format!("{ID_BASE}-{:02x}", b0)
+    };
+
+    // --- Timestamp: fresh by default with a small fuzzer jitter, stale past
+    // the window on keyword/byte, garbage on keyword/byte.
+    let garbage_time =
+        lower.contains("not-a-time") || lower.contains("garbage-time") || b2 % 8 == 7;
+    let stale = lower.contains("stale") || b2 % 4 == 1;
+    let future = b2 % 2 == 0;
+    let timestamp = if garbage_time {
+        "not-a-time".to_owned()
+    } else if stale {
+        let skew = MAX_TIMESTAMP_SKEW_MS + 60_000 + i64::from(b2) * 1000;
+        let sent = if future { NOW_MS + skew } else { NOW_MS - skew };
+        format_iso_millis(sent)
+    } else {
+        let jitter = i64::from(b2 % 60) * 1000;
+        format_iso_millis(NOW_MS + jitter)
+    };
+
+    // --- Signature: correct, then tampered by keyword/byte. Bad-prefix is a
+    // separate refusal shape from a wrong-but-well-formed MAC.
+    let tampered = lower.contains("tamper") || lower.contains("bad-sig") || b1 % 4 == 1;
+    let bad_prefix = lower.contains("bad-prefix") || b1 % 16 == 15;
+    let mut signature = sign(&message_id, &timestamp, &body);
+    if bad_prefix {
+        signature = format!("md5={}", &signature["sha256=".len()..]);
+    } else if tampered {
+        let last = signature.pop().unwrap();
+        signature.push(if last == '0' { '1' } else { '0' });
+    }
+
+    // --- Verify through the real header gate, asserting the known ground
+    // truth. A signature-bypass mutant returns Ok on tampered inputs; a
+    // freshness-widening mutant returns Ok on stale inputs; either fails here.
+    let parsed = headers(&message_id, &timestamp, &signature, &message_type);
+    if bad_id {
+        assert_eq!(parsed.unwrap_err(), EventSubError::InvalidHeader);
+        return;
+    }
+    let h = parsed.expect("fuzzed headers are valid");
+    let first = verify_delivery(&secret, &h, &body, NOW_MS);
+    assert_eq!(first, verify_delivery(&secret, &h, &body, NOW_MS));
+
+    if bad_prefix || tampered {
+        assert_eq!(first, Err(EventSubError::BadSignature));
+        return;
+    }
+    if garbage_time {
+        assert_eq!(first, Err(EventSubError::InvalidTimestamp));
+        return;
+    }
+    if stale {
+        // Ground truth from the shared clock parser, not the code under test.
+        let sent = parse_iso_millis(&timestamp).expect("stale timestamp parses");
+        assert!(NOW_MS.saturating_sub(sent).abs() > MAX_TIMESTAMP_SKEW_MS);
+        assert_eq!(first, Err(EventSubError::StaleTimestamp));
+        return;
+    }
+    // Fresh + correctly signed: allow for the jitter case where the derived
+    // timestamp is itself just outside the window (byte-derived jitter is
+    // bounded fresh, but assert from the clock rather than the flag).
+    match parse_iso_millis(&timestamp) {
+        None => assert_eq!(first, Err(EventSubError::InvalidTimestamp)),
+        Some(sent) if NOW_MS.saturating_sub(sent).abs() > MAX_TIMESTAMP_SKEW_MS => {
+            assert_eq!(first, Err(EventSubError::StaleTimestamp))
+        }
+        Some(_) => assert_eq!(first, Ok(())),
+    }
+    if first.is_err() {
+        return;
+    }
+
+    // --- Classify the verified delivery. Template shapes pin their exact
+    // variant; anything else must be deterministic and in the documented
+    // error set. A misrouting mutant (e.g. revocation -> Ignored) fails here.
+    let first_class = classify(&message_type, &body);
+    assert_eq!(first_class, classify(&message_type, &body));
+    if message_type == "something_new" {
+        assert_eq!(first_class, Ok(Delivery::Ignored));
+        return;
+    }
+    if message_type == "webhook_callback_verification" && body == challenge_body() {
+        assert_eq!(
+            first_class,
+            Ok(Delivery::Challenge(
+                "pogchamp-kappa-360noscope-vohiyo".to_owned()
+            ))
+        );
+    } else if message_type == "notification" && body == notification_body() {
+        assert!(matches!(
+            first_class,
+            Ok(Delivery::Notification(ref s)) if s.broadcaster_user_id == "1337"
+        ));
+    } else if message_type == "revocation" && body == revocation_body() {
+        assert_eq!(
+            first_class,
+            Ok(Delivery::Revocation {
+                subscription_id: "sub-1".to_owned(),
+                reason: two_bot_core::twitch_eventsub::RevocationReason::AuthorizationRevoked,
+            })
+        );
+    } else {
+        // Mismatched or raw bodies: no panic, deterministic, documented errors.
+        if let Err(err) = &first_class {
+            assert!(matches!(
+                err,
+                EventSubError::InvalidBody
+                    | EventSubError::WrongSubscription
+                    | EventSubError::InvalidChallenge
+            ));
+        }
+    }
+
+    // --- Parser-only pass: arbitrary bytes through `classify` without needing
+    // a signature. Must never panic and must be deterministic.
+    let mut raw: Vec<u8> = data.to_vec();
+    if raw.len() > MAX_RAW_BODY {
+        raw.truncate(MAX_RAW_BODY);
+    }
+    let probe_type = sanitize_type(&String::from_utf8_lossy(data));
+    let probe_type = if probe_type.is_empty() {
+        "notification".to_owned()
+    } else {
+        probe_type
+    };
+    let a = classify(&probe_type, &raw);
+    assert_eq!(a, classify(&probe_type, &raw));
+});
