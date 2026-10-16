@@ -1,11 +1,13 @@
 /**
- * Release-tagged error events grouped by error_class.
+ * Release-tagged error events grouped by event-specific fields.
  *
- * Workers Logs is the error tracker (no Sentry, no Gatus): every structured
- * Worker error event carries `release` (the container git SHA from /readyz
- * `build_revision`) so a new error after a deploy points at that release,
- * and `error_class` for grouping. Traces stay disabled: fetch spans would
- * record `url.full`, copying the ops webhook token into trace storage.
+ * Workers Logs is the error tracker (no Sentry, no Gatus): the
+ * `container_gateway_failure` and `metrics_alert` events carry `release` (the
+ * container git SHA from /readyz `build_revision`) so a new error after a deploy
+ * points at that release. Gateway failures group by `class`; metrics alerts
+ * group by rule in `content`.
+ * Traces stay disabled: fetch spans would record `url.full`, copying the ops
+ * webhook token into trace storage.
  * Reads fixtures only; never touches a live Worker.
  */
 import { test } from "node:test";

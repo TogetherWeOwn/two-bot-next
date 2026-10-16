@@ -1,10 +1,10 @@
 /**
  * Release-tagged error events for Workers Logs.
  *
- * Workers Logs is the tracker: every structured Worker error event carries
- * `release` (the container git SHA from /readyz `build_revision`, stamped at
- * deploy time from `GITHUB_SHA` via `scripts/staging_rollout.py`) so a new
- * error after a deploy points at that release, plus `worker_version`
+ * Workers Logs is the tracker: `container_gateway_failure` and `metrics_alert`
+ * events carry `release` (the container git SHA from /readyz `build_revision`,
+ * stamped at deploy time from `GITHUB_SHA` via `scripts/staging_rollout.py`) so
+ * a new error after a deploy points at that release, plus `worker_version`
  * (`CF_VERSION_METADATA.id`) to join the deploy receipt. Group gateway
  * failures by `class` and metrics alerts by the alert rule in `content`; a
  * validated last error class appears in content only for

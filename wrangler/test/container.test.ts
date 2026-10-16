@@ -528,9 +528,9 @@ test("keepalive logs only phase and class even when the failure object carries m
   assert.ok(h.logs.every((entry) => !entry.includes("hunter2")));
 });
 
-// Release-tagged error tracking grouped by error_class: the keepalive
+// Release-tagged error tracking groups gateway failures by `class`: the keepalive
 // re-emits the container failure with the /readyz git SHA as `release`
-// (Workers Logs groups by error_class filtered to that release).
+// (Workers Logs filters by release and groups by class).
 const RELEASE_SHA = "9f3a1c7e2b4d6a8c0e1f3a5b7c9d2e4f6a8b0c1d";
 
 test("keepalive tags the gateway failure with the container release and worker version", async (t) => {

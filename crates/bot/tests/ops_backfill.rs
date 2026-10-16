@@ -141,6 +141,8 @@ fn spawn_bot() -> (Bot, SocketAddr) {
             Instant::now() < deadline,
             "bot did not serve health on the configured port"
         );
+        // Bounded 20 ms backoff under the 15 s deadline (~50 health
+        // polls/s): lets the child boot without spinning a core per test.
         thread::sleep(Duration::from_millis(20));
     }
     (bot, addr)

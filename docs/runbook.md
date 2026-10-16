@@ -276,6 +276,37 @@ Unknown, wrong-method and overlong shapes collapse to `other` with no new
 series. Source: [`metrics.rs`](../crates/core/src/metrics.rs),
 [`executor_metrics.rs`](../crates/discord/src/executor_metrics.rs).
 
+#### Alert: REST 5xx
+
+More than 10% of Discord REST requests between two keepalive samples (minimum
+10 requests in the window) returned 5xx. Unlike 429s, a 5xx burst is never
+healthy backpressure: it is Discord-side failure or a broken request shape
+from a fresh deploy. A counter reset (process restart) skips the window rather
+than firing. `transport` failures (timeouts and cancellations before response
+headers) are not counted here; they surface through job timeout classes.
+
+First response: read the hot route from the `route` label on
+`two_bot_rest_requests_total{route,result="5xx"}` via the authorized
+`/ops/metrics` scrape; confirm whether a deploy or promotion is in progress
+(check the staging workflow result and recent merges — a fresh deploy can
+explain a new hot route). Do not replay uncertain writes: a 5xx leaves the
+effect unknown, so reconcile through the recorded disposition before retrying
+anything the burst may have executed twice.
+
+Evaluate rollback when the burst starts with the deployed revision: compare the
+alert's first-firing window with the staging-rollout evidence (or the gated
+production run) for that SHA. A 5xx share introduced by a promotion stage
+requires a manual rollback decision unless a 5xx-specific per-stage health gate
+is configured and wired to the shared gradual-promotion action. When its
+configured gate fails, the action restores the recorded pre-promote version; a
+manual rollback names the recorded Worker version and container image from the
+failed run's snapshot. A burst on an unchanged revision is a Discord incident
+or a dependency regression, not a rollback.
+
+Escalate when the 5xx share stays above threshold across several windows after
+containment, or when 5xx coincide with 429/transport failures suggesting a
+wider Discord or network incident.
+
 #### Alert: DB pool
 
 The SQLx pool sat at its maximum with zero idle connections for three
@@ -1781,7 +1812,7 @@ into this Rust binary without an implemented dispatch path.
 | Attribution/scorecard/plan/onboarding/automation reports | Legacy read-only reporting CLIs intentionally dropped by parity decision; core calculations/store presence does not add operator commands. |
 | Staging provision/verify/reset and Discord e2e harness | Legacy tooling intentionally dropped; next uses local fixtures/agent-testdb and its own soak evidence. Never reset live/staging databases for tests. |
 | Preflight/exact-grant acceptance, Wave 0 exports, Wick whitelist, redesign/role cleanup | No equivalent next operator preflight/export/grant CLI identified. Core permission contracts are not live-grant proof; redesign and third-party dashboard verification are outside routine operations. |
-| Cutover import/backfill/capture/dedupe, dual-running, command registration, live identity/bot removal | Cutover tools are separate ports, **not dropped**. Execution is out of scope and has separate gates. This runbook cannot authorize activation, backfill, or legacy-bot removal. |
+| Cutover import/backfill/capture/dedupe, dual-running, command registration, live identity/bot removal | Cutover tools are separate ports, **not dropped**. Execution is out of scope and has separate gates. This runbook cannot authorize activation, backfill, or legacy-bot removal. Rate limits, cursors/resume, dry-run counts and failure anchors for backfills live in [backfill-runbook.md](backfill-runbook.md). |
 | Host bootstrap/systemd, 48-hour backups, logrotate/housekeeping | Deployment topology differs; timers remain templates. Host execution is broker/operator-owned, not an agent shell task or Container installation recipe. |
 | Secret storage/rotation and legacy credential filenames | Names/custody guidance retained, runtime spellings separated. No rotation commands: credential changes require separate approval and exact consumer wiring. |
 | Staging acceptance fixtures, hierarchy/grants, bot startup mapping and evidence | Replaced by next test-container/local-fixture coverage and the explicit staging soak. Legacy reset/provisioning evidence and contradictory historical status are not current next-runtime proof. |

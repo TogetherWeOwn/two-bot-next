@@ -3,10 +3,11 @@
 This is a separate `cargo-fuzz` workspace, explicitly excluded from the root
 workspace. Normal `cargo build`, workspace tests/clippy, `check` and cargo-deny
 keep their existing members, dependency lockfile and stable toolchain. The required
-`fuzz-compile` CI job (`check.yml`, gated by `ci-ok`) builds all fifteen targets
+`fuzz-compile` CI job (`check.yml`, gated by `ci-ok`) builds all sixteen targets
 on pinned nightly `nightly-2026-10-01` + `cargo-fuzz 0.13.2` and then replays
-the `eventsub_delivery` seed corpus once (`-runs=0`, no fuzzing); no scheduled
-or continuous fuzz campaign exists, and the other targets are compile-only in CI.
+the `eventsub_delivery` seed corpus once (`-runs=0`, no fuzzing). The other
+fifteen targets are compile-only in required CI; bounded manual smokes exist for
+`vote_kick` and `helix_token`. No scheduled or continuous fuzz campaign exists.
 
 ## Coverage
 
@@ -27,6 +28,7 @@ or continuous fuzz campaign exists, and the other targets are compile-only in CI
 | `lfg_select` | `lfg::parse_lfg_select`, `lfg_custom_id`, `parse_role_spec`, `spec_roles`, `lfg_select_options` | Arbitrary NUL-separated post id / select value / raw `custom_id` / role-spec fields (capped at 4 fields, 256 chars per id field, spec up to `MAX_ROLE_SPEC_CHARS` + 64 chars so the boundary is reachable). Select parse: foreign and forged (case, padding, zero-width) prefixes refuse (`None`); a doubled prefix strips once; after the one exact `two:lfg:` prefix the post id and role key are carried byte-for-byte (no trim, fold or unescape; the parser has no length bound, so the select path inherits Discord's 100-char component caps), and `Leave` only on the exact `__leave__` value. Accepted specs hold the store invariants (1–20 unique valid keys, never `__leave__`, trimmed 1–80 unit labels, slots 1–99), re-parse from their canonical rendering, and mint select options whose values sign up for exactly that role key (leave option last). A separately built row around a fuzzed label keeps every option label within the 100-unit cap. `TooLong` iff over `MAX_ROLE_SPEC_CHARS` (checked first); `BadCount` for more than 20 entries within that bound; `BadKey` echoes at most 128 chars. Seeds mirror the hostile matrix (forged/doubled prefixes, mentions, reserved and duplicate keys, Kelvin-sign key, radix slots, 20-role boundary, 21 roles, overlong ids and spec). No database, Discord client, network or secret. |
 | `internal_action_validators` | `internal_actions::parse_body_object`, `require_timestamp`/`require_reason`/`require_snowflake`/`require_settings_key`, `validate_event_key`/`validate_idempotency_key`/`validate_moderation_numbers`, `within_skew`, `valid_nonce_format`, `build_role_keys`/`build_channel_keys`/`parse_keys`, `assert_private_bind`/`is_private_address`, `assert_allowed`, `new_request_id` | The request-validator seams the `internal_action` target does not reach. Arbitrary bytes go through the strict body parser (size ceiling, single object, deterministic), and every accepted object runs the field validators; each NUL-separated field runs the string grammars. Independent oracles pin the nonce, idempotency-key, event-key, snowflake and settings-key grammars, the skew window and the per-verb numeric bounds; accepted timestamps are `toISOString()`-shaped and stable on re-validation; accepted key maps hold trimmed keys and canonical snowflakes; signing-key ids are unique; a successful private bind is never a wildcard and hostnames are never private; unknown actions are never allowed; request ids are 26 Crockford characters. Known quirk, deliberately not asserted: a doubly bracketed host such as `[[::1]]` binds as `[::1]`. Seeds reuse the `internal_action` bodies and the bot nonce fixture strings plus hostile fields, duplicate keys, bind hosts and key maps. No database, Discord client, network or secret. |
 | `eventsub_delivery` | `twitch_eventsub::verify_delivery`, `twitch_eventsub::classify` | Structured delivery inputs (signature, timestamp skew, message type, body) signed with public synthetic test material so MAC failure cannot starve the JSON parser. Fixed matrix pins challenge / notification / revocation happy paths plus tampered-signature (`BadSignature`), stale-timestamp (`StaleTimestamp`), unknown-type (`Ignored`) and oversize (`BodyTooLarge`) refusals; fuzzed inputs assert tampered inputs never verify (signature-bypass mutant fails), stale inputs never verify (freshness-widening mutant fails), and verified templates classify to their exact variant (misrouting mutant fails). Raw bodies get a signature-independent `classify` pass for parser coverage. Message ids stay in the header alphabet, types are capped at 64 chars, raw bodies at 8 KiB. Seeds cover challenge, notification, revocation, tampered signature, stale timestamp and unknown message type; keyword-guided inputs suppress byte-derived hostile flags so each seed reaches its named shape (pinned in the fixed matrix), and CI replays the seeds once. No database, Discord client, network or secret. |
+| `helix_token` | `twitch_helix::parse_token_response` | Arbitrary bounded bytes decode as JSON before the production token parser; successful parses must retain a nonnegative expiry and redacted token formatting. Seeds cover a valid response, near-expiry token, missing fields, wrong types and a >64 KiB body. The target caps each input at 128 KiB; it uses a fixed synthetic clock and no network, database, credentials or secrets. The separate `helix-token-fuzz-smoke` workflow runs a bounded 60-second seed-backed campaign and uploads the receipt. |
 
 All seeds use synthetic IDs/text; no token, environment secret, database,
 Discord client or network is needed at runtime. MEE6's crate currently has SQLx
@@ -63,11 +65,13 @@ set -euo pipefail
 : "${FUZZ_OUTPUT_DIR:?set an absolute non-source output directory}"
 FUZZ_SECONDS=${FUZZ_SECONDS:-300}
 mkdir -p "$FUZZ_OUTPUT_DIR/target" "$FUZZ_OUTPUT_DIR/logs"
-for target in internal_action automod prefix_trigger mee6_export guild_config_snapshot voice_config rsvp settings_map vote_kick vote_kick_reason slash_input_bounds cutover_parse lfg_select internal_action_validators eventsub_delivery; do
+for target in internal_action automod prefix_trigger mee6_export guild_config_snapshot voice_config rsvp settings_map vote_kick vote_kick_reason slash_input_bounds cutover_parse lfg_select internal_action_validators eventsub_delivery helix_token; do
   mkdir -p "$FUZZ_OUTPUT_DIR/corpus/$target" "$FUZZ_OUTPUT_DIR/artifacts/$target"
+  max_len=65536
+  if [[ "$target" == helix_token ]]; then max_len=131072; fi
   cargo +nightly fuzz run --target-dir "$FUZZ_OUTPUT_DIR/target" \
     "$target" "$FUZZ_OUTPUT_DIR/corpus/$target" "fuzz/corpus/$target" -- \
-    -max_total_time="$FUZZ_SECONDS" -max_len=65536 -rss_limit_mb=2048 -timeout=10 \
+    -max_total_time="$FUZZ_SECONDS" -max_len="$max_len" -rss_limit_mb=2048 -timeout=10 \
     -artifact_prefix="$FUZZ_OUTPUT_DIR/artifacts/$target/" \
     2>&1 | tee "$FUZZ_OUTPUT_DIR/logs/$target.log"
 done

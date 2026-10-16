@@ -374,9 +374,11 @@ jobs:
       # Deterministic quality gates (docs/quality-gates.md). Steps, not jobs:
       # they reuse this lane's runner, container and toolchain, so no new
       # runner minutes beyond the step itself, and ci-ok already covers them.
-      # WARN gates annotate but never fail on findings; a broken gate step
-      # still fails so blindness cannot hide. The inventory gate is HARD and
-      # always on (pure Python, milliseconds); the rest are gated on the rust
+      # Patch coverage and the squawk lint stay WARN (they annotate but never
+      # fail on findings); unwrap request-paths and semgrep are HARD and fail
+      # on new findings. A broken gate step still fails so blindness cannot
+      # hide. The inventory gate is HARD and always on (pure Python,
+      # milliseconds); the rest are gated on the rust
       # selector like the other heavy steps.
       - name: CI test-target inventory
         run: python3 scripts/ci/check-test-inventory.py
@@ -421,7 +423,7 @@ jobs:
             echo "::warning::patch coverage measurement did not complete; see the rust-tests lane for the authoritative unit-test result"
           fi
 
-      - name: Unwrap in request paths (WARN)
+      - name: Unwrap in request paths (HARD)
         if: needs.job-inputs.outputs.rust != 'false'
         shell: bash
         env:
@@ -446,7 +448,7 @@ jobs:
             --base-ref "$QUALITY_BASE" --head-ref "$QUALITY_HEAD"
           PATH="$RUNNER_TEMP/ast-grep:$PATH" ast-grep test -c sgconfig.yml
 
-      - name: Semgrep Rust rules (WARN)
+      - name: Semgrep Rust rules (HARD)
         if: needs.job-inputs.outputs.rust != 'false'
         shell: bash
         env:
@@ -1969,10 +1971,9 @@ jobs:
       - name: Fetch pinned fuzz dependencies (locked)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fetch --locked
-      # Builds all fifteen libFuzzer targets. No fuzz campaign or corpus
-      # output; the workflow's existing weekly run also builds these targets
-      # and replays only the bounded eventsub_delivery seeds below. The bounded
-      # vote_kick smoke stays a manual non-controller step (see fuzz/README.md).
+      # Builds all sixteen libFuzzer targets. No campaign or generated corpus
+      # output; the existing weekly run replays only the bounded eventsub_delivery
+      # seeds below. Bounded vote_kick and helix_token smokes are manual (README).
       # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the
       # toolchain from the repo-root rust-toolchain.toml (stable 1.98.1) even
       # with working-directory fuzz/, so a bare `cargo fuzz build` runs under
@@ -1985,7 +1986,7 @@ jobs:
       # and exits without fuzzing. A signing-key drift between the harness
       # and production, or seed misrouting, panics an assertion here instead
       # of passing a compile-only gate. Compile stays the only gate for the
-      # other fourteen targets.
+      # other fifteen targets.
       - name: Seed replay for eventsub_delivery (bounded, no campaign)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz run eventsub_delivery -- -runs=0 -timeout=10 -rss_limit_mb=2048
