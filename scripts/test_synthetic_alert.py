@@ -1,5 +1,6 @@
 """Offline synthetic-alert fixtures; stdlib only, no network access."""
 
+import importlib
 import io
 import json
 import os
@@ -11,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import synthetic_alert as alert  # noqa: E402
+alert = importlib.import_module("synthetic_alert")
 
 HOOK = "https://discord.com/api/webhooks/123456789012345678/synthetic-token-not-a-secret"
 

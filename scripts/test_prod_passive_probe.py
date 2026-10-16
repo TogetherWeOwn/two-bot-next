@@ -1,5 +1,6 @@
 """Offline passive production probe fixtures; stdlib only, no network access."""
 
+import importlib
 import io
 import json
 import os
@@ -11,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import prod_passive_probe as probe  # noqa: E402
+probe = importlib.import_module("prod_passive_probe")
 
 PROD = "https://two-bot-next.example-sub.workers.dev"
 PROD_ALT = "https://two-bot-next-production.example-sub.workers.dev"
