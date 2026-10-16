@@ -295,8 +295,8 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             ack(id)
         }
         Ok(Delivery::Revocation { .. }) => {
-            // Reconcile runs at boot and after revocation in the Helix slice;
-            // here only acknowledge so Twitch does not retry.
+            // The bounded reconcile pass re-subscribes; here only acknowledge
+            // so Twitch does not retry.
             tracing::info!(
                 event = "eventsub_receiver",
                 status = 200,

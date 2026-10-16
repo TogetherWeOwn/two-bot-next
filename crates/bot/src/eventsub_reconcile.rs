@@ -15,7 +15,7 @@
 //! secret value, header, challenge or body byte: only scalar counts, statuses
 //! and error classes.
 
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, future::Future, time::Duration};
 
 use two_bot_core::twitch_eventsub::{CallbackUrl, ExistingSubscription, WebhookSecret};
 use two_bot_core::twitch_helix::{
@@ -322,8 +322,15 @@ fn stopped(shutdown: &tokio::sync::watch::Receiver<bool>) -> bool {
 
 /// Startup run, then the bounded interval, until shutdown. Failures are
 /// logged per pass and never stop the loop: the next tick retries.
-async fn run_loop(mut shutdown: tokio::sync::watch::Receiver<bool>) {
-    run_once().await;
+async fn run_loop<P, Fut>(
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    interval: Duration,
+    mut pass: P,
+) where
+    P: FnMut() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    pass().await;
     loop {
         tokio::select! {
             biased;
@@ -331,12 +338,12 @@ async fn run_loop(mut shutdown: tokio::sync::watch::Receiver<bool>) {
                 let _ = result;
                 return;
             }
-            _ = tokio::time::sleep(Duration::from_secs(RECONCILE_INTERVAL_SECS)) => {}
+            _ = tokio::time::sleep(interval) => {}
         }
         if stopped(&shutdown) {
             return;
         }
-        run_once().await;
+        pass().await;
     }
 }
 
@@ -352,7 +359,11 @@ pub fn spawn_if_enabled(shutdown: tokio::sync::watch::Receiver<bool>) {
         );
         return;
     }
-    tokio::spawn(run_loop(shutdown));
+    tokio::spawn(run_loop(
+        shutdown,
+        Duration::from_secs(RECONCILE_INTERVAL_SECS),
+        run_once,
+    ));
 }
 
 #[cfg(test)]
@@ -747,5 +758,45 @@ mod tests {
         );
         assert_eq!(seen[2].method, Method::DELETE);
         assert_eq!(seen[3].method, Method::POST);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_loop_repeats_each_interval_until_shutdown() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let passes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&passes);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_loop(shutdown_rx, Duration::from_secs(60), move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async {}
+        }));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            passes.load(Ordering::SeqCst),
+            1,
+            "startup pass runs at once"
+        );
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(
+            passes.load(Ordering::SeqCst),
+            2,
+            "first interval tick runs a pass"
+        );
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(
+            passes.load(Ordering::SeqCst),
+            3,
+            "second interval tick runs a pass"
+        );
+        shutdown_tx.send(true).expect("loop holds the receiver");
+        task.await.expect("loop exits on shutdown");
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert_eq!(
+            passes.load(Ordering::SeqCst),
+            3,
+            "no pass runs after shutdown"
+        );
     }
 }

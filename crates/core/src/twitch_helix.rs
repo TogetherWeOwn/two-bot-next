@@ -12,8 +12,9 @@
 //!   refresh-before-expiry ([`TOKEN_REFRESH_SKEW_MS`]) and
 //!   [`parse_token_response`].
 //! - [`plan_boot_actions`]: the accumulated subscription list plus desired
-//!   broadcasters in, deletes-before-creates plan out. Pure: runs at boot and
-//!   after a `revocation`, never on a timer.
+//!   broadcasters in, deletes-before-creates plan out. Pure: holds no timers;
+//!   the bot runtime (`eventsub_reconcile`) runs it at startup and on a
+//!   bounded interval.
 //! - [`HelixClient`]: executes the plan over a [`HelixTransport`]. Tests
 //!   inject a scripted transport; production uses [`HyperHelixTransport`]
 //!   (hyper 1.x over rustls, one fresh client per request, fixed hosts only).

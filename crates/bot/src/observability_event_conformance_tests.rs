@@ -574,3 +574,92 @@ fn eventsub_events_are_recorded_in_the_catalog_doc() {
         );
     }
 }
+
+/// `crates/bot/src/eventsub_reconcile.rs`: the subscription reconcile log
+/// vocabulary. The file is permanent, so it is read at compile time; the
+/// message set, the bounded `event` field, the `error_class` tokens and the
+/// `status` tokens each fail closed when renamed or added without a catalog row.
+const EVENTSUB_RECONCILE_RS_EVENTS: [&str; 10] = [
+    "eventsub reconcile parked: TWO_EVENTSUB is not exactly 1",
+    "eventsub reconcile refused: callback configuration is invalid",
+    "eventsub reconcile parked: broadcaster allowlist is empty, no subscriptions mutated",
+    "eventsub reconcile refused: Twitch credentials are missing or invalid",
+    "eventsub reconcile refused: webhook secret is missing or invalid",
+    "eventsub reconcile found failed subscriptions on our callback; deleting and re-creating",
+    "eventsub reconcile follow-up listing is missing a healthy subscription",
+    "eventsub subscriptions re-created but none verified yet",
+    "eventsub subscriptions reconciled",
+    "eventsub reconcile failed",
+];
+const EVENTSUB_RECONCILE_ERROR_CLASSES: [&str; 6] = [
+    "reconcile_prior_failed",
+    "reconcile_unhealthy",
+    "reconcile_pending",
+    "reconcile_config_invalid",
+    "reconcile_no_broadcasters",
+    "reconcile_failed",
+];
+const EVENTSUB_RECONCILE_STATUSES: [&str; 3] = ["parked", "healthy", "pending"];
+const EVENTSUB_RECONCILE_EVENT_FIELD: &str = "eventsub_reconcile";
+const EVENTSUB_RECONCILE_RS: &str = include_str!("eventsub_reconcile.rs");
+
+/// Quoted values of every `field = "..."` pair, in file order.
+fn quoted_field_values<'a>(source: &'a str, field: &str) -> Vec<&'a str> {
+    let marker = format!("{field} = \"");
+    let mut out = Vec::new();
+    let mut search_from = 0;
+    while let Some(rel) = source[search_from..].find(&marker) {
+        let start = search_from + rel + marker.len();
+        match source[start..].find('"') {
+            Some(end) => {
+                out.push(&source[start..start + end]);
+                search_from = start + end + 1;
+            }
+            None => panic!("unterminated {field} value fails closed"),
+        }
+    }
+    out
+}
+
+#[test]
+fn eventsub_reconcile_emissions_match_the_catalog() {
+    let source = EVENTSUB_RECONCILE_RS;
+    assert_eq!(
+        sorted_unique(traced_messages(source)),
+        sorted_unique(EVENTSUB_RECONCILE_RS_EVENTS.to_vec()),
+        "reconcile emitted an uncataloged message or dropped a cataloged one: \
+         record it in docs/observability-event-catalog.md and EVENTSUB_RECONCILE_RS_EVENTS together"
+    );
+    let traced = traced_messages(source).len();
+    let fielded = source.matches("event = \"eventsub_reconcile\"").count();
+    assert_eq!(
+        fielded, traced,
+        "every reconcile log callsite carries event = \"eventsub_reconcile\" \
+         ({fielded} fielded of {traced} callsites)"
+    );
+    assert_eq!(
+        sorted_unique(quoted_field_values(source, "error_class")),
+        sorted_unique(EVENTSUB_RECONCILE_ERROR_CLASSES.to_vec()),
+        "new reconcile error_class fails closed: record it in the catalog and EVENTSUB_RECONCILE_ERROR_CLASSES"
+    );
+    assert_eq!(
+        sorted_unique(quoted_field_values(source, "status")),
+        sorted_unique(EVENTSUB_RECONCILE_STATUSES.to_vec()),
+        "new reconcile status fails closed: record it in the catalog and EVENTSUB_RECONCILE_STATUSES"
+    );
+}
+
+#[test]
+fn eventsub_reconcile_events_are_recorded_in_the_catalog_doc() {
+    let catalog = observability_catalog_doc();
+    for token in EVENTSUB_RECONCILE_RS_EVENTS
+        .into_iter()
+        .chain(EVENTSUB_RECONCILE_ERROR_CLASSES)
+        .chain([EVENTSUB_RECONCILE_EVENT_FIELD])
+    {
+        assert!(
+            catalog.contains(token),
+            "reconcile token missing from docs/observability-event-catalog.md: {token}"
+        );
+    }
+}
