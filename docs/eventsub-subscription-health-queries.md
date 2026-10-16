@@ -174,10 +174,11 @@ the added pending filter.
 Expected while the reconcile slice is undeployed. After it deploys, each pass
 ends with one terminal outcome line from the table above; a failed or unhealthy
 pass may log earlier `reconcile_prior_failed` or `reconcile_unhealthy` lines
-within the same pass. Passes run at startup and then hourly. The loop sleeps a
-full `RECONCILE_INTERVAL_SECS` (3600 s) after each pass returns, so the gap from
-one pass's terminal outcome to the next pass's terminal outcome is always over
-one hour; a 60-minute window with no terminal outcome is normal.
+within the same pass. Passes run at startup and then hourly. Within one uninterrupted container
+boot, the loop sleeps a full `RECONCILE_INTERVAL_SECS` (3600 s) after each pass
+returns, so the gap from one pass's terminal outcome to the next pass's
+terminal outcome is over one hour; a 60-minute window with no terminal outcome
+is normal. A restart can run the startup pass sooner.
 
 A window of more than two hours with none of the three Q2 queries returning a
 line (with `TWO_EVENTSUB=1` set) shows only that no pass has completed in that
@@ -187,9 +188,11 @@ Helix calls looks the same as a stopped task in these logs. Do not restart on
 silence alone. The Operator first confirms the container is still alive with an
 unfiltered read of the same service (omit `--contains`): unrelated lines still
 arriving mean the process is up, and the Operator then investigates the
-reconcile task rather than restarting. Healthy lines absent while the other
-queries return lines means the task is running and failing or pending, not
-stopped.
+reconcile task rather than restarting. When a failure or pending outcome is
+present and healthy lines are absent, reconciliation failed or remained pending
+at that outcome's timestamp; those lines prove only that it ran then. Parked
+outcomes, including `flag_dark` and `reconcile_no_broadcasters`, do not establish
+that an active reconcile ran and are neither failure nor pending evidence.
 
 ## Q3 — revocation count (total today; by reason needs a logging slice)
 
