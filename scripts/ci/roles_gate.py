@@ -134,16 +134,16 @@ def run_gate(binary, target, url, expected_host, expected_database, expected_bra
         )
     except (OSError, subprocess.SubprocessError):
         raise Refused("roles verify refused to run against the target database")
+    stdout = proc.stdout or ""
+    stderr = proc.stderr or ""
+    findings = findings_from_output(stdout, stderr)
     if proc.returncode == 0:
-        return []
-    findings = findings_from_output(proc.stdout or "", proc.stderr or "")
+        if any(line.startswith("DATABASE ROLES VERIFIED") for line in stdout.splitlines()) and not findings:
+            return []
+        raise Refused("roles verify returned an unverified clean result")
     if proc.returncode == 1 and findings:
         return findings
-    last_line = (proc.stderr or "").strip().splitlines()
-    raise Refused(
-        f"roles verify refused the gate (exit {proc.returncode}): "
-        f"{last_line[-1] if last_line else 'no detail'}"
-    )
+    raise Refused(f"roles verify refused the gate (exit {proc.returncode})")
 
 
 def main(argv=None, env=None, run=None):

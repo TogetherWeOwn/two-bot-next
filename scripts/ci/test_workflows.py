@@ -1194,6 +1194,10 @@ def roles_gate_errors(workflow, name="deploy-staging.yml"):
     if "roles-gate" not in needs:
         errors.append(f"{name}:deploy: must needs the roles-gate (drift must block the deploy)")
     steps = gate.get("steps") or []
+    if "continue-on-error" in gate:
+        errors.append(f"{name}:roles-gate: job must not tolerate failure")
+    if any("if" in step or "continue-on-error" in step for step in steps):
+        errors.append(f"{name}:roles-gate: gate steps must not skip or tolerate failure")
     if len(steps) != 4:
         errors.append(f"{name}:roles-gate: must run exactly checkout, SHA check, build and the gate")
         return errors
@@ -1207,12 +1211,16 @@ def roles_gate_errors(workflow, name="deploy-staging.yml"):
         errors.append(f"{name}:roles-gate: SHA check must pin the step to the deploy SHA")
     if "cargo build -p two-bot --bin two-bot --locked" not in str(build.get("run", "")):
         errors.append(f"{name}:roles-gate: build must compile the reviewed two-bot binary locked")
-    if (run.get("shell") != "bash" or "set -o pipefail" not in str(run.get("run", ""))
-            or "scripts/ci/roles_gate.py" not in str(run.get("run", ""))
-            or "--target staging" not in str(run.get("run", ""))
-            or "TWO_DATABASE_URL" not in str(run.get("env", ""))):
-        errors.append(f"{name}:roles-gate: gate step must run the reviewed script over pipefail "
-                      "with the plan binding and the staging target")
+    expected_run = """set -o pipefail
+python3 scripts/ci/roles_gate.py \\
+  --binary ./target/debug/two-bot --target staging \\
+  --expected-host "$TWO_BOT_STAGING_HOST" --expected-database "$TWO_BOT_STAGING_DATABASE" \\
+  --expected-branch-id "$TWO_BOT_STAGING_BRANCH_ID"
+"""
+    if (run.get("shell") != "bash" or str(run.get("run", "")).strip() != expected_run.strip()
+            or (run.get("env") or {}).get("TWO_DATABASE_URL")
+            != "${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}"):
+        errors.append(f"{name}:roles-gate: gate step must pin the exact fail-closed staging command and plan binding")
     # The expected staging identity is pinned independently of the secret
     # binding (vars, never derived from the URL): a wrong-target binding must
     # refuse instead of reading the wrong database.
@@ -1266,6 +1274,10 @@ def production_roles_gate_errors(workflow, name="deploy-production.yml"):
     if "roles-gate" not in needs or "guard" not in needs:
         errors.append(f"{name}:production: must needs the guard and the roles-gate (drift must block the deploy)")
     steps = gate.get("steps") or []
+    if "continue-on-error" in gate:
+        errors.append(f"{name}:roles-gate: job must not tolerate failure")
+    if any("if" in step or "continue-on-error" in step for step in steps):
+        errors.append(f"{name}:roles-gate: gate steps must not skip or tolerate failure")
     if len(steps) != 5:
         errors.append(f"{name}:roles-gate: must run exactly checkout, tooling checkout, SHA check, build and the gate")
         return errors
@@ -1285,14 +1297,20 @@ def production_roles_gate_errors(workflow, name="deploy-production.yml"):
         errors.append(f"{name}:roles-gate: SHA check must pin the step to the guarded SHA")
     if "cargo build -p two-bot --bin two-bot --locked" not in str(build.get("run", "")):
         errors.append(f"{name}:roles-gate: build must compile the reviewed two-bot binary locked")
-    if (run.get("shell") != "bash" or "set -o pipefail" not in str(run.get("run", ""))
-            or "scripts/ci/roles_gate.py" not in str(run.get("run", ""))
-            or "--target production" not in str(run.get("run", ""))
-            or "--mode" not in str(run.get("run", ""))
-            or "--allow-unstaged" not in str(run.get("run", ""))
-            or "TWO_DATABASE_URL" not in str(run.get("env", ""))):
-        errors.append(f"{name}:roles-gate: gate step must run the reviewed script over pipefail "
-                      "with the plan binding, the production target and the guard-verified waive flags")
+    expected_run = """set -o pipefail
+python3 tooling/scripts/ci/roles_gate.py \\
+  --binary ./target/debug/two-bot --target production \\
+  --expected-host "$TWO_BOT_PRODUCTION_HOST" --expected-database "$TWO_BOT_PRODUCTION_DATABASE" \\
+  --expected-branch-id "$TWO_BOT_PRODUCTION_BRANCH_ID" \\
+  --mode "$MODE" --allow-unstaged "$ALLOW_UNSTAGED"
+"""
+    run_env = run.get("env") or {}
+    if (run.get("shell") != "bash" or str(run.get("run", "")).strip() != expected_run.strip()
+            or run_env.get("TWO_DATABASE_URL")
+            != "${{ secrets.TWO_BOT_PRODUCTION_PLAN_DATABASE_URL }}"
+            or run_env.get("MODE") != "${{ needs.guard.outputs.mode }}"
+            or run_env.get("ALLOW_UNSTAGED") != "${{ needs.guard.outputs.allow_unstaged }}"):
+        errors.append(f"{name}:roles-gate: gate step must pin the exact production command and guard-verified values")
     # The expected production identity is pinned independently of the secret
     # binding (vars, never derived from the URL): a wrong-target binding must
     # refuse instead of reading the wrong database. A PlanetScale host also
@@ -1567,6 +1585,12 @@ class WorkflowTests(unittest.TestCase):
             lambda w: w["jobs"]["roles-gate"]["steps"][3].__setitem__("run", "wrangler deploy"),
             lambda w: w["jobs"]["roles-gate"]["steps"][3].get("env", {}).__setitem__(
                 "LEAK", "${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}"),
+            lambda w: w["jobs"]["roles-gate"]["steps"][3].__setitem__("if", "${{ false }}"),
+            lambda w: w["jobs"]["roles-gate"].__setitem__("if", "${{ false }}"),
+            lambda w: w["jobs"]["roles-gate"]["steps"][3].__setitem__("continue-on-error", True),
+            lambda w: w["jobs"]["roles-gate"].__setitem__("continue-on-error", True),
+            lambda w: w["jobs"]["roles-gate"]["steps"][3].__setitem__(
+                "run", w["jobs"]["roles-gate"]["steps"][3]["run"] + " || true"),
         ):
             changed = copy.deepcopy(staging)
             mutate(changed)
@@ -1819,6 +1843,16 @@ class WorkflowTests(unittest.TestCase):
                 "LEAK", "${{ secrets.TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL }}"),
             lambda w: w["jobs"]["roles-gate"]["steps"][4].get("env", {}).__setitem__(
                 "TWO_BOT_PRODUCTION_BRANCH_ID", ""),
+            lambda w: w["jobs"]["roles-gate"]["steps"][4].__setitem__("if", "${{ false }}"),
+            lambda w: w["jobs"]["roles-gate"].__setitem__("if", "${{ false }}"),
+            lambda w: w["jobs"]["roles-gate"]["steps"][4].__setitem__("continue-on-error", True),
+            lambda w: w["jobs"]["roles-gate"].__setitem__("continue-on-error", True),
+            lambda w: w["jobs"]["roles-gate"]["steps"][4].__setitem__(
+                "run", w["jobs"]["roles-gate"]["steps"][4]["run"] + " || true"),
+            lambda w: w["jobs"]["roles-gate"]["steps"][4].get("env", {}).__setitem__(
+                "MODE", "rollback"),
+            lambda w: w["jobs"]["roles-gate"]["steps"][4].get("env", {}).__setitem__(
+                "ALLOW_UNSTAGED", "true"),
         ):
             changed = copy.deepcopy(production)
             mutate(changed)

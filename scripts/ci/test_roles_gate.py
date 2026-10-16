@@ -10,6 +10,7 @@ from roles_gate import (
     drift_message,
     findings_from_output,
     main,
+    run_gate,
     validated_findings,
     verify_binding,
     waive_reason,
@@ -135,6 +136,50 @@ class WaiveTests(unittest.TestCase):
 
     def test_live_sha_redeploy_waives(self):
         self.assertIsNotNone(waive_reason("deploy", "true"))
+
+
+class RunGateTests(unittest.TestCase):
+    def invoke(self, returncode, stdout="", stderr=""):
+        from unittest import mock
+        import types
+
+        proc = types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+        with mock.patch("roles_gate.subprocess.run", return_value=proc):
+            return run_gate("two-bot", "staging", STAGING_URL, STAGING_HOST, STAGING_DB, "")
+
+    def test_clean_exit_requires_verified_success_marker(self):
+        self.assertEqual(self.invoke(0, "DATABASE ROLES VERIFIED\n"), [])
+        for output in (
+            "",
+            "NOT DATABASE ROLES VERIFIED\n",
+            "drift: missing grant X\n",
+            "DATABASE ROLES VERIFIED\ndrift: missing grant X\n",
+        ):
+            with self.subTest(output=output), self.assertRaises(Refused):
+                self.invoke(0, output)
+
+    def test_exit_one_returns_reported_drift_findings(self):
+        self.assertEqual(
+            self.invoke(1, "", "drift: missing grant SELECT on public.t\n"),
+            ["missing grant SELECT on public.t"],
+        )
+
+    def test_exit_one_without_drift_refuses(self):
+        with self.assertRaises(Refused):
+            self.invoke(1, "", "could not connect")
+
+    def test_other_exit_refuses_without_child_stderr(self):
+        with self.assertRaises(Refused) as raised:
+            self.invoke(2, "", "postgresql://user:S3cr3tPW@host/db")
+        self.assertEqual(str(raised.exception), "roles verify refused the gate (exit 2)")
+
+    def test_timeout_refuses(self):
+        import subprocess
+        from unittest import mock
+
+        with mock.patch("roles_gate.subprocess.run", side_effect=subprocess.TimeoutExpired("two-bot", 600)):
+            with self.assertRaises(Refused):
+                run_gate("two-bot", "staging", STAGING_URL, STAGING_HOST, STAGING_DB, "")
 
 
 class MainTests(unittest.TestCase):
