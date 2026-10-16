@@ -1362,6 +1362,162 @@ async fn post_apply_unreadable_ledger_is_unknown_not_empty() -> TestResult {
     Ok(())
 }
 
+/// Fault: the store chain fails after the cutover chain already committed.
+/// A raising trigger on the empty store ledger fails the first store insert,
+/// so the apply exits 1 with the store failure key plus the committed
+/// cutover evidence. Removing the `with_cutover_evidence` wiring or renaming
+/// the store key back fails this test.
+#[tokio::test]
+#[ignore = "requires agent-testdb or the CI service"]
+async fn store_failure_keeps_committed_cutover_evidence() -> TestResult {
+    let fx = Fixture::new().await?;
+    seed_staging_state(&fx).await?;
+    // Create the store ledger empty with the migrator as owner, without
+    // running any store DDL: `ensure_migrations_table` runs even for an
+    // empty migrator, so the cutover apply below still sees a pristine
+    // schema in its normal first-chain order.
+    {
+        let options = PgConnectOptions::new_without_pgpass()
+            .host(&fx.host)
+            .port(5432)
+            .username(&fx.mlogin)
+            .password("")
+            .database(&fx.database)
+            .ssl_mode(PgSslMode::Disable);
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect(|conn: &mut PgConnection, _meta| {
+                Box::pin(async move {
+                    conn.execute("SET ROLE two_bot_migrator").await?;
+                    Ok::<_, sqlx::Error>(())
+                })
+            })
+            .connect_with(options)
+            .await?;
+        let mut empty = Migrator::with_migrations(Vec::new());
+        empty.dangerous_set_table_name(two_bot_store::TABLE_NAME);
+        empty.run(&pool).await?;
+        pool.close().await;
+    }
+    let mut c = fx.scratch().await?;
+    sqlx::query(
+        "CREATE FUNCTION public.stg_fx_store_fail() RETURNS trigger LANGUAGE plpgsql \
+         AS $$ BEGIN RAISE EXCEPTION 'injected store migration failure'; END $$",
+    )
+    .execute(&mut c)
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER stg_fx_store_fail BEFORE INSERT ON public._two_bot_migrations \
+         FOR EACH ROW EXECUTE FUNCTION public.stg_fx_store_fail()",
+    )
+    .execute(&mut c)
+    .await?;
+    sqlx::query("GRANT SELECT ON public._sqlx_migrations TO two_bot_migrator_ro")
+        .execute(&mut c)
+        .await?;
+    sqlx::query("GRANT SELECT ON public._two_bot_migrations TO two_bot_migrator_ro")
+        .execute(&mut c)
+        .await?;
+    c.close().await?;
+    let (host, db) = (fx.host.clone(), fx.database.clone());
+    let member = fx.url(&fx.mlogin, &fx.database);
+    let ro = fx.url(&fx.rologin, &fx.database);
+
+    let (code, out, err) = fx
+        .run("--plan", Some(ro), &host, &db, RunExpect::default())
+        .await;
+    assert_eq!(code, 0, "{err}");
+    let plan = manifest(&out);
+    let plan_hash = plan["plan_manifest_sha256"]
+        .as_str()
+        .expect("plan hash")
+        .to_owned();
+    let store_hash = plan["store_plan_manifest_sha256"]
+        .as_str()
+        .expect("store plan hash")
+        .to_owned();
+    let plan_artifact = snapshot_plan_manifest(&out);
+    let pending = pending_list(&plan["pending_before"]);
+    assert!(!pending.is_empty(), "cutover chain must be pending");
+    let expected_csv = pending
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let store_pending = pending_list(&plan["pending_store_before"]);
+    assert!(!store_pending.is_empty(), "store chain must be pending");
+    let store_csv = store_pending
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let (code, stdout, stderr) = fx
+        .run(
+            "--apply",
+            Some(member),
+            &host,
+            &db,
+            RunExpect::bound(
+                Some(&expected_csv),
+                Some(&store_csv),
+                (&plan_hash, &store_hash, "424242", &plan_artifact),
+            ),
+        )
+        .await;
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("migration execution failed"), "{stderr}");
+    let evidence = manifest(&stdout);
+    // The store chain's own failure key (success-manifest family), never the
+    // old `store_ledger_after` name and never the cutover key.
+    assert!(
+        evidence["ledger_store_after_failure"].is_array(),
+        "store failure key must be an array: {stdout}"
+    );
+    assert!(
+        evidence.get("store_ledger_after_failure").is_none(),
+        "old store key must be gone: {stdout}"
+    );
+    let error = evidence["error"].as_str().expect("original error");
+    assert!(
+        error.contains("injected store migration failure"),
+        "{error}"
+    );
+    // The cutover apply already committed earlier in the same run: its rows
+    // and count ride along via `with_cutover_evidence`. Without that wiring
+    // both asserts fail.
+    let ledger_after = evidence["ledger_after"].as_array().expect("cutover ledger");
+    assert_eq!(
+        ledger_after.len(),
+        SEED_VERSIONS.len() + pending.len(),
+        "ledger_after must hold the committed cutover rows: {stdout}"
+    );
+    assert!(
+        ledger_after.iter().any(|row| row["version"] == pending[0]),
+        "newly applied cutover version missing: {stdout}"
+    );
+    assert_eq!(
+        evidence["applied_count"].as_u64().unwrap(),
+        pending.len() as u64,
+        "applied_count must equal the cutover count: {stdout}"
+    );
+    // Database truth: cutover fully applied, store ledger still empty (the
+    // failed insert rolled back its transaction).
+    let mut c = fx.scratch().await?;
+    let total = two_bot_cutover::staging_migrate::MIGRATOR.iter().count() as i64;
+    let cutover_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM public._sqlx_migrations")
+        .fetch_one(&mut c)
+        .await?;
+    assert_eq!(cutover_rows, total, "cutover must have committed");
+    let store_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM public._two_bot_migrations")
+        .fetch_one(&mut c)
+        .await?;
+    assert_eq!(store_rows, 0, "failed store insert must leave no row");
+    c.close().await?;
+    fx.finish().await?;
+    Ok(())
+}
+
 /// The connection count must be visible to the unprivileged plan login:
 /// `backend_type` is NULL for other roles' sessions without
 /// `pg_read_all_stats`, so a filtered `pg_stat_activity` count sees only the
