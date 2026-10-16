@@ -3328,7 +3328,7 @@ mod tests {
 
         let mut exec = execution(ModerationAction::TempBan);
         exec.request_id = "req-tempban-429".to_owned();
-        exec.idempotency_key = "key-tempban-429".to_owned();
+        exec.idempotency_key = "test-key-429".to_owned();
         svc.execute(&exec).await.expect("tempban");
         {
             let mut inner = svc.store.inner.lock().expect("lock");
