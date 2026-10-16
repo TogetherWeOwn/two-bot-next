@@ -618,8 +618,10 @@ mod tests {
         assert!(text.contains("http.request.method=GET"), "method missing");
         for known in ["/health", "/healthz", "/readyz", "/metrics", "/ops/summary"] {
             assert!(
-                text.lines()
-                    .any(|l| l.ends_with(&format!("http.request.path={known}"))),
+                text.lines().any(|line| {
+                    line.split_whitespace()
+                        .any(|field| field == format!("http.request.path={known}"))
+                }),
                 "known route missing"
             );
         }
@@ -629,7 +631,10 @@ mod tests {
             .count();
         let marked = text
             .lines()
-            .filter(|l| l.ends_with("http.request.path=[REDACTED]"))
+            .filter(|line| {
+                line.split_whitespace()
+                    .any(|field| field == "http.request.path=[REDACTED]")
+            })
             .count();
         assert_eq!(spans, cases.len(), "one span per request");
         assert_eq!(marked, 10, "unknown paths must carry the marker");
