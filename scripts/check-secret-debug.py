@@ -70,8 +70,18 @@ def split_top_level(payload):
     for i, ch in enumerate(payload):
         if ch in "(<[{":
             depth += 1
-        elif ch in ")>]}":
+        elif ch in ")]}":
             depth -= 1
+        elif ch == ">":
+            # The `>` of a `->` return arrow is not a closing angle
+            # bracket: counting it drives depth to -1, the following
+            # top-level comma is missed, and a raw field can hide
+            # behind an earlier `Secret<...>`. Clamp stray `>` at 0
+            # for the same reason.
+            if i > 0 and payload[i - 1] == "-":
+                continue
+            if depth > 0:
+                depth -= 1
         elif ch == "," and depth == 0:
             fields.append(payload[start:i])
             start = i + 1
@@ -171,6 +181,7 @@ class GuardTests(unittest.TestCase):
         self.assertFalse(violations('#[derive(Debug)] enum Fixture { Claimed(Secret<[u8; 32]>, u64), }'))
         self.assertFalse(violations('#[derive(Debug)] enum Fixture { Claimed(Option<Secret<String>>, u64), }'))
         self.assertFalse(violations('#[derive(Debug)] enum Fixture { Claimed((u64, u64), Secret<String>), }'))
+        self.assertFalse(violations('#[derive(Debug)] enum Fixture { Token(fn() -> Secret<String>), }'))
 
     def test_tuple_mixed_and_array_payloads_fail(self):
         for variant in [
@@ -181,6 +192,8 @@ class GuardTests(unittest.TestCase):
             "Token(Secret<String>, [u8; 32])",
             "Claimed((u64, u64), String)",
             "Token((u64,u64), Vec<u8>)",
+            "Token(fn() -> Secret<String>, String)",
+            "Token(Box<dyn Fn() -> Secret<String>>, String)",
         ]:
             code = f"#[derive(Debug)] enum Fixture {{ {variant}, Other, }}"
             self.assertEqual(len(violations(code)), 1, code)
