@@ -18,8 +18,9 @@ backup/restore operator commands.
 
 On-call: [operations runbook](docs/runbook.md) — health/logs, redeploy/rollback,
 RESUME semantics, kill-switch/feature wiring boundaries, backups and common
-failures. See also [backup procedures](docs/backup.md) and
-[staging soak](docs/staging-soak.md).
+failures. The [observability runbook](docs/runbook-observability.md) explains
+alert triage, deployment-to-PR correlation, and current monitoring limits. See
+also [backup procedures](docs/backup.md) and [staging soak](docs/staging-soak.md).
 
 ## Architecture
 
