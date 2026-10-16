@@ -8,8 +8,11 @@
 //! `allowed_mentions: { parse: [] }`; this repository does not yet contain
 //! that sender, so the no-ping guarantee is a receiver contract, not verified
 //! behavior. Only a provably-unsent send failure releases the claim (the
-//! store deletes it only for the token-holding owner: [`release_live`]
-//! before the send starts, `release_started_live` after it starts) and
+//! store deletes it only for the token-holding owner:
+//! [`release_live`](crate::stream_live_store::release_live) before the
+//! send starts,
+//! [`release_started_live`](crate::stream_live_store::release_started_live)
+//! after it starts) and
 //! answers 5xx so Twitch retries; claim and stamp failures answer
 //! 5xx WITHOUT releasing, because a stamped-failed send may already have
 //! reached Discord. A retry of a started or delivered claim is acknowledged
