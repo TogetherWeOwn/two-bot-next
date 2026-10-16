@@ -880,8 +880,8 @@ mod tests {
         format!("reload-{nanos:032x}-{nonce:016x}")
     }
 
-    /// Re-read the Operator map with `secret`, the same process-wide step a
-    /// no-restart rotation performs (no rebind, no restart).
+    /// Build a parsed test config carrying `secret`; this does not mutate a
+    /// bound receiver. Runtime config reload wiring is covered separately.
     fn reload_config_for(secret: &str) -> EventsubReceiverConfig {
         let mut vars = std::collections::HashMap::new();
         vars.insert("TWO_EVENTSUB".to_owned(), "1".to_owned());
@@ -1178,35 +1178,5 @@ mod tests {
                 "secret material reached the reload-path logs"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn bound_receiver_does_not_observe_config_rotation() {
-        // Gap pin: `ReceiverState` clones the secret at bind time and never
-        // re-reads it. The old secret works before the config is re-read.
-        let old_secret = fresh_reload_secret();
-        let new_secret = fresh_reload_secret();
-        let bound = router_for_secret(&old_secret);
-        let body = challenge_body();
-        let timestamp = fresh_timestamp();
-        let old_id = "synthetic-reload-0008";
-        let old_signature = sign_with(&old_secret, old_id, &timestamp, body.as_bytes());
-        let before_rotation =
-            reload_response(bound.clone(), old_id, &timestamp, &old_signature, body).await;
-        assert_eq!(before_rotation.status(), StatusCode::OK);
-
-        // Simulate the Operator map changing without restarting or rebinding.
-        let _reloaded = reload_config_for(&new_secret);
-        // Today's bound receiver still accepts the old secret here (200).
-        // When the reload holder lands, this post-rotation expectation must
-        // flip to 401, and the new-secret expectation below must flip 401 ->
-        // 200 on this same router. Never keep both secrets accepted.
-        let after_rotation =
-            reload_response(bound.clone(), old_id, &timestamp, &old_signature, body).await;
-        assert_eq!(after_rotation.status(), StatusCode::OK);
-        let new_id = "synthetic-reload-0009";
-        let new_signature = sign_with(&new_secret, new_id, &timestamp, body.as_bytes());
-        let missed = reload_response(bound, new_id, &timestamp, &new_signature, body).await;
-        assert_eq!(missed.status(), StatusCode::UNAUTHORIZED);
     }
 }
