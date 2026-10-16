@@ -307,6 +307,35 @@ class StableGateTests(unittest.TestCase):
             rb.wait_stable(BAD_VERSION, 0.0)
 
 
+class RollbackPostTests(unittest.TestCase):
+    def test_post_accepts_http_201_created_envelope(self):
+        # Cloudflare creates a rollout with HTTP 201; the client must
+        # return the result envelope instead of failing api_http_failure.
+        payload = {"success": True, "result": {"id": "r-new"}}
+
+        class FakeResponse:
+            status = 201
+
+            def read(self, _limit):
+                return json.dumps(payload).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class FakeOpener:
+            def open(self, _request, timeout=None):
+                return FakeResponse()
+
+        client = rollback.RollbackClient(ACCOUNT, "token")
+        client.opener = FakeOpener()
+        self.assertEqual(
+            client.post(f"/containers/applications/{APP_ID}/rollouts", {"image": good_image()}),
+            {"id": "r-new"})
+
+
 class RollbackRunTests(unittest.TestCase):
     def routes(self, serving=BAD_VERSION):
         prev = rollout_row("r-prev", good_image(), created="2026-10-14T00:00:00Z")
