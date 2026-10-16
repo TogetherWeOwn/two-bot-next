@@ -21,7 +21,6 @@
 //! sites in the four in-scope files, so add new failure logs with one of
 //! these helpers instead of formatting the error.
 
-use sqlx::error::ErrorKind;
 use two_bot_core::{
     automation_quota::QuotaWriteError, feeds_store::FeedStoreError,
     leveling_store::LevelingStoreError, send_admission::AdmissionError,
@@ -38,23 +37,7 @@ use two_bot_discord::{
 /// are never surfaced: rerun the failing operation path for detail.
 #[must_use]
 pub(crate) fn db_class(error: &sqlx::Error) -> &'static str {
-    match error {
-        sqlx::Error::Database(db) => match db.kind() {
-            ErrorKind::UniqueViolation => "unique_violation",
-            ErrorKind::ForeignKeyViolation => "foreign_key_violation",
-            ErrorKind::NotNullViolation => "not_null_violation",
-            ErrorKind::CheckViolation => "check_violation",
-            ErrorKind::ExclusionViolation => "exclusion_violation",
-            // `ErrorKind::Other` and any future kind: never the code/message.
-            _ => "database",
-        },
-        sqlx::Error::PoolTimedOut => "pool_timeout",
-        sqlx::Error::PoolClosed => "pool_closed",
-        sqlx::Error::WorkerCrashed => "worker_crashed",
-        sqlx::Error::Io(_) | sqlx::Error::Tls(_) => "connection",
-        sqlx::Error::RowNotFound => "row_not_found",
-        _ => "query",
-    }
+    two_bot_core::error_chain::db_cause(error)
 }
 
 /// Reason text for the gateway failure log line (TOG-25067): the
@@ -161,7 +144,7 @@ pub(crate) fn channel_response_class(error: &ChannelResponseError) -> &'static s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::error::DatabaseError;
+    use sqlx::error::{DatabaseError, ErrorKind};
     use std::borrow::Cow;
     use std::fmt;
 
