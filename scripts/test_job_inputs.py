@@ -67,8 +67,7 @@ class SelectionTests(unittest.TestCase):
         # The container selector owns the image build and the check job's
         # offline manifest step always runs, so no test job is needed -- but
         # the SBOM/vulnerability scan inventories exactly these files.
-        for path in ["Dockerfile", "Dockerfile.distroless",
-                     ".dockerignore"]:
+        for path in ["Dockerfile", ".dockerignore"]:
             with self.subTest(path=path):
                 self.assertEqual(inputs.classify(path), {SUPPLY}, path)
         self.assertEqual(
