@@ -109,13 +109,39 @@ def dockerfile_parity_errors(root):
     return errors
 
 
+def dockerfile_builder_digest(root, name):
+    """Builder digest from a Dockerfile's FROM rust:<tag>@sha256:<digest> line."""
+    try:
+        text = (root / name).read_text()
+    except Exception:
+        return None
+    match = re.search(r"(?m)^FROM\s+rust:[^\s@]+@sha256:([0-9a-f]{64})", text)
+    return match.group(1) if match else None
+
+
 def container_image_errors(root):
-    """Selected job containers use the pinned Rust trixie image tag."""
+    """Selected job containers use the pinned Rust trixie image tag and digest.
+
+    The tag must match rust-toolchain.toml and the digest must match the
+    Dockerfile builder digest, so a digest-only roll on either side fails.
+    """
     errors = []
     try:
         expected = expected_image_tag(read_channel(root))
     except Exception as exc:
         return [f"rust-toolchain.toml unreadable: {exc}"]
+    builder_digests = {}
+    for name in DOCKERFILES:
+        digest = dockerfile_builder_digest(root, name)
+        if digest is None:
+            errors.append(f"{name}: no pinned rust builder digest found")
+        else:
+            builder_digests[name] = digest
+    if len(set(builder_digests.values())) > 1:
+        detail = ", ".join(f"{n}@sha256:{d[:12]}" for n, d in sorted(builder_digests.items()))
+        errors.append(f"builder digests disagree: {detail}")
+        return errors
+    expected_digest = next(iter(builder_digests.values()), None)
     for name, job_ids in CONTAINER_WORKFLOWS.items():
         path = root / ".github/workflows" / name
         try:
@@ -132,6 +158,11 @@ def container_image_errors(root):
                 errors.append(f"{name}#{job_id}: expected pinned rust:{expected}@sha256 image, got {image!r}")
             elif match.group(1) != expected:
                 errors.append(f"{name}#{job_id}: expected rust:{expected}, got rust:{match.group(1)}")
+            elif expected_digest is not None and match.group(2) != expected_digest:
+                errors.append(
+                    f"{name}#{job_id}: container digest sha256:{match.group(2)[:12]} "
+                    f"does not match builder digest sha256:{expected_digest[:12]}"
+                )
     return errors
 
 
@@ -152,11 +183,12 @@ jobs:
           toolchain: "{toolchain}" # Match rust-toolchain.toml; floating stable can drift.
 """
 
-PINNED_DOCKERFILE = "FROM rust:{tag}@sha256:abc AS builder\n"
-PINNED_CONTAINER_IMAGE = "rust:{tag}@sha256:" + "a" * 64
+PINNED_DIGEST = "a" * 64
+PINNED_DOCKERFILE = "FROM rust:{tag}@sha256:{digest} AS builder\n"
+PINNED_CONTAINER_IMAGE = "rust:{tag}@sha256:{digest}"
 
 
-def make_fixture_root(parent, channel="1.98.1", workflow_toolchain="1.98.1", docker_tag="1.98-trixie", container_tag="1.98-trixie"):
+def make_fixture_root(parent, channel="1.98.1", workflow_toolchain="1.98.1", docker_tag="1.98-trixie", container_tag="1.98-trixie", docker_digest=PINNED_DIGEST, container_digest=PINNED_DIGEST):
     root = Path(parent) / "root"
     (root / ".github/workflows").mkdir(parents=True)
     (root / "rust-toolchain.toml").write_text(
@@ -171,13 +203,13 @@ def make_fixture_root(parent, channel="1.98.1", workflow_toolchain="1.98.1", doc
         if not path.exists():
             path.write_text("name: fixture\njobs:\n")
         job_text = "\n".join(
-            f"  {job_id}:\n    container:\n      image: {PINNED_CONTAINER_IMAGE.format(tag=container_tag)}"
+            f"  {job_id}:\n    container:\n      image: {PINNED_CONTAINER_IMAGE.format(tag=container_tag, digest=container_digest)}"
             for job_id in job_ids
         )
         with path.open("a") as fixture:
             fixture.write(job_text + "\n")
     for name in DOCKERFILES:
-        (root / name).write_text(PINNED_DOCKERFILE.format(tag=docker_tag))
+        (root / name).write_text(PINNED_DOCKERFILE.format(tag=docker_tag, digest=docker_digest))
     return root
 
 
@@ -221,6 +253,26 @@ class ToolchainParityTests(unittest.TestCase):
             errors = container_image_errors(root)
             self.assertEqual(len(errors), sum(map(len, CONTAINER_WORKFLOWS.values())))
             self.assertTrue(all("1.98-bookworm" in error for error in errors))
+            wired = toolchain_parity_errors(root)
+            self.assertTrue(wired, "container drift must fail through the CI entry point")
+            self.assertTrue(any("1.98-bookworm" in error for error in wired))
+
+    def test_digest_only_drifted_container_image_fails(self):
+        with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
+            root = make_fixture_root(scratch, container_digest="b" * 64)
+            errors = container_image_errors(root)
+            self.assertEqual(len(errors), sum(map(len, CONTAINER_WORKFLOWS.values())))
+            self.assertTrue(all("digest" in error for error in errors))
+            wired = toolchain_parity_errors(root)
+            self.assertTrue(wired, "digest-only drift must fail through the CI entry point")
+            self.assertTrue(any("digest" in error for error in wired))
+
+    def test_digest_only_drifted_builder_fails(self):
+        with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
+            root = make_fixture_root(scratch, docker_digest="b" * 64)
+            errors = container_image_errors(root)
+            self.assertEqual(len(errors), sum(map(len, CONTAINER_WORKFLOWS.values())))
+            self.assertTrue(all("digest" in error for error in errors))
 
     def test_each_container_image_is_covered(self):
         for name, job_ids in CONTAINER_WORKFLOWS.items():
@@ -233,7 +285,7 @@ class ToolchainParityTests(unittest.TestCase):
             with self.subTest(drifted=drifted):
                 with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
                     root = make_fixture_root(scratch)
-                    (root / drifted).write_text(PINNED_DOCKERFILE.format(tag="1.99-trixie"))
+                    (root / drifted).write_text(PINNED_DOCKERFILE.format(tag="1.99-trixie", digest=PINNED_DIGEST))
                     errors = dockerfile_parity_errors(root)
                     self.assertEqual(len(errors), 1, errors)
                     self.assertIn(drifted, errors[0])
