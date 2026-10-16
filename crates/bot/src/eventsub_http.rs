@@ -892,10 +892,6 @@ mod tests {
             .expect("enabled")
     }
 
-    fn router_for_secret(secret: &str) -> Router {
-        router(Arc::new(ReceiverState::new(&reload_config_for(secret))))
-    }
-
     fn sign_with(secret: &str, message_id: &str, timestamp: &str, body: &[u8]) -> String {
         let mut mac = <Hmac<Sha256>>::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(message_id.as_bytes());
@@ -1048,26 +1044,104 @@ mod tests {
         assert_eq!(reloaded.status(), StatusCode::OK);
     }
 
-    #[derive(Clone)]
-    struct ReloadLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    #[derive(Clone, Default)]
+    struct ReloadLogRecorder {
+        text: std::sync::Arc<std::sync::Mutex<String>>,
+        next_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
 
-    impl std::io::Write for ReloadLogWriter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
+    impl ReloadLogRecorder {
+        fn text(&self) -> String {
+            self.text.lock().unwrap().clone()
         }
 
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
+        fn push(&self, line: String) {
+            let mut text = self.text.lock().unwrap();
+            text.push_str(&line);
+            text.push('\n');
         }
     }
 
-    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for ReloadLogWriter {
-        type Writer = Self;
+    struct ReloadLogVisit<'a>(&'a mut String);
 
-        fn make_writer(&'writer self) -> Self::Writer {
-            self.clone()
+    impl ReloadLogVisit<'_> {
+        fn push(&mut self, field: &tracing::field::Field, value: String) {
+            use std::fmt::Write as _;
+            write!(self.0, " {}={value}", field.name()).unwrap();
         }
+    }
+
+    impl tracing::field::Visit for ReloadLogVisit<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.push(field, format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.push(field, format!("{value:?}"));
+        }
+
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            self.push(field, value.to_string());
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.push(field, value.to_string());
+        }
+
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.push(field, value.to_string());
+        }
+
+        fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+            self.push(field, value.to_string());
+        }
+
+        fn record_error(
+            &mut self,
+            field: &tracing::field::Field,
+            value: &(dyn std::error::Error + 'static),
+        ) {
+            self.push(field, format!("{value}"));
+        }
+    }
+
+    impl tracing::Subscriber for ReloadLogRecorder {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            let id = self
+                .next_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let mut line = format!("span {}:{id}", attrs.metadata().name());
+            attrs.record(&mut ReloadLogVisit(&mut line));
+            self.push(line);
+            tracing::span::Id::from_u64(id)
+        }
+
+        fn record(&self, _: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+            let mut line = String::from("record");
+            values.record(&mut ReloadLogVisit(&mut line));
+            self.push(line);
+        }
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut line = format!(
+                "event {} {}",
+                event.metadata().level(),
+                event.metadata().target()
+            );
+            event.record(&mut ReloadLogVisit(&mut line));
+            self.push(line);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
     }
 
     #[test]
@@ -1102,63 +1176,36 @@ mod tests {
                 assert!(rendered.contains("[REDACTED]"));
             }
         }
-        // Live refusal and acknowledgement paths log only scalar fields: run
-        // both through one router pair under a capturing subscriber. The
-        // current-thread runtime keeps every event on the capturing thread;
-        // the marker proves the capture was live so the redaction assertions
-        // below cannot pass vacuously.
-        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let writer = ReloadLogWriter(std::sync::Arc::clone(&bytes));
-        let subscriber = tracing_subscriber::fmt()
-            .json()
-            .with_writer(writer)
-            .finish();
+        // Exercise the reload on one bound state, and capture its subsequent
+        // refusal and acknowledgement events with a per-test recorder. A direct
+        // subscriber avoids fmt's shared callsite capture racing parallel tests.
+        let state = Arc::new(ReceiverState::new(&reload_config_for(&old_secret)));
+        let bound = router(Arc::clone(&state));
+        let recorder = ReloadLogRecorder::default();
         let body = challenge_body();
-        tracing::subscriber::with_default(subscriber, || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tracing::subscriber::with_default(recorder.clone(), || {
             runtime.block_on(async {
-                // Refusal: a new-signed delivery against the pre-reload router.
+                state.reload_secret(&reload_config_for(&new_secret));
                 let timestamp = fresh_timestamp();
-                let refused_id = "synthetic-reload-0006";
-                let refused_signature =
-                    sign_with(&new_secret, refused_id, &timestamp, body.as_bytes());
-                let refused = router_for_secret(&old_secret)
-                    .oneshot(request(
-                        "POST",
-                        EVENTSUB_PATH,
-                        Some(refused_id),
-                        Some(&timestamp),
-                        Some(&refused_signature),
-                        Some("webhook_callback_verification"),
-                        body,
-                    ))
-                    .await
-                    .unwrap();
+                let old_id = "synthetic-reload-0006";
+                let old_signature = sign_with(&old_secret, old_id, &timestamp, body.as_bytes());
+                let refused =
+                    reload_response(bound.clone(), old_id, &timestamp, &old_signature, body).await;
                 assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
                 let refused_bytes = axum::body::to_bytes(refused.into_body(), 4096)
                     .await
                     .unwrap();
                 assert!(!String::from_utf8_lossy(&refused_bytes).contains(&old_secret));
                 assert!(!String::from_utf8_lossy(&refused_bytes).contains(&new_secret));
-                // Acknowledgement: an old-signed delivery against its router.
-                let accepted_id = "synthetic-reload-0007";
-                let accepted_signature =
-                    sign_with(&old_secret, accepted_id, &timestamp, body.as_bytes());
-                let accepted = router_for_secret(&old_secret)
-                    .oneshot(request(
-                        "POST",
-                        EVENTSUB_PATH,
-                        Some(accepted_id),
-                        Some(&timestamp),
-                        Some(&accepted_signature),
-                        Some("webhook_callback_verification"),
-                        body,
-                    ))
-                    .await
-                    .unwrap();
+
+                let new_id = "synthetic-reload-0007";
+                let new_signature = sign_with(&new_secret, new_id, &timestamp, body.as_bytes());
+                let accepted =
+                    reload_response(bound, new_id, &timestamp, &new_signature, body).await;
                 assert_eq!(accepted.status(), StatusCode::OK);
                 let accepted_bytes = axum::body::to_bytes(accepted.into_body(), 4096)
                     .await
@@ -1167,7 +1214,7 @@ mod tests {
                 tracing::info!("reload log capture live");
             });
         });
-        let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        let text = recorder.text();
         assert!(
             text.contains("reload log capture live"),
             "log capture missed events; the redaction assertions would pass vacuously"
