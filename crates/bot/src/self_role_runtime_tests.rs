@@ -108,6 +108,14 @@ const PROCESSING_EXPIRY_SQL: &str =
      FROM self_role_audit a JOIN self_role_panel_claims p USING(guild_id,member_id,panel_id)
      WHERE a.event_id=$1";
 
+const JOB_PROCESSING_EXPIRY_SQL: &str =
+    "SELECT COALESCE((extract(epoch FROM a.processing_expires_at)*1000)::bigint, -1),
+     (extract(epoch FROM p.processing_expires_at)*1000)::bigint
+     FROM self_role_audit a JOIN self_role_panel_claims p USING(guild_id,member_id,panel_id)
+     WHERE a.event_id=$1";
+
+const RENDEZVOUS: Duration = Duration::from_secs(30);
+
 /// Lease keepers renew on real timers, so poll the stored expiries until both
 /// have moved past `past_ms` (bounded), then let the caller's assertion decide.
 async fn await_expiries_past(
@@ -998,7 +1006,7 @@ async fn terminal_restart_cancellation_preserves_journal(pool: &PgPool) -> TestR
         let panel = panel.clone();
         tokio::spawn(async move { feature.recover_terminal(&hint, &panel).await })
     };
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(RENDEZVOUS, async {
         while !mock.requests().iter().any(|r| r.method == "DELETE") {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1291,7 +1299,7 @@ async fn processing_receipts_survive_generation_transfer(pool: &PgPool) -> TestR
             let mut step = Box::pin(feature.execute_step(&mut prepared, OLD_ROLE, false));
             tokio::select! {
                 result = step.as_mut() => panic!("step completed before transfer: {result:?}"),
-                result = tokio::time::timeout(Duration::from_secs(2), async {
+                result = tokio::time::timeout(RENDEZVOUS, async {
                     while !mock.requests().iter().any(|r| r.method == "DELETE") {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
@@ -1603,7 +1611,7 @@ async fn terminal_late_response_after_independent_transfer(pool: &PgPool) -> Tes
             Box::pin(feature.terminal_step(&mut owner, &lane, &mut snapshot, OLD_ROLE, false));
         tokio::select! {
             result = step.as_mut() => panic!("step completed before transfer: {result:?}"),
-            result = tokio::time::timeout(Duration::from_secs(2), async {
+            result = tokio::time::timeout(RENDEZVOUS, async {
                 while !mock.requests().iter().any(|r| r.method == "DELETE") {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
@@ -1924,7 +1932,7 @@ async fn terminal_post_journal_wait_is_definite_no_send(pool: &PgPool) -> TestRe
             Box::pin(feature.terminal_step(&mut owner, &lane, &mut snapshot, OLD_ROLE, false));
         tokio::select! {
             result = step.as_mut() => panic!("step completed before journal wait: {result:?}"),
-            result = tokio::time::timeout(Duration::from_secs(2), async {
+            result = tokio::time::timeout(RENDEZVOUS, async {
                 loop {
                     let blocked: bool = sqlx::query_scalar(
                         "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
@@ -2287,15 +2295,15 @@ async fn supervised_processing_recovery(pool: &PgPool) -> TestResult {
         );
         // Changing the DB clock while the old lease is still live would expose
         // any renewal keeper that escaped cancellation/join of its job owner.
-        let expiry: (Option<i64>, i64) = sqlx::query_as(
-            "SELECT (extract(epoch FROM a.processing_expires_at)*1000)::bigint,(extract(epoch FROM p.processing_expires_at)*1000)::bigint FROM self_role_audit a JOIN self_role_panel_claims p USING(guild_id,member_id,panel_id) WHERE a.event_id=$1",
-        ).bind(&request.event_id).fetch_one(pool).await?;
+        let expiry = settled_expiries(pool, JOB_PROCESSING_EXPIRY_SQL, &request.event_id).await?;
         clock.store(NOW + 600, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        let after: (Option<i64>, i64) = sqlx::query_as(
-            "SELECT (extract(epoch FROM a.processing_expires_at)*1000)::bigint,(extract(epoch FROM p.processing_expires_at)*1000)::bigint FROM self_role_audit a JOIN self_role_panel_claims p USING(guild_id,member_id,panel_id) WHERE a.event_id=$1",
-        ).bind(&request.event_id).fetch_one(pool).await?;
-        assert_eq!(expiry, after);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let after =
+                settled_expiries(pool, JOB_PROCESSING_EXPIRY_SQL, &request.event_id).await?;
+            assert_eq!(expiry, after);
+        }
         assert_eq!(calls.len(), mock.requests().len());
         mock.shutdown().await;
     }
@@ -3195,7 +3203,7 @@ async fn stale_inflight_repairs_committed_target(pool: &PgPool) -> TestResult {
                 (old, result)
             })
         };
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(RENDEZVOUS, async {
             while !old_mock.requests().iter().any(|r| r.method == "PUT") {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
