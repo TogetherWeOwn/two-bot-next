@@ -275,11 +275,25 @@ jobs:
           # The fence release route is shown only for the intentionally-fenced
           # refusal; any other failure (auth, transition-not-confirmed) takes
           # the generic branch, never the fence guidance.
-          if ! output="$(
-            OWNERSHIP_EXPECTED_DEPLOYMENT="$(python3 -c 'import json,os;print(json.load(open(os.environ["ROLLOUT_DIR"]+"/receipt.json"))["worker_version"])')" \
+          # The outer bound must exceed the client's own retry window
+          # (takeoverWindowMs 330s, covering old code answering 5xx for up to
+          # 300s) plus one in-flight attempt (GET+POST, 15s abort each), so a
+          # takeover that would succeed late in its window is never killed
+          # mid-retry; test_workflows.py pins this relation. 390s = 330s
+          # window + 30s attempt + startup/shutdown margin.
+          if output="$(
+            timeout --signal=TERM --kill-after=10s 390s \
+              env OWNERSHIP_EXPECTED_DEPLOYMENT="$(python3 -c 'import json,os;print(json.load(open(os.environ["ROLLOUT_DIR"]+"/receipt.json"))["worker_version"])')" \
               node scripts/ownership-control.mjs deployment-takeover 2>&1
           )"; then
+            printf '%s\n' "$output"
+          else
+            result=$?
             echo "$output" >&2
+            if [[ $result -eq 124 || $result -eq 137 ]]; then
+              echo "::error::Staging ownership takeover timed out after 390 seconds; verify rollback evidence and current ownership, and do not release the fence manually."
+              exit 1
+            fi
             case "$output" in
               *"Singleton is intentionally fenced or uninitialized"*)
                 echo "::error::Staging singleton fenced: re-run Actions > deploy-staging > Run workflow with release_fence checked after handoff authorization (or: gh workflow run deploy-staging.yml --ref main -f release_fence=true). A push/default never releases; do not change credentials." ;;
@@ -288,7 +302,6 @@ jobs:
             esac
             exit 1
           fi
-          printf '%s\n' "$output"
       - name: Verify exact new rollout and serving Worker/container readiness
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

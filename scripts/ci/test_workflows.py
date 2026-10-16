@@ -1630,16 +1630,25 @@ class WorkflowTests(unittest.TestCase):
             rollout_dir = temp / "rollout"
             rollout_dir.mkdir()
             (rollout_dir / "receipt.json").write_text('{"worker_version":"test-version"}', encoding="utf-8")
-            base_env = dict(os.environ, ROLLOUT_DIR=str(rollout_dir))
-            shell = 'node() { printf \'%s\\n\' "$MOCK_CONTROL_OUTPUT"; return 1; }\n' + run
+            bin_dir = temp / "bin"
+            bin_dir.mkdir()
+            node = bin_dir / "node"
+            node.write_text('#!/bin/sh\nprintf \'%s\\n\' "$MOCK_CONTROL_OUTPUT"\nexit "${MOCK_CONTROL_EXIT:-1}"\n', encoding="utf-8")
+            node.chmod(0o755)
+            bash_env = temp / "bash-env"
+            bash_env.write_text(f'export PATH="{bin_dir}:$PATH"\n', encoding="utf-8")
+            base_env = dict(os.environ, ROLLOUT_DIR=str(rollout_dir),
+                            PATH=f"{bin_dir}:{os.environ.get('PATH', '')}", BASH_ENV=str(bash_env))
+            shell = run
             cases = (
                 ("Singleton is intentionally fenced or uninitialized; explicit staging release required",
-                 "Staging singleton fenced", True),
-                ("HTTP 401 Unauthorized", "Staging ownership takeover failed (not a fence refusal)", False),
+                 "Staging singleton fenced", True, 1),
+                ("HTTP 401 Unauthorized", "Staging ownership takeover failed (not a fence refusal)", False, 1),
+                ("", "Staging ownership takeover timed out after 390 seconds", False, 124),
             )
-            for output, expected, is_fenced in cases:
-                with self.subTest(output=output):
-                    env = dict(base_env, MOCK_CONTROL_OUTPUT=output)
+            for output, expected, is_fenced, exit_code in cases:
+                with self.subTest(output=output, exit_code=exit_code):
+                    env = dict(base_env, MOCK_CONTROL_OUTPUT=output, MOCK_CONTROL_EXIT=str(exit_code))
                     proc = subprocess.run(
                         ["bash", "-c", shell], cwd=ROOT / "wrangler", env=env,
                         capture_output=True, text=True, timeout=10,
@@ -1648,6 +1657,29 @@ class WorkflowTests(unittest.TestCase):
                     self.assertEqual(proc.returncode, 1, output_text)
                     self.assertIn(expected, output_text)
                     self.assertEqual("release_fence" in output_text, is_fenced)
+
+    def test_staging_takeover_outer_timeout_exceeds_the_client_retry_window(self):
+        # The workflow's `timeout` must never kill the control client inside
+        # its own retry window: a final attempt may start at the window edge
+        # and still spend one GET plus one POST, each bounded by the client's
+        # AbortSignal. Killing it there could terminate it after the POST
+        # committed an epoch and roll back a healthy deploy. Pin both sides:
+        # above window + one in-flight attempt, yet close enough that a true
+        # hang still fails fast instead of fencing staging.
+        steps = self.workflows["deploy-staging.yml"]["jobs"]["deploy"]["steps"]
+        run = next(step for step in steps if step.get("id") == "takeover")["run"]
+        outer = re.search(r"timeout --signal=TERM --kill-after=\d+s (\d+)s", run)
+        self.assertIsNotNone(outer, run)
+        client = (ROOT / "wrangler/scripts/ownership-control.mjs").read_text(encoding="utf-8")
+        window = re.search(r"takeoverWindowMs = (\d+)", client)
+        abort = re.search(r"AbortSignal\.timeout\((\d+)\)", client)
+        self.assertIsNotNone(window)
+        self.assertIsNotNone(abort)
+        outer_ms = int(outer.group(1)) * 1000
+        minimum_ms = int(window.group(1)) + 2 * int(abort.group(1))
+        self.assertGreater(outer_ms, minimum_ms)
+        self.assertLess(outer_ms, minimum_ms + 120_000)
+        self.assertIn(f"timed out after {outer.group(1)} seconds", run)
 
     def test_staging_runs_unconditionally_for_push_and_dispatch(self):
         staging = self.workflows["deploy-staging.yml"]
