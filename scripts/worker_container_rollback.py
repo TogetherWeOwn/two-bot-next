@@ -120,13 +120,8 @@ class RollbackClient(base.Client):
             ) from None
         except (base.URLError, TimeoutError, OSError):
             raise GateError("api_transport_failure") from None
-        # Cloudflare creates a container rollout with HTTP 201; any success
-        # 2xx carrying the success envelope is a created/applied rollout.
-        # Genuine failures still surface as api_http_failure with the status
-        # and allowlisted error codes (never the response body, which can
-        # carry configuration values).
-        require(200 <= status < 300 and len(raw) <= base.MAX_BODY, "api_http_failure",
-                f"status={status}")
+        # Cloudflare answers a created container rollout with 201, a Worker deployment with 200.
+        require(status in (200, 201) and len(raw) <= base.MAX_BODY, "api_http_failure", f"status={status}")
         data = base.mapping(base.decode(raw))
         require(data.get("success") is True and "result" in data, "api_failure")
         return data["result"]

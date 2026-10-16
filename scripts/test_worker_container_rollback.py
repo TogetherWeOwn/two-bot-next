@@ -11,6 +11,7 @@ import sys
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # E402-safe by convention: every scripts/ test adds its own directory first,
@@ -307,35 +308,6 @@ class StableGateTests(unittest.TestCase):
             rb.wait_stable(BAD_VERSION, 0.0)
 
 
-class RollbackPostTests(unittest.TestCase):
-    def test_post_accepts_http_201_created_envelope(self):
-        # Cloudflare creates a rollout with HTTP 201; the client must
-        # return the result envelope instead of failing api_http_failure.
-        payload = {"success": True, "result": {"id": "r-new"}}
-
-        class FakeResponse:
-            status = 201
-
-            def read(self, _limit):
-                return json.dumps(payload).encode()
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
-        class FakeOpener:
-            def open(self, _request, timeout=None):
-                return FakeResponse()
-
-        client = rollback.RollbackClient(ACCOUNT, "token")
-        client.opener = FakeOpener()
-        self.assertEqual(
-            client.post(f"/containers/applications/{APP_ID}/rollouts", {"image": good_image()}),
-            {"id": "r-new"})
-
-
 class RollbackRunTests(unittest.TestCase):
     def routes(self, serving=BAD_VERSION):
         prev = rollout_row("r-prev", good_image(), created="2026-10-14T00:00:00Z")
@@ -499,6 +471,61 @@ class MainValidationTests(unittest.TestCase):
              "--actor", "a:b", "--evidence", "e.json"], self.base_env())
         self.assertEqual(code, 1)
         self.assertIn("invalid_expected_sha", out)
+
+
+class PostStatusTests(unittest.TestCase):
+    """A created rollout (201) is success; the 10-16 staging auto-rollback
+    posted its rollout, read 201 and failed the run as api_http_failure."""
+
+    class Response:
+        def __init__(self, status, body):
+            self.status, self.body = status, body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, limit):
+            return self.body[:limit]
+
+    def client(self, status):
+        body = json.dumps({"success": True, "result": {"id": "r-1"}}).encode()
+        client = rollback.RollbackClient(ACCOUNT, "token")
+        client.opener = type("Opener", (), {"open": lambda _self, request, timeout: self.Response(status, body)})()
+        return client
+
+    def test_created_201_is_success(self):
+        self.assertEqual(self.client(201).post("/x", {}), {"id": "r-1"})
+
+    def test_ok_200_is_success(self):
+        self.assertEqual(self.client(200).post("/x", {}), {"id": "r-1"})
+
+    def test_other_2xx_fails_closed(self):
+        with self.assertRaises(base.GateError) as raised:
+            self.client(202).post("/x", {})
+        self.assertEqual(str(raised.exception), "api_http_failure")
+
+
+class ControlFenceHintTests(unittest.TestCase):
+    def refusal(self, stderr):
+        failed = rollback.subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr=stderr)
+        control = rollback.control_client("staging", "secret-token", "https://w.example", "https://s.example", "actor")
+        with mock.patch.object(rollback.subprocess, "run", return_value=failed):
+            with self.assertRaises(base.GateError) as raised:
+                control("takeover")
+        return raised.exception
+
+    def test_fenced_refusal_names_the_operator_release_route(self):
+        error = self.refusal("Singleton is intentionally fenced or uninitialized; explicit staging release required\n")
+        self.assertEqual(str(error), "ownership_control_failed")
+        self.assertIn("release_fence", error.detail)
+        self.assertNotIn("secret-token", error.detail)
+
+    def test_other_refusals_carry_no_release_hint(self):
+        error = self.refusal("Ownership transition not confirmed\n")
+        self.assertEqual(error.detail, "Ownership transition not confirmed")
 
 
 if __name__ == "__main__":
