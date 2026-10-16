@@ -3,9 +3,12 @@
 import json
 import os
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import production_schema_gate
 from production_schema_gate import (
     Refused,
     connection_warning,
@@ -14,6 +17,7 @@ from production_schema_gate import (
     main,
     pending_versions,
     pins_from_url,
+    run_gate,
     verify_binding,
     waive_reason,
 )
@@ -138,6 +142,47 @@ class VerifyBindingTests(unittest.TestCase):
             self.assertTrue(is_staging_host(host), host)
         for host in ("two-production-1.example.com", "ep-prod-1.example.com"):
             self.assertFalse(is_staging_host(host), host)
+
+
+class RunGateArgvTests(unittest.TestCase):
+    """run_gate must forward the identity pins to the binary, not just to main."""
+
+    def capture_argv(self, *args):
+        captured = []
+
+        def fake_run(argv, **kwargs):
+            captured.append(list(argv))
+            return types.SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"pending_before": []}) + "\n",
+                stderr="",
+            )
+
+        with mock.patch.object(production_schema_gate.subprocess, "run", fake_run):
+            manifest = run_gate("bin", SHA, *args)
+        self.assertEqual(manifest["pending_before"], [])
+        self.assertEqual(len(captured), 1)
+        return captured[0]
+
+    def flag_value(self, argv, flag):
+        self.assertIn(flag, argv)
+        return argv[argv.index(flag) + 1]
+
+    def test_forwards_branch_pin_for_planetscale_host(self):
+        argv = self.capture_argv(
+            "postgresql://two-bot-migrator.cnlmx96ec5kw:pw@myapp.pg.psdb.cloud:5432/postgres",
+            "myapp.pg.psdb.cloud",
+            "postgres",
+            "cnlmx96ec5kw",
+        )
+        self.assertEqual(self.flag_value(argv, "--production-branch-id"), "cnlmx96ec5kw")
+        self.assertEqual(self.flag_value(argv, "--production-host"), "myapp.pg.psdb.cloud")
+        self.assertEqual(self.flag_value(argv, "--production-database"), "postgres")
+
+    def test_forwards_empty_branch_for_non_planetscale_host(self):
+        # The binary treats an empty --production-branch-id as no-pin.
+        argv = self.capture_argv(PROD_URL, PROD_HOST, PROD_DB, "")
+        self.assertEqual(self.flag_value(argv, "--production-branch-id"), "")
 
 
 class WaiveReasonTests(unittest.TestCase):
