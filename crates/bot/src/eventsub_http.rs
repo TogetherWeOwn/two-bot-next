@@ -865,6 +865,18 @@ mod tests {
             let body = source.split_once(start).expect("delivery arm start").1;
             body.split_once(end).expect("next delivery arm").0
         };
+        let assert_classification = |body: &str, expected: &str| {
+            let calls = body.matches("eventsub_classified(").count();
+            let expected_call = format!("eventsub_classified(\"{expected}\")");
+            assert_eq!(
+                calls, 1,
+                "delivery arm must emit exactly one classification, found {calls}"
+            );
+            assert!(
+                body.contains(&expected_call),
+                "delivery arm must classify as {expected}"
+            );
+        };
 
         for (start, end, kind) in [
             (
@@ -884,7 +896,7 @@ mod tests {
             ),
             (
                 "Ok(Delivery::Ignored)",
-                "// Deterministic planning errors",
+                "Err(EventSubError::WrongSubscription) | Err(EventSubError::InvalidBody)",
                 "ignored",
             ),
             (
@@ -897,12 +909,9 @@ mod tests {
                 "Err(e) => {",
                 "ignored",
             ),
-            ("Err(e) => {", "\n        }\n    }\n}", "ignored"),
+            ("Err(e) => {", "\n    }\n}\n\n#[cfg(test)]", "ignored"),
         ] {
-            assert!(
-                arm(start, end).contains(&format!("eventsub_classified(\"{kind}\")")),
-                "{kind} classification must remain in its own delivery arm"
-            );
+            assert_classification(arm(start, end), kind);
         }
     }
 
