@@ -1106,6 +1106,16 @@ mod tests {
     }
 
     impl tracing::Subscriber for ReloadLogRecorder {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            // A callsite may first be registered while another parallel test's
+            // dispatcher is active. Re-check against this test's dispatcher so
+            // that its recorder receives events regardless of registration order.
+            tracing::subscriber::Interest::sometimes()
+        }
+
         fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
             true
         }
