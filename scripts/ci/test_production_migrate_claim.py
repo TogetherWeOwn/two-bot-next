@@ -23,6 +23,7 @@ ENV = {
     "SOURCE_SHA": "a" * 40,
     "PRODUCTION_HOST": "prod-host.invalid",
     "PRODUCTION_DATABASE": "two_bot",
+    "PRODUCTION_BRANCH_ID": "",
     "RECOVERY_REF": "recovery-review#decision",
     "ACL_REF": "acl-review#decision",
     "EXPECTED_PENDING": "1,9007199254740993",
@@ -89,17 +90,38 @@ class ProductionClaimTests(unittest.TestCase):
                 with self.assertRaises(Refused):
                     build_claim(plan, env)
 
-    def test_refuses_branched_production_target(self):
-        # Production takes no branch pin yet: a manifest carrying one fails
-        # closed until a production branch pin lands.
-        for branch_id in ("cnfixture01", "main"):
-            with self.subTest(branch_id=branch_id):
-                plan = deepcopy(self.plan)
-                plan["target"]["branch_id"] = branch_id
-                plan["plan_manifest_sha256"] = projection_hash(plan)
-                with self.assertRaises(Refused):
-                    build_claim(plan, {**self.env,
-                                       "PLAN_MANIFEST_SHA256": plan["plan_manifest_sha256"]})
+    def test_accepts_production_branch_pin(self):
+        # Production mirrors the staging pin: a PlanetScale manifest carrying
+        # the pinned branch id binds when the request names the same pin.
+        host = "abc-useast1-1.horizon.psdb.cloud"
+        plan = deepcopy(self.plan)
+        plan["target"] = {"host": host, "database": "postgres", "branch_id": "cnfixture01"}
+        plan["plan_manifest_sha256"] = projection_hash(plan)
+        env = {**self.env, "PRODUCTION_HOST": host, "PRODUCTION_DATABASE": "postgres",
+               "PRODUCTION_BRANCH_ID": "cnfixture01",
+               "PLAN_MANIFEST_SHA256": plan["plan_manifest_sha256"]}
+        claim = build_claim(plan, env)
+        self.assertEqual(claim["target"], plan["target"])
+
+    def test_refuses_branch_pin_mismatch(self):
+        # A PlanetScale manifest without the pin, or a request pin that does
+        # not match the manifest, refuses.
+        host = "abc-useast1-1.horizon.psdb.cloud"
+        plan = deepcopy(self.plan)
+        plan["target"] = {"host": host, "database": "postgres", "branch_id": "cnfixture01"}
+        plan["plan_manifest_sha256"] = projection_hash(plan)
+        base = {**self.env, "PRODUCTION_HOST": host, "PRODUCTION_DATABASE": "postgres",
+                "PLAN_MANIFEST_SHA256": plan["plan_manifest_sha256"]}
+        with self.assertRaises(Refused):
+            build_claim(plan, {**base, "PRODUCTION_BRANCH_ID": "otherbranch"})
+        unpinned = deepcopy(self.plan)
+        unpinned["target"] = {"host": host, "database": "postgres", "branch_id": ""}
+        unpinned["plan_manifest_sha256"] = projection_hash(unpinned)
+        with self.assertRaises(Refused):
+            build_claim(unpinned, {**self.env, "PRODUCTION_HOST": host,
+                                   "PRODUCTION_DATABASE": "postgres",
+                                   "PRODUCTION_BRANCH_ID": "",
+                                   "PLAN_MANIFEST_SHA256": unpinned["plan_manifest_sha256"]})
 
     def test_refuses_wrong_workflow_identity(self):
         with self.assertRaises(Refused):

@@ -2339,8 +2339,11 @@ dependencies = [
 name = "two-bot-next-fuzz"
 version = "0.0.0"
 dependencies = [
+ "hex",
+ "hmac",
  "libfuzzer-sys",
  "serde_json",
+ "sha2 0.11.0",
  "two-bot",
  "two-bot-core",
  "two-bot-cutover",

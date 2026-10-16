@@ -190,6 +190,22 @@ fn refuse<T>(message: impl Into<String>) -> Result<T, RunError> {
     Err(RunError::Refused(message.into()))
 }
 
+fn with_cutover_evidence(
+    error: RunError,
+    cutover_after: &[LedgerRow],
+    cutover_applied: usize,
+) -> RunError {
+    match error {
+        RunError::Failed(message, evidence) => {
+            let mut evidence = evidence.as_object().cloned().unwrap_or_default();
+            evidence.insert("ledger_after".to_owned(), ledger_json(cutover_after));
+            evidence.insert("applied_count".to_owned(), json!(cutover_applied));
+            RunError::Failed(message, Value::Object(evidence))
+        }
+        RunError::Refused(message) => RunError::Refused(message),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Request {
     pub url: Option<String>,
@@ -197,11 +213,13 @@ pub struct Request {
     pub source_sha: String,
     pub expected_host: String,
     pub expected_database: String,
-    /// Pinned PlanetScale branch id (non-secret workflow input). Empty means
-    /// no pin (Neon and test hosts). Required when the pinned host is a
-    /// `*.psdb.cloud` endpoint: PlanetScale routes by the username's
-    /// `{role}.{branch_id}` suffix while every branch shares `postgres` as
-    /// the database name, so host+database alone cannot fix the branch.
+    /// Pinned PlanetScale branch id (non-secret workflow input:
+    /// `--staging-branch-id` on staging, `--production-branch-id` on
+    /// production). Empty means no pin (Neon and test hosts). Required when
+    /// the pinned host is a `*.psdb.cloud` endpoint: PlanetScale routes by
+    /// the username's `{role}.{branch_id}` suffix while every branch shares
+    /// `postgres` as the database name, so host+database alone cannot fix
+    /// the branch.
     pub expected_branch_id: String,
     pub recovery_evidence_ref: String,
     pub acl_plan_ref: String,
@@ -293,7 +311,10 @@ fn check_binding_shape(
             .next()
             .is_some_and(|suffix| suffix.eq_ignore_ascii_case(want));
         if !matches {
-            return refuse("binding branch does not match the pinned staging branch");
+            return refuse(format!(
+                "binding branch does not match the pinned {} branch",
+                req.target.as_str()
+            ));
         }
     }
     Ok(())
@@ -551,17 +572,27 @@ pub fn validate_request(req: &Request) -> Result<(), RunError> {
     // PlanetScale branch pin: every branch shares `postgres` as the database
     // name and routes by the username's `{role}.{branch_id}` suffix, so the
     // host+database pin alone cannot fix the branch. A `*.psdb.cloud` pin
-    // requires the non-secret branch id; other hosts accept an empty pin.
-    // (Production takes no branch pin yet; its fail-closed refusal lives
-    // after the pooled-shape check below so pooled bindings keep the pooled
-    // refusal in both gates, mirroring `verify_target`.)
+    // requires the non-secret branch id (`--staging-branch-id` on staging,
+    // `--production-branch-id` on production); other hosts accept an empty
+    // pin. The missing-pin refusal lives after the pooled-shape check above
+    // so pooled bindings keep the pooled refusal in both gates, mirroring
+    // `verify_target`; the production refusal must not name
+    // `--staging-branch-id`, which the production target rejects.
     let branch = req.expected_branch_id.trim();
     if !branch.is_empty() && !branch_id_valid(branch) {
-        return refuse("staging branch id is not a bare branch pin");
+        return refuse(format!(
+            "{} branch id is not a bare branch pin",
+            req.target.as_str()
+        ));
     }
-    if branch.is_empty() && req.target == Target::Staging && is_planetscale_host(&req.expected_host)
-    {
-        return refuse("PlanetScale hosts require --staging-branch-id");
+    if branch.is_empty() && is_planetscale_host(&req.expected_host) {
+        return match req.target {
+            Target::Staging => refuse("PlanetScale hosts require --staging-branch-id"),
+            Target::Production => refuse(
+                "production PlanetScale dispatch needs a production branch pin \
+                 (--production-branch-id)",
+            ),
+        };
     }
     match &req.expected_pending {
         Some(raw) => {
@@ -658,20 +689,6 @@ pub fn validate_request(req: &Request) -> Result<(), RunError> {
             check_binding_shape(req, &options)?;
         }
     }
-    // The production target takes no branch pin yet, so a production dispatch
-    // aimed at a `*.psdb.cloud` host fails closed here until the production
-    // branch-pin follow-up lands. After the pooled-shape check so pooled
-    // bindings keep the pooled refusal, mirroring `verify_target`; the
-    // message must not name `--staging-branch-id`, which production rejects.
-    if req.target == Target::Production
-        && req.expected_branch_id.trim().is_empty()
-        && is_planetscale_host(&req.expected_host)
-    {
-        return refuse(
-            "production PlanetScale dispatch needs a production branch pin, \
-             which is not supported yet; refusing",
-        );
-    }
     Ok(())
 }
 
@@ -763,15 +780,14 @@ fn verify_target(req: &Request, tls: TlsPolicy) -> Result<PgConnectOptions, RunE
     }
     // Fail-closed PlanetScale pin: a `*.psdb.cloud` binding without a pinned
     // branch id refuses even when host+database match, so a dispatch that
-    // forgets the branch pin cannot reach an unpinned branch. Production
-    // takes no branch pin yet and fails closed here until the production
-    // branch-pin follow-up lands; its refusal must not name
-    // `--staging-branch-id`, which the production target rejects.
+    // forgets the branch pin cannot reach an unpinned branch. The production
+    // refusal must not name `--staging-branch-id`, which the production
+    // target rejects.
     if req.expected_branch_id.trim().is_empty() && is_planetscale_host(&host) {
         if req.target == Target::Production {
             return refuse(
-                "production PlanetScale dispatch needs a production branch pin, \
-                 which is not supported yet; refusing",
+                "production PlanetScale dispatch needs a production branch pin \
+                 (--production-branch-id)",
             );
         }
         return refuse("PlanetScale hosts require --staging-branch-id");
@@ -1265,7 +1281,7 @@ async fn apply_chain(
     // literals (one per chain) so no table name is interpolated from input.
     let ledger_key = match chain {
         Chain::Cutover => "ledger_after",
-        Chain::Store => "store_ledger_after",
+        Chain::Store => "ledger_store_after",
     };
     let outcome = migrator.run(pool).await;
     let read_back = read_ledger_after_run(pool, chain).await;
@@ -1403,7 +1419,9 @@ async fn run_on_pool(
             applied = count;
         }
         if !store_pending.is_empty() {
-            let (rows, count) = apply_chain(pool, Chain::Store, &store, &store_before).await?;
+            let (rows, count) = apply_chain(pool, Chain::Store, &store, &store_before)
+                .await
+                .map_err(|error| with_cutover_evidence(error, &after, applied))?;
             store_after = rows;
             store_applied = count;
         }
@@ -1461,6 +1479,23 @@ mod tests {
                 checksum_hex: hex::encode(&m.checksum),
             })
             .collect()
+    }
+
+    #[test]
+    fn store_failure_retains_committed_cutover_evidence() {
+        let cutover = rows();
+        let failure = RunError::Failed(
+            "store migration failed".to_owned(),
+            json!({"error": "store failure", "ledger_store_after_failure": LEDGER_UNKNOWN}),
+        );
+
+        let RunError::Failed(_, evidence) = with_cutover_evidence(failure, &cutover, cutover.len())
+        else {
+            panic!("failure should stay a failure");
+        };
+        assert_eq!(evidence["ledger_after"], ledger_json(&cutover));
+        assert_eq!(evidence["applied_count"], cutover.len());
+        assert_eq!(evidence["ledger_store_after_failure"], LEDGER_UNKNOWN);
     }
 
     #[test]
@@ -1678,7 +1713,7 @@ mod tests {
         );
         assert_eq!(
             versions.len(),
-            two_bot_store::embedded_versions().len(),
+            two_bot_store::MIGRATOR.iter().count(),
             "runner embeds the whole store chain"
         );
     }
@@ -2753,15 +2788,15 @@ mod tests {
     }
 
     #[test]
-    fn production_planetscale_refuses_without_a_production_pin() {
-        // Production takes no branch pin yet: even the direct PlanetScale
-        // endpoint refuses in both gates until the production branch-pin
-        // follow-up lands. The refusal must name the missing production
-        // pin and never `--staging-branch-id`, which production rejects.
+    fn production_planetscale_branch_pin_mirrors_staging() {
+        // A PlanetScale pin without the branch id refuses in both gates: the
+        // refusal must name the production pin and never
+        // `--staging-branch-id`, which production rejects.
         let mut req = production_plan();
         req.expected_host = "abc-useast1-1.horizon.psdb.cloud".to_owned();
+        req.expected_database = "postgres".to_owned();
         req.url = Some(
-            "postgresql://migrator@abc-useast1-1.horizon.psdb.cloud:5432/two_bot?sslmode=require"
+            "postgresql://migrator@abc-useast1-1.horizon.psdb.cloud:5432/postgres?sslmode=require"
                 .to_owned(),
         );
         for gate in [
@@ -2778,6 +2813,60 @@ mod tests {
                 "production refusal must not name the staging pin, got: {err}"
             );
         }
+        // A direct endpoint with the matching `{role}.{branch_id}` username
+        // passes both gates.
+        let pinned = Request {
+            url: Some(
+                "postgresql://migrator.cnfixture01@abc-useast1-1.horizon.psdb.cloud:5432/postgres?sslmode=require"
+                    .to_owned(),
+            ),
+            expected_branch_id: "cnfixture01".to_owned(),
+            ..req.clone()
+        };
+        assert!(validate_request(&pinned).is_ok());
+        assert!(verify_target(&pinned, TlsPolicy::Required).is_ok());
+        // Pooled shapes and a wrong branch refuse in both gates even when the
+        // pins match them.
+        for (url, branch) in [
+            (
+                "postgresql://migrator.cnfixture01@abc-useast1-1.horizon.psdb.cloud:6432/postgres?sslmode=require",
+                "cnfixture01",
+            ),
+            (
+                "postgresql://migrator.cnfixture01%7Cread-bouncer@abc-useast1-1.horizon.psdb.cloud:6432/postgres?sslmode=require",
+                "cnfixture01",
+            ),
+            (
+                "postgresql://migrator.otherbranch@abc-useast1-1.horizon.psdb.cloud:5432/postgres?sslmode=require",
+                "cnfixture01",
+            ),
+        ] {
+            let req = Request {
+                url: Some(url.to_owned()),
+                expected_branch_id: branch.to_owned(),
+                ..req.clone()
+            };
+            assert!(
+                matches!(validate_request(&req), Err(RunError::Refused(_))),
+                "validate must refuse {url}"
+            );
+            assert!(
+                matches!(
+                    verify_target(&req, TlsPolicy::Required),
+                    Err(RunError::Refused(_))
+                ),
+                "verify must refuse {url}"
+            );
+        }
+        // A malformed pin refuses before any DDL. The message names the
+        // production pin shape, never the staging flag.
+        let bad = Request {
+            expected_branch_id: "not a branch!".to_owned(),
+            ..pinned.clone()
+        };
+        let err = validate_request(&bad).unwrap_err().to_string();
+        assert!(err.contains("production"), "{err}");
+        assert!(!err.contains("--staging-branch-id"), "{err}");
     }
 
     #[test]
@@ -2943,7 +3032,9 @@ mod tests {
                 acl_plan_ref: "TOG-2#doc".to_owned(),
                 apply: false,
                 expected_pending: None,
+                expected_store_pending: None,
                 plan_manifest_sha256: None,
+                store_plan_manifest_sha256: None,
                 plan_run_id: None,
                 plan_manifest_path: None,
             };

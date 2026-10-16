@@ -66,6 +66,13 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "automod_processed_messages", measure: TableMeasure::Columns(&["processed_at"]) },
     TableSpec { table: "automod_violations", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "backfill_cursors", measure: TableMeasure::Columns(&["updated_at"]) },
+    // History rows may be inserted long after their Discord send time during
+    // catch-up; sent_at is source time, not the row's write time.
+    TableSpec {
+        table: "backfill_history_messages",
+        measure: TableMeasure::Unmeasurable("sent_at records message time, not when catch-up inserted the row"),
+    },
+    TableSpec { table: "backfill_history_counts", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "community_facts", measure: TableMeasure::Columns(&["recorded_at"]) },
     TableSpec { table: "community_scorecard_alerts", measure: TableMeasure::Columns(&["created_at"]) },
     // Retry reservation (TOG-11145): next_attempt_at is a BIGINT epoch-ms
@@ -192,6 +199,8 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         measure: TableMeasure::Unmeasurable("seed reference data with no timestamp column"),
     },
     TableSpec { table: "rank_snapshots", measure: TableMeasure::Columns(&["snapshot_at"]) },
+    TableSpec { table: "rollback_journal", measure: TableMeasure::Columns(&["recorded_at"]) },
+    TableSpec { table: "rollback_watermarks", measure: TableMeasure::Columns(&["updated_at"]) },
     // Retention deletion ledger (0438): request creation stamps requested_at,
     // completion rewrites completed_at without touching requested_at, so the
     // maximum across both is the row's last write (same shape as tickets).

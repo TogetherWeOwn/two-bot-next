@@ -265,6 +265,7 @@ jobs:
           --skip post_failure_unreadable_ledger_is_unknown_not_empty
           --skip post_failure_readable_ledger_keeps_array_output
           --skip post_apply_unreadable_ledger_is_unknown_not_empty
+          --skip store_failure_keeps_committed_cutover_evidence
           --skip connection_count_sees_other_roles_from_plan_login
           --skip database::actions_persist_rows_and_preserve_other_events_and_guilds
           --skip a_restarted_worker_rediscovers_a_channel_whose_rollback_failed

@@ -11,17 +11,20 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 STATIC_FALSE = "${{ false }}"
 JOB_INVENTORY = {
-    # Branch keeps the moderation-db job; main #84 added the supply-chain job.
-    # The pin must be the union of both sides.
+    # The nextest branch adds its required lane; main adds the production schema gate.
+    # The inventory pin must retain both changes.
     "check.yml": {"check", "moderation-db", "parity-docs", "self-role-store", "job-inputs", "container-inputs", "container",
                   "community-db", "feeds-db", "tickets-postgres", "worker", "supply-chain", "ci-ok",
                   # `check` is now the lint lane; the test steps it used to
                   # carry run in these three parallel lanes, all gated by ci-ok.
                   "rust-tests", "ignored-db-stores", "ignored-db-runtime",
                   # Compile-only libFuzzer build, gated by ci-ok like the Rust lanes.
-                  "fuzz-compile"},
-    "deploy-production.yml": {"guard", "production", "release"},
-    "deploy-staging.yml": {"deploy", "schema-gate", "voice-synthetic"},
+                  "fuzz-compile",
+                  # Promoted nextest lane (shared reusable), gated by ci-ok
+                  # like the Rust lanes.
+                  "nextest"},
+    "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "production", "release"},
+    "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "voice-synthetic"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
     "release.yml": {"tag", "sbom-target", "release-sbom", "attach-sbom"},
@@ -50,11 +53,11 @@ JOB_INVENTORY = {
     # runner. Read-only, no secrets, no deploy route: the generic
     # deployment/probe scan already passes, so only the inventory pin is needed.
     "vote-kick-fuzz-smoke.yml": {"vote-kick-smoke"},
-    # SDLC 2.3 CI speed pilot (advisory only, never required, never in
-    # ci-ok): dorny/paths-filter affected-only selection, the shared
-    # nextest lane, and the minutes-per-merged-PR report.
-    "ci-speed.yml": {"changes", "nextest", "report"},
-    # Shared nextest lane, called by ci-speed.yml; org-level home is
+    # SDLC 2.3 CI speed evidence (the shared nextest lane graduated to a
+    # required check.yml job): dorny/paths-filter affected-only selection
+    # and the minutes-per-merged-PR report.
+    "ci-speed.yml": {"changes", "report"},
+    # Shared nextest lane, called by check.yml; org-level home is
     # TogetherWeOwn/.github with a pinned SHA like test-guard.
     "reusable-rust-nextest.yml": {"nextest"},
     # Advisory PR-size labels (org reusable, advisory only, never required):
@@ -70,9 +73,10 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
                    ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml",
                    # SDLC separation gate: org reusable, warn mode, pinned SHA.
                    ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95",
-                   # SDLC 2.3 CI speed pilot: advisory caller to the shared
-                   # nextest lane (local path until the central move).
-                   ("ci-speed.yml", "nextest"): "./.github/workflows/reusable-rust-nextest.yml",
+                   # SDLC 2.3 CI speed pilot, promoted: required check.yml
+                   # caller to the shared nextest lane (local path until
+                   # the central move).
+                   ("check.yml", "nextest"): "./.github/workflows/reusable-rust-nextest.yml",
                    # Advisory PR-size labels: thin caller to the central
                    # reusable, pinned SHA (repin both refs together).
                    ("pr-size.yml", "pr-size"): "TogetherWeOwn/.github/.github/workflows/pr-size.yml@82c5b367c6e3e8032666029dc22d206fff39c3f2",
@@ -122,7 +126,7 @@ RUNTIME_PATHS = (
     "crates/bot/src/main.rs", "crates/core/Cargo.toml", "crates/core/README.md",
     "crates/core/tests/fixtures/reference_settings.json", "src/main.rs",
     "sql/web_v1.sql", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "deny.toml",
-    "migrations.lock", "Dockerfile", "Dockerfile.distroless", ".dockerignore",
+    "migrations.lock", "Dockerfile", ".dockerignore",
     "wrangler/wrangler.toml", "wrangler/src/index.ts", "wrangler/package.json",
     "wrangler/package-lock.json", "wrangler/scripts/ownership-control.mjs",
     "wrangler/README.md", "scripts/staging_rollout.py", "scripts/container-smoke.py",
@@ -220,7 +224,7 @@ def staging_claim_errors(claim, name="staging-migrate.yml",
 
     Parametrized by workflow name, job identity, artifact names, publisher
     script and host/database/branch env/input names so the production mirror
-    pins the same shape with its own names (production passes no branch pin).
+    pins the same shape with its own names.
     """
     errors = []
     prefix = f"{name}:claim:"
@@ -286,8 +290,8 @@ def production_claim_errors(claim):
         host_input="production_host",
         db_env="PRODUCTION_DATABASE",
         db_input="production_database",
-        branch_env=None,
-        branch_input=None,
+        branch_env="PRODUCTION_BRANCH_ID",
+        branch_input="production_branch_id",
     )
 
 
@@ -302,11 +306,11 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
                      target_flag, host_flag, db_flag, other_host_flag,
                      other_db_flag, other_plan_secret, other_migrator_secret,
                      branch_input="staging_branch_id", branch_flag="--staging-branch-id",
-                     other_branch_flag=None):
+                     branch_label="staging", other_branch_flag=None):
     """Parametrized migration-runner shape (staging and production mirrors).
 
-    Dispatch-only with exactly the reviewed inputs (staging carries the
-    PlanetScale branch pin, production does not yet), three jobs
+    Dispatch-only with exactly the reviewed inputs (each target carries its
+    own PlanetScale branch pin), three jobs
     (plan always runs through the no-reviewer plan environment, unprotected
     claim transports the apply request, apply runs only for mode=apply after a
     green plan and claim through the reviewed apply environment), each job with
@@ -478,9 +482,9 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
     # and branch mismatches before any DDL.
     if branch_flag is not None:
         if branch_flag not in plan_runs:
-            errors.append(f"{name}:plan: must pass the staging branch pin to the runner")
+            errors.append(f"{name}:plan: must pass the {branch_label} branch pin to the runner")
         if branch_flag not in apply_runs:
-            errors.append(f"{name}:apply: must pass the staging branch pin to the runner")
+            errors.append(f"{name}:apply: must pass the {branch_label} branch pin to the runner")
     apply_fetch = [step for step in apply.get("steps", [])
                    if str(step.get("uses", "")).startswith("actions/download-artifact@")]
     if len(apply_fetch) != 1:
@@ -530,15 +534,16 @@ def staging_migrate_errors(workflow, name="staging-migrate.yml",
                           target_flag=target_flag, host_flag=host_flag, db_flag=db_flag,
                           other_host_flag=other_host_flag, other_db_flag=other_db_flag,
                           other_plan_secret=other_plan_secret,
-                          other_migrator_secret=other_migrator_secret)
+                          other_migrator_secret=other_migrator_secret,
+                          other_branch_flag="--production-branch-id")
 
 
 def production_migrate_errors(workflow):
     """Production mirror of the migration-runner shape.
 
-    Production declares no branch pin yet (the runner fails closed on
-    `*.psdb.cloud` hosts until a production branch pin lands), so the
-    branch assertions are skipped for this target.
+    Production carries its own PlanetScale branch pin
+    (`production_branch_id` / `--production-branch-id`), mirroring staging
+    with production names; the staging pin must never appear.
     """
     return migrate_errors(workflow, name="production-migrate.yml",
                           plan_env="production-migrate-plan", apply_env="production-migrate-apply",
@@ -551,7 +556,9 @@ def production_migrate_errors(workflow):
                           other_db_flag="--staging-database",
                           other_plan_secret="TWO_BOT_STAGING_PLAN_DATABASE_URL",
                           other_migrator_secret="TWO_BOT_STAGING_MIGRATOR_DATABASE_URL",
-                          branch_input=None, branch_flag=None,
+                          branch_input="production_branch_id",
+                          branch_flag="--production-branch-id",
+                          branch_label="production",
                           other_branch_flag="--staging-branch-id")
 
 
@@ -937,8 +944,10 @@ def production_errors(workflow):
         errors.append(f"{name}: production must be dispatch-only")
     jobs = workflow.get("jobs", {})
     production, guard = jobs.get("production", {}), jobs.get("guard", {})
-    if production.get("environment") != "production" or production.get("needs") != "guard":
-        errors.append(f"{name}:production: must wait for the guard and the protected Environment")
+    needs = production.get("needs")
+    needs = [needs] if isinstance(needs, str) else (needs or [])
+    if production.get("environment") != "production" or set(needs) != {"guard", "schema-gate", "roles-gate"}:
+        errors.append(f"{name}:production: must wait for the guard, the schema gate, the roles gate and the protected Environment")
     if "if" in production:
         errors.append(f"{name}:production: a job condition could bypass the guard outputs")
     if ("environment" in guard or "uses" in guard
@@ -1059,6 +1068,268 @@ def schema_gate_errors(workflow, name="deploy-staging.yml"):
     return errors
 
 
+def production_schema_gate_errors(workflow, name="deploy-production.yml"):
+    """Pre-deploy production schema-drift gate: read-only plan, fail closed.
+
+    One job runs on every deploy-production dispatch after the guard (it
+    needs the guarded SHA: a dispatch SHA is an input, not github.sha),
+    through the no-reviewer `production-migrate-plan` environment, builds the
+    reviewed `staging-migrate` binary and fails the run with a `schema drift`
+    error when the guarded source is ahead of the production ledger. The
+    production job must `needs` both the guard and the gate, so drift can
+    never deploy silently. Plan-only: no migrator binding, no `--apply`, no
+    role/grant route, no wrangler, no secret indexing. Rollback and live-SHA
+    takeover redeploys serve no new schema and waive the ledger check inside
+    the reviewed script (recorded, never a job-level skip: the job carries
+    no `if:`).
+    """
+    errors = []
+    jobs = workflow.get("jobs") or {}
+    gate = jobs.get("schema-gate", {})
+    if gate.get("environment") != "production-migrate-plan":
+        errors.append(f"{name}:schema-gate: must read only the production-migrate-plan Environment binding")
+    if gate.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:schema-gate: must keep contents:read only")
+    if "if" in gate:
+        errors.append(f"{name}:schema-gate: a job condition would let drift deploy silently")
+    if gate.get("needs") != "guard":
+        errors.append(f"{name}:schema-gate: must wait for the guard (it gates the guarded SHA)")
+    if not runner_allowed("schema-gate", gate.get("runs-on")):
+        errors.append(f"{name}:schema-gate: must use the routed runner expression for job 'schema-gate'")
+    if gate.get("timeout-minutes") != "30":
+        errors.append(f"{name}:schema-gate: timeout must stay 30 minutes")
+    if (gate.get("container") or {}).get("image") != SCHEMA_GATE_IMAGE:
+        errors.append(f"{name}:schema-gate: must build on the pinned plan-job image")
+    production = jobs.get("production", {})
+    needs = production.get("needs")
+    needs = [needs] if isinstance(needs, str) else (needs or [])
+    if "schema-gate" not in needs or "guard" not in needs:
+        errors.append(f"{name}:production: must needs the guard and the schema-gate (drift must block the deploy)")
+    steps = gate.get("steps") or []
+    if len(steps) != 5:
+        errors.append(f"{name}:schema-gate: must run exactly checkout, tooling checkout, SHA check, build and the gate")
+        return errors
+    checkout, tooling, sha_check, build, run = steps
+    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
+            or (checkout.get("with") or {}).get("persist-credentials") != "false" \
+            or (checkout.get("with") or {}).get("fetch-depth") != "0" \
+            or "needs.guard.outputs.sha" not in str((checkout.get("with") or {}).get("ref", "")):
+        errors.append(f"{name}:schema-gate: checkout must be pinned, credentialless, full-depth and on the guarded SHA")
+    if not str(tooling.get("uses", "")).startswith("actions/checkout@") \
+            or (tooling.get("with") or {}).get("persist-credentials") != "false" \
+            or (tooling.get("with") or {}).get("path") != "tooling" \
+            or "github.sha" not in str((tooling.get("with") or {}).get("ref", "")):
+        errors.append(f"{name}:schema-gate: tooling checkout must be pinned, credentialless and on the workflow commit")
+    if ("needs.guard.outputs.sha" not in str(sha_check.get("env", ""))
+            or "git rev-parse HEAD" not in str(sha_check.get("run", ""))):
+        errors.append(f"{name}:schema-gate: SHA check must pin the step to the guarded SHA")
+    if "cargo build -p two-bot-cutover --bin staging-migrate --locked" not in str(build.get("run", "")):
+        errors.append(f"{name}:schema-gate: build must compile the reviewed staging-migrate binary locked")
+    if (run.get("shell") != "bash" or "set -o pipefail" not in str(run.get("run", ""))
+            or "scripts/ci/production_schema_gate.py" not in str(run.get("run", ""))
+            or "--source-sha" not in str(run.get("run", ""))
+            or "--mode" not in str(run.get("run", ""))
+            or "--allow-unstaged" not in str(run.get("run", ""))
+            or "TWO_BOT_PRODUCTION_PLAN_DATABASE_URL" not in str(run.get("env", ""))):
+        errors.append(f"{name}:schema-gate: gate step must run the reviewed script over pipefail "
+                      "with the plan binding, the guarded SHA and the guard-verified waive flags")
+    # The expected production identity is pinned independently of the secret
+    # binding (vars, never derived from the URL): a wrong-target binding must
+    # refuse instead of reading the wrong database. A PlanetScale host also
+    # takes the branch pin, exactly as production-migrate does.
+    env_text = str(run.get("env", ""))
+    for pin, var in (("TWO_BOT_PRODUCTION_HOST", "vars.TWO_BOT_PRODUCTION_HOST"),
+                     ("TWO_BOT_PRODUCTION_DATABASE", "vars.TWO_BOT_PRODUCTION_DATABASE"),
+                     ("TWO_BOT_PRODUCTION_BRANCH_ID", "vars.TWO_BOT_PRODUCTION_BRANCH_ID")):
+        if pin not in env_text or var not in env_text:
+            errors.append(f"{name}:schema-gate: gate step must pin {pin} from {var}")
+    if "inputs." in str(gate):
+        errors.append(f"{name}:schema-gate: must read only guard-verified outputs, never raw inputs")
+    text = str(gate).lower().replace(" ", "")
+    for marker in ("wrangler", "--apply", "migrator", "roles", "tojson(secrets", "secrets["):
+        if marker in text:
+            errors.append(f"{name}:schema-gate: must not contain {marker!r} (plan-only, no apply/grant route)")
+    return errors
+
+
+# Markers banned from the roles-gate job text (lowercased, spaces removed).
+# `roles` itself is legitimate here (`db roles verify`); instead the ban
+# targets the write binding (`migrator_database_url`), the plan-print
+# subcommand (`rolesplan`: verify-only, never `db roles plan`), apply and
+# wrangler routes, and secret indexing.
+ROLES_GATE_MARKERS = ("wrangler", "--apply", "rolesplan", "migrator_database_url",
+                      "tojson(secrets", "secrets[")
+
+
+def roles_gate_errors(workflow, name="deploy-staging.yml"):
+    """Pre-deploy role-drift gate: read-only verify, fail closed, no new privilege.
+
+    One job runs on every deploy-staging run (no `if:`, no `needs:` of its own)
+    through the no-reviewer `staging-migrate-plan` environment, builds the
+    reviewed `two-bot` binary and fails the run when `db roles verify` reports
+    any finding. The deploy job must `needs` the gate, so drift can never
+    deploy silently. Verify-only: no migrator write binding, no `--apply`, no
+    `roles plan` subcommand, no wrangler, no secret indexing.
+    """
+    errors = []
+    jobs = workflow.get("jobs") or {}
+    gate = jobs.get("roles-gate", {})
+    if gate.get("environment") != "staging-migrate-plan":
+        errors.append(f"{name}:roles-gate: must read only the staging-migrate-plan Environment binding")
+    if gate.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:roles-gate: must keep contents:read only")
+    if "if" in gate:
+        errors.append(f"{name}:roles-gate: a job condition would let drift deploy silently")
+    if "needs" in gate:
+        errors.append(f"{name}:roles-gate: must wait for nothing (it is the wait)")
+    if not runner_allowed("roles-gate", gate.get("runs-on")):
+        errors.append(f"{name}:roles-gate: must use the routed runner expression for job 'roles-gate'")
+    if gate.get("timeout-minutes") != "30":
+        errors.append(f"{name}:roles-gate: timeout must stay 30 minutes")
+    if (gate.get("container") or {}).get("image") != SCHEMA_GATE_IMAGE:
+        errors.append(f"{name}:roles-gate: must build on the pinned plan-job image")
+    deploy = jobs.get("deploy", {})
+    needs = deploy.get("needs")
+    needs = [needs] if isinstance(needs, str) else (needs or [])
+    if "roles-gate" not in needs:
+        errors.append(f"{name}:deploy: must needs the roles-gate (drift must block the deploy)")
+    steps = gate.get("steps") or []
+    if "continue-on-error" in gate:
+        errors.append(f"{name}:roles-gate: job must not tolerate failure")
+    if any("if" in step or "continue-on-error" in step for step in steps):
+        errors.append(f"{name}:roles-gate: gate steps must not skip or tolerate failure")
+    if len(steps) != 4:
+        errors.append(f"{name}:roles-gate: must run exactly checkout, SHA check, build and the gate")
+        return errors
+    checkout, sha_check, build, run = steps
+    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
+            or (checkout.get("with") or {}).get("persist-credentials") != "false" \
+            or (checkout.get("with") or {}).get("fetch-depth") != "0":
+        errors.append(f"{name}:roles-gate: checkout must be pinned, credentialless and full-depth")
+    if ("${{ github.sha }}" not in str(sha_check.get("env", ""))
+            or "git rev-parse HEAD" not in str(sha_check.get("run", ""))):
+        errors.append(f"{name}:roles-gate: SHA check must pin the step to the deploy SHA")
+    if "cargo build -p two-bot --bin two-bot --locked" not in str(build.get("run", "")):
+        errors.append(f"{name}:roles-gate: build must compile the reviewed two-bot binary locked")
+    expected_run = """set -o pipefail
+python3 scripts/ci/roles_gate.py \\
+  --binary ./target/debug/two-bot --target staging \\
+  --expected-host "$TWO_BOT_STAGING_HOST" --expected-database "$TWO_BOT_STAGING_DATABASE" \\
+  --expected-branch-id "$TWO_BOT_STAGING_BRANCH_ID"
+"""
+    if (run.get("shell") != "bash" or str(run.get("run", "")).strip() != expected_run.strip()
+            or (run.get("env") or {}).get("TWO_DATABASE_URL")
+            != "${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}"):
+        errors.append(f"{name}:roles-gate: gate step must pin the exact fail-closed staging command and plan binding")
+    # The expected staging identity is pinned independently of the secret
+    # binding (vars, never derived from the URL): a wrong-target binding must
+    # refuse instead of reading the wrong database.
+    env_text = str(run.get("env", ""))
+    for pin, var in (("TWO_BOT_STAGING_HOST", "vars.TWO_BOT_STAGING_HOST"),
+                     ("TWO_BOT_STAGING_DATABASE", "vars.TWO_BOT_STAGING_DATABASE"),
+                     ("TWO_BOT_STAGING_BRANCH_ID", "vars.TWO_BOT_STAGING_BRANCH_ID")):
+        if pin not in env_text or var not in env_text:
+            errors.append(f"{name}:roles-gate: gate step must pin {pin} from {var}")
+    text = str(gate).lower().replace(" ", "")
+    for marker in ROLES_GATE_MARKERS:
+        if marker in text:
+            errors.append(f"{name}:roles-gate: must not contain {marker!r} (verify-only, no apply/grant route)")
+    return errors
+
+
+def production_roles_gate_errors(workflow, name="deploy-production.yml"):
+    """Pre-deploy production role-drift gate: read-only verify, fail closed.
+
+    One job runs on every deploy-production dispatch after the guard (it
+    needs the guarded SHA: a dispatch SHA is an input, not github.sha),
+    through the no-reviewer `production-migrate-plan` environment, builds the
+    reviewed `two-bot` binary and fails the run when `db roles verify` reports
+    any finding on a new build. The production job must `needs` the guard and
+    both gates, so drift can never deploy silently. Verify-only: no migrator
+    write binding, no `--apply`, no `roles plan` subcommand, no wrangler, no
+    secret indexing. Rollback and live-SHA takeover redeploys serve no
+    new-table grants and waive the findings check inside the reviewed script
+    (recorded, never a job-level skip: the job carries no `if:`).
+    """
+    errors = []
+    jobs = workflow.get("jobs") or {}
+    gate = jobs.get("roles-gate", {})
+    if gate.get("environment") != "production-migrate-plan":
+        errors.append(f"{name}:roles-gate: must read only the production-migrate-plan Environment binding")
+    if gate.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:roles-gate: must keep contents:read only")
+    if "if" in gate:
+        errors.append(f"{name}:roles-gate: a job condition would let drift deploy silently")
+    if gate.get("needs") != "guard":
+        errors.append(f"{name}:roles-gate: must wait for the guard (it gates the guarded SHA)")
+    if not runner_allowed("roles-gate", gate.get("runs-on")):
+        errors.append(f"{name}:roles-gate: must use the routed runner expression for job 'roles-gate'")
+    if gate.get("timeout-minutes") != "30":
+        errors.append(f"{name}:roles-gate: timeout must stay 30 minutes")
+    if (gate.get("container") or {}).get("image") != SCHEMA_GATE_IMAGE:
+        errors.append(f"{name}:roles-gate: must build on the pinned plan-job image")
+    production = jobs.get("production", {})
+    needs = production.get("needs")
+    needs = [needs] if isinstance(needs, str) else (needs or [])
+    if "roles-gate" not in needs or "guard" not in needs:
+        errors.append(f"{name}:production: must needs the guard and the roles-gate (drift must block the deploy)")
+    steps = gate.get("steps") or []
+    if "continue-on-error" in gate:
+        errors.append(f"{name}:roles-gate: job must not tolerate failure")
+    if any("if" in step or "continue-on-error" in step for step in steps):
+        errors.append(f"{name}:roles-gate: gate steps must not skip or tolerate failure")
+    if len(steps) != 5:
+        errors.append(f"{name}:roles-gate: must run exactly checkout, tooling checkout, SHA check, build and the gate")
+        return errors
+    checkout, tooling, sha_check, build, run = steps
+    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
+            or (checkout.get("with") or {}).get("persist-credentials") != "false" \
+            or (checkout.get("with") or {}).get("fetch-depth") != "0" \
+            or "needs.guard.outputs.sha" not in str((checkout.get("with") or {}).get("ref", "")):
+        errors.append(f"{name}:roles-gate: checkout must be pinned, credentialless, full-depth and on the guarded SHA")
+    if not str(tooling.get("uses", "")).startswith("actions/checkout@") \
+            or (tooling.get("with") or {}).get("persist-credentials") != "false" \
+            or (tooling.get("with") or {}).get("path") != "tooling" \
+            or "github.sha" not in str((tooling.get("with") or {}).get("ref", "")):
+        errors.append(f"{name}:roles-gate: tooling checkout must be pinned, credentialless and on the workflow commit")
+    if ("needs.guard.outputs.sha" not in str(sha_check.get("env", ""))
+            or "git rev-parse HEAD" not in str(sha_check.get("run", ""))):
+        errors.append(f"{name}:roles-gate: SHA check must pin the step to the guarded SHA")
+    if "cargo build -p two-bot --bin two-bot --locked" not in str(build.get("run", "")):
+        errors.append(f"{name}:roles-gate: build must compile the reviewed two-bot binary locked")
+    expected_run = """set -o pipefail
+python3 tooling/scripts/ci/roles_gate.py \\
+  --binary ./target/debug/two-bot --target production \\
+  --expected-host "$TWO_BOT_PRODUCTION_HOST" --expected-database "$TWO_BOT_PRODUCTION_DATABASE" \\
+  --expected-branch-id "$TWO_BOT_PRODUCTION_BRANCH_ID" \\
+  --mode "$MODE" --allow-unstaged "$ALLOW_UNSTAGED"
+"""
+    run_env = run.get("env") or {}
+    if (run.get("shell") != "bash" or str(run.get("run", "")).strip() != expected_run.strip()
+            or run_env.get("TWO_DATABASE_URL")
+            != "${{ secrets.TWO_BOT_PRODUCTION_PLAN_DATABASE_URL }}"
+            or run_env.get("MODE") != "${{ needs.guard.outputs.mode }}"
+            or run_env.get("ALLOW_UNSTAGED") != "${{ needs.guard.outputs.allow_unstaged }}"):
+        errors.append(f"{name}:roles-gate: gate step must pin the exact production command and guard-verified values")
+    # The expected production identity is pinned independently of the secret
+    # binding (vars, never derived from the URL): a wrong-target binding must
+    # refuse instead of reading the wrong database. A PlanetScale host also
+    # takes the branch pin, exactly as production-migrate does.
+    env_text = str(run.get("env", ""))
+    for pin, var in (("TWO_BOT_PRODUCTION_HOST", "vars.TWO_BOT_PRODUCTION_HOST"),
+                     ("TWO_BOT_PRODUCTION_DATABASE", "vars.TWO_BOT_PRODUCTION_DATABASE"),
+                     ("TWO_BOT_PRODUCTION_BRANCH_ID", "vars.TWO_BOT_PRODUCTION_BRANCH_ID")):
+        if pin not in env_text or var not in env_text:
+            errors.append(f"{name}:roles-gate: gate step must pin {pin} from {var}")
+    if "inputs." in str(gate):
+        errors.append(f"{name}:roles-gate: must read only guard-verified outputs, never raw inputs")
+    text = str(gate).lower().replace(" ", "")
+    for marker in ROLES_GATE_MARKERS:
+        if marker in text:
+            errors.append(f"{name}:roles-gate: must not contain {marker!r} (verify-only, no apply/grant route)")
+    return errors
+
+
 def voice_synthetic_errors(workflow):
     """Live staging voice synthetic (docs/voice-synthetic.md).
 
@@ -1136,11 +1407,14 @@ def workflow_policy_errors(workflows):
             errors.append(f"{name}: job inventory changed")
         if name == "deploy-production.yml":
             errors.extend(production_errors(workflow))
+            errors.extend(production_schema_gate_errors(workflow))
+            errors.extend(production_roles_gate_errors(workflow))
             continue
         if name == "deploy-staging.yml":
             errors.extend(staging_dispatch_errors(workflow))
             errors.extend(staging_active_errors(workflow))
             errors.extend(schema_gate_errors(workflow))
+            errors.extend(roles_gate_errors(workflow))
         if name == "voice-synthetic.yml":
             # Pinned shape above; the generic environment scan below would
             # flag its voice-synthetic Environment binding.
@@ -1183,6 +1457,9 @@ def workflow_policy_errors(workflows):
         for job_id, job in jobs.items():
             if name == "deploy-staging.yml" and job_id == "schema-gate":
                 continue  # pre-deploy drift gate: pinned by schema_gate_errors above;
+                # the generic environment scan below would flag its plan binding
+            if name == "deploy-staging.yml" and job_id == "roles-gate":
+                continue  # pre-deploy role-drift gate: pinned by roles_gate_errors above;
                 # the generic environment scan below would flag its plan binding
             if name == "deploy-staging.yml" and job_id == "deploy":
                 continue  # the live deploy route: pinned by the staging checks above
@@ -1295,6 +1572,80 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("needs", gate)
         # The chain stays ordered: gate first, deploy second, synthetic last.
         self.assertEqual(staging["jobs"]["voice-synthetic"].get("needs"), "deploy")
+
+    def test_roles_gate_shape_is_pinned_and_mutations_fail(self):
+        import copy
+        staging = self.workflows["deploy-staging.yml"]
+        self.assertEqual(roles_gate_errors(staging), [])
+        for mutate in (
+            lambda w: w["jobs"]["roles-gate"].__setitem__("environment", "staging-migrate-apply"),
+            lambda w: w["jobs"]["roles-gate"].__setitem__("if", "github.ref == 'refs/heads/main'"),
+            lambda w: w["jobs"]["roles-gate"].__setitem__("needs", "deploy"),
+            lambda w: w["jobs"]["deploy"].pop("needs"),
+            lambda w: w["jobs"]["roles-gate"]["steps"][3].__setitem__("run", "wrangler deploy"),
+            lambda w: w["jobs"]["roles-gate"]["steps"][3].get("env", {}).__setitem__(
+                "LEAK", "${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}"),
+            lambda w: w["jobs"]["roles-gate"]["steps"][3].__setitem__("if", "${{ false }}"),
+            lambda w: w["jobs"]["roles-gate"].__setitem__("if", "${{ false }}"),
+            lambda w: w["jobs"]["roles-gate"]["steps"][3].__setitem__("continue-on-error", True),
+            lambda w: w["jobs"]["roles-gate"].__setitem__("continue-on-error", True),
+            lambda w: w["jobs"]["roles-gate"]["steps"][3].__setitem__(
+                "run", w["jobs"]["roles-gate"]["steps"][3]["run"] + " || true"),
+        ):
+            changed = copy.deepcopy(staging)
+            mutate(changed)
+            self.assertNotEqual(roles_gate_errors(changed), [])
+
+    def test_staging_deploy_needs_roles_gate(self):
+        staging = self.workflows["deploy-staging.yml"]
+        self.assertEqual(roles_gate_errors(staging), [])
+        deploy, gate = staging["jobs"]["deploy"], staging["jobs"]["roles-gate"]
+        needs = [deploy["needs"]] if isinstance(deploy["needs"], str) else deploy["needs"]
+        self.assertIn("schema-gate", needs)
+        self.assertIn("roles-gate", needs)
+        self.assertEqual(gate.get("environment"), "staging-migrate-plan")
+        self.assertNotIn("if", gate)
+        self.assertNotIn("needs", gate)
+        # The chain stays ordered: gates first, deploy second, synthetic last.
+        self.assertEqual(staging["jobs"]["voice-synthetic"].get("needs"), "deploy")
+
+    def test_staging_takeover_fence_hint_is_scoped_to_the_fenced_refusal(self):
+        # Execute the actual workflow shell with a stub control client. This
+        # catches swapped case bodies as well as an unscoped fence hint.
+        import os
+        import subprocess
+        import tempfile
+
+        steps = self.workflows["deploy-staging.yml"]["jobs"]["deploy"]["steps"]
+        takeover = next(step for step in steps if step.get("id") == "takeover")
+        run = takeover["run"]
+        self.assertIn("deployment-takeover", run)
+        self.assertIn("Singleton is intentionally fenced or uninitialized", run)
+        self.assertIn("Staging singleton fenced", run)
+        self.assertIn("not a fence refusal", run)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            rollout_dir = temp / "rollout"
+            rollout_dir.mkdir()
+            (rollout_dir / "receipt.json").write_text('{"worker_version":"test-version"}', encoding="utf-8")
+            base_env = dict(os.environ, ROLLOUT_DIR=str(rollout_dir))
+            shell = 'node() { printf \'%s\\n\' "$MOCK_CONTROL_OUTPUT"; return 1; }\n' + run
+            cases = (
+                ("Singleton is intentionally fenced or uninitialized; explicit staging release required",
+                 "Staging singleton fenced", True),
+                ("HTTP 401 Unauthorized", "Staging ownership takeover failed (not a fence refusal)", False),
+            )
+            for output, expected, is_fenced in cases:
+                with self.subTest(output=output):
+                    env = dict(base_env, MOCK_CONTROL_OUTPUT=output)
+                    proc = subprocess.run(
+                        ["bash", "-c", shell], cwd=ROOT / "wrangler", env=env,
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    output_text = proc.stdout + proc.stderr
+                    self.assertEqual(proc.returncode, 1, output_text)
+                    self.assertIn(expected, output_text)
+                    self.assertEqual("release_fence" in output_text, is_fenced)
 
     def test_staging_runs_unconditionally_for_push_and_dispatch(self):
         staging = self.workflows["deploy-staging.yml"]
@@ -1443,6 +1794,82 @@ class WorkflowTests(unittest.TestCase):
                         if "run" in step:
                             step["run"] = step["run"].replace(pin, "")
                 self.assertTrue(mutated(drop))
+
+    def test_production_schema_gate_shape_is_pinned_and_mutations_fail(self):
+        import copy
+        production = self.workflows["deploy-production.yml"]
+        self.assertEqual(production_schema_gate_errors(production), [])
+        self.assertEqual(production_errors(production), [])
+        for mutate in (
+            lambda w: w["jobs"]["schema-gate"].__setitem__("environment", "production-migrate-apply"),
+            lambda w: w["jobs"]["schema-gate"].__setitem__("if", "github.ref == 'refs/heads/main'"),
+            lambda w: w["jobs"]["schema-gate"].__setitem__("needs", "production"),
+            lambda w: w["jobs"]["production"].__setitem__("needs", "guard"),
+            lambda w: w["jobs"]["production"].__setitem__("needs", ["schema-gate"]),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4].__setitem__("run", "wrangler deploy"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4].get("env", {}).__setitem__(
+                "LEAK", "${{ secrets.TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL }}"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4].get("env", {}).__setitem__(
+                "TWO_BOT_PRODUCTION_BRANCH_ID", ""),
+        ):
+            changed = copy.deepcopy(production)
+            mutate(changed)
+            self.assertNotEqual(production_schema_gate_errors(changed), [])
+
+    def test_production_deploy_needs_prod_schema_gate(self):
+        production = self.workflows["deploy-production.yml"]
+        self.assertEqual(production_schema_gate_errors(production), [])
+        needs = production["jobs"]["production"]["needs"]
+        needs = [needs] if isinstance(needs, str) else needs
+        self.assertIn("guard", needs)
+        self.assertIn("schema-gate", needs)
+        self.assertEqual(production["jobs"]["schema-gate"].get("needs"), "guard")
+        self.assertEqual(production["jobs"]["schema-gate"].get("environment"),
+                         "production-migrate-plan")
+        self.assertNotIn("if", production["jobs"]["schema-gate"])
+
+    def test_production_roles_gate_shape_is_pinned_and_mutations_fail(self):
+        import copy
+        production = self.workflows["deploy-production.yml"]
+        self.assertEqual(production_roles_gate_errors(production), [])
+        self.assertEqual(production_errors(production), [])
+        for mutate in (
+            lambda w: w["jobs"]["roles-gate"].__setitem__("environment", "production-migrate-apply"),
+            lambda w: w["jobs"]["roles-gate"].__setitem__("if", "github.ref == 'refs/heads/main'"),
+            lambda w: w["jobs"]["roles-gate"].__setitem__("needs", "production"),
+            lambda w: w["jobs"]["production"].__setitem__("needs", ["guard", "schema-gate"]),
+            lambda w: w["jobs"]["roles-gate"]["steps"][4].__setitem__("run", "wrangler deploy"),
+            lambda w: w["jobs"]["roles-gate"]["steps"][4].get("env", {}).__setitem__(
+                "LEAK", "${{ secrets.TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL }}"),
+            lambda w: w["jobs"]["roles-gate"]["steps"][4].get("env", {}).__setitem__(
+                "TWO_BOT_PRODUCTION_BRANCH_ID", ""),
+            lambda w: w["jobs"]["roles-gate"]["steps"][4].__setitem__("if", "${{ false }}"),
+            lambda w: w["jobs"]["roles-gate"].__setitem__("if", "${{ false }}"),
+            lambda w: w["jobs"]["roles-gate"]["steps"][4].__setitem__("continue-on-error", True),
+            lambda w: w["jobs"]["roles-gate"].__setitem__("continue-on-error", True),
+            lambda w: w["jobs"]["roles-gate"]["steps"][4].__setitem__(
+                "run", w["jobs"]["roles-gate"]["steps"][4]["run"] + " || true"),
+            lambda w: w["jobs"]["roles-gate"]["steps"][4].get("env", {}).__setitem__(
+                "MODE", "rollback"),
+            lambda w: w["jobs"]["roles-gate"]["steps"][4].get("env", {}).__setitem__(
+                "ALLOW_UNSTAGED", "true"),
+        ):
+            changed = copy.deepcopy(production)
+            mutate(changed)
+            self.assertNotEqual(production_roles_gate_errors(changed), [])
+
+    def test_production_deploy_needs_prod_roles_gate(self):
+        production = self.workflows["deploy-production.yml"]
+        self.assertEqual(production_roles_gate_errors(production), [])
+        needs = production["jobs"]["production"]["needs"]
+        needs = [needs] if isinstance(needs, str) else needs
+        self.assertIn("guard", needs)
+        self.assertIn("schema-gate", needs)
+        self.assertIn("roles-gate", needs)
+        self.assertEqual(production["jobs"]["roles-gate"].get("needs"), "guard")
+        self.assertEqual(production["jobs"]["roles-gate"].get("environment"),
+                         "production-migrate-plan")
+        self.assertNotIn("if", production["jobs"]["roles-gate"])
 
     def test_staging_migrate_runner_shape_is_pinned(self):
         # TOG-11572: the slice's own workflow must satisfy its carve-out, and
@@ -1663,7 +2090,8 @@ class WorkflowTests(unittest.TestCase):
             with self.subTest(trigger=trigger):
                 self.assertTrue(mutated(lambda w, t=trigger: w["on"].update({t: ""})))
         for missing in ("acl_plan_ref", "plan_manifest_sha256", "plan_run_id",
-                        "production_host", "production_database"):
+                        "production_host", "production_database",
+                        "production_branch_id"):
             with self.subTest(missing=missing):
                 def drop(w, missing=missing):
                     del w["on"]["workflow_dispatch"]["inputs"][missing]
@@ -1705,7 +2133,8 @@ class WorkflowTests(unittest.TestCase):
                         if "--target production" in str(step.get("run", "")):
                             step["run"] = step["run"].replace("--target production", "")
             self.assertTrue(mutated(drop_target))
-        for wrong in ("--target staging", "--staging-host", "--staging-database"):
+        for wrong in ("--target staging", "--staging-host", "--staging-database",
+                      "--staging-branch-id"):
             with self.subTest(wrong=wrong):
                 def widen(w, wrong=wrong):
                     for step in w["jobs"]["plan"]["steps"]:
@@ -1985,7 +2414,26 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(set(installers["check"][0]["with"]["components"].replace(" ", "").split(",")),
                          {"rustfmt", "clippy"})
 
-    def test_rust_tests_toolchain_install_is_retry_guarded(self):
+    def pinned_toolchain_lanes(self, channel):
+        # Every PR-gating job that installs the repository pin: all of
+        # check.yml (the ci-ok aggregate) and the shared nextest lane it
+        # calls. The nightly-pinned fuzz lane installs a different toolchain
+        # and is excluded by the channel match.
+        lanes = []
+        for workflow_name in ("check.yml", "reusable-rust-nextest.yml"):
+            for job_id, job in self.workflows[workflow_name]["jobs"].items():
+                if any(str(step.get("uses", "")).startswith("dtolnay/rust-toolchain@")
+                       and step.get("with", {}).get("toolchain") == channel
+                       for step in job.get("steps", [])):
+                    lanes.append((workflow_name, job_id))
+        # Sentinels: an enumeration that silently found nothing would pass
+        # every subtest vacuously.
+        for lane in (("check.yml", "ignored-db-runtime"), ("reusable-rust-nextest.yml", "nextest")):
+            self.assertIn(lane, lanes)
+        self.assertNotIn(("check.yml", "fuzz-compile"), lanes)
+        return lanes
+
+    def test_rust_toolchain_installs_are_retry_guarded(self):
         # `rustup toolchain install` inside the installer failed once on main
         # with `Network is unreachable` syncing the channel manifest, failing
         # the job before any test ran (green on re-run). The upstream
@@ -1993,36 +2441,125 @@ class WorkflowTests(unittest.TestCase):
         # continues on error and the next step retries the same pin and fails
         # closed. The retry must request the repository pin and every
         # component the installer requests, or a green retry can mask a drift.
+        # Every PR-gating lane that installs the pin must carry the guard: a
+        # 4-second install failure on ignored-db-runtime reddened PR #984
+        # while the identical step passed on the other lanes of the same
+        # head. The lanes are enumerated from the workflows, not listed, so a
+        # new lane cannot install the pin unguarded. Scheduled and manual
+        # workflows (nightly, benchmark, fuzz smoke) do not gate a PR and
+        # stay out of scope.
         channel = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
-        steps = self.workflows["check.yml"]["jobs"]["rust-tests"]["steps"]
-        installers = [index for index, step in enumerate(steps)
-                      if str(step.get("uses", "")).startswith("dtolnay/rust-toolchain@")]
-        self.assertEqual(len(installers), 1)
-        index = installers[0]
-        installer = steps[index]
-        self.assertTrue(installer.get("continue-on-error"),
-                        "toolchain installer must continue so the retry step can run")
-        self.assertIn("id", installer)
-        retry = steps[index + 1]
-        self.assertNotIn("uses", retry)
-        self.assertIn("run", retry)
-        self.assertEqual(retry.get("if"), f"steps.{installer['id']}.outcome == 'failure'")
-        self.assertNotEqual(retry.get("continue-on-error"), True,
-                            "the retry must fail the job when the toolchain stays missing")
-        self.assertIn(channel, retry["run"])
-        for component in installer["with"]["components"].replace(" ", "").split(","):
-            with self.subTest(component=component):
-                self.assertIn(component, retry["run"])
-        with self.subTest(change="retry step removed"):
-            workflows = deepcopy(self.workflows)
-            del workflows["check.yml"]["jobs"]["rust-tests"]["steps"][index + 1]
-            retry_steps = workflows["check.yml"]["jobs"]["rust-tests"]["steps"]
-            still_guarded = (
-                len(retry_steps) > index + 1
-                and "run" in retry_steps[index + 1]
-                and retry_steps[index + 1].get("if") == f"steps.{installer['id']}.outcome == 'failure'"
-            )
-            self.assertFalse(still_guarded, "removing the retry step must fail this guard")
+        targets = self.pinned_toolchain_lanes(channel)
+        for workflow_name, job_id in targets:
+            with self.subTest(workflow=workflow_name, job=job_id):
+                steps = self.workflows[workflow_name]["jobs"][job_id]["steps"]
+                installers = [index for index, step in enumerate(steps)
+                              if str(step.get("uses", "")).startswith("dtolnay/rust-toolchain@")]
+                self.assertEqual(len(installers), 1)
+                index = installers[0]
+                installer = steps[index]
+                self.assertTrue(installer.get("continue-on-error"),
+                                "toolchain installer must continue so the retry step can run")
+                self.assertIn("id", installer)
+                retry = steps[index + 1]
+                self.assertNotIn("uses", retry)
+                self.assertIn("run", retry)
+                # Container steps default to sh, where `set -euo pipefail`
+                # aborts before any retry runs (b7753a4). The retry needs bash.
+                self.assertEqual(retry.get("shell"), "bash",
+                                 "toolchain retry must run under bash, not container sh")
+                self.assertEqual(retry.get("if"), f"steps.{installer['id']}.outcome == 'failure'")
+                self.assertNotEqual(retry.get("continue-on-error"), True,
+                                    "the retry must fail the job when the toolchain stays missing")
+                self.assertIn(channel, retry["run"])
+                components = installer.get("with", {}).get("components", "")
+                for component in filter(None, components.replace(" ", "").split(",")):
+                    with self.subTest(component=component):
+                        self.assertIn(component, retry["run"])
+                with self.subTest(change="retry step removed"):
+                    workflows = deepcopy(self.workflows)
+                    del workflows[workflow_name]["jobs"][job_id]["steps"][index + 1]
+                    retry_steps = workflows[workflow_name]["jobs"][job_id]["steps"]
+                    still_guarded = (
+                        len(retry_steps) > index + 1
+                        and "run" in retry_steps[index + 1]
+                        and retry_steps[index + 1].get("if") == f"steps.{installer['id']}.outcome == 'failure'"
+                    )
+                    self.assertFalse(still_guarded, "removing the retry step must fail this guard")
+
+    def test_rust_toolchain_retry_fails_closed_behaviorally(self):
+        # Behavioral pin for the retry guard above: substrings alone cannot
+        # pin branch selection (deleting `[ "$attempt" -lt 5 ] || exit 1`
+        # keeps every substring while the step exits 0 with no toolchain
+        # installed) or the exact pin (a `rustup default stable` keeps the
+        # install-line substring). Run each retry step under bash with
+        # function-shimmed fake `rustup`/`sleep` (a function shim, not a
+        # PATH shim, so the pin also runs in harnesses that sanitize PATH
+        # on exec): always-failing rustup exits 1 after exactly 5 installs
+        # with no default, and rustup succeeding on attempt 2 exits 0 having
+        # defaulted the exact repository pin.
+        import os
+        import subprocess
+        import tempfile
+
+        channel = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
+        targets = self.pinned_toolchain_lanes(channel)
+        fake_prelude = (
+            "rustup() {\n"
+            "  printf '%s\\n' \"$*\" >> \"$FAKE_RUSTUP_CALLS\"\n"
+            "  FAKE_N=$((${FAKE_N:-0} + 1))\n"
+            "  if [ \"$FAKE_N\" -lt \"$FAKE_SUCCEED_ON\" ]; then return 1; fi\n"
+            "  return 0\n"
+            "}\n"
+            "sleep() { :; }\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            calls_path = tmp_path / "rustup-calls.txt"
+            for workflow_name, job_id in targets:
+                steps = self.workflows[workflow_name]["jobs"][job_id]["steps"]
+                installers = [index for index, step in enumerate(steps)
+                              if str(step.get("uses", "")).startswith("dtolnay/rust-toolchain@")]
+                self.assertEqual(len(installers), 1)
+                run_text = str(steps[installers[0] + 1]["run"])
+                for case_name, succeed_on, expected_status, expected_installs in (
+                    ("always-fails", "99", 1, 5),
+                    ("succeeds-on-2", "2", 0, 2),
+                ):
+                    with self.subTest(workflow=workflow_name, job=job_id, case=case_name):
+                        calls_path.write_text("", encoding="utf-8")
+                        run_env = dict(os.environ)
+                        run_env.update(
+                            {
+                                "FAKE_RUSTUP_CALLS": str(calls_path),
+                                "FAKE_SUCCEED_ON": succeed_on,
+                            }
+                        )
+                        proc = subprocess.run(
+                            ["bash", "-c", fake_prelude + run_text],
+                            env=run_env,
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                        )
+                        self.assertEqual(
+                            proc.returncode, expected_status,
+                            f"unexpected retry status: {proc.stderr}",
+                        )
+                        calls = calls_path.read_text(encoding="utf-8").splitlines()
+                        installs = [line for line in calls if line.startswith("toolchain install ")]
+                        self.assertEqual(len(installs), expected_installs,
+                                         f"expected {expected_installs} installs, got: {calls}")
+                        for line in installs:
+                            self.assertIn(channel, line,
+                                          f"retry must install the exact pin, got: {line!r}")
+                        defaults = [line for line in calls if line.startswith("default ")]
+                        if expected_status == 0:
+                            self.assertIn(f"default {channel} --force-non-host", defaults,
+                                          f"retry must default the exact pin, got: {calls}")
+                        else:
+                            self.assertEqual(defaults, [],
+                                             f"failed retry must not default anything, got: {calls}")
 
     def test_overflow_runner_must_name_its_own_job(self):
         self.assertTrue(runner_allowed("worker", self.workflows["check.yml"]["jobs"]["worker"]["runs-on"]))
@@ -2099,61 +2636,70 @@ class WorkflowTests(unittest.TestCase):
         self.assertIs(profile.get("fail-fast"), False)
 
     def test_nextest_shared_backends_stay_off_pull_requests(self):
-        # R2 write credentials must never reach PR-built code (build scripts
-        # and tests execute at the PR head, and a shared R2 bucket has no
-        # per-PR scope: a PR could poison objects main later links). The
-        # GitHub-cache backend has the same quota shape: the lane's entries
-        # share the repo Actions cache with the warm `check` entry. PR runs
-        # therefore use sccache on local disk only; shared backends are
-        # main/push-only.
+        # R2 write credentials must never reach PR- or merge-queue-built code
+        # (build scripts and tests execute at a head that is not on `main`
+        # yet, and a shared R2 bucket has no per-PR scope: a PR could poison
+        # objects main later links). check.yml runs on merge_group, so a
+        # pull_request-only denylist is not enough. Only push-to-main and
+        # workflow_dispatch runs may use shared backends; every other event
+        # uses sccache on local disk only. The GitHub-cache backend has the
+        # same quota shape: the lane's entries share the repo Actions cache
+        # with the warm `check` entry, so non-main runs must not grow it.
         lane = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
         select = next(step for step in lane.get("steps", [])
                       if str(step.get("name", "")).startswith("Select sccache backend"))
         run_text = str(select.get("run", ""))
-        self.assertIn("pull_request", run_text)
+        self.assertIn("workflow_dispatch", run_text)
         self.assertIn("github.event_name", str(select.get("env", "")))
         self.assertIn("local disk", run_text)
-        # The pull_request branch must come FIRST: reordering the R2 branch
-        # ahead of it (even with the guard kept as a later elif) would let
-        # shared-backend credentials reach PR runs as soon as any secret is
-        # set, while every substring above stays present. Nothing
+        # The allowlist branch must come FIRST: a denylist (`!=`) or a
+        # reordered R2 branch ahead of it would let shared-backend
+        # credentials reach merge_group runs as soon as any secret is set,
+        # while every substring above stays present. Nothing
         # credential-shaped may precede the guard.
         lines = run_text.splitlines()
         gate = next(i for i, line in enumerate(lines)
-                    if "NEXTEST_EVENT" in line and "pull_request" in line)
-        # Exact pin: an inverted (!=), dead (&& false), or reordered guard
-        # all keep the `if ` prefix, so pin the full first line.
+                    if "NEXTEST_EVENT" in line)
+        # Exact pin: a denylist, dead (&& false), or reordered guard all keep
+        # the `if ` prefix, so pin the full first line.
         self.assertEqual(
             lines[gate].strip(),
-            'if [ "$NEXTEST_EVENT" = "pull_request" ]; then',
-            f"pull_request guard must be the exact first branch, got: {lines[gate]!r}",
+            'if [ "$NEXTEST_EVENT" = "push" ] || [ "$NEXTEST_EVENT" = "workflow_dispatch" ]; then',
+            f"push/workflow_dispatch allowlist must be the exact first branch, got: {lines[gate]!r}",
         )
         before = "\n".join(lines[:gate])
         self.assertNotIn("GITHUB_ENV", before)
         self.assertNotIn("R2_", before)
         self.assertNotIn("SCCACHE_", before)
-        # The pull_request body must write nothing shared: an extra
-        # SCCACHE_/R2_/GITHUB_ENV write inside the PR branch keeps every
-        # substring above while leaking credentials on PR runs.
-        end = next(
-            i
-            for i in range(gate + 1, len(lines))
-            if lines[i].strip().startswith("elif ")
-            or lines[i].strip() == "else"
-            or lines[i].strip().startswith("fi")
-        )
-        pr_body = "\n".join(lines[gate + 1 : end])
-        self.assertNotIn("GITHUB_ENV", pr_body)
-        self.assertNotIn("R2_", pr_body)
-        self.assertNotIn("SCCACHE_", pr_body)
-        self.assertNotIn("AWS_", pr_body)
-        # The shared backends are still configured off-PR: this guards
+        indent = lines[gate][: len(lines[gate]) - len(lines[gate].lstrip())]
+
+        def outer_boundary(start, word):
+            return next(
+                i
+                for i in range(start, len(lines))
+                if lines[i].strip() == word
+                and lines[i][: len(lines[i]) - len(lines[i].lstrip())] == indent
+            )
+
+        outer_else = outer_boundary(gate + 1, "else")
+        outer_fi = outer_boundary(outer_else + 1, "fi")
+        # The local-disk body must write nothing shared: an extra
+        # SCCACHE_/R2_/GITHUB_ENV write inside it keeps every substring above
+        # while leaking credentials on PR and merge-queue runs.
+        disk_body = "\n".join(lines[outer_else + 1 : outer_fi])
+        self.assertIn("local disk", disk_body)
+        self.assertNotIn("GITHUB_ENV", disk_body)
+        self.assertNotIn("R2_", disk_body)
+        self.assertNotIn("SCCACHE_", disk_body)
+        self.assertNotIn("AWS_", disk_body)
+        # The shared backends are still configured on main: this guards
         # against gutting the step instead of guarding it.
-        self.assertIn("GITHUB_ENV", "\n".join(lines[end:]))
-        # Behavioral pin: run the extracted step under bash. On PRs the
-        # env file stays empty even with all R2 vars set; off-PR the R2
-        # lines appear. Catches inverted/dead guards and PR-branch writes
-        # that structural pins miss.
+        self.assertIn("GITHUB_ENV", "\n".join(lines[gate + 1 : outer_else]))
+        # Behavioral pin: run the extracted step under bash. On
+        # pull_request, merge_group, and other events the env file stays
+        # empty even with all R2 vars set; on push and workflow_dispatch
+        # the R2 lines appear. Catches inverted/dead guards and disk-branch
+        # writes that structural pins miss.
         import os
         import subprocess
         import tempfile
@@ -2169,48 +2715,52 @@ class WorkflowTests(unittest.TestCase):
             backend_env_path = tmp.name
         try:
             base = dict(os.environ)
-            pr_env = dict(base)
-            pr_env.update(
-                {
-                    "NEXTEST_EVENT": "pull_request",
-                    **r2_env,
-                    "GITHUB_ENV": backend_env_path,
-                }
-            )
-            Path(backend_env_path).write_text("", encoding="utf-8")
-            proc = subprocess.run(
-                ["bash", "-c", run_text],
-                env=pr_env,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            self.assertEqual(proc.returncode, 0, f"PR backend step failed: {proc.stderr}")
-            self.assertEqual(
-                Path(backend_env_path).read_text(encoding="utf-8"),
-                "",
-                "PR run must not write shared-backend credentials",
-            )
-            push_env = dict(base)
-            push_env.update(
-                {
-                    "NEXTEST_EVENT": "push",
-                    **r2_env,
-                    "GITHUB_ENV": backend_env_path,
-                }
-            )
-            Path(backend_env_path).write_text("", encoding="utf-8")
-            proc = subprocess.run(
-                ["bash", "-c", run_text],
-                env=push_env,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            self.assertEqual(proc.returncode, 0, f"push backend step failed: {proc.stderr}")
-            written = Path(backend_env_path).read_text(encoding="utf-8")
-            self.assertIn("SCCACHE_BUCKET=test-bucket", written)
-            self.assertIn("AWS_ACCESS_KEY_ID=test-key", written)
+            for event in ("pull_request", "merge_group", "schedule"):
+                with self.subTest(event=event):
+                    run_env = dict(base)
+                    run_env.update(
+                        {
+                            "NEXTEST_EVENT": event,
+                            **r2_env,
+                            "GITHUB_ENV": backend_env_path,
+                        }
+                    )
+                    Path(backend_env_path).write_text("", encoding="utf-8")
+                    proc = subprocess.run(
+                        ["bash", "-c", run_text],
+                        env=run_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(proc.returncode, 0, f"{event} backend step failed: {proc.stderr}")
+                    self.assertEqual(
+                        Path(backend_env_path).read_text(encoding="utf-8"),
+                        "",
+                        f"{event} run must not write shared-backend credentials",
+                    )
+            for event in ("push", "workflow_dispatch"):
+                with self.subTest(event=event):
+                    run_env = dict(base)
+                    run_env.update(
+                        {
+                            "NEXTEST_EVENT": event,
+                            **r2_env,
+                            "GITHUB_ENV": backend_env_path,
+                        }
+                    )
+                    Path(backend_env_path).write_text("", encoding="utf-8")
+                    proc = subprocess.run(
+                        ["bash", "-c", run_text],
+                        env=run_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(proc.returncode, 0, f"{event} backend step failed: {proc.stderr}")
+                    written = Path(backend_env_path).read_text(encoding="utf-8")
+                    self.assertIn("SCCACHE_BUCKET=test-bucket", written)
+                    self.assertIn("AWS_ACCESS_KEY_ID=test-key", written)
         finally:
             try:
                 os.unlink(backend_env_path)
@@ -2219,26 +2769,142 @@ class WorkflowTests(unittest.TestCase):
         raw = (ROOT / ".github/workflows/reusable-rust-nextest.yml").read_text(encoding="utf-8")
         self.assertNotIn("adds no cache footprint", raw)
 
-    def test_ci_speed_withholds_r2_secrets_on_pull_request(self):
-        # Even with the callee-side guard, the caller must not forward R2
-        # write secrets on pull_request events. The gate must read
-        # `!= 'pull_request' && secrets.X || ''`: the seemingly equivalent
-        # `== 'pull_request' && '' || secrets.X` forwards the secret anyway,
-        # because '' is falsy in GitHub expressions.
-        job = self.workflows["ci-speed.yml"]["jobs"]["nextest"]
+    def test_required_nextest_withholds_r2_secrets_on_pull_request(self):
+        # Even with the callee-side guard, the caller must forward R2 write
+        # secrets only on push to main and workflow_dispatch. check.yml runs
+        # on merge_group too, so a `!= 'pull_request'` gate would forward the
+        # secrets to queued code that is not on `main` yet. The gate must
+        # read `(== 'push' || == 'workflow_dispatch') && secrets.X || ''`:
+        # the seemingly equivalent `== 'pull_request' && '' || secrets.X`
+        # forwards the secret anyway, because '' is falsy in GitHub
+        # expressions.
+        job = self.workflows["check.yml"]["jobs"]["nextest"]
         r2_keys = ("SCCACHE_BUCKET", "SCCACHE_ENDPOINT", "SCCACHE_REGION",
                    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
         for key in r2_keys:
             with self.subTest(secret=key):
-                # Exact pin: only `!= 'pull_request' && secrets.X || ''`
-                # withholds the secret on pull_request. Flipping && to ||
-                # (or leading with `== 'pull_request' && ''`) forwards it
+                # Exact pin: the allowlist form withholds the secret on
+                # pull_request AND merge_group. A `!= 'pull_request'` form or
+                # a leading `== ... && ''` form forwards it on some event
                 # while keeping every substring present, so substrings
                 # cannot pin this gate.
                 self.assertEqual(
                     str(job["secrets"][key]),
-                    "${{ github.event_name != 'pull_request' && secrets." + key + " || '' }}",
+                    "${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets." + key + " || '' }}",
                 )
+
+    def test_required_nextest_caller_shape_is_pinned(self):
+        # The promoted lane is a required check.yml job: least-privilege
+        # grant, rust-selector gate like the other Rust test lanes, exact
+        # head SHA into the reusable lane, and R2 secrets only off-PR
+        # (pinned by the withholding test above).
+        job = self.workflows["check.yml"]["jobs"]["nextest"]
+        self.assertEqual(job.get("name"), "rust nextest")
+        self.assertEqual(job.get("permissions"), {"contents": "read"})
+        self.assertIn("job-inputs", job.get("needs", []))
+        self.assertIn("needs.job-inputs.outputs.rust != 'false'", job.get("if", ""))
+        self.assertEqual(job.get("uses"), "./.github/workflows/reusable-rust-nextest.yml")
+        self.assertEqual(job["with"]["ref"], "${{ github.event.pull_request.head.sha || github.sha }}")
+        self.assertNotIn("runs-on", job)
+        agg = self.workflows["check.yml"]["jobs"]["ci-ok"]
+        self.assertIn("nextest", agg["needs"])
+        self.assertIn("NEXTEST_RESULT", "\n".join(step.get("run", "") for step in agg["steps"]))
+
+    def test_required_nextest_timeout_ceiling_is_pinned(self):
+        # Gate ceiling: the required lane must keep its 45-minute ceiling.
+        # Raising it hides a wedged runner; the pin forces a reviewed change.
+        job = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
+        # BaseLoader keeps scalars as strings; "45" is the 45-minute ceiling.
+        self.assertEqual(job.get("timeout-minutes"), "45")
+
+    def test_required_nextest_quarantine_ejects_without_revert(self):
+        # Red-group ejection path: the `quarantine` input must exist with an
+        # empty default, and the nextest step must turn each filter into a
+        # `--skip` so the rest of the suite still gates. Pinned
+        # cargo-nextest 0.9.99 only accepts `--skip` AFTER the `--`
+        # separator, so the pin asserts the exact argv order: a `--skip`
+        # before `--` fails the whole lane with a usage error.
+        workflow = self.workflows["reusable-rust-nextest.yml"]
+        quarantine = workflow["on"]["workflow_call"]["inputs"]["quarantine"]
+        self.assertEqual(quarantine.get("default"), "")
+        job = workflow["jobs"]["nextest"]
+        run_nextest = next(step for step in job.get("steps", [])
+                           if str(step.get("name", "")).startswith("cargo nextest"))
+        self.assertEqual(run_nextest["env"]["QUARANTINE"], "${{ inputs.quarantine }}")
+        run_text = str(run_nextest.get("run", ""))
+        self.assertIn("--skip", run_text)
+        self.assertIn("$QUARANTINE", run_text)
+        self.assertIn('-- "${skip_args[@]}"', run_text)
+        self.assertNotIn("--profile ci $skip_args", run_text)
+        # Behavioral pin: substrings alone cannot pin branch selection (an
+        # inverted empty/non-empty guard, or a flag dropped from one branch,
+        # keeps every substring above while silently disabling ejection).
+        # Run the extracted step under bash with a function-shimmed fake
+        # `cargo` that records its argv and emits the JUnit file the rest of
+        # the step copies, then pin the exact argv for both quarantine
+        # states. (A function shim, not a PATH shim, so the pin also runs
+        # in harnesses that sanitize PATH on exec.)
+        import os
+        import subprocess
+        import tempfile
+
+        base_argv = [
+            "nextest", "run", "--workspace", "--lib", "--bins",
+            "--features", "two-bot-core/db", "--locked", "--profile", "ci",
+        ]
+        cases = (
+            ("empty-quarantine", "", base_argv, 0, 0),
+            (
+                "two-quarantine-filters",
+                "red_group other_red",
+                base_argv + ["--", "--skip", "red_group", "--skip", "other_red"],
+                0,
+                0,
+            ),
+            # A real nextest failure must remain the step result after the
+            # JUnit report is copied for the always-run ledger/upload steps.
+            ("nextest-failure", "", base_argv, 37, 37),
+        )
+        fake_cargo = (
+            "cargo() {\n"
+            "  printf '%s\\n' \"$@\" > \"$FAKE_CARGO_ARGV\"\n"
+            "  mkdir -p target/nextest/ci\n"
+            "  printf '<testsuites/>\\n' > target/nextest/ci/junit.xml\n"
+            "  return \"${FAKE_CARGO_STATUS:-0}\"\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            argv_path = tmp_path / "cargo-argv.txt"
+            for case_name, quarantine_value, expected_argv, cargo_status, expected_status in cases:
+                with self.subTest(case=case_name):
+                    work_dir = tmp_path / ("work-" + case_name)
+                    work_dir.mkdir()
+                    run_env = dict(os.environ)
+                    run_env.update(
+                        {
+                            "QUARANTINE": quarantine_value,
+                            "FAKE_CARGO_ARGV": str(argv_path),
+                            "FAKE_CARGO_STATUS": str(cargo_status),
+                        }
+                    )
+                    proc = subprocess.run(
+                        ["bash", "-eo", "pipefail", "-c", fake_cargo + run_text],
+                        cwd=work_dir,
+                        env=run_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(
+                        proc.returncode, expected_status,
+                        f"unexpected step status for {case_name}: {proc.stderr}",
+                    )
+                    recorded = argv_path.read_text(encoding="utf-8").splitlines()
+                    self.assertEqual(recorded, expected_argv)
+                    report = work_dir / "junit.xml"
+                    self.assertTrue(report.is_file(), f"nextest report was not copied for {case_name}")
+                    self.assertEqual(report.read_text(encoding="utf-8"), "<testsuites/>\n")
 
     def test_ci_speed_rollout_documents_pr_local_cache(self):
         rollout = (ROOT / "docs/ci-speed-rollout.md").read_text(encoding="utf-8")

@@ -154,14 +154,17 @@ def build_claim(manifest, env):
             and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}", target["host"])
             and isinstance(target.get("database"), str)
             and re.fullmatch(r"[a-zA-Z0-9_.-]{1,63}", target["database"])
-            and target.get("branch_id") == ""
+            and isinstance(target.get("branch_id"), str)
+            and re.fullmatch(r"[A-Za-z0-9_-]{0,63}", target["branch_id"])
             and "staging" not in target["host"].lower()
             and "neon.tech" not in target["host"].lower()
             and "agent-testdb" not in target["host"].lower()
             and "-pooler" not in target["host"].lower(),
             "target is not a bare production identity")
+    if target["host"].lower().endswith(".psdb.cloud"):
+        require(target["branch_id"] != "", "PlanetScale target must carry the pinned branch id")
     require(target == {"host": env.get("PRODUCTION_HOST"), "database": env.get("PRODUCTION_DATABASE"),
-                       "branch_id": ""},
+                       "branch_id": env.get("PRODUCTION_BRANCH_ID", "")},
             "plan target does not match the request")
     for key, env_key in (("recovery_evidence_ref", "RECOVERY_REF"), ("acl_plan_ref", "ACL_REF")):
         value = env.get(env_key, "")

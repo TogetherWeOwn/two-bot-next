@@ -4,7 +4,8 @@
 //! staging-migrate --target staging|production --plan|--apply --source-sha <40hex>
 //!   --staging-host <host> --staging-database <db> [--staging-branch-id <branch>]
 //!   (staging only)
-//!   --production-host <host> --production-database <db> (production only)
+//!   --production-host <host> --production-database <db>
+//!   [--production-branch-id <branch>] (production only)
 //!   --recovery-evidence-ref <ref> --acl-plan-ref <ref>
 //!   [--expected-pending <ascending,comma-separated versions>]
 //!   [--expected-store-pending <ascending,comma-separated store versions>]
@@ -30,12 +31,11 @@
 //! proving the bound hashes came from the named producing run; --plan prints that
 //! manifest (including both hashes) and ignores the plan-binding flags.
 //!
-//! `--staging-branch-id` pins the PlanetScale branch id (non-secret, staging
-//! target only): it is required for `*.psdb.cloud` hosts and must match the
-//! binding username's `{role}.{branch_id}` suffix; empty (the default) means no
-//! pin and is accepted for Neon and test hosts. The production target takes no
-//! branch pin yet, so a production dispatch aimed at a `*.psdb.cloud` host
-//! fails closed until a production branch pin lands (follow-up).
+//! `--staging-branch-id` (staging target) and `--production-branch-id`
+//! (production target) pin the PlanetScale branch id (non-secret): the pin is
+//! required for `*.psdb.cloud` hosts and must match the binding username's
+//! `{role}.{branch_id}` suffix; empty (the default) means no pin and is
+//! accepted for Neon and test hosts.
 //! Exit: 0 ok, 2 refused before any DDL, 1 failed (evidence on stdout).
 
 // Operator CLI reports intentionally use stdout; runtime/library modules do not.
@@ -65,6 +65,7 @@ fn real_main() -> i32 {
             | "--staging-branch-id"
             | "--production-host"
             | "--production-database"
+            | "--production-branch-id"
             | "--recovery-evidence-ref"
             | "--acl-plan-ref"
             | "--expected-pending"
@@ -98,8 +99,11 @@ fn real_main() -> i32 {
         Target::Staging => {
             if values.contains_key("--production-host")
                 || values.contains_key("--production-database")
+                || values.contains_key("--production-branch-id")
             {
-                return refused("staging target takes --staging-host/--staging-database only");
+                return refused(
+                    "staging target takes --staging-host/--staging-database/--staging-branch-id only",
+                );
             }
             (
                 get("--staging-host"),
@@ -113,13 +117,13 @@ fn real_main() -> i32 {
                 || values.contains_key("--staging-branch-id")
             {
                 return refused(
-                    "production target takes --production-host/--production-database only",
+                    "production target takes --production-host/--production-database/--production-branch-id only",
                 );
             }
             (
                 get("--production-host"),
                 get("--production-database"),
-                String::new(),
+                get("--production-branch-id"),
             )
         }
     };

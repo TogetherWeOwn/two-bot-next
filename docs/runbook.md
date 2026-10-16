@@ -276,6 +276,37 @@ Unknown, wrong-method and overlong shapes collapse to `other` with no new
 series. Source: [`metrics.rs`](../crates/core/src/metrics.rs),
 [`executor_metrics.rs`](../crates/discord/src/executor_metrics.rs).
 
+#### Alert: REST 5xx
+
+More than 10% of Discord REST requests between two keepalive samples (minimum
+10 requests in the window) returned 5xx. Unlike 429s, a 5xx burst is never
+healthy backpressure: it is Discord-side failure or a broken request shape
+from a fresh deploy. A counter reset (process restart) skips the window rather
+than firing. `transport` failures (timeouts and cancellations before response
+headers) are not counted here; they surface through job timeout classes.
+
+First response: read the hot route from the `route` label on
+`two_bot_rest_requests_total{route,result="5xx"}` via the authorized
+`/ops/metrics` scrape; confirm whether a deploy or promotion is in progress
+(check the staging workflow result and recent merges — a fresh deploy can
+explain a new hot route). Do not replay uncertain writes: a 5xx leaves the
+effect unknown, so reconcile through the recorded disposition before retrying
+anything the burst may have executed twice.
+
+Evaluate rollback when the burst starts with the deployed revision: compare the
+alert's first-firing window with the staging-rollout evidence (or the gated
+production run) for that SHA. A 5xx share introduced by a promotion stage
+requires a manual rollback decision unless a 5xx-specific per-stage health gate
+is configured and wired to the shared gradual-promotion action. When its
+configured gate fails, the action restores the recorded pre-promote version; a
+manual rollback names the recorded Worker version and container image from the
+failed run's snapshot. A burst on an unchanged revision is a Discord incident
+or a dependency regression, not a rollback.
+
+Escalate when the 5xx share stays above threshold across several windows after
+containment, or when 5xx coincide with 429/transport failures suggesting a
+wider Discord or network incident.
+
 #### Alert: DB pool
 
 The SQLx pool sat at its maximum with zero idle connections for three
@@ -893,8 +924,13 @@ Outcomes: `pending_before` and `pending_store_before` both empty prints
 `schema drift: staging database is behind source <sha>: pending versions [...]`
 — fix it with the manual `staging-migrate` apply dispatch for that source
 (reviewed plan, exact `expected_pending` plus `expected_store_pending` when
-the store chain is behind), then re-run `deploy-staging`. The gate never fixes drift
-itself. The plan manifest is written to `staging-schema-gate-manifest.json`
+the store chain is behind). When applying the store chain, the apply creates a
+new ledger whose default privileges do not automatically grant the plan login
+read access: reapply the full reviewed role plan (`two-bot db roles plan`), run
+`verify` and require 0 findings, then re-run `deploy-staging`. The drift output
+prints this sequence. For cutover-only apply, re-run `deploy-staging` after
+apply. The gate never fixes drift itself. The plan manifest is written to
+`staging-schema-gate-manifest.json`
 in the job workspace; its `audit.connection_usage` (sessions summed from
 `pg_stat_database.numbackends`, readable in full by the plan login) warns —
 never fails — when usage is strictly above 80% of the non-superuser ceiling
@@ -917,6 +953,7 @@ Invocation (secret-free; each URL comes only from its existing binding):
 ```text
 staging-migrate --target production --plan --source-sha <40hex> \
   --production-host <host> --production-database <db> \
+  [--production-branch-id <branch>] \
   --recovery-evidence-ref <ref> --acl-plan-ref <ref> \
   [--expected-pending <ascending,comma-separated versions>]
 staging-migrate --target production --apply <same flags> --expected-pending <list> \
@@ -925,6 +962,11 @@ staging-migrate --target production --apply <same flags> --expected-pending <lis
   --plan-run-id <run id> \
   --plan-manifest-path <producing run's downloaded manifest>
 ```
+
+`--production-branch-id` pins the PlanetScale branch id (non-secret). It is
+required when `--production-host` ends in `.psdb.cloud` (PlanetScale routes
+branches by the binding username's `{role}.{branch_id}` suffix, while every
+branch shares `postgres` as the database name); other hosts leave it empty.
 
 `--target` is explicit with no default: a run without it refuses, a staging
 run never reads a production pin or binding, and a production run never reads
@@ -939,7 +981,10 @@ the binding-host check, so a mistaken production pin aimed at staging still
 fails closed before any DDL. The binding-host check additionally refuses any
 non-`5432` port and any pooled (`|…`) login on production, so a binding
 copied from the app's pooled connection string still fails closed (pooler
-`SET ROLE` and the migrator lock need the direct endpoint). The manifest carries `migration_target`
+`SET ROLE` and the migrator lock need the direct endpoint). A `*.psdb.cloud`
+pin without `--production-branch-id`, a malformed pin, or a binding whose
+username branch suffix does not match the pin refuses the same way, in both
+gates. The manifest carries `migration_target`
 (`staging` or `production`); the claim publisher requires the matching value.
 
 The workflow mirrors the staging shape with the `production-migrate-` prefix:
@@ -951,10 +996,9 @@ actions, routed runner, pipefail shell, and artifact names
 retention, stored ZIP entries). The `claim` job runs
 `scripts/ci/production_migrate_claim.py`, which binds the same projection hash
 but requires the production workflow path, environment, and
-`PRODUCTION_HOST`/`PRODUCTION_DATABASE` pins. The production target takes no
-branch pin yet, so a production dispatch refuses
-closed (exit 2) until the production branch-pin follow-up lands; the
-production path is unavailable until then. Both environments
+`PRODUCTION_HOST`/`PRODUCTION_DATABASE`/`PRODUCTION_BRANCH_ID` pins (the
+claim refuses a PlanetScale plan without the pinned branch id, or a request
+pin that does not match the plan). Both environments
 and both secrets must exist before dispatch; the host provisions them after
 this change merges. The cutover itself does not need this path: the fresh
 `two_bot` bootstrap uses the tested provisioner flow.
@@ -1329,8 +1373,9 @@ or existing operator handoff; see [backup.md](backup.md) for unit contracts.
 | Website event action stuck `needs_reconciliation` after an ambiguous create | No automatic retry: re-submitting under a new key can make a second event. Read the actual guild scheduled events in Discord, then resolve the exact intent with the inspection-first, explicitly confirmed `two-bot reconcile-event` CLI (`--list`, then `--created`/`--updated`/`--cancelled`/`--no-effect` with `--execute`). See [the receiver contract](internal-actions-receiver.md); never re-submit the operation under a new key before reconciling. |
 | `POST /internal/actions` 404 on staging | The route is dark unless the Worker var `INTERNAL_ACTIONS_INGRESS` (staging env) **and** the secret `TWO_INTERNAL_ACTIONS` are both exactly `1`. Wrong method, a trailing slash or any query string is also 404 by design. Production is always 404. |
 | `POST /internal/actions` 503 `unavailable` | The container is not running (public ingress never starts it; wait for the probe or keepalive), the ownership fence refused this deployment, or the receiver answered something other than its JSON envelope. Check `/readyz` and ownership status; do not retry-loop a signed request with a new nonce. |
+| `POST /hooks/twitch` refusal or 404 on staging | The EventSub receiver is staging-only and dark unless the Worker route gate and the container listener are both enabled. Read the [EventSub operator runbook](eventsub-runbook.md) for the enable order, secret agreement, challenge echo, and the full refusal matrix before changing anything. |
 | Ready but feature inactive | Gateway readiness says nothing about library-only commands/jobs/kill switches. Check [runtime boundaries](#containment-kill-switches-and-feature-flags), not extra environment guesses. |
-| Worker restored but Rust regression remains | Worker-version rollback did not prove image rollback. Inspect the active image and use a schema-compatible full redeploy of the known-good pair. |
+| Worker restored but Rust regression remains | A bare `wrangler rollback` does not prove image rollback; the `deploy-production` rollback dispatch restores Worker version and container image together with a stable gate. Inspect the active image and use the workflow rollback (or a schema-compatible full redeploy of the known-good pair). |
 | Backup/drill red | Preserve valid archives; inspect exit status, verifier line, table counts and off-box receipt. Rehearse only on a prepared test database. No automatic promotion to a production restore. |
 
 ## Incident playbooks
@@ -1358,6 +1403,9 @@ staging container. [Tabletop evidence](incident-tabletop-2026-10-01.md) separate
 local source rehearsal, actual staging observations and unfinished acceptance.
 The [October-6 staging record](incident-tabletop-2026-10-06.md) is the Discord and
 Neon dry run against the live staging baseline, with its open evidence gaps.
+The [October-15 production postmortem](production-incident-2026-10-15-postmortem.md)
+records the production gateway crash-loop, its provisional schema-gap cause, and
+the rollback receipts; read it before any production gateway recovery.
 A denied observation or successful offline test is not a completed staging drill.
 
 ### Discord gateway or API outage
