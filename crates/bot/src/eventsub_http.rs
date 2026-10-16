@@ -882,6 +882,22 @@ mod tests {
                 "Ok(Delivery::Ignored)",
                 "revocation",
             ),
+            (
+                "Ok(Delivery::Ignored)",
+                "// Deterministic planning errors",
+                "ignored",
+            ),
+            (
+                "Err(EventSubError::WrongSubscription) | Err(EventSubError::InvalidBody)",
+                "Err(EventSubError::InvalidChallenge)",
+                "ignored",
+            ),
+            (
+                "Err(EventSubError::InvalidChallenge)",
+                "Err(e) => {",
+                "ignored",
+            ),
+            ("Err(e) => {", "\n        }\n    }\n}", "ignored"),
         ] {
             assert!(
                 arm(start, end).contains(&format!("eventsub_classified(\"{kind}\")")),
