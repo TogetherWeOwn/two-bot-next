@@ -29,12 +29,16 @@ use crate::gateway_failure::FailureClass;
 /// sanitized chain. The tests assert substrings, not this exact layout.
 #[must_use]
 pub fn render_backfill_failure(class: FailureClass, step: BackfillStep, chain: &str) -> String {
-    two_bot_core::error_chain::render_backfill_failure(class.as_str(), step, chain)
+    two_bot_core::error_chain::render_backfill_failure(class.as_str(), step, &sanitize_chain(chain))
 }
 
 /// One retention failure line: the gateway class, the stage step, and the
 /// sanitized chain. The tests assert substrings, not this exact layout.
 #[must_use]
 pub fn render_retention_failure(class: FailureClass, step: RetentionStep, chain: &str) -> String {
-    two_bot_core::error_chain::render_retention_failure(class.as_str(), step, chain)
+    two_bot_core::error_chain::render_retention_failure(
+        class.as_str(),
+        step,
+        &sanitize_chain(chain),
+    )
 }

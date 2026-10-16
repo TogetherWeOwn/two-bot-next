@@ -29,7 +29,6 @@
 //! (<https://docs.discord.com/developers/topics/rate-limits>).
 
 use sqlx::{Pool, Postgres};
-use thiserror::Error;
 
 /// Upsert SQL, byte-for-byte the acceptance target's `PUT_HISTORY_MESSAGE_SQL`.
 const PUT_MESSAGE_SQL: &str = "INSERT INTO backfill_history_messages
@@ -47,22 +46,47 @@ const RECORD_COUNT_SQL: &str = "INSERT INTO backfill_history_counts
 /// History-store failure: a database error, or ids/count that fail validation.
 /// Validation runs before any SQL, so an invalid write never touches the database.
 ///
-/// Fail closed: the `Db` variant carries no `sqlx::Error` payload. Its
-/// `Display`, `Debug` and `source()` are all fixed, so no SQLSTATE, message,
-/// connection URL or statement detail can surface through error formatting.
-/// Structured callers that need a failure token use their own fixed
-/// `db_class`/`db_cause` values, never this error's text.
-#[derive(Debug, Error)]
+/// Fail closed: the `Db` variant keeps its `sqlx::Error` payload (the
+/// frozen acceptance suite constructs it directly, and `?` conversions need
+/// the `From` impl), but its `Display`, `Debug` and `source()` never touch
+/// it, so no SQLSTATE, message, connection URL or statement detail can
+/// surface through error formatting. Structured callers that need a failure
+/// token use their own fixed `db_class`/`db_cause` values, never this
+/// error's text.
 pub enum BackfillHistoryError {
-    #[error("backfill history database error: database error")]
-    Db,
-    #[error("invalid backfill history row: {0}")]
+    Db(sqlx::Error),
     Invalid(&'static str),
 }
 
+impl std::fmt::Display for BackfillHistoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Db(_) => write!(f, "backfill history database error: database error"),
+            Self::Invalid(reason) => write!(f, "invalid backfill history row: {reason}"),
+        }
+    }
+}
+
+impl std::fmt::Debug for BackfillHistoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Never the payload: derived `Debug` would print the whole sqlx chain.
+            Self::Db(_) => write!(f, "Db"),
+            Self::Invalid(reason) => write!(f, "Invalid({reason:?})"),
+        }
+    }
+}
+
+impl std::error::Error for BackfillHistoryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // Never the payload: the sqlx chain carries URLs and statements.
+        None
+    }
+}
+
 impl From<sqlx::Error> for BackfillHistoryError {
-    fn from(_: sqlx::Error) -> Self {
-        Self::Db
+    fn from(error: sqlx::Error) -> Self {
+        Self::Db(error)
     }
 }
 

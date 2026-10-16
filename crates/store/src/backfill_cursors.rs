@@ -18,7 +18,6 @@
 //! wrapper and the tests can never drift apart.
 
 use sqlx::{Pool, Postgres};
-use thiserror::Error;
 
 /// The nine backfill families from the TOG-22852 plan.
 pub const BACKFILL_FAMILIES: &[&str] = &[
@@ -52,22 +51,47 @@ const GET_SQL: &str = "SELECT cursor FROM backfill_cursors WHERE family = $1";
 /// validation. Validation runs before any SQL, so an invalid write never
 /// touches the database.
 ///
-/// Fail closed: the `Db` variant carries no `sqlx::Error` payload. Its
-/// `Display`, `Debug` and `source()` are all fixed, so no SQLSTATE, message,
-/// connection URL or statement detail can surface through error formatting.
-/// Structured callers that need a failure token use their own fixed
-/// `db_class`/`db_cause` values, never this error's text.
-#[derive(Debug, Error)]
+/// Fail closed: the `Db` variant keeps its `sqlx::Error` payload (the
+/// frozen acceptance suite constructs it directly, and `?` conversions need
+/// the `From` impl), but its `Display`, `Debug` and `source()` never touch
+/// it, so no SQLSTATE, message, connection URL or statement detail can
+/// surface through error formatting. Structured callers that need a failure
+/// token use their own fixed `db_class`/`db_cause` values, never this
+/// error's text.
 pub enum BackfillCursorError {
-    #[error("backfill cursor database error: database error")]
-    Db,
-    #[error("invalid backfill cursor: {0}")]
+    Db(sqlx::Error),
     Invalid(&'static str),
 }
 
+impl std::fmt::Display for BackfillCursorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Db(_) => write!(f, "backfill cursor database error: database error"),
+            Self::Invalid(reason) => write!(f, "invalid backfill cursor: {reason}"),
+        }
+    }
+}
+
+impl std::fmt::Debug for BackfillCursorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Never the payload: derived `Debug` would print the whole sqlx chain.
+            Self::Db(_) => write!(f, "Db"),
+            Self::Invalid(reason) => write!(f, "Invalid({reason:?})"),
+        }
+    }
+}
+
+impl std::error::Error for BackfillCursorError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // Never the payload: the sqlx chain carries URLs and statements.
+        None
+    }
+}
+
 impl From<sqlx::Error> for BackfillCursorError {
-    fn from(_: sqlx::Error) -> Self {
-        Self::Db
+    fn from(error: sqlx::Error) -> Self {
+        Self::Db(error)
     }
 }
 
