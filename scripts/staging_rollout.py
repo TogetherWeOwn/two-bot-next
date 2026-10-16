@@ -741,6 +741,7 @@ def verify(args, client):
     pinned = None
     lag_streak = 0
     image_stale = 0
+    listing_seen_target = False
     drift_candidate = False
     app = row = None
     while time.monotonic() < client.deadline:
@@ -751,6 +752,8 @@ def verify(args, client):
             client, lambda: application(client), app, row, image, drift_candidate, verification_started)
         require(app["id"] == baseline["application_id"]
                 and app["durable_objects"]["namespace_id"] == baseline["namespace_id"], "application_identity_drift")
+        listed_image = mapping(app.get("configuration")).get("image")
+        listing_seen_target = listing_seen_target or listed_image == image
         if pinned is None:
             pinned = select_rollout(rollouts(client, app["id"]), baseline, image)
             client.observation = "no_new_rollout"
@@ -770,7 +773,6 @@ def verify(args, client):
                 deadline_aware_read(
                     client, lambda: active_worker(client, version), app, row, image,
                     drift_candidate, verification_started)
-            listed_image = mapping(app.get("configuration")).get("image")
             stale = (complete or lag) and listed_image != image
             drift_candidate = stale
             if stale:
@@ -821,7 +823,14 @@ def verify(args, client):
                             and re.fullmatch(IMAGE, final_previous_image)
                             and final_image == final_previous_image
                         )
-                        if final_image != image and not verified_previous_image:
+                        later_rollouts = []
+                        if final_image != image and verified_previous_image and not listing_seen_target:
+                            later_rollouts = [mapping(item) for item in rollouts(client, app["id"])
+                                              if mapping(item).get("id") != pinned["id"]
+                                              and timestamp(mapping(item).get("created_at"))
+                                              > timestamp(pinned.get("created_at"))]
+                        if (final_image != image and (not verified_previous_image or listing_seen_target
+                                                      or later_rollouts)):
                             raise GateError("application_image_drift",
                                             image_drift_detail(client, final_app, final, image))
                         listing_lag = final_image != image

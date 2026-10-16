@@ -2267,14 +2267,60 @@ class OrchestrationTests(OfflineTestCase):
         client.deadline = 1000
         self.assertEqual(self.drift_error(client).detail, "listing_image=other later_rollouts=0")
 
-    def test_final_image_mismatch_carries_the_same_detail_and_observation(self):
+    def test_final_listing_regression_to_baseline_fails_with_ready_runtime(self):
         self.prepare_baseline()
         self.write_deploy_output()
         client = verify_client()
         client.api_routes[APP_PATH] = [[app()], [app(OLD_IMAGE)]]
-        error = self.drift_error(client)
-        self.assertEqual(error.detail, "listing_image=baseline later_rollouts=0")
-        self.assertIn("application_image=stale polls=1", client.observation)
+        client.deadline = 1000
+
+        with self.assertRaises(rollout.GateError) as caught:
+            rollout.verify(self.args, client)
+
+        self.assertEqual(str(caught.exception), "application_image_drift")
+        self.assertEqual(caught.exception.detail, "listing_image=baseline later_rollouts=0")
+        self.assertIn(("request", URL + "/readyz"), client.calls)
+        self.assertIn(("request", URL + "/health"), client.calls)
+        self.assert_no_evidence()
+
+    def test_target_seen_before_rollout_pin_then_baseline_listing_fails(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        client.api_routes[APP_PATH] = [[app()], [app(OLD_IMAGE)]]
+        client.api_routes[ROWS_PATH] = [[old_row()], [old_row(), completed_row()]]
+        client.deadline = 1000
+
+        with self.assertRaises(rollout.GateError) as caught:
+            rollout.verify(self.args, client)
+
+        self.assertEqual(str(caught.exception), "application_image_drift")
+        self.assertEqual(caught.exception.detail, "listing_image=baseline later_rollouts=0")
+        self.assertIn(("request", URL + "/readyz"), client.calls)
+        self.assertIn(("request", URL + "/health"), client.calls)
+        self.assert_no_evidence()
+
+    def test_final_baseline_listing_with_later_rollout_fails_with_ready_runtime(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        client.api_routes[APP_PATH] = [[app(OLD_IMAGE)]]
+        reverting = completed_row()
+        reverting.update(id="later_rollout", created_at=date(1))
+        reverting["target_configuration"]["image"] = OLD_IMAGE
+        client.api_routes[ROWS_PATH] = [[old_row(), completed_row()],
+                                        [old_row(), completed_row(), reverting]]
+        client.deadline = 1000
+
+        with self.assertRaises(rollout.GateError) as caught:
+            rollout.verify(self.args, client)
+
+        self.assertEqual(str(caught.exception), "application_image_drift")
+        self.assertEqual(caught.exception.detail,
+                         "listing_image=baseline later_rollouts=1 latest_later=completed:baseline")
+        self.assertIn(("request", URL + "/readyz"), client.calls)
+        self.assertIn(("request", URL + "/health"), client.calls)
+        self.assert_no_evidence()
 
     def test_image_drift_detail_failure_never_masks_the_gate_error(self):
         self.prepare_baseline()

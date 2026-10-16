@@ -92,10 +92,11 @@ not production authorization or a migration tool.
    `"active_lag": true` on this path. The application listing is read separately
    from the rollout record and can briefly trail it. A target digest in the listing
    is accepted normally; a stale listing is accepted only when its digest matches the
-   completed rollout's verified previous-image digest and the exact Worker passes
-   the runtime probes. On the active-lag counter shape, that listing-lag acceptance
-   still requires two consecutive full passes. Successful stale-listing acceptance
-   records `"application_listing_lag": true`.
+   completed rollout's verified previous-image digest, the listing has never shown
+   the target during this verification, a final rollout-list read finds no newer
+   rollout, and the exact Worker passes the runtime probes. On the active-lag counter
+   shape, that listing-lag acceptance still requires two consecutive full passes.
+   Successful stale-listing acceptance records `"application_listing_lag": true`.
 
    A stale listing that is not verified as the rollout's previous image fails as
    `application_image_drift`. For a verified previous-image listing that has not
@@ -115,8 +116,10 @@ not production authorization or a migration tool.
    `latest_later=<status>:<target|baseline|other>` when a rollout created after the
    pinned one exists. `listing_image=baseline` with a later `completed:baseline`
    rollout means the control plane reverted the application after the pinned rollout
-   completed; `listing_image=baseline` with `later_rollouts=0` means the listing never
-   moved. Digests, configurations and ids are never printed.
+   completed. A baseline listing is accepted only if the gate never saw the target
+   during this verification and the final rollout-list read found no newer rollout;
+   `later_rollouts=0` alone does not establish that history. Digests, configurations
+   and ids are never printed.
 7. Require the intended Worker version at 100% traffic, `/readyz` **200** with all
    components ready and the exact compiled revision/build ID, and `/health` 200.
    Both responses carry `x-two-worker-version`, overwritten by the outer Worker
