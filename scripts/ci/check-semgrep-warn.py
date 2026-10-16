@@ -8,9 +8,9 @@ findings print ``::error::`` annotations and the script exits 1;
 pre-existing ones are grandfathered in ``docs/quality-gates.md`` and stay
 quiet.
 
-HARD mode: a blind gate (missing binary, unreadable config or diff) fails
-closed instead of passing. Only malformed arguments exit non-zero for
-another reason.
+HARD mode: a blind gate (missing binary, unreadable config or diff, or a scan
+that reports a parse, timeout or config error) fails closed instead of
+passing. Only malformed arguments exit non-zero for another reason.
 """
 
 import argparse
@@ -23,6 +23,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / ".semgrep/rust-warn.yml"
 MAX_ANNOTATIONS = 10
+# Only these scan diagnostics leave coverage intact, so they annotate the PR
+# instead of failing it. Every other `errors` entry (timeouts, partial or
+# failed parses, config errors, unknown types or levels) means a file was not
+# fully scanned and blinds the gate.
+NONFATAL_LEVELS = {"warn", "info"}
+NONFATAL_TYPES = {"dependencyresolutionerror"}
+
+
+def error_type_name(raw):
+    """Semgrep emits a bare string for most error types and a ``[name,
+    payload]`` list for those that carry data (e.g. ``PartialParsing``)."""
+    if isinstance(raw, list) and raw and isinstance(raw[0], str):
+        return raw[0]
+    return raw if isinstance(raw, str) else None
 
 
 def run_semgrep(semgrep):
@@ -56,8 +70,7 @@ def run_semgrep(semgrep):
         if not isinstance(entry, dict):
             return None, "semgrep report contains an invalid error entry"
         level = entry.get("level")
-        error_type = entry.get("type")
-        code = entry.get("code")
+        error_type = error_type_name(entry.get("type"))
         path = entry.get("path")
         message = entry.get("message")
         if (not isinstance(level, str) or not isinstance(error_type, str)
@@ -70,12 +83,10 @@ def run_semgrep(semgrep):
         message = (message or "<no message>").replace("\r", " ").replace("\n", " ").strip()
         detail = (f"level={level}, type={error_type}, path={path}: "
                   f"{message[:300]}")
-        if level.lower() == "error" or "config" in error_type.lower() \
-                or (isinstance(code, str) and "config" in code.lower()):
-            return None, f"semgrep reported an error ({detail})"
-        if level.lower() not in {"warn", "warning", "info"}:
-            return None, f"semgrep reported an unclassified error ({detail})"
-        scan_warnings.append(detail)
+        if level.lower() in NONFATAL_LEVELS and error_type.lower() in NONFATAL_TYPES:
+            scan_warnings.append(detail)
+            continue
+        return None, f"semgrep reported a scan error ({detail})"
     findings = set()
     for result in report["results"]:
         if not isinstance(result, dict):

@@ -39,6 +39,35 @@ REPORT = {"results": [
 ]}
 
 
+# Verbatim `errors[]` entry from semgrep 1.180.0 (the pinned version) for a
+# file with a recoverable syntax error: `type` is a [name, payload] list.
+REAL_PARTIAL_PARSING_ERROR = {
+    "code": 3,
+    "level": "warn",
+    "type": ["PartialParsing", [{
+        "path": "crates/x/src/bad.rs",
+        "start": {"line": 1, "col": 24, "offset": 0},
+        "end": {"line": 1, "col": 25, "offset": 1},
+    }]],
+    "message": "Syntax error at line crates/x/src/bad.rs:1:\n `2` was unexpected",
+    "path": "crates/x/src/bad.rs",
+    "spans": [{
+        "file": "crates/x/src/bad.rs",
+        "start": {"line": 1, "col": 24, "offset": 0},
+        "end": {"line": 1, "col": 25, "offset": 1},
+    }],
+}
+
+# Same semgrep version, file that fails to parse at all: `type` is a string.
+REAL_SYNTAX_ERROR = {
+    "code": 3,
+    "level": "warn",
+    "type": "Syntax error",
+    "message": "Syntax error at line crates/x/src/bad.rs:1:\n `fn a( {` was unexpected",
+    "path": "crates/x/src/bad.rs",
+}
+
+
 def fake_semgrep(payload):
     import shlex
     tmp = tempfile.TemporaryDirectory()
@@ -105,17 +134,93 @@ class ParseTests(unittest.TestCase):
 
     def test_warning_error_entry_keeps_findings_and_reports_details(self):
         report = {"results": REPORT["results"], "errors": [{
-            "level": "warn", "type": "Timeout", "path": "crates/core/src/y.rs",
-            "message": "scan reached per-file timeout",
+            "level": "warn", "type": "DependencyResolutionError", "path": "crates/core/src/y.rs",
+            "message": "dependency resolution was unavailable",
         }]}
         with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(
                 returncode=0, stdout=json.dumps(report), stderr="")):
             findings, warning = gate.run_semgrep("semgrep")
         self.assertIsNotNone(findings)
         self.assertEqual(len(findings), 3)
-        self.assertIn("Timeout", warning)
+        self.assertIn("DependencyResolutionError", warning)
         self.assertIn("crates/core/src/y.rs", warning)
-        self.assertIn("scan reached per-file timeout", warning)
+        self.assertIn("dependency resolution was unavailable", warning)
+
+    def test_warn_level_scan_failures_are_blindness_with_details(self):
+        failure_types = (
+            "Timeout", "OutOfMemory", "StackOverflow", "FixpointTimeout",
+            "TimeoutDuringInterfile", "OutOfMemoryDuringInterfile",
+            "ParseError", "PartialParsing", "PatternParseError", "RuleParseError",
+        )
+        for failure_type in failure_types:
+            with self.subTest(failure_type=failure_type):
+                report = {"results": [], "errors": [{
+                    "level": "warn", "type": failure_type, "path": "crates/core/src/y.rs",
+                    "message": "file could not be fully scanned",
+                }]}
+                with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(
+                        returncode=0, stdout=json.dumps(report), stderr="")):
+                    findings, error = gate.run_semgrep("semgrep")
+                self.assertIsNone(findings)
+                self.assertIn(failure_type, error)
+                self.assertIn("crates/core/src/y.rs", error)
+
+    def run_report(self, report):
+        with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=json.dumps(report), stderr="")):
+            return gate.run_semgrep("semgrep")
+
+    def test_real_partial_parsing_entry_is_blindness_with_details(self):
+        findings, error = self.run_report(
+            {"results": REPORT["results"], "errors": [REAL_PARTIAL_PARSING_ERROR]})
+        self.assertIsNone(findings)
+        self.assertIn("type=PartialParsing", error)
+        self.assertIn("crates/x/src/bad.rs", error)
+        self.assertIn("was unexpected", error)
+        self.assertNotIn("invalid error entry", error)
+
+    def test_real_syntax_error_entry_is_blindness_with_details(self):
+        findings, error = self.run_report({"results": [], "errors": [REAL_SYNTAX_ERROR]})
+        self.assertIsNone(findings)
+        self.assertIn("type=Syntax error", error)
+        self.assertIn("crates/x/src/bad.rs", error)
+
+    def test_list_typed_nonfatal_warning_keeps_findings(self):
+        entry = {"level": "warn", "path": "crates/core/src/y.rs",
+                 "type": ["DependencyResolutionError", ["lockfile unreadable"]],
+                 "message": "dependency resolution was unavailable"}
+        findings, warning = self.run_report({"results": REPORT["results"], "errors": [entry]})
+        self.assertEqual(len(findings), 3)
+        self.assertIn("type=DependencyResolutionError", warning)
+
+    def test_warn_level_config_error_is_blindness(self):
+        entry = {"level": "warn", "type": "Config error", "code": 2,
+                 "path": "config.yml", "message": "invalid rule"}
+        findings, error = self.run_report({"results": [], "errors": [entry]})
+        self.assertIsNone(findings)
+        self.assertIn("Config error", error)
+
+    def test_unknown_level_is_blindness(self):
+        entry = {"level": "fatal", "type": "DependencyResolutionError",
+                 "path": "crates/core/src/y.rs", "message": "unexpected severity"}
+        findings, error = self.run_report({"results": [], "errors": [entry]})
+        self.assertIsNone(findings)
+        self.assertIn("level=fatal", error)
+
+    def test_malformed_error_type_is_blindness(self):
+        for bad_type in ([], [1, "x"], 5, None, {"name": "PartialParsing"}):
+            with self.subTest(bad_type=bad_type):
+                entry = {"level": "warn", "type": bad_type, "path": "a.rs", "message": "m"}
+                findings, error = self.run_report({"results": [], "errors": [entry]})
+                self.assertIsNone(findings)
+                self.assertIn("invalid error entry", error)
+
+    def test_scan_disables_per_file_timeout(self):
+        with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=json.dumps({"results": []}), stderr="")) as run:
+            gate.run_semgrep("semgrep")
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[argv.index("--timeout") + 1], "0")
 
     def test_error_level_entry_is_blindness_with_details(self):
         report = {"results": [], "errors": [{
@@ -217,22 +322,22 @@ class GateTests(unittest.TestCase):
         self.assertNotIn("::error::", output)
         self.assertNotIn("::warning::", output)
 
-    def test_warn_level_scan_error_is_annotated_but_does_not_fail(self):
+    def test_dependency_warning_is_annotated_but_does_not_fail(self):
         report = {"results": [], "errors": [{
-            "level": "warn", "type": "Timeout", "path": "crates/core/src/y.rs",
-            "message": "scan reached per-file timeout",
+            "level": "warn", "type": "DependencyResolutionError", "path": "crates/core/src/y.rs",
+            "message": "dependency resolution was unavailable",
         }]}
         code, output = self.run_gate(report, set())
         self.assertEqual(code, 0)
         self.assertIn("::warning::", output)
-        self.assertIn("Timeout", output)
+        self.assertIn("DependencyResolutionError", output)
         self.assertIn("crates/core/src/y.rs", output)
-        self.assertIn("scan reached per-file timeout", output)
+        self.assertIn("dependency resolution was unavailable", output)
 
     def test_warning_details_cannot_inject_workflow_commands(self):
         report = {"results": [], "errors": [{
-            "level": "warn", "type": "Timeout", "path": "file.rs",
-            "message": "timeout\n::error::injected",
+            "level": "warn", "type": "DependencyResolutionError", "path": "file.rs",
+            "message": "dependency warning\n::error::injected",
         }]}
         code, output = self.run_gate(report, set())
         self.assertEqual(code, 0)
