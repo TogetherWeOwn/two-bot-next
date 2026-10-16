@@ -67,6 +67,9 @@ use two_bot_core::{
     internal_actions::{self, AUTH_FAILURE_MESSAGE, NONCE_TTL_SECONDS, SKEW_SECONDS},
 };
 
+use crate::backfill_retention_chains::{render_backfill_failure, BackfillStep};
+use crate::gateway_failure::FailureClass;
+
 /// Route under test. Keep in sync with `crate::server::TRACED_PATHS`.
 pub const BACKFILL_PATH: &str = "/ops/backfill/progress";
 
@@ -330,6 +333,18 @@ fn unavailable(id: &str) -> Response {
         .into_response()
 }
 
+/// Render the snapshot-read failure line for the 503 path below. One helper
+/// owns the step attribution so it is pinned in one place:
+/// `snapshot_failure_pins_snapshot_read_step` fails if the site ever renders
+/// a different step, where the substring-only wiring pin would stay green.
+fn snapshot_store_failure(chain: &str) -> String {
+    render_backfill_failure(
+        FailureClass::StoreUnavailable,
+        BackfillStep::SnapshotRead,
+        chain,
+    )
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -395,9 +410,13 @@ async fn handler(
                 })),
             )
                 .into_response(),
-            Err(_) => {
+            Err(err) => {
+                let failure = snapshot_store_failure(crate::db_log::db_class(&err));
                 tracing::warn!(
                     msg = "ops_backfill_snapshot_failed",
+                    class = FailureClass::StoreUnavailable.as_str(),
+                    step = BackfillStep::SnapshotRead.as_str(),
+                    failure = %failure,
                     "backfill snapshot unreadable"
                 );
                 unavailable(&id)
@@ -535,6 +554,30 @@ mod tests {
                 }
             }
             _ => {}
+        }
+    }
+
+    #[test]
+    fn snapshot_failure_pins_snapshot_read_step() {
+        // The 503 path renders through `snapshot_store_failure`, so this pins
+        // the wired step: a mutant swapping in any other step fails here,
+        // where the substring-only wiring pin would stay green.
+        let line = snapshot_store_failure("pool_timeout");
+        assert!(
+            line.contains("step=snapshot_read"),
+            "snapshot 503 must attribute SnapshotRead: {line:?}"
+        );
+        for other in [
+            "rate_limit_client",
+            "cursor_checkpoint",
+            "audit_catch_up",
+            "history_put",
+            "history_count",
+        ] {
+            assert!(
+                !line.contains(other),
+                "snapshot 503 must not attribute {other}: {line:?}"
+            );
         }
     }
 
