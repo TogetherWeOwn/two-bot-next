@@ -3,6 +3,8 @@ use serde_json::json;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 
+#[path = "voice_cold_authority_tests.rs"]
+mod cold_authority;
 #[path = "voice_delete_guard_tests.rs"]
 mod delete_guards;
 #[path = "voice_join_requests_tests.rs"]
@@ -6208,7 +6210,15 @@ fn parse_logging_subcommands() {
 #[tokio::test]
 async fn logging_command_needs_an_admin() {
     let runtime = logging_runtime(Arc::default(), None, None);
-    let member = logging_interaction(sub_option("show", vec![]), false);
+    // Ready guild-role facts, not cold ones: command_snapshot's @everyone
+    // carries no permissions and the member holds no roles, so authority
+    // resolves to a known non-admin and the denial is permanent.
+    // (logging_snapshot's @everyone carries MANAGE_CHANNELS, and a held
+    // role missing from the snapshot is the cold warming-up case covered
+    // by the cold-authority tests.)
+    assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
+    let mut member = logging_interaction(sub_option("show", vec![]), false);
+    member.member.as_mut().unwrap().roles.clear();
     let (owned, response) = handle_capture(&runtime, &member).await;
     assert!(owned);
     assert_eq!(
@@ -6334,10 +6344,19 @@ async fn logging_mention_refuses_unsafe_roles_without_saving() {
         let response = response.expect("refusal");
         let text = response_text(&response);
         if case == "missing-held" {
-            // The actor's own role is missing from cache, so the guild admin
-            // gate denies before target validation runs. Either layer refuses
-            // without saving.
-            assert_eq!(text, "You need Manage Channels to use /logging.", "{case}");
+            // The actor's own role is missing from cache, so guild-role
+            // facts are incomplete: a cold authority state. The reply is
+            // the retryable warming-up text, not a permanent denial, and
+            // nothing is saved.
+            let lower = text.to_ascii_lowercase();
+            assert!(
+                lower.contains("warm") && (lower.contains("try again") || lower.contains("retry")),
+                "{case}: expected warming-up + retry reply, got: {text}"
+            );
+            assert!(
+                !text.contains("You need Manage Channels to use /logging."),
+                "{case}: cold reply must not be a permanent denial, got: {text}"
+            );
         } else {
             assert!(text.contains("Nothing was changed"), "{case}: {text}");
         }
@@ -6441,10 +6460,19 @@ async fn logging_channel_refuses_non_text_unknown_and_hidden_targets() {
         .await;
         let text = response_text(&response.unwrap());
         if case == "missing-held" {
-            // The actor's own role is missing from cache, so the guild admin
-            // gate denies before target validation runs. Either layer refuses
-            // without saving.
-            assert_eq!(text, "You need Manage Channels to use /logging.", "{case}");
+            // The actor's own role is missing from cache, so guild-role
+            // facts are incomplete: a cold authority state. The reply is
+            // the retryable warming-up text, not a permanent denial, and
+            // nothing is saved.
+            let lower = text.to_ascii_lowercase();
+            assert!(
+                lower.contains("warm") && (lower.contains("try again") || lower.contains("retry")),
+                "{case}: expected warming-up + retry reply, got: {text}"
+            );
+            assert!(
+                !text.contains("You need Manage Channels to use /logging."),
+                "{case}: cold reply must not be a permanent denial, got: {text}"
+            );
         } else {
             assert!(text.contains("Nothing was changed"), "{case}: {text}");
         }
@@ -7977,7 +8005,16 @@ async fn responder_without_guild_roles_refuses_channel_permission_claims_without
     assert_eq!(*trace.lock().unwrap(), ["defer", "complete"]);
     let completed = replies.completed.lock().unwrap();
     assert_eq!(completed.len(), 1);
-    assert!(response_text(&completed[0]).contains("You need Manage Channels"));
+    let text = response_text(&completed[0]);
+    let lower = text.to_ascii_lowercase();
+    assert!(
+        lower.contains("warm") && (lower.contains("try again") || lower.contains("retry")),
+        "cold denial must say warming up and ask to retry, got: {text:?}"
+    );
+    assert!(
+        !text.contains("You need Manage Channels"),
+        "cold denial must not report a permanent denial, got: {text:?}"
+    );
 }
 
 #[tokio::test]

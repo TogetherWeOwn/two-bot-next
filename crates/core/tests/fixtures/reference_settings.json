@@ -124,6 +124,8 @@
   "TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS": "Staging synthetic voice-test bots counted as human occupants; ignored for the live guild.",
   "TWO_TEXT_COMMANDS": "Enable optional text triggers only while automations are enabled.",
   "TWO_TICKET_COOLDOWN_SECONDS": "Cooldown between ticket openings.",
+  "TWO_TWITCH_BROADCASTERS": "Comma-separated Twitch broadcaster_user_ids the startup reconcile subscribes to on the bot callback; empty parks reconcile without mutations. Operator-provisioned and never dashboard-stored.",
+  "TWO_TWITCH_CALLBACK_URL": "Public HTTPS callback Twitch posts EventSub deliveries to; reconcile only touches subscriptions on this URL. Operator-provisioned and never dashboard-stored.",
   "TWO_TWITCH_CLIENT_ID": "Twitch application client id for Helix calls; Operator-provisioned and never dashboard-stored.",
   "TWO_TWITCH_CLIENT_SECRET": "Twitch application client secret for app-token refresh; Operator-provisioned and never rendered.",
   "TWO_TWITCH_WEBHOOK_SECRET": "Signing secret for Twitch EventSub deliveries; Operator-provisioned and never rendered."
