@@ -25,12 +25,13 @@ the step itself.
   only, no registry) flags new `todo!`/`unimplemented!`, empty `.expect("")`,
   `panic!` in non-test code and `process::exit` in library code; current
   backlog is 41 `panic!` hits below.
-- Squawk migration lint (WARN): `scripts/ci/check-squawk-migrations.py`
+- Squawk migration lint (HARD): `scripts/ci/check-squawk-migrations.py`
   flags risky statements (`adding-required-field`, `creating-index`,
   `adding-check-constraint`, `changing-column-type`, `dropping-object`) in
-  changed migration files only. Findings annotate the PR and pass; broken
-  tooling fails so blindness cannot hide. Promotion to HARD flips the step
-  to `--strict` after the advisory soak; see `docs/migrations.md`.
+  changed migration files only. Findings fail the required check; broken
+  tooling also fails so blindness cannot hide. Two exact transactional
+  event-store indexes have documented statement-specific waivers; see
+  `docs/migrations.md`.
 - Voice synthetic required (HARD): `voice-synthetic.yml` fails when the
   staging test-bot token is missing unless explicitly opted out; see
   `docs/voice-synthetic.md`.

@@ -45,8 +45,9 @@ history in staging or production.
 migration files changed since the baseline (CI passes the PR base SHA, the
 push-before SHA, or `origin/main`; without `--base-ref` it lints every
 file). It is a deterministic squawk subset: standard library only, no
-database, no network. Findings warn without failing the PR; `--strict`
-turns them into errors for the later required phase.
+database, no network. The required CI step runs with `--strict`, so findings
+fail the PR. The two documented transactional index exceptions below are
+matched by exact migration path and complete normalized statement.
 
 Write migrations that stay silent:
 
@@ -70,6 +71,16 @@ Write migrations that stay silent:
   `VALIDATE CONSTRAINT` separately.
 - Type change or drop: prefer an additive migration (new column, backfill,
   swap) and coordinate removal across deploys.
+
+Two exact `creating-index` findings are waived for the transactional event-store
+indexes in migrations 0443 and 0444. The waiver matches only each migration path
+and the complete normalized `CREATE INDEX` statement; any changed statement,
+additional index in either file, or index in another migration remains subject to
+strict lint. This exception is documented beside the checker configuration and
+is grounded in the observed CI deadlock: `CREATE INDEX CONCURRENTLY` waits on
+open snapshots while parallel disposable-database test migrators wait on SQLx's
+advisory lock, producing PostgreSQL `40P01`. It does not relax any other
+migration check or the required lint gate.
 
 The checker discovers `crates/*/migrations/*.sql` dynamically with
 `--migration-glob` and `--exclude` overrides and no hardcoded crate list,
