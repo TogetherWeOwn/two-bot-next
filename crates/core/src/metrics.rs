@@ -383,8 +383,9 @@ pub const INTERNAL_ACTION_OUTCOMES: &[&str] = &[
 /// `error` when the facts writer failed, `timeout` when the drain missed the
 /// dispatch deadline. Both warn and continue; `other` absorbs unknown reasons.
 pub const COMMUNITY_FACTS_DRAIN_REASONS: &[&str] = &["error", "timeout", "other"];
-/// Verified EventSub deliveries by bounded receiver classification. No header,
-/// body, broadcaster, subscription, or secret data reaches the label.
+/// Verified EventSub deliveries by bounded receiver classification. `other`
+/// captures unknown/future classification errors; no header, body, broadcaster,
+/// subscription, or secret data reaches the label.
 pub const EVENTSUB_DELIVERY_KINDS: [&str; 6] = [
     "challenge",
     "notification",

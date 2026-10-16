@@ -189,14 +189,14 @@ direct `containerFetch`, because the Worker answers those shapes first):
 | Status | Code | Retryable | Meaning / first action |
 |---|---|---|---|
 | 400 | `malformed` | false | Query string present, empty body, or invalid challenge on a direct fetch. The query gate runs before verification. Check the forwarded request shape, not the secret. Source: `crates/bot/src/eventsub_http.rs:188-189,259-260,341-343`. |
-| 401 | `unauthorized` | false | Signature, freshness, or timestamp failure, or (on a direct fetch) missing/malformed delivery headers. Via the Worker, a malformed header shape is 400 at ingress (row above); first action is still secret agreement and clock skew (10-minute window). Source: `crates/bot/src/eventsub_http.rs:223-227,255-268`. |
+| 401 | `unauthorized` | false | Signature, freshness, or timestamp failure, or (on a direct fetch) missing/malformed delivery headers. Via the Worker, a malformed header shape is 400 at ingress (row above); first action is still secret agreement and clock skew (10-minute window). Source: `crates/bot/src/eventsub_http.rs:224-235,263-278`. |
 | 404 | `not_found` | false | Wrong path (exact path is `/hooks/twitch`) or any non-callback route via the fallback on a direct fetch. Via the public URL the Worker already answered non-POSTs and bad shapes with its own 404. Source: `crates/bot/src/eventsub_http.rs:35,184-189`. |
 | 405 | `method_not_allowed` | false | Anything but POST on the callback path on a direct fetch. Via the public URL the Worker drops non-POSTs with its own 404 before the container. Source: `crates/bot/src/eventsub_http.rs:191-203`. |
-| 408 | `request_timeout` | true | Body slower than the 5 s read budget while holding one of the 32 permits. Retriable: the sender (Twitch) backs off and redelivers. Source: `crates/bot/src/eventsub_http.rs:38,241-250`. |
-| 413 | `payload_too_large` | false | Body over the 64 KiB cap, checked before verification. Genuine `stream.online` bodies are well under 2 KiB; treat 413 as a malformed or abusive sender. Source: `crates/bot/src/eventsub_http.rs:36,230-240,258-265`, `crates/core/src/twitch_eventsub.rs:49-51`. |
-| 415 | `unsupported_media_type` | false | Content type is not exactly `application/json` or `application/json; charset=utf-8` (case-insensitive); anything else, including another encoding, is refused. Source: `crates/bot/src/eventsub_http.rs:198-214`. |
-| 503 | `busy` / `upstream_timeout` | true | All 32 permits held (`busy`), or the whole request past the 20 s budget (`upstream_timeout`). Both mean the receiver is saturated or stalled, not that the delivery was bad; the sender retries. Check container saturation, not the secret. Source: `crates/bot/src/eventsub_http.rs:37-39,150-171`. |
-| 503 | `unavailable` | true | A future/unrecognized post-verification classification error; the receiver fails closed so Twitch retries. This is distinct from Worker-ingress `unavailable` above. Inspect `classification failed` and bounded `error_class`; do not assume saturation or a Worker relay failure. Source: `crates/bot/src/eventsub_http.rs:345-362`. |
+| 408 | `request_timeout` | true | Body slower than the 5 s read budget while holding one of the 32 permits. Retriable: the sender (Twitch) backs off and redelivers. Source: `crates/bot/src/eventsub_http.rs:38,238-257`. |
+| 413 | `payload_too_large` | false | Body over the 64 KiB cap, checked before verification. Genuine `stream.online` bodies are well under 2 KiB; treat 413 as a malformed or abusive sender. Source: `crates/bot/src/eventsub_http.rs:36,238-247`, `crates/core/src/twitch_eventsub.rs:49-51`. |
+| 415 | `unsupported_media_type` | false | Content type is not exactly `application/json` or `application/json; charset=utf-8` (case-insensitive); anything else, including another encoding, is refused. Source: `crates/bot/src/eventsub_http.rs:204-222`. |
+| 503 | `busy` / `upstream_timeout` | true | All 32 permits held (`busy`), or the whole request past the 20 s budget (`upstream_timeout`). Both mean the receiver is saturated or stalled, not that the delivery was bad; the sender retries. Check container saturation, not the secret. Source: `crates/bot/src/eventsub_http.rs:37-39,148-171`. |
+| 503 | `unavailable` | true | A future/unrecognized post-verification classification error; the receiver fails closed so Twitch retries and counts it as metric `kind="other"`. This is distinct from Worker-ingress `unavailable` above. Inspect `classification failed` and its error class; do not assume saturation or a Worker relay failure. Source: `crates/bot/src/eventsub_http.rs:345-362`. |
 
 Verified deliveries that need no operator action answer `200`:
 
@@ -208,7 +208,8 @@ Verified deliveries that need no operator action answer `200`:
   non-verification messages (`WrongSubscription`, `InvalidBody`):
   acknowledged with 2xx so Twitch does not retry what will never succeed.
   Unknown/future `classify()` errors are not included: they return retryable
-  503 `unavailable` so an unrecognized failure is not silently discarded.
+  503 `unavailable` and count as metric `kind="other"` so an unrecognized
+  failure is not silently discarded or conflated with known ignored deliveries.
   This carve-out excludes `webhook_callback_verification`: `classify()`
   returns `WrongSubscription` / `InvalidBody` for a challenge with the wrong
   type or version, or an unparsable signed body, and the handler still acks

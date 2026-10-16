@@ -343,7 +343,7 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             refuse(state, StatusCode::BAD_REQUEST, "malformed", false, id)
         }
         Err(e) => {
-            two_bot_core::metrics::global().eventsub_classified("ignored");
+            two_bot_core::metrics::global().eventsub_classified("other");
             // A future classify error may be transient. Keep it retryable
             // rather than acknowledging it as a permanent delivery outcome.
             tracing::warn!(
@@ -919,7 +919,7 @@ mod tests {
                 "Err(e) => {",
                 "ignored",
             ),
-            ("Err(e) => {", "\n    }\n}\n\n#[cfg(test)]", "ignored"),
+            ("Err(e) => {", "\n    }\n}\n\n#[cfg(test)]", "other"),
         ] {
             assert_classification(arm(start, end), kind);
         }
