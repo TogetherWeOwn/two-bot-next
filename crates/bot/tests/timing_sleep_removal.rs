@@ -220,8 +220,34 @@ fn assert_no_code_contains(source: &str, snippet: &str, context: &str) {
     assert!(!code_only(source).contains(snippet), "{context}");
 }
 
+fn contains_continue_keyword(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    let needle = b"continue";
+    let mut index = 0;
+    while index + needle.len() <= bytes.len() {
+        if &bytes[index..index + needle.len()] == needle {
+            let before_ok = index == 0
+                || !(bytes[index - 1].is_ascii_alphanumeric() || bytes[index - 1] == b'_');
+            let after = index + needle.len();
+            let after_ok = after >= bytes.len()
+                || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
+            if before_ok && after_ok {
+                return true;
+            }
+            index += needle.len();
+        } else {
+            index += 1;
+        }
+    }
+    false
+}
+
 fn assert_poll_site(source: &str, loop_marker: &str) {
     let body = loop_body(source, loop_marker);
+    assert!(
+        !contains_continue_keyword(&body),
+        "poll loop must not bypass its backoff with continue"
+    );
     assert_eq!(
         body.matches("sleep(").count(),
         1,
@@ -511,6 +537,19 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
     let if_false_wait_http = wait_http.replace(sleep, &format!("if false {{ {sleep} }}"));
     assert!(std::panic::catch_unwind(|| {
         assert_poll_site(&if_false_wait_http, "loop");
+    })
+    .is_err());
+
+    // A `continue` before the backoff bypasses it every iteration (M10: the
+    // checkpoint loop busy-spins on store loads when `seq` never equals its
+    // target) while the sleep text remains, so the guard must reject any
+    // `continue` inside a poll loop body.
+    let continue_wait_http = wait_http.replace(
+        sleep,
+        "if true { continue; }\n            sleep(Duration::from_millis(10)).await;",
+    );
+    assert!(std::panic::catch_unwind(|| {
+        assert_poll_site(&continue_wait_http, "loop");
     })
     .is_err());
 
