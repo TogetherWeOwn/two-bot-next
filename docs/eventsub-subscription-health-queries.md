@@ -88,10 +88,12 @@ above.
 
 The log proxy (executed below) covers the negative direction: in a healthy
 window there are no `revocation acknowledged` lines (Q3), no
-`reconcile_unhealthy` / `reconcile_failed` lines (Q2), and no `delivery
-refused` bursts (Q4). Absence is not proof — a silently dropped subscription
-(a deleted callback, an expired Operator secret) emits nothing until Twitch
-revokes or the next reconcile lists it.
+`reconcile_prior_failed`, `reconcile_unhealthy`, `reconcile_failed`, or
+`reconcile_pending` outcomes (Q2), and no `delivery refused` bursts (Q4).
+A `parked` line with `reason="flag_dark"` means reconcile is disabled; it is
+not evidence of healthy subscriptions. Absence is not proof — a silently
+dropped subscription (a deleted callback, an expired Operator secret) emits
+nothing until Twitch revokes or the next reconcile lists it.
 
 Sample (staging container, `delivery refused` sweep, 30 min):
 
@@ -115,28 +117,36 @@ routine probe traffic.
 
 Reconcile runs at startup and hourly behind `TWO_EVENTSUB=1` (PR #989,
 unmerged at pack writing): list, diff deletes-before-creates on the bot's
-own callback, execute, then confirm with a follow-up listing. Every pass
-logs one scalar line with `event = "eventsub_reconcile"`:
+own callback, execute, then confirm with a follow-up listing. A pass can emit
+multiple scalar lines with `event = "eventsub_reconcile"`; an early warning
+or error is not necessarily the final outcome. The emitted messages are:
 
 | Line | Meaning |
 | --- | --- |
+| `eventsub reconcile found failed subscriptions on our callback; deleting and re-creating`, `error_class="reconcile_prior_failed"` (+ `prior_failed`) | a prior failed subscription was found; reconciliation continues, so this is a failure signal but not the pass's final result |
+| `eventsub reconcile follow-up listing is missing a healthy subscription`, `error_class="reconcile_unhealthy"` (+ `missing`) | deletes/creates ran but a broadcaster still has no healthy subscription; this is followed by the wrapper failure below |
+| `eventsub reconcile failed`, `error_class="reconcile_failed"` | the pass failed (for example, listing, planning, execution, or the unhealthy follow-up check); an unhealthy pass emits this after the `reconcile_unhealthy` line |
+| `eventsub subscriptions re-created but none verified yet`, `error_class="reconcile_pending"`, `status="pending"` (+ counts on the dashboard) | the pass completed, but none of the subscriptions is verified yet; this is pending, not healthy |
 | `eventsub subscriptions reconciled`, `status="healthy"` (+ `deleted` / `created` / `already_exists` counts on the dashboard; the read script drops count fields) | last pass fully healthy |
-| `eventsub reconcile follow-up listing is missing a healthy subscription`, `error_class="reconcile_unhealthy"` (+ `missing`) | deletes/creates ran but a broadcaster still has no healthy subscription — the unhealthy set |
-| `eventsub reconcile failed`, `error_class="reconcile_failed"` | the pass itself errored (list, plan or execute) |
-| `eventsub reconcile parked …`, `error_class="reconcile_no_broadcasters"` (warn) | allowlist empty, nothing mutated |
-| `eventsub reconcile refused …`, `error_class="reconcile_config_invalid"` (error) | callback, credentials or secret invalid; needs the Operator |
+| `eventsub reconcile parked: broadcaster allowlist is empty, no subscriptions mutated`, `error_class="reconcile_no_broadcasters"` (warn) | allowlist empty, nothing mutated |
+| `eventsub reconcile parked: TWO_EVENTSUB is not exactly 1`, `status="parked"`, `reason="flag_dark"` | feature flag is off; startup/task setup is parked and no reconcile is running |
+| `eventsub reconcile refused: …`, `error_class="reconcile_config_invalid"` (error) | callback, credentials, or secret invalid; needs the Operator |
 
-The newest `eventsub_reconcile` line in the window is the last outcome; a
-`healthy` line after failures is the recovery. Until PR #989 deploys to
-staging there is no scheduled reconcile at all, so this query is the canary
-for the rollout itself.
+Do not infer the final outcome from the newest line alone: an unhealthy pass
+logs both `reconcile_unhealthy` and the later `reconcile_failed` wrapper, and
+`reconcile_prior_failed` can precede either a failure or a later healthy line.
+A `reconcile_pending` line is its own non-healthy result. A later `healthy`
+line is the recovery. A `flag_dark` parked line means there is no active
+reconcile evidence, not that subscriptions are healthy. Until PR #989 deploys
+to staging, there is no scheduled reconcile at all, so this query is the
+canary for the rollout itself.
 
 The container reader's `--contains` option checks message text; it does not
 filter the flattened `event` field, and the script omits that field from its
 output. For the complete event-level view, use Workers Observability Query
 Builder on dataset `containers`, select this service id, filter
 `event = "eventsub_reconcile"`, and display `message`, `status`, and
-`error_class`. The CLI's message filters are two separate read-only queries:
+`error_class`. The CLI's message filters are three separate read-only queries:
 
 ```bash
 python3 scripts/container_stdout_read.py \
@@ -145,14 +155,19 @@ python3 scripts/container_stdout_read.py \
 python3 scripts/container_stdout_read.py \
   --service a038b0ad-a1f9-4966-bfb7-f992c602d938 \
   --minutes 30 --contains "eventsub subscriptions reconciled"
+python3 scripts/container_stdout_read.py \
+  --service a038b0ad-a1f9-4966-bfb7-f992c602d938 \
+  --minutes 30 --contains "subscriptions re-created but none verified yet"
 ```
 
-The first matches failure and refusal messages; the second matches the
-successful `eventsub subscriptions reconciled` message. For example, the
-literal `eventsub subscriptions reconciled` matches the second filter; this
-is an illustrative match from the reconcile log contract, not an observed
-staging event. The live staging read for 2026-10-15 21:41–22:11Z returned
-zero lines for both filters, so it cannot provide a truthful positive sample.
+The first matches prior-failure, unhealthy/failure, parked, and refusal
+messages. The second matches the successful `eventsub subscriptions
+reconciled` message; the third matches the `reconcile_pending` outcome. For
+example, the pending-message literal is an illustrative match from the
+reconcile log contract, not an observed staging event. The live staging read
+for 2026-10-15 21:41–22:11Z returned zero lines for both original filters, so
+it cannot provide a truthful positive sample; no staging result is claimed for
+the added pending filter.
 Expected while the reconcile slice is undeployed. After it deploys, expect
 one `healthy` line per hour per container boot plus one per startup; a gap
 with `TWO_EVENTSUB=1` set means the task is not running and is itself the
