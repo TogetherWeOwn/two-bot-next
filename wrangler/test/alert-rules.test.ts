@@ -227,6 +227,96 @@ test("voice failures ignore trickles and restarts, fire on lone dead-letters/orp
   assert.deepEqual(ev([`two_bot_voice_orphans_total 1`], quiet.state).firing, ["voice_failures"]);
 });
 
+/** Creator-join SLI lines: received joins, benign duplicate refusals, moves within 5 s. */
+function joinLines(received: number, duplicate: number, fast: number): string[] {
+  return [
+    `two_bot_voice_joins_received_total ${received}`,
+    `two_bot_voice_join_refused_total{reason="duplicate"} ${duplicate}`,
+    `two_bot_voice_join_to_move_seconds_bucket{le="5"} ${fast}`,
+  ];
+}
+/** Burn windows need real time gaps, so these tests drive evaluateMetrics directly. */
+const evAt = (lines: string[], prev: MetricsAlertState, now: number) =>
+  evaluateMetrics(parseExposition(body(lines)), prev, now);
+
+test("voice join fast burn pages on a 1 h spike while the diluted 6 h window stays silent", () => {
+  // Five healthy hours: 9,900 genuine joins, 99 slow (2x burn, silent).
+  let state = evAt(joinLines(0, 0, 0), EMPTY_STATE, 0).state;
+  state = evAt(joinLines(10000, 100, 9801), state, 18000).state;
+  assert.deepEqual(evAt(joinLines(10000, 100, 9801), state, 18000).firing, []);
+  // The last hour burns at ~40x: 990 genuine, 198 never moved within 5 s.
+  state = evAt(joinLines(10900, 109, 10513), state, 21300).state;
+  const spiking = evAt(joinLines(11000, 110, 10593), state, 21600);
+  assert.deepEqual(spiking.firing, ["voice_join_fast_burn"]);
+  assert.equal(ruleFor("voice_join_fast_burn")?.severity, undefined, "fast burn pages");
+  // The 6 h window dilutes the same hour to ~5.5x: below the 6x slow line.
+  assert.ok(!spiking.firing.includes("voice_join_slow_burn"));
+  // Recovery: a healthy hour stops the page.
+  const recovered = evAt(joinLines(21000, 210, 20493), spiking.state, 25200);
+  assert.deepEqual(recovered.firing, []);
+});
+
+test("voice join slow burn tickets on a sustained 6 h grind that never trips fast burn", () => {
+  // Steady 8x burn, one 30 min tick at a time: 500 genuine joins and 20 slow
+  // moves per tick, 13 ticks over 6 h.
+  let state = EMPTY_STATE;
+  for (let i = 0; i <= 12; i++) {
+    state = evAt(joinLines(i * 505, i * 5, i * 480), state, i * 1800).state;
+  }
+  const grinding = evAt(joinLines(13 * 505, 13 * 5, 13 * 480), state, 13 * 1800);
+  // 13 ticks: 6,500 genuine, 6,240 fast, 260 slow = 8x burn.
+  assert.deepEqual(grinding.firing, ["voice_join_slow_burn"]);
+  assert.equal(ruleFor("voice_join_slow_burn")?.severity, "ticket");
+  // The same 8x never reaches the 14.4x fast line in any 1 h / 5 min window.
+  assert.ok(!grinding.firing.includes("voice_join_fast_burn"));
+});
+
+test("voice join burn stays silent on healthy traffic, quiet windows and benign duplicates", () => {
+  // Healthy at a fifth of the budget: 1,000 genuine, 1 slow (0.2x burn).
+  let state = evAt(joinLines(0, 0, 0), EMPTY_STATE, 0).state;
+  state = evAt(joinLines(1010, 10, 999), state, 3600).state;
+  assert.deepEqual(evAt(joinLines(2010, 20, 1998), state, 7200).firing, []);
+  // Quiet guilds never fire: no joins, no windows.
+  const quiet = evAt(joinLines(0, 0, 0), EMPTY_STATE, 0);
+  assert.deepEqual(evAt(joinLines(0, 0, 0), quiet.state, 3600).firing, []);
+  // Benign post-move refusals are not genuine joins: 50 duplicate refusals
+  // against zero moves is working as designed, not burn.
+  const dupes = evAt(joinLines(0, 0, 0), EMPTY_STATE, 0);
+  assert.deepEqual(evAt(joinLines(50, 50, 0), dupes.state, 3600).firing, []);
+  // Below the volume floor even total failure stays silent: 5 bad joins cannot
+  // page a guild that barely uses voice.
+  const thin = evAt(joinLines(0, 0, 0), EMPTY_STATE, 0);
+  assert.deepEqual(evAt(joinLines(5, 0, 0), thin.state, 3600).firing, []);
+  // At the floor the same total failure does fire: 20 genuine and 10 in the
+  // short window, 0 fast anywhere.
+  const floor = evAt(joinLines(0, 0, 0), EMPTY_STATE, 0);
+  const atFloor = evAt(joinLines(10, 0, 0), floor.state, 3300);
+  assert.deepEqual(evAt(joinLines(20, 0, 0), atFloor.state, 3600).firing, ["voice_join_fast_burn", "voice_join_slow_burn"]);
+});
+
+test("voice join burn rebuilds on restart and holds through malformed scrapes", () => {
+  let state = evAt(joinLines(0, 0, 0), EMPTY_STATE, 0).state;
+  state = evAt(joinLines(900, 9, 720), state, 3300).state;
+  const firing = evAt(joinLines(1000, 10, 800), state, 3600);
+  assert.deepEqual(firing.firing, ["voice_join_fast_burn", "voice_join_slow_burn"]);
+  // A counter that went backwards means the process restarted: the ring is
+  // rebuilt from this sample and both rules resolve instead of firing.
+  const restart = evAt(joinLines(1, 0, 0), firing.state, 3660);
+  assert.deepEqual(restart.firing, []);
+  assert.equal(restart.state.joinBurn?.length, 1);
+  // A scrape that renames the bucket holds the firing key instead of
+  // resolving it: a Rust rename must fail loudly, never go quiet.
+  const renamed = evAt([
+    `two_bot_voice_joins_received_total 1100`,
+    `two_bot_voice_join_refused_total{reason="duplicate"} 11`,
+    `two_bot_voice_join_to_move_seconds_bucket{le="5s"} 880`,
+  ], firing.state, 3660);
+  assert.deepEqual(renamed.firing, ["voice_join_fast_burn", "voice_join_slow_burn"]);
+  // Recovery after the hold still resolves.
+  const recovered = evAt(joinLines(2100, 21, 2069), firing.state, 7200);
+  assert.deepEqual(recovered.firing, []);
+});
+
 test("gateway missed events fire on any increase, never on the first sample or a reset", () => {
   const base = ev([`two_bot_gateway_missed_events_total 0`]);
   assert.deepEqual(base.firing, []);
@@ -553,6 +643,8 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "dispatch_drops",
     "job_unknown_stale",
     "gateway_checkpoint_failures",
+    "voice_join_fast_burn",
+    "voice_join_slow_burn",
   ]);
   assert.equal(packetFilename("job_stale:rank", window), `evidence-job_stale-${window}.json`);
   assert.equal(packetFilename("job_consecutive_failures:counter", window), `evidence-job_consecutive_failures-${window}.json`);
@@ -568,6 +660,8 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("dispatch_drops:reactions", window), `evidence-dispatch_drops-${window}.json`);
   assert.equal(packetFilename("job_unknown_stale:audit_retry", window), `evidence-job_unknown_stale-${window}.json`);
   assert.equal(packetFilename("gateway_checkpoint_failures", window), `evidence-gateway_checkpoint_failures-${window}.json`);
+  assert.equal(packetFilename("voice_join_fast_burn", window), `evidence-voice_join_fast_burn-${window}.json`);
+  assert.equal(packetFilename("voice_join_slow_burn", window), `evidence-voice_join_slow_burn-${window}.json`);
   // Unknown keys get no filename rather than a misleading one; hostile
   // window stamps stay filename-safe.
   assert.equal(packetFilename("no_such_rule", window), undefined);
@@ -661,6 +755,13 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
       ev([`two_bot_gateway_checkpoint_failures_total{stage="commit"} 0`]).state,
     ).firing,
   );
+  // Burn windows need real time gaps: a 1 h spike at ~38x budget burn trips
+  // both the fast (1 h + 5 min) and slow (6 h + 30 min) windows.
+  const burnBase = NOW - 3600;
+  let burn = evaluateMetrics(parseExposition(body(joinLines(0, 0, 0))), EMPTY_STATE, burnBase);
+  burn = evaluateMetrics(parseExposition(body(joinLines(900, 9, 720))), burn.state, burnBase + 3300);
+  burn = evaluateMetrics(parseExposition(body(joinLines(1000, 10, 800))), burn.state, burnBase + 3600);
+  firing.push(...burn.firing);
   assert.equal(firing.length, RULES.length, `expected one firing key per rule, got: ${firing.join(", ")}`);
   const packets = transitionMessages([], firing);
   assert.equal(packets.length, RULES.length);

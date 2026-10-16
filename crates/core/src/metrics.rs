@@ -254,6 +254,13 @@ pub const VOICE_JOIN_REFUSAL_REASONS: &[&str] = &[
     "name_blocked",
     "other",
 ];
+/// Rendered `le` labels for `two_bot_voice_join_to_move_seconds_bucket`: the
+/// eight finite `BUCKETS_MICROS` bounds as seconds plus `+Inf`. Pinned here so
+/// the Worker scrape validator (`wrangler/src/metrics-scrape.ts`) and its
+/// fixture derive the same spelling from this contract instead of restating it.
+pub const VOICE_JOIN_TO_MOVE_BUCKET_LE: &[&str] = &[
+    "0.001", "0.005", "0.01", "0.05", "0.1", "0.5", "1", "5", "+Inf",
+];
 /// Action-queue lanes for the `two_bot_voice_queue_pending{lane}` gauge.
 pub const VOICE_QUEUE_LANES: &[&str] = &["urgent", "deferred"];
 /// Vote-kick outcomes for `two_bot_voice_vote_kick_total{outcome}` (M4.30):
