@@ -143,6 +143,8 @@ is the single shared spelling also pinned in `evidence.rs`
 | --- | --- | --- |
 | `job_unknown_stale` | `two_bot_job_last_success_timestamp_seconds{job}` for labels outside `JOB_INTERVAL_SECONDS`, `TICKER_STALE_JOBS` and `UNKNOWN_STALE_EXCLUDED` | Ticket when a job without a cadence entry has a nonzero success timestamp older than 2 hours; never-succeeded stays silent; `session_checkpoint` is event-driven and excluded |
 | `gateway_unpaired_disconnect` | `two_bot_gateway_disconnects_total` against `two_bot_gateway_resumes_total` plus fresh `two_bot_gateway_events_total{event="READY"}` | Pages after 3 consecutive samples with disconnect growth and no RESUMED or fresh READY growth (pairing in `pairGatewayDisconnects`); any recovery growth clears at once; the disconnect counter increments in `gateway.rs` (`transport_disconnected`) |
+| `voice_join_fast_burn` | `two_bot_voice_joins_received_total` minus benign `duplicate` refusals in `two_bot_voice_join_refused_total` against `two_bot_voice_join_to_move_seconds_bucket{le="5"}` | Pages when the creator-join budget (99.5% moved within 5 s) burns faster than 14.4x in both the 1 h and 5 min windows; every non-duplicate refusal, failed move and slow (>5 s) move is burn; windows under 10 genuine joins never fire; a backwards counter rebuilds the window and missing inputs hold the previous state |
+| `voice_join_slow_burn` | Same inputs as `voice_join_fast_burn` | Ticket, not page: same budget burning faster than 6x in both the 6 h and 30 min windows; catches the sustained grind the fast rule never spikes on; do not close as "fast burn resolved" |
 
 ## Gateway failure classes (`/readyz` `gateway_failure`)
 
