@@ -308,8 +308,8 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
         }
         Ok(Delivery::Revocation { .. }) => {
             two_bot_core::metrics::global().eventsub_classified("revocation");
-            // Reconcile runs at boot and after revocation in the Helix slice;
-            // here only acknowledge so Twitch does not retry.
+            // The bounded reconcile pass re-subscribes; here only acknowledge
+            // so Twitch does not retry.
             tracing::info!(
                 event = "eventsub_receiver",
                 status = 200,

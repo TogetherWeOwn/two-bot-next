@@ -79,9 +79,11 @@ apply dispatch (reviewed plan required), then re-dispatch. A rollback and a
 live-SHA takeover redeploy serve no new schema and waive the ledger check
 (recorded in the run, never a silent skip), so recovery never waits on it.
 
-Operator setup (once): create the non-secret repo vars
-`TWO_BOT_PRODUCTION_HOST` and `TWO_BOT_PRODUCTION_DATABASE` with the pinned
-production endpoint host and database name, and confirm the
+Operator setup (once): create the non-secret vars
+`TWO_BOT_PRODUCTION_HOST`, `TWO_BOT_PRODUCTION_DATABASE` and
+`TWO_BOT_PRODUCTION_BRANCH_ID` (on the `production-migrate-plan` environment)
+with the pinned production endpoint host, database name and PlanetScale
+branch id, and confirm the
 `production-migrate-plan` environment exposes the read-only
 `TWO_BOT_PRODUCTION_PLAN_DATABASE_URL` secret. Until the pins exist the gate
 fails closed on new builds (rollback and live-SHA redeploy still run).

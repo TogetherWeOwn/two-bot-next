@@ -21,8 +21,8 @@
 //!   announcements-channel post.
 //! - [`CallbackUrl`], [`create_subscription_body`], [`parse_subscriptions`] and
 //!   [`reconcile`]: subscription management as pure request bodies and a
-//!   create/delete plan. No Helix polling: reconcile runs at boot and after a
-//!   `revocation`, never on a timer.
+//!   create/delete plan. No Helix polling and no timers here: the bot runtime
+//!   runs reconcile at startup and on a bounded interval.
 //!
 //! The HTTP receiver, Helix client, credential loading and durable dedup
 //! ledger are separate reviewed slices; every caller of `WebhookSecret::expose()`
