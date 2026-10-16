@@ -406,14 +406,15 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     if (s.labels["result"] === "5xx") rest5xx += s.value;
   }
   // A counter that went backwards means the process restarted: no window.
-  // `?? 0` covers DO storage written before the 5xx field existed.
+  // DO storage written before the 5xx field existed has no usable baseline.
+  const rest5xxSeen = prev.rest5xx !== undefined;
   const prevRest5xx = prev.rest5xx ?? 0;
   const reset = rest429 < prev.rest429 || rest5xx < prevRest5xx || restTotal < prev.restTotal;
   const dTotal = restTotal - prev.restTotal;
   const d429 = rest429 - prev.rest429;
   if (!reset && dTotal >= REST_429_MIN_REQUESTS && d429 / dTotal > REST_429_RATIO) firing.push("rest_429_rate");
   const d5xx = rest5xx - prevRest5xx;
-  if (!reset && dTotal >= REST_5XX_MIN_REQUESTS && d5xx / dTotal > REST_5XX_RATIO) firing.push("rest_5xx_rate");
+  if (rest5xxSeen && !reset && dTotal >= REST_5XX_MIN_REQUESTS && d5xx / dTotal > REST_5XX_RATIO) firing.push("rest_5xx_rate");
 
   const configured = gauge("two_bot_db_pool_configured")[0]?.value === 1;
   const size = gauge("two_bot_db_pool_connections")[0]?.value;
