@@ -73,7 +73,8 @@ After the reviewer approves (or the automated approval passes), the job:
 
 Before step 2, a schema gate runs the read-only `production-migrate plan` on
 the guarded SHA through the no-reviewer `production-migrate-plan` environment
-and refuses a new build whose migrations are ahead of the production ledger.
+and refuses a new build when either the cutover or store migration chain is
+ahead of its production ledger (`pending_before` or `pending_store_before`).
 Apply the named pending versions through the manual `production-migrate`
 apply dispatch (reviewed plan required), then re-dispatch. A rollback and a
 live-SHA takeover redeploy serve no new schema and waive the ledger check
