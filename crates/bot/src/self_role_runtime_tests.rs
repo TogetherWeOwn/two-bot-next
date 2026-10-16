@@ -21,6 +21,21 @@ const OLD_ROLE: &str = "100000000000000009";
 const NOW: i64 = 1_700_000_000_000;
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+#[tokio::test(start_paused = true)]
+async fn store_errors_report_only_database_or_timeout_kind() {
+    let database = store_io(async { Err::<(), _>(StoreError::InvalidLease) }).await;
+    assert!(matches!(
+        database,
+        Err(RuntimeError::Store(StoreErrorKind::Database))
+    ));
+
+    let timeout = store_io(std::future::pending::<Result<(), StoreError>>()).await;
+    assert!(matches!(
+        timeout,
+        Err(RuntimeError::Store(StoreErrorKind::Timeout))
+    ));
+}
+
 fn panel(mode: PanelMode) -> SelfRolePanel {
     SelfRolePanel {
         id: "games".into(),
@@ -326,6 +341,7 @@ async fn exercise(pool: &PgPool) -> TestResult {
     reaction_partial_and_duplicate(pool).await?;
     exclusive_lane_before_reads(pool).await?;
     lost_panel_lane_release_is_logged(pool).await?;
+    zero_row_receipt_completion_is_unmatched_receipt(pool).await?;
     Ok(())
 }
 
@@ -1531,6 +1547,78 @@ async fn repeated_processing_tickets_preserve_pending(pool: &PgPool) -> TestResu
             mock.shutdown().await;
         }
     }
+    Ok(())
+}
+
+/// A zero-row completion means the database answered successfully but no
+/// ticket matched. Driven through the real receipt path, it must surface as its
+/// own kind: never a database failure, deliberately never `Stale`.
+async fn zero_row_receipt_completion_is_unmatched_receipt(pool: &PgPool) -> TestResult {
+    let clock = Arc::new(AtomicI64::new(NOW));
+    let mock = MockRest::start(snapshot(&[OLD_ROLE, OTHER]), ScriptedResponse::status(500)).await;
+    let feature = runtime(pool, &clock, &mock);
+    let mut panel = panel(PanelMode::Select);
+    panel.id = "unmatched-receipt".into();
+    let request = request(
+        "unmatched-receipt-event",
+        Selection::Select {
+            option_keys: vec!["new".into()],
+        },
+    );
+    let mut prepared = ready(feature.prepare(&request, &panel).await.unwrap());
+    let generation = prepared.event.generation;
+    let ticket = feature
+        .store
+        .journal_role_exchange(
+            &prepared.event,
+            prepared.panel.as_ref(),
+            &ExchangeIntent {
+                role_id: NEW_ROLE.into(),
+                adding: true,
+                compensating: false,
+            },
+        )
+        .await?
+        .unwrap();
+    let no_send = Err(SelfRoleRestError::InvalidId);
+    feature
+        .complete_step_receipt(&ticket, &no_send)
+        .await
+        .unwrap();
+    let completed = vec![(
+        generation,
+        NEW_ROLE.to_owned(),
+        true,
+        false,
+        "no_send".to_owned(),
+        None,
+    )];
+    assert_eq!(role_receipts(pool, &request.event_id).await?, completed);
+    // Exact replay is idempotent and still matches the ticket.
+    feature
+        .complete_step_receipt(&ticket, &no_send)
+        .await
+        .unwrap();
+
+    let contradicting = Ok(RoleExchange {
+        result: Ok(()),
+        owned_after: true,
+        response_received: true,
+        response_status: Some(204),
+    });
+    let error = feature
+        .complete_step_receipt(&ticket, &contradicting)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, RuntimeError::Store(StoreErrorKind::UnmatchedReceipt)),
+        "{error:?}"
+    );
+    assert_eq!(role_receipts(pool, &request.event_id).await?, completed);
+
+    feature.park(&mut prepared).await;
+    drop(prepared);
+    mock.shutdown().await;
     Ok(())
 }
 
