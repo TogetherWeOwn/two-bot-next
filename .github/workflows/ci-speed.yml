@@ -61,7 +61,6 @@ jobs:
               - 'deny.toml'
               - 'migrations.lock'
               - 'Dockerfile'
-              - 'Dockerfile.distroless'
               - '.dockerignore'
               - 'sql/**'
               - '.config/nextest.toml'

@@ -126,7 +126,7 @@ RUNTIME_PATHS = (
     "crates/bot/src/main.rs", "crates/core/Cargo.toml", "crates/core/README.md",
     "crates/core/tests/fixtures/reference_settings.json", "src/main.rs",
     "sql/web_v1.sql", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "deny.toml",
-    "migrations.lock", "Dockerfile", "Dockerfile.distroless", ".dockerignore",
+    "migrations.lock", "Dockerfile", ".dockerignore",
     "wrangler/wrangler.toml", "wrangler/src/index.ts", "wrangler/package.json",
     "wrangler/package-lock.json", "wrangler/scripts/ownership-control.mjs",
     "wrangler/README.md", "scripts/staging_rollout.py", "scripts/container-smoke.py",
@@ -255,7 +255,9 @@ def staging_claim_errors(claim, name="staging-migrate.yml",
         pairs.append((branch_env, branch_input))
     pairs.extend([("RECOVERY_REF", "recovery_evidence_ref"),
                   ("ACL_REF", "acl_plan_ref"), ("EXPECTED_PENDING", "expected_pending"),
+                  ("EXPECTED_STORE_PENDING", "expected_store_pending"),
                   ("PLAN_MANIFEST_SHA256", "plan_manifest_sha256"),
+                  ("STORE_PLAN_MANIFEST_SHA256", "store_plan_manifest_sha256"),
                   ("PLAN_RUN_ID", "plan_run_id")])
     expected_env = {key: "${{ inputs." + value + " }}" for key, value in pairs}
     if publish.get("env") != expected_env or publish.get("shell") != "bash":
@@ -324,10 +326,12 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
     if set(on) != {"workflow_dispatch"}:
         errors.append(f"{name}: must be dispatch-only (no push/pull_request/schedule)")
     inputs = ((on.get("workflow_dispatch") or {}).get("inputs") or {})
-    optional = {"mode", "expected_pending", "plan_manifest_sha256", "plan_run_id"}
+    optional = {"mode", "expected_pending", "expected_store_pending",
+                "plan_manifest_sha256", "store_plan_manifest_sha256", "plan_run_id"}
     expected = {"mode", "source_sha", host_input, db_input,
                 "recovery_evidence_ref", "acl_plan_ref", "expected_pending",
-                "plan_manifest_sha256", "plan_run_id"}
+                "expected_store_pending", "plan_manifest_sha256",
+                "store_plan_manifest_sha256", "plan_run_id"}
     if branch_input is not None:
         expected.add(branch_input)
         optional.add(branch_input)
@@ -356,7 +360,13 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
                 or "ascending" not in str(pending.get("description")).lower()):
             errors.append(f"{name}: expected_pending must stay optional, default empty, "
                           "and documented as the ascending reviewed plan list")
-        for key in ("plan_manifest_sha256", "plan_run_id"):
+        store_pending = inputs.get("expected_store_pending") or {}
+        if (str(store_pending.get("required")).lower() != "false"
+                or store_pending.get("default") != ""
+                or "ascending" not in str(store_pending.get("description")).lower()):
+            errors.append(f"{name}: expected_store_pending must stay optional, default empty, "
+                          "and documented as the ascending reviewed store plan list")
+        for key in ("plan_manifest_sha256", "store_plan_manifest_sha256", "plan_run_id"):
             field = inputs.get(key) or {}
             if str(field.get("required")).lower() != "false" or field.get("default") != "":
                 errors.append(f"{name}: {key} must stay optional and default empty "
@@ -365,6 +375,10 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
         if "sha" not in str(digest.get("description")).lower():
             errors.append(f"{name}: plan_manifest_sha256 must document the manifest-hash contract "
                           "(apply refuses unless it matches on the same source_sha)")
+        store_digest = inputs.get("store_plan_manifest_sha256") or {}
+        if "sha" not in str(store_digest.get("description")).lower():
+            errors.append(f"{name}: store_plan_manifest_sha256 must document the store "
+                          "manifest-hash contract (apply refuses unless it matches)")
         acl = inputs.get("acl_plan_ref") or {}
         if "bare" not in str(acl.get("description")).lower():
             errors.append(f"{name}: acl_plan_ref must document the bare reference contract "
@@ -452,8 +466,12 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
         errors.append(f"{name}:apply: must run the migrator with --apply only")
     if "--plan-manifest-sha256" not in apply_runs or "--plan-run-id" not in apply_runs:
         errors.append(f"{name}:apply: must pass the plan-bound manifest hash and run id to the runner")
+    if "--store-plan-manifest-sha256" not in apply_runs or "--expected-store-pending" not in apply_runs:
+        errors.append(f"{name}:apply: must pass the store plan-bound manifest hash and pending list to the runner")
     if "--plan-manifest-sha256" in plan_runs or "--plan-run-id" in plan_runs:
         errors.append(f"{name}:plan: must not take plan-bound inputs (it produces the manifest)")
+    if "--store-plan-manifest-sha256" in plan_runs:
+        errors.append(f"{name}:plan: must not take the store plan-bound hash (it produces the manifest)")
     if "--plan-manifest-path" not in apply_runs:
         errors.append(f"{name}:apply: must pass the producing run's downloaded manifest to the runner")
     if "--plan-manifest-path" in plan_runs:
@@ -1117,11 +1135,12 @@ def production_schema_gate_errors(workflow, name="deploy-production.yml"):
                       "with the plan binding, the guarded SHA and the guard-verified waive flags")
     # The expected production identity is pinned independently of the secret
     # binding (vars, never derived from the URL): a wrong-target binding must
-    # refuse instead of reading the wrong database. Production takes no
-    # branch pin.
+    # refuse instead of reading the wrong database. A PlanetScale host also
+    # takes the branch pin, exactly as production-migrate does.
     env_text = str(run.get("env", ""))
     for pin, var in (("TWO_BOT_PRODUCTION_HOST", "vars.TWO_BOT_PRODUCTION_HOST"),
-                     ("TWO_BOT_PRODUCTION_DATABASE", "vars.TWO_BOT_PRODUCTION_DATABASE")):
+                     ("TWO_BOT_PRODUCTION_DATABASE", "vars.TWO_BOT_PRODUCTION_DATABASE"),
+                     ("TWO_BOT_PRODUCTION_BRANCH_ID", "vars.TWO_BOT_PRODUCTION_BRANCH_ID")):
         if pin not in env_text or var not in env_text:
             errors.append(f"{name}:schema-gate: gate step must pin {pin} from {var}")
     if "inputs." in str(gate):
@@ -1533,6 +1552,8 @@ class WorkflowTests(unittest.TestCase):
             lambda w: w["jobs"]["schema-gate"]["steps"][4].__setitem__("run", "wrangler deploy"),
             lambda w: w["jobs"]["schema-gate"]["steps"][4].get("env", {}).__setitem__(
                 "LEAK", "${{ secrets.TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL }}"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4].get("env", {}).__setitem__(
+                "TWO_BOT_PRODUCTION_BRANCH_ID", ""),
         ):
             changed = copy.deepcopy(production)
             mutate(changed)

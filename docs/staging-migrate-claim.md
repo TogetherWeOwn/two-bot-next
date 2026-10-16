@@ -49,8 +49,10 @@ The JSON object carries these fields, with no database URL or credentials:
 | `workflow_head_sha` | `github.sha`, the workflow run's full lowercase 40-hex revision |
 | `source_sha` | reviewed migration source, full lowercase 40-hex; can differ from workflow head |
 | `plan_manifest_sha256` | lowercase 64-hex Rust projection digest |
+| `store_plan_manifest_sha256` | lowercase 64-hex Rust store-chain projection digest |
 | `target` | object with bare non-secret `host` and `database` |
 | `expected_pending` | strictly ascending array of canonical positive i64 **decimal strings** |
+| `expected_store_pending` | strictly ascending array of canonical positive i64 **decimal strings** for the store chain |
 | `recovery_evidence_ref`, `acl_plan_ref` | bare evidence references, not credential-bearing URLs |
 
 The publisher compares the request's source, target, pending set and approval
@@ -84,6 +86,14 @@ Use `source_migrations[].sha384`, not `sha384_recomputed`. This is not JSON
 serialization, not a digest of the enclosing self-describing manifest, and not
 an upload-artifact ZIP digest. Target, role and approval references are outside
 this projection, so comparing the hash alone cannot verify them.
+
+The store chain (`crates/store/migrations/`, ledger
+`public._two_bot_migrations`) binds through a second projection of the exact
+same shape: `source_sha`, then `pending_store_before`, then **all up store
+source migrations** as `version:description:sha384`, each plus LF. The claim
+carries it as `store_plan_manifest_sha256` with `expected_store_pending`;
+the runner recomputes both projections and proves both against the producing
+run's manifest before any DDL. The cutover projection is unchanged.
 
 The shared synthetic vectors are:
 
