@@ -11,7 +11,10 @@ the step itself.
 - Dependency advisories (HARD): the `cargo-deny` step (`check all`, which
   includes advisories) runs on every PR, not only Rust-selected ones.
 - Request-path unwrap (HARD): the local `sgconfig.yml` runs the request-path
-  `.unwrap()` rule, and `scripts/ci/check-unwrap-request-paths.py` fails the
+  `.unwrap()` rules (`no-unwrap-request-paths` for direct calls plus
+  `no-unwrap-request-paths-in-macros` for `unwrap` inside macro token trees,
+  which the base pattern cannot see), and
+  `scripts/ci/check-unwrap-request-paths.py` fails the
   PR when the diff adds a hit. The six shared Rust detectors from
   TogetherWeOwn/paperclip-ops-tooling `quality/meta-only/` at source commit
   `a10103b5f8c9846b8d12cc2d19c7bc2246d12349` stay advisory (WARN): they flag
@@ -27,6 +30,10 @@ the step itself.
   only, no registry) fails the PR on newly added `todo!`/`unimplemented!`,
   empty `.expect("")`, `panic!` in non-test code or `process::exit` in
   library code. Pre-existing hits are grandfathered below, not deleted.
+  Known gap: an empty `.expect("")` inside a macro body (for example
+  `vec![x.expect("")]`) is not matched by the `$X.expect("")` pattern, for
+  the same macro-token-tree reason as the unwrap gate; there are no such
+  hits in the tree today, so the gap is documented rather than gated.
 - Squawk migration lint (HARD; `dropping-object` WARN):
   `scripts/ci/check-squawk-migrations.py` flags risky statements in changed
   migration files only. `adding-required-field`, `creating-index`,

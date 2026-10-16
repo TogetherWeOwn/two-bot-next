@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """HARD gate: no new `.unwrap()` in request-path source files.
 
-The request-path rule is defined by
-``ast-grep-rules/no-unwrap-request-paths.yml`` (request-path file globs with
-test files/dirs ignored; inline ``#[cfg(test)]`` modules are included). Six
-additional Rust advisories and their fixtures come from the shared meta-only
-assets. The script runs ``ast-grep scan --json --warning``
+The request-path rules are defined by
+``ast-grep-rules/no-unwrap-request-paths.yml`` (direct ``$X.unwrap()`` calls)
+and ``ast-grep-rules/no-unwrap-request-paths-in-macros.yml`` (``unwrap``
+inside macro token trees, which the base pattern cannot see because ast-grep
+parses macro arguments as opaque ``token_tree``). Both share the request-path
+file globs with test files/dirs ignored; inline ``#[cfg(test)]`` modules are
+included. Six additional Rust advisories and their fixtures come from the
+shared meta-only assets. The script runs ``ast-grep scan --json --warning``
 and intersects all reported hits with
 the lines the PR adds (``git diff -U0 base head``), so only newly added
 findings fail. Existing unwrap hits are listed in ``docs/unwrap-backlog.md``.
@@ -27,6 +30,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 RULE_ID = "no-unwrap-request-paths"
+MACRO_RULE_ID = "no-unwrap-request-paths-in-macros"
+ENFORCED_RULE_IDS = frozenset({RULE_ID, MACRO_RULE_ID})
 BACKLOG_NAME = "docs/unwrap-backlog.md"
 MAX_ANNOTATIONS = 10
 
@@ -75,9 +80,9 @@ def run_scan(ast_grep, all_rules=False):
         if (not isinstance(path, str) or not path
                 or type(line) is not int or line < 0):
             return None, "ast-grep scan contains an invalid finding"
-        if not all_rules and rule_id != RULE_ID:
+        if not all_rules and rule_id not in ENFORCED_RULE_IDS:
             continue
-        if rule_id == RULE_ID:
+        if rule_id in ENFORCED_RULE_IDS:
             end = location.get("end")
             if not isinstance(end, dict):
                 return None, "ast-grep scan contains an invalid finding location"
@@ -157,7 +162,7 @@ def main(argv=None):
     if hits is None:
         error(f"ast-grep HARD gate is blind ({scan_error}); failing closed")
         return 1
-    unwrap_hits = [hit for hit in hits if hit[0] == RULE_ID]
+    unwrap_hits = [hit for hit in hits if hit[0] in ENFORCED_RULE_IDS]
     print(f"unwrap request-path gate: {len(unwrap_hits)} enforced-scope hit(s)")
     print(f"ast-grep advisory gate: {len(hits) - len(unwrap_hits)} other rule hit(s)")
 
@@ -170,9 +175,9 @@ def main(argv=None):
     if not fresh:
         print("ast-grep HARD gate: no added findings in scope")
         return 0
-    unwrap_fresh = [hit for hit in fresh if hit[0] == RULE_ID]
+    unwrap_fresh = [hit for hit in fresh if hit[0] in ENFORCED_RULE_IDS]
     for rule_id, path, line in fresh[:MAX_ANNOTATIONS]:
-        if rule_id == RULE_ID:
+        if rule_id in ENFORCED_RULE_IDS:
             error(f"{path}:{line} adds .unwrap() in a request-path source file "
                   "(inline test modules are included)")
         else:

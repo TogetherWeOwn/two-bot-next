@@ -115,6 +115,26 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(error, "")
         self.assertEqual(len(hits), 2)
 
+    def test_scan_enforces_macro_rule_hits(self):
+        fixture = [{"ruleId": gate.MACRO_RULE_ID, "file": "a.rs",
+                    "range": {"start": {"line": 3}, "end": {"line": 3}}}]
+        tmp, binary = fake_ast_grep(json.dumps(fixture))
+        try:
+            hits, error = gate.run_scan(binary)
+        finally:
+            tmp.cleanup()
+        self.assertEqual(error, "")
+        self.assertEqual(hits, [("a.rs", 4)])
+
+    def test_scan_macro_end_line_before_start_is_blindness(self):
+        finding = {"ruleId": gate.MACRO_RULE_ID, "file": "a.rs",
+                   "range": {"start": {"line": 2}, "end": {"line": 1}}}
+        with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=json.dumps([finding]), stderr="")):
+            hits, error = gate.run_scan("ast-grep")
+        self.assertIsNone(hits)
+        self.assertIn("invalid finding location", error)
+
     def test_all_rules_scan_includes_advisory_rule_ids(self):
         tmp, binary = fake_ast_grep(json.dumps(SCAN_FIXTURE))
         try:
@@ -385,6 +405,30 @@ class GateTests(unittest.TestCase):
         self.assertIn("::error::", out.getvalue())
         self.assertIn("gateway_commands.rs:2", out.getvalue())
 
+    def test_fresh_unwrap_inside_macro_fails(self):
+        tmp, root = make_repo()
+        try:
+            path = "crates/bot/src/gateway_commands.rs"
+            base = commit(root, {path: "fn p() {}\n"})
+            head = commit(root, {path: 'fn p() {}\nassert_eq!(x.unwrap(), 1);\n'})
+            real_root, gate.ROOT = gate.ROOT, root
+            scan = [{"ruleId": gate.MACRO_RULE_ID, "file": path,
+                     "range": {"start": {"line": 1}, "end": {"line": 1}}}]
+            fake_tmp, binary = fake_ast_grep(json.dumps(scan))
+            out = io.StringIO()
+            try:
+                with redirect_stdout(out):
+                    code = gate.main(["--base-ref", base, "--head-ref", head,
+                                      "--ast-grep", binary])
+            finally:
+                fake_tmp.cleanup()
+                gate.ROOT = real_root
+        finally:
+            tmp.cleanup()
+        self.assertEqual(code, 1)
+        self.assertIn("::error::", out.getvalue())
+        self.assertIn("gateway_commands.rs:2", out.getvalue())
+
     def test_preexisting_hit_is_silent(self):
         code, output = self.run_gate(SCAN_FIXTURE, "HEAD", "HEAD")
         self.assertEqual(code, 0)
@@ -446,11 +490,29 @@ class RuleShapeTests(unittest.TestCase):
         self.assertNotIn("cfg(test)", ignores)
         self.assertIn("inline test modules", rule["message"])
 
+    def test_macro_rule_covers_unwrap_inside_macro_token_trees(self):
+        rule = yaml.safe_load(
+            (ROOT / "ast-grep-rules/no-unwrap-request-paths-in-macros.yml").read_text())
+        self.assertEqual(rule["id"], "no-unwrap-request-paths-in-macros")
+        self.assertEqual(rule["language"], "rust")
+        self.assertEqual(rule["rule"]["kind"], "identifier")
+        self.assertIn("unwrap", rule["rule"]["regex"])
+        self.assertIn("token_tree", json.dumps(rule["rule"]))
+        base = yaml.safe_load(
+            (ROOT / "ast-grep-rules/no-unwrap-request-paths.yml").read_text())
+        self.assertEqual(rule["files"], base["files"])
+        self.assertEqual(rule["ignores"], base["ignores"])
+        self.assertEqual(gate.MACRO_RULE_ID, "no-unwrap-request-paths-in-macros")
+        self.assertIn(gate.RULE_ID, gate.ENFORCED_RULE_IDS)
+        self.assertIn(gate.MACRO_RULE_ID, gate.ENFORCED_RULE_IDS)
+
     def test_backlog_documents_inline_test_module_enforcement(self):
         backlog = (ROOT / "docs/unwrap-backlog.md").read_text()
         self.assertIn("no-unwrap-request-paths", backlog)
+        self.assertIn("no-unwrap-request-paths-in-macros", backlog)
         self.assertIn("inline `#[cfg(test)]` modules are included", backlog)
-        self.assertIn("36 findings across 9 rule-scope", backlog)
+        self.assertIn("50 findings across 9 rule-scope", backlog)
+        self.assertIn("36 direct plus 14 inside macros", backlog)
         self.assertIn("not a count of unique source lines", backlog)
         self.assertNotIn("50 hit lines across 9 files", backlog)
         self.assertIn("those hits are not filtered from enforcement", backlog)
