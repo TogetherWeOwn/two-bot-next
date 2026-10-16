@@ -18,7 +18,6 @@ jobs:
     timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
-      FUZZ_OUTPUT_DIR: ${{ runner.temp }}/helix-token-smoke
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -34,6 +33,8 @@ jobs:
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fetch --locked
       - name: Record host and toolchain versions
+        env:
+          FUZZ_OUTPUT_DIR: ${{ runner.temp }}/helix-token-smoke
         run: |
           set -euo pipefail
           mkdir -p "$FUZZ_OUTPUT_DIR/logs"
@@ -48,6 +49,8 @@ jobs:
             grep -A1 'name = "libfuzzer-sys"' fuzz/Cargo.lock
           } | tee "$FUZZ_OUTPUT_DIR/logs/versions.txt"
       - name: helix_token 60 s smoke
+        env:
+          FUZZ_OUTPUT_DIR: ${{ runner.temp }}/helix-token-smoke
         run: |
           set -euo pipefail
           mkdir -p "$FUZZ_OUTPUT_DIR/target" "$FUZZ_OUTPUT_DIR/logs" \
@@ -65,6 +68,8 @@ jobs:
           exit "$status"
       - name: Summarize smoke result
         if: always()
+        env:
+          FUZZ_OUTPUT_DIR: ${{ runner.temp }}/helix-token-smoke
         run: |
           {
             echo "### helix_token 60 s smoke"
