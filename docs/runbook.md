@@ -424,7 +424,7 @@ Creator joins are burning the 99.5%-moved-within-5 s error budget faster than
 `two_bot_voice_join_refused_total`, against
 `two_bot_voice_join_to_move_seconds_bucket{le="5"}`). Every non-duplicate
 refusal, failed move and slow (>5 s) move is burn. Each window needs at least
-10 genuine joins and two slow moves; one event alone cannot page or ticket.
+10 genuine joins and two bad moves; one event alone cannot page or ticket.
 Receive counters lag one scrape so an in-flight move can complete. After startup
 or restart, a window stays inactive until its full history is available; a
 counter reset rebuilds the ring instead of firing.
