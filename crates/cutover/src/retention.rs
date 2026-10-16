@@ -261,12 +261,21 @@ pub async fn run_retention(
         RetentionMode::DryRun => RetentionStep::DryRun,
         RetentionMode::Execute => RetentionStep::Expiry,
     };
-    let result = async {
-        let started = std::time::Instant::now();
-        let mut tx = pool.begin().await?;
-        let report = match mode {
+    run_retention_inner(pool, mode, &mut step)
+        .await
+        .map_err(|error| RetentionFailure::from_sqlx(step, &error))
+}
+
+async fn run_retention_inner(
+    pool: &PgPool,
+    mode: RetentionMode,
+    active_step: &mut RetentionStep,
+) -> Result<RetentionReport, sqlx::Error> {
+    let started = std::time::Instant::now();
+    let mut tx = pool.begin().await?;
+    let report = match mode {
         RetentionMode::DryRun => {
-            step = RetentionStep::DryRun;
+            *active_step = RetentionStep::DryRun;
             sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
                 .execute(&mut *tx)
                 .await?;
@@ -280,10 +289,10 @@ pub async fn run_retention(
             .await?;
             let overdue = count_overdue_deletions(&mut tx).await?;
             let pendings: Vec<(String, String)> = sqlx::query_as(
-                "SELECT guild_id, user_id FROM retention_deletion_requests WHERE status = 'pending'",
-            )
-            .fetch_all(&mut *tx)
-            .await?;
+            "SELECT guild_id, user_id FROM retention_deletion_requests WHERE status = 'pending'",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
             // A schema-coverage refusal defers every pending request (the
             // live drain rolls back only that request's savepoint), so the
             // dry run mirrors it: with gaps, all pendings are deferred.
@@ -349,7 +358,7 @@ pub async fn run_retention(
             }
         }
         RetentionMode::Execute => {
-            step = RetentionStep::Expiry;
+            *active_step = RetentionStep::Expiry;
             sqlx::query("SET LOCAL lock_timeout = '5s'")
                 .execute(&mut *tx)
                 .await?;
@@ -379,31 +388,31 @@ pub async fn run_retention(
                 .execute(&mut *tx)
                 .await?;
             let presence =
-                sqlx::query("DELETE FROM presence_probe WHERE observed_at < to_char(now() - make_interval(days => $1), 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')")
-                    .bind(PRESENCE_RAW_RETENTION_DAYS)
-                    .execute(&mut *tx)
-                    .await?
-                    .rows_affected();
+            sqlx::query("DELETE FROM presence_probe WHERE observed_at < to_char(now() - make_interval(days => $1), 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')")
+                .bind(PRESENCE_RAW_RETENTION_DAYS)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
             let voice = sqlx::query(
-                "DELETE FROM events WHERE event_type IN ('voice_session_started', 'voice_session_ended') AND occurred_at < now() - make_interval(days => $1)",
-            )
-            .bind(VOICE_RAW_RETENTION_DAYS)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+            "DELETE FROM events WHERE event_type IN ('voice_session_started', 'voice_session_ended') AND occurred_at < now() - make_interval(days => $1)",
+        )
+        .bind(VOICE_RAW_RETENTION_DAYS)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
             let audit = sqlx::query(
-                "DELETE FROM operational_audit_log WHERE occurred_at < now() - make_interval(days => $1)",
-            )
-            .bind(AUDIT_CACHE_RETENTION_DAYS)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+            "DELETE FROM operational_audit_log WHERE occurred_at < now() - make_interval(days => $1)",
+        )
+        .bind(AUDIT_CACHE_RETENTION_DAYS)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
             let overdue = count_overdue_deletions(&mut tx).await?;
             // Schema gaps are computed once per run, before either drain. A
             // gap means no purge or deletion can certify completeness, so
             // every pending request defers and every queued guild stays
             // queued; the exact gaps ride the warn logs for the code fix.
-            step = RetentionStep::DeletionIntake;
+            *active_step = RetentionStep::DeletionIntake;
             let schema_gaps = crate::member_erasure::schema_gaps(&mut tx).await?;
             let schema_gapped = !schema_gaps.is_empty();
             // Pending deletions drain BEFORE guild purges so a departed
@@ -412,10 +421,10 @@ pub async fn run_retention(
             // schema-coverage refusal rolls back only that request, leaving
             // it pending, while other failures abort the run.
             let pendings: Vec<(String, String, String)> = sqlx::query_as(
-                "SELECT request_id, guild_id, user_id FROM retention_deletion_requests WHERE status = 'pending'",
-            )
-            .fetch_all(&mut *tx)
-            .await?;
+            "SELECT request_id, guild_id, user_id FROM retention_deletion_requests WHERE status = 'pending'",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
             let mut completed = 0u64;
             let mut deferred = 0u64;
             let mut gap_deferred = 0u64;
@@ -475,10 +484,10 @@ pub async fn run_retention(
                 );
             }
             let guilds: Vec<(String, i64)> = sqlx::query_as(
-                "SELECT guild_id, (EXTRACT(EPOCH FROM (clock_timestamp() - enqueued_at)))::BIGINT FROM retention_guild_purge_queue",
-            )
-            .fetch_all(&mut *tx)
-            .await?;
+            "SELECT guild_id, (EXTRACT(EPOCH FROM (clock_timestamp() - enqueued_at)))::BIGINT FROM retention_guild_purge_queue",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
             let mut guild_rows = 0u64;
             let mut guild_failed = 0u64;
             let mut guild_deferred = 0u64;
@@ -568,11 +577,8 @@ pub async fn run_retention(
                 duration_ms: started.elapsed().as_millis() as u64,
             }
         }
-        };
-        Ok(report)
-    }
-    .await;
-    result.map_err(|error| RetentionFailure::from_sqlx(step, &error))
+    };
+    Ok(report)
 }
 
 /// Record a guild removal. A dispatch with no `unavailable` flag (or an
@@ -1131,12 +1137,19 @@ async fn count_queued_guild_rows(
 mod tests {
     use super::*;
 
-    #[test]
-    fn aborted_deletion_intake_reports_its_step_and_safe_cause() {
-        let failure =
-            RetentionFailure::from_sqlx(RetentionStep::DeletionIntake, &sqlx::Error::RowNotFound);
-        assert_eq!(failure.step(), RetentionStep::DeletionIntake);
-        assert_eq!(failure.cause(), "row_not_found");
+    #[tokio::test]
+    async fn run_abort_step_follows_mode() {
+        let pool = PgPool::connect_lazy("postgres://unused:unused@localhost/unused").unwrap();
+        pool.close().await;
+
+        for (mode, expected_step) in [
+            (RetentionMode::DryRun, RetentionStep::DryRun),
+            (RetentionMode::Execute, RetentionStep::Expiry),
+        ] {
+            let failure = run_retention(&pool, mode).await.unwrap_err();
+            assert_eq!(failure.step(), expected_step);
+            assert_eq!(failure.cause(), "pool_closed");
+        }
     }
 
     #[test]
