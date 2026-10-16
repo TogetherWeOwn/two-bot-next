@@ -27,18 +27,35 @@ its flag names settle.
 
 ### Cutover CLIs (`crates/cutover/src/rest.rs`)
 
-- 110 ms floor between requests: `min_interval: Duration::from_millis(110)`
-  (`rest.rs:210`; module contract `rest.rs:4`). The floor is per client, so
-  never run two backfill writers against the same token concurrently and
-  assume the budget holds — the floor does not coordinate across processes.
-- 429 parks for the response's own wait, then retries within the same
-  attempt budget (`rest.rs:268`, `rest.rs:304`, `rest.rs:476`):
-  `retry_after_wait_ms()` is header seconds (body `retry_after` wins when
-  finite), × 1000, + 250 ms padding, clamped to 60 s per wait
-  (`crates/core/src/action_outcomes.rs:163-181`; padding
-  `RETRY_AFTER_PADDING_MS:179`, clamp `MAX_RETRY_AFTER_MS:181`). A missing
-  or garbage header falls back to 1 s + 250 ms (`action_outcomes.rs:386-388`
-  pins this).
+- The client also has a 110 ms local floor between requests
+  (`rest.rs:210`; module contract `rest.rs:4`). This is not the admission
+  authority: `RestClient::from_env` binds the durable token-wide PostgreSQL
+  lane (`rest.rs:146-187`; [send-admission runbook](discord-send-admission.md#transportbootstrap-handoff)).
+  The same token and database share that lane with the live bot. A dry run
+  of a Discord-reading CLI also acquires and releases lane occupancy;
+  `dedupe-events` does not use Discord or this lane. Concurrent same-token
+  writers are refused by the lane rather than coordinated by the local floor;
+  backfill traffic also competes with live-bot traffic.
+- A 429 uses local `retry_after_wait_ms()` pacing inside the CLI attempt
+  budget (`rest.rs:268`, `rest.rs:304`, `rest.rs:476`): header seconds (body
+  `retry_after` wins when finite), × 1000, + 250 ms padding, locally clamped
+  to 60 s (`crates/discord/src/executor.rs:319`; delegated calculation
+  `crates/core/src/action_outcomes.rs:163-181`; padding
+  `RETRY_AFTER_PADDING_MS:179`, clamp `MAX_RETRY_AFTER_MS:181`). Missing or
+  garbage timing falls back locally to 1 s + 250 ms (`action_outcomes.rs:386-388`).
+  Separately, the durable lane promotes Discord cooldowns to the token-wide
+  hold; a valid finite hold is not capped at 60 s, and missing or
+  unrepresentable timing installs an indefinite hold (`discord-send-admission.md:53-58`).
+  The CLI's shorter local sleep does not clear that hold: a later attempt can
+  fail closed as admission-blocked, with no self-healing of an indefinite
+  hold. A 429 can therefore pause live-bot sends too. Do not restart the
+  process, delete lane rows, or treat a local retry as proof the lane reopened;
+  use the [send admission blocked alert](runbook.md#alert-send-admission-blocked) and Operator recovery path.
+  CLI startup prints `send admission bootstrap failed: ...` when the
+  required authority cannot connect (`backfill.rs:90-93`,
+  `backfill_messages.rs:65-68`, `capture.rs:57-60`). A missing admission
+  table instead surfaces as an admission storage failure on the first
+  request; it is not the bootstrap error (`crates/core/src/send_admission/postgres.rs:110-139`).
 - 5xx backs off at 500 × 2^attempt ms and gives up as retry-exhausted
   (`rest.rs:270`, `rest.rs:306`, `rest.rs:478`;
   `backoff_duration` at `rest.rs:701-703`, base `BACKOFF_BASE_MS` in
@@ -61,12 +78,12 @@ with shared admission:
 - Paced lane 110 ms, kick lane 350 ms (`PACE_INTERVAL_MS` at
   `executor.rs:66`, `KICK_INTERVAL_MS` at `executor.rs:69`, wired at
   `executor.rs:971-972`).
-- Paced GETs retry 429 with the same `retry_after_wait_ms()` and spend
-  one of the same 5 tries per 429/5xx/transport failure; a steady 429
-  stream exhausts the budget instead of parking forever
-  (`get_json_observed` at `executor.rs:1753`, 429 arm at
-  `executor.rs:1791-1805`). A global 429 installs the shared pause and is
-  retried at next admission instead of sleeping locally
+- Paced GETs retry 429 with `retry_after_wait_ms()` and spend one of the
+  same 5 tries per 429/5xx/transport failure; a steady 429 stream exhausts
+  the budget instead of parking forever (`get_json_observed` at
+  `executor.rs:1753`, 429 arm at `executor.rs:1791-1805`). In the kick
+  path, a global 429 uses the header-anchored shared deadline at the next
+  admission, while route-local 429s sleep locally
   (`executor.rs:1686-1691`).
 - The process-wide guard (`crates/discord/src/ratelimit_guard.rs`) counts
   401/403/429 toward the invalid-request budget — 10-minute rolling window
@@ -90,28 +107,29 @@ Nine endpoint families share one vocabulary
 `history`, `event_users`, `reactions`, `pins`, `bans`, `invites`,
 `onboarding`.
 
-- Checkpoint with `put_backfill_cursor`, resume with
-  `get_backfill_cursor` (`backfill_cursors.rs:65-84`, `91-100`).
-  Validation runs before any SQL: unknown families and empty/`"0"`
-  cursors are refused (`71-77`), and an untouched family reads as `None`
-  — resume-from-start, never a synthesized zero cursor (`87-90`).
-- The SQL is byte-for-byte the acceptance target's literals
-  (`PUT_SQL:43-46`, `GET_SQL:49`), so wrapper and tests cannot drift.
-- Database fence: `cursor TEXT NOT NULL CHECK (length(cursor) > 0 AND
-  cursor <> '0')` in `crates/store/migrations/0408_backfill_cursors.sql`
-  and its cutover-chain mirror
-  `crates/cutover/migrations/0435_backfill_cursors.sql` (identical
+- `put_backfill_cursor` and `get_backfill_cursor` define the checkpoint
+  interface (`backfill_cursors.rs:65-100`), but as of this head no shipped
+  binary or runtime job calls them. The route in §2 therefore reports all
+  nine families as `cursor: null` / `updated_at: null` in normal operation;
+  these are schema and route contracts, not usable live checkpoints. The history CLIs
+  (`backfill`, `backfill-messages`) do not checkpoint cursors: resume today
+  means re-running the relevant history scan with a deeper `--max-pages`
+  (see §4), which re-walks channel history.
+- The member-catchup module defines a separate
+  `member_catchup_cursors` resume table (`member_catchup.rs:156-199`); its
+  database operations are exercised by tests, but no shipped binary or
+  runtime job currently invokes that worker path. The `members` row in
+  `backfill_cursors` is only a progress mirror in the module contract, not
+  the member worker's resume state.
+- The `backfill_cursors` SQL is byte-for-byte the acceptance target's
+  literals (`PUT_SQL:43-46`, `GET_SQL:49`). Database fence:
+  `cursor TEXT NOT NULL CHECK (length(cursor) > 0 AND cursor <> '0')` in
+  `crates/store/migrations/0408_backfill_cursors.sql` and its cutover-chain
+  mirror `crates/cutover/migrations/0435_backfill_cursors.sql` (identical
   `CREATE TABLE IF NOT EXISTS`, additive-only, cross-runnable in either
   order). A zero restart cannot be persisted even if validation is
-  bypassed. Privacy fence, same as event-store S1: `family`, `cursor`,
-  `updated_at` only — no bodies, no status text, no payload columns.
-- Who writes which family: the member-catchup path checkpoints the
-  `members` family with the same SQL shape on every cursor advance
-  (`crates/cutover/src/member_catchup.rs:156-189`). The history CLIs
-  (`backfill`, `backfill-messages`, below) do **not** checkpoint cursors:
-  they re-walk channel history per invocation, so resume there means
-  re-running with a deeper `--max-pages` (see §4 page-cap guidance), not
-  reading a cursor row.
+  bypassed. Privacy fence: `family`, `cursor`, `updated_at` only — no
+  bodies, status text, or payload columns.
 
 ### Reading the frontier: `GET /ops/backfill/progress`
 
@@ -129,22 +147,28 @@ empty-store baseline (`376-386`).
 
 Interpreting the body (`families_body`, `270-297`):
 
-- `cursor` + `updated_at` (epoch seconds) are the actionable signal and
-  are exposed verbatim. A stale `updated_at` means the family is stuck;
-  a `null` cursor means it never checkpointed.
+- `cursor` + `updated_at` (epoch seconds) are exposed verbatim. At this
+  head, all nine families return null because no shipped process writes
+  these rows; null is not evidence that a family has never run. Once a
+  wired worker writes a row, its timestamp can help locate a stalled
+  checkpoint, but it cannot currently diagnose one.
 - `progress` is `0.0` and `eta_seconds` is `null` by ruling until a
-  worker slice records totals (`32-42`); any non-zero value today would be
-  fiction. Do not report ETA from this route.
+  worker slice records totals (`ops_backfill.rs:32-42`); do not report ETA
+  from this route.
 - Only vocabulary keys are exposed; unknown stored families never become
   labels (`267-276`).
 
 ## 3. Dry-run and staged-delete counts
 
-All history CLIs default to dry-run and print a `DRY RUN` banner; nothing
-is written unless the operator passes the explicit write flag. Env for
-the Discord-reading CLIs: `DISCORD_TOKEN` (or `DISCORD_BOT_TOKEN`),
+`backfill`, `backfill-messages`, and `capture` WRITE by default; pass
+`--dry-run` to report only. `dedupe-events` is the only CLI here that
+defaults to a dry run (writes require `--apply`). The history CLIs print
+a `DRY RUN` banner when that flag is passed. Env for the
+Discord-reading CLIs: `DISCORD_TOKEN` (or `DISCORD_BOT_TOKEN`),
 `DISCORD_GUILD_ID`, `TWO_DATABASE_URL` (`backfill.rs:8-9`, token fallback
-`45-49`, guild/DB checks `74-87`).
+`45-49`, guild/DB checks `74-87`). Even dry runs of those
+Discord-reading CLIs require the shared send-admission authority described
+in §1.
 
 | Binary | Dry-run form | Write form | Banner / gates |
 |---|---|---|---|
@@ -152,7 +176,7 @@ the Discord-reading CLIs: `DISCORD_TOKEN` (or `DISCORD_BOT_TOKEN`),
 | `backfill-messages` (first/second/third message milestones) | `backfill-messages --dry-run` (flag `backfill_messages.rs:29`) | bare writes; milestones only ever move earlier, never later (module docs `1-8`) | banner (`76-80`); ladder writes and activity touches gated (`258-294`) |
 | `capture` (join capture) | `capture --dry-run` (flag `capture.rs:26`) | bare writes | banner (`68-70`); writes gated (`145`, `167`) |
 | `dedupe-events` (clear double-logged joins/leaves) | default: counts without writing (`dedupe_events.rs:72`) | bare `--apply` deletes in 200-id chunks (`133-143`); prints `deleted {n}` | `DRY RUN - nothing will be deleted` (`78-82`); dry prints `would delete {found}` plus per-type rows/people/dupes and the remaining total (`124-129`, `159-166`) |
-| retention job (library, `retention.rs`) | `RetentionMode::DryRun` reports per-class counts and deletes nothing (`73-78`, `187-203`) | `RetentionMode::Execute` deletes, drains the guild-purge queue, completes pending deletions | per-class fields `presence_raw_deleted`/`voice_raw_deleted`/`audit_cache_deleted`/`guild_rows_purged` (`82-90`); receipts (not row counts) for user deletions (`140-144`); `total_deleted` sums the disjoint row classes (`146-151`) |
+| retention job (supervised bot job; `retention_jobs.rs`) | `TWO_RETENTION_MODE` unset (default) or `dry-run` reports per-class counts without deleting; runs every 15 minutes (`retention_jobs.rs:23,29,33-43`) | `TWO_RETENTION_MODE=execute` enables deletes; `off` parks the job. See [privacy retention settings](privacy.md#retention-and-explicit-exceptions) | per-class counts are `presence_raw_deleted`/`voice_raw_deleted`/`audit_cache_deleted`/`guild_rows_purged` (`retention.rs:82-90`); receipts, not row counts, for user deletions (`140-144`); `total_deleted` sums disjoint row classes (`146-151`) |
 
 Safety rails, verified in code:
 
@@ -189,8 +213,9 @@ Staging-name-only recipe (no secrets, no live run performed for this
 doc; Operator cards own execution and bindings):
 
 ```sh
-DISCORD_GUILD_ID="$STAGING_GUILD_ID" TWO_DATABASE_URL="$STAGING_DIRECT_URL" \
-  backfill --dry-run --max-pages=25
+export DISCORD_GUILD_ID="$STAGING_GUILD_ID"
+export TWO_DATABASE_URL="$STAGING_DIRECT_URL"
+backfill --dry-run --max-pages=25
 backfill-messages --dry-run --max-pages=60
 dedupe-events --guild "$STAGING_GUILD_ID" --dry-run
 ```
@@ -213,7 +238,7 @@ The vocabulary is fixed (`ScanCompletion`, `rest.rs:722-752`):
 | `page-cap` | hit `--max-pages`; sets `truncated` (`rest.rs:679`) | no — re-run deeper (4× suggestion above) |
 | `unreadable` | 403/404 page: token cannot see the channel | no — check access, not a bug |
 | `retry-exhausted` | 5xx survived all 5 tries (`rest.rs:271`) | no — check Discord status / service health |
-| `request-failed` | transport/Twilight/wire failure (`rest.rs:646-647`) | no — check service health before re-running |
+| `request-failed` | transport/Twilight/wire failure; includes exhausted 429s (`HTTP 429`) and send-admission refusals mapped to `Wire` (`rest.rs:263, 647`; `crates/cutover/src/rest.rs:272`) | no — check REST 429 and [send-admission blocked](runbook.md#alert-send-admission-blocked) alerts before treating it as a Discord outage |
 | `invalid-response` | page body failed to decode (`rest.rs:645`) | no — one bad row fails its page; report it |
 
 Burst triage:
@@ -229,12 +254,17 @@ Burst triage:
 - Member-list traversal has hard ceilings: 500 pages / 500 000 members
   (`MAX_MEMBER_PAGES`, `MAX_MEMBERS`, `rest.rs:55-57`); a non-advancing
   page is `MemberCursorStalled` and a ceiling hit is
-  `MemberCeilingExceeded` (`RestError`, `rest.rs:44-50`) — never a
-  partial roster presented as complete.
-- Zero members read is an intent hint, not an empty guild: the CLI exits
-  1 naming Server Members Intent (`backfill.rs:110-123`).
+  `MemberCeilingExceeded` (`RestError`, `rest.rs:44-50`). These variants
+  are library-level errors and are not printed by `backfill` or `capture`.
+  Both binaries discard any member-list error and print a
+  `Read zero members ... Server Members Intent` hint before exiting 1
+  (`backfill.rs:110-123`, `capture.rs:120-128`); the wording differs between
+  them. The hint can also mask a stalled cursor, ceiling, exhausted 429/5xx
+  retries, or admission refusal; check REST and send-admission alerts before
+  concluding the intent is off. This is not proof of an empty guild or a
+  complete roster.
 - Archived-thread discovery has its own budget
-  (`DEFAULT_ARCHIVED_THREAD_PAGES = 10`, `rest.rs:761`); early stops are
+  (`DEFAULT_ARCHIVED_THREAD_PAGES = 10`, `rest.rs:769`); early stops are
   reported per forum (`backfill_messages.rs:312-318`), not silently
   complete.
 - Route-level anchors: progress-route 503 means the database is
