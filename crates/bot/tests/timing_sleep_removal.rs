@@ -109,6 +109,25 @@ fn skip_non_code(bytes: &[u8], index: usize) -> Option<usize> {
     None
 }
 
+fn code_only(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut code = bytes.to_vec();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if let Some(next) = skip_non_code(bytes, cursor) {
+            for index in cursor..next {
+                if !matches!(bytes[index], b'\n' | b'\r') {
+                    code[index] = b' ';
+                }
+            }
+            cursor = next;
+        } else {
+            cursor += 1;
+        }
+    }
+    String::from_utf8(code).expect("masking source preserves UTF-8")
+}
+
 fn braced_block(source: &str, open: usize) -> String {
     let bytes = source.as_bytes();
     let mut cursor = open;
@@ -145,6 +164,7 @@ fn function_body(source: &str, name: &str) -> String {
 }
 
 fn loop_body(source: &str, marker: &str) -> String {
+    let source = code_only(source);
     let marker_start = source
         .find(marker)
         .unwrap_or_else(|| panic!("missing poll loop {marker:?}"));
@@ -152,7 +172,7 @@ fn loop_body(source: &str, marker: &str) -> String {
         .find('{')
         .map(|offset| marker_start + offset)
         .unwrap_or_else(|| panic!("missing poll loop body {marker:?}"));
-    braced_block(source, open)
+    braced_block(&source, open)
 }
 
 fn source_between(source: &str, start: &str, end: &str) -> String {
@@ -222,6 +242,7 @@ fn assert_preflight_429_attempt_pin(source: &str) {
 }
 
 fn assert_settle_window(source: &str) {
+    let source = code_only(source);
     assert!(
         source.contains("Duration::from_millis(200)"),
         "post-ready settle window must remain 200 ms"
@@ -230,7 +251,7 @@ fn assert_settle_window(source: &str) {
         source.contains("while tokio::time::Instant::now() < settle_until"),
         "post-ready settle window must poll until its deadline"
     );
-    let settle_loop = loop_body(source, "while tokio::time::Instant::now() < settle_until");
+    let settle_loop = loop_body(&source, "while tokio::time::Instant::now() < settle_until");
     assert_eq!(
         settle_loop.matches("bot.assert_alive();").count(),
         1,
@@ -241,7 +262,7 @@ fn assert_settle_window(source: &str) {
         2,
         "settle loop must assert liveness inside and after the window"
     );
-    assert_poll_site(source, "while tokio::time::Instant::now() < settle_until");
+    assert_poll_site(&source, "while tokio::time::Instant::now() < settle_until");
 }
 
 #[test]
@@ -404,6 +425,21 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
     let moved_settle_sleep = format!("{}\n{sleep}", settle.replace(sleep, ""));
     assert!(std::panic::catch_unwind(|| {
         assert_settle_window(&moved_settle_sleep);
+    })
+    .is_err());
+
+    let commented_wait_http = wait_http.replace(sleep, &format!("// {sleep}"));
+    assert!(std::panic::catch_unwind(|| {
+        assert_poll_site(&commented_wait_http, "loop");
+    })
+    .is_err());
+
+    let commented_settle_duration = settle.replace(
+        "Duration::from_millis(200)",
+        "// Duration::from_millis(200)",
+    );
+    assert!(std::panic::catch_unwind(|| {
+        assert_settle_window(&commented_settle_duration);
     })
     .is_err());
 }
