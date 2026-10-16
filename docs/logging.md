@@ -43,7 +43,7 @@ Docker explicitly sets `LOG_FORMAT=json`; native runs also default to JSON.
 | `build_sha`, `release` | Image build identity on every line: the built/released git SHA (`BOT_BUILD_REVISION`), `"unknown"` for local builds. Reserved envelope keys, never spoofable by application fields |
 | `spans` | Root-to-leaf list of named spans and typed fields; omitted when no span applies |
 | `code`, `count`, `hot_keys`, `revision` | Numeric bounded status/counters/revisions |
-| `signal`, `missing`, `reason` | Short bounded classifications/binding names, not raw provider data |
+| `signal`, `missing`, `reason`, `message_type` | Short bounded classifications/binding names, not raw provider data |
 
 Event fields are flattened into the root. Correlation fields from spans are also
 promoted to the root: inner span wins over outer; explicit event field wins over
