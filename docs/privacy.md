@@ -177,8 +177,8 @@ answer, open the live page and quote what it says that day.
 ## Retention and explicit exceptions
 
 The retention module (`two-bot-cutover::retention`, migration `0438`)
-implements the rolling windows when invoked: raw presence/voice rows roll off
-at 30 days, the audit-log cache expires at 45 days, and user deletion requests
+applies rolling nominal windows when invoked: raw presence/voice rows use a
+30-day window, the audit-log cache uses 45 days, and user deletion requests
 complete in under 72 hours with a receipt unless a replay guard is unresolved,
 in which case the request stays pending with no receipt and is reported as
 deferred (with overdue requests older than 72 hours counted separately).
@@ -193,25 +193,53 @@ job runs on a bounded schedule: a dry run that deletes nothing unless
 purger is installed: do not claim a live 30/90-day TTL beyond the windows
 this job enforces. Every run reports per-class metrics, with partial runs
 (deferred/overdue deletions, failed guild purges) surfaced as warnings that
-stay retryable. When the database is behind the binary (an unapplied
-migration or grant), the gateway acks dispatches whose queue write hits the
-schema gap instead of crash-looping: a skipped rejoin-cancel is a no-op, but
-a skipped true guild removal is logged at error level with the guild id
+stay retryable. The existing `presence_probe`, funnel `events` and
+`operational_audit_log` cutoffs are evaluated at each successful run; scheduling
+or database failures can retain those rows beyond their nominal windows until a
+later successful run. The cadence headroom below is specific to `event_store`.
+
+When the database is behind the binary (an unapplied migration or grant), the
+gateway acks dispatches whose queue write hits the schema gap instead of
+crash-looping: a skipped rejoin-cancel is a no-op, but a skipped true guild
+removal is logged at error level with the guild id
 (`retention purge skipped; schema gap, operator replay required`) and must be
-replayed by the Operator once the migration lands, running the same insert
-the live path runs: `INSERT INTO retention_guild_purge_queue (guild_id)
-VALUES ('<guild id>') ON CONFLICT (guild_id) DO NOTHING;`
+replayed by the Operator once the migration lands, running the same insert the
+live path runs:
+
+```sql
+INSERT INTO retention_guild_purge_queue (guild_id)
+VALUES ('<guild id>') ON CONFLICT (guild_id) DO NOTHING;
+```
+
 Conditional: replay only if no `GUILD_CREATE` for that guild was acked after
 the `operator replay required` line — a later `retention lifecycle skipped;
 schema gap, nothing to cancel` warn for the same guild means it rejoined, so
-skip the insert while the guild is live (replaying it would queue a live
-guild for the next `execute` run). Run the default dry run first and confirm
-the guild is still gone before executing.
+skip the insert while the guild is live (replaying it would queue a live guild
+for the next `execute` run). Run the default dry run first and confirm the
+guild is still gone before executing.
 
-The append-only event-store capture (`event_store`, when its slices land)
-follows the same rule: its rows persist until erasure, and its TTL policy is
-an explicit placeholder awaiting a reviewed migration, not an installed
-timer. The per-user purge path is this procedure plus one manifest entry per
+The append-only event-store capture (`event_store`) carries one narrow,
+documented retention exception: the same retention job expires its raw
+presence and voice captures (`PRESENCE_UPDATE`, `VOICE_STATE_UPDATE`,
+`VOICE_SERVER_UPDATE`) at 30 days and its cached Discord audit entries
+(`GUILD_AUDIT_LOG_ENTRY_CREATE`) at 45 days, selected by `event_time`
+(never the insertion time, so a backfill or replay cannot extend old
+data's lifetime) and only in `execute` mode. For these event-store captures,
+the 15-minute supervised retention lifecycle reserves one cadence as cutoff
+headroom and selects rows at or before `next_sweep_deadline - retention_window`
+(inclusive UTC instant),
+so those captures can expire up to 15 minutes before their nominal maximum age.
+Each run commits at most one globally capped batch of 1,000 rows across all
+three capture classes, ordered by oldest `event_time`; later runs continue the
+backlog, allowing user-deletion and guild-purge work to proceed each cadence.
+Dry-run reports the full eligible capture backlog, not just one batch. If a
+batch times out, that batch rolls back; batches committed by earlier runs stay
+committed, and the remaining backlog is retried on a later cadence. This is not
+a claim that an arbitrarily large or
+continuously growing backlog can be drained within one cadence; steady-state
+expiry depends on the supervised job keeping up with arrivals. Capture writers
+stay insert-only and no other `event_store` family has an age TTL; those rows
+persist until erasure. The per-user purge path is this procedure plus one manifest entry per
 landing slice, deleting by guild plus user; rows without a user id purge per
 guild (and per message or thread where the columns exist) instead. The
 capture fence is ids, timestamps and enums only: no message bodies and no

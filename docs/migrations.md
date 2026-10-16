@@ -48,8 +48,10 @@ file). It is a deterministic squawk subset: standard library only, no
 database, no network. CI runs with `--strict`: `adding-required-field`,
 `creating-index`, `adding-check-constraint`, and `changing-column-type` findings
 fail the PR. `dropping-object` remains a warning because safe, coordinated
-removal still ends with a `DROP TABLE` or `DROP COLUMN`. Omit `--strict` for a
-local advisory preview of all five rules.
+removal still ends with a `DROP TABLE` or `DROP COLUMN`. The two documented
+transactional index exceptions below are matched by exact migration path and
+complete normalized statement. Omit `--strict` for a local advisory preview of
+all five rules.
 
 Write migrations that stay silent:
 
@@ -61,10 +63,28 @@ Write migrations that stay silent:
   `CONCURRENTLY` cannot run inside a transaction block). An index on a
   table created earlier in the same migration file targets an empty table
   and is not flagged.
+- If a concurrent index migration fails before it is recorded, the interrupted
+  build may leave an invalid index, and a successful build may be unrecorded.
+  Do not retry blindly: inspect the named index and migration ledger first. If
+  the migration is unapplied and the index exists, remove that index with a
+  standalone `DROP INDEX CONCURRENTLY IF EXISTS <schema>.<index>` command, then
+  retry through the normal migration runner. Do not bundle the drop with the
+  create in one migration query; PostgreSQL rejects concurrent index operations
+  inside a transaction block.
 - New check: `ADD CONSTRAINT ... CHECK (...) NOT VALID`, then
   `VALIDATE CONSTRAINT` separately.
 - Type change or drop: prefer an additive migration (new column, backfill,
   swap) and coordinate removal across deploys.
+
+Two exact `creating-index` findings are waived for the transactional event-store
+indexes in migrations 0444 and 0445. The waiver matches only each migration path
+and the complete normalized `CREATE INDEX` statement; any changed statement,
+additional index in either file, or index in another migration remains subject to
+strict lint. This exception is documented beside the checker configuration and
+is grounded in the observed CI deadlock: `CREATE INDEX CONCURRENTLY` waits on
+open snapshots while parallel disposable-database test migrators wait on SQLx's
+advisory lock, producing PostgreSQL `40P01`. It does not relax any other
+migration check or the required lint gate.
 
 The checker discovers `crates/*/migrations/*.sql` dynamically with
 `--migration-glob` and `--exclude` overrides and no hardcoded crate list,

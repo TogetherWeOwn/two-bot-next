@@ -40,7 +40,8 @@ the step itself.
   `adding-check-constraint`, and `changing-column-type` findings fail the PR
   under `--strict`; `dropping-object` remains advisory because coordinated
   removal still requires a final `DROP TABLE` or `DROP COLUMN`. Broken tooling
-  fails so blindness cannot hide; see `docs/migrations.md`.
+  fails so blindness cannot hide. Two exact transactional event-store indexes
+  have documented statement-specific waivers; see `docs/migrations.md`.
 - Voice synthetic required (HARD): `voice-synthetic.yml` fails when the
   staging test-bot token is missing unless explicitly opted out; see
   `docs/voice-synthetic.md`.
