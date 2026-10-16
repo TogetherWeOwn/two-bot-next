@@ -1907,6 +1907,22 @@ mod tests {
     }
 
     #[test]
+    fn voice_join_bucket_labels_match_the_pinned_contract() {
+        let metrics = Metrics::default();
+        metrics.voice_join_to_move(Duration::from_millis(1));
+        let text = metrics.render(None);
+        let rendered: Vec<&str> = text
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("two_bot_voice_join_to_move_seconds_bucket{le=\"")?
+                    .split('"')
+                    .next()
+            })
+            .collect();
+        assert_eq!(rendered, VOICE_JOIN_TO_MOVE_BUCKET_LE);
+    }
+
+    #[test]
     fn voice_join_occupancy_buckets_cap_without_new_series() {
         // Seeding TEST (occupancy-to-join curve): one counter per occupancy
         // bucket, capped at 7+ so cardinality stays fixed. No channel, member
