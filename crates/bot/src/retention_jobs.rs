@@ -16,6 +16,8 @@ use std::{sync::Arc, time::Duration};
 use sqlx::PgPool;
 use two_bot_cutover::retention::{run_retention, RetentionMode, RETENTION_CADENCE_SECONDS};
 
+use crate::backfill_retention_chains::render_retention_failure;
+use crate::gateway_failure::FailureClass;
 use crate::jobs::{self, ErrorClass, Job};
 
 /// Process-environment key selecting the retention mode. Exact,
@@ -89,9 +91,20 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
         action: Arc::new(move || {
             let pool = pool.clone();
             Box::pin(async move {
-                let report = run_retention(&pool, mode)
-                    .await
-                    .map_err(|_| ErrorClass::Database)?;
+                let report = run_retention(&pool, mode).await.map_err(|err| {
+                    let step = err.step();
+                    let failure =
+                        render_retention_failure(FailureClass::StoreUnavailable, step, err.cause());
+                    tracing::warn!(
+                        message = "retention_run_failed",
+                        mode = ?mode,
+                        class = FailureClass::StoreUnavailable.as_str(),
+                        step = step.as_str(),
+                        failure = %failure,
+                        "retention run aborted on a database error, retryable",
+                    );
+                    ErrorClass::Database
+                })?;
                 let partial = report.guild_purges_failed > 0
                     || report.guild_purges_deferred > 0
                     || report.deletions_deferred > 0

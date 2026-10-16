@@ -284,11 +284,16 @@ impl EventMutateEffect for MockEventMutate {
 #[derive(Default)]
 struct MockModeration {
     calls: AtomicUsize,
+    request_ids: std::sync::Mutex<Vec<String>>,
 }
 
 impl MockModeration {
     fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    fn request_ids(&self) -> Vec<String> {
+        self.request_ids.lock().unwrap().clone()
     }
 }
 
@@ -296,12 +301,13 @@ impl ModerationEffect for MockModeration {
     fn execute_moderation<'a>(
         &'a self,
         request: &'a InternalMemberRequest,
-        _: &'a str,
+        request_id: &'a str,
         _: &'a str,
         _: i64,
     ) -> BoxFuture<'a, Result<TerminalResponse, ActionError>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.request_ids.lock().unwrap().push(request_id.to_owned());
             let target = DiscordId::new(request.target_id()).expect("validated target");
             Ok(TerminalResponse::Success {
                 resource_id: Some(target),
@@ -2162,6 +2168,35 @@ async fn moderation_success_replays_without_second_effect_but_changed_bytes_conf
         5,
         "one effect per verb, replays effect-free"
     );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn moderation_ledger_ids_are_not_caller_request_ids() {
+    let Some(db) = database().await else { return };
+    let _flag = MODERATION_FLAG_LOCK.lock().await;
+    set_moderation_flags(true);
+    let moderation = Arc::new(MockModeration::default());
+    let app = moderation_app(db.pool().clone(), moderation.clone());
+    let caller_id = two_bot_core::internal_actions::new_request_id(now_ms(), &[7; 16]);
+
+    for intent in ["intent-warn-one", "intent-warn-two"] {
+        let mut request = signed(&moderation_payload("moderation.warn"), "old", intent);
+        request
+            .headers_mut()
+            .insert("x-request-id", HeaderValue::from_str(&caller_id).unwrap());
+        let (status, _, body) = answer(app.clone(), request).await;
+        assert_eq!(status, StatusCode::OK, "{intent}: {body}");
+        assert_eq!(body["request_id"], caller_id);
+    }
+
+    set_moderation_flags(false);
+    assert_eq!(moderation.calls(), 2);
+    let ledger_ids = moderation.request_ids();
+    assert_eq!(ledger_ids.len(), 2);
+    assert_ne!(ledger_ids[0], caller_id);
+    assert_ne!(ledger_ids[1], caller_id);
+    assert_ne!(ledger_ids[0], ledger_ids[1]);
     db.close().await.unwrap();
 }
 

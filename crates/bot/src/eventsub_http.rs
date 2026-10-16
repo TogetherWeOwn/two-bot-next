@@ -27,6 +27,7 @@ use axum::{
 };
 use serde_json::json;
 use tokio::{net::TcpListener, sync::Semaphore};
+use tracing::Instrument;
 use two_bot_core::{
     eventsub_receiver_config::EventsubReceiverConfig,
     twitch_eventsub::{classify, verify_delivery, Delivery, DeliveryHeaders, EventSubError},
@@ -90,10 +91,6 @@ fn router(state: Arc<ReceiverState>) -> Router {
         .with_state(state)
 }
 
-fn request_id() -> String {
-    two_bot_core::internal_actions::new_request_id(now_ms_u64(), &rand::random())
-}
-
 fn now_ms_u64() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -151,31 +148,43 @@ fn ack(id: &str) -> Response {
     (StatusCode::OK, Json(json!({"ok": true, "request_id": id}))).into_response()
 }
 
-async fn not_found(State(state): State<Arc<ReceiverState>>) -> Response {
-    // Fallback for any non-callback path or method: no header is trusted.
-    refuse(
-        &state,
-        StatusCode::NOT_FOUND,
-        "not_found",
-        false,
-        &request_id(),
-        "unknown",
-    )
+async fn not_found(State(state): State<Arc<ReceiverState>>, request: Request) -> Response {
+    // Honor the Worker's `x-request-id` when it has a generated shape, so one
+    // id joins the Worker, Durable Object and container logs.
+    let id = crate::logging::incoming_request_id(request.headers());
+    let span = crate::logging::request_span(&id);
+    async move {
+        refuse(
+            &state,
+            StatusCode::NOT_FOUND,
+            "not_found",
+            false,
+            &id,
+            "unknown",
+        )
+    }
+    .instrument(span)
+    .await
 }
 
 async fn handle(State(state): State<Arc<ReceiverState>>, request: Request) -> Response {
-    let id = request_id();
-    let Ok(_permit) = Arc::clone(&state.capacity).try_acquire_owned() else {
-        return refuse(
-            &state,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "busy",
-            true,
-            &id,
-            "unknown",
-        );
-    };
-    receive_with_timeout(&state, &id, receive(&state, request, &id)).await
+    let id = crate::logging::incoming_request_id(request.headers());
+    let span = crate::logging::request_span(&id);
+    async move {
+        let Ok(_permit) = Arc::clone(&state.capacity).try_acquire_owned() else {
+            return refuse(
+                &state,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "busy",
+                true,
+                &id,
+                "unknown",
+            );
+        };
+        receive_with_timeout(&state, &id, receive(&state, request, &id)).await
+    }
+    .instrument(span)
+    .await
 }
 
 async fn receive_with_timeout(
@@ -931,6 +940,101 @@ mod tests {
         assert!(!logs.contains("has space"));
         assert!(!logs.contains("synthetic-delivery-0014"));
         assert!(!logs.contains("https://example.com/hooks/twitch"));
+    }
+
+    /// Child: the real redaction probe, alone in its own process (see the
+    /// parent below). Scoped JSON captures lose events when sibling tests
+    /// share the binary (tracing-core resolves a callsite's first
+    /// registration against the registering thread's dispatcher), so the log
+    /// assertions run here and the parent only relays the exit status.
+    ///
+    /// Redaction proof for the receiver path: secrets riding the query
+    /// string, authorization/cookie headers or the body never reach the JSON
+    /// logs (which carry only scalar event/status/error_class plus the
+    /// correlation id), while the honored `x-request-id` is both logged and
+    /// echoed in the envelope — the join a staging curl can verify per hop.
+    #[tokio::test]
+    async fn refusal_logs_carry_request_id_child() {
+        if std::env::var_os("EVENTSUB_REDACTION_PROBE").is_none() {
+            return;
+        }
+        use tracing::instrument::WithSubscriber;
+
+        let sent = two_bot_core::internal_actions::new_request_id(1_720_000_000_000, &[9u8; 16]);
+        let capture = crate::logging::Capture::default();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/hooks/twitch?token=synthetic-query-secret")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer synthetic-auth-secret")
+            .header("cookie", "session=synthetic-cookie-secret")
+            .header("x-request-id", &sent)
+            .header("twitch-eventsub-message-id", "synthetic-delivery-9001")
+            .header("twitch-eventsub-message-timestamp", fresh_timestamp())
+            .header(
+                "twitch-eventsub-message-signature",
+                "sha256=0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .header("twitch-eventsub-message-type", "notification")
+            .body(Body::from(challenge_body()))
+            .unwrap();
+        let response = app()
+            .oneshot(request)
+            .with_subscriber(crate::logging::capture_subscriber(capture.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["request_id"], sent);
+        let text = capture.text();
+        assert!(
+            text.contains(sent.as_str()),
+            "honored id missing from logs: {text}"
+        );
+        for secret in [
+            "synthetic-query-secret",
+            "synthetic-auth-secret",
+            "synthetic-cookie-secret",
+            "synthetic-challenge-0001",
+        ] {
+            assert!(!text.contains(secret), "sensitive value reached logs");
+        }
+    }
+
+    /// Parent: re-run only the probe above in an env-cleared child. A
+    /// separate process avoids process-global tracing-callsite races with
+    /// the parallel suite.
+    #[test]
+    fn refusal_logs_carry_request_id_without_secrets() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .args([
+                "eventsub_http::tests::refusal_logs_carry_request_id_child",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("EVENTSUB_REDACTION_PROBE", "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "isolated redaction probe failed: {stderr}"
+        );
+        assert!(stdout.contains("running 1 test"));
+        assert!(stdout.contains("refusal_logs_carry_request_id_child ... ok"));
+        for marker in [
+            "synthetic-query-secret",
+            "synthetic-auth-secret",
+            "synthetic-cookie-secret",
+            "synthetic-challenge-0001",
+        ] {
+            assert!(!stdout.contains(marker) && !stderr.contains(marker));
+        }
     }
 
     #[tokio::test]

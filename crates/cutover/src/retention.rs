@@ -74,6 +74,14 @@ use sqlx::PgPool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::{Duration, OffsetDateTime};
+use two_bot_core::error_chain::{
+    db_cause, render_retention_failure, RetentionStep, STORE_UNAVAILABLE_CLASS,
+};
+
+// Store class token for retention failure lines: the shared
+// `STORE_UNAVAILABLE_CLASS` from core, so this side cannot drift from the
+// bot gateway's `FailureClass::StoreUnavailable` token (equality is pinned
+// by the bot `backfill_retention_chains` test).
 
 /// Raw presence/voice rows older than this roll off.
 pub const PRESENCE_RAW_RETENTION_DAYS: i32 = 30;
@@ -223,13 +231,56 @@ fn next_request_id() -> String {
     format!("del-{nanos:x}-{seq:x}")
 }
 
+/// Render a deletion-intake failure line for the warn sites below (user-
+/// deletion deferrals, schema-gap purges, replay-guard deferrals, purge
+/// failures). One helper owns the step attribution so it is pinned in one
+/// place: `deletion_intake_failure_pins_its_step` fails if any site ever
+/// renders a different step, where the substring-only wiring pin would stay
+/// green.
+fn deletion_intake_failure(chain: &str) -> String {
+    render_retention_failure(
+        STORE_UNAVAILABLE_CLASS,
+        RetentionStep::DeletionIntake,
+        chain,
+    )
+}
+
+/// A retention run failure with its stage and a fixed, safe cause token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionFailure {
+    step: RetentionStep,
+    cause: &'static str,
+}
+
+impl RetentionFailure {
+    fn from_sqlx(step: RetentionStep, error: &sqlx::Error) -> Self {
+        Self {
+            step,
+            cause: db_cause(error),
+        }
+    }
+
+    /// Stage active when the database operation failed.
+    #[must_use]
+    pub const fn step(self) -> RetentionStep {
+        self.step
+    }
+
+    /// Fixed database-cause token; never includes database error text.
+    #[must_use]
+    pub const fn cause(self) -> &'static str {
+        self.cause
+    }
+}
+
 /// Run the retention job: apply rolling-window deletes, pending user-deletion
 /// completion, and the guild-purge drain, then attempt one globally capped raw
 /// event-store batch. Dry run reports the full raw-expiry backlog and changes
 /// nothing. Execute runs raw expiry only after core retention succeeds. The core
 /// transaction commits separately from the raw batch; raw-stage failure is
-/// logged and returned as a database error so the supervisor retries next
-/// cadence, while already committed core work remains complete. User-deletion
+/// logged and returned as a `RetentionFailure` (step plus fixed cause token)
+/// for the scheduler to map to `ErrorClass::Database` and retry next cadence,
+/// while already committed core work remains complete. User-deletion
 /// and queue writes happen in ONE transaction with the same lock/timeout
 /// discipline as `erase_member`; each pending deletion
 /// runs in its own savepoint so one guard or schema-coverage refusal leaves
@@ -250,11 +301,25 @@ fn next_request_id() -> String {
 pub async fn run_retention(
     pool: &PgPool,
     mode: RetentionMode,
+) -> Result<RetentionReport, RetentionFailure> {
+    let mut step = match mode {
+        RetentionMode::DryRun => RetentionStep::DryRun,
+        RetentionMode::Execute => RetentionStep::Expiry,
+    };
+    run_retention_inner(pool, mode, &mut step)
+        .await
+        .map_err(|error| RetentionFailure::from_sqlx(step, &error))
+}
+
+async fn run_retention_inner(
+    pool: &PgPool,
+    mode: RetentionMode,
+    active_step: &mut RetentionStep,
 ) -> Result<RetentionReport, sqlx::Error> {
     let started = std::time::Instant::now();
     let at = OffsetDateTime::now_utc();
     let next_sweep_deadline = at + Duration::seconds(RETENTION_CADENCE_SECONDS as i64);
-    let core = run_retention_core(pool, mode);
+    let core = run_retention_core(pool, mode, active_step);
     let raw_expiry = async {
         if mode == RetentionMode::DryRun {
             count_raw_expiry_candidates(pool, next_sweep_deadline).await
@@ -289,11 +354,18 @@ pub async fn run_retention(
             report.audit_cache_deleted += raw_expiry.audit_cache_deleted;
         }
         Err(error) => {
+            if mode == RetentionMode::Execute {
+                *active_step = RetentionStep::Expiry;
+            }
+            let step = *active_step;
+            let failure = render_retention_failure(STORE_UNAVAILABLE_CLASS, step, db_cause(&error));
             tracing::warn!(
-                message = "retention_run",
+                message = "retention_raw_expiry_failed",
                 mode = ?mode,
                 raw_expiry_failed = true,
-                error = %format!("{error:?}"),
+                class = STORE_UNAVAILABLE_CLASS,
+                step = step.as_str(),
+                failure = %failure,
                 presence_raw_deleted = report.presence_raw_deleted,
                 voice_raw_deleted = report.voice_raw_deleted,
                 audit_cache_deleted = report.audit_cache_deleted,
@@ -331,11 +403,13 @@ where
 async fn run_retention_core(
     pool: &PgPool,
     mode: RetentionMode,
+    active_step: &mut RetentionStep,
 ) -> Result<RetentionReport, sqlx::Error> {
     let started = std::time::Instant::now();
     let mut tx = pool.begin().await?;
     let report = match mode {
         RetentionMode::DryRun => {
+            *active_step = RetentionStep::DryRun;
             sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
                 .execute(&mut *tx)
                 .await?;
@@ -349,10 +423,10 @@ async fn run_retention_core(
             .await?;
             let overdue = count_overdue_deletions(&mut tx).await?;
             let pendings: Vec<(String, String)> = sqlx::query_as(
-                "SELECT guild_id, user_id FROM retention_deletion_requests WHERE status = 'pending'",
-            )
-            .fetch_all(&mut *tx)
-            .await?;
+            "SELECT guild_id, user_id FROM retention_deletion_requests WHERE status = 'pending'",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
             // A schema-coverage refusal defers every pending request (the
             // live drain rolls back only that request's savepoint), so the
             // dry run mirrors it: with gaps, all pendings are deferred.
@@ -418,6 +492,7 @@ async fn run_retention_core(
             }
         }
         RetentionMode::Execute => {
+            *active_step = RetentionStep::Expiry;
             sqlx::query("SET LOCAL lock_timeout = '5s'")
                 .execute(&mut *tx)
                 .await?;
@@ -446,12 +521,11 @@ async fn run_retention_core(
             sqlx::query(sqlx::AssertSqlSafe(lock_sql))
                 .execute(&mut *tx)
                 .await?;
-            let presence =
-                sqlx::query("DELETE FROM presence_probe WHERE observed_at < to_char(now() - make_interval(days => $1), 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')")
-                    .bind(PRESENCE_RAW_RETENTION_DAYS)
-                    .execute(&mut *tx)
-                    .await?
-                    .rows_affected();
+            let presence = sqlx::query("DELETE FROM presence_probe WHERE observed_at < to_char(now() - make_interval(days => $1), 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')")
+                .bind(PRESENCE_RAW_RETENTION_DAYS)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
             let voice = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM events WHERE event_type IN ({FUNNEL_VOICE_EVENT_TYPES}) AND occurred_at < now() - make_interval(days => $1)"
             )))
@@ -460,17 +534,18 @@ async fn run_retention_core(
             .await?
             .rows_affected();
             let audit = sqlx::query(
-                "DELETE FROM operational_audit_log WHERE occurred_at < now() - make_interval(days => $1)",
-            )
-            .bind(AUDIT_CACHE_RETENTION_DAYS)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+            "DELETE FROM operational_audit_log WHERE occurred_at < now() - make_interval(days => $1)",
+        )
+        .bind(AUDIT_CACHE_RETENTION_DAYS)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
             let overdue = count_overdue_deletions(&mut tx).await?;
             // Schema gaps are computed once per run, before either drain. A
             // gap means no purge or deletion can certify completeness, so
             // every pending request defers and every queued guild stays
             // queued; the exact gaps ride the warn logs for the code fix.
+            *active_step = RetentionStep::DeletionIntake;
             let schema_gaps = crate::member_erasure::schema_gaps(&mut tx).await?;
             let schema_gapped = !schema_gaps.is_empty();
             // Pending deletions drain BEFORE guild purges so a departed
@@ -479,10 +554,10 @@ async fn run_retention_core(
             // schema-coverage refusal rolls back only that request, leaving
             // it pending, while other failures abort the run.
             let pendings: Vec<(String, String, String)> = sqlx::query_as(
-                "SELECT request_id, guild_id, user_id FROM retention_deletion_requests WHERE status = 'pending'",
-            )
-            .fetch_all(&mut *tx)
-            .await?;
+            "SELECT request_id, guild_id, user_id FROM retention_deletion_requests WHERE status = 'pending'",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
             let mut completed = 0u64;
             let mut deferred = 0u64;
             let mut gap_deferred = 0u64;
@@ -527,20 +602,25 @@ async fn run_retention_core(
                 }
             }
             if !deferred_ids.is_empty() {
+                let failure =
+                    deletion_intake_failure("replay guard or schema gap deferred the request");
                 tracing::warn!(
                     deferred = deferred,
                     schema_gap_deferrals = gap_deferred,
                     overdue = overdue,
                     requests = ?deferred_ids,
                     schema_gaps = ?schema_gaps,
+                    class = STORE_UNAVAILABLE_CLASS,
+                    step = RetentionStep::DeletionIntake.as_str(),
+                    failure = %failure,
                     "retention user deletions deferred by unresolved replay guard or schema coverage"
                 );
             }
             let guilds: Vec<(String, i64)> = sqlx::query_as(
-                "SELECT guild_id, (EXTRACT(EPOCH FROM (clock_timestamp() - enqueued_at)))::BIGINT FROM retention_guild_purge_queue",
-            )
-            .fetch_all(&mut *tx)
-            .await?;
+            "SELECT guild_id, (EXTRACT(EPOCH FROM (clock_timestamp() - enqueued_at)))::BIGINT FROM retention_guild_purge_queue",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
             let mut guild_rows = 0u64;
             let mut guild_failed = 0u64;
             let mut guild_deferred = 0u64;
@@ -553,9 +633,13 @@ async fn run_retention_core(
             if schema_gapped {
                 guild_failed = guilds.len() as u64;
                 if !guilds.is_empty() {
+                    let failure = deletion_intake_failure("schema gap deferred the purge");
                     tracing::warn!(
                         guilds = ?guilds,
                         schema_gaps = ?schema_gaps,
+                        class = STORE_UNAVAILABLE_CLASS,
+                        step = RetentionStep::DeletionIntake.as_str(),
+                        failure = %failure,
                         "retention guild purges deferred by schema coverage, kept queued"
                     );
                 }
@@ -585,16 +669,24 @@ async fn run_retention_core(
                                 guild_deferred += 1;
                                 guild_deferred_oldest =
                                     guild_deferred_oldest.max((*waited_secs).max(0) as u64);
+                                let failure =
+                                    deletion_intake_failure("replay guard deferred the purge");
                                 tracing::warn!(
                                     guild_id = %guild,
                                     waited_secs = (*waited_secs).max(0),
+                                    class = STORE_UNAVAILABLE_CLASS,
+                                    step = RetentionStep::DeletionIntake.as_str(),
+                                    failure = %failure,
                                     "retention guild purge deferred by unresolved replay guard, kept queued"
                                 );
                             } else {
                                 guild_failed += 1;
+                                let failure = deletion_intake_failure(db_cause(&err));
                                 tracing::warn!(
                                     guild_id = %guild,
-                                    error = %format!("{err:?}"),
+                                    class = STORE_UNAVAILABLE_CLASS,
+                                    step = RetentionStep::DeletionIntake.as_str(),
+                                    failure = %failure,
                                     "retention guild purge failed, kept queued"
                                 );
                             }
@@ -1552,5 +1644,47 @@ mod retention_stage_order_tests {
         assert_eq!(report.deletions_completed, 2);
         assert!(matches!(raw_result, Err(sqlx::Error::RowNotFound)));
         assert!(core_ran.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn run_abort_step_follows_mode() {
+        let pool = PgPool::connect_lazy("postgres://unused:unused@localhost/unused").unwrap();
+        pool.close().await;
+
+        for (mode, expected_step) in [
+            (RetentionMode::DryRun, RetentionStep::DryRun),
+            (RetentionMode::Execute, RetentionStep::Expiry),
+        ] {
+            let failure = run_retention(&pool, mode).await.unwrap_err();
+            assert_eq!(failure.step(), expected_step);
+            assert_eq!(failure.cause(), "pool_closed");
+        }
+    }
+
+    #[test]
+    fn deletion_intake_failure_pins_its_step() {
+        // Every warn site renders through `deletion_intake_failure`, so this
+        // pins all four at once: a mutant swapping in any other step fails
+        // here, where the substring-only wiring pin would stay green.
+        let line = deletion_intake_failure("pool_timeout");
+        assert!(
+            line.contains("step=deletion_intake"),
+            "deletion-intake warns must attribute DeletionIntake: {line:?}"
+        );
+        for other in ["step=expiry", "step=dry_run"] {
+            assert!(
+                !line.contains(other),
+                "deletion-intake warns must not attribute {other}: {line:?}"
+            );
+        }
+        assert!(
+            line.contains(&format!("class={STORE_UNAVAILABLE_CLASS} ")),
+            "deletion-intake warns must carry the shared store class: {line:?}"
+        );
     }
 }
