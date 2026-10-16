@@ -17,12 +17,22 @@ distroless-bound gates in the same PR: `dockerfile_parity_errors` in
 `scripts/test-supply-chain.py` for the base-image pins and the runtime
 assertions (no RUN, no apt-get/useradd//var/lib/dpkg, USER 65532),
 `scripts/runtime-image-evidence.py` for the status.d layout (it rejects
-var/lib/dpkg/status), and `scripts/vulnerability-preflight.py` for DISTRO. Keep
-the Rust version aligned with `rust-toolchain.toml`; do not mix trixie-built
-binaries with bookworm runtime libraries. Require the parity guard, the sbom
-supply-chain lane, image build/smoke, and staging handshake to pass before
-calling the rollback complete. SBOMs regenerate per head through the
-supply-chain lane.
+var/lib/dpkg/status), and `scripts/vulnerability-preflight.py` for DISTRO. A
+Bookworm rollback also requires a fresh CISO vulnerability disposition for the
+measured HIGH/CRITICAL tuples: the prior 17-tuple decision expired on
+2026-10-08 and does not carry over. Do not restore exceptions or add
+`.trivyignore.yaml` entries until that disposition is recorded; then encode
+only its approved, scoped, expiring exceptions there. Keep
+`scripts/vulnerability-preflight.py` as a non-accepting tuple/provenance check:
+it must bind the scan to the Bookworm distro and continue to report findings
+as `not-accepted`; do not add exception-acceptance logic to the preflight.
+Without a current disposition, keep the SBOM gate red and fix findings by
+updating the base digest. Keep the Rust version aligned with
+`rust-toolchain.toml`; do not mix trixie-built binaries with bookworm runtime
+libraries. Require the parity guard, the sbom supply-chain lane, image
+build/smoke, staging handshake, and the current CISO disposition for any
+accepted tuples to pass before calling the rollback complete. SBOMs regenerate
+per head through the supply-chain lane.
 
 ## Verdict
 
@@ -78,7 +88,7 @@ Both images fit the smoke budgets (112 MiB image, 11 MiB binary).
 
 | Image | Finding |
 |---|---|
-| `debian:bookworm-slim` | 52 HIGH/CRITICAL (16 under CISO conditional acceptance expiring 2026-10-08, 36 unaccepted; gate red) — run `36942267564` (scan job failed, suppression 0) |
+| `debian:bookworm-slim` | 52 HIGH/CRITICAL (16 conditional tuples from the original 17-tuple CISO disposition; one CVE-2026-78408 mount tuple was later retired by removal; the remaining conditions expired 2026-10-08; 36 unaccepted; gate red) — run `36942267564` (scan job failed, suppression 0) |
 | `debian:trixie-slim` Step A | left HIGH/CRITICAL rows with no CISO disposition, superseded by the pre-approved Step B ([TOG-11974](/TOG/issues/TOG-11974) CEO decision) — exact counts not re-verified from reachable logs for this card |
 | `cc-debian13:nonroot` trial | **0 HIGH/CRITICAL** in both Rust-workspace and image gates; 14 deb packages; preflight bound with 0 suppressed — run `36948616604` |
 
