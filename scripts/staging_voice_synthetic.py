@@ -700,8 +700,10 @@ def run_live(args, token):
             # only for real users, so a bot token cannot invoke the slash
             # commands themselves). Each write is verified by a read-back and
             # restored, so a green run leaves the room as the bot made it. A
-            # failed step records a note (its check FAILs); a 403 or 429
-            # records a SKIP reason instead, like the rename case.
+            # failed step records a note (its check FAILs). A limit 403 FAILs
+            # (the owner Manage Channels grant was lost after creation); a
+            # limit/privacy 429 and a privacy 403 (its one-time Manage Roles
+            # grant is still pending) record SKIP reasons instead.
             obs["limit_forbidden"] = obs["limit_rate_limited"] = False
             obs["limit_set_ok"] = obs["limit_restored"] = False
             try:
