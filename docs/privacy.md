@@ -198,6 +198,26 @@ stay retryable. The existing `presence_probe`, funnel `events` and
 or database failures can retain those rows beyond their nominal windows until a
 later successful run. The cadence headroom below is specific to `event_store`.
 
+When the database is behind the binary (an unapplied migration or grant), the
+gateway acks dispatches whose queue write hits the schema gap instead of
+crash-looping: a skipped rejoin-cancel is a no-op, but a skipped true guild
+removal is logged at error level with the guild id
+(`retention purge skipped; schema gap, operator replay required`) and must be
+replayed by the Operator once the migration lands, running the same insert the
+live path runs:
+
+```sql
+INSERT INTO retention_guild_purge_queue (guild_id)
+VALUES ('<guild id>') ON CONFLICT (guild_id) DO NOTHING;
+```
+
+Conditional: replay only if no `GUILD_CREATE` for that guild was acked after
+the `operator replay required` line — a later `retention lifecycle skipped;
+schema gap, nothing to cancel` warn for the same guild means it rejoined, so
+skip the insert while the guild is live (replaying it would queue a live guild
+for the next `execute` run). Run the default dry run first and confirm the
+guild is still gone before executing.
+
 The append-only event-store capture (`event_store`) carries one narrow,
 documented retention exception: the same retention job expires its raw
 presence and voice captures (`PRESENCE_UPDATE`, `VOICE_STATE_UPDATE`,

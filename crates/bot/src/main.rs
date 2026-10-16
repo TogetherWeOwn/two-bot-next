@@ -397,6 +397,7 @@ async fn run(cli_args: &[String]) {
                     let db = store.ok_or_else(|| {
                         step_failure(
                             FailureClass::StoreUnavailable,
+                            "store_unavailable",
                             sqlx::Error::InvalidArgument(
                                 "DATABASE_URL required for gateway checkpoint".into(),
                             ),
@@ -409,7 +410,11 @@ async fn run(cli_args: &[String]) {
                         two_bot_cutover::connect(&url, gateway::GATEWAY_POOL_MAX, true)
                             .await
                             .map_err(|error| {
-                                step_failure(FailureClass::GatewayPoolConnectFailed, error)
+                                step_failure(
+                                    FailureClass::GatewayPoolConnectFailed,
+                                    "gateway_pool_connect",
+                                    error,
+                                )
                             })?;
                     let pool = db.pool().clone();
                     let store = two_bot_cutover::gateway_session::GatewaySessionStore::new(
@@ -417,12 +422,13 @@ async fn run(cli_args: &[String]) {
                         guild_id.to_string(),
                         0,
                     );
-                    let saved = gateway::load_boot_session(&store)
-                        .await
-                        .map_err(|error| step_failure(FailureClass::CheckpointLoadFailed, error))?;
+                    let saved = gateway::load_boot_session(&store).await.map_err(|error| {
+                        step_failure(FailureClass::CheckpointLoadFailed, "checkpoint_load", error)
+                    })?;
                     let gates = two_bot_core::OnboardingGates::from_env().map_err(|_| {
                         step_failure(
                             FailureClass::OnboardingGatesInvalid,
+                            "onboarding_gates",
                             sqlx::Error::InvalidArgument("invalid onboarding gates".into()),
                         )
                     })?;
@@ -458,13 +464,21 @@ async fn run(cli_args: &[String]) {
                             &std::env::vars().collect(),
                         )
                         .map_err(|error| {
-                            step_failure(FailureClass::CustomCommandsInitFailed, error)
+                            step_failure(
+                                FailureClass::CustomCommandsInitFailed,
+                                "custom_commands_config",
+                                error,
+                            )
                         })?;
                         runtime
                             .initialize_custom_commands(config)
                             .await
                             .map_err(|error| {
-                                step_failure(FailureClass::CustomCommandsInitFailed, error)
+                                step_failure(
+                                    FailureClass::CustomCommandsInitFailed,
+                                    "custom_commands_init",
+                                    error,
+                                )
                             })?;
                     }
                     // Onboarding renders through that same executor: one shared
@@ -483,6 +497,7 @@ async fn run(cli_args: &[String]) {
                             .map_err(|_| {
                                 step_failure(
                                     FailureClass::OnboardingInitFailed,
+                                    "onboarding_init",
                                     sqlx::Error::InvalidArgument(
                                         "onboarding initialization failed".into(),
                                     ),
@@ -499,7 +514,11 @@ async fn run(cli_args: &[String]) {
                         build_persistent_pipeline(&store, guild_id, token.clone(), leveling)
                             .await
                             .map_err(|error| {
-                                step_failure(FailureClass::MilestonesLoadFailed, error)
+                                step_failure(
+                                    FailureClass::MilestonesLoadFailed,
+                                    "milestones_load",
+                                    error,
+                                )
                             })?,
                     );
                     // Community voice + message capture: arm the Postgres
@@ -522,6 +541,7 @@ async fn run(cli_args: &[String]) {
                         .map_err(|_| {
                             step_failure(
                                 FailureClass::RaidExecutorFailed,
+                                "raid_executor",
                                 sqlx::Error::InvalidArgument("raid REST executor failed".into()),
                             )
                         })?,
@@ -563,6 +583,7 @@ async fn run(cli_args: &[String]) {
                             tracing::error!(reason, "automod configuration rejected");
                             step_failure(
                                 FailureClass::AutomodConfigInvalid,
+                                "automod_config",
                                 sqlx::Error::InvalidArgument(reason.into()),
                             )
                         })?
@@ -582,6 +603,7 @@ async fn run(cli_args: &[String]) {
                                 .map_err(|_| {
                                     step_failure(
                                         FailureClass::AutomodExecutorFailed,
+                                        "automod_executor",
                                         sqlx::Error::InvalidArgument(
                                             "automod REST executor failed".into(),
                                         ),
@@ -634,7 +656,9 @@ async fn run(cli_args: &[String]) {
                         },
                     )
                     .await
-                    .map_err(|error| step_failure(FailureClass::GatewayRuntimeFailed, error))
+                    .map_err(|error| {
+                        step_failure(FailureClass::GatewayRuntimeFailed, "gateway_run", error)
+                    })
                 })
                 .catch_unwind()
                 .await;
@@ -643,6 +667,7 @@ async fn run(cli_args: &[String]) {
                 Ok(Err(failed)) => Some(failed),
                 Err(_) => Some(step_failure(
                     FailureClass::GatewayTaskPanicked,
+                    "gateway_panic",
                     sqlx::Error::InvalidArgument("gateway task panicked".into()),
                 )),
             };
@@ -653,14 +678,8 @@ async fn run(cli_args: &[String]) {
                     // keepalive scrape sees the checkpoint counter; startup
                     // failures keep the short 15 s linger.
                     let linger = shutdown::failure_linger(failed.class);
-                    publish_gateway_failure(
-                        &state,
-                        &failure_slot,
-                        failed.class,
-                        linger_stop,
-                        linger,
-                    )
-                    .await;
+                    publish_gateway_failure(&state, &failure_slot, &failed, linger_stop, linger)
+                        .await;
                     Err(failed.error)
                 }
             }
@@ -780,19 +799,28 @@ fn internal_receiver_prerequisites(config: &Config) -> Result<&str, &'static str
 /// `linger` before the task returns (and the supervisor drains and exits). The
 /// Worker's 60 s keepalive and the rollout gate's 5 s poll can only report the
 /// class while the listener is still up. A shutdown request ends the linger at
-/// once, so SIGTERM never waits on it. Only the fixed class is logged or
-/// stored: SQLx errors can carry a connection URL.
+/// once, so SIGTERM never waits on it. The log line carries the failing step,
+/// the sanitized reason and the SQLSTATE alongside the fixed class (TOG-25067:
+/// the class alone could not explain the prod crash loop); the raw SQLx error
+/// is never formatted — it can carry a connection URL — and `/readyz` still
+/// serves only the fixed class.
 async fn publish_gateway_failure(
     state: &RwLock<GatewayState>,
     slot: &FailureSlot,
-    class: FailureClass,
+    failed: &gateway_failure::StepFailure,
     stopping: tokio::sync::watch::Receiver<bool>,
     linger: std::time::Duration,
 ) {
+    let class = failed.class;
+    let reason = db_log::failure_reason(&failed.error);
+    let code = db_log::error_code(&failed.error);
     tracing::error!(
         msg = "gateway_failed",
         startup_phase = gateway_failure::FailurePhase::DurableGateway.as_str(),
         error_class = class.as_str(),
+        failed_step = failed.step,
+        reason = %reason,
+        error_code = code.as_deref().unwrap_or("none"),
         "durable gateway failed; checkpoint unchanged, readiness unavailable"
     );
     slot.record(GatewayFailure::durable_gateway(class));

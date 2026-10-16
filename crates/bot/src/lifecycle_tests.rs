@@ -662,10 +662,15 @@ async fn failure_class_is_served_on_readyz_for_the_whole_linger_then_the_task_en
     let mut publish = tokio::spawn({
         let state = state.clone();
         async move {
+            let failed = crate::gateway_failure::step_failure(
+                FailureClass::CheckpointLoadFailed,
+                "checkpoint_load",
+                sqlx::Error::InvalidArgument("lifecycle test".into()),
+            );
             crate::publish_gateway_failure(
                 &state.gateway,
                 &state.failure,
-                FailureClass::CheckpointLoadFailed,
+                &failed,
                 stopping,
                 linger,
             )
@@ -701,10 +706,15 @@ async fn shutdown_cuts_the_failure_linger_short() {
     let publish = tokio::spawn({
         let state = state.clone();
         async move {
+            let failed = crate::gateway_failure::step_failure(
+                FailureClass::GatewayRuntimeFailed,
+                "gateway_run",
+                sqlx::Error::InvalidArgument("lifecycle test".into()),
+            );
             crate::publish_gateway_failure(
                 &state.gateway,
                 &state.failure,
-                FailureClass::GatewayRuntimeFailed,
+                &failed,
                 stopping,
                 Duration::from_secs(3600),
             )
@@ -725,10 +735,15 @@ async fn an_already_draining_gateway_is_not_reverted_to_starting() {
     use crate::gateway_failure::FailureClass;
     let state = server::SharedState::new(Arc::new(RwLock::new(GatewayState::Draining)), None);
     let (_shutdown, stopping) = watch::channel(false);
+    let failed = crate::gateway_failure::step_failure(
+        FailureClass::GatewayRuntimeFailed,
+        "gateway_run",
+        sqlx::Error::InvalidArgument("lifecycle test".into()),
+    );
     crate::publish_gateway_failure(
         &state.gateway,
         &state.failure,
-        FailureClass::GatewayRuntimeFailed,
+        &failed,
         stopping,
         Duration::ZERO,
     )
@@ -745,10 +760,15 @@ async fn supervisor_still_exits_with_an_error_after_a_lingering_failure() {
     let task = tokio::spawn({
         let state = state.clone();
         async move {
+            let failed = crate::gateway_failure::step_failure(
+                FailureClass::AutomodConfigInvalid,
+                "automod_config",
+                sqlx::Error::InvalidArgument("lifecycle test".into()),
+            );
             crate::publish_gateway_failure(
                 &state.gateway,
                 &state.failure,
-                FailureClass::AutomodConfigInvalid,
+                &failed,
                 stopping,
                 Duration::from_secs(15),
             )
