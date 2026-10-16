@@ -123,7 +123,7 @@ gates (`feature_commands.rs`), moderation (`moderation.rs`), onboarding
 (`onboarding.rs`), automod (`automod.rs`), scorecard and classifier
 (`community.rs`). An empty ID list never contains a live ID.
 
-Catalog entries: 128.
+Catalog entries: 130.
 
 | Key | Class | Parsed default | Application | Description |
 | --- | --- | --- | --- | --- |
@@ -252,6 +252,8 @@ Catalog entries: 128.
 | `TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS` | env_only | Not specified in Next | environment only | Staging synthetic voice-test bots counted as human occupants; ignored for the live guild. |
 | `TWO_TEXT_COMMANDS` | cold | `false` | env at boot; stored unwired | Enable optional text triggers only while automations are enabled. |
 | `TWO_TICKET_COOLDOWN_SECONDS` | cold | Not specified in Next | stored unwired | Cooldown between ticket openings. |
+| `TWO_TWITCH_BROADCASTERS` | env_only | Not specified in Next | environment only | Comma-separated Twitch broadcaster_user_ids the startup reconcile subscribes to on the bot callback; empty parks reconcile without mutations. Operator-provisioned and never dashboard-stored. |
+| `TWO_TWITCH_CALLBACK_URL` | env_only | Not specified in Next | environment only | Public HTTPS callback Twitch posts EventSub deliveries to; reconcile only touches subscriptions on this URL. Operator-provisioned and never dashboard-stored. |
 | `TWO_TWITCH_CLIENT_ID` | env_only | Not specified in Next | environment only | Twitch application client id for Helix calls; Operator-provisioned and never dashboard-stored. |
 | `TWO_TWITCH_CLIENT_SECRET` | env_only | Not rendered (secret) | environment only | Twitch application client secret for app-token refresh; Operator-provisioned and never rendered. |
 | `TWO_TWITCH_WEBHOOK_SECRET` | env_only | Not rendered (secret) | environment only | Signing secret for Twitch EventSub deliveries; Operator-provisioned and never rendered. |

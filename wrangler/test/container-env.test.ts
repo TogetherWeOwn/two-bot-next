@@ -127,6 +127,40 @@ test("the existing 4 Container vars are unchanged and cannot be overridden", () 
   }
 });
 
+test("eventsub reconcile inputs and Helix credentials reach the Container on explicit lines while forwarded", () => {
+  const env = {
+    TWO_EVENTSUB: "1",
+    TWO_TWITCH_WEBHOOK_SECRET: "fixture",
+    TWO_TWITCH_CALLBACK_URL: "https://hooks.example.com/twitch",
+    TWO_TWITCH_BROADCASTERS: "111,222",
+    TWO_TWITCH_CLIENT_ID: "synthetic-operator-client-id-01",
+    TWO_TWITCH_CLIENT_SECRET: ["synthetic", "operator", "client", "secret", "01"].join("-"),
+  };
+  const forwarded = containerEnv(env);
+  for (const name of [
+    "TWO_EVENTSUB",
+    "TWO_TWITCH_WEBHOOK_SECRET",
+    "TWO_TWITCH_CALLBACK_URL",
+    "TWO_TWITCH_BROADCASTERS",
+    "TWO_TWITCH_CLIENT_ID",
+    "TWO_TWITCH_CLIENT_SECRET",
+  ] as const) {
+    assert.equal(forwarded[name], env[name], name);
+  }
+  // Dark without the signing secret: none of the six travel.
+  const dark = containerEnv({ TWO_EVENTSUB: "1" });
+  for (const name of [
+    "TWO_EVENTSUB",
+    "TWO_TWITCH_WEBHOOK_SECRET",
+    "TWO_TWITCH_CALLBACK_URL",
+    "TWO_TWITCH_BROADCASTERS",
+    "TWO_TWITCH_CLIENT_ID",
+    "TWO_TWITCH_CLIENT_SECRET",
+  ]) {
+    assert.equal(dark[name], undefined, name);
+  }
+});
+
 test("configured voice infrastructure IDs reach the Container unchanged", () => {
   const vars = {
     DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID: "600",

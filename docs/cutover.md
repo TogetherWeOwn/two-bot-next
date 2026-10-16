@@ -359,7 +359,7 @@ alongside an unconfirmed Next gateway.
 - Configured server startup runs embedded migrations; it is not a read-only
   preflight. Gateway boot wires the funnel pipeline, not the full feature/job
   stack. Domain/store libraries and command definitions are not activated
-  runtime evidence: [boot](../crates/bot/src/main.rs#L106),
+  runtime evidence: [boot](../crates/bot/src/main.rs#L120),
   [pipeline construction](../crates/bot/src/gateway.rs#L1765).
 - Fresh checkpoints (up to 15 minutes old) automatically trigger RESUME.
   Persistence deduplicates funnel batches, not all Discord effects:
