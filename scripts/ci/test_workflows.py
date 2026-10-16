@@ -2124,6 +2124,10 @@ class WorkflowTests(unittest.TestCase):
                 retry = steps[index + 1]
                 self.assertNotIn("uses", retry)
                 self.assertIn("run", retry)
+                # Container steps default to sh, where `set -euo pipefail`
+                # aborts before any retry runs (b7753a4). The retry needs bash.
+                self.assertEqual(retry.get("shell"), "bash",
+                                 "toolchain retry must run under bash, not container sh")
                 self.assertEqual(retry.get("if"), f"steps.{installer['id']}.outcome == 'failure'")
                 self.assertNotEqual(retry.get("continue-on-error"), True,
                                     "the retry must fail the job when the toolchain stays missing")
@@ -2142,6 +2146,84 @@ class WorkflowTests(unittest.TestCase):
                         and retry_steps[index + 1].get("if") == f"steps.{installer['id']}.outcome == 'failure'"
                     )
                     self.assertFalse(still_guarded, "removing the retry step must fail this guard")
+
+    def test_rust_toolchain_retry_fails_closed_behaviorally(self):
+        # Behavioral pin for the retry guard above: substrings alone cannot
+        # pin branch selection (deleting `[ "$attempt" -lt 5 ] || exit 1`
+        # keeps every substring while the step exits 0 with no toolchain
+        # installed) or the exact pin (a `rustup default stable` keeps the
+        # install-line substring). Run each retry step under bash with
+        # function-shimmed fake `rustup`/`sleep` (a function shim, not a
+        # PATH shim, so the pin also runs in harnesses that sanitize PATH
+        # on exec): always-failing rustup exits 1 after exactly 5 installs
+        # with no default, and rustup succeeding on attempt 2 exits 0 having
+        # defaulted the exact repository pin.
+        import os
+        import subprocess
+        import tempfile
+
+        channel = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
+        targets = (
+            ("check.yml", "rust-tests"),
+            ("check.yml", "ignored-db-runtime"),
+            ("reusable-rust-nextest.yml", "nextest"),
+        )
+        fake_prelude = (
+            "rustup() {\n"
+            "  printf '%s\\n' \"$*\" >> \"$FAKE_RUSTUP_CALLS\"\n"
+            "  FAKE_N=$((${FAKE_N:-0} + 1))\n"
+            "  if [ \"$FAKE_N\" -lt \"$FAKE_SUCCEED_ON\" ]; then return 1; fi\n"
+            "  return 0\n"
+            "}\n"
+            "sleep() { :; }\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            calls_path = tmp_path / "rustup-calls.txt"
+            for workflow_name, job_id in targets:
+                steps = self.workflows[workflow_name]["jobs"][job_id]["steps"]
+                installers = [index for index, step in enumerate(steps)
+                              if str(step.get("uses", "")).startswith("dtolnay/rust-toolchain@")]
+                self.assertEqual(len(installers), 1)
+                run_text = str(steps[installers[0] + 1]["run"])
+                for case_name, succeed_on, expected_status, expected_installs in (
+                    ("always-fails", "99", 1, 5),
+                    ("succeeds-on-2", "2", 0, 2),
+                ):
+                    with self.subTest(workflow=workflow_name, job=job_id, case=case_name):
+                        calls_path.write_text("", encoding="utf-8")
+                        run_env = dict(os.environ)
+                        run_env.update(
+                            {
+                                "FAKE_RUSTUP_CALLS": str(calls_path),
+                                "FAKE_SUCCEED_ON": succeed_on,
+                            }
+                        )
+                        proc = subprocess.run(
+                            ["bash", "-c", fake_prelude + run_text],
+                            env=run_env,
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                        )
+                        self.assertEqual(
+                            proc.returncode, expected_status,
+                            f"unexpected retry status: {proc.stderr}",
+                        )
+                        calls = calls_path.read_text(encoding="utf-8").splitlines()
+                        installs = [line for line in calls if line.startswith("toolchain install ")]
+                        self.assertEqual(len(installs), expected_installs,
+                                         f"expected {expected_installs} installs, got: {calls}")
+                        for line in installs:
+                            self.assertIn(channel, line,
+                                          f"retry must install the exact pin, got: {line!r}")
+                        defaults = [line for line in calls if line.startswith("default ")]
+                        if expected_status == 0:
+                            self.assertIn(f"default {channel} --force-non-host", defaults,
+                                          f"retry must default the exact pin, got: {calls}")
+                        else:
+                            self.assertEqual(defaults, [],
+                                             f"failed retry must not default anything, got: {calls}")
 
     def test_overflow_runner_must_name_its_own_job(self):
         self.assertTrue(runner_allowed("worker", self.workflows["check.yml"]["jobs"]["worker"]["runs-on"]))
