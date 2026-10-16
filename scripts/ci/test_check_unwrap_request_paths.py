@@ -13,6 +13,8 @@ import stat
 import subprocess
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -117,6 +119,51 @@ class ScanTests(unittest.TestCase):
         self.assertIsNone(hits)
         self.assertTrue(error)
 
+    def test_nonzero_exit_with_empty_output_is_blindness(self):
+        with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(
+                returncode=1, stdout="", stderr="scan failed")):
+            hits, error = gate.run_scan("ast-grep")
+        self.assertIsNone(hits)
+        self.assertIn("exited 1", error)
+
+    def test_empty_success_output_is_blindness(self):
+        with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout="", stderr="")):
+            hits, error = gate.run_scan("ast-grep")
+        self.assertIsNone(hits)
+        self.assertIn("empty", error)
+
+    def test_malformed_json_shape_is_blindness(self):
+        with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=json.dumps({"findings": []}), stderr="")):
+            hits, error = gate.run_scan("ast-grep")
+        self.assertIsNone(hits)
+        self.assertIn("invalid shape", error)
+
+    def test_malformed_finding_is_blindness(self):
+        with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=json.dumps([None]), stderr="")):
+            hits, error = gate.run_scan("ast-grep")
+        self.assertIsNone(hits)
+        self.assertIn("invalid finding", error)
+
+    def test_finding_without_line_is_blindness(self):
+        finding = {"ruleId": gate.RULE_ID, "file": "a.rs", "range": {"start": {}}}
+        with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=json.dumps([finding]), stderr="")):
+            hits, error = gate.run_scan("ast-grep")
+        self.assertIsNone(hits)
+        self.assertIn("invalid finding", error)
+
+    def test_boolean_line_is_blindness(self):
+        finding = {"ruleId": gate.RULE_ID, "file": "a.rs",
+                   "range": {"start": {"line": True}}}
+        with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=json.dumps([finding]), stderr="")):
+            hits, error = gate.run_scan("ast-grep")
+        self.assertIsNone(hits)
+        self.assertIn("invalid finding", error)
+
 
 class DiffTests(unittest.TestCase):
     def test_added_lines_tracks_new_file_lines(self):
@@ -157,6 +204,22 @@ class GateTests(unittest.TestCase):
             gate.ROOT = real_root
             tmp.cleanup()
         return code, out.getvalue()
+
+    def test_inline_test_hit_uses_in_scope_diagnostic(self):
+        real_scan, real_added = gate.run_scan, gate.added_lines
+        gate.run_scan = lambda _binary, all_rules=False: (
+            [(gate.RULE_ID, "crates/bot/src/gateway_commands.rs", 12)], "")
+        gate.added_lines = lambda _base, _head: (
+            {("crates/bot/src/gateway_commands.rs", 12)}, "")
+        out = io.StringIO()
+        try:
+            with redirect_stdout(out):
+                code = gate.main(["--base-ref", "base", "--head-ref", "head"])
+        finally:
+            gate.run_scan, gate.added_lines = real_scan, real_added
+        self.assertEqual(code, 1)
+        self.assertIn("inline test modules are included", out.getvalue())
+        self.assertNotIn("non-test request path", out.getvalue())
 
     def test_fresh_unwrap_fails(self):
         tmp, root = make_repo()
@@ -240,10 +303,14 @@ class RuleShapeTests(unittest.TestCase):
         ignores = " ".join(rule["ignores"])
         for marker in ("_tests", "/tests/"):
             self.assertIn(marker, ignores)
+        self.assertNotIn("cfg(test)", ignores)
+        self.assertIn("inline test modules", rule["message"])
 
-    def test_backlog_exists_and_names_every_enforced_hit(self):
+    def test_backlog_documents_inline_test_module_enforcement(self):
         backlog = (ROOT / "docs/unwrap-backlog.md").read_text()
         self.assertIn("no-unwrap-request-paths", backlog)
+        self.assertIn("inline `#[cfg(test)]` modules are included", backlog)
+        self.assertIn("those hits are not filtered from enforcement", backlog)
 
     def test_shared_rust_advisories_have_local_rules_and_fixtures(self):
         rule_ids = {

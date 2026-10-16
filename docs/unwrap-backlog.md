@@ -1,25 +1,28 @@
-# `.unwrap()` backlog in non-test request paths
+# `.unwrap()` request-path HARD gate scope
 
 Rule: `ast-grep-rules/no-unwrap-request-paths.yml` (HARD: newly added hits
-fail the PR). The gate fails on any line the diff adds.
+fail the PR). The gate fails on any added hit reported by the rule.
 
-Scope: production source (`crates/*/src`, `src`) whose path contains
-`route`, `handler`, `interaction`, `command` or `webhook`, excluding test
-files, test-only directories, and lines inside inline `#[cfg(test)]` modules.
-The ast-grep rule itself only ignores test files/dirs, so its raw output
-still flags `.unwrap()` calls inside inline test modules; those flags are out
-of production scope. `unwrap` in tests is idiomatic.
+Scope: Rust source (`crates/*/src`, `src`) whose path contains `route`,
+`handler`, `interaction`, `command` or `webhook`, excluding test files and
+test-only directories. The rule does not parse Rust module attributes, so
+inline `#[cfg(test)]` modules are included: adding or touching a matching
+`.unwrap()` in one of those modules fails the gate too. This is intentionally
+stricter than a production-only rule; `unwrap` may be idiomatic in tests, but
+those hits are not filtered from enforcement. Existing hits remain silent
+unless the PR adds the hit line.
 
-## Status: zero production hits (2026-10-15, `f6d1ad2f7`; re-verified on the HARD promotion)
+## Current scope inventory (2026-10-15, `f6d1ad2f7`; re-verified on the HARD promotion)
 
-Grandfathered production set is empty until 2027-01-15: there is nothing to
-work down, and the gate fails on any newly added hit.
+There is no grandfathered production-only set: the HARD gate applies to all
+new matches in scope, including inline test modules. The existing inventory
+below records the observed locations; it is not an exemption from enforcement.
 
-Every `.unwrap()` in a rule-scope file sits inside an inline `#[cfg(test)]`
-module: 50 hit lines across 9 files, none before its file's test-module
-start. ast-grep is not installed on the controller, so this was verified by
-replicating the rule globs with grep, applying the rule ignores
-(`*_tests.rs`, `tests/`), and checking each hit against its file's
+Every `.unwrap()` found in the rule-scope files at this snapshot sits inside
+an inline `#[cfg(test)]` module: 50 hit lines across 9 files, none before its
+file's test-module start. ast-grep is not installed on the controller, so this
+was verified by replicating the rule globs with grep, applying the rule
+ignores (`*_tests.rs`, `tests/`), and checking each hit against its file's
 `#[cfg(test)]` boundary:
 
 - `crates/bot/src/commands_cli.rs`: test mod `:278`, hits `:295+`
@@ -32,7 +35,7 @@ replicating the rule globs with grep, applying the rule ignores
 - `crates/discord/src/interactions.rs`: test mods `:838`/`:862`, hits `:848+`
 - `crates/discord/src/lfg_interactions.rs`: test mod `:471`, hits `:497+`
 
-Rule-scope files with no production hit and no hit before their test module
+Other rule-scope files with no hit before their inline test module
 include `command_runtime.rs`, `self_role_handlers.rs`,
 `command_permissions.rs`, `command_restoration.rs`, `custom_command_service.rs`,
 `custom_command_store.rs`, `feature_commands.rs`, `handlers.rs`,

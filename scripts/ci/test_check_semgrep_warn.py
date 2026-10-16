@@ -10,6 +10,8 @@ import json
 import stat
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -32,7 +34,7 @@ REPORT = {"results": [
     {"check_id": "rust-warn.rust-todo-unimplemented", "path": "crates/core/src/x.rs",
      "start": {"line": 9}},
     {"check_id": "rust-warn.rust-panic-in-prod", "path": "crates/core/src/x.rs",
-     "start": {}},
+     "start": {"line": 20}},
 ]}
 
 
@@ -56,7 +58,8 @@ class ParseTests(unittest.TestCase):
             tmp.cleanup()
         self.assertEqual(error, "")
         self.assertEqual(findings, {("rust-panic-in-prod", "crates/core/src/x.rs", 4),
-                                    ("rust-todo-unimplemented", "crates/core/src/x.rs", 9)})
+                                    ("rust-todo-unimplemented", "crates/core/src/x.rs", 9),
+                                    ("rust-panic-in-prod", "crates/core/src/x.rs", 20)})
 
     def test_garbage_report_is_blindness(self):
         tmp, binary = fake_semgrep("not json")
@@ -71,6 +74,59 @@ class ParseTests(unittest.TestCase):
         findings, error = gate.run_semgrep("/nonexistent/semgrep")
         self.assertIsNone(findings)
         self.assertTrue(error)
+
+    def test_nonzero_exit_with_empty_output_is_blindness(self):
+        with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(
+                returncode=2, stdout="", stderr="invalid config")):
+            findings, error = gate.run_semgrep("semgrep")
+        self.assertIsNone(findings)
+        self.assertIn("exited 2", error)
+
+    def test_report_errors_are_blindness(self):
+        with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=json.dumps({"results": [], "errors": [{"message": "bad config"}]}),
+                stderr="")):
+            findings, error = gate.run_semgrep("semgrep")
+        self.assertIsNone(findings)
+        self.assertIn("reported errors", error)
+
+    def test_empty_success_output_is_blindness(self):
+        with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout="", stderr="")):
+            findings, error = gate.run_semgrep("semgrep")
+        self.assertIsNone(findings)
+        self.assertIn("empty", error)
+
+    def test_malformed_result_is_blindness(self):
+        with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=json.dumps({"results": [None]}), stderr="")):
+            findings, error = gate.run_semgrep("semgrep")
+        self.assertIsNone(findings)
+        self.assertIn("invalid result", error)
+
+    def test_malformed_result_location_is_blindness(self):
+        report = {"results": [{"check_id": "rule", "path": "a.rs", "start": "bad"}]}
+        with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=json.dumps(report), stderr="")):
+            findings, error = gate.run_semgrep("semgrep")
+        self.assertIsNone(findings)
+        self.assertIn("invalid result", error)
+
+    def test_result_without_line_is_blindness(self):
+        report = {"results": [{"check_id": "rule", "path": "a.rs", "start": {}}]}
+        with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=json.dumps(report), stderr="")):
+            findings, error = gate.run_semgrep("semgrep")
+        self.assertIsNone(findings)
+        self.assertIn("invalid result", error)
+
+    def test_boolean_line_is_blindness(self):
+        report = {"results": [{"check_id": "rule", "path": "a.rs", "start": {"line": True}}]}
+        with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=json.dumps(report), stderr="")):
+            findings, error = gate.run_semgrep("semgrep")
+        self.assertIsNone(findings)
+        self.assertIn("invalid result", error)
 
 
 class GateTests(unittest.TestCase):

@@ -37,17 +37,34 @@ def run_semgrep(semgrep):
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return None, f"semgrep did not run: {exc}"
+    if proc.returncode != 0:
+        return None, f"semgrep exited {proc.returncode}: {proc.stderr.strip()[:200]}"
+    if not proc.stdout.strip():
+        return None, "semgrep output is empty"
     try:
-        report = json.loads(proc.stdout or "{}")
+        report = json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
         return None, f"semgrep output is not JSON: {exc}"
+    if not isinstance(report, dict) or not isinstance(report.get("results"), list):
+        return None, "semgrep report has an invalid shape"
+    if report.get("errors"):
+        return None, "semgrep reported errors"
     findings = set()
-    for result in report.get("results", []):
-        rule = result.get("check_id", "").split(".")[-1]
+    for result in report["results"]:
+        if not isinstance(result, dict):
+            return None, "semgrep report contains an invalid result"
+        start = result.get("start")
+        if not isinstance(start, dict):
+            return None, "semgrep report contains an invalid result location"
+        check_id = result.get("check_id")
         path = result.get("path")
-        line = (result.get("start") or {}).get("line")
-        if rule and isinstance(path, str) and isinstance(line, int):
-            findings.add((rule, path, line))
+        line = start.get("line")
+        if (not isinstance(check_id, str) or not check_id
+                or not isinstance(path, str) or not path
+                or type(line) is not int or line < 1):
+            return None, "semgrep report contains an invalid result"
+        rule = check_id.split(".")[-1]
+        findings.add((rule, path, line))
     return findings, ""
 
 

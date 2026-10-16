@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""HARD gate: no new `.unwrap()` in non-test request paths.
+"""HARD gate: no new `.unwrap()` in request-path source files.
 
 The request-path rule is defined by
 ``ast-grep-rules/no-unwrap-request-paths.yml`` (request-path file globs with
-test files/dirs ignored). Six additional Rust advisories and their fixtures
-come from the shared meta-only assets. The script runs ``ast-grep scan --json``
+test files/dirs ignored; inline ``#[cfg(test)]`` modules are included). Six
+additional Rust advisories and their fixtures come from the shared meta-only
+assets. The script runs ``ast-grep scan --json``
 and intersects all reported hits with
 the lines the PR adds (``git diff -U0 base head``), so only newly added
 findings fail. Existing unwrap hits are listed in ``docs/unwrap-backlog.md``.
@@ -12,9 +13,9 @@ findings fail. Existing unwrap hits are listed in ``docs/unwrap-backlog.md``.
 HARD mode: a newly added `.unwrap()` in scope prints ``::error::``
 annotations and the script exits 1. Findings from the six shared advisory
 rules stay WARN-only (``::warning::``, exit still 0 when they are the only
-fresh hits). A blind gate (missing binary, unreadable diff) fails closed
-instead of passing; only malformed arguments exit non-zero for another
-reason.
+fresh hits). A blind gate (missing binary, failed/empty scan, malformed
+scanner output, or unreadable diff) fails closed instead of passing; only
+malformed arguments exit non-zero for another reason.
 """
 
 import argparse
@@ -46,19 +47,37 @@ def run_scan(ast_grep, all_rules=False):
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return None, f"ast-grep scan did not run: {exc}"
+    if proc.returncode != 0:
+        return None, f"ast-grep scan exited {proc.returncode}: {proc.stderr.strip()[:200]}"
+    if not proc.stdout.strip():
+        return None, "ast-grep scan output is empty"
     try:
-        findings = json.loads(proc.stdout or "[]")
+        findings = json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
         return None, f"ast-grep scan output is not JSON: {exc}"
+    if not isinstance(findings, list):
+        return None, "ast-grep scan output has an invalid shape"
     hits = []
     for finding in findings:
-        if not all_rules and finding.get("ruleId", RULE_ID) != RULE_ID:
-            continue
-        line = (finding.get("range") or {}).get("start", {}).get("line")
+        if not isinstance(finding, dict):
+            return None, "ast-grep scan contains an invalid finding"
+        rule_id = finding.get("ruleId", RULE_ID)
+        if not isinstance(rule_id, str) or not rule_id:
+            return None, "ast-grep scan contains an invalid finding"
+        location = finding.get("range")
+        if not isinstance(location, dict):
+            return None, "ast-grep scan contains an invalid finding location"
+        start = location.get("start")
+        if not isinstance(start, dict):
+            return None, "ast-grep scan contains an invalid finding location"
+        line = start.get("line")
         path = finding.get("file")
-        if isinstance(line, int) and isinstance(path, str):
-            rule_id = finding.get("ruleId", RULE_ID)
-            hits.append((rule_id, path, line) if all_rules else (path, line))
+        if (not isinstance(path, str) or not path
+                or type(line) is not int or line < 1):
+            return None, "ast-grep scan contains an invalid finding"
+        if not all_rules and rule_id != RULE_ID:
+            continue
+        hits.append((rule_id, path, line) if all_rules else (path, line))
     return hits, ""
 
 
@@ -133,7 +152,8 @@ def main(argv=None):
     unwrap_fresh = [hit for hit in fresh if hit[0] == RULE_ID]
     for rule_id, path, line in fresh[:MAX_ANNOTATIONS]:
         if rule_id == RULE_ID:
-            error(f"{path}:{line} adds .unwrap() in a non-test request path")
+            error(f"{path}:{line} adds .unwrap() in a request-path source file "
+                  "(inline test modules are included)")
         else:
             warn(f"{path}:{line} matches ast-grep rule {rule_id}")
     if len(fresh) > MAX_ANNOTATIONS:
