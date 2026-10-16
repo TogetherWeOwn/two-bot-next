@@ -84,6 +84,49 @@ count as recovery. See the detailed rule definitions and their alert-response
 sections in [the operations runbook](runbook.md#metrics-alerts) and
 [metrics reference](metrics.md#off-container-scrape-and-alert-rules).
 
+## Request-id correlation
+
+One `request_id` joins the Worker, Durable Object, container and queued-work
+logs for a single flow. The Worker stamps `x-request-id` on every forwarded
+request (honoring a valid inbound 26-char Crockford value, else minting one),
+the DO forwards it to the container, and the container receivers honor the
+same shape for their request spans, refusal envelopes and queued follow-up
+tasks. Anything else in that header (bearer tokens, URLs, free text, or a
+missing header) mints a fresh id and is never logged as one. Every container
+log line also carries `build_sha` and `release` (the image's git SHA,
+`"unknown"` for local builds). Log lines carry the route (`http.request.path`
+on request spans, allowlisted) or job (`job` on periodic-job lines) where one
+applies, and `error_class` on failure lines.
+
+To trace one id across all hops, reuse the same `x-request-id` for two
+staging requests: a malformed one (refused at the Worker edge) and a
+well-shaped one with a bogus signature (forwarded Worker -> DO -> container,
+refused by the container). Each hop logs only refusals, so the two requests
+together put one id in every system without needing a signing secret:
+
+```sh
+RID=01ARZ3NDEKTSV4RRFFQ69G5FAV  # any 26-char Crockford id you mint
+BASE="https://<staging-worker>/internal/actions"
+curl -X POST "$BASE" -H "x-request-id: $RID" \
+  -H "content-type: text/plain" -d '{}'
+curl -X POST "$BASE" -H "x-request-id: $RID" \
+  -H "content-type: application/json" \
+  -H "x-two-key-id: probe" -H "x-two-timestamp: 1790000000" \
+  -H "x-two-nonce: probe-nonce-0001" \
+  -H "x-two-signature: sha256=0000000000000000000000000000000000000000000000000000000000000000" \
+  -d '{"action":"announcement.post"}'
+```
+
+Then filter Workers Logs for `$RID` (the Worker's `internal_actions_ingress`
+refusal) and the `containers` dataset for `$RID` (the container's
+`internal action refused` line); both refusal envelopes echo the same id in
+`request_id`. The container leg is reachable only through the DO forward, so
+its line proves the Worker -> DO -> container header path. The same header
+rides public probes (`/health`, `/readyz`) into the container request span.
+Queued follow-up tasks inherit the request span, so their lines carry the
+same id. Scheduled keepalive ticks and periodic jobs carry their own minted
+ids: they join to themselves, not to an inbound request.
+
 ## Known coverage limits
 
 These are deliberate, visible limits of the current implementation; do not
@@ -92,9 +135,9 @@ claim them as shipped acceptance:
 - Worker/DO alert log lines and Discord messages do not yet consistently carry
   the Container Git SHA and a direct log-query URL. Use the build/deploy
   correlation procedure above.
-- Container tracing is structured JSON, but a single `request_id` is not yet
-  propagated end-to-end from Worker through Container, Durable Object, and
-  queued work. Do not assume logs can be joined by request ID.
+- Worker/DO log lines do not carry the container `build_sha`/`release`: the
+  Worker version ID is distinct from the Git SHA. Correlate via the procedure
+  above.
 - Release-tagged external error tracking is not configured. Production Workers
   Logs are enabled unsampled; traces remain disabled to avoid recording
   credential-bearing URLs.

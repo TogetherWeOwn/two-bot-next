@@ -13,10 +13,13 @@
  * nonce burn; this module only bounds what may reach it (method, exact path,
  * no query, content type, 2 MiB body, timeouts, header allowlist, rate caps)
  * and never relays Container error text. Nothing here is ever logged except
- * scalar event/status/error_class: no header values, body bytes or query.
+ * scalar event/status/error_class/request_id: no header values, body bytes
+ * or query. The request id is the validated `x-request-id` shape (or a fresh
+ * one), so it joins the DO and container logs without carrying secrets.
  */
 
 import { TokenBuckets } from "./redirect.ts";
+import { REQUEST_ID_HEADER, ensureRequestId, newRequestId } from "./request-id.ts";
 
 export const ACTIONS_PATH = "/internal/actions";
 /** Fixed receiver port, distinct from BOT_PORT (8080). */
@@ -92,17 +95,22 @@ export function notFound(): Response {
   return new Response("not found", { status: 404 });
 }
 
-/** The receiver's envelope, with a fixed message: never Container text. */
+/**
+ * The receiver's envelope, with a fixed message: never Container text. The
+ * id is the flow's `x-request-id` (honored inbound or minted at the edge),
+ * so one value joins the Worker, DO and container logs with this response.
+ */
 export function envelope(
   status: number,
   code: string,
   retryable: boolean,
   headers: Record<string, string> = {},
+  requestId: string = newRequestId(),
 ): Response {
   return Response.json(
     {
       ok: false,
-      request_id: crypto.randomUUID(),
+      request_id: requestId,
       error: { code, message: "request refused", retryable },
     },
     { status, headers: { "cache-control": "no-store", ...headers } },
@@ -114,9 +122,10 @@ function refuse(
   code: string,
   retryable: boolean,
   headers?: Record<string, string>,
+  requestId: string = newRequestId(),
 ): Response {
-  console.warn(JSON.stringify({ event: "internal_actions_ingress", status, error_class: code }));
-  return envelope(status, code, retryable, headers);
+  console.warn(JSON.stringify({ event: "internal_actions_ingress", status, error_class: code, request_id: requestId }));
+  return envelope(status, code, retryable, headers, requestId);
 }
 
 /** True when the receiver would answer 404 for this request shape. */
@@ -129,31 +138,36 @@ export function isActionsRequest(request: Request): boolean {
 /**
  * The allowlisted headers, or the refusal that explains the first bad one.
  * `authorization`, `cookie`, `cf-connecting-ip` and any caller-supplied
- * deployment header are never copied (CISO C3).
+ * deployment header are never copied (CISO C3). `x-request-id` is the one
+ * caller header that flows on: only its validated generated shape (a
+ * non-secret 26-char token; anything else is replaced with a fresh id), so
+ * the DO and container can join this request in their own logs.
  */
 export function allowlistedHeaders(source: Headers): { headers: Headers } | { refusal: Response } {
+  const requestId = ensureRequestId(source.get(REQUEST_ID_HEADER));
   const media = source.get("content-type");
   if (
     media === null || media.length > 128 || !CONTENT_TYPES.includes(media.toLowerCase()) ||
     source.has("content-encoding")
   ) {
-    return { refusal: refuse(415, "unsupported_media_type", false) };
+    return { refusal: refuse(415, "unsupported_media_type", false, undefined, requestId) };
   }
   const headers = new Headers({ "content-type": media });
   for (const [name, max] of SIGNING_HEADERS) {
     const value = source.get(name);
-    if (value === null || value === "") return { refusal: refuse(401, "unauthorized", false) };
+    if (value === null || value === "") return { refusal: refuse(401, "unauthorized", false, undefined, requestId) };
     if (value.length > max || !HEADER_VALUE.test(value)) {
-      return { refusal: refuse(400, "malformed", false) };
+      return { refusal: refuse(400, "malformed", false, undefined, requestId) };
     }
     headers.set(name, value);
   }
   const [name, max] = IDEMPOTENCY_HEADER;
   const key = source.get(name);
   if (key !== null) {
-    if (key.length > max || !HEADER_VALUE.test(key)) return { refusal: refuse(400, "malformed", false) };
+    if (key.length > max || !HEADER_VALUE.test(key)) return { refusal: refuse(400, "malformed", false, undefined, requestId) };
     headers.set(name, key);
   }
+  headers.set(REQUEST_ID_HEADER, requestId);
   return { headers };
 }
 
@@ -161,12 +175,13 @@ export type BodyRead = { bytes: Uint8Array } | { refusal: Response };
 
 /** Read at most MAX_BODY_BYTES within BODY_TIMEOUT_MS, byte for byte. */
 export async function readBody(request: Request): Promise<BodyRead> {
+  const requestId = ensureRequestId(request.headers.get(REQUEST_ID_HEADER));
   const declared = request.headers.get("content-length");
   if (declared !== null) {
-    if (!/^\d{1,10}$/.test(declared)) return { refusal: refuse(400, "malformed", false) };
-    if (Number(declared) > MAX_BODY_BYTES) return { refusal: refuse(413, "payload_too_large", false) };
+    if (!/^\d{1,10}$/.test(declared)) return { refusal: refuse(400, "malformed", false, undefined, requestId) };
+    if (Number(declared) > MAX_BODY_BYTES) return { refusal: refuse(413, "payload_too_large", false, undefined, requestId) };
   }
-  if (request.body === null) return { refusal: refuse(400, "malformed", false) };
+  if (request.body === null) return { refusal: refuse(400, "malformed", false, undefined, requestId) };
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -179,22 +194,22 @@ export async function readBody(request: Request): Promise<BodyRead> {
       const step = await Promise.race([reader.read(), timeout]);
       if (step === "timeout") {
         void reader.cancel().catch(() => {});
-        return { refusal: refuse(408, "request_timeout", true) };
+        return { refusal: refuse(408, "request_timeout", true, undefined, requestId) };
       }
       if (step.done) break;
       total += step.value.byteLength;
       if (total > MAX_BODY_BYTES) {
         void reader.cancel().catch(() => {});
-        return { refusal: refuse(413, "payload_too_large", false) };
+        return { refusal: refuse(413, "payload_too_large", false, undefined, requestId) };
       }
       chunks.push(step.value);
     }
   } catch {
-    return { refusal: refuse(400, "malformed", false) };
+    return { refusal: refuse(400, "malformed", false, undefined, requestId) };
   } finally {
     clearTimeout(timer);
   }
-  if (total === 0) return { refusal: refuse(400, "malformed", false) };
+  if (total === 0) return { refusal: refuse(400, "malformed", false, undefined, requestId) };
   const bytes = new Uint8Array(total);
   let offset = 0;
   for (const chunk of chunks) {
@@ -224,13 +239,14 @@ export async function handleActionsIngress(
   forward: (sanitized: Request) => Promise<Response>,
 ): Promise<Response> {
   if (!isActionsRequest(request)) return notFound();
+  const requestId = ensureRequestId(request.headers.get(REQUEST_ID_HEADER));
   const verdict = actionsBuckets.take(clientKey);
   if (!verdict.allowed) {
-    return refuse(429, "rate_limited", true, { "retry-after": String(verdict.retryAfter) });
+    return refuse(429, "rate_limited", true, { "retry-after": String(verdict.retryAfter) }, requestId);
   }
   const checked = allowlistedHeaders(request.headers);
   if ("refusal" in checked) return checked.refusal;
-  if (inFlight >= MAX_IN_FLIGHT) return refuse(429, "rate_limited", true, { "retry-after": "1" });
+  if (inFlight >= MAX_IN_FLIGHT) return refuse(429, "rate_limited", true, { "retry-after": "1" }, requestId);
   inFlight++;
   try {
     const body = await readBody(request);
@@ -246,11 +262,11 @@ export async function handleActionsIngress(
     });
     try {
       const upstream = await Promise.race([forward(sanitized), deadline]);
-      if (upstream === "timeout") return refuse(504, "upstream_timeout", true);
+      if (upstream === "timeout") return refuse(504, "upstream_timeout", true, undefined, requestId);
       return upstream;
     } catch {
       // DO construction/binding failures: never serialize the exception.
-      return refuse(503, "unavailable", true);
+      return refuse(503, "unavailable", true, undefined, requestId);
     } finally {
       clearTimeout(timer);
     }
