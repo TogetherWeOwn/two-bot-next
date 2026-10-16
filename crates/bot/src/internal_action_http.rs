@@ -1847,12 +1847,14 @@ async fn moderation_member(
         Err(_) => return reject(Failure::code(ErrorCode::Internal)),
     };
     // Resolution (guild facts, actor/target/bot snapshots) and the shared
-    // moderation service run inside the effect. Definitive refusals become
-    // terminal receipts; snapshot/transport uncertainty stays fenced.
+    // moderation service run inside the effect. Keep the caller-correlated `id`
+    // for logs and wire responses; ledger rows need a container-owned identity
+    // so a caller cannot collide separate moderation executions.
     let now = now_ms() as i64;
+    let ledger_id = two_bot_core::internal_actions::new_request_id(now as u64, &rand::random());
     match state
         .moderation
-        .execute_moderation(&request, id, &idempotency, now)
+        .execute_moderation(&request, &ledger_id, &idempotency, now)
         .await
     {
         Ok(response) => {
@@ -2046,11 +2048,14 @@ async fn moderate_channel(
     };
     // Actor resolution and the shared channel-moderation service run inside
     // the effect. Definitive refusals become terminal receipts; snapshot,
-    // transport and rate-limit uncertainty stays fenced.
-    let now = format_iso_millis(now_ms() as i64);
+    // transport and rate-limit uncertainty stays fenced. Keep the caller-
+    // correlated `id` for logs and wire responses, but use an owned ledger id.
+    let now_ms = now_ms() as i64;
+    let ledger_id = two_bot_core::internal_actions::new_request_id(now_ms as u64, &rand::random());
+    let now = format_iso_millis(now_ms);
     match state
         .channel
-        .execute_channel(&request, id, &idempotency, &now)
+        .execute_channel(&request, &ledger_id, &idempotency, &now)
         .await
     {
         Ok(result) => {
