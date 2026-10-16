@@ -29,7 +29,7 @@ use two_bot_discord::internal_member_moderation::{
 };
 use two_bot_discord::{ActionExecutor, MODERATION_TIMEOUT_MS};
 
-#[allow(dead_code)]
+#[path = "mutation_429_member_common.rs"]
 mod common;
 
 const GUILD: &str = "100000000000000001";

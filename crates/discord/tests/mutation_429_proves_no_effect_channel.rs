@@ -31,7 +31,7 @@
 //! while asserting the lane stays fenced.
 #![cfg(feature = "db")]
 
-#[allow(dead_code)]
+#[path = "mutation_429_common.rs"]
 mod common;
 
 use common::{fresh_message_id, MockRest, ScriptedResponse};
