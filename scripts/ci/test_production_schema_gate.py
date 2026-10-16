@@ -3,9 +3,12 @@
 import json
 import os
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import production_schema_gate
 from production_schema_gate import (
     Refused,
     connection_warning,
@@ -14,6 +17,7 @@ from production_schema_gate import (
     main,
     pending_versions,
     pins_from_url,
+    run_gate,
     verify_binding,
     waive_reason,
 )
@@ -24,21 +28,31 @@ PROD_URL = f"postgresql://two_bot_migrator_ro:pw@{PROD_HOST}:5432/{PROD_DB}"
 SHA = "a" * 40
 
 
-def env(url=PROD_URL, host=PROD_HOST, database=PROD_DB):
+def env(url=PROD_URL, host=PROD_HOST, database=PROD_DB, branch=""):
     return {
         "TWO_BOT_PRODUCTION_PLAN_DATABASE_URL": url,
         "TWO_BOT_PRODUCTION_HOST": host,
         "TWO_BOT_PRODUCTION_DATABASE": database,
+        "TWO_BOT_PRODUCTION_BRANCH_ID": branch,
     }
 
 
 class PinsFromUrlTests(unittest.TestCase):
     def test_direct_url_yields_lowercase_host_and_database(self):
-        host, database = pins_from_url(
+        host, database, branch = pins_from_url(
             "postgresql://two_bot_migrator_ro:pw@Two-Production-1.Example.COM:5432/two_bot"
         )
         self.assertEqual(host, "two-production-1.example.com")
         self.assertEqual(database, "two_bot")
+        self.assertEqual(branch, "")
+
+    def test_planetscale_url_yields_branch_from_username_suffix(self):
+        host, database, branch = pins_from_url(
+            "postgresql://two-bot-migrator.cnlmx96ec5kw:pw@myapp.pg.psdb.cloud:5432/postgres"
+        )
+        self.assertEqual(host, "myapp.pg.psdb.cloud")
+        self.assertEqual(database, "postgres")
+        self.assertEqual(branch, "cnlmx96ec5kw")
 
     def test_pooler_port_is_refused_before_any_plan(self):
         with self.assertRaises(Refused):
@@ -61,15 +75,15 @@ class VerifyBindingTests(unittest.TestCase):
     """The binding is compared with independently pinned vars, never itself."""
 
     def test_matching_binding_passes_and_returns_pins(self):
-        self.assertEqual(verify_binding(PROD_URL, PROD_HOST, PROD_DB), (PROD_HOST, PROD_DB))
+        self.assertEqual(verify_binding(PROD_URL, PROD_HOST, PROD_DB, ""), (PROD_HOST, PROD_DB, ""))
 
     def test_wrong_target_binding_is_refused(self):
         other = f"postgresql://two_bot_migrator_ro:pw@{PROD_HOST}:5432/other_db"
         with self.assertRaises(Refused):
-            verify_binding(other, PROD_HOST, PROD_DB)
+            verify_binding(other, PROD_HOST, PROD_DB, "")
         wrong_host = f"postgresql://two_bot_migrator_ro:pw@other-host.example.com:5432/{PROD_DB}"
         with self.assertRaises(Refused):
-            verify_binding(wrong_host, PROD_HOST, PROD_DB)
+            verify_binding(wrong_host, PROD_HOST, PROD_DB, "")
 
     def test_prod_like_pins_stay_allowed(self):
         # The production host and database are production-like by
@@ -79,23 +93,38 @@ class VerifyBindingTests(unittest.TestCase):
                 "postgresql://two_bot_migrator_ro:pw@ep-prod-1.example.com:5432/two_bot_prod",
                 "ep-prod-1.example.com",
                 "two_bot_prod",
+                "",
             ),
-            ("ep-prod-1.example.com", "two_bot_prod"),
+            ("ep-prod-1.example.com", "two_bot_prod", ""),
         )
 
     def test_staging_pins_and_bindings_are_refused(self):
         staging_url = "postgresql://two_bot_migrator_ro:pw@ep-staging-1.aws.neon.tech/two_bot"
         with self.assertRaises(Refused):
-            verify_binding(staging_url, "ep-staging-1.aws.neon.tech", "two_bot")
+            verify_binding(staging_url, "ep-staging-1.aws.neon.tech", "two_bot", "")
         with self.assertRaises(Refused):
-            verify_binding(PROD_URL, "ep-staging-1.aws.neon.tech", PROD_DB)
+            verify_binding(PROD_URL, "ep-staging-1.aws.neon.tech", PROD_DB, "")
         with self.assertRaises(Refused):
-            verify_binding(staging_url, PROD_HOST, PROD_DB)
+            verify_binding(staging_url, PROD_HOST, PROD_DB, "")
 
     def test_planetscale_binding_refuses_without_a_branch_pin(self):
         psdb = "postgresql://two-bot-migrator.cnlmx96ec5kw:pw@myapp.pg.psdb.cloud:5432/postgres"
         with self.assertRaises(Refused):
-            verify_binding(psdb, "myapp.pg.psdb.cloud", "postgres")
+            verify_binding(psdb, "myapp.pg.psdb.cloud", "postgres", "")
+
+    def test_planetscale_binding_passes_with_matching_branch_pin(self):
+        psdb = "postgresql://two-bot-migrator.cnlmx96ec5kw:pw@myapp.pg.psdb.cloud:5432/postgres"
+        self.assertEqual(
+            verify_binding(psdb, "myapp.pg.psdb.cloud", "postgres", "cnlmx96ec5kw"),
+            ("myapp.pg.psdb.cloud", "postgres", "cnlmx96ec5kw"),
+        )
+
+    def test_planetscale_binding_refuses_mismatched_or_malformed_branch_pin(self):
+        psdb = "postgresql://two-bot-migrator.cnlmx96ec5kw:pw@myapp.pg.psdb.cloud:5432/postgres"
+        for branch in ("otherbranch1", "bad branch", "bad/branch"):
+            with self.subTest(branch=branch):
+                with self.assertRaises(Refused):
+                    verify_binding(psdb, "myapp.pg.psdb.cloud", "postgres", branch)
 
     def test_empty_or_pooler_expected_pins_are_refused(self):
         for host, database in (
@@ -105,7 +134,7 @@ class VerifyBindingTests(unittest.TestCase):
         ):
             with self.subTest(host=host, database=database):
                 with self.assertRaises(Refused):
-                    verify_binding(PROD_URL, host, database)
+                    verify_binding(PROD_URL, host, database, "")
 
     def test_staging_host_fence(self):
         for host in ("agent-testdb", "127.0.0.1", "localhost",
@@ -113,6 +142,47 @@ class VerifyBindingTests(unittest.TestCase):
             self.assertTrue(is_staging_host(host), host)
         for host in ("two-production-1.example.com", "ep-prod-1.example.com"):
             self.assertFalse(is_staging_host(host), host)
+
+
+class RunGateArgvTests(unittest.TestCase):
+    """run_gate must forward the identity pins to the binary, not just to main."""
+
+    def capture_argv(self, *args):
+        captured = []
+
+        def fake_run(argv, **kwargs):
+            captured.append(list(argv))
+            return types.SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"pending_before": []}) + "\n",
+                stderr="",
+            )
+
+        with mock.patch.object(production_schema_gate.subprocess, "run", fake_run):
+            manifest = run_gate("bin", SHA, *args)
+        self.assertEqual(manifest["pending_before"], [])
+        self.assertEqual(len(captured), 1)
+        return captured[0]
+
+    def flag_value(self, argv, flag):
+        self.assertIn(flag, argv)
+        return argv[argv.index(flag) + 1]
+
+    def test_forwards_branch_pin_for_planetscale_host(self):
+        argv = self.capture_argv(
+            "postgresql://two-bot-migrator.cnlmx96ec5kw:pw@myapp.pg.psdb.cloud:5432/postgres",
+            "myapp.pg.psdb.cloud",
+            "postgres",
+            "cnlmx96ec5kw",
+        )
+        self.assertEqual(self.flag_value(argv, "--production-branch-id"), "cnlmx96ec5kw")
+        self.assertEqual(self.flag_value(argv, "--production-host"), "myapp.pg.psdb.cloud")
+        self.assertEqual(self.flag_value(argv, "--production-database"), "postgres")
+
+    def test_forwards_empty_branch_for_non_planetscale_host(self):
+        # The binary treats an empty --production-branch-id as no-pin.
+        argv = self.capture_argv(PROD_URL, PROD_HOST, PROD_DB, "")
+        self.assertEqual(self.flag_value(argv, "--production-branch-id"), "")
 
 
 class WaiveReasonTests(unittest.TestCase):
@@ -154,6 +224,21 @@ class MainTests(unittest.TestCase):
                                "--mode", "deploy", "--allow-unstaged", "true"],
                               refuse_run, out), 0)
             self.assertIn("waived", json.loads(out.read_text()))
+
+    def test_main_forwards_branch_pin_from_env(self):
+        seen = []
+
+        def capture(*args):
+            seen.append(args)
+            return {"pending_before": []}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "manifest.json"
+            self.assertEqual(
+                main(["--binary", "bin", "--source-sha", SHA, "--mode", "deploy",
+                      "--manifest-out", str(out)],
+                     env=env(branch="cnlmx96ec5kw"), run=capture), 0)
+            self.assertEqual(seen[0][-1], "cnlmx96ec5kw")
 
     def test_clean_plan_passes(self):
         with tempfile.TemporaryDirectory() as tmp:
