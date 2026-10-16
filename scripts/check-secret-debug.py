@@ -65,6 +65,38 @@ def tuple_variants(body):
         yield match.group(1), body[match.end():end - 1], match.start()
 
 
+def strip_secret_spans(text):
+    """Remove balanced `Secret<...>` spans, leaving any raw types behind.
+
+    A per-field `Secret<` anywhere check is fail-open when a raw type is
+    nested in the same top-level field as a `Secret`: e.g.
+    `(Secret<String>, String)`, `Option<(Secret<String>, String)>` and
+    `fn() -> (Secret<String>, String)` all print the raw element under
+    derived Debug. Stripping the balanced spans (the `>` of a `->`
+    inside the span does not close it) exposes such raw remnants.
+    """
+    out, i = [], 0
+    while True:
+        match = re.search(r"\bSecret\s*<", text[i:])
+        if not match:
+            out.append(text[i:])
+            return "".join(out)
+        start = i + match.start()
+        out.append(text[i:start])
+        depth, j = 1, i + match.end()
+        while j < len(text) and depth:
+            if text[j] == "<":
+                depth += 1
+            elif text[j] == ">" and not (j > 0 and text[j - 1] == "-"):
+                depth -= 1
+            j += 1
+        i = j
+
+
+def has_raw_outside_secret(text):
+    return bool(RAW.search(strip_secret_spans(text)))
+
+
 def split_top_level(payload):
     fields, depth, start = [], 0, 0
     for i, ch in enumerate(payload):
@@ -111,9 +143,7 @@ def violations(source, path="fixture.rs"):
         body = clean[start:end - 1]
         for field in FIELD.finditer(body):
             name, field_type = field.groups()
-            if not SENSITIVE.search(name) or not RAW.search(field_type):
-                continue
-            if re.search(r"\bSecret\s*<", field_type):
+            if not SENSITIVE.search(name) or not has_raw_outside_secret(field_type):
                 continue
             if (path, match["name"], name) in EXCEPTIONS:
                 continue
@@ -123,7 +153,7 @@ def violations(source, path="fixture.rs"):
             if not SENSITIVE_VARIANT.fullmatch(name):
                 continue
             if not any(
-                RAW.search(field) and not re.search(r"\bSecret\s*<", field)
+                has_raw_outside_secret(field)
                 for field in split_top_level(payload)
             ):
                 continue
@@ -194,9 +224,19 @@ class GuardTests(unittest.TestCase):
             "Token((u64,u64), Vec<u8>)",
             "Token(fn() -> Secret<String>, String)",
             "Token(Box<dyn Fn() -> Secret<String>>, String)",
+            "Claimed((Secret<String>, String))",
+            "Token(Option<(Secret<String>, String)>)",
+            "Token(fn() -> (Secret<String>, String))",
         ]:
             code = f"#[derive(Debug)] enum Fixture {{ {variant}, Other, }}"
             self.assertEqual(len(violations(code)), 1, code)
+
+    def test_arrow_inside_secret_at_depth_passes(self):
+        # The `>` of `->` at depth > 0 must not close a bracket: without
+        # that guard the payload splits/strips at the arrow and the raw
+        # `String` inside the `Secret<...>` span looks unwrapped.
+        self.assertFalse(violations('#[derive(Debug)] enum Fixture { Token(Secret<fn() -> u64, String>), }'))
+        self.assertFalse(violations('#[derive(Debug)] enum Fixture { Token(Secret<fn() -> String>), }'))
 
     def test_exception_is_exact(self):
         code = '#[derive(Debug)] struct ModerationMarker { token: String }'
