@@ -1757,10 +1757,10 @@ jobs:
       - name: Fetch pinned fuzz dependencies (locked)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fetch --locked
-      # Builds all fifteen libFuzzer targets. No fuzz campaign, no corpus
-      # output, no schedule; the only execution in this job is the bounded
-      # eventsub_delivery seed replay below. The bounded vote_kick smoke
-      # stays a manual non-controller step (see fuzz/README.md).
+      # Builds all fifteen libFuzzer targets. No fuzz campaign or corpus
+      # output; the workflow's existing weekly run also builds these targets
+      # and replays only the bounded eventsub_delivery seeds below. The bounded
+      # vote_kick smoke stays a manual non-controller step (see fuzz/README.md).
       # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the
       # toolchain from the repo-root rust-toolchain.toml (stable 1.98.1) even
       # with working-directory fuzz/, so a bare `cargo fuzz build` runs under
