@@ -1549,7 +1549,7 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertIn('report_path="$GITHUB_WORKSPACE/lcov.info"', step["run"])
         self.assertIn('[ ! -s "$report_path" ]', step["run"])
-        self.assertIn('--lcov --output-path "$report_path"', step["run"])
+        self.assertIn("--lcov --output-path /dev/stdout > \"$report_path\"", step["run"])
         # Guarded suites are measured per suite with their accepted URL and
         # merged: --no-report per run, one final report. Selected ignored runs
         # are serial and never execute the reference-docs regen.

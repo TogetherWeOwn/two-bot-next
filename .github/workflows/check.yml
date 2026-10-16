@@ -741,13 +741,9 @@ jobs:
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test reengagement_list_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-core --features db --locked --test member_moderation_db -- --ignored --test-threads=1 --skip regenerate_reference_docs
           # Merge every collected profile into the single LCOV report the gate reads.
-          cov_run "$COV" llvm-cov report --lcov --output-path "$report_path"
-          if [ ! -s "$report_path" ]; then
-            # Some runners report the output path as saved without exposing the
-            # file to the job container. Capture llvm-cov's stdout directly there.
-            echo "::warning::llvm-cov reported a saved LCOV report, but the file is missing; retrying via stdout"
-            cov_run "$COV" llvm-cov report --lcov > "$report_path"
-          fi
+          # Write through the process stdout device: cargo-llvm-cov's path-based
+          # export can report success while the file is absent in the job container.
+          cov_run "$COV" llvm-cov report --lcov --output-path /dev/stdout > "$report_path"
           if [ ! -s "$report_path" ]; then
             echo "::error::patch coverage measurement produced no lcov report"
             exit 1
