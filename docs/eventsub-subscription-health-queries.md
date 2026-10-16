@@ -169,9 +169,12 @@ for 2026-10-15 21:41–22:11Z returned zero lines for both original filters, so
 it cannot provide a truthful positive sample; no staging result is claimed for
 the added pending filter.
 Expected while the reconcile slice is undeployed. After it deploys, expect
-one `healthy` line per hour per container boot plus one per startup; a gap
-with `TWO_EVENTSUB=1` set means the task is not running and is itself the
-finding.
+at least one line from the three Q2 queries per hour per container boot plus
+one per startup; a window of one hour or more with none of the three Q2
+queries returning a line (with `TWO_EVENTSUB=1` set) means the task is not
+running and is itself the finding. Healthy lines absent while the other
+queries return lines means the task is running and failing or pending, not
+stopped.
 
 ## Q3 — revocation count (total today; by reason needs a logging slice)
 
