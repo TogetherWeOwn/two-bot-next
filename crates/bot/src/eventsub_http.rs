@@ -1,9 +1,9 @@
 //! Private Twitch EventSub receiver (`POST /hooks/twitch`). Never merge this
 //! router into the health socket. Verification (`twitch_eventsub::verify_delivery`)
-//! precedes any JSON parsing; classification errors after verification are
-//! deterministic and are acknowledged with 2xx so Twitch does not retry them.
-//! Only transient failures (none in this slice: no send, no ledger) would be
-//! 5xx. No Helix client and no durable ledger here (separate slices).
+//! precedes any JSON parsing; known deterministic classification errors are
+//! acknowledged with 2xx so Twitch does not retry them. Unknown/future errors
+//! fail closed with retryable 503. No Helix client and no durable ledger here
+//! (separate slices).
 //!
 //! Logging carries only scalar `event`/`status`/`error_class`: no header
 //! values, challenge, body bytes or query. The callback path never reaches a
@@ -327,8 +327,8 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             ack(id)
         }
         // Deterministic planning errors: acknowledge with 2xx so Twitch does
-        // not retry what will never succeed. Only transient send/ledger
-        // failures (not in this slice) are 5xx.
+        // not retry what will never succeed. Unknown/future classification
+        // errors remain retryable through the fallback below.
         Err(EventSubError::WrongSubscription) | Err(EventSubError::InvalidBody) => {
             two_bot_core::metrics::global().eventsub_classified("ignored");
             tracing::info!(
@@ -884,6 +884,7 @@ mod tests {
 
         let catch_all = arm("Err(e) => {", "\n    }\n}\n\n#[cfg(test)]");
         assert!(catch_all.contains("StatusCode::SERVICE_UNAVAILABLE"));
+        assert!(!catch_all.contains("ack("));
         assert!(catch_all.contains("\"unavailable\""));
         assert!(catch_all.contains("                true,"));
 
