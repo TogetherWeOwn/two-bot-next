@@ -816,6 +816,7 @@ def verify(args, client):
                                 and final_app["durable_objects"]["namespace_id"] == baseline["namespace_id"],
                                 "application_identity_drift")
                         final_image = mapping(final_app.get("configuration")).get("image")
+                        listing_seen_target = listing_seen_target or final_image == image
                         final_previous_image = mapping(final.get("current_configuration")).get("image")
                         verified_previous_image = (
                             isinstance(final_image, str) and re.fullmatch(IMAGE, final_image)

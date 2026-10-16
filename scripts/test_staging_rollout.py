@@ -1917,6 +1917,19 @@ class OrchestrationTests(OfflineTestCase):
         self.assertTrue(evidence["application_listing_lag"])
         self.assert_no_secret_saved_or_printed()
 
+    def test_target_seen_on_final_reread_then_baseline_fails_during_lag_confirmation(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = self.lag_client([ready_response(), ready_response()])
+        stale = app(OLD_IMAGE)
+        client.api_routes[APP_PATH] = [[stale], [app()], [stale], [stale]]
+        client.deadline = 1000
+
+        self.assert_gate("application_image_drift", rollout.verify, self.args, client)
+        self.assert_no_evidence()
+        self.assertEqual(self.clock.sleeps, [5])
+        self.assert_no_secret_saved_or_printed()
+
     def test_lag_confirmation_survives_stale_listing_past_the_poll_cap(self):
         self.prepare_baseline()
         self.write_deploy_output()
