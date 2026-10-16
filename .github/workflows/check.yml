@@ -742,6 +742,12 @@ jobs:
           # Merge every collected profile into the single LCOV report the gate reads.
           cov_run "$COV" llvm-cov report --lcov --output-path "$report_path"
           if [ ! -s "$report_path" ]; then
+            # Some runners report the output path as saved without exposing the
+            # file to the job container. Capture llvm-cov's stdout directly there.
+            echo "::warning::llvm-cov reported a saved LCOV report, but the file is missing; retrying via stdout"
+            cov_run "$COV" llvm-cov report --lcov > "$report_path"
+          fi
+          if [ ! -s "$report_path" ]; then
             echo "::error::patch coverage measurement produced no lcov report"
             exit 1
           fi
