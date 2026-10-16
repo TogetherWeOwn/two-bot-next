@@ -144,7 +144,7 @@ Classification after verification:
   Source: `crates/core/src/twitch_eventsub.rs:225-231`.
 - An empty, oversized, or non-graphic challenge is `InvalidChallenge` and
   answers `400 malformed`, never an echo.
-  Source: `crates/bot/src/eventsub_http.rs:326-328`.
+  Source: `crates/bot/src/eventsub_http.rs:341-343`.
 
 If the challenge echo never arrives at Twitch, check in order: the Worker
 route gate (both flags `1`?), the container bind (did startup refuse?), the
@@ -188,10 +188,10 @@ direct `containerFetch`, because the Worker answers those shapes first):
 
 | Status | Code | Retryable | Meaning / first action |
 |---|---|---|---|
-| 400 | `malformed` | false | Query string present, empty body, or invalid challenge on a direct fetch. The query gate runs before verification. Check the forwarded request shape, not the secret. Source: `crates/bot/src/eventsub_http.rs:180-182,251-253,326-328`. |
+| 400 | `malformed` | false | Query string present, empty body, or invalid challenge on a direct fetch. The query gate runs before verification. Check the forwarded request shape, not the secret. Source: `crates/bot/src/eventsub_http.rs:188-189,259-260,341-343`. |
 | 401 | `unauthorized` | false | Signature, freshness, or timestamp failure, or (on a direct fetch) missing/malformed delivery headers. Via the Worker, a malformed header shape is 400 at ingress (row above); first action is still secret agreement and clock skew (10-minute window). Source: `crates/bot/src/eventsub_http.rs:223-227,255-268`. |
-| 404 | `not_found` | false | Wrong path (exact path is `/hooks/twitch`) or any non-callback route via the fallback on a direct fetch. Via the public URL the Worker already answered non-POSTs and bad shapes with its own 404. Source: `crates/bot/src/eventsub_http.rs:35,138-146,176-179`. |
-| 405 | `method_not_allowed` | false | Anything but POST on the callback path on a direct fetch. Via the public URL the Worker drops non-POSTs with its own 404 before the container. Source: `crates/bot/src/eventsub_http.rs:183-195`. |
+| 404 | `not_found` | false | Wrong path (exact path is `/hooks/twitch`) or any non-callback route via the fallback on a direct fetch. Via the public URL the Worker already answered non-POSTs and bad shapes with its own 404. Source: `crates/bot/src/eventsub_http.rs:35,184-189`. |
+| 405 | `method_not_allowed` | false | Anything but POST on the callback path on a direct fetch. Via the public URL the Worker drops non-POSTs with its own 404 before the container. Source: `crates/bot/src/eventsub_http.rs:191-203`. |
 | 408 | `request_timeout` | true | Body slower than the 5 s read budget while holding one of the 32 permits. Retriable: the sender (Twitch) backs off and redelivers. Source: `crates/bot/src/eventsub_http.rs:38,241-250`. |
 | 413 | `payload_too_large` | false | Body over the 64 KiB cap, checked before verification. Genuine `stream.online` bodies are well under 2 KiB; treat 413 as a malformed or abusive sender. Source: `crates/bot/src/eventsub_http.rs:36,230-240,258-265`, `crates/core/src/twitch_eventsub.rs:49-51`. |
 | 415 | `unsupported_media_type` | false | Content type is not exactly `application/json` or `application/json; charset=utf-8` (case-insensitive); anything else, including another encoding, is refused. Source: `crates/bot/src/eventsub_http.rs:198-214`. |
@@ -217,14 +217,15 @@ Verified deliveries that need no operator action answer `200`:
   delivery ignored` immediately after a subscription creation means the
   challenge was not echoed: delete and recreate the subscription.
 
-Source: `crates/bot/src/eventsub_http.rs:287-325`.
+Source: `crates/bot/src/eventsub_http.rs:281-340`.
 
 Log lines to expect (scalar fields only):
 
 - `eventsub delivery refused` (warn: `status`, `error_class`)
 - `challenge answered`, `notification acknowledged`, `revocation acknowledged`,
   `delivery ignored` (info: `status = 200`)
-- `classification failed` followed by `eventsub delivery refused` (warn:
+- `classification failed` (warn: `status = 503`, `error_class` is the
+  classification error text), followed by `eventsub delivery refused` (warn:
   `status = 503`, `error_class = "unavailable"`) for unknown/future
   classification errors
 
