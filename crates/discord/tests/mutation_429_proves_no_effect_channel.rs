@@ -596,7 +596,6 @@ fn allowed_test_url(url: &str, ci: bool) -> bool {
 struct TestDb {
     admin: PgPool,
     pool: PgPool,
-    options: PgConnectOptions,
     schema: String,
 }
 
@@ -646,7 +645,6 @@ impl TestDb {
         Self {
             admin,
             pool,
-            options,
             schema,
         }
     }
