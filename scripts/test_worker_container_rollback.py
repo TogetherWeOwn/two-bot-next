@@ -472,5 +472,40 @@ class MainValidationTests(unittest.TestCase):
         self.assertIn("invalid_expected_sha", out)
 
 
+class PostStatusTests(unittest.TestCase):
+    """A created rollout (201) is success; the 10-16 staging auto-rollback
+    posted its rollout, read 201 and failed the run as api_http_failure."""
+
+    class Response:
+        def __init__(self, status, body):
+            self.status, self.body = status, body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, limit):
+            return self.body[:limit]
+
+    def client(self, status):
+        body = json.dumps({"success": True, "result": {"id": "r-1"}}).encode()
+        client = rollback.RollbackClient(ACCOUNT, "token")
+        client.opener = type("Opener", (), {"open": lambda _self, request, timeout: self.Response(status, body)})()
+        return client
+
+    def test_created_201_is_success(self):
+        self.assertEqual(self.client(201).post("/x", {}), {"id": "r-1"})
+
+    def test_ok_200_is_success(self):
+        self.assertEqual(self.client(200).post("/x", {}), {"id": "r-1"})
+
+    def test_other_2xx_fails_closed(self):
+        with self.assertRaises(base.GateError) as raised:
+            self.client(202).post("/x", {})
+        self.assertEqual(str(raised.exception), "api_http_failure")
+
+
 if __name__ == "__main__":
     unittest.main()
