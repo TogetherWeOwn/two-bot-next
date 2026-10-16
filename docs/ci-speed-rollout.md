@@ -3,19 +3,39 @@
 One definition, inherited everywhere. Anything on this page used by more
 than one repo lives ONCE at org level; per-repo files only call it.
 
-## What ships in this pilot (advisory, this repo)
+## Promotion (2026-10-15): nextest is required
+
+The advisory pilot graduated. `check.yml` calls the shared lane as the
+`nextest` job (rust-selector gated, aggregated by `ci-ok`, 45-minute
+ceiling pinned in `scripts/ci/test_workflows.py`); `ci-speed.yml` keeps
+the affected-paths selection and the minutes-per-merged-PR report.
+No new required-check context was created: `ci-ok` stays the single
+aggregate, so no branch-protection change was needed.
+
+Red-group ejection without a revert: the reusable lane takes a
+`quarantine` input (whitespace-separated nextest filters, empty by
+default). Each filter becomes one `--skip` after the `--` separator
+(pinned cargo-nextest 0.9.99 only accepts `--skip` there), so the rest
+of the suite still gates while the red group is out. Drilled on a
+throwaway draft PR (synthetic failing test went red, then green under
+quarantine, PR closed unmerged) before the promotion merged; the first
+quarantine run caught a `--skip`-before-`--` usage error, which the fix
+and the re-run receipts on the promotion PR close out.
+
+## What shipped in the pilot (advisory, this repo)
 
 - `dorny/paths-filter` in `.github/workflows/ci-speed.yml` (`changes` job):
   affected-only pre-filter for the advisory lane. Required lanes keep the
   existing `job-inputs` selector; the required `ci-ok` aggregator is
   untouched, so no required context can strand.
 - `Swatinem/rust-cache` (restore-only from the warm `check` entry) plus
-  `sccache` in `.github/workflows/reusable-rust-nextest.yml`: off-PR runs
-  (push to main, workflow_dispatch) use the R2 backend when
+  `sccache` in `.github/workflows/reusable-rust-nextest.yml`: push-to-main
+  and workflow_dispatch runs use the R2 backend when
   `SCCACHE_BUCKET`/`SCCACHE_ENDPOINT` secrets exist and degrade to the
-  GitHub-cache backend otherwise. Pull-request runs use sccache on local
-  disk only: no R2 write credential ever reaches PR-built code (the lane
-  compiles and executes code at the PR head, and a shared R2 bucket has no
+  GitHub-cache backend otherwise. Every other event (pull_request,
+  merge_group, ...) uses sccache on local disk only: no R2 write credential
+  ever reaches code that is not on `main` yet (the lane compiles and
+  executes code at an unmerged head, and a shared R2 bucket has no
   per-PR scope), and the lane writes no shared Actions-cache entry that
   could crowd out the warm `check` entry. No new paid SaaS, no new Actions
   minutes beyond the advisory job itself.
@@ -61,9 +81,9 @@ than one repo lives ONCE at org level; per-repo files only call it.
   file I/O with offline fixtures (`test_flake_ledger.py`,
   `test_ci_minutes.py`) that run in the `check` lane's `scripts/ci`
   discover step. Identical input bytes give identical output bytes.
-- The pilot workflow is staging/advisory: it never gates merge, never
-  touches `ci-ok`, and follows the routed-runner, minimal-grant and
-  inventory pins in `scripts/ci/test_workflows.py`.
+- The lane graduated from advisory to required (see Promotion above):
+  it gates merge through `ci-ok` and follows the routed-runner,
+  minimal-grant and inventory pins in `scripts/ci/test_workflows.py`.
 - The phase0/blocker ledger was not present in this repo, so there was no
   local ledger to backtest against; the parser fixtures above are the
   backtest, and the first advisory runs attach real JUnit evidence.
