@@ -24,7 +24,7 @@ FIELD = re.compile(r"\b(\w+)\s*:\s*([^,\n}]+)")
 # credential-bearing variant name (a claim token is an ownership
 # credential in this codebase). Anchored: `SecretTooShort(String)`
 # carries a key id, not a secret, and must not trip this.
-TUPLE_VARIANT = re.compile(r"\b([A-Z]\w*)\s*\(([^{}]*?)\)")
+TUPLE_VARIANT = re.compile(r"\b([A-Z]\w*)\s*\(")
 SENSITIVE_VARIANT = re.compile(
     r"(?:claimed?|claimtoken|token|accesstoken|refreshtoken|secret|password|credentials?)",
     re.IGNORECASE,
@@ -46,6 +46,23 @@ EXCEPTIONS = {
     ("crates/core/src/voice_naming.rs", "Segment", "Token"):
         "voice name-template token name (lowercased @@name@@), not a credential",
 }
+
+
+def tuple_variants(body):
+    """Yield (name, payload, offset) for tuple variants in `body`.
+
+    The payload is captured with balanced-paren scanning: a non-greedy
+    regex stops at the first inner `)`, so fields after a parenthesized
+    field (e.g. `Claimed((u64, u64), String)`) would never be checked.
+    """
+    for match in TUPLE_VARIANT.finditer(body):
+        depth, end = 1, match.end()
+        while end < len(body) and depth:
+            depth += (body[end] == "(") - (body[end] == ")")
+            end += 1
+        if depth:
+            continue
+        yield match.group(1), body[match.end():end - 1], match.start()
 
 
 def split_top_level(payload):
@@ -92,8 +109,7 @@ def violations(source, path="fixture.rs"):
                 continue
             line = source.count("\n", 0, start + field.start()) + 1
             results.append(f"{path}:{line}: {match['name']}.{name} is raw under derived Debug; use Secret<T>")
-        for variant in TUPLE_VARIANT.finditer(body):
-            name, payload = variant.groups()
+        for name, payload, variant_start in tuple_variants(body):
             if not SENSITIVE_VARIANT.fullmatch(name):
                 continue
             if not any(
@@ -103,7 +119,7 @@ def violations(source, path="fixture.rs"):
                 continue
             if (path, match["name"], name) in EXCEPTIONS:
                 continue
-            line = source.count("\n", 0, start + variant.start()) + 1
+            line = source.count("\n", 0, start + variant_start) + 1
             results.append(f"{path}:{line}: {match['name']}::{name} is raw under derived Debug; use Secret<T>")
     return results
 
@@ -154,6 +170,7 @@ class GuardTests(unittest.TestCase):
         self.assertFalse(violations('#[derive(Debug)] enum Fixture { Message(String), Count(u64), }'))
         self.assertFalse(violations('#[derive(Debug)] enum Fixture { Claimed(Secret<[u8; 32]>, u64), }'))
         self.assertFalse(violations('#[derive(Debug)] enum Fixture { Claimed(Option<Secret<String>>, u64), }'))
+        self.assertFalse(violations('#[derive(Debug)] enum Fixture { Claimed((u64, u64), Secret<String>), }'))
 
     def test_tuple_mixed_and_array_payloads_fail(self):
         for variant in [
@@ -162,6 +179,8 @@ class GuardTests(unittest.TestCase):
             "ClaimToken([u8; 32])",
             "Claimed([u8; 32])",
             "Token(Secret<String>, [u8; 32])",
+            "Claimed((u64, u64), String)",
+            "Token((u64,u64), Vec<u8>)",
         ]:
             code = f"#[derive(Debug)] enum Fixture {{ {variant}, Other, }}"
             self.assertEqual(len(violations(code)), 1, code)
