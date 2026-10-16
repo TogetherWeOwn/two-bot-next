@@ -289,11 +289,14 @@ fn sleep_calls(code: &str) -> Vec<(usize, &str)> {
     let bytes = code.as_bytes();
     let mut calls = Vec::new();
     let mut index = 0;
-    while index + b"sleep".len() <= bytes.len() {
-        if &bytes[index..index + b"sleep".len()] == b"sleep" {
+    while index < bytes.len() {
+        let call_name = [b"sleep_until".as_slice(), b"sleep".as_slice()]
+            .into_iter()
+            .find(|name| bytes[index..].starts_with(name));
+        if let Some(name) = call_name {
             let before_ok = index == 0
                 || !(bytes[index - 1].is_ascii_alphanumeric() || bytes[index - 1] == b'_');
-            let after = index + b"sleep".len();
+            let after = index + name.len();
             let after_ok = after >= bytes.len()
                 || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
             let open = after
@@ -714,6 +717,17 @@ fn source_block_parser_ignores_braces_in_comments_and_literals() {
 
 #[test]
 fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
+    let sleep_until_comment_and_literal =
+        "// tokio::time::sleep_until(deadline);\nlet text = \"sleep_until(deadline)\";";
+    assert_no_sleep_calls(
+        sleep_until_comment_and_literal,
+        "comments and literals must not count as timing sleeps",
+    );
+    assert_no_sleep_calls(
+        "timeout(STEP, future); stream.connect_timeout(addr, limit); yield_now().await;",
+        "timeouts and scheduler yields must not count as timing sleeps",
+    );
+
     let wait_http = function_body(ALIVE, "wait_http");
     assert_poll_site(&wait_http, "loop", 10);
     let changed_backoff = wait_http.replace("from_millis(10)", "from_millis(50)");
@@ -842,6 +856,15 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
         assert_sleep_inventory(&spaced_stray_sleep, 4, "alive.rs sleep inventory");
     })
     .is_err());
+    let stray_sleep_until = ALIVE.replacen(
+        "bot.assert_alive();",
+        "tokio::time::sleep_until(tokio::time::Instant::now()).await;\n            bot.assert_alive();",
+        1,
+    );
+    assert!(std::panic::catch_unwind(|| {
+        assert_sleep_inventory(&stray_sleep_until, 4, "alive.rs sleep inventory");
+    })
+    .is_err());
 }
 
 #[test]
@@ -874,6 +897,17 @@ fn polling_guard_pins_exact_ops_deadline_and_preflight_attempt_assertions() {
     assert!(std::panic::catch_unwind(|| {
         assert_no_sleep_calls(
             &spaced_sleep,
+            "preflight 429 test must remain free of timing sleeps",
+        );
+    })
+    .is_err());
+    let sleep_until = preflight_test.replace(
+        "assert_eq!(mock.requests().len(), 1);",
+        "tokio::time::sleep_until(tokio::time::Instant::now()).await;\n            assert_eq!(mock.requests().len(), 1);",
+    );
+    assert!(std::panic::catch_unwind(|| {
+        assert_no_sleep_calls(
+            &sleep_until,
             "preflight 429 test must remain free of timing sleeps",
         );
     })
