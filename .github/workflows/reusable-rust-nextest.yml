@@ -109,9 +109,29 @@ jobs:
           exit 1
 
       - name: Install Rust toolchain
+        id: toolchain
         uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (2026-09-12)
         with:
           toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+        # Continue so the retry below can reinstall the same pin; it fails closed.
+        continue-on-error: true
+
+      # Retry the exact pin on a transient network failure; fails closed if it stays missing.
+      - name: Retry Rust toolchain install on transient network failure
+        if: steps.toolchain.outcome == 'failure'
+        shell: bash
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: 1
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host; then
+              rustup default "1.98.1" --force-non-host
+              exit 0
+            fi
+            [ "$attempt" -lt 5 ] || exit 1
+            sleep $((attempt * 15))
+          done
 
       # PR and merge-queue isolation first: sccache stays on local disk
       # only and no shared-backend credential is written anywhere. R2 write

@@ -2093,7 +2093,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(set(installers["check"][0]["with"]["components"].replace(" ", "").split(",")),
                          {"rustfmt", "clippy"})
 
-    def test_rust_tests_toolchain_install_is_retry_guarded(self):
+    def test_rust_toolchain_installs_are_retry_guarded(self):
         # `rustup toolchain install` inside the installer failed once on main
         # with `Network is unreachable` syncing the channel manifest, failing
         # the job before any test ran (green on re-run). The upstream
@@ -2101,36 +2101,47 @@ class WorkflowTests(unittest.TestCase):
         # continues on error and the next step retries the same pin and fails
         # closed. The retry must request the repository pin and every
         # component the installer requests, or a green retry can mask a drift.
+        # Every lane that installs the pin must carry the guard: a 4-second
+        # install failure on ignored-db-runtime reddened PR #984 while the
+        # identical step passed on the other lanes of the same head.
         channel = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
-        steps = self.workflows["check.yml"]["jobs"]["rust-tests"]["steps"]
-        installers = [index for index, step in enumerate(steps)
-                      if str(step.get("uses", "")).startswith("dtolnay/rust-toolchain@")]
-        self.assertEqual(len(installers), 1)
-        index = installers[0]
-        installer = steps[index]
-        self.assertTrue(installer.get("continue-on-error"),
-                        "toolchain installer must continue so the retry step can run")
-        self.assertIn("id", installer)
-        retry = steps[index + 1]
-        self.assertNotIn("uses", retry)
-        self.assertIn("run", retry)
-        self.assertEqual(retry.get("if"), f"steps.{installer['id']}.outcome == 'failure'")
-        self.assertNotEqual(retry.get("continue-on-error"), True,
-                            "the retry must fail the job when the toolchain stays missing")
-        self.assertIn(channel, retry["run"])
-        for component in installer["with"]["components"].replace(" ", "").split(","):
-            with self.subTest(component=component):
-                self.assertIn(component, retry["run"])
-        with self.subTest(change="retry step removed"):
-            workflows = deepcopy(self.workflows)
-            del workflows["check.yml"]["jobs"]["rust-tests"]["steps"][index + 1]
-            retry_steps = workflows["check.yml"]["jobs"]["rust-tests"]["steps"]
-            still_guarded = (
-                len(retry_steps) > index + 1
-                and "run" in retry_steps[index + 1]
-                and retry_steps[index + 1].get("if") == f"steps.{installer['id']}.outcome == 'failure'"
-            )
-            self.assertFalse(still_guarded, "removing the retry step must fail this guard")
+        targets = (
+            ("check.yml", "rust-tests"),
+            ("check.yml", "ignored-db-runtime"),
+            ("reusable-rust-nextest.yml", "nextest"),
+        )
+        for workflow_name, job_id in targets:
+            with self.subTest(workflow=workflow_name, job=job_id):
+                steps = self.workflows[workflow_name]["jobs"][job_id]["steps"]
+                installers = [index for index, step in enumerate(steps)
+                              if str(step.get("uses", "")).startswith("dtolnay/rust-toolchain@")]
+                self.assertEqual(len(installers), 1)
+                index = installers[0]
+                installer = steps[index]
+                self.assertTrue(installer.get("continue-on-error"),
+                                "toolchain installer must continue so the retry step can run")
+                self.assertIn("id", installer)
+                retry = steps[index + 1]
+                self.assertNotIn("uses", retry)
+                self.assertIn("run", retry)
+                self.assertEqual(retry.get("if"), f"steps.{installer['id']}.outcome == 'failure'")
+                self.assertNotEqual(retry.get("continue-on-error"), True,
+                                    "the retry must fail the job when the toolchain stays missing")
+                self.assertIn(channel, retry["run"])
+                components = installer.get("with", {}).get("components", "")
+                for component in filter(None, components.replace(" ", "").split(",")):
+                    with self.subTest(component=component):
+                        self.assertIn(component, retry["run"])
+                with self.subTest(change="retry step removed"):
+                    workflows = deepcopy(self.workflows)
+                    del workflows[workflow_name]["jobs"][job_id]["steps"][index + 1]
+                    retry_steps = workflows[workflow_name]["jobs"][job_id]["steps"]
+                    still_guarded = (
+                        len(retry_steps) > index + 1
+                        and "run" in retry_steps[index + 1]
+                        and retry_steps[index + 1].get("if") == f"steps.{installer['id']}.outcome == 'failure'"
+                    )
+                    self.assertFalse(still_guarded, "removing the retry step must fail this guard")
 
     def test_overflow_runner_must_name_its_own_job(self):
         self.assertTrue(runner_allowed("worker", self.workflows["check.yml"]["jobs"]["worker"]["runs-on"]))
