@@ -66,9 +66,10 @@ its flag names settle.
   (see §4). Anything outside 2xx/403/404/429/5xx is a hard `Wire` error.
 - Every run prints its own Discord cost (`rest.requests()`,
   `backfill.rs:470-473`, `backfill_messages.rs:319-323`): requests plus
-  wall time. A re-run that scanned nothing should show few requests; a
-  large number with no rows written points at unreadable pages, not at
-  successful work.
+  wall time. A successful re-run over already-populated history can scan
+  pages without inserting rows. Read the scan-completion and
+  `INCOMPLETE: unreadable` entries to distinguish a complete no-op from
+  unreadable pages; request count alone is not proof of successful work.
 
 ### Runtime executor (`crates/discord/src/executor.rs`)
 
@@ -161,9 +162,12 @@ Interpreting the body (`families_body`, `270-297`):
 ## 3. Dry-run and staged-delete counts
 
 `backfill`, `backfill-messages`, and `capture` WRITE by default; pass
-`--dry-run` to report only. `dedupe-events` is the only CLI here that
-defaults to a dry run (writes require `--apply`). The history CLIs print
-a `DRY RUN` banner when that flag is passed. Env for the
+`--dry-run` to suppress backfill data writes. This does not prevent those
+CLIs from applying migrations when the schema is behind (see the migration
+gate below). `dedupe-events` is the only CLI here that defaults to a dry
+run (writes require `--apply`); its `--dry-run` suppresses delete writes,
+not migrations (it does not migrate). The history CLIs print a `DRY RUN`
+banner when that flag is passed. Env for the
 Discord-reading CLIs: `DISCORD_TOKEN` (or `DISCORD_BOT_TOKEN`),
 `DISCORD_GUILD_ID`, `TWO_DATABASE_URL` (`backfill.rs:8-9`, token fallback
 `45-49`, guild/DB checks `74-87`). Even dry runs of those
@@ -288,14 +292,15 @@ cargo fmt --all -- --check
 grep -rn "BACKFILL_FAMILIES\|put_backfill_cursor\|get_backfill_cursor" crates/store/src/backfill_cursors.rs
 grep -rn "X-RateLimit-Reset-After\|reset_after\|x-ratelimit-reset" crates/discord/src crates/cutover/src || echo "no shipped Reset-After reader"
 grep -n "would delete\|chunks(200)\|DRY RUN" crates/cutover/src/bin/dedupe_events.rs
-grep -n "ScanCompletion::" crates/cutover/src/rest.rs | head
+grep -n "ScanCompletion::" crates/cutover/src/rest.rs
 ```
 
 - `cargo fmt --all -- --check`: run per the PR checklist (docs-only
   change; result recorded in the PR Verification section).
-- Citation grep above confirms every command, flag, constant and report
-  line cited here, including the negative result that no shipped
-  `Reset-After` reader exists (acceptance-suite only).
+- The checks above cover the cursor vocabulary and store interface, the
+  shipped `Reset-After` reader search, dedupe output terms, and all
+  `ScanCompletion` occurrences in `crates/cutover/src/rest.rs`. They do not
+  verify every command, flag, constant, or citation in this runbook.
 - Not run: any CLI against staging/production, any database migration,
   the ignored DB-backed tests (require `TWO_TEST_DATABASE_URL`; CI runs
   them explicitly). The `--dry-run` recipes in §3 are documented from
