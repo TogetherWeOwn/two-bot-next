@@ -691,7 +691,7 @@ async fn count_raw_expiry_candidates(
         let guild_placeholder = next_placeholder;
         let user_placeholder = next_placeholder + 1;
         sql.push_str(&format!(
-            " AND NOT (guild_id = ${guild_placeholder} AND (actor_id = ${user_placeholder} OR target_id = ${user_placeholder} OR user_id = ${user_placeholder} OR inviter_id = ${user_placeholder}))"
+            " AND (guild_id = ${guild_placeholder} AND (actor_id = ${user_placeholder} OR target_id = ${user_placeholder} OR user_id = ${user_placeholder} OR inviter_id = ${user_placeholder})) IS NOT TRUE"
         ));
         next_placeholder += 2;
     }

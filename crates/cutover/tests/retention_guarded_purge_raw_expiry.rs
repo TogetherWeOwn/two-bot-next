@@ -156,6 +156,7 @@ async fn dry_run_and_execute_agree_on_queued_guild_and_pending_user_overlap() {
                ('PRESENCE_UPDATE', $1, $2, now() - interval '31 days', now(), 'overlap-queued-presence'),
                ('VOICE_STATE_UPDATE', $1, $2, now() - interval '31 days', now(), 'overlap-queued-voice'),
                ('PRESENCE_UPDATE', $3, $4, now() - interval '31 days', now(), 'overlap-pending-presence'),
+               ('VOICE_SERVER_UPDATE', $3, NULL, now() - interval '31 days', now(), 'overlap-pending-anonymous-voice'),
                ('PRESENCE_UPDATE', $5, $6, now() - interval '31 days', now(), 'overlap-control-presence')",
         )
         .bind(QUEUED_GUILD)
@@ -193,15 +194,15 @@ async fn dry_run_and_execute_agree_on_queued_guild_and_pending_user_overlap() {
             .expect("dry-run overlap retention");
         assert_eq!(
             (dry.presence_raw_deleted, dry.voice_raw_deleted, dry.audit_cache_deleted),
-            (1, 0, 0),
-            "dry run must count only the control capture as raw: queued-guild rows belong to the purge, the pending user's row to its receipt"
+            (1, 1, 0),
+            "dry run must count the control capture and anonymous voice-server row as raw: queued-guild rows belong to the purge, the pending user's identified row to its receipt"
         );
         assert_eq!(
             dry.guild_rows_purged, 3,
             "dry run must attribute all three queued-guild captures to the purge"
         );
         assert_eq!(dry.deletions_completed, 1);
-        assert_eq!(dry.total_deleted(), 4);
+        assert_eq!(dry.total_deleted(), 5);
 
         let live = run_retention(&pool, RetentionMode::Execute)
             .await
