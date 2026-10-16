@@ -212,6 +212,9 @@ class EvaluateTests(unittest.TestCase):
         self.assertTrue(gate._contains_fn_body("pub fn digest() -> [u8; 32] { [0; 32] }\n"))
         self.assertFalse(gate._contains_fn_body("trait T {\n    fn digest() -> [u8; 32];\n}\n"))
 
+    def test_semicolon_char_literal_in_const_generic_does_not_end_signature(self):
+        self.assertTrue(gate._contains_fn_body("fn f<const C: char = ';'>() { }\n"))
+
     def test_unbalanced_block_comment_opener_before_a_fn_does_not_hide_it(self):
         # A glob such as `src/internal/*` in a line comment or a string has an
         # unbalanced `/*`; it must never make a later real fn invisible.

@@ -145,8 +145,9 @@ def _contains_fn_body(source):
 
     Linear scan (no regular expressions): ``;`` inside ``()``/``[]`` pairs
     (for example ``[u8; 32]``) never terminates the signature, so only a
-    ``{`` or ``;`` at nesting depth zero decides. Double-quoted strings and
-    ``//``/``/* */`` comments are skipped *after* an ``fn`` token so a brace
+    ``{`` or ``;`` at nesting depth zero decides. Double-quoted strings,
+    character literals, and ``//``/``/* */`` comments are skipped *after* an
+    ``fn`` token so a brace
     inside them cannot fake a body. No text before an ``fn`` token is ever
     used to skip it (a glob like ``src/*`` in a comment or string is an
     unbalanced ``/*`` that would hide every later function), so an ``fn``
@@ -184,6 +185,20 @@ def _contains_fn_body(source):
                 in_string = True
                 cursor += 1
                 continue
+            if ch == "'":
+                # Skip Rust char literals, but leave lifetimes (for example
+                # `'a`) to the normal signature scan.
+                char_end = cursor + 1
+                if char_end < total and source[char_end] == "\\":
+                    char_end += 2
+                    if char_end < total and source[char_end - 1] == "u" and source[char_end] == "{":
+                        close = source.find("}", char_end + 1)
+                        char_end = close + 1 if close != -1 else total
+                else:
+                    char_end += 1
+                if char_end < total and source[char_end] == "'":
+                    cursor = char_end + 1
+                    continue
             if ch == "/" and cursor + 1 < total and source[cursor + 1] == "/":
                 line_end = source.find("\n", cursor + 2)
                 cursor = total if line_end == -1 else line_end + 1
