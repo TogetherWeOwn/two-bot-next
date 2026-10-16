@@ -5,7 +5,8 @@
 //! fail closed with retryable 503. No Helix client and no durable ledger here
 //! (separate slices).
 //!
-//! Logging carries only scalar `event`/`status`/`error_class`: no header
+//! Logging carries only scalar `event`/`status`/`error_class` plus the bounded
+//! `message_type` (refusals) and `reason` (revocation ack) scalars: no header
 //! values, challenge, body bytes or query. The callback path never reaches a
 //! trace span (`server::TRACED_PATHS` must not list it; unknown paths render
 //! as `[REDACTED]`).
@@ -114,18 +115,33 @@ fn envelope(status: StatusCode, code: &str, retryable: bool, id: &str) -> Respon
     (status, body).into_response()
 }
 
+/// Bounded `message_type` scalar for refuse lines: the three Twitch types the
+/// receiver handles, else `unknown`. Raw header values never reach a log
+/// line, so a failed challenge separates from a malformed notification or
+/// an edge probe in logs alone.
+fn bounded_message_type(value: &str) -> &'static str {
+    match value {
+        "webhook_callback_verification" => "webhook_callback_verification",
+        "notification" => "notification",
+        "revocation" => "revocation",
+        _ => "unknown",
+    }
+}
+
 fn refuse(
     state: &ReceiverState,
     status: StatusCode,
     code: &str,
     retryable: bool,
     id: &str,
+    message_type: &'static str,
 ) -> Response {
     let _ = state;
     tracing::warn!(
         event = "eventsub_receiver",
         status = status.as_u16(),
         error_class = code,
+        message_type = message_type,
         "eventsub delivery refused"
     );
     envelope(status, code, retryable, id)
@@ -136,19 +152,28 @@ fn ack(id: &str) -> Response {
 }
 
 async fn not_found(State(state): State<Arc<ReceiverState>>) -> Response {
+    // Fallback for any non-callback path or method: no header is trusted.
     refuse(
         &state,
         StatusCode::NOT_FOUND,
         "not_found",
         false,
         &request_id(),
+        "unknown",
     )
 }
 
 async fn handle(State(state): State<Arc<ReceiverState>>, request: Request) -> Response {
     let id = request_id();
     let Ok(_permit) = Arc::clone(&state.capacity).try_acquire_owned() else {
-        return refuse(&state, StatusCode::SERVICE_UNAVAILABLE, "busy", true, &id);
+        return refuse(
+            &state,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            true,
+            &id,
+            "unknown",
+        );
     };
     receive_with_timeout(&state, &id, receive(&state, request, &id)).await
 }
@@ -160,12 +185,15 @@ async fn receive_with_timeout(
 ) -> Response {
     match tokio::time::timeout(REQUEST_TIMEOUT, receive).await {
         Ok(response) => response,
+        // The stalled future is opaque on timeout: the message type may never
+        // have been established, so `unknown` is the honest scalar.
         Err(_) => refuse(
             state,
             StatusCode::SERVICE_UNAVAILABLE,
             "upstream_timeout",
             true,
             id,
+            "unknown",
         ),
     }
 }
@@ -183,10 +211,24 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
     // a direct `containerFetch` must not reach verification with extras.
     let path = request.uri().path();
     if path != EVENTSUB_PATH {
-        return refuse(state, StatusCode::NOT_FOUND, "not_found", false, id);
+        return refuse(
+            state,
+            StatusCode::NOT_FOUND,
+            "not_found",
+            false,
+            id,
+            "unknown",
+        );
     }
     if request.uri().query().is_some() {
-        return refuse(state, StatusCode::BAD_REQUEST, "malformed", false, id);
+        return refuse(
+            state,
+            StatusCode::BAD_REQUEST,
+            "malformed",
+            false,
+            id,
+            "unknown",
+        );
     }
     if request.method() != Method::POST {
         let mut response = refuse(
@@ -195,6 +237,7 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             "method_not_allowed",
             false,
             id,
+            "unknown",
         );
         response
             .headers_mut()
@@ -218,6 +261,7 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             "unsupported_media_type",
             false,
             id,
+            "unknown",
         );
     }
 
@@ -230,7 +274,15 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
     }) {
         Ok(headers) => headers,
         Err(_) => {
-            return refuse(state, StatusCode::UNAUTHORIZED, "unauthorized", false, id);
+            // Headers missing or malformed: the message type is untrusted.
+            return refuse(
+                state,
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                false,
+                id,
+                "unknown",
+            );
         }
     };
     let message_type = headers.message_type().to_owned();
@@ -244,6 +296,7 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
                 "payload_too_large",
                 false,
                 id,
+                bounded_message_type(&message_type),
             );
         }
         Err(_) => {
@@ -253,11 +306,19 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
                 "request_timeout",
                 true,
                 id,
+                bounded_message_type(&message_type),
             );
         }
     };
     if raw.is_empty() {
-        return refuse(state, StatusCode::BAD_REQUEST, "malformed", false, id);
+        return refuse(
+            state,
+            StatusCode::BAD_REQUEST,
+            "malformed",
+            false,
+            id,
+            bounded_message_type(&message_type),
+        );
     }
 
     two_bot_core::metrics::global().eventsub_received();
@@ -272,9 +333,17 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
                 "payload_too_large",
                 false,
                 id,
+                bounded_message_type(&message_type),
             );
         }
-        return refuse(state, StatusCode::UNAUTHORIZED, "unauthorized", false, id);
+        return refuse(
+            state,
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            false,
+            id,
+            bounded_message_type(&message_type),
+        );
     }
 
     match classify(&message_type, &raw) {
@@ -306,13 +375,15 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             );
             ack(id)
         }
-        Ok(Delivery::Revocation { .. }) => {
+        Ok(Delivery::Revocation { reason, .. }) => {
             two_bot_core::metrics::global().eventsub_classified("revocation");
             // The bounded reconcile pass re-subscribes; here only acknowledge
-            // so Twitch does not retry.
+            // so Twitch does not retry. The bounded `reason` scalar (never the
+            // subscription id) answers revocation counts by reason from logs alone.
             tracing::info!(
                 event = "eventsub_receiver",
                 status = 200,
+                reason = reason.as_str(),
                 "revocation acknowledged"
             );
             ack(id)
@@ -340,7 +411,17 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
         }
         Err(EventSubError::InvalidChallenge) => {
             two_bot_core::metrics::global().eventsub_classified("ignored");
-            refuse(state, StatusCode::BAD_REQUEST, "malformed", false, id)
+            // Same `malformed` error class as a bad notification body, but
+            // `message_type = "webhook_callback_verification"` separates
+            // failed challenges in logs alone.
+            refuse(
+                state,
+                StatusCode::BAD_REQUEST,
+                "malformed",
+                false,
+                id,
+                bounded_message_type(&message_type),
+            )
         }
         Err(e) => {
             let _ = e;
@@ -353,6 +434,7 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
                 "unavailable",
                 true,
                 id,
+                bounded_message_type(&message_type),
             )
         }
     }
@@ -366,7 +448,7 @@ mod tests {
     use sha2::Sha256;
     use std::sync::{
         atomic::{AtomicU64, Ordering},
-        OnceLock,
+        Mutex, OnceLock,
     };
     use tower::ServiceExt as _;
 
@@ -418,6 +500,35 @@ mod tests {
             .unwrap()
             .as_millis() as i64;
         two_bot_core::format_iso_millis(now)
+    }
+
+    #[derive(Clone)]
+    struct EventSubLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for EventSubLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_eventsub_logs() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
+        // Share the global capture subscriber first so callsite interest stays
+        // stable when peer tests hit the same log site on other threads;
+        // the local JSON writer still captures only this test's events.
+        let _global = crate::tracing_capture::global();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::clone(&bytes);
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || EventSubLogWriter(Arc::clone(&output)))
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (bytes, guard)
     }
 
     struct TestHeaders<'a> {
@@ -724,10 +835,26 @@ mod tests {
         assert_eq!(value["error"]["retryable"], false);
     }
 
+    #[test]
+    fn bounded_message_type_accepts_only_known_eventsub_types() {
+        for (input, expected) in [
+            (
+                "webhook_callback_verification",
+                "webhook_callback_verification",
+            ),
+            ("notification", "notification"),
+            ("revocation", "revocation"),
+            ("untrusted-header-value", "unknown"),
+        ] {
+            assert_eq!(bounded_message_type(input), expected);
+        }
+    }
+
     #[tokio::test]
     async fn malformed_challenge_is_refused() {
         // Empty and non-graphic challenges are `InvalidChallenge`: 400, never
         // an ack. Each body is signed exactly as sent.
+        let (logs, _subscriber) = capture_eventsub_logs();
         for challenge in ["", "has space"] {
             let body = format!(
                 r#"{{"challenge":{challenge:?},"subscription":{{"id":"synthetic-sub-0014","status":"webhook_callback_verification_pending","type":"stream.online","version":"1","condition":{{"broadcaster_user_id":"123456"}},"transport":{{"method":"webhook","callback":"https://example.com/hooks/twitch"}},"created_at":"2026-10-13T00:00:00Z"}}}}"#
@@ -757,6 +884,18 @@ mod tests {
             assert_eq!(value["error"]["code"], "malformed");
             assert_eq!(value["error"]["retryable"], false);
         }
+
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert_eq!(logs.matches("\"event\":\"eventsub_receiver\"").count(), 2);
+        assert_eq!(
+            logs.matches("\"message_type\":\"webhook_callback_verification\"")
+                .count(),
+            2
+        );
+        assert_eq!(logs.matches("\"error_class\":\"malformed\"").count(), 2);
+        assert!(!logs.contains("has space"));
+        assert!(!logs.contains("synthetic-delivery-0014"));
+        assert!(!logs.contains("https://example.com/hooks/twitch"));
     }
 
     #[tokio::test]

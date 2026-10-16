@@ -206,6 +206,22 @@ pub enum RevocationReason {
     Other,
 }
 
+impl RevocationReason {
+    /// Bounded log scalar for the revocation ack line: Twitch's revocation
+    /// `status` vocabulary, so revocation counts by reason are answerable
+    /// from logs alone. No id, header, body or secret travels with it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UserRemoved => "user_removed",
+            Self::AuthorizationRevoked => "authorization_revoked",
+            Self::NotificationFailuresExceeded => "notification_failures_exceeded",
+            Self::VersionRemoved => "version_removed",
+            Self::Other => "other",
+        }
+    }
+}
+
 /// A verified delivery, classified by message type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Delivery {
@@ -819,6 +835,54 @@ mod tests {
             classify("notification", b"not json"),
             Err(EventSubError::InvalidBody)
         );
+    }
+
+    #[test]
+    fn revocation_statuses_map_to_bounded_log_scalars() {
+        // Twitch's revocation `status` vocabulary plus the unmapped collapse:
+        // the receiver logs only `RevocationReason::as_str`, so log counts by
+        // reason stay exact without header or body bytes leaving the process.
+        for (status, reason, scalar) in [
+            (
+                "user_removed",
+                RevocationReason::UserRemoved,
+                "user_removed",
+            ),
+            (
+                "authorization_revoked",
+                RevocationReason::AuthorizationRevoked,
+                "authorization_revoked",
+            ),
+            (
+                "notification_failures_exceeded",
+                RevocationReason::NotificationFailuresExceeded,
+                "notification_failures_exceeded",
+            ),
+            (
+                "version_removed",
+                RevocationReason::VersionRemoved,
+                "version_removed",
+            ),
+            ("gone_without_notice", RevocationReason::Other, "other"),
+        ] {
+            let body = json!({
+                "subscription": {
+                    "id": "sub-9", "type": "stream.online", "version": "1",
+                    "status": status,
+                    "condition": {"broadcaster_user_id": "1337"},
+                },
+            })
+            .to_string();
+            assert_eq!(
+                classify("revocation", body.as_bytes()),
+                Ok(Delivery::Revocation {
+                    subscription_id: "sub-9".to_owned(),
+                    reason,
+                }),
+                "status {status}"
+            );
+            assert_eq!(reason.as_str(), scalar, "status {status}");
+        }
     }
 
     #[test]

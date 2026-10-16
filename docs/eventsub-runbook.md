@@ -61,7 +61,7 @@ listener and the internal-actions receiver:
   Source: `wrangler/src/index.ts:582-597`.
 - Binding completes before any gateway or job task starts. A bind failure logs
   `eventsub startup refused` and exits the process.
-  Source: `crates/bot/src/eventsub_http.rs:57-70`, `crates/bot/src/main.rs:337-348`.
+  Source: `crates/bot/src/eventsub_http.rs:58-71`, `crates/bot/src/main.rs:337-348`.
 
 ## Secret provisioning and rotation
 
@@ -85,11 +85,11 @@ Rules for the signing secret:
 - The handler never re-reads the environment: the secret is cloned into
   receiver state at bind time. A new value takes effect on container restart,
   not on secret edit alone.
-  Source: `crates/bot/src/eventsub_http.rs:46-55`.
+  Source: `crates/bot/src/eventsub_http.rs:47-56`.
 - Logs carry only scalar `event` / `status` / `error_class`. Header values,
   the challenge, body bytes, and query strings are never logged.
   Source: `crates/bot/src/eventsub_http.rs:1-11`,
-  `crates/bot/src/eventsub_http.rs:117-132`.
+  `crates/bot/src/eventsub_http.rs:122-148`.
 
 Rotation procedure (needs its own authorization; this runbook does not grant
 it): Twitch fixes the transport secret at subscription creation and offers
@@ -138,13 +138,13 @@ Classification after verification:
   on a `stream.online` v1 subscription is echoed as the `200 text/plain`
   body with `Cache-Control: no-store`.
   Source: `crates/core/src/twitch_eventsub.rs:245-272`,
-  `crates/bot/src/eventsub_http.rs:281-297`.
+  `crates/bot/src/eventsub_http.rs:350-366`.
 - Only `stream.online` version `1` is accepted; any other subscription type
   or version is a deterministic `WrongSubscription` error.
   Source: `crates/core/src/twitch_eventsub.rs:225-231`.
 - An empty, oversized, or non-graphic challenge is `InvalidChallenge` and
   answers `400 malformed`, never an echo.
-  Source: `crates/bot/src/eventsub_http.rs:341-343`.
+  Source: `crates/bot/src/eventsub_http.rs:412-425`.
 
 If the challenge echo never arrives at Twitch, check in order: the Worker
 route gate (both flags `1`?), the container bind (did startup refuse?), the
@@ -153,7 +153,7 @@ the subscription creation (the challenge was not echoed — delete and
 recreate the subscription, see below), and only then the callback URL shape
 (plain `https`, no port, query, fragment, or userinfo; canonical form).
 Source: `crates/core/src/twitch_eventsub.rs:400-431`,
-`crates/bot/src/eventsub_http.rs:332-340`.
+`crates/bot/src/eventsub_http.rs:403-411`.
 
 ## Refusal matrix
 
@@ -188,15 +188,15 @@ direct `containerFetch`, because the Worker answers those shapes first):
 
 | Status | Code | Retryable | Meaning / first action |
 |---|---|---|---|
-| 400 | `malformed` | false | Query string present, empty body, or invalid challenge on a direct fetch. The query gate runs before verification. Check the forwarded request shape, not the secret. Source: `crates/bot/src/eventsub_http.rs:188-189,259-260,341-343`. |
-| 401 | `unauthorized` | false | Signature, freshness, or timestamp failure, or (on a direct fetch) missing/malformed delivery headers. Via the Worker, a malformed header shape is 400 at ingress (row above); first action is still secret agreement and clock skew (10-minute window). Source: `crates/bot/src/eventsub_http.rs:224-235,263-278`. |
-| 404 | `not_found` | false | Wrong path (exact path is `/hooks/twitch`) or any non-callback route via the fallback on a direct fetch. Via the public URL the Worker already answered non-POSTs and bad shapes with its own 404. Source: `crates/bot/src/eventsub_http.rs:35,88,138-146,184-189`. |
-| 405 | `method_not_allowed` | false | Anything but POST on the callback path on a direct fetch. Via the public URL the Worker drops non-POSTs with its own 404 before the container. Source: `crates/bot/src/eventsub_http.rs:191-203`. |
-| 408 | `request_timeout` | true | Body slower than the 5 s read budget while holding one of the 32 permits. Retriable: the sender (Twitch) backs off and redelivers. Source: `crates/bot/src/eventsub_http.rs:38,238-257`. |
-| 413 | `payload_too_large` | false | Body over the 64 KiB cap, checked before verification. Genuine `stream.online` bodies are well under 2 KiB; treat 413 as a malformed or abusive sender. Source: `crates/bot/src/eventsub_http.rs:36,238-247`, `crates/core/src/twitch_eventsub.rs:49-51`. |
-| 415 | `unsupported_media_type` | false | Content type is not exactly `application/json` or `application/json; charset=utf-8` (case-insensitive); anything else, including another encoding, is refused. Source: `crates/bot/src/eventsub_http.rs:204-222`. |
-| 503 | `busy` / `upstream_timeout` | true | All 32 permits held (`busy`), or the whole request past the 20 s budget (`upstream_timeout`). Both mean the receiver is saturated or stalled, not that the delivery was bad; the sender retries. Check container saturation, not the secret. Source: `crates/bot/src/eventsub_http.rs:37-39,148-171`. |
-| 503 | `unavailable` | true | A future/unrecognized post-verification classification error; the receiver fails closed so Twitch retries and counts it as metric `kind="other"`. This is distinct from Worker-ingress `unavailable` above. Inspect the `eventsub delivery refused` warning and the `two_bot_eventsub_classified_total{kind="other"}` counter; the refusal log uses the bounded error class `unavailable`, so it does not identify a specific future variant. Do not assume saturation or a Worker relay failure. Source: `crates/bot/src/eventsub_http.rs:345-359`. |
+| 400 | `malformed` | false | Query string present, empty body, or invalid challenge on a direct fetch. The query gate runs before verification. Check the forwarded request shape, not the secret. Source: `crates/bot/src/eventsub_http.rs:223-232,313-322,412-425`. |
+| 401 | `unauthorized` | false | Signature, freshness, or timestamp failure, or (on a direct fetch) missing/malformed delivery headers. Via the Worker, a malformed header shape is 400 at ingress (row above); first action is still secret agreement and clock skew (10-minute window). Source: `crates/bot/src/eventsub_http.rs:269-287,325-347`. |
+| 404 | `not_found` | false | Wrong path (exact path is `/hooks/twitch`) or any non-callback route via the fallback on a direct fetch. Via the public URL the Worker already answered non-POSTs and bad shapes with its own 404. Source: `crates/bot/src/eventsub_http.rs:35-36,88-89,154-165,213-222`. |
+| 405 | `method_not_allowed` | false | Anything but POST on the callback path on a direct fetch. Via the public URL the Worker drops non-POSTs with its own 404 before the container. Source: `crates/bot/src/eventsub_http.rs:233-246`. |
+| 408 | `request_timeout` | true | Body slower than the 5 s read budget while holding one of the 32 permits. Retriable: the sender (Twitch) backs off and redelivers. Source: `crates/bot/src/eventsub_http.rs:38-40,290-312`. |
+| 413 | `payload_too_large` | false | Body over the 64 KiB cap, checked before verification. Genuine `stream.online` bodies are well under 2 KiB; treat 413 as a malformed or abusive sender. Source: `crates/bot/src/eventsub_http.rs:37,290-301`, `crates/core/src/twitch_eventsub.rs:49-51`. |
+| 415 | `unsupported_media_type` | false | Content type is not exactly `application/json` or `application/json; charset=utf-8` (case-insensitive); anything else, including another encoding, is refused. Source: `crates/bot/src/eventsub_http.rs:247-266`. |
+| 503 | `busy` / `upstream_timeout` | true | All 32 permits held (`busy`), or the whole request past the 20 s budget (`upstream_timeout`). Both mean the receiver is saturated or stalled, not that the delivery was bad; the sender retries. Check container saturation, not the secret. Source: `crates/bot/src/eventsub_http.rs:38-40,167-199`. |
+| 503 | `unavailable` | true | A future/unrecognized post-verification classification error; the receiver fails closed so Twitch retries and counts it as metric `kind="other"`. This is distinct from Worker-ingress `unavailable` above. Inspect the `eventsub delivery refused` warning and the `two_bot_eventsub_classified_total{kind="other"}` counter; the refusal log uses the bounded error class `unavailable`, so it does not identify a specific future variant. Do not assume saturation or a Worker relay failure. Source: `crates/bot/src/eventsub_http.rs:426-439`. |
 
 Verified deliveries that need no operator action answer `200`:
 
@@ -218,7 +218,7 @@ Verified deliveries that need no operator action answer `200`:
   delivery ignored` immediately after a subscription creation means the
   challenge was not echoed: delete and recreate the subscription.
 
-Source: `crates/bot/src/eventsub_http.rs:281-340`.
+Source: `crates/bot/src/eventsub_http.rs:350-411`.
 
 Log lines to expect (scalar fields only):
 
@@ -229,7 +229,7 @@ Log lines to expect (scalar fields only):
   unknown/future classification errors expect `status = 503` and
   `error_class = "unavailable"`, plus the `kind="other"` metric increment
 
-Source: `crates/bot/src/eventsub_http.rs:117-136,270-362`.
+Source: `crates/bot/src/eventsub_http.rs:131-148,324-439`.
 
 ## Dark-unless-enabled behavior
 
