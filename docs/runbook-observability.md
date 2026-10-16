@@ -41,8 +41,11 @@ No Gatus or third-party monitor is used.
 2. Open the corresponding Cloudflare Workers Observability logs for the
    environment and time window. Filter `container_gateway_failure` and
    `metrics_alert` lines by `release` (the deployed git SHA) to scope errors
-   to that release, grouped by `error_class`. For Container failures, use the
-   `containers` dataset or the dashboard's Container logs; do not rely on the
+   to that release. Group gateway failures by `class`; group metrics alerts by
+   the alert rule in `content`. Error-class grouping applies to metrics alerts
+   only when `content` includes a validated last error class, as with
+   `job_consecutive_failures`. For Container failures, use the `containers`
+   dataset or the dashboard's Container logs; do not rely on the
    Wrangler `logs` tail to show Rust stdout.
 3. Read `/readyz` and, when authorized, the read-only `/ops/gateway` summary.
    Capture `build_revision` and `build_id` from the response. Never treat the
@@ -100,10 +103,11 @@ claim them as shipped acceptance:
   queued work. Do not assume logs can be joined by request ID.
 - Release-tagged error tracking is Workers Logs, not an external service.
   Every `container_gateway_failure` and `metrics_alert` line carries `release`
-  (the container git SHA) and `worker_version`, grouped by `error_class` /
-  last error class. Filter a deploy window by `release` to see whether a new
-  error belongs to that release. Traces remain disabled to avoid recording
-  credential-bearing URLs.
+  (the container git SHA) and `worker_version`. Filter a deploy window by
+  `release`; group gateway failures by `class` and metrics alerts by the alert
+  rule in `content`. A last error class is available only when metrics-alert
+  `content` includes a validated one. Traces remain disabled to avoid
+  recording credential-bearing URLs.
 - This repository's synthetic workflow is staging-oriented. Do not describe it
   as a passive five-minute production user-flow check unless the production
   schedule and alert delivery have been independently verified.

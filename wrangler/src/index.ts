@@ -627,8 +627,8 @@ export class TwoBotContainer extends Container<Env> {
   private readonly initialization: Promise<void>;
   private recoveryFailed = false;
   // Last container git SHA seen on /readyz this tick. Tags the keepalive
-  // error events (release-tagged tracking grouped by error_class); a failed
-  // probe leaves "unknown" rather than a stale release from a replaced image.
+  // error events (gateway failures by class; metrics alerts by rule/content);
+  // a failed probe leaves "unknown" rather than a stale release from a replaced image.
   private lastRelease: string | null = null;
   private static readonly KEEPALIVE_KEY = "two-bot:keepalive:v1";
 

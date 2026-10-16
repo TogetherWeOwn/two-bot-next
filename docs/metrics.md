@@ -342,13 +342,15 @@ as dynamic labels.
   `custom_commands_init_failed`, `milestones_load_failed`,
   `automod_config_invalid`, `automod_executor_failed`, `raid_executor_failed`,
   `gateway_runtime_failed` or `gateway_task_panicked` (every `FailureClass`
-  variant in `crates/bot/src/gateway_failure.rs`). Only `[a-z0-9_]{1,32}`
-  tokens are ever logged; anything else is dropped. `release` is the container
-  git SHA from `/readyz` `build_revision` (stamped at deploy time, `"unknown"`
-  when unparseable, never echoed); `worker_version` is the platform Worker
-  version id. `metrics_alert` lines carry the same `release`/`worker_version`
-  from that tick's probe, so Workers Logs groups errors by `error_class`
-  scoped to the release that produced them. See
+  variant in `crates/bot/src/gateway_failure.rs`). Only `phase` and `class`
+  use `[a-z0-9_]{1,32}` tokens; anything else is dropped. `release` is the
+  container git SHA from `/readyz` `build_revision` (stamped at deploy time,
+  `"unknown"` when unparseable, never echoed); `worker_version` is the platform
+  Worker version id. `metrics_alert` lines carry the same `release` and
+  `worker_version` from that tick's probe. Group gateway failures by `class`;
+  group metrics alerts by the alert rule in `content`. Error-class grouping
+  applies to metrics alerts only when `content` includes a validated last error
+  class, as with `job_consecutive_failures`. See
   [startup diagnostics](startup-diagnostics.md#self-diagnosing-gateway-failures-readyz-gateway_failure).
 - `two_bot_voice_join_to_move_seconds` is a label-free histogram from creator
   join gateway receipt to successful member move. Cancelled/failed joins do not

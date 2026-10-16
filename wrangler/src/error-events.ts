@@ -1,13 +1,15 @@
 /**
- * Release-tagged error events for Workers Logs (release-tagged error
- * tracking grouped by error_class).
+ * Release-tagged error events for Workers Logs.
  *
  * Workers Logs is the tracker: every structured Worker error event carries
  * `release` (the container git SHA from /readyz `build_revision`, stamped at
  * deploy time from `GITHUB_SHA` via `scripts/staging_rollout.py`) so a new
  * error after a deploy points at that release, plus `worker_version`
- * (`CF_VERSION_METADATA.id`) to join the deploy receipt. `error_class`
- * stays the grouping key. Strict tokens only: the container controls the
+ * (`CF_VERSION_METADATA.id`) to join the deploy receipt. Group gateway
+ * failures by `class` and metrics alerts by the alert rule in `content`; a
+ * validated last error class appears in content only for
+ * `job_consecutive_failures` alerts.
+ * Strict tokens only: the container controls the
  * probe body, so anything that is not a hex SHA becomes the visible
  * `"unknown"` bucket instead of echoed text. No secrets, URLs, headers or
  * bodies are ever logged here.
