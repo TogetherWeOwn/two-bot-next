@@ -277,21 +277,17 @@ fn assert_poll_site(source: &str, loop_marker: &str) {
 /// `loop_body`: brace depth 1 just inside the loop's own braces, matched over
 /// code only so a commented-out or `if false`-wrapped copy does not satisfy
 /// the pin.
-fn assert_direct_loop_statement(loop_body: &str, snippet: &str, context: &str) {
-    let code = code_only(loop_body);
+fn assert_direct_statement_at_depth(source: &str, snippet: &str, depth: i32, context: &str) {
+    let code = code_only(source);
     let masked_snippet = code_only(snippet);
     let pos = code.find(&masked_snippet).unwrap_or_else(|| {
         panic!("{context}");
     });
-    let mut depth = 0i32;
-    for byte in code[..pos].bytes() {
-        match byte {
-            b'{' => depth += 1,
-            b'}' => depth -= 1,
-            _ => {}
-        }
-    }
-    assert_eq!(depth, 1, "{context}");
+    assert_eq!(brace_depth_before(&code, pos), depth, "{context}");
+}
+
+fn assert_direct_loop_statement(loop_body: &str, snippet: &str, context: &str) {
+    assert_direct_statement_at_depth(loop_body, snippet, 1, context);
 }
 
 fn assert_sleep_inventory(source: &str, expected: usize, context: &str) {
@@ -402,18 +398,30 @@ fn assert_wait_http_poll_under_step_deadline(wait_http: &str) {
 }
 
 fn assert_budget_lane_hold_pin(source: &str) {
-    assert_code_contains(
-        source,
+    let code = code_only(source);
+    let loop_start = code
+        .find("for (name, gateway_response) in [")
+        .expect("budget test must retain its response loop");
+    let loop_open = code[loop_start..]
+        .find("] {")
+        .map(|offset| loop_start + offset + 2)
+        .expect("budget response loop must retain its opening brace");
+    let response_loop = braced_block(&code, loop_open);
+    assert_direct_loop_statement(
+        &response_loop,
         r#"assert_eq!(mock.requests().len(), 3, "{name}: lane held, no retry");"#,
-        "budget lane-hold test must retain its exact three-attempt assertion",
+        "budget lane-hold assertion must be a direct statement inside the response loop",
     );
 }
 
 fn assert_preflight_429_attempt_pin(source: &str) {
-    assert_code_contains(
-        source,
+    let code = code_only(source);
+    assert!(code.starts_with('{') && code.ends_with('}'));
+    assert_direct_statement_at_depth(
+        &code[1..code.len() - 1],
         "assert_eq!(mock.requests().len(), 1);",
-        "preflight 429 test must retain its exact one-attempt assertion",
+        0,
+        "preflight 429 one-attempt assertion must be a direct top-level test statement",
     );
 }
 
@@ -426,8 +434,8 @@ fn assert_settle_window(source: &str) {
         "post-ready settle deadline must start 200 ms in the future"
     );
     assert!(
-        source.contains("while tokio::time::Instant::now() < settle_until"),
-        "post-ready settle window must poll until its deadline"
+        source.contains("while tokio::time::Instant::now() < settle_until {"),
+        "post-ready settle loop must retain its ungated deadline header"
     );
     let settle_loop = loop_body(&source, "while tokio::time::Instant::now() < settle_until");
     assert_eq!(
@@ -701,6 +709,21 @@ fn polling_guard_pins_exact_ops_deadline_and_preflight_attempt_assertions() {
         assert_budget_lane_hold_pin(&commented_budget_pin);
     })
     .is_err());
+    let if_false_budget_pin =
+        budget_test.replace(budget_pin, &format!("if false {{ {budget_pin} }}"));
+    assert!(std::panic::catch_unwind(|| {
+        assert_budget_lane_hold_pin(&if_false_budget_pin);
+    })
+    .is_err());
+
+    let if_false_attempt_pin = preflight_test.replace(
+        "assert_eq!(mock.requests().len(), 1);",
+        "if false { assert_eq!(mock.requests().len(), 1); }",
+    );
+    assert!(std::panic::catch_unwind(|| {
+        assert_preflight_429_attempt_pin(&if_false_attempt_pin);
+    })
+    .is_err());
 
     let wait_http = function_body(ALIVE, "wait_http");
     // The positive control passes through the placement-aware helper: the
@@ -780,6 +803,14 @@ fn polling_guard_rejects_misplaced_deadline_and_liveness_checks() {
     let lifecycle = function_body(ALIVE, "lifecycle");
     let settle = source_between(&lifecycle, "let settle_until =", "assert_ready_correlation");
     assert_settle_window(&settle);
+    let boot_gated_settle = settle.replace(
+        "while tokio::time::Instant::now() < settle_until {",
+        "while tokio::time::Instant::now() < settle_until && boot == 0 {",
+    );
+    assert!(boot_gated_settle
+        .contains("while tokio::time::Instant::now() < settle_until && boot == 0 {"));
+    assert!(std::panic::catch_unwind(|| assert_settle_window(&boot_gated_settle)).is_err());
+
     let if_false_liveness =
         settle.replacen("bot.assert_alive();", "if false { bot.assert_alive(); }", 1);
     assert_eq!(
