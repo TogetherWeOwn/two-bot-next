@@ -2330,7 +2330,7 @@
         "section": 12,
         "row": [
           "EventSub subscription reconcile at startup plus a bounded hourly interval (#989, open)",
-          "Open-PR tip `c9264b63` (read-only): `crates/bot/src/eventsub_reconcile.rs:28-34` (`TWO_TWITCH_CALLBACK_URL` callback gate, `TWO_TWITCH_BROADCASTERS` allowlist with empty-parks, `RECONCILE_INTERVAL_SECS = 3_600`), `:47-56` (`gate_open`/`enabled` exactly-`1` gate) plus `:272-280` (`spawn_if_enabled`), spawned in `crates/bot/src/main.rs:384`; catalog plus generated-reference plus container-env additions ride the same PR, as does the `docs/stream-funnel.md` interval rewrite"
+          "Open-PR tip `06e7f00d` (read-only): `crates/bot/src/eventsub_reconcile.rs:28-34` (`TWO_TWITCH_CALLBACK_URL` callback gate, `TWO_TWITCH_BROADCASTERS` allowlist with empty-parks, `RECONCILE_INTERVAL_SECS = 3_600`), `:53-61` (`gate_open`/`enabled`, exactly-`1` gate) plus `:343-346` (`spawn_if_enabled`, gated by `enabled()`), spawned in `crates/bot/src/main.rs:384`; catalog plus generated-reference plus container-env additions ride the same PR, as does the `docs/stream-funnel.md` interval rewrite"
         ]
       },
       "owner": [
