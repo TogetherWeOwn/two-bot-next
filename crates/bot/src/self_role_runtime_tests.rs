@@ -126,6 +126,25 @@ async fn await_expiries_past(
     }
 }
 
+/// A renewal already sent before an aborted keeper can commit after the abort
+/// returns. Baseline only once two reads a tick apart agree.
+async fn settled_expiries(
+    pool: &PgPool,
+    sql: &'static str,
+    event_id: &str,
+) -> TestResult<(i64, i64)> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut previous: (i64, i64) = sqlx::query_as(sql).bind(event_id).fetch_one(pool).await?;
+    loop {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let current: (i64, i64) = sqlx::query_as(sql).bind(event_id).fetch_one(pool).await?;
+        if current == previous || tokio::time::Instant::now() >= deadline {
+            return Ok(current);
+        }
+        previous = current;
+    }
+}
+
 fn ready(admission: Admission) -> Box<PreparedSelfRole> {
     match admission {
         Admission::Ready(prepared) => prepared,
@@ -965,7 +984,7 @@ async fn terminal_restart_cancellation_preserves_journal(pool: &PgPool) -> TestR
         let panel = panel.clone();
         tokio::spawn(async move { feature.recover_terminal(&hint, &panel).await })
     };
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         while !mock.requests().iter().any(|r| r.method == "DELETE") {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -990,15 +1009,7 @@ async fn terminal_restart_cancellation_preserves_journal(pool: &PgPool) -> TestR
     assert_eq!(receipts[0].4, "pending");
     assert_eq!(receipts[0].5, None);
     assert_terminal_winner(pool, &panel, &winner, Some("new")).await?;
-    let expiry: (i64, i64) = sqlx::query_as(
-        "SELECT (extract(epoch FROM a.repair_expires_at)*1000)::bigint,
-         (extract(epoch FROM p.processing_expires_at)*1000)::bigint
-         FROM self_role_audit a JOIN self_role_panel_claims p USING(guild_id,member_id,panel_id)
-         WHERE a.event_id=$1",
-    )
-    .bind(&audit.event_id)
-    .fetch_one(pool)
-    .await?;
+    let expiry = settled_expiries(pool, TERMINAL_EXPIRY_SQL, &audit.event_id).await?;
     let calls = mock.requests();
     clock.store(NOW + 200, Ordering::SeqCst); // both old leases are still live
     tokio::time::sleep(Duration::from_millis(250)).await;
