@@ -89,7 +89,9 @@ pub enum SupervisedExit {
     /// Every attempt failed; the runner published [`GatewayState::Draining`]
     /// so readyz fails closed and the container supervisor takes over.
     BudgetExhausted,
-    /// A shutdown request arrived before or during the episode.
+    /// A shutdown request arrived, or draining began, before or during the
+    /// episode. [`GatewayState::Draining`] is sticky: once observed the
+    /// runner never overwrites it and makes no further attempts.
     ShutdownRequested,
 }
 
@@ -146,7 +148,12 @@ pub fn reconnect_delay(policy: &ReconnectPolicy, attempt: u32) -> Option<Duratio
 /// Exhausting the budget publishes [`GatewayState::Draining`] so readyz fails
 /// closed. A shutdown that is already pending wins before any attempt
 /// (checked at the top of each iteration, so one arriving during a backoff
-/// sleep ends the episode before the next attempt).
+/// sleep ends the episode before the next attempt). Draining is sticky, as at
+/// every other publish site: if an outside owner publishes
+/// [`GatewayState::Draining`] during the unlocked `connect` or backoff sleep,
+/// neither publish overwrites it (readyz is never resurrected to ready or
+/// starting after draining begins) and the episode ends with
+/// [`SupervisedExit::ShutdownRequested`] instead of retrying into the drain.
 pub async fn run_supervised<C, S>(
     state: Arc<RwLock<GatewayState>>,
     policy: ReconnectPolicy,
@@ -169,17 +176,36 @@ where
             () = &mut shutdown => return SupervisedExit::ShutdownRequested,
             () = std::future::ready(()) => {}
         }
+        // Draining published during the previous backoff sleep (or before
+        // the episode started) is terminal: make no further attempts.
+        if *state.read().await == GatewayState::Draining {
+            return SupervisedExit::ShutdownRequested;
+        }
         let outcome = Box::into_pin(connect(attempt)).await;
         match outcome {
             AttemptOutcome::Connected => {
-                *state.write().await = GatewayState::Connected;
+                // Guard Draining set during the unlocked connect await, the
+                // same stickiness every other Connected publish keeps.
+                let mut guard = state.write().await;
+                if *guard == GatewayState::Draining {
+                    return SupervisedExit::ShutdownRequested;
+                }
+                *guard = GatewayState::Connected;
                 return SupervisedExit::Reconnected;
             }
             AttemptOutcome::Retryable => {
                 if attempt + 1 >= policy.max_attempts {
                     break;
                 }
-                *state.write().await = GatewayState::Armed;
+                // Same Draining guard as every other Armed publish; scoped
+                // so the lock is never held across the sleep below.
+                {
+                    let mut guard = state.write().await;
+                    if *guard == GatewayState::Draining {
+                        return SupervisedExit::ShutdownRequested;
+                    }
+                    *guard = GatewayState::Armed;
+                }
                 // `attempt` is within budget (checked above), so the delay
                 // exists; fall back to no wait rather than panic if a future
                 // policy rule ever disagrees.

@@ -8,7 +8,9 @@
 //! paused Tokio timers, notifications, and bounded yields only):
 //!
 //! - schedule pins (green now, guard the builder's edits): cap, jitter
-//!   bounds, determinism, budget end, no-panic extremes, sane defaults.
+//!   bounds, per-attempt doubling at windows derived independently of
+//!   `reconnect_delay`, determinism, budget end, no-panic extremes, sane
+//!   defaults.
 //! - readyz pins (green now): backoff serves `starting` (never `ready`, never
 //!   `parked`); a parked gateway still fails the strict gate.
 //! - loop pins: a flapping gateway reconnects on the bounded schedule with
@@ -16,6 +18,9 @@
 //!   exactly the budgeted attempts.
 //! - shutdown pin (green now and later): a pending shutdown ends the episode
 //!   before any attempt.
+//! - draining pins: Draining published mid-episode (during the connect await
+//!   or the backoff sleep) is never overwritten by the Connected/Armed
+//!   publishes and ends the episode with no further attempts.
 
 use super::*;
 use crate::gateway_backoff::{
@@ -211,6 +216,30 @@ fn reconnect_schedule_carries_bounded_jitter() {
     assert!(
         delay >= Duration::from_secs(15) && delay <= Duration::from_secs(30),
         "capped delay must lie in [cap/2, cap], got {delay:?}"
+    );
+}
+
+#[test]
+fn reconnect_schedule_doubles_per_attempt() {
+    // Windows are derived by hand from "base * 2^attempt, equal jitter in
+    // [grown/2, grown]" — never from reconnect_delay itself — so a schedule
+    // that fails to grow (grown = base on every attempt) lands in [2s, 4s]
+    // at attempts 1 and 2 and fails both windows below.
+    let policy = ReconnectPolicy {
+        base_delay: Duration::from_secs(4),
+        max_delay: Duration::from_secs(3600),
+        max_attempts: 4,
+        seed: 11,
+    };
+    let first = reconnect_delay(&policy, 1).expect("within budget");
+    assert!(
+        first >= Duration::from_secs(4) && first <= Duration::from_secs(8),
+        "attempt 1 must lie in [grown/2, grown] for grown 8s, got {first:?}"
+    );
+    let second = reconnect_delay(&policy, 2).expect("within budget");
+    assert!(
+        second >= Duration::from_secs(8) && second <= Duration::from_secs(16),
+        "attempt 2 must lie in [grown/2, grown] for grown 16s, got {second:?}"
     );
 }
 
@@ -431,4 +460,120 @@ async fn shutdown_wins_before_any_attempt() {
         SupervisedExit::ShutdownRequested
     );
     assert_eq!(script.attempts(), 0, "no attempt after shutdown");
+}
+
+/// Connector that stands in for the outside drain owner: it publishes
+/// Draining during the supervisor's unlocked connect await (the race the
+/// publish guards exist for), then reports `outcome`.
+fn draining_connector(
+    state: Arc<RwLock<GatewayState>>,
+    attempts: Arc<std::sync::Mutex<u32>>,
+    outcome: AttemptOutcome,
+) -> impl FnMut(u32) -> Box<dyn Future<Output = AttemptOutcome> + Send> {
+    move |_| {
+        let state = Arc::clone(&state);
+        let attempts = Arc::clone(&attempts);
+        Box::new(async move {
+            *attempts.lock().expect("attempt counter") += 1;
+            *state.write().await = GatewayState::Draining;
+            outcome
+        }) as Box<dyn Future<Output = AttemptOutcome> + Send>
+    }
+}
+
+#[tokio::test]
+async fn draining_during_connect_is_never_overwritten_by_connected() {
+    // Draining begins while the connect runs; the Connected publish must not
+    // resurrect readyz to ready, and the episode ends without claiming a
+    // reconnect the drain has already superseded.
+    let state = Arc::new(RwLock::new(GatewayState::Connected));
+    let attempts = Arc::new(std::sync::Mutex::new(0_u32));
+    let exit = run_supervised(
+        Arc::clone(&state),
+        tiny_policy(),
+        draining_connector(
+            Arc::clone(&state),
+            Arc::clone(&attempts),
+            AttemptOutcome::Connected,
+        ),
+        std::future::pending(),
+    )
+    .await;
+    assert_eq!(exit, SupervisedExit::ShutdownRequested);
+    assert_eq!(*attempts.lock().expect("attempt counter"), 1);
+    assert_eq!(
+        *state.read().await,
+        GatewayState::Draining,
+        "Connected publish must never overwrite Draining"
+    );
+}
+
+#[tokio::test]
+async fn draining_during_connect_is_never_overwritten_by_armed() {
+    // Same race on the retry path: the Armed publish must not resurrect
+    // readyz to starting, and no further attempt runs into the drain.
+    let state = Arc::new(RwLock::new(GatewayState::Connected));
+    let attempts = Arc::new(std::sync::Mutex::new(0_u32));
+    let exit = run_supervised(
+        Arc::clone(&state),
+        tiny_policy(),
+        draining_connector(
+            Arc::clone(&state),
+            Arc::clone(&attempts),
+            AttemptOutcome::Retryable,
+        ),
+        std::future::pending(),
+    )
+    .await;
+    assert_eq!(exit, SupervisedExit::ShutdownRequested);
+    assert_eq!(*attempts.lock().expect("attempt counter"), 1);
+    assert_eq!(
+        *state.read().await,
+        GatewayState::Draining,
+        "Armed publish must never overwrite Draining"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn draining_during_backoff_sleep_ends_the_episode_before_the_next_attempt() {
+    // First attempt fails and the supervisor backs off (Armed). Draining
+    // begins during that sleep: when the timer fires the episode must end
+    // instead of making another attempt or publishing over Draining.
+    let policy = tiny_policy();
+    let state = Arc::new(RwLock::new(GatewayState::Connected));
+    let script = Script::new(Arc::clone(&state), u32::MAX);
+    let supervised = tokio::spawn(run_supervised(
+        Arc::clone(&state),
+        policy,
+        script.connector(),
+        std::future::pending(),
+    ));
+    let next_attempt = script.attempted.notified();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), next_attempt)
+            .await
+            .is_ok(),
+        "supervisor must reach the first attempt within a bounded wait"
+    );
+    for _ in 0..10 {
+        if supervised.is_finished() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        *state.read().await,
+        GatewayState::Armed,
+        "supervisor must be inside the backoff before draining begins"
+    );
+    *state.write().await = GatewayState::Draining;
+    let delay = reconnect_delay(&policy, 0).expect("attempt is within budget");
+    tokio::time::advance(delay).await;
+    let exit = tokio::time::timeout(Duration::from_secs(1), supervised)
+        .await
+        .expect("episode must end when the backoff timer fires")
+        .expect("supervisor task");
+    assert_eq!(exit, SupervisedExit::ShutdownRequested);
+    assert_eq!(script.attempts(), 1, "no attempt may run after draining");
+    assert_eq!(*state.read().await, GatewayState::Draining);
 }
