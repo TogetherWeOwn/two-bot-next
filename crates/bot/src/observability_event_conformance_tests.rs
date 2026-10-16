@@ -16,8 +16,8 @@ use std::collections::BTreeSet;
 // them to. The message string (last argument to the `tracing` macro) is the
 // event name; fields such as `sequence` or `guild_id` are context, not names.
 
-/// `crates/bot/src/gateway.rs`: all eighteen traced in the file are cataloged.
-const GATEWAY_RS_EVENTS: [&str; 18] = [
+/// `crates/bot/src/gateway.rs`: all twenty traced in the file are cataloged.
+const GATEWAY_RS_EVENTS: [&str; 20] = [
     "cold resume committed; requesting voice snapshot via identify",
     "gateway reconnect failed; Twilight will retry",
     "gateway shard loop started",
@@ -36,6 +36,8 @@ const GATEWAY_RS_EVENTS: [&str; 18] = [
     "interaction acknowledgement blocked; advancing past lost callback",
     "interaction response failed; not replaying command",
     "READY identity differs from boot token; ordered identity not armed",
+    "retention lifecycle skipped; schema gap, nothing to cancel",
+    "retention purge skipped; schema gap, operator replay required",
 ];
 
 /// `crates/bot/src/main.rs`: the seven cataloged `tracing` messages.

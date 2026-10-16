@@ -202,8 +202,8 @@ jobs:
         run: |
           set -euo pipefail
           curl -fsSL -o "$RUNNER_TEMP/actionlint.tgz" \
-            https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz
-          echo "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757  $RUNNER_TEMP/actionlint.tgz" | sha256sum -c -
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/actionlint.tgz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/actionlint.tgz" -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint" -shellcheck= -pyflakes=
 
@@ -1757,8 +1757,9 @@ jobs:
       - name: Fetch pinned fuzz dependencies (locked)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fetch --locked
-      # Compile-only: builds all fourteen libFuzzer targets without executing them.
-      # No execution, no corpus output, no schedule; the bounded
+      # Builds all fifteen libFuzzer targets. No fuzz campaign or corpus
+      # output; the workflow's existing weekly run also builds these targets
+      # and replays only the bounded eventsub_delivery seeds below. The bounded
       # vote_kick smoke stays a manual non-controller step (see fuzz/README.md).
       # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the
       # toolchain from the repo-root rust-toolchain.toml (stable 1.98.1) even
@@ -1767,6 +1768,15 @@ jobs:
       - name: Compile-only fuzz build (no execution)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz build
+      # Bounded seed replay, eventsub_delivery only: `-runs=0` executes each
+      # committed corpus seed exactly once (plus the target's fixed matrix)
+      # and exits without fuzzing. A signing-key drift between the harness
+      # and production, or seed misrouting, panics an assertion here instead
+      # of passing a compile-only gate. Compile stays the only gate for the
+      # other fourteen targets.
+      - name: Seed replay for eventsub_delivery (bounded, no campaign)
+        working-directory: fuzz
+        run: cargo +nightly-2026-10-01 fuzz run eventsub_delivery -- -runs=0 -timeout=10 -rss_limit_mb=2048
 
   worker:
     name: worker check
@@ -1835,6 +1845,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollout.py -v
       - name: Verify staging rollback drill (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollback_drill.py -v
+      - name: Verify worker-container rollback (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_worker_container_rollback.py -v
       - name: Verify staging container backout/restore drill (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill.py -v
       - name: Verify staging ownership-takeover retry (offline fixtures)

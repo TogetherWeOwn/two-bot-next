@@ -139,7 +139,8 @@ below is present but is not called by a runtime receiver yet.
 ## Private container receiver
 
 `crates/bot/src/eventsub_http.rs` plus
-`crates/core/src/eventsub_receiver_config.rs`:
+`crates/core/src/eventsub_receiver_config.rs`. Operator procedure:
+[EventSub operator runbook](eventsub-runbook.md).
 
 - Binds `0.0.0.0:8092` (`EVENTSUB_RECEIVER_PORT` in `wrangler/src/eventsub.ts`)
   when `TWO_EVENTSUB` is exactly `"1"` with a valid `TWO_EVENTSUB_BIND` and
