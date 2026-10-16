@@ -4,8 +4,8 @@ Runtime switched; two cutover preconditions remain open. The default
 `Dockerfile` builds digest-pinned
 `gcr.io/distroless/cc-debian13:nonroot` since PR #84 (CEO scope decision for
 the supply-chain slice). `Dockerfile.distroless` is kept as a documented
-fallback mirroring the default; it is not built by CI. No `wrangler/` or
-workflow files were touched by the switch.
+fallback mirroring the default; it is not built by CI. The switch did not touch
+files under `wrangler/`.
 
 Staging TLS-handshake receipt: deploy-staging run `38773972225` verified the
 distroless head `46a30b19e` with `/health` 200 and `/readyz` 200 (all
