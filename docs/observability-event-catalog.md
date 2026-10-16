@@ -70,7 +70,7 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `challenge answered` | `crates/bot/src/eventsub_http.rs` (`receive`) | Webhook verification challenge answered with the plaintext challenge; Twitch enables the subscription |
 | `notification acknowledged` | `crates/bot/src/eventsub_http.rs` (`receive`) | Notification verified and acknowledged; durable claim wiring lands in a follow-up slice |
 | `revocation acknowledged` | `crates/bot/src/eventsub_http.rs` (`receive`) | Revocation verified and acknowledged; boot/periodic reconcile owns re-subscription |
-| `delivery ignored` | `crates/bot/src/eventsub_http.rs` (`receive`, three sites) | Deterministic planning error or unknown classify variant acknowledged with 2xx so Twitch does not retry |
+| `delivery ignored` | `crates/bot/src/eventsub_http.rs` (`receive`, three info sites) | Known ignored delivery or deterministic planning error acknowledged with 2xx; unknown/future classification errors instead emit `classification failed` and retryable 503 |
 | `event = "eventsub_receiver"` | `crates/bot/src/eventsub_http.rs` (`refuse`, `receive`) | Bounded `event` field value every receiver emission carries; no header, token or body leaves the process |
 
 ## Gateway metric event labels

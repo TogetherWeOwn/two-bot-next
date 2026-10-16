@@ -163,9 +163,10 @@ and log one scalar warn line (`event="eventsub_receiver"`, `status`,
 `error_class`). Worker-ingress refusals use the same envelope except the
 404 below, which is plain-text `not found`, and log
 `event="eventsub_ingress"`. Retryable refusals are the container
-timeout/busy rows plus the Worker 429 / 504 / 503 rows; this slice has no
-send and no durable ledger, so a verified delivery retries only on a
-pathological scheduling stall, and the retry re-acks with no side effects.
+timeout/busy rows, the Worker 429 / 504 / 503 rows, and the container's
+unknown/future classification fallback (503 `unavailable`). This slice has no
+send and no durable ledger; ordinary verified deliveries have no side effects
+before acknowledgement.
 Container non-POST answers also carry an `Allow: POST` header.
 Source: `wrangler/src/eventsub.ts:101-125`, `crates/bot/src/eventsub_http.rs`.
 
@@ -195,6 +196,7 @@ direct `containerFetch`, because the Worker answers those shapes first):
 | 413 | `payload_too_large` | false | Body over the 64 KiB cap, checked before verification. Genuine `stream.online` bodies are well under 2 KiB; treat 413 as a malformed or abusive sender. Source: `crates/bot/src/eventsub_http.rs:36,230-240,258-265`, `crates/core/src/twitch_eventsub.rs:49-51`. |
 | 415 | `unsupported_media_type` | false | Content type is not exactly `application/json` or `application/json; charset=utf-8` (case-insensitive); anything else, including another encoding, is refused. Source: `crates/bot/src/eventsub_http.rs:198-214`. |
 | 503 | `busy` / `upstream_timeout` | true | All 32 permits held (`busy`), or the whole request past the 20 s budget (`upstream_timeout`). Both mean the receiver is saturated or stalled, not that the delivery was bad; the sender retries. Check container saturation, not the secret. Source: `crates/bot/src/eventsub_http.rs:37-39,150-171`. |
+| 503 | `unavailable` | true | A future/unrecognized post-verification classification error; the receiver fails closed so Twitch retries. This is distinct from Worker-ingress `unavailable` above. Inspect `classification failed` and bounded `error_class`; do not assume saturation or a Worker relay failure. Source: `crates/bot/src/eventsub_http.rs:345-362`. |
 
 Verified deliveries that need no operator action answer `200`:
 
@@ -202,9 +204,11 @@ Verified deliveries that need no operator action answer `200`:
   slice has no send and no ledger, so the receiver only acks; the Helix
   slice plans the reconcile list but nothing calls it at runtime yet, so any
   re-subscription after a revocation is manual.
-- Unknown message types, and deterministic classification errors on
+- Unknown message types, and known deterministic classification errors on
   non-verification messages (`WrongSubscription`, `InvalidBody`):
   acknowledged with 2xx so Twitch does not retry what will never succeed.
+  Unknown/future `classify()` errors are not included: they return retryable
+  503 `unavailable` so an unrecognized failure is not silently discarded.
   This carve-out excludes `webhook_callback_verification`: `classify()`
   returns `WrongSubscription` / `InvalidBody` for a challenge with the wrong
   type or version, or an unparsable signed body, and the handler still acks
@@ -220,8 +224,11 @@ Log lines to expect (scalar fields only):
 - `eventsub delivery refused` (warn: `status`, `error_class`)
 - `challenge answered`, `notification acknowledged`, `revocation acknowledged`,
   `delivery ignored` (info: `status = 200`)
+- `classification failed` followed by `eventsub delivery refused` (warn:
+  `status = 503`, `error_class = "unavailable"`) for unknown/future
+  classification errors
 
-Source: `crates/bot/src/eventsub_http.rs:117-136,270-325`.
+Source: `crates/bot/src/eventsub_http.rs:117-136,270-362`.
 
 ## Dark-unless-enabled behavior
 
