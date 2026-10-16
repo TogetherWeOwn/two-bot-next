@@ -42,7 +42,9 @@ delivered.
 ## Proving the path
 
 Dispatch the workflow from `main` with `force_fail: true`: the staging probe
-hits an unallowlisted origin, the fence refuses, the evidence upload keeps
-the refusal, and the alert step posts. The prod schedule and delivery are
-verified independently the same way: one forced staging failure proves the
-alert path, and the prod job's own green/red runs prove its schedule.
+hits an unallowlisted origin and refuses before making a request. That fence
+refusal produces no evidence receipt; the upload step tolerates the missing
+file, and the alert posts with unknown build identity and the run link. This
+proves the staging failure-to-alert path, not production alert delivery. Verify
+the production schedule from its own runs, and verify production alert delivery
+from an independently evidenced production failure and its matching alert.
