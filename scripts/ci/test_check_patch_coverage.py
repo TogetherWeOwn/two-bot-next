@@ -64,6 +64,7 @@ class LcovTests(unittest.TestCase):
             "garbage",
             "SF:src/lib.rs\nend_of_record\n",
             "SF:src/lib.rs\nDA:not-a-line,1\n",
+            "SF:src/lib.rs\nDA:1\n",
             "SF:src/lib.rs\nDA:0,0\n",
             "SF:src/lib.rs\nDA:-1,1\n",
             "SF:src/lib.rs\nDA:1,-1\n",
@@ -77,6 +78,28 @@ class LcovTests(unittest.TestCase):
                     Path(lcov).unlink()
                 self.assertIsNone(hits)
                 self.assertIn("DA", error)
+
+    def test_malformed_lcov_records_with_valid_data_are_blindness(self):
+        for record in ("DA:bad,1", "DA:1", "DA:0,0", "DA:-1,1", "DA:1,-1"):
+            text = f"SF:src/lib.rs\nDA:1,1\n{record}\nend_of_record\n"
+            with self.subTest(record=record):
+                lcov = write_lcov(text)
+                try:
+                    hits, error = gate.read_lcov(lcov)
+                finally:
+                    Path(lcov).unlink()
+                self.assertIsNone(hits)
+                self.assertIn("DA", error)
+
+    def test_empty_source_with_data_after_valid_records_is_blindness(self):
+        text = "SF:src/lib.rs\nDA:1,1\nend_of_record\nSF:\nDA:2,1\nend_of_record\n"
+        lcov = write_lcov(text)
+        try:
+            hits, error = gate.read_lcov(lcov)
+        finally:
+            Path(lcov).unlink()
+        self.assertIsNone(hits)
+        self.assertIn("DA", error)
 
 
 class EvaluateTests(unittest.TestCase):
@@ -147,6 +170,22 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("::error::", out.getvalue())
         self.assertIn("blind", out.getvalue())
+
+    def test_unreadable_diff_fails_closed(self):
+        lcov = write_lcov(LCOV)
+        real_read, real_added = gate.read_lcov, gate.added_lines
+        gate.read_lcov = lambda _path: real_read(lcov)
+        gate.added_lines = lambda _base, _head: (None, "diff unavailable")
+        out = io.StringIO()
+        try:
+            with redirect_stdout(out):
+                code = gate.main(["--lcov", lcov])
+        finally:
+            gate.read_lcov, gate.added_lines = real_read, real_added
+            Path(lcov).unlink()
+        self.assertEqual(code, 1)
+        self.assertIn("::error::", out.getvalue())
+        self.assertIn("could not read the diff", out.getvalue())
 
 
 class DiffTests(unittest.TestCase):

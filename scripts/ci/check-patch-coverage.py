@@ -37,20 +37,26 @@ def read_lcov(path):
     hits = {}
     current = None
     data_records = 0
+    malformed_records = False
     for raw in text.splitlines():
         if raw.startswith("SF:"):
             current = raw[3:].strip() or None
-        elif raw.startswith("DA:") and current is not None:
+        elif raw.startswith("DA:"):
             parts = raw[3:].split(",")
             try:
                 line, count = int(parts[0]), int(parts[1])
             except (ValueError, IndexError):
+                malformed_records = True
                 continue
-            if line >= 1 and count >= 0:
-                hits[(current, line)] = count
-                data_records += 1
+            if current is None or line < 1 or count < 0:
+                malformed_records = True
+                continue
+            hits[(current, line)] = count
+            data_records += 1
         elif raw.strip() == "end_of_record":
             current = None
+    if malformed_records:
+        return None, "lcov report contains malformed DA records"
     if not data_records:
         return None, "lcov report contains no valid DA records"
     return hits, ""
