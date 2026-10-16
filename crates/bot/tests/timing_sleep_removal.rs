@@ -20,7 +20,7 @@
 //!    one-attempt-no-retry pins.
 //!
 //! Builder contract (renegotiate on the card, never by editing this file to
-//! loosen it): keep every poll backoff at or under 50 ms and under a
+//! loosen it): keep every poll backoff a literal 1–50 ms duration under a
 //! deadline, keep the post-ready settle window, and keep every other
 //! assertion in those files byte-identical. This file itself never sleeps.
 
@@ -30,6 +30,109 @@ const ALIVE: &str = include_str!("alive.rs");
 const OPS_BACKFILL: &str = include_str!("ops_backfill.rs");
 const PREFLIGHT: &str = include_str!("preflight.rs");
 
+fn skip_non_code(bytes: &[u8], index: usize) -> Option<usize> {
+    if bytes.get(index..index + 2) == Some(b"//") {
+        return Some(
+            bytes[index + 2..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(bytes.len(), |offset| index + 2 + offset),
+        );
+    }
+    if bytes.get(index..index + 2) == Some(b"/*") {
+        let mut cursor = index + 2;
+        let mut depth = 1;
+        while cursor + 1 < bytes.len() {
+            match &bytes[cursor..cursor + 2] {
+                b"/*" => {
+                    depth += 1;
+                    cursor += 2;
+                }
+                b"*/" => {
+                    depth -= 1;
+                    cursor += 2;
+                    if depth == 0 {
+                        return Some(cursor);
+                    }
+                }
+                _ => cursor += 1,
+            }
+        }
+        return Some(bytes.len());
+    }
+
+    let raw_start = if bytes.get(index) == Some(&b'r') {
+        Some(index)
+    } else if bytes.get(index..index + 2) == Some(b"br") {
+        Some(index + 1)
+    } else {
+        None
+    };
+    if let Some(raw_start) = raw_start {
+        let mut quote = raw_start + 1;
+        while bytes.get(quote) == Some(&b'#') {
+            quote += 1;
+        }
+        if bytes.get(quote) == Some(&b'"') {
+            let hashes = quote - raw_start - 1;
+            let mut cursor = quote + 1;
+            while cursor < bytes.len() {
+                if bytes[cursor] == b'"'
+                    && bytes.get(cursor + 1..cursor + 1 + hashes)
+                        == Some(&bytes[raw_start + 1..quote])
+                {
+                    return Some(cursor + 1 + hashes);
+                }
+                cursor += 1;
+            }
+            return Some(bytes.len());
+        }
+    }
+
+    if matches!(bytes.get(index), Some(b'"' | b'\'')) {
+        let quote_index = index;
+        let quote = bytes[quote_index];
+        let mut cursor = quote_index + 1;
+        while cursor < bytes.len() {
+            if quote == b'\'' && cursor - quote_index > 12 {
+                return None;
+            }
+            match bytes[cursor] {
+                b'\\' => cursor = (cursor + 2).min(bytes.len()),
+                byte if byte == quote => return Some(cursor + 1),
+                b'\n' if quote == b'\'' => return None,
+                _ => cursor += 1,
+            }
+        }
+        return (quote == b'"').then_some(bytes.len());
+    }
+    None
+}
+
+fn braced_block(source: &str, open: usize) -> String {
+    let bytes = source.as_bytes();
+    let mut cursor = open;
+    let mut depth = 0;
+    while cursor < bytes.len() {
+        if let Some(next) = skip_non_code(bytes, cursor) {
+            cursor = next;
+            continue;
+        }
+        match bytes[cursor] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return source[open..=cursor].to_owned();
+                }
+            }
+            _ => {}
+        }
+        cursor += 1;
+    }
+    panic!("unterminated block at byte {open}");
+}
+
 fn function_body(source: &str, name: &str) -> String {
     let signature = source
         .find(&format!("fn {name}("))
@@ -38,20 +141,18 @@ fn function_body(source: &str, name: &str) -> String {
         .find('{')
         .map(|offset| signature + offset)
         .unwrap_or_else(|| panic!("missing body for function {name}"));
-    let mut depth = 0;
-    for (offset, byte) in source[body_start..].bytes().enumerate() {
-        match byte {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return source[body_start..=body_start + offset].to_owned();
-                }
-            }
-            _ => {}
-        }
-    }
-    panic!("unterminated body for function {name}");
+    braced_block(source, body_start)
+}
+
+fn loop_body(source: &str, marker: &str) -> String {
+    let marker_start = source
+        .find(marker)
+        .unwrap_or_else(|| panic!("missing poll loop {marker:?}"));
+    let open = source[marker_start..]
+        .find('{')
+        .map(|offset| marker_start + offset)
+        .unwrap_or_else(|| panic!("missing poll loop body {marker:?}"));
+    braced_block(source, open)
 }
 
 fn source_between(source: &str, start: &str, end: &str) -> String {
@@ -65,16 +166,58 @@ fn source_between(source: &str, start: &str, end: &str) -> String {
     source[start..end].to_owned()
 }
 
-fn assert_poll_site(source: &str, expected_sleep: &str) {
+fn assert_poll_site(source: &str, loop_marker: &str) {
+    let body = loop_body(source, loop_marker);
     assert_eq!(
-        source.matches("sleep(").count(),
+        body.matches("sleep(").count(),
         1,
-        "each poll site must contain exactly one sleep call"
+        "each poll loop must contain exactly one sleep call"
     );
-    assert_eq!(
-        source.matches(expected_sleep).count(),
-        1,
-        "each poll site must use its literal bounded backoff"
+    let sleep_args = body.split_once("sleep(").expect("sleep call is present").1;
+    let (millis, suffix) = sleep_args
+        .strip_prefix("Duration::from_millis(")
+        .and_then(|args| args.split_once(')'))
+        .unwrap_or_else(|| panic!("poll backoff must use a literal millisecond duration"));
+    assert!(
+        suffix.starts_with(").await;") || suffix.starts_with(");"),
+        "poll backoff must pass only its literal duration to sleep"
+    );
+    assert!(
+        !millis.is_empty() && millis.bytes().all(|byte| byte.is_ascii_digit()),
+        "poll backoff must use a literal millisecond duration"
+    );
+    let millis = millis
+        .parse::<u64>()
+        .unwrap_or_else(|_| panic!("poll backoff must use a literal millisecond duration"));
+    assert!(
+        (1..=50).contains(&millis),
+        "poll backoff must be between 1 and 50 ms"
+    );
+}
+
+fn assert_ops_backfill_deadline(source: &str) {
+    assert!(
+        source.contains(
+            r#"assert!(
+            Instant::now() < deadline,
+            "bot did not serve health on the configured port"
+        );"#
+        ),
+        "spawn_bot health poll must retain its exact deadline assertion"
+    );
+}
+
+fn assert_budget_lane_hold_pin(source: &str) {
+    assert!(
+        source.contains(r#"assert_eq!(mock.requests().len(), 3, "{name}: lane held, no retry");"#),
+        "budget lane-hold test must retain its exact three-attempt assertion"
+    );
+}
+
+fn assert_preflight_429_attempt_pin(source: &str) {
+    assert!(
+        source.contains("assert_eq!(mock.requests().len(), 1);"),
+        "preflight 429 test must retain its exact one-attempt assertion"
     );
 }
 
@@ -87,25 +230,31 @@ fn assert_settle_window(source: &str) {
         source.contains("while tokio::time::Instant::now() < settle_until"),
         "post-ready settle window must poll until its deadline"
     );
+    let settle_loop = loop_body(source, "while tokio::time::Instant::now() < settle_until");
+    assert_eq!(
+        settle_loop.matches("bot.assert_alive();").count(),
+        1,
+        "settle loop must assert liveness during the window"
+    );
     assert_eq!(
         source.matches("bot.assert_alive();").count(),
         2,
         "settle loop must assert liveness inside and after the window"
     );
-    assert_poll_site(source, "sleep(Duration::from_millis(10)).await;");
+    assert_poll_site(source, "while tokio::time::Instant::now() < settle_until");
 }
 
 #[test]
 fn alive_polling_uses_bounded_backoff_under_deadline() {
     let wait_http = function_body(ALIVE, "wait_http");
-    assert_poll_site(&wait_http, "sleep(Duration::from_millis(10)).await;");
+    assert_poll_site(&wait_http, "loop");
     assert!(
         wait_http.contains("timeout(STEP"),
         "wait_http must retain its STEP deadline"
     );
 
     let checkpoint = function_body(ALIVE, "checkpoint");
-    assert_poll_site(&checkpoint, "sleep(Duration::from_millis(10)).await;");
+    assert_poll_site(&checkpoint, "loop");
     assert!(
         checkpoint.contains("timeout(STEP"),
         "checkpoint must retain its STEP deadline"
@@ -113,7 +262,7 @@ fn alive_polling_uses_bounded_backoff_under_deadline() {
 
     let lifecycle = function_body(ALIVE, "lifecycle");
     let events_tick = source_between(&lifecycle, "let ticked = timeout(STEP", "ticked.is_ok()");
-    assert_poll_site(&events_tick, "sleep(Duration::from_millis(10)).await;");
+    assert_poll_site(&events_tick, "loop");
     let settle = source_between(&lifecycle, "let settle_until =", "assert_ready_correlation");
     assert_settle_window(&settle);
 
@@ -126,11 +275,8 @@ fn alive_polling_uses_bounded_backoff_under_deadline() {
 #[test]
 fn ops_backfill_spawn_uses_bounded_backoff_under_deadline() {
     let spawn_bot = function_body(OPS_BACKFILL, "spawn_bot");
-    assert_poll_site(&spawn_bot, "thread::sleep(Duration::from_millis(20));");
-    assert!(
-        spawn_bot.contains("deadline"),
-        "ops_backfill.rs health poll must stay under its deadline"
-    );
+    assert_poll_site(&spawn_bot, "loop");
+    assert_ops_backfill_deadline(&spawn_bot);
     assert!(
         !spawn_bot.contains("yield_now"),
         "ops_backfill.rs must not busy-spin on bare scheduler yields"
@@ -139,19 +285,39 @@ fn ops_backfill_spawn_uses_bounded_backoff_under_deadline() {
 
 #[test]
 fn preflight_429_lane_hold_stays_sleep_free_with_one_attempt_pins() {
-    assert!(
-        !PREFLIGHT.contains("sleep("),
-        "preflight.rs must keep its lane-hold tests free of timing sleeps"
+    let budget_test = function_body(
+        PREFLIGHT,
+        "session_start_budget_pass_warn_fail_and_fail_closed",
     );
     assert!(
-        PREFLIGHT.contains("lane held, no retry"),
-        "preflight.rs must keep the lane-held-no-retry assertion on the \
-         429/server-error budget reads"
+        !budget_test.contains("sleep("),
+        "budget lane-hold tests must remain free of timing sleeps"
+    );
+    assert_budget_lane_hold_pin(&budget_test);
+
+    let preflight_test = function_body(
+        PREFLIGHT,
+        "preflight_429_is_one_attempt_and_stops_the_check_sequence",
     );
     assert!(
-        PREFLIGHT.contains("mock.requests().len()"),
-        "preflight.rs must keep the exact one-attempt request-count pins"
+        !preflight_test.contains("sleep("),
+        "preflight 429 test must remain free of timing sleeps"
     );
+    assert_preflight_429_attempt_pin(&preflight_test);
+}
+
+#[test]
+fn source_block_parser_ignores_braces_in_comments_and_literals() {
+    let source = r####"fn sample() {
+        let close = "}";
+        let raw = r#"{ still a string }"#;
+        /* { nested /* } */ comment } */
+        loop { break; }
+    }"####;
+    let open = source.find('{').unwrap();
+    let block = braced_block(source, open);
+    assert!(block.contains("loop { break; }"));
+    assert!(block.ends_with("    }"));
 }
 
 /// The replacement pattern itself, with no sleep anywhere in this file: a
@@ -180,11 +346,11 @@ async fn deterministic_notify_on_a_shared_lock_needs_no_sleep() {
 #[test]
 fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
     let wait_http = function_body(ALIVE, "wait_http");
-    assert_poll_site(&wait_http, "sleep(Duration::from_millis(10)).await;");
+    assert_poll_site(&wait_http, "loop");
     assert!(std::panic::catch_unwind(|| {
         assert_poll_site(
             &wait_http.replace("sleep(Duration::from_millis(10)).await;", ""),
-            "sleep(Duration::from_millis(10)).await;",
+            "loop",
         );
     })
     .is_err());
@@ -194,7 +360,7 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
                 "sleep(Duration::from_millis(10)).await;",
                 "sleep(Duration::from_millis(backoff_ms)).await;",
             ),
-            "sleep(Duration::from_millis(10)).await;",
+            "loop",
         );
     })
     .is_err());
@@ -204,7 +370,7 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
                 "sleep(Duration::from_millis(10)).await;",
                 "sleep(Duration::from_secs(1)).await;",
             ),
-            "sleep(Duration::from_millis(10)).await;",
+            "loop",
         );
     })
     .is_err());
@@ -222,6 +388,46 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
         assert_settle_window(
             &settle.replace("bot.assert_alive();", "// liveness assertion removed"),
         );
+    })
+    .is_err());
+
+    let sleep = "sleep(Duration::from_millis(10)).await;";
+    let moved_wait_http =
+        wait_http
+            .replace(sleep, "")
+            .replacen("loop {", &format!("{sleep}\n        loop {{"), 1);
+    assert!(std::panic::catch_unwind(|| {
+        assert_poll_site(&moved_wait_http, "loop");
+    })
+    .is_err());
+
+    let moved_settle_sleep = format!("{}\n{sleep}", settle.replace(sleep, ""));
+    assert!(std::panic::catch_unwind(|| {
+        assert_settle_window(&moved_settle_sleep);
+    })
+    .is_err());
+}
+
+#[test]
+fn polling_guard_pins_exact_ops_deadline_and_preflight_attempt_assertions() {
+    let spawn_bot = function_body(OPS_BACKFILL, "spawn_bot");
+    let without_deadline_check = spawn_bot.replace(
+        "assert!(\n            Instant::now() < deadline,\n            \"bot did not serve health on the configured port\"\n        );",
+        "// deadline check removed",
+    );
+    assert!(without_deadline_check.contains("deadline"));
+    assert!(std::panic::catch_unwind(|| {
+        assert_ops_backfill_deadline(&without_deadline_check);
+    })
+    .is_err());
+
+    let preflight_test = function_body(
+        PREFLIGHT,
+        "preflight_429_is_one_attempt_and_stops_the_check_sequence",
+    );
+    let without_attempt_pin = preflight_test.replace("assert_eq!(mock.requests().len(), 1);", "");
+    assert!(std::panic::catch_unwind(|| {
+        assert_preflight_429_attempt_pin(&without_attempt_pin);
     })
     .is_err());
 }
