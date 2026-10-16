@@ -73,10 +73,11 @@ def run_scan(ast_grep, all_rules=False):
         line = start.get("line")
         path = finding.get("file")
         if (not isinstance(path, str) or not path
-                or type(line) is not int or line < 1):
+                or type(line) is not int or line < 0):
             return None, "ast-grep scan contains an invalid finding"
         if not all_rules and rule_id != RULE_ID:
             continue
+        line += 1
         hits.append((rule_id, path, line) if all_rules else (path, line))
     return hits, ""
 

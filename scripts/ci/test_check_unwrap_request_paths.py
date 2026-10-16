@@ -76,6 +76,17 @@ def fake_ast_grep(payload):
 
 
 class ScanTests(unittest.TestCase):
+    def test_scan_converts_zero_based_lines_to_one_based(self):
+        fixture = [{"ruleId": gate.RULE_ID, "file": "a.rs",
+                    "range": {"start": {"line": 0}}}]
+        tmp, binary = fake_ast_grep(json.dumps(fixture))
+        try:
+            hits, error = gate.run_scan(binary)
+        finally:
+            tmp.cleanup()
+        self.assertEqual(error, "")
+        self.assertEqual(hits, [("a.rs", 1)])
+
     def test_scan_keeps_only_rule_hits_with_line_numbers(self):
         tmp, binary = fake_ast_grep(json.dumps(SCAN_FIXTURE))
         try:
@@ -83,8 +94,8 @@ class ScanTests(unittest.TestCase):
         finally:
             tmp.cleanup()
         self.assertEqual(error, "")
-        self.assertEqual(hits, [("crates/bot/src/gateway_commands.rs", 10),
-                                ("crates/bot/src/gateway_commands.rs", 99)])
+        self.assertEqual(hits, [("crates/bot/src/gateway_commands.rs", 11),
+                                ("crates/bot/src/gateway_commands.rs", 100)])
 
     def test_scan_keeps_duplicate_line_findings_for_the_backlog_count(self):
         fixture = [dict(SCAN_FIXTURE[0]), dict(SCAN_FIXTURE[0])]
@@ -103,7 +114,7 @@ class ScanTests(unittest.TestCase):
         finally:
             tmp.cleanup()
         self.assertEqual(error, "")
-        self.assertIn(("some-other-rule", "crates/bot/src/gateway_commands.rs", 11), hits)
+        self.assertIn(("some-other-rule", "crates/bot/src/gateway_commands.rs", 12), hits)
 
     def test_scan_reports_garbage_instead_of_crashing(self):
         tmp, binary = fake_ast_grep("not json")
@@ -229,7 +240,7 @@ class GateTests(unittest.TestCase):
             real_root, gate.ROOT = gate.ROOT, root
             scan = [{"ruleId": "no-unwrap-request-paths",
                      "file": "crates/bot/src/gateway_commands.rs",
-                     "range": {"start": {"line": 2}}}]
+                     "range": {"start": {"line": 1}}}]
             fake_tmp, binary = fake_ast_grep(json.dumps(scan))
             out = io.StringIO()
             try:

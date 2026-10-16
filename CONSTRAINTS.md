@@ -57,11 +57,11 @@ not adding one.
 
 Why 80% patch coverage: high enough to force a test for new logic, low
 enough to let a config line or a rename through. Patch coverage stays
-WARN-first because the codebase predates the gate; unwrap and semgrep
-graduated to HARD with their pre-existing hits grandfathered with expiry
-(docs/quality-gates.md, docs/unwrap-backlog.md). Below high-or-above for
-dependencies is mostly noise, so the
-advisory scan stays HARD from day one.
+WARN-first because the codebase predates the gate. Semgrep's pre-existing hits
+are grandfathered through 2027-01-15 (docs/quality-gates.md); unwrap has no
+grandfathered production-only set, and its existing request-path findings are
+catalogued in docs/unwrap-backlog.md. Below high-or-above for dependencies is
+mostly noise, so the advisory scan stays HARD from day one.
 
 ## Measured, not yet enforced
 
