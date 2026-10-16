@@ -29,7 +29,11 @@ use two_bot_discord::{
     ActionExecutor,
 };
 
+#[cfg(not(test))]
 const STORE_TIMEOUT: Duration = Duration::from_secs(5);
+// Shared CI databases can stall for seconds; fixtures assert state, not latency.
+#[cfg(test)]
+const STORE_TIMEOUT: Duration = Duration::from_secs(60);
 const LANE_WAIT: Duration = Duration::from_secs(20);
 const LANE_BACKOFF: Duration = Duration::from_millis(100);
 
