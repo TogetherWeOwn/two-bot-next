@@ -9,6 +9,12 @@
 //! subscription. Anything unhealthy is logged with an `error_class`, never
 //! silent.
 //!
+//! The plan runs one action at a time: a rejected action (a typo'd
+//! broadcaster id answers 400, a rate limit 429, a blip 5xx) is logged and
+//! counted, and the rest of the plan and the final listing still run, so one
+//! bad id cannot starve the broadcasters sorted after it. The pass then fails
+//! with the failed and missing counts.
+//!
 //! The task runs once at startup and on a bounded interval afterwards. The
 //! signing secret travels only inside `WebhookSecret` (HMAC plus the
 //! create-subscription body, both inside core) and no log line carries a
@@ -17,7 +23,9 @@
 
 use std::{collections::HashMap, future::Future, time::Duration};
 
-use two_bot_core::twitch_eventsub::{CallbackUrl, ExistingSubscription, WebhookSecret};
+use two_bot_core::twitch_eventsub::{
+    CallbackUrl, ExistingSubscription, SubscriptionAction, WebhookSecret,
+};
 use two_bot_core::twitch_helix::{
     plan_boot_actions, webhook_secret_from_env, ActionOutcome, HelixClient, HelixCredentials,
     HelixError, HelixTransport, HyperHelixTransport,
@@ -172,10 +180,70 @@ fn summarize(outcomes: &[ActionOutcome]) -> ReconcileSummary {
     summary
 }
 
+/// What running a plan action by action produced.
+struct PlanRun {
+    /// Outcomes of the actions that succeeded, in plan order.
+    outcomes: Vec<ActionOutcome>,
+    /// Actions that failed; every later action still ran.
+    failed: usize,
+    /// The first failed action's error, returned when the pass fails.
+    first_failure: Option<HelixError>,
+}
+
+/// `delete` or `create`, for the scalar action-failure log.
+fn action_label(action: &SubscriptionAction) -> &'static str {
+    match action {
+        SubscriptionAction::Delete { .. } => "delete",
+        SubscriptionAction::Create { .. } => "create",
+    }
+}
+
+/// Run `plan` one action at a time so a rejected action cannot starve the
+/// ones after it: `execute_actions` returns on the first non-2xx answer, and
+/// the creates are sorted, so a poisoned broadcaster id would otherwise block
+/// every later create on every pass. Each failure is logged with its action
+/// kind and error, counted, and the plan carries on; the plan is bounded by
+/// the broadcaster allowlist, so the pass stays bounded too.
+async fn run_plan<T: HelixTransport>(
+    client: &mut HelixClient<T>,
+    plan: &[SubscriptionAction],
+    callback: &CallbackUrl,
+    secret: &WebhookSecret,
+) -> PlanRun {
+    let mut run = PlanRun {
+        outcomes: Vec::with_capacity(plan.len()),
+        failed: 0,
+        first_failure: None,
+    };
+    for action in plan {
+        match client
+            .execute_actions(std::slice::from_ref(action), callback, secret)
+            .await
+        {
+            Ok(mut done) => run.outcomes.append(&mut done),
+            Err(error) => {
+                tracing::error!(
+                    event = "eventsub_reconcile",
+                    error_class = "reconcile_action_failed",
+                    action = action_label(action),
+                    error = %error,
+                    "eventsub reconcile action failed; continuing with the rest of the plan"
+                );
+                run.failed += 1;
+                if run.first_failure.is_none() {
+                    run.first_failure = Some(error);
+                }
+            }
+        }
+    }
+    run
+}
+
 /// List, diff with `plan_boot_actions` (deletes before creates, our callback
-/// only), execute with `execute_actions`, then confirm with a follow-up
-/// `list_subscriptions`: every desired broadcaster must hold a healthy
-/// subscription afterwards, else the pass fails loudly.
+/// only), run the plan action by action, then confirm with a follow-up
+/// `list_subscriptions` that always runs: the pass fails loudly, with the
+/// failed and missing counts, when any action failed or a desired broadcaster
+/// lacks a healthy subscription afterwards.
 pub async fn reconcile_all<T: HelixTransport>(
     client: &mut HelixClient<T>,
     callback: &CallbackUrl,
@@ -194,23 +262,24 @@ pub async fn reconcile_all<T: HelixTransport>(
         );
     }
     let plan = plan_boot_actions(desired, callback, &existing)?;
-    let outcomes = client.execute_actions(&plan, callback, secret).await?;
+    let run = run_plan(client, &plan, callback, secret).await;
     let confirmed = client.list_subscriptions().await?;
     let missing = unconfirmed_broadcasters(desired, callback, &confirmed);
-    if !missing.is_empty() {
+    if run.failed > 0 || !missing.is_empty() {
         tracing::error!(
             event = "eventsub_reconcile",
             error_class = "reconcile_unhealthy",
             broadcasters = desired.len(),
+            failed = run.failed,
             missing = missing.len(),
             prior_failed = prior_failed,
-            "eventsub reconcile follow-up listing is missing a healthy subscription"
+            "eventsub reconcile did not converge: an action failed or a healthy subscription is missing"
         );
-        return Err(HelixError::BadResponse(
+        return Err(run.first_failure.unwrap_or(HelixError::BadResponse(
             "reconcile follow-up listing is missing a healthy subscription",
-        ));
+        )));
     }
-    let mut summary = summarize(&outcomes);
+    let mut summary = summarize(&run.outcomes);
     summary.prior_failed = prior_failed;
     let status = if pending_only(desired, callback, &confirmed) {
         "pending"
@@ -434,6 +503,13 @@ mod tests {
         fn no_content() -> Result<HelixResponse, HelixError> {
             Ok(HelixResponse {
                 status: StatusCode::NO_CONTENT,
+                body: Vec::new(),
+            })
+        }
+
+        fn rejected(status: StatusCode) -> Result<HelixResponse, HelixError> {
+            Ok(HelixResponse {
+                status,
                 body: Vec::new(),
             })
         }
@@ -721,6 +797,117 @@ mod tests {
         assert!(
             matches!(error, HelixError::BadResponse(_)),
             "unhealthy state must surface, not count as done: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_runs_later_creates_after_a_rejected_create_then_fails() {
+        let listing = json!({"data": [], "pagination": {}});
+        let confirmed = json!({
+            "data": [
+                subscription_entry("id-111", "enabled", "111", "https://hooks.example.com/twitch"),
+                subscription_entry("id-333", "enabled", "333", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let log = CallLog::default();
+        let transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                ScriptTransport::listing_answer(&listing),
+                ScriptTransport::no_content(),
+                ScriptTransport::rejected(StatusCode::BAD_REQUEST),
+                ScriptTransport::no_content(),
+                ScriptTransport::listing_answer(&confirmed),
+            ],
+            log.clone(),
+        );
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let error = reconcile_all(
+            &mut client,
+            &callback(),
+            &["111".to_owned(), "222".to_owned(), "333".to_owned()],
+            &test_secret(),
+        )
+        .await
+        .expect_err("a rejected create must fail the pass");
+        assert!(
+            matches!(
+                error,
+                HelixError::HelixRejected { status, .. } if status == StatusCode::BAD_REQUEST
+            ),
+            "the first rejected action is the pass error: {error}"
+        );
+        let seen = log.requests();
+        assert_eq!(
+            seen.len(),
+            6,
+            "token, listing, three creates, follow-up listing"
+        );
+        assert_eq!(seen[4].method, Method::POST);
+        assert!(
+            seen[4]
+                .body
+                .as_ref()
+                .expect("create carries a body")
+                .expose()
+                .contains("333"),
+            "the create after the rejected one is still issued"
+        );
+        assert_eq!(
+            seen[5].method,
+            Method::GET,
+            "the follow-up listing runs after a failed action"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_fails_on_a_rejected_delete_even_when_nothing_is_missing() {
+        let listing = json!({
+            "data": [
+                subscription_entry("stale-id", "enabled", "111", "https://hooks.example.com/twitch"),
+                subscription_entry("keep-id", "enabled", "222", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let confirmed = json!({
+            "data": [
+                subscription_entry("stale-id", "enabled", "111", "https://hooks.example.com/twitch"),
+                subscription_entry("keep-id", "enabled", "222", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let log = CallLog::default();
+        let transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                ScriptTransport::listing_answer(&listing),
+                ScriptTransport::rejected(StatusCode::INTERNAL_SERVER_ERROR),
+                ScriptTransport::listing_answer(&confirmed),
+            ],
+            log.clone(),
+        );
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let error = reconcile_all(
+            &mut client,
+            &callback(),
+            &["222".to_owned()],
+            &test_secret(),
+        )
+        .await
+        .expect_err("a rejected delete must fail the pass even though 222 is healthy");
+        assert!(
+            matches!(
+                error,
+                HelixError::HelixRejected { status, .. }
+                    if status == StatusCode::INTERNAL_SERVER_ERROR
+            ),
+            "the rejected delete is the pass error: {error}"
+        );
+        assert_eq!(
+            log.requests().len(),
+            4,
+            "token, listing, delete, follow-up listing"
         );
     }
 

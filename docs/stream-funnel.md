@@ -90,7 +90,11 @@ Subscription management is pure request building plus a diff
 wiring (`crates/bot/src/eventsub_reconcile.rs`) runs it once at startup and on
 a bounded hourly interval while `TWO_EVENTSUB` is exactly `1`, and it only
 touches subscriptions on the bot's own callback (`TWO_TWITCH_CALLBACK_URL`).
-Deletes precede creates because Twitch answers 409 to a duplicate create. A
+Deletes precede creates because Twitch answers 409 to a duplicate create. The
+plan runs one action at a time: a rejected action (for example a 400 for a
+mistyped broadcaster id) is logged and counted, the later actions and the
+final listing still run, and the pass then fails with the failed and missing
+counts, so one bad id never starves the broadcasters after it. A
 `revocation` delivery is acknowledged by the receiver and healed by the next
 pass; the desired set comes from `TWO_TWITCH_BROADCASTERS` (empty parks the
 pass without mutations).

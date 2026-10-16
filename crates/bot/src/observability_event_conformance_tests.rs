@@ -579,20 +579,22 @@ fn eventsub_events_are_recorded_in_the_catalog_doc() {
 /// vocabulary. The file is permanent, so it is read at compile time; the
 /// message set, the bounded `event` field, the `error_class` tokens and the
 /// `status` tokens each fail closed when renamed or added without a catalog row.
-const EVENTSUB_RECONCILE_RS_EVENTS: [&str; 10] = [
+const EVENTSUB_RECONCILE_RS_EVENTS: [&str; 11] = [
     "eventsub reconcile parked: TWO_EVENTSUB is not exactly 1",
     "eventsub reconcile refused: callback configuration is invalid",
     "eventsub reconcile parked: broadcaster allowlist is empty, no subscriptions mutated",
     "eventsub reconcile refused: Twitch credentials are missing or invalid",
     "eventsub reconcile refused: webhook secret is missing or invalid",
     "eventsub reconcile found failed subscriptions on our callback; deleting and re-creating",
-    "eventsub reconcile follow-up listing is missing a healthy subscription",
+    "eventsub reconcile action failed; continuing with the rest of the plan",
+    "eventsub reconcile did not converge: an action failed or a healthy subscription is missing",
     "eventsub subscriptions re-created but none verified yet",
     "eventsub subscriptions reconciled",
     "eventsub reconcile failed",
 ];
-const EVENTSUB_RECONCILE_ERROR_CLASSES: [&str; 6] = [
+const EVENTSUB_RECONCILE_ERROR_CLASSES: [&str; 7] = [
     "reconcile_prior_failed",
+    "reconcile_action_failed",
     "reconcile_unhealthy",
     "reconcile_pending",
     "reconcile_config_invalid",
