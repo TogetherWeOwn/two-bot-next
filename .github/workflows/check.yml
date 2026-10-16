@@ -374,9 +374,11 @@ jobs:
       # Deterministic quality gates (docs/quality-gates.md). Steps, not jobs:
       # they reuse this lane's runner, container and toolchain, so no new
       # runner minutes beyond the step itself, and ci-ok already covers them.
-      # WARN gates annotate but never fail on findings; a broken gate step
-      # still fails so blindness cannot hide. The inventory gate is HARD and
-      # always on (pure Python, milliseconds); the rest are gated on the rust
+      # Patch coverage and the squawk lint stay WARN (they annotate but never
+      # fail on findings); unwrap request-paths and semgrep are HARD and fail
+      # on new findings. A broken gate step still fails so blindness cannot
+      # hide. The inventory gate is HARD and always on (pure Python,
+      # milliseconds); the rest are gated on the rust
       # selector like the other heavy steps.
       - name: CI test-target inventory
         run: python3 scripts/ci/check-test-inventory.py
@@ -421,7 +423,7 @@ jobs:
             echo "::warning::patch coverage measurement did not complete; see the rust-tests lane for the authoritative unit-test result"
           fi
 
-      - name: Unwrap in request paths (WARN)
+      - name: Unwrap in request paths (HARD)
         if: needs.job-inputs.outputs.rust != 'false'
         shell: bash
         env:
@@ -446,7 +448,7 @@ jobs:
             --base-ref "$QUALITY_BASE" --head-ref "$QUALITY_HEAD"
           PATH="$RUNNER_TEMP/ast-grep:$PATH" ast-grep test -c sgconfig.yml
 
-      - name: Semgrep Rust rules (WARN)
+      - name: Semgrep Rust rules (HARD)
         if: needs.job-inputs.outputs.rust != 'false'
         shell: bash
         env:
