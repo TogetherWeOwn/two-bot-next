@@ -292,8 +292,10 @@ fn assert_preflight_429_attempt_pin(source: &str) {
 fn assert_settle_window(source: &str) {
     let source = code_only(source);
     assert!(
-        source.contains("Duration::from_millis(200)"),
-        "post-ready settle window must remain 200 ms"
+        source.contains(
+            "let settle_until = tokio::time::Instant::now() + Duration::from_millis(200);"
+        ),
+        "post-ready settle deadline must start 200 ms in the future"
     );
     assert!(
         source.contains("while tokio::time::Instant::now() < settle_until"),
@@ -456,6 +458,11 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
     let lifecycle = function_body(ALIVE, "lifecycle");
     let settle = source_between(&lifecycle, "let settle_until =", "assert_ready_correlation");
     assert_settle_window(&settle);
+    let flipped_deadline = settle.replace(
+        "Instant::now() + Duration::from_millis(200)",
+        "Instant::now() - Duration::from_millis(200)",
+    );
+    assert!(std::panic::catch_unwind(|| assert_settle_window(&flipped_deadline)).is_err());
     assert!(std::panic::catch_unwind(|| {
         assert_settle_window(
             &settle.replace("Duration::from_millis(200)", "Duration::from_millis(0)"),
