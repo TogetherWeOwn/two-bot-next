@@ -146,10 +146,13 @@ def _contains_fn_body(source):
     Linear scan (no regular expressions): ``;`` inside ``()``/``[]`` pairs
     (for example ``[u8; 32]``) never terminates the signature, so only a
     ``{`` or ``;`` at nesting depth zero decides. Double-quoted strings and
-    ``//``/``/* */`` comments are skipped so a brace inside them cannot fake
-    a body. A fail-closed conservative choice: an ``fn`` token hidden in a
-    comment still scans forward, which can only report a body (uncovered),
-    never silence a measurable file.
+    ``//``/``/* */`` comments are skipped *after* an ``fn`` token so a brace
+    inside them cannot fake a body. No text before an ``fn`` token is ever
+    used to skip it (a glob like ``src/*`` in a comment or string is an
+    unbalanced ``/*`` that would hide every later function), so an ``fn``
+    token inside a comment still scans forward. That is the fail-closed
+    choice: it can only report a body (uncovered), never silence a
+    measurable file.
     """
     total = len(source)
     pos = 0
@@ -163,18 +166,10 @@ def _contains_fn_body(source):
         if (before.isalnum() or before == "_") or (after.isalnum() or after == "_"):
             pos = idx + 2
             continue
-        line_start = source.rfind("\n", 0, idx) + 1
-        if "//" in source[line_start:idx]:
-            pos = idx + 2
-            continue
-        if source.count("/*", 0, idx) > source.count("*/", 0, idx):
-            pos = idx + 2
-            continue
         depth_paren = 0
         depth_bracket = 0
         cursor = after_pos
         in_string = False
-        terminated = False
         while cursor < total:
             ch = source[cursor]
             if in_string:
@@ -210,12 +205,9 @@ def _contains_fn_body(source):
             elif ch == "{" and depth_paren == 0 and depth_bracket == 0:
                 return True
             elif ch == ";" and depth_paren == 0 and depth_bracket == 0:
-                terminated = True
                 break
             cursor += 1
         pos = idx + 2
-        if not terminated and cursor >= total:
-            continue
 
 
 def has_instrumentable_function(path):

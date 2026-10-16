@@ -205,6 +205,40 @@ class EvaluateTests(unittest.TestCase):
                 gate.ROOT = real_root
         self.assertEqual(result, (0, 1, [("crates/core/src/digest.rs", 1)]))
 
+    def test_array_semicolon_in_return_type_is_instrumentable(self):
+        # The bracket guard is only observable on the return-type shape: the
+        # `;` sits at paren depth zero, so only the bracket depth keeps it
+        # from ending the signature before the body brace.
+        self.assertTrue(gate._contains_fn_body("pub fn digest() -> [u8; 32] { [0; 32] }\n"))
+        self.assertFalse(gate._contains_fn_body("trait T {\n    fn digest() -> [u8; 32];\n}\n"))
+
+    def test_unbalanced_block_comment_opener_before_a_fn_does_not_hide_it(self):
+        # A glob such as `src/internal/*` in a line comment or a string has an
+        # unbalanced `/*`; it must never make a later real fn invisible.
+        cases = {
+            "line-comment glob": "//! Modules under src/internal/* are private.\npub fn body_hash() { }\n",
+            "doc-comment glob": "/// matches src/*\npub fn run() { }\n",
+            "string glob": 'const GLOB: &str = "src/*";\npub fn run() { }\n',
+            "inline comment before fn": "const X: u8 = 1; // see src/*\npub fn run() { }\n",
+        }
+        for label, source in cases.items():
+            with self.subTest(label=label):
+                self.assertTrue(gate._contains_fn_body(source))
+
+    def test_unbalanced_block_comment_opener_keeps_changed_file_uncovered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "crates/core/src/internal_actions.rs"
+            source.parent.mkdir(parents=True)
+            source.write_text("//! Actions live under src/internal/*.\n\npub fn body_hash() { }\n")
+            real_root = gate.ROOT
+            gate.ROOT = root
+            try:
+                result = gate.evaluate({}, {("crates/core/src/internal_actions.rs", 3)})
+            finally:
+                gate.ROOT = real_root
+        self.assertEqual(result, (0, 1, [("crates/core/src/internal_actions.rs", 3)]))
+
     def test_measurable_source_exclusions_and_root_source_are_pinned(self):
         cases = {
             "crates/bot/src/gateway.rs": True,

@@ -1222,6 +1222,16 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(step["env"][base_key], expected_base)
                 self.assertEqual(step["env"][head_key], expected_head)
 
+    def test_rust_tests_timeout_leaves_headroom_for_coverage_measurement(self):
+        # The HARD patch-coverage step re-runs the suite under llvm-cov
+        # (16m36s of a 26m19s job at the exact head), so the PR-event limit must
+        # stay well above that: a slow runner reports a verdict, not a timeout.
+        job = self.workflows["check.yml"]["jobs"]["rust-tests"]
+        self.assertEqual(
+            job["timeout-minutes"],
+            "${{ github.event_name == 'push' && 60 || 45 }}",
+        )
+
     def test_patch_coverage_runs_with_db_and_includes_ignored_tests(self):
         job = self.workflows["check.yml"]["jobs"]["rust-tests"]
         step = next(
