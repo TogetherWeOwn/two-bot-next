@@ -203,22 +203,29 @@ async fn scheduled_runtime_probe(pool: &PgPool, role: &str) -> Result<(), sqlx::
     Ok(())
 }
 
-/// Every migration in apply order: the cutover chain, then the store chain
-/// that staging applies on top under its own ledger. Both are read from their
-/// directories so a new migration is exercised without a hardcoded list.
+/// Every migration path in apply order: the cutover chain, then the store
+/// chain that staging applies on top under its own ledger. Both are read from
+/// their directories so a new migration is exercised without a hardcoded list.
+fn migration_paths() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    for chain in ["../cutover/migrations", "../store/migrations"] {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(chain);
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)
+            .expect("migrations directory")
+            .map(|entry| entry.expect("migration entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+            .collect();
+        entries.sort();
+        assert!(!entries.is_empty(), "no migrations found in {chain}");
+        paths.extend(entries);
+    }
+    paths
+}
+
+/// `migration_paths` with each file's version prefix and contents.
 fn migration_files() -> Vec<(i64, String)> {
-    ["../cutover/migrations", "../store/migrations"]
+    let files: Vec<(i64, String)> = migration_paths()
         .iter()
-        .flat_map(|chain| {
-            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(chain);
-            let mut entries: Vec<_> = std::fs::read_dir(&dir)
-                .expect("migrations directory")
-                .map(|entry| entry.expect("migration entry").path())
-                .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
-                .collect();
-            entries.sort();
-            entries
-        })
         .map(|path| {
             let name = path
                 .file_name()
@@ -226,17 +233,30 @@ fn migration_files() -> Vec<(i64, String)> {
                 .to_string_lossy();
             let digits: String = name.chars().take_while(|c| c.is_ascii_digit()).collect();
             let version: i64 = digits.parse().expect("migration version prefix");
-            let sql = std::fs::read_to_string(&path).expect("read migration");
+            let sql = std::fs::read_to_string(path).expect("read migration");
             (version, sql)
         })
-        .collect()
+        .collect();
+    // The two ledgers are separate, but the fixtures below select by version
+    // alone, so a version reused across the chains would apply the wrong file.
+    let mut seen = std::collections::BTreeSet::new();
+    for (version, _) in &files {
+        assert!(
+            seen.insert(*version),
+            "migration version {version} is in both chains"
+        );
+    }
+    files
 }
 
 async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     // Every real migration file in apply order, not a reduced fixture that
     // omits trigger/sequence paths or newer tables. A new migration without a
     // matrix row fails the offline coverage test and drifts here.
-    for (_, sql) in migration_files() {
+    let paths = migration_paths();
+    assert!(!paths.is_empty(), "no migrations found");
+    for path in paths {
+        let sql = std::fs::read_to_string(&path).expect("migration file readable");
         // Never grant a shared cluster role: isolate names even in migrations.
         execute(pool, isolated(&sql, roles)).await?;
     }
