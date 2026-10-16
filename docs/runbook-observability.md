@@ -98,9 +98,13 @@ claim them as shipped acceptance:
 - Release-tagged external error tracking is not configured. Production Workers
   Logs are enabled unsampled; traces remain disabled to avoid recording
   credential-bearing URLs.
-- This repository's synthetic workflow is staging-oriented. Do not describe it
-  as a passive five-minute production user-flow check unless the production
-  schedule and alert delivery have been independently verified.
+- The five-minute user-flow synthetic (`synthetic-user-flow` workflow, see
+  [synthetic-user-flow](synthetic-user-flow.md)) probes staging plus a passive
+  production check on the same schedule, and posts one Discord ops-channel
+  alert per failure with the container build revision and the GitHub run link.
+  Production stays passive: it observes and alerts only, and never blocks a
+  deploy. Verify a schedule change or a new alert destination with one forced
+  staging failure (dispatch `force_fail`) before claiming delivery.
 - The shared promotion workflow already has a gated readiness check and
   rollback behavior. Do not treat this as proof of a gradual traffic rollout
   or an error-rate-triggered production rollback.
