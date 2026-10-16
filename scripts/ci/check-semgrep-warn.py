@@ -110,8 +110,8 @@ def added_lines(base_ref, head_ref):
     """Added (file, new-line) pairs from a zero-context diff of Rust files."""
     try:
         proc = subprocess.run(
-            ["git", "-C", str(ROOT), "diff", "-U0", "--no-color", "-M",
-             f"{base_ref}", f"{head_ref}", "--", "*.rs"],
+            ["git", "-C", str(ROOT), "-c", "core.quotepath=false", "diff",
+             "-U0", "--no-color", "-M", f"{base_ref}", f"{head_ref}", "--", "*.rs"],
             capture_output=True,
             text=True,
             timeout=120,
@@ -121,24 +121,37 @@ def added_lines(base_ref, head_ref):
     if proc.returncode != 0:
         return None, f"git diff exited {proc.returncode}: {proc.stderr.strip()[:200]}"
     added = set()
-    path, new_line = None, 0
+    path, new_line, in_hunk = None, 0, False
     for raw in proc.stdout.splitlines():
-        if raw.startswith("+++ b/"):
-            path = raw[len("+++ b/"):]
+        if raw.startswith("diff --git "):
+            path, in_hunk = None, False
+            continue
+        if not in_hunk and raw.startswith("+++ "):
+            if raw == "+++ /dev/null":
+                path = None
+            elif raw.startswith("+++ b/") and raw[len("+++ b/"):]:
+                path = raw[len("+++ b/"):]
+            else:
+                return None, "git diff contains an unrecognized file path header"
             continue
         match = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", raw)
         if match:
             new_line = int(match.group(1))
+            in_hunk = True
             continue
-        if path is None:
+        if path is None or not in_hunk:
             continue
-        if raw.startswith("+") and not raw.startswith("+++"):
+        if raw.startswith("+"):
             added.add((path, new_line))
             new_line += 1
-        elif raw.startswith("-") and not raw.startswith("---"):
+        elif raw.startswith("-"):
             continue
-        else:
+        elif raw == r"\ No newline at end of file":
+            continue
+        elif raw.startswith(" "):
             new_line += 1
+        else:
+            return None, "git diff contains an unrecognized hunk line"
     return added, ""
 
 

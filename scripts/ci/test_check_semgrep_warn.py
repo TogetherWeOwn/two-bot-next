@@ -275,6 +275,53 @@ class ParseTests(unittest.TestCase):
 
 
 class DiffTests(unittest.TestCase):
+    def test_added_lines_tracks_non_ascii_path(self):
+        tmp, root = make_repo()
+        try:
+            path = "crates/core/src/café.rs"
+            base = commit(root, {path: "fn main() {}\n"})
+            head = commit(root, {path: "fn main() {}\npanic!(\"new\");\n"})
+            real_root, gate.ROOT = gate.ROOT, root
+            try:
+                added, error = gate.added_lines(base, head)
+            finally:
+                gate.ROOT = real_root
+        finally:
+            tmp.cleanup()
+        self.assertEqual(error, "")
+        self.assertEqual(added, {(path, 2)})
+
+    def test_quoted_diff_path_fails_closed(self):
+        quoted_diff = "\n".join((
+            'diff --git "a/caf\\303\\251.rs" "b/caf\\303\\251.rs"',
+            '--- "a/caf\\303\\251.rs"',
+            '+++ "b/caf\\303\\251.rs"',
+            "@@ -0,0 +1 @@",
+            '+panic!("new");',
+            "",
+        ))
+        with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=quoted_diff, stderr="")):
+            added, error = gate.added_lines("base", "head")
+        self.assertIsNone(added)
+        self.assertIn("unrecognized", error)
+
+    def test_added_lines_ignores_no_newline_marker(self):
+        tmp, root = make_repo()
+        try:
+            path = "crates/core/src/example.rs"
+            base = commit(root, {path: "fn main() {}"})
+            head = commit(root, {path: 'fn main() { panic!("new"); }'})
+            real_root, gate.ROOT = gate.ROOT, root
+            try:
+                added, error = gate.added_lines(base, head)
+            finally:
+                gate.ROOT = real_root
+        finally:
+            tmp.cleanup()
+        self.assertEqual(error, "")
+        self.assertEqual(added, {(path, 1)})
+
     def test_pure_rename_does_not_add_every_line(self):
         tmp, root = make_repo()
         try:
