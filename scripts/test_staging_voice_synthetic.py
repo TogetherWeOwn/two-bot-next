@@ -254,15 +254,56 @@ class EffectivePermissionsTest(unittest.TestCase):
     MANAGE_ROLES = 1 << 28
     ADMINISTRATOR = 1 << 3
 
-    def permissions(self, *, everyone=0, roles=None, overwrites=None, owner=None):
+    def permissions(self, *, everyone=0, roles=None, overwrites=None, owner=None,
+                    member_role_ids=None):
         role_rows = [{"id": self.GUILD, "permissions": str(everyone)}]
         role_rows.extend(roles or [])
+        if member_role_ids is None:
+            member_role_ids = [r["id"] for r in (roles or [])]
         return synth.effective_permissions(
-            self.GUILD, self.BOT, [r["id"] for r in (roles or [])],
-            role_rows, overwrites or [], guild_owner_id=owner)
+            self.GUILD, self.BOT, member_role_ids, role_rows, overwrites or [],
+            guild_owner_id=owner)
+
+    def test_everyone_base_role_contributes_permissions(self):
+        result = self.permissions(everyone=self.MANAGE_ROLES)
+        self.assertTrue(result & self.MANAGE_ROLES)
 
     def test_assigned_role_grants_manage_roles(self):
         result = self.permissions(roles=[{"id": "role", "permissions": str(self.MANAGE_ROLES)}])
+        self.assertTrue(result & self.MANAGE_ROLES)
+
+    def test_everyone_overwrite_deny_removes_base_permission(self):
+        result = self.permissions(
+            everyone=self.MANAGE_ROLES,
+            overwrites=[{"id": self.GUILD, "type": 0, "allow": "0",
+                         "deny": str(self.MANAGE_ROLES)}])
+        self.assertFalse(result & self.MANAGE_ROLES)
+
+    def test_everyone_overwrite_allow_grants_permission(self):
+        result = self.permissions(
+            overwrites=[{"id": self.GUILD, "type": 0, "allow": str(self.MANAGE_ROLES),
+                         "deny": "0"}])
+        self.assertTrue(result & self.MANAGE_ROLES)
+
+    def test_role_overwrite_allow_grants_permission(self):
+        result = self.permissions(
+            roles=[{"id": "role", "permissions": "0"}],
+            overwrites=[{"id": "role", "type": 0, "allow": str(self.MANAGE_ROLES),
+                         "deny": "0"}])
+        self.assertTrue(result & self.MANAGE_ROLES)
+
+    def test_unassigned_role_overwrite_does_not_grant_permission(self):
+        result = self.permissions(
+            roles=[{"id": "other-role", "permissions": "0"}],
+            member_role_ids=[],
+            overwrites=[{"id": "other-role", "type": 0,
+                         "allow": str(self.MANAGE_ROLES), "deny": "0"}])
+        self.assertFalse(result & self.MANAGE_ROLES)
+
+    def test_member_overwrite_allow_grants_permission(self):
+        result = self.permissions(
+            overwrites=[{"id": self.BOT, "type": 1, "allow": str(self.MANAGE_ROLES),
+                         "deny": "0"}])
         self.assertTrue(result & self.MANAGE_ROLES)
 
     def test_role_overwrite_deny_wins_over_role_allow(self):
@@ -288,6 +329,19 @@ class EffectivePermissionsTest(unittest.TestCase):
             overwrites=[{"id": self.BOT, "type": 1, "allow": "0", "deny": str(self.MANAGE_ROLES)}],
             owner=self.BOT)
         self.assertTrue(result & self.MANAGE_ROLES)
+
+    def test_owner_bypass_is_preserved_by_privacy_facts(self):
+        roles = [{"id": self.GUILD, "name": "@everyone", "permissions": "0"}]
+        channel = {"permission_overwrites": [{
+            "id": self.GUILD, "type": 0, "allow": "0",
+            "deny": str(self.MANAGE_ROLES)}]}
+        member = {"roles": []}
+        facts = synth.privacy_facts(
+            channel, roles, member, self.GUILD, self.BOT, guild_owner_id=self.BOT)
+        self.assertTrue(facts["privacy_product_bot_manage_roles"])
+        not_owner = synth.privacy_facts(
+            channel, roles, member, self.GUILD, self.BOT, guild_owner_id="another-user")
+        self.assertFalse(not_owner["privacy_product_bot_manage_roles"])
 
 
 class PrivacyFactsTest(unittest.TestCase):
@@ -342,6 +396,54 @@ class PrivacyFactsTest(unittest.TestCase):
         # alone must not read as the /private precondition.
         facts = self.facts(role_perms=self.MANAGE_ROLES)
         self.assertFalse(facts["privacy_product_bot_manage_roles"])
+
+    def test_role_overwrite_allow_grants_the_product_bot_permissions(self):
+        facts = self.facts(role_perms=0, overwrites=[
+            {"id": self.GUILD, "type": 0, "allow": "0", "deny": "0"},
+            {"id": "role", "type": 0,
+             "allow": str(self.VIEW | self.MANAGE_ROLES), "deny": "0"},
+        ])
+        self.assertTrue(facts["privacy_product_bot_manage_roles"])
+
+    def test_role_overwrite_deny_removes_the_product_bot_permission(self):
+        facts = self.facts(role_perms=self.VIEW | self.MANAGE_ROLES, overwrites=[
+            {"id": self.GUILD, "type": 0, "allow": "0", "deny": "0"},
+            {"id": "role", "type": 0, "allow": "0",
+             "deny": str(self.MANAGE_ROLES)},
+        ])
+        self.assertFalse(facts["privacy_product_bot_manage_roles"])
+
+    def test_room_overwrite_deny_removes_the_product_bot_permission(self):
+        facts = self.facts(role_perms=self.VIEW | self.MANAGE_ROLES, overwrites=[
+            {"id": self.GUILD, "type": 0, "allow": "0",
+             "deny": str(self.VIEW | self.MANAGE_ROLES)},
+        ])
+        self.assertFalse(facts["privacy_product_bot_manage_roles"])
+
+    def test_member_overwrite_allow_grants_the_product_bot_permission(self):
+        facts = self.facts(role_perms=0, overwrites=[
+            {"id": self.GUILD, "type": 0, "allow": "0", "deny": "0"},
+            {"id": self.PRODUCT_BOT, "type": 1,
+             "allow": str(self.VIEW | self.MANAGE_ROLES), "deny": "0"},
+        ])
+        self.assertTrue(facts["privacy_product_bot_manage_roles"])
+
+    def test_member_overwrite_deny_removes_the_product_bot_permission(self):
+        facts = self.facts(role_perms=self.VIEW | self.MANAGE_ROLES, overwrites=[
+            {"id": self.GUILD, "type": 0, "allow": "0", "deny": "0"},
+            {"id": self.PRODUCT_BOT, "type": 1, "allow": "0",
+             "deny": str(self.MANAGE_ROLES)},
+        ])
+        self.assertFalse(facts["privacy_product_bot_manage_roles"])
+
+    def test_other_member_overwrite_does_not_grant_the_product_bot_permission(self):
+        facts = self.facts(role_perms=0, overwrites=[
+            {"id": self.GUILD, "type": 0, "allow": "0", "deny": "0"},
+            {"id": "another-member", "type": 1,
+             "allow": str(self.VIEW | self.MANAGE_ROLES), "deny": "0"},
+        ])
+        self.assertFalse(facts["privacy_product_bot_manage_roles"])
+        self.assertFalse(facts["privacy_no_member_manage_roles"])
 
     def test_any_member_manage_roles_grant_is_reported(self):
         facts = self.facts(overwrites=[
