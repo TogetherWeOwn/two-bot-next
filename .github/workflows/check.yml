@@ -155,15 +155,15 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-check-migrations.py
           python3 scripts/check-migrations.py --base-ref "$MIGRATION_BASE"
 
-      # Squawk-subset migration lint (advisory, docs/quality-gates.md): flags
-      # risky statements in changed migration files without failing the PR.
-      # Broken tooling still fails so blindness cannot hide. Promotion to a
-      # required check flips this step to --strict after the advisory soak.
-      - name: Squawk migration lint (advisory)
+      # Squawk-subset migration lint (required, docs/quality-gates.md): flags
+      # risky statements in changed migration files and fails the PR.
+      # Broken tooling still fails so blindness cannot hide. Promoted from
+      # advisory to --strict after the 24h advisory soak.
+      - name: Squawk migration lint (required)
         env:
           SQUAWK_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
         run: |
-          python3 scripts/ci/check-squawk-migrations.py --base-ref "$SQUAWK_BASE"
+          python3 scripts/ci/check-squawk-migrations.py --base-ref "$SQUAWK_BASE" --strict
 
       # Finish the pinned toolchain before the first pip run. The image ships
       # the pinned Rust version without rustfmt or clippy, and rust-toolchain.toml

@@ -39,14 +39,14 @@ locked without changing their contents; this is a source-control baseline, **not
 an attestation that a database has applied them**. CI never queries migration
 history in staging or production.
 
-## Risky-statement lint (advisory)
+## Risky-statement lint (required)
 
 `python3 scripts/ci/check-squawk-migrations.py --base-ref <sha>` lints the
 migration files changed since the baseline (CI passes the PR base SHA, the
 push-before SHA, or `origin/main`; without `--base-ref` it lints every
 file). It is a deterministic squawk subset: standard library only, no
-database, no network. Findings warn without failing the PR; `--strict`
-turns them into errors for the later required phase.
+database, no network. CI runs it with `--strict`, so findings fail
+the PR; omit the flag for an advisory local preview.
 
 Write migrations that stay silent:
 
