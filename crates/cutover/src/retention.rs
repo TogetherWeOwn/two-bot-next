@@ -292,6 +292,7 @@ pub async fn run_retention(
             tracing::warn!(
                 message = "retention_raw_expiry_failed",
                 mode = ?mode,
+                error = %format!("{error:?}"),
                 "core retention completed; raw expiry failed and will retry on the next cadence",
             );
             return Err(error);
@@ -612,6 +613,17 @@ async fn run_retention_core(
 /// Execute deletes at most one capped batch of this eligible set per run; the
 /// read-only projection must not report only the first batch as the total
 /// would-delete count.
+///
+/// Execute stages run time-window, then eligible user deletions, then guild
+/// purges, and only then the capped raw batch (see [`run_retention`] and
+/// [`run_retention_stages`]). The dry-run count therefore excludes rows those
+/// preceding stages would already delete, mirroring the dry-run core: captures
+/// matching an eligible (guard-clear, schema-covered) pending deletion settle
+/// as receipts, never as raw row counts, and captures in a queued guild whose
+/// purge would succeed are purged as guild rows. Guard-deferred and
+/// schema-gapped guilds stay queued, and guard-deferred deletions stay
+/// pending, so the independent raw age policy still removes those captures
+/// and they remain counted here.
 async fn count_raw_expiry_candidates(
     pool: &PgPool,
     next_sweep_deadline: OffsetDateTime,
@@ -628,24 +640,75 @@ async fn count_raw_expiry_candidates(
     sqlx::query("SET LOCAL statement_timeout = '15s'")
         .execute(&mut *tx)
         .await?;
-    let (presence, voice, audit): (i64, i64, i64) = sqlx::query_as(
+    // Mirror the dry-run core's preceding-stage settlement: a schema-coverage
+    // gap defers every pending deletion and every queued guild purge, so with
+    // gaps nothing precedes the raw batch and no row is excluded.
+    let schema_gapped = !crate::member_erasure::schema_gaps(&mut tx)
+        .await?
+        .is_empty();
+    let mut eligible_pairs: Vec<(String, String)> = Vec::new();
+    let mut queued_unguarded: Vec<String> = Vec::new();
+    if !schema_gapped {
+        let pendings: Vec<(String, String)> = sqlx::query_as(
+            "SELECT guild_id, user_id FROM retention_deletion_requests WHERE status = 'pending'",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        for (guild_id, user_id) in &pendings {
+            if !crate::member_erasure::has_unresolved_guards(&mut tx, guild_id, user_id).await? {
+                eligible_pairs.push((guild_id.clone(), user_id.clone()));
+            }
+        }
+        let queued: Vec<String> =
+            sqlx::query_scalar("SELECT guild_id FROM retention_guild_purge_queue")
+                .fetch_all(&mut *tx)
+                .await?;
+        for guild_id in &queued {
+            if !crate::member_erasure::has_unresolved_guild_guards(&mut tx, guild_id).await? {
+                queued_unguarded.push(guild_id.clone());
+            }
+        }
+    }
+    let mut sql = String::from(
         "SELECT
             count(*) FILTER (WHERE event_type = $4),
             count(*) FILTER (WHERE event_type = ANY($5)),
             count(*) FILTER (WHERE event_type = $6)
          FROM event_store
-         WHERE (event_type = $4 AND event_time <= $1)
+         WHERE ((event_type = $4 AND event_time <= $1)
             OR (event_type = ANY($5) AND event_time <= $2)
-            OR (event_type = $6 AND event_time <= $3)",
-    )
-    .bind(presence_cutoff)
-    .bind(voice_cutoff)
-    .bind(audit_cutoff)
-    .bind(CAPTURE_PRESENCE)
-    .bind(&CAPTURE_VOICE[..])
-    .bind(CAPTURE_AUDIT)
-    .fetch_one(&mut *tx)
-    .await?;
+            OR (event_type = $6 AND event_time <= $3))",
+    );
+    let mut next_placeholder = 7usize;
+    if !queued_unguarded.is_empty() {
+        sql.push_str(&format!(" AND NOT (guild_id = ANY(${next_placeholder}))"));
+        next_placeholder += 1;
+    }
+    // Same member predicate as the user-deletion stage's `event_store` plan
+    // entry (`guild_id = $1 AND (actor/target/user/inviter = $2)`): a row this
+    // stage deletes settles as a receipt, never as a raw row count.
+    for _ in &eligible_pairs {
+        let guild_placeholder = next_placeholder;
+        let user_placeholder = next_placeholder + 1;
+        sql.push_str(&format!(
+            " AND NOT (guild_id = ${guild_placeholder} AND (actor_id = ${user_placeholder} OR target_id = ${user_placeholder} OR user_id = ${user_placeholder} OR inviter_id = ${user_placeholder}))"
+        ));
+        next_placeholder += 2;
+    }
+    let mut query = sqlx::query_as::<_, (i64, i64, i64)>(sqlx::AssertSqlSafe(sql))
+        .bind(presence_cutoff)
+        .bind(voice_cutoff)
+        .bind(audit_cutoff)
+        .bind(CAPTURE_PRESENCE)
+        .bind(&CAPTURE_VOICE[..])
+        .bind(CAPTURE_AUDIT);
+    if !queued_unguarded.is_empty() {
+        query = query.bind(queued_unguarded);
+    }
+    for (guild_id, user_id) in eligible_pairs {
+        query = query.bind(guild_id).bind(user_id);
+    }
+    let (presence, voice, audit): (i64, i64, i64) = query.fetch_one(&mut *tx).await?;
     tx.commit().await?;
     Ok(RetentionReport {
         presence_raw_deleted: presence as u64,
@@ -1026,8 +1089,12 @@ fn guild_purge_sql(table: &str) -> String {
 /// starting at `first_placeholder`; empty when the table has no
 /// time-window stage. Mirrors the Execute deletes in [`run_retention`] so
 /// the dry-run guild projection can exclude rows that stage would already
-/// have removed. `event_store` needs three: presence, voice and audit captures
-/// share a table but have per-class cutoffs.
+/// have removed. `event_store` has no arm here on purpose: its raw-expiry
+/// batch runs AFTER the guild purge in [`run_retention_stages`], so a queued
+/// guild's time-eligible captures are purged as guild rows in Execute and the
+/// dry-run projection must count them as guild rows too. The dry-run raw
+/// count ([`count_raw_expiry_candidates`]) excludes those guild and
+/// eligible-user rows instead, keeping the per-class buckets disjoint.
 fn guild_projection_time_exclusions(table: &str, first_placeholder: usize) -> Vec<(String, i32)> {
     match table {
         "events" => vec![(
@@ -1040,28 +1107,6 @@ fn guild_projection_time_exclusions(table: &str, first_placeholder: usize) -> Ve
             format!("occurred_at < now() - make_interval(days => ${first_placeholder})"),
             AUDIT_CACHE_RETENTION_DAYS,
         )],
-        "event_store" => vec![
-            (
-                format!(
-                    "event_type = '{CAPTURE_PRESENCE}' AND event_time <= now() + make_interval(secs => {RETENTION_CADENCE_SECONDS}) - make_interval(days => ${first_placeholder})"
-                ),
-                PRESENCE_RAW_RETENTION_DAYS,
-            ),
-            (
-                format!(
-                    "event_type IN ('{}', '{}') AND event_time <= now() + make_interval(secs => {RETENTION_CADENCE_SECONDS}) - make_interval(days => ${})",
-                    CAPTURE_VOICE[0], CAPTURE_VOICE[1], first_placeholder + 1
-                ),
-                VOICE_RAW_RETENTION_DAYS,
-            ),
-            (
-                format!(
-                    "event_type = '{CAPTURE_AUDIT}' AND event_time <= now() + make_interval(secs => {RETENTION_CADENCE_SECONDS}) - make_interval(days => ${})",
-                    first_placeholder + 2
-                ),
-                AUDIT_CACHE_RETENTION_DAYS,
-            ),
-        ],
         _ => Vec::new(),
     }
 }

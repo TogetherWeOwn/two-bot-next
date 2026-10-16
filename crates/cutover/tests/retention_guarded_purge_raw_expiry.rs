@@ -3,7 +3,9 @@
 use std::future::Future;
 
 use sqlx::PgPool;
-use two_bot_cutover::retention::{handle_guild_delete, run_retention, RetentionMode};
+use two_bot_cutover::retention::{
+    handle_guild_delete, request_user_deletion, run_retention, RetentionMode,
+};
 use two_bot_testsupport::TestDatabase;
 
 const GUILD: &str = "333333333333333333";
@@ -128,6 +130,110 @@ async fn unresolved_guild_purge_defers_while_eligible_voice_capture_expires() {
         .await
         .expect("read queued guild purge");
         assert_eq!(queued, 1, "the deferred guild purge must remain queued");
+    })
+    .await;
+}
+
+/// Dry-run and Execute must attribute the same expired capture to the same
+/// class. Execute stages run user deletions, then guild purges, and only then
+/// the capped raw batch, so an expired capture in a queued unguarded guild is
+/// a guild row (not raw), and an eligible pending user's expired capture
+/// settles as a receipt (counted nowhere in `total_deleted`, never as raw).
+/// The dry run must preview exactly that split.
+#[tokio::test]
+async fn dry_run_and_execute_agree_on_queued_guild_and_pending_user_overlap() {
+    with_database(|pool| async move {
+        const QUEUED_GUILD: &str = "777777777777777777";
+        const QUEUED_MEMBER: &str = "888888888888888888";
+        const PENDING_GUILD: &str = "999999999999999999";
+        const PENDING_MEMBER: &str = "101010101010101010";
+        const CONTROL_GUILD: &str = "121212121212121212";
+        const CONTROL_MEMBER: &str = "131313131313131313";
+
+        sqlx::query(
+            "INSERT INTO event_store (event_type, guild_id, user_id, event_time, received_at, dedup_key)
+             VALUES
+               ('PRESENCE_UPDATE', $1, $2, now() - interval '31 days', now(), 'overlap-queued-presence'),
+               ('VOICE_STATE_UPDATE', $1, $2, now() - interval '31 days', now(), 'overlap-queued-voice'),
+               ('PRESENCE_UPDATE', $3, $4, now() - interval '31 days', now(), 'overlap-pending-presence'),
+               ('PRESENCE_UPDATE', $5, $6, now() - interval '31 days', now(), 'overlap-control-presence')",
+        )
+        .bind(QUEUED_GUILD)
+        .bind(QUEUED_MEMBER)
+        .bind(PENDING_GUILD)
+        .bind(PENDING_MEMBER)
+        .bind(CONTROL_GUILD)
+        .bind(CONTROL_MEMBER)
+        .execute(&pool)
+        .await
+        .expect("seed overlapping presence/voice captures");
+        sqlx::query(
+            "INSERT INTO event_store (event_type, guild_id, actor_id, target_id, event_time, received_at, dedup_key)
+             VALUES ('GUILD_AUDIT_LOG_ENTRY_CREATE', $1, $2, $3, now() - interval '46 days', now(), 'overlap-queued-audit')",
+        )
+        .bind(QUEUED_GUILD)
+        .bind(QUEUED_MEMBER)
+        .bind("141414141414141414")
+        .execute(&pool)
+        .await
+        .expect("seed overlapping audit capture");
+
+        assert!(
+            handle_guild_delete(&pool, QUEUED_GUILD, None)
+                .await
+                .expect("enqueue overlapping guild purge"),
+            "queued guild must enqueue a purge"
+        );
+        request_user_deletion(&pool, PENDING_GUILD, PENDING_MEMBER)
+            .await
+            .expect("enqueue overlapping deletion request");
+
+        let dry = run_retention(&pool, RetentionMode::DryRun)
+            .await
+            .expect("dry-run overlap retention");
+        assert_eq!(
+            (dry.presence_raw_deleted, dry.voice_raw_deleted, dry.audit_cache_deleted),
+            (1, 0, 0),
+            "dry run must count only the control capture as raw: queued-guild rows belong to the purge, the pending user's row to its receipt"
+        );
+        assert_eq!(
+            dry.guild_rows_purged, 3,
+            "dry run must attribute all three queued-guild captures to the purge"
+        );
+        assert_eq!(dry.deletions_completed, 1);
+        assert_eq!(dry.total_deleted(), 4);
+
+        let live = run_retention(&pool, RetentionMode::Execute)
+            .await
+            .expect("execute overlap retention");
+        assert_eq!(
+            (
+                live.presence_raw_deleted,
+                live.voice_raw_deleted,
+                live.audit_cache_deleted,
+                live.guild_rows_purged,
+            ),
+            (
+                dry.presence_raw_deleted,
+                dry.voice_raw_deleted,
+                dry.audit_cache_deleted,
+                dry.guild_rows_purged,
+            ),
+            "execute must attribute each overlapped row to the same class the dry run previewed"
+        );
+        assert_eq!(live.deletions_completed, 1);
+        assert_eq!(live.total_deleted(), dry.total_deleted());
+
+        let remaining: Vec<String> = sqlx::query_scalar(
+            "SELECT dedup_key FROM event_store ORDER BY dedup_key",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read surviving captures");
+        assert!(
+            remaining.is_empty(),
+            "queued, pending-user and control captures must all be gone after execute, survivors: {remaining:?}"
+        );
     })
     .await;
 }
