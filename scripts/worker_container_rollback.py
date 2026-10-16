@@ -120,7 +120,13 @@ class RollbackClient(base.Client):
             ) from None
         except (base.URLError, TimeoutError, OSError):
             raise GateError("api_transport_failure") from None
-        require(status == 200 and len(raw) <= base.MAX_BODY, "api_http_failure", f"status={status}")
+        # Cloudflare creates a container rollout with HTTP 201; any success
+        # 2xx carrying the success envelope is a created/applied rollout.
+        # Genuine failures still surface as api_http_failure with the status
+        # and allowlisted error codes (never the response body, which can
+        # carry configuration values).
+        require(200 <= status < 300 and len(raw) <= base.MAX_BODY, "api_http_failure",
+                f"status={status}")
         data = base.mapping(base.decode(raw))
         require(data.get("success") is True and "result" in data, "api_failure")
         return data["result"]
@@ -284,7 +290,16 @@ def control_client(variant, token, worker_url, staging_url, actor, root=None):
             match = SAFE_CONTROL_LINE.match(line)
             if match and any(f"HTTP {s}" in match.group(0) for s in AUTH_STATUSES):
                 raise GateError("ownership_auth_failed")
-            raise GateError("ownership_control_failed", match.group(0) if match else None)
+            detail = match.group(0) if match else None
+            if detail is not None and "intentionally fenced" in detail:
+                # Operator-safe refusal hint: fixed text only, never the
+                # token, request or response. The release stays an explicit
+                # workflow_dispatch with release_fence=true, never a push.
+                detail += ("; operator release: Actions > deploy-staging > "
+                           "Run workflow with release_fence checked after handoff "
+                           "authorization (push/default never releases; "
+                           "do not change credentials)")
+            raise GateError("ownership_control_failed", detail)
         try:
             return base.mapping(json.loads(result.stdout))
         except ValueError:
