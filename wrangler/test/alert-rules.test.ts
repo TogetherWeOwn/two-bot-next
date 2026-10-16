@@ -346,6 +346,22 @@ test("voice join burn waits for full window history after a fresh ring", () => {
   assert.deepEqual(evAt(joinLines(12, 0, 10), state, 120).firing, []);
 });
 
+test("voice join burn stays silent when healthy bursts land on window edges", () => {
+  let state = EMPTY_STATE;
+  // Build complete history with a low, healthy arrival rate. All joins move
+  // within five seconds; the bursts sit on the 6 h, 30 min, 1 h and 5 min edges.
+  for (let minute = -360; minute <= 360; minute++) {
+    const arrivals = minute <= 0 ? 0 : 3 + (minute === 1 ? 40 : 0) + (minute === 331 ? 20 : 0)
+      + (minute === 301 ? 30 : 0) + (minute === 356 ? 10 : 0);
+    const total = (state.joinBurn?.at(-1)?.received ?? 0) + arrivals;
+    state = evAt(joinLines(total, 0, total), state, minute * 60).state;
+  }
+  const settled = evAt(joinLines(state.joinBurn?.at(-1)?.received ?? 0, 0, state.joinBurn?.at(-1)?.fastMoves ?? 0), state, 360 * 60 + 60);
+  assert.deepEqual(settled.firing, []);
+  assert.ok(!settled.firing.includes("voice_join_fast_burn"), "healthy bursts must not page");
+  assert.ok(!settled.firing.includes("voice_join_slow_burn"), "healthy bursts must not ticket");
+});
+
 test("voice join burn requires more than one bad move per window", () => {
   let state = evAt(joinLines(0, 0, 0), EMPTY_STATE, 0).state;
   // A quiet hour gives the fast windows complete history without any burn.

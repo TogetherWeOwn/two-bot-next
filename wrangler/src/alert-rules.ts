@@ -388,8 +388,10 @@ function joinBurnEvaluation(samples: Sample[], ring: JoinBurnSnapshot[], nowSeco
   const cutoff = nowSeconds - JOIN_SLOW_LONG_SECONDS - JOIN_BURN_HISTORY_MARGIN_SECONDS;
   const next = [...ring.filter((s) => s.t > cutoff && s.t <= nowSeconds), snapshot];
   // Receive/duplicate counters lag one scrape so joins can finish moving before
-  // they enter the denominator. Each window uses its own boundary baseline; the
-  // move window starts one scrape later and ends at the current histogram.
+  // they enter the denominator. The denominator ends at the prior scrape while
+  // moves end at the current histogram; compute bad moves from both the shifted
+  // move-window baseline and the common denominator baseline, keeping the lower
+  // estimate so an oldest-edge burst cannot masquerade as failed moves.
   const end = ring[ring.length - 1] ?? snapshot;
   const baselineAtOrBefore = (time: number, ceiling: number): JoinBurnSnapshot | undefined => {
     const eligible = next.filter((s) => s.t <= time && s.t <= ceiling);
@@ -404,11 +406,16 @@ function joinBurnEvaluation(samples: Sample[], ring: JoinBurnSnapshot[], nowSeco
     const genuine = (end.received - end.duplicate) - (receivedBase.received - receivedBase.duplicate);
     if (genuine < JOIN_BURN_MIN_JOINS) return undefined;
     const good = fastMoves - moveBase.fastMoves;
+    const commonGenuine = (snapshot.received - snapshot.duplicate) - (moveBase.received - moveBase.duplicate);
+    if (commonGenuine < JOIN_BURN_MIN_JOINS) return undefined;
     // Window-boundary skew can briefly move more joins than arrived: never
-    // report negative burn, just no burn.
-    const bad = Math.max(0, genuine - good);
-    if (bad < JOIN_BURN_MIN_BAD) return undefined;
-    return bad / (genuine * JOIN_SLO_BUDGET);
+    // report negative burn, just no burn. Compare the offset-window burn with
+    // an estimate whose arrival and move counters share the move baseline; the
+    // latter excludes an oldest-edge arrival with no matching completion.
+    const offsetBad = Math.max(0, genuine - good);
+    const commonBad = Math.max(0, commonGenuine - good);
+    if (offsetBad < JOIN_BURN_MIN_BAD || commonBad < JOIN_BURN_MIN_BAD) return undefined;
+    return Math.min(offsetBad / (genuine * JOIN_SLO_BUDGET), commonBad / (commonGenuine * JOIN_SLO_BUDGET));
   };
   const fastLong = burn(JOIN_FAST_LONG_SECONDS);
   const fastShort = burn(JOIN_FAST_SHORT_SECONDS);
