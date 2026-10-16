@@ -1369,22 +1369,42 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(staging["jobs"]["voice-synthetic"].get("needs"), "deploy")
 
     def test_staging_takeover_fence_hint_is_scoped_to_the_fenced_refusal(self):
-        # The takeover step must show the fence release route only for the
-        # intentionally-fenced refusal. An unscoped `||` would print it for
-        # any failure (auth, transition-not-confirmed), sending operators to
-        # release the fence for a problem releasing cannot fix.
+        # Execute the actual workflow shell with a stub control client. This
+        # catches swapped case bodies as well as an unscoped fence hint.
+        import os
+        import subprocess
+        import tempfile
+
         steps = self.workflows["deploy-staging.yml"]["jobs"]["deploy"]["steps"]
         takeover = next(step for step in steps if step.get("id") == "takeover")
         run = takeover["run"]
         self.assertIn("deployment-takeover", run)
         self.assertIn("Singleton is intentionally fenced or uninitialized", run)
         self.assertIn("Staging singleton fenced", run)
-        # The fence guidance sits under the fenced-match guard, never on an
-        # unscoped failure branch; other failures take the generic branch.
-        self.assertLess(run.index("Singleton is intentionally fenced or uninitialized"),
-                        run.index("Staging singleton fenced"))
         self.assertIn("not a fence refusal", run)
-        self.assertNotIn("deployment-takeover || {", run)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            rollout_dir = temp / "rollout"
+            rollout_dir.mkdir()
+            (rollout_dir / "receipt.json").write_text('{"worker_version":"test-version"}', encoding="utf-8")
+            base_env = dict(os.environ, ROLLOUT_DIR=str(rollout_dir))
+            shell = 'node() { printf \'%s\\n\' "$MOCK_CONTROL_OUTPUT"; return 1; }\n' + run
+            cases = (
+                ("Singleton is intentionally fenced or uninitialized; explicit staging release required",
+                 "Staging singleton fenced", True),
+                ("HTTP 401 Unauthorized", "Staging ownership takeover failed (not a fence refusal)", False),
+            )
+            for output, expected, is_fenced in cases:
+                with self.subTest(output=output):
+                    env = dict(base_env, MOCK_CONTROL_OUTPUT=output)
+                    proc = subprocess.run(
+                        ["bash", "-c", shell], cwd=ROOT / "wrangler", env=env,
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    output_text = proc.stdout + proc.stderr
+                    self.assertEqual(proc.returncode, 1, output_text)
+                    self.assertIn(expected, output_text)
+                    self.assertEqual("release_fence" in output_text, is_fenced)
 
     def test_staging_runs_unconditionally_for_push_and_dispatch(self):
         staging = self.workflows["deploy-staging.yml"]
