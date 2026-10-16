@@ -14,8 +14,11 @@ members = ["."]
 resolver = "2"
 
 [dependencies]
+hex = "0.4"
+hmac = "0.13"
 libfuzzer-sys = "=0.4.13"
 serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.11"
 two-bot-core = { version = "0.4.0", path = "../crates/core", default-features = false } # x-release-please-version
 two-bot-cutover = { version = "0.4.0", path = "../crates/cutover" } # x-release-please-version
 two-bot = { version = "0.4.0", path = "../crates/bot" } # x-release-please-version
@@ -115,6 +118,20 @@ bench = false
 [[bin]]
 name = "internal_action_validators"
 path = "fuzz_targets/internal_action_validators.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "eventsub_delivery"
+path = "fuzz_targets/eventsub_delivery.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "helix_token"
+path = "fuzz_targets/helix_token.rs"
 test = false
 doc = false
 bench = false

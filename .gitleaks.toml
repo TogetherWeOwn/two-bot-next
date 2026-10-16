@@ -18,3 +18,15 @@ regexes = ['''^123456789012345678$''']
 description = "Public LFG CI boolean switch, not an API credential"
 regexTarget = "secret"
 regexes = ['^TWO_LFG_TESTDB_CI=1$']
+
+# This fixture was introduced by b27e06432dc6437fc3da5ca7b2219b3fec41765e.
+# Merge this base policy before fix/mutation-429-proves-no-effect; remove it
+# only when the full-history scan no longer reaches that introducing commit.
+[[allowlists]]
+description = "Historical synthetic member-moderation test idempotency fixture"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "secret"
+commits = ["b27e06432dc6437fc3da5ca7b2219b3fec41765e"]
+paths = ['''^crates/core/src/member_moderation\.rs$''']
+regexes = ['''^key-tempban-429$''']

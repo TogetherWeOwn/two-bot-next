@@ -10,7 +10,7 @@ import tempfile
 import unittest
 import zipfile
 
-from staging_migrate_claim import build_claim, projection_hash, Refused, unique_object
+from staging_migrate_claim import build_claim, projection_hash, store_projection_hash, Refused, unique_object
 from test_workflows import load_workflows, staging_migrate_errors
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -28,6 +28,7 @@ ENV = {
     "MODE": "apply",
     "PLAN_RUN_ID": "37110947190",
     "PLAN_MANIFEST_SHA256": "e4a3136346ca546df4f1f4f654322c278ff7df1d5902ec5685cd43036b41beea",
+    "STORE_PLAN_MANIFEST_SHA256": "37b4068df78c6e975a6fca576f109260be97c4aa5defa316380be3c0f5c4f593",
     "SOURCE_SHA": "a" * 40,
     "STAGING_HOST": "staging.invalid",
     "STAGING_DATABASE": "two_bot",
@@ -35,6 +36,7 @@ ENV = {
     "RECOVERY_REF": "recovery-review#decision",
     "ACL_REF": "acl-review#decision",
     "EXPECTED_PENDING": "1,9007199254740993",
+    "EXPECTED_STORE_PENDING": "400,9007199254740992",
 }
 
 
@@ -55,6 +57,8 @@ class ClaimTests(unittest.TestCase):
             self.assertEqual(output.read_bytes(), CLAIM.read_bytes())
         self.assertEqual(expected["plan_run_id"], "37110947190")
         self.assertEqual(expected["expected_pending"], ["1", "9007199254740993"])
+        self.assertEqual(expected["expected_store_pending"], ["400", "9007199254740992"])
+        self.assertEqual(expected["store_plan_manifest_sha256"], ENV["STORE_PLAN_MANIFEST_SHA256"])
         self.assertNotEqual(expected["workflow_head_sha"], expected["source_sha"])
 
     def test_digest_is_exact_rust_projection_not_document_or_zip_bytes(self):
@@ -77,6 +81,25 @@ class ClaimTests(unittest.TestCase):
         plan["source_migrations"][1]["description"] = "changed already applied"
         self.assertNotEqual(projection_hash(plan), digest)
 
+    def test_store_digest_is_its_own_exact_projection(self):
+        digest = store_projection_hash(self.plan)
+        self.assertEqual(digest, ENV["STORE_PLAN_MANIFEST_SHA256"])
+        self.assertNotEqual(digest, ENV["PLAN_MANIFEST_SHA256"])
+        reformatted = json.loads(json.dumps(self.plan, separators=(",", ":")))
+        self.assertEqual(store_projection_hash(reformatted), digest)
+        for mutation in (lambda p: p["source_store_migrations"][0].update(description="changed"),
+                         lambda p: p["source_store_migrations"][0].update(sha384="0" * 96),
+                         lambda p: p.update(source_sha="c" * 40),
+                         lambda p: p.update(pending_store_before=[400])):
+            plan = deepcopy(self.plan)
+            mutation(plan)
+            self.assertNotEqual(store_projection_hash(plan), digest)
+        # The cutover projection never sees the store table and vice versa.
+        plan = deepcopy(self.plan)
+        plan["source_migrations"][0]["description"] = "cutover changed"
+        self.assertEqual(store_projection_hash(plan), digest)
+        self.assertNotEqual(projection_hash(plan), ENV["PLAN_MANIFEST_SHA256"])
+
     def test_wrong_producer_context_or_binding_refuses(self):
         for key, bad in (("GITHUB_REPOSITORY", "other/repo"), ("GITHUB_EVENT_NAME", "pull_request"),
                          ("GITHUB_REF", "refs/heads/topic"), ("GITHUB_WORKFLOW_REF", "other/workflow"),
@@ -93,7 +116,14 @@ class ClaimTests(unittest.TestCase):
                          ("EXPECTED_PENDING", "1,1"), ("EXPECTED_PENDING", "9007199254740993,1"),
                          ("EXPECTED_PENDING", "0,9007199254740993"), ("EXPECTED_PENDING", "-1,9007199254740993"),
                          ("EXPECTED_PENDING", "1,9223372036854775808"),
-                         ("EXPECTED_PENDING", "1,9_007_199_254_740_993")):
+                         ("EXPECTED_PENDING", "1,9_007_199_254_740_993"),
+                         ("STORE_PLAN_MANIFEST_SHA256", "c" * 64),
+                         ("EXPECTED_STORE_PENDING", "400"),
+                         ("EXPECTED_STORE_PENDING", "400,401"),
+                         ("EXPECTED_STORE_PENDING", "400,9007199254740992,400"),
+                         ("EXPECTED_STORE_PENDING", "9007199254740992,400"),
+                         ("EXPECTED_STORE_PENDING", "400,9223372036854775808"),
+                         ("EXPECTED_STORE_PENDING", "400,9_007_199_254_740_992")):
             with self.subTest(key=key, bad=bad):
                 with self.assertRaises(Refused):
                     build_claim(self.plan, {**ENV, key: bad})
@@ -101,10 +131,16 @@ class ClaimTests(unittest.TestCase):
     def test_malformed_plan_or_secret_bearing_metadata_refuses(self):
         for key, bad in (("mode", "apply"), ("runner_version", 2), ("runner_version", True),
                          ("role", "two_bot_migrator"), ("plan_manifest_sha256", None),
-                         ("applied_count", 1), ("plan_provenance_verified", True),
+                         ("store_plan_manifest_sha256", None),
+                         ("applied_count", 1), ("applied_store_count", 1),
+                         ("plan_provenance_verified", True),
                          ("plan_run_id", "37110947190"), ("ledger_after", [{"changed": True}]),
+                         ("ledger_store_after", [{"changed": True}]),
                          ("pending_before", [True]), ("pending_before", [1, 1]),
                          ("pending_before", [1, 2**63]), ("source_migrations", None),
+                         ("pending_store_before", [True]), ("pending_store_before", [400, 400]),
+                         ("pending_store_before", [400, 2**63]),
+                         ("source_store_migrations", None),
                          ("target", {"host": "staging.invalid", "database": "two_bot", "url": "secret"})):
             with self.subTest(key=key):
                 plan = {**self.plan, key: bad}

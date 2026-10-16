@@ -2,9 +2,10 @@
 //! Missing gateway prerequisites park; configured database failures exit safely.
 
 use std::{
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     process::{Child, Command, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -37,6 +38,55 @@ fn get(addr: SocketAddr, path: &str) -> std::io::Result<String> {
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
     Ok(response)
+}
+
+fn forward_lines(reader: impl Read + Send + 'static, lines: mpsc::Sender<String>) {
+    thread::spawn(move || {
+        for line in BufReader::new(reader).lines().map_while(Result::ok) {
+            if lines.send(line).is_err() {
+                return;
+            }
+        }
+    });
+}
+
+#[test]
+fn eventsub_reconcile_startup_pass_runs_from_the_entrypoint() {
+    // The gate is open but no callback is configured, so the startup pass
+    // refuses before any Helix call. That refusal log is the proof the
+    // entrypoint spawned the reconcile task.
+    let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve test port");
+    let bind = reserved.local_addr().unwrap().to_string();
+    drop(reserved);
+    let mut child = command("127.0.0.1:0")
+        .env("DISCORD_TOKEN", "INVALID")
+        .env("GUILD_ID", "123")
+        .env("TWO_EVENTSUB", "1")
+        .env("TWO_EVENTSUB_BIND", bind)
+        .env("TWO_TWITCH_WEBHOOK_SECRET", "synthetic-webhook-secret-01")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start test bot");
+    let (lines_tx, lines_rx) = mpsc::channel();
+    forward_lines(child.stdout.take().unwrap(), lines_tx.clone());
+    forward_lines(child.stderr.take().unwrap(), lines_tx);
+    let _bot = Bot(child);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut logs = String::new();
+    loop {
+        match lines_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(line) => {
+                if line.contains("eventsub_reconcile") && line.contains("reconcile_config_invalid")
+                {
+                    return;
+                }
+                logs.push_str(&line);
+                logs.push('\n');
+            }
+            Err(_) => panic!("startup reconcile pass never logged its refusal; child logs: {logs}"),
+        }
+    }
 }
 
 #[test]

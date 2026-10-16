@@ -21,6 +21,26 @@ What it proves on the deployed staging bot (stdlib only, no third-party code):
              10-minutes per-channel limit, so workflow retries do not fail)
   metrics    optional: /ops/metrics `two_bot_voice_names_total` counts the room
              as created_with_template (SKIP when no metrics token is configured)
+  limit      the room's `user_limit` PATCHes to a probed value and back with a
+             read-back after each write (FAIL on HTTP 403: the owner grant was
+             lost after creation; SKIP on HTTP 429; the same Discord
+             field `/limit` and `/unlimit` manage)
+  privacy    the room's @everyone overwrite matches the public Connect
+             baseline, the staging product bot has effective View Channel and
+             Manage Roles on the room (the `/private` overwrite precondition),
+             and no member overwrite grants Manage Roles (read-only)
+  name_panel the room's name after the rename cycle renders from its template
+             (not the "<display>'s room" fallback): what the `/name` panel's
+             Current-name line would show
+
+The limit check exercises the channel field `/limit` and `/unlimit` write;
+privacy reads the public @everyone baseline and the staging product bot's
+computed View Channel and Manage Roles permission (the `/private`
+precondition, mirroring `can_edit_overwrites`), and name_panel
+reads the template-rendered name. These checks do not invoke slash commands
+(Discord only creates interactions for real users, so a bot token cannot). A
+PASS means the room the staging bot made has the expected owner permissions and
+privacy baseline; a FAIL names the fact that did not hold.
 
 Identity and fences (fail-closed, before any request):
   - TWO_VOICE_SYNTHETIC_BOT_TOKEN: a dedicated test bot (never the bot under
@@ -62,7 +82,9 @@ API = "https://discord.com/api/v10"
 GATEWAY = "gateway.discord.gg"
 INTENTS = 1 | (1 << 7)  # GUILDS | GUILD_VOICE_STATES (no privileged intents)
 VIEW, CONNECT, MANAGE = 1 << 10, 1 << 20, 1 << 4
+MANAGE_ROLES, ADMINISTRATOR = 1 << 28, 1 << 3
 OWNER_BITS = VIEW | CONNECT | MANAGE
+STAGING_PRODUCT_BOT_ID = "1469137636663758888"
 VOICE_TYPES = (2, 13)
 FALLBACK = re.compile(r"^.+['’]s room$")
 # Marker appended to the staging creator's name for the rename case. The run
@@ -103,6 +125,77 @@ def voice_order(channels, parent_id):
     return sorted(rows, key=lambda c: (c.get("position", 0), int(c["id"])))
 
 
+def effective_permissions(guild_id, member_id, member_role_ids, roles, overwrites,
+                          guild_owner_id=None):
+    """Compute Discord guild and channel permissions for one member."""
+    if member_id == guild_owner_id:
+        return (1 << 64) - 1
+    role_ids = {str(role_id) for role_id in member_role_ids}
+    role_by_id = {str(role.get("id")): role for role in roles}
+    everyone = role_by_id.get(str(guild_id), {})
+    permissions = int(everyone.get("permissions") or 0)
+    for role_id in role_ids:
+        permissions |= int(role_by_id.get(role_id, {}).get("permissions") or 0)
+    if permissions & ADMINISTRATOR:
+        return (1 << 64) - 1
+
+    everyone_overwrite = next((o for o in overwrites
+                               if int(o.get("type", -1)) == 0
+                               and str(o.get("id")) == str(guild_id)), None)
+    if everyone_overwrite:
+        permissions &= ~int(everyone_overwrite.get("deny") or 0)
+        permissions |= int(everyone_overwrite.get("allow") or 0)
+
+    role_denies = role_allows = 0
+    for overwrite in overwrites:
+        if int(overwrite.get("type", -1)) == 0 and str(overwrite.get("id")) in role_ids:
+            role_denies |= int(overwrite.get("deny") or 0)
+            role_allows |= int(overwrite.get("allow") or 0)
+    permissions &= ~role_denies
+    permissions |= role_allows
+
+    member_overwrite = next((o for o in overwrites
+                             if int(o.get("type", -1)) == 1
+                             and str(o.get("id")) == str(member_id)), None)
+    if member_overwrite:
+        permissions &= ~int(member_overwrite.get("deny") or 0)
+        permissions |= int(member_overwrite.get("allow") or 0)
+    return permissions
+
+
+def privacy_facts(channel, roles, member, guild_id, product_bot_id, guild_owner_id=None):
+    """Return the three read-only privacy assertions for the newly created room."""
+    overwrites = channel.get("permission_overwrites", []) or []
+    everyone = [o for o in overwrites
+                if int(o.get("type", -1)) == 0 and str(o.get("id")) == str(guild_id)]
+    everyone_allow = int(everyone[0].get("allow") or 0) if len(everyone) == 1 else 0
+    everyone_deny = int(everyone[0].get("deny") or 0) if len(everyone) == 1 else 0
+    public_baseline = (len(everyone) <= 1
+                       and not (everyone_allow & CONNECT)
+                       and not (everyone_deny & CONNECT))
+    no_member_grant = not any(
+        int(o.get("type", -1)) == 1 and int(o.get("allow") or 0) & MANAGE_ROLES
+        for o in overwrites)
+    product_member_roles = [str(role_id) for role_id in member.get("roles", [])]
+    product_permissions = effective_permissions(
+        guild_id, product_bot_id, product_member_roles, roles, overwrites,
+        guild_owner_id=guild_owner_id)
+    # Mirrors can_edit_overwrites in
+    # crates/bot/src/voice_rooms/private_runtime.rs: rewriting the @everyone
+    # overwrite needs VIEW_CHANNEL|MANAGE_ROLES, not Manage Roles alone.
+    product_can_edit = (product_permissions & (VIEW | MANAGE_ROLES)) == (VIEW | MANAGE_ROLES)
+    role_by_id = {str(role.get("id")): role for role in roles}
+    product_role_names = [role_by_id[role_id].get("name", role_id)
+                          for role_id in product_member_roles if role_id in role_by_id]
+    product_role = ", ".join(product_role_names) or "no assigned staging role"
+    return {
+        "privacy_public_baseline": public_baseline,
+        "privacy_product_bot_manage_roles": bool(product_can_edit),
+        "privacy_no_member_manage_roles": no_member_grant,
+        "privacy_product_bot_role": product_role,
+    }
+
+
 def creator_block(channels_before, creator):
     """The creator's existing rooms before the join, mirroring plan_placement:
     a creator that already has rooms groups the new one at the end of that
@@ -135,7 +228,14 @@ def evaluate(obs):
     (int or None when unavailable), channels_before (guild channels before the
     join; the creator's existing rooms move the expected slot to their end),
     received_delta (joins-received delta or None when metrics are unavailable),
-    refused_delta (per-reason refused deltas, {} when unavailable).
+    refused_delta (per-reason refused deltas, {} when unavailable),
+    limit_initial/limit_probed (user_limit before/probed), limit_set_ok and
+    limit_restored (each write verified by read-back), limit_forbidden (FAIL
+    reason: the owner Manage Channels grant was lost after creation) and
+    limit_rate_limited (SKIP reason), limit_note, privacy_public_baseline,
+    privacy_product_bot_manage_roles, privacy_no_member_manage_roles,
+    privacy_product_bot_role (read-only privacy facts), privacy_note, panel_name
+    (the room's name read after the rename cycle) and panel_note.
     """
     out = []
     creator, room_id = obs["creator"], obs.get("room_id")
@@ -193,6 +293,56 @@ def evaluate(obs):
                          "restore it manually"))
     else:
         out.append(check("rename", False, note or "creator rename was not applied"))
+    limit_note = obs.get("limit_note")
+    if obs.get("limit_forbidden"):
+        out.append(check("limit", False,
+                         "room user_limit PATCH answered HTTP 403: the test bot owns "
+                         "its room, so its owner Manage Channels grant was lost or "
+                         "ineffective after creation; restore the member overwrite "
+                         "(the owner check reads creation-time grants and cannot "
+                         "see this loss)"))
+    elif obs.get("limit_rate_limited"):
+        out.append(check("limit", False,
+                         "room user_limit PATCH hit Discord's rate limit (HTTP 429): "
+                         "a retry or dispatch collided; limit skipped",
+                         skip=True))
+    elif obs.get("limit_set_ok") and obs.get("limit_restored"):
+        out.append(check("limit", True,
+                         f"user_limit {obs.get('limit_initial')} -> {obs.get('limit_probed')} "
+                         f"-> {obs.get('limit_initial')} (each write verified by read-back)"))
+    elif limit_note and not obs.get("limit_set_ok"):
+        out.append(check("limit", False, limit_note))
+    elif obs.get("limit_set_ok") and not obs.get("limit_restored"):
+        out.append(check("limit", False,
+                         "room user_limit was set but NOT restored to "
+                         f"{obs.get('limit_initial')}; restore it manually"))
+    else:
+        out.append(check("limit", False, limit_note or "room user_limit was not round-tripped"))
+    privacy_note = obs.get("privacy_note")
+    public_baseline = obs.get("privacy_public_baseline", False)
+    product_manage_roles = obs.get("privacy_product_bot_manage_roles", False)
+    no_member_grant = obs.get("privacy_no_member_manage_roles", False)
+    product_role = obs.get("privacy_product_bot_role") or "no assigned staging role"
+    privacy_detail = (
+        f"@everyone public Connect baseline={'PASS' if public_baseline else 'FAIL'}; "
+        f"product bot staging role {product_role!r} effective View Channel|Manage Roles="
+        f"{'PASS' if product_manage_roles else 'FAIL'}; "
+        f"member overwrites grant Manage Roles={'no' if no_member_grant else 'yes'}"
+    )
+    if privacy_note:
+        out.append(check("privacy", False, privacy_note))
+    else:
+        out.append(check("privacy", public_baseline and product_manage_roles and no_member_grant,
+                         privacy_detail))
+    panel = obs.get("panel_name") or ""
+    if panel and not FALLBACK.match(panel):
+        out.append(check("name_panel", True,
+                         f"post-rename room name {panel!r} renders from its template "
+                         "(what the /name panel's Current-name line shows)"))
+    else:
+        out.append(check("name_panel", False,
+                         obs.get("panel_note") or
+                         f"post-rename room name {panel!r} is missing or the fallback"))
     return out
 
 
@@ -579,6 +729,62 @@ def run_live(args, token):
             obs["channels"] = rest(token, f"/guilds/{args.guild}/channels")
             obs["statuses"] = [e["d"].get("status") for e in s.events
                                if e["t"] == "VOICE_CHANNEL_STATUS_UPDATE" and e["d"].get("id") == room_id]
+            # The limit owner-command round-trip exercises the user_limit
+            # field /limit and /unlimit manage, through the same REST PATCH
+            # path the bot writes. The privacy check is read-only; the
+            # name-panel check reads the rendered room name. Discord creates
+            # interactions only for real users, so a bot token cannot invoke
+            # the slash commands themselves. Each limit write is verified by
+            # a read-back and restored. A failed step records a note (its
+            # check FAILs). A limit 403 FAILs (the owner Manage Channels grant
+            # was lost after creation); a limit 429 is allowed to SKIP.
+            obs["limit_forbidden"] = obs["limit_rate_limited"] = False
+            obs["limit_set_ok"] = obs["limit_restored"] = False
+            try:
+                seen = rest(token, f"/channels/{room_id}")
+                initial = int(seen.get("user_limit") or 0)
+                probed = 3 if initial == 2 else 2
+                obs["limit_initial"], obs["limit_probed"] = initial, probed
+                status, _ = rest_patch(token, f"/channels/{room_id}", {"user_limit": probed})
+                if status == 403:
+                    obs["limit_forbidden"] = True
+                elif status == 429:
+                    obs["limit_rate_limited"] = True
+                    obs["limit_note"] = ("room user_limit PATCH answered 429 "
+                                         "(rate limit); limit skipped")
+                elif status is not None and 200 <= status < 300:
+                    if int(rest(token, f"/channels/{room_id}").get("user_limit") or 0) == probed:
+                        obs["limit_set_ok"] = True
+                        back, _ = rest_patch(token, f"/channels/{room_id}",
+                                             {"user_limit": initial})
+                        if (back is not None and 200 <= back < 300
+                                and int(rest(token, f"/channels/{room_id}")
+                                        .get("user_limit") or 0) == initial):
+                            obs["limit_restored"] = True
+                else:
+                    obs["limit_note"] = f"room user_limit PATCH answered {status}; limit skipped"
+            except Exception as exc:
+                obs["limit_note"] = f"{type(exc).__name__} during the limit round-trip"
+            try:
+                room = rest(token, f"/channels/{room_id}")
+                roles = rest(token, f"/guilds/{args.guild}/roles")
+                product_member = rest(
+                    token, f"/guilds/{args.guild}/members/{STAGING_PRODUCT_BOT_ID}")
+                guild = rest(token, f"/guilds/{args.guild}")
+                obs.update(privacy_facts(room, roles, product_member, args.guild,
+                                         STAGING_PRODUCT_BOT_ID, guild.get("owner_id")))
+            except Exception as exc:
+                obs["privacy_note"] = (
+                    f"{type(exc).__name__} reading room privacy facts; could not verify "
+                    f"the product bot's staging role ({STAGING_PRODUCT_BOT_ID}) "
+                    "effective Manage Roles")
+            # Name-panel render: read the room's name after the rename and
+            # limit round-trips. No write: the /name panel's Current-name line
+            # shows whatever this GET returns.
+            try:
+                obs["panel_name"] = rest(token, f"/channels/{room_id}").get("name")
+            except Exception as exc:
+                obs["panel_note"] = f"{type(exc).__name__} reading the room name for the panel"
             # Hop from our own room straight back into the creator: a member
             # doing this must get a new room, not stay in the lobby.
             s.voice(args.guild, args.creator)

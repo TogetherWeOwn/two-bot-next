@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Advisory lint for risky Postgres migration statements (squawk subset).
+"""Lint risky Postgres migration statements (squawk subset).
 
 Scans changed migration files for statements that take disruptive locks or
 break running application code. Deterministic: standard library only, no
@@ -14,9 +14,10 @@ squawk binary or shared reusable workflow:
 - dropping-object: DROP TABLE or DROP COLUMN breaks running code.
 
 Advisory by default: findings print as ::warning annotations and exit 0.
---strict prints ::error and exits 1 (the promotion path to a required
-check). Tooling failures (unresolvable baseline, unreadable file) always
-exit 1 so blindness can never read as clean.
+--strict makes the first four rules blocking; dropping-object remains a
+warning because coordinated removals still require a final DROP. Tooling
+failures (unresolvable baseline, unreadable file) always exit 1 so blindness
+can never read as clean.
 """
 
 import argparse
@@ -36,6 +37,7 @@ RULES = (
     "changing-column-type",
     "dropping-object",
 )
+STRICT_RULES = frozenset(RULES) - {"dropping-object"}
 
 # These exact transactional indexes are narrowly waived: concurrent builds
 # deadlocked CI's parallel disposable-database migrators (40P01) while they
@@ -43,12 +45,12 @@ RULES = (
 # creating-index finding strict, including any other statement in these files.
 TRANSACTIONAL_INDEX_WAIVERS = {
     (
-        "crates/cutover/migrations/0443_event_store_expiry_index.sql",
+        "crates/cutover/migrations/0444_event_store_expiry_index.sql",
         "create index if not exists idx_event_store_expiry_event_time_id "
         "on event_store (event_time, id)",
     ),
     (
-        "crates/cutover/migrations/0444_event_store_expiry_class_index.sql",
+        "crates/cutover/migrations/0445_event_store_expiry_class_index.sql",
         "create index if not exists idx_event_store_expiry_class_time_id "
         "on event_store (event_type, event_time, id)",
     ),
@@ -496,7 +498,11 @@ def main(argv=None):
         help="repeatable fnmatch exclusion applied after the globs",
     )
     parser.add_argument("--base-ref", default=None, help="Git baseline; lint files changed since it (default: lint all files)")
-    parser.add_argument("--strict", action="store_true", help="exit 1 on findings (required-check mode)")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="exit 1 on the four blocking rules; dropping-object remains advisory",
+    )
     args = parser.parse_args(argv)
     globs = args.migration_glob if args.migration_glob else [DEFAULT_GLOB]
     try:
@@ -504,18 +510,21 @@ def main(argv=None):
     except (SquawkError, OSError) as error:
         print(f"squawk gate: {error}", file=sys.stderr)
         return 1
-    level = "error" if args.strict else "warning"
     for relative, line, rule in findings:
+        level = "error" if args.strict and rule in STRICT_RULES else "warning"
         print(f"::{level} file={relative},line={line}::[squawk:{rule}] {ADVICE[rule]}")
+    blocking = args.strict and any(
+        rule in STRICT_RULES for _, _, rule in findings
+    )
     if findings:
         files = sorted({relative for relative, _, _ in findings})
         print(
             f"squawk gate: {len(findings)} finding(s) in {len(files)} file(s)"
-            + ("" if args.strict else " (advisory)")
+            + ("" if blocking else " (advisory)")
         )
     else:
         print("squawk gate: no risky migration statements")
-    return 1 if args.strict and findings else 0
+    return 1 if blocking else 0
 
 
 if __name__ == "__main__":

@@ -20,6 +20,9 @@ creator) and asserts:
 | rejoin | the test bot hops from that room straight back into the creator, and a second new room appears and it is moved into that room (a member must never stay in the lobby) |
 | delete | after the test bot leaves, every room it was moved into (the first room and the rejoin room) is deleted within the empty grace |
 | rename | the creator is renamed before the join and restored after; the post-rename join must still move the test bot into a new room (SKIP while the test bot may not rename — see below) |
+| limit | the room's `user_limit` PATCHes to a probed value and back, each write verified by read-back (FAIL on 403, SKIP on 429) |
+| privacy | read-only checks confirm the room's @everyone Connect overwrite matches the public baseline, the staging product bot has effective View Channel and Manage Roles (the `/private` overwrite precondition), and no member overwrite grants Manage Roles (FAIL on any mismatch or read error) |
+| name_panel | the room's name after the rename cycle still renders from its template, not the fallback (what the `/name` panel's Current-name line shows) |
 | metrics | optional: `two_bot_voice_names_total{outcome="created_with_template"}` grows (SKIP without a metrics token) |
 
 A failed `create` names the refusal reason: the run snapshots
@@ -117,6 +120,38 @@ skipped and the check FAILs naming the residue, so it is restored manually
 instead of being renamed over. Restore runs whenever a rename was attempted
 and the live name differs from the original, so a rename Discord applied but
 whose response was lost is still restored.
+
+## Owner-command checks (limit, privacy, name panel)
+
+While the test bot owns its room, the synthetic exercises the same Discord
+fields `/limit`, `/unlimit` and `/name` manage through the REST paths the bot
+writes: `user_limit` PATCHes and a final read of the template-rendered room
+name. Each write is verified by a read-back and restored, so a green run leaves
+the room as the bot made it. Privacy is different: it performs only GETs and
+checks the room's public @everyone Connect baseline, the staging product bot's
+effective View Channel and Manage Roles permission (the `/private` overwrite
+precondition), and that no member overwrite grants Manage
+Roles. It does not edit or restore an overwrite.
+
+What this proves — and what it does not: a PASS means the room the staging
+bot created is owner-manageable for the tested limit/name operations, and its
+privacy permissions match the read-only assertions. It does not invoke the
+slash commands themselves: Discord creates interactions only for real users,
+so a bot token cannot. The slash path (registration, gating, replies) stays
+covered by the Rust test suite and the registry smoke.
+
+Grants and SKIP conditions, mirroring the rename case:
+
+- `limit` needs the owner Manage Channels grant the room already carries. A
+  403 FAILs: the test bot owns its room, so the grant was lost or ineffective
+  after creation (the `owner` check reads creation-time grants and cannot see
+  this loss). A 429 SKIPs.
+- `privacy` is read-only and requires no Manage Roles grant for the test bot.
+  A mismatch or REST read error FAILs; privacy never SKIPs on 403 or 429. If
+  the staging product bot lacks effective View Channel and Manage Roles, the
+  failure names its staging role.
+- `name_panel` is read-only and needs no grant: it FAILs when the
+  post-rename room name is missing or the `<display>'s room` fallback.
 
 ## Run it by hand
 

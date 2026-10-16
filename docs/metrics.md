@@ -73,6 +73,9 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_community_facts_drain_failures_total{reason}` | Warn-and-continue community-facts drain failures in the gateway dispatch worker. `reason` is `error` (the facts writer returned an error) or `timeout` (the drain missed the dispatch deadline), or `other` (see label allowlists below). Each failed dispatch counts once; a committed drain counts nothing. The worker never stalls on this, and the scorecard fails closed on missing coverage. Alert-threshold hook for M2.1: alert when the counter increases across consecutive scrapes; a single failed drain is not paging |
 | `two_bot_audit_delivery_halt` | Audit mirror delivery-halt state for staleness evaluation: `1` while the persistent kill switch is engaged, `0` once cleared. Label-free gauge set once per readable `audit_retry` sweep from the store's `delivery_halt` read; an unreadable halt keeps the last reported state, and a halted sweep still counts as a job `success` (the sweep ran; it claimed nothing by design). Manual check, not an alert input: no alert rule consumes this series and production alert forwarding stays off. No actor ID, timestamp, error text or row content ever reaches exposition |
 | `two_bot_event_store_consumer_lag_seconds` | Event-store consumer lag in seconds (`received_at` minus `event_time` for the newest observed capture row); `0` when unobserved. Label-free gauge; S1 exposes the series and its setter contract (last writer wins; non-finite or negative input clears to `0` so exposition stays a finite non-negative duration). The periodic store-read caller lands with the consumer slice, so until then the series reads `0` (unobserved), not "no lag". Manual check, not an alert input: no alert rule consumes this series. No message, channel, user, dedup-key, content or body label ever reaches exposition |
+| `two_bot_eventsub_received_total` | Verified-shape EventSub deliveries accepted for signature verification, including tampered signatures. Requests rejected before body intake are not deliveries; label-free counter |
+| `two_bot_eventsub_classified_total{kind}` | EventSub deliveries classified by fixed `kind`: `challenge`, `notification`, `revocation`, `tampered`, `ignored` or `other`. `ignored` covers known unrecognized or invalid outcomes, including deterministic 2xx acknowledgments, invalid challenges, and non-signature verification failures; `other` marks unknown/future classification errors, which return retryable 503. Only `BadSignature` is `tampered`. No IDs, tokens, headers, body text or secrets become labels |
+| `two_bot_eventsub_posts_total{outcome}` | Go-live post outcomes: `attempted`, `succeeded`, `failed` or `other`. The current receiver slice does not send go-live posts, so these remain zero until the sender is wired; no IDs, content or errors become labels |
 
 ## REST admission guard
 
@@ -176,6 +179,10 @@ Renaming a metric, label, or allowlisted value breaks scrapers; new values
 are added to these compile-time lists in `crates/core/src/metrics.rs`, never
 as dynamic labels.
 
+- `two_bot_eventsub_classified_total{kind}` — `kind` is one of
+  `challenge`, `notification`, `revocation`, `tampered`, `ignored` or `other`.
+- `two_bot_eventsub_posts_total{outcome}` — `outcome` is one of `attempted`,
+  `succeeded`, `failed` or `other`.
 - `two_bot_gateway_events_total{event}` — `event` is one of `READY`,
   `RESUMED`, `GUILD_CREATE`, `GUILD_DELETE`, `GUILD_UPDATE`,
   `GUILD_MEMBER_ADD`, `GUILD_MEMBER_REMOVE`, `GUILD_MEMBER_UPDATE`,
@@ -542,6 +549,7 @@ exposition proxy, and ownership and bearer controls are unchanged.
 | `job_stale:<job>` | last success older than 2 x the job cadence (never-succeeded is ignored) | [job stale](runbook.md#alert-job-stale) |
 | `job_consecutive_failures:<job>` | `two_bot_job_consecutive_failures` >= 3 | [job failures](runbook.md#alert-job-failures) |
 | `rest_429_rate` | 429s > 10% of REST requests between samples, >= 10 requests | [REST 429](runbook.md#alert-rest-429) |
+| `rest_5xx_rate` | 5xx > 10% of REST requests between samples, >= 10 requests | [REST 5xx](runbook.md#alert-rest-5xx) |
 | `db_pool_saturated` | pool at max, 0 idle, 3 consecutive samples | [DB pool](runbook.md#alert-db-pool) |
 | `db_errors` | 3+ storage failures between samples (restarts skip the window) | [DB errors](runbook.md#alert-db-errors) |
 | `send_admission_blocked` | new admission refusals in 3 consecutive samples | [send admission blocked](runbook.md#alert-send-admission-blocked) |

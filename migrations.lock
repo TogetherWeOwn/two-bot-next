@@ -404,7 +404,6 @@
     "crates/cutover/migrations/0439_event_store_invite_scheduled_event_capture.sql": {
       "sha256": "ec8fa9475530ab759dafa3d2963e9465796daa7e05f8d500d001aa2a13721312",
       "justification": "Event-store S7 invite + scheduled-event capture: order-independent event_store invite columns (invite_code_hash as hex sha256, never the raw code, plus inviter_id) and scheduled-event columns (scheduled_event_id plus event_status/entity_type integer enums) with nullable convergence and the shared UNIQUE dedup index; ids+hash+timestamps+enums only, no description/name/location/username columns. Renumbered to 0439 because the merged retention migration owns 0438; the S7 migration has not merged."
-
     },
     "crates/cutover/migrations/0440_stream_live_claims.sql": {
       "sha256": "c34223b642a8c626281eef8fecef96f165a9d96be4acf510bff550f5d5e50c72",
@@ -414,15 +413,19 @@
       "sha256": "fb64d28a044ed67813fc4056aa964df52a15c3010405c2394c8da01feebb25db",
       "justification": "Guild-level game-activity aggregates (no member columns): additive table with nonnegativity plus voice-within-total checks; cutover chain copy, IF NOT EXISTS. Renumbered 0440 to 0441 after main's cutover 0440 stream-live claims; global migration numbers remain unique across both chains."
     },
+    "crates/cutover/migrations/0443_stream_live_send_started.sql": {
+      "sha256": "8b7d50d4c332178adb67ee88a0de6c9c071fd3aaceacb48c94e806209f229844",
+      "justification": "Stale-claim recovery fence for the Twitch go-live ledger: send_started_at marker committed before the first Discord POST plus a claim_token ownership fence (generated on claim, rotated on takeover, required to start/stamp/release) so atomic takeover reclaims only never-sent stale claims and ambiguous started/delivered rows stay fenced. Renumbered 0441 to 0443 after main claimed 0441/0442 for game-activity aggregates; never merged under 0441."
+    },
     "crates/store/migrations/0442_game_activity_guild_aggregates.sql": {
       "sha256": "1fccfea2ca41d6047c4ac2af17b955c3f76b2fa108bfe648f6e22dc8845a6f60",
       "justification": "Guild-level game-activity aggregates (no member columns): additive table with nonnegativity plus voice-within-total checks; store chain copy, IF NOT EXISTS. Renumbered 0441 to 0442 after main's cutover 0440 stream-live claims; global migration numbers remain unique across both chains."
     },
-    "crates/cutover/migrations/0443_event_store_expiry_index.sql": {
+    "crates/cutover/migrations/0444_event_store_expiry_index.sql": {
       "sha256": "44d0e0371d3536192ccf7e2ccec0c52e5066480392f18413f95b69a872b81750",
-      "justification": "Initial event_time/id index for bounded raw expiry, superseded by 0444's event-class index; built transactionally because concurrent index creation deadlocks parallel test migrators."
+      "justification": "Initial event_time/id index for bounded raw expiry, superseded by 0445's event-class index; built transactionally because concurrent index creation deadlocks parallel test migrators."
     },
-    "crates/cutover/migrations/0444_event_store_expiry_class_index.sql": {
+    "crates/cutover/migrations/0445_event_store_expiry_class_index.sql": {
       "sha256": "0d9633dc2763776ac633aff5f694d02ad6d5f0afb7b39d2b20d8ad8e0750c700",
       "justification": "Replace the broad event-time index with a per-event-class index so capped expiry scans avoid non-expiring event-store families."
     }

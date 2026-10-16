@@ -39,15 +39,19 @@ locked without changing their contents; this is a source-control baseline, **not
 an attestation that a database has applied them**. CI never queries migration
 history in staging or production.
 
-## Risky-statement lint (advisory)
+## Risky-statement lint (required, with one advisory rule)
 
 `python3 scripts/ci/check-squawk-migrations.py --base-ref <sha>` lints the
 migration files changed since the baseline (CI passes the PR base SHA, the
 push-before SHA, or `origin/main`; without `--base-ref` it lints every
 file). It is a deterministic squawk subset: standard library only, no
-database, no network. The required CI step runs with `--strict`, so findings
-fail the PR. The two documented transactional index exceptions below are
-matched by exact migration path and complete normalized statement.
+database, no network. CI runs with `--strict`: `adding-required-field`,
+`creating-index`, `adding-check-constraint`, and `changing-column-type` findings
+fail the PR. `dropping-object` remains a warning because safe, coordinated
+removal still ends with a `DROP TABLE` or `DROP COLUMN`. The two documented
+transactional index exceptions below are matched by exact migration path and
+complete normalized statement. Omit `--strict` for a local advisory preview of
+all five rules.
 
 Write migrations that stay silent:
 
@@ -73,7 +77,7 @@ Write migrations that stay silent:
   swap) and coordinate removal across deploys.
 
 Two exact `creating-index` findings are waived for the transactional event-store
-indexes in migrations 0443 and 0444. The waiver matches only each migration path
+indexes in migrations 0444 and 0445. The waiver matches only each migration path
 and the complete normalized `CREATE INDEX` statement; any changed statement,
 additional index in either file, or index in another migration remains subject to
 strict lint. This exception is documented beside the checker configuration and
@@ -84,9 +88,9 @@ migration check or the required lint gate.
 
 The checker discovers `crates/*/migrations/*.sql` dynamically with
 `--migration-glob` and `--exclude` overrides and no hardcoded crate list,
-so the same script ports 1:1 into a central reusable workflow called from
-every repo (org rollout follow-up: central repo plus org ruleset required
-workflow, then `--strict` here).
+so the same script can be adopted 1:1 by a central reusable workflow called
+from every repo. The remaining org rollout follow-up is a central repo plus
+an org-ruleset required workflow; `--strict` is already enabled here.
 
 ## Existing migration changes
 

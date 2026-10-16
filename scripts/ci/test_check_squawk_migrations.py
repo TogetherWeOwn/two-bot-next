@@ -62,7 +62,7 @@ class RuleTests(unittest.TestCase):
         )
 
     def test_transactional_event_store_index_waiver_is_exact(self):
-        path = "crates/cutover/migrations/0443_event_store_expiry_index.sql"
+        path = "crates/cutover/migrations/0444_event_store_expiry_index.sql"
         statement = (
             "CREATE INDEX IF NOT EXISTS idx_event_store_expiry_event_time_id "
             "ON event_store (event_time, id)"
@@ -688,6 +688,30 @@ class ExitCodeTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("::error file=", out)
 
+    def test_strict_drop_only_passes_with_warning(self):
+        target = self.root / FIRST
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("DROP TABLE legacy_table;\n")
+        code, out = self.run_checker("--strict")
+        self.assertEqual(code, 0)
+        self.assertIn("::warning file=", out)
+        self.assertIn("[squawk:dropping-object]", out)
+        self.assertIn("(advisory)", out)
+
+    def test_strict_drop_and_blocking_finding_fails(self):
+        target = self.root / FIRST
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            "DROP TABLE legacy_table;\n"
+            "CREATE INDEX bad_idx ON guilds (name);\n"
+        )
+        code, out = self.run_checker("--strict")
+        self.assertEqual(code, 1)
+        self.assertIn("::warning file=", out)
+        self.assertIn("[squawk:dropping-object]", out)
+        self.assertIn("::error file=", out)
+        self.assertIn("[squawk:creating-index]", out)
+
     def test_clean_tree_passes_in_both_modes(self):
         target = self.root / FIRST
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -699,11 +723,11 @@ class ExitCodeTests(unittest.TestCase):
 
     def test_exact_transactional_index_waivers_stay_strict_for_other_indexes(self):
         approved = {
-            "crates/cutover/migrations/0443_event_store_expiry_index.sql": (
+            "crates/cutover/migrations/0444_event_store_expiry_index.sql": (
                 "CREATE INDEX IF NOT EXISTS idx_event_store_expiry_event_time_id "
                 "ON event_store (event_time, id);\n"
             ),
-            "crates/cutover/migrations/0444_event_store_expiry_class_index.sql": (
+            "crates/cutover/migrations/0445_event_store_expiry_class_index.sql": (
                 "CREATE INDEX IF NOT EXISTS idx_event_store_expiry_class_time_id "
                 "ON event_store (event_type, event_time, id);\n"
             ),
