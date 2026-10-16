@@ -207,6 +207,48 @@ fn parse_sleep_millis(sleep_args: &str, context: &str) -> u64 {
     millis
 }
 
+fn declaration_count(source: &str, keyword: &str, name: &str) -> usize {
+    let code = code_only(source);
+    let bytes = code.as_bytes();
+    let keyword = keyword.as_bytes();
+    let name = name.as_bytes();
+    let mut count = 0;
+    let mut index = 0;
+    while index + keyword.len() <= bytes.len() {
+        if &bytes[index..index + keyword.len()] == keyword
+            && (index == 0
+                || !(bytes[index - 1].is_ascii_alphanumeric() || bytes[index - 1] == b'_'))
+        {
+            let after_keyword = index + keyword.len();
+            if bytes
+                .get(after_keyword)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            {
+                index = after_keyword;
+                continue;
+            }
+            let mut binding = after_keyword;
+            while bytes.get(binding).is_some_and(u8::is_ascii_whitespace) {
+                binding += 1;
+            }
+            if keyword == b"let" && bytes.get(binding..binding + 4) == Some(b"mut ") {
+                binding += 4;
+            }
+            if bytes.get(binding..binding + name.len()) == Some(name)
+                && !bytes
+                    .get(binding + name.len())
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            {
+                count += 1;
+            }
+            index = after_keyword;
+        } else {
+            index += 1;
+        }
+    }
+    count
+}
+
 fn assert_code_contains(source: &str, snippet: &str, context: &str) {
     // Mask both sides: a snippet hidden in a comment or literal in the
     // source must not satisfy the pin, and string literals inside the
@@ -357,6 +399,21 @@ const OPS_DEADLINE_ASSERT: &str = r#"assert!(
             "bot did not serve health on the configured port"
         );"#;
 const OPS_DEADLINE_BINDING: &str = "let deadline = Instant::now() + Duration::from_secs(15);";
+const ALIVE_STEP_BINDING: &str = "const STEP: Duration = Duration::from_secs(5);";
+
+fn assert_alive_step_deadline(source: &str) {
+    let code = code_only(source);
+    assert_eq!(
+        declaration_count(&code, "const", "STEP"),
+        1,
+        "alive.rs must retain exactly one STEP deadline binding"
+    );
+    assert_eq!(
+        code.matches(ALIVE_STEP_BINDING).count(),
+        1,
+        "alive.rs STEP deadline must remain exactly 5 s"
+    );
+}
 
 fn brace_depth_before(code: &str, pos: usize) -> i32 {
     let mut depth = 0i32;
@@ -423,6 +480,17 @@ fn assert_ops_backfill_deadline(source: &str) {
         source,
         OPS_DEADLINE_ASSERT,
         "spawn_bot health poll must retain its exact deadline assertion",
+    );
+    let code = code_only(source);
+    assert_eq!(
+        declaration_count(&code, "let", "deadline"),
+        1,
+        "spawn_bot must retain exactly one deadline binding"
+    );
+    assert_eq!(
+        code.matches(OPS_DEADLINE_BINDING).count(),
+        1,
+        "spawn_bot deadline must remain exactly 15 s"
     );
     assert_direct_statement_at_depth(
         source,
@@ -563,6 +631,7 @@ fn assert_settle_window(source: &str) {
 
 #[test]
 fn alive_polling_uses_bounded_backoff_under_deadline() {
+    assert_alive_step_deadline(ALIVE);
     let wait_http = function_body(ALIVE, "wait_http");
     assert_wait_http_poll_under_step_deadline(&wait_http);
 
@@ -778,6 +847,7 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
 #[test]
 fn polling_guard_pins_exact_ops_deadline_and_preflight_attempt_assertions() {
     let spawn_bot = function_body(OPS_BACKFILL, "spawn_bot");
+    assert_ops_backfill_deadline(&spawn_bot);
     let changed_backoff = spawn_bot.replace("from_millis(20)", "from_millis(50)");
     assert!(std::panic::catch_unwind(|| {
         assert_poll_site(&changed_backoff, "loop", 20);
@@ -909,6 +979,19 @@ fn polling_guard_pins_exact_ops_deadline_and_preflight_attempt_assertions() {
     })
     .is_err());
 
+    let stretched_step = ALIVE.replace(
+        "const STEP: Duration = Duration::from_secs(5);",
+        "const STEP: Duration = Duration::from_secs(86400);",
+    );
+    assert!(stretched_step.contains("Duration::from_secs(86400)"));
+    assert!(std::panic::catch_unwind(|| assert_alive_step_deadline(&stretched_step)).is_err());
+    let shadowed_step = ALIVE.replacen(
+        "async fn wait_http(bot: &mut Bot, addr: SocketAddr, path: &str, code: u16) -> String {",
+        "async fn wait_http(bot: &mut Bot, addr: SocketAddr, path: &str, code: u16) -> String {\n    const STEP: Duration = Duration::from_secs(86400);",
+        1,
+    );
+    assert!(std::panic::catch_unwind(|| assert_alive_step_deadline(&shadowed_step)).is_err());
+
     let wait_http = function_body(ALIVE, "wait_http");
     // The positive control passes through the placement-aware helper: the
     // loop sits inside its STEP wrapper in the real source.
@@ -925,6 +1008,27 @@ fn polling_guard_pins_exact_ops_deadline_and_preflight_attempt_assertions() {
     assert!(long_deadline.contains("86400"));
     assert!(std::panic::catch_unwind(|| {
         assert_ops_backfill_deadline(&long_deadline);
+    })
+    .is_err());
+
+    // A shadow binding inside the loop preserves the original top-level
+    // deadline while restarting the timeout on every poll iteration.
+    let shadow_deadline = spawn_bot.replacen(
+        "loop {",
+        "loop {\n            let deadline = Instant::now() + Duration::from_secs(15);",
+        1,
+    );
+    assert!(std::panic::catch_unwind(|| {
+        assert_ops_backfill_deadline(&shadow_deadline);
+    })
+    .is_err());
+    let stretched_shadow_deadline = spawn_bot.replacen(
+        "loop {",
+        "loop {\n            let deadline = Instant::now() + Duration::from_secs(86400);",
+        1,
+    );
+    assert!(std::panic::catch_unwind(|| {
+        assert_ops_backfill_deadline(&stretched_shadow_deadline);
     })
     .is_err());
 
