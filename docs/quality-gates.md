@@ -48,7 +48,7 @@ the step itself.
   `cfg_attr(..., allow/expect/ignore)` count as waivers. The
   guard reads that table from the base branch, so a PR cannot exempt itself.
 
-## Semgrep backlog (41 `panic!` hits, grandfathered until 2027-01-15)
+## Semgrep backlog (50 `panic!` hits, grandfathered until 2027-01-15)
 
 Grandfathered on the HARD promotion: these pre-existing hits stay silent
 (the gate only fails on lines the diff adds) until 2027-01-15. Work them
@@ -59,11 +59,15 @@ output if they drift.
 - `crates/bot/src/gateway.rs`: 12
 - `crates/core/src/onboarding.rs`: 7
 - `crates/bot/src/backup_cli.rs`: 3
+- `crates/discord/src/voice_rooms.rs`: 3
 - `crates/core/src/rsvp_store.rs`: 2
 - `crates/cutover/src/parse.rs`: 2
 - `crates/cutover/src/voice_config_apply.rs`: 2
 - `crates/testsupport/src/lib.rs`: 2
 - `crates/bot/src/dispatch.rs`, `gateway_failure.rs`, `logging.rs`,
-  `crates/core/src/channel_moderation_store.rs`, `community_store.rs`,
-  `disable_preflight.rs`, `inactivity_store.rs`, `internal_actions.rs`,
-  `presence_store.rs`, `settings.rs`, `voice_rooms.rs`: 1 each
+  `ops_http.rs`, `crates/core/src/backup/s3.rs`,
+  `channel_moderation_store.rs`, `community_store.rs`,
+  `disable_preflight.rs`, `game_activity_store.rs`, `inactivity_store.rs`,
+  `internal_actions.rs`, `presence_store.rs`, `settings.rs`,
+  `voice_rooms.rs`, `crates/cutover/src/privacy.rs`, `staging_migrate.rs`,
+  `crates/store/src/backfill_history.rs`: 1 each
