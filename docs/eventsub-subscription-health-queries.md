@@ -64,11 +64,14 @@ No log line proves healthy. The authoritative check is the Helix listing
 (Operator-run, GET-only, never a mutation):
 
 ```bash
-curl --silent --show-error --max-time 15 \
-  -H "Client-Id: ${TWO_TWITCH_CLIENT_ID}" \
-  -H "Authorization: Bearer ${APP_TOKEN}" \
-  "https://api.twitch.tv/helix/eventsub/subscriptions?type=stream.online"
+printf 'header = "Client-Id: %s"\nheader = "Authorization: Bearer %s"\n' \
+  "${TWO_TWITCH_CLIENT_ID}" "${APP_TOKEN}" |
+  curl --silent --show-error --max-time 15 -K - \
+    "https://api.twitch.tv/helix/eventsub/subscriptions?type=stream.online"
 ```
+
+The headers reach curl on stdin, so neither the token nor the client id is in
+the process argument list. Do not replace them with inline `-H` flags.
 
 Shape contract (pinned by the `listing_url_carries_exactly_one_filter` unit
 test in `crates/core/src/twitch_helix.rs`): exactly one filter — Twitch
@@ -172,11 +175,19 @@ Expected while the reconcile slice is undeployed. After it deploys, expect
 roughly one line from the three Q2 queries per pass (one pass per hour, plus
 one per startup). The loop sleeps a full `RECONCILE_INTERVAL_SECS` (3600 s)
 after each pass returns, so a normal emission-to-emission gap is always over
-one hour and a 60-minute empty window happens every cycle. Only a window of
-more than two hours with none of the three Q2 queries returning a line (with
-`TWO_EVENTSUB=1` set) means the task is not running and is itself the finding.
-Healthy lines absent while the other queries return lines means the task is
-running and failing or pending, not stopped.
+one hour and a 60-minute empty window happens every cycle.
+
+A window of more than two hours with none of the three Q2 queries returning a
+line (with `TWO_EVENTSUB=1` set) shows only that no pass has completed in that
+window. It does not prove the task stopped: `run_once` has no overall deadline
+and a pass emits no terminal line until it finishes, so a long pass of bounded
+Helix calls looks the same as a stopped task in these logs. Do not restart on
+silence alone. The Operator first confirms the container is still alive with an
+unfiltered read of the same service (omit `--contains`): unrelated lines still
+arriving mean the process is up, and the Operator then investigates the
+reconcile task rather than restarting. Healthy lines absent while the other
+queries return lines means the task is running and failing or pending, not
+stopped.
 
 ## Q3 — revocation count (total today; by reason needs a logging slice)
 
