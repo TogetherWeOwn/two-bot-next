@@ -31,7 +31,9 @@ use two_bot_discord::ActionExecutor;
 use crate::{
     command_runtime::new_id,
     jobs::{self, ErrorClass, Job},
-    self_role_runtime::{Admission, RuntimeError, Selection, SelfRoleRequest, SelfRoleRuntime},
+    self_role_runtime::{
+        Admission, RuntimeError, Selection, SelfRoleRequest, SelfRoleRuntime, StoreErrorKind,
+    },
 };
 
 pub(crate) const RECOVERY_JOB_NAME: &str = "self_role_recovery";
@@ -319,7 +321,8 @@ impl SelfRoleService {
                         .await
                         .map(|_| ())
                         .map_err(|error| match error {
-                            RuntimeError::Store(_) => ErrorClass::Database,
+                            RuntimeError::Store(StoreErrorKind::Timeout) => ErrorClass::Timeout,
+                            RuntimeError::Store(StoreErrorKind::Database) => ErrorClass::Database,
                             RuntimeError::Rest(_) => ErrorClass::Rest,
                             _ => ErrorClass::Configuration,
                         })
