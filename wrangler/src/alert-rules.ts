@@ -152,7 +152,8 @@ export interface MetricsAlertState {
   /** Latest fixed failure class by job; absent on state stored by older Worker versions. */
   jobErrorClasses?: Record<string, JobErrorClass>;
   rest429: number;
-  rest5xx: number;
+  /** Missing on state stored before REST 5xx tracking was introduced. */
+  rest5xx?: number;
   restTotal: number;
   poolStreak: number;
   dbErrors: number;
@@ -384,12 +385,13 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
   // Error-rate sibling of the 429 rule: a 5xx burst (Discord-side failures or
   // a broken request shape from a fresh deploy) pages like a hot 429 route.
   // `transport` (failures before response headers) stays out: timeouts and
-  // cancellations already surface through job timeout classes. `?? 0` covers
-  // DO storage written before this field existed.
+  // cancellations already surface through job timeout classes. Missing 5xx
+  // state from older DO storage establishes a baseline without firing.
+  const hasRest5xxBaseline = prev.rest5xx !== undefined;
   const prevRest5xx = prev.rest5xx ?? 0;
   const reset5xx = rest5xx < prevRest5xx || restTotal < prev.restTotal;
   const d5xx = rest5xx - prevRest5xx;
-  if (!reset5xx && dTotal >= REST_5XX_MIN_REQUESTS && d5xx / dTotal > REST_5XX_RATIO) firing.push("rest_5xx_rate");
+  if (hasRest5xxBaseline && !reset5xx && dTotal >= REST_5XX_MIN_REQUESTS && d5xx / dTotal > REST_5XX_RATIO) firing.push("rest_5xx_rate");
 
   const configured = gauge("two_bot_db_pool_configured")[0]?.value === 1;
   const size = gauge("two_bot_db_pool_connections")[0]?.value;

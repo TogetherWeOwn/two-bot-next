@@ -295,12 +295,13 @@ anything the burst may have executed twice.
 
 Evaluate rollback when the burst starts with the deployed revision: compare the
 alert's first-firing window with the staging-rollout evidence (or the gated
-production run) for that SHA. A 5xx share introduced by a promotion stage is a
-rollback trigger — the shared gradual-promotion action restores the recorded
-pre-promote version when its per-stage health gate fails, and a manual rollback
-names the recorded Worker version and container image from the failed run's
-snapshot. A burst on an unchanged revision is a Discord incident or a
-dependency regression, not a rollback.
+production run) for that SHA. A 5xx share introduced by a promotion stage
+requires a manual rollback decision unless a 5xx-specific per-stage health gate
+is configured and wired to the shared gradual-promotion action. When its
+configured gate fails, the action restores the recorded pre-promote version; a
+manual rollback names the recorded Worker version and container image from the
+failed run's snapshot. A burst on an unchanged revision is a Discord incident
+or a dependency regression, not a rollback.
 
 Escalate when the 5xx share stays above threshold across several windows after
 containment, or when 5xx coincide with 429/transport failures suggesting a
