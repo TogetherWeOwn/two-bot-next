@@ -42,3 +42,20 @@ pub fn render_retention_failure(class: FailureClass, step: RetentionStep, chain:
         &sanitize_chain(chain),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use two_bot_core::error_chain::STORE_UNAVAILABLE_CLASS;
+
+    #[test]
+    fn store_unavailable_token_matches_core_shared_const() {
+        // The cutover retention paths render with the shared core const; this
+        // fails the moment the bot gateway token drifts from it.
+        assert_eq!(
+            FailureClass::StoreUnavailable.as_str(),
+            STORE_UNAVAILABLE_CLASS,
+            "bot gateway token drifted from the shared core const cutover uses",
+        );
+    }
+}

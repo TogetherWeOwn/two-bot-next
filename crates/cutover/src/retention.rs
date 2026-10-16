@@ -58,13 +58,14 @@
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use two_bot_core::error_chain::{db_cause, render_retention_failure, RetentionStep};
+use two_bot_core::error_chain::{
+    db_cause, render_retention_failure, RetentionStep, STORE_UNAVAILABLE_CLASS,
+};
 
-/// Store class token for retention failure lines. This mirrors the bot
-/// crate's `gateway_failure::FailureClass::StoreUnavailable` token: that enum
-/// lives in the bot crate, which depends on this one, so the token is
-/// repeated here as a literal and pinned by the bot acceptance suite.
-const STORE_UNAVAILABLE_CLASS: &str = "store_unavailable";
+// Store class token for retention failure lines: the shared
+// `STORE_UNAVAILABLE_CLASS` from core, so this side cannot drift from the
+// bot gateway's `FailureClass::StoreUnavailable` token (equality is pinned
+// by the bot `backfill_retention_chains` test).
 
 /// Raw presence/voice rows older than this roll off.
 pub const PRESENCE_RAW_RETENTION_DAYS: i32 = 30;
@@ -189,6 +190,20 @@ fn next_request_id() -> String {
     };
     let seq = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
     format!("del-{nanos:x}-{seq:x}")
+}
+
+/// Render a deletion-intake failure line for the warn sites below (user-
+/// deletion deferrals, schema-gap purges, replay-guard deferrals, purge
+/// failures). One helper owns the step attribution so it is pinned in one
+/// place: `deletion_intake_failure_pins_its_step` fails if any site ever
+/// renders a different step, where the substring-only wiring pin would stay
+/// green.
+fn deletion_intake_failure(chain: &str) -> String {
+    render_retention_failure(
+        STORE_UNAVAILABLE_CLASS,
+        RetentionStep::DeletionIntake,
+        chain,
+    )
 }
 
 /// Run the retention job: rolling-window deletes, pending user-deletion
@@ -409,11 +424,8 @@ pub async fn run_retention(
                 }
             }
             if !deferred_ids.is_empty() {
-                let failure = render_retention_failure(
-                    STORE_UNAVAILABLE_CLASS,
-                    RetentionStep::DeletionIntake,
-                    "replay guard or schema gap deferred the request",
-                );
+                let failure =
+                    deletion_intake_failure("replay guard or schema gap deferred the request");
                 tracing::warn!(
                     deferred = deferred,
                     schema_gap_deferrals = gap_deferred,
@@ -443,11 +455,7 @@ pub async fn run_retention(
             if schema_gapped {
                 guild_failed = guilds.len() as u64;
                 if !guilds.is_empty() {
-                    let failure = render_retention_failure(
-                        STORE_UNAVAILABLE_CLASS,
-                        RetentionStep::DeletionIntake,
-                        "schema gap deferred the purge",
-                    );
+                    let failure = deletion_intake_failure("schema gap deferred the purge");
                     tracing::warn!(
                         guilds = ?guilds,
                         schema_gaps = ?schema_gaps,
@@ -483,11 +491,8 @@ pub async fn run_retention(
                                 guild_deferred += 1;
                                 guild_deferred_oldest =
                                     guild_deferred_oldest.max((*waited_secs).max(0) as u64);
-                                let failure = render_retention_failure(
-                                    STORE_UNAVAILABLE_CLASS,
-                                    RetentionStep::DeletionIntake,
-                                    "replay guard deferred the purge",
-                                );
+                                let failure =
+                                    deletion_intake_failure("replay guard deferred the purge");
                                 tracing::warn!(
                                     guild_id = %guild,
                                     waited_secs = (*waited_secs).max(0),
@@ -498,11 +503,7 @@ pub async fn run_retention(
                                 );
                             } else {
                                 guild_failed += 1;
-                                let failure = render_retention_failure(
-                                    STORE_UNAVAILABLE_CLASS,
-                                    RetentionStep::DeletionIntake,
-                                    db_cause(&err),
-                                );
+                                let failure = deletion_intake_failure(db_cause(&err));
                                 tracing::warn!(
                                     guild_id = %guild,
                                     class = STORE_UNAVAILABLE_CLASS,
@@ -1085,4 +1086,31 @@ async fn count_queued_guild_rows(
         }
     }
     Ok((total, deferred_guilds, deferred_oldest))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deletion_intake_failure_pins_its_step() {
+        // Every warn site renders through `deletion_intake_failure`, so this
+        // pins all four at once: a mutant swapping in any other step fails
+        // here, where the substring-only wiring pin would stay green.
+        let line = deletion_intake_failure("pool_timeout");
+        assert!(
+            line.contains("step=deletion_intake"),
+            "deletion-intake warns must attribute DeletionIntake: {line:?}"
+        );
+        for other in ["step=expiry", "step=dry_run"] {
+            assert!(
+                !line.contains(other),
+                "deletion-intake warns must not attribute {other}: {line:?}"
+            );
+        }
+        assert!(
+            line.contains(&format!("class={STORE_UNAVAILABLE_CLASS} ")),
+            "deletion-intake warns must carry the shared store class: {line:?}"
+        );
+    }
 }

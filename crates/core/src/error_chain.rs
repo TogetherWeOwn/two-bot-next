@@ -5,7 +5,9 @@
 //! crate passes its gateway `FailureClass` token); the step comes from
 //! [`BackfillStep`] / [`RetentionStep`]. Every token matches
 //! `[a-z0-9_]{1,32}`, the shape `scripts/staging_rollout.py` and the Worker
-//! accept.
+//! accept. The renderers enforce the class contract themselves: a class
+//! outside it renders as [`INVALID_CLASS_TOKEN`], so this `pub` API stays
+//! the log-safety gate no matter what a future caller passes.
 //!
 //! The chain must never carry raw error text: a `sqlx::Error` Display/Debug
 //! chain can embed connection URLs, statement detail, and member snowflakes.
@@ -90,10 +92,43 @@ impl RetentionStep {
     }
 }
 
+/// Store class token shared by the bot gateway
+/// (`FailureClass::StoreUnavailable`) and the cutover retention paths. It
+/// lives here — not as a literal in either crate — so the two sides cannot
+/// drift apart; the bot side pins equality in the
+/// `backfill_retention_chains` tests.
+pub const STORE_UNAVAILABLE_CLASS: &str = "store_unavailable";
+
+/// Fallback class token substituted when a caller supplies a class outside
+/// the `[a-z0-9_]{1,32}` contract. Fixed vocabulary so the fallback itself
+/// always matches what `scripts/staging_rollout.py` and the Worker accept.
+pub const INVALID_CLASS_TOKEN: &str = "invalid_class";
+
+/// The class contract both renderers enforce: `[a-z0-9_]{1,32}`.
+fn is_class_token(value: &str) -> bool {
+    (1..=32).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// Keep a caller-supplied class only when it matches the contract; otherwise
+/// substitute the safe fallback so a credential URL, email, or any other
+/// free-form text can never ride the `class=` field into a log line.
+fn sanitize_class(class: &str) -> &str {
+    if is_class_token(class) {
+        class
+    } else {
+        INVALID_CLASS_TOKEN
+    }
+}
+
 /// One backfill failure line: the caller-supplied class token, the stage
-/// step, and the sanitized chain.
+/// step, and the sanitized chain. A class outside the contract renders as
+/// [`INVALID_CLASS_TOKEN`].
 #[must_use]
 pub fn render_backfill_failure(class: &str, step: BackfillStep, chain: &str) -> String {
+    let class = sanitize_class(class);
     format!(
         "backfill_failed class={class} step={} chain={}",
         step.as_str(),
@@ -102,9 +137,11 @@ pub fn render_backfill_failure(class: &str, step: BackfillStep, chain: &str) -> 
 }
 
 /// One retention failure line: the caller-supplied class token, the stage
-/// step, and the sanitized chain.
+/// step, and the sanitized chain. A class outside the contract renders as
+/// [`INVALID_CLASS_TOKEN`].
 #[must_use]
 pub fn render_retention_failure(class: &str, step: RetentionStep, chain: &str) -> String {
+    let class = sanitize_class(class);
     format!(
         "retention_failed class={class} step={} chain={}",
         step.as_str(),
@@ -223,6 +260,67 @@ mod tests {
         );
         assert!(!line.contains("operator@example.com"), "{line:?}");
         assert!(line.contains("deletion_intake"), "{line:?}");
+    }
+
+    #[test]
+    fn class_must_match_the_contract_or_fall_back() {
+        // Contract-shaped classes pass through byte-identical.
+        for valid in ["store_unavailable", "pool_timeout", "a", "x1_y2_z3"] {
+            let line = render_backfill_failure(valid, BackfillStep::SnapshotRead, "pool_timeout");
+            assert!(
+                line.contains(&format!("class={valid} ")),
+                "valid class must survive: {line:?}"
+            );
+            let line =
+                render_retention_failure(valid, RetentionStep::DeletionIntake, "pool_timeout");
+            assert!(
+                line.contains(&format!("class={valid} ")),
+                "valid class must survive: {line:?}"
+            );
+        }
+        // Probe-proven leak shape: a credential URL as class must never reach
+        // the line; neither may mixed-case, empty, spaced, or over-long input.
+        let hostile_class = "postgres://user@db.internal/app";
+        let over_long = "x".repeat(33);
+        for hostile in [
+            hostile_class,
+            "StoreUnavailable",
+            "",
+            "has space",
+            over_long.as_str(),
+        ] {
+            let line = render_backfill_failure(hostile, BackfillStep::SnapshotRead, "pool_timeout");
+            assert!(
+                line.contains(&format!("class={INVALID_CLASS_TOKEN} ")),
+                "hostile class must fall back: {line:?}"
+            );
+            assert!(
+                !line.contains(hostile) || hostile.is_empty(),
+                "hostile class leaked: {line:?}"
+            );
+            let line =
+                render_retention_failure(hostile, RetentionStep::DeletionIntake, "pool_timeout");
+            assert!(
+                line.contains(&format!("class={INVALID_CLASS_TOKEN} ")),
+                "hostile class must fall back: {line:?}"
+            );
+            assert!(
+                !line.contains(hostile) || hostile.is_empty(),
+                "hostile class leaked: {line:?}"
+            );
+        }
+        assert!(
+            !render_backfill_failure(hostile_class, BackfillStep::SnapshotRead, "pool_timeout")
+                .contains("db.internal"),
+            "credential-URL host must not survive class validation"
+        );
+    }
+
+    #[test]
+    fn shared_store_class_matches_the_contract() {
+        assert!(is_class_token(STORE_UNAVAILABLE_CLASS));
+        assert_eq!(STORE_UNAVAILABLE_CLASS, "store_unavailable");
+        assert!(is_class_token(INVALID_CLASS_TOKEN));
     }
 
     #[test]

@@ -333,6 +333,18 @@ fn unavailable(id: &str) -> Response {
         .into_response()
 }
 
+/// Render the snapshot-read failure line for the 503 path below. One helper
+/// owns the step attribution so it is pinned in one place:
+/// `snapshot_failure_pins_snapshot_read_step` fails if the site ever renders
+/// a different step, where the substring-only wiring pin would stay green.
+fn snapshot_store_failure(chain: &str) -> String {
+    render_backfill_failure(
+        FailureClass::StoreUnavailable,
+        BackfillStep::SnapshotRead,
+        chain,
+    )
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -399,11 +411,7 @@ async fn handler(
             )
                 .into_response(),
             Err(err) => {
-                let failure = render_backfill_failure(
-                    FailureClass::StoreUnavailable,
-                    BackfillStep::SnapshotRead,
-                    crate::db_log::db_class(&err),
-                );
+                let failure = snapshot_store_failure(crate::db_log::db_class(&err));
                 tracing::warn!(
                     msg = "ops_backfill_snapshot_failed",
                     class = FailureClass::StoreUnavailable.as_str(),
@@ -546,6 +554,30 @@ mod tests {
                 }
             }
             _ => {}
+        }
+    }
+
+    #[test]
+    fn snapshot_failure_pins_snapshot_read_step() {
+        // The 503 path renders through `snapshot_store_failure`, so this pins
+        // the wired step: a mutant swapping in any other step fails here,
+        // where the substring-only wiring pin would stay green.
+        let line = snapshot_store_failure("pool_timeout");
+        assert!(
+            line.contains("step=snapshot_read"),
+            "snapshot 503 must attribute SnapshotRead: {line:?}"
+        );
+        for other in [
+            "rate_limit_client",
+            "cursor_checkpoint",
+            "audit_catch_up",
+            "history_put",
+            "history_count",
+        ] {
+            assert!(
+                !line.contains(other),
+                "snapshot 503 must not attribute {other}: {line:?}"
+            );
         }
     }
 
