@@ -451,6 +451,22 @@ fn assert_loop_inside_step_timeout(source: &str, context: &str, expected_millis:
     assert_poll_site(&body, "loop", expected_millis);
 }
 
+fn wrap_settle_loop(lifecycle: &str, gate: &str) -> String {
+    const LOOP: &str = "while tokio::time::Instant::now() < settle_until {";
+    let code = code_only(lifecycle);
+    let loop_start = code.find(LOOP).expect("settle loop must be present");
+    let loop_open = loop_start + LOOP.len() - 1;
+    let loop_block = braced_block(&code, loop_open);
+    let loop_end = loop_open + loop_block.len();
+    format!(
+        "{}{} {{ {} }}{}",
+        &lifecycle[..loop_start],
+        gate,
+        &lifecycle[loop_start..loop_end],
+        &lifecycle[loop_end..]
+    )
+}
+
 fn assert_settle_ungated(lifecycle: &str) {
     // The settle window and SIGTERM must both be direct statements of the
     // per-boot loop. A shared conditional around both would preserve their
@@ -465,6 +481,11 @@ fn assert_settle_ungated(lifecycle: &str) {
         &boot_loop,
         "let settle_until =",
         "settle window must be a direct statement of the per-boot loop",
+    );
+    assert_direct_loop_statement(
+        &boot_loop,
+        "while tokio::time::Instant::now() < settle_until {",
+        "settle loop must be a reachable direct statement of the per-boot loop",
     );
     assert_eq!(
         boot_loop.matches("bot.terminate().await;").count(),
@@ -535,6 +556,50 @@ fn assert_wait_http_poll_under_step_deadline(wait_http: &str) {
         wait_http,
         "wait_http must poll inside its STEP deadline",
         10,
+    );
+}
+
+fn assert_timeout_async_result_suffix(source: &str, expected_suffix: &str, context: &str) {
+    const TIMEOUT: &str = "timeout(STEP, async {";
+    let code = code_only(source);
+    let timeout_start = code
+        .find(TIMEOUT)
+        .unwrap_or_else(|| panic!("{context}: missing active STEP timeout"));
+    assert_eq!(
+        code.matches(TIMEOUT).count(),
+        1,
+        "{context}: expected exactly one active STEP timeout"
+    );
+    let timeout_open = timeout_start + TIMEOUT.len() - 1;
+    let timeout_block = braced_block(&code, timeout_open);
+    let result_start = timeout_open + timeout_block.len();
+    assert!(
+        source[result_start..]
+            .trim_start()
+            .starts_with(expected_suffix),
+        "{context}: STEP timeout result must be handled immediately"
+    );
+}
+
+fn assert_wait_http_timeout_expiry(source: &str) {
+    assert_timeout_async_result_suffix(
+        source,
+        r#")
+    .await
+    .unwrap_or_else(|_| panic!("{path} did not return {code} before deadline"))
+}"#,
+        "wait_http must panic when its STEP timeout expires",
+    );
+}
+
+fn assert_checkpoint_timeout_expiry(source: &str) {
+    assert_timeout_async_result_suffix(
+        source,
+        r#")
+    .await
+    .expect("durable checkpoint deadline");
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM events")"#,
+        "checkpoint must fail when its STEP timeout expires",
     );
 }
 
@@ -637,8 +702,10 @@ fn alive_polling_uses_bounded_backoff_under_deadline() {
     assert_alive_step_deadline(ALIVE);
     let wait_http = function_body(ALIVE, "wait_http");
     assert_wait_http_poll_under_step_deadline(&wait_http);
+    assert_wait_http_timeout_expiry(&wait_http);
 
     let checkpoint = function_body(ALIVE, "checkpoint");
+    assert_checkpoint_timeout_expiry(&checkpoint);
     assert_loop_inside_step_timeout(
         &checkpoint,
         "checkpoint must poll inside its STEP deadline",
@@ -1126,6 +1193,39 @@ fn polling_guard_rejects_misplaced_deadline_and_liveness_checks() {
     // The `timeout(STEP` wrapper text stays present but the poll loop is
     // hoisted outside it: the loop then runs without the STEP deadline.
     let wait_http = function_body(ALIVE, "wait_http");
+    assert_wait_http_timeout_expiry(&wait_http);
+    let defaulted_timeout = wait_http.replace(
+        ".unwrap_or_else(|_| panic!(\"{path} did not return {code} before deadline\"))",
+        ".unwrap_or_default()",
+    );
+    assert_ne!(
+        defaulted_timeout, wait_http,
+        "timeout-swallowing mutant must apply"
+    );
+    assert!(std::panic::catch_unwind(|| {
+        assert_wait_http_timeout_expiry(&defaulted_timeout);
+    })
+    .is_err());
+    let dead_handler = format!(
+        "{defaulted_timeout}\n// .await\n// .unwrap_or_else(|_| panic!(\"{{path}} did not return {{code}} before deadline\"))"
+    );
+    assert!(std::panic::catch_unwind(|| {
+        assert_wait_http_timeout_expiry(&dead_handler);
+    })
+    .is_err());
+
+    let checkpoint = function_body(ALIVE, "checkpoint");
+    assert_checkpoint_timeout_expiry(&checkpoint);
+    let ignored_timeout = checkpoint.replace(".expect(\"durable checkpoint deadline\");", ".ok();");
+    assert_ne!(
+        ignored_timeout, checkpoint,
+        "timeout-swallowing mutant must apply"
+    );
+    assert!(std::panic::catch_unwind(|| {
+        assert_checkpoint_timeout_expiry(&ignored_timeout);
+    })
+    .is_err());
+
     let sleep = "sleep(Duration::from_millis(10)).await;";
     let loop_outside_timeout = format!(
         "loop {{ {sleep} }}\n{}",
@@ -1140,6 +1240,12 @@ fn polling_guard_rejects_misplaced_deadline_and_liveness_checks() {
     // The settle-loop liveness text stays present but is wrapped in a
     // never-taken branch: a post-RESUMED crash would go undetected.
     let lifecycle = function_body(ALIVE, "lifecycle");
+    assert_settle_ungated(&lifecycle);
+    for gate in ["if false", "if boot == 0", "if boot != 1"] {
+        let gated_loop = wrap_settle_loop(&lifecycle, gate);
+        assert!(gated_loop.contains(gate));
+        assert!(std::panic::catch_unwind(|| assert_settle_ungated(&gated_loop)).is_err());
+    }
     let settle = source_between(&lifecycle, "let settle_until =", "assert_ready_correlation");
     assert_settle_window(&settle);
     let boot_gated_settle = settle.replace(
