@@ -186,6 +186,40 @@ fn source_between(source: &str, start: &str, end: &str) -> String {
     source[start..end].to_owned()
 }
 
+fn parse_sleep_millis(sleep_args: &str, context: &str) -> u64 {
+    let (millis, suffix) = sleep_args
+        .strip_prefix("Duration::from_millis(")
+        .and_then(|args| args.split_once(')'))
+        .unwrap_or_else(|| panic!("{context} must use a literal millisecond duration"));
+    assert!(
+        suffix.starts_with(").await;") || suffix.starts_with(");"),
+        "{context} must pass only its literal duration to sleep"
+    );
+    assert!(
+        !millis.is_empty() && millis.bytes().all(|byte| byte.is_ascii_digit()),
+        "{context} must use a literal millisecond duration"
+    );
+    let millis = millis
+        .parse::<u64>()
+        .unwrap_or_else(|_| panic!("{context} must use a literal millisecond duration"));
+    assert!(
+        (1..=50).contains(&millis),
+        "{context} must be between 1 and 50 ms"
+    );
+    millis
+}
+
+fn assert_code_contains(source: &str, snippet: &str, context: &str) {
+    // Mask both sides: a snippet hidden in a comment or literal in the
+    // source must not satisfy the pin, and string literals inside the
+    // snippet itself are masked to the same spaces on both sides.
+    assert!(code_only(source).contains(&code_only(snippet)), "{context}");
+}
+
+fn assert_no_code_contains(source: &str, snippet: &str, context: &str) {
+    assert!(!code_only(source).contains(snippet), "{context}");
+}
+
 fn assert_poll_site(source: &str, loop_marker: &str) {
     let body = loop_body(source, loop_marker);
     assert_eq!(
@@ -193,51 +227,65 @@ fn assert_poll_site(source: &str, loop_marker: &str) {
         1,
         "each poll loop must contain exactly one sleep call"
     );
-    let sleep_args = body.split_once("sleep(").expect("sleep call is present").1;
-    let (millis, suffix) = sleep_args
-        .strip_prefix("Duration::from_millis(")
-        .and_then(|args| args.split_once(')'))
-        .unwrap_or_else(|| panic!("poll backoff must use a literal millisecond duration"));
-    assert!(
-        suffix.starts_with(").await;") || suffix.starts_with(");"),
-        "poll backoff must pass only its literal duration to sleep"
+    let (before_sleep, sleep_args) = body.split_once("sleep(").expect("sleep call is present");
+    // The sleep must be a direct statement of the loop body (brace depth 1,
+    // just inside the loop's own braces), not nested in a conditional or
+    // block that may never run while the loop busy-spins.
+    let mut depth = 0i32;
+    for byte in before_sleep.bytes() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        depth, 1,
+        "poll backoff must be a direct statement of the poll loop body"
     );
-    assert!(
-        !millis.is_empty() && millis.bytes().all(|byte| byte.is_ascii_digit()),
-        "poll backoff must use a literal millisecond duration"
+    parse_sleep_millis(sleep_args, "poll backoff");
+}
+
+fn assert_sleep_inventory(source: &str, expected: usize, context: &str) {
+    // Whole-file inventory over code only: a stray sleep anywhere in the
+    // file (not just inside the named poll loops) must go red, whether it
+    // changes the count or uses a non-literal / non-millisecond duration.
+    let code = code_only(source);
+    let sleeps: Vec<&str> = code.split("sleep(").collect();
+    assert_eq!(
+        sleeps.len() - 1,
+        expected,
+        "{context} must contain exactly {expected} sleep call(s)"
     );
-    let millis = millis
-        .parse::<u64>()
-        .unwrap_or_else(|_| panic!("poll backoff must use a literal millisecond duration"));
-    assert!(
-        (1..=50).contains(&millis),
-        "poll backoff must be between 1 and 50 ms"
-    );
+    for sleep_args in &sleeps[1..] {
+        parse_sleep_millis(sleep_args, context);
+    }
 }
 
 fn assert_ops_backfill_deadline(source: &str) {
-    assert!(
-        source.contains(
-            r#"assert!(
+    assert_code_contains(
+        source,
+        r#"assert!(
             Instant::now() < deadline,
             "bot did not serve health on the configured port"
-        );"#
-        ),
-        "spawn_bot health poll must retain its exact deadline assertion"
+        );"#,
+        "spawn_bot health poll must retain its exact deadline assertion",
     );
 }
 
 fn assert_budget_lane_hold_pin(source: &str) {
-    assert!(
-        source.contains(r#"assert_eq!(mock.requests().len(), 3, "{name}: lane held, no retry");"#),
-        "budget lane-hold test must retain its exact three-attempt assertion"
+    assert_code_contains(
+        source,
+        r#"assert_eq!(mock.requests().len(), 3, "{name}: lane held, no retry");"#,
+        "budget lane-hold test must retain its exact three-attempt assertion",
     );
 }
 
 fn assert_preflight_429_attempt_pin(source: &str) {
-    assert!(
-        source.contains("assert_eq!(mock.requests().len(), 1);"),
-        "preflight 429 test must retain its exact one-attempt assertion"
+    assert_code_contains(
+        source,
+        "assert_eq!(mock.requests().len(), 1);",
+        "preflight 429 test must retain its exact one-attempt assertion",
     );
 }
 
@@ -269,16 +317,18 @@ fn assert_settle_window(source: &str) {
 fn alive_polling_uses_bounded_backoff_under_deadline() {
     let wait_http = function_body(ALIVE, "wait_http");
     assert_poll_site(&wait_http, "loop");
-    assert!(
-        wait_http.contains("timeout(STEP"),
-        "wait_http must retain its STEP deadline"
+    assert_code_contains(
+        &wait_http,
+        "timeout(STEP",
+        "wait_http must retain its STEP deadline",
     );
 
     let checkpoint = function_body(ALIVE, "checkpoint");
     assert_poll_site(&checkpoint, "loop");
-    assert!(
-        checkpoint.contains("timeout(STEP"),
-        "checkpoint must retain its STEP deadline"
+    assert_code_contains(
+        &checkpoint,
+        "timeout(STEP",
+        "checkpoint must retain its STEP deadline",
     );
 
     let lifecycle = function_body(ALIVE, "lifecycle");
@@ -287,9 +337,11 @@ fn alive_polling_uses_bounded_backoff_under_deadline() {
     let settle = source_between(&lifecycle, "let settle_until =", "assert_ready_correlation");
     assert_settle_window(&settle);
 
-    assert!(
-        !ALIVE.contains("yield_now"),
-        "alive.rs must not busy-spin on bare scheduler yields"
+    assert_sleep_inventory(ALIVE, 4, "alive.rs sleep inventory");
+    assert_no_code_contains(
+        ALIVE,
+        "yield_now",
+        "alive.rs must not busy-spin on bare scheduler yields",
     );
 }
 
@@ -298,9 +350,11 @@ fn ops_backfill_spawn_uses_bounded_backoff_under_deadline() {
     let spawn_bot = function_body(OPS_BACKFILL, "spawn_bot");
     assert_poll_site(&spawn_bot, "loop");
     assert_ops_backfill_deadline(&spawn_bot);
-    assert!(
-        !spawn_bot.contains("yield_now"),
-        "ops_backfill.rs must not busy-spin on bare scheduler yields"
+    assert_sleep_inventory(OPS_BACKFILL, 1, "ops_backfill.rs sleep inventory");
+    assert_no_code_contains(
+        &spawn_bot,
+        "yield_now",
+        "ops_backfill.rs must not busy-spin on bare scheduler yields",
     );
 }
 
@@ -310,9 +364,10 @@ fn preflight_429_lane_hold_stays_sleep_free_with_one_attempt_pins() {
         PREFLIGHT,
         "session_start_budget_pass_warn_fail_and_fail_closed",
     );
-    assert!(
-        !budget_test.contains("sleep("),
-        "budget lane-hold tests must remain free of timing sleeps"
+    assert_no_code_contains(
+        &budget_test,
+        "sleep(",
+        "budget lane-hold tests must remain free of timing sleeps",
     );
     assert_budget_lane_hold_pin(&budget_test);
 
@@ -320,11 +375,13 @@ fn preflight_429_lane_hold_stays_sleep_free_with_one_attempt_pins() {
         PREFLIGHT,
         "preflight_429_is_one_attempt_and_stops_the_check_sequence",
     );
-    assert!(
-        !preflight_test.contains("sleep("),
-        "preflight 429 test must remain free of timing sleeps"
+    assert_no_code_contains(
+        &preflight_test,
+        "sleep(",
+        "preflight 429 test must remain free of timing sleeps",
     );
     assert_preflight_429_attempt_pin(&preflight_test);
+    assert_sleep_inventory(PREFLIGHT, 0, "preflight.rs sleep inventory");
 }
 
 #[test]
@@ -442,6 +499,26 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
         assert_settle_window(&commented_settle_duration);
     })
     .is_err());
+
+    // A sleep nested in a never-taken branch is not a loop backoff.
+    let if_false_wait_http = wait_http.replace(sleep, &format!("if false {{ {sleep} }}"));
+    assert!(std::panic::catch_unwind(|| {
+        assert_poll_site(&if_false_wait_http, "loop");
+    })
+    .is_err());
+
+    // A stray long sleep outside every named poll loop breaks the
+    // whole-file inventory even though each named site still passes.
+    assert_sleep_inventory(ALIVE, 4, "alive.rs sleep inventory");
+    let stray_long_sleep = ALIVE.replacen(
+        "bot.assert_alive();",
+        "sleep(Duration::from_secs(5)).await;\n            bot.assert_alive();",
+        1,
+    );
+    assert!(std::panic::catch_unwind(|| {
+        assert_sleep_inventory(&stray_long_sleep, 4, "alive.rs sleep inventory");
+    })
+    .is_err());
 }
 
 #[test]
@@ -464,6 +541,48 @@ fn polling_guard_pins_exact_ops_deadline_and_preflight_attempt_assertions() {
     let without_attempt_pin = preflight_test.replace("assert_eq!(mock.requests().len(), 1);", "");
     assert!(std::panic::catch_unwind(|| {
         assert_preflight_429_attempt_pin(&without_attempt_pin);
+    })
+    .is_err());
+
+    // Block-commenting a pinned assertion must not satisfy its pin: the
+    // raw text is still present, but it is no longer code.
+    let deadline_assert = "assert!(\n            Instant::now() < deadline,\n            \"bot did not serve health on the configured port\"\n        );";
+    let commented_deadline =
+        spawn_bot.replace(deadline_assert, &format!("/* {deadline_assert} */"));
+    assert!(commented_deadline.contains(deadline_assert));
+    assert!(std::panic::catch_unwind(|| {
+        assert_ops_backfill_deadline(&commented_deadline);
+    })
+    .is_err());
+
+    let commented_attempt_pin = preflight_test.replace(
+        "assert_eq!(mock.requests().len(), 1);",
+        "/* assert_eq!(mock.requests().len(), 1); */",
+    );
+    assert!(std::panic::catch_unwind(|| {
+        assert_preflight_429_attempt_pin(&commented_attempt_pin);
+    })
+    .is_err());
+
+    let budget_test = function_body(
+        PREFLIGHT,
+        "session_start_budget_pass_warn_fail_and_fail_closed",
+    );
+    let budget_pin = r#"assert_eq!(mock.requests().len(), 3, "{name}: lane held, no retry");"#;
+    let commented_budget_pin = budget_test.replace(budget_pin, &format!("/* {budget_pin} */"));
+    assert!(std::panic::catch_unwind(|| {
+        assert_budget_lane_hold_pin(&commented_budget_pin);
+    })
+    .is_err());
+
+    let wait_http = function_body(ALIVE, "wait_http");
+    let commented_deadline_call = wait_http.replace("timeout(STEP", "/* timeout(STEP */ timeout(");
+    assert!(std::panic::catch_unwind(|| {
+        assert_code_contains(
+            &commented_deadline_call,
+            "timeout(STEP",
+            "wait_http must retain its STEP deadline",
+        );
     })
     .is_err());
 }
