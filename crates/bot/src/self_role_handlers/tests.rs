@@ -132,6 +132,35 @@ async fn recovery_job_has_bounded_cadence_jitter_and_owned_service() {
     assert_eq!(Arc::strong_count(&service), 1);
 }
 
+#[test]
+fn recovery_error_class_keeps_each_store_kind_distinct() {
+    use two_bot_discord::executor::self_roles::SelfRoleRestError;
+
+    assert_eq!(
+        recovery_error_class(RuntimeError::Store(StoreErrorKind::Timeout)),
+        ErrorClass::Timeout
+    );
+    assert_eq!(
+        recovery_error_class(RuntimeError::Store(StoreErrorKind::Database)),
+        ErrorClass::Database
+    );
+    // A zero-row receipt completion answered successfully, so it must not
+    // report as a database failure. State mismatches share the
+    // configuration class without becoming `Stale`.
+    assert_eq!(
+        recovery_error_class(RuntimeError::Store(StoreErrorKind::UnmatchedReceipt)),
+        ErrorClass::Configuration
+    );
+    assert_eq!(
+        recovery_error_class(RuntimeError::Rest(SelfRoleRestError::RateLimited)),
+        ErrorClass::Rest
+    );
+    assert_eq!(
+        recovery_error_class(RuntimeError::Stale),
+        ErrorClass::Configuration
+    );
+}
+
 #[tokio::test]
 async fn empty_or_denied_catalogue_never_registers_a_surface() {
     let allowlist = [GUILD.to_string()].into_iter().collect();

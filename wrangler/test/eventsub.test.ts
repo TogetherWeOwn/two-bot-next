@@ -47,14 +47,18 @@ const DARK_ENV = {
   REDIRECT_FALLBACK_CODE: "",
   REDIRECT_MAPPINGS_JSON: "[]",
 };
-/** What staging runs after the Operator's last step: flag plus signing secret. */
+/** What staging runs after the Operator's last step: flag, reconcile inputs and credentials. */
 const ENABLED_ENV = {
   ...DARK_ENV,
   EVENTSUB_INGRESS: "1",
   TWO_EVENTSUB: "1",
-  // Built from parts: a single assigned literal on this key trips gitleaks
-  // generic-api-key. The joined runtime value is unchanged.
+  // Built from parts: a single assigned literal on a secret key trips gitleaks
+  // generic-api-key. The joined runtime values are unchanged.
   TWO_TWITCH_WEBHOOK_SECRET: ["synthetic", "operator", "secret", "01"].join("-"),
+  TWO_TWITCH_CALLBACK_URL: "https://hooks.example.com/twitch",
+  TWO_TWITCH_BROADCASTERS: "111222333444555666",
+  TWO_TWITCH_CLIENT_ID: "synthetic-operator-client-id-01",
+  TWO_TWITCH_CLIENT_SECRET: ["synthetic", "operator", "client", "secret", "01"].join("-"),
 };
 
 const DELIVERY_HEADERS: Record<string, string> = {
@@ -255,7 +259,7 @@ test("enabled flag without the signing secret stays dark: nothing forwarded, no 
   assert.equal(response.status, 503);
 });
 
-test("enabled env forwards flag, bind, marker and secret and pins 8092 in requiredPorts", async (t) => {
+test("enabled env forwards flag, bind, marker, reconcile inputs and credentials and pins 8092 in requiredPorts", async (t) => {
   const h = await harness(t, ENABLED_ENV);
   await h.warm();
   assert.equal(h.starts.length, 1);
@@ -267,6 +271,26 @@ test("enabled env forwards flag, bind, marker and secret and pins 8092 in requir
     forwarded["TWO_TWITCH_WEBHOOK_SECRET"],
     ENABLED_ENV.TWO_TWITCH_WEBHOOK_SECRET,
     "signing secret forwarded only with the flag",
+  );
+  assert.equal(
+    forwarded["TWO_TWITCH_CALLBACK_URL"],
+    ENABLED_ENV.TWO_TWITCH_CALLBACK_URL,
+    "reconcile callback forwarded on its own explicit line",
+  );
+  assert.equal(
+    forwarded["TWO_TWITCH_BROADCASTERS"],
+    ENABLED_ENV.TWO_TWITCH_BROADCASTERS,
+    "reconcile allowlist forwarded on its own explicit line",
+  );
+  assert.equal(
+    forwarded["TWO_TWITCH_CLIENT_ID"],
+    ENABLED_ENV.TWO_TWITCH_CLIENT_ID,
+    "Helix client id forwarded on its own explicit line",
+  );
+  assert.equal(
+    forwarded["TWO_TWITCH_CLIENT_SECRET"],
+    ENABLED_ENV.TWO_TWITCH_CLIENT_SECRET,
+    "Helix client secret forwarded on its own explicit line",
   );
   assert.deepEqual(h.bot.requiredPorts, [8080, EVENTSUB_RECEIVER_PORT]);
   // Combined with the internal-actions receiver: both sidecars are checked.

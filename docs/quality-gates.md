@@ -10,27 +10,37 @@ the step itself.
   lines the PR adds. Shortfalls annotate the PR and pass.
 - Dependency advisories (HARD): the `cargo-deny` step (`check all`, which
   includes advisories) runs on every PR, not only Rust-selected ones.
-- Rust ast-grep advisories (WARN): the local `sgconfig.yml` runs the request-path
-  `.unwrap()` rule plus the six Rust detectors and positive/negative fixtures
-  adapted from TogetherWeOwn/paperclip-ops-tooling `quality/meta-only/` at
-  source commit `a10103b5f8c9846b8d12cc2d19c7bc2246d12349`. The additional rules
-  flag byte-based UTF-8 splitting, dropped `wait_for` futures, erased `map_err`
+- Request-path unwrap (HARD): the local `sgconfig.yml` runs the request-path
+  `.unwrap()` rules (`no-unwrap-request-paths` for direct calls plus
+  `no-unwrap-request-paths-in-macros` for `unwrap` inside macro token trees,
+  which the base pattern cannot see), and
+  `scripts/ci/check-unwrap-request-paths.py` fails the
+  PR when the diff adds a hit. The six shared Rust detectors from
+  TogetherWeOwn/paperclip-ops-tooling `quality/meta-only/` at source commit
+  `a10103b5f8c9846b8d12cc2d19c7bc2246d12349` stay advisory (WARN): they flag
+  byte-based UTF-8 splitting, dropped `wait_for` futures, erased `map_err`
   causes, wildcard errors collapsed to `AccessDenied`, and process-global env or
-  metrics access in tests. Only findings on added lines warn; the unwrap backlog
-  remains in `docs/unwrap-backlog.md`. Thanks to the shared tooling contributors.
+  metrics access in tests. Only findings on added lines fail or warn; the
+  unwrap backlog remains in `docs/unwrap-backlog.md`. Thanks to the shared
+  tooling contributors.
   The corresponding Rust review checklist is available at the same source commit
   ([`rust-bot.yaml`](https://github.com/TogetherWeOwn/paperclip-ops-tooling/blob/a10103b5f8c9846b8d12cc2d19c7bc2246d12349/quality/meta-only/checklists/rust-bot.yaml));
   it is review guidance with fail-unknown evidence rules, not an automated CI gate.
-- Semgrep Rust rules (WARN): vendored `.semgrep/rust-warn.yml` (local rules
-  only, no registry) flags new `todo!`/`unimplemented!`, empty `.expect("")`,
-  `panic!` in non-test code and `process::exit` in library code; current
-  backlog is 41 `panic!` hits below.
-- Squawk migration lint (WARN): `scripts/ci/check-squawk-migrations.py`
-  flags risky statements (`adding-required-field`, `creating-index`,
-  `adding-check-constraint`, `changing-column-type`, `dropping-object`) in
-  changed migration files only. Findings annotate the PR and pass; broken
-  tooling fails so blindness cannot hide. Promotion to HARD flips the step
-  to `--strict` after the advisory soak; see `docs/migrations.md`.
+- Semgrep Rust rules (HARD): vendored `.semgrep/rust-warn.yml` (local rules
+  only, no registry) fails the PR on newly added `todo!`/`unimplemented!`,
+  empty `.expect("")`, `panic!` in non-test code or `process::exit` in
+  library code. Pre-existing hits are grandfathered below, not deleted.
+  Known gap: an empty `.expect("")` inside a macro body (for example
+  `vec![x.expect("")]`) is not matched by the `$X.expect("")` pattern, for
+  the same macro-token-tree reason as the unwrap gate; there are no such
+  hits in the tree today, so the gap is documented rather than gated.
+- Squawk migration lint (HARD; `dropping-object` WARN):
+  `scripts/ci/check-squawk-migrations.py` flags risky statements in changed
+  migration files only. `adding-required-field`, `creating-index`,
+  `adding-check-constraint`, and `changing-column-type` findings fail the PR
+  under `--strict`; `dropping-object` remains advisory because coordinated
+  removal still requires a final `DROP TABLE` or `DROP COLUMN`. Broken tooling
+  fails so blindness cannot hide; see `docs/migrations.md`.
 - Voice synthetic required (HARD): `voice-synthetic.yml` fails when the
   staging test-bot token is missing unless explicitly opted out; see
   `docs/voice-synthetic.md`.
@@ -46,16 +56,26 @@ the step itself.
   `cfg_attr(..., allow/expect/ignore)` count as waivers. The
   guard reads that table from the base branch, so a PR cannot exempt itself.
 
-## Semgrep backlog (41 `panic!` hits, WARN)
+## Semgrep backlog (50 `panic!` hits, grandfathered until 2027-01-15)
+
+Grandfathered on the HARD promotion: these pre-existing hits stay silent
+(the gate only fails on lines the diff adds) until 2027-01-15. Work them
+down or renew the date with a reason; never silently delete the list to get
+green. Counts below are the pinned snapshot; re-pin with real semgrep
+output if they drift.
 
 - `crates/bot/src/gateway.rs`: 12
 - `crates/core/src/onboarding.rs`: 7
 - `crates/bot/src/backup_cli.rs`: 3
+- `crates/discord/src/voice_rooms.rs`: 3
 - `crates/core/src/rsvp_store.rs`: 2
 - `crates/cutover/src/parse.rs`: 2
 - `crates/cutover/src/voice_config_apply.rs`: 2
 - `crates/testsupport/src/lib.rs`: 2
 - `crates/bot/src/dispatch.rs`, `gateway_failure.rs`, `logging.rs`,
-  `crates/core/src/channel_moderation_store.rs`, `community_store.rs`,
-  `disable_preflight.rs`, `inactivity_store.rs`, `internal_actions.rs`,
-  `presence_store.rs`, `settings.rs`, `voice_rooms.rs`: 1 each
+  `ops_http.rs`, `crates/core/src/backup/s3.rs`,
+  `channel_moderation_store.rs`, `community_store.rs`,
+  `disable_preflight.rs`, `game_activity_store.rs`, `inactivity_store.rs`,
+  `internal_actions.rs`, `presence_store.rs`, `settings.rs`,
+  `voice_rooms.rs`, `crates/cutover/src/privacy.rs`, `staging_migrate.rs`,
+  `crates/store/src/backfill_history.rs`: 1 each
