@@ -862,7 +862,7 @@ def verify(args, client):
                         client.zero_instance_last = diagnostic
                 if failure and "gateway_failure=" not in client.observation:
                     client.observation += " gateway_failure=" + failure
-        if (stale and image_stale > APPLICATION_IMAGE_STALE_POLLS
+        if (stale and not passed and image_stale > APPLICATION_IMAGE_STALE_POLLS
                 and "gateway_failure=" not in (client.observation or "")):
             raise GateError("application_image_drift", image_drift_detail(client, app, row, image))
         if not passed:

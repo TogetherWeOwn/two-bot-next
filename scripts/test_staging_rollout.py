@@ -1917,6 +1917,23 @@ class OrchestrationTests(OfflineTestCase):
         self.assertTrue(evidence["application_listing_lag"])
         self.assert_no_secret_saved_or_printed()
 
+    def test_lag_confirmation_survives_stale_listing_past_the_poll_cap(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = self.lag_client([*( (503, *ready_response()[1:]) for _ in range(24) ),
+                                  ready_response(), ready_response()])
+        stale = app(OLD_IMAGE)
+        client.api_routes[APP_PATH] = [[stale]]
+        client.deadline = 10000
+
+        rollout.verify(self.args, client)
+
+        evidence = json.loads(Path(self.args.evidence).read_text())
+        self.assertTrue(evidence["active_lag"])
+        self.assertTrue(evidence["application_listing_lag"])
+        self.assertEqual(evidence["image"], IMAGE)
+        self.assert_no_secret_saved_or_printed()
+
     def test_listing_lag_beyond_the_former_twelve_poll_cap_still_passes(self):
         # Observed in CI: the listing trails a deploy by more than 12 polls while
         # the container already serves the exact build (TOG-15905).
