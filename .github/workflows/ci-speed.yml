@@ -71,6 +71,27 @@ jobs:
               # TOG-25165): an edit there can change what it runs, so the
               # affected-paths signal must select rust (job-inputs rule 4).
               - '.github/workflows/check.yml'
+              # job-inputs marks content-read docs/configs as Rust-affecting;
+              # keep the advisory selector aligned without selecting all docs.
+              - 'docs/parity.md'
+              - 'docs/cutover.md'
+              - 'docs/commands.md'
+              - 'docs/configuration.md'
+              - 'docs/voice-rooms.md'
+              - 'docs/voice-conditions-core.md'
+              - 'docs/soak-checklist.json'
+              - 'docs/soak-checklist.md'
+              - 'docs/staging-e2e-command-matrix.md'
+              - 'docs/smoke-expected-responses.md'
+              - 'docs/smoke-run-record.md'
+              - 'docs/smoke-surface-inventory.md'
+              - 'docs/privacy.md'
+              - 'docs/database-roles.md'
+              - 'docs/rollback-delta.md'
+              - 'docs/backup.md'
+              - 'docs/metrics.md'
+              - 'docs/startup-diagnostics.md'
+              - 'wrangler/wrangler.toml'
             worker:
               - 'wrangler/**'
             docs:

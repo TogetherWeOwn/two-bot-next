@@ -61,6 +61,15 @@ NEXTEST_BEHAVIOR_INPUTS = (
     ".github/workflows/check.yml",
 )
 
+# Content-read docs and config paths classified as Rust by the authoritative
+# selector. Derive these from the selector itself so additions cannot be
+# omitted from the advisory-filter coverage pin.
+JOB_INPUT_RUST_CONTENT = (
+    job_inputs.RUST_DOCS
+    | job_inputs.RUST_WORKER_DOCS
+    | job_inputs.RUST_WORKER_EXACT
+)
+
 # Image-only inputs: the advisory filter lists them under `rust`, but the
 # authoritative selector correctly routes them to `supply` alone, so the
 # required test lane skips image-only PRs instead of burning a compile.
@@ -98,13 +107,14 @@ class NextestAffectedPathsTests(unittest.TestCase):
         self.assertEqual(uses, DORNY_PIN)
 
     def test_behavior_inputs_exist(self):
-        for path in NEXTEST_BEHAVIOR_INPUTS + IMAGE_ONLY_INPUTS + DOCS_ONLY_INPUTS:
+        for path in (NEXTEST_BEHAVIOR_INPUTS + tuple(JOB_INPUT_RUST_CONTENT)
+                     + IMAGE_ONLY_INPUTS + DOCS_ONLY_INPUTS):
             with self.subTest(path=path):
                 self.assertTrue((ROOT / path).exists(), f"{path} no longer exists")
 
     def test_rust_filter_covers_nextest_behavior_inputs(self):
         _, filters = paths_filter_step()
-        for path in NEXTEST_BEHAVIOR_INPUTS:
+        for path in NEXTEST_BEHAVIOR_INPUTS + tuple(JOB_INPUT_RUST_CONTENT):
             with self.subTest(path=path):
                 self.assertTrue(
                     any(filter_pattern_matches(pattern, path)
@@ -125,7 +135,7 @@ class NextestAffectedPathsTests(unittest.TestCase):
                     f"{path} unexpectedly selects the rust lane")
 
     def test_job_inputs_selects_rust_for_nextest_behavior_inputs(self):
-        for path in NEXTEST_BEHAVIOR_INPUTS:
+        for path in NEXTEST_BEHAVIOR_INPUTS + tuple(JOB_INPUT_RUST_CONTENT):
             with self.subTest(path=path):
                 self.assertIn(job_inputs.RUST, job_inputs.classify(path), path)
 
