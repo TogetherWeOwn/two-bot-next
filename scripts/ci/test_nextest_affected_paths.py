@@ -1,12 +1,12 @@
-"""Offline pins for the nextest lane's affected-paths gating (TOG-25286).
+"""Offline pins for the nextest lane's affected-paths gating.
 
 The promoted required lane (`check.yml` job `nextest`, name `rust nextest`;
-promotion itself lives on TOG-25165 / PR #984, read here read-only and never
+promotion itself lives in companion PR #984, read here read-only and never
 edited) runs only when Rust-affecting paths change. Two selectors decide
 that, and they must agree on the lane's inputs:
 
 - `dorny/paths-filter` in `ci-speed.yml` (`changes` job): the affected-only
-  pre-filter from done TOG-24378. Its `rust` set must cover every input that
+  pre-filter. Its `rust` set must cover every input that
   can change nextest behavior, or the advisory signal and the
   minutes-per-merged-PR report silently stop reflecting the lane.
 - `scripts/job-inputs.py` (`rust` output): the authoritative selector the
