@@ -194,18 +194,19 @@ where
                 return SupervisedExit::Reconnected;
             }
             AttemptOutcome::Retryable => {
+                // Check Draining before either publishing Armed or exhausting
+                // the budget. The final attempt still has to honor a drain
+                // that arrived during its unlocked connect await.
+                let mut guard = state.write().await;
+                if *guard == GatewayState::Draining {
+                    return SupervisedExit::ShutdownRequested;
+                }
                 if attempt + 1 >= policy.max_attempts {
-                    break;
+                    *guard = GatewayState::Draining;
+                    return SupervisedExit::BudgetExhausted;
                 }
-                // Same Draining guard as every other Armed publish; scoped
-                // so the lock is never held across the sleep below.
-                {
-                    let mut guard = state.write().await;
-                    if *guard == GatewayState::Draining {
-                        return SupervisedExit::ShutdownRequested;
-                    }
-                    *guard = GatewayState::Armed;
-                }
+                *guard = GatewayState::Armed;
+                drop(guard);
                 // `attempt` is within budget (checked above), so the delay
                 // exists; fall back to no wait rather than panic if a future
                 // policy rule ever disagrees.

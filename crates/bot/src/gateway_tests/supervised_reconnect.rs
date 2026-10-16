@@ -509,6 +509,28 @@ async fn draining_during_connect_is_never_overwritten_by_connected() {
 }
 
 #[tokio::test]
+async fn draining_during_final_retryable_connect_returns_shutdown_requested() {
+    let mut policy = tiny_policy();
+    policy.max_attempts = 1;
+    let state = Arc::new(RwLock::new(GatewayState::Connected));
+    let attempts = Arc::new(std::sync::Mutex::new(0_u32));
+    let exit = run_supervised(
+        Arc::clone(&state),
+        policy,
+        draining_connector(
+            Arc::clone(&state),
+            Arc::clone(&attempts),
+            AttemptOutcome::Retryable,
+        ),
+        std::future::pending(),
+    )
+    .await;
+    assert_eq!(exit, SupervisedExit::ShutdownRequested);
+    assert_eq!(*attempts.lock().expect("attempt counter"), 1);
+    assert_eq!(*state.read().await, GatewayState::Draining);
+}
+
+#[tokio::test]
 async fn draining_during_connect_is_never_overwritten_by_armed() {
     // Same race on the retry path: the Armed publish must not resurrect
     // readyz to starting, and no further attempt runs into the drain.
