@@ -724,7 +724,7 @@ jobs:
           # re-run them here with their accepted URL; profiles merge below.
           # Flags mirror the corresponding ignored-db lane steps.
           export TWO_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test
-          cov_run "$COV" llvm-cov --no-report -p two-bot-core --features db --locked channel_moderation -- --include-ignored --test-threads=1 --skip regenerate_reference_docs
+          cov_run "$COV" llvm-cov --no-report -p two-bot-core --features db --locked -- channel_moderation --include-ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run env -u PGPASSWORD -u PGPASSFILE -u PGOPTIONS "$COV" llvm-cov --no-report -p two-bot-discord --features db --locked --test channel_moderation_runtime -- --include-ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-discord --features db --locked --test internal_channel_moderation -- --include-ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-core --features db --test feeds_store --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs

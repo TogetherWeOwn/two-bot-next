@@ -1354,15 +1354,20 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(step["env"]["QUALITY_BASE"], expected_base)
         self.assertEqual(step["env"]["QUALITY_HEAD"], "${{ github.sha }}")
         self.assertIn("--ignore-run-fail", step["run"])
-        # --include-ignored is a libtest flag: it must follow the `--`
-        # separator, otherwise cargo-llvm-cov rejects it as an invalid option.
-        self.assertIn("-- --include-ignored", step["run"])
         self.assertIn("--features two-bot-core/db", step["run"])
         self.assertIn("--lib --bins --tests", step["run"])
+        self.assertIn(
+            "--no-report -- --ignored --test-threads=1 --skip regenerate_reference_docs",
+            step["run"],
+        )
+        self.assertIn(
+            "--locked -- channel_moderation --include-ignored --test-threads=1",
+            step["run"],
+        )
         self.assertIn('[ ! -s "$RUNNER_TEMP/lcov.info" ]', step["run"])
         # Guarded suites are measured per suite with their accepted URL and
-        # merged: --no-report per run, one final report. Ignored runs are
-        # serial and never execute the reference-docs regen.
+        # merged: --no-report per run, one final report. Selected ignored runs
+        # are serial and never execute the reference-docs regen.
         self.assertIn("--no-report", step["run"])
         self.assertIn("llvm-cov report --lcov", step["run"])
         # Non-ignored tests stay parallel; only the ignored sweep is serial.
