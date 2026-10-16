@@ -19,7 +19,7 @@ DERIVE = re.compile(
     r"(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum)\s+(?P<name>\w+)[^{;]*\{"
 )
 DERIVE_ONE = re.compile(r"#\[derive\((?P<traits>[^)]*)\)\]")
-FIELD = re.compile(r"\b(\w+)\s*:\s*([^,\n}]+)")
+FIELD = re.compile(r"\b(\w+)\s*:(?!:)\s*")
 # Tuple variants carry no field name, so key off an exactly
 # credential-bearing variant name (a claim token is an ownership
 # credential in this codebase). Anchored: `SecretTooShort(String)`
@@ -121,6 +121,35 @@ def split_top_level(payload):
     return fields
 
 
+def named_fields(body):
+    """Yield (name, type, offset) for named fields in `body`.
+
+    The type is captured with balanced-bracket scanning: truncating at
+    the first comma (the old `[^,\\n}]+`) hides every raw element after
+    it, e.g. `token: (u64, String)` or `token: (Secret<String>, String)`.
+    Scanning stops at a top-level comma, semicolon, or closing bracket.
+    """
+    for match in FIELD.finditer(body):
+        depth, end = 0, match.end()
+        while end < len(body):
+            ch = body[end]
+            if ch in "(<[{":
+                depth += 1
+            elif ch in ")]}":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif ch == ">":
+                if end > 0 and body[end - 1] == "-":
+                    pass  # return arrow, not a closing angle bracket
+                elif depth > 0:
+                    depth -= 1
+            elif ch in ",;" and depth == 0:
+                break
+            end += 1
+        yield match.group(1), body[match.end():end], match.start()
+
+
 def blank_literals(source):
     pattern = r'//[^\n]*|/\*[\s\S]*?\*/|r(#+)?"[\s\S]*?"\1|"(?:\\.|[^"\\])*"'
     return re.sub(pattern, lambda m: re.sub(r"[^\n]", " ", m.group()), source)
@@ -141,13 +170,12 @@ def violations(source, path="fixture.rs"):
             depth += (clean[end] == "{") - (clean[end] == "}")
             end += 1
         body = clean[start:end - 1]
-        for field in FIELD.finditer(body):
-            name, field_type = field.groups()
+        for name, field_type, field_start in named_fields(body):
             if not SENSITIVE.search(name) or not has_raw_outside_secret(field_type):
                 continue
             if (path, match["name"], name) in EXCEPTIONS:
                 continue
-            line = source.count("\n", 0, start + field.start()) + 1
+            line = source.count("\n", 0, start + field_start) + 1
             results.append(f"{path}:{line}: {match['name']}.{name} is raw under derived Debug; use Secret<T>")
         for name, payload, variant_start in tuple_variants(body):
             if not SENSITIVE_VARIANT.fullmatch(name):
@@ -237,6 +265,23 @@ class GuardTests(unittest.TestCase):
         # `String` inside the `Secret<...>` span looks unwrapped.
         self.assertFalse(violations('#[derive(Debug)] enum Fixture { Token(Secret<fn() -> u64, String>), }'))
         self.assertFalse(violations('#[derive(Debug)] enum Fixture { Token(Secret<fn() -> String>), }'))
+
+    def test_named_fields_after_first_comma_fail(self):
+        for field in [
+            "token: (u64, String)",
+            "token: (Secret<String>, String)",
+            "token: Option<(Secret<String>, String)>",
+            "password: HashMap<u64, String>",
+            "token: fn() -> (Secret<String>, String)",
+        ]:
+            code = f"#[derive(Debug)] struct Fixture {{ {field}, }}"
+            self.assertEqual(len(violations(code)), 1, code)
+        code = "#[derive(Debug)] enum Fixture { V { token: (u64, String) }, }"
+        self.assertEqual(len(violations(code)), 1, code)
+
+    def test_named_wrapped_fields_after_first_comma_pass(self):
+        self.assertFalse(violations('#[derive(Debug)] struct Safe { token: (Secret<String>, u64), }'))
+        self.assertFalse(violations('#[derive(Debug)] struct Safe { token: (u64, Secret<String>), }'))
 
     def test_exception_is_exact(self):
         code = '#[derive(Debug)] struct ModerationMarker { token: String }'
