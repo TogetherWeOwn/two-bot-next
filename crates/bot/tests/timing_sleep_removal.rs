@@ -243,6 +243,37 @@ fn contains_keyword(code: &str, keyword: &str) -> bool {
     false
 }
 
+fn sleep_calls(code: &str) -> Vec<(usize, &str)> {
+    let bytes = code.as_bytes();
+    let mut calls = Vec::new();
+    let mut index = 0;
+    while index + b"sleep".len() <= bytes.len() {
+        if &bytes[index..index + b"sleep".len()] == b"sleep" {
+            let before_ok = index == 0
+                || !(bytes[index - 1].is_ascii_alphanumeric() || bytes[index - 1] == b'_');
+            let after = index + b"sleep".len();
+            let after_ok = after >= bytes.len()
+                || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
+            let open = after
+                + bytes[after..]
+                    .iter()
+                    .take_while(|byte| byte.is_ascii_whitespace())
+                    .count();
+            if before_ok && after_ok && bytes.get(open) == Some(&b'(') {
+                calls.push((index, &code[open + 1..]));
+            }
+            index = after;
+        } else {
+            index += 1;
+        }
+    }
+    calls
+}
+
+fn assert_no_sleep_calls(source: &str, context: &str) {
+    assert!(sleep_calls(&code_only(source)).is_empty(), "{context}");
+}
+
 fn assert_no_loop_control_flow(loop_body: &str, context: &str) {
     let code = code_only(loop_body);
     for keyword in ["break", "continue", "return"] {
@@ -253,23 +284,24 @@ fn assert_no_loop_control_flow(loop_body: &str, context: &str) {
     }
 }
 
-fn assert_poll_site(source: &str, loop_marker: &str) {
+fn assert_poll_site(source: &str, loop_marker: &str, expected_millis: u64) {
     let body = loop_body(source, loop_marker);
     assert!(
         !contains_keyword(&body, "continue"),
         "poll loop must not bypass its backoff with continue"
     );
+    let sleeps = sleep_calls(&body);
     assert_eq!(
-        body.matches("sleep(").count(),
+        sleeps.len(),
         1,
         "each poll loop must contain exactly one sleep call"
     );
-    let (before_sleep, sleep_args) = body.split_once("sleep(").expect("sleep call is present");
+    let (sleep_pos, sleep_args) = sleeps[0];
     // The sleep must be a direct statement of the loop body (brace depth 1,
     // just inside the loop's own braces), not nested in a conditional or
     // block that may never run while the loop busy-spins.
     let mut depth = 0i32;
-    for byte in before_sleep.bytes() {
+    for byte in body[..sleep_pos].bytes() {
         match byte {
             b'{' => depth += 1,
             b'}' => depth -= 1,
@@ -280,7 +312,11 @@ fn assert_poll_site(source: &str, loop_marker: &str) {
         depth, 1,
         "poll backoff must be a direct statement of the poll loop body"
     );
-    parse_sleep_millis(sleep_args, "poll backoff");
+    let actual_millis = parse_sleep_millis(sleep_args, "poll backoff");
+    assert_eq!(
+        actual_millis, expected_millis,
+        "poll backoff must remain exactly {expected_millis} ms"
+    );
 }
 
 /// Require `snippet` to appear as a direct, reachable statement of
@@ -305,13 +341,13 @@ fn assert_sleep_inventory(source: &str, expected: usize, context: &str) {
     // file (not just inside the named poll loops) must go red, whether it
     // changes the count or uses a non-literal / non-millisecond duration.
     let code = code_only(source);
-    let sleeps: Vec<&str> = code.split("sleep(").collect();
+    let sleeps = sleep_calls(&code);
     assert_eq!(
-        sleeps.len() - 1,
+        sleeps.len(),
         expected,
         "{context} must contain exactly {expected} sleep call(s)"
     );
-    for sleep_args in &sleeps[1..] {
+    for (_, sleep_args) in sleeps {
         parse_sleep_millis(sleep_args, context);
     }
 }
@@ -350,28 +386,35 @@ fn timeout_step_async_body(source: &str, context: &str) -> String {
     braced_block(&code, open)
 }
 
-fn assert_loop_inside_step_timeout(source: &str, context: &str) {
+fn assert_loop_inside_step_timeout(source: &str, context: &str, expected_millis: u64) {
     let body = timeout_step_async_body(source, context);
-    assert_poll_site(&body, "loop");
+    assert_poll_site(&body, "loop", expected_millis);
 }
 
 fn assert_settle_ungated(lifecycle: &str) {
-    // The settle window must run every boot at the same nesting as SIGTERM.
-    // Wrapping it in `if boot == 0` drops the post-RESUMED window on boot 1
-    // (the exact gap the window was added to close); wrapping it in
-    // `if false` drops it entirely. Both keep the settle text present, so
-    // the depth of `let settle_until` must equal the depth of `terminate`.
-    let code = code_only(lifecycle);
-    let settle_pos = code
-        .find("let settle_until =")
-        .expect("settle window must declare its deadline");
-    let term_pos = code
-        .find("bot.terminate().await;")
-        .expect("lifecycle must terminate the bot");
+    // The settle window and SIGTERM must both be direct statements of the
+    // per-boot loop. A shared conditional around both would preserve their
+    // relative depth while skipping the window on some boots.
+    let boot_loop = loop_body(lifecycle, "for boot in 0..2");
     assert_eq!(
-        brace_depth_before(&code, settle_pos),
-        brace_depth_before(&code, term_pos),
-        "settle window must sit at the same depth as SIGTERM so it runs every boot"
+        boot_loop.matches("let settle_until =").count(),
+        1,
+        "each boot must have exactly one settle deadline"
+    );
+    assert_direct_loop_statement(
+        &boot_loop,
+        "let settle_until =",
+        "settle window must be a direct statement of the per-boot loop",
+    );
+    assert_eq!(
+        boot_loop.matches("bot.terminate().await;").count(),
+        1,
+        "each boot must terminate its bot exactly once"
+    );
+    assert_direct_loop_statement(
+        &boot_loop,
+        "bot.terminate().await;",
+        "SIGTERM must be a direct statement of the per-boot loop",
     );
 }
 
@@ -417,7 +460,11 @@ fn assert_ops_backfill_deadline(source: &str) {
 /// terminator still sits between the two markers textually, so the
 /// between-markers check alone is placement-blind.
 fn assert_wait_http_poll_under_step_deadline(wait_http: &str) {
-    assert_loop_inside_step_timeout(wait_http, "wait_http must poll inside its STEP deadline");
+    assert_loop_inside_step_timeout(
+        wait_http,
+        "wait_http must poll inside its STEP deadline",
+        10,
+    );
 }
 
 fn assert_budget_lane_hold_pin(source: &str) {
@@ -507,7 +554,11 @@ fn assert_settle_window(source: &str) {
         2,
         "settle loop must assert liveness inside and after the window"
     );
-    assert_poll_site(&source, "while tokio::time::Instant::now() < settle_until");
+    assert_poll_site(
+        &source,
+        "while tokio::time::Instant::now() < settle_until",
+        10,
+    );
 }
 
 #[test]
@@ -516,13 +567,18 @@ fn alive_polling_uses_bounded_backoff_under_deadline() {
     assert_wait_http_poll_under_step_deadline(&wait_http);
 
     let checkpoint = function_body(ALIVE, "checkpoint");
-    assert_loop_inside_step_timeout(&checkpoint, "checkpoint must poll inside its STEP deadline");
+    assert_loop_inside_step_timeout(
+        &checkpoint,
+        "checkpoint must poll inside its STEP deadline",
+        10,
+    );
 
     let lifecycle = function_body(ALIVE, "lifecycle");
     let events_tick = source_between(&lifecycle, "let ticked = timeout(STEP", "ticked.is_ok()");
     assert_loop_inside_step_timeout(
         &events_tick,
         "events tick must poll inside its STEP deadline",
+        10,
     );
     let settle = source_between(&lifecycle, "let settle_until =", "assert_ready_correlation");
     assert_settle_window(&settle);
@@ -539,7 +595,7 @@ fn alive_polling_uses_bounded_backoff_under_deadline() {
 #[test]
 fn ops_backfill_spawn_uses_bounded_backoff_under_deadline() {
     let spawn_bot = function_body(OPS_BACKFILL, "spawn_bot");
-    assert_poll_site(&spawn_bot, "loop");
+    assert_poll_site(&spawn_bot, "loop", 20);
     assert_ops_backfill_deadline(&spawn_bot);
     assert_sleep_inventory(OPS_BACKFILL, 1, "ops_backfill.rs sleep inventory");
     assert_no_code_contains(
@@ -555,9 +611,8 @@ fn preflight_429_lane_hold_stays_sleep_free_with_one_attempt_pins() {
         PREFLIGHT,
         "session_start_budget_pass_warn_fail_and_fail_closed",
     );
-    assert_no_code_contains(
+    assert_no_sleep_calls(
         &budget_test,
-        "sleep(",
         "budget lane-hold tests must remain free of timing sleeps",
     );
     assert_budget_lane_hold_pin(&budget_test);
@@ -566,9 +621,8 @@ fn preflight_429_lane_hold_stays_sleep_free_with_one_attempt_pins() {
         PREFLIGHT,
         "preflight_429_is_one_attempt_and_stops_the_check_sequence",
     );
-    assert_no_code_contains(
+    assert_no_sleep_calls(
         &preflight_test,
-        "sleep(",
         "preflight 429 test must remain free of timing sleeps",
     );
     assert_preflight_429_attempt_pin(&preflight_test);
@@ -592,11 +646,14 @@ fn source_block_parser_ignores_braces_in_comments_and_literals() {
 #[test]
 fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
     let wait_http = function_body(ALIVE, "wait_http");
-    assert_poll_site(&wait_http, "loop");
+    assert_poll_site(&wait_http, "loop", 10);
+    let changed_backoff = wait_http.replace("from_millis(10)", "from_millis(50)");
+    assert!(std::panic::catch_unwind(|| assert_poll_site(&changed_backoff, "loop", 10)).is_err());
     assert!(std::panic::catch_unwind(|| {
         assert_poll_site(
             &wait_http.replace("sleep(Duration::from_millis(10)).await;", ""),
             "loop",
+            10,
         );
     })
     .is_err());
@@ -607,6 +664,7 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
                 "sleep(Duration::from_millis(backoff_ms)).await;",
             ),
             "loop",
+            10,
         );
     })
     .is_err());
@@ -617,6 +675,7 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
                 "sleep(Duration::from_secs(1)).await;",
             ),
             "loop",
+            10,
         );
     })
     .is_err());
@@ -648,7 +707,7 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
             .replace(sleep, "")
             .replacen("loop {", &format!("{sleep}\n        loop {{"), 1);
     assert!(std::panic::catch_unwind(|| {
-        assert_poll_site(&moved_wait_http, "loop");
+        assert_poll_site(&moved_wait_http, "loop", 10);
     })
     .is_err());
 
@@ -660,7 +719,7 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
 
     let commented_wait_http = wait_http.replace(sleep, &format!("// {sleep}"));
     assert!(std::panic::catch_unwind(|| {
-        assert_poll_site(&commented_wait_http, "loop");
+        assert_poll_site(&commented_wait_http, "loop", 10);
     })
     .is_err());
 
@@ -676,7 +735,7 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
     // A sleep nested in a never-taken branch is not a loop backoff.
     let if_false_wait_http = wait_http.replace(sleep, &format!("if false {{ {sleep} }}"));
     assert!(std::panic::catch_unwind(|| {
-        assert_poll_site(&if_false_wait_http, "loop");
+        assert_poll_site(&if_false_wait_http, "loop", 10);
     })
     .is_err());
 
@@ -689,7 +748,7 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
         "if true { continue; }\n            sleep(Duration::from_millis(10)).await;",
     );
     assert!(std::panic::catch_unwind(|| {
-        assert_poll_site(&continue_wait_http, "loop");
+        assert_poll_site(&continue_wait_http, "loop", 10);
     })
     .is_err());
 
@@ -705,11 +764,25 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
         assert_sleep_inventory(&stray_long_sleep, 4, "alive.rs sleep inventory");
     })
     .is_err());
+    let spaced_stray_sleep = ALIVE.replacen(
+        "bot.assert_alive();",
+        "sleep (Duration::from_secs(5)).await;\n            bot.assert_alive();",
+        1,
+    );
+    assert!(std::panic::catch_unwind(|| {
+        assert_sleep_inventory(&spaced_stray_sleep, 4, "alive.rs sleep inventory");
+    })
+    .is_err());
 }
 
 #[test]
 fn polling_guard_pins_exact_ops_deadline_and_preflight_attempt_assertions() {
     let spawn_bot = function_body(OPS_BACKFILL, "spawn_bot");
+    let changed_backoff = spawn_bot.replace("from_millis(20)", "from_millis(50)");
+    assert!(std::panic::catch_unwind(|| {
+        assert_poll_site(&changed_backoff, "loop", 20);
+    })
+    .is_err());
     let without_deadline_check = spawn_bot.replace(
         "assert!(\n            Instant::now() < deadline,\n            \"bot did not serve health on the configured port\"\n        );",
         "// deadline check removed",
@@ -724,6 +797,17 @@ fn polling_guard_pins_exact_ops_deadline_and_preflight_attempt_assertions() {
         PREFLIGHT,
         "preflight_429_is_one_attempt_and_stops_the_check_sequence",
     );
+    let spaced_sleep = preflight_test.replace(
+        "assert_eq!(mock.requests().len(), 1);",
+        "sleep (Duration::from_millis(1)).await;\n            assert_eq!(mock.requests().len(), 1);",
+    );
+    assert!(std::panic::catch_unwind(|| {
+        assert_no_sleep_calls(
+            &spaced_sleep,
+            "preflight 429 test must remain free of timing sleeps",
+        );
+    })
+    .is_err());
     let without_attempt_pin = preflight_test.replace("assert_eq!(mock.requests().len(), 1);", "");
     assert!(std::panic::catch_unwind(|| {
         assert_preflight_429_attempt_pin(&without_attempt_pin);
@@ -847,12 +931,17 @@ fn polling_guard_pins_exact_ops_deadline_and_preflight_attempt_assertions() {
     // Positive controls: checkpoint and events-tick loops sit inside
     // their STEP wrappers in the real source.
     let checkpoint = function_body(ALIVE, "checkpoint");
-    assert_loop_inside_step_timeout(&checkpoint, "checkpoint must poll inside its STEP deadline");
+    assert_loop_inside_step_timeout(
+        &checkpoint,
+        "checkpoint must poll inside its STEP deadline",
+        10,
+    );
     let lifecycle = function_body(ALIVE, "lifecycle");
     let events_tick = source_between(&lifecycle, "let ticked = timeout(STEP", "ticked.is_ok()");
     assert_loop_inside_step_timeout(
         &events_tick,
         "events tick must poll inside its STEP deadline",
+        10,
     );
 }
 
@@ -958,6 +1047,7 @@ fn polling_guard_rejects_misplaced_deadline_and_liveness_checks() {
         assert_loop_inside_step_timeout(
             &loop_outside_checkpoint,
             "checkpoint must poll inside its STEP deadline",
+            10,
         );
     })
     .is_err());
@@ -975,6 +1065,7 @@ fn polling_guard_rejects_misplaced_deadline_and_liveness_checks() {
         assert_loop_inside_step_timeout(
             &loop_outside_tick,
             "events tick must poll inside its STEP deadline",
+            10,
         );
     })
     .is_err());
@@ -983,6 +1074,13 @@ fn polling_guard_rejects_misplaced_deadline_and_liveness_checks() {
     // never-taken branch: boot 1 then skips the post-RESUMED window, the
     // exact gap the window was added to close.
     assert_settle_ungated(&lifecycle);
+    let shared_gate = lifecycle
+        .replacen("let settle_until =", "if boot == 0 { let settle_until =", 1)
+        .replacen("bot.terminate().await;", "bot.terminate().await; }", 1);
+    assert!(std::panic::catch_unwind(|| {
+        assert_settle_ungated(&shared_gate);
+    })
+    .is_err());
     let gated_boot_zero = lifecycle
         .replacen("let settle_until =", "if boot == 0 { let settle_until =", 1)
         .replacen("bot.terminate().await;", "} bot.terminate().await;", 1);
