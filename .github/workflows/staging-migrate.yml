@@ -205,6 +205,10 @@ jobs:
     # The binding must be scoped to the staging-migrate-apply environment
     # (required reviewer, main-only deployment branches) so a workflow edited
     # on another branch cannot read it.
+    # Required follow-up (fail-closed deploy gate): migrations create tables
+    # but grant nothing. After the apply, the operator reapplies the full role
+    # plan (`two-bot db roles plan`) and `two-bot db roles verify` must read
+    # 0; deploy-staging refuses any build while findings remain.
     if: github.ref == 'refs/heads/main' && inputs.mode == 'apply'
     needs: [plan, claim]
     environment: staging-migrate-apply
