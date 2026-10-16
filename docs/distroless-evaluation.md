@@ -22,7 +22,10 @@ Bookworm rollback also requires a fresh CISO vulnerability disposition for the
 measured HIGH/CRITICAL tuples: the prior 17-tuple decision expired on
 2026-10-08 and does not carry over. Do not restore exceptions or add
 `.trivyignore.yaml` entries until that disposition is recorded; then encode
-only its approved, scoped, expiring exceptions there. Keep
+only its approved, scoped, expiring exceptions there. In the same PR, update
+both empty-file pins in `scripts/test-supply-chain.py`: the regex asserting
+`vulnerabilities: []` and the active-content equality assertion. Replace them
+with the approved entries and their reviewed evidence. Keep
 `scripts/vulnerability-preflight.py` as a non-accepting tuple/provenance check:
 it must bind the scan to the Bookworm distro and continue to report findings
 as `not-accepted`; do not add exception-acceptance logic to the preflight.
