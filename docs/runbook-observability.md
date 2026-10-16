@@ -99,15 +99,23 @@ claim them as shipped acceptance:
   Logs are enabled unsampled; traces remain disabled to avoid recording
   credential-bearing URLs.
 - The five-minute user-flow synthetic (`synthetic-user-flow` workflow, see
-  [synthetic-user-flow](synthetic-user-flow.md)) probes staging plus a passive
-  production check on the same schedule, and posts one Discord ops-channel
-  alert per failure with the container build revision and the GitHub run link.
-  Production stays passive: it observes and alerts only, and never blocks a
-  deploy. Verify a schedule change or a new alert destination with one forced
-  staging failure (dispatch `force_fail`) before claiming delivery.
-- The shared promotion workflow already has a gated readiness check and
-  rollback behavior. Do not treat this as proof of a gradual traffic rollout
-  or an error-rate-triggered production rollback.
+  [synthetic-user-flow](synthetic-user-flow.md)) defines staging and passive
+  production probes, each with failure alerts. Production remains read-only and
+  never blocks a deploy. The workflow's `force_fail` input exercises staging
+  only; do not claim live schedule or alert delivery until the operator bindings
+  and matching run/artifact evidence have been independently verified.
+- Error-rate detection is installed: `rest_5xx_rate` pages when 5xx exceed 10%
+  of Discord REST requests between keepalive samples (minimum 10 requests),
+  with the rollback evaluation in [Alert: REST 5xx](runbook.md#alert-rest-5xx).
+  What is not yet wired is a canary-stage error-rate gate that fails a
+  promotion stage automatically: a 5xx burst during promotion pages on-call,
+  and the existing per-stage health gates roll back only on their own probe
+  failures.
+- The shared central gradual-promotion action promotes 5-50-100% with
+  per-stage health gates and automatic rollback to the recorded pre-promote
+  version. This repository has no caller wiring to it yet, so do not treat
+  the existing gated readiness check plus manual rollback as proof of a
+  gradual traffic rollout here.
 
 For the full health, metrics, and rollback procedures, see the
 [operations runbook](runbook.md), [metrics reference](metrics.md), and

@@ -276,6 +276,37 @@ Unknown, wrong-method and overlong shapes collapse to `other` with no new
 series. Source: [`metrics.rs`](../crates/core/src/metrics.rs),
 [`executor_metrics.rs`](../crates/discord/src/executor_metrics.rs).
 
+#### Alert: REST 5xx
+
+More than 10% of Discord REST requests between two keepalive samples (minimum
+10 requests in the window) returned 5xx. Unlike 429s, a 5xx burst is never
+healthy backpressure: it is Discord-side failure or a broken request shape
+from a fresh deploy. A counter reset (process restart) skips the window rather
+than firing. `transport` failures (timeouts and cancellations before response
+headers) are not counted here; they surface through job timeout classes.
+
+First response: read the hot route from the `route` label on
+`two_bot_rest_requests_total{route,result="5xx"}` via the authorized
+`/ops/metrics` scrape; confirm whether a deploy or promotion is in progress
+(check the staging workflow result and recent merges — a fresh deploy can
+explain a new hot route). Do not replay uncertain writes: a 5xx leaves the
+effect unknown, so reconcile through the recorded disposition before retrying
+anything the burst may have executed twice.
+
+Evaluate rollback when the burst starts with the deployed revision: compare the
+alert's first-firing window with the staging-rollout evidence (or the gated
+production run) for that SHA. A 5xx share introduced by a promotion stage
+requires a manual rollback decision unless a 5xx-specific per-stage health gate
+is configured and wired to the shared gradual-promotion action. When its
+configured gate fails, the action restores the recorded pre-promote version; a
+manual rollback names the recorded Worker version and container image from the
+failed run's snapshot. A burst on an unchanged revision is a Discord incident
+or a dependency regression, not a rollback.
+
+Escalate when the 5xx share stays above threshold across several windows after
+containment, or when 5xx coincide with 429/transport failures suggesting a
+wider Discord or network incident.
+
 #### Alert: DB pool
 
 The SQLx pool sat at its maximum with zero idle connections for three
