@@ -785,6 +785,26 @@ class ClientSanitizationTests(OfflineTestCase):
         self.assertEqual(client.opener.open.call_count, 3)
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.25, 0.5])
 
+    def test_authenticated_api_backoff_is_clamped_to_the_deadline(self):
+        # Near the deadline the retry sleep must be clamped to the remaining
+        # budget, so the next attempt observes the expired deadline and the
+        # gate reports rollout_timeout, never an unclamped sleep past it.
+        now = [100.0]
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            now[0] += seconds
+
+        client = rollout.Client(ACCOUNT, SENTINEL, deadline=100.125)
+        client.opener.open.side_effect = URLError(SENTINEL)
+        with patch.object(rollout.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(rollout.time, "sleep", side_effect=sleep):
+            self.assert_gate("rollout_timeout", client.api, "/containers/applications")
+        self.assertEqual(sleeps, [0.125])
+        self.assertLess(sleeps[0], rollout.API_TRANSPORT_BACKOFF_SECONDS[0])
+        self.assertEqual(client.opener.open.call_count, 1)
+
     def test_authenticated_http_and_transport_errors_have_fixed_codes(self):
         for error, code in [(HTTPError("https://offline.invalid", 500, SENTINEL, {},
                                       io.BytesIO(SENTINEL.encode())), "api_http_failure"),
@@ -943,8 +963,8 @@ class DeploymentWiringTests(unittest.TestCase):
         # the old-to-new handover still re-posts. Deleting either side must
         # redden this suite.
         self.assertIn("set -euo pipefail", takeover[0])
-        self.assertIn("timeout --signal=TERM --kill-after=10s 240s", takeover[0])
-        self.assertIn("timed out after 240 seconds", takeover[0])
+        self.assertIn("timeout --signal=TERM --kill-after=10s 390s", takeover[0])
+        self.assertIn("timed out after 390 seconds", takeover[0])
         self.assertNotRegex(takeover[0], r"(?m)^\s*(?:if|continue-on-error):")
         self.assertIn("OWNERSHIP_EXPECTED_DEPLOYMENT", takeover[0])
         self.assertIn("receipt.json", takeover[0])
@@ -2060,24 +2080,39 @@ class OrchestrationTests(OfflineTestCase):
         client.opener = Opener()
         return client, timeouts
 
+    def gate_error_at_deadline_offset(self, offset):
+        self.clock.now = 100.0
+        self.clock.sleeps.clear()
+        for path in (self.args.receipt, self.args.output, self.args.deploy_config):
+            Path(path).unlink(missing_ok=True)
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client, timeouts = self.client_with_real_deadline_reads()
+        client.deadline -= offset
+        with self.assertRaises(rollout.GateError) as caught:
+            rollout.verify(self.args, client)
+        return client, timeouts, caught.exception
+
     def test_deadline_aware_reads_cover_deadline_offsets_across_stale_poll(self):
         expiring_reads = set()
-        # Offsets 5..6.5s expire before the pinned rollout is established; those
-        # correctly remain api_transport_failure rather than being called drift.
         offsets = [index / 2 for index in range(27) if index not in range(10, 14)]
         for offset in offsets:
             with self.subTest(offset=offset):
-                self.clock.now = 100.0
-                self.clock.sleeps.clear()
-                for path in (self.args.receipt, self.args.output, self.args.deploy_config):
-                    Path(path).unlink(missing_ok=True)
-                self.prepare_baseline()
-                self.write_deploy_output()
-                client, timeouts = self.client_with_real_deadline_reads()
-                client.deadline -= offset
-                error = self.drift_error(client)
+                client, timeouts, error = self.gate_error_at_deadline_offset(offset)
+                self.assertEqual(str(error), "application_image_drift")
                 self.assertEqual(error.detail, "listing_image=baseline later_rollouts=0")
                 self.assertIn("application_image=stale polls=", client.observation)
+                expiring_reads.update(url for url, timeout in timeouts if timeout <= 2)
+                self.assert_no_evidence()
+                self.assert_no_secret_saved_or_printed()
+        # Offsets 5..6.5s expire before the pinned rollout is established,
+        # so there is no drift candidate yet. The deadline-clamped transport
+        # retry turns those expiring reads into rollout_timeout once the
+        # budget is spent; pin that instead of leaving the band unasserted.
+        for offset in (5.0, 5.5, 6.0, 6.5):
+            with self.subTest(offset=offset):
+                client, timeouts, error = self.gate_error_at_deadline_offset(offset)
+                self.assertEqual(str(error), "rollout_timeout")
                 expiring_reads.update(url for url, timeout in timeouts if timeout <= 2)
                 self.assert_no_evidence()
                 self.assert_no_secret_saved_or_printed()
@@ -2109,6 +2144,27 @@ class OrchestrationTests(OfflineTestCase):
         client.deadline = 100 + 5 * 3
         self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
         self.assertIn("gateway_failure=durable_gateway:checkpoint_load_failed", client.observation)
+        self.assert_no_evidence()
+
+    def test_stale_cap_keeps_rollout_timeout_when_a_gateway_failure_is_named(self):
+        # Past the stale-poll cap, a named gateway failure must keep the
+        # rollout_timeout class the rollback keys on; the cap may only
+        # classify drift when no gateway failure is in the observation.
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        stale = app()
+        stale["configuration"] = {"image": OLD_IMAGE}
+        client.api_routes[APP_PATH] = [[stale]]
+        failure = {"phase": "durable_gateway", "class": "checkpoint_load_failed"}
+        client.request_routes[URL + "/readyz"] = [
+            (503, {"x-two-worker-version": VERSION}, self.readyz_body(failure))]
+        client.deadline = 1000
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertIn("gateway_failure=durable_gateway:checkpoint_load_failed", client.observation)
+        self.assertIn("application_image=stale polls=", client.observation)
+        stale_polls = int(re.search(r"application_image=stale polls=(\d+)", client.observation).group(1))
+        self.assertGreater(stale_polls, rollout.APPLICATION_IMAGE_STALE_POLLS)
         self.assert_no_evidence()
 
     def test_persistent_stale_application_image_fails_as_drift_after_the_tolerance(self):

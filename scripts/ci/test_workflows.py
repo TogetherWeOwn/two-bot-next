@@ -1423,7 +1423,7 @@ class WorkflowTests(unittest.TestCase):
                 ("Singleton is intentionally fenced or uninitialized; explicit staging release required",
                  "Staging singleton fenced", True, 1),
                 ("HTTP 401 Unauthorized", "Staging ownership takeover failed (not a fence refusal)", False, 1),
-                ("", "Staging ownership takeover timed out after 240 seconds", False, 124),
+                ("", "Staging ownership takeover timed out after 390 seconds", False, 124),
             )
             for output, expected, is_fenced, exit_code in cases:
                 with self.subTest(output=output, exit_code=exit_code):
@@ -1436,6 +1436,29 @@ class WorkflowTests(unittest.TestCase):
                     self.assertEqual(proc.returncode, 1, output_text)
                     self.assertIn(expected, output_text)
                     self.assertEqual("release_fence" in output_text, is_fenced)
+
+    def test_staging_takeover_outer_timeout_exceeds_the_client_retry_window(self):
+        # The workflow's `timeout` must never kill the control client inside
+        # its own retry window: a final attempt may start at the window edge
+        # and still spend one GET plus one POST, each bounded by the client's
+        # AbortSignal. Killing it there could terminate it after the POST
+        # committed an epoch and roll back a healthy deploy. Pin both sides:
+        # above window + one in-flight attempt, yet close enough that a true
+        # hang still fails fast instead of fencing staging.
+        steps = self.workflows["deploy-staging.yml"]["jobs"]["deploy"]["steps"]
+        run = next(step for step in steps if step.get("id") == "takeover")["run"]
+        outer = re.search(r"timeout --signal=TERM --kill-after=\d+s (\d+)s", run)
+        self.assertIsNotNone(outer, run)
+        client = (ROOT / "wrangler/scripts/ownership-control.mjs").read_text(encoding="utf-8")
+        window = re.search(r"takeoverWindowMs = (\d+)", client)
+        abort = re.search(r"AbortSignal\.timeout\((\d+)\)", client)
+        self.assertIsNotNone(window)
+        self.assertIsNotNone(abort)
+        outer_ms = int(outer.group(1)) * 1000
+        minimum_ms = int(window.group(1)) + 2 * int(abort.group(1))
+        self.assertGreater(outer_ms, minimum_ms)
+        self.assertLess(outer_ms, minimum_ms + 120_000)
+        self.assertIn(f"timed out after {outer.group(1)} seconds", run)
 
     def test_staging_runs_unconditionally_for_push_and_dispatch(self):
         staging = self.workflows["deploy-staging.yml"]
