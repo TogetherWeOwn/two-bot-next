@@ -929,6 +929,8 @@ class DeploymentWiringTests(unittest.TestCase):
         # the old-to-new handover still re-posts. Deleting either side must
         # redden this suite.
         self.assertIn("set -euo pipefail", takeover[0])
+        self.assertIn("timeout --signal=TERM --kill-after=10s 240s", takeover[0])
+        self.assertIn("timed out after 240 seconds", takeover[0])
         self.assertNotRegex(takeover[0], r"(?m)^\s*(?:if|continue-on-error):")
         self.assertIn("OWNERSHIP_EXPECTED_DEPLOYMENT", takeover[0])
         self.assertIn("receipt.json", takeover[0])
@@ -1108,6 +1110,41 @@ class OrchestrationTests(OfflineTestCase):
                 self.config.write_text(config)
                 self.assert_gate(code, self.prepare_baseline)
         self.assertFalse(Path(self.args.receipt).exists())
+
+    def test_unrelated_application_listing_image_does_not_pass(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        unrelated = app(REPOSITORY + "@sha256:" + "f" * 64)
+        client = verify_client()
+        client.api_routes[APP_PATH] = [[unrelated], [unrelated]]
+        self.assert_gate("application_image_drift", rollout.verify, self.args, client)
+        self.assert_no_evidence()
+
+    def test_unrelated_listing_does_not_mask_gateway_failure_classification(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        unrelated = app(REPOSITORY + "@sha256:" + "f" * 64)
+        client = verify_client()
+        client.api_routes[APP_PATH] = [[unrelated]]
+        failure = {"phase": "durable_gateway", "class": "checkpoint_load_failed"}
+        client.request_routes[URL + "/readyz"] = [
+            (503, {"x-two-worker-version": VERSION}, self.readyz_body(failure))]
+        client.deadline = self.clock.now + 15
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertIn("gateway_failure=durable_gateway:checkpoint_load_failed", client.observation)
+        self.assert_no_evidence()
+
+    def test_stale_application_listing_does_not_reject_exact_healthy_rollout(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        stale = app(OLD_IMAGE)
+        client = verify_client()
+        client.api_routes[APP_PATH] = [[stale], [stale]]
+        rollout.verify(self.args, client)
+        evidence = json.loads(Path(self.args.evidence).read_text())
+        self.assertEqual(evidence["image"], IMAGE)
+        self.assertEqual(evidence["rollout_id"], NEW_ROLLOUT)
+        self.assert_no_secret_saved_or_printed()
 
     def test_success_exact_pinned_evidence_with_post_probe_rechecks(self):
         self.prepare_baseline()
@@ -1819,8 +1856,7 @@ class OrchestrationTests(OfflineTestCase):
         self.write_deploy_output()
         for key, value, code in [("id", "different_application", "application_identity_drift"),
                                  ("durable_objects", {"namespace_id": "different_namespace"},
-                                  "application_identity_drift"),
-                                 ("configuration", {"image": OLD_IMAGE}, "application_image_drift")]:
+                                  "application_identity_drift")]:
             with self.subTest(key=key):
                 client = verify_client()
                 client.deadline = 400  # long enough to exhaust the stale-image tolerance
@@ -1842,8 +1878,9 @@ class OrchestrationTests(OfflineTestCase):
         evidence = json.loads(Path(self.args.evidence).read_text())
         self.assertEqual(evidence["image"], IMAGE)
         self.assertNotIn("active_lag", evidence)
-        # Stale polls never count toward acceptance: two waits, then the fresh pass.
-        self.assertEqual(self.clock.sleeps[:2], [5, 5])
+        # The exact healthy runtime is authoritative even while the listing lags.
+        self.assertEqual(self.clock.sleeps, [])
+        self.assertTrue(evidence["application_listing_lag"])
         self.assert_no_secret_saved_or_printed()
 
     def test_listing_lag_beyond_the_former_twelve_poll_cap_still_passes(self):
@@ -1860,7 +1897,8 @@ class OrchestrationTests(OfflineTestCase):
         rollout.verify(self.args, client)
         evidence = json.loads(Path(self.args.evidence).read_text())
         self.assertEqual(evidence["image"], IMAGE)
-        self.assertEqual(self.clock.sleeps[:20], [5] * 20)
+        self.assertEqual(self.clock.sleeps, [])
+        self.assertTrue(evidence["application_listing_lag"])
         self.assert_no_secret_saved_or_printed()
 
     def test_stale_application_image_is_reported_and_never_accepted(self):
@@ -1971,50 +2009,22 @@ class OrchestrationTests(OfflineTestCase):
                             test_case.readyz_body(gateway_failure), 503,
                             {"x-two-worker-version": VERSION},
                         )
-                    status, headers, body = ready_response()
-                    return Response(body, status, headers)
+                    status, headers, _ = ready_response()
+                    body = test_case.readyz_body(
+                        None, components=[["process", "ready"], ["gateway", "down"]])
+                    return Response(body, 503, headers)
                 raise AssertionError(f"unexpected runtime URL: {url}")
 
         client = rollout.Client(ACCOUNT, SENTINEL, deadline=clock.now + 300)
         client.opener = Opener()
         return client, timeouts
 
-    def test_deadline_transport_timeout_during_read_keeps_stale_listing_drift_detail(self):
-        self.prepare_baseline()
-        self.write_deploy_output()
-        client, timeouts = self.client_with_real_deadline_reads()
-        error = self.drift_error(client)
-        self.assertEqual(error.detail, "listing_image=baseline later_rollouts=0")
-        self.assertIn("application_image=stale polls=", client.observation)
-        self.assertTrue(any(url == client.base + APP_PATH and timeout <= 2 for url, timeout in timeouts))
-        self.assert_no_evidence()
-        self.assert_no_secret_saved_or_printed()
-
-    def test_deadline_transport_timeout_keeps_gateway_failure_rollback_class(self):
-        self.prepare_baseline()
-        self.write_deploy_output()
-        failure = {"phase": "durable_gateway", "class": "checkpoint_load_failed"}
-        client, _ = self.client_with_real_deadline_reads(failure)
-        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
-        self.assertIn("gateway_failure=durable_gateway:checkpoint_load_failed", client.observation)
-        self.assert_no_evidence()
-        self.assert_no_secret_saved_or_printed()
-
-    def test_deadline_expiring_during_warm_read_keeps_stale_listing_drift(self):
-        self.prepare_baseline()
-        self.write_deploy_output()
-        client, timeouts = self.client_with_real_deadline_reads()
-        client.deadline += 4  # let the final stale poll reach its warm health probe
-        error = self.drift_error(client)
-        self.assertEqual(error.detail, "listing_image=baseline later_rollouts=0")
-        self.assertTrue(any(url == URL + "/health" and timeout <= 2 for url, timeout in timeouts))
-        self.assertIn("application_image=stale polls=", client.observation)
-        self.assert_no_evidence()
-        self.assert_no_secret_saved_or_printed()
-
     def test_deadline_aware_reads_cover_deadline_offsets_across_stale_poll(self):
         expiring_reads = set()
-        for offset in [index / 2 for index in range(27)]:
+        # Offsets 5..6.5s expire before the pinned rollout is established; those
+        # correctly remain api_transport_failure rather than being called drift.
+        offsets = [index / 2 for index in range(27) if index not in range(10, 14)]
+        for offset in offsets:
             with self.subTest(offset=offset):
                 self.clock.now = 100.0
                 self.clock.sleeps.clear()
@@ -2034,6 +2044,16 @@ class OrchestrationTests(OfflineTestCase):
             client.base + APP_PATH, client.base + DETAIL_PATH,
             URL + "/health", URL + "/readyz",
         } <= expiring_reads)
+
+    def test_deadline_transport_timeout_keeps_gateway_failure_rollback_class(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        failure = {"phase": "durable_gateway", "class": "checkpoint_load_failed"}
+        client, _ = self.client_with_real_deadline_reads(failure)
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assertIn("gateway_failure=durable_gateway:checkpoint_load_failed", client.observation)
+        self.assert_no_evidence()
+        self.assert_no_secret_saved_or_printed()
 
     def test_stale_listing_at_the_deadline_keeps_rollout_timeout_when_a_gateway_failure_is_named(self):
         self.prepare_baseline()
@@ -2058,11 +2078,21 @@ class OrchestrationTests(OfflineTestCase):
         stale["configuration"] = {"image": OLD_IMAGE}
         client.api_routes[APP_PATH] = [[stale]]
         client.deadline = 1000
+        self.make_unready(client)
         self.assert_gate("application_image_drift", rollout.verify, self.args, client)
-        self.assertEqual(client.calls.count(("api", APP_PATH)), rollout.APPLICATION_IMAGE_STALE_POLLS + 1)
+        self.assertGreater(client.calls.count(("api", APP_PATH)), rollout.APPLICATION_IMAGE_STALE_POLLS)
         self.assert_no_evidence()
 
+    def make_unready(self, client):
+        _, headers, _ = ready_response()
+        client.request_routes[URL + "/readyz"] = [
+            (503, headers, self.readyz_body(None, components=[["process", "ready"], ["gateway", "down"]]))]
+
     def drift_error(self, client):
+        # Listing drift is an error only when the exact deployed build is not
+        # actually ready; a healthy exact build is accepted despite stale listing.
+        if isinstance(client, FakeClient):
+            self.make_unready(client)
         with self.assertRaises(rollout.GateError) as caught:
             rollout.verify(self.args, client)
         self.assertEqual(str(caught.exception), "application_image_drift")
@@ -2113,7 +2143,7 @@ class OrchestrationTests(OfflineTestCase):
         client.api_routes[APP_PATH] = [[app()], [app(OLD_IMAGE)]]
         error = self.drift_error(client)
         self.assertEqual(error.detail, "listing_image=baseline later_rollouts=0")
-        self.assertIn("application_image=final_mismatch", client.observation)
+        self.assertIn("application_image=stale polls=1", client.observation)
 
     def test_image_drift_detail_failure_never_masks_the_gate_error(self):
         self.prepare_baseline()
@@ -2132,6 +2162,7 @@ class OrchestrationTests(OfflineTestCase):
         client = verify_client()
         client.api_routes[APP_PATH] = [[app(OLD_IMAGE)]]
         client.deadline = 1000
+        self.make_unready(client)
         self.stdout.seek(0)
         self.stdout.truncate()
         with patch.object(sys, "argv", argv), patch.object(rollout, "Client", return_value=client):
@@ -2140,22 +2171,21 @@ class OrchestrationTests(OfflineTestCase):
         self.assertEqual(self.stdout.getvalue().splitlines(), [
             "staging rollout gate failed: application_image_drift",
             "staging rollout diagnostic: listing_image=baseline later_rollouts=0",
-            f"last observation before failure: rollout=completed instances=active:1,healthy:1,failed:0,"
-            f"starting:0,scheduling:0 application_image=stale polls={polls}"])
+            f"last observation before failure: rollout=converged readyz=503 "
+            f"components=process:ready,gateway:down identity=match application_image=stale polls={polls}"])
         self.assert_no_secret_saved_or_printed()
 
-    def test_final_application_id_namespace_and_image_are_rechecked(self):
+    def test_final_application_id_and_namespace_are_rechecked(self):
         self.prepare_baseline()
         self.write_deploy_output()
         for key, value in [("id", "different_application"),
-                           ("durable_objects", {"namespace_id": "different_namespace"}),
-                           ("configuration", {"image": OLD_IMAGE})]:
+                           ("durable_objects", {"namespace_id": "different_namespace"})]:
             with self.subTest(key=key):
                 client = verify_client()
                 changed = app()
                 changed[key] = value
                 client.api_routes[APP_PATH] = [[app()], [changed]]
-                self.assert_gate("application_image_drift", rollout.verify, self.args, client)
+                self.assert_gate("application_identity_drift", rollout.verify, self.args, client)
                 self.assertIn(("request", URL + "/readyz"), client.calls)
                 self.assertEqual(client.calls.count(("api", APP_PATH)), 2)
                 self.assert_no_evidence()

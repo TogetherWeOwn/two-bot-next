@@ -32,15 +32,16 @@ USER_AGENT = "two-bot-next-staging-rollout/1.0"
 ACTIVE_LAG_CONFIRMATIONS = 2
 # Polls tolerated while a completed rollout's target image is not yet reflected
 # by the application listing. The listing is read separately from the rollout
-# record and can trail it right after a deploy; a persistent mismatch still
-# fails closed as `application_image_drift`. A poll cycle runs about 11s in CI
-# (5s sleep plus the control-plane reads), so 24 polls is roughly 4.5 minutes.
-# Stale polls only count once the rollout completes while the 300s verify
-# deadline runs from the start, so the deadline usually ends a mismatch that
-# never clears before this cap does; verify reports that as the same drift
-# (see `IMAGE_DRIFT_DIAGNOSTIC_SECONDS`). Twelve (about 2.5 minutes) sat in the
-# middle of the observed lag: on 10-05..10-07 completed verify steps ran up to
-# 192s while eight runs with a healthy, exact-build container failed at 129-186s.
+# record and can trail it right after a deploy. A mismatch is accepted only when
+# the pinned rollout plus exact-build /readyz and /health probes prove the new
+# build is serving; otherwise persistent staleness fails as drift. A poll cycle
+# runs about 11s in CI (5s sleep plus the control-plane reads), so 24 polls is
+# roughly 4.5 minutes. Stale polls only count once the rollout completes while
+# the 300s verify deadline runs from the start, so the deadline usually ends a
+# mismatch that never clears before this cap does (see
+# `IMAGE_DRIFT_DIAGNOSTIC_SECONDS`). Twelve (about 2.5 minutes) sat in the middle
+# of the observed lag: on 10-05..10-07 completed verify steps ran up to 192s while
+# eight runs with a healthy, exact-build container failed at 129-186s.
 APPLICATION_IMAGE_STALE_POLLS = 24
 # Extra time after the verify deadline for the control-plane read behind the
 # drift diagnostic, including when an in-flight poll read reaches the deadline.
@@ -731,6 +732,7 @@ def verify(args, client):
     while time.monotonic() < client.deadline:
         probed = False
         passed = False
+        stale = False
         app = deadline_aware_read(
             client, lambda: application(client), app, row, image, drift_candidate, verification_started)
         require(app["id"] == baseline["application_id"]
@@ -754,25 +756,33 @@ def verify(args, client):
                 deadline_aware_read(
                     client, lambda: active_worker(client, version), app, row, image,
                     drift_candidate, verification_started)
-            stale = (complete or lag) and mapping(app.get("configuration")).get("image") != image
+            listed_image = mapping(app.get("configuration")).get("image")
+            previous_image = mapping(row.get("current_configuration")).get("image") if complete or lag else None
+            stale = (complete or lag) and listed_image != image
             drift_candidate = stale
             if stale:
                 image_stale += 1
                 client.observation += f" application_image=stale polls={image_stale}"
-                if image_stale > APPLICATION_IMAGE_STALE_POLLS:
-                    raise GateError("application_image_drift", image_drift_detail(client, app, row, image))
             else:
                 image_stale = 0
-            if (complete or lag) and not stale:
+            # The application listing is eventually consistent and can remain on
+            # its baseline image after the rollout and serving process converge.
+            # The pinned rollout plus exact-build /readyz and /health probes are
+            # the acceptance evidence; keep polling those while the listing lags.
+            if complete or lag:
                 active_worker(client, version)
                 status, headers, body = client.request(url + "/readyz")
                 probed = True
                 observed = "rollout=active_lag " if lag else "rollout=converged "
                 client.observation = observed + runtime_observation(
                     status, headers, body, version, baseline["revision"], baseline["build_id"])
+                if stale:
+                    client.observation += f" application_image=stale polls={image_stale}"
                 if runtime_ready(status, headers, body, version, baseline["revision"], baseline["build_id"]):
                     health, health_headers, _ = client.request(url + "/health")
                     client.observation = f"{observed}readyz=200 health={health}"
+                    if stale:
+                        client.observation += f" application_image=stale polls={image_stale}"
                     if health == 200 and health_headers.get("x-two-worker-version") == version:
                         # Re-read control plane after the runtime probes; neither
                         # Worker activation nor container rollout is transactional.
@@ -787,18 +797,22 @@ def verify(args, client):
                                 or active_lag(final, image, pinned["target_version"]),
                                 "rollout_not_converged")
                         final_app = application(client)
-                        if not (final_app["id"] == app["id"]
-                                and final_app["durable_objects"]["namespace_id"] == baseline["namespace_id"]
-                                and mapping(final_app.get("configuration")).get("image") == image):
-                            client.observation += " application_image=final_mismatch"
+                        require(final_app["id"] == app["id"]
+                                and final_app["durable_objects"]["namespace_id"] == baseline["namespace_id"],
+                                "application_identity_drift")
+                        final_image = mapping(final_app.get("configuration")).get("image")
+                        if final_image != image and final_image != previous_image:
                             raise GateError("application_image_drift",
-                                            image_drift_detail(client, final_app, row, image))
+                                            image_drift_detail(client, final_app, final, image))
+                        listing_lag = final_image != image
                         if complete or lag_streak + 1 >= ACTIVE_LAG_CONFIRMATIONS:
                             evidence = {"worker_version": version, "application_id": app["id"],
                                         "rollout_id": pinned["id"],
                                         "target_version": pinned["target_version"],
                                         "image": image, "revision": baseline["revision"],
                                         "build_id": baseline["build_id"], "readyz": 200, "health": 200}
+                            if listing_lag:
+                                evidence["application_listing_lag"] = True
                             if lag:
                                 evidence["active_lag"] = True
                             save(args.evidence, evidence)
@@ -828,6 +842,9 @@ def verify(args, client):
                         client.zero_instance_last = diagnostic
                 if failure and "gateway_failure=" not in client.observation:
                     client.observation += " gateway_failure=" + failure
+        if (stale and image_stale > APPLICATION_IMAGE_STALE_POLLS
+                and "gateway_failure=" not in (client.observation or "")):
+            raise GateError("application_image_drift", image_drift_detail(client, app, row, image))
         if not passed:
             lag_streak = 0
         time.sleep(max(0, min(5, client.deadline - time.monotonic())))
