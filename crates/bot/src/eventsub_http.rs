@@ -343,15 +343,10 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             refuse(state, StatusCode::BAD_REQUEST, "malformed", false, id)
         }
         Err(e) => {
+            let _ = e;
             two_bot_core::metrics::global().eventsub_classified("other");
             // A future classify error may be transient. Keep it retryable
             // rather than acknowledging it as a permanent delivery outcome.
-            tracing::warn!(
-                event = "eventsub_receiver",
-                status = 503,
-                error_class = %e,
-                "classification failed"
-            );
             refuse(
                 state,
                 StatusCode::SERVICE_UNAVAILABLE,

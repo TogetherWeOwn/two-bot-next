@@ -196,7 +196,7 @@ direct `containerFetch`, because the Worker answers those shapes first):
 | 413 | `payload_too_large` | false | Body over the 64 KiB cap, checked before verification. Genuine `stream.online` bodies are well under 2 KiB; treat 413 as a malformed or abusive sender. Source: `crates/bot/src/eventsub_http.rs:36,238-247`, `crates/core/src/twitch_eventsub.rs:49-51`. |
 | 415 | `unsupported_media_type` | false | Content type is not exactly `application/json` or `application/json; charset=utf-8` (case-insensitive); anything else, including another encoding, is refused. Source: `crates/bot/src/eventsub_http.rs:204-222`. |
 | 503 | `busy` / `upstream_timeout` | true | All 32 permits held (`busy`), or the whole request past the 20 s budget (`upstream_timeout`). Both mean the receiver is saturated or stalled, not that the delivery was bad; the sender retries. Check container saturation, not the secret. Source: `crates/bot/src/eventsub_http.rs:37-39,148-171`. |
-| 503 | `unavailable` | true | A future/unrecognized post-verification classification error; the receiver fails closed so Twitch retries and counts it as metric `kind="other"`. This is distinct from Worker-ingress `unavailable` above. Inspect `classification failed` and its error class; do not assume saturation or a Worker relay failure. Source: `crates/bot/src/eventsub_http.rs:345-362`. |
+| 503 | `unavailable` | true | A future/unrecognized post-verification classification error; the receiver fails closed so Twitch retries and counts it as metric `kind="other"`. This is distinct from Worker-ingress `unavailable` above. Inspect the `eventsub delivery refused` warning and the `two_bot_eventsub_classified_total{kind="other"}` counter; the refusal log uses the bounded error class `unavailable`, so it does not identify a specific future variant. Do not assume saturation or a Worker relay failure. Source: `crates/bot/src/eventsub_http.rs:345-359`. |
 
 Verified deliveries that need no operator action answer `200`:
 
@@ -225,10 +225,9 @@ Log lines to expect (scalar fields only):
 - `eventsub delivery refused` (warn: `status`, `error_class`)
 - `challenge answered`, `notification acknowledged`, `revocation acknowledged`,
   `delivery ignored` (info: `status = 200`)
-- `classification failed` (warn: `status = 503`, `error_class` is the
-  classification error text), followed by `eventsub delivery refused` (warn:
-  `status = 503`, `error_class = "unavailable"`) for unknown/future
-  classification errors
+- `eventsub delivery refused` (warn: `status`, bounded `error_class`); for
+  unknown/future classification errors expect `status = 503` and
+  `error_class = "unavailable"`, plus the `kind="other"` metric increment
 
 Source: `crates/bot/src/eventsub_http.rs:117-136,270-362`.
 
