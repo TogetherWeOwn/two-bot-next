@@ -16,9 +16,11 @@
 //! - loop pins: a flapping gateway reconnects on the bounded schedule with
 //!   timer-resolution-bounded gaps, and an always-failing gateway stops after
 //!   exactly the budgeted attempts.
-//! - shutdown pins: a pending shutdown ends the episode before any attempt,
-//!   and a SIGTERM during a backoff sleep preempts the sleep instead of
-//!   waiting it out.
+//! - shutdown pins: a pending shutdown ends the episode before any attempt, a
+//!   SIGTERM during a backoff sleep preempts the sleep instead of waiting it
+//!   out, a SIGTERM during a hanging connect preempts the connect without
+//!   waiting for it, and a shutdown that is already ready never starts an
+//!   attempt (the connector is built lazily inside the raced branch).
 //! - draining pins: Draining published mid-episode (during the connect await
 //!   or the backoff sleep) is never overwritten by the Connected/Armed
 //!   publishes and ends the episode with no further attempts.
@@ -536,6 +538,149 @@ async fn shutdown_during_backoff_sleep_ends_episode_without_waiting_out_the_dela
         GatewayState::Armed,
         "shutdown leaves the backoff state for its owner to drain"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_during_hanging_connect_ends_episode_without_waiting_for_it() {
+    // A hanging connect must not block shutdown: the connect is raced against
+    // shutdown (biased, shutdown first), so a SIGTERM mid-connect ends the
+    // episode promptly instead of waiting for the connector. A plain
+    // `connect(attempt).await` hangs here and fails the prompt-finish assert.
+    // The invocation counter lives outside the returned future so the test
+    // also proves the hanging attempt actually started (exactly one).
+    let policy = tiny_policy();
+    let state = Arc::new(RwLock::new(GatewayState::Connected));
+    let invocations = Arc::new(std::sync::Mutex::new(0_u32));
+    let counting = Arc::clone(&invocations);
+    let shutdown_signal = Arc::new(tokio::sync::Notify::new());
+    let shutdown_waiter = Arc::clone(&shutdown_signal);
+    let supervised = tokio::spawn(run_supervised(
+        Arc::clone(&state),
+        policy,
+        move |_| {
+            *counting.lock().expect("invocation counter") += 1;
+            Box::new(std::future::pending()) as Box<dyn Future<Output = AttemptOutcome> + Send>
+        },
+        async move {
+            shutdown_waiter.notified().await;
+        },
+    ));
+    for _ in 0..100 {
+        if *invocations.lock().expect("invocation counter") == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        *invocations.lock().expect("invocation counter"),
+        1,
+        "supervisor must start exactly one hanging attempt before shutdown fires"
+    );
+    // Let the supervisor enter the connect-vs-shutdown race before firing.
+    for _ in 0..10 {
+        if supervised.is_finished() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !supervised.is_finished(),
+        "a hanging connect must not finish on its own"
+    );
+    let before = tokio::time::Instant::now();
+    shutdown_signal.notify_one();
+    for _ in 0..100 {
+        if supervised.is_finished() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        supervised.is_finished(),
+        "shutdown during a hanging connect must end the episode promptly"
+    );
+    assert_eq!(
+        supervised.await.expect("supervisor task"),
+        SupervisedExit::ShutdownRequested
+    );
+    assert_eq!(
+        *invocations.lock().expect("invocation counter"),
+        1,
+        "shutdown must win without starting a spurious second attempt"
+    );
+    let elapsed = tokio::time::Instant::now() - before;
+    assert_eq!(
+        elapsed,
+        Duration::ZERO,
+        "preempting a hanging connect must not advance the paused clock, got {elapsed:?}"
+    );
+    // No outcome was ever reported, so no publish ran: the state is untouched.
+    assert_eq!(*state.read().await, GatewayState::Connected);
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_ready_before_connect_starts_no_attempt() {
+    // The connector is built lazily inside the raced branch: a shutdown that
+    // is already ready when the connect race is entered never invokes the
+    // connector. Building `connect(attempt)` eagerly while entering `select!`
+    // constructs (and drops unpolled) one spurious attempt and fails the
+    // zero-invocation assert below.
+    let policy = tiny_policy();
+    let state = Arc::new(RwLock::new(GatewayState::Connected));
+    let invocations = Arc::new(std::sync::Mutex::new(0_u32));
+    let counting = Arc::clone(&invocations);
+    let shutdown_signal = Arc::new(tokio::sync::Notify::new());
+    let shutdown_waiter = Arc::clone(&shutdown_signal);
+    // Hold the state write lock so the supervisor blocks on its Draining
+    // check after the pre-attempt shutdown poll: firing shutdown while it is
+    // blocked guarantees shutdown is already ready when the connect race is
+    // entered, with no timing race either way.
+    let guard = state.write().await;
+    let supervised = tokio::spawn(run_supervised(
+        Arc::clone(&state),
+        policy,
+        move |_| {
+            *counting.lock().expect("invocation counter") += 1;
+            Box::new(std::future::pending()) as Box<dyn Future<Output = AttemptOutcome> + Send>
+        },
+        async move {
+            shutdown_waiter.notified().await;
+        },
+    ));
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !supervised.is_finished(),
+        "supervisor must block on the held state lock"
+    );
+    assert_eq!(
+        *invocations.lock().expect("invocation counter"),
+        0,
+        "no attempt may start while the supervisor is still on its Draining check"
+    );
+    shutdown_signal.notify_one();
+    drop(guard);
+    for _ in 0..100 {
+        if supervised.is_finished() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        supervised.is_finished(),
+        "a ready shutdown must end the episode without starting an attempt"
+    );
+    assert_eq!(
+        supervised.await.expect("supervisor task"),
+        SupervisedExit::ShutdownRequested
+    );
+    assert_eq!(
+        *invocations.lock().expect("invocation counter"),
+        0,
+        "a shutdown that wins the connect race must never invoke the connector"
+    );
+    assert_eq!(*state.read().await, GatewayState::Connected);
 }
 
 /// Connector that stands in for the outside drain owner: it publishes

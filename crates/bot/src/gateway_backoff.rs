@@ -182,10 +182,17 @@ where
         if *state.read().await == GatewayState::Draining {
             return SupervisedExit::ShutdownRequested;
         }
+        // The connect future is built lazily inside the raced branch: calling
+        // `connect(attempt)` while building the `select!` futures would
+        // construct (and drop unpolled) an attempt even when shutdown wins
+        // the race. Deferring the call into the branch means a shutdown that
+        // is already ready never starts an attempt.
         let outcome = tokio::select! {
             biased;
             () = &mut shutdown => return SupervisedExit::ShutdownRequested,
-            outcome = Box::into_pin(connect(attempt)) => outcome,
+            outcome = async {
+                Box::into_pin(connect(attempt)).await
+            } => outcome,
         };
         match outcome {
             AttemptOutcome::Connected => {
