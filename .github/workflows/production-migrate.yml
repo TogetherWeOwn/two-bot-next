@@ -195,6 +195,11 @@ jobs:
     # The binding must be scoped to the production-migrate-apply environment
     # (required reviewer, main-only deployment branches) so a workflow edited
     # on another branch cannot read it.
+    # Required follow-up (fail-closed deploy gate): migrations create tables
+    # but grant nothing. After the apply, the operator reapplies the full role
+    # plan (`two-bot db roles plan`) and `two-bot db roles verify` must read
+    # 0; deploy-production refuses any new build while findings remain (the
+    # 2026-10-16 crash-loop: migrations 0424-0441 without the role reapply).
     if: github.ref == 'refs/heads/main' && inputs.mode == 'apply'
     needs: [plan, claim]
     environment: production-migrate-apply
