@@ -1364,7 +1364,9 @@ class WorkflowTests(unittest.TestCase):
             "--locked -- channel_moderation --include-ignored --test-threads=1",
             step["run"],
         )
-        self.assertIn('[ ! -s "$RUNNER_TEMP/lcov.info" ]', step["run"])
+        self.assertIn('report_path="$GITHUB_WORKSPACE/lcov.info"', step["run"])
+        self.assertIn('[ ! -s "$report_path" ]', step["run"])
+        self.assertIn('--lcov --output-path "$report_path"', step["run"])
         # Guarded suites are measured per suite with their accepted URL and
         # merged: --no-report per run, one final report. Selected ignored runs
         # are serial and never execute the reference-docs regen.

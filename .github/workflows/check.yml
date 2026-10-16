@@ -701,7 +701,8 @@ jobs:
           done
           echo "b3f68e625481fed9b16444174f3fa5ebcdbde4a1878803a35eabe2dcefcdc41a  $archive" | sha256sum --check -
           tar -xzf "$archive" -C "$RUNNER_TEMP" cargo-llvm-cov
-          rm -f "$RUNNER_TEMP/lcov.info"
+          report_path="$GITHUB_WORKSPACE/lcov.info"
+          rm -f "$report_path"
           COV="$RUNNER_TEMP/cargo-llvm-cov"
           cov_run() {
             if ! "$@"; then
@@ -739,12 +740,12 @@ jobs:
           cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test reengagement_list_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
           cov_run "$COV" llvm-cov --no-report -p two-bot-core --features db --locked --test member_moderation_db -- --ignored --test-threads=1 --skip regenerate_reference_docs
           # Merge every collected profile into the single LCOV report the gate reads.
-          cov_run "$COV" llvm-cov report --lcov --output-path "$RUNNER_TEMP/lcov.info"
-          if [ ! -s "$RUNNER_TEMP/lcov.info" ]; then
+          cov_run "$COV" llvm-cov report --lcov --output-path "$report_path"
+          if [ ! -s "$report_path" ]; then
             echo "::error::patch coverage measurement produced no lcov report"
             exit 1
           fi
-          python3 scripts/ci/check-patch-coverage.py --lcov "$RUNNER_TEMP/lcov.info" \
+          python3 scripts/ci/check-patch-coverage.py --lcov "$report_path" \
             --base-ref "$QUALITY_BASE" --head-ref "$QUALITY_HEAD"
   # Required nextest lane (SDLC 2.3 CI speed pilot, promoted): the workspace
   # lib/bins scope under cargo-nextest (one retry, JUnit, flake ledger) via
