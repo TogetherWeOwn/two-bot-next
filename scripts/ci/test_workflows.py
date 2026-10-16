@@ -1360,6 +1360,37 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("--features two-bot-core/db", step["run"])
         self.assertIn("--lib --bins --tests", step["run"])
         self.assertIn('[ ! -s "$RUNNER_TEMP/lcov.info" ]', step["run"])
+        # Guarded suites are measured per suite with their accepted URL and
+        # merged: --no-report per run, one final report. Ignored runs are
+        # serial and never execute the reference-docs regen.
+        self.assertIn("--no-report", step["run"])
+        self.assertIn("llvm-cov report --lcov", step["run"])
+        # Non-ignored tests stay parallel; only the ignored sweep is serial.
+        self.assertIn("-- --ignored --test-threads=1", step["run"])
+        self.assertIn("--test-threads=1", step["run"])
+        self.assertIn("--skip regenerate_reference_docs", step["run"])
+        self.assertIn(
+            "TWO_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test",
+            step["run"],
+        )
+        self.assertIn(
+            "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/agent_test",
+            step["run"],
+        )
+        self.assertIn("MEMBER_TESTDB=agent-testdb", step["run"])
+        for target in (
+            "channel_moderation_runtime",
+            "internal_channel_moderation",
+            "feeds_store",
+            "legacy_verify_db",
+            "staging_migrate_db",
+            "internal_events",
+            "raid_list_db",
+            "reengagement_list_db",
+            "member_moderation_db",
+        ):
+            with self.subTest(target=target):
+                self.assertIn(target, step["run"])
         self.assertEqual(
             step["env"]["TWO_TEST_DATABASE_URL"],
             "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",

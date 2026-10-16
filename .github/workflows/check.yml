@@ -702,12 +702,44 @@ jobs:
           echo "b3f68e625481fed9b16444174f3fa5ebcdbde4a1878803a35eabe2dcefcdc41a  $archive" | sha256sum --check -
           tar -xzf "$archive" -C "$RUNNER_TEMP" cargo-llvm-cov
           rm -f "$RUNNER_TEMP/lcov.info"
-          if ! "$RUNNER_TEMP/cargo-llvm-cov" llvm-cov --workspace --lib --bins --tests \
+          COV="$RUNNER_TEMP/cargo-llvm-cov"
+          cov_run() {
+            if ! "$@"; then
+              echo "::error::patch coverage measurement failed to build or report"
+              exit 1
+            fi
+          }
+          # Main sweep under the bootstrap URL: non-ignored tests first at
+          # full parallelism, then ignored tests serially. The ignored stores
+          # share tables and locks, so parallel runs race and
+          # --ignore-run-fail would then drop their coverage silently.
+          # The reference-docs regen never runs in CI: it rewrites committed docs.
+          cov_run "$COV" llvm-cov --workspace --lib --bins --tests \
+            --features two-bot-core/db --locked --ignore-run-fail --no-report
+          cov_run "$COV" llvm-cov --workspace --lib --bins --tests \
             --features two-bot-core/db --locked --ignore-run-fail \
-            --lcov --output-path "$RUNNER_TEMP/lcov.info" -- --include-ignored; then
-            echo "::error::patch coverage measurement failed to build or report"
-            exit 1
-          fi
+            --no-report -- --ignored --test-threads=1 --skip regenerate_reference_docs
+          # Guarded suites accept only the exact agent_test URL (no password
+          # segment). Under the bootstrap URL above their guards panic, so
+          # re-run them here with their accepted URL; profiles merge below.
+          # Flags mirror the corresponding ignored-db lane steps.
+          export TWO_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test
+          cov_run "$COV" llvm-cov --no-report -p two-bot-core --features db --locked channel_moderation -- --include-ignored --test-threads=1 --skip regenerate_reference_docs
+          cov_run env -u PGPASSWORD -u PGPASSFILE -u PGOPTIONS "$COV" llvm-cov --no-report -p two-bot-discord --features db --locked --test channel_moderation_runtime -- --include-ignored --test-threads=1 --skip regenerate_reference_docs
+          cov_run "$COV" llvm-cov --no-report -p two-bot-discord --features db --locked --test internal_channel_moderation -- --include-ignored --test-threads=1 --skip regenerate_reference_docs
+          cov_run "$COV" llvm-cov --no-report -p two-bot-core --features db --test feeds_store --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
+          cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test legacy_verify_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
+          cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test staging_migrate_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
+          # Suites pinned to the agent_test database under the empty-password
+          # URL form, plus the member-moderation suite behind MEMBER_TESTDB.
+          export TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/agent_test
+          export MEMBER_TESTDB=agent-testdb
+          cov_run "$COV" llvm-cov --no-report -p two-bot-discord --features db --locked --test internal_events -- --include-ignored --test-threads=1 --skip regenerate_reference_docs
+          cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test raid_list_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
+          cov_run "$COV" llvm-cov --no-report -p two-bot-cutover --test reengagement_list_db --locked -- --ignored --test-threads=1 --skip regenerate_reference_docs
+          cov_run "$COV" llvm-cov --no-report -p two-bot-core --features db --locked --test member_moderation_db -- --ignored --test-threads=1 --skip regenerate_reference_docs
+          # Merge every collected profile into the single LCOV report the gate reads.
+          cov_run "$COV" llvm-cov report --lcov --output-path "$RUNNER_TEMP/lcov.info"
           if [ ! -s "$RUNNER_TEMP/lcov.info" ]; then
             echo "::error::patch coverage measurement produced no lcov report"
             exit 1

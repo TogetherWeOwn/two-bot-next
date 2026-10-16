@@ -10,6 +10,16 @@ existing disposable Postgres service, rather than the lint-only `check` lane.
   `scripts/ci/check-patch-coverage.py` requires 80% line coverage over the
   lines the PR adds. Measurement uses the `rust-tests` lane's disposable
   Postgres service and test database so ignored database-backed tests can run.
+  Non-ignored tests run at full parallelism; ignored tests run serially
+  (`--test-threads=1`): the ignored stores share tables and locks, so
+  parallel runs race. The reference-docs regen is skipped: it rewrites
+  committed docs and must never run in CI. Suites whose
+  guards accept only the `agent_test` database are re-measured with their
+  accepted URL (`cargo llvm-cov --no-report` per suite, merged with a final
+  `cargo llvm-cov report --lcov`): the channel-moderation, feeds-store,
+  legacy-verify and staging-migrate suites under the exact `agent_test` URL,
+  the internal-events, raid-list and reengagement-list suites under the
+  empty-password form, and member-moderation behind `MEMBER_TESTDB`.
   Shortfalls and missing or empty reports fail the PR. The step runs after the
   ordinary rust-tests steps and uses `always()` so their failures do not suppress
   coverage output or get hidden by a coverage shortfall. Measurement also uses

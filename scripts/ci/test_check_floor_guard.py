@@ -609,6 +609,25 @@ class ThresholdTests(unittest.TestCase):
         head = base.replace(REAL_PATCH_ROW, MOVED_PATCH_ROW)
         self.assertEqual(gate.threshold_violations(base, head), [])
 
+    def test_checked_by_patch_coverage_rejects_move_to_unapproved_lane(self):
+        base = ENFORCED_BASE.replace(PATCH_ROW, REAL_PATCH_ROW)
+        head = base.replace(
+            REAL_PATCH_ROW,
+            REAL_PATCH_ROW.replace("`check` lane", "`worker` lane"),
+        )
+        errors = gate.threshold_violations(base, head)
+        self.assertTrue(any("Checked-by scope narrowed" in e for e in errors), errors)
+
+    def test_checked_by_patch_coverage_rejects_move_from_unapproved_lane(self):
+        worker_row = REAL_PATCH_ROW.replace("`check` lane", "`worker` lane")
+        base = ENFORCED_BASE.replace(PATCH_ROW, worker_row)
+        head = base.replace(
+            worker_row,
+            worker_row.replace("`worker` lane", "`rust-tests` lane"),
+        )
+        errors = gate.threshold_violations(base, head)
+        self.assertTrue(any("Checked-by scope narrowed" in e for e in errors), errors)
+
     def test_checked_by_real_row_rejects_unapproved_lane_migration(self):
         base = ENFORCED_BASE.replace(LINT_ROW, REAL_LINT_ROW) + REAL_DEPENDENCIES_ROW
         head = base.replace("`cargo-deny check all`, `check` lane",
