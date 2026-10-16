@@ -13,7 +13,7 @@ that, and they must agree on the lane's inputs:
   required lanes gate on. Every behavioral nextest input must select `rust`
   here, or `ci-ok` accepts a skip on a PR the lane should have gated.
 
-Image-only inputs (`Dockerfile*`, `.dockerignore`) are the deliberate
+Image-only inputs (`Dockerfile`, `.dockerignore`) are the deliberate
 exception: they correctly skip the test lane (the container and supply
 lanes cover them) while the advisory filter stays conservative.
 """
@@ -75,7 +75,6 @@ JOB_INPUT_RUST_CONTENT = (
 # required test lane skips image-only PRs instead of burning a compile.
 IMAGE_ONLY_INPUTS = (
     "Dockerfile",
-    "Dockerfile.distroless",
     ".dockerignore",
 )
 
