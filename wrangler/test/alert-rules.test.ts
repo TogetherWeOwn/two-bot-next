@@ -131,6 +131,19 @@ test("429 rate uses the delta, ignores resets and tiny windows", () => {
   assert.deepEqual(restart.firing, []);
 });
 
+test("5xx rate uses the delta, ignores resets and tiny windows", () => {
+  const first = ev([`two_bot_rest_requests_total{route="other",result="2xx"} 100`, `two_bot_rest_requests_total{route="other",result="5xx"} 0`]);
+  const hot = ev([`two_bot_rest_requests_total{route="other",result="2xx"} 180`, `two_bot_rest_requests_total{route="other",result="5xx"} 20`], first.state);
+  assert.deepEqual(hot.firing, ["rest_5xx_rate"]);
+  const small = ev([`two_bot_rest_requests_total{route="other",result="2xx"} 100`, `two_bot_rest_requests_total{route="other",result="5xx"} 5`], first.state);
+  assert.deepEqual(small.firing, []);
+  const restart = ev([`two_bot_rest_requests_total{route="other",result="5xx"} 1`], hot.state);
+  assert.deepEqual(restart.firing, []);
+  // A 429 burst is not a 5xx burst: the two rates track independently.
+  const other = ev([`two_bot_rest_requests_total{route="other",result="2xx"} 180`, `two_bot_rest_requests_total{route="other",result="429"} 20`], first.state);
+  assert.deepEqual(other.firing, ["rest_429_rate"]);
+});
+
 test("db pool saturation needs three consecutive samples", () => {
   const lines = ["two_bot_db_pool_configured 1", "two_bot_db_pool_connections 5", "two_bot_db_pool_max_connections 5", "two_bot_db_pool_idle_connections 0"];
   let state = EMPTY_STATE;
@@ -542,6 +555,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
     "job_stale",
     "job_consecutive_failures",
     "rest_429_rate",
+    "rest_5xx_rate",
     "db_pool_saturated",
     "db_errors",
     "send_admission_blocked",
@@ -557,6 +571,7 @@ test("fired packets carry the shared rule-id spelling (TOG-12100)", () => {
   assert.equal(packetFilename("job_stale:rank", window), `evidence-job_stale-${window}.json`);
   assert.equal(packetFilename("job_consecutive_failures:counter", window), `evidence-job_consecutive_failures-${window}.json`);
   assert.equal(packetFilename("rest_429_rate", window), `evidence-rest_429_rate-${window}.json`);
+  assert.equal(packetFilename("rest_5xx_rate", window), `evidence-rest_5xx_rate-${window}.json`);
   assert.equal(packetFilename("db_pool_saturated", window), `evidence-db_pool_saturated-${window}.json`);
   assert.equal(packetFilename("db_errors", window), `evidence-db_errors-${window}.json`);
   assert.equal(packetFilename("send_admission_blocked", window), `evidence-send_admission_blocked-${window}.json`);
@@ -607,6 +622,10 @@ test("every fired packet carries a runbook deep link that resolves in checked-in
     ...ev(
       [`two_bot_rest_requests_total{route="other",result="2xx"} 180`, `two_bot_rest_requests_total{route="other",result="429"} 20`],
       ev([`two_bot_rest_requests_total{route="other",result="2xx"} 100`, `two_bot_rest_requests_total{route="other",result="429"} 0`]).state,
+    ).firing,
+    ...ev(
+      [`two_bot_rest_requests_total{route="other",result="2xx"} 180`, `two_bot_rest_requests_total{route="other",result="5xx"} 20`],
+      ev([`two_bot_rest_requests_total{route="other",result="2xx"} 100`, `two_bot_rest_requests_total{route="other",result="5xx"} 0`]).state,
     ).firing,
   ];
   const poolLines = ["two_bot_db_pool_configured 1", "two_bot_db_pool_connections 5", "two_bot_db_pool_max_connections 5", "two_bot_db_pool_idle_connections 0"];
