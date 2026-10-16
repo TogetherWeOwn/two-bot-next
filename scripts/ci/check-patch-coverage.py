@@ -40,6 +40,8 @@ def read_lcov(path):
     malformed_records = False
     for raw in text.splitlines():
         if raw.startswith("SF:"):
+            if current is not None:
+                malformed_records = True
             current = raw[3:].strip() or None
         elif raw.startswith("DA:"):
             parts = raw[3:].split(",")
@@ -55,6 +57,8 @@ def read_lcov(path):
             data_records += 1
         elif raw.strip() == "end_of_record":
             current = None
+    if current is not None:
+        malformed_records = True
     if malformed_records:
         return None, "lcov report contains malformed DA records"
     if not data_records:

@@ -91,6 +91,30 @@ class LcovTests(unittest.TestCase):
                 self.assertIsNone(hits)
                 self.assertIn("DA", error)
 
+    def test_unterminated_section_at_eof_is_blindness(self):
+        for text in (
+            "SF:src/lib.rs\nDA:1,1\n",
+            "SF:src/lib.rs\nDA:1,1\nend_of_record\nSF:src/other.rs\nDA:2,1\n",
+        ):
+            with self.subTest(text=text):
+                lcov = write_lcov(text)
+                try:
+                    hits, error = gate.read_lcov(lcov)
+                finally:
+                    Path(lcov).unlink()
+                self.assertIsNone(hits)
+                self.assertIn("DA", error)
+
+    def test_new_section_before_end_of_record_is_blindness(self):
+        text = "SF:src/lib.rs\nDA:1,1\nSF:src/other.rs\nDA:2,1\nend_of_record\n"
+        lcov = write_lcov(text)
+        try:
+            hits, error = gate.read_lcov(lcov)
+        finally:
+            Path(lcov).unlink()
+        self.assertIsNone(hits)
+        self.assertIn("DA", error)
+
     def test_empty_source_with_data_after_valid_records_is_blindness(self):
         text = "SF:src/lib.rs\nDA:1,1\nend_of_record\nSF:\nDA:2,1\nend_of_record\n"
         lcov = write_lcov(text)
