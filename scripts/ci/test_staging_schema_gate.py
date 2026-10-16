@@ -1,9 +1,11 @@
 """Offline gate-contract tests; no database, no Actions dispatch, no secrets."""
 
 import json
+import tempfile
 import unittest
 
 from staging_schema_gate import (
+    main,
     Refused,
     branch_id_valid,
     connection_warning,
@@ -12,6 +14,35 @@ from staging_schema_gate import (
     pins_from_url,
     verify_binding,
 )
+
+
+class MainTests(unittest.TestCase):
+    def test_store_pending_fails_and_clean_manifest_passes(self):
+        source_sha = "a" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_out = f"{directory}/manifest.json"
+
+            def run_with_store_pending(*_args):
+                return {"pending_before": [], "pending_store_before": [400]}
+
+            result = main(
+                ["--binary", "staging-migrate", "--source-sha", source_sha,
+                 "--manifest-out", manifest_out],
+                env={},
+                run=run_with_store_pending,
+            )
+            self.assertEqual(result, 1)
+
+            def run_clean(*_args):
+                return {"pending_before": [], "pending_store_before": []}
+
+            result = main(
+                ["--binary", "staging-migrate", "--source-sha", source_sha,
+                 "--manifest-out", manifest_out],
+                env={},
+                run=run_clean,
+            )
+            self.assertEqual(result, 0)
 
 
 class PinsFromUrlTests(unittest.TestCase):
