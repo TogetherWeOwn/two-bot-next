@@ -24,8 +24,6 @@
 //! deadline, keep the post-ready settle window, and keep every other
 //! assertion in those files byte-identical. This file itself never sleeps.
 
-use std::time::Duration;
-
 const ALIVE: &str = include_str!("alive.rs");
 const OPS_BACKFILL: &str = include_str!("ops_backfill.rs");
 const PREFLIGHT: &str = include_str!("preflight.rs");
@@ -272,6 +270,27 @@ fn assert_poll_site(source: &str, loop_marker: &str) {
     parse_sleep_millis(sleep_args, "poll backoff");
 }
 
+/// Require `snippet` to appear as a direct, reachable statement of
+/// `loop_body`: brace depth 1 just inside the loop's own braces, matched over
+/// code only so a commented-out or `if false`-wrapped copy does not satisfy
+/// the pin.
+fn assert_direct_loop_statement(loop_body: &str, snippet: &str, context: &str) {
+    let code = code_only(loop_body);
+    let masked_snippet = code_only(snippet);
+    let pos = code.find(&masked_snippet).unwrap_or_else(|| {
+        panic!("{context}");
+    });
+    let mut depth = 0i32;
+    for byte in code[..pos].bytes() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            _ => {}
+        }
+    }
+    assert_eq!(depth, 1, "{context}");
+}
+
 fn assert_sleep_inventory(source: &str, expected: usize, context: &str) {
     // Whole-file inventory over code only: a stray sleep anywhere in the
     // file (not just inside the named poll loops) must go red, whether it
@@ -288,15 +307,37 @@ fn assert_sleep_inventory(source: &str, expected: usize, context: &str) {
     }
 }
 
+const OPS_DEADLINE_ASSERT: &str = r#"assert!(
+            Instant::now() < deadline,
+            "bot did not serve health on the configured port"
+        );"#;
+
 fn assert_ops_backfill_deadline(source: &str) {
     assert_code_contains(
         source,
-        r#"assert!(
-            Instant::now() < deadline,
-            "bot did not serve health on the configured port"
-        );"#,
+        OPS_DEADLINE_ASSERT,
         "spawn_bot health poll must retain its exact deadline assertion",
     );
+    // Placement: the deadline assertion must be a direct statement of the
+    // health-poll loop body. A copy moved above the loop or wrapped in
+    // `if false` leaves the text present but the poll hangs past its
+    // deadline instead of failing at it.
+    let body = loop_body(source, "loop");
+    assert_direct_loop_statement(
+        &body,
+        OPS_DEADLINE_ASSERT,
+        "spawn_bot deadline assertion must be a direct statement inside the health-poll loop body",
+    );
+}
+
+/// Require the `wait_http` poll loop to sit inside its `timeout(STEP, ...)`
+/// wrapper: the loop must be found between the timeout open and the
+/// `.unwrap_or_else` terminator, matched over code only so a commented-out
+/// wrapper does not satisfy the pin.
+fn assert_wait_http_poll_under_step_deadline(wait_http: &str) {
+    let code = code_only(wait_http);
+    let window = source_between(&code, "timeout(STEP", ".unwrap_or_else");
+    assert_poll_site(&window, "loop");
 }
 
 fn assert_budget_lane_hold_pin(source: &str) {
@@ -333,6 +374,14 @@ fn assert_settle_window(source: &str) {
         1,
         "settle loop must assert liveness during the window"
     );
+    // Placement: the in-window liveness check must be a direct, reachable
+    // statement of the settle loop body. An `if false`-wrapped copy keeps
+    // the text present while a post-RESUMED crash goes undetected.
+    assert_direct_loop_statement(
+        &settle_loop,
+        "bot.assert_alive();",
+        "settle-loop liveness check must be a direct reachable statement of the settle loop body",
+    );
     assert_eq!(
         source.matches("bot.assert_alive();").count(),
         2,
@@ -344,12 +393,7 @@ fn assert_settle_window(source: &str) {
 #[test]
 fn alive_polling_uses_bounded_backoff_under_deadline() {
     let wait_http = function_body(ALIVE, "wait_http");
-    assert_poll_site(&wait_http, "loop");
-    assert_code_contains(
-        &wait_http,
-        "timeout(STEP",
-        "wait_http must retain its STEP deadline",
-    );
+    assert_wait_http_poll_under_step_deadline(&wait_http);
 
     let checkpoint = function_body(ALIVE, "checkpoint");
     assert_poll_site(&checkpoint, "loop");
@@ -424,29 +468,6 @@ fn source_block_parser_ignores_braces_in_comments_and_literals() {
     let block = braced_block(source, open);
     assert!(block.contains("loop { break; }"));
     assert!(block.ends_with("    }"));
-}
-
-/// The replacement pattern itself, with no sleep anywhere in this file: a
-/// producer flips a shared lock and wakes a `Notify`; the consumer waits on
-/// that wakeup under a deadline. If the notify were replaced by a timing
-/// sleep, the consumer would hang to its deadline instead of waking early.
-#[tokio::test]
-async fn deterministic_notify_on_a_shared_lock_needs_no_sleep() {
-    use std::sync::{Arc, Mutex};
-    use tokio::sync::Notify;
-
-    let ready = Arc::new(Mutex::new(false));
-    let notify = Arc::new(Notify::new());
-    let producer_ready = ready.clone();
-    let producer_notify = notify.clone();
-    tokio::spawn(async move {
-        *producer_ready.lock().expect("shared readiness flag") = true;
-        producer_notify.notify_one();
-    });
-    tokio::time::timeout(Duration::from_secs(5), notify.notified())
-        .await
-        .expect("deterministic wakeup before the deadline");
-    assert!(*ready.lock().expect("shared readiness flag"));
 }
 
 #[test]
@@ -622,13 +643,74 @@ fn polling_guard_pins_exact_ops_deadline_and_preflight_attempt_assertions() {
     .is_err());
 
     let wait_http = function_body(ALIVE, "wait_http");
+    // The positive control passes through the placement-aware helper: the
+    // loop sits inside its STEP wrapper in the real source.
+    assert_wait_http_poll_under_step_deadline(&wait_http);
     let commented_deadline_call = wait_http.replace("timeout(STEP", "/* timeout(STEP */ timeout(");
     assert!(std::panic::catch_unwind(|| {
-        assert_code_contains(
-            &commented_deadline_call,
-            "timeout(STEP",
-            "wait_http must retain its STEP deadline",
-        );
+        assert_wait_http_poll_under_step_deadline(&commented_deadline_call);
+    })
+    .is_err());
+}
+
+#[test]
+fn polling_guard_rejects_misplaced_deadline_and_liveness_checks() {
+    // The ops_backfill deadline text stays present but moves above the poll
+    // loop: the poll then hangs past its deadline instead of failing at it.
+    let spawn_bot = function_body(OPS_BACKFILL, "spawn_bot");
+    assert_ops_backfill_deadline(&spawn_bot);
+    let moved_above = spawn_bot.replace(OPS_DEADLINE_ASSERT, "").replacen(
+        "loop {",
+        &format!("{OPS_DEADLINE_ASSERT}\n        loop {{"),
+        1,
+    );
+    assert!(moved_above.contains("Instant::now() < deadline"));
+    assert!(std::panic::catch_unwind(|| {
+        assert_ops_backfill_deadline(&moved_above);
+    })
+    .is_err());
+
+    // The deadline text stays present but is wrapped in a never-taken
+    // branch: the loop body no longer executes it while health hangs.
+    let if_false_deadline = spawn_bot.replace(
+        OPS_DEADLINE_ASSERT,
+        &format!("if false {{ {OPS_DEADLINE_ASSERT} }}"),
+    );
+    assert!(std::panic::catch_unwind(|| {
+        assert_ops_backfill_deadline(&if_false_deadline);
+    })
+    .is_err());
+
+    // The `timeout(STEP` wrapper text stays present but the poll loop is
+    // hoisted outside it: the loop then runs without the STEP deadline.
+    let wait_http = function_body(ALIVE, "wait_http");
+    let sleep = "sleep(Duration::from_millis(10)).await;";
+    let loop_outside_timeout = format!(
+        "loop {{ {sleep} }}\n{}",
+        wait_http.replacen("loop {", "if true {", 1)
+    );
+    assert!(loop_outside_timeout.contains("timeout(STEP"));
+    assert!(std::panic::catch_unwind(|| {
+        assert_wait_http_poll_under_step_deadline(&loop_outside_timeout);
+    })
+    .is_err());
+
+    // The settle-loop liveness text stays present but is wrapped in a
+    // never-taken branch: a post-RESUMED crash would go undetected.
+    let lifecycle = function_body(ALIVE, "lifecycle");
+    let settle = source_between(&lifecycle, "let settle_until =", "assert_ready_correlation");
+    assert_settle_window(&settle);
+    let if_false_liveness =
+        settle.replacen("bot.assert_alive();", "if false { bot.assert_alive(); }", 1);
+    assert_eq!(
+        code_only(&if_false_liveness)
+            .matches("bot.assert_alive();")
+            .count(),
+        2,
+        "mutant must keep both liveness texts present"
+    );
+    assert!(std::panic::catch_unwind(|| {
+        assert_settle_window(&if_false_liveness);
     })
     .is_err());
 }
