@@ -118,3 +118,10 @@ path = "fuzz_targets/internal_action_validators.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "helix_token"
+path = "fuzz_targets/helix_token.rs"
+test = false
+doc = false
+bench = false
