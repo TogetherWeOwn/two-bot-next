@@ -128,3 +128,10 @@ path = "fuzz_targets/eventsub_delivery.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "helix_token"
+path = "fuzz_targets/helix_token.rs"
+test = false
+doc = false
+bench = false

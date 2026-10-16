@@ -53,6 +53,8 @@ JOB_INVENTORY = {
     # runner. Read-only, no secrets, no deploy route: the generic
     # deployment/probe scan already passes, so only the inventory pin is needed.
     "vote-kick-fuzz-smoke.yml": {"vote-kick-smoke"},
+    # Manual, bounded Helix token parser fuzz smoke; read-only and secret-free.
+    "helix-token-fuzz-smoke.yml": {"helix-token-smoke"},
     # SDLC 2.3 CI speed evidence (the shared nextest lane graduated to a
     # required check.yml job): dorny/paths-filter affected-only selection
     # and the minutes-per-merged-PR report.
