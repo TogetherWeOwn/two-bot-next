@@ -257,14 +257,14 @@ test("voice join fast burn pages on a 1 h spike while the diluted 6 h window sta
 });
 
 test("voice join slow burn tickets on a sustained 6 h grind that never trips fast burn", () => {
-  // Steady 8x burn, one 30 min tick at a time: 500 genuine joins and 20 slow
-  // moves per tick, 13 ticks over 6 h.
+  // Steady 8x burn, one minute at a time: 100 genuine joins and 4 slow
+  // moves per tick. The cadence keeps genuine traffic in the short windows.
   let state = EMPTY_STATE;
-  for (let i = 0; i <= 12; i++) {
-    state = evAt(joinLines(i * 505, i * 5, i * 480), state, i * 1800).state;
+  for (let i = 0; i <= 360; i++) {
+    state = evAt(joinLines(i * 100, 0, i * 96), state, i * 60).state;
   }
-  const grinding = evAt(joinLines(13 * 505, 13 * 5, 13 * 480), state, 13 * 1800);
-  // 13 ticks: 6,500 genuine, 6,240 fast, 260 slow = 8x burn.
+  const grinding = evAt(joinLines(361 * 100, 0, 361 * 96), state, 361 * 60);
+  // 361 ticks: 36,100 genuine, 34,656 fast, 1,444 slow = 8x burn.
   assert.deepEqual(grinding.firing, ["voice_join_slow_burn"]);
   assert.equal(ruleFor("voice_join_slow_burn")?.severity, "ticket");
   // The same 8x never reaches the 14.4x fast line in any 1 h / 5 min window.
@@ -283,9 +283,10 @@ test("voice join burn stays silent on healthy traffic, quiet windows and benign 
   // against zero moves is working as designed, not burn.
   const dupes = evAt(joinLines(0, 0, 0), EMPTY_STATE, 0);
   assert.deepEqual(evAt(joinLines(50, 50, 0), dupes.state, 3600).firing, []);
-  // Below the volume floor even total failure stays silent: 5 bad joins cannot
-  // page a guild that barely uses voice.
-  const thin = evAt(joinLines(0, 0, 0), EMPTY_STATE, 0);
+  // Below the volume floor even total failure stays silent: 5 bad joins in
+  // both long and short windows cannot page a guild that barely uses voice.
+  let thin = evAt(joinLines(0, 0, 0), EMPTY_STATE, 0);
+  thin = evAt(joinLines(0, 0, 0), thin.state, 3300);
   assert.deepEqual(evAt(joinLines(5, 0, 0), thin.state, 3600).firing, []);
   // At the floor the same total failure does fire: 20 genuine and 10 in the
   // short window, 0 fast anywhere.
