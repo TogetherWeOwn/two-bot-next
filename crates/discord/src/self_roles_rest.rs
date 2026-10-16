@@ -378,19 +378,17 @@ impl ActionExecutor {
             return Err(guard_error(error));
         }
         self.stamp_paced_lane(&mut lane, false);
-        let (result, response_status) = match tokio::time::timeout(
-            Duration::from_millis(MODERATION_TIMEOUT_MS),
-            self.send_status(&request),
-        )
-        .await
-        {
-            Ok(Ok(204)) => (Ok(()), Some(204)),
-            Ok(Ok(code)) => (
-                status_code(code).and(Err(SelfRoleRestError::Ambiguous)),
-                Some(code),
-            ),
-            _ => (Err(SelfRoleRestError::Ambiguous), None),
-        };
+        let (result, response_status) =
+            match tokio::time::timeout(self.inner.moderation_timeout, self.send_status(&request))
+                .await
+            {
+                Ok(Ok(204)) => (Ok(()), Some(204)),
+                Ok(Ok(code)) => (
+                    status_code(code).and(Err(SelfRoleRestError::Ambiguous)),
+                    Some(code),
+                ),
+                _ => (Err(SelfRoleRestError::Ambiguous), None),
+            };
         let owned_after = owns().await.unwrap_or(false);
         Ok(RoleExchange {
             result,

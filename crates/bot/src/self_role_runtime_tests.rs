@@ -89,9 +89,23 @@ fn snapshot(held: &[&str]) -> Vec<ScriptedResponse> {
 }
 
 fn runtime(pool: &PgPool, clock: &Arc<AtomicI64>, mock: &MockRest) -> SelfRoleRuntime {
+    runtime_with_timeout(pool, clock, mock, RENDEZVOUS)
+}
+
+fn runtime_with_timeout(
+    pool: &PgPool,
+    clock: &Arc<AtomicI64>,
+    mock: &MockRest,
+    timeout: Duration,
+) -> SelfRoleRuntime {
     SelfRoleRuntime {
         store: SelfRoleStore::with_test_clock(pool.clone(), 300, clock.clone()).unwrap(),
-        executor: ActionExecutor::with_proxy("fixture-token".into(), Some(mock.origin())).unwrap(),
+        executor: ActionExecutor::with_proxy_and_moderation_timeout(
+            "fixture-token".into(),
+            Some(mock.origin()),
+            timeout,
+        )
+        .unwrap(),
         guild_id: GUILD.into(),
         bot_id: BOT.into(),
     }
@@ -991,8 +1005,10 @@ async fn terminal_restart_cancellation_preserves_journal(pool: &PgPool) -> TestR
     let mut panel = panel(PanelMode::Select);
     panel.id = "terminal-cancel-delayed-repair".into();
     let mut script = snapshot(&[OLD_ROLE, OTHER]);
-    script.push(ScriptedResponse::status(204).delayed(Duration::from_secs(5)));
-    let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+    let delete_index = script.len();
+    script.push(ScriptedResponse::status(204));
+    let (mock, response_gate) =
+        MockRest::start_gated_at(script, ScriptedResponse::status(500), delete_index).await;
     let feature = Arc::new(runtime(pool, &clock, &mock));
     let audit = terminal_seed(&feature.store, &panel, &panel.id, false).await?;
     let winner = terminal_winner(&feature.store, &panel, Some("new")).await?;
@@ -1006,12 +1022,7 @@ async fn terminal_restart_cancellation_preserves_journal(pool: &PgPool) -> TestR
         let panel = panel.clone();
         tokio::spawn(async move { feature.recover_terminal(&hint, &panel).await })
     };
-    tokio::time::timeout(RENDEZVOUS, async {
-        while !mock.requests().iter().any(|r| r.method == "DELETE") {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await?;
+    tokio::time::timeout(RENDEZVOUS, response_gate.wait_for_request()).await?;
     clock.store(NOW + 100, Ordering::SeqCst);
     let renewed =
         await_expiries_past(pool, TERMINAL_EXPIRY_SQL, &audit.event_id, NOW + 300).await?;
@@ -1019,6 +1030,7 @@ async fn terminal_restart_cancellation_preserves_journal(pool: &PgPool) -> TestR
     assert!(!owner.is_finished());
     owner.abort();
     assert!(owner.await.unwrap_err().is_cancelled());
+    response_gate.release();
     let effects = terminal_evidence(pool, &audit, true, false).await?;
     assert_eq!(effects.attempted_added_role_ids, [OLD_ROLE]);
     assert_eq!(effects.attempted_removed_role_ids, [OLD_ROLE]);
@@ -1109,7 +1121,11 @@ async fn terminal_partial_repair_exchange_outcomes(pool: &PgPool) -> TestResult 
         script.push(failure); // only one add attempt, no executor retry
         script.extend(snapshot(&[NEW_ROLE, OTHER])); // later authoritative convergence
         let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
-        let feature = runtime(pool, &clock, &mock);
+        let feature = if pending {
+            runtime_with_timeout(pool, &clock, &mock, Duration::from_secs(5))
+        } else {
+            runtime(pool, &clock, &mock)
+        };
         let audit = terminal_seed(&feature.store, &panel, &panel.id, false).await?;
         let winner = terminal_winner(&feature.store, &panel, Some("new")).await?;
         let hint = feature
@@ -1280,9 +1296,12 @@ async fn processing_receipts_survive_generation_transfer(pool: &PgPool) -> TestR
             panel.id = format!("processing-receipt-{exclusive}-{status}");
             panel.exclusive = exclusive;
             let mut script = snapshot(&[OLD_ROLE, OTHER]);
-            script.push(ScriptedResponse::status(status).delayed(Duration::from_secs(3)));
+            let response_index = script.len();
+            script.push(ScriptedResponse::status(status));
             script.extend(snapshot(&[OLD_ROLE, OTHER]));
-            let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+            let (mock, response_gate) =
+                MockRest::start_gated_at(script, ScriptedResponse::status(500), response_index)
+                    .await;
             let feature = runtime(pool, &clock, &mock);
             let request = request(
                 &panel.id,
@@ -1314,6 +1333,7 @@ async fn processing_receipts_survive_generation_transfer(pool: &PgPool) -> TestR
             assert_eq!(replacement.generation, original.generation + 1);
             assert!(replacement.exchange_pending);
             let owner_state = exchange_owner_state(pool, &request.event_id).await?;
+            response_gate.release();
             assert!(matches!(step.await, Err(RuntimeError::Stale)));
             // The late response updates ONLY its receipt, not the replacement's
             // immutable intent, effect checkpoint, phase, claims or target.
@@ -1595,8 +1615,10 @@ async fn terminal_late_response_after_independent_transfer(pool: &PgPool) -> Tes
         let mut panel = panel(PanelMode::Select);
         panel.id = format!("terminal-late-transfer-{status}-{evidence_transfer}");
         let mut script = snapshot(&[OLD_ROLE, OTHER]);
-        script.push(ScriptedResponse::status(status).delayed(Duration::from_secs(3)));
-        let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+        let response_index = script.len();
+        script.push(ScriptedResponse::status(status));
+        let (mock, response_gate) =
+            MockRest::start_gated_at(script, ScriptedResponse::status(500), response_index).await;
         let feature = runtime(pool, &clock, &mock);
         let audit = terminal_seed(&feature.store, &panel, &panel.id, false).await?;
         let winner = terminal_winner(&feature.store, &panel, Some("new")).await?;
@@ -1652,6 +1674,7 @@ async fn terminal_late_response_after_independent_transfer(pool: &PgPool) -> Tes
             assert!(feature.store.owns_superseded_claim(&evidence_claim).await?);
         }
         let owner_state = exchange_owner_state(pool, &audit.event_id).await?;
+        response_gate.release();
         assert!(matches!(step.await, Err(RuntimeError::Stale)));
         if evidence_transfer {
             assert_eq!(
@@ -2138,16 +2161,19 @@ async fn supervised_processing_recovery(pool: &PgPool) -> TestResult {
         };
         let pending = matches!(case, "pending" | "timeout" | "stopped");
         let mut script = snapshot(&held);
+        let mut gated_response_index = None;
         if case == "timeout" {
-            script.push(
-                ScriptedResponse::json(200, json!({"user":{"id":USER},"roles":held}))
-                    .delayed(Duration::from_secs(5)),
-            );
+            gated_response_index = Some(script.len());
+            script.push(ScriptedResponse::json(
+                200,
+                json!({"user":{"id":USER},"roles":held}),
+            ));
         } else if case != "stopped" {
             script.extend(snapshot(&held)); // recovered admission
             script.extend(snapshot(&held)); // execution
             if case == "shutdown" {
-                script.push(ScriptedResponse::status(204).delayed(Duration::from_secs(5)));
+                gated_response_index = Some(script.len());
+                script.push(ScriptedResponse::status(204));
             } else if case == "success" {
                 script.push(ScriptedResponse::status(204)); // DELETE old
                 script.extend(snapshot(&[OTHER]));
@@ -2156,7 +2182,16 @@ async fn supervised_processing_recovery(pool: &PgPool) -> TestResult {
                 script.extend(snapshot(&[NEW_ROLE, OTHER])); // settlement
             }
         }
-        let mock = MockRest::start(script, ScriptedResponse::status(500)).await;
+        let (mock, response_gate) = if let Some(index) = gated_response_index {
+            let (mock, gate) =
+                MockRest::start_gated_at(script, ScriptedResponse::status(500), index).await;
+            (mock, Some(gate))
+        } else {
+            (
+                MockRest::start(script, ScriptedResponse::status(500)).await,
+                None,
+            )
+        };
         let feature = runtime(pool, &clock, &mock);
         let mut panel = panel(PanelMode::Button);
         panel.id = format!("supervised-recovery-{case}");
@@ -2209,11 +2244,10 @@ async fn supervised_processing_recovery(pool: &PgPool) -> TestResult {
             },
         ));
         if case == "shutdown" {
-            tokio::time::timeout(RENDEZVOUS, async {
-                while !mock.requests().iter().any(|r| r.method == "PUT") {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
+            tokio::time::timeout(
+                RENDEZVOUS,
+                response_gate.as_ref().unwrap().wait_for_request(),
+            )
             .await?;
         } else if case != "stopped" {
             tokio::time::timeout(RENDEZVOUS, async {
@@ -2236,6 +2270,9 @@ async fn supervised_processing_recovery(pool: &PgPool) -> TestResult {
         }
         stop.send_replace(true);
         tokio::time::timeout(Duration::from_secs(2), owner).await???;
+        if let Some(gate) = &response_gate {
+            gate.release();
+        }
         let current = status.read().await[RECOVERY_JOB_NAME].clone();
         assert!(!current.running);
         if case == "stopped" {
