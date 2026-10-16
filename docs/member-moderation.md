@@ -238,9 +238,10 @@ post-dispatch failures never do. If that release write itself fails, the caller
 still gets the original refusal and nothing is retried: the row stays
 `in_flight`, so a retry answers `in_progress` instead of repeating the
 mutation. The service logs one `moderation_idempotency_release_failed` error
-with only a fixed `action` and `cause` (`discord_rejected` or
-`store_rolled_back`), never the key, an id or the raw store error. Such a line
-means one caller-supplied key will keep answering `in_progress`; the signal does
+with only a fixed `action` and `cause` (`discord_rejected`,
+`discord_rate_limited`, or `store_rolled_back`), never a key, an id or the raw
+store error. Such a line means one caller-supplied key will keep answering
+`in_progress`; the signal does
 not name it, and no code expires or takes over the row.
 
 ## Verification
