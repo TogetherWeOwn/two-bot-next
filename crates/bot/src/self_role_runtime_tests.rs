@@ -36,6 +36,24 @@ async fn store_errors_report_only_database_or_timeout_kind() {
     ));
 }
 
+#[test]
+fn unmatched_receipt_completion_stays_distinct_from_database_and_stale() {
+    // A zero-row receipt completion means the database answered successfully
+    // but no ticket matched. It must stay its own kind: never a database
+    // failure, and deliberately never `Stale`.
+    let error = RuntimeError::Store(StoreErrorKind::UnmatchedReceipt);
+    assert!(!matches!(
+        error,
+        RuntimeError::Store(StoreErrorKind::Database)
+    ));
+    assert!(!matches!(
+        error,
+        RuntimeError::Store(StoreErrorKind::Timeout)
+    ));
+    assert!(!matches!(error, RuntimeError::Stale));
+    assert_ne!(StoreErrorKind::UnmatchedReceipt, StoreErrorKind::Database);
+}
+
 fn panel(mode: PanelMode) -> SelfRolePanel {
     SelfRolePanel {
         id: "games".into(),

@@ -320,12 +320,7 @@ impl SelfRoleService {
                         .recover_once()
                         .await
                         .map(|_| ())
-                        .map_err(|error| match error {
-                            RuntimeError::Store(StoreErrorKind::Timeout) => ErrorClass::Timeout,
-                            RuntimeError::Store(StoreErrorKind::Database) => ErrorClass::Database,
-                            RuntimeError::Rest(_) => ErrorClass::Rest,
-                            _ => ErrorClass::Configuration,
-                        })
+                        .map_err(recovery_error_class)
                 })
             }),
         }
@@ -441,6 +436,19 @@ impl SelfRoleService {
                 SelfRoleResult::Pending
             }
         }
+    }
+}
+
+/// Scalar job-metric class for a recovery sweep failure. Every store kind
+/// maps explicitly so a timeout never reports as a database failure and a
+/// zero-row receipt completion never conflates with real database errors.
+pub(crate) fn recovery_error_class(error: RuntimeError) -> ErrorClass {
+    match error {
+        RuntimeError::Store(StoreErrorKind::Timeout) => ErrorClass::Timeout,
+        RuntimeError::Store(StoreErrorKind::Database) => ErrorClass::Database,
+        RuntimeError::Store(StoreErrorKind::UnmatchedReceipt) => ErrorClass::Configuration,
+        RuntimeError::Rest(_) => ErrorClass::Rest,
+        _ => ErrorClass::Configuration,
     }
 }
 

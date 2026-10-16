@@ -122,6 +122,10 @@ pub(crate) struct SelfRoleRequest {
 pub(crate) enum StoreErrorKind {
     Timeout,
     Database,
+    /// Receipt completion matched zero rows: the database answered
+    /// successfully but token, generation or disposition did not match.
+    /// Deliberately not `Stale` and not `Database`.
+    UnmatchedReceipt,
 }
 
 #[derive(Debug)]
@@ -462,7 +466,7 @@ impl SelfRoleRuntime {
     ) -> Result<(), RuntimeError> {
         if let Some(receipt) = step_receipt(exchange) {
             if !store_io(self.store.complete_role_exchange(ticket, receipt)).await? {
-                return Err(RuntimeError::Store(StoreErrorKind::Database));
+                return Err(RuntimeError::Store(StoreErrorKind::UnmatchedReceipt));
             }
         }
         Ok(())
