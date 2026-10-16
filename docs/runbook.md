@@ -716,10 +716,14 @@ previously healthy version from your deployment record; never silently choose
 
 `.github/workflows/staging-migrate.yml` (manual, staging-only, no production
 path) runs `staging-migrate --plan|--apply` from `crates/cutover/src/bin/staging_migrate.rs`.
-It embeds this crate's migrations through the SQLx **0.9.0 library** (no
-`sqlx-cli`; the pin is asserted against `Cargo.lock`), keeps the ledger in
-`public._sqlx_migrations`, and runs `SET ROLE` in SQLx's per-connection
-`after_connect`, verifying `current_user` on every connection. The two modes
+It embeds two migration chains through the SQLx **0.9.0 library** (no
+`sqlx-cli`; the pin is asserted against `Cargo.lock`): this crate's
+migrations (ledger `public._sqlx_migrations`) and the store migrations from
+`two-bot-store` (ledger `public._two_bot_migrations`, the chain the DML-only
+gateway needs at boot). Each chain is planned, applied and verified
+separately with its own pending list and plan-binding hash. The runner runs
+`SET ROLE` in SQLx's per-connection `after_connect`, verifying `current_user`
+on every connection. The two modes
 use two credentials and two groups, so the plan is physically read-only:
 `--plan` reads only `TWO_BOT_STAGING_PLAN_DATABASE_URL` (a login holding only
 `two_bot_migrator_ro`, the `staging-migrate-plan` environment secret) and runs
@@ -735,9 +739,15 @@ staging-migrate --target staging --plan --source-sha <40hex> --staging-host <hos
   --recovery-evidence-ref <ref> --acl-plan-ref <ref> \
   [--expected-pending <ascending,comma-separated versions>]
 staging-migrate --target staging --apply <same flags> --expected-pending <list> \
-  --plan-manifest-sha256 <64hex> --plan-run-id <run id> \
+  --expected-store-pending <store list> \
+  --plan-manifest-sha256 <64hex> --store-plan-manifest-sha256 <64hex> \
+  --plan-run-id <run id> \
   --plan-manifest-path <producing run's downloaded manifest>
 ```
+
+Both chains (cutover and store) are planned, applied and verified in one
+run, each with its own pending list, manifest hash and ledger; `--apply`
+refuses unless both lists and both hashes match the reviewed plan.
 
 `--staging-branch-id` pins the PlanetScale branch id (non-secret). It is
 required when `--staging-host` ends in `.psdb.cloud` (PlanetScale routes
@@ -770,7 +780,8 @@ A passing apply records `"plan_provenance_verified": true` in its manifest.
 `--plan` also fills an `audit` block (`null` for apply) from one explicit
 `READ ONLY` transaction on the same read-only login: the ledger owner
 (`ledger_owner`), `ledger_counts` (successful rows, max successful version,
-failed rows), one `memberships` entry per migrator login (`two_bot_migrator`,
+failed rows), the store ledger's `store_ledger_owner` / `store_ledger_counts`,
+one `memberships` entry per migrator login (`two_bot_migrator`,
 `two_bot_migrator_ro`, `two_bot_migrator_ro_plan`, `two_bot_migrator_apply`):
 an `exists` flag (so a missing login reads `false` instead of vanishing), the
 aggregated direct `member_of` list, and the transitive `member_of_migrator` /
@@ -792,10 +803,11 @@ a `*.psdb.cloud` pin has no `--staging-branch-id`, the pin is malformed, or the
 binding username's branch suffix does not match the pinned branch, the login
 cannot assume `two_bot_migrator` (apply) or `two_bot_migrator_ro` (plan), the
 plan login also holds `two_bot_migrator`, a reference is missing, `--apply` has no
-`--expected-pending` or it mismatches, `--apply` has no `plan_manifest_sha256`/
-`plan_run_id` or the hash does not match the recomputed manifest, `--apply`
-has no producing-run manifest or that manifest does not carry the bound hash,
-or the ledger has a failed/incomplete
+`--expected-pending` / `--expected-store-pending` or either mismatches,
+`--apply` has no `plan_manifest_sha256` / `store_plan_manifest_sha256` /
+`plan_run_id` or either hash does not match the recomputed manifest, `--apply`
+has no producing-run manifest or that manifest does not carry the bound hashes,
+or either ledger has a failed/incomplete
 row, a SHA-384 mismatch or a version unknown to the source. The database name needs no `staging`
 substring (the verified shared-Neon staging database is `two_bot`); the pinned
 host plus the binding-match check is the staging identity. It never resets,
@@ -876,12 +888,18 @@ Pooler hosts/ports and production-like or empty pins refuse with fixed,
 secret-free messages. When the three variables are unset the gate fails
 closed, so set and verify them in the environment before relying on deploys.
 
-Outcomes: `pending_before` empty prints `schema gate clean` and the deploy
-proceeds; non-empty pending exits 1 with `schema drift: staging database is
-behind source <sha>: pending versions [...]` — fix it with the manual
-`staging-migrate` apply dispatch for that source (reviewed plan, exact
-`expected_pending`), then re-run `deploy-staging`. The gate never fixes drift
-itself. The plan manifest is written to `staging-schema-gate-manifest.json`
+Outcomes: `pending_before` and `pending_store_before` both empty prints
+`schema gate clean` and the deploy proceeds; either non-empty exits 1 with
+`schema drift: staging database is behind source <sha>: pending versions [...]`
+— fix it with the manual `staging-migrate` apply dispatch for that source
+(reviewed plan, exact `expected_pending` plus `expected_store_pending` when
+the store chain is behind). When applying the store chain, the apply creates a
+new ledger whose default privileges do not automatically grant the plan login
+read access: reapply the full reviewed role plan (`two-bot db roles plan`), run
+`verify` and require 0 findings, then re-run `deploy-staging`. The drift output
+prints this sequence. For cutover-only apply, re-run `deploy-staging` after
+apply. The gate never fixes drift itself. The plan manifest is written to
+`staging-schema-gate-manifest.json`
 in the job workspace; its `audit.connection_usage` (sessions summed from
 `pg_stat_database.numbackends`, readable in full by the plan login) warns —
 never fails — when usage is strictly above 80% of the non-superuser ceiling
@@ -908,7 +926,9 @@ staging-migrate --target production --plan --source-sha <40hex> \
   --recovery-evidence-ref <ref> --acl-plan-ref <ref> \
   [--expected-pending <ascending,comma-separated versions>]
 staging-migrate --target production --apply <same flags> --expected-pending <list> \
-  --plan-manifest-sha256 <64hex> --plan-run-id <run id> \
+  --expected-store-pending <store list> \
+  --plan-manifest-sha256 <64hex> --store-plan-manifest-sha256 <64hex> \
+  --plan-run-id <run id> \
   --plan-manifest-path <producing run's downloaded manifest>
 ```
 
