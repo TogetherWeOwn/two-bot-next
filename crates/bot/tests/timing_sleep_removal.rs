@@ -221,9 +221,9 @@ fn assert_no_code_contains(source: &str, snippet: &str, context: &str) {
     );
 }
 
-fn contains_continue_keyword(code: &str) -> bool {
+fn contains_keyword(code: &str, keyword: &str) -> bool {
     let bytes = code.as_bytes();
-    let needle = b"continue";
+    let needle = keyword.as_bytes();
     let mut index = 0;
     while index + needle.len() <= bytes.len() {
         if &bytes[index..index + needle.len()] == needle {
@@ -243,10 +243,20 @@ fn contains_continue_keyword(code: &str) -> bool {
     false
 }
 
+fn assert_no_loop_control_flow(loop_body: &str, context: &str) {
+    let code = code_only(loop_body);
+    for keyword in ["break", "continue", "return"] {
+        assert!(
+            !contains_keyword(&code, keyword),
+            "{context} must not contain `{keyword}`"
+        );
+    }
+}
+
 fn assert_poll_site(source: &str, loop_marker: &str) {
     let body = loop_body(source, loop_marker);
     assert!(
-        !contains_continue_keyword(&body),
+        !contains_keyword(&body, "continue"),
         "poll loop must not bypass its backoff with continue"
     );
     assert_eq!(
@@ -310,6 +320,7 @@ const OPS_DEADLINE_ASSERT: &str = r#"assert!(
             Instant::now() < deadline,
             "bot did not serve health on the configured port"
         );"#;
+const OPS_DEADLINE_BINDING: &str = "let deadline = Instant::now() + Duration::from_secs(15);";
 
 fn brace_depth_before(code: &str, pos: usize) -> i32 {
     let mut depth = 0i32;
@@ -370,10 +381,22 @@ fn assert_ops_backfill_deadline(source: &str) {
         OPS_DEADLINE_ASSERT,
         "spawn_bot health poll must retain its exact deadline assertion",
     );
-    assert_code_contains(
+    assert_direct_statement_at_depth(
         source,
-        "let deadline = Instant::now() + Duration::from_secs(15);",
-        "spawn_bot must retain its 15 s deadline",
+        OPS_DEADLINE_BINDING,
+        1,
+        "spawn_bot 15 s deadline must be a direct helper-body statement before the health-poll loop",
+    );
+    let code = code_only(source);
+    let deadline_pos = code
+        .find(OPS_DEADLINE_BINDING)
+        .expect("spawn_bot must retain its 15 s deadline");
+    let loop_pos = code
+        .find("loop {")
+        .expect("spawn_bot must retain its health-poll loop");
+    assert!(
+        deadline_pos < loop_pos,
+        "spawn_bot 15 s deadline must be bound before the health-poll loop"
     );
     // Placement: the deadline assertion must be a direct statement of the
     // health-poll loop body. A copy moved above the loop or wrapped in
@@ -399,14 +422,41 @@ fn assert_wait_http_poll_under_step_deadline(wait_http: &str) {
 
 fn assert_budget_lane_hold_pin(source: &str) {
     let code = code_only(source);
+    let loop_header = "for (name, gateway_response) in [";
+    assert_eq!(
+        code.matches(loop_header).count(),
+        1,
+        "budget test must retain exactly one response loop"
+    );
+    assert_direct_statement_at_depth(
+        source,
+        loop_header,
+        1,
+        "budget response loop must be a reachable top-level test-body statement",
+    );
     let loop_start = code
-        .find("for (name, gateway_response) in [")
+        .find(loop_header)
         .expect("budget test must retain its response loop");
     let loop_open = code[loop_start..]
         .find("] {")
         .map(|offset| loop_start + offset + 2)
         .expect("budget response loop must retain its opening brace");
+    let rate_limited_row = r#"        (
+            "rate limited",
+            ScriptedResponse::json(429, json!({"retry_after": 0.001, "global": true})),
+        ),"#;
+    let response_cases = &source[loop_start..loop_open];
+    assert!(
+        response_cases.contains(rate_limited_row),
+        "budget response loop must retain its rate-limited 429 case"
+    );
+    assert_code_contains(
+        response_cases,
+        rate_limited_row,
+        "budget rate-limited 429 case must remain active code in the response rows",
+    );
     let response_loop = braced_block(&code, loop_open);
+    assert_no_loop_control_flow(&response_loop, "budget lane-hold loop");
     assert_direct_loop_statement(
         &response_loop,
         r#"assert_eq!(mock.requests().len(), 3, "{name}: lane held, no retry");"#,
@@ -438,6 +488,7 @@ fn assert_settle_window(source: &str) {
         "post-ready settle loop must retain its ungated deadline header"
     );
     let settle_loop = loop_body(&source, "while tokio::time::Instant::now() < settle_until");
+    assert_no_loop_control_flow(&settle_loop, "post-ready settle loop");
     assert_eq!(
         settle_loop.matches("bot.assert_alive();").count(),
         1,
@@ -716,6 +767,55 @@ fn polling_guard_pins_exact_ops_deadline_and_preflight_attempt_assertions() {
     })
     .is_err());
 
+    let response_loop_header = "for (name, gateway_response) in [";
+    let code = code_only(&budget_test);
+    let loop_start = code.find(response_loop_header).unwrap();
+    let loop_open = code[loop_start..]
+        .find("] {")
+        .map(|offset| loop_start + offset + 2)
+        .unwrap();
+    let loop_body = braced_block(&code, loop_open);
+    let loop_end = loop_open + loop_body.len();
+    let disabled_budget_loop = format!(
+        "{}if false {{ {} }}{}",
+        &budget_test[..loop_start],
+        &budget_test[loop_start..loop_end],
+        &budget_test[loop_end..]
+    );
+    assert!(std::panic::catch_unwind(|| {
+        assert_budget_lane_hold_pin(&disabled_budget_loop);
+    })
+    .is_err());
+
+    let missing_budget_loop = budget_test.replace(response_loop_header, "");
+    assert!(std::panic::catch_unwind(|| {
+        assert_budget_lane_hold_pin(&missing_budget_loop);
+    })
+    .is_err());
+
+    let rate_limited_row = r#"        (
+            "rate limited",
+            ScriptedResponse::json(429, json!({"retry_after": 0.001, "global": true})),
+        ),"#;
+    assert!(budget_test.contains(rate_limited_row));
+    let missing_429_case = budget_test.replace(rate_limited_row, "");
+    assert!(std::panic::catch_unwind(|| {
+        assert_budget_lane_hold_pin(&missing_429_case);
+    })
+    .is_err());
+
+    for flow in ["continue;", "break;", "return;"] {
+        let bypassed_budget_loop = format!(
+            "{} {flow} {}",
+            &budget_test[..loop_open + 1],
+            &budget_test[loop_open + 1..]
+        );
+        assert!(std::panic::catch_unwind(|| {
+            assert_budget_lane_hold_pin(&bypassed_budget_loop);
+        })
+        .is_err());
+    }
+
     let if_false_attempt_pin = preflight_test.replace(
         "assert_eq!(mock.requests().len(), 1);",
         "if false { assert_eq!(mock.requests().len(), 1); }",
@@ -773,6 +873,18 @@ fn polling_guard_rejects_misplaced_deadline_and_liveness_checks() {
     })
     .is_err());
 
+    let deadline_binding = "let deadline = Instant::now() + Duration::from_secs(15);";
+    let moved_inside_loop = spawn_bot.replace(deadline_binding, "").replacen(
+        "loop {",
+        &format!("loop {{\n            {deadline_binding}"),
+        1,
+    );
+    assert!(moved_inside_loop.contains(deadline_binding));
+    assert!(std::panic::catch_unwind(|| {
+        assert_ops_backfill_deadline(&moved_inside_loop);
+    })
+    .is_err());
+
     // The deadline text stays present but is wrapped in a never-taken
     // branch: the loop body no longer executes it while health hangs.
     let if_false_deadline = spawn_bot.replace(
@@ -824,6 +936,15 @@ fn polling_guard_rejects_misplaced_deadline_and_liveness_checks() {
         assert_settle_window(&if_false_liveness);
     })
     .is_err());
+
+    for flow in ["break;", "return;", "continue;"] {
+        let early_exit = settle.replacen(
+            "while tokio::time::Instant::now() < settle_until {",
+            &format!("while tokio::time::Instant::now() < settle_until {{ {flow}"),
+            1,
+        );
+        assert!(std::panic::catch_unwind(|| assert_settle_window(&early_exit)).is_err());
+    }
 
     // The checkpoint loop text stays present but is hoisted outside its
     // STEP wrapper: it then runs unbounded until the CI step timeout.
