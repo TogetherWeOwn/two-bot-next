@@ -57,7 +57,7 @@ JOB_INVENTORY = {
     # required check.yml job): dorny/paths-filter affected-only selection
     # and the minutes-per-merged-PR report.
     "ci-speed.yml": {"changes", "report"},
-    # Shared nextest lane, called by ci-speed.yml; org-level home is
+    # Shared nextest lane, called by check.yml; org-level home is
     # TogetherWeOwn/.github with a pinned SHA like test-guard.
     "reusable-rust-nextest.yml": {"nextest"},
     # Advisory PR-size labels (org reusable, advisory only, never required):
@@ -2093,6 +2093,25 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(set(installers["check"][0]["with"]["components"].replace(" ", "").split(",")),
                          {"rustfmt", "clippy"})
 
+    def pinned_toolchain_lanes(self, channel):
+        # Every PR-gating job that installs the repository pin: all of
+        # check.yml (the ci-ok aggregate) and the shared nextest lane it
+        # calls. The nightly-pinned fuzz lane installs a different toolchain
+        # and is excluded by the channel match.
+        lanes = []
+        for workflow_name in ("check.yml", "reusable-rust-nextest.yml"):
+            for job_id, job in self.workflows[workflow_name]["jobs"].items():
+                if any(str(step.get("uses", "")).startswith("dtolnay/rust-toolchain@")
+                       and step.get("with", {}).get("toolchain") == channel
+                       for step in job.get("steps", [])):
+                    lanes.append((workflow_name, job_id))
+        # Sentinels: an enumeration that silently found nothing would pass
+        # every subtest vacuously.
+        for lane in (("check.yml", "ignored-db-runtime"), ("reusable-rust-nextest.yml", "nextest")):
+            self.assertIn(lane, lanes)
+        self.assertNotIn(("check.yml", "fuzz-compile"), lanes)
+        return lanes
+
     def test_rust_toolchain_installs_are_retry_guarded(self):
         # `rustup toolchain install` inside the installer failed once on main
         # with `Network is unreachable` syncing the channel manifest, failing
@@ -2101,15 +2120,15 @@ class WorkflowTests(unittest.TestCase):
         # continues on error and the next step retries the same pin and fails
         # closed. The retry must request the repository pin and every
         # component the installer requests, or a green retry can mask a drift.
-        # Every lane that installs the pin must carry the guard: a 4-second
-        # install failure on ignored-db-runtime reddened PR #984 while the
-        # identical step passed on the other lanes of the same head.
+        # Every PR-gating lane that installs the pin must carry the guard: a
+        # 4-second install failure on ignored-db-runtime reddened PR #984
+        # while the identical step passed on the other lanes of the same
+        # head. The lanes are enumerated from the workflows, not listed, so a
+        # new lane cannot install the pin unguarded. Scheduled and manual
+        # workflows (nightly, benchmark, fuzz smoke) do not gate a PR and
+        # stay out of scope.
         channel = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
-        targets = (
-            ("check.yml", "rust-tests"),
-            ("check.yml", "ignored-db-runtime"),
-            ("reusable-rust-nextest.yml", "nextest"),
-        )
+        targets = self.pinned_toolchain_lanes(channel)
         for workflow_name, job_id in targets:
             with self.subTest(workflow=workflow_name, job=job_id):
                 steps = self.workflows[workflow_name]["jobs"][job_id]["steps"]
@@ -2163,11 +2182,7 @@ class WorkflowTests(unittest.TestCase):
         import tempfile
 
         channel = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
-        targets = (
-            ("check.yml", "rust-tests"),
-            ("check.yml", "ignored-db-runtime"),
-            ("reusable-rust-nextest.yml", "nextest"),
-        )
+        targets = self.pinned_toolchain_lanes(channel)
         fake_prelude = (
             "rustup() {\n"
             "  printf '%s\\n' \"$*\" >> \"$FAKE_RUSTUP_CALLS\"\n"

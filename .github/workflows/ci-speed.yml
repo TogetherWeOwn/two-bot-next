@@ -42,9 +42,10 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      # Affected-only pre-filter for the advisory lane. Required lanes keep
-      # the authoritative `job-inputs` selector; this output only decides
-      # whether the advisory nextest run below is worth its minutes.
+      # Affected-paths selection, logged by the note below. Informational
+      # only: the required lanes (nextest included) take their gating from
+      # the authoritative `job-inputs` selector in check.yml, not from
+      # these outputs.
       - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3.0.4
         id: filter
         with:
