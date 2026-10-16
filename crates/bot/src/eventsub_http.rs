@@ -501,6 +501,10 @@ mod tests {
     }
 
     fn capture_eventsub_logs() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
+        // Share the global capture subscriber first so callsite interest stays
+        // stable when peer tests hit the same log site on other threads;
+        // the local JSON writer still captures only this test's events.
+        let _global = crate::tracing_capture::global();
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let output = Arc::clone(&bytes);
         let subscriber = tracing_subscriber::fmt()
