@@ -168,6 +168,7 @@ EXEMPT_RULES = {
     "job_stale": _NO_ROW_YET_REASON,
     "job_consecutive_failures": _NO_ROW_YET_REASON,
     "rest_429_rate": _NO_ROW_YET_REASON,
+    "rest_5xx_rate": _NO_ROW_YET_REASON,
     "db_pool_saturated": _NO_ROW_YET_REASON,
     "db_errors": _NO_ROW_YET_REASON,
     "send_admission_blocked": _NO_ROW_YET_REASON,

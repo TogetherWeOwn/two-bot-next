@@ -75,7 +75,8 @@ class RequiredChecksReportTests(unittest.TestCase):
         for job in ("job-inputs", "container-inputs", "supply-chain", "check", "rust-tests",
                     "ignored-db-stores", "ignored-db-runtime", "worker",
                     "parity-docs", "self-role-store", "community-db",
-                    "feeds-db", "tickets-postgres", "moderation-db", "fuzz-compile"):
+                    "feeds-db", "tickets-postgres", "moderation-db", "fuzz-compile",
+                    "nextest"):
             self.assertIn(job, agg["needs"], job)
         # Advisory image smoke remains off the image-build critical path.
         self.assertNotIn("container", agg["needs"])
@@ -87,7 +88,7 @@ class RequiredChecksReportTests(unittest.TestCase):
                        "FEEDS_DB_RESULT", "TICKETS_RESULT",
                        "MODERATION_DB_RESULT", "RUST_TESTS_RESULT",
                        "IGNORED_DB_STORES_RESULT", "IGNORED_DB_RUNTIME_RESULT",
-                       "FUZZ_COMPILE_RESULT"):
+                       "FUZZ_COMPILE_RESULT", "NEXTEST_RESULT"):
             self.assertIn(marker, body, marker)
 
     def test_legacy_duplicate_aggregate_is_removed(self):
@@ -98,38 +99,68 @@ class RequiredChecksReportTests(unittest.TestCase):
         block = re.search(r"(?ms)^  container:\n(.*?)(?=^  [a-z][a-z-]*:|\Z)", source)[1]
         self.assertRegex(block, r"(?m)^    # ci-ok: exempt \S.+")
 
-    def test_fuzz_compile_is_required_and_compile_only(self):
-        job = self.workflows["check.yml"]["jobs"]["fuzz-compile"]
+    def test_fuzz_compile_is_required_with_bounded_seed_replay(self):
+        workflow = self.workflows["check.yml"]
+        job = workflow["jobs"]["fuzz-compile"]
         self.assertEqual(job.get("name"), "fuzz compile")
         self.assertEqual(job.get("permissions"), {"contents": "read"})
         self.assertIn("job-inputs", job.get("needs", []))
         self.assertIn("needs.job-inputs.outputs.rust != 'false'", job.get("if", ""))
         self.assertIn("fuzz-compile", job.get("runs-on", ""))
-        self.assertNotIn("schedule", self.workflows["check.yml"].get("on", {}).get("pull_request", {}))
         text = str(job)
-        self.assertIn("cargo-fuzz --version 0.13.2 --locked", text)
+        install = [step for step in job.get("steps", [])
+                   if step.get("name") == "Install pinned cargo-fuzz"]
+        self.assertEqual(len(install), 1)
+        self.assertEqual(install[0].get("run"), "cargo install cargo-fuzz --version 0.13.2 --locked")
         self.assertIn("nightly-2026-10-01", text)
-        self.assertIn("cargo +nightly-2026-10-01 fuzz build", text)
-        self.assertNotIn("fuzz run", text)
         self.assertNotIn("max_total_time", text)
-        # Separate workspace: the build runs inside fuzz/, never the root lockfile.
+
+        # Separate workspace: compilation and the bounded replay are distinct steps in fuzz/.
         build = [step for step in job.get("steps", []) if "fuzz build" in str(step.get("run", ""))]
         self.assertEqual(len(build), 1)
         self.assertEqual(build[0].get("working-directory"), "fuzz")
-        # The `+nightly` selector is load-bearing: rustup resolves the toolchain
-        # from the repo-root rust-toolchain.toml (stable), so a bare
-        # `cargo fuzz build` runs under stable and fails on `-Zsanitizer`.
-        self.assertIn("cargo +nightly-2026-10-01 fuzz build", build[0].get("run", ""))
+        self.assertEqual(build[0].get("run"), "cargo +nightly-2026-10-01 fuzz build")
+        replay = [step for step in job.get("steps", [])
+                  if "fuzz run eventsub_delivery" in str(step.get("run", ""))]
+        self.assertEqual(len(replay), 1)
+        self.assertEqual(replay[0].get("working-directory"), "fuzz")
+        fuzz_runs = [step for step in job.get("steps", [])
+                     if "fuzz run" in step.get("run", "")]
+        self.assertEqual(fuzz_runs, replay)
+        self.assertIsNot(fuzz_runs[0], build[0])
+        self.assertEqual(
+            replay[0].get("run"),
+            "cargo +nightly-2026-10-01 fuzz run eventsub_delivery -- -runs=0 -timeout=10 -rss_limit_mb=2048",
+        )
+
+        # The committed target and seeds are what the bounded replay executes.
+        self.assertTrue((ROOT / "fuzz/fuzz_targets/eventsub_delivery.rs").is_file())
+        corpus = ROOT / "fuzz/corpus/eventsub_delivery"
+        self.assertTrue(corpus.is_dir())
+        self.assertTrue(any(seed.is_file() for seed in corpus.iterdir()))
+
         # Pinned dependencies: the committed fuzz/Cargo.lock is the gate's
         # version inventory. `--locked` fails the required job instead of
         # silently resolving fresh crates.io versions on every run.
         fetch = [step for step in job.get("steps", []) if "fetch --locked" in str(step.get("run", ""))]
         self.assertEqual(len(fetch), 1)
         self.assertEqual(fetch[0].get("working-directory"), "fuzz")
-        self.assertIn("cargo +nightly-2026-10-01 fetch --locked", fetch[0].get("run", ""))
-        agg = self.workflows["check.yml"]["jobs"]["ci-ok"]
+        self.assertEqual(fetch[0].get("run"), "cargo +nightly-2026-10-01 fetch --locked")
+        agg = workflow["jobs"]["ci-ok"]
         self.assertIn("fuzz-compile", agg["needs"])
         self.assertIn("FUZZ_COMPILE_RESULT", "\n".join(step.get("run", "") for step in agg["steps"]))
+
+    def test_nextest_is_required_and_rust_gated(self):
+        job = self.workflows["check.yml"]["jobs"]["nextest"]
+        self.assertEqual(job.get("name"), "rust nextest")
+        self.assertEqual(job.get("permissions"), {"contents": "read"})
+        self.assertIn("job-inputs", job.get("needs", []))
+        self.assertIn("needs.job-inputs.outputs.rust != 'false'", job.get("if", ""))
+        self.assertEqual(job.get("uses"), "./.github/workflows/reusable-rust-nextest.yml")
+        self.assertNotIn("schedule", self.workflows["check.yml"].get("on", {}).get("pull_request", {}))
+        agg = self.workflows["check.yml"]["jobs"]["ci-ok"]
+        self.assertIn("nextest", agg["needs"])
+        self.assertIn("NEXTEST_RESULT", "\n".join(step.get("run", "") for step in agg["steps"]))
 
     def aggregator(self, name):
         job = self.workflows["check.yml"]["jobs"][name]
@@ -192,7 +223,7 @@ class RequiredChecksReportTests(unittest.TestCase):
         # lint still pass. Docs changes continue to select the worker lane.
         gated = {"rust-tests", "ignored-db-stores", "ignored-db-runtime", "self-role-store",
                  "community-db", "feeds-db", "tickets-postgres", "moderation-db",
-                 "parity-docs", "supply-chain", "fuzz-compile"}
+                 "parity-docs", "supply-chain", "fuzz-compile", "nextest"}
         for name in AGGREGATORS:
             with self.subTest(aggregator=name):
                 skipped = {job: "skipped" for job in gated}
