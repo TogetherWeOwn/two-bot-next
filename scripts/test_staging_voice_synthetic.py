@@ -46,9 +46,10 @@ def obs(**over):
         "limit_probed": 2,
         "limit_set_ok": True,
         "limit_restored": True,
-        "privacy_initial_denies": False,
-        "privacy_toggled": True,
-        "privacy_restored": True,
+        "privacy_public_baseline": True,
+        "privacy_product_bot_manage_roles": True,
+        "privacy_no_member_manage_roles": True,
+        "privacy_product_bot_role": "Owen QA Test",
         "panel_name": "🍄 Synthetic’s workshop",
     }
     base.update(over)
@@ -191,27 +192,33 @@ class EvaluateTest(unittest.TestCase):
         result = verdicts(obs(limit_restored=False))
         self.assertEqual(result["limit"], "FAIL")
 
-    def test_privacy_passes_on_verified_toggle_and_restore(self):
+    def test_privacy_passes_on_read_only_public_baseline_and_permissions(self):
         self.assertEqual(verdicts(obs())["privacy"], "PASS")
 
-    def test_privacy_skips_when_the_test_bot_may_not_edit_overwrites(self):
-        result = verdicts(obs(privacy_toggled=False, privacy_restored=False,
-                              privacy_forbidden=True))
-        self.assertEqual(result["privacy"], "SKIP")
+    def test_privacy_fails_when_everyone_connect_is_not_public(self):
+        self.assertEqual(verdicts(obs(privacy_public_baseline=False))["privacy"], "FAIL")
 
-    def test_privacy_skips_on_rate_limit(self):
-        result = verdicts(obs(privacy_toggled=False, privacy_restored=False,
-                              privacy_rate_limited=True,
-                              privacy_note="overwrite PUT answered 429; privacy skipped"))
-        self.assertEqual(result["privacy"], "SKIP")
+    def test_privacy_fails_when_product_bot_role_lacks_manage_roles(self):
+        failing = obs(privacy_product_bot_manage_roles=False,
+                      privacy_product_bot_role="TWO Staging Product")
+        self.assertEqual(verdicts(failing)["privacy"], "FAIL")
+        detail = next(c["detail"] for c in synth.evaluate(failing)
+                      if c["check"] == "privacy")
+        self.assertIn("TWO Staging Product", detail)
+        self.assertNotIn("test bot", detail.lower())
 
-    def test_privacy_fails_when_not_toggled(self):
-        result = verdicts(obs(privacy_toggled=False, privacy_restored=False))
-        self.assertEqual(result["privacy"], "FAIL")
+    def test_privacy_fails_when_member_overwrite_grants_manage_roles(self):
+        self.assertEqual(verdicts(obs(privacy_no_member_manage_roles=False))["privacy"], "FAIL")
 
-    def test_privacy_fails_when_toggled_but_not_restored(self):
-        result = verdicts(obs(privacy_restored=False))
-        self.assertEqual(result["privacy"], "FAIL")
+    def test_privacy_read_error_fails_and_names_product_role(self):
+        result = synth.evaluate(obs(privacy_note=(
+            "HTTPError reading room privacy facts; could not verify the product bot's "
+            "staging role effective Manage Roles")))
+        privacy = next(c for c in result if c["check"] == "privacy")
+        self.assertEqual(privacy["verdict"], "FAIL")
+        self.assertIn("product bot's staging role", privacy["detail"])
+        self.assertNotIn("test bot", privacy["detail"].lower())
+
 
     def test_name_panel_passes_on_template_render(self):
         self.assertEqual(verdicts(obs())["name_panel"], "PASS")
@@ -239,6 +246,211 @@ class EvaluateTest(unittest.TestCase):
                       if c["check"] == "create")
         self.assertNotIn("received=", detail)
         self.assertNotIn("unknown_creator", detail)
+
+
+class EffectivePermissionsTest(unittest.TestCase):
+    GUILD = "700"
+    BOT = "800"
+    MANAGE_ROLES = 1 << 28
+    ADMINISTRATOR = 1 << 3
+
+    def permissions(self, *, everyone=0, roles=None, overwrites=None, owner=None,
+                    member_role_ids=None):
+        role_rows = [{"id": self.GUILD, "permissions": str(everyone)}]
+        role_rows.extend(roles or [])
+        if member_role_ids is None:
+            member_role_ids = [r["id"] for r in (roles or [])]
+        return synth.effective_permissions(
+            self.GUILD, self.BOT, member_role_ids, role_rows, overwrites or [],
+            guild_owner_id=owner)
+
+    def test_everyone_base_role_contributes_permissions(self):
+        result = self.permissions(everyone=self.MANAGE_ROLES)
+        self.assertTrue(result & self.MANAGE_ROLES)
+
+    def test_assigned_role_grants_manage_roles(self):
+        result = self.permissions(roles=[{"id": "role", "permissions": str(self.MANAGE_ROLES)}])
+        self.assertTrue(result & self.MANAGE_ROLES)
+
+    def test_everyone_overwrite_deny_removes_base_permission(self):
+        result = self.permissions(
+            everyone=self.MANAGE_ROLES,
+            overwrites=[{"id": self.GUILD, "type": 0, "allow": "0",
+                         "deny": str(self.MANAGE_ROLES)}])
+        self.assertFalse(result & self.MANAGE_ROLES)
+
+    def test_everyone_overwrite_allow_grants_permission(self):
+        result = self.permissions(
+            overwrites=[{"id": self.GUILD, "type": 0, "allow": str(self.MANAGE_ROLES),
+                         "deny": "0"}])
+        self.assertTrue(result & self.MANAGE_ROLES)
+
+    def test_role_overwrite_allow_grants_permission(self):
+        result = self.permissions(
+            roles=[{"id": "role", "permissions": "0"}],
+            overwrites=[{"id": "role", "type": 0, "allow": str(self.MANAGE_ROLES),
+                         "deny": "0"}])
+        self.assertTrue(result & self.MANAGE_ROLES)
+
+    def test_unassigned_role_overwrite_does_not_grant_permission(self):
+        result = self.permissions(
+            roles=[{"id": "other-role", "permissions": "0"}],
+            member_role_ids=[],
+            overwrites=[{"id": "other-role", "type": 0,
+                         "allow": str(self.MANAGE_ROLES), "deny": "0"}])
+        self.assertFalse(result & self.MANAGE_ROLES)
+
+    def test_member_overwrite_allow_grants_permission(self):
+        result = self.permissions(
+            overwrites=[{"id": self.BOT, "type": 1, "allow": str(self.MANAGE_ROLES),
+                         "deny": "0"}])
+        self.assertTrue(result & self.MANAGE_ROLES)
+
+    def test_role_overwrite_deny_wins_over_role_allow(self):
+        result = self.permissions(
+            roles=[{"id": "role", "permissions": str(self.MANAGE_ROLES)}],
+            overwrites=[{"id": "role", "type": 0, "allow": "0", "deny": str(self.MANAGE_ROLES)}])
+        self.assertFalse(result & self.MANAGE_ROLES)
+
+    def test_member_overwrite_deny_wins_over_role_grant(self):
+        result = self.permissions(
+            roles=[{"id": "role", "permissions": str(self.MANAGE_ROLES)}],
+            overwrites=[{"id": self.BOT, "type": 1, "allow": "0", "deny": str(self.MANAGE_ROLES)}])
+        self.assertFalse(result & self.MANAGE_ROLES)
+
+    def test_administrator_bypasses_channel_overwrites(self):
+        result = self.permissions(
+            roles=[{"id": "role", "permissions": str(self.ADMINISTRATOR)}],
+            overwrites=[{"id": self.BOT, "type": 1, "allow": "0", "deny": str(self.MANAGE_ROLES)}])
+        self.assertTrue(result & self.MANAGE_ROLES)
+
+    def test_guild_owner_bypasses_channel_overwrites(self):
+        result = self.permissions(
+            overwrites=[{"id": self.BOT, "type": 1, "allow": "0", "deny": str(self.MANAGE_ROLES)}],
+            owner=self.BOT)
+        self.assertTrue(result & self.MANAGE_ROLES)
+
+    def test_owner_bypass_is_preserved_by_privacy_facts(self):
+        roles = [{"id": self.GUILD, "name": "@everyone", "permissions": "0"}]
+        channel = {"permission_overwrites": [{
+            "id": self.GUILD, "type": 0, "allow": "0",
+            "deny": str(self.MANAGE_ROLES)}]}
+        member = {"roles": []}
+        facts = synth.privacy_facts(
+            channel, roles, member, self.GUILD, self.BOT, guild_owner_id=self.BOT)
+        self.assertTrue(facts["privacy_product_bot_manage_roles"])
+        not_owner = synth.privacy_facts(
+            channel, roles, member, self.GUILD, self.BOT, guild_owner_id="another-user")
+        self.assertFalse(not_owner["privacy_product_bot_manage_roles"])
+
+
+class PrivacyFactsTest(unittest.TestCase):
+    GUILD = "700"
+    PRODUCT_BOT = "800"
+    VIEW = 1 << 10
+    MANAGE_ROLES = 1 << 28
+    CONNECT = 1 << 20
+
+    def facts(self, *, overwrites=None, role_perms=None):
+        channel = {"permission_overwrites": overwrites or [
+            {"id": self.GUILD, "type": 0, "allow": "0", "deny": "0"}]}
+        if role_perms is None:
+            role_perms = self.VIEW | self.MANAGE_ROLES
+        roles = [
+            {"id": self.GUILD, "name": "@everyone", "permissions": "0"},
+            {"id": "role", "name": "Staging Product", "permissions": str(role_perms)},
+        ]
+        member = {"roles": ["role"]}
+        return synth.privacy_facts(channel, roles, member, self.GUILD, self.PRODUCT_BOT)
+
+    def test_all_three_privacy_facts_pass_on_public_room(self):
+        facts = self.facts()
+        self.assertTrue(facts["privacy_public_baseline"])
+        self.assertTrue(facts["privacy_product_bot_manage_roles"])
+        self.assertTrue(facts["privacy_no_member_manage_roles"])
+        self.assertEqual(facts["privacy_product_bot_role"], "Staging Product")
+
+    def test_private_connect_deny_breaks_public_baseline(self):
+        facts = self.facts(overwrites=[
+            {"id": self.GUILD, "type": 0, "allow": "0", "deny": str(self.CONNECT)}])
+        self.assertFalse(facts["privacy_public_baseline"])
+
+    def test_everyone_allow_connect_breaks_public_baseline(self):
+        facts = self.facts(overwrites=[
+            {"id": self.GUILD, "type": 0, "allow": str(self.CONNECT), "deny": "0"}])
+        self.assertFalse(facts["privacy_public_baseline"])
+
+    def test_duplicate_everyone_overwrites_break_public_baseline(self):
+        facts = self.facts(overwrites=[
+            {"id": self.GUILD, "type": 0, "allow": "0", "deny": "0"},
+            {"id": self.GUILD, "type": 0, "allow": "0", "deny": "0"},
+        ])
+        self.assertFalse(facts["privacy_public_baseline"])
+
+    def test_product_role_without_manage_roles_fails(self):
+        facts = self.facts(role_perms=self.VIEW)
+        self.assertFalse(facts["privacy_product_bot_manage_roles"])
+
+    def test_product_role_without_view_channel_fails(self):
+        # can_edit_overwrites needs VIEW_CHANNEL|MANAGE_ROLES: Manage Roles
+        # alone must not read as the /private precondition.
+        facts = self.facts(role_perms=self.MANAGE_ROLES)
+        self.assertFalse(facts["privacy_product_bot_manage_roles"])
+
+    def test_role_overwrite_allow_grants_the_product_bot_permissions(self):
+        facts = self.facts(role_perms=0, overwrites=[
+            {"id": self.GUILD, "type": 0, "allow": "0", "deny": "0"},
+            {"id": "role", "type": 0,
+             "allow": str(self.VIEW | self.MANAGE_ROLES), "deny": "0"},
+        ])
+        self.assertTrue(facts["privacy_product_bot_manage_roles"])
+
+    def test_role_overwrite_deny_removes_the_product_bot_permission(self):
+        facts = self.facts(role_perms=self.VIEW | self.MANAGE_ROLES, overwrites=[
+            {"id": self.GUILD, "type": 0, "allow": "0", "deny": "0"},
+            {"id": "role", "type": 0, "allow": "0",
+             "deny": str(self.MANAGE_ROLES)},
+        ])
+        self.assertFalse(facts["privacy_product_bot_manage_roles"])
+
+    def test_room_overwrite_deny_removes_the_product_bot_permission(self):
+        facts = self.facts(role_perms=self.VIEW | self.MANAGE_ROLES, overwrites=[
+            {"id": self.GUILD, "type": 0, "allow": "0",
+             "deny": str(self.VIEW | self.MANAGE_ROLES)},
+        ])
+        self.assertFalse(facts["privacy_product_bot_manage_roles"])
+
+    def test_member_overwrite_allow_grants_the_product_bot_permission(self):
+        facts = self.facts(role_perms=0, overwrites=[
+            {"id": self.GUILD, "type": 0, "allow": "0", "deny": "0"},
+            {"id": self.PRODUCT_BOT, "type": 1,
+             "allow": str(self.VIEW | self.MANAGE_ROLES), "deny": "0"},
+        ])
+        self.assertTrue(facts["privacy_product_bot_manage_roles"])
+
+    def test_member_overwrite_deny_removes_the_product_bot_permission(self):
+        facts = self.facts(role_perms=self.VIEW | self.MANAGE_ROLES, overwrites=[
+            {"id": self.GUILD, "type": 0, "allow": "0", "deny": "0"},
+            {"id": self.PRODUCT_BOT, "type": 1, "allow": "0",
+             "deny": str(self.MANAGE_ROLES)},
+        ])
+        self.assertFalse(facts["privacy_product_bot_manage_roles"])
+
+    def test_other_member_overwrite_does_not_grant_the_product_bot_permission(self):
+        facts = self.facts(role_perms=0, overwrites=[
+            {"id": self.GUILD, "type": 0, "allow": "0", "deny": "0"},
+            {"id": "another-member", "type": 1,
+             "allow": str(self.VIEW | self.MANAGE_ROLES), "deny": "0"},
+        ])
+        self.assertFalse(facts["privacy_product_bot_manage_roles"])
+        self.assertFalse(facts["privacy_no_member_manage_roles"])
+
+    def test_any_member_manage_roles_grant_is_reported(self):
+        facts = self.facts(overwrites=[
+            {"id": self.GUILD, "type": 0, "allow": "0", "deny": "0"},
+            {"id": "900", "type": 1, "allow": str(self.MANAGE_ROLES), "deny": "0"},
+        ])
+        self.assertFalse(facts["privacy_no_member_manage_roles"])
 
 
 class MetricsSnapshotTest(unittest.TestCase):
@@ -512,28 +724,6 @@ class BodyCapTest(unittest.TestCase):
                 synth.rest_patch("t", f"/channels/{CREATOR}", {"name": "x"})
         self.assertEqual(str(ctx.exception), "Discord REST read answered over the body cap")
 
-    def test_put_overwrite_reports_status_without_raising(self):
-        seen = []
-        with mock.patch.object(synth.urllib.request, "urlopen",
-                               return_value=self.response(b"{}", seen)):
-            self.assertEqual(synth.rest_put_overwrite("t", ROOM, CREATOR, 0, 1048576, 0), 200)
-        self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
-
-    def test_put_overwrite_forbidden_reports_403(self):
-        seen = []
-        with mock.patch.object(synth.urllib.request, "urlopen",
-                               side_effect=self.http_error(b"{}", seen, code=403)):
-            self.assertEqual(synth.rest_put_overwrite("t", ROOM, CREATOR, 0, 1048576, 0), 403)
-        self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
-
-    def test_put_overwrite_over_cap_refuses(self):
-        big = b"y" * (synth.MAX_BODY_BYTES + 1)
-        with mock.patch.object(synth.urllib.request, "urlopen",
-                               return_value=self.response(big, [])):
-            with self.assertRaises(synth.BodyTooLarge) as ctx:
-                synth.rest_put_overwrite("t", ROOM, CREATOR, 0, 1048576, 0)
-        self.assertEqual(str(ctx.exception), "Discord REST read answered over the body cap")
-
     def test_user_agent_pins_are_unchanged(self):
         requests = []
 
@@ -544,9 +734,8 @@ class BodyCapTest(unittest.TestCase):
         with mock.patch.object(synth.urllib.request, "urlopen", side_effect=fake_open):
             synth.rest("t", f"/channels/{ROOM}")
             synth.rest_patch("t", f"/channels/{ROOM}", {"name": "x"})
-            synth.rest_put_overwrite("t", ROOM, CREATOR, 0, 1048576, 0)
             synth.metrics_value("https://two-bot-next-staging.x", "tok")
-        self.assertEqual(len(requests), 4)
+        self.assertEqual(len(requests), 3)
         for req in requests:
             self.assertEqual(req.get_header("User-agent"), self.EXPECTED_UA)
 
