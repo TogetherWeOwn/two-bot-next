@@ -40,15 +40,16 @@ adding a second unique constraint.
 
 ## Retention and erasure wiring
 
-No automatic age-based purger exists for this table. Rows persist until an
-authorized erasure or a per-guild purge removes them. Do not claim a
-30/90-day TTL where no enforcing timer exists; see
-[privacy.md](privacy.md#retention-and-explicit-exceptions).
-
-The TTL policy is a placeholder on purpose: a future retention decision
-needs its own reviewed migration and policy, roughly shaped as a
-`DELETE` bounded by `event_time`, never as a silent background rewrite.
-This note does not authorize that migration, its interval or its schedule.
+The existing supervised retention job applies age expiry only to the raw
+presence/voice capture families and cached Discord audit entries described in
+[privacy.md](privacy.md#retention-and-explicit-exceptions). It selects by
+`event_time`, runs deletes only in `execute` mode, and processes one globally
+capped batch per cadence. The job defaults to dry-run; its report shows the full
+eligible backlog, while an execute run deletes at most 1,000 rows. Cutoff
+headroom and the limits of the batch guarantee are documented in the privacy
+policy section. This does not add age expiry to other `event_store` families,
+which remain until authorized erasure or per-guild purge. Do not claim a
+30/90-day TTL for those unrelated families.
 
 The per-user purge path is the existing member-erasure procedure in
 [privacy.md](privacy.md#procedure): each landing slice registers an

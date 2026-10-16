@@ -232,9 +232,10 @@ so those captures can expire up to 15 minutes before their nominal maximum age.
 Each run commits at most one globally capped batch of 1,000 rows across all
 three capture classes, ordered by oldest `event_time`; later runs continue the
 backlog, allowing user-deletion and guild-purge work to proceed each cadence.
-Dry-run reports the full eligible capture backlog, not just one batch. A
-timed-out run keeps an already committed raw batch and retries the remaining
-backlog on a later cadence. This is not a claim that an arbitrarily large or
+Dry-run reports the full eligible capture backlog, not just one batch. If a
+batch times out, that batch rolls back; batches committed by earlier runs stay
+committed, and the remaining backlog is retried on a later cadence. This is not
+a claim that an arbitrarily large or
 continuously growing backlog can be drained within one cadence; steady-state
 expiry depends on the supervised job keeping up with arrivals. Capture writers
 stay insert-only and no other `event_store` family has an age TTL; those rows
