@@ -222,9 +222,9 @@ their login status or silently removing memberships. It contains no passwords.
    reads 0 findings. For later migrations, the order is fixed: (a) dispatch the
    matching migration workflow plan (`staging-migrate.yml` with
    `--target staging` for staging, `production-migrate.yml` with
-   `--target production` for PlanetScale main `two_bot`; production takes no
-   branch pin yet, so a production dispatch aimed at a PlanetScale host
-   refuses closed until the production branch-pin follow-up lands) and review
+   `--target production` for PlanetScale main `two_bot`, passing
+   `production_branch_id` (required for `*.psdb.cloud` hosts; it must match
+   the binding username's `{role}.{branch_id}` suffix)) and review
    the pending set; (b) dispatch apply through the reviewed environment so the dedicated
    migrator login creates objects with `SET ROLE two_bot_migrator` from the
    start: creator-specific default ACLs belong to the group, not automatically

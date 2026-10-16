@@ -42,6 +42,14 @@ def obs(**over):
         "metrics_delta": 1,
         "rename_applied": True,
         "rename_restored": True,
+        "limit_initial": 0,
+        "limit_probed": 2,
+        "limit_set_ok": True,
+        "limit_restored": True,
+        "privacy_initial_denies": False,
+        "privacy_toggled": True,
+        "privacy_restored": True,
+        "panel_name": "🍄 Synthetic’s workshop",
     }
     base.update(over)
     return base
@@ -155,6 +163,64 @@ class EvaluateTest(unittest.TestCase):
             obs(rename_applied=False, rename_restored=False, rename_note="x"))
             if c["check"] == "rename")
         self.assertIn("x", detail)
+
+    def test_limit_passes_on_verified_set_and_restore(self):
+        self.assertEqual(verdicts(obs())["limit"], "PASS")
+
+    def test_limit_fails_when_owner_passes_but_patch_is_forbidden(self):
+        result = verdicts(obs(limit_set_ok=False, limit_restored=False, limit_forbidden=True))
+        self.assertEqual(result["owner"], "PASS")
+        self.assertEqual(result["limit"], "FAIL")
+        detail = next(c["detail"] for c in synth.evaluate(
+            obs(limit_set_ok=False, limit_restored=False, limit_forbidden=True))
+            if c["check"] == "limit")
+        self.assertIn("403", detail)
+        self.assertIn("Manage Channels", detail)
+
+    def test_limit_skips_on_rate_limit(self):
+        result = verdicts(obs(limit_set_ok=False, limit_restored=False,
+                              limit_rate_limited=True,
+                              limit_note="user_limit PATCH answered 429; limit skipped"))
+        self.assertEqual(result["limit"], "SKIP")
+
+    def test_limit_fails_when_not_applied(self):
+        result = verdicts(obs(limit_set_ok=False, limit_restored=False))
+        self.assertEqual(result["limit"], "FAIL")
+
+    def test_limit_fails_when_set_but_not_restored(self):
+        result = verdicts(obs(limit_restored=False))
+        self.assertEqual(result["limit"], "FAIL")
+
+    def test_privacy_passes_on_verified_toggle_and_restore(self):
+        self.assertEqual(verdicts(obs())["privacy"], "PASS")
+
+    def test_privacy_skips_when_the_test_bot_may_not_edit_overwrites(self):
+        result = verdicts(obs(privacy_toggled=False, privacy_restored=False,
+                              privacy_forbidden=True))
+        self.assertEqual(result["privacy"], "SKIP")
+
+    def test_privacy_skips_on_rate_limit(self):
+        result = verdicts(obs(privacy_toggled=False, privacy_restored=False,
+                              privacy_rate_limited=True,
+                              privacy_note="overwrite PUT answered 429; privacy skipped"))
+        self.assertEqual(result["privacy"], "SKIP")
+
+    def test_privacy_fails_when_not_toggled(self):
+        result = verdicts(obs(privacy_toggled=False, privacy_restored=False))
+        self.assertEqual(result["privacy"], "FAIL")
+
+    def test_privacy_fails_when_toggled_but_not_restored(self):
+        result = verdicts(obs(privacy_restored=False))
+        self.assertEqual(result["privacy"], "FAIL")
+
+    def test_name_panel_passes_on_template_render(self):
+        self.assertEqual(verdicts(obs())["name_panel"], "PASS")
+
+    def test_name_panel_fails_on_fallback(self):
+        self.assertEqual(verdicts(obs(panel_name="Synthetic's room"))["name_panel"], "FAIL")
+
+    def test_name_panel_fails_when_missing(self):
+        self.assertEqual(verdicts(obs(panel_name=None))["name_panel"], "FAIL")
 
     def test_failed_create_names_the_refusal_reason(self):
         # RED first: a create stall must name its refusal reason and the
@@ -446,6 +512,28 @@ class BodyCapTest(unittest.TestCase):
                 synth.rest_patch("t", f"/channels/{CREATOR}", {"name": "x"})
         self.assertEqual(str(ctx.exception), "Discord REST read answered over the body cap")
 
+    def test_put_overwrite_reports_status_without_raising(self):
+        seen = []
+        with mock.patch.object(synth.urllib.request, "urlopen",
+                               return_value=self.response(b"{}", seen)):
+            self.assertEqual(synth.rest_put_overwrite("t", ROOM, CREATOR, 0, 1048576, 0), 200)
+        self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
+
+    def test_put_overwrite_forbidden_reports_403(self):
+        seen = []
+        with mock.patch.object(synth.urllib.request, "urlopen",
+                               side_effect=self.http_error(b"{}", seen, code=403)):
+            self.assertEqual(synth.rest_put_overwrite("t", ROOM, CREATOR, 0, 1048576, 0), 403)
+        self.assertEqual(seen, [synth.MAX_BODY_BYTES + 1])
+
+    def test_put_overwrite_over_cap_refuses(self):
+        big = b"y" * (synth.MAX_BODY_BYTES + 1)
+        with mock.patch.object(synth.urllib.request, "urlopen",
+                               return_value=self.response(big, [])):
+            with self.assertRaises(synth.BodyTooLarge) as ctx:
+                synth.rest_put_overwrite("t", ROOM, CREATOR, 0, 1048576, 0)
+        self.assertEqual(str(ctx.exception), "Discord REST read answered over the body cap")
+
     def test_user_agent_pins_are_unchanged(self):
         requests = []
 
@@ -456,8 +544,9 @@ class BodyCapTest(unittest.TestCase):
         with mock.patch.object(synth.urllib.request, "urlopen", side_effect=fake_open):
             synth.rest("t", f"/channels/{ROOM}")
             synth.rest_patch("t", f"/channels/{ROOM}", {"name": "x"})
+            synth.rest_put_overwrite("t", ROOM, CREATOR, 0, 1048576, 0)
             synth.metrics_value("https://two-bot-next-staging.x", "tok")
-        self.assertEqual(len(requests), 3)
+        self.assertEqual(len(requests), 4)
         for req in requests:
             self.assertEqual(req.get_header("User-agent"), self.EXPECTED_UA)
 

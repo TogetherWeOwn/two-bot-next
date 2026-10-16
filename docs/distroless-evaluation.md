@@ -1,17 +1,15 @@
 # Distroless runtime evaluation ([TOG-12144](/TOG/issues/TOG-12144), follow-up of [TOG-10893](/TOG/issues/TOG-10893))
 
-Trial only. The default image is unchanged (`Dockerfile` still builds
-`debian:bookworm-slim`); switching it is a separate CEO-gated decision.
-The trial variant is `Dockerfile.distroless`: identical to the CI-proven
-runtime from commit `5957e929` ([TOG-10893](/TOG/issues/TOG-10893) SBOM branch)
-except for its header comment. No `wrangler/` or workflow files were touched.
+Historical evaluation. The cutover has adopted the digest-pinned distroless
+runtime as the default image in `Dockerfile`. This document preserves the
+original measurements and compatibility findings; the former trial image is
+not a separate build path.
 
 ## Verdict
 
-Recommend adopting `gcr.io/distroless/cc-debian13:nonroot` (digest-pinned,
-trixie builder) as the default runtime through a separate CEO-gated cutover
-card — not this one — after the preconditions below. Do not use the `static`
-variant; do not deploy a `debug-nonroot` variant.
+The default runtime is `gcr.io/distroless/cc-debian13:nonroot` (digest-pinned,
+trixie builder). Do not use the `static` variant or deploy a `debug-nonroot`
+variant.
 
 ## Compatibility
 
@@ -82,11 +80,11 @@ else (14 packages, no shell or package manager).
 
 ## Runtime profile: cold start, RSS and readiness timings
 
-Trial-image profiling for the cutover guard. The default `Dockerfile` now builds
-the same pinned `cc-debian13:nonroot` base digest as this trial variant — only
-build-provenance labels differ, and labels do not execute — so this profile
-covers both images. No guard logic changes here; thresholds stay where the
-cutover guard reads them in the
+Historical trial-image profiling for the cutover guard. The default
+`Dockerfile` builds the pinned `cc-debian13:nonroot` base digest; current
+build-provenance arguments and labels do not alter the runtime. This profile
+remains historical evidence. No guard logic changes here; thresholds stay
+where the cutover guard reads them in the
 [production signal thresholds](production-deploy.md#signal-thresholds-budgets-and-rollback-triggers).
 
 ### Repeatable procedure
@@ -96,7 +94,7 @@ controller. No secrets, database or Discord traffic are used at any step.
 
 ```sh
 docker buildx build --load --platform linux/amd64 \
-  -t two-bot:distroless-profile -f Dockerfile.distroless .
+  -t two-bot:distroless-profile -f Dockerfile .
 python3 scripts/container-smoke.py two-bot:distroless-profile
 ```
 

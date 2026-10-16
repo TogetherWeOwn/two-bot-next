@@ -86,10 +86,18 @@ What the core does, in order, for every delivery:
    retries. Classification or planning errors alone must not trigger a retry.
 
 Subscription management is pure request building plus a diff
-(`create_subscription_body`, `parse_subscriptions`, `reconcile`). It runs at
-boot and after a `revocation`, never on a timer, and it only touches
-subscriptions on the bot's own callback. Deletes precede creates because
-Twitch answers 409 to a duplicate create.
+(`create_subscription_body`, `parse_subscriptions`, `reconcile`). The runtime
+wiring (`crates/bot/src/eventsub_reconcile.rs`) runs it once at startup and on
+a bounded hourly interval while `TWO_EVENTSUB` is exactly `1`, and it only
+touches subscriptions on the bot's own callback (`TWO_TWITCH_CALLBACK_URL`).
+Deletes precede creates because Twitch answers 409 to a duplicate create. The
+plan runs one action at a time: a rejected action (for example a 400 for a
+mistyped broadcaster id) is logged and counted, the later actions and the
+final listing still run, and the pass then fails with the failed and missing
+counts, so one bad id never starves the broadcasters after it. A
+`revocation` delivery is acknowledged by the receiver and healed by the next
+pass; the desired set comes from `TWO_TWITCH_BROADCASTERS` (empty parks the
+pass without mutations).
 
 Secret handling: the signing secret is a `WebhookSecret` (10-100 ASCII, as
 Twitch requires) wrapping `Secret<String>`; its `Debug` is `[REDACTED]`. It is
@@ -131,7 +139,8 @@ below is present but is not called by a runtime receiver yet.
 ## Private container receiver
 
 `crates/bot/src/eventsub_http.rs` plus
-`crates/core/src/eventsub_receiver_config.rs`:
+`crates/core/src/eventsub_receiver_config.rs`. Operator procedure:
+[EventSub operator runbook](eventsub-runbook.md).
 
 - Binds `0.0.0.0:8092` (`EVENTSUB_RECEIVER_PORT` in `wrangler/src/eventsub.ts`)
   when `TWO_EVENTSUB` is exactly `"1"` with a valid `TWO_EVENTSUB_BIND` and
@@ -157,8 +166,11 @@ below is present but is not called by a runtime receiver yet.
   `TRACED_PATHS` (`crates/bot/src/server.rs`) and renders as `[REDACTED]`.
 - The DO adds `8092` to `requiredPorts` plus the container bind only while
   `TWO_EVENTSUB` is `"1"` with the signing secret present; the Worker
-  forwards the flag, the fixed bind, the container marker and the Operator
-  secret on explicit lines, and forwards nothing when the secret is missing.
+  forwards the flag, the fixed bind, the container marker, the reconcile
+  inputs (`TWO_TWITCH_CALLBACK_URL`, `TWO_TWITCH_BROADCASTERS`) and the Twitch
+  credentials (`TWO_TWITCH_CLIENT_ID`, `TWO_TWITCH_CLIENT_SECRET`,
+  `TWO_TWITCH_WEBHOOK_SECRET`) on explicit lines, and forwards nothing when
+  the secret is missing.
   `scripts/check-env-bindings.py` rejects any `TWO_EVENTSUB*` or
   `TWO_TWITCH_*` var in `wrangler.toml`.
 
@@ -167,15 +179,20 @@ below is present but is not called by a runtime receiver yet.
 `crates/core/src/twitch_helix.rs` drives the plan from `twitch_eventsub`:
 
 - Credentials are Operator-provisioned (`TWO_TWITCH_CLIENT_ID`,
-  `TWO_TWITCH_CLIENT_SECRET`, `TWO_TWITCH_WEBHOOK_SECRET`); the Container
-  reads them from its own environment, never from forwarded Worker vars.
+  `TWO_TWITCH_CLIENT_SECRET`, `TWO_TWITCH_WEBHOOK_SECRET`); the Worker
+  forwards them on explicit containerEnvVars lines while the EventSub receiver
+  is forwarded, and the Container reads them from its process environment.
   Every value travels inside `Secret`, so even a `Debug` dump renders
   `[REDACTED]`.
 - The app token is cached and refreshed 60 s before its `expires_in`
-  instant, plus once on a 401 with a single retry. No timers: reconcile
-  runs at boot and after a `revocation` only.
+  instant, plus once on a 401 with a single retry. The Helix calls have no
+  timers of their own; the bot runtime (`crates/bot/src/eventsub_reconcile.rs`)
+  invokes them once at startup and on a bounded hourly interval.
 - `list_subscriptions` follows every `stream.online` page (up to a bounded
   limit); pass its complete result to `plan_boot_actions` for the deletes-first
   plan, then `execute_actions` runs it in order. A create that answers 409
   counts as done only after a follow-up listing confirms a healthy subscription
-  for that broadcaster on the configured callback.
+  for that broadcaster on the configured callback. After the plan executes, a
+  final listing confirms every desired broadcaster holds a healthy subscription
+  on the bot callback; anything missing or unhealthy logs with an `error_class`
+  and fails the pass, never silently.

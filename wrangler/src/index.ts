@@ -183,6 +183,14 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   TWO_EVENTSUB?: string;
   /** Operator-set Worker secret carrying the Twitch signing secret. Never flag-forwarded. */
   TWO_TWITCH_WEBHOOK_SECRET?: string;
+  /** Operator-set reconcile callback URL. Forwarded on its own explicit containerEnvVars line while the EventSub receiver is forwarded, never flag-forwarded. */
+  TWO_TWITCH_CALLBACK_URL?: string;
+  /** Operator-set reconcile broadcaster allowlist. Forwarded on its own explicit containerEnvVars line while the EventSub receiver is forwarded, never flag-forwarded. */
+  TWO_TWITCH_BROADCASTERS?: string;
+  /** Operator-set Helix client id. Forwarded on its own explicit containerEnvVars line while the EventSub receiver is forwarded, never flag-forwarded. */
+  TWO_TWITCH_CLIENT_ID?: string;
+  /** Operator-set Helix client secret. Forwarded on its own explicit containerEnvVars line while the EventSub receiver is forwarded, never flag-forwarded. */
+  TWO_TWITCH_CLIENT_SECRET?: string;
   /** Operator-set Worker secrets for the private receiver. Never flag-forwarded. */
   TWO_INTERNAL_ACTIONS?: string;
   TWO_INTERNAL_CALLERS?: string;
@@ -583,8 +591,11 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
   // exactly "1" with the signing secret present; any other state forwards
   // nothing, so a typo or a missing secret cannot crash-loop the gateway
   // (the receiver boots all-or-nothing). The bind and the container marker
-  // are the Worker's constants, never Operator-set values. The signing secret
-  // travels on its own explicit line and is never logged.
+  // are the Worker's constants, never Operator-set values. The signing secret,
+  // reconcile inputs and Helix credentials each travel on their own explicit
+  // line and are never logged. Absent stays absent so a half-provisioned
+  // enable fails loudly in the Container (reconcile_config_invalid) instead
+  // of silently running dark.
   if (eventsubReceiverForwarded(env)) {
     if (port === EVENTSUB_RECEIVER_PORT) throw new Error("BOT_PORT must differ from the EventSub receiver port");
     if (port === RECEIVER_PORT) throw new Error("BOT_PORT must differ from the internal-actions receiver port");
@@ -592,6 +603,10 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
     vars["TWO_EVENTSUB_BIND"] = EVENTSUB_RECEIVER_BIND;
     vars[CONTAINER_MARKER] = CONTAINER_MARKER_VALUE;
     vars["TWO_TWITCH_WEBHOOK_SECRET"] = env.TWO_TWITCH_WEBHOOK_SECRET as string;
+    if (env.TWO_TWITCH_CALLBACK_URL) vars["TWO_TWITCH_CALLBACK_URL"] = env.TWO_TWITCH_CALLBACK_URL;
+    if (env.TWO_TWITCH_BROADCASTERS) vars["TWO_TWITCH_BROADCASTERS"] = env.TWO_TWITCH_BROADCASTERS;
+    if (env.TWO_TWITCH_CLIENT_ID) vars["TWO_TWITCH_CLIENT_ID"] = env.TWO_TWITCH_CLIENT_ID;
+    if (env.TWO_TWITCH_CLIENT_SECRET) vars["TWO_TWITCH_CLIENT_SECRET"] = env.TWO_TWITCH_CLIENT_SECRET;
   }
   return vars;
 }

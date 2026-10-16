@@ -3,6 +3,8 @@ use serde_json::json;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 
+#[path = "voice_cold_authority_tests.rs"]
+mod cold_authority;
 #[path = "voice_delete_guard_tests.rs"]
 mod delete_guards;
 #[path = "voice_join_requests_tests.rs"]
@@ -1335,11 +1337,16 @@ impl std::io::Write for JoinLogWriter {
 fn capture_join_logs() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
     // Share the reconcile tests' global subscriber to keep callsite interest
     // stable; the local JSON writer captures only this runtime's events.
+    // Admit DEBUG: benign duplicate refusals log at debug, and the default
+    // fmt max is INFO, so without this the duplicate refusal line is dropped.
+    // No other capture user filters on a field a debug line sets, so their
+    // exact counts are unaffected.
     let _global = tracing_capture::global();
     let bytes = Arc::new(Mutex::new(Vec::new()));
     let output = Arc::clone(&bytes);
     let subscriber = tracing_subscriber::fmt()
         .json()
+        .with_max_level(tracing::Level::DEBUG)
         .with_writer(move || JoinLogWriter(Arc::clone(&output)))
         .finish();
     let guard = tracing::subscriber::set_default(subscriber);
@@ -1473,6 +1480,115 @@ async fn duplicate_voice_frames_and_duplicate_tickets_do_not_create_twice() {
         worker.http.created_attributes.lock().unwrap()[0].user_limit,
         8
     );
+}
+
+#[tokio::test]
+async fn refused_creator_joins_log_channel_and_creator_map_state() {
+    // Stall triage needs the refusing channel and the creator-map state on
+    // every refusal line: the channel id, the ticket's map generation versus
+    // the live one, whether the channel is a known creator, and the map size.
+    let (bytes, _subscriber) = capture_join_logs();
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let ticket = join(&mut worker, MEMBER);
+    // Same ticket twice: the repeat is refused as a benign duplicate while
+    // the channel stays a known creator.
+    assert!(!worker.accept_join(ticket, "duplicate", 8, NOW.to_owned()));
+    // A join into a channel the creator map never held.
+    let unknown = JoinTicket {
+        creator_id: 999,
+        ..ticket
+    };
+    assert!(!worker.accept_join(unknown, "new room", 9, NOW.to_owned()));
+    // A stale ticket on a gateway that has not re-readied: flip ready on the
+    // same worker and re-offer the queued ticket. The stale_ticket check runs
+    // before the duplicate check, so the reason is stale_ticket with
+    // ready=false, proving the field varies instead of being a constant.
+    worker.live.write_state().ready = false;
+    assert!(!worker.accept_join(ticket, "new room", 10, NOW.to_owned()));
+    // A halted worker refuses joins until restart: seed a credential refusal
+    // so the first dispatch halts it, then join again and check the halted
+    // line carries the same channel and map-state fields.
+    let (live, store, http, _) = fixture();
+    store
+        .claim_script
+        .lock()
+        .unwrap()
+        .push_back(Err(StoreError::CredentialRefused));
+    let mut halted_worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    join(&mut halted_worker, MEMBER);
+    dispatch(&mut halted_worker, 0).await;
+    assert!(halted_worker.halted());
+    let halted_ticket = halted_worker
+        .live
+        .voice_update(MEMBER + 1, Some(CREATOR), Some(false))
+        .unwrap();
+    assert!(!halted_worker.accept_join(halted_ticket, "new room", 10, NOW.to_owned()));
+    // A name the automod filter blocks: refused as name_blocked with the
+    // same channel and map-state fields.
+    let (live, store, http, _) = fixture();
+    let mut worker = GuildRoomWorker::load(live, store, http)
+        .await
+        .unwrap()
+        .with_name_policy(Arc::new(fixture_policy(&["room"])));
+    assert!(!join_as(&mut worker, MEMBER, "Ava"));
+    let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+    let refusals: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["fields"]["message"] == "voice creator join refused before queueing")
+        .collect();
+    assert_eq!(refusals.len(), 5, "{text}");
+    let fields = &refusals[0]["fields"];
+    assert_eq!(fields["voice_event"], "voice_join_received");
+    assert_eq!(fields["reason"], "duplicate");
+    assert_eq!(fields["channel"], CREATOR.to_string());
+    assert_eq!(fields["ticket_generation"], ticket.generation);
+    assert_eq!(fields["live_generation"], ticket.generation);
+    assert_eq!(fields["known"], true);
+    assert_eq!(fields["creators_len"], 1);
+    assert_eq!(fields["halted"], false);
+    assert_eq!(fields["ready"], true);
+    let fields = &refusals[1]["fields"];
+    assert_eq!(fields["voice_event"], "voice_join_received");
+    assert_eq!(fields["reason"], "unknown_creator");
+    assert_eq!(fields["channel"], "999");
+    assert_eq!(fields["ticket_generation"], ticket.generation);
+    assert_eq!(fields["live_generation"], ticket.generation);
+    assert_eq!(fields["known"], false);
+    assert_eq!(fields["creators_len"], 1);
+    assert_eq!(fields["halted"], false);
+    assert_eq!(fields["ready"], true);
+    let fields = &refusals[2]["fields"];
+    assert_eq!(fields["voice_event"], "voice_join_received");
+    assert_eq!(fields["reason"], "stale_ticket");
+    assert_eq!(fields["channel"], CREATOR.to_string());
+    assert_eq!(fields["ticket_generation"], ticket.generation);
+    assert_eq!(fields["live_generation"], ticket.generation);
+    assert_eq!(fields["known"], true);
+    assert_eq!(fields["creators_len"], 1);
+    assert_eq!(fields["halted"], false);
+    assert_eq!(fields["ready"], false);
+    let fields = &refusals[3]["fields"];
+    assert_eq!(fields["voice_event"], "voice_join_received");
+    assert_eq!(fields["reason"], "halted");
+    assert_eq!(fields["channel"], CREATOR.to_string());
+    assert_eq!(fields["ticket_generation"], halted_ticket.generation);
+    assert_eq!(fields["live_generation"], halted_ticket.generation);
+    assert_eq!(fields["known"], true);
+    assert_eq!(fields["creators_len"], 1);
+    assert_eq!(fields["halted"], true);
+    assert_eq!(fields["ready"], true);
+    let fields = &refusals[4]["fields"];
+    assert_eq!(fields["voice_event"], "voice_join_received");
+    assert_eq!(fields["reason"], "name_blocked");
+    assert_eq!(fields["channel"], CREATOR.to_string());
+    assert_eq!(fields["ticket_generation"], ticket.generation);
+    assert_eq!(fields["live_generation"], ticket.generation);
+    assert_eq!(fields["known"], true);
+    assert_eq!(fields["creators_len"], 1);
+    assert_eq!(fields["halted"], false);
+    assert_eq!(fields["ready"], true);
 }
 
 #[tokio::test]
@@ -6094,7 +6210,15 @@ fn parse_logging_subcommands() {
 #[tokio::test]
 async fn logging_command_needs_an_admin() {
     let runtime = logging_runtime(Arc::default(), None, None);
-    let member = logging_interaction(sub_option("show", vec![]), false);
+    // Ready guild-role facts, not cold ones: command_snapshot's @everyone
+    // carries no permissions and the member holds no roles, so authority
+    // resolves to a known non-admin and the denial is permanent.
+    // (logging_snapshot's @everyone carries MANAGE_CHANNELS, and a held
+    // role missing from the snapshot is the cold warming-up case covered
+    // by the cold-authority tests.)
+    assert!(runtime.publish_snapshot(GUILD, command_snapshot()));
+    let mut member = logging_interaction(sub_option("show", vec![]), false);
+    member.member.as_mut().unwrap().roles.clear();
     let (owned, response) = handle_capture(&runtime, &member).await;
     assert!(owned);
     assert_eq!(
@@ -6220,10 +6344,19 @@ async fn logging_mention_refuses_unsafe_roles_without_saving() {
         let response = response.expect("refusal");
         let text = response_text(&response);
         if case == "missing-held" {
-            // The actor's own role is missing from cache, so the guild admin
-            // gate denies before target validation runs. Either layer refuses
-            // without saving.
-            assert_eq!(text, "You need Manage Channels to use /logging.", "{case}");
+            // The actor's own role is missing from cache, so guild-role
+            // facts are incomplete: a cold authority state. The reply is
+            // the retryable warming-up text, not a permanent denial, and
+            // nothing is saved.
+            let lower = text.to_ascii_lowercase();
+            assert!(
+                lower.contains("warm") && (lower.contains("try again") || lower.contains("retry")),
+                "{case}: expected warming-up + retry reply, got: {text}"
+            );
+            assert!(
+                !text.contains("You need Manage Channels to use /logging."),
+                "{case}: cold reply must not be a permanent denial, got: {text}"
+            );
         } else {
             assert!(text.contains("Nothing was changed"), "{case}: {text}");
         }
@@ -6327,10 +6460,19 @@ async fn logging_channel_refuses_non_text_unknown_and_hidden_targets() {
         .await;
         let text = response_text(&response.unwrap());
         if case == "missing-held" {
-            // The actor's own role is missing from cache, so the guild admin
-            // gate denies before target validation runs. Either layer refuses
-            // without saving.
-            assert_eq!(text, "You need Manage Channels to use /logging.", "{case}");
+            // The actor's own role is missing from cache, so guild-role
+            // facts are incomplete: a cold authority state. The reply is
+            // the retryable warming-up text, not a permanent denial, and
+            // nothing is saved.
+            let lower = text.to_ascii_lowercase();
+            assert!(
+                lower.contains("warm") && (lower.contains("try again") || lower.contains("retry")),
+                "{case}: expected warming-up + retry reply, got: {text}"
+            );
+            assert!(
+                !text.contains("You need Manage Channels to use /logging."),
+                "{case}: cold reply must not be a permanent denial, got: {text}"
+            );
         } else {
             assert!(text.contains("Nothing was changed"), "{case}: {text}");
         }
@@ -7863,7 +8005,16 @@ async fn responder_without_guild_roles_refuses_channel_permission_claims_without
     assert_eq!(*trace.lock().unwrap(), ["defer", "complete"]);
     let completed = replies.completed.lock().unwrap();
     assert_eq!(completed.len(), 1);
-    assert!(response_text(&completed[0]).contains("You need Manage Channels"));
+    let text = response_text(&completed[0]);
+    let lower = text.to_ascii_lowercase();
+    assert!(
+        lower.contains("warm") && (lower.contains("try again") || lower.contains("retry")),
+        "cold denial must say warming up and ask to retry, got: {text:?}"
+    );
+    assert!(
+        !text.contains("You need Manage Channels"),
+        "cold denial must not report a permanent denial, got: {text:?}"
+    );
 }
 
 #[tokio::test]

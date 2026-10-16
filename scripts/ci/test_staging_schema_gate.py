@@ -1,9 +1,11 @@
 """Offline gate-contract tests; no database, no Actions dispatch, no secrets."""
 
 import json
+import tempfile
 import unittest
 
 from staging_schema_gate import (
+    main,
     Refused,
     branch_id_valid,
     connection_warning,
@@ -12,6 +14,35 @@ from staging_schema_gate import (
     pins_from_url,
     verify_binding,
 )
+
+
+class MainTests(unittest.TestCase):
+    def test_store_pending_fails_and_clean_manifest_passes(self):
+        source_sha = "a" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_out = f"{directory}/manifest.json"
+
+            def run_with_store_pending(*_args):
+                return {"pending_before": [], "pending_store_before": [400]}
+
+            result = main(
+                ["--binary", "staging-migrate", "--source-sha", source_sha,
+                 "--manifest-out", manifest_out],
+                env={},
+                run=run_with_store_pending,
+            )
+            self.assertEqual(result, 1)
+
+            def run_clean(*_args):
+                return {"pending_before": [], "pending_store_before": []}
+
+            result = main(
+                ["--binary", "staging-migrate", "--source-sha", source_sha,
+                 "--manifest-out", manifest_out],
+                env={},
+                run=run_clean,
+            )
+            self.assertEqual(result, 0)
 
 
 class PinsFromUrlTests(unittest.TestCase):
@@ -114,12 +145,24 @@ class PendingVersionsTests(unittest.TestCase):
     def test_nonempty_pending_is_returned_in_order(self):
         self.assertEqual(pending_versions({"pending_before": [12, 13]}), [12, 13])
 
+    def test_store_pending_reads_its_own_field(self):
+        manifest = {"pending_before": [], "pending_store_before": [400, 401]}
+        self.assertEqual(pending_versions(manifest, "pending_store_before"), [400, 401])
+        self.assertEqual(pending_versions(manifest), [])
+
     def test_malformed_manifest_fails_closed(self):
         for bad in ({}, {"pending_before": None}, {"pending_before": ["12"]},
                     {"pending_before": [12, 11]}, {"pending_before": True}):
             with self.subTest(bad=bad):
                 with self.assertRaises(Refused):
                     pending_versions(bad)
+        # A manifest without the store field fails closed too: the gate must
+        # see both chains before calling a deploy clean.
+        for bad in ({}, {"pending_store_before": None}, {"pending_store_before": ["400"]},
+                    {"pending_store_before": [401, 400]}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(Refused):
+                    pending_versions(bad, "pending_store_before")
 
 
 class DriftMessageTests(unittest.TestCase):
@@ -131,6 +174,17 @@ class DriftMessageTests(unittest.TestCase):
         self.assertIn("a" * 40, message)
         self.assertIn("staging-migrate", message)
         self.assertIn("apply", message)
+        self.assertNotIn("Store chain", message)
+
+    def test_store_drift_names_the_store_fix_and_role_restore_sequence(self):
+        message = drift_message([], "a" * 40, [400, 401])
+        self.assertIn("schema drift", message)
+        self.assertIn("400", message)
+        self.assertIn("expected_store_pending", message)
+        self.assertIn("reapply the full role-plan", message)
+        self.assertIn("two-bot db roles plan", message)
+        self.assertIn("verify", message)
+        self.assertIn("redeploy", message)
 
 
 class ConnectionWarningTests(unittest.TestCase):
