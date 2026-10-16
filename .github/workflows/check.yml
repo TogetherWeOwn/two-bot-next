@@ -392,7 +392,7 @@ jobs:
           # rust-tests lane. Keep collecting coverage, then let that lane
           # report test failures while this gate checks the generated report.
           rm -f "$RUNNER_TEMP/lcov.info"
-          if ! "$RUNNER_TEMP/cargo-llvm-cov" llvm-cov --workspace --lib --locked \
+          if ! "$RUNNER_TEMP/cargo-llvm-cov" llvm-cov --workspace --lib --bins --locked \
             --ignore-run-fail --lcov --output-path "$RUNNER_TEMP/lcov.info"; then
             echo "::error::patch coverage measurement failed to build or report"
             exit 1

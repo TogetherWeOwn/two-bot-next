@@ -1229,6 +1229,7 @@ class WorkflowTests(unittest.TestCase):
             if step.get("name") == "Patch coverage (HARD, 80% of added lines)"
         )
         self.assertIn("--ignore-run-fail", step["run"])
+        self.assertIn("--lib --bins", step["run"])
         self.assertIn('[ ! -s "$RUNNER_TEMP/lcov.info" ]', step["run"])
         self.assertNotIn("measurement did not complete", step["run"])
 

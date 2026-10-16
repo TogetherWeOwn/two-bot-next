@@ -5,7 +5,7 @@ HARD fails the PR. All Rust gates run as steps of the `check` lane in
 `check.yml` on the existing routed runner, so no new runner minutes beyond
 the step itself.
 
-- Patch coverage (HARD): `cargo llvm-cov --workspace --lib` plus
+- Patch coverage (HARD): `cargo llvm-cov --workspace --lib --bins` plus
   `scripts/ci/check-patch-coverage.py` requires 80% line coverage over the
   lines the PR adds. Shortfalls and missing or empty reports fail the PR.
   Measurement uses `--ignore-run-fail` so unit-test failures do not suppress

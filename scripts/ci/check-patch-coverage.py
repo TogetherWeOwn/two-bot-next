@@ -6,7 +6,9 @@ Inputs are a ``cargo llvm-cov --lcov`` report and a zero-context
 it as executable (a ``DA`` record); it is covered when its execution count is
 positive. The gate reports covered/coverable over the intersection and fails
 below ``--threshold`` percent (default 80). A patch with no coverable changed
-lines passes with a note.
+lines passes with a note. A changed line in a measured Rust source file
+(``crates/*/src/**`` or ``src/**``) that has no lcov record at all counts as
+uncovered, so uninstrumented code can never pass as "nothing to measure".
 
 HARD mode: a shortfall prints ``::error::`` annotations and exits 1. A blind
 gate (missing or unusable lcov, unreadable diff) also errors and exits 1; it
@@ -111,6 +113,31 @@ def normalize(path):
         return text.lstrip("./")
 
 
+def is_measurable_source(path):
+    """Workspace-relative Rust sources the lib+bins report must instrument.
+
+    Test-only files (``*_test.rs``, ``*_tests.rs``, ``test_*.rs``,
+    ``tests.rs``, or anything under a ``tests`` directory) are excluded:
+    changing only tests must not fail the gate.
+    """
+    if not path.endswith(".rs"):
+        return False
+    parts = path.split("/")
+    filename = parts[-1]
+    if filename in ("tests.rs",):
+        return False
+    if (filename.startswith("test_") or filename.endswith("_test.rs")
+            or filename.endswith("_tests.rs")):
+        return False
+    if "tests" in parts:
+        return False
+    if len(parts) >= 4 and parts[0] == "crates" and parts[2] == "src":
+        return True
+    if len(parts) >= 2 and parts[0] == "src":
+        return True
+    return False
+
+
 def evaluate(hits, added):
     """(covered, coverable, uncovered-added-lines) over changed executable lines."""
     by_file = {}
@@ -118,7 +145,16 @@ def evaluate(hits, added):
         by_file.setdefault(normalize(path), {})[line] = count
     covered, uncovered = 0, []
     for path, line in sorted(added):
-        count = by_file.get(path, {}).get(line)
+        norm = normalize(path)
+        file_cov = by_file.get(norm)
+        if file_cov is None:
+            # No lcov record for this file at all. A changed source file the
+            # report must instrument counts as uncovered, so bin code or a new
+            # file can never pass as "nothing to measure".
+            if is_measurable_source(norm):
+                uncovered.append((path, line))
+            continue
+        count = file_cov.get(line)
         if count is None:
             continue
         if count > 0:

@@ -139,6 +139,25 @@ class EvaluateTests(unittest.TestCase):
         covered, coverable, _ = gate.evaluate(hits, {("crates/x.rs", 7)})
         self.assertEqual((covered, coverable), (1, 1))
 
+    def test_changed_source_file_without_lcov_record_is_uncovered(self):
+        hits = {("crates/bot/src/voice_rooms.rs", 1): 1}
+        covered, coverable, uncovered = gate.evaluate(
+            hits, {("crates/bot/src/voice_rooms.rs", 1),
+                   ("crates/bot/src/gateway.rs", 300)})
+        self.assertEqual((covered, coverable), (1, 2))
+        self.assertEqual(uncovered, [("crates/bot/src/gateway.rs", 300)])
+
+    def test_uninstrumented_test_files_and_non_sources_stay_unmeasured(self):
+        hits = {("crates/bot/src/voice_rooms.rs", 1): 1}
+        for path in ("crates/bot/src/audit_gateway_tests.rs",
+                     "crates/bot/tests/integration.rs",
+                     "docs/notes.md"):
+            with self.subTest(path=path):
+                covered, coverable, uncovered = gate.evaluate(
+                    hits, {(path, 1)})
+                self.assertEqual((covered, coverable), (0, 0))
+                self.assertEqual(uncovered, [])
+
 
 class EndToEndTests(unittest.TestCase):
     def run_gate(self, lcov_text, added):
@@ -174,6 +193,15 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertNotIn("::error::", output)
         self.assertIn("no coverable changed lines", output)
+
+    def test_uninstrumented_bin_change_fails_instead_of_no_coverable_note(self):
+        lib_lcov = ("TN:\nSF:crates/bot/src/voice_rooms.rs\nDA:1,1\n"
+                    "end_of_record\n")
+        code, output = self.run_gate(lib_lcov, {("crates/bot/src/gateway.rs", 300)})
+        self.assertEqual(code, 1)
+        self.assertIn("::error::", output)
+        self.assertNotIn("no coverable changed lines", output)
+        self.assertIn("crates/bot/src/gateway.rs:300", output)
 
     def test_missing_lcov_fails_closed(self):
         out = io.StringIO()
