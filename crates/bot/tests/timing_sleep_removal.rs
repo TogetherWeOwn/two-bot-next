@@ -30,74 +30,110 @@ const ALIVE: &str = include_str!("alive.rs");
 const OPS_BACKFILL: &str = include_str!("ops_backfill.rs");
 const PREFLIGHT: &str = include_str!("preflight.rs");
 
-/// Every `sleep(Duration::from_millis(N))` value in a target. Second-based
-/// sleeps are rejected separately, so only millisecond backoffs are listed.
-fn sleep_millis_values(source: &str) -> Vec<u64> {
-    let needle = "sleep(Duration::from_millis(";
-    let mut values = Vec::new();
-    let mut rest = source;
-    while let Some(idx) = rest.find(needle) {
-        rest = &rest[idx + needle.len()..];
-        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if let Ok(millis) = digits.parse::<u64>() {
-            values.push(millis);
+fn function_body(source: &str, name: &str) -> String {
+    let signature = source
+        .find(&format!("fn {name}("))
+        .unwrap_or_else(|| panic!("missing function {name}"));
+    let body_start = source[signature..]
+        .find('{')
+        .map(|offset| signature + offset)
+        .unwrap_or_else(|| panic!("missing body for function {name}"));
+    let mut depth = 0;
+    for (offset, byte) in source[body_start..].bytes().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return source[body_start..=body_start + offset].to_owned();
+                }
+            }
+            _ => {}
         }
     }
-    values
+    panic!("unterminated body for function {name}");
 }
 
-/// Shared bound: at least one millisecond backoff exists, none exceeds the
-/// 50 ms cap, and none sleeps in whole seconds. Per-attempt `timeout(...)`
-/// values are not sleeps and are not capped here.
-fn assert_bounded_backoff(source: &str, target: &str) {
-    assert!(
-        !source.contains("sleep(Duration::from_secs"),
-        "{target} must not sleep in whole seconds; keep poll backoffs in milliseconds"
+fn source_between(source: &str, start: &str, end: &str) -> String {
+    let start = source
+        .find(start)
+        .unwrap_or_else(|| panic!("missing source boundary {start:?}"));
+    let end = source[start..]
+        .find(end)
+        .map(|offset| start + offset)
+        .unwrap_or_else(|| panic!("missing source boundary {end:?}"));
+    source[start..end].to_owned()
+}
+
+fn assert_poll_site(source: &str, expected_sleep: &str) {
+    assert_eq!(
+        source.matches("sleep(").count(),
+        1,
+        "each poll site must contain exactly one sleep call"
     );
-    let values = sleep_millis_values(source);
-    assert!(
-        !values.is_empty(),
-        "{target} must poll with a bounded millisecond backoff under its deadline"
+    assert_eq!(
+        source.matches(expected_sleep).count(),
+        1,
+        "each poll site must use its literal bounded backoff"
     );
-    for millis in &values {
-        assert!(
-            *millis <= 50,
-            "{target} sleep of {millis} ms exceeds the 50 ms bounded-backoff cap"
-        );
-    }
+}
+
+fn assert_settle_window(source: &str) {
+    assert!(
+        source.contains("Duration::from_millis(200)"),
+        "post-ready settle window must remain 200 ms"
+    );
+    assert!(
+        source.contains("while tokio::time::Instant::now() < settle_until"),
+        "post-ready settle window must poll until its deadline"
+    );
+    assert_eq!(
+        source.matches("bot.assert_alive();").count(),
+        2,
+        "settle loop must assert liveness inside and after the window"
+    );
+    assert_poll_site(source, "sleep(Duration::from_millis(10)).await;");
 }
 
 #[test]
 fn alive_polling_uses_bounded_backoff_under_deadline() {
-    assert_bounded_backoff(ALIVE, "alive.rs");
+    let wait_http = function_body(ALIVE, "wait_http");
+    assert_poll_site(&wait_http, "sleep(Duration::from_millis(10)).await;");
     assert!(
-        ALIVE.contains("STEP"),
-        "alive.rs polls must stay under the STEP deadline"
+        wait_http.contains("timeout(STEP"),
+        "wait_http must retain its STEP deadline"
     );
+
+    let checkpoint = function_body(ALIVE, "checkpoint");
+    assert_poll_site(&checkpoint, "sleep(Duration::from_millis(10)).await;");
     assert!(
-        ALIVE.contains("timeout("),
-        "alive.rs polls must stay under a timeout deadline"
+        checkpoint.contains("timeout(STEP"),
+        "checkpoint must retain its STEP deadline"
     );
+
+    let lifecycle = function_body(ALIVE, "lifecycle");
+    let events_tick = source_between(&lifecycle, "let ticked = timeout(STEP", "ticked.is_ok()");
+    assert_poll_site(&events_tick, "sleep(Duration::from_millis(10)).await;");
+    let settle = source_between(&lifecycle, "let settle_until =", "assert_ready_correlation");
+    assert_settle_window(&settle);
+
     assert!(
         !ALIVE.contains("yield_now"),
-        "alive.rs must not busy-spin on bare scheduler yields; use a bounded millisecond backoff"
-    );
-    assert!(
-        ALIVE.contains("settle_until"),
-        "alive.rs must keep the post-ready settle window that polls liveness before SIGTERM"
+        "alive.rs must not busy-spin on bare scheduler yields"
     );
 }
 
 #[test]
 fn ops_backfill_spawn_uses_bounded_backoff_under_deadline() {
-    assert_bounded_backoff(OPS_BACKFILL, "ops_backfill.rs");
+    let spawn_bot = function_body(OPS_BACKFILL, "spawn_bot");
+    assert_poll_site(&spawn_bot, "thread::sleep(Duration::from_millis(20));");
     assert!(
-        OPS_BACKFILL.contains("deadline"),
+        spawn_bot.contains("deadline"),
         "ops_backfill.rs health poll must stay under its deadline"
     );
     assert!(
-        !OPS_BACKFILL.contains("yield_now"),
-        "ops_backfill.rs must not busy-spin on bare scheduler yields; use a bounded millisecond backoff"
+        !spawn_bot.contains("yield_now"),
+        "ops_backfill.rs must not busy-spin on bare scheduler yields"
     );
 }
 
@@ -139,4 +175,53 @@ async fn deterministic_notify_on_a_shared_lock_needs_no_sleep() {
         .await
         .expect("deterministic wakeup before the deadline");
     assert!(*ready.lock().expect("shared readiness flag"));
+}
+
+#[test]
+fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
+    let wait_http = function_body(ALIVE, "wait_http");
+    assert_poll_site(&wait_http, "sleep(Duration::from_millis(10)).await;");
+    assert!(std::panic::catch_unwind(|| {
+        assert_poll_site(
+            &wait_http.replace("sleep(Duration::from_millis(10)).await;", ""),
+            "sleep(Duration::from_millis(10)).await;",
+        );
+    })
+    .is_err());
+    assert!(std::panic::catch_unwind(|| {
+        assert_poll_site(
+            &wait_http.replace(
+                "sleep(Duration::from_millis(10)).await;",
+                "sleep(Duration::from_millis(backoff_ms)).await;",
+            ),
+            "sleep(Duration::from_millis(10)).await;",
+        );
+    })
+    .is_err());
+    assert!(std::panic::catch_unwind(|| {
+        assert_poll_site(
+            &wait_http.replace(
+                "sleep(Duration::from_millis(10)).await;",
+                "sleep(Duration::from_secs(1)).await;",
+            ),
+            "sleep(Duration::from_millis(10)).await;",
+        );
+    })
+    .is_err());
+
+    let lifecycle = function_body(ALIVE, "lifecycle");
+    let settle = source_between(&lifecycle, "let settle_until =", "assert_ready_correlation");
+    assert_settle_window(&settle);
+    assert!(std::panic::catch_unwind(|| {
+        assert_settle_window(
+            &settle.replace("Duration::from_millis(200)", "Duration::from_millis(0)"),
+        );
+    })
+    .is_err());
+    assert!(std::panic::catch_unwind(|| {
+        assert_settle_window(
+            &settle.replace("bot.assert_alive();", "// liveness assertion removed"),
+        );
+    })
+    .is_err());
 }
