@@ -1,16 +1,20 @@
 # Quality gates
 
 Deterministic CI gates (no reviewer needed). WARN reports without failing;
-HARD fails the PR. All Rust gates run as steps of the `check` lane in
-`check.yml` on the existing routed runner, so no new runner minutes beyond
-the step itself.
+HARD fails the PR. Gates run in their designated lanes in `check.yml` on the
+existing routed runner. Patch coverage runs in `rust-tests`, alongside the
+existing disposable Postgres service, rather than the lint-only `check` lane.
 
-- Patch coverage (HARD): `cargo llvm-cov --workspace --lib --bins` plus
+- Patch coverage (HARD): `cargo llvm-cov --workspace --lib --bins
+  --features two-bot-core/db --include-ignored` plus
   `scripts/ci/check-patch-coverage.py` requires 80% line coverage over the
-  lines the PR adds. Shortfalls and missing or empty reports fail the PR.
-  Measurement uses `--ignore-run-fail` so unit-test failures do not suppress
-  coverage output; the rust-tests lane remains responsible for reporting those
-  failures. A build or report-generation failure fails this gate.
+  lines the PR adds. Measurement uses the `rust-tests` lane's disposable
+  Postgres service and test database so ignored database-backed tests can run.
+  Shortfalls and missing or empty reports fail the PR. The step runs after the
+  ordinary rust-tests steps and uses `always()` so their failures do not suppress
+  coverage output or get hidden by a coverage shortfall. Measurement also uses
+  `--ignore-run-fail` to preserve LCOV output when tests invoked by llvm-cov fail.
+  A build or report-generation failure fails this gate.
 - Dependency advisories (HARD): the `cargo-deny` step (`check all`, which
   includes advisories) runs on every PR, not only Rust-selected ones.
 - Rust ast-grep advisories (WARN): the local `sgconfig.yml` runs the request-path

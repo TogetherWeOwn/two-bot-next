@@ -66,11 +66,13 @@ in `scripts/ci/test_required_checks.py`. Only advisory `container smoke` is
 exempt: it can take up to 30 minutes, and image security stays gated through
 the SBOM job. The legacy `required-checks` aggregate is removed.
 
-Deterministic quality gates (patch coverage HARD, per-PR advisories HARD,
-ast-grep and Semgrep WARN, required voice synthetic, test-target inventory
-HARD) run as steps of the `check` lane on the existing routed runner; see
-[`docs/quality-gates.md`](docs/quality-gates.md). New checks start in WARN
-(report, never fail) and flip to HARD only with their backlog burned down.
+Deterministic quality gates (per-PR advisories HARD, ast-grep and Semgrep
+WARN, required voice synthetic, test-target inventory HARD) run in their
+respective lanes on the existing routed runner; see
+[`docs/quality-gates.md`](docs/quality-gates.md). Patch coverage (HARD) runs in
+`rust-tests` with the disposable Postgres service and ignored database-backed
+tests. New checks start in WARN (report, never fail) and flip to HARD only with
+their backlog burned down.
 
 Every Rust setup step in `check.yml` installs the exact version from
 `rust-toolchain.toml`, including fmt/clippy components where required. Do not use

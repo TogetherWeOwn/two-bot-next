@@ -369,41 +369,6 @@ jobs:
           FLOOR_HEAD: ${{ github.sha }}
         run: python3 scripts/ci/check-floor-guard.py --base-ref "$FLOOR_BASE" --head-ref "$FLOOR_HEAD"
 
-      - name: Patch coverage (HARD, 80% of added lines)
-        if: needs.job-inputs.outputs.rust != 'false'
-        # The check job runs in a container whose default shell is sh (no pipefail).
-        shell: bash
-        env:
-          QUALITY_BASE: ${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before || 'origin/main' }}
-          QUALITY_HEAD: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          rustup component add llvm-tools-preview
-          archive="$RUNNER_TEMP/cargo-llvm-cov.tar.gz"
-          for attempt in 1 2 3; do
-            curl -fsSL -o "$archive" \
-              https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.9.1/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz && break
-            [ "$attempt" -lt 3 ] || exit 1
-            sleep 5
-          done
-          echo "b3f68e625481fed9b16444174f3fa5ebcdbde4a1878803a35eabe2dcefcdc41a  $archive" | sha256sum --check -
-          tar -xzf "$archive" -C "$RUNNER_TEMP" cargo-llvm-cov
-          # Unit-test failures during measurement are owned HARD by the
-          # rust-tests lane. Keep collecting coverage, then let that lane
-          # report test failures while this gate checks the generated report.
-          rm -f "$RUNNER_TEMP/lcov.info"
-          if ! "$RUNNER_TEMP/cargo-llvm-cov" llvm-cov --workspace --lib --bins --locked \
-            --ignore-run-fail --lcov --output-path "$RUNNER_TEMP/lcov.info"; then
-            echo "::error::patch coverage measurement failed to build or report"
-            exit 1
-          fi
-          if [ ! -s "$RUNNER_TEMP/lcov.info" ]; then
-            echo "::error::patch coverage measurement produced no lcov report"
-            exit 1
-          fi
-          python3 scripts/ci/check-patch-coverage.py --lcov "$RUNNER_TEMP/lcov.info" \
-            --base-ref "$QUALITY_BASE" --head-ref "$QUALITY_HEAD"
-
       - name: Unwrap in request paths (WARN)
         if: needs.job-inputs.outputs.rust != 'false'
         shell: bash
@@ -507,7 +472,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 1
+          fetch-depth: 0
 
       - name: Job-container prerequisites (loopback forward to agent-testdb)
         run: |
@@ -609,6 +574,7 @@ jobs:
           save-if: ${{ github.event_name == 'push' }}
 
       - name: Prepare isolated test databases
+        id: prepare_test_databases
         run: |
           createdb -h agent-testdb -U agent_test two_bot_test_ci
           createdb -h agent-testdb -U agent_test two_next_backup_ci
@@ -616,6 +582,7 @@ jobs:
           printf 'PAPERCLIP_RUN_SCRATCH_DIR=%s/two-bot-check-scratch\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
 
       - name: Verify disposable Postgres defaults
+        id: verify_disposable_postgres
         run: |
           python3 - <<'PY'
           import json
@@ -680,6 +647,46 @@ jobs:
 
       - name: Measure metrics RSS (local fixtures only)
         run: cargo run -p two-bot-core --example metrics_rss --locked
+
+      # Run after the ordinary tests so coverage shortfalls do not hide their
+      # failures. Still collect coverage when an earlier test step failed.
+      - name: Patch coverage (HARD, 80% of added lines)
+        if: always() && !cancelled() && steps.prepare_test_databases.outcome == 'success' && steps.verify_disposable_postgres.outcome == 'success'
+        shell: bash
+        env:
+          QUALITY_BASE: ${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before || 'origin/main' }}
+          QUALITY_HEAD: ${{ github.sha }}
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+          TWO_RSVP_RUNTIME_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+          TWO_BOT_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_next_backup_ci
+          TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/postgres
+          AUTOMOD_CI_TESTDB: '1'
+          PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/two-bot-coverage-tests
+        run: |
+          set -euo pipefail
+          rustup component add llvm-tools-preview
+          archive="$RUNNER_TEMP/cargo-llvm-cov.tar.gz"
+          for attempt in 1 2 3; do
+            curl -fsSL -o "$archive" \
+              https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.9.1/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz && break
+            [ "$attempt" -lt 3 ] || exit 1
+            sleep 5
+          done
+          echo "b3f68e625481fed9b16444174f3fa5ebcdbde4a1878803a35eabe2dcefcdc41a  $archive" | sha256sum --check -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" cargo-llvm-cov
+          rm -f "$RUNNER_TEMP/lcov.info"
+          if ! "$RUNNER_TEMP/cargo-llvm-cov" llvm-cov --workspace --lib --bins \
+            --features two-bot-core/db --include-ignored --locked --ignore-run-fail \
+            --lcov --output-path "$RUNNER_TEMP/lcov.info"; then
+            echo "::error::patch coverage measurement failed to build or report"
+            exit 1
+          fi
+          if [ ! -s "$RUNNER_TEMP/lcov.info" ]; then
+            echo "::error::patch coverage measurement produced no lcov report"
+            exit 1
+          fi
+          python3 scripts/ci/check-patch-coverage.py --lcov "$RUNNER_TEMP/lcov.info" \
+            --base-ref "$QUALITY_BASE" --head-ref "$QUALITY_HEAD"
 
   ignored-db-stores:
     name: ignored db (stores)

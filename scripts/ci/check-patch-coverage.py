@@ -8,7 +8,9 @@ positive. The gate reports covered/coverable over the intersection and fails
 below ``--threshold`` percent (default 80). A patch with no coverable changed
 lines passes with a note. A changed line in a measured Rust source file
 (``crates/*/src/**`` or ``src/**``) that has no lcov record at all counts as
-uncovered, so uninstrumented code can never pass as "nothing to measure".
+uncovered when the file defines a function body, so uninstrumented code can
+never pass as "nothing to measure" while functionless module/re-export files
+remain outside the executable-line denominator.
 
 HARD mode: a shortfall prints ``::error::`` annotations and exits 1. A blind
 gate (missing or unusable lcov, unreadable diff) also errors and exits 1; it
@@ -138,6 +140,20 @@ def is_measurable_source(path):
     return False
 
 
+def has_instrumentable_function(path):
+    """Whether a source file contains a function body the coverage report can map."""
+    try:
+        source = (ROOT / path).read_text()
+    except OSError:
+        # An unreadable changed source is not evidence that the gate may skip it.
+        return True
+    return re.search(
+        r'(?m)^\s*(?:(?:pub(?:\([^)]*\))?|async|const|unsafe|default)\s+)*'
+        r'(?:extern(?:\s+"[^"]+")?\s+)?fn\s+(?:r#)?\w+[^;{]*\{',
+        source,
+    ) is not None
+
+
 def evaluate(hits, added):
     """(covered, coverable, uncovered-added-lines) over changed executable lines."""
     by_file = {}
@@ -151,7 +167,7 @@ def evaluate(hits, added):
             # No lcov record for this file at all. A changed source file the
             # report must instrument counts as uncovered, so bin code or a new
             # file can never pass as "nothing to measure".
-            if is_measurable_source(norm):
+            if is_measurable_source(norm) and has_instrumentable_function(norm):
                 uncovered.append((path, line))
             continue
         count = file_cov.get(line)

@@ -147,6 +147,67 @@ class EvaluateTests(unittest.TestCase):
         self.assertEqual((covered, coverable), (1, 2))
         self.assertEqual(uncovered, [("crates/bot/src/gateway.rs", 300)])
 
+    def test_changed_functionless_source_without_lcov_record_stays_unmeasured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "crates/core/src/lib.rs"
+            source.parent.mkdir(parents=True)
+            source.write_text("/// module docs\\n#[cfg(feature = \\\"db\\\")]\\npub mod store;\\n")
+            real_root = gate.ROOT
+            gate.ROOT = root
+            try:
+                result = gate.evaluate({}, {("crates/core/src/lib.rs", 1),
+                                            ("crates/core/src/lib.rs", 2),
+                                            ("crates/core/src/lib.rs", 3)})
+            finally:
+                gate.ROOT = real_root
+        self.assertEqual(result, (0, 0, []))
+
+    def test_trait_declaration_without_a_body_stays_unmeasured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "crates/core/src/my_trait.rs"
+            source.parent.mkdir(parents=True)
+            source.write_text("pub trait Foo {\n    fn bar(&self);\n}\n")
+            real_root = gate.ROOT
+            gate.ROOT = root
+            try:
+                result = gate.evaluate({}, {("crates/core/src/my_trait.rs", 2)})
+            finally:
+                gate.ROOT = real_root
+        self.assertEqual(result, (0, 0, []))
+
+    def test_extern_c_function_without_lcov_record_is_uncovered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "crates/core/src/ffi.rs"
+            source.parent.mkdir(parents=True)
+            source.write_text('pub extern "C" fn handler() {}\n')
+            real_root = gate.ROOT
+            gate.ROOT = root
+            try:
+                result = gate.evaluate({}, {("crates/core/src/ffi.rs", 1)})
+            finally:
+                gate.ROOT = real_root
+        self.assertEqual(result, (0, 1, [("crates/core/src/ffi.rs", 1)]))
+
+    def test_measurable_source_exclusions_and_root_source_are_pinned(self):
+        cases = {
+            "crates/bot/src/gateway.rs": True,
+            "src/lib.rs": True,
+            "crates/bot/src/tests.rs": False,
+            "crates/bot/src/test_support.rs": False,
+            "crates/bot/src/foo_test.rs": False,
+            "crates/bot/src/foo_tests.rs": False,
+            "crates/bot/src/tests/mod.rs": False,
+            "crates/bot/tests/integration.rs": False,
+            "docs/notes.rs": False,
+            "docs/notes.md": False,
+        }
+        for path, expected in cases.items():
+            with self.subTest(path=path):
+                self.assertEqual(gate.is_measurable_source(path), expected)
+
     def test_uninstrumented_test_files_and_non_sources_stay_unmeasured(self):
         hits = {("crates/bot/src/voice_rooms.rs", 1): 1}
         for path in ("crates/bot/src/audit_gateway_tests.rs",

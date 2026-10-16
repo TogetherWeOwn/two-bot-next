@@ -1212,7 +1212,6 @@ class WorkflowTests(unittest.TestCase):
         expected_head = "${{ github.sha }}"
         for name in (
             "Floor guard (HARD, CONSTRAINTS.md floor)",
-            "Patch coverage (HARD, 80% of added lines)",
             "Unwrap in request paths (WARN)",
             "Semgrep Rust rules (WARN)",
         ):
@@ -1223,15 +1222,48 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(step["env"][base_key], expected_base)
                 self.assertEqual(step["env"][head_key], expected_head)
 
-    def test_patch_coverage_measurement_writes_report_despite_test_failures(self):
+    def test_patch_coverage_runs_with_db_and_includes_ignored_tests(self):
+        job = self.workflows["check.yml"]["jobs"]["rust-tests"]
         step = next(
-            step for step in self.workflows["check.yml"]["jobs"]["check"]["steps"]
+            step for step in job["steps"]
             if step.get("name") == "Patch coverage (HARD, 80% of added lines)"
         )
+        expected_base = "${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before || 'origin/main' }}"
+        self.assertEqual(step["env"]["QUALITY_BASE"], expected_base)
+        self.assertEqual(step["env"]["QUALITY_HEAD"], "${{ github.sha }}")
         self.assertIn("--ignore-run-fail", step["run"])
+        self.assertIn("--include-ignored", step["run"])
+        self.assertIn("--features two-bot-core/db", step["run"])
         self.assertIn("--lib --bins", step["run"])
         self.assertIn('[ ! -s "$RUNNER_TEMP/lcov.info" ]', step["run"])
-        self.assertNotIn("measurement did not complete", step["run"])
+        self.assertEqual(
+            step["env"]["TWO_TEST_DATABASE_URL"],
+            "postgres://agent_test:@agent-testdb:5432/two_bot_test_ci",
+        )
+        self.assertIn("agent-testdb", job["services"])
+        self.assertEqual(
+            step["if"],
+            "always() && !cancelled() && steps.prepare_test_databases.outcome == 'success' "
+            "&& steps.verify_disposable_postgres.outcome == 'success'",
+        )
+        test_steps = [
+            index for index, candidate in enumerate(job["steps"])
+            if "cargo test" in str(candidate.get("run", ""))
+        ]
+        self.assertTrue(test_steps)
+        self.assertGreater(job["steps"].index(step), max(test_steps))
+        self.assertEqual(
+            next(candidate for candidate in job["steps"]
+                 if candidate.get("name") == "Prepare isolated test databases")["id"],
+            "prepare_test_databases",
+        )
+        self.assertEqual(
+            next(candidate for candidate in job["steps"]
+                 if candidate.get("name") == "Verify disposable Postgres defaults")["id"],
+            "verify_disposable_postgres",
+        )
+        checkout = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@"))
+        self.assertEqual(checkout["with"]["fetch-depth"], "0")
 
     def test_voice_synthetic_shape_is_pinned_and_mutations_fail(self):
         import copy
