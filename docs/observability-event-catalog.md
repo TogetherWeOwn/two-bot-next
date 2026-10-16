@@ -153,6 +153,7 @@ is the single shared spelling also pinned in `evidence.rs`
 
 | Rule | Input series | Meaning |
 | --- | --- | --- |
+| `rest_5xx_rate` | `two_bot_rest_requests_total{result="5xx"}` and all `two_bot_rest_requests_total` samples | Pages when at least 10 new REST requests arrive between samples and more than 10% are 5xx; a counter reset suppresses the window. |
 | `job_unknown_stale` | `two_bot_job_last_success_timestamp_seconds{job}` for labels outside `JOB_INTERVAL_SECONDS`, `TICKER_STALE_JOBS` and `UNKNOWN_STALE_EXCLUDED` | Ticket when a job without a cadence entry has a nonzero success timestamp older than 2 hours; never-succeeded stays silent; `session_checkpoint` is event-driven and excluded |
 | `gateway_unpaired_disconnect` | `two_bot_gateway_disconnects_total` against `two_bot_gateway_resumes_total` plus fresh `two_bot_gateway_events_total{event="READY"}` | Pages after 3 consecutive samples with disconnect growth and no RESUMED or fresh READY growth (pairing in `pairGatewayDisconnects`); any recovery growth clears at once; the disconnect counter increments in `gateway.rs` (`transport_disconnected`) |
 
