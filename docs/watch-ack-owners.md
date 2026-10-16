@@ -31,6 +31,7 @@ the `RESOLVED` line before closing the incident
 | `job_stale:<job>` | on-call operator | 15 min from the page |
 | `job_consecutive_failures:<job>` | on-call operator | 15 min from the page |
 | `rest_429_rate` | on-call operator | 15 min from the page |
+| `rest_5xx_rate` | on-call operator | 15 min from the page |
 | `db_pool_saturated` | on-call operator | 15 min from the page |
 | `db_errors` | on-call operator | 15 min from the page |
 | `send_admission_blocked` | on-call operator | 15 min from the page |

@@ -155,15 +155,15 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-check-migrations.py
           python3 scripts/check-migrations.py --base-ref "$MIGRATION_BASE"
 
-      # Squawk-subset migration lint (advisory, docs/quality-gates.md): flags
-      # risky statements in changed migration files without failing the PR.
-      # Broken tooling still fails so blindness cannot hide. Promotion to a
-      # required check flips this step to --strict after the advisory soak.
-      - name: Squawk migration lint (advisory)
+      # Squawk-subset migration lint (required, docs/quality-gates.md): in
+      # --strict mode four rules fail the PR; dropping-object stays advisory
+      # because coordinated removals still require a final DROP. Broken tooling
+      # still fails so blindness cannot hide.
+      - name: Squawk migration lint (required)
         env:
           SQUAWK_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
         run: |
-          python3 scripts/ci/check-squawk-migrations.py --base-ref "$SQUAWK_BASE"
+          python3 scripts/ci/check-squawk-migrations.py --base-ref "$SQUAWK_BASE" --strict
 
       # Finish the pinned toolchain before the first pip run. The image ships
       # the pinned Rust version without rustfmt or clippy, and rust-toolchain.toml
@@ -374,9 +374,10 @@ jobs:
       # Deterministic quality gates (docs/quality-gates.md). Steps, not jobs:
       # they reuse this lane's runner, container and toolchain, so no new
       # runner minutes beyond the step itself, and ci-ok already covers them.
-      # WARN gates annotate but never fail on findings; a broken gate step
-      # still fails so blindness cannot hide. The inventory gate is HARD and
-      # always on (pure Python, milliseconds); the rest are gated on the rust
+      # Patch coverage, squawk, unwrap request-paths and semgrep are HARD and
+      # fail on new findings. A broken gate step still fails so blindness cannot
+      # hide. The inventory gate is HARD and always on (pure Python,
+      # milliseconds); the rest are gated on the rust
       # selector like the other heavy steps.
       - name: CI test-target inventory
         run: python3 scripts/ci/check-test-inventory.py
@@ -390,7 +391,7 @@ jobs:
           FLOOR_HEAD: ${{ github.sha }}
         run: python3 scripts/ci/check-floor-guard.py --base-ref "$FLOOR_BASE" --head-ref "$FLOOR_HEAD"
 
-      - name: Unwrap in request paths (WARN)
+      - name: Unwrap in request paths (HARD)
         if: needs.job-inputs.outputs.rust != 'false'
         shell: bash
         env:
@@ -415,7 +416,7 @@ jobs:
             --base-ref "$QUALITY_BASE" --head-ref "$QUALITY_HEAD"
           PATH="$RUNNER_TEMP/ast-grep:$PATH" ast-grep test -c sgconfig.yml
 
-      - name: Semgrep Rust rules (WARN)
+      - name: Semgrep Rust rules (HARD)
         if: needs.job-inputs.outputs.rust != 'false'
         shell: bash
         env:
