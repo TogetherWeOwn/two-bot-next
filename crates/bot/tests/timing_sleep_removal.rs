@@ -431,13 +431,13 @@ fn brace_depth_before(code: &str, pos: usize) -> i32 {
 }
 
 fn timeout_step_async_body(source: &str, context: &str) -> String {
-    // The first `{` after `timeout(STEP` opens the async block; the poll
+    // The first `{` after `timeout(STEP,` opens the async block; the poll
     // loop must live inside those braces, not merely between the timeout
     // call and a later terminator. Matched over code only so a
     // commented-out wrapper does not satisfy the pin.
     let code = code_only(source);
     let start = code
-        .find("timeout(STEP")
+        .find("timeout(STEP,")
         .unwrap_or_else(|| panic!("{context}"));
     let open = code[start..]
         .find('{')
@@ -1081,6 +1081,32 @@ fn polling_guard_pins_exact_ops_deadline_and_preflight_attempt_assertions() {
         "events tick must poll inside its STEP deadline",
         10,
     );
+
+    // Each call-site stretch must fail even though the async poll loop remains
+    // inside the timeout block.
+    let stretched_wait_http = wait_http.replace("timeout(STEP,", "timeout(STEP * 100,");
+    assert!(std::panic::catch_unwind(|| {
+        assert_wait_http_poll_under_step_deadline(&stretched_wait_http);
+    })
+    .is_err());
+    let stretched_checkpoint = checkpoint.replace("timeout(STEP,", "timeout(STEP * 100,");
+    assert!(std::panic::catch_unwind(|| {
+        assert_loop_inside_step_timeout(
+            &stretched_checkpoint,
+            "checkpoint must poll inside its STEP deadline",
+            10,
+        );
+    })
+    .is_err());
+    let stretched_events_tick = events_tick.replace("timeout(STEP,", "timeout(STEP * 100,");
+    assert!(std::panic::catch_unwind(|| {
+        assert_loop_inside_step_timeout(
+            &stretched_events_tick,
+            "events tick must poll inside its STEP deadline",
+            10,
+        );
+    })
+    .is_err());
 }
 
 #[test]
