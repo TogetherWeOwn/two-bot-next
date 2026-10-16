@@ -132,7 +132,7 @@ async fn mutation_429_releases_member_claim_for_same_key_retry() {
             &target(TARGET_A),
             100,
             "req-429",
-            "key-429",
+            "key-429-valid",
             NOW_MS,
         )
         .await
@@ -147,7 +147,7 @@ async fn mutation_429_releases_member_claim_for_same_key_retry() {
             &target(TARGET_A),
             100,
             "req-429",
-            "key-429",
+            "key-429-valid",
             NOW_MS,
         )
         .await
@@ -195,7 +195,7 @@ async fn mutation_429_releases_only_the_failed_attempt() {
             &target(TARGET_A),
             100,
             "req-429",
-            "key-429",
+            "key-429-valid",
             NOW_MS
         )
         .await
@@ -211,7 +211,7 @@ async fn mutation_429_releases_only_the_failed_attempt() {
             &target(TARGET_A),
             100,
             "req-429",
-            "key-429",
+            "key-429-valid",
             NOW_MS,
         )
         .await
@@ -239,7 +239,7 @@ async fn mutation_5xx_stays_fenced() {
             &target(TARGET_A),
             100,
             "req-5xx",
-            "key-5xx",
+            "key-5xx-valid",
             NOW_MS
         )
         .await
@@ -256,7 +256,7 @@ async fn mutation_5xx_stays_fenced() {
             &target(TARGET_A),
             100,
             "req-5xx",
-            "key-5xx",
+            "key-5xx-valid",
             NOW_MS
         )
         .await
