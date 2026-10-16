@@ -16,7 +16,7 @@ use std::{sync::Arc, time::Duration};
 use sqlx::PgPool;
 use two_bot_cutover::retention::{run_retention, RetentionMode};
 
-use crate::backfill_retention_chains::{render_retention_failure, RetentionStep};
+use crate::backfill_retention_chains::render_retention_failure;
 use crate::gateway_failure::FailureClass;
 use crate::jobs::{self, ErrorClass, Job};
 
@@ -67,18 +67,6 @@ pub(crate) fn pool_from_url(url: &str) -> Result<PgPool, ErrorClass> {
         .connect_lazy_with(options))
 }
 
-/// Map the job mode to the whole-run abort step: a dry-run abort is a
-/// [`RetentionStep::DryRun`] projection failure, an execute abort is a
-/// [`RetentionStep::Expiry`] delete failure. One helper owns the mapping so
-/// it is pinned in one place: `run_abort_step_follows_mode` fails if the
-/// arms ever swap, where the substring-only wiring pin would stay green.
-fn run_abort_step(mode: RetentionMode) -> RetentionStep {
-    match mode {
-        RetentionMode::DryRun => RetentionStep::DryRun,
-        RetentionMode::Execute => RetentionStep::Expiry,
-    }
-}
-
 /// The supervised retention job: fixed-phase [`CADENCE`], jittered start,
 /// per-attempt [`TIMEOUT`], panic-isolated by the supervisor like every job.
 /// The real action calls the existing cutover retention operation; every
@@ -102,16 +90,9 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
             let pool = pool.clone();
             Box::pin(async move {
                 let report = run_retention(&pool, mode).await.map_err(|err| {
-                    // Whole-run abort: per-stage failure lines inside
-                    // `run_retention` carry the exact step, so this line
-                    // marks the opening stage the retryable
-                    // pool/connection aborts surface at.
-                    let step = run_abort_step(mode);
-                    let failure = render_retention_failure(
-                        FailureClass::StoreUnavailable,
-                        step,
-                        crate::db_log::db_class(&err),
-                    );
+                    let step = err.step();
+                    let failure =
+                        render_retention_failure(FailureClass::StoreUnavailable, step, err.cause());
                     tracing::warn!(
                         message = "retention_run_failed",
                         mode = ?mode,
@@ -168,35 +149,5 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
                 Ok(())
             })
         }),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn run_abort_step_follows_mode() {
-        // The whole-run abort renders through `run_abort_step`, so this pins
-        // the mode mapping: swapping the arms fails here, where the
-        // substring-only wiring pin would stay green.
-        assert_eq!(run_abort_step(RetentionMode::DryRun), RetentionStep::DryRun);
-        assert_eq!(
-            run_abort_step(RetentionMode::Execute),
-            RetentionStep::Expiry
-        );
-        let dry = render_retention_failure(
-            FailureClass::StoreUnavailable,
-            run_abort_step(RetentionMode::DryRun),
-            "pool_timeout",
-        );
-        assert!(dry.contains("step=dry_run"), "{dry:?}");
-        let live = render_retention_failure(
-            FailureClass::StoreUnavailable,
-            run_abort_step(RetentionMode::Execute),
-            "pool_timeout",
-        );
-        assert!(live.contains("step=expiry"), "{live:?}");
-        assert!(!live.contains("step=dry_run"), "{live:?}");
     }
 }

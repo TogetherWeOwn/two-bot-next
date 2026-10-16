@@ -206,6 +206,34 @@ fn deletion_intake_failure(chain: &str) -> String {
     )
 }
 
+/// A retention run failure with its stage and a fixed, safe cause token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionFailure {
+    step: RetentionStep,
+    cause: &'static str,
+}
+
+impl RetentionFailure {
+    fn from_sqlx(step: RetentionStep, error: &sqlx::Error) -> Self {
+        Self {
+            step,
+            cause: two_bot_core::error_chain::db_cause(error),
+        }
+    }
+
+    /// Stage active when the database operation failed.
+    #[must_use]
+    pub const fn step(self) -> RetentionStep {
+        self.step
+    }
+
+    /// Fixed database-cause token; never includes database error text.
+    #[must_use]
+    pub const fn cause(self) -> &'static str {
+        self.cause
+    }
+}
+
 /// Run the retention job: rolling-window deletes, pending user-deletion
 /// completion, then guild-purge drain. Dry run reports counts and changes
 /// nothing. Deletion and queue writes happen in ONE transaction with the
@@ -228,11 +256,17 @@ fn deletion_intake_failure(chain: &str) -> String {
 pub async fn run_retention(
     pool: &PgPool,
     mode: RetentionMode,
-) -> Result<RetentionReport, sqlx::Error> {
-    let started = std::time::Instant::now();
-    let mut tx = pool.begin().await?;
-    let report = match mode {
+) -> Result<RetentionReport, RetentionFailure> {
+    let mut step = match mode {
+        RetentionMode::DryRun => RetentionStep::DryRun,
+        RetentionMode::Execute => RetentionStep::Expiry,
+    };
+    let result = async {
+        let started = std::time::Instant::now();
+        let mut tx = pool.begin().await?;
+        let report = match mode {
         RetentionMode::DryRun => {
+            step = RetentionStep::DryRun;
             sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
                 .execute(&mut *tx)
                 .await?;
@@ -315,6 +349,7 @@ pub async fn run_retention(
             }
         }
         RetentionMode::Execute => {
+            step = RetentionStep::Expiry;
             sqlx::query("SET LOCAL lock_timeout = '5s'")
                 .execute(&mut *tx)
                 .await?;
@@ -368,6 +403,7 @@ pub async fn run_retention(
             // gap means no purge or deletion can certify completeness, so
             // every pending request defers and every queued guild stays
             // queued; the exact gaps ride the warn logs for the code fix.
+            step = RetentionStep::DeletionIntake;
             let schema_gaps = crate::member_erasure::schema_gaps(&mut tx).await?;
             let schema_gapped = !schema_gaps.is_empty();
             // Pending deletions drain BEFORE guild purges so a departed
@@ -532,8 +568,11 @@ pub async fn run_retention(
                 duration_ms: started.elapsed().as_millis() as u64,
             }
         }
-    };
-    Ok(report)
+        };
+        Ok(report)
+    }
+    .await;
+    result.map_err(|error| RetentionFailure::from_sqlx(step, &error))
 }
 
 /// Record a guild removal. A dispatch with no `unavailable` flag (or an
@@ -1091,6 +1130,14 @@ async fn count_queued_guild_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aborted_deletion_intake_reports_its_step_and_safe_cause() {
+        let failure =
+            RetentionFailure::from_sqlx(RetentionStep::DeletionIntake, &sqlx::Error::RowNotFound);
+        assert_eq!(failure.step(), RetentionStep::DeletionIntake);
+        assert_eq!(failure.cause(), "row_not_found");
+    }
 
     #[test]
     fn deletion_intake_failure_pins_its_step() {
