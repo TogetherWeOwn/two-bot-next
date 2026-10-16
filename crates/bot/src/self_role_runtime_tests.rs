@@ -2209,14 +2209,14 @@ async fn supervised_processing_recovery(pool: &PgPool) -> TestResult {
             },
         ));
         if case == "shutdown" {
-            tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::time::timeout(RENDEZVOUS, async {
                 while !mock.requests().iter().any(|r| r.method == "PUT") {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
             .await?;
         } else if case != "stopped" {
-            tokio::time::timeout(Duration::from_secs(8), async {
+            tokio::time::timeout(RENDEZVOUS, async {
                 loop {
                     let current = status.read().await[RECOVERY_JOB_NAME].clone();
                     if case == "timeout" {
@@ -2655,7 +2655,7 @@ async fn shared_reaction_dispatch_and_disabled_gate(pool: &PgPool) -> TestResult
             command.dispatch(&event);
             if enabled {
                 // Only a bounded fixture wait for detached dispatch; no CI polling.
-                let rows = tokio::time::timeout(Duration::from_secs(8), async {
+                let rows = tokio::time::timeout(RENDEZVOUS, async {
                     loop {
                         let rows: Vec<(String, String)> = sqlx::query_as(
                             "SELECT event_id,outcome FROM self_role_audit WHERE panel_id=$1 ORDER BY event_order COLLATE \"C\"",
@@ -3172,7 +3172,8 @@ async fn stale_inflight_repairs_committed_target(pool: &PgPool) -> TestResult {
         let mut panel = panel(PanelMode::Select);
         panel.id = format!("stale-inflight-{empty}");
         let mut old_script = snapshot(&[OTHER]);
-        old_script.push(ScriptedResponse::status(204).delayed(Duration::from_secs(4)));
+        let stale_put_index = old_script.len();
+        old_script.push(ScriptedResponse::status(204));
         let live = if empty {
             vec![OLD_ROLE, OTHER]
         } else {
@@ -3186,7 +3187,9 @@ async fn stale_inflight_repairs_committed_target(pool: &PgPool) -> TestResult {
         old_script.extend(snapshot(&live)); // stale PUT applied AFTER winner settled
         old_script.push(ScriptedResponse::status(204)); // repair DELETE obsolete old
         old_script.extend(snapshot(&target));
-        let old_mock = MockRest::start(old_script, ScriptedResponse::status(500)).await;
+        let (old_mock, old_response_gate) =
+            MockRest::start_gated_at(old_script, ScriptedResponse::status(500), stale_put_index)
+                .await;
         let old_runtime = Arc::new(runtime(pool, &clock, &old_mock));
         let mut old_request = request(
             &format!("stale-old-{empty}"),
@@ -3203,12 +3206,8 @@ async fn stale_inflight_repairs_committed_target(pool: &PgPool) -> TestResult {
                 (old, result)
             })
         };
-        tokio::time::timeout(RENDEZVOUS, async {
-            while !old_mock.requests().iter().any(|r| r.method == "PUT") {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await?;
+        tokio::time::timeout(RENDEZVOUS, old_response_gate.wait_for_request()).await?;
+        assert!(old_mock.requests().iter().any(|r| r.method == "PUT"));
         // Database expiry while the remote mutation is in flight. A different
         // worker/executor wins; the stale worker cannot cancel Discord's call.
         clock.store(NOW + 500, Ordering::SeqCst);
@@ -3236,9 +3235,11 @@ async fn stale_inflight_repairs_committed_target(pool: &PgPool) -> TestResult {
             .unwrap();
         assert!(
             !inflight.is_finished(),
-            "winner must settle before old response arrives"
+            "old response stays gated until the winner settles"
         );
-        let (mut stale, result) = tokio::time::timeout(Duration::from_secs(6), inflight).await??;
+        old_response_gate.release();
+        tokio::time::timeout(RENDEZVOUS, old_response_gate.wait_for_completion()).await?;
+        let (mut stale, result) = tokio::time::timeout(RENDEZVOUS, inflight).await??;
         assert!(matches!(result, Err(RuntimeError::Stale)));
         assert!(!stale.event.exchange_pending); // received late 204, retained evidence
         old_runtime
@@ -3973,11 +3974,7 @@ async fn exclusive_lane_before_reads(pool: &PgPool) -> TestResult {
         .release_panel_claim(first.panel.as_ref().unwrap())
         .await?;
     drop(first);
-    let second = ready(
-        tokio::time::timeout(Duration::from_secs(3), contender)
-            .await??
-            .unwrap(),
-    );
+    let second = ready(tokio::time::timeout(RENDEZVOUS, contender).await??.unwrap());
     assert_eq!(second.event.desired_role_ids, [NEW_ROLE]);
     assert_eq!(mock.requests().len(), 8);
     drop(second);
