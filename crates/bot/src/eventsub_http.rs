@@ -344,17 +344,21 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
         }
         Err(e) => {
             two_bot_core::metrics::global().eventsub_classified("ignored");
-            // Unreachable today: post-verification `classify` only yields
-            // WrongSubscription, InvalidBody or InvalidChallenge (all handled
-            // above). Warn loudly so a future classify variant shows up in
-            // logs instead of silently acking.
+            // A future classify error may be transient. Keep it retryable
+            // rather than acknowledging it as a permanent delivery outcome.
             tracing::warn!(
                 event = "eventsub_receiver",
-                status = 200,
+                status = 503,
                 error_class = %e,
-                "delivery ignored"
+                "classification failed"
             );
-            ack(id)
+            refuse(
+                state,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                true,
+                id,
+            )
         }
     }
 }
@@ -877,6 +881,11 @@ mod tests {
                 "delivery arm must classify as {expected}"
             );
         };
+
+        let catch_all = arm("Err(e) => {", "\n    }\n}\n\n#[cfg(test)]");
+        assert!(catch_all.contains("StatusCode::SERVICE_UNAVAILABLE"));
+        assert!(catch_all.contains("\"unavailable\""));
+        assert!(catch_all.contains("                true,"));
 
         for (start, end, kind) in [
             (
