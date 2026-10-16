@@ -366,6 +366,19 @@ mod tests {
 
     static NEXT_TEST_SECRET: AtomicU64 = AtomicU64::new(1);
 
+    /// Receiver tests emit through the shared `refuse`/challenge callsites.
+    /// `tracing-core` resolves a callsite's first registration against the
+    /// registering thread's default, so a scoped capture can miss events if a
+    /// sibling test registers those callsites first; the log-hygiene test
+    /// therefore reads the process-wide `crate::tracing_capture::global()`.
+    /// That capture is shared with every test in this binary, so each reader
+    /// keeps only the text appended after its own start offset — and every
+    /// router-driving test in this module serializes here, so a sibling's
+    /// `eventsub delivery refused` / `challenge answered` lines cannot land in
+    /// (or satisfy) another test's slice. Acquire it first, before anything
+    /// that can emit through those callsites.
+    static RECEIVER_LOG_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// Runtime-generated signing secret: no literal key material reaches the
     /// HMAC, so CodeQL's hard-coded-key rule stays silent. Shared across tests
     /// in the binary via `OnceLock` so `config()` and `sign()` agree.
@@ -474,6 +487,7 @@ mod tests {
 
     #[tokio::test]
     async fn challenge_echoes_as_text_plain() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         let body = challenge_body();
         let timestamp = fresh_timestamp();
         let signature = sign("synthetic-delivery-0001", &timestamp, body.as_bytes());
@@ -502,6 +516,7 @@ mod tests {
 
     #[tokio::test]
     async fn bad_signature_is_401_without_echo() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         let body = challenge_body();
         let timestamp = fresh_timestamp();
         let response = app()
@@ -527,6 +542,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_message_type_is_acknowledged() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         let body = r#"{"subscription":{"id":"synthetic-sub-0001","status":"enabled","type":"stream.online","version":"1","condition":{"broadcaster_user_id":"123456"},"transport":{"method":"webhook","callback":"https://example.com/hooks/twitch"},"created_at":"2026-10-13T00:00:00Z"}}"#;
         let timestamp = fresh_timestamp();
         let signature = sign("synthetic-delivery-0002", &timestamp, body.as_bytes());
@@ -552,6 +568,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_path_and_method_are_rejected() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         let body = challenge_body();
         let timestamp = fresh_timestamp();
         let signature = sign("synthetic-delivery-0003", &timestamp, body.as_bytes());
@@ -585,6 +602,7 @@ mod tests {
 
     #[tokio::test]
     async fn deterministic_classification_errors_are_acknowledged() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         // Valid signature over a notification body whose subscription is not
         // stream.online v1: deterministic, must be 2xx, never a retry.
         let body = r#"{"subscription":{"id":"synthetic-sub-0009","status":"enabled","type":"stream.offline","version":"1","condition":{"broadcaster_user_id":"123456"},"transport":{"method":"webhook","callback":"https://example.com/hooks/twitch"},"created_at":"2026-10-13T00:00:00Z"},"event":{"broadcaster_user_id":"123456"}}"#;
@@ -607,6 +625,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_string_is_refused_before_verification() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         // Signed exactly like the happy path: the query gate runs first, so a
         // valid signature must still answer 400, never reach the receiver.
         let body = challenge_body();
@@ -636,6 +655,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_content_type_is_refused() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         let body = challenge_body();
         let timestamp = fresh_timestamp();
         let message_id = "synthetic-delivery-0012";
@@ -690,6 +710,7 @@ mod tests {
 
     #[tokio::test]
     async fn oversize_body_is_refused() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         // Headers pass `from_lookup`; the 64 KiB cap triggers before verify.
         let timestamp = fresh_timestamp();
         let big = vec![b'a'; MAX_BODY_BYTES + 1];
@@ -720,6 +741,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_challenge_is_refused() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         // Empty and non-graphic challenges are `InvalidChallenge`: 400, never
         // an ack. Each body is signed exactly as sent.
         for challenge in ["", "has space"] {
@@ -755,6 +777,7 @@ mod tests {
 
     #[tokio::test]
     async fn busy_returns_503_with_retryable() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         // Hold every permit: the semaphore gate runs before path, method,
         // content-type and verification, so even a bare request gets 503.
         let state = Arc::new(ReceiverState::new(&config()));
@@ -776,6 +799,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn slow_body_times_out_with_408_and_retryable() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         // A body that never ends must hit the 5 s read budget instead of
         // holding one of the 32 permits: 408 `request_timeout`, retriable.
         let timestamp = fresh_timestamp();
@@ -826,6 +850,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn stalled_request_times_out_with_503_and_retryable() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         // The 20 s outer budget maps a stalled receive to 503
         // `upstream_timeout`, retriable.
         let state = ReceiverState::new(&config());
@@ -923,6 +948,7 @@ mod tests {
 
     #[tokio::test]
     async fn reloaded_secret_verifies_new_deliveries() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         let old_secret = fresh_reload_secret();
         let new_secret = fresh_reload_secret();
         assert_ne!(old_secret, new_secret, "rotation must change the secret");
@@ -948,6 +974,7 @@ mod tests {
 
     #[tokio::test]
     async fn pre_reload_secret_is_rejected_after_reload() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         let old_secret = fresh_reload_secret();
         let new_secret = fresh_reload_secret();
         let state = Arc::new(ReceiverState::new(&reload_config_for(&old_secret)));
@@ -992,6 +1019,7 @@ mod tests {
 
     #[tokio::test]
     async fn in_flight_delivery_during_reload_is_deterministic() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         let old_secret = fresh_reload_secret();
         let new_secret = fresh_reload_secret();
         let state = Arc::new(ReceiverState::new(&reload_config_for(&old_secret)));
@@ -1044,118 +1072,9 @@ mod tests {
         assert_eq!(reloaded.status(), StatusCode::OK);
     }
 
-    #[derive(Clone, Default)]
-    struct ReloadLogRecorder {
-        text: std::sync::Arc<std::sync::Mutex<String>>,
-        next_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    }
-
-    impl ReloadLogRecorder {
-        fn text(&self) -> String {
-            self.text.lock().unwrap().clone()
-        }
-
-        fn push(&self, line: String) {
-            let mut text = self.text.lock().unwrap();
-            text.push_str(&line);
-            text.push('\n');
-        }
-    }
-
-    struct ReloadLogVisit<'a>(&'a mut String);
-
-    impl ReloadLogVisit<'_> {
-        fn push(&mut self, field: &tracing::field::Field, value: String) {
-            use std::fmt::Write as _;
-            write!(self.0, " {}={value}", field.name()).unwrap();
-        }
-    }
-
-    impl tracing::field::Visit for ReloadLogVisit<'_> {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            self.push(field, format!("{value:?}"));
-        }
-
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            self.push(field, format!("{value:?}"));
-        }
-
-        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-            self.push(field, value.to_string());
-        }
-
-        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-            self.push(field, value.to_string());
-        }
-
-        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
-            self.push(field, value.to_string());
-        }
-
-        fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
-            self.push(field, value.to_string());
-        }
-
-        fn record_error(
-            &mut self,
-            field: &tracing::field::Field,
-            value: &(dyn std::error::Error + 'static),
-        ) {
-            self.push(field, format!("{value}"));
-        }
-    }
-
-    impl tracing::Subscriber for ReloadLogRecorder {
-        fn register_callsite(
-            &self,
-            _: &'static tracing::Metadata<'static>,
-        ) -> tracing::subscriber::Interest {
-            // A callsite may first be registered while another parallel test's
-            // dispatcher is active. Re-check against this test's dispatcher so
-            // that its recorder receives events regardless of registration order.
-            tracing::subscriber::Interest::sometimes()
-        }
-
-        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-
-        fn new_span(&self, attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            let id = self
-                .next_id
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                + 1;
-            let mut line = format!("span {}:{id}", attrs.metadata().name());
-            attrs.record(&mut ReloadLogVisit(&mut line));
-            self.push(line);
-            tracing::span::Id::from_u64(id)
-        }
-
-        fn record(&self, _: &tracing::span::Id, values: &tracing::span::Record<'_>) {
-            let mut line = String::from("record");
-            values.record(&mut ReloadLogVisit(&mut line));
-            self.push(line);
-        }
-
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-
-        fn event(&self, event: &tracing::Event<'_>) {
-            let mut line = format!(
-                "event {} {}",
-                event.metadata().level(),
-                event.metadata().target()
-            );
-            event.record(&mut ReloadLogVisit(&mut line));
-            self.push(line);
-        }
-
-        fn enter(&self, _: &tracing::span::Id) {}
-
-        fn exit(&self, _: &tracing::span::Id) {}
-    }
-
-    #[test]
-    fn reload_path_never_logs_or_debugs_secret_material() {
+    #[tokio::test]
+    async fn reload_path_never_logs_or_debugs_secret_material() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         let old_secret = fresh_reload_secret();
         let new_secret = fresh_reload_secret();
         let secrets = [&old_secret, &new_secret];
@@ -1186,45 +1105,43 @@ mod tests {
                 assert!(rendered.contains("[REDACTED]"));
             }
         }
-        // Exercise the reload on one bound state, and capture its subsequent
-        // refusal and acknowledgement events with a per-test recorder. A direct
-        // subscriber avoids fmt's shared callsite capture racing parallel tests.
+        // Exercise the reload on one bound state, and read its subsequent
+        // refusal and acknowledgement events from the process-wide capture
+        // (see `RECEIVER_LOG_SERIAL`). Calling `global()` here ensures the
+        // process-wide dispatch is installed before the start offset; that
+        // one-time install (`Dispatch::new`) rebuilds every callsite's
+        // cached interest against the live dispatches, so a sibling that
+        // registered these callsites before the install cannot starve this
+        // test of events.
+        let capture = crate::tracing_capture::global();
+        let start = capture.text().len();
         let state = Arc::new(ReceiverState::new(&reload_config_for(&old_secret)));
         let bound = router(Arc::clone(&state));
-        let recorder = ReloadLogRecorder::default();
         let body = challenge_body();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
+        state.reload_secret(&reload_config_for(&new_secret));
+        let timestamp = fresh_timestamp();
+        let old_id = "synthetic-reload-0006";
+        let old_signature = sign_with(&old_secret, old_id, &timestamp, body.as_bytes());
+        let refused =
+            reload_response(bound.clone(), old_id, &timestamp, &old_signature, body).await;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        let refused_bytes = axum::body::to_bytes(refused.into_body(), 4096)
+            .await
             .unwrap();
-        tracing::subscriber::with_default(recorder.clone(), || {
-            runtime.block_on(async {
-                state.reload_secret(&reload_config_for(&new_secret));
-                let timestamp = fresh_timestamp();
-                let old_id = "synthetic-reload-0006";
-                let old_signature = sign_with(&old_secret, old_id, &timestamp, body.as_bytes());
-                let refused =
-                    reload_response(bound.clone(), old_id, &timestamp, &old_signature, body).await;
-                assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
-                let refused_bytes = axum::body::to_bytes(refused.into_body(), 4096)
-                    .await
-                    .unwrap();
-                assert!(!String::from_utf8_lossy(&refused_bytes).contains(&old_secret));
-                assert!(!String::from_utf8_lossy(&refused_bytes).contains(&new_secret));
+        assert!(!String::from_utf8_lossy(&refused_bytes).contains(&old_secret));
+        assert!(!String::from_utf8_lossy(&refused_bytes).contains(&new_secret));
 
-                let new_id = "synthetic-reload-0007";
-                let new_signature = sign_with(&new_secret, new_id, &timestamp, body.as_bytes());
-                let accepted =
-                    reload_response(bound, new_id, &timestamp, &new_signature, body).await;
-                assert_eq!(accepted.status(), StatusCode::OK);
-                let accepted_bytes = axum::body::to_bytes(accepted.into_body(), 4096)
-                    .await
-                    .unwrap();
-                assert_eq!(&accepted_bytes[..], b"synthetic-challenge-0001");
-                tracing::info!("reload log capture live");
-            });
-        });
-        let text = recorder.text();
+        let new_id = "synthetic-reload-0007";
+        let new_signature = sign_with(&new_secret, new_id, &timestamp, body.as_bytes());
+        let accepted = reload_response(bound, new_id, &timestamp, &new_signature, body).await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let accepted_bytes = axum::body::to_bytes(accepted.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(&accepted_bytes[..], b"synthetic-challenge-0001");
+        tracing::info!("reload log capture live");
+
+        let text = capture.text().split_off(start);
         assert!(
             text.contains("reload log capture live"),
             "log capture missed events; the redaction assertions would pass vacuously"
