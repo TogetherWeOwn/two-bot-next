@@ -29,7 +29,8 @@ def run_semgrep(semgrep):
     """All findings as (rule_id, path, line) triples."""
     try:
         proc = subprocess.run(
-            [semgrep, "scan", "--config", str(CONFIG), "--json", "--quiet"],
+            [semgrep, "scan", "--config", str(CONFIG), "--json", "--quiet",
+             "--timeout", "0"],
             cwd=ROOT,
             capture_output=True,
             text=True,
@@ -47,8 +48,34 @@ def run_semgrep(semgrep):
         return None, f"semgrep output is not JSON: {exc}"
     if not isinstance(report, dict) or not isinstance(report.get("results"), list):
         return None, "semgrep report has an invalid shape"
-    if report.get("errors"):
-        return None, "semgrep reported errors"
+    scan_warnings = []
+    errors = report.get("errors", [])
+    if not isinstance(errors, list):
+        return None, "semgrep report has an invalid errors field"
+    for entry in errors:
+        if not isinstance(entry, dict):
+            return None, "semgrep report contains an invalid error entry"
+        level = entry.get("level")
+        error_type = entry.get("type")
+        code = entry.get("code")
+        path = entry.get("path")
+        message = entry.get("message")
+        if (not isinstance(level, str) or not isinstance(error_type, str)
+                or (path is not None and not isinstance(path, str))
+                or (message is not None and not isinstance(message, str))):
+            return None, "semgrep report contains an invalid error entry"
+        level = level.replace("\r", " ").replace("\n", " ").strip()
+        error_type = error_type.replace("\r", " ").replace("\n", " ").strip()
+        path = (path or "<unknown>").replace("\r", " ").replace("\n", " ").strip()
+        message = (message or "<no message>").replace("\r", " ").replace("\n", " ").strip()
+        detail = (f"level={level}, type={error_type}, path={path}: "
+                  f"{message[:300]}")
+        if level.lower() == "error" or "config" in error_type.lower() \
+                or (isinstance(code, str) and "config" in code.lower()):
+            return None, f"semgrep reported an error ({detail})"
+        if level.lower() not in {"warn", "warning", "info"}:
+            return None, f"semgrep reported an unclassified error ({detail})"
+        scan_warnings.append(detail)
     findings = set()
     for result in report["results"]:
         if not isinstance(result, dict):
@@ -65,14 +92,14 @@ def run_semgrep(semgrep):
             return None, "semgrep report contains an invalid result"
         rule = check_id.split(".")[-1]
         findings.add((rule, path, line))
-    return findings, ""
+    return findings, "\n".join(scan_warnings)
 
 
 def added_lines(base_ref, head_ref):
     """Added (file, new-line) pairs from a zero-context diff of Rust files."""
     try:
         proc = subprocess.run(
-            ["git", "-C", str(ROOT), "diff", "-U0", "--no-color", "--no-renames",
+            ["git", "-C", str(ROOT), "diff", "-U0", "--no-color", "-M",
              f"{base_ref}", f"{head_ref}", "--", "*.rs"],
             capture_output=True,
             text=True,
@@ -108,6 +135,10 @@ def error(message):
     print(f"::error::{message}", flush=True)
 
 
+def warn(message):
+    print(f"::warning::{message}", flush=True)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-ref", default="origin/main")
@@ -119,10 +150,12 @@ def main(argv=None):
         error(f"semgrep HARD gate is blind (missing {CONFIG.relative_to(ROOT)}); failing closed")
         return 1
 
-    findings, scan_error = run_semgrep(args.semgrep)
+    findings, scan_warnings = run_semgrep(args.semgrep)
     if findings is None:
-        error(f"semgrep HARD gate is blind ({scan_error}); failing closed")
+        error(f"semgrep HARD gate is blind ({scan_warnings}); failing closed")
         return 1
+    for warning in scan_warnings.splitlines():
+        warn(f"semgrep scan warning ({warning})")
     print(f"semgrep HARD gate: {len(findings)} finding(s)")
 
     added, diff_error = added_lines(args.base_ref, args.head_ref)

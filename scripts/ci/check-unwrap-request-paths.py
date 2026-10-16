@@ -5,7 +5,7 @@ The request-path rule is defined by
 ``ast-grep-rules/no-unwrap-request-paths.yml`` (request-path file globs with
 test files/dirs ignored; inline ``#[cfg(test)]`` modules are included). Six
 additional Rust advisories and their fixtures come from the shared meta-only
-assets. The script runs ``ast-grep scan --json``
+assets. The script runs ``ast-grep scan --json --warning``
 and intersects all reported hits with
 the lines the PR adds (``git diff -U0 base head``), so only newly added
 findings fail. Existing unwrap hits are listed in ``docs/unwrap-backlog.md``.
@@ -39,7 +39,7 @@ def run_scan(ast_grep, all_rules=False):
     """
     try:
         proc = subprocess.run(
-            [ast_grep, "scan", "--json"],
+            [ast_grep, "scan", "--json", "--warning"],
             cwd=ROOT,
             capture_output=True,
             text=True,
@@ -86,7 +86,7 @@ def added_lines(base_ref, head_ref):
     """Added (file, new-line) pairs from a zero-context diff of Rust files."""
     try:
         proc = subprocess.run(
-            ["git", "-C", str(ROOT), "diff", "-U0", "--no-color", "--no-renames",
+            ["git", "-C", str(ROOT), "diff", "-U0", "--no-color", "-M",
              f"{base_ref}", f"{head_ref}", "--", "*.rs"],
             capture_output=True,
             text=True,

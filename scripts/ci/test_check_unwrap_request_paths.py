@@ -76,6 +76,14 @@ def fake_ast_grep(payload):
 
 
 class ScanTests(unittest.TestCase):
+    def test_scan_downgrades_all_rules_to_warnings(self):
+        with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=json.dumps(SCAN_FIXTURE), stderr="")) as run:
+            hits, error = gate.run_scan("ast-grep", all_rules=True)
+        self.assertEqual(error, "")
+        self.assertEqual(len(hits), 3)
+        self.assertIn("--warning", run.call_args.args[0])
+
     def test_scan_converts_zero_based_lines_to_one_based(self):
         fixture = [{"ruleId": gate.RULE_ID, "file": "a.rs",
                     "range": {"start": {"line": 0}}}]
@@ -191,6 +199,25 @@ class DiffTests(unittest.TestCase):
             tmp.cleanup()
         self.assertEqual(error, "")
         self.assertEqual(added, {("a.rs", 2), ("a.rs", 3)})
+
+    def test_pure_rename_does_not_add_every_line(self):
+        tmp, root = make_repo()
+        try:
+            base = commit(root, {"interactions.rs": "one\ntwo\nthree\n"})
+            (root / "interactions.rs").rename(root / "rooms.rs")
+            subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "rename"], cwd=root, check=True)
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root,
+                                  capture_output=True, text=True, check=True).stdout.strip()
+            real_root, gate.ROOT = gate.ROOT, root
+            try:
+                added, error = gate.added_lines(base, head)
+            finally:
+                gate.ROOT = real_root
+        finally:
+            tmp.cleanup()
+        self.assertEqual(error, "")
+        self.assertEqual(added, set())
 
     def test_bad_refs_are_reported(self):
         real_root, gate.ROOT = gate.ROOT, Path(tempfile.mkdtemp())

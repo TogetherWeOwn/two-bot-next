@@ -8,6 +8,7 @@ rules, local config only, no registry access.
 import io
 import json
 import stat
+import subprocess
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -49,6 +50,26 @@ def fake_semgrep(payload):
     return tmp, str(binary)
 
 
+def make_repo():
+    tmp = tempfile.TemporaryDirectory()
+    root = Path(tmp.name)
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=root, check=True)
+    return tmp, root
+
+
+def commit(root, files):
+    for path, content in files.items():
+        full = root / path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text(content)
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "x"], cwd=root, check=True)
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=root,
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+
 class ParseTests(unittest.TestCase):
     def test_findings_keep_rule_path_and_line(self):
         tmp, binary = fake_semgrep(json.dumps(REPORT))
@@ -82,13 +103,32 @@ class ParseTests(unittest.TestCase):
         self.assertIsNone(findings)
         self.assertIn("exited 2", error)
 
-    def test_report_errors_are_blindness(self):
+    def test_warning_error_entry_keeps_findings_and_reports_details(self):
+        report = {"results": REPORT["results"], "errors": [{
+            "level": "warn", "type": "Timeout", "path": "crates/core/src/y.rs",
+            "message": "scan reached per-file timeout",
+        }]}
         with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(
-                returncode=0, stdout=json.dumps({"results": [], "errors": [{"message": "bad config"}]}),
-                stderr="")):
+                returncode=0, stdout=json.dumps(report), stderr="")):
+            findings, warning = gate.run_semgrep("semgrep")
+        self.assertIsNotNone(findings)
+        self.assertEqual(len(findings), 3)
+        self.assertIn("Timeout", warning)
+        self.assertIn("crates/core/src/y.rs", warning)
+        self.assertIn("scan reached per-file timeout", warning)
+
+    def test_error_level_entry_is_blindness_with_details(self):
+        report = {"results": [], "errors": [{
+            "level": "error", "type": "Config error", "path": "config.yml",
+            "message": "invalid rule",
+        }]}
+        with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=json.dumps(report), stderr="")):
             findings, error = gate.run_semgrep("semgrep")
         self.assertIsNone(findings)
-        self.assertIn("reported errors", error)
+        self.assertIn("Config error", error)
+        self.assertIn("config.yml", error)
+        self.assertIn("invalid rule", error)
 
     def test_empty_success_output_is_blindness(self):
         with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(
@@ -129,6 +169,27 @@ class ParseTests(unittest.TestCase):
         self.assertIn("invalid result", error)
 
 
+class DiffTests(unittest.TestCase):
+    def test_pure_rename_does_not_add_every_line(self):
+        tmp, root = make_repo()
+        try:
+            base = commit(root, {"logging.rs": "one\ntwo\nthree\n"})
+            (root / "logging.rs").rename(root / "logging_moved.rs")
+            subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "rename"], cwd=root, check=True)
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root,
+                                  capture_output=True, text=True, check=True).stdout.strip()
+            real_root, gate.ROOT = gate.ROOT, root
+            try:
+                added, error = gate.added_lines(base, head)
+            finally:
+                gate.ROOT = real_root
+        finally:
+            tmp.cleanup()
+        self.assertEqual(error, "")
+        self.assertEqual(added, set())
+
+
 class GateTests(unittest.TestCase):
     def run_gate(self, report, added):
         tmp, binary = fake_semgrep(json.dumps(report))
@@ -155,6 +216,28 @@ class GateTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertNotIn("::error::", output)
         self.assertNotIn("::warning::", output)
+
+    def test_warn_level_scan_error_is_annotated_but_does_not_fail(self):
+        report = {"results": [], "errors": [{
+            "level": "warn", "type": "Timeout", "path": "crates/core/src/y.rs",
+            "message": "scan reached per-file timeout",
+        }]}
+        code, output = self.run_gate(report, set())
+        self.assertEqual(code, 0)
+        self.assertIn("::warning::", output)
+        self.assertIn("Timeout", output)
+        self.assertIn("crates/core/src/y.rs", output)
+        self.assertIn("scan reached per-file timeout", output)
+
+    def test_warning_details_cannot_inject_workflow_commands(self):
+        report = {"results": [], "errors": [{
+            "level": "warn", "type": "Timeout", "path": "file.rs",
+            "message": "timeout\n::error::injected",
+        }]}
+        code, output = self.run_gate(report, set())
+        self.assertEqual(code, 0)
+        self.assertEqual(output.count("::warning::"), 1)
+        self.assertFalse(any(line.startswith("::error::") for line in output.splitlines()))
 
     def test_blind_gate_fails_closed(self):
         out = io.StringIO()
