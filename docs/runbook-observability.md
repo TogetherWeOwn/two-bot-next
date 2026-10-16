@@ -39,9 +39,11 @@ No Gatus or third-party monitor is used.
    not copy webhook URLs, bearer values, member identifiers, message content,
    database URLs, request headers, or raw remote error bodies into the incident.
 2. Open the corresponding Cloudflare Workers Observability logs for the
-   environment and time window. For Container failures, use the `containers`
-   dataset or the dashboard's Container logs; do not rely on the Wrangler
-   `logs` tail to show Rust stdout.
+   environment and time window. Filter `container_gateway_failure` and
+   `metrics_alert` lines by `release` (the deployed git SHA) to scope errors
+   to that release, grouped by `error_class`. For Container failures, use the
+   `containers` dataset or the dashboard's Container logs; do not rely on the
+   Wrangler `logs` tail to show Rust stdout.
 3. Read `/readyz` and, when authorized, the read-only `/ops/gateway` summary.
    Capture `build_revision` and `build_id` from the response. Never treat the
    Worker version ID as the Git SHA.
@@ -68,7 +70,8 @@ counter between metric samples. `gateway_unpaired_disconnect` detects a
 sustained disconnect without RESUMED or fresh READY. Read the class and failed
 step from the Container's structured `gateway_failed` log line, which carries
 `failed_step` and the sanitized `error_code`. The Worker separately writes a
-`container_gateway_failure` event with only the phase and class. The `/readyz`
+`container_gateway_failure` event with the phase, class, `release`, and
+`worker_version`. The `/readyz`
 `gateway_failure` field also exposes phase and class only. SQL errors are never
 emitted verbatim. A PostgreSQL SQLSTATE code appears only when the producer
 explicitly extracts it; do not infer one from a generic `database` class. A
@@ -95,8 +98,11 @@ claim them as shipped acceptance:
 - Container tracing is structured JSON, but a single `request_id` is not yet
   propagated end-to-end from Worker through Container, Durable Object, and
   queued work. Do not assume logs can be joined by request ID.
-- Release-tagged external error tracking is not configured. Production Workers
-  Logs are enabled unsampled; traces remain disabled to avoid recording
+- Release-tagged error tracking is Workers Logs, not an external service.
+  Every `container_gateway_failure` and `metrics_alert` line carries `release`
+  (the container git SHA) and `worker_version`, grouped by `error_class` /
+  last error class. Filter a deploy window by `release` to see whether a new
+  error belongs to that release. Traces remain disabled to avoid recording
   credential-bearing URLs.
 - This repository's synthetic workflow is staging-oriented. Do not describe it
   as a passive five-minute production user-flow check unless the production
