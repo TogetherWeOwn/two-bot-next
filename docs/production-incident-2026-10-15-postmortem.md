@@ -2,9 +2,10 @@
 
 **Status: root cause PROVISIONAL.** The cause below is the leading hypothesis
 from the incident investigation (production 19 migrations behind staging).
-It stays provisional until the RCA fix PR (#978: `failed_step` + error-code
-logging, schema-gap survival) merges and names the failing step from a real
-log line. Update this section when that lands; do not treat the hypothesis
+The RCA fix PR (#978: `failed_step` + error-code logging, schema-gap survival)
+merged on 2026-10-15 at 21:35Z. The hypothesis stays provisional until a
+production log line from a build that includes #978 names the failing step.
+Update this section when that line is captured; do not treat the hypothesis
 as proven before then.
 
 ## Timeline (all UTC, 2026-10-15)
@@ -34,7 +35,7 @@ There is no `0434` in `crates/cutover/migrations` (counted there), so the
 gap is exactly these 19. (`crates/store/migrations/0434_privacy_opt_out.sql`
 exists outside the cutover set, as does `0442_game_activity_guild_aggregates.sql`.)
 
-Fitted mechanism (code-verified at `6baab871`, log proof pending #978): on the first
+Fitted mechanism (code-verified at `6baab871`; log proof pending a #978 build): on the first
 `GUILD_CREATE` after boot, `retention_lifecycle`
 (`crates/bot/src/gateway.rs:611`, inner call at `:626`) calls
 `cancel_guild_purge` (`crates/cutover/src/retention.rs:527`, DELETE at
