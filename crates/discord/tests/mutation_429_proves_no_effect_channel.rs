@@ -1,10 +1,8 @@
 //! M8.1 acceptance: mutation HTTP 429 proves no effect (website channel slice).
 //!
-//! Failing-first regressions for the `proves_no_effect` alignment follow-up
-//! noted at `docs/channel-lane-reconciliation.md:97`. The website channel
-//! executor (`InternalChannelExecutor`) still classifies a mutation 429 as
-//! ambiguous (fenced) instead of releasing the failed attempt like the
-//! slash-runtime path (`channel_moderation.rs`) does.
+//! These database-backed regressions verify that the website channel executor
+//! releases a rate-limited mutation attempt for retry, while uncertain outcomes
+//! (5xx, timeout, cancellation, and unexpected statuses) remain fenced.
 //!
 //! Run with the disposable test database (never staging or production):
 //!
@@ -14,21 +12,9 @@
 //!   --test mutation_429_proves_no_effect_channel -- --ignored --test-threads=1
 //! ```
 //!
-//! * 429 tests assert the DESIRED behavior and run RED on current HEAD.
-//!   The builder fixes production code and MUST NOT edit this file.
-//! * Fence tests (5xx, timeout, cancellation, unexpected status) assert the
-//!   ambiguity contract that must survive the fix; they are GREEN guards.
-//!
 //! Cancellation is modelled distinctly from timeout: the caller drops the
 //! in-flight attempt (aborted task) instead of waiting for Discord's 5 s
 //! abort. Both must stay fenced.
-//!
-//! NOTE for the builder: two legacy tests pin the OLD 429-as-ambiguous
-//! behavior and must be updated on the build card (not here):
-//! `ambiguous_permission_responses_retain_request_channel_and_recovery_fences`
-//! and `uncertain_purge_deletions_keep_same_key_and_distinct_key_fenced` in
-//! `crates/discord/tests/internal_channel_moderation.rs` both loop over 429
-//! while asserting the lane stays fenced.
 #![cfg(feature = "db")]
 
 #[path = "mutation_429_common.rs"]

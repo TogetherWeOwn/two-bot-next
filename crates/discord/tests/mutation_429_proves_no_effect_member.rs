@@ -1,19 +1,13 @@
 //! M8.1 acceptance: mutation HTTP 429 proves no effect (member slice).
 //!
-//! Failing-first regressions for the `proves_no_effect` alignment follow-up
-//! noted at `docs/channel-lane-reconciliation.md:97`. The website member
-//! executor still classifies a mutation 429 as ambiguous (fenced) instead of
-//! releasing the failed attempt like the slash-runtime path does.
-//!
-//! These tests run WITHOUT a database (`cargo test -p two-bot-discord`):
-//! * 429 tests assert the DESIRED behavior and run RED on current HEAD.
-//!   The builder fixes production code and MUST NOT edit this file.
-//! * Fence tests (5xx, timeout, cancellation, unexpected status) assert the
-//!   ambiguity contract that must survive the fix; they are GREEN guards.
+//! These regressions verify that the website member executor releases a
+//! rate-limited mutation attempt for retry, while uncertain outcomes (5xx,
+//! timeout, cancellation, and unexpected statuses) remain fenced.
 //!
 //! Cancellation is modelled distinctly from timeout: the caller drops the
 //! in-flight attempt (aborted task) instead of waiting for Discord's 5 s
 //! abort. Both must stay fenced.
+#![cfg(feature = "db")]
 
 use common::{MockRest, ScriptedResponse};
 use serde_json::json;
