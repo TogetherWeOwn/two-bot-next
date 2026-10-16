@@ -62,6 +62,7 @@ READINESS_TOKENS = frozenset({
     "deployment_id_missing", "operation_failed",
 })
 VERIFY_TIMEOUT_SECONDS = 300
+API_TRANSPORT_BACKOFF_SECONDS = (0.25, 0.5)
 MAX_TIMEOUT_DIAGNOSTIC_SECONDS = 3600
 TOKEN = re.compile(r"[a-z0-9_]{1,32}")
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
@@ -168,11 +169,24 @@ class Client:
             return 0, {}, b""
 
     def api(self, path):
-        status, _, body = self.request(self.base + path, authenticated=True)
-        require(status == 200, "api_http_failure")
-        data = decode(body)
-        require(mapping(data).get("success") is True and "result" in data, "api_failure")
-        return data["result"]
+        for attempt in range(len(API_TRANSPORT_BACKOFF_SECONDS) + 1):
+            try:
+                status, _, body = self.request(self.base + path, authenticated=True)
+            except GateError as error:
+                if str(error) != "api_transport_failure":
+                    raise
+                if attempt == len(API_TRANSPORT_BACKOFF_SECONDS):
+                    raise GateError("api_transport_failure") from None
+                delay = API_TRANSPORT_BACKOFF_SECONDS[attempt]
+                if self.deadline is not None:
+                    delay = min(delay, self.deadline - time.monotonic())
+                    require(delay > 0, "rollout_timeout")
+                time.sleep(delay)
+                continue
+            require(status == 200, "api_http_failure")
+            data = decode(body)
+            require(mapping(data).get("success") is True and "result" in data, "api_failure")
+            return data["result"]
 
 
 def decode(body):
@@ -757,7 +771,6 @@ def verify(args, client):
                     client, lambda: active_worker(client, version), app, row, image,
                     drift_candidate, verification_started)
             listed_image = mapping(app.get("configuration")).get("image")
-            previous_image = mapping(row.get("current_configuration")).get("image") if complete or lag else None
             stale = (complete or lag) and listed_image != image
             drift_candidate = stale
             if stale:
@@ -801,7 +814,14 @@ def verify(args, client):
                                 and final_app["durable_objects"]["namespace_id"] == baseline["namespace_id"],
                                 "application_identity_drift")
                         final_image = mapping(final_app.get("configuration")).get("image")
-                        if final_image != image and final_image != previous_image:
+                        final_previous_image = mapping(final.get("current_configuration")).get("image")
+                        verified_previous_image = (
+                            isinstance(final_image, str) and re.fullmatch(IMAGE, final_image)
+                            and isinstance(final_previous_image, str)
+                            and re.fullmatch(IMAGE, final_previous_image)
+                            and final_image == final_previous_image
+                        )
+                        if final_image != image and not verified_previous_image:
                             raise GateError("application_image_drift",
                                             image_drift_detail(client, final_app, final, image))
                         listing_lag = final_image != image

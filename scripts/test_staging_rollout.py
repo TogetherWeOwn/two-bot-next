@@ -771,6 +771,20 @@ class IdentityAndControlPlaneTests(OfflineTestCase):
 
 
 class ClientSanitizationTests(OfflineTestCase):
+    def test_authenticated_api_retries_transport_failures_with_bounded_backoff(self):
+        client = rollout.Client(ACCOUNT, SENTINEL)
+        response = Mock(status=200, headers={})
+        response.read.return_value = json.dumps({"success": True, "result": []}).encode()
+        context = MagicMock()
+        context.__enter__.return_value = response
+        client.opener.open.side_effect = [URLError(SENTINEL), TimeoutError(SENTINEL), context]
+
+        with patch.object(rollout.time, "sleep") as sleep:
+            self.assertEqual(client.api("/containers/applications"), [])
+
+        self.assertEqual(client.opener.open.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.25, 0.5])
+
     def test_authenticated_http_and_transport_errors_have_fixed_codes(self):
         for error, code in [(HTTPError("https://offline.invalid", 500, SENTINEL, {},
                                       io.BytesIO(SENTINEL.encode())), "api_http_failure"),
@@ -1901,6 +1915,33 @@ class OrchestrationTests(OfflineTestCase):
         self.assertTrue(evidence["application_listing_lag"])
         self.assert_no_secret_saved_or_printed()
 
+    def test_missing_listing_and_previous_images_do_not_count_as_verified_lag(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        missing_image = app()
+        missing_image["configuration"] = {}
+        client.api_routes[APP_PATH] = [[missing_image], [missing_image]]
+        missing_previous_image = completed_row()
+        missing_previous_image["current_configuration"] = {}
+        client.api_routes[DETAIL_PATH] = [missing_previous_image, missing_previous_image]
+
+        self.assert_gate("application_image_drift", rollout.verify, self.args, client)
+        self.assert_no_evidence()
+
+    def test_final_rollout_baseline_image_is_used_to_verify_listing_lag(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        stale = app(OLD_IMAGE)
+        client.api_routes[APP_PATH] = [[stale], [stale]]
+        changed = completed_row()
+        changed["current_configuration"]["image"] = REPOSITORY + "@sha256:" + "f" * 64
+        client.api_routes[DETAIL_PATH] = [completed_row(), changed]
+
+        self.assert_gate("application_image_drift", rollout.verify, self.args, client)
+        self.assert_no_evidence()
+
     def test_stale_application_image_is_reported_and_never_accepted(self):
         self.prepare_baseline()
         self.write_deploy_output()
@@ -2009,7 +2050,7 @@ class OrchestrationTests(OfflineTestCase):
                             test_case.readyz_body(gateway_failure), 503,
                             {"x-two-worker-version": VERSION},
                         )
-                    status, headers, _ = ready_response()
+                    _, headers, _ = ready_response()
                     body = test_case.readyz_body(
                         None, components=[["process", "ready"], ["gateway", "down"]])
                     return Response(body, 503, headers)
@@ -2097,6 +2138,23 @@ class OrchestrationTests(OfflineTestCase):
             rollout.verify(self.args, client)
         self.assertEqual(str(caught.exception), "application_image_drift")
         return caught.exception
+
+    def test_nonconverged_poll_clears_previous_stale_image_state_before_timeout(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        stale = app(OLD_IMAGE)
+        client.api_routes[APP_PATH] = [[stale]]
+        pending = completed_row()
+        pending["status"] = "progressing"
+        pending["health"]["instances"].update(active=0, healthy=0, starting=1)
+        client.api_routes[DETAIL_PATH] = [completed_row(), pending]
+        _, headers, body = ready_response()
+        client.request_routes[URL + "/readyz"] = [(503, headers, body)]
+        client.deadline = 100 + 10
+
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assert_no_evidence()
 
     def test_persistent_stale_image_drift_reports_where_the_listing_points(self):
         self.prepare_baseline()

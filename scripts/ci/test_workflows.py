@@ -1409,16 +1409,25 @@ class WorkflowTests(unittest.TestCase):
             rollout_dir = temp / "rollout"
             rollout_dir.mkdir()
             (rollout_dir / "receipt.json").write_text('{"worker_version":"test-version"}', encoding="utf-8")
-            base_env = dict(os.environ, ROLLOUT_DIR=str(rollout_dir))
-            shell = 'node() { printf \'%s\\n\' "$MOCK_CONTROL_OUTPUT"; return 1; }\n' + run
+            bin_dir = temp / "bin"
+            bin_dir.mkdir()
+            node = bin_dir / "node"
+            node.write_text('#!/bin/sh\nprintf \'%s\\n\' "$MOCK_CONTROL_OUTPUT"\nexit "${MOCK_CONTROL_EXIT:-1}"\n', encoding="utf-8")
+            node.chmod(0o755)
+            bash_env = temp / "bash-env"
+            bash_env.write_text(f'export PATH="{bin_dir}:$PATH"\n', encoding="utf-8")
+            base_env = dict(os.environ, ROLLOUT_DIR=str(rollout_dir),
+                            PATH=f"{bin_dir}:{os.environ.get('PATH', '')}", BASH_ENV=str(bash_env))
+            shell = run
             cases = (
                 ("Singleton is intentionally fenced or uninitialized; explicit staging release required",
-                 "Staging singleton fenced", True),
-                ("HTTP 401 Unauthorized", "Staging ownership takeover failed (not a fence refusal)", False),
+                 "Staging singleton fenced", True, 1),
+                ("HTTP 401 Unauthorized", "Staging ownership takeover failed (not a fence refusal)", False, 1),
+                ("", "Staging ownership takeover timed out after 240 seconds", False, 124),
             )
-            for output, expected, is_fenced in cases:
-                with self.subTest(output=output):
-                    env = dict(base_env, MOCK_CONTROL_OUTPUT=output)
+            for output, expected, is_fenced, exit_code in cases:
+                with self.subTest(output=output, exit_code=exit_code):
+                    env = dict(base_env, MOCK_CONTROL_OUTPUT=output, MOCK_CONTROL_EXIT=str(exit_code))
                     proc = subprocess.run(
                         ["bash", "-c", shell], cwd=ROOT / "wrangler", env=env,
                         capture_output=True, text=True, timeout=10,

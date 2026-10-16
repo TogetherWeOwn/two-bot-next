@@ -226,7 +226,7 @@ jobs:
             result=$?
             echo "$output" >&2
             if [[ $result -eq 124 || $result -eq 137 ]]; then
-              echo "::error::Staging ownership takeover timed out after 240 seconds; verify rollback evidence and keep the ownership fence unchanged."
+              echo "::error::Staging ownership takeover timed out after 240 seconds; verify rollback evidence and current ownership, and do not release the fence manually."
               exit 1
             fi
             case "$output" in
