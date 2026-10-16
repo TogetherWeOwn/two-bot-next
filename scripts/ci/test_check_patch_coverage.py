@@ -64,6 +64,9 @@ class LcovTests(unittest.TestCase):
             "garbage",
             "SF:src/lib.rs\nend_of_record\n",
             "SF:src/lib.rs\nDA:not-a-line,1\n",
+            "SF:src/lib.rs\nDA:0,0\n",
+            "SF:src/lib.rs\nDA:-1,1\n",
+            "SF:src/lib.rs\nDA:1,-1\n",
             "SF:\nDA:1,1\nend_of_record\n",
         ):
             with self.subTest(text=text):

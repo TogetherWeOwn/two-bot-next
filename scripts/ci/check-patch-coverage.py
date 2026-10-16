@@ -43,10 +43,12 @@ def read_lcov(path):
         elif raw.startswith("DA:") and current is not None:
             parts = raw[3:].split(",")
             try:
-                hits[(current, int(parts[0]))] = int(parts[1])
-                data_records += 1
+                line, count = int(parts[0]), int(parts[1])
             except (ValueError, IndexError):
                 continue
+            if line >= 1 and count >= 0:
+                hits[(current, line)] = count
+                data_records += 1
         elif raw.strip() == "end_of_record":
             current = None
     if not data_records:
