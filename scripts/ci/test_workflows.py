@@ -122,7 +122,7 @@ RUNTIME_PATHS = (
     "crates/bot/src/main.rs", "crates/core/Cargo.toml", "crates/core/README.md",
     "crates/core/tests/fixtures/reference_settings.json", "src/main.rs",
     "sql/web_v1.sql", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "deny.toml",
-    "migrations.lock", "Dockerfile", "Dockerfile.distroless", ".dockerignore",
+    "migrations.lock", "Dockerfile", ".dockerignore",
     "wrangler/wrangler.toml", "wrangler/src/index.ts", "wrangler/package.json",
     "wrangler/package-lock.json", "wrangler/scripts/ownership-control.mjs",
     "wrangler/README.md", "scripts/staging_rollout.py", "scripts/container-smoke.py",
@@ -1113,11 +1113,12 @@ def production_schema_gate_errors(workflow, name="deploy-production.yml"):
                       "with the plan binding, the guarded SHA and the guard-verified waive flags")
     # The expected production identity is pinned independently of the secret
     # binding (vars, never derived from the URL): a wrong-target binding must
-    # refuse instead of reading the wrong database. Production takes no
-    # branch pin.
+    # refuse instead of reading the wrong database. A PlanetScale host also
+    # takes the branch pin, exactly as production-migrate does.
     env_text = str(run.get("env", ""))
     for pin, var in (("TWO_BOT_PRODUCTION_HOST", "vars.TWO_BOT_PRODUCTION_HOST"),
-                     ("TWO_BOT_PRODUCTION_DATABASE", "vars.TWO_BOT_PRODUCTION_DATABASE")):
+                     ("TWO_BOT_PRODUCTION_DATABASE", "vars.TWO_BOT_PRODUCTION_DATABASE"),
+                     ("TWO_BOT_PRODUCTION_BRANCH_ID", "vars.TWO_BOT_PRODUCTION_BRANCH_ID")):
         if pin not in env_text or var not in env_text:
             errors.append(f"{name}:schema-gate: gate step must pin {pin} from {var}")
     if "inputs." in str(gate):
@@ -1529,6 +1530,8 @@ class WorkflowTests(unittest.TestCase):
             lambda w: w["jobs"]["schema-gate"]["steps"][4].__setitem__("run", "wrangler deploy"),
             lambda w: w["jobs"]["schema-gate"]["steps"][4].get("env", {}).__setitem__(
                 "LEAK", "${{ secrets.TWO_BOT_PRODUCTION_MIGRATOR_DATABASE_URL }}"),
+            lambda w: w["jobs"]["schema-gate"]["steps"][4].get("env", {}).__setitem__(
+                "TWO_BOT_PRODUCTION_BRANCH_ID", ""),
         ):
             changed = copy.deepcopy(production)
             mutate(changed)
