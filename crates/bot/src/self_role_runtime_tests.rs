@@ -119,8 +119,15 @@ async fn await_expiries_past(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let expiry: (i64, i64) = sqlx::query_as(sql).bind(event_id).fetch_one(pool).await?;
-        if (expiry.0 > past_ms && expiry.1 > past_ms) || tokio::time::Instant::now() >= deadline {
+        if expiry.0 > past_ms && expiry.1 > past_ms {
             return Ok(expiry);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "self-role expiries did not renew before the deadline",
+            )
+            .into());
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -138,8 +145,15 @@ async fn settled_expiries(
     loop {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let current: (i64, i64) = sqlx::query_as(sql).bind(event_id).fetch_one(pool).await?;
-        if current == previous || tokio::time::Instant::now() >= deadline {
+        if current == previous {
             return Ok(current);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "self-role expiries did not settle before the deadline",
+            )
+            .into());
         }
         previous = current;
     }
@@ -1012,19 +1026,14 @@ async fn terminal_restart_cancellation_preserves_journal(pool: &PgPool) -> TestR
     let expiry = settled_expiries(pool, TERMINAL_EXPIRY_SQL, &audit.event_id).await?;
     let calls = mock.requests();
     clock.store(NOW + 200, Ordering::SeqCst); // both old leases are still live
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    let after: (i64, i64) = sqlx::query_as(
-        "SELECT (extract(epoch FROM a.repair_expires_at)*1000)::bigint,
-         (extract(epoch FROM p.processing_expires_at)*1000)::bigint
-         FROM self_role_audit a JOIN self_role_panel_claims p USING(guild_id,member_id,panel_id)
-         WHERE a.event_id=$1",
-    )
-    .bind(&audit.event_id)
-    .fetch_one(pool)
-    .await?;
-    assert_eq!(expiry, after); // neither renewal keeper escaped its cancelled owner
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let after = settled_expiries(pool, TERMINAL_EXPIRY_SQL, &audit.event_id).await?;
+        assert_eq!(expiry, after); // neither renewal keeper escaped its cancelled owner
+        assert_eq!(calls.len(), mock.requests().len());
+    }
     assert_eq!(calls.len(), 5);
-    assert_eq!(calls.len(), mock.requests().len());
     assert_eq!(calls[4].method, "DELETE");
     assert!(calls[4].path.ends_with(OLD_ROLE));
     let after_effects = terminal_evidence(pool, &audit, true, false).await?;
@@ -3814,7 +3823,9 @@ async fn recovery_and_renewal(pool: &PgPool) -> TestResult {
     ));
     assert_eq!(mock.requests().len(), 4); // duplicate did not fetch/replan
     clock.store(NOW + 200, Ordering::SeqCst);
-    await_expiries_past(pool, PROCESSING_EXPIRY_SQL, &request.event_id, NOW + 300).await?;
+    let renewed =
+        await_expiries_past(pool, PROCESSING_EXPIRY_SQL, &request.event_id, NOW + 300).await?;
+    assert!(renewed.0 > NOW + 300 && renewed.1 > NOW + 300);
     clock.store(NOW + 300, Ordering::SeqCst);
     assert!(prepared.owns().await.unwrap()); // BOTH renewed past original expiry
     let old_event = prepared.event.clone();
