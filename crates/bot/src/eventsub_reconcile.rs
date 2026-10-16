@@ -42,6 +42,12 @@ pub struct ReconcileSummary {
     pub created: usize,
     /// 409 creates confirmed healthy by the follow-up listing.
     pub already_exists: usize,
+    /// Pre-pass subscriptions on our callback already in a failed status
+    /// (`webhook_callback_verification_failed`,
+    /// `notification_failures_exceeded`, `authorization_revoked`). Surfaced
+    /// even when the re-create succeeds so a never-verifying callback cannot
+    /// log `healthy` while cycling delete/create every hour.
+    pub prior_failed: usize,
 }
 
 /// True when the EventSub slice is enabled in `vars`.
@@ -93,6 +99,44 @@ fn is_healthy_status(status: &str) -> bool {
     matches!(status, "enabled" | "webhook_callback_verification_pending")
 }
 
+/// True when the status is a terminal Twitch failure that `reconcile` deletes
+/// and re-creates (as opposed to healthy `enabled`/`pending` or an unknown
+/// value, which the follow-up listing judges).
+fn is_failed_status(status: &str) -> bool {
+    matches!(
+        status,
+        "webhook_callback_verification_failed"
+            | "notification_failures_exceeded"
+            | "authorization_revoked"
+    )
+}
+
+/// Pre-pass subscriptions on our callback already in a failed status.
+fn count_prior_failed(existing: &[ExistingSubscription], callback: &CallbackUrl) -> usize {
+    existing
+        .iter()
+        .filter(|sub| sub.callback == callback.as_str() && is_failed_status(&sub.status))
+        .count()
+}
+
+/// True when the follow-up listing holds a healthy subscription for every
+/// desired broadcaster but none is `enabled` yet (all
+/// `webhook_callback_verification_pending`): the callback has not verified,
+/// so the pass must log `pending`, never `healthy`. Call only after the
+/// missing check passes, so every desired broadcaster is healthy here.
+fn pending_only(
+    desired: &[String],
+    callback: &CallbackUrl,
+    confirmed: &[ExistingSubscription],
+) -> bool {
+    !desired.is_empty()
+        && !confirmed.iter().any(|sub| {
+            sub.callback == callback.as_str()
+                && sub.status == "enabled"
+                && desired.contains(&sub.broadcaster_user_id)
+        })
+}
+
 /// Desired broadcasters without a healthy subscription on our callback in the
 /// follow-up listing.
 fn unconfirmed_broadcasters(
@@ -137,6 +181,16 @@ pub async fn reconcile_all<T: HelixTransport>(
     secret: &WebhookSecret,
 ) -> Result<ReconcileSummary, HelixError> {
     let existing = client.list_subscriptions().await?;
+    let prior_failed = count_prior_failed(&existing, callback);
+    if prior_failed > 0 {
+        tracing::error!(
+            event = "eventsub_reconcile",
+            error_class = "reconcile_prior_failed",
+            broadcasters = desired.len(),
+            prior_failed = prior_failed,
+            "eventsub reconcile found failed subscriptions on our callback; deleting and re-creating"
+        );
+    }
     let plan = plan_boot_actions(desired, callback, &existing)?;
     let outcomes = client.execute_actions(&plan, callback, secret).await?;
     let confirmed = client.list_subscriptions().await?;
@@ -147,13 +201,29 @@ pub async fn reconcile_all<T: HelixTransport>(
             error_class = "reconcile_unhealthy",
             broadcasters = desired.len(),
             missing = missing.len(),
+            prior_failed = prior_failed,
             "eventsub reconcile follow-up listing is missing a healthy subscription"
         );
         return Err(HelixError::BadResponse(
             "reconcile follow-up listing is missing a healthy subscription",
         ));
     }
-    let summary = summarize(&outcomes);
+    let mut summary = summarize(&outcomes);
+    summary.prior_failed = prior_failed;
+    if pending_only(desired, callback, &confirmed) {
+        tracing::warn!(
+            event = "eventsub_reconcile",
+            error_class = "reconcile_pending",
+            status = "pending",
+            broadcasters = desired.len(),
+            deleted = summary.deleted,
+            created = summary.created,
+            already_exists = summary.already_exists,
+            prior_failed = summary.prior_failed,
+            "eventsub subscriptions re-created but none verified yet"
+        );
+        return Ok(summary);
+    }
     tracing::info!(
         event = "eventsub_reconcile",
         status = "healthy",
@@ -161,6 +231,7 @@ pub async fn reconcile_all<T: HelixTransport>(
         deleted = summary.deleted,
         created = summary.created,
         already_exists = summary.already_exists,
+        prior_failed = summary.prior_failed,
         "eventsub subscriptions reconciled"
     );
     Ok(summary)
@@ -447,6 +518,72 @@ mod tests {
     }
 
     #[test]
+    fn failed_status_set_covers_terminal_twitch_states() {
+        for status in [
+            "webhook_callback_verification_failed",
+            "notification_failures_exceeded",
+            "authorization_revoked",
+        ] {
+            assert!(is_failed_status(status), "{status}");
+        }
+        for status in [
+            "enabled",
+            "webhook_callback_verification_pending",
+            "",
+            "other",
+        ] {
+            assert!(!is_failed_status(status), "{status}");
+        }
+    }
+
+    #[test]
+    fn prior_failed_counts_only_failed_subscriptions_on_our_callback() {
+        let other = CallbackUrl::new("https://other.example.com/twitch")
+            .expect("fixture callback must parse");
+        let existing = vec![
+            ExistingSubscription {
+                id: "failed-id".to_owned(),
+                status: "webhook_callback_verification_failed".to_owned(),
+                broadcaster_user_id: "444".to_owned(),
+                callback: callback().as_str().to_owned(),
+            },
+            ExistingSubscription {
+                id: "pending-id".to_owned(),
+                status: "webhook_callback_verification_pending".to_owned(),
+                broadcaster_user_id: "444".to_owned(),
+                callback: callback().as_str().to_owned(),
+            },
+            ExistingSubscription {
+                id: "foreign-failed-id".to_owned(),
+                status: "authorization_revoked".to_owned(),
+                broadcaster_user_id: "444".to_owned(),
+                callback: other.as_str().to_owned(),
+            },
+        ];
+        assert_eq!(count_prior_failed(&existing, &callback()), 1);
+        assert!(pending_only(
+            &["444".to_owned()],
+            &callback(),
+            &[ExistingSubscription {
+                id: "fresh-id".to_owned(),
+                status: "webhook_callback_verification_pending".to_owned(),
+                broadcaster_user_id: "444".to_owned(),
+                callback: callback().as_str().to_owned(),
+            }]
+        ));
+        assert!(!pending_only(
+            &["444".to_owned()],
+            &callback(),
+            &[ExistingSubscription {
+                id: "live-id".to_owned(),
+                status: "enabled".to_owned(),
+                broadcaster_user_id: "444".to_owned(),
+                callback: callback().as_str().to_owned(),
+            }]
+        ));
+    }
+
+    #[test]
     fn interval_is_bounded_and_nonzero() {
         const {
             assert!(RECONCILE_INTERVAL_SECS > 0);
@@ -473,6 +610,7 @@ mod tests {
                 deleted: 1,
                 created: 1,
                 already_exists: 1,
+                prior_failed: 0,
             }
         );
         assert_eq!(
@@ -524,6 +662,7 @@ mod tests {
                 deleted: 1,
                 created: 1,
                 already_exists: 0,
+                prior_failed: 0,
             }
         );
         let seen = log.requests();
@@ -561,5 +700,52 @@ mod tests {
             matches!(error, HelixError::BadResponse(_)),
             "unhealthy state must surface, not count as done: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn reconcile_surfaces_prior_failed_when_failed_entry_is_recreated_to_pending() {
+        let listing = json!({
+            "data": [
+                subscription_entry("failed-id", "webhook_callback_verification_failed", "444", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let confirmed = json!({
+            "data": [
+                subscription_entry("fresh-id", "webhook_callback_verification_pending", "444", "https://hooks.example.com/twitch"),
+            ],
+            "pagination": {},
+        });
+        let log = CallLog::default();
+        let transport = ScriptTransport::new(
+            vec![
+                ScriptTransport::token_answer(),
+                ScriptTransport::listing_answer(&listing),
+                ScriptTransport::no_content(),
+                ScriptTransport::no_content(),
+                ScriptTransport::listing_answer(&confirmed),
+            ],
+            log.clone(),
+        );
+        let mut client = HelixClient::new(transport, creds()).with_clock(|| 0);
+        let summary = reconcile_all(
+            &mut client,
+            &callback(),
+            &["444".to_owned()],
+            &test_secret(),
+        )
+        .await
+        .expect("pending follow-up after a prior failure must still succeed");
+        assert_eq!(summary.prior_failed, 1);
+        assert_eq!(summary.deleted, 1);
+        assert_eq!(summary.created, 1);
+        let seen = log.requests();
+        assert_eq!(
+            seen.len(),
+            5,
+            "token, listing, delete, create, follow-up listing"
+        );
+        assert_eq!(seen[2].method, Method::DELETE);
+        assert_eq!(seen[3].method, Method::POST);
     }
 }

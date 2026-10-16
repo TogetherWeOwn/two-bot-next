@@ -161,8 +161,11 @@ below is present but is not called by a runtime receiver yet.
   `TRACED_PATHS` (`crates/bot/src/server.rs`) and renders as `[REDACTED]`.
 - The DO adds `8092` to `requiredPorts` plus the container bind only while
   `TWO_EVENTSUB` is `"1"` with the signing secret present; the Worker
-  forwards the flag, the fixed bind, the container marker and the Operator
-  secret on explicit lines, and forwards nothing when the secret is missing.
+  forwards the flag, the fixed bind, the container marker, the reconcile
+  inputs (`TWO_TWITCH_CALLBACK_URL`, `TWO_TWITCH_BROADCASTERS`) and the Twitch
+  credentials (`TWO_TWITCH_CLIENT_ID`, `TWO_TWITCH_CLIENT_SECRET`,
+  `TWO_TWITCH_WEBHOOK_SECRET`) on explicit lines, and forwards nothing when
+  the secret is missing.
   `scripts/check-env-bindings.py` rejects any `TWO_EVENTSUB*` or
   `TWO_TWITCH_*` var in `wrangler.toml`.
 
@@ -171,8 +174,9 @@ below is present but is not called by a runtime receiver yet.
 `crates/core/src/twitch_helix.rs` drives the plan from `twitch_eventsub`:
 
 - Credentials are Operator-provisioned (`TWO_TWITCH_CLIENT_ID`,
-  `TWO_TWITCH_CLIENT_SECRET`, `TWO_TWITCH_WEBHOOK_SECRET`); the Container
-  reads them from its own environment, never from forwarded Worker vars.
+  `TWO_TWITCH_CLIENT_SECRET`, `TWO_TWITCH_WEBHOOK_SECRET`); the Worker
+  forwards them on explicit containerEnvVars lines while the EventSub receiver
+  is forwarded, and the Container reads them from its process environment.
   Every value travels inside `Secret`, so even a `Debug` dump renders
   `[REDACTED]`.
 - The app token is cached and refreshed 60 s before its `expires_in`
