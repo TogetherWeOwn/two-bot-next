@@ -11,8 +11,14 @@ Staging TLS-handshake receipt: deploy-staging run `38773972225` verified the
 distroless head `46a30b19e` with `/health` 200 and `/readyz` 200 (all
 components ready, gateway included) plus a green voice-synthetic pass — the
 `rustls-platform-verifier` system-bundle path completes live Discord TLS.
-Rollback is one commit: restore the bookworm `Dockerfile` from the parent of
-the distroless switch (`3a571ab`). SBOMs regenerate per head through the
+Rollback requires a coordinated change, not a one-file restore: use a matched,
+pinned bookworm builder and runtime in `Dockerfile`, mirror that pair in
+`Dockerfile.distroless` in lockstep as the fallback mirror, and update
+`dockerfile_parity_errors` in `scripts/ci/test_toolchain_parity.py` to allow the
+explicit rollback pair. Keep the Rust version aligned with
+`rust-toolchain.toml`; do not mix trixie-built binaries with bookworm runtime
+libraries. Require the parity guard, image build/smoke, and staging handshake to
+pass before calling the rollback complete. SBOMs regenerate per head through the
 supply-chain lane.
 
 ## Verdict

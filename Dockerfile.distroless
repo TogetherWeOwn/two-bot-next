@@ -3,8 +3,8 @@
 # documented fallback, not a separate trial. The default image switched to
 # digest-pinned `gcr.io/distroless/cc-debian13:nonroot` in PR #84 under the
 # CEO scope decision for the supply-chain slice; `docs/distroless-evaluation.md`
-# records the staging TLS-handshake receipt and the one-commit bookworm
-# rollback. Do not use the `static` variant; never deploy a `debug-nonroot`
+# records the staging TLS-handshake receipt and coordinated bookworm rollback
+# requirements. Do not use the `static` variant; never deploy a `debug-nonroot`
 # variant.
 #
 # Provenance: body matches the default `Dockerfile` except for this header,
