@@ -330,7 +330,7 @@ jobs:
   # (and, through `needs`, the deploy below) instead of crash-looping the new
   # build at gateway startup. Read-only `production-migrate plan` through the
   # no-reviewer `production-migrate-plan` environment binding; the expected
-  # host/database pins are non-secret `vars.*` compared against that binding
+  # host/database/branch pins are non-secret `vars.*` compared against that binding
   # (never derived from it), so a wrong-target binding refuses instead of
   # reading the wrong database. Drift is fixed by the manual
   # production-migrate apply dispatch named in the failure, never by this
@@ -379,10 +379,12 @@ jobs:
           TWO_BOT_PRODUCTION_PLAN_DATABASE_URL: ${{ secrets.TWO_BOT_PRODUCTION_PLAN_DATABASE_URL }}
           # Non-secret expected production identity (repo vars, Operator-owned;
           # unset pins refuse): the gate refuses unless the secret binding
-          # matches these pins. New vars: TWO_BOT_PRODUCTION_HOST and
-          # TWO_BOT_PRODUCTION_DATABASE (see docs/production-deploy.md).
+          # matches these pins. Vars: TWO_BOT_PRODUCTION_HOST,
+          # TWO_BOT_PRODUCTION_DATABASE and TWO_BOT_PRODUCTION_BRANCH_ID
+          # (see docs/production-deploy.md).
           TWO_BOT_PRODUCTION_HOST: ${{ vars.TWO_BOT_PRODUCTION_HOST }}
           TWO_BOT_PRODUCTION_DATABASE: ${{ vars.TWO_BOT_PRODUCTION_DATABASE }}
+          TWO_BOT_PRODUCTION_BRANCH_ID: ${{ vars.TWO_BOT_PRODUCTION_BRANCH_ID }}
           SOURCE_SHA: ${{ needs.guard.outputs.sha }}
           MODE: ${{ needs.guard.outputs.mode }}
           ALLOW_UNSTAGED: ${{ needs.guard.outputs.allow_unstaged }}
