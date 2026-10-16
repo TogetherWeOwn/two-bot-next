@@ -170,6 +170,14 @@ async fn receive_with_timeout(
     }
 }
 
+fn record_verification_failure(metrics: &two_bot_core::metrics::Metrics, error: &EventSubError) {
+    if *error == EventSubError::BadSignature {
+        metrics.eventsub_classified("tampered");
+    } else {
+        metrics.eventsub_classified("ignored");
+    }
+}
+
 async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Response {
     // Exact path, no query: the Worker forwards only the sanitized shape, but
     // a direct `containerFetch` must not reach verification with extras.
@@ -254,9 +262,9 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
 
     two_bot_core::metrics::global().eventsub_received();
     if let Err(error) = verify_delivery(&state.secret, &headers, &raw, now_ms_i64()) {
-        two_bot_core::metrics::global().eventsub_classified("tampered");
-        // `BodyTooLarge` cannot arrive here (`to_bytes` caps first), but map
-        // it explicitly rather than collapsing every variant into one arm.
+        // Timestamp failures happen only after a valid HMAC. Only a signature
+        // mismatch is evidence of a tampered delivery.
+        record_verification_failure(two_bot_core::metrics::global(), &error);
         if error == EventSubError::BodyTooLarge {
             return refuse(
                 state,
@@ -821,6 +829,65 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["error"]["code"], "request_timeout");
         assert_eq!(value["error"]["retryable"], true);
+    }
+
+    #[test]
+    fn eventsub_verification_failures_only_mark_bad_signatures_tampered() {
+        let metrics = two_bot_core::metrics::Metrics::default();
+        record_verification_failure(&metrics, &EventSubError::BadSignature);
+        for error in [
+            EventSubError::InvalidTimestamp,
+            EventSubError::StaleTimestamp,
+            EventSubError::BodyTooLarge,
+        ] {
+            record_verification_failure(&metrics, &error);
+        }
+
+        let exposition = metrics.render(None);
+        assert!(exposition.contains("two_bot_eventsub_classified_total{kind=\"tampered\"} 1\n"));
+        assert!(exposition.contains("two_bot_eventsub_classified_total{kind=\"ignored\"} 3\n"));
+    }
+
+    #[test]
+    fn eventsub_classification_literals_stay_with_their_delivery_arms() {
+        let source = include_str!("eventsub_http.rs");
+        let verify_failure = source
+            .split_once("if let Err(error) = verify_delivery")
+            .expect("verify failure branch")
+            .1
+            .split_once("match classify(")
+            .expect("classification match")
+            .0;
+        assert!(verify_failure
+            .contains("record_verification_failure(two_bot_core::metrics::global(), &error)"));
+
+        let arm = |start: &str, end: &str| {
+            let body = source.split_once(start).expect("delivery arm start").1;
+            body.split_once(end).expect("next delivery arm").0
+        };
+
+        for (start, end, kind) in [
+            (
+                "Ok(Delivery::Challenge(",
+                "Ok(Delivery::Notification(",
+                "challenge",
+            ),
+            (
+                "Ok(Delivery::Notification(",
+                "Ok(Delivery::Revocation",
+                "notification",
+            ),
+            (
+                "Ok(Delivery::Revocation",
+                "Ok(Delivery::Ignored)",
+                "revocation",
+            ),
+        ] {
+            assert!(
+                arm(start, end).contains(&format!("eventsub_classified(\"{kind}\")")),
+                "{kind} classification must remain in its own delivery arm"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
