@@ -115,6 +115,26 @@ export const VOICE_FAILURE_MIN_OPS = 10;
 export const DISPATCH_DROP_SAMPLES = 3;
 /** Mirrors the fixed DISPATCH_LANES allowlist in crates/core/src/metrics.rs. */
 export const DISPATCH_LANES: readonly string[] = ["messages", "interactions", "registry", "privileged", "busy", "reactions"];
+/** Creator-join SLO: this share of genuine joins must move within 5 s (99.5%). */
+export const JOIN_SLO_BUDGET = 0.005;
+/** Fast burn: alert when both the 1 h and 5 min windows burn faster than this. */
+export const JOIN_FAST_BURN = 14.4;
+/** Long window for the fast-burn rule, seconds. */
+export const JOIN_FAST_LONG_SECONDS = 3600;
+/** Short confirmation window for the fast-burn rule, seconds. */
+export const JOIN_FAST_SHORT_SECONDS = 300;
+/** Slow burn: ticket when both the 6 h and 30 min windows burn faster than this. */
+export const JOIN_SLOW_BURN = 6;
+/** Long window for the slow-burn rule, seconds. */
+export const JOIN_SLOW_LONG_SECONDS = 21600;
+/** Short confirmation window for the slow-burn rule, seconds. */
+export const JOIN_SLOW_SHORT_SECONDS = 1800;
+/** A burn window with fewer genuine joins than this never fires (quiet guilds stay silent). */
+export const JOIN_BURN_MIN_JOINS = 10;
+/** One bad join alone never pages or tickets, even at the volume floor. */
+export const JOIN_BURN_MIN_BAD = 2;
+/** Burn snapshots older than the slow window plus this margin are pruned. */
+export const JOIN_BURN_HISTORY_MARGIN_SECONDS = 600;
 
 export const RULES: readonly RuleDef[] = [
   { id: "job_stale", summary: `scheduled job has no success for more than ${STALE_INTERVALS} intervals`, runbook: "runbook.md#alert-job-stale" },
@@ -132,6 +152,8 @@ export const RULES: readonly RuleDef[] = [
   { id: "dispatch_drops", summary: `dispatch-lane drops grew for ${DISPATCH_DROP_SAMPLES} consecutive sample windows (reactions include fairness refusals; not proof of gateway packet loss)`, runbook: "runbook.md#alert-dispatch-drops", severity: "ticket" },
   { id: "job_unknown_stale", summary: `job without a cadence entry has no success for more than ${UNKNOWN_JOB_STALE_SECONDS / 3600} hours`, runbook: "runbook.md#alert-job-unknown-stale", severity: "ticket" },
   { id: "gateway_checkpoint_failures", summary: `gateway checkpoint commit failures increased between samples`, runbook: "runbook.md#alert-checkpoint-failures" },
+  { id: "voice_join_fast_burn", summary: `creator-join error budget burning faster than ${JOIN_FAST_BURN}x over 1 h and 5 min (99.5% moved within 5 s)`, runbook: "runbook.md#alert-voice-join-fast-burn" },
+  { id: "voice_join_slow_burn", summary: `creator-join error budget burning faster than ${JOIN_SLOW_BURN}x over 6 h and 30 min (99.5% moved within 5 s)`, runbook: "runbook.md#alert-voice-join-slow-burn", severity: "ticket" },
 ];
 
 /**
@@ -189,6 +211,21 @@ export interface MetricsAlertState {
   dispatchDrops?: Record<string, number>;
   /** Consecutive positive deltas, capped at DISPATCH_DROP_SAMPLES. */
   dispatchDropStreaks?: Record<string, number>;
+  /**
+   * Creator-join burn snapshots for the SLO windows, oldest first. Each entry
+   * carries the scrape time plus cumulative counters (received joins,
+   * benign duplicate refusals, moves within 5 s). Absent on state stored by
+   * older Worker versions; the first valid sample only stores a baseline.
+   */
+  joinBurn?: JoinBurnSnapshot[];
+}
+
+/** One cumulative creator-join SLI snapshot feeding the burn-rate windows. */
+export interface JoinBurnSnapshot {
+  t: number;
+  received: number;
+  duplicate: number;
+  fastMoves: number;
 }
 
 export const EMPTY_STATE: MetricsAlertState = { firing: [], jobErrorClasses: {}, rest429: 0, rest5xx: 0, restTotal: 0, poolStreak: 0, dbErrors: 0, sendBlocked: 0, sendBlockedStreak: 0, voiceOps: 0, voiceFailures: 0, voiceDeadLetters: 0, voiceOrphans: 0, gatewayMissed: 0, gatewayMissedSeen: false, checkpointFailures: 0, checkpointFailuresSeen: false, receiverRefusals: {}, receiverRefusalsSeen: false, receiverRefusalStreaks: {}, gatewayDisconnects: 0, gatewayRecoveries: 0, gatewayUnpairedSeen: false, gatewayUnpaired: 0, gatewayUnpairedStreak: 0, dispatchDrops: {}, dispatchDropStreaks: {} };
@@ -301,6 +338,87 @@ function pairGatewayDisconnects(samples: Sample[], prev: MetricsAlertState): { f
       gatewayUnpaired: outstanding ? 1 : 0,
       gatewayUnpairedStreak: streak,
     },
+  };
+}
+
+/**
+ * One cumulative counter series with exactly these labels, or undefined when
+ * absent, duplicated, mislabeled or not a safe nonnegative integer. Keeps a
+ * Rust rename or malformed value from silently holding the burn rules off.
+ */
+function exactCounter(matches: Sample[], labels: Record<string, string>): number | undefined {
+  const rows = matches.filter((s) =>
+    Object.keys(s.labels).length === Object.keys(labels).length
+    && Object.entries(labels).every(([key, value]) => s.labels[key] === value));
+  if (rows.length !== 1) return undefined;
+  const value = rows[0]!.value;
+  return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+interface JoinBurnResult {
+  fast: boolean;
+  slow: boolean;
+  /** Inputs were missing or malformed: the caller retains the previous firing state. */
+  held: boolean;
+  ring: JoinBurnSnapshot[];
+}
+
+/**
+ * Multiwindow burn rate over the creator-join SLI ring. `held` is true when
+ * the join series are unusable and the ring is carried unchanged; a backwards
+ * counter (process restart) rebuilds the ring from this sample and fires
+ * nothing. Otherwise the sample is appended, entries older than the slow
+ * window plus margin are pruned, and each fully covered window burns as
+ * bad / (genuine x budget) against its threshold. Each window also needs the
+ * minimum join volume and at least two bad moves to fire.
+ */
+function joinBurnEvaluation(samples: Sample[], ring: JoinBurnSnapshot[], nowSeconds: number): JoinBurnResult {
+  const gauge = (name: string) => samples.filter((s) => s.name === name);
+  const received = exactCounter(gauge("two_bot_voice_joins_received_total"), {});
+  const duplicate = exactCounter(gauge("two_bot_voice_join_refused_total"), { reason: "duplicate" });
+  const fastMoves = exactCounter(gauge("two_bot_voice_join_to_move_seconds_bucket"), { le: "5" });
+  if (received === undefined || duplicate === undefined || fastMoves === undefined) {
+    return { fast: false, slow: false, held: true, ring };
+  }
+  const snapshot: JoinBurnSnapshot = { t: nowSeconds, received, duplicate, fastMoves };
+  const last = ring[ring.length - 1];
+  if (last !== undefined && (received < last.received || duplicate < last.duplicate || fastMoves < last.fastMoves)) {
+    return { fast: false, slow: false, held: false, ring: [snapshot] };
+  }
+  const cutoff = nowSeconds - JOIN_SLOW_LONG_SECONDS - JOIN_BURN_HISTORY_MARGIN_SECONDS;
+  const next = [...ring.filter((s) => s.t > cutoff && s.t <= nowSeconds), snapshot];
+  // Receive/duplicate counters lag one scrape so joins can finish moving before
+  // they enter the denominator. Each window uses its own boundary baseline; the
+  // move window starts one scrape later and ends at the current histogram.
+  const end = ring[ring.length - 1] ?? snapshot;
+  const baselineAtOrBefore = (time: number, ceiling: number): JoinBurnSnapshot | undefined => {
+    const eligible = next.filter((s) => s.t <= time && s.t <= ceiling);
+    return eligible[eligible.length - 1];
+  };
+  const burn = (windowSeconds: number): number | undefined => {
+    const receivedBase = baselineAtOrBefore(end.t - windowSeconds, end.t);
+    const moveBase = baselineAtOrBefore(nowSeconds - windowSeconds, nowSeconds);
+    // No sample at or before either boundary means the ring does not yet cover
+    // this full window, so wait for history rather than treating it as complete.
+    if (receivedBase === undefined || moveBase === undefined) return undefined;
+    const genuine = (end.received - end.duplicate) - (receivedBase.received - receivedBase.duplicate);
+    if (genuine < JOIN_BURN_MIN_JOINS) return undefined;
+    const good = fastMoves - moveBase.fastMoves;
+    // Window-boundary skew can briefly move more joins than arrived: never
+    // report negative burn, just no burn.
+    const bad = Math.max(0, genuine - good);
+    if (bad < JOIN_BURN_MIN_BAD) return undefined;
+    return bad / (genuine * JOIN_SLO_BUDGET);
+  };
+  const fastLong = burn(JOIN_FAST_LONG_SECONDS);
+  const fastShort = burn(JOIN_FAST_SHORT_SECONDS);
+  const slowLong = burn(JOIN_SLOW_LONG_SECONDS);
+  const slowShort = burn(JOIN_SLOW_SHORT_SECONDS);
+  return {
+    fast: fastLong !== undefined && fastShort !== undefined && fastLong > JOIN_FAST_BURN && fastShort > JOIN_FAST_BURN,
+    slow: slowLong !== undefined && slowShort !== undefined && slowLong > JOIN_SLOW_BURN && slowShort > JOIN_SLOW_BURN,
+    held: false,
+    ring: next,
   };
 }
 
@@ -459,6 +577,25 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     firing.push("voice_failures");
   }
 
+  // Creator-join SLO burn rate (Google SRE workbook multiwindow): 99.5% of
+  // genuine creator joins must move within 5 s. Good events are the
+  // `two_bot_voice_join_to_move_seconds_bucket{le="5"}` cumulative count;
+  // genuine joins are `two_bot_voice_joins_received_total` minus the benign
+  // post-move `duplicate` refusals (`two_bot_voice_join_refused_total`).
+  // Every other refusal, failed move and slow (>5 s) move is budget burn.
+  // The fast rule pages when both the 1 h and 5 min windows burn faster
+  // than 14.4x; the slow rule tickets when both the 6 h and 30 min windows
+  // burn faster than 6x. A window with fewer genuine joins than
+  // JOIN_BURN_MIN_JOINS never fires, so quiet guilds stay silent. A counter
+  // that went backwards means the process restarted: the ring is rebuilt
+  // from this sample and nothing fires. Missing or malformed join series
+  // hold the previous firing state without appending a snapshot.
+  const joinBurn = joinBurnEvaluation(samples, prev.joinBurn ?? [], nowSeconds);
+  if (joinBurn.fast) firing.push("voice_join_fast_burn");
+  else if (prev.firing.includes("voice_join_fast_burn") && joinBurn.held) firing.push("voice_join_fast_burn");
+  if (joinBurn.slow) firing.push("voice_join_slow_burn");
+  else if (prev.firing.includes("voice_join_slow_burn") && joinBurn.held) firing.push("voice_join_slow_burn");
+
   // Gateway missed events (sequence gaps inside one session): any increase
   // between two samples fails the zero-missed-events acceptance. The first
   // sample only stores the baseline and never fires; a counter that went
@@ -575,7 +712,7 @@ export function evaluateMetrics(samples: Sample[], prev: MetricsAlertState, nowS
     if (grew && (wasFiring || streak >= DISPATCH_DROP_SAMPLES)) firing.push(key);
   }
 
-  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, dispatchDrops, dispatchDropStreaks } };
+  return { firing, state: { firing, jobErrorClasses, rest429, rest5xx, restTotal, poolStreak, dbErrors, sendBlocked, sendBlockedStreak, voiceOps, voiceFailures, voiceDeadLetters, voiceOrphans, gatewayMissed, gatewayMissedSeen: true, checkpointFailures, checkpointFailuresSeen: true, receiverRefusals, receiverRefusalsSeen: true, receiverRefusalStreaks, ...unpaired.fields, dispatchDrops, dispatchDropStreaks, joinBurn: joinBurn.ring } };
 }
 
 export function ruleFor(key: string): RuleDef | undefined {

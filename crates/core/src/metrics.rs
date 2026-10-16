@@ -254,6 +254,13 @@ pub const VOICE_JOIN_REFUSAL_REASONS: &[&str] = &[
     "name_blocked",
     "other",
 ];
+/// Rendered `le` labels for `two_bot_voice_join_to_move_seconds_bucket`: the
+/// eight finite `BUCKETS_MICROS` bounds as seconds plus `+Inf`. The rendered
+/// exposition is tested against this list, and the Worker scrape validator
+/// (`wrangler/src/metrics-scrape.ts`) and its fixture are checked against it.
+pub const VOICE_JOIN_TO_MOVE_BUCKET_LE: &[&str] = &[
+    "0.001", "0.005", "0.01", "0.05", "0.1", "0.5", "1", "5", "+Inf",
+];
 /// Action-queue lanes for the `two_bot_voice_queue_pending{lane}` gauge.
 pub const VOICE_QUEUE_LANES: &[&str] = &["urgent", "deferred"];
 /// Vote-kick outcomes for `two_bot_voice_vote_kick_total{outcome}` (M4.30):
@@ -1984,6 +1991,22 @@ mod tests {
         assert!(text.contains("two_bot_voice_join_to_move_seconds_sum 0.5\n"));
         assert!(text.contains("two_bot_voice_join_to_move_seconds_bucket{le=\"0.1\"} 0\n"));
         assert!(text.contains("two_bot_voice_join_to_move_seconds_bucket{le=\"0.5\"} 2\n"));
+    }
+
+    #[test]
+    fn voice_join_bucket_labels_match_the_pinned_contract() {
+        let metrics = Metrics::default();
+        metrics.voice_join_to_move(Duration::from_millis(1));
+        let text = metrics.render(None);
+        let rendered: Vec<&str> = text
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("two_bot_voice_join_to_move_seconds_bucket{le=\"")?
+                    .split('"')
+                    .next()
+            })
+            .collect();
+        assert_eq!(rendered, VOICE_JOIN_TO_MOVE_BUCKET_LE);
     }
 
     #[test]
