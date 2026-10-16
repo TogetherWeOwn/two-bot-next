@@ -135,8 +135,9 @@ below is present but is not called by a runtime receiver yet.
   route stays dark until a receiver wires this flow.
 - Ownership is fenced by a claim token (migration 0443): claiming
   generates one, takeover rotates it, and `mark_live_send_started`,
-  `mark_live_delivered` and `release_live` act only for the token they
-  are given. A timed-out-but-running original owner therefore cannot
+  `mark_live_delivered`, `release_live` and `release_started_live` act
+  only for the token they are given. A timed-out-but-running original
+  owner therefore cannot
   start, stamp or release a row a takeover gave to a new owner; exactly
   one owner can post. If the conflicting row disappears before the
   takeover lands, `claim_live` loops back to the insert instead of
@@ -145,7 +146,10 @@ below is present but is not called by a runtime receiver yet.
   then remain `delivered_at IS NULL` with `send_started_at NOT NULL`;
   `release_live` deletes a row only for its token-holding owner while it
   is still never-started, so it must never be used as stale recovery or
-  after a stamp failure. Started and delivered rows are never
+  after a stamp failure; `release_started_live` is the separate
+  token-gated path for a started row whose send provably never landed,
+  and must likewise never be used on an ambiguous outcome or after a
+  stamp failure. Started and delivered rows are never
   reclaimed, even when stale, or a retry can double-post a delivery that may
   already have reached Discord.
 - Delivered rows are retained indefinitely as dedup fences. This slice adds no
@@ -154,7 +158,8 @@ below is present but is not called by a runtime receiver yet.
 - The receiver MUST post with `allowed_mentions: { parse: [] }`. No sender
   exists in this slice, so that no-ping contract has not been runtime-verified.
 - A send that provably never reached Discord deletes its unposted row
-  (`release_live`) and the receiver answers 5xx so Twitch retries; a
+  (`release_live` before the send starts, `release_started_live` after
+  it starts) and the receiver answers 5xx so Twitch retries; a
   delivered row is stamped and never deleted, so retries after a successful
   stamp cannot double-post. The claim → send → settle table is
   `stream_live::disposition`; its async glue belongs with the receiver.

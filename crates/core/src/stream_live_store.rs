@@ -7,7 +7,8 @@
 //! [`mark_live_send_started`] BEFORE the first Discord POST (mirroring
 //! `automod_delivery_claims.mutation_started`: no lease automatically retries
 //! a mutation whose Discord outcome is uncertain). A send that provably never
-//! reached Discord deletes its unposted row ([`release_live`]) so the Twitch
+//! reached Discord deletes its unposted row ([`release_live`] before the
+//! send starts, [`release_started_live`] after it starts) so the Twitch
 //! retry can claim again; a delivered row is stamped
 //! ([`mark_live_delivered`]) and never deleted, so retries after a successful
 //! stamp cannot double-post.
@@ -26,13 +27,17 @@
 //! Ownership is fenced by a claim token (migration 0443, mirroring
 //! `automod_delivery_claims.claim_token`): a fresh insert generates one and
 //! a takeover rotates it, and [`mark_live_send_started`],
-//! [`mark_live_delivered`] and [`release_live`] only act on the row whose
-//! token they present. A timed-out-but-running original owner therefore
+//! [`mark_live_delivered`], [`release_live`] and [`release_started_live`]
+//! only act on the row whose token they present. A timed-out-but-running
+//! original owner therefore
 //! cannot start, stamp or release the row a takeover gave to a new owner:
 //! its token no longer matches, so exactly one owner can post.
 //! [`release_live`] additionally refuses started rows, so it stays the
 //! same-process provably-unsent, never-started path and must never be used
-//! as stale recovery or after a stamp failure. One row per go-live is
+//! as stale recovery or after a stamp failure; [`release_started_live`] is
+//! the separate token-gated path for a started row whose Discord send
+//! provably never landed, and likewise must never be used on an ambiguous
+//! outcome or after a stamp failure. One row per go-live is
 //! retained indefinitely as the dedup fence; this slice adds no purge.
 //! Rows carry no member identity (Twitch broadcaster id plus the
 //! announcements channel), hence no member-erasure entry.
@@ -75,9 +80,10 @@ pub struct LiveClaim {
 pub enum ClaimOutcome {
     /// This delivery owns the post; send it, then stamp or release. The
     /// payload is the row's claim token: an ownership capability the owner
-    /// must present to [`mark_live_send_started`], [`mark_live_delivered`]
-    /// and [`release_live`]. A takeover rotates it, fencing out the
-    /// previous owner. Never log it: the [`Secret`] wrapper redacts it
+    /// must present to [`mark_live_send_started`], [`mark_live_delivered`],
+    /// [`release_live`] and [`release_started_live`]. A takeover rotates
+    /// it, fencing out the previous owner. Never log it: the [`Secret`]
+    /// wrapper redacts it
     /// under `Debug`, and callers reach it only through `expose()`.
     Claimed(Secret<String>),
     /// A never-started claim exists but its lease is still fresh: its owner
@@ -172,6 +178,37 @@ pub async fn release_live(
         == 1)
 }
 
+/// Delete a started, undelivered claim whose Discord send provably never
+/// reached Discord, so a Twitch retry can claim again. Returns `true` only
+/// when the caller's own started row was released: the claim token must
+/// match, `send_started_at` must be set and `delivered_at` must still be
+/// NULL. Call this ONLY for the `SendFailed` disposition after
+/// [`mark_live_send_started`], where Discord proved non-delivery (an
+/// explicit rejection such as 429/4xx, or a connection refused before any
+/// response could carry a post). NEVER call this on a timeout or other
+/// ambiguous result, or after a stamp failure: a post that landed with a
+/// lost response must stay claimed or the retry double-posts. The store
+/// cannot verify the proof itself; that classification is the receiver's
+/// `SendFailed` contract. Stale retries never use this path:
+/// [`reclaim_stale_live`] refuses started rows.
+pub async fn release_started_live(
+    pool: &Pool<Postgres>,
+    dedup_key: &str,
+    claim_token: &str,
+) -> Result<bool, sqlx::Error> {
+    Ok(sqlx::query(
+        "DELETE FROM stream_live_claims
+         WHERE dedup_key = $1 AND claim_token = $2
+           AND delivered_at IS NULL AND send_started_at IS NOT NULL",
+    )
+    .bind(dedup_key)
+    .bind(claim_token)
+    .execute(pool)
+    .await?
+    .rows_affected()
+        == 1)
+}
+
 /// Stamp a posted claim with its Discord message receipt. Only the
 /// current owner (matching claim token) can stamp. Returns `true` when a
 /// pending row was stamped. The row is kept: its existence is the
@@ -201,7 +238,8 @@ pub async fn mark_live_delivered(
 /// the row is already started or delivered, so this delivery is a
 /// `Duplicate`. After `true` only [`mark_live_delivered`] with the same
 /// token can settle the row; [`release_live`] can no longer free it and
-/// stale recovery will never reclaim it.
+/// stale recovery will never reclaim it. Only [`release_started_live`],
+/// on a provably-unsent `SendFailed`, may delete it.
 pub async fn mark_live_send_started(
     pool: &Pool<Postgres>,
     dedup_key: &str,

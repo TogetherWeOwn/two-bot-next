@@ -330,14 +330,16 @@ async fn started_claim_is_never_reclaimed_even_when_stale() {
             .expect("restart"),
         "send start must be idempotent"
     );
-    // A started row can never be released, even by its owner: after a
-    // stamp failure the send may already have reached Discord, so the
-    // row stays fenced instead of freeing a retry to double-post.
+    // A started row can never be released via `release_live`, even by
+    // its owner: after a stamp failure the send may already have reached
+    // Discord, so the row stays fenced instead of freeing a retry to
+    // double-post. (`release_started_live` exists only for a provably
+    // unsent `SendFailed`; this stamp-failed path must never call it.)
     assert!(
         !release_live(&pool, &key, &token)
             .await
             .expect("release started"),
-        "a started row must survive release"
+        "a started row must survive release_live"
     );
     // Send-succeeded/stamp-failed: Discord may already have the post, so
     // ageing the row must NOT make it reclaimable.
@@ -382,6 +384,12 @@ async fn delivered_rows_are_never_reclaimed() {
         !release_live(&pool, &key, &token).await.expect("release"),
         "a delivered row must survive release"
     );
+    assert!(
+        !release_started_live(&pool, &key, &token)
+            .await
+            .expect("release started delivered"),
+        "a delivered row must survive release_started_live"
+    );
     assert_eq!(
         claim_live(&pool, &claim(&key)).await.expect("replay"),
         ClaimOutcome::Duplicate
@@ -405,6 +413,59 @@ async fn delivered_rows_are_never_reclaimed() {
             .await
             .expect("start delivered"),
         "a delivered row must not start sending"
+    );
+    cleanup(pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "needs the disposable agent-testdb container"]
+async fn started_send_that_provably_failed_releases_for_the_retry() {
+    let (pool, schema) = setup().await;
+    let key = format!("{:064x}", 0x5e1dfa11u64);
+    let token = claimed(claim_live(&pool, &claim(&key)).await.expect("claim"));
+    // The receiver starts the send, then Discord provably rejects it
+    // (SendFailed): the started row must be releasable by its owner so
+    // the Twitch retry can claim and post.
+    assert!(mark_live_send_started(&pool, &key, &token)
+        .await
+        .expect("start"));
+    assert!(
+        !release_live(&pool, &key, &token).await.expect("release"),
+        "release_live must still refuse a started row"
+    );
+    assert!(
+        !release_started_live(&pool, &key, "stale-owner-token")
+            .await
+            .expect("release started wrong token"),
+        "releasing a started row with a foreign token must report false"
+    );
+    assert!(
+        release_started_live(&pool, &key, &token)
+            .await
+            .expect("release started"),
+        "a provably-unsent started row must release for its owner"
+    );
+    // The retry now owns the go-live fresh, with a rotated token.
+    let retry_token = claimed(claim_live(&pool, &claim(&key)).await.expect("retry"));
+    assert_ne!(retry_token, token, "a fresh claim must mint a new token");
+    cleanup(pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "needs the disposable agent-testdb container"]
+async fn reclaiming_a_missing_key_claims_it_fresh() {
+    let (pool, schema) = setup().await;
+    let key = format!("{:064x}", 0x9155119u64);
+    // No row exists: reclaim must claim it fresh (the vanished-row arm),
+    // not answer Duplicate for a go-live nobody posted.
+    claimed(
+        reclaim_stale_live(&pool, &claim(&key), STALE_CLAIM_LEASE_SECS)
+            .await
+            .expect("reclaim missing"),
+    );
+    assert_eq!(
+        claim_live(&pool, &claim(&key)).await.expect("retry"),
+        ClaimOutcome::InFlight
     );
     cleanup(pool, &schema).await;
 }

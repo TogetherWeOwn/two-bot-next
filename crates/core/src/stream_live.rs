@@ -8,8 +8,9 @@
 //! `allowed_mentions: { parse: [] }`; this repository does not yet contain
 //! that sender, so the no-ping guarantee is a receiver contract, not verified
 //! behavior. Only a provably-unsent send failure releases the claim (the
-//! store deletes it only for the token-holding owner of a never-started
-//! row) and answers 5xx so Twitch retries; claim and stamp failures answer
+//! store deletes it only for the token-holding owner: [`release_live`]
+//! before the send starts, `release_started_live` after it starts) and
+//! answers 5xx so Twitch retries; claim and stamp failures answer
 //! 5xx WITHOUT releasing, because a stamped-failed send may already have
 //! reached Discord. A retry of a started or delivered claim is acknowledged
 //! with 2xx and skipped, while a retry of a fresh never-started claim is
@@ -64,8 +65,10 @@ pub struct Disposition {
     pub status: u16,
     /// Release the unposted claim so the retry can claim again. Only set
     /// when the send provably never reached Discord (`SendFailed`); the
-    /// store honours it only for the claim-token owner of a never-started
-    /// row, so a started row stays fenced even if a receiver asks.
+    /// store honours it only for the claim-token owner, via `release_live`
+    /// for a never-started row or `release_started_live` for a started
+    /// one. An ambiguous or stamp-failed send never sets this, so its row
+    /// stays fenced.
     pub release: bool,
 }
 
