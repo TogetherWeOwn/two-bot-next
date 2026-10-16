@@ -100,6 +100,16 @@ def commit(root, files):
 
 
 class ParseTests(unittest.TestCase):
+    def test_findings_key_empty_expect_to_call_end_line(self):
+        report = {"results": [{
+            "check_id": "rust-warn.rust-empty-expect",
+            "path": "crates/bot/src/logging.rs",
+            "start": {"line": 10}, "end": {"line": 12},
+        }]}
+        findings, error = self.run_report(report)
+        self.assertEqual(error, "")
+        self.assertEqual(findings, {("rust-empty-expect", "crates/bot/src/logging.rs", 12)})
+
     def test_findings_keep_rule_path_and_line(self):
         tmp, binary = fake_semgrep(json.dumps(REPORT))
         try:
@@ -265,6 +275,15 @@ class ParseTests(unittest.TestCase):
         self.assertIsNone(findings)
         self.assertIn("invalid result", error)
 
+    def test_empty_expect_end_line_before_start_is_blindness(self):
+        report = {"results": [{
+            "check_id": "rust-warn.rust-empty-expect", "path": "a.rs",
+            "start": {"line": 2}, "end": {"line": 1},
+        }]}
+        findings, error = self.run_report(report)
+        self.assertIsNone(findings)
+        self.assertIn("invalid result location", error)
+
     def test_boolean_line_is_blindness(self):
         report = {"results": [{"check_id": "rule", "path": "a.rs", "start": {"line": True}}]}
         with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(
@@ -356,6 +375,28 @@ class GateTests(unittest.TestCase):
             gate.run_semgrep, gate.added_lines = real_run, real_added
             tmp.cleanup()
         return code, out.getvalue()
+
+    def test_multiline_expect_added_on_chain_tail_fails(self):
+        report = {"results": [{
+            "check_id": "rust-warn.rust-empty-expect",
+            "path": "crates/bot/src/logging.rs",
+            "start": {"line": 1032}, "end": {"line": 1034},
+        }]}
+        code, output = self.run_gate(
+            report, {("crates/bot/src/logging.rs", 1034)})
+        self.assertEqual(code, 1)
+        self.assertIn("logging.rs:1034", output)
+
+    def test_editing_receiver_of_existing_multiline_expect_stays_silent(self):
+        report = {"results": [{
+            "check_id": "rust-warn.rust-empty-expect",
+            "path": "crates/bot/src/logging.rs",
+            "start": {"line": 1032}, "end": {"line": 1034},
+        }]}
+        code, output = self.run_gate(
+            report, {("crates/bot/src/logging.rs", 1032)})
+        self.assertEqual(code, 0)
+        self.assertNotIn("::error::", output)
 
     def test_new_finding_fails(self):
         code, output = self.run_gate(REPORT, {("crates/core/src/x.rs", 4)})

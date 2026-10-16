@@ -116,7 +116,10 @@ jobs:
     # TOG-11143: STAGING_OWNERSHIP_CONTROL_TOKEN is a `staging` environment
     # secret (TOG-12030); the job must declare the environment to read it.
     environment: staging
-    timeout-minutes: 30
+    # Sized for the worst case: the deploy, a failing verify and the
+    # auto-rollback budget (600 s image + 900 s gate). A 30 min cap can
+    # cancel the run mid-rollback and leave staging fenced.
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: wrangler
@@ -158,7 +161,22 @@ jobs:
             --receipt "$ROLLOUT_DIR/baseline.json" \
             --output "$WRANGLER_OUTPUT_FILE_PATH" \
             --deploy-config "$ROLLOUT_DIR/staging-deploy.json"
+      # Snapshot the serving Worker version and container image BEFORE
+      # replacing anything: a failed verify below auto-rolls back to exactly
+      # this state. Allowlisted IDs only, safe to keep as a run artifact.
+      - name: Snapshot the pre-deploy rollback state
+        id: snapshot
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          python3 ../scripts/worker_container_rollback.py snapshot \
+            --variant staging \
+            --out "$ROLLOUT_DIR/staging-rollback-snapshot.json"
+          python3 -c 'import json, os; print(json.dumps(json.load(open(os.environ["ROLLOUT_DIR"] + "/staging-rollback-snapshot.json")), sort_keys=True))'
       - name: Deploy to staging
+        id: deploy
         uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
         with:
           workingDirectory: wrangler
@@ -184,6 +202,7 @@ jobs:
             --output "$WRANGLER_OUTPUT_FILE_PATH" \
             --evidence "$ROLLOUT_DIR/receipt.json"
       - name: Transfer staging ownership to the deployed version
+        id: takeover
         env:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
@@ -194,8 +213,23 @@ jobs:
           # Pin the takeover client to the receipt-validated Worker version, so a
           # retry answered by a stale version refuses while the old-to-new
           # handover still re-posts. The receipt holds only the version UUID.
-          OWNERSHIP_EXPECTED_DEPLOYMENT="$(python3 -c 'import json,os;print(json.load(open(os.environ["ROLLOUT_DIR"]+"/receipt.json"))["worker_version"])')" \
-            node scripts/ownership-control.mjs deployment-takeover
+          # The fence release route is shown only for the intentionally-fenced
+          # refusal; any other failure (auth, transition-not-confirmed) takes
+          # the generic branch, never the fence guidance.
+          if ! output="$(
+            OWNERSHIP_EXPECTED_DEPLOYMENT="$(python3 -c 'import json,os;print(json.load(open(os.environ["ROLLOUT_DIR"]+"/receipt.json"))["worker_version"])')" \
+              node scripts/ownership-control.mjs deployment-takeover 2>&1
+          )"; then
+            echo "$output" >&2
+            case "$output" in
+              *"Singleton is intentionally fenced or uninitialized"*)
+                echo "::error::Staging singleton fenced: re-run Actions > deploy-staging > Run workflow with release_fence checked after handoff authorization (or: gh workflow run deploy-staging.yml --ref main -f release_fence=true). A push/default never releases; do not change credentials." ;;
+              *)
+                echo "::error::Staging ownership takeover failed (not a fence refusal); see the control-client output above. Do not change credentials." ;;
+            esac
+            exit 1
+          fi
+          printf '%s\n' "$output"
       - name: Verify exact new rollout and serving Worker/container readiness
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -210,6 +244,41 @@ jobs:
           # Evidence contains only allowlisted version/digest/build IDs + statuses.
           # No raw Wrangler sessions, CF configs, env values or HTTP error bodies.
           python3 -c 'import json, os; print(json.dumps(json.load(open(os.environ["ROLLOUT_DIR"] + "/evidence.json")), sort_keys=True))'
+      # A failed verify after a deploy rolls back automatically to the
+      # pre-deploy snapshot (Worker version AND container image, with
+      # takeover). The run still fails red: the rollback restores service,
+      # it never certifies the build. Without a deploy or a snapshot there
+      # is nothing to restore.
+      - name: Auto-roll back Worker version and container image
+        id: auto_rollback
+        if: failure() && steps.deploy.outcome == 'success' && steps.snapshot.outcome == 'success'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          ROLLBACK_ACTOR: github-actions:${{ github.run_id }}:${{ github.sha }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+        run: |
+          set -euo pipefail
+          # No --expected-sha: the snapshot restores the previous serving
+          # build, whose /readyz reports the previous revision, not the
+          # failed SHA. Identity rests on the restored Worker version header.
+          python3 ../scripts/worker_container_rollback.py rollback \
+            --variant staging \
+            --worker-url "$STAGING_WORKER_URL" \
+            --snapshot "$ROLLOUT_DIR/staging-rollback-snapshot.json" \
+            --actor "$ROLLBACK_ACTOR" \
+            --evidence "$ROLLOUT_DIR/auto-rollback-evidence.json"
+          python3 -c 'import json, os; print(json.dumps(json.load(open(os.environ["ROLLOUT_DIR"] + "/auto-rollback-evidence.json")), sort_keys=True))'
+      - name: Upload the rollout evidence
+        if: always() && steps.snapshot.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: staging-rollout-evidence
+          path: ${{ env.ROLLOUT_DIR }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
 
   # Live voice synthetic against the deployed staging bot (docs/voice-synthetic.md).
   # A failure fails this workflow run, and deploy-production only promotes a

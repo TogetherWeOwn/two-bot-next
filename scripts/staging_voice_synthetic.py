@@ -21,6 +21,23 @@ What it proves on the deployed staging bot (stdlib only, no third-party code):
              10-minutes per-channel limit, so workflow retries do not fail)
   metrics    optional: /ops/metrics `two_bot_voice_names_total` counts the room
              as created_with_template (SKIP when no metrics token is configured)
+  limit      the room's `user_limit` PATCHes to a probed value and back with a
+             read-back after each write (FAIL on HTTP 403: the owner grant was
+             lost after creation; SKIP on HTTP 429; the same Discord
+             field `/limit` and `/unlimit` manage)
+  privacy    the room's @everyone Connect overwrite toggles and restores with a
+             read-back after each write (SKIP while the test bot may not edit
+             overwrites: its staging role needs Manage Roles once; SKIP on
+             HTTP 429; the same Discord entry `/private` and `/public` rewrite)
+  name_panel the room's name after the rename cycle renders from its template
+             (not the "<display>'s room" fallback): what the `/name` panel's
+             Current-name line would show
+
+The limit/privacy/name_panel checks exercise the Discord channel fields the
+owner commands manage through the same REST paths the bot writes; they do not
+invoke the slash commands themselves (Discord only creates interactions for
+real users, so a bot token cannot). A PASS means the room the staging bot made
+is fully owner-manageable; a FAIL names the field that did not round-trip.
 
 Identity and fences (fail-closed, before any request):
   - TWO_VOICE_SYNTHETIC_BOT_TOKEN: a dedicated test bot (never the bot under
@@ -135,7 +152,15 @@ def evaluate(obs):
     (int or None when unavailable), channels_before (guild channels before the
     join; the creator's existing rooms move the expected slot to their end),
     received_delta (joins-received delta or None when metrics are unavailable),
-    refused_delta (per-reason refused deltas, {} when unavailable).
+    refused_delta (per-reason refused deltas, {} when unavailable),
+    limit_initial/limit_probed (user_limit before/probed), limit_set_ok and
+    limit_restored (each write verified by read-back), limit_forbidden (FAIL
+    reason: the owner Manage Channels grant was lost after creation) and
+    limit_rate_limited (SKIP reason), limit_note, privacy_initial_denies
+    (@everyone Connect deny before the toggle), privacy_toggled and
+    privacy_restored (each write verified by read-back), privacy_forbidden
+    and privacy_rate_limited (SKIP reasons), privacy_note, panel_name (the
+    room's name read after the rename cycle) and panel_note.
     """
     out = []
     creator, room_id = obs["creator"], obs.get("room_id")
@@ -193,6 +218,68 @@ def evaluate(obs):
                          "restore it manually"))
     else:
         out.append(check("rename", False, note or "creator rename was not applied"))
+    limit_note = obs.get("limit_note")
+    if obs.get("limit_forbidden"):
+        out.append(check("limit", False,
+                         "room user_limit PATCH answered HTTP 403: the test bot owns "
+                         "its room, so its owner Manage Channels grant was lost or "
+                         "ineffective after creation; restore the member overwrite "
+                         "(the owner check reads creation-time grants and cannot "
+                         "see this loss)"))
+    elif obs.get("limit_rate_limited"):
+        out.append(check("limit", False,
+                         "room user_limit PATCH hit Discord's rate limit (HTTP 429): "
+                         "a retry or dispatch collided; limit skipped",
+                         skip=True))
+    elif obs.get("limit_set_ok") and obs.get("limit_restored"):
+        out.append(check("limit", True,
+                         f"user_limit {obs.get('limit_initial')} -> {obs.get('limit_probed')} "
+                         f"-> {obs.get('limit_initial')} (each write verified by read-back)"))
+    elif limit_note and not obs.get("limit_set_ok"):
+        out.append(check("limit", False, limit_note))
+    elif obs.get("limit_set_ok") and not obs.get("limit_restored"):
+        out.append(check("limit", False,
+                         "room user_limit was set but NOT restored to "
+                         f"{obs.get('limit_initial')}; restore it manually"))
+    else:
+        out.append(check("limit", False, limit_note or "room user_limit was not round-tripped"))
+    privacy_note = obs.get("privacy_note")
+    if obs.get("privacy_forbidden"):
+        out.append(check("privacy", False,
+                         "test bot may not rewrite the room's @everyone overwrite "
+                         "(HTTP 403): grant its staging role Manage Roles once, "
+                         "then the private/public toggle gates",
+                         skip=True))
+    elif obs.get("privacy_rate_limited"):
+        out.append(check("privacy", False,
+                         "room overwrite PUT hit Discord's rate limit (HTTP 429): "
+                         "a retry or dispatch collided; privacy skipped",
+                         skip=True))
+    elif obs.get("privacy_toggled") and obs.get("privacy_restored"):
+        out.append(check("privacy", True,
+                         "@everyone Connect deny "
+                         f"{'on' if obs.get('privacy_initial_denies') else 'off'} -> "
+                         f"{'off' if obs.get('privacy_initial_denies') else 'on'} -> "
+                         f"{'on' if obs.get('privacy_initial_denies') else 'off'} "
+                         "(each write verified by read-back)"))
+    elif privacy_note and not obs.get("privacy_toggled"):
+        out.append(check("privacy", False, privacy_note))
+    elif obs.get("privacy_toggled") and not obs.get("privacy_restored"):
+        out.append(check("privacy", False,
+                         "room @everyone Connect deny was toggled but NOT restored; "
+                         "restore it manually"))
+    else:
+        out.append(check("privacy", False,
+                         privacy_note or "room @everyone Connect deny was not round-tripped"))
+    panel = obs.get("panel_name") or ""
+    if panel and not FALLBACK.match(panel):
+        out.append(check("name_panel", True,
+                         f"post-rename room name {panel!r} renders from its template "
+                         "(what the /name panel's Current-name line shows)"))
+    else:
+        out.append(check("name_panel", False,
+                         obs.get("panel_note") or
+                         f"post-rename room name {panel!r} is missing or the fallback"))
     return out
 
 
@@ -425,6 +512,34 @@ def rest_patch(token, path, payload, timeout=20):
     return status, json.loads(raw)
 
 
+def rest_put_overwrite(token, channel_id, overwrite_id, allow, deny, ow_type, timeout=20):
+    """PUT one channel permission overwrite under the same body cap.
+
+    `allow`/`deny` are ints sent as Discord's string bitfields; `ow_type` is 0
+    for a role (@everyone) or 1 for a member. Returns the HTTP status (a 403
+    means the test bot may not edit overwrites; 429 is Discord's rate limit);
+    only an over-cap body raises BodyTooLarge, like the GET/PATCH paths.
+    """
+    data = json.dumps({"allow": str(allow), "deny": str(deny), "type": ow_type}).encode()
+    req = urllib.request.Request(f"{API}/channels/{channel_id}/permissions/{overwrite_id}",
+                                 data=data, headers={
+                                     "Authorization": f"Bot {token}",
+                                     "User-Agent": "two-bot-voice-synthetic (staging)",
+                                     "Content-Type": "application/json"}, method="PUT")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read(MAX_BODY_BYTES + 1)
+            status = resp.status
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(MAX_BODY_BYTES + 1)
+        if len(raw) > MAX_BODY_BYTES:
+            raise BodyTooLarge("Discord REST read answered over the body cap") from None
+        return exc.code
+    if len(raw) > MAX_BODY_BYTES:
+        raise BodyTooLarge("Discord REST read answered over the body cap")
+    return status
+
+
 def metrics_value(staging_url, token):
     if not (staging_url and token):
         return None
@@ -579,6 +694,99 @@ def run_live(args, token):
             obs["channels"] = rest(token, f"/guilds/{args.guild}/channels")
             obs["statuses"] = [e["d"].get("status") for e in s.events
                                if e["t"] == "VOICE_CHANNEL_STATUS_UPDATE" and e["d"].get("id") == room_id]
+            # Owner-command round-trips on the room we own: the same Discord
+            # fields /limit, /private//public and /name manage, driven through
+            # the same REST paths the bot writes (Discord creates interactions
+            # only for real users, so a bot token cannot invoke the slash
+            # commands themselves). Each write is verified by a read-back and
+            # restored, so a green run leaves the room as the bot made it. A
+            # failed step records a note (its check FAILs). A limit 403 FAILs
+            # (the owner Manage Channels grant was lost after creation); a
+            # limit/privacy 429 and a privacy 403 (its one-time Manage Roles
+            # grant is still pending) record SKIP reasons instead.
+            obs["limit_forbidden"] = obs["limit_rate_limited"] = False
+            obs["limit_set_ok"] = obs["limit_restored"] = False
+            try:
+                seen = rest(token, f"/channels/{room_id}")
+                initial = int(seen.get("user_limit") or 0)
+                probed = 3 if initial == 2 else 2
+                obs["limit_initial"], obs["limit_probed"] = initial, probed
+                status, _ = rest_patch(token, f"/channels/{room_id}", {"user_limit": probed})
+                if status == 403:
+                    obs["limit_forbidden"] = True
+                elif status == 429:
+                    obs["limit_rate_limited"] = True
+                    obs["limit_note"] = ("room user_limit PATCH answered 429 "
+                                         "(rate limit); limit skipped")
+                elif status is not None and 200 <= status < 300:
+                    if int(rest(token, f"/channels/{room_id}").get("user_limit") or 0) == probed:
+                        obs["limit_set_ok"] = True
+                        back, _ = rest_patch(token, f"/channels/{room_id}",
+                                             {"user_limit": initial})
+                        if (back is not None and 200 <= back < 300
+                                and int(rest(token, f"/channels/{room_id}")
+                                        .get("user_limit") or 0) == initial):
+                            obs["limit_restored"] = True
+                else:
+                    obs["limit_note"] = f"room user_limit PATCH answered {status}; limit skipped"
+            except Exception as exc:
+                obs["limit_note"] = f"{type(exc).__name__} during the limit round-trip"
+            obs["privacy_forbidden"] = obs["privacy_rate_limited"] = False
+            obs["privacy_toggled"] = obs["privacy_restored"] = False
+            try:
+                seen = rest(token, f"/channels/{room_id}")
+                current = [o for o in seen.get("permission_overwrites", []) or []
+                           if o.get("type") == 0 and str(o.get("id")) == str(args.guild)]
+                allow = int(current[0].get("allow") or 0) if current else 0
+                deny = int(current[0].get("deny") or 0) if current else 0
+                initial_denies = bool(deny & CONNECT)
+                obs["privacy_initial_denies"] = initial_denies
+                if initial_denies:
+                    planned_allow, planned_deny = allow, deny & ~CONNECT
+                else:
+                    planned_allow, planned_deny = allow & ~CONNECT, deny | CONNECT
+                status = rest_put_overwrite(token, room_id, args.guild,
+                                            planned_allow, planned_deny, 0)
+                if status == 403:
+                    obs["privacy_forbidden"] = True
+                elif status == 429:
+                    obs["privacy_rate_limited"] = True
+                    obs["privacy_note"] = ("room overwrite PUT answered 429 "
+                                           "(rate limit); privacy skipped")
+                elif status is not None and 200 <= status < 300:
+                    now = rest(token, f"/channels/{room_id}")
+                    entries = [o for o in now.get("permission_overwrites", []) or []
+                               if o.get("type") == 0 and str(o.get("id")) == str(args.guild)]
+                    denies = (bool(int(entries[0].get("deny") or 0) & CONNECT)
+                              if entries else False)
+                    if denies == (not initial_denies):
+                        obs["privacy_toggled"] = True
+                        back = rest_put_overwrite(token, room_id, args.guild, allow, deny, 0)
+                        if back is not None and 200 <= back < 300:
+                            fin = rest(token, f"/channels/{room_id}")
+                            fentries = [o for o in fin.get("permission_overwrites", []) or []
+                                        if o.get("type") == 0
+                                        and str(o.get("id")) == str(args.guild)]
+                            fdenies = (bool(int(fentries[0].get("deny") or 0) & CONNECT)
+                                       if fentries else False)
+                            if fdenies == initial_denies:
+                                obs["privacy_restored"] = True
+                    else:
+                        obs["privacy_note"] = ("room overwrite PUT answered "
+                                               f"{status} but @everyone Connect reads back "
+                                               f"{'denied' if denies else 'allowed'}")
+                else:
+                    obs["privacy_note"] = f"room overwrite PUT answered {status}; privacy skipped"
+            except Exception as exc:
+                obs["privacy_note"] = f"{type(exc).__name__} during the privacy round-trip"
+            # Name-panel render: read the room's name after the rename cycle
+            # (the limit/privacy writes may have triggered a bot re-render, so
+            # read last). No write: the /name panel's Current-name line shows
+            # whatever this GET returns.
+            try:
+                obs["panel_name"] = rest(token, f"/channels/{room_id}").get("name")
+            except Exception as exc:
+                obs["panel_note"] = f"{type(exc).__name__} reading the room name for the panel"
             # Hop from our own room straight back into the creator: a member
             # doing this must get a new room, not stay in the lobby.
             s.voice(args.guild, args.creator)

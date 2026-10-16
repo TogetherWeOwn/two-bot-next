@@ -103,6 +103,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'privacy_opt_out_audit', 'table'),
     ('public', 'game_activity_guild_aggregates', 'table'),
     ('public', '_sqlx_migrations', 'ledger'),
+    ('public', '_two_bot_migrations', 'ledger'),
     ('public', 'events_id_seq', 'sequence'),
     ('public', 'event_store_id_seq', 'sequence'),
     ('public', 'gateway_onboarding_jobs_id_seq', 'sequence'),

@@ -12,28 +12,30 @@ stricter than a production-only rule; `unwrap` may be idiomatic in tests, but
 those hits are not filtered from enforcement. Existing hits remain silent
 unless the PR adds the hit line.
 
-## Current scope inventory (2026-10-15, `f6d1ad2f7`; re-verified on the HARD promotion)
+## Current scope inventory (2026-10-16, re-verified at `4280f388b`)
 
 There is no grandfathered production-only set: the HARD gate applies to all
 new matches in scope, including inline test modules. The existing inventory
 below records the observed locations; it is not an exemption from enforcement.
 
-Every `.unwrap()` found in the rule-scope files at this snapshot sits inside
-an inline `#[cfg(test)]` module: 50 hit lines across 9 files, none before its
-file's test-module start. ast-grep is not installed on the controller, so this
-was verified by replicating the rule globs with grep, applying the rule
-ignores (`*_tests.rs`, `tests/`), and checking each hit against its file's
-`#[cfg(test)]` boundary:
+The pinned ast-grep 0.50.0 scan reported 36 findings across 9 rule-scope
+files; these are scanner matches, not a count of unique source lines. Every
+match is inside an inline `#[cfg(test)]` module. The per-file findings and
+module boundaries were:
 
-- `crates/bot/src/commands_cli.rs`: test mod `:278`, hits `:295+`
-- `crates/bot/src/gateway_commands.rs`: test mod `:289`, hits `:383+`
-- `crates/bot/src/interaction_admission.rs`: test mod `:112`, hits `:180+`
-- `crates/core/src/commands.rs`: test mod `:329`, hits `:338+`
-- `crates/core/src/custom_commands.rs`: test mod `:619`, hits `:868+`
-- `crates/core/src/router.rs`: test mod `:742`, hits `:1665+`
-- `crates/discord/src/command_registry.rs`: test mod `:231`, hits `:238+`
-- `crates/discord/src/interactions.rs`: test mods `:838`/`:862`, hits `:848+`
-- `crates/discord/src/lfg_interactions.rs`: test mod `:471`, hits `:497+`
+- `crates/bot/src/commands_cli.rs`: 2; test module starts at `:278`
+- `crates/bot/src/gateway_commands.rs`: 4; test module starts at `:289`
+- `crates/bot/src/interaction_admission.rs`: 8; test module starts at `:112`
+- `crates/core/src/commands.rs`: 6; test module starts at `:329`
+- `crates/core/src/custom_commands.rs`: 1; test module starts at `:619`
+- `crates/core/src/router.rs`: 2; test module starts at `:742`
+- `crates/discord/src/command_registry.rs`: 7; test module starts at `:231`
+- `crates/discord/src/interactions.rs`: 3; test modules start at `:838` and `:862`
+- `crates/discord/src/lfg_interactions.rs`: 3; test module starts at `:471`
+
+This inventory reflects the pinned ast-grep 0.50.0 scan at commit
+`4280f388b`. The test-module boundaries are descriptive only and do not filter
+hits from enforcement.
 
 Other rule-scope files with no hit before their inline test module
 include `command_runtime.rs`, `self_role_handlers.rs`,

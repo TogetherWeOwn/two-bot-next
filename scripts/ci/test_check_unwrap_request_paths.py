@@ -34,10 +34,10 @@ SPEC.loader.exec_module(gate)
 SCAN_FIXTURE = [
     {"ruleId": "no-unwrap-request-paths",
      "file": "crates/bot/src/gateway_commands.rs",
-     "range": {"start": {"line": 10}}},
+     "range": {"start": {"line": 10}, "end": {"line": 10}}},
     {"ruleId": "no-unwrap-request-paths",
      "file": "crates/bot/src/gateway_commands.rs",
-     "range": {"start": {"line": 99}}},
+     "range": {"start": {"line": 99}, "end": {"line": 99}}},
     {"ruleId": "some-other-rule",
      "file": "crates/bot/src/gateway_commands.rs",
      "range": {"start": {"line": 11}}},
@@ -84,16 +84,16 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(len(hits), 3)
         self.assertIn("--warning", run.call_args.args[0])
 
-    def test_scan_converts_zero_based_lines_to_one_based(self):
+    def test_scan_keys_multiline_unwrap_to_call_line(self):
         fixture = [{"ruleId": gate.RULE_ID, "file": "a.rs",
-                    "range": {"start": {"line": 0}}}]
+                    "range": {"start": {"line": 0}, "end": {"line": 2}}}]
         tmp, binary = fake_ast_grep(json.dumps(fixture))
         try:
             hits, error = gate.run_scan(binary)
         finally:
             tmp.cleanup()
         self.assertEqual(error, "")
-        self.assertEqual(hits, [("a.rs", 1)])
+        self.assertEqual(hits, [("a.rs", 3)])
 
     def test_scan_keeps_only_rule_hits_with_line_numbers(self):
         tmp, binary = fake_ast_grep(json.dumps(SCAN_FIXTURE))
@@ -173,6 +173,15 @@ class ScanTests(unittest.TestCase):
             hits, error = gate.run_scan("ast-grep")
         self.assertIsNone(hits)
         self.assertIn("invalid finding", error)
+
+    def test_end_line_before_start_is_blindness(self):
+        finding = {"ruleId": gate.RULE_ID, "file": "a.rs",
+                   "range": {"start": {"line": 2}, "end": {"line": 1}}}
+        with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=json.dumps([finding]), stderr="")):
+            hits, error = gate.run_scan("ast-grep")
+        self.assertIsNone(hits)
+        self.assertIn("invalid finding location", error)
 
     def test_boolean_line_is_blindness(self):
         finding = {"ruleId": gate.RULE_ID, "file": "a.rs",
@@ -306,6 +315,52 @@ class GateTests(unittest.TestCase):
         self.assertIn("inline test modules are included", out.getvalue())
         self.assertNotIn("non-test request path", out.getvalue())
 
+    def test_multiline_unwrap_added_on_chain_tail_fails(self):
+        tmp, root = make_repo()
+        try:
+            path = "crates/bot/src/gateway_commands.rs"
+            base = commit(root, {path: "let value = Some(1u8)\n    .map(|x| x + 1);\n"})
+            head = commit(root, {path: "let value = Some(1u8)\n    .map(|x| x + 1)\n    .unwrap();\n"})
+            real_root, gate.ROOT = gate.ROOT, root
+            scan = [{"ruleId": gate.RULE_ID, "file": path,
+                     "range": {"start": {"line": 0}, "end": {"line": 2}}}]
+            fake_tmp, binary = fake_ast_grep(json.dumps(scan))
+            out = io.StringIO()
+            try:
+                with redirect_stdout(out):
+                    code = gate.main(["--base-ref", base, "--head-ref", head,
+                                      "--ast-grep", binary])
+            finally:
+                fake_tmp.cleanup()
+                gate.ROOT = real_root
+        finally:
+            tmp.cleanup()
+        self.assertEqual(code, 1)
+        self.assertIn("gateway_commands.rs:3", out.getvalue())
+
+    def test_editing_receiver_of_existing_multiline_unwrap_stays_silent(self):
+        tmp, root = make_repo()
+        try:
+            path = "crates/bot/src/gateway_commands.rs"
+            base = commit(root, {path: "let value = Some(1u8)\n    .map(|x| x + 1)\n    .unwrap();\n"})
+            head = commit(root, {path: "let value = Some(2u8)\n    .map(|x| x + 1)\n    .unwrap();\n"})
+            real_root, gate.ROOT = gate.ROOT, root
+            scan = [{"ruleId": gate.RULE_ID, "file": path,
+                     "range": {"start": {"line": 0}, "end": {"line": 2}}}]
+            fake_tmp, binary = fake_ast_grep(json.dumps(scan))
+            out = io.StringIO()
+            try:
+                with redirect_stdout(out):
+                    code = gate.main(["--base-ref", base, "--head-ref", head,
+                                      "--ast-grep", binary])
+            finally:
+                fake_tmp.cleanup()
+                gate.ROOT = real_root
+        finally:
+            tmp.cleanup()
+        self.assertEqual(code, 0)
+        self.assertNotIn("::error::", out.getvalue())
+
     def test_fresh_unwrap_fails(self):
         tmp, root = make_repo()
         try:
@@ -314,7 +369,7 @@ class GateTests(unittest.TestCase):
             real_root, gate.ROOT = gate.ROOT, root
             scan = [{"ruleId": "no-unwrap-request-paths",
                      "file": "crates/bot/src/gateway_commands.rs",
-                     "range": {"start": {"line": 1}}}]
+                     "range": {"start": {"line": 1}, "end": {"line": 1}}}]
             fake_tmp, binary = fake_ast_grep(json.dumps(scan))
             out = io.StringIO()
             try:
@@ -395,6 +450,9 @@ class RuleShapeTests(unittest.TestCase):
         backlog = (ROOT / "docs/unwrap-backlog.md").read_text()
         self.assertIn("no-unwrap-request-paths", backlog)
         self.assertIn("inline `#[cfg(test)]` modules are included", backlog)
+        self.assertIn("36 findings across 9 rule-scope", backlog)
+        self.assertIn("not a count of unique source lines", backlog)
+        self.assertNotIn("50 hit lines across 9 files", backlog)
         self.assertIn("those hits are not filtered from enforcement", backlog)
 
     def test_shared_rust_advisories_have_local_rules_and_fixtures(self):

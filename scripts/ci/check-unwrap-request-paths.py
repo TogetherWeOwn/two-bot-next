@@ -77,6 +77,13 @@ def run_scan(ast_grep, all_rules=False):
             return None, "ast-grep scan contains an invalid finding"
         if not all_rules and rule_id != RULE_ID:
             continue
+        if rule_id == RULE_ID:
+            end = location.get("end")
+            if not isinstance(end, dict):
+                return None, "ast-grep scan contains an invalid finding location"
+            line = end.get("line")
+            if type(line) is not int or line < start.get("line"):
+                return None, "ast-grep scan contains an invalid finding location"
         line += 1
         hits.append((rule_id, path, line) if all_rules else (path, line))
     return hits, ""

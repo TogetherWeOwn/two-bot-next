@@ -102,6 +102,13 @@ def run_semgrep(semgrep):
                 or type(line) is not int or line < 1):
             return None, "semgrep report contains an invalid result"
         rule = check_id.split(".")[-1]
+        if rule == "rust-empty-expect":
+            end = result.get("end")
+            if not isinstance(end, dict):
+                return None, "semgrep report contains an invalid result location"
+            line = end.get("line")
+            if type(line) is not int or line < start.get("line"):
+                return None, "semgrep report contains an invalid result location"
         findings.add((rule, path, line))
     return findings, "\n".join(scan_warnings)
 
