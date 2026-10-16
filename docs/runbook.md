@@ -904,12 +904,18 @@ Invocation (secret-free; each URL comes only from its existing binding):
 ```text
 staging-migrate --target production --plan --source-sha <40hex> \
   --production-host <host> --production-database <db> \
+  [--production-branch-id <branch>] \
   --recovery-evidence-ref <ref> --acl-plan-ref <ref> \
   [--expected-pending <ascending,comma-separated versions>]
 staging-migrate --target production --apply <same flags> --expected-pending <list> \
   --plan-manifest-sha256 <64hex> --plan-run-id <run id> \
   --plan-manifest-path <producing run's downloaded manifest>
 ```
+
+`--production-branch-id` pins the PlanetScale branch id (non-secret). It is
+required when `--production-host` ends in `.psdb.cloud` (PlanetScale routes
+branches by the binding username's `{role}.{branch_id}` suffix, while every
+branch shares `postgres` as the database name); other hosts leave it empty.
 
 `--target` is explicit with no default: a run without it refuses, a staging
 run never reads a production pin or binding, and a production run never reads
@@ -924,7 +930,10 @@ the binding-host check, so a mistaken production pin aimed at staging still
 fails closed before any DDL. The binding-host check additionally refuses any
 non-`5432` port and any pooled (`|…`) login on production, so a binding
 copied from the app's pooled connection string still fails closed (pooler
-`SET ROLE` and the migrator lock need the direct endpoint). The manifest carries `migration_target`
+`SET ROLE` and the migrator lock need the direct endpoint). A `*.psdb.cloud`
+pin without `--production-branch-id`, a malformed pin, or a binding whose
+username branch suffix does not match the pin refuses the same way, in both
+gates. The manifest carries `migration_target`
 (`staging` or `production`); the claim publisher requires the matching value.
 
 The workflow mirrors the staging shape with the `production-migrate-` prefix:
@@ -936,10 +945,9 @@ actions, routed runner, pipefail shell, and artifact names
 retention, stored ZIP entries). The `claim` job runs
 `scripts/ci/production_migrate_claim.py`, which binds the same projection hash
 but requires the production workflow path, environment, and
-`PRODUCTION_HOST`/`PRODUCTION_DATABASE` pins. The production target takes no
-branch pin yet, so a production dispatch refuses
-closed (exit 2) until the production branch-pin follow-up lands; the
-production path is unavailable until then. Both environments
+`PRODUCTION_HOST`/`PRODUCTION_DATABASE`/`PRODUCTION_BRANCH_ID` pins (the
+claim refuses a PlanetScale plan without the pinned branch id, or a request
+pin that does not match the plan). Both environments
 and both secrets must exist before dispatch; the host provisions them after
 this change merges. The cutover itself does not need this path: the fresh
 `two_bot` bootstrap uses the tested provisioner flow.
@@ -1314,8 +1322,9 @@ or existing operator handoff; see [backup.md](backup.md) for unit contracts.
 | Website event action stuck `needs_reconciliation` after an ambiguous create | No automatic retry: re-submitting under a new key can make a second event. Read the actual guild scheduled events in Discord, then resolve the exact intent with the inspection-first, explicitly confirmed `two-bot reconcile-event` CLI (`--list`, then `--created`/`--updated`/`--cancelled`/`--no-effect` with `--execute`). See [the receiver contract](internal-actions-receiver.md); never re-submit the operation under a new key before reconciling. |
 | `POST /internal/actions` 404 on staging | The route is dark unless the Worker var `INTERNAL_ACTIONS_INGRESS` (staging env) **and** the secret `TWO_INTERNAL_ACTIONS` are both exactly `1`. Wrong method, a trailing slash or any query string is also 404 by design. Production is always 404. |
 | `POST /internal/actions` 503 `unavailable` | The container is not running (public ingress never starts it; wait for the probe or keepalive), the ownership fence refused this deployment, or the receiver answered something other than its JSON envelope. Check `/readyz` and ownership status; do not retry-loop a signed request with a new nonce. |
+| `POST /hooks/twitch` refusal or 404 on staging | The EventSub receiver is staging-only and dark unless the Worker route gate and the container listener are both enabled. Read the [EventSub operator runbook](eventsub-runbook.md) for the enable order, secret agreement, challenge echo, and the full refusal matrix before changing anything. |
 | Ready but feature inactive | Gateway readiness says nothing about library-only commands/jobs/kill switches. Check [runtime boundaries](#containment-kill-switches-and-feature-flags), not extra environment guesses. |
-| Worker restored but Rust regression remains | Worker-version rollback did not prove image rollback. Inspect the active image and use a schema-compatible full redeploy of the known-good pair. |
+| Worker restored but Rust regression remains | A bare `wrangler rollback` does not prove image rollback; the `deploy-production` rollback dispatch restores Worker version and container image together with a stable gate. Inspect the active image and use the workflow rollback (or a schema-compatible full redeploy of the known-good pair). |
 | Backup/drill red | Preserve valid archives; inspect exit status, verifier line, table counts and off-box receipt. Rehearse only on a prepared test database. No automatic promotion to a production restore. |
 
 ## Incident playbooks

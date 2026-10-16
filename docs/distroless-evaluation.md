@@ -1,22 +1,21 @@
 # Distroless runtime evaluation ([TOG-12144](/TOG/issues/TOG-12144), follow-up of [TOG-10893](/TOG/issues/TOG-10893))
 
-Runtime switched; two cutover preconditions remain open. The default
-`Dockerfile` builds digest-pinned
-`gcr.io/distroless/cc-debian13:nonroot` since PR #84 (CEO scope decision for
-the supply-chain slice). `Dockerfile.distroless` is kept as a documented
-fallback mirroring the default; it is not built by CI. The switch did not touch
-files under `wrangler/`.
+Historical evaluation. The cutover has adopted the digest-pinned distroless
+runtime as the default image in `Dockerfile`. This document preserves the
+original measurements and compatibility findings; the former trial image
+(`Dockerfile.distroless`, retired in #1007) is not a separate build path.
+The switch did not touch files under `wrangler/`.
 
 Staging TLS-handshake receipt: deploy-staging run `38773972225` verified the
 distroless head `46a30b19e` with `/health` 200 and `/readyz` 200 (all
 components ready, gateway included) plus a green voice-synthetic pass — the
 `rustls-platform-verifier` system-bundle path completes live Discord TLS.
 Rollback requires a coordinated change, not a one-file restore: use a matched,
-pinned bookworm builder and runtime in `Dockerfile`, mirror that pair in
-`Dockerfile.distroless` in lockstep, and update the distroless-bound gates in
-the same PR: `dockerfile_parity_errors` in `scripts/ci/test_toolchain_parity.py`
-for the builder pin, `scripts/test-supply-chain.py` for the base-image pins and
-the runtime assertions (no RUN, no apt-get/useradd//var/lib/dpkg, USER 65532),
+pinned bookworm builder and runtime in `Dockerfile` and update the
+distroless-bound gates in the same PR: `dockerfile_parity_errors` in
+`scripts/ci/test_toolchain_parity.py` for the builder pin,
+`scripts/test-supply-chain.py` for the base-image pins and the runtime
+assertions (no RUN, no apt-get/useradd//var/lib/dpkg, USER 65532),
 `scripts/runtime-image-evidence.py` for the status.d layout (it rejects
 var/lib/dpkg/status), and `scripts/vulnerability-preflight.py` for DISTRO. Keep
 the Rust version aligned with `rust-toolchain.toml`; do not mix trixie-built
@@ -27,17 +26,13 @@ supply-chain lane.
 
 ## Verdict
 
-Adopted `gcr.io/distroless/cc-debian13:nonroot` (digest-pinned,
-trixie builder) as the default runtime in PR #84 under the CEO scope
-decision. Per-precondition status at closeout: TLS handshake met per the
-cutover note above (deploy-staging run `38773972225`); backup/guild-config
-upload-hook path still open (needs sidecar/static upload binaries or
-host-side upload per `docs/backup.md`; not proven on the distroless image);
-CISO acknowledgement of the 14-package inventory and pin-refresh runbook
-still open (no receipt linked).
-Original recommendation (kept for provenance): adopt through a separate
-CEO-gated cutover card after the preconditions below. Do not use the `static`
-variant; do not deploy a `debug-nonroot` variant.
+The default runtime is `gcr.io/distroless/cc-debian13:nonroot` (digest-pinned,
+trixie builder). Do not use the `static` variant or deploy a `debug-nonroot`
+variant. Per-precondition status: TLS handshake met per the cutover note above
+(deploy-staging run `38773972225`); backup/guild-config upload-hook path still
+open (needs sidecar/static upload binaries or host-side upload per
+`docs/backup.md`; not proven on the distroless image); CISO acknowledgement of
+the 14-package inventory and pin-refresh runbook still open (no receipt linked).
 
 ## Compatibility
 
@@ -112,11 +107,11 @@ else (14 packages, no shell or package manager).
 
 ## Runtime profile: cold start, RSS and readiness timings
 
-Trial-image profiling for the cutover guard. The default `Dockerfile` body and
-`Dockerfile.distroless` body are now identical apart from the fallback header
-(guarded by `dockerfile_mirror_errors` in `scripts/ci/test_toolchain_parity.py`),
-so this profile covers both images. No guard logic changes here; thresholds stay where the
-cutover guard reads them in the
+Historical trial-image profiling for the cutover guard. The default
+`Dockerfile` builds the pinned `cc-debian13:nonroot` base digest; current
+build-provenance arguments and labels do not alter the runtime. This profile
+remains historical evidence. No guard logic changes here; thresholds stay
+where the cutover guard reads them in the
 [production signal thresholds](production-deploy.md#signal-thresholds-budgets-and-rollback-triggers).
 
 ### Repeatable procedure
@@ -126,7 +121,7 @@ controller. No secrets, database or Discord traffic are used at any step.
 
 ```sh
 docker buildx build --load --platform linux/amd64 \
-  -t two-bot:distroless-profile -f Dockerfile.distroless .
+  -t two-bot:distroless-profile -f Dockerfile .
 python3 scripts/container-smoke.py two-bot:distroless-profile
 ```
 

@@ -3,7 +3,7 @@
 `rust-toolchain.toml` is the single source of truth (currently 1.98.1).
 Every `dtolnay/rust-toolchain` step in `check.yml`, `nightly.yml` and
 `pipeline-benchmark.yml` must request that exact channel (the fuzz-compile
-job alone uses pinned nightly), and both Dockerfiles must build
+job alone uses pinned nightly), and `Dockerfile` must build
 `FROM rust:<major>.<minor>-trixie` on the same channel, since the toolchain
 header demands bump-both-together. Runs offline via the existing
 `Source-level CI gate regressions` discover step in check.yml.
@@ -21,7 +21,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ("check.yml", "nightly.yml", "pipeline-benchmark.yml")
-DOCKERFILES = ("Dockerfile", "Dockerfile.distroless")
+DOCKERFILES = ("Dockerfile",)
 # libFuzzer needs nightly; pinned date, not floating stable.
 FUZZ_TOOLCHAIN = "nightly-2026-10-01"
 MATCH_COMMENT = "Match rust-toolchain.toml"
@@ -102,64 +102,8 @@ def dockerfile_parity_errors(root):
     return errors
 
 
-FALLBACK_BODY_MARKER = "# two-bot-next: single always-on"
-DOCKERFILE_PARSER_DIRECTIVE = re.compile(r"^#\s*(?:syntax|escape|check)\s*=", re.IGNORECASE)
-
-
-def is_comment_header(text):
-    """Only blank lines and ordinary comments may precede the mirrored body."""
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped and (not stripped.startswith("#") or DOCKERFILE_PARSER_DIRECTIVE.match(stripped)):
-            return False
-    return True
-
-
-def starts_with_parser_directive(text):
-    """A fallback header must not move an active directive away from line one."""
-    first_line = next(iter(text.splitlines()), "").strip()
-    return bool(DOCKERFILE_PARSER_DIRECTIVE.match(first_line))
-
-
-def fallback_body(text, default_text):
-    """Strip a comment-only fallback header: body is the trailing default text."""
-    if text == default_text:
-        return text
-    idx = text.find(default_text)
-    if idx != -1 and text[idx:] == default_text and is_comment_header(text[:idx]):
-        return text[idx:]
-    marker_idx = text.find(FALLBACK_BODY_MARKER)
-    if marker_idx != -1 and is_comment_header(text[:marker_idx]):
-        return text[marker_idx:]
-    return text
-
-
-def dockerfile_mirror_errors(root):
-    """Dockerfile.distroless body (header stripped) equals Dockerfile."""
-    try:
-        default_text = (root / "Dockerfile").read_text()
-    except Exception as exc:
-        return [f"Dockerfile unreadable: {exc}"]
-    try:
-        fallback_text = (root / "Dockerfile.distroless").read_text()
-    except Exception as exc:
-        return [f"Dockerfile.distroless unreadable: {exc}"]
-    if starts_with_parser_directive(default_text) and fallback_text != default_text:
-        return ["Dockerfile.distroless cannot prepend a header before Dockerfile parser directives"]
-    if fallback_body(fallback_text, default_text) != default_text:
-        return [
-            "Dockerfile.distroless body drifted from Dockerfile "
-            "(strip leading header and diff)"
-        ]
-    return []
-
-
 def toolchain_parity_errors(root):
-    return (
-        workflow_toolchain_errors(root)
-        + dockerfile_parity_errors(root)
-        + dockerfile_mirror_errors(root)
-    )
+    return workflow_toolchain_errors(root) + dockerfile_parity_errors(root)
 
 
 PINNED_WORKFLOW = """\
@@ -197,10 +141,9 @@ class ToolchainParityTests(unittest.TestCase):
     def test_pinned_tree_passes(self):
         self.assertEqual(toolchain_parity_errors(ROOT), [])
 
-    def test_both_dockerfiles_are_covered(self):
-        self.assertEqual(set(DOCKERFILES), {"Dockerfile", "Dockerfile.distroless"})
-        for name in DOCKERFILES:
-            self.assertTrue((ROOT / name).is_file(), name)
+    def test_only_default_dockerfile_is_covered(self):
+        self.assertEqual(DOCKERFILES, ("Dockerfile",))
+        self.assertTrue((ROOT / "Dockerfile").is_file())
 
     def test_pinned_fixture_passes(self):
         with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
@@ -236,65 +179,6 @@ class ToolchainParityTests(unittest.TestCase):
                     errors = dockerfile_parity_errors(root)
                     self.assertEqual(len(errors), 1, errors)
                     self.assertIn(drifted, errors[0])
-
-    def test_mirror_pinned_tree_passes(self):
-        self.assertEqual(dockerfile_mirror_errors(ROOT), [])
-
-    def test_mirror_header_stripped_passes(self):
-        with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
-            root = make_fixture_root(scratch)
-            body = (root / "Dockerfile").read_text()
-            header = (
-                "# fallback header\n"
-                "# mirrors the default except for this header\n\n"
-            )
-            (root / "Dockerfile.distroless").write_text(header + body)
-            self.assertEqual(dockerfile_mirror_errors(root), [])
-
-    def test_mirror_body_drift_fails(self):
-        with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
-            root = make_fixture_root(scratch)
-            body = (root / "Dockerfile").read_text()
-            header = (
-                "# fallback header\n"
-                "# mirrors the default except for this header\n\n"
-            )
-            (root / "Dockerfile.distroless").write_text(header + body)
-            (root / "Dockerfile").write_text(body + "# drift\n")
-            errors = dockerfile_mirror_errors(root)
-            self.assertEqual(len(errors), 1, errors)
-            self.assertIn("Dockerfile.distroless body drifted", errors[0])
-
-    def test_mirror_header_only_edit_passes(self):
-        with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
-            root = make_fixture_root(scratch)
-            body = (root / "Dockerfile").read_text()
-            (root / "Dockerfile.distroless").write_text(
-                "# a different header, same body\n# still a comment\n\n" + body
-            )
-            self.assertEqual(dockerfile_mirror_errors(root), [])
-
-    def test_mirror_rejects_non_comment_and_parser_directive_prefixes(self):
-        for prefix in ("RUN echo injected\n", "# syntax=docker/dockerfile:1.7\n"):
-            with self.subTest(prefix=prefix):
-                with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
-                    root = make_fixture_root(scratch)
-                    body = (root / "Dockerfile").read_text()
-                    (root / "Dockerfile.distroless").write_text(prefix + body)
-                    errors = dockerfile_mirror_errors(root)
-                    self.assertTrue(errors, f"invalid prefix must fail: {prefix!r}")
-
-    def test_mirror_rejects_header_before_default_parser_directive(self):
-        with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
-            root = make_fixture_root(scratch)
-            body = (root / "Dockerfile").read_text()
-            default = "# syntax=docker/dockerfile:1.7\n" + body
-            (root / "Dockerfile").write_text(default)
-            (root / "Dockerfile.distroless").write_text(default)
-            self.assertEqual(dockerfile_mirror_errors(root), [])
-            (root / "Dockerfile.distroless").write_text("# fallback header\n" + default)
-            errors = dockerfile_mirror_errors(root)
-            self.assertTrue(errors, "a fallback header must not demote a Dockerfile parser directive")
 
     def test_loose_channel_fails(self):
         with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:

@@ -143,11 +143,9 @@ or the current PR diff.
   image: no Dockerfile, base digest, release profile, or SBOM workflow change
   rode with that branch. The separately sourced builder refresh changes the
   builder tag and digest, not the runtime image or its measurement status.
-- `Dockerfile.distroless` is a documented fallback mirroring the default
-  `Dockerfile` (same body apart from the fallback header; guarded by
-  `dockerfile_mirror_errors` in `scripts/ci/test_toolchain_parity.py`),
-  never built by CI. Either file builds the same distroless runtime for
-  local evidence collection while that guard stays green.
+- The distroless runtime is now the default image in `Dockerfile`; its
+  provenance arguments and labels are part of the cutover image build. Earlier
+  trial measurements remain historical evidence, not a separate build path.
 - Runtime is Debian 13 distroless (`cc-debian13:nonroot`); the older Bookworm
   notes and conditional dispositions in `docs/supply-chain.md` do not carry
   over. Automated Docker updates track both pinned references; the unversioned
