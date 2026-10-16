@@ -103,17 +103,33 @@ def dockerfile_parity_errors(root):
 
 
 FALLBACK_BODY_MARKER = "# two-bot-next: single always-on"
+DOCKERFILE_PARSER_DIRECTIVE = re.compile(r"^#\s*(?:syntax|escape|check)\s*=", re.IGNORECASE)
+
+
+def is_comment_header(text):
+    """Only blank lines and ordinary comments may precede the mirrored body."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped and (not stripped.startswith("#") or DOCKERFILE_PARSER_DIRECTIVE.match(stripped)):
+            return False
+    return True
+
+
+def starts_with_parser_directive(text):
+    """A fallback header must not move an active directive away from line one."""
+    first_line = next(iter(text.splitlines()), "").strip()
+    return bool(DOCKERFILE_PARSER_DIRECTIVE.match(first_line))
 
 
 def fallback_body(text, default_text):
-    """Strip the fallback header: body is the trailing default text."""
+    """Strip a comment-only fallback header: body is the trailing default text."""
     if text == default_text:
         return text
     idx = text.find(default_text)
-    if idx != -1 and text[idx:] == default_text:
+    if idx != -1 and text[idx:] == default_text and is_comment_header(text[:idx]):
         return text[idx:]
     marker_idx = text.find(FALLBACK_BODY_MARKER)
-    if marker_idx != -1:
+    if marker_idx != -1 and is_comment_header(text[:marker_idx]):
         return text[marker_idx:]
     return text
 
@@ -128,6 +144,8 @@ def dockerfile_mirror_errors(root):
         fallback_text = (root / "Dockerfile.distroless").read_text()
     except Exception as exc:
         return [f"Dockerfile.distroless unreadable: {exc}"]
+    if starts_with_parser_directive(default_text) and fallback_text != default_text:
+        return ["Dockerfile.distroless cannot prepend a header before Dockerfile parser directives"]
     if fallback_body(fallback_text, default_text) != default_text:
         return [
             "Dockerfile.distroless body drifted from Dockerfile "
@@ -255,6 +273,28 @@ class ToolchainParityTests(unittest.TestCase):
                 "# a different header, same body\n# still a comment\n\n" + body
             )
             self.assertEqual(dockerfile_mirror_errors(root), [])
+
+    def test_mirror_rejects_non_comment_and_parser_directive_prefixes(self):
+        for prefix in ("RUN echo injected\n", "# syntax=docker/dockerfile:1.7\n"):
+            with self.subTest(prefix=prefix):
+                with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
+                    root = make_fixture_root(scratch)
+                    body = (root / "Dockerfile").read_text()
+                    (root / "Dockerfile.distroless").write_text(prefix + body)
+                    errors = dockerfile_mirror_errors(root)
+                    self.assertTrue(errors, f"invalid prefix must fail: {prefix!r}")
+
+    def test_mirror_rejects_header_before_default_parser_directive(self):
+        with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:
+            root = make_fixture_root(scratch)
+            body = (root / "Dockerfile").read_text()
+            default = "# syntax=docker/dockerfile:1.7\n" + body
+            (root / "Dockerfile").write_text(default)
+            (root / "Dockerfile.distroless").write_text(default)
+            self.assertEqual(dockerfile_mirror_errors(root), [])
+            (root / "Dockerfile.distroless").write_text("# fallback header\n" + default)
+            errors = dockerfile_mirror_errors(root)
+            self.assertTrue(errors, "a fallback header must not demote a Dockerfile parser directive")
 
     def test_loose_channel_fails(self):
         with tempfile.TemporaryDirectory(prefix="toolchain-parity-") as scratch:

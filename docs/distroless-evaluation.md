@@ -1,6 +1,7 @@
 # Distroless runtime evaluation ([TOG-12144](/TOG/issues/TOG-12144), follow-up of [TOG-10893](/TOG/issues/TOG-10893))
 
-Cutover complete. The default `Dockerfile` builds digest-pinned
+Runtime switched; two cutover preconditions remain open. The default
+`Dockerfile` builds digest-pinned
 `gcr.io/distroless/cc-debian13:nonroot` since PR #84 (CEO scope decision for
 the supply-chain slice). `Dockerfile.distroless` is kept as a documented
 fallback mirroring the default; it is not built by CI. No `wrangler/` or
@@ -62,7 +63,7 @@ variant; do not deploy a `debug-nonroot` variant.
 
 | Image | Run / head | Size | Binary |
 |---|---|---|---|
-| `debian:bookworm-slim` (current default, main) | [36951099822](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36951099822) / `1c6481b6` (`sha256:715f…`) | 96,108,544 B (91.66 MiB) | 10,517,528 B (10.03 MiB) |
+| `debian:bookworm-slim` (historical default on main at the time) | [36951099822](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36951099822) / `1c6481b6` (`sha256:715f…`) | 96,108,544 B (91.66 MiB) | 10,517,528 B (10.03 MiB) |
 | `cc-debian13:nonroot` (trial) | [36948616604](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36948616604) job attempt 2 / `9cc4815b` (`sha256:2bc5…`) | 42,807,296 B (40.82 MiB) | 10,518,416 B (10.03 MiB) |
 | **Delta** | | **−53,301,248 B (−50.84 MiB, −55.5 %)** | +888 B (noise; same opt-z/LTO/strip profile) |
 
