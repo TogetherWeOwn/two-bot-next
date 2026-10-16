@@ -203,18 +203,22 @@ async fn scheduled_runtime_probe(pool: &PgPool, role: &str) -> Result<(), sqlx::
     Ok(())
 }
 
-/// Every cutover migration in source order, read from the directory so a new
-/// migration is exercised without updating a hardcoded list.
+/// Every migration in apply order: the cutover chain, then the store chain
+/// that staging applies on top under its own ledger. Both are read from their
+/// directories so a new migration is exercised without a hardcoded list.
 fn migration_files() -> Vec<(i64, String)> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cutover/migrations");
-    let mut entries: Vec<_> = std::fs::read_dir(&dir)
-        .expect("cutover migrations directory")
-        .map(|entry| entry.expect("migration entry").path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
-        .collect();
-    entries.sort();
-    entries
+    ["../cutover/migrations", "../store/migrations"]
         .iter()
+        .flat_map(|chain| {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(chain);
+            let mut entries: Vec<_> = std::fs::read_dir(&dir)
+                .expect("migrations directory")
+                .map(|entry| entry.expect("migration entry").path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+                .collect();
+            entries.sort();
+            entries
+        })
         .map(|path| {
             let name = path
                 .file_name()
@@ -222,26 +226,17 @@ fn migration_files() -> Vec<(i64, String)> {
                 .to_string_lossy();
             let digits: String = name.chars().take_while(|c| c.is_ascii_digit()).collect();
             let version: i64 = digits.parse().expect("migration version prefix");
-            let sql = std::fs::read_to_string(path).expect("read migration");
+            let sql = std::fs::read_to_string(&path).expect("read migration");
             (version, sql)
         })
         .collect()
 }
 
 async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
-    // Every real migration file in version order, not a reduced fixture that
+    // Every real migration file in apply order, not a reduced fixture that
     // omits trigger/sequence paths or newer tables. A new migration without a
     // matrix row fails the offline coverage test and drifts here.
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cutover/migrations");
-    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-        .expect("migrations directory")
-        .map(|entry| entry.expect("migration entry").path())
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sql"))
-        .collect();
-    paths.sort();
-    assert!(!paths.is_empty(), "no migrations found");
-    for path in paths {
-        let sql = std::fs::read_to_string(&path).expect("migration file readable");
+    for (_, sql) in migration_files() {
         // Never grant a shared cluster role: isolate names even in migrations.
         execute(pool, isolated(&sql, roles)).await?;
     }
