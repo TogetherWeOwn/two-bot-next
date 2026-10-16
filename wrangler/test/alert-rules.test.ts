@@ -131,23 +131,7 @@ test("429 rate uses the delta, ignores resets and tiny windows", () => {
   assert.deepEqual(restart.firing, []);
 });
 
-test("5xx rate establishes a baseline for legacy state before evaluating a window", () => {
-  const legacy = { ...EMPTY_STATE, restTotal: 10_000 } as MetricsAlertState;
-  delete (legacy as Partial<MetricsAlertState>).rest5xx;
-  const baseline = ev([
-    `two_bot_rest_requests_total{route="other",result="2xx"} 9990`,
-    `two_bot_rest_requests_total{route="other",result="5xx"} 30`,
-  ], legacy);
-  assert.deepEqual(baseline.firing, []);
-  assert.equal(baseline.state.rest5xx, 30);
-  const hot = ev([
-    `two_bot_rest_requests_total{route="other",result="2xx"} 10000`,
-    `two_bot_rest_requests_total{route="other",result="5xx"} 40`,
-  ], baseline.state);
-  assert.deepEqual(hot.firing, ["rest_5xx_rate"]);
-});
-
-test("5xx rate uses the delta, ignores resets and tiny windows", () => {
+test("5xx rate uses the delta, baselines legacy state, and ignores resets and tiny windows", () => {
   const first = ev([`two_bot_rest_requests_total{route="other",result="2xx"} 100`, `two_bot_rest_requests_total{route="other",result="5xx"} 0`]);
   const hot = ev([`two_bot_rest_requests_total{route="other",result="2xx"} 180`, `two_bot_rest_requests_total{route="other",result="5xx"} 20`], first.state);
   assert.deepEqual(hot.firing, ["rest_5xx_rate"]);
@@ -155,6 +139,24 @@ test("5xx rate uses the delta, ignores resets and tiny windows", () => {
   assert.deepEqual(small.firing, []);
   const restart = ev([`two_bot_rest_requests_total{route="other",result="5xx"} 1`], hot.state);
   assert.deepEqual(restart.firing, []);
+
+  const legacy = { ...first.state, restTotal: 1000 };
+  delete legacy.rest5xx;
+  const baseline = ev([
+    `two_bot_rest_requests_total{route="other",result="2xx"} 1010`,
+    `two_bot_rest_requests_total{route="other",result="5xx"} 50`,
+  ], legacy);
+  assert.deepEqual(baseline.firing, []);
+  assert.equal(baseline.state.rest5xx, 50);
+  const later = ev([
+    `two_bot_rest_requests_total{route="other",result="2xx"} 1018`,
+    `two_bot_rest_requests_total{route="other",result="5xx"} 62`,
+  ], baseline.state);
+  assert.deepEqual(later.firing, ["rest_5xx_rate"]);
+
+  // A 429 burst is not a 5xx burst: the two rates track independently.
+  const other = ev([`two_bot_rest_requests_total{route="other",result="2xx"} 180`, `two_bot_rest_requests_total{route="other",result="429"} 20`], first.state);
+  assert.deepEqual(other.firing, ["rest_429_rate"]);
 });
 
 test("alert messages carry build revision, failure detail and the log-query link", () => {

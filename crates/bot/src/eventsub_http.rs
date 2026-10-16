@@ -5,14 +5,15 @@
 //! Only transient failures (none in this slice: no send, no ledger) would be
 //! 5xx. No Helix client and no durable ledger here (separate slices).
 //!
-//! Logging carries only scalar `event`/`status`/`error_class`: no header
+//! Logging carries only scalar `event`/`status`/`error_class` plus the bounded
+//! `message_type` (refusals) and `reason` (revocation ack) scalars: no header
 //! values, challenge, body bytes or query. The callback path never reaches a
 //! trace span (`server::TRACED_PATHS` must not list it; unknown paths render
 //! as `[REDACTED]`).
 
 use std::{
     future::IntoFuture,
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -39,18 +40,23 @@ const BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 struct ReceiverState {
-    secret: two_bot_core::twitch_eventsub::WebhookSecret,
+    secret: RwLock<two_bot_core::twitch_eventsub::WebhookSecret>,
     capacity: Arc<Semaphore>,
 }
 
 impl ReceiverState {
     fn new(config: &EventsubReceiverConfig) -> Self {
         Self {
-            // `WebhookSecret` is `Clone` (wraps `Secret<String>`); keep the
-            // value inside the state so the handler never re-reads the env.
-            secret: config.secret().clone(),
+            // Keep one atomic secret snapshot in the state; handlers never
+            // re-read the environment or observe partially replaced material.
+            secret: RwLock::new(config.secret().clone()),
             capacity: Arc::new(Semaphore::new(MAX_REQUESTS)),
         }
+    }
+
+    #[cfg(test)]
+    fn reload_secret(&self, config: &EventsubReceiverConfig) {
+        *self.secret.write().expect("EventSub secret lock poisoned") = config.secret().clone();
     }
 }
 
@@ -114,18 +120,33 @@ fn envelope(status: StatusCode, code: &str, retryable: bool, id: &str) -> Respon
     (status, body).into_response()
 }
 
+/// Bounded `message_type` scalar for refuse lines: the three Twitch types the
+/// receiver handles, else `unknown`. Raw header values never reach a log
+/// line, so a failed challenge separates from a malformed notification or
+/// an edge probe in logs alone.
+fn bounded_message_type(value: &str) -> &'static str {
+    match value {
+        "webhook_callback_verification" => "webhook_callback_verification",
+        "notification" => "notification",
+        "revocation" => "revocation",
+        _ => "unknown",
+    }
+}
+
 fn refuse(
     state: &ReceiverState,
     status: StatusCode,
     code: &str,
     retryable: bool,
     id: &str,
+    message_type: &'static str,
 ) -> Response {
     let _ = state;
     tracing::warn!(
         event = "eventsub_receiver",
         status = status.as_u16(),
         error_class = code,
+        message_type = message_type,
         "eventsub delivery refused"
     );
     envelope(status, code, retryable, id)
@@ -136,19 +157,28 @@ fn ack(id: &str) -> Response {
 }
 
 async fn not_found(State(state): State<Arc<ReceiverState>>) -> Response {
+    // Fallback for any non-callback path or method: no header is trusted.
     refuse(
         &state,
         StatusCode::NOT_FOUND,
         "not_found",
         false,
         &request_id(),
+        "unknown",
     )
 }
 
 async fn handle(State(state): State<Arc<ReceiverState>>, request: Request) -> Response {
     let id = request_id();
     let Ok(_permit) = Arc::clone(&state.capacity).try_acquire_owned() else {
-        return refuse(&state, StatusCode::SERVICE_UNAVAILABLE, "busy", true, &id);
+        return refuse(
+            &state,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            true,
+            &id,
+            "unknown",
+        );
     };
     receive_with_timeout(&state, &id, receive(&state, request, &id)).await
 }
@@ -160,12 +190,15 @@ async fn receive_with_timeout(
 ) -> Response {
     match tokio::time::timeout(REQUEST_TIMEOUT, receive).await {
         Ok(response) => response,
+        // The stalled future is opaque on timeout: the message type may never
+        // have been established, so `unknown` is the honest scalar.
         Err(_) => refuse(
             state,
             StatusCode::SERVICE_UNAVAILABLE,
             "upstream_timeout",
             true,
             id,
+            "unknown",
         ),
     }
 }
@@ -175,10 +208,24 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
     // a direct `containerFetch` must not reach verification with extras.
     let path = request.uri().path();
     if path != EVENTSUB_PATH {
-        return refuse(state, StatusCode::NOT_FOUND, "not_found", false, id);
+        return refuse(
+            state,
+            StatusCode::NOT_FOUND,
+            "not_found",
+            false,
+            id,
+            "unknown",
+        );
     }
     if request.uri().query().is_some() {
-        return refuse(state, StatusCode::BAD_REQUEST, "malformed", false, id);
+        return refuse(
+            state,
+            StatusCode::BAD_REQUEST,
+            "malformed",
+            false,
+            id,
+            "unknown",
+        );
     }
     if request.method() != Method::POST {
         let mut response = refuse(
@@ -187,6 +234,7 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             "method_not_allowed",
             false,
             id,
+            "unknown",
         );
         response
             .headers_mut()
@@ -210,6 +258,7 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             "unsupported_media_type",
             false,
             id,
+            "unknown",
         );
     }
 
@@ -222,7 +271,15 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
     }) {
         Ok(headers) => headers,
         Err(_) => {
-            return refuse(state, StatusCode::UNAUTHORIZED, "unauthorized", false, id);
+            // Headers missing or malformed: the message type is untrusted.
+            return refuse(
+                state,
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                false,
+                id,
+                "unknown",
+            );
         }
     };
     let message_type = headers.message_type().to_owned();
@@ -236,6 +293,7 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
                 "payload_too_large",
                 false,
                 id,
+                bounded_message_type(&message_type),
             );
         }
         Err(_) => {
@@ -245,14 +303,27 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
                 "request_timeout",
                 true,
                 id,
+                bounded_message_type(&message_type),
             );
         }
     };
     if raw.is_empty() {
-        return refuse(state, StatusCode::BAD_REQUEST, "malformed", false, id);
+        return refuse(
+            state,
+            StatusCode::BAD_REQUEST,
+            "malformed",
+            false,
+            id,
+            bounded_message_type(&message_type),
+        );
     }
 
-    if let Err(error) = verify_delivery(&state.secret, &headers, &raw, now_ms_i64()) {
+    let secret = state
+        .secret
+        .read()
+        .expect("EventSub secret lock poisoned")
+        .clone();
+    if let Err(error) = verify_delivery(&secret, &headers, &raw, now_ms_i64()) {
         // `BodyTooLarge` cannot arrive here (`to_bytes` caps first), but map
         // it explicitly rather than collapsing every variant into one arm.
         if error == EventSubError::BodyTooLarge {
@@ -262,9 +333,17 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
                 "payload_too_large",
                 false,
                 id,
+                bounded_message_type(&message_type),
             );
         }
-        return refuse(state, StatusCode::UNAUTHORIZED, "unauthorized", false, id);
+        return refuse(
+            state,
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            false,
+            id,
+            bounded_message_type(&message_type),
+        );
     }
 
     match classify(&message_type, &raw) {
@@ -294,12 +373,14 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             );
             ack(id)
         }
-        Ok(Delivery::Revocation { .. }) => {
+        Ok(Delivery::Revocation { reason, .. }) => {
             // The bounded reconcile pass re-subscribes; here only acknowledge
-            // so Twitch does not retry.
+            // so Twitch does not retry. The bounded `reason` scalar (never the
+            // subscription id) answers revocation counts by reason from logs alone.
             tracing::info!(
                 event = "eventsub_receiver",
                 status = 200,
+                reason = reason.as_str(),
                 "revocation acknowledged"
             );
             ack(id)
@@ -324,7 +405,17 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
             ack(id)
         }
         Err(EventSubError::InvalidChallenge) => {
-            refuse(state, StatusCode::BAD_REQUEST, "malformed", false, id)
+            // Same `malformed` error class as a bad notification body, but
+            // `message_type = "webhook_callback_verification"` separates
+            // failed challenges in logs alone.
+            refuse(
+                state,
+                StatusCode::BAD_REQUEST,
+                "malformed",
+                false,
+                id,
+                bounded_message_type(&message_type),
+            )
         }
         Err(e) => {
             // Unreachable today: post-verification `classify` only yields
@@ -350,11 +441,24 @@ mod tests {
     use sha2::Sha256;
     use std::sync::{
         atomic::{AtomicU64, Ordering},
-        OnceLock,
+        Mutex, OnceLock,
     };
     use tower::ServiceExt as _;
 
     static NEXT_TEST_SECRET: AtomicU64 = AtomicU64::new(1);
+
+    /// Receiver tests emit through the shared `refuse`/challenge callsites.
+    /// `tracing-core` resolves a callsite's first registration against the
+    /// registering thread's default, so a scoped capture can miss events if a
+    /// sibling test registers those callsites first; the log-hygiene test
+    /// therefore reads the process-wide `crate::tracing_capture::global()`.
+    /// That capture is shared with every test in this binary, so each reader
+    /// keeps only the text appended after its own start offset — and every
+    /// router-driving test in this module serializes here, so a sibling's
+    /// `eventsub delivery refused` / `challenge answered` lines cannot land in
+    /// (or satisfy) another test's slice. Acquire it first, before anything
+    /// that can emit through those callsites.
+    static RECEIVER_LOG_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Runtime-generated signing secret: no literal key material reaches the
     /// HMAC, so CodeQL's hard-coded-key rule stays silent. Shared across tests
@@ -402,6 +506,35 @@ mod tests {
             .unwrap()
             .as_millis() as i64;
         two_bot_core::format_iso_millis(now)
+    }
+
+    #[derive(Clone)]
+    struct EventSubLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for EventSubLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_eventsub_logs() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
+        // Share the global capture subscriber first so callsite interest stays
+        // stable when peer tests hit the same log site on other threads;
+        // the local JSON writer still captures only this test's events.
+        let _global = crate::tracing_capture::global();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::clone(&bytes);
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || EventSubLogWriter(Arc::clone(&output)))
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (bytes, guard)
     }
 
     struct TestHeaders<'a> {
@@ -464,6 +597,7 @@ mod tests {
 
     #[tokio::test]
     async fn challenge_echoes_as_text_plain() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         let body = challenge_body();
         let timestamp = fresh_timestamp();
         let signature = sign("synthetic-delivery-0001", &timestamp, body.as_bytes());
@@ -492,6 +626,7 @@ mod tests {
 
     #[tokio::test]
     async fn bad_signature_is_401_without_echo() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         let body = challenge_body();
         let timestamp = fresh_timestamp();
         let response = app()
@@ -517,6 +652,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_message_type_is_acknowledged() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         let body = r#"{"subscription":{"id":"synthetic-sub-0001","status":"enabled","type":"stream.online","version":"1","condition":{"broadcaster_user_id":"123456"},"transport":{"method":"webhook","callback":"https://example.com/hooks/twitch"},"created_at":"2026-10-13T00:00:00Z"}}"#;
         let timestamp = fresh_timestamp();
         let signature = sign("synthetic-delivery-0002", &timestamp, body.as_bytes());
@@ -542,6 +678,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_path_and_method_are_rejected() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         let body = challenge_body();
         let timestamp = fresh_timestamp();
         let signature = sign("synthetic-delivery-0003", &timestamp, body.as_bytes());
@@ -575,6 +712,7 @@ mod tests {
 
     #[tokio::test]
     async fn deterministic_classification_errors_are_acknowledged() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         // Valid signature over a notification body whose subscription is not
         // stream.online v1: deterministic, must be 2xx, never a retry.
         let body = r#"{"subscription":{"id":"synthetic-sub-0009","status":"enabled","type":"stream.offline","version":"1","condition":{"broadcaster_user_id":"123456"},"transport":{"method":"webhook","callback":"https://example.com/hooks/twitch"},"created_at":"2026-10-13T00:00:00Z"},"event":{"broadcaster_user_id":"123456"}}"#;
@@ -597,6 +735,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_string_is_refused_before_verification() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         // Signed exactly like the happy path: the query gate runs first, so a
         // valid signature must still answer 400, never reach the receiver.
         let body = challenge_body();
@@ -626,6 +765,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_content_type_is_refused() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         let body = challenge_body();
         let timestamp = fresh_timestamp();
         let message_id = "synthetic-delivery-0012";
@@ -680,6 +820,7 @@ mod tests {
 
     #[tokio::test]
     async fn oversize_body_is_refused() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         // Headers pass `from_lookup`; the 64 KiB cap triggers before verify.
         let timestamp = fresh_timestamp();
         let big = vec![b'a'; MAX_BODY_BYTES + 1];
@@ -708,10 +849,27 @@ mod tests {
         assert_eq!(value["error"]["retryable"], false);
     }
 
+    #[test]
+    fn bounded_message_type_accepts_only_known_eventsub_types() {
+        for (input, expected) in [
+            (
+                "webhook_callback_verification",
+                "webhook_callback_verification",
+            ),
+            ("notification", "notification"),
+            ("revocation", "revocation"),
+            ("untrusted-header-value", "unknown"),
+        ] {
+            assert_eq!(bounded_message_type(input), expected);
+        }
+    }
+
     #[tokio::test]
     async fn malformed_challenge_is_refused() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         // Empty and non-graphic challenges are `InvalidChallenge`: 400, never
         // an ack. Each body is signed exactly as sent.
+        let (logs, _subscriber) = capture_eventsub_logs();
         for challenge in ["", "has space"] {
             let body = format!(
                 r#"{{"challenge":{challenge:?},"subscription":{{"id":"synthetic-sub-0014","status":"webhook_callback_verification_pending","type":"stream.online","version":"1","condition":{{"broadcaster_user_id":"123456"}},"transport":{{"method":"webhook","callback":"https://example.com/hooks/twitch"}},"created_at":"2026-10-13T00:00:00Z"}}}}"#
@@ -741,10 +899,23 @@ mod tests {
             assert_eq!(value["error"]["code"], "malformed");
             assert_eq!(value["error"]["retryable"], false);
         }
+
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert_eq!(logs.matches("\"event\":\"eventsub_receiver\"").count(), 2);
+        assert_eq!(
+            logs.matches("\"message_type\":\"webhook_callback_verification\"")
+                .count(),
+            2
+        );
+        assert_eq!(logs.matches("\"error_class\":\"malformed\"").count(), 2);
+        assert!(!logs.contains("has space"));
+        assert!(!logs.contains("synthetic-delivery-0014"));
+        assert!(!logs.contains("https://example.com/hooks/twitch"));
     }
 
     #[tokio::test]
     async fn busy_returns_503_with_retryable() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         // Hold every permit: the semaphore gate runs before path, method,
         // content-type and verification, so even a bare request gets 503.
         let state = Arc::new(ReceiverState::new(&config()));
@@ -766,6 +937,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn slow_body_times_out_with_408_and_retryable() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         // A body that never ends must hit the 5 s read budget instead of
         // holding one of the 32 permits: 408 `request_timeout`, retriable.
         let timestamp = fresh_timestamp();
@@ -816,6 +988,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn stalled_request_times_out_with_503_and_retryable() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
         // The 20 s outer budget maps a stalled receive to 503
         // `upstream_timeout`, retriable.
         let state = ReceiverState::new(&config());
@@ -848,5 +1021,276 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["error"]["code"], "upstream_timeout");
         assert_eq!(value["error"]["retryable"], true);
+    }
+
+    // Webhook-secret reload coverage: the no-restart rotation contract.
+    //
+    // Tests rotate one bound ReceiverState through its test-visible reload
+    // seam, then verify deliveries through the same router. Production binds
+    // the initial secret at startup; runtime configuration wiring remains a
+    // separate follow-up. Secrets are runtime-generated per test, so no key
+    // material appears in source or overlaps the module's signing fixture.
+
+    /// Runtime-generated reload secret: never a literal, so the hardcoded-key
+    /// rule stays silent. The embedded counter makes every call distinct,
+    /// even within the same nanosecond.
+    fn fresh_reload_secret() -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is after the Unix epoch")
+            .as_nanos();
+        let nonce = NEXT_TEST_SECRET.fetch_add(1, Ordering::Relaxed);
+        format!("reload-{nanos:032x}-{nonce:016x}")
+    }
+
+    /// Build a parsed test config carrying `secret`; this does not mutate a
+    /// bound receiver. Runtime config reload wiring is covered separately.
+    fn reload_config_for(secret: &str) -> EventsubReceiverConfig {
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("TWO_EVENTSUB".to_owned(), "1".to_owned());
+        vars.insert("TWO_EVENTSUB_BIND".to_owned(), "127.0.0.1:8092".to_owned());
+        vars.insert("TWO_TWITCH_WEBHOOK_SECRET".to_owned(), secret.to_owned());
+        EventsubReceiverConfig::from_map(&vars)
+            .unwrap()
+            .expect("enabled")
+    }
+
+    fn sign_with(secret: &str, message_id: &str, timestamp: &str, body: &[u8]) -> String {
+        let mut mac = <Hmac<Sha256>>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(message_id.as_bytes());
+        mac.update(timestamp.as_bytes());
+        mac.update(body);
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    async fn reload_response(
+        router: Router,
+        message_id: &str,
+        timestamp: &str,
+        signature: &str,
+        body: &'static str,
+    ) -> axum::response::Response {
+        router
+            .oneshot(request(
+                "POST",
+                EVENTSUB_PATH,
+                Some(message_id),
+                Some(timestamp),
+                Some(signature),
+                Some("webhook_callback_verification"),
+                body,
+            ))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reloaded_secret_verifies_new_deliveries() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
+        let old_secret = fresh_reload_secret();
+        let new_secret = fresh_reload_secret();
+        assert_ne!(old_secret, new_secret, "rotation must change the secret");
+        let state = Arc::new(ReceiverState::new(&reload_config_for(&old_secret)));
+        let bound = router(Arc::clone(&state));
+        state.reload_secret(&reload_config_for(&new_secret));
+
+        let body = challenge_body();
+        let timestamp = fresh_timestamp();
+        let message_id = "synthetic-reload-0001";
+        let signature = sign_with(&new_secret, message_id, &timestamp, body.as_bytes());
+        let response = reload_response(bound, message_id, &timestamp, &signature, body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/plain"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"synthetic-challenge-0001");
+    }
+
+    #[tokio::test]
+    async fn pre_reload_secret_is_rejected_after_reload() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
+        let old_secret = fresh_reload_secret();
+        let new_secret = fresh_reload_secret();
+        let state = Arc::new(ReceiverState::new(&reload_config_for(&old_secret)));
+        let bound = router(Arc::clone(&state));
+        let body = challenge_body();
+        let timestamp = fresh_timestamp();
+
+        let before_id = "synthetic-reload-0002";
+        let before_signature = sign_with(&old_secret, before_id, &timestamp, body.as_bytes());
+        let before = reload_response(
+            bound.clone(),
+            before_id,
+            &timestamp,
+            &before_signature,
+            body,
+        )
+        .await;
+        assert_eq!(before.status(), StatusCode::OK);
+
+        state.reload_secret(&reload_config_for(&new_secret));
+        let old_id = "synthetic-reload-0003";
+        let old_signature = sign_with(&old_secret, old_id, &timestamp, body.as_bytes());
+        let stale = reload_response(bound.clone(), old_id, &timestamp, &old_signature, body).await;
+        assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
+        assert_ne!(
+            stale.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a stale secret is a deterministic refusal, never a 500"
+        );
+        let bytes = axum::body::to_bytes(stale.into_body(), 4096).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["code"], "unauthorized");
+        assert_eq!(value["error"]["retryable"], false);
+        assert!(!String::from_utf8_lossy(&bytes).contains("synthetic-challenge-0001"));
+
+        let new_id = "synthetic-reload-0004";
+        let new_signature = sign_with(&new_secret, new_id, &timestamp, body.as_bytes());
+        let fresh = reload_response(bound, new_id, &timestamp, &new_signature, body).await;
+        assert_eq!(fresh.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn in_flight_delivery_during_reload_is_deterministic() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
+        let old_secret = fresh_reload_secret();
+        let new_secret = fresh_reload_secret();
+        let state = Arc::new(ReceiverState::new(&reload_config_for(&old_secret)));
+        let bound = router(Arc::clone(&state));
+        let body = challenge_body();
+        let timestamp = fresh_timestamp();
+        let old_id = "synthetic-reload-0005";
+        let old_signature = sign_with(&old_secret, old_id, &timestamp, body.as_bytes());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let held_body = Body::from_stream(futures_util::stream::once(async move {
+            started_tx.send(()).expect("test is waiting for body read");
+            release_rx.await.expect("test releases the request body")
+        }));
+        let request = request_with_content_type(
+            EVENTSUB_PATH,
+            "application/json",
+            "POST",
+            TestHeaders {
+                message_id: Some(old_id),
+                timestamp: Some(&timestamp),
+                signature: Some(&old_signature),
+                message_type: Some("webhook_callback_verification"),
+            },
+            held_body,
+        );
+        let pending = tokio::spawn(bound.clone().oneshot(request));
+
+        // The request is waiting for its body while the shared secret changes.
+        started_rx
+            .await
+            .expect("receiver began reading request body");
+        state.reload_secret(&reload_config_for(&new_secret));
+        release_tx
+            .send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                body.as_bytes().to_vec(),
+            )))
+            .expect("receiver is waiting for request body");
+        let in_flight = pending.await.unwrap().unwrap();
+        assert_eq!(in_flight.status(), StatusCode::UNAUTHORIZED);
+        assert_ne!(
+            in_flight.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "one atomic secret snapshot yields a deterministic refusal, never a 500"
+        );
+
+        let new_id = "synthetic-reload-0006";
+        let new_signature = sign_with(&new_secret, new_id, &timestamp, body.as_bytes());
+        let reloaded = reload_response(bound, new_id, &timestamp, &new_signature, body).await;
+        assert_eq!(reloaded.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn reload_path_never_logs_or_debugs_secret_material() {
+        let _receiver_log_serial = RECEIVER_LOG_SERIAL.lock().await;
+        let old_secret = fresh_reload_secret();
+        let new_secret = fresh_reload_secret();
+        let secrets = [&old_secret, &new_secret];
+        // `Debug` on either side of the rotation redacts both secrets.
+        for config in [
+            reload_config_for(&old_secret),
+            reload_config_for(&new_secret),
+        ] {
+            for rendered in [format!("{config:?}"), format!("{config:#?}")] {
+                for secret in secrets {
+                    assert!(
+                        !rendered.contains(secret.as_str()),
+                        "reloaded config Debug leaked secret material"
+                    );
+                }
+                assert!(rendered.contains("[REDACTED]"));
+            }
+            for rendered in [
+                format!("{:?}", config.secret()),
+                format!("{:#?}", config.secret()),
+            ] {
+                for secret in secrets {
+                    assert!(
+                        !rendered.contains(secret.as_str()),
+                        "webhook secret Debug leaked secret material"
+                    );
+                }
+                assert!(rendered.contains("[REDACTED]"));
+            }
+        }
+        // Exercise the reload on one bound state, and read its subsequent
+        // refusal and acknowledgement events from the process-wide capture
+        // (see `RECEIVER_LOG_SERIAL`). Calling `global()` here ensures the
+        // process-wide dispatch is installed before the start offset; that
+        // one-time install (`Dispatch::new`) rebuilds every callsite's
+        // cached interest against the live dispatches, so a sibling that
+        // registered these callsites before the install cannot starve this
+        // test of events.
+        let capture = crate::tracing_capture::global();
+        let start = capture.text().len();
+        let state = Arc::new(ReceiverState::new(&reload_config_for(&old_secret)));
+        let bound = router(Arc::clone(&state));
+        let body = challenge_body();
+        state.reload_secret(&reload_config_for(&new_secret));
+        let timestamp = fresh_timestamp();
+        let old_id = "synthetic-reload-0006";
+        let old_signature = sign_with(&old_secret, old_id, &timestamp, body.as_bytes());
+        let refused =
+            reload_response(bound.clone(), old_id, &timestamp, &old_signature, body).await;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        let refused_bytes = axum::body::to_bytes(refused.into_body(), 4096)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&refused_bytes).contains(&old_secret));
+        assert!(!String::from_utf8_lossy(&refused_bytes).contains(&new_secret));
+
+        let new_id = "synthetic-reload-0007";
+        let new_signature = sign_with(&new_secret, new_id, &timestamp, body.as_bytes());
+        let accepted = reload_response(bound, new_id, &timestamp, &new_signature, body).await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let accepted_bytes = axum::body::to_bytes(accepted.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(&accepted_bytes[..], b"synthetic-challenge-0001");
+        tracing::info!("reload log capture live");
+
+        let text = capture.text().split_off(start);
+        assert!(
+            text.contains("reload log capture live"),
+            "log capture missed events; the redaction assertions would pass vacuously"
+        );
+        assert!(text.contains("eventsub delivery refused"));
+        assert!(text.contains("challenge answered"));
+        for secret in secrets {
+            assert!(
+                !text.contains(secret.as_str()),
+                "secret material reached the reload-path logs"
+            );
+        }
     }
 }

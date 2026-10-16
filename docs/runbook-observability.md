@@ -105,9 +105,18 @@ claim them as shipped acceptance:
 - This repository's synthetic workflow is staging-oriented. Do not describe it
   as a passive five-minute production user-flow check unless the production
   schedule and alert delivery have been independently verified.
-- The shared promotion workflow already has a gated readiness check and
-  rollback behavior. Do not treat this as proof of a gradual traffic rollout
-  or an error-rate-triggered production rollback.
+- Error-rate detection is installed: `rest_5xx_rate` pages when 5xx exceed 10%
+  of Discord REST requests between keepalive samples (minimum 10 requests),
+  with the rollback evaluation in [Alert: REST 5xx](runbook.md#alert-rest-5xx).
+  What is not yet wired is a canary-stage error-rate gate that fails a
+  promotion stage automatically: a 5xx burst during promotion pages on-call,
+  and the existing per-stage health gates roll back only on their own probe
+  failures.
+- The shared central gradual-promotion action promotes 5-50-100% with
+  per-stage health gates and automatic rollback to the recorded pre-promote
+  version. This repository has no caller wiring to it yet, so do not treat
+  the existing gated readiness check plus manual rollback as proof of a
+  gradual traffic rollout here.
 
 For the full health, metrics, and rollback procedures, see the
 [operations runbook](runbook.md), [metrics reference](metrics.md), and

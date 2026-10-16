@@ -224,8 +224,9 @@ topk(5, sum by (route) (increase(two_bot_rest_requests_total{result="transport"}
 The rule fires above 10% 429s between two keepalive samples with at least 10
 requests in the window (`rest_429_rate`). The executor honors `retry-after`
 per attempt, so read the `route` label first and confirm no deploy is in
-progress before acting. 5xx/transport shares are informational — no rule
-covers them. Counter resets skip the window.
+progress before acting. The 5xx share has the same 10% / 10-request rule
+(`rest_5xx_rate`); only `transport` shares stay informational with no rule.
+Counter resets skip the window.
 
 Guard and token state (private `/metrics` `two_bot_rest_guard_*` + logs + `/readyz`):
 

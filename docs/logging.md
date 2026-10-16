@@ -41,7 +41,7 @@ Docker explicitly sets `LOG_FORMAT=json`; native runs also default to JSON.
 | `run_id` | Process invocation correlation: boot Unix nanoseconds + PID; not a durable job/session ID |
 | `spans` | Root-to-leaf list of named spans and typed fields; omitted when no span applies |
 | `code`, `count`, `hot_keys`, `revision` | Numeric bounded status/counters/revisions |
-| `signal`, `missing`, `reason` | Short bounded classifications/binding names, not raw provider data |
+| `signal`, `missing`, `reason`, `message_type` | Short bounded classifications/binding names, not raw provider data |
 
 Event fields are flattened into the root. Correlation fields from spans are also
 promoted to the root: inner span wins over outer; explicit event field wins over
