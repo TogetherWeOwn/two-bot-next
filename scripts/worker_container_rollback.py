@@ -286,14 +286,13 @@ def control_client(variant, token, worker_url, staging_url, actor, root=None):
             if match and any(f"HTTP {s}" in match.group(0) for s in AUTH_STATUSES):
                 raise GateError("ownership_auth_failed")
             detail = match.group(0) if match else None
-            if detail is not None and "intentionally fenced" in detail:
-                # Operator-safe refusal hint: fixed text only, never the
-                # token, request or response. The release stays an explicit
-                # workflow_dispatch with release_fence=true, never a push.
-                detail += ("; operator release: Actions > deploy-staging > "
-                           "Run workflow with release_fence checked after handoff "
-                           "authorization (push/default never releases; "
-                           "do not change credentials)")
+            # No operator release hint here: this client's takeover calls run
+            # with OWNERSHIP_RELEASE_FENCE=true, so the staging client never
+            # answers them with the fenced refusal (ownership-control.mjs
+            # throws it only when !releaseFence), and the production client
+            # throws the same prefix with a different release route. The
+            # scoped fence guidance lives in the deploy-staging takeover
+            # step, which runs with release_fence=false by default.
             raise GateError("ownership_control_failed", detail)
         try:
             return base.mapping(json.loads(result.stdout))

@@ -1368,6 +1368,24 @@ class WorkflowTests(unittest.TestCase):
         # The chain stays ordered: gate first, deploy second, synthetic last.
         self.assertEqual(staging["jobs"]["voice-synthetic"].get("needs"), "deploy")
 
+    def test_staging_takeover_fence_hint_is_scoped_to_the_fenced_refusal(self):
+        # The takeover step must show the fence release route only for the
+        # intentionally-fenced refusal. An unscoped `||` would print it for
+        # any failure (auth, transition-not-confirmed), sending operators to
+        # release the fence for a problem releasing cannot fix.
+        steps = self.workflows["deploy-staging.yml"]["jobs"]["deploy"]["steps"]
+        takeover = next(step for step in steps if step.get("id") == "takeover")
+        run = takeover["run"]
+        self.assertIn("deployment-takeover", run)
+        self.assertIn("Singleton is intentionally fenced or uninitialized", run)
+        self.assertIn("Staging singleton fenced", run)
+        # The fence guidance sits under the fenced-match guard, never on an
+        # unscoped failure branch; other failures take the generic branch.
+        self.assertLess(run.index("Singleton is intentionally fenced or uninitialized"),
+                        run.index("Staging singleton fenced"))
+        self.assertIn("not a fence refusal", run)
+        self.assertNotIn("deployment-takeover || {", run)
+
     def test_staging_runs_unconditionally_for_push_and_dispatch(self):
         staging = self.workflows["deploy-staging.yml"]
         self.assertEqual(staging_dispatch_errors(staging), [])
