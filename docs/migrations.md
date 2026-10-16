@@ -58,6 +58,14 @@ Write migrations that stay silent:
   `CONCURRENTLY` cannot run inside a transaction block). An index on a
   table created earlier in the same migration file targets an empty table
   and is not flagged.
+- If a concurrent index migration fails before it is recorded, the interrupted
+  build may leave an invalid index, and a successful build may be unrecorded.
+  Do not retry blindly: inspect the named index and migration ledger first. If
+  the migration is unapplied and the index exists, remove that index with a
+  standalone `DROP INDEX CONCURRENTLY IF EXISTS <schema>.<index>` command, then
+  retry through the normal migration runner. Do not bundle the drop with the
+  create in one migration query; PostgreSQL rejects concurrent index operations
+  inside a transaction block.
 - New check: `ADD CONSTRAINT ... CHECK (...) NOT VALID`, then
   `VALIDATE CONSTRAINT` separately.
 - Type change or drop: prefer an additive migration (new column, backfill,

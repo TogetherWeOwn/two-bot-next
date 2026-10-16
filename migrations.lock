@@ -417,6 +417,10 @@
     "crates/store/migrations/0442_game_activity_guild_aggregates.sql": {
       "sha256": "1fccfea2ca41d6047c4ac2af17b955c3f76b2fa108bfe648f6e22dc8845a6f60",
       "justification": "Guild-level game-activity aggregates (no member columns): additive table with nonnegativity plus voice-within-total checks; store chain copy, IF NOT EXISTS. Renumbered 0441 to 0442 after main's cutover 0440 stream-live claims; global migration numbers remain unique across both chains."
+    },
+    "crates/cutover/migrations/0443_event_store_expiry_index.sql": {
+      "sha256": "30d3b402165793d0734382326242e54e62e6aea175612079c2749849424778de",
+      "justification": "Add a concurrent event_time/id index so bounded oldest-first raw event-store expiry avoids sorting the append-only table."
     }
   }
 }

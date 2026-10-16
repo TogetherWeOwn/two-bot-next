@@ -83,6 +83,10 @@ pub const VOICE_RAW_RETENTION_DAYS: i32 = 30;
 pub const AUDIT_CACHE_RETENTION_DAYS: i32 = 45;
 /// User deletion requests complete well inside this many hours.
 pub const DELETION_SLA_HOURS: i64 = 72;
+/// Retention job cadence and raw-expiry maximum-age headroom.
+pub const RETENTION_CADENCE_SECONDS: u64 = 900;
+/// Maximum raw event-store rows selected by one expiry statement.
+const MAX_RAW_EXPIRY_ROWS_PER_BATCH: u32 = 1_000;
 
 /// Voice-session `events.event_type` values the time window selects: the
 /// producer's real funnel values plus the historical spellings already
@@ -128,9 +132,11 @@ pub struct RetentionReport {
     /// constraint error (see the warn log for the guild id).
     pub guild_purges_failed: u64,
     /// Queued guild purges deferred by an unresolved replay guard in this
-    /// run, in both modes. Deferred guilds stay queued with rows untouched
-    /// until the guards settle; unlike `guild_purges_failed` this needs no
-    /// incident response, only guard settlement (see `purge_guild` for
+    /// run, in both modes. Deferred guilds stay queued and the purge itself
+    /// does not delete their rows until guards settle; the independent raw
+    /// event-store age policy can still remove eligible captures. Unlike
+    /// `guild_purges_failed` this needs no incident response, only guard
+    /// settlement (see `purge_guild` for
     /// the per-guard settlement path). The dry run probes the same guards,
     /// so it reports exactly what the live run will defer, including guards
     /// of members with a pending user-deletion request: those rows are
@@ -217,10 +223,15 @@ fn next_request_id() -> String {
     format!("del-{nanos:x}-{seq:x}")
 }
 
-/// Run the retention job: rolling-window deletes, pending user-deletion
-/// completion, then guild-purge drain. Dry run reports counts and changes
-/// nothing. Deletion and queue writes happen in ONE transaction with the
-/// same lock/timeout discipline as `erase_member`; each pending deletion
+/// Run the retention job: apply rolling-window deletes, pending user-deletion
+/// completion, and the guild-purge drain, then attempt one globally capped raw
+/// event-store batch. Dry run reports the full raw-expiry backlog and changes
+/// nothing. Execute runs raw expiry only after core retention succeeds. The core
+/// transaction commits separately from the raw batch; raw-stage failure is
+/// logged and returned as a database error so the supervisor retries next
+/// cadence, while already committed core work remains complete. User-deletion
+/// and queue writes happen in ONE transaction with the same lock/timeout
+/// discipline as `erase_member`; each pending deletion
 /// runs in its own savepoint so one guard or schema-coverage refusal leaves
 /// that request pending without rolling back the time-window deletes, and
 /// each guild purge runs in its own savepoint so one bad guild stays queued
@@ -237,6 +248,73 @@ fn next_request_id() -> String {
 /// `schema_gap_deferrals` with the gap list in the warn log, and every queued
 /// guild stays queued (counted in `guild_purges_failed`) while gaps exist.
 pub async fn run_retention(
+    pool: &PgPool,
+    mode: RetentionMode,
+) -> Result<RetentionReport, sqlx::Error> {
+    let started = std::time::Instant::now();
+    let at = OffsetDateTime::now_utc();
+    let next_sweep_deadline = at + Duration::seconds(RETENTION_CADENCE_SECONDS as i64);
+    let core = run_retention_core(pool, mode);
+    let raw_expiry = async {
+        if mode == RetentionMode::DryRun {
+            count_raw_expiry_candidates(pool, next_sweep_deadline).await
+        } else {
+            let batch = run_raw_expiry_batch(
+                pool,
+                mode,
+                at,
+                next_sweep_deadline,
+                MAX_RAW_EXPIRY_ROWS_PER_BATCH,
+            )
+            .await?;
+            if batch.total_deleted() > 0 {
+                tracing::info!(
+                    message = "retention_raw_expiry_committed",
+                    mode = ?mode,
+                    presence_raw_deleted = batch.presence_raw_deleted,
+                    voice_raw_deleted = batch.voice_raw_deleted,
+                    audit_cache_deleted = batch.audit_cache_deleted,
+                    "raw retention batch committed",
+                );
+            }
+            Ok(batch)
+        }
+    };
+
+    let (mut report, raw_result) = run_retention_stages(core, raw_expiry).await?;
+    match raw_result {
+        Ok(raw_expiry) => {
+            report.presence_raw_deleted += raw_expiry.presence_raw_deleted;
+            report.voice_raw_deleted += raw_expiry.voice_raw_deleted;
+            report.audit_cache_deleted += raw_expiry.audit_cache_deleted;
+        }
+        Err(error) => {
+            tracing::warn!(
+                message = "retention_raw_expiry_failed",
+                mode = ?mode,
+                "core retention completed; raw expiry failed and will retry on the next cadence",
+            );
+            return Err(error);
+        }
+    }
+    report.duration_ms = started.elapsed().as_millis() as u64;
+    Ok(report)
+}
+
+async fn run_retention_stages<Core, Raw>(
+    core: Core,
+    raw_expiry: Raw,
+) -> Result<(RetentionReport, Result<RetentionReport, sqlx::Error>), sqlx::Error>
+where
+    Core: std::future::Future<Output = Result<RetentionReport, sqlx::Error>>,
+    Raw: std::future::Future<Output = Result<RetentionReport, sqlx::Error>>,
+{
+    let core = core.await?;
+    let raw_expiry = raw_expiry.await;
+    Ok((core, raw_expiry))
+}
+
+async fn run_retention_core(
     pool: &PgPool,
     mode: RetentionMode,
 ) -> Result<RetentionReport, sqlx::Error> {
@@ -354,49 +432,22 @@ pub async fn run_retention(
             sqlx::query(sqlx::AssertSqlSafe(lock_sql))
                 .execute(&mut *tx)
                 .await?;
-            let mut presence =
+            let presence =
                 sqlx::query("DELETE FROM presence_probe WHERE observed_at < to_char(now() - make_interval(days => $1), 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')")
                     .bind(PRESENCE_RAW_RETENTION_DAYS)
                     .execute(&mut *tx)
                     .await?
                     .rows_affected();
-            // Raw captures expire by event_time, never received_at, in the
-            // same transaction: a failure anywhere below rolls every
-            // time-window delete back instead of reporting partial success.
-            presence += sqlx::query(
-                "DELETE FROM event_store WHERE event_type = $1 AND event_time < now() - make_interval(days => $2)",
-            )
-            .bind(CAPTURE_PRESENCE)
-            .bind(PRESENCE_RAW_RETENTION_DAYS)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-            let mut voice = sqlx::query(sqlx::AssertSqlSafe(format!(
+            let voice = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM events WHERE event_type IN ({FUNNEL_VOICE_EVENT_TYPES}) AND occurred_at < now() - make_interval(days => $1)"
             )))
             .bind(VOICE_RAW_RETENTION_DAYS)
             .execute(&mut *tx)
             .await?
             .rows_affected();
-            voice += sqlx::query(
-                "DELETE FROM event_store WHERE event_type = ANY($1) AND event_time < now() - make_interval(days => $2)",
-            )
-            .bind(CAPTURE_VOICE.as_slice())
-            .bind(VOICE_RAW_RETENTION_DAYS)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-            let mut audit = sqlx::query(
+            let audit = sqlx::query(
                 "DELETE FROM operational_audit_log WHERE occurred_at < now() - make_interval(days => $1)",
             )
-            .bind(AUDIT_CACHE_RETENTION_DAYS)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-            audit += sqlx::query(
-                "DELETE FROM event_store WHERE event_type = $1 AND event_time < now() - make_interval(days => $2)",
-            )
-            .bind(CAPTURE_AUDIT)
             .bind(AUDIT_CACHE_RETENTION_DAYS)
             .execute(&mut *tx)
             .await?
@@ -557,6 +608,61 @@ pub async fn run_retention(
     Ok(report)
 }
 
+/// Count the full bounded-policy backlog for the lifecycle's dry-run report.
+/// Execute deletes at most one capped batch of this eligible set per run; the
+/// read-only projection must not report only the first batch as the total
+/// would-delete count.
+async fn count_raw_expiry_candidates(
+    pool: &PgPool,
+    next_sweep_deadline: OffsetDateTime,
+) -> Result<RetentionReport, sqlx::Error> {
+    let started = std::time::Instant::now();
+    let presence_cutoff =
+        next_sweep_deadline - Duration::days(i64::from(PRESENCE_RAW_RETENTION_DAYS));
+    let voice_cutoff = next_sweep_deadline - Duration::days(i64::from(VOICE_RAW_RETENTION_DAYS));
+    let audit_cutoff = next_sweep_deadline - Duration::days(i64::from(AUDIT_CACHE_RETENTION_DAYS));
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SET LOCAL statement_timeout = '15s'")
+        .execute(&mut *tx)
+        .await?;
+    let (presence, voice, audit): (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+            count(*) FILTER (WHERE event_type = $4),
+            count(*) FILTER (WHERE event_type = ANY($5)),
+            count(*) FILTER (WHERE event_type = $6)
+         FROM event_store
+         WHERE (event_type = $4 AND event_time <= $1)
+            OR (event_type = ANY($5) AND event_time <= $2)
+            OR (event_type = $6 AND event_time <= $3)",
+    )
+    .bind(presence_cutoff)
+    .bind(voice_cutoff)
+    .bind(audit_cutoff)
+    .bind(CAPTURE_PRESENCE)
+    .bind(&CAPTURE_VOICE[..])
+    .bind(CAPTURE_AUDIT)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(RetentionReport {
+        presence_raw_deleted: presence as u64,
+        voice_raw_deleted: voice as u64,
+        audit_cache_deleted: audit as u64,
+        guild_rows_purged: 0,
+        guild_purges_failed: 0,
+        guild_purges_deferred: 0,
+        guild_purges_deferred_oldest_secs: 0,
+        deletions_completed: 0,
+        deletions_deferred: 0,
+        schema_gap_deferrals: 0,
+        deletions_overdue: 0,
+        duration_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
 /// One bounded batch of raw `event_store` expiry for the existing retention
 /// lifecycle: at most `max_rows` rows across the presence, voice and
 /// audit-cache classes combined (oldest `event_time` first), in a single
@@ -572,14 +678,16 @@ pub async fn run_retention(
 /// after it; a zero `max_rows` or a nonpositive horizon is refused before
 /// any write.
 ///
-/// A backlog larger than one batch needs repeated calls within the same
-/// lifecycle cycle until a call reports fewer than `max_rows` rows; one
-/// bounded batch alone is not a maximum-age guarantee. The lifecycle owner
-/// supplies the deadline from its real cadence (no second scheduler lives
-/// here). Dry run reports the same bounded candidate set and writes
-/// nothing. Only the three raw-capture classes are reported; every other
-/// report field is zero because guild purges and user deletions stay with
-/// [`run_retention`].
+/// A caller that needs to drain a backlog may repeat calls until one reports
+/// fewer than `max_rows` rows; each call commits at most one batch. The
+/// production lifecycle intentionally runs one batch per cadence so overdue
+/// user deletions and guild purges still run when raw captures accumulate.
+/// The lifecycle owner supplies the deadline from its real cadence (no second
+/// scheduler lives here). Dry run reports at most one batch, not the full
+/// backlog; the `run_retention` lifecycle dry run reports the full count.
+/// Dry run writes nothing. Only the three raw-capture classes are reported; every
+/// other report field is zero because guild purges and user deletions stay
+/// with [`run_retention`].
 pub async fn run_raw_expiry_batch(
     pool: &PgPool,
     mode: RetentionMode,
@@ -594,11 +702,13 @@ pub async fn run_raw_expiry_batch(
         ));
     }
     let started = std::time::Instant::now();
-    let raw_cutoff = next_sweep_deadline - Duration::days(i64::from(PRESENCE_RAW_RETENTION_DAYS));
+    let presence_cutoff =
+        next_sweep_deadline - Duration::days(i64::from(PRESENCE_RAW_RETENTION_DAYS));
+    let voice_cutoff = next_sweep_deadline - Duration::days(i64::from(VOICE_RAW_RETENTION_DAYS));
     let audit_cutoff = next_sweep_deadline - Duration::days(i64::from(AUDIT_CACHE_RETENTION_DAYS));
-    // Presence and voice share the 30-day window; the audit cache uses 45.
-    let eligible = "(event_type IN ($4, $5, $6) AND event_time <= $1) \
-                    OR (event_type = $7 AND event_time <= $2)";
+    let eligible = "(event_type = $5 AND event_time <= $1) \
+                    OR (event_type IN ($6, $7) AND event_time <= $2) \
+                    OR (event_type = $8 AND event_time <= $3)";
     let mut tx = pool.begin().await?;
     let selected: Vec<String> = match mode {
         RetentionMode::DryRun => {
@@ -606,9 +716,10 @@ pub async fn run_raw_expiry_batch(
                 .execute(&mut *tx)
                 .await?;
             sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-                "SELECT event_type FROM event_store WHERE {eligible} ORDER BY event_time, id LIMIT $3"
+                "SELECT event_type FROM event_store WHERE {eligible} ORDER BY event_time, id LIMIT $4"
             )))
-            .bind(raw_cutoff)
+            .bind(presence_cutoff)
+            .bind(voice_cutoff)
             .bind(audit_cutoff)
             .bind(i64::from(max_rows))
             .bind(CAPTURE_PRESENCE)
@@ -625,15 +736,13 @@ pub async fn run_raw_expiry_batch(
             sqlx::query("SET LOCAL statement_timeout = '15s'")
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query("LOCK TABLE event_store IN SHARE ROW EXCLUSIVE MODE")
-                .execute(&mut *tx)
-                .await?;
             sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM event_store WHERE id IN \
-                 (SELECT id FROM event_store WHERE {eligible} ORDER BY event_time, id LIMIT $3) \
+                 (SELECT id FROM event_store WHERE {eligible} ORDER BY event_time, id LIMIT $4) \
                  RETURNING event_type"
             )))
-            .bind(raw_cutoff)
+            .bind(presence_cutoff)
+            .bind(voice_cutoff)
             .bind(audit_cutoff)
             .bind(i64::from(max_rows))
             .bind(CAPTURE_PRESENCE)
@@ -917,8 +1026,8 @@ fn guild_purge_sql(table: &str) -> String {
 /// starting at `first_placeholder`; empty when the table has no
 /// time-window stage. Mirrors the Execute deletes in [`run_retention`] so
 /// the dry-run guild projection can exclude rows that stage would already
-/// have removed. `event_store` needs two: its presence/voice captures and
-/// its audit cache carry different windows on the same table.
+/// have removed. `event_store` needs three: presence, voice and audit captures
+/// share a table but have per-class cutoffs.
 fn guild_projection_time_exclusions(table: &str, first_placeholder: usize) -> Vec<(String, i32)> {
     match table {
         "events" => vec![(
@@ -934,15 +1043,21 @@ fn guild_projection_time_exclusions(table: &str, first_placeholder: usize) -> Ve
         "event_store" => vec![
             (
                 format!(
-                    "event_type IN ('{CAPTURE_PRESENCE}', '{}', '{}') AND event_time < now() - make_interval(days => ${first_placeholder})",
-                    CAPTURE_VOICE[0], CAPTURE_VOICE[1]
+                    "event_type = '{CAPTURE_PRESENCE}' AND event_time <= now() + make_interval(secs => {RETENTION_CADENCE_SECONDS}) - make_interval(days => ${first_placeholder})"
                 ),
                 PRESENCE_RAW_RETENTION_DAYS,
             ),
             (
                 format!(
-                    "event_type = '{CAPTURE_AUDIT}' AND event_time < now() - make_interval(days => ${})",
-                    first_placeholder + 1
+                    "event_type IN ('{}', '{}') AND event_time <= now() + make_interval(secs => {RETENTION_CADENCE_SECONDS}) - make_interval(days => ${})",
+                    CAPTURE_VOICE[0], CAPTURE_VOICE[1], first_placeholder + 1
+                ),
+                VOICE_RAW_RETENTION_DAYS,
+            ),
+            (
+                format!(
+                    "event_type = '{CAPTURE_AUDIT}' AND event_time <= now() + make_interval(secs => {RETENTION_CADENCE_SECONDS}) - make_interval(days => ${})",
+                    first_placeholder + 2
                 ),
                 AUDIT_CACHE_RETENTION_DAYS,
             ),
@@ -1014,11 +1129,12 @@ async fn count_overdue_deletions(
 /// for a departed guild still completes with a receipt instead of vanishing.
 /// Re-checks the queue row under the caller's lock: a guild whose purge was
 /// cancelled via [`cancel_guild_purge`] (rejoin before the run) keeps its rows.
-/// Refuses before deleting anything while any replay guard is unresolved
+/// Refuses before the guild-purge DELETEs while any replay guard is unresolved
 /// anywhere in the guild (see `has_unresolved_guild_guards` in
-/// `crate::member_erasure`, which takes no member exclusions): the error
-/// keeps the guild queued with rows untouched until the guards settle, and
-/// the caller reports it via `guild_purges_deferred` (with the wait in
+/// `crate::member_erasure`, which takes no member exclusions): the purge keeps
+/// the guild queued and its rows untouched until the guards settle. The
+/// separate age-expiry stage can still remove eligible raw event-store captures.
+/// The caller reports the refusal via `guild_purges_deferred` (with the wait in
 /// `guild_purges_deferred_oldest_secs`), never `guild_purges_failed`.
 /// `not_sent` internal intents deliberately block too: a `not_sent` row is a
 /// live same-key retry permit (the owning caller may still re-claim it), and
@@ -1087,14 +1203,7 @@ async fn count_presence_raw(
         .bind(PRESENCE_RAW_RETENTION_DAYS)
         .fetch_one(&mut **tx)
         .await?;
-    let capture: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM event_store WHERE event_type = $1 AND event_time < now() - make_interval(days => $2)",
-    )
-    .bind(CAPTURE_PRESENCE)
-    .bind(PRESENCE_RAW_RETENTION_DAYS)
-    .fetch_one(&mut **tx)
-    .await?;
-    Ok((probe + capture) as u64)
+    Ok(probe as u64)
 }
 
 async fn count_voice_raw(
@@ -1106,14 +1215,7 @@ async fn count_voice_raw(
     .bind(VOICE_RAW_RETENTION_DAYS)
     .fetch_one(&mut **tx)
     .await?;
-    let capture: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM event_store WHERE event_type = ANY($1) AND event_time < now() - make_interval(days => $2)",
-    )
-    .bind(CAPTURE_VOICE.as_slice())
-    .bind(VOICE_RAW_RETENTION_DAYS)
-    .fetch_one(&mut **tx)
-    .await?;
-    Ok((funnel + capture) as u64)
+    Ok(funnel as u64)
 }
 
 async fn count_audit_cache(
@@ -1125,14 +1227,7 @@ async fn count_audit_cache(
     .bind(AUDIT_CACHE_RETENTION_DAYS)
     .fetch_one(&mut **tx)
     .await?;
-    let capture: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM event_store WHERE event_type = $1 AND event_time < now() - make_interval(days => $2)",
-    )
-    .bind(CAPTURE_AUDIT)
-    .bind(AUDIT_CACHE_RETENTION_DAYS)
-    .fetch_one(&mut **tx)
-    .await?;
-    Ok((operational + capture) as u64)
+    Ok(operational as u64)
 }
 
 /// One dynamically-numbered bind for a guild-projection count.
@@ -1260,4 +1355,99 @@ async fn count_queued_guild_rows(
         }
     }
     Ok((total, deferred_guilds, deferred_oldest))
+}
+
+#[cfg(test)]
+mod raw_expiry_producer_tests {
+    use super::{CAPTURE_AUDIT, CAPTURE_PRESENCE, CAPTURE_VOICE, FUNNEL_VOICE_EVENT_TYPES};
+    use twilight_model::gateway::event::EventType as Dispatch;
+    use two_bot_core::funnel::EventType as Funnel;
+
+    #[test]
+    fn expiry_literals_match_their_producer_enum_names() {
+        assert_eq!(CAPTURE_PRESENCE, Dispatch::PresenceUpdate.name().unwrap());
+        assert_eq!(CAPTURE_VOICE[0], Dispatch::VoiceStateUpdate.name().unwrap());
+        assert_eq!(
+            CAPTURE_VOICE[1],
+            Dispatch::VoiceServerUpdate.name().unwrap()
+        );
+        assert_eq!(
+            CAPTURE_AUDIT,
+            Dispatch::GuildAuditLogEntryCreate.name().unwrap()
+        );
+        for (event, expected) in [
+            (Funnel::VoiceSessionStart, "voice_session_start"),
+            (Funnel::VoiceSessionEnd, "voice_session_end"),
+        ] {
+            assert_eq!(event.as_str(), expected);
+            assert!(FUNNEL_VOICE_EVENT_TYPES.contains(&format!("'{expected}'")));
+        }
+        for historical in ["voice_session_started", "voice_session_ended"] {
+            assert!(
+                FUNNEL_VOICE_EVENT_TYPES.contains(&format!("'{historical}'")),
+                "historical voice event spelling {historical} must remain covered",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod retention_stage_order_tests {
+    use super::{run_retention_stages, RetentionReport};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn empty_report() -> RetentionReport {
+        RetentionReport {
+            presence_raw_deleted: 0,
+            voice_raw_deleted: 0,
+            audit_cache_deleted: 0,
+            guild_rows_purged: 0,
+            guild_purges_failed: 0,
+            guild_purges_deferred: 0,
+            guild_purges_deferred_oldest_secs: 0,
+            deletions_completed: 0,
+            deletions_deferred: 0,
+            schema_gap_deferrals: 0,
+            deletions_overdue: 0,
+            duration_ms: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn core_failure_prevents_raw_expiry_mutation() {
+        let raw_ran = AtomicBool::new(false);
+        let core = async { Err::<RetentionReport, _>(sqlx::Error::RowNotFound) };
+        let raw_expiry = async {
+            raw_ran.store(true, Ordering::SeqCst);
+            Ok::<_, sqlx::Error>(empty_report())
+        };
+
+        let result = run_retention_stages(core, raw_expiry).await;
+
+        assert!(matches!(result, Err(sqlx::Error::RowNotFound)));
+        assert!(!raw_ran.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn raw_expiry_failure_does_not_skip_core_retention() {
+        let core_ran = AtomicBool::new(false);
+        let core = async {
+            core_ran.store(true, Ordering::SeqCst);
+            let mut report = empty_report();
+            report.deletions_completed = 2;
+            Ok::<_, sqlx::Error>(report)
+        };
+        let raw_expiry = async {
+            assert!(core_ran.load(Ordering::SeqCst));
+            Err(sqlx::Error::RowNotFound)
+        };
+
+        let (report, raw_result) = run_retention_stages(core, raw_expiry)
+            .await
+            .expect("core report survives raw-expiry failure");
+
+        assert_eq!(report.deletions_completed, 2);
+        assert!(matches!(raw_result, Err(sqlx::Error::RowNotFound)));
+        assert!(core_ran.load(Ordering::SeqCst));
+    }
 }
