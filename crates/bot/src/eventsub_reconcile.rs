@@ -48,6 +48,8 @@ pub struct ReconcileSummary {
     /// even when the re-create succeeds so a never-verifying callback cannot
     /// log `healthy` while cycling delete/create every hour.
     pub prior_failed: usize,
+    /// Final follow-up status for a successful reconcile pass.
+    pub status: Option<&'static str>,
 }
 
 /// True when the EventSub slice is enabled in `vars`.
@@ -210,7 +212,13 @@ pub async fn reconcile_all<T: HelixTransport>(
     }
     let mut summary = summarize(&outcomes);
     summary.prior_failed = prior_failed;
-    if pending_only(desired, callback, &confirmed) {
+    let status = if pending_only(desired, callback, &confirmed) {
+        "pending"
+    } else {
+        "healthy"
+    };
+    summary.status = Some(status);
+    if status == "pending" {
         tracing::warn!(
             event = "eventsub_reconcile",
             error_class = "reconcile_pending",
@@ -622,6 +630,7 @@ mod tests {
                 created: 1,
                 already_exists: 1,
                 prior_failed: 0,
+                status: None,
             }
         );
         assert_eq!(
@@ -667,6 +676,7 @@ mod tests {
         )
         .await
         .expect("healthy follow-up must succeed");
+        assert_eq!(summary.status, Some("healthy"));
         assert_eq!(
             summary,
             ReconcileSummary {
@@ -674,6 +684,7 @@ mod tests {
                 created: 1,
                 already_exists: 0,
                 prior_failed: 0,
+                status: Some("healthy"),
             }
         );
         let seen = log.requests();
@@ -747,6 +758,7 @@ mod tests {
         )
         .await
         .expect("pending follow-up after a prior failure must still succeed");
+        assert_eq!(summary.status, Some("pending"));
         assert_eq!(summary.prior_failed, 1);
         assert_eq!(summary.deleted, 1);
         assert_eq!(summary.created, 1);
