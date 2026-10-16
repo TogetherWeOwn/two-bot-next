@@ -9,11 +9,11 @@ below ``--threshold`` percent (default 80). A patch with no coverable changed
 lines passes with a note.
 
 HARD mode: a shortfall prints ``::error::`` annotations and exits 1. A blind
-gate (missing lcov, unreadable diff) also errors and exits 1; it must never
-turn a blind PR green. Only the check.yml measurement wrapper stays
-warn-only: when ``cargo llvm-cov`` itself fails to run, unit-test failures
-are owned HARD by the rust-tests lane, so that path warns instead of failing
-this lane. Malformed arguments exit non-zero.
+gate (missing or unusable lcov, unreadable diff) also errors and exits 1; it
+must never turn a blind PR green. The check.yml measurement wrapper uses
+``--ignore-run-fail`` to collect coverage despite unit-test failures, which are
+owned HARD by the rust-tests lane. Build or report-generation failures still
+fail this lane. Malformed arguments exit non-zero.
 """
 
 import argparse
@@ -36,17 +36,21 @@ def read_lcov(path):
         return None, "lcov report is empty"
     hits = {}
     current = None
+    data_records = 0
     for raw in text.splitlines():
         if raw.startswith("SF:"):
-            current = raw[3:].strip()
+            current = raw[3:].strip() or None
         elif raw.startswith("DA:") and current is not None:
             parts = raw[3:].split(",")
             try:
                 hits[(current, int(parts[0]))] = int(parts[1])
+                data_records += 1
             except (ValueError, IndexError):
                 continue
         elif raw.strip() == "end_of_record":
             current = None
+    if not data_records:
+        return None, "lcov report contains no valid DA records"
     return hits, ""
 
 

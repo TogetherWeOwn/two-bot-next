@@ -59,6 +59,22 @@ class LcovTests(unittest.TestCase):
         self.assertIsNone(hits)
         self.assertTrue(error)
 
+    def test_garbage_lcov_without_data_records_is_blindness(self):
+        for text in (
+            "garbage",
+            "SF:src/lib.rs\nend_of_record\n",
+            "SF:src/lib.rs\nDA:not-a-line,1\n",
+            "SF:\nDA:1,1\nend_of_record\n",
+        ):
+            with self.subTest(text=text):
+                lcov = write_lcov(text)
+                try:
+                    hits, error = gate.read_lcov(lcov)
+                finally:
+                    Path(lcov).unlink()
+                self.assertIsNone(hits)
+                self.assertIn("DA", error)
+
 
 class EvaluateTests(unittest.TestCase):
     def test_only_changed_executable_lines_count(self):
