@@ -1757,9 +1757,10 @@ jobs:
       - name: Fetch pinned fuzz dependencies (locked)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fetch --locked
-      # Compile-only: builds all fifteen libFuzzer targets without executing them.
-      # No execution, no corpus output, no schedule; the bounded
-      # vote_kick smoke stays a manual non-controller step (see fuzz/README.md).
+      # Builds all fifteen libFuzzer targets. No fuzz campaign, no corpus
+      # output, no schedule; the only execution in this job is the bounded
+      # eventsub_delivery seed replay below. The bounded vote_kick smoke
+      # stays a manual non-controller step (see fuzz/README.md).
       # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the
       # toolchain from the repo-root rust-toolchain.toml (stable 1.98.1) even
       # with working-directory fuzz/, so a bare `cargo fuzz build` runs under
@@ -1767,6 +1768,15 @@ jobs:
       - name: Compile-only fuzz build (no execution)
         working-directory: fuzz
         run: cargo +nightly-2026-10-01 fuzz build
+      # Bounded seed replay, eventsub_delivery only: `-runs=0` executes each
+      # committed corpus seed exactly once (plus the target's fixed matrix)
+      # and exits without fuzzing. A signing-key drift between the harness
+      # and production, or seed misrouting, panics an assertion here instead
+      # of passing a compile-only gate. Compile stays the only gate for the
+      # other fourteen targets.
+      - name: Seed replay for eventsub_delivery (bounded, no campaign)
+        working-directory: fuzz
+        run: cargo +nightly-2026-10-01 fuzz run eventsub_delivery -- -runs=0 -timeout=10 -rss_limit_mb=2048
 
   worker:
     name: worker check
