@@ -1172,6 +1172,8 @@ mod tests {
             text.contains("reload log capture live"),
             "log capture missed events; the redaction assertions would pass vacuously"
         );
+        assert!(text.contains("eventsub delivery refused"));
+        assert!(text.contains("challenge answered"));
         for secret in secrets {
             assert!(
                 !text.contains(secret.as_str()),
