@@ -120,7 +120,10 @@ class RollbackClient(base.Client):
             ) from None
         except (base.URLError, TimeoutError, OSError):
             raise GateError("api_transport_failure") from None
-        require(status == 200 and len(raw) <= base.MAX_BODY, "api_http_failure", f"status={status}")
+        # The rollout-create POST answers 201 Created on success; requiring
+        # exactly 200 turns a restored image into api_http_failure.
+        require(status in (200, 201) and len(raw) <= base.MAX_BODY, "api_http_failure",
+                f"status={status}")
         data = base.mapping(base.decode(raw))
         require(data.get("success") is True and "result" in data, "api_failure")
         return data["result"]

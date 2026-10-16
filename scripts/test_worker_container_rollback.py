@@ -472,5 +472,67 @@ class MainValidationTests(unittest.TestCase):
         self.assertIn("invalid_expected_sha", out)
 
 
+class ScriptedResponse:
+    """Minimal urllib response: status plus a fixed body."""
+
+    def __init__(self, status, payload):
+        self.status = status
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self, limit=None):
+        return self.payload
+
+
+class ScriptedOpener:
+    def __init__(self, status, payload):
+        self.status = status
+        self.payload = payload
+
+    def open(self, request, timeout=None):
+        return ScriptedResponse(self.status, self.payload)
+
+
+def real_post(status, payload):
+    """Run the real RollbackClient.post against a scripted HTTP status."""
+    client = rollback.RollbackClient(ACCOUNT, "token")
+    client.opener = ScriptedOpener(status, payload)
+    return client.post(f"/containers/applications/{APP_ID}/rollouts",
+                       {"strategy": "rolling"})
+
+
+def success_envelope(result):
+    return json.dumps({"success": True, "result": result}).encode()
+
+
+class PostHttpStatusTests(unittest.TestCase):
+    def test_post_accepts_201_created(self):
+        # The container rollout-create POST answers 201 on success; the
+        # staging auto-rollback once failed a restored image as
+        # api_http_failure status=201.
+        self.assertEqual(real_post(201, success_envelope({"id": "r-new"})),
+                         {"id": "r-new"})
+
+    def test_post_still_accepts_200(self):
+        self.assertEqual(real_post(200, success_envelope({"id": "r-new"})),
+                         {"id": "r-new"})
+
+    def test_post_rejects_500(self):
+        with self.assertRaises(base.GateError) as caught:
+            real_post(500, b"{}")
+        self.assertEqual(caught.exception.args[0], "api_http_failure")
+        self.assertEqual(caught.exception.detail, "status=500")
+
+    def test_post_rejects_unsuccessful_envelope(self):
+        with self.assertRaises(base.GateError) as caught:
+            real_post(201, json.dumps({"success": False, "result": {}}).encode())
+        self.assertEqual(caught.exception.args[0], "api_failure")
+
+
 if __name__ == "__main__":
     unittest.main()
