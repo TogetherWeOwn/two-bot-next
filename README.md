@@ -79,22 +79,27 @@ claim. Staging deploys from `main`; production deploys through the manual
 Twitch `stream.online` deliveries arrive at the staging-only public Worker
 route (`POST /hooks/twitch`, `wrangler/src/eventsub.ts:30`), which forwards
 them inward (`wrangler/src/eventsub.ts:223`) to the private container
-receiver (`crates/bot/src/eventsub_http.rs:1`). The Worker route answers only when the staging variables `EVENTSUB_INGRESS`
-and `TWO_EVENTSUB` are both exactly `1`. The container listener starts only
-when `TWO_EVENTSUB` is exactly `1` with a valid bind and webhook secret
-(`crates/core/src/eventsub_receiver_config.rs:5`). Unset or `0` is dark; any
-other value, or an enabled configuration with a missing or invalid bind or
-secret, stops container startup. There is no health-only fallback; see the
-[EventSub runbook](docs/eventsub-runbook.md). Every delivery body is capped at
-64 KiB and verified (`twitch_eventsub::verify_delivery`,
+receiver (`crates/bot/src/eventsub_http.rs:1`). The Worker route answers only
+when the staging-only Worker var `EVENTSUB_INGRESS` and the Operator-set Worker
+secret `TWO_EVENTSUB` are both exactly `1`. A missing `TWO_TWITCH_WEBHOOK_SECRET`
+leaves the route live but forwards nothing, so it responds `503 unavailable`;
+flags other than `1` keep the route dark. The container listener on a direct
+start requires `TWO_EVENTSUB` exactly `1`, a valid bind with a nonzero port, and
+a valid webhook secret (`crates/core/src/eventsub_receiver_config.rs:5`). On a
+direct container start, unset or `0` stays dark; any other value, or an enabled
+configuration with a missing or invalid bind or secret, stops startup. Through
+the Worker, a present-but-invalid secret stops container startup. There is no
+health-only fallback; see the [EventSub runbook](docs/eventsub-runbook.md).
+Every delivery body is capped at 64 KiB and verified
+(`twitch_eventsub::verify_delivery`,
 `crates/core/src/twitch_eventsub.rs:169`) before JSON parsing or classification
 (`classify`, `crates/core/src/twitch_eventsub.rs:245`). Only `stream.online`
 version 1 is accepted for classification. The runtime receiver currently only
 acknowledges verified notifications and revocations: it does not create a post
 plan, claim a durable ledger row, or publish an announcement. Core planning and
-claim logic is not yet wired to a send path. Planning rules
-live in the [stream funnel](docs/stream-funnel.md); the operator runbook is
-the [EventSub runbook](docs/eventsub-runbook.md). The keys (`TWO_EVENTSUB`,
+claim logic is not yet wired to a send path. Planning rules live in the
+[stream funnel](docs/stream-funnel.md); the operator runbook is the
+[EventSub runbook](docs/eventsub-runbook.md). The keys (`TWO_EVENTSUB`,
 `TWO_EVENTSUB_BIND`, `TWO_TWITCH_WEBHOOK_SECRET`) are catalogued in
 [Configuration](docs/configuration.md) (`docs/configuration.md:194`).
 
