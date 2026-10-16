@@ -36,6 +36,7 @@ use axum::{
 use futures_util::future::BoxFuture;
 use serde_json::{json, Map, Value};
 use tokio::{net::TcpListener, sync::Semaphore};
+use tracing::Instrument;
 use two_bot_core::{
     automation_transfer::{
         diff_import, export_document, max_import_entries, parse_import_document, ImportOutcome,
@@ -57,11 +58,10 @@ use two_bot_core::{
         InternalStoreError, RequestIdentity, TerminalFailure, TerminalResponse,
     },
     internal_actions::{
-        new_request_id, require_field_str, require_snowflake, unmapped_event_key,
-        validate_announcement, validate_event_input, validate_event_key, validate_idempotency_key,
-        ActionError, AuthDecision, AuthHeaders, AuthenticatedRequest, ErrorCode,
-        GuildAddMemberRequest, InternalFlags, RoleAssignRequest, TokenBuckets, ACTIONS_PATH,
-        MAX_BODY_BYTES, SKEW_SECONDS,
+        require_field_str, require_snowflake, unmapped_event_key, validate_announcement,
+        validate_event_input, validate_event_key, validate_idempotency_key, ActionError,
+        AuthDecision, AuthHeaders, AuthenticatedRequest, ErrorCode, GuildAddMemberRequest,
+        InternalFlags, RoleAssignRequest, TokenBuckets, ACTIONS_PATH, MAX_BODY_BYTES, SKEW_SECONDS,
     },
     internal_settings::SettingsCommand,
     member_moderation_store::PgMemberModerationStore,
@@ -1191,46 +1191,59 @@ fn router(state: Arc<ReceiverState>) -> Router {
         .with_state(state)
 }
 
-async fn not_found(State(state): State<Arc<ReceiverState>>) -> Response {
-    state.reject(
-        Failure::http(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            false,
-            ErrorCode::Malformed,
-        ),
-        KeyLabel::Invalid,
-        ActionLabel::Unknown,
-        &request_id(),
-    )
-}
-
-async fn handle(State(state): State<Arc<ReceiverState>>, request: Request) -> Response {
-    let id = request_id();
-    let Ok(_permit) = Arc::clone(&state.capacity).try_acquire_owned() else {
-        return state.reject(
+async fn not_found(State(state): State<Arc<ReceiverState>>, request: Request) -> Response {
+    let id = crate::logging::incoming_request_id(request.headers());
+    let span = crate::logging::request_span(&id);
+    async move {
+        state.reject(
             Failure::http(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "busy",
-                true,
-                ErrorCode::RateLimited,
+                StatusCode::NOT_FOUND,
+                "not_found",
+                false,
+                ErrorCode::Malformed,
             ),
             KeyLabel::Invalid,
             ActionLabel::Unknown,
             &id,
-        );
-    };
-    match tokio::time::timeout(REQUEST_TIMEOUT, receive(&state, request, &id)).await {
-        Ok(response) => response,
-        // Dropping the future retains an announcement claim (a fresh nonce sees
-        // InFlight or NeedsReconciliation); event mutations finish in their own task.
-        Err(_) => state.reject(
-            Failure::code(ErrorCode::UpstreamTimeout),
-            KeyLabel::Invalid,
-            ActionLabel::Unknown,
-            &id,
-        ),
+        )
     }
+    .instrument(span)
+    .await
+}
+
+async fn handle(State(state): State<Arc<ReceiverState>>, request: Request) -> Response {
+    // Honor the Worker's `x-request-id` when it has a generated shape, so one
+    // id joins the Worker, Durable Object, container and queued-work logs.
+    let id = crate::logging::incoming_request_id(request.headers());
+    let span = crate::logging::request_span(&id);
+    async move {
+        let Ok(_permit) = Arc::clone(&state.capacity).try_acquire_owned() else {
+            return state.reject(
+                Failure::http(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "busy",
+                    true,
+                    ErrorCode::RateLimited,
+                ),
+                KeyLabel::Invalid,
+                ActionLabel::Unknown,
+                &id,
+            );
+        };
+        match tokio::time::timeout(REQUEST_TIMEOUT, receive(&state, request, &id)).await {
+            Ok(response) => response,
+            // Dropping the future retains an announcement claim (a fresh nonce sees
+            // InFlight or NeedsReconciliation); event mutations finish in their own task.
+            Err(_) => state.reject(
+                Failure::code(ErrorCode::UpstreamTimeout),
+                KeyLabel::Invalid,
+                ActionLabel::Unknown,
+                &id,
+            ),
+        }
+    }
+    .instrument(span)
+    .await
 }
 
 async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Response {
@@ -1342,18 +1355,25 @@ async fn receive(state: &Arc<ReceiverState>, request: Request, id: &str) -> Resp
         let task_idempotency = headers.idempotency.map(str::to_owned);
         let task_id = id.to_owned();
         let task_key = key.clone();
-        let task = tokio::spawn(async move {
-            mutate_event(
-                &task_state,
-                &task_decision,
-                &task_raw,
-                task_idempotency.as_deref(),
-                &task_id,
-                task_key,
-                action,
-            )
-            .await
-        });
+        // Queued work inherits the request span: `tokio::spawn` does not
+        // propagate tracing context, so without this the follow-up's log
+        // lines could not join the Worker/DO/container request by id.
+        let task_span = tracing::Span::current();
+        let task = tokio::spawn(
+            async move {
+                mutate_event(
+                    &task_state,
+                    &task_decision,
+                    &task_raw,
+                    task_idempotency.as_deref(),
+                    &task_id,
+                    task_key,
+                    action,
+                )
+                .await
+            }
+            .instrument(task_span),
+        );
         return match task.await {
             Ok(response) => response,
             Err(_) => state.reject(Failure::reconciliation(), key, action, id),
@@ -3211,10 +3231,6 @@ fn now_ms() -> u64 {
         .map_or(0, |elapsed| {
             elapsed.as_millis().try_into().unwrap_or(u64::MAX)
         })
-}
-
-fn request_id() -> String {
-    new_request_id(now_ms(), &rand::random())
 }
 
 #[cfg(test)]

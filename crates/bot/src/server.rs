@@ -160,6 +160,7 @@ impl<B> MakeSpan<B> for RedactedHttpMakeSpan {
             "request",
             http.request.method = %request.method(),
             http.request.path = %redacted_path(request.uri()),
+            request_id = %crate::logging::incoming_request_id(request.headers()),
         )
     }
 }

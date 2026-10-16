@@ -12,6 +12,7 @@ import { randomBytes } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import worker, { TwoBotContainer, type Env } from "../src/index.ts";
 import { OWNER_KEY, DEPLOYMENT_HEADER } from "../src/ownership.ts";
+import { isRequestId } from "../src/request-id.ts";
 import {
   ACTIONS_PATH,
   CONTAINER_MARKER,
@@ -21,6 +22,7 @@ import {
   MAX_RESPONSE_BYTES,
   RECEIVER_BIND,
   RECEIVER_PORT,
+  handleActionsIngress,
   relayReceiverResponse,
   resetIngressLimits,
 } from "../src/internal-actions.ts";
@@ -428,9 +430,11 @@ test("forwards exactly the allowlisted headers and unchanged bytes to the fixed 
   assert.equal(call.method, "POST");
   assert.equal(Buffer.compare(call.body, payload), 0, "body bytes unchanged");
   assert.deepEqual(Object.keys(call.headers).sort(), [
-    "content-type", "idempotency-key",
+    "content-type", "idempotency-key", "x-request-id",
     "x-two-key-id", "x-two-nonce", "x-two-signature", "x-two-timestamp",
   ]);
+  // No inbound id here, so the edge minted one: a valid join key, not a leak.
+  assert.ok(isRequestId(call.headers["x-request-id"] ?? ""));
   assert.equal(call.headers["x-two-signature"], SIGNATURE);
   assert.equal(call.headers["x-two-nonce"], NONCE);
   assert.equal(call.headers["content-type"], "application/json");
@@ -554,7 +558,7 @@ test("the ownership fence refuses ingress; a stale or spoofed deployment never f
   assert.equal(h.seen.length, before);
 });
 
-test("logs carry only scalar event, status and error class", async (t) => {
+test("logs carry only scalar event, status, error class and request id", async (t) => {
   const h = await harness(t, ENABLED_ENV);
   await h.warm();
   const secrets = [SIGNATURE, NONCE, BODY, KEYS, "203.0.113", INTENT_ID];
@@ -567,10 +571,72 @@ test("logs carry only scalar event, status and error class", async (t) => {
   assert.ok(ingress.length >= 3, "refusals are logged");
   for (const line of ingress) {
     const record = JSON.parse(line) as Record<string, unknown>;
-    assert.deepEqual(Object.keys(record).sort(), ["error_class", "event", "status"]);
+    assert.deepEqual(Object.keys(record).sort(), ["error_class", "event", "request_id", "status"]);
     assert.match(String(record["error_class"]), /^[a-z_]+$/);
+    assert.ok(isRequestId(String(record["request_id"])), `bad id shape: ${line}`);
   }
   for (const line of h.logs) for (const secret of secrets) assert.ok(!line.includes(secret), secret);
+});
+
+test("minted request id survives header filtering and an upstream refusal", async (t) => {
+  resetIngressLimits();
+  t.after(() => resetIngressLimits());
+  t.mock.method(console, "warn", () => {});
+  const attacker = "Bearer synthetic-ingress-secret";
+  let forwardedId: string | null = null;
+  const response = await handleActionsIngress(
+    post(BODY, { ...SIGNED_HEADERS, "x-request-id": attacker }),
+    "request-id-correlation-test",
+    async (sanitized) => {
+      forwardedId = sanitized.headers.get("x-request-id");
+      throw new Error("synthetic upstream failure");
+    },
+  );
+  assert.equal(response.status, 503);
+  const body = await response.json() as { request_id: string };
+  assert.ok(isRequestId(forwardedId ?? ""));
+  assert.equal(body.request_id, forwardedId);
+});
+
+test("honored request id survives ingress refusal and receiver forward", async (t) => {
+  const h = await harness(t, ENABLED_ENV);
+  await h.warm();
+  // Hand-built 26-char Crockford id (no I/L/O/U, no lowercase).
+  const sent = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+  assert.equal(sent.length, 26);
+  const refused = await h.call(post(BODY, { ...SIGNED_HEADERS, "content-type": "text/plain", "x-request-id": sent }));
+  assert.equal(refused.status, 415);
+  assert.equal((await refused.json() as { request_id: string }).request_id, sent);
+  const forwarded = await h.call(post(BODY, { ...SIGNED_HEADERS, "x-request-id": sent }));
+  assert.equal(forwarded.status, 200);
+  const calls = h.receiverCalls();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.headers["x-request-id"], sent);
+  const ingress = h.logs.filter((line) => line.includes("internal_actions_ingress"));
+  assert.ok(ingress.every((line) => line.includes(sent)), "refusal log must join by the sent id");
+  // An attacker-shaped value is never honored, forwarded or logged.
+  const attacker = "Bearer synthetic-ingress-secret";
+  const refusedAttacker = await h.call(post(BODY, { ...SIGNED_HEADERS, "content-type": "text/plain", "x-request-id": attacker }));
+  assert.equal(refusedAttacker.status, 415);
+  const minted = (await refusedAttacker.json() as { request_id: string }).request_id;
+  assert.ok(isRequestId(minted));
+  assert.notEqual(minted, attacker);
+  await h.call(post(BODY, { ...SIGNED_HEADERS, "x-request-id": attacker }));
+  for (const callRecord of h.receiverCalls().slice(1)) {
+    assert.ok(isRequestId(callRecord.headers["x-request-id"] ?? ""));
+    assert.notEqual(callRecord.headers["x-request-id"], attacker);
+  }
+  for (const line of h.logs) assert.ok(!line.includes("synthetic-ingress-secret"), line);
+});
+
+test("receiver relay refusal keeps the request id from the incoming request", async () => {
+  const sent = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+  const response = await relayReceiverResponse(new Response("synthetic receiver failure", {
+    status: 503,
+    headers: { "content-type": "text/plain" },
+  }), sent);
+  assert.equal(response.status, 503);
+  assert.equal((await response.json() as { request_id: string }).request_id, sent);
 });
 
 // ---------------------------------------------------------------- container wiring

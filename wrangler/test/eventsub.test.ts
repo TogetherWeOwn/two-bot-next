@@ -11,11 +11,13 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import worker, { TwoBotContainer, type Env } from "../src/index.ts";
 import { DEPLOYMENT_HEADER, OWNER_KEY } from "../src/ownership.ts";
+import { isRequestId } from "../src/request-id.ts";
 import {
   EVENTSUB_PATH,
   EVENTSUB_RECEIVER_BIND,
   EVENTSUB_RECEIVER_PORT,
   MAX_BODY_BYTES,
+  handleEventsubIngress,
   MAX_IN_FLIGHT,
   relayEventsubResponse,
   resetEventsubIngressLimits,
@@ -513,6 +515,8 @@ test("forwards exactly the allowlisted headers and unchanged bytes to the fixed 
   for (const dropped of ["authorization", "cookie", "twitch-eventsub-message-retry", "twitch-eventsub-subscription-type", "x-forwarded-for", "x-custom", "cf-connecting-ip"]) {
     assert.ok(!(dropped in call.headers), `${dropped} must not forward`);
   }
+  // No inbound id here, so the edge minted one: a valid join key, not a leak.
+  assert.ok(isRequestId(call.headers["x-request-id"] ?? ""));
   // The fence id is stamped server-side, never taken from the caller.
   assert.notEqual(call.headers[DEPLOYMENT_HEADER.toLowerCase()], "caller-chosen-deployment");
 });
@@ -610,7 +614,7 @@ test("public ingress never starts the container: a cold instance answers 503 wit
   assert.deepEqual(h.starts, [], "container not started");
 });
 
-test("logs carry only scalar event/status/error_class: no header value, challenge or body ever lands", async (t) => {
+test("logs carry only scalar event/status/error_class/request_id: no header value, challenge or body ever lands", async (t) => {
   const h = await harness(t, ENABLED_ENV);
   await h.warm();
   h.serveEventsubReceiver();
@@ -625,4 +629,68 @@ test("logs carry only scalar event/status/error_class: no header value, challeng
   for (const secret of [MESSAGE_ID, MESSAGE_SIGNATURE, MESSAGE_TIMESTAMP, CHALLENGE, BODY]) {
     assert.ok(!text.includes(secret), "sensitive value reached the logs");
   }
+  const ingress = h.logs.filter((line) => line.includes("eventsub_ingress"));
+  assert.ok(ingress.length >= 1, "refusals are logged");
+  for (const line of ingress) {
+    const record = JSON.parse(line) as Record<string, unknown>;
+    assert.deepEqual(Object.keys(record).sort(), ["error_class", "event", "request_id", "status"]);
+    assert.ok(isRequestId(String(record["request_id"])), `bad id shape: ${line}`);
+  }
+});
+
+test("minted request id survives EventSub header filtering and upstream refusal", async (t) => {
+  resetEventsubIngressLimits();
+  t.after(() => resetEventsubIngressLimits());
+  t.mock.method(console, "warn", () => {});
+  const attacker = "Bearer synthetic-eventsub-secret";
+  let forwardedId: string | null = null;
+  const response = await handleEventsubIngress(
+    post(BODY, { ...DELIVERY_HEADERS, "x-request-id": attacker }),
+    "request-id-correlation-test",
+    async (sanitized) => {
+      forwardedId = sanitized.headers.get("x-request-id");
+      throw new Error("synthetic upstream failure");
+    },
+  );
+  assert.equal(response.status, 503);
+  const body = await response.json() as { request_id: string };
+  assert.ok(isRequestId(forwardedId ?? ""));
+  assert.equal(body.request_id, forwardedId);
+});
+
+test("EventSub relay refusal keeps the request id from the incoming request", async () => {
+  const sent = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+  const response = await relayEventsubResponse(new Response("synthetic receiver failure", {
+    status: 503,
+    headers: { "content-type": "text/plain" },
+  }), sent);
+  assert.equal(response.status, 503);
+  assert.equal((await response.json() as { request_id: string }).request_id, sent);
+});
+
+test("x-request-id is honored across refusal, envelope and receiver forward", async (t) => {
+  const h = await harness(t, ENABLED_ENV);
+  await h.warm();
+  h.serveEventsubReceiver();
+  // Hand-built 26-char Crockford id (no I/L/O/U, no lowercase).
+  const sent = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+  const refused = await h.call(post(BODY, { ...DELIVERY_HEADERS, "content-type": "text/plain", "x-request-id": sent }));
+  assert.equal(refused.status, 415);
+  assert.equal((await refused.json() as { request_id: string }).request_id, sent);
+  const forwarded = await h.call(post(BODY, { ...DELIVERY_HEADERS, "x-request-id": sent }));
+  assert.equal(forwarded.status, 200);
+  await forwarded.arrayBuffer();
+  const calls = h.receiverCalls();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.headers["x-request-id"], sent);
+  const ingress = h.logs.filter((line) => line.includes("eventsub_ingress"));
+  assert.ok(ingress.every((line) => line.includes(sent)), "refusal log must join by the sent id");
+  // An attacker-shaped value is never honored, forwarded or logged.
+  const attacker = "Bearer synthetic-eventsub-secret";
+  const refusedAttacker = await h.call(post(BODY, { ...DELIVERY_HEADERS, "content-type": "text/plain", "x-request-id": attacker }));
+  assert.equal(refusedAttacker.status, 415);
+  const minted = (await refusedAttacker.json() as { request_id: string }).request_id;
+  assert.ok(isRequestId(minted));
+  assert.notEqual(minted, attacker);
+  for (const line of h.logs) assert.ok(!line.includes("synthetic-eventsub-secret"), line);
 });

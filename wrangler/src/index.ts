@@ -106,6 +106,7 @@ import {
 } from "./alert-rules.ts";
 import { parseAlertScrape } from "./metrics-scrape.ts";
 import { applySecurityHeaders, withSecurityHeaders } from "./security-headers.ts";
+import { REQUEST_ID_HEADER, ensureRequestId } from "./request-id.ts";
 import { handleMcp } from "./mcp.ts";
 import {
   OPS_DASHBOARD_PATH,
@@ -866,9 +867,13 @@ export class TwoBotContainer extends Container<Env> {
    */
   private async internalActions(request: Request): Promise<Response> {
     if (!ingressEnabled(this.env) || !isActionsRequest(request)) return notFound();
-    const checked = allowlistedHeaders(request.headers);
+    // The Worker's stamped id (or a fresh one): the forward already carries
+    // it via the allowlisted headers, and these envelopes echo it so a 503
+    // still joins the flow's Worker and container logs.
+    const requestId = ensureRequestId(request.headers.get(REQUEST_ID_HEADER));
+    const checked = allowlistedHeaders(request.headers, requestId);
     if ("refusal" in checked) return checked.refusal;
-    const body = await readBody(request);
+    const body = await readBody(request, requestId);
     if ("refusal" in body) return body.refusal;
     const forward = forwardRequest(
       `http://c${ACTIONS_PATH}`,
@@ -879,17 +884,17 @@ export class TwoBotContainer extends Container<Env> {
     try {
       return await this.owned(async () => {
         await this.ownership.require(this.id(), request.headers.get(DEPLOYMENT_HEADER) ?? "");
-        if (!this.ctx.container?.running) return envelope(503, "unavailable", true);
+        if (!this.ctx.container?.running) return envelope(503, "unavailable", true, {}, requestId);
         try {
-          return await relayReceiverResponse(await this.containerFetch(forward, RECEIVER_PORT));
+          return await relayReceiverResponse(await this.containerFetch(forward, RECEIVER_PORT), requestId);
         } catch {
-          return envelope(503, "unavailable", true);
+          return envelope(503, "unavailable", true, {}, requestId);
         }
       });
     } catch (error) {
       // Logs the closed ownership reason; the caller only sees the envelope.
       refused(error);
-      return envelope(503, "unavailable", true);
+      return envelope(503, "unavailable", true, {}, requestId);
     }
   }
 
@@ -904,9 +909,12 @@ export class TwoBotContainer extends Container<Env> {
    */
   private async internalEventsub(request: Request): Promise<Response> {
     if (!eventsubIngressEnabled(this.env) || !isEventsubRequest(request)) return notFound();
-    const checked = eventsubAllowlistedHeaders(request.headers);
+    // Same join as the actions path above: the forward carries the stamped
+    // id, and these envelopes echo it so a 503 still joins the flow's logs.
+    const requestId = ensureRequestId(request.headers.get(REQUEST_ID_HEADER));
+    const checked = eventsubAllowlistedHeaders(request.headers, requestId);
     if ("refusal" in checked) return checked.refusal;
-    const body = await readEventsubBody(request);
+    const body = await readEventsubBody(request, requestId);
     if ("refusal" in body) return body.refusal;
     const forward = forwardRequest(
       `http://c${EVENTSUB_PATH}`,
@@ -917,17 +925,17 @@ export class TwoBotContainer extends Container<Env> {
     try {
       return await this.owned(async () => {
         await this.ownership.require(this.id(), request.headers.get(DEPLOYMENT_HEADER) ?? "");
-        if (!this.ctx.container?.running) return envelope(503, "unavailable", true);
+        if (!this.ctx.container?.running) return envelope(503, "unavailable", true, {}, requestId);
         try {
-          return await relayEventsubResponse(await this.containerFetch(forward, EVENTSUB_RECEIVER_PORT));
+          return await relayEventsubResponse(await this.containerFetch(forward, EVENTSUB_RECEIVER_PORT), requestId);
         } catch {
-          return envelope(503, "unavailable", true);
+          return envelope(503, "unavailable", true, {}, requestId);
         }
       });
     } catch (error) {
       // Logs the closed ownership reason; the caller only sees the envelope.
       refused(error);
-      return envelope(503, "unavailable", true);
+      return envelope(503, "unavailable", true, {}, requestId);
     }
   }
 
@@ -1483,8 +1491,9 @@ export default {
         });
       }
       // Sanitize the forwarded probe: keep the origin (Host) the Container
-      // expects, but drop the query, caller headers and body. The only header
-      // the DO sees is the Worker-stamped deployment id the fence requires.
+      // expects, but drop the query, caller headers and body. The DO sees the
+      // Worker-stamped deployment id the fence requires, plus the validated
+      // `x-request-id` so the container's request span joins this probe.
       const clean = new URL(request.url);
       clean.search = "";
       clean.hash = "";
@@ -1494,11 +1503,12 @@ export default {
       try {
         deployment = deploymentId(env.CF_VERSION_METADATA?.id);
       } catch (error) { return refused(error); }
+      const probeId = ensureRequestId(request.headers.get(REQUEST_ID_HEADER));
       let response: Response;
       try {
         const sanitized = new Request(clean.toString(), {
           method: request.method,
-          headers: { [DEPLOYMENT_HEADER]: deployment },
+          headers: { [DEPLOYMENT_HEADER]: deployment, [REQUEST_ID_HEADER]: probeId },
         });
         const upstream = await env.TWO_BOT.getByName(SINGLETON_NAME).fetch(sanitized);
         // SDK startup failures arrive as responses rather than rejections.
