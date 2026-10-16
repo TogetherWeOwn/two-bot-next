@@ -171,11 +171,13 @@ reconcile log contract, not an observed staging event. The live staging read
 for 2026-10-15 21:41–22:11Z returned zero lines for both original filters, so
 it cannot provide a truthful positive sample; no staging result is claimed for
 the added pending filter.
-Expected while the reconcile slice is undeployed. After it deploys, expect
-roughly one line from the three Q2 queries per pass (one pass per hour, plus
-one per startup). The loop sleeps a full `RECONCILE_INTERVAL_SECS` (3600 s)
-after each pass returns, so a normal emission-to-emission gap is always over
-one hour and a 60-minute empty window happens every cycle.
+Expected while the reconcile slice is undeployed. After it deploys, each pass
+ends with one terminal outcome line from the table above; a failed or unhealthy
+pass may log earlier `reconcile_prior_failed` or `reconcile_unhealthy` lines
+within the same pass. Passes run at startup and then hourly. The loop sleeps a
+full `RECONCILE_INTERVAL_SECS` (3600 s) after each pass returns, so the gap from
+one pass's terminal outcome to the next pass's terminal outcome is always over
+one hour; a 60-minute window with no terminal outcome is normal.
 
 A window of more than two hours with none of the three Q2 queries returning a
 line (with `TWO_EVENTSUB=1` set) shows only that no pass has completed in that
