@@ -319,7 +319,7 @@ impl SelfRoleService {
                         .await
                         .map(|_| ())
                         .map_err(|error| match error {
-                            RuntimeError::Store => ErrorClass::Database,
+                            RuntimeError::Store(_) => ErrorClass::Database,
                             RuntimeError::Rest(_) => ErrorClass::Rest,
                             _ => ErrorClass::Configuration,
                         })

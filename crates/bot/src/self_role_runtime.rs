@@ -118,9 +118,15 @@ pub(crate) struct SelfRoleRequest {
 }
 
 /// Scalar diagnostics only. Store/provider detail and claim tokens never escape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoreErrorKind {
+    Timeout,
+    Database,
+}
+
 #[derive(Debug)]
 pub(crate) enum RuntimeError {
-    Store,
+    Store(StoreErrorKind),
     Rest(SelfRoleRestError),
     Stale,
     InvalidSnapshot,
@@ -132,11 +138,11 @@ async fn store_io<T>(
 ) -> Result<T, RuntimeError> {
     tokio::time::timeout(STORE_TIMEOUT, operation)
         .await
-        .map_err(|_| RuntimeError::Store)?
+        .map_err(|_| RuntimeError::Store(StoreErrorKind::Timeout))?
         .map_err(|error| match error {
             StoreError::StaleClaim => RuntimeError::Stale,
             StoreError::PendingExchange => RuntimeError::PendingExchange,
-            _ => RuntimeError::Store,
+            _ => RuntimeError::Store(StoreErrorKind::Database),
         })
 }
 
@@ -456,7 +462,7 @@ impl SelfRoleRuntime {
     ) -> Result<(), RuntimeError> {
         if let Some(receipt) = step_receipt(exchange) {
             if !store_io(self.store.complete_role_exchange(ticket, receipt)).await? {
-                return Err(RuntimeError::Store);
+                return Err(RuntimeError::Store(StoreErrorKind::Database));
             }
         }
         Ok(())

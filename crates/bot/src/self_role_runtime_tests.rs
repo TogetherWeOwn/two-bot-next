@@ -21,6 +21,21 @@ const OLD_ROLE: &str = "100000000000000009";
 const NOW: i64 = 1_700_000_000_000;
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+#[tokio::test(start_paused = true)]
+async fn store_errors_report_only_database_or_timeout_kind() {
+    let database = store_io(async { Err::<(), _>(StoreError::InvalidLease) }).await;
+    assert!(matches!(
+        database,
+        Err(RuntimeError::Store(StoreErrorKind::Database))
+    ));
+
+    let timeout = store_io(std::future::pending::<Result<(), StoreError>>()).await;
+    assert!(matches!(
+        timeout,
+        Err(RuntimeError::Store(StoreErrorKind::Timeout))
+    ));
+}
+
 fn panel(mode: PanelMode) -> SelfRolePanel {
     SelfRolePanel {
         id: "games".into(),
