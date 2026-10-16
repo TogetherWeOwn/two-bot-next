@@ -3321,6 +3321,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sweep_requeues_rate_limited_unbans() {
+        let discord = MockMemberDiscord::new();
+        let store = MemMemberStore::new();
+        let svc = service(discord.clone(), store.clone());
+
+        let mut exec = execution(ModerationAction::TempBan);
+        exec.request_id = "req-tempban-429".to_owned();
+        exec.idempotency_key = "key-tempban-429".to_owned();
+        svc.execute(&exec).await.expect("tempban");
+        {
+            let mut inner = svc.store.inner.lock().expect("lock");
+            let row = inner.unbans.get_mut("req-tempban-429").expect("staged");
+            row.execute_at = "2023-11-14T22:00:00.000Z".to_owned();
+        }
+        svc.discord.fail_with("unban", DiscordError::RateLimited);
+        let err = svc
+            .run_due_unbans(GUILD)
+            .await
+            .expect_err("first error rethrown");
+        assert_eq!(err, MemberError::Discord(DiscordError::RateLimited));
+        assert_eq!(
+            svc.store.unban_state("req-tempban-429"),
+            Some("pending".to_owned())
+        );
+        svc.discord.clear_failure("unban");
+        assert_eq!(svc.run_due_unbans(GUILD).await.expect("retry sweep"), 1);
+        assert_eq!(
+            svc.store.unban_state("req-tempban-429"),
+            Some("done".to_owned())
+        );
+    }
+
+    #[tokio::test]
     async fn tempban_ban_rejection_cancels_the_staged_row() {
         let discord = MockMemberDiscord::new();
         let store = MemMemberStore::new();
@@ -4419,6 +4452,33 @@ mod tests {
         discord.clear_failure("kick");
         assert_eq!(svc.execute(&request).await, Err(MemberError::InFlight));
         assert_eq!(discord.call_count("kick"), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_release_after_rate_limit_names_the_rate_limit_cause() {
+        let capture = LogCapture::global();
+        let discord = MockMemberDiscord::new();
+        let store = FaultyStore::wrap(MemMemberStore::new());
+        let svc = MemberModerationService::new(discord.clone(), store.clone(), policy(), || {
+            1_700_000_000_000
+        });
+        let request = execution_with_id(ModerationAction::Kick, "req-rate-limit-release-fault");
+
+        discord.fail_with("kick", DiscordError::RateLimited);
+        store.arm_release();
+        let mark = capture.mark();
+        let err = svc.execute(&request).await.expect_err("rate limited");
+        assert_eq!(err, MemberError::Discord(DiscordError::RateLimited));
+        let lines = capture.lines(mark, RELEASE_FAILED, "moderation.kick");
+        assert_eq!(lines.len(), 1, "one diagnostic per failed release");
+        assert!(
+            lines[0].contains("cause=\"discord_rate_limited\""),
+            "{}",
+            lines[0]
+        );
+        assert!(!lines[0].contains("req-rate-limit-release-fault"));
+        assert_eq!(svc.execute(&request).await, Err(MemberError::InFlight));
+        assert_eq!(discord.call_count("kick"), 1);
     }
 
     // The storage branch of the same rule: a rolled-back stage releases the
