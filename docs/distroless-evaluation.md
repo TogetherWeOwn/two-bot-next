@@ -13,12 +13,16 @@ components ready, gateway included) plus a green voice-synthetic pass — the
 `rustls-platform-verifier` system-bundle path completes live Discord TLS.
 Rollback requires a coordinated change, not a one-file restore: use a matched,
 pinned bookworm builder and runtime in `Dockerfile`, mirror that pair in
-`Dockerfile.distroless` in lockstep as the fallback mirror, and update
-`dockerfile_parity_errors` in `scripts/ci/test_toolchain_parity.py` to allow the
-explicit rollback pair. Keep the Rust version aligned with
-`rust-toolchain.toml`; do not mix trixie-built binaries with bookworm runtime
-libraries. Require the parity guard, image build/smoke, and staging handshake to
-pass before calling the rollback complete. SBOMs regenerate per head through the
+`Dockerfile.distroless` in lockstep, and update the distroless-bound gates in
+the same PR: `dockerfile_parity_errors` in `scripts/ci/test_toolchain_parity.py`
+for the builder pin, `scripts/test-supply-chain.py` for the base-image pins and
+the runtime assertions (no RUN, no apt-get/useradd//var/lib/dpkg, USER 65532),
+`scripts/runtime-image-evidence.py` for the status.d layout (it rejects
+var/lib/dpkg/status), and `scripts/vulnerability-preflight.py` for DISTRO. Keep
+the Rust version aligned with `rust-toolchain.toml`; do not mix trixie-built
+binaries with bookworm runtime libraries. Require the parity guard, the sbom
+supply-chain lane, image build/smoke, and staging handshake to pass before
+calling the rollback complete. SBOMs regenerate per head through the
 supply-chain lane.
 
 ## Verdict
