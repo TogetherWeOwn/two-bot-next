@@ -290,9 +290,22 @@ pub async fn run_retention(
         }
         Err(error) => {
             tracing::warn!(
-                message = "retention_raw_expiry_failed",
+                message = "retention_run",
                 mode = ?mode,
+                raw_expiry_failed = true,
                 error = %format!("{error:?}"),
+                presence_raw_deleted = report.presence_raw_deleted,
+                voice_raw_deleted = report.voice_raw_deleted,
+                audit_cache_deleted = report.audit_cache_deleted,
+                guild_rows_purged = report.guild_rows_purged,
+                guild_purges_failed = report.guild_purges_failed,
+                guild_purges_deferred = report.guild_purges_deferred,
+                guild_purges_deferred_oldest_secs = report.guild_purges_deferred_oldest_secs,
+                deletions_completed = report.deletions_completed,
+                deletions_deferred = report.deletions_deferred,
+                schema_gap_deferrals = report.schema_gap_deferrals,
+                deletions_overdue = report.deletions_overdue,
+                duration_ms = started.elapsed().as_millis() as u64,
                 "core retention completed; raw expiry failed and will retry on the next cadence",
             );
             return Err(error);
@@ -669,46 +682,54 @@ async fn count_raw_expiry_candidates(
             }
         }
     }
-    let mut sql = String::from(
-        "SELECT
-            count(*) FILTER (WHERE event_type = $4),
-            count(*) FILTER (WHERE event_type = ANY($5)),
-            count(*) FILTER (WHERE event_type = $6)
-         FROM event_store
-         WHERE ((event_type = $4 AND event_time <= $1)
-            OR (event_type = ANY($5) AND event_time <= $2)
-            OR (event_type = $6 AND event_time <= $3))",
-    );
-    let mut next_placeholder = 7usize;
-    if !queued_unguarded.is_empty() {
-        sql.push_str(&format!(" AND NOT (guild_id = ANY(${next_placeholder}))"));
-        next_placeholder += 1;
-    }
-    // Same member predicate as the user-deletion stage's `event_store` plan
-    // entry (`guild_id = $1 AND (actor/target/user/inviter = $2)`): a row this
-    // stage deletes settles as a receipt, never as a raw row count.
-    for _ in &eligible_pairs {
-        let guild_placeholder = next_placeholder;
-        let user_placeholder = next_placeholder + 1;
-        sql.push_str(&format!(
-            " AND (guild_id = ${guild_placeholder} AND (actor_id = ${user_placeholder} OR target_id = ${user_placeholder} OR user_id = ${user_placeholder} OR inviter_id = ${user_placeholder})) IS NOT TRUE"
-        ));
-        next_placeholder += 2;
-    }
-    let mut query = sqlx::query_as::<_, (i64, i64, i64)>(sqlx::AssertSqlSafe(sql))
-        .bind(presence_cutoff)
-        .bind(voice_cutoff)
-        .bind(audit_cutoff)
-        .bind(CAPTURE_PRESENCE)
-        .bind(&CAPTURE_VOICE[..])
-        .bind(CAPTURE_AUDIT);
-    if !queued_unguarded.is_empty() {
-        query = query.bind(queued_unguarded);
-    }
-    for (guild_id, user_id) in eligible_pairs {
-        query = query.bind(guild_id).bind(user_id);
-    }
-    let (presence, voice, audit): (i64, i64, i64) = query.fetch_one(&mut *tx).await?;
+    // Keep SQL shape constant as the pending-deletion queue grows. Separate
+    // per-class counts also let the composite event_type/event_time index
+    // provide a bounded range scan for each expiring family.
+    let eligible_guilds: Vec<String> = eligible_pairs
+        .iter()
+        .map(|(guild_id, _)| guild_id.clone())
+        .collect();
+    let eligible_users: Vec<String> = eligible_pairs
+        .iter()
+        .map(|(_, user_id)| user_id.clone())
+        .collect();
+    let presence = count_raw_expiry_class(
+        &mut tx,
+        CAPTURE_PRESENCE,
+        presence_cutoff,
+        &queued_unguarded,
+        &eligible_guilds,
+        &eligible_users,
+    )
+    .await?;
+    let voice_state = count_raw_expiry_class(
+        &mut tx,
+        CAPTURE_VOICE[0],
+        voice_cutoff,
+        &queued_unguarded,
+        &eligible_guilds,
+        &eligible_users,
+    )
+    .await?;
+    let voice_server = count_raw_expiry_class(
+        &mut tx,
+        CAPTURE_VOICE[1],
+        voice_cutoff,
+        &queued_unguarded,
+        &eligible_guilds,
+        &eligible_users,
+    )
+    .await?;
+    let audit = count_raw_expiry_class(
+        &mut tx,
+        CAPTURE_AUDIT,
+        audit_cutoff,
+        &queued_unguarded,
+        &eligible_guilds,
+        &eligible_users,
+    )
+    .await?;
+    let voice = voice_state + voice_server;
     tx.commit().await?;
     Ok(RetentionReport {
         presence_raw_deleted: presence as u64,
@@ -724,6 +745,36 @@ async fn count_raw_expiry_candidates(
         deletions_overdue: 0,
         duration_ms: started.elapsed().as_millis() as u64,
     })
+}
+
+async fn count_raw_expiry_class(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    event_type: &str,
+    cutoff: OffsetDateTime,
+    queued_guilds: &[String],
+    eligible_guilds: &[String],
+    eligible_users: &[String],
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM event_store
+         WHERE event_type = $1 AND event_time <= $2
+           AND guild_id <> ALL($3::text[])
+           AND NOT EXISTS (
+               SELECT 1 FROM unnest($4::text[], $5::text[]) AS eligible(guild_id, user_id)
+               WHERE event_store.guild_id = eligible.guild_id
+                 AND (event_store.actor_id = eligible.user_id
+                   OR event_store.target_id = eligible.user_id
+                   OR event_store.user_id = eligible.user_id
+                   OR event_store.inviter_id = eligible.user_id)
+           )",
+    )
+    .bind(event_type)
+    .bind(cutoff)
+    .bind(queued_guilds.to_vec())
+    .bind(eligible_guilds.to_vec())
+    .bind(eligible_users.to_vec())
+    .fetch_one(&mut **tx)
+    .await
 }
 
 /// One bounded batch of raw `event_store` expiry for the existing retention
@@ -769,9 +820,18 @@ pub async fn run_raw_expiry_batch(
         next_sweep_deadline - Duration::days(i64::from(PRESENCE_RAW_RETENTION_DAYS));
     let voice_cutoff = next_sweep_deadline - Duration::days(i64::from(VOICE_RAW_RETENTION_DAYS));
     let audit_cutoff = next_sweep_deadline - Duration::days(i64::from(AUDIT_CACHE_RETENTION_DAYS));
-    let eligible = "(event_type = $5 AND event_time <= $1) \
-                    OR (event_type IN ($6, $7) AND event_time <= $2) \
-                    OR (event_type = $8 AND event_time <= $3)";
+    // Restrict each branch by its indexed event_type before applying the
+    // timestamp range. A single OR predicate on event_time walks the entire
+    // event_time index through non-expiring families on every cadence.
+    let candidates = "WITH candidates AS (\
+        (SELECT id, event_time, event_type FROM event_store WHERE event_type = $5 AND event_time <= $1 ORDER BY event_time, id LIMIT $4) \
+        UNION ALL \
+        (SELECT id, event_time, event_type FROM event_store WHERE event_type = $6 AND event_time <= $2 ORDER BY event_time, id LIMIT $4) \
+        UNION ALL \
+        (SELECT id, event_time, event_type FROM event_store WHERE event_type = $7 AND event_time <= $2 ORDER BY event_time, id LIMIT $4) \
+        UNION ALL \
+        (SELECT id, event_time, event_type FROM event_store WHERE event_type = $8 AND event_time <= $3 ORDER BY event_time, id LIMIT $4)\
+    )";
     let mut tx = pool.begin().await?;
     let selected: Vec<String> = match mode {
         RetentionMode::DryRun => {
@@ -779,7 +839,7 @@ pub async fn run_raw_expiry_batch(
                 .execute(&mut *tx)
                 .await?;
             sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-                "SELECT event_type FROM event_store WHERE {eligible} ORDER BY event_time, id LIMIT $4"
+                "{candidates} SELECT event_type FROM candidates ORDER BY event_time, id LIMIT $4"
             )))
             .bind(presence_cutoff)
             .bind(voice_cutoff)
@@ -800,9 +860,7 @@ pub async fn run_raw_expiry_batch(
                 .execute(&mut *tx)
                 .await?;
             sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-                "DELETE FROM event_store WHERE id IN \
-                 (SELECT id FROM event_store WHERE {eligible} ORDER BY event_time, id LIMIT $4) \
-                 RETURNING event_type"
+                "{candidates} DELETE FROM event_store USING (SELECT id FROM candidates ORDER BY event_time, id LIMIT $4) AS batch WHERE event_store.id = batch.id RETURNING event_store.event_type"
             )))
             .bind(presence_cutoff)
             .bind(voice_cutoff)
