@@ -848,6 +848,35 @@ mod tests {
     }
 
     #[test]
+    fn eventsub_received_is_counted_once_before_verification() {
+        // `two_bot_eventsub_received_total` includes tampered deliveries only
+        // because `eventsub_received()` runs after the empty-body gate and
+        // before `verify_delivery`. A behavioral delta test would race on the
+        // process-global registry under parallel test threads, so pin the
+        // position in source instead.
+        let source = include_str!("eventsub_http.rs");
+        let non_test = source.split_once("#[cfg(test)]").expect("test module").0;
+        assert_eq!(
+            non_test.matches("eventsub_received()").count(),
+            1,
+            "receiver must count each accepted delivery exactly once via eventsub_received()"
+        );
+        let empty_pos = non_test.find("if raw.is_empty()").expect("empty-body gate");
+        let received_pos = non_test.find("eventsub_received()").expect("receipt call");
+        let verify_pos = non_test
+            .find("if let Err(error) = verify_delivery")
+            .expect("verification branch");
+        assert!(
+            empty_pos < received_pos && received_pos < verify_pos,
+            "eventsub_received() must run after the empty-body gate and before verify_delivery so tampered deliveries still count toward received_total"
+        );
+        assert!(
+            non_test[empty_pos..verify_pos].contains("eventsub_received()"),
+            "receipt call must sit in the slice between the empty-body gate and verify_delivery"
+        );
+    }
+
+    #[test]
     fn eventsub_classification_literals_stay_with_their_delivery_arms() {
         let source = include_str!("eventsub_http.rs");
         let verify_failure = source
