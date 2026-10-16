@@ -100,10 +100,11 @@ claim them as shipped acceptance:
   credential-bearing URLs.
 - The five-minute user-flow synthetic (`synthetic-user-flow` workflow, see
   [synthetic-user-flow](synthetic-user-flow.md)) defines staging and passive
-  production probes, each with failure alerts. Production remains read-only and
-  never blocks a deploy. The workflow's `force_fail` input exercises staging
-  only; do not claim live schedule or alert delivery until the operator bindings
-  and matching run/artifact evidence have been independently verified.
+  production probes, with one alert after two consecutive failures and one
+  recovery message per incident. Production remains read-only and never blocks
+  a deploy. The workflow's `force_fail` input exercises staging only; do not
+  claim live schedule or alert delivery until the operator bindings and matching
+  run/artifact evidence have been independently verified.
 - Error-rate detection is installed: `rest_5xx_rate` pages when 5xx exceed 10%
   of Discord REST requests between keepalive samples (minimum 10 requests),
   with the rollback evaluation in [Alert: REST 5xx](runbook.md#alert-rest-5xx).

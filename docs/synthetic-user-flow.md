@@ -11,7 +11,7 @@ a request is sent. No Gatus or third-party monitor is used.
 | Job | Probe | Target |
 | --- | --- | --- |
 | `staging` | `scripts/staging_health_contract_probe.py` | `$STAGING_WORKER_URL` (repo var) |
-| `prod-passive` | `scripts/prod_passive_probe.py` | `$PROD_WORKER_URL` (repo var) |
+| `prod-passive` | `scripts/prod_passive_probe.py` | `$PRODUCTION_WORKER_URL` (repo var) |
 
 Each job writes one JSON evidence receipt (`synthetic-staging-<run>.json`,
 `synthetic-prod-<run>.json`, 14-day artifacts) and fails on any check FAIL
@@ -20,8 +20,11 @@ only, and never blocks a deploy.
 
 ## Failure alerts
 
-A failing job posts one Discord ops-channel message via
-`scripts/synthetic_alert.py`, reusing the Worker alert pattern:
+Two consecutive failed probes open one Discord ops-channel incident via
+`scripts/synthetic_alert.py`; further failed samples are suppressed until a
+successful probe posts one recovery message. This mirrors the Worker's
+failure-threshold and one-alert-per-incident behavior. The manual
+`force_fail: true` staging proof bypasses the threshold intentionally:
 
 ```text
 two-bot-next ALERT synthetic-user-flow:<staging|prod>: <failing checks>. Runbook: <runbook URL> | build <revision> <build_id> (git <sha>) | logs <github run URL>
@@ -29,13 +32,17 @@ two-bot-next ALERT synthetic-user-flow:<staging|prod>: <failing checks>. Runbook
 
 `allowed_mentions` is off. The destination is Discord-only: any non-Discord
 webhook URL refuses before any request, and the URL itself is never printed.
-A green probe sends nothing, so green runs need no secret. A failed probe
-with no webhook fails the alert step, so a silent alert path cannot read as
-delivered.
+Runs with no incident transition send nothing and need no webhook. When an
+alert or recovery transition is due, a missing webhook fails that step, so a
+silent notification path cannot read as delivered.
 
 ## Operator bindings
 
-- Repo vars `STAGING_WORKER_URL`, `PROD_WORKER_URL`: the two Worker origins.
+- Repository variables `STAGING_WORKER_URL` and `PRODUCTION_WORKER_URL`:
+  the staging and production Worker origins. The latter must match the existing
+  `production` Environment variable because the synthetic runs in the separate
+  `synthetic-alerts` Environment. A missing variable skips that target with a
+  visible warning instead of producing recurring configuration failures.
 - Environment `synthetic-alerts`, secret `SYNTHETIC_ALERT_WEBHOOK_URL`: the
   Discord webhook. Never paste it into a command, log, or report.
 

@@ -4,8 +4,9 @@ name: synthetic-user-flow
 # the staging health-contract probe plus a passive production probe, each
 # read-only GETs against its own Worker origin. A probe failure posts one
 # Discord ops-channel alert reusing the Worker alert pattern (build revision
-# plus the GitHub run link), then fails the job. Production is passive only:
-# the prod job observes and alerts, it never blocks a deploy.
+# plus the GitHub run link). Alerts fire after two consecutive failed probes,
+# once per incident, with a recovery message on the first successful probe.
+# Production is passive only: the prod job observes and alerts, it never blocks a deploy.
 #
 # When it runs: every 5 minutes on main, plus manual dispatch. The dispatch
 # `force_fail` input proves the failure-to-alert path without touching prod:
@@ -13,11 +14,12 @@ name: synthetic-user-flow
 # (exit 2), the upload tolerates the missing receipt, and the alert posts with
 # unknown build identity plus the run link.
 #
-# Operator bindings (never in this file): repo vars STAGING_WORKER_URL and
-# PROD_WORKER_URL carry the two Worker origins, and the `synthetic-alerts`
+# Operator bindings (never in this file): repository vars STAGING_WORKER_URL
+# and PRODUCTION_WORKER_URL carry the two Worker origins (the latter must
+# match the production Environment value), and the `synthetic-alerts`
 # environment secret SYNTHETIC_ALERT_WEBHOOK_URL carries the Discord webhook.
-# A green probe needs no secret; a failed probe with no webhook fails the
-# alert step so a silent alert path cannot read as delivered.
+# Missing target vars skip that probe with a notice; an event that needs a
+# notification fails if the webhook is missing or delivery fails.
 on:
   schedule:
     - cron: '*/5 * * * *'
@@ -38,6 +40,7 @@ jobs:
   staging:
     name: staging user-flow synthetic
     permissions:
+      actions: read
       contents: read
     if: github.ref == 'refs/heads/main'
     environment: synthetic-alerts
@@ -50,12 +53,17 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
       - name: Run the staging user-flow probe
+        id: probe
+        if: vars.STAGING_WORKER_URL != '' || inputs.force_fail
         env:
           STAGING_WORKER_URL: ${{ (inputs.force_fail && 'https://example.invalid') || vars.STAGING_WORKER_URL }}
           RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           python3 scripts/staging_health_contract_probe.py --evidence "synthetic-staging-$RUN_ID.json"
+      - name: Notice missing staging target binding
+        if: steps.probe.outcome == 'skipped' && vars.STAGING_WORKER_URL == '' && !inputs.force_fail
+        run: echo "::warning::Skipping staging synthetic because STAGING_WORKER_URL is unset"
       - name: Upload the staging evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -64,22 +72,22 @@ jobs:
           path: synthetic-staging-${{ github.run_id }}.json
           if-no-files-found: ignore
           retention-days: 14
-      - name: Alert the ops channel on failure
-        if: failure()
+      - name: Alert the ops channel on incident transition
+        if: always()
         env:
           SYNTHETIC_ALERT_WEBHOOK_URL: ${{ secrets.SYNTHETIC_ALERT_WEBHOOK_URL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROBE_OUTCOME: ${{ steps.probe.outcome }}
+          FORCE_FAIL: ${{ inputs.force_fail }}
           RUN_ID: ${{ github.run_id }}
           GIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [ -z "${SYNTHETIC_ALERT_WEBHOOK_URL:-}" ]; then
-            echo "::error::SYNTHETIC_ALERT_WEBHOOK_URL missing in the synthetic-alerts environment; the staging failure cannot alert"
-            exit 1
-          fi
           python3 scripts/synthetic_alert.py --env staging --evidence "synthetic-staging-$RUN_ID.json"
   prod-passive:
     name: prod passive user-flow synthetic
     permissions:
+      actions: read
       contents: read
     if: github.ref == 'refs/heads/main'
     environment: synthetic-alerts
@@ -92,12 +100,17 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
       - name: Run the passive production probe
+        id: probe
+        if: vars.PRODUCTION_WORKER_URL != ''
         env:
-          PROD_WORKER_URL: ${{ vars.PROD_WORKER_URL }}
+          PROD_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
           RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           python3 scripts/prod_passive_probe.py --evidence "synthetic-prod-$RUN_ID.json"
+      - name: Notice missing production target binding
+        if: steps.probe.outcome == 'skipped' && vars.PRODUCTION_WORKER_URL == ''
+        run: echo "::warning::Skipping production synthetic because PRODUCTION_WORKER_URL is unset"
       - name: Upload the prod evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -106,16 +119,14 @@ jobs:
           path: synthetic-prod-${{ github.run_id }}.json
           if-no-files-found: ignore
           retention-days: 14
-      - name: Alert the ops channel on failure
-        if: failure()
+      - name: Alert the ops channel on incident transition
+        if: always()
         env:
           SYNTHETIC_ALERT_WEBHOOK_URL: ${{ secrets.SYNTHETIC_ALERT_WEBHOOK_URL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROBE_OUTCOME: ${{ steps.probe.outcome }}
           RUN_ID: ${{ github.run_id }}
           GIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [ -z "${SYNTHETIC_ALERT_WEBHOOK_URL:-}" ]; then
-            echo "::error::SYNTHETIC_ALERT_WEBHOOK_URL missing in the synthetic-alerts environment; the prod failure cannot alert"
-            exit 1
-          fi
           python3 scripts/synthetic_alert.py --env prod --evidence "synthetic-prod-$RUN_ID.json"

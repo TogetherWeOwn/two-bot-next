@@ -1402,12 +1402,13 @@ def synthetic_user_flow_errors(workflow):
     """Five-minute user-flow synthetic (docs/synthetic-user-flow.md).
 
     Runs on a 5-minute schedule and manual dispatch, only from main, through
-    the `synthetic-alerts` environment whose single secret is the Discord
-    webhook. Two jobs: `staging` runs the reviewed staging health-contract
-    probe, `prod-passive` runs the reviewed passive production probe (observe
-    and alert only, never a deploy gate). Each job is checkout, one probe Run
-    step, an always() evidence upload, and one failure() alert step that posts
-    via the reviewed alert script. No wrangler, no deploy route, no `set -x`.
+    the `synthetic-alerts` environment. Two jobs: `staging` runs the reviewed
+    staging health-contract probe, `prod-passive` runs the reviewed passive
+    production probe (observe and alert only, never a deploy gate). Each job
+    has an optional target probe, a notice when its binding is absent, an
+    always() evidence upload, and an always() transition step. That step reads
+    recent run history with actions:read, alerts after two failures, and posts
+    recovery once. No wrangler, no deploy route, no `set -x`.
     """
     name = "synthetic-user-flow.yml"
     errors = []
@@ -1444,8 +1445,8 @@ def synthetic_user_flow_errors(workflow):
             errors.append(f"{name}:{job_id}: must read only the synthetic-alerts Environment")
         if job.get("if") != "github.ref == 'refs/heads/main'":
             errors.append(f"{name}:{job_id}: must run only from main")
-        if job.get("permissions") != {"contents": "read"}:
-            errors.append(f"{name}:{job_id}: must keep contents:read only")
+        if job.get("permissions") != {"actions": "read", "contents": "read"}:
+            errors.append(f"{name}:{job_id}: must keep actions:read plus contents:read only")
         if job.get("timeout-minutes") != "10":
             errors.append(f"{name}:{job_id}: timeout must stay 10 minutes")
         if not runner_allowed(job_id, job.get("runs-on")):
@@ -1454,23 +1455,32 @@ def synthetic_user_flow_errors(workflow):
             if key in job:
                 errors.append(f"{name}:{job_id}: must not set {key}")
         steps = job.get("steps") or []
-        if len(steps) != 4:
-            errors.append(f"{name}:{job_id}: must run exactly checkout, probe, upload and alert")
+        if len(steps) != 5:
+            errors.append(f"{name}:{job_id}: must run checkout, probe, notice, upload and alert")
             continue
-        checkout, probe_step, upload, alert_step = steps
+        checkout, probe_step, notice, upload, alert_step = steps
         if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
                 or (checkout.get("with") or {}).get("persist-credentials") != "false":
             errors.append(f"{name}:{job_id}: checkout must be pinned and must not persist credentials")
         if expected_script[job_id] not in str(probe_step.get("run", "")) or "uses" in probe_step:
             errors.append(f"{name}:{job_id}: probe step must call {expected_script[job_id]}")
+        expected_target = "STAGING_WORKER_URL" if job_id == "staging" else "PRODUCTION_WORKER_URL"
+        if probe_step.get("id") != "probe" or expected_target not in str(probe_step.get("if", "")):
+            errors.append(f"{name}:{job_id}: probe must be skipped when {expected_target} is unset")
+        expected_notice = expected_target + " is unset"
+        if expected_notice not in str(notice.get("run", "")) or "::warning::" not in str(notice.get("run", "")):
+            errors.append(f"{name}:{job_id}: missing-binding skip must emit a notice")
         if upload.get("if") != "always()":
             errors.append(f"{name}:{job_id}: upload must run with if: always() so failures keep their artifact")
         if not str(upload.get("uses", "")).startswith("actions/upload-artifact@"):
             errors.append(f"{name}:{job_id}: must upload the run evidence artifact")
-        if alert_step.get("if") != "failure()":
-            errors.append(f"{name}:{job_id}: alert must run only with if: failure()")
+        if alert_step.get("if") != "always()":
+            errors.append(f"{name}:{job_id}: transition step must run with if: always()")
         if "scripts/synthetic_alert.py" not in str(alert_step.get("run", "")):
             errors.append(f"{name}:{job_id}: alert step must call scripts/synthetic_alert.py")
+        if (alert_step.get("env", {}).get("GITHUB_TOKEN") != "${{ secrets.GITHUB_TOKEN }}"
+                or alert_step.get("env", {}).get("PROBE_OUTCOME") != "${{ steps.probe.outcome }}"):
+            errors.append(f"{name}:{job_id}: transition step must pass the run token and probe outcome via env")
         for step in steps:
             if step is not alert_step and "secrets." in str(step):
                 errors.append(f"{name}:{job_id}: only the alert step may hold a secret")
@@ -1480,8 +1490,8 @@ def synthetic_user_flow_errors(workflow):
         if marker in text:
             errors.append(f"{name}: must not contain {marker!r}")
     secrets = set(re.findall(r"secrets\.([a-z0-9_]+)", text))
-    if secrets != {"synthetic_alert_webhook_url"}:
-        errors.append(f"{name}: must read exactly the SYNTHETIC_ALERT_WEBHOOK_URL secret")
+    if secrets != {"synthetic_alert_webhook_url", "github_token"}:
+        errors.append(f"{name}: must read only the webhook secret and read-only GitHub token")
     return errors
 
 
@@ -3014,7 +3024,11 @@ class WorkflowTests(unittest.TestCase):
             for job_id, job in workflow["jobs"].items():
                 with self.subTest(workflow=name, job=job_id):
                     expected = {"contents": "read"}
-                    if (name, job_id) == ("supply-chain.yml", "pr-lint"):
+                    if (name, job_id) in (("synthetic-user-flow.yml", "staging"),
+                                          ("synthetic-user-flow.yml", "prod-passive")):
+                        # Read workflow/job history to debounce alerts and detect recovery.
+                        expected = {"contents": "read", "actions": "read"}
+                    elif (name, job_id) == ("supply-chain.yml", "pr-lint"):
                         expected["pull-requests"] = "read"
                     elif (name, job_id) == ("test-guard.yml", "test-guard"):
                         # Marker-label actor audit via the issue-events API.

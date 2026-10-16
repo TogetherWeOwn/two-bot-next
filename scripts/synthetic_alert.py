@@ -22,6 +22,8 @@ import sys
 import urllib.error
 import urllib.request
 
+from synthetic_alert_history import HistoryError, previous_probe_outcomes, transition
+
 RUNBOOK_URL = ("https://github.com/TogetherWeOwn/two-bot-next"
                "/blob/main/docs/runbook-observability.md")
 # Same Discord-only destination boundary as wrangler/src/index.ts.
@@ -66,12 +68,13 @@ def summarize(evidence):
     return text if len(text) <= 300 else text[:297] + "..."
 
 
-def build_content(env, evidence, git_sha, run_link):
-    summary = summarize(evidence)
+def build_content(env, evidence, git_sha, run_link, event="alert"):
+    summary = summarize(evidence) if event == "alert" else "the probe is healthy again"
     revision = printable((evidence or {}).get("build_revision")) or "unknown"
     build_id = printable((evidence or {}).get("build_id")) or "unknown"
     sha = printable(git_sha) or "unknown"
-    content = (f"two-bot-next ALERT synthetic-user-flow:{env}: {summary}. "
+    kind = "ALERT" if event == "alert" else "RECOVERY"
+    content = (f"two-bot-next {kind} synthetic-user-flow:{env}: {summary}. "
                f"Runbook: {RUNBOOK_URL} | "
                f"build {revision} {build_id} (git {sha}) | logs {run_link}")
     return content if len(content) <= MAX_CONTENT else content[:MAX_CONTENT - 3] + "..."
@@ -115,6 +118,24 @@ def parse_args(argv):
 
 def main(argv=None):
     args = parse_args(argv)
+    current = os.environ.get("PROBE_OUTCOME")
+    # A missing/skipped probe (for example, an unset optional target binding)
+    # is not a sample and must not create an alert or recovery transition.
+    if current not in ("success", "failure"):
+        print("synthetic_alert: no probe sample; no alert transition", file=sys.stderr)
+        return 0
+    try:
+        previous = previous_probe_outcomes(os.environ, args.env)
+    except HistoryError as error:
+        if current == "success":
+            print(f"synthetic_alert: warning: {error}; healthy probe remains green", file=sys.stderr)
+            return 0
+        print(f"synthetic_alert: {error}", file=sys.stderr)
+        return 1
+    event = transition(current, previous, os.environ.get("FORCE_FAIL") == "true")
+    if event is None:
+        print("synthetic_alert: no alert transition", file=sys.stderr)
+        return 0
     webhook_url = os.environ.get("SYNTHETIC_ALERT_WEBHOOK_URL")
     if not webhook_url:
         print("synthetic_alert: SYNTHETIC_ALERT_WEBHOOK_URL is not set", file=sys.stderr)
@@ -122,14 +143,14 @@ def main(argv=None):
     evidence = load_evidence(args.evidence)
     content = build_content(args.env, evidence,
                             os.environ.get("GIT_SHA") or os.environ.get("GITHUB_SHA"),
-                            run_link())
+                            run_link(), event)
     print(content)
     try:
         post(webhook_url, content)
     except AlertError as error:
         print(f"synthetic_alert: {error}", file=sys.stderr)
         return 1
-    print(f"synthetic_alert: delivered for {args.env}", file=sys.stderr)
+    print(f"synthetic_alert: delivered {event} for {args.env}", file=sys.stderr)
     return 0
 
 
